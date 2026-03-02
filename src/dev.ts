@@ -1,5 +1,8 @@
 import { execSync, spawn } from "node:child_process";
-import { existsSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 
 // ============================================
 // dev.ts — AI + tmux + git worktree 开发环境
@@ -21,17 +24,74 @@ function shExec(cmd: string): void {
   execSync(cmd, { stdio: "inherit", timeout: 30000 });
 }
 
-// --- 项目目录映射 ---
-const PROJECT_DIRS: Record<string, string> = {
-  coco: `${process.env.HOME}/go/src/code.byted.org/nextcode/coco`,
-  vecode: `${process.env.HOME}/go/src/code.byted.org/vecode/vecode`,
-};
+// --- 配置 ---
+interface Config {
+  projects: Record<string, string>;
+  worktreeBase?: string;
+  notesBase?: string;
+}
 
-const WORKTREE_BASE = "/private/tmp/jyn/projects";
-const NOTES_BASE = "/private/tmp/jyn/notes";
+const CONFIG_PATH = join(homedir(), ".tmux-worktree.json");
+
+function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
+  return new Promise((resolve) => rl.question(question, resolve));
+}
+
+async function initConfigInteractive(): Promise<Config> {
+  console.log(`${CONFIG_PATH} 不存在，开始初始化...\n`);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const projects: Record<string, string> = {};
+
+    console.log("添加项目 (留空结束):");
+    while (true) {
+      const name = (await prompt(rl, "  项目名称: ")).trim();
+      if (!name) break;
+      const path = (await prompt(rl, "  仓库路径: ")).trim();
+      if (!path) break;
+      projects[name] = path.replace(/^~/, homedir());
+    }
+
+    if (Object.keys(projects).length === 0) {
+      console.error("\n错误: 至少需要添加一个项目");
+      process.exit(1);
+    }
+
+    console.log();
+    const defaultWorktree = "/private/tmp/tmux-worktree/projects";
+    const defaultNotes = "/private/tmp/tmux-worktree/notes";
+
+    const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
+    const notesInput = (await prompt(rl, `notes 目录 (${defaultNotes}): `)).trim();
+
+    const config: Config = { projects };
+    if (worktreeInput) config.worktreeBase = worktreeInput.replace(/^~/, homedir());
+    if (notesInput) config.notesBase = notesInput.replace(/^~/, homedir());
+
+    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+    console.log(`\n✅ 已保存到 ${CONFIG_PATH}\n`);
+    return config;
+  } finally {
+    rl.close();
+  }
+}
+
+async function loadConfig(): Promise<Config> {
+  if (existsSync(CONFIG_PATH)) {
+    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
+  }
+  return initConfigInteractive();
+}
+
 const SESSION_NAME_MAX_LEN = 20;
 
 export async function run() {
+  const config = await loadConfig();
+  const PROJECT_DIRS = config.projects;
+  const WORKTREE_BASE = config.worktreeBase ?? "/private/tmp/tmux-worktree/projects";
+  const NOTES_BASE = config.notesBase ?? "/private/tmp/tmux-worktree/notes";
+
   // --- 参数解析 ---
   const [aiCmd, project, sessionArg] = process.argv.slice(2);
 

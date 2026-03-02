@@ -1,7 +1,10 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
+  "files": [
+    "dist"
+  ],
   "bin": {
     "tmux-worktree": "./dist/cli.js"
   },
