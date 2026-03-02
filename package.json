@@ -6,7 +6,8 @@
     "dist"
   ],
   "bin": {
-    "tmux-worktree": "./dist/cli.js"
+    "tmux-worktree": "./dist/cli.js",
+    "tw": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsup src/cli.ts --format esm --target node20"
