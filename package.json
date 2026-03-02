@@ -1,0 +1,15 @@
+{
+  "name": "@byted-codebase/tmux-worktree",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "tmux-worktree": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup src/cli.ts --format esm --target node20"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}
