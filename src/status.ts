@@ -61,11 +61,48 @@ function collectSessions(): SessionInfo[] {
     .map((name) => ({ name, isCurrent: name === currentSession }));
 }
 
+// ─── Project colors ───
+const PROJECT_COLORS = [
+  "\x1b[38;5;168m", // rose
+  "\x1b[38;5;114m", // green
+  "\x1b[38;5;215m", // orange
+  "\x1b[38;5;75m",  // sky blue
+  "\x1b[38;5;183m", // lavender
+  "\x1b[38;5;44m",  // teal
+  "\x1b[38;5;222m", // gold
+  "\x1b[38;5;210m", // salmon
+  "\x1b[38;5;157m", // mint
+  "\x1b[38;5;147m", // periwinkle
+  "\x1b[38;5;203m", // coral
+  "\x1b[38;5;120m", // lime
+];
+const RESET = "\x1b[0m";
+const BOLD = "\x1b[1m";
+
+function getProjectName(sessionName: string): string {
+  const idx = sessionName.indexOf("-");
+  return idx > 0 ? sessionName.substring(0, idx) : sessionName;
+}
+
+function buildProjectColorMap(sessions: SessionInfo[]): Map<string, string> {
+  const map = new Map<string, string>();
+  let colorIdx = 0;
+  for (const s of sessions) {
+    const project = getProjectName(s.name);
+    if (!map.has(project)) {
+      map.set(project, PROJECT_COLORS[colorIdx % PROJECT_COLORS.length]);
+      colorIdx++;
+    }
+  }
+  return map;
+}
+
 // ─── Render ───
 function renderFrame(sessions: SessionInfo[]): string[] {
   const { cols } = getTermSize();
   const lines: string[] = [];
   rowSessionMap = new Map();
+  const colorMap = buildProjectColorMap(sessions);
 
   lines.push("");
 
@@ -75,11 +112,26 @@ function renderFrame(sessions: SessionInfo[]): string[] {
     const colEnd = colStart + info.name.length - 1;
     rowSessionMap.set(rowIndex, { name: info.name, colStart, colEnd });
 
-    const marker = info.isCurrent ? "\x1b[31m●\x1b[0m" : esc.dim("○");
-    const name = info.isCurrent ? `\x1b[31m${info.name}\x1b[0m` : info.name;
+    const project = getProjectName(info.name);
+    const color = colorMap.get(project) || "\x1b[37m";
+
+    const marker = info.isCurrent ? `${color}${BOLD}●${RESET}` : `${color}○${RESET}`;
+
+    const dashIdx = info.name.indexOf("-");
+    let name: string;
+    if (dashIdx > 0) {
+      const projectPart = info.name.substring(0, dashIdx);
+      const titlePart = info.name.substring(dashIdx);
+      if (info.isCurrent) {
+        name = `${color}${BOLD}${projectPart}${RESET}${titlePart}`;
+      } else {
+        name = `${color}${projectPart}${RESET}${esc.dim(titlePart)}`;
+      }
+    } else {
+      name = info.isCurrent ? `${color}${BOLD}${info.name}${RESET}` : `${color}${info.name}${RESET}`;
+    }
 
     let row = ` ${marker} ${name}`;
-    // truncate if needed
     const stripped = row.replace(/\x1b\[[0-9;]*m/g, "");
     if (stripped.length > cols) {
       row = stripped.slice(0, cols - 1) + "…";

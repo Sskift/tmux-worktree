@@ -1,6 +1,7 @@
 import { execSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 
@@ -169,9 +170,13 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
     }
 
     // --- Session 名称 ---
-    console.log(`\ntmux session 名称，用于区分多个工作环境`);
-    const sessInput = (await prompt(rl, `Session 名称 (默认 ${sessionName}): `)).trim();
-    if (sessInput) sessionName = sessInput;
+    console.log(`\n输入 session 标题，最终名称为 <project>-<title>`);
+    const sessInput = (await prompt(rl, `Session 标题 (留空只用项目名 '${sessionName}'): `)).trim();
+    if (sessInput && projectKey) {
+      sessionName = `${projectKey}-${sessInput}`;
+    } else if (sessInput) {
+      sessionName = sessInput;
+    }
 
     console.log();
     return { aiCmd, projectDir, sessionName: sessionName.slice(0, SESSION_NAME_MAX_LEN), useWorktree, projectKey };
@@ -214,7 +219,7 @@ function parseArgs(projects: Record<string, string>): RunParams {
   const mappedDir = projects[project];
   if (mappedDir) {
     // 项目在映射中
-    const sessionName = (sessionArg ?? project).slice(0, SESSION_NAME_MAX_LEN);
+    const sessionName = sessionArg ? `${project}-${sessionArg}`.slice(0, SESSION_NAME_MAX_LEN) : project;
     return { aiCmd, projectDir: mappedDir, sessionName, useWorktree: true, projectKey: project };
   }
 
@@ -293,12 +298,13 @@ export async function run() {
   console.log(`   笔记文件: ${notesFile}`);
   console.log();
 
-  // 创建 session，初始窗口运行 status (最左栏 20%)
+  // 创建 session，初始窗口运行 status (最左栏固定宽度)
   shExec(`tmux new-session -d -s ${session} -c ${workDir}`);
-  shExec(`tmux send-keys -t '${session}.1' 'npx tmux-worktree status' C-m`);
+  const cliPath = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
+  shExec(`tmux send-keys -t '${session}.1' 'node "${cliPath}" status' C-m`);
 
-  // 右侧 80%：AI 命令
-  shExec(`tmux split-window -h -t '${session}.1' -c ${workDir} -l 90%`);
+  // 右侧：AI 命令
+  shExec(`tmux split-window -h -t '${session}.1' -c ${workDir}`);
   shExec(`tmux send-keys -t '${session}.2' '${aiCmd}' C-m`);
 
   // AI 命令右侧再分出 40% 给终端 + 笔记
@@ -317,13 +323,21 @@ export async function run() {
   // 聚焦到 AI 命令栏
   shExec(`tmux select-pane -t '${session}.2'`);
 
-  // 连接
+  // 连接：如果已在 tmux 中则 switch-client，否则 attach
   console.log(`✅ 环境就绪，正在连接 tmux session "${session}"...`);
-  const child = spawn("tmux", ["attach", "-t", session], {
-    stdio: "inherit",
-  });
-  const exitCode = await new Promise<number>((resolve) => {
-    child.on("exit", (code) => resolve(code ?? 0));
-  });
-  process.exitCode = exitCode;
+  const inTmux = !!process.env.TMUX;
+  if (inTmux) {
+    shExec(`tmux switch-client -t '${session}'`);
+  } else {
+    const child = spawn("tmux", ["attach", "-t", session], {
+      stdio: "inherit",
+    });
+    const exitCode = await new Promise<number>((resolve) => {
+      child.on("exit", (code) => resolve(code ?? 0));
+    });
+    process.exitCode = exitCode;
+  }
+
+  // 调整左侧大小
+  shExec(`tmux resize-pane -t '${session}:1.1' -x 30`);
 }
