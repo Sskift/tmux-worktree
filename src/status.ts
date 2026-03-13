@@ -47,7 +47,7 @@ interface SessionInfo {
 // ─── Row-to-session mapping (for mouse clicks) ───
 let rowSessionMap: Map<
   number,
-  { name: string; colStart: number; colEnd: number }
+  { name: string; colStart: number; colEnd: number; closeCol: number }
 > = new Map();
 
 // ─── Collect sessions ───
@@ -79,6 +79,34 @@ const PROJECT_COLORS = [
 const RESET = "\x1b[0m";
 const BOLD = "\x1b[1m";
 
+// ─── Display width (CJK chars = 2 columns) ───
+function displayWidth(s: string): number {
+  let w = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    // CJK Unified Ideographs, CJK Extension A/B, CJK Compatibility, Fullwidth forms,
+    // Hangul Syllables, CJK Radicals, Kangxi Radicals, Enclosed CJK, CJK Symbols
+    if (
+      (cp >= 0x1100 && cp <= 0x115f) ||  // Hangul Jamo
+      (cp >= 0x2e80 && cp <= 0x303e) ||  // CJK Radicals, Kangxi, CJK Symbols
+      (cp >= 0x3040 && cp <= 0x33bf) ||  // Hiragana, Katakana, CJK Compatibility
+      (cp >= 0x3400 && cp <= 0x4dbf) ||  // CJK Extension A
+      (cp >= 0x4e00 && cp <= 0xa4cf) ||  // CJK Unified, Yi
+      (cp >= 0xac00 && cp <= 0xd7af) ||  // Hangul Syllables
+      (cp >= 0xf900 && cp <= 0xfaff) ||  // CJK Compatibility Ideographs
+      (cp >= 0xfe30 && cp <= 0xfe6f) ||  // CJK Compatibility Forms
+      (cp >= 0xff01 && cp <= 0xff60) ||  // Fullwidth Forms
+      (cp >= 0xffe0 && cp <= 0xffe6) ||  // Fullwidth Signs
+      (cp >= 0x20000 && cp <= 0x2fa1f)   // CJK Extension B+ and Compatibility Supplement
+    ) {
+      w += 2;
+    } else {
+      w += 1;
+    }
+  }
+  return w;
+}
+
 function getProjectName(sessionName: string): string {
   const idx = sessionName.indexOf("-");
   return idx > 0 ? sessionName.substring(0, idx) : sessionName;
@@ -106,11 +134,11 @@ function renderFrame(sessions: SessionInfo[]): string[] {
 
   lines.push("");
 
+  // Calculate max session name display width for aligned "x" column
+  const maxNameWidth = sessions.reduce((max, s) => Math.max(max, displayWidth(s.name)), 0);
+
   for (const info of sessions) {
     const rowIndex = lines.length;
-    const colStart = 4;
-    const colEnd = colStart + info.name.length - 1;
-    rowSessionMap.set(rowIndex, { name: info.name, colStart, colEnd });
 
     const project = getProjectName(info.name);
     const color = colorMap.get(project) || "\x1b[37m";
@@ -131,8 +159,19 @@ function renderFrame(sessions: SessionInfo[]): string[] {
       name = info.isCurrent ? `${color}${BOLD}${info.name}${RESET}` : `${color}${info.name}${RESET}`;
     }
 
-    let row = ` ${marker} ${name}`;
+    // Pad name to align the "x" column (use display width for CJK support)
+    const padding = maxNameWidth - displayWidth(info.name);
+    let row = ` ${marker} ${name}${" ".repeat(padding)}  ${esc.dim("x")}`;
     const stripped = row.replace(/\x1b\[[0-9;]*m/g, "");
+
+    // Derive click columns using display width (1-based for SGR mouse)
+    // Layout: " ● name<padding>  x" → name starts at display col 4
+    const nameDisplayWidth = displayWidth(info.name);
+    const colStart = 4; // 1-based: space(1) + marker(1) + space(1) + name at 4
+    const colEnd = colStart + nameDisplayWidth - 1;
+    const closeCol = colStart + maxNameWidth + 2; // after padding + 2-space gap
+    rowSessionMap.set(rowIndex, { name: info.name, colStart, colEnd, closeCol });
+
     if (stripped.length > cols) {
       row = stripped.slice(0, cols - 1) + "…";
     }
@@ -175,11 +214,25 @@ function parseSGRMouse(data: string): MouseEvent | null {
   };
 }
 
-// ─── Handle mouse click → switch tmux session ───
+// ─── Handle mouse click → switch or close tmux session ───
 function handleMouseClick(row: number, col: number) {
   const lineIndex = row - 1;
   const entry = rowSessionMap.get(lineIndex);
   if (!entry) return;
+
+  if (col === entry.closeCol) {
+    // Close session: kill it and switch to next or first
+    const sessions = collectSessions();
+    const idx = sessions.findIndex((s) => s.name === entry.name);
+    const remaining = sessions.filter((s) => s.name !== entry.name);
+    if (remaining.length > 0) {
+      // Pick the next session, or wrap to first
+      const nextIdx = idx >= remaining.length ? 0 : idx;
+      sh(`tmux switch-client -t "${remaining[nextIdx].name}" 2>/dev/null`);
+    }
+    sh(`tmux kill-session -t "${entry.name}" 2>/dev/null`);
+    return;
+  }
 
   if (col >= entry.colStart && col <= entry.colEnd) {
     sh(`tmux switch-client -t "${entry.name}" 2>/dev/null`);
