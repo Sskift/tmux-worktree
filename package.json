@@ -1,6 +1,6 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "0.1.3",
+  "version": "0.1.5",
   "type": "module",
   "files": [
     "dist"
