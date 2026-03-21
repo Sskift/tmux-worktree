@@ -266,8 +266,23 @@ export async function run() {
     const label = projectKey ?? params.sessionName;
 
     console.log(`📦 项目: ${label} (${projectDir})`);
-    console.log(`🔄 正在从远程拉取最新代码...`);
-    shExec(`git -C ${projectDir} fetch origin master --quiet`);
+
+    // 动态检测默认分支
+    let defaultBranch = sh(
+      `git -C ${projectDir} symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`
+    )
+      ?.replace("refs/remotes/origin/", "")
+      ?.trim();
+    if (!defaultBranch) {
+      // fallback: 检查 main 或 master
+      const hasMaster = sh(
+        `git -C ${projectDir} ls-remote --heads origin master 2>/dev/null`
+      );
+      defaultBranch = hasMaster ? "master" : "main";
+    }
+
+    console.log(`🔄 正在从远程拉取最新代码 (${defaultBranch})...`);
+    shExec(`git -C ${projectDir} fetch origin ${defaultBranch} --quiet`);
 
     // 创建 worktree
     const branchId = Math.random().toString(36).slice(2, 7);
@@ -278,7 +293,7 @@ export async function run() {
     console.log(`🌿 创建 worktree 分支: ${branchName}`);
     console.log(`   路径: ${worktreeDir}`);
     shExec(
-      `git -C ${projectDir} worktree add -b ${branchName} ${worktreeDir} origin/master --quiet`
+      `git -C ${projectDir} worktree add -b ${branchName} ${worktreeDir} origin/${defaultBranch} --quiet`
     );
     workDir = worktreeDir;
   } else {
