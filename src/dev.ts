@@ -29,7 +29,6 @@ function shExec(cmd: string): void {
 interface Config {
   projects: Record<string, string>;
   worktreeBase?: string;
-  notesBase?: string;
 }
 
 const CONFIG_PATH = join(homedir(), ".tmux-worktree.json");
@@ -61,14 +60,11 @@ async function initConfigInteractive(): Promise<Config> {
 
     console.log();
     const defaultWorktree = "/private/tmp/tmux-worktree/projects";
-    const defaultNotes = "/private/tmp/tmux-worktree/notes";
 
     const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
-    const notesInput = (await prompt(rl, `notes 目录 (${defaultNotes}): `)).trim();
 
     const config: Config = { projects };
     if (worktreeInput) config.worktreeBase = worktreeInput.replace(/^~/, homedir());
-    if (notesInput) config.notesBase = notesInput.replace(/^~/, homedir());
 
     writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
     console.log(`\n✅ 已保存到 ${CONFIG_PATH}\n`);
@@ -240,7 +236,6 @@ export async function run() {
   const config = await loadConfig();
   const PROJECT_DIRS = config.projects;
   const WORKTREE_BASE = config.worktreeBase ?? "/private/tmp/tmux-worktree/projects";
-  const NOTES_BASE = config.notesBase ?? "/private/tmp/tmux-worktree/notes";
 
   // --- 参数解析 ---
   const hasArgs = process.argv.length > 2;
@@ -306,11 +301,9 @@ export async function run() {
   const session = resolveSessionName(params.sessionName);
 
   // --- 创建 tmux session ---
-  const notesFile = `${NOTES_BASE}/${session}.md`;
   console.log(`\n🖥️  正在创建 tmux session...`);
   console.log(`   Session:  ${session}`);
   console.log(`   AI 命令:  ${aiCmd}`);
-  console.log(`   笔记文件: ${notesFile}`);
   console.log();
 
   // 创建 session，初始窗口运行 status (最左栏固定宽度)
@@ -322,18 +315,8 @@ export async function run() {
   shExec(`tmux split-window -h -t '${session}.1' -c ${workDir}`);
   shExec(`tmux send-keys -t '${session}.2' '${aiCmd}' C-m`);
 
-  // AI 命令右侧再分出 40% 给终端 + 笔记
+  // AI 命令右侧再分出 40% 给终端
   shExec(`tmux split-window -h -t '${session}.2' -c ${workDir} -l 40%`);
-
-  // 终端下方分出笔记 pane
-  mkdirSync(NOTES_BASE, { recursive: true });
-  if (!existsSync(notesFile)) {
-    writeFileSync(notesFile, `# ${session}\n`);
-  }
-  shExec(`tmux split-window -v -t '${session}.3' -l 40%`);
-  shExec(
-    `tmux send-keys -t '${session}.4' 'vi +2 -c startinsert ${notesFile}' C-m`
-  );
 
   // 聚焦到 AI 命令栏
   shExec(`tmux select-pane -t '${session}.2'`);
