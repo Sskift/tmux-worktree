@@ -28,7 +28,7 @@ export function ThemePicker({ current, onChange }: Props) {
         <span
           className="theme__swatch"
           style={{
-            background: `linear-gradient(135deg, ${theme.vars["--accent-a"]}, ${theme.vars["--accent-b"]} 50%, ${theme.vars["--accent-c"]})`,
+            background: `linear-gradient(135deg, ${theme.ui["--accent-a"]}, ${theme.ui["--accent-b"]} 50%, ${theme.ui["--accent-c"]})`,
           }}
         />
         <span className="theme__label">{theme.label}</span>
@@ -50,7 +50,7 @@ export function ThemePicker({ current, onChange }: Props) {
                 <span
                   className="theme__swatch"
                   style={{
-                    background: `linear-gradient(135deg, ${t.vars["--accent-a"]}, ${t.vars["--accent-b"]} 50%, ${t.vars["--accent-c"]})`,
+                    background: `linear-gradient(135deg, ${t.ui["--accent-a"]}, ${t.ui["--accent-b"]} 50%, ${t.ui["--accent-c"]})`,
                   }}
                 />
                 <span className="theme__label">{t.label}</span>

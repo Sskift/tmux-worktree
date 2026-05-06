@@ -3,31 +3,12 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  THEME_CHANGED_EVENT,
+  getCurrentPalette,
+  type TerminalPalette,
+} from "./themes";
 import "@xterm/xterm/css/xterm.css";
-
-const THEME = {
-  background: "#0d0e10",
-  foreground: "#e6e6e8",
-  cursor: "#b794f6",
-  cursorAccent: "#0d0e10",
-  selectionBackground: "rgba(183, 148, 246, 0.3)",
-  black: "#1a1d23",
-  red: "#ff8272",
-  green: "#9ae6b4",
-  yellow: "#f6ad55",
-  blue: "#90cdf4",
-  magenta: "#d6bcfa",
-  cyan: "#81e6d9",
-  white: "#e6e6e8",
-  brightBlack: "#5a5d68",
-  brightRed: "#feb2b2",
-  brightGreen: "#9ae6b4",
-  brightYellow: "#fbd38d",
-  brightBlue: "#90cdf4",
-  brightMagenta: "#b794f6",
-  brightCyan: "#81e6d9",
-  brightWhite: "#ffffff",
-};
 
 type Props = {
   cmd: string;
@@ -56,7 +37,7 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
       lineHeight: 1.2,
       cursorBlink: true,
       allowTransparency: false,
-      theme: THEME,
+      theme: getCurrentPalette(),
       scrollback: 5000,
     });
     const fit = new FitAddon();
@@ -75,6 +56,13 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
 
     safeFit();
     term.focus();
+
+    const onThemeChange = (e: Event) => {
+      const detail = (e as CustomEvent<TerminalPalette>).detail;
+      if (!detail) return;
+      term.options.theme = detail;
+    };
+    window.addEventListener(THEME_CHANGED_EVENT, onThemeChange);
 
     const start = async () => {
       try {
@@ -119,6 +107,7 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
     return () => {
       cancelled = true;
       ro.disconnect();
+      window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       unlistenChunk?.();
       unlistenExit?.();
       if (ptyId) invoke("pty_kill", { id: ptyId }).catch(() => {});
