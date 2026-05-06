@@ -10,10 +10,18 @@
 Apple Silicon Mac:
 
 ```bash
-curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
+npx -y --registry=https://bnpm.byted.org @byted-codebase/tw-dashboard-installer
 ```
 
-脚本会从 codebase release 拉最新 dmg,挂载,把 `.app` 拷到 `/Applications`,清掉 macOS 隔离属性,然后 `open -a tw-dashboard` 就能用。Intel Mac 暂未发布,自行 [构建 release](#构建-release)。
+如果 `~/.npmrc` 已经把 `@byted-codebase` 配到了 `https://bnpm.byted.org`(装过 tw CLI 的多半都有),可以省掉 `--registry`:
+
+```bash
+npx -y @byted-codebase/tw-dashboard-installer
+```
+
+包里带的 dmg 会被挂载、`ditto` 拷到 `/Applications/`,清掉 macOS 隔离属性,装好就能 `open -a tw-dashboard`。Intel Mac 暂未发布(arch 字段已就绪,差个 universal build),自行 [构建 release](#构建-release)。
+
+> **为什么用 npm 包而不是 `curl | bash`?** byted codebase 所有 HTTP 请求(包括 `/raw/`)都走 SSO,匿名 curl 拿不到内容;bnpm tarball 是内部唯一不要 SSO 的渠道,顺势把 dmg 也塞进 npm 包统一分发。
 
 ## 技术栈
 
@@ -66,6 +74,12 @@ app/
 │   ├── tauri.conf.json           # 窗口/bundle 配置
 │   ├── Cargo.toml                # Rust 依赖
 │   └── capabilities/default.json # 权限白名单
+├── installer/                    # bnpm 分发包(@byted-codebase/tw-dashboard-installer)
+│   ├── installer.mjs             # node 安装脚本(挂载 dmg → /Applications)
+│   ├── package.json              # bin: tw-dashboard-install
+│   └── dmg/                      # 发布时由 release.sh 填充(.gitignore)
+├── scripts/
+│   └── release.sh                # bump 版本 + tauri build + 同步 dmg + npm publish
 ├── package.json
 ├── vite.config.ts
 └── tsconfig.json
@@ -133,28 +147,33 @@ open /Applications/tw-dashboard.app
 
 ## 发布 release
 
-`app/scripts/install.sh` 通过 codebase release 的 `permalink/latest` URL 拉 dmg,所以新版本要走 release 流程。
+走 bnpm 分发,**不**走 codebase release(byted 这套 codebase 不是 GitLab,Releases 功能没有;HTTP 路径全要 SSO,匿名 curl 拿不到)。
+
+一条命令搞定 bump + 构建 + 同步 dmg + 发布:
 
 ```bash
-# 1. bump 版本号(app/src-tauri/tauri.conf.json 的 "version" 字段、app/package.json 也同步一下)
-# 2. 重新构建
-cd app && npm run tauri build
-
-# 3. 打 tag 并 push
-git tag v0.1.0
-git push origin v0.1.0
+# 1. bump 版本号(只改 app/src-tauri/tauri.conf.json 的 "version")
+# 2. 跑发布脚本
+./app/scripts/release.sh
 ```
 
-然后去 codebase web UI:
+脚本做的事:
 
-1. 项目页 → **Deployments → Releases → New release**,选刚 push 的 tag
-2. **Release assets → Asset links → Add another link**:
-   - URL:先把 dmg 上传到 release 描述里(markdown 上传得到一个 `/-/project/uploads/<hash>/...` 链接)
-   - Link title:随便,例如 `tw-dashboard.dmg`
-   - Type:`Package`
-   - **Direct asset path:`/downloads/tw-dashboard.dmg`** ← 必须是这个路径,`install.sh` 才能从 `permalink/latest/downloads/tw-dashboard.dmg` 拿到
+1. 从 `tauri.conf.json` 读版本号
+2. `npm run tauri build`(可加 `--no-build` 跳过)
+3. 拷贝 `target/release/bundle/dmg/tw-dashboard_<ver>_aarch64.dmg` → `app/installer/dmg/tw-dashboard-arm64.dmg`
+4. 同步 `app/installer/package.json` 的 `version`
+5. `cd app/installer && npm publish --registry=https://bnpm.byted.org`
 
-文件名固定为 `tw-dashboard.dmg`(不带版本号),让 install 脚本可以稳定指向最新版。
+预览不发布:`./app/scripts/release.sh --dry-run`(会调 `npm pack --dry-run` 列出 tarball 内容)。
+
+发布完毕后用户跑:
+
+```bash
+npx -y --registry=https://bnpm.byted.org @byted-codebase/tw-dashboard-installer
+```
+
+bnpm 拉最新 tarball,内置 `installer.mjs` 自动 mount dmg + ditto 到 `/Applications/` + xattr 去隔离 + 退出。
 
 ## 跨架构构建
 
@@ -191,7 +210,7 @@ Tauri 2 默认不放开 `window.startDragging` 和 dialog 插件,在 `src-tauri/
 
 - **Tauri 版本错位**: `@tauri-apps/api` 和 Rust crate `tauri` 的 minor 版本必须对齐,否则 `tauri build` 报错(dev 仅警告)。改一边就 `cargo update -p tauri --precise <版本>` 或 `npm install @tauri-apps/api@<版本>`。
 - **Linux 未验证**:目前只在 macOS arm64 上验过。
-- **没有 codesign**:dmg 跨机器分发会被 macOS Gatekeeper 标记隔离属性,首次打开会被拒。`install.sh` 会自动 `xattr -dr` 处理掉;手动安装的话也可以执行同样的命令,或者走完整 `codesign --deep --force --options runtime ...` + notarize 流程。
+- **没有 codesign**:dmg 跨机器分发会被 macOS Gatekeeper 标记隔离属性,首次打开会被拒。`installer.mjs` 会自动 `xattr -dr` 处理掉;手动安装的话也可以执行同样的命令,或者走完整 `codesign --deep --force --options runtime ...` + notarize 流程。
 
 ## Roadmap
 
