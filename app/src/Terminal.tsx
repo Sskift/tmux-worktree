@@ -1,0 +1,125 @@
+import { useEffect, useRef } from "react";
+import { Terminal as XTerm } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import "@xterm/xterm/css/xterm.css";
+
+const THEME = {
+  background: "#0d0e10",
+  foreground: "#e6e6e8",
+  cursor: "#b794f6",
+  cursorAccent: "#0d0e10",
+  selectionBackground: "rgba(183, 148, 246, 0.3)",
+  black: "#1a1d23",
+  red: "#ff8272",
+  green: "#9ae6b4",
+  yellow: "#f6ad55",
+  blue: "#90cdf4",
+  magenta: "#d6bcfa",
+  cyan: "#81e6d9",
+  white: "#e6e6e8",
+  brightBlack: "#5a5d68",
+  brightRed: "#feb2b2",
+  brightGreen: "#9ae6b4",
+  brightYellow: "#fbd38d",
+  brightBlue: "#90cdf4",
+  brightMagenta: "#b794f6",
+  brightCyan: "#81e6d9",
+  brightWhite: "#ffffff",
+};
+
+type Props = {
+  cmd: string;
+  args: string[];
+  cwd?: string;
+};
+
+export function Terminal({ cmd, args, cwd }: Props) {
+  const hostRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+
+    let ptyId: string | null = null;
+    let unlistenChunk: UnlistenFn | null = null;
+    let unlistenExit: UnlistenFn | null = null;
+    let cancelled = false;
+
+    const term = new XTerm({
+      fontFamily: '"JetBrains Mono", "SF Mono", Menlo, ui-monospace, monospace',
+      fontSize: 13,
+      lineHeight: 1.2,
+      cursorBlink: true,
+      allowTransparency: false,
+      theme: THEME,
+      scrollback: 5000,
+    });
+    const fit = new FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+
+    const safeFit = () => {
+      try {
+        fit.fit();
+      } catch {
+        // ignore — host not yet sized
+      }
+    };
+
+    safeFit();
+    term.focus();
+
+    const start = async () => {
+      try {
+        const { cols, rows } = term;
+        const id = await invoke<string>("pty_open", {
+          args: { cmd, args, cwd, cols, rows },
+        });
+        if (cancelled) {
+          await invoke("pty_kill", { id }).catch(() => {});
+          return;
+        }
+        ptyId = id;
+
+        unlistenChunk = await listen<{ id: string; data: string }>(
+          `pty:${id}`,
+          (e) => term.write(e.payload.data),
+        );
+        unlistenExit = await listen<{ id: string; code: number }>(
+          `pty-exit:${id}`,
+          (e) => {
+            term.write(`\r\n\x1b[2m[exit ${e.payload.code}]\x1b[0m\r\n`);
+          },
+        );
+
+        term.onData((data) => {
+          if (ptyId) invoke("pty_write", { id: ptyId, data }).catch(() => {});
+        });
+        term.onResize(({ cols, rows }) => {
+          if (ptyId)
+            invoke("pty_resize", { id: ptyId, cols, rows }).catch(() => {});
+        });
+      } catch (e) {
+        term.write(`\r\n\x1b[31m[pty error] ${String(e)}\x1b[0m\r\n`);
+      }
+    };
+
+    start();
+
+    const ro = new ResizeObserver(() => safeFit());
+    ro.observe(host);
+
+    return () => {
+      cancelled = true;
+      ro.disconnect();
+      unlistenChunk?.();
+      unlistenExit?.();
+      if (ptyId) invoke("pty_kill", { id: ptyId }).catch(() => {});
+      term.dispose();
+    };
+  }, [cmd, args.join("\x1f"), cwd]);
+
+  return <div ref={hostRef} className="term" />;
+}
