@@ -445,6 +445,17 @@ button:disabled {
   display: flex;
 }
 
+.pane__body--stack {
+  position: relative;
+}
+
+.term-slot {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+}
+
 .term {
   flex: 1;
   min-height: 0;

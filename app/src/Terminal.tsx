@@ -33,10 +33,13 @@ type Props = {
   cmd: string;
   args: string[];
   cwd?: string;
+  active?: boolean;
 };
 
-export function Terminal({ cmd, args, cwd }: Props) {
+export function Terminal({ cmd, args, cwd, active = true }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
+  const termRef = useRef<XTerm | null>(null);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -59,6 +62,8 @@ export function Terminal({ cmd, args, cwd }: Props) {
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+    termRef.current = term;
+    fitRef.current = fit;
 
     const safeFit = () => {
       try {
@@ -118,8 +123,23 @@ export function Terminal({ cmd, args, cwd }: Props) {
       unlistenExit?.();
       if (ptyId) invoke("pty_kill", { id: ptyId }).catch(() => {});
       term.dispose();
+      termRef.current = null;
+      fitRef.current = null;
     };
   }, [cmd, args.join("\x1f"), cwd]);
+
+  useEffect(() => {
+    if (!active) return;
+    const term = termRef.current;
+    const fit = fitRef.current;
+    if (!term || !fit) return;
+    requestAnimationFrame(() => {
+      try {
+        fit.fit();
+      } catch {}
+      term.focus();
+    });
+  }, [active]);
 
   return <div ref={hostRef} className="term" />;
 }

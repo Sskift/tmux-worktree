@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
@@ -44,7 +44,10 @@ function colorForProject(map: Map<string, string>, project: string): string {
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
-  const [scratchCwd, setScratchCwd] = useState<string | null>(null);
+  const [openedSessions, setOpenedSessions] = useState<string[]>([]);
+  const [cwdsBySession, setCwdsBySession] = useState<Record<string, string>>(
+    {},
+  );
   const [error, setError] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
@@ -59,6 +62,7 @@ function App() {
     } catch {}
     return { left: 240, right: 380 };
   });
+  const cwdRequested = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     localStorage.setItem("tw-dashboard:cols", JSON.stringify(cols));
@@ -93,8 +97,17 @@ function App() {
       const list = await invoke<Session[]>("list_sessions");
       setSessions(list);
       setError(null);
+      const live = new Set(list.map((s) => s.name));
+      setOpenedSessions((prev) => prev.filter((n) => live.has(n)));
+      setCwdsBySession((prev) => {
+        const next: Record<string, string> = {};
+        for (const [k, v] of Object.entries(prev)) {
+          if (live.has(k)) next[k] = v;
+        }
+        return next;
+      });
       setSelected((cur) => {
-        if (cur && list.some((s) => s.name === cur)) return cur;
+        if (cur && live.has(cur)) return cur;
         return list[0]?.name ?? null;
       });
     } catch (e) {
@@ -109,22 +122,21 @@ function App() {
   }, [refresh]);
 
   useEffect(() => {
-    if (!selected) {
-      setScratchCwd(null);
-      return;
-    }
-    let cancelled = false;
+    if (!selected) return;
+    setOpenedSessions((prev) =>
+      prev.includes(selected) ? prev : [...prev, selected],
+    );
+    if (cwdsBySession[selected] || cwdRequested.current.has(selected)) return;
+    cwdRequested.current.add(selected);
     invoke<string>("session_cwd", { name: selected })
       .then((cwd) => {
-        if (!cancelled) setScratchCwd(cwd || null);
+        if (cwd) setCwdsBySession((prev) => ({ ...prev, [selected]: cwd }));
       })
-      .catch(() => {
-        if (!cancelled) setScratchCwd(null);
+      .catch(() => {})
+      .finally(() => {
+        cwdRequested.current.delete(selected);
       });
-    return () => {
-      cancelled = true;
-    };
-  }, [selected]);
+  }, [selected, cwdsBySession]);
 
   const colorMap = new Map<string, string>();
 
@@ -228,12 +240,20 @@ function App() {
               <span className="pane__title">{selected}</span>
               <span className="pane__hint dim">tmux attach</span>
             </div>
-            <div className="pane__body">
-              <Terminal
-                key={selected}
-                cmd="tmux"
-                args={["attach-session", "-t", selected]}
-              />
+            <div className="pane__body pane__body--stack">
+              {openedSessions.map((name) => (
+                <div
+                  key={name}
+                  className="term-slot"
+                  style={{ display: name === selected ? "flex" : "none" }}
+                >
+                  <Terminal
+                    cmd="tmux"
+                    args={["attach-session", "-t", name]}
+                    active={name === selected}
+                  />
+                </div>
+              ))}
             </div>
           </div>
         ) : (
@@ -250,19 +270,31 @@ function App() {
       />
 
       <aside className="scratch">
-        {selected && scratchCwd ? (
+        {selected ? (
           <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
               <span className="pane__hint dim">zsh</span>
             </div>
-            <div className="pane__body">
-              <Terminal
-                key={selected}
-                cmd="/bin/zsh"
-                args={["-l"]}
-                cwd={scratchCwd}
-              />
+            <div className="pane__body pane__body--stack">
+              {openedSessions.map((name) => {
+                const cwd = cwdsBySession[name];
+                if (!cwd) return null;
+                return (
+                  <div
+                    key={name}
+                    className="term-slot"
+                    style={{ display: name === selected ? "flex" : "none" }}
+                  >
+                    <Terminal
+                      cmd="/bin/zsh"
+                      args={["-l"]}
+                      cwd={cwd}
+                      active={name === selected}
+                    />
+                  </div>
+                );
+              })}
             </div>
           </div>
         ) : (
