@@ -558,6 +558,31 @@ button:disabled {
   gap: 6px;
 }
 
+.field__row {
+  display: flex;
+  gap: 6px;
+}
+
+.field__row .field__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox input {
+  accent-color: var(--accent-a);
+  cursor: pointer;
+}
+
 .field__label {
   font-size: 11px;
   text-transform: uppercase;

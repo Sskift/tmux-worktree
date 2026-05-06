@@ -128,7 +128,8 @@ fn list_projects() -> Result<Vec<Project>, String> {
 
 #[derive(Deserialize)]
 struct CreateArgs {
-    project: String,
+    project: Option<String>,
+    path: Option<String>,
     #[serde(rename = "aiCmd")]
     ai_cmd: String,
     name: Option<String>,
@@ -210,17 +211,36 @@ fn random_id() -> String {
 fn create_worktree(args: CreateArgs) -> Result<String, String> {
     let home = dirs::home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
-    let config_text = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("read {}: {e}", config_path.display()))?;
-    let config: serde_json::Value =
-        serde_json::from_str(&config_text).map_err(|e| format!("parse config: {e}"))?;
+    let config: serde_json::Value = if config_path.exists() {
+        let config_text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+        serde_json::from_str(&config_text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        serde_json::json!({})
+    };
 
-    let project_dir = config
-        .get("projects")
-        .and_then(|v| v.get(&args.project))
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| format!("project '{}' not in ~/.tmux-worktree.json", args.project))?
-        .to_string();
+    let (project_label, project_dir) = if let Some(name) = args.project.as_deref() {
+        let dir = config
+            .get("projects")
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("project '{name}' not in ~/.tmux-worktree.json"))?
+            .to_string();
+        (name.to_string(), dir)
+    } else if let Some(path) = args.path.as_deref() {
+        let p = path.trim();
+        if p.is_empty() {
+            return Err("project or path required".into());
+        }
+        let label = std::path::Path::new(p)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        (label, p.to_string())
+    } else {
+        return Err("project or path required".into());
+    };
 
     if !std::path::Path::new(&project_dir).exists() {
         return Err(format!("project dir does not exist: {project_dir}"));
@@ -234,9 +254,9 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 
     let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
     let base_session = if trimmed_name.is_empty() {
-        args.project.clone()
+        project_label.clone()
     } else {
-        format!("{}-{}", args.project, trimmed_name)
+        format!("{}-{}", project_label, trimmed_name)
     };
     let session = unique_session_name(&base_session);
 
@@ -263,7 +283,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 
         let branch_id = random_id();
         let branch_name = format!("{}-{}", session, branch_id);
-        let project_worktree_root = format!("{}/{}", worktree_base, args.project);
+        let project_worktree_root = format!("{}/{}", worktree_base, project_label);
         std::fs::create_dir_all(&project_worktree_root)
             .map_err(|e| format!("mkdir {project_worktree_root}: {e}"))?;
         let worktree_dir = format!("{}/{}", project_worktree_root, branch_name);
@@ -324,6 +344,156 @@ fn session_cwd(name: String) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Deserialize)]
+struct AddProjectArgs {
+    name: String,
+    path: String,
+}
+
+#[tauri::command]
+fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
+    let name = args.name.trim();
+    let path = args.path.trim();
+    if name.is_empty() {
+        return Err("name required".into());
+    }
+    if path.is_empty() {
+        return Err("path required".into());
+    }
+    if !std::path::Path::new(path).is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+
+    let mut config: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read config: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        serde_json::json!({ "projects": {} })
+    };
+
+    let projects = config
+        .as_object_mut()
+        .ok_or("config root is not an object")?
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("projects is not an object")?;
+    projects.insert(name.to_string(), serde_json::Value::String(path.to_string()));
+
+    let pretty = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("serialize config: {e}"))?;
+    std::fs::write(&config_path, pretty).map_err(|e| format!("write config: {e}"))?;
+
+    list_projects()
+}
+
+#[derive(Serialize, Clone)]
+struct GitStatus {
+    branch: String,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    conflicts: u32,
+    files: Vec<GitFile>,
+}
+
+#[derive(Serialize, Clone)]
+struct GitFile {
+    code: String,
+    path: String,
+}
+
+#[tauri::command]
+fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
+    let inside = run_quiet(&[
+        "git",
+        "-C",
+        &cwd,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ]);
+    if inside.as_deref() != Some("true") {
+        return Ok(None);
+    }
+
+    let output = std::process::Command::new("git")
+        .args(["-C", &cwd, "status", "--porcelain=v2", "--branch"])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut status = GitStatus {
+        branch: String::new(),
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        conflicts: 0,
+        files: Vec::new(),
+    };
+
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            status.branch = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            status.upstream = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(a) = parts.next() {
+                status.ahead = a.trim_start_matches('+').parse().unwrap_or(0);
+            }
+            if let Some(b) = parts.next() {
+                status.behind = b.trim_start_matches('-').parse().unwrap_or(0);
+            }
+        } else if let Some(rest) = line.strip_prefix("1 ") {
+            // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+            let mut parts = rest.splitn(9, ' ');
+            let xy = parts.next().unwrap_or("..");
+            let path = parts.nth(7).unwrap_or("").to_string();
+            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
+            if x != '.' { status.staged += 1; }
+            if y != '.' { status.unstaged += 1; }
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("2 ") {
+            // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X-score> <path><tab><origPath>
+            let mut parts = rest.splitn(10, ' ');
+            let xy = parts.next().unwrap_or("..");
+            let tail = parts.nth(8).unwrap_or("");
+            let path = tail.split('\t').next().unwrap_or("").to_string();
+            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
+            if x != '.' { status.staged += 1; }
+            if y != '.' { status.unstaged += 1; }
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("u ") {
+            let mut parts = rest.splitn(11, ' ');
+            let xy = parts.next().unwrap_or("UU");
+            let path = parts.nth(9).unwrap_or("").to_string();
+            status.conflicts += 1;
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            status.untracked += 1;
+            status.files.push(GitFile { code: "??".to_string(), path: rest.to_string() });
+        }
+    }
+
+    Ok(Some(status))
 }
 
 #[tauri::command]
@@ -472,6 +642,7 @@ fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(Arc::new(PtyState::default()));
             Ok(())
@@ -479,9 +650,11 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             list_projects,
+            add_project,
             create_worktree,
             kill_session,
             session_cwd,
+            git_status,
             pty_open,
             pty_write,
             pty_resize,
