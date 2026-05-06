@@ -464,27 +464,28 @@ fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
             }
         } else if let Some(rest) = line.strip_prefix("1 ") {
             // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
-            let mut parts = rest.splitn(9, ' ');
+            let mut parts = rest.splitn(8, ' ');
             let xy = parts.next().unwrap_or("..");
-            let path = parts.nth(7).unwrap_or("").to_string();
+            let path = parts.nth(6).unwrap_or("").to_string();
             let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
             if x != '.' { status.staged += 1; }
             if y != '.' { status.unstaged += 1; }
             status.files.push(GitFile { code: xy.to_string(), path });
         } else if let Some(rest) = line.strip_prefix("2 ") {
             // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X-score> <path><tab><origPath>
-            let mut parts = rest.splitn(10, ' ');
+            let mut parts = rest.splitn(9, ' ');
             let xy = parts.next().unwrap_or("..");
-            let tail = parts.nth(8).unwrap_or("");
+            let tail = parts.nth(7).unwrap_or("");
             let path = tail.split('\t').next().unwrap_or("").to_string();
             let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
             if x != '.' { status.staged += 1; }
             if y != '.' { status.unstaged += 1; }
             status.files.push(GitFile { code: xy.to_string(), path });
         } else if let Some(rest) = line.strip_prefix("u ") {
-            let mut parts = rest.splitn(11, ' ');
+            // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+            let mut parts = rest.splitn(10, ' ');
             let xy = parts.next().unwrap_or("UU");
-            let path = parts.nth(9).unwrap_or("").to_string();
+            let path = parts.nth(8).unwrap_or("").to_string();
             status.conflicts += 1;
             status.files.push(GitFile { code: xy.to_string(), path });
         } else if let Some(rest) = line.strip_prefix("? ") {

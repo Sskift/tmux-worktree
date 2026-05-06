@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { ThemePicker } from "./ThemePicker";
+import { GitStatusPanel } from "./GitStatusPanel";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import "./App.css";
 
@@ -62,11 +63,21 @@ function App() {
     } catch {}
     return { left: 240, right: 380 };
   });
+  const [gitHeight, setGitHeight] = useState<number>(() => {
+    const s = localStorage.getItem("tw-dashboard:git-height");
+    const n = s ? parseInt(s, 10) : NaN;
+    return Number.isFinite(n) ? n : 220;
+  });
   const cwdRequested = useRef<Set<string>>(new Set());
+  const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     localStorage.setItem("tw-dashboard:cols", JSON.stringify(cols));
   }, [cols]);
+
+  useEffect(() => {
+    localStorage.setItem("tw-dashboard:git-height", String(gitHeight));
+  }, [gitHeight]);
 
   const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -87,6 +98,30 @@ function App() {
       document.body.style.userSelect = "";
     };
     document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const startSidebarSplit = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const container = sidebarSplitRef.current;
+    if (!container) return;
+    const startY = e.clientY;
+    const startH = gitHeight;
+    const total = container.getBoundingClientRect().height;
+    const onMove = (ev: MouseEvent) => {
+      const dy = ev.clientY - startY;
+      const h = Math.max(80, Math.min(total - 120, startH - dy));
+      setGitHeight(h);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "row-resize";
     document.body.style.userSelect = "none";
     document.addEventListener("mousemove", onMove);
     document.addEventListener("mouseup", onUp);
@@ -163,63 +198,75 @@ function App() {
           </button>
         </header>
 
-        <nav className="sidebar__sessions">
-          {sessions.length === 0 && !error && (
-            <div className="empty">no tmux sessions</div>
-          )}
-          {error && <div className="empty empty--error">{error}</div>}
-          {sessions.map((s) => {
-            const key = projectKey(s.name);
-            const color = colorForProject(colorMap, key);
-            const dash = s.name.indexOf("-");
-            const head = dash > 0 ? s.name.slice(0, dash) : s.name;
-            const tail = dash > 0 ? s.name.slice(dash) : "";
-            const isSelected = s.name === selected;
-            return (
-              <div
-                key={s.name}
-                className={`session ${isSelected ? "session--selected" : ""}`}
-                onClick={() => setSelected(s.name)}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") setSelected(s.name);
-                }}
-              >
-                <span
-                  className={`session__dot ${s.attached ? "session__dot--attached" : ""}`}
-                  style={{ background: color }}
-                />
-                <span className="session__name">
-                  <span className="session__head" style={{ color }}>
-                    {head}
-                  </span>
-                  <span className="session__tail">{tail}</span>
-                </span>
-                <span className="session__meta">
-                  {s.window_count}w
-                </span>
-                <button
-                  type="button"
-                  className="session__kill"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    try {
-                      await invoke("kill_session", { name: s.name });
-                      refresh();
-                    } catch (err) {
-                      setError(String(err));
-                    }
+        <div className="sidebar__split" ref={sidebarSplitRef}>
+          <nav className="sidebar__sessions">
+            {sessions.length === 0 && !error && (
+              <div className="empty">no tmux sessions</div>
+            )}
+            {error && <div className="empty empty--error">{error}</div>}
+            {sessions.map((s) => {
+              const key = projectKey(s.name);
+              const color = colorForProject(colorMap, key);
+              const dash = s.name.indexOf("-");
+              const head = dash > 0 ? s.name.slice(0, dash) : s.name;
+              const tail = dash > 0 ? s.name.slice(dash) : "";
+              const isSelected = s.name === selected;
+              return (
+                <div
+                  key={s.name}
+                  className={`session ${isSelected ? "session--selected" : ""}`}
+                  onClick={() => setSelected(s.name)}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") setSelected(s.name);
                   }}
-                  title="kill session"
-                  aria-label={`kill session ${s.name}`}
                 >
-                  ×
-                </button>
-              </div>
-            );
-          })}
-        </nav>
+                  <span
+                    className={`session__dot ${s.attached ? "session__dot--attached" : ""}`}
+                    style={{ background: color }}
+                  />
+                  <span className="session__name">
+                    <span className="session__head" style={{ color }}>
+                      {head}
+                    </span>
+                    <span className="session__tail">{tail}</span>
+                  </span>
+                  <span className="session__meta">
+                    {s.window_count}w
+                  </span>
+                  <button
+                    type="button"
+                    className="session__kill"
+                    onClick={async (e) => {
+                      e.stopPropagation();
+                      try {
+                        await invoke("kill_session", { name: s.name });
+                        refresh();
+                      } catch (err) {
+                        setError(String(err));
+                      }
+                    }}
+                    title="kill session"
+                    aria-label={`kill session ${s.name}`}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </nav>
+
+          <div
+            className="splitter splitter--horizontal"
+            onMouseDown={startSidebarSplit}
+            aria-label="resize git panel"
+          />
+
+          <div className="sidebar__git" style={{ height: gitHeight }}>
+            <GitStatusPanel cwd={selected ? cwdsBySession[selected] ?? null : null} />
+          </div>
+        </div>
 
         <footer className="sidebar__footer">
           <span className="dim">{sessions.length} session{sessions.length === 1 ? "" : "s"}</span>
