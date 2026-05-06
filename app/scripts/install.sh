@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # tw-dashboard one-line installer.
-# Usage: curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/-/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
+# Usage: curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
 set -euo pipefail
 
 REPO_URL="https://code.byted.org/jiangyunong/tmux-worktree"
 ASSET_NAME="tw-dashboard.dmg"
-DMG_URL="${REPO_URL}/-/releases/permalink/latest/downloads/${ASSET_NAME}"
+DMG_URL="${REPO_URL}/releases/permalink/latest/downloads/${ASSET_NAME}"
 APP_NAME="tw-dashboard.app"
 INSTALL_DIR="/Applications"
 

@@ -10,7 +10,7 @@
 Apple Silicon Mac:
 
 ```bash
-curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/-/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
+curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
 ```
 
 脚本会从 codebase release 拉最新 dmg,挂载,把 `.app` 拷到 `/Applications`,清掉 macOS 隔离属性,然后 `open -a tw-dashboard` 就能用。Intel Mac 暂未发布,自行 [构建 release](#构建-release)。
