@@ -300,6 +300,12 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn kill_session(name: String) -> Result<(), String> {
+    run_check(&["tmux", "kill-session", "-t", &name])?;
+    Ok(())
+}
+
+#[tauri::command]
 fn pty_open(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
@@ -453,6 +459,7 @@ pub fn run() {
             list_sessions,
             list_projects,
             create_worktree,
+            kill_session,
             pty_open,
             pty_write,
             pty_resize,

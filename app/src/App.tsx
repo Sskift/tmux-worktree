@@ -97,11 +97,15 @@ function App() {
             const tail = dash > 0 ? s.name.slice(dash) : "";
             const isSelected = s.name === selected;
             return (
-              <button
+              <div
                 key={s.name}
-                type="button"
                 className={`session ${isSelected ? "session--selected" : ""}`}
                 onClick={() => setSelected(s.name)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") setSelected(s.name);
+                }}
               >
                 <span
                   className={`session__dot ${s.attached ? "session__dot--attached" : ""}`}
@@ -116,7 +120,25 @@ function App() {
                 <span className="session__meta">
                   {s.window_count}w
                 </span>
-              </button>
+                <button
+                  type="button"
+                  className="session__kill"
+                  onClick={async (e) => {
+                    e.stopPropagation();
+                    if (!confirm(`kill session "${s.name}"?`)) return;
+                    try {
+                      await invoke("kill_session", { name: s.name });
+                      refresh();
+                    } catch (err) {
+                      setError(String(err));
+                    }
+                  }}
+                  title="kill session"
+                  aria-label={`kill session ${s.name}`}
+                >
+                  ×
+                </button>
+              </div>
             );
           })}
         </nav>
