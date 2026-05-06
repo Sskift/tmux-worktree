@@ -67,6 +67,18 @@ button:disabled {
   background: var(--bg);
 }
 
+.titlebar-drag {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  -webkit-app-region: drag;
+  app-region: drag;
+  z-index: 50;
+  pointer-events: auto;
+}
+
 /* ─── Sidebar ───────────────────────────────────────────────── */
 
 .sidebar {

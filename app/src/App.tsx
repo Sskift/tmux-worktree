@@ -69,6 +69,7 @@ function App() {
 
   return (
     <div className="app">
+      <div className="titlebar-drag" />
       <aside className="sidebar">
         <header className="sidebar__header">
           <div className="brand">
