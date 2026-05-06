@@ -61,22 +61,38 @@ button:disabled {
 
 .app {
   display: grid;
-  grid-template-columns: 240px 1fr 380px;
+  grid-template-rows: 32px 1fr;
   height: 100vh;
   width: 100vw;
   background: var(--bg);
 }
 
-.titlebar-drag {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 32px;
+.titlebar {
+  grid-column: 1 / -1;
+  grid-row: 1;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
   -webkit-app-region: drag;
   app-region: drag;
-  z-index: 50;
-  pointer-events: auto;
+}
+
+.splitter {
+  grid-row: 2;
+  background: transparent;
+  cursor: col-resize;
+  transition: background 100ms ease;
+  user-select: none;
+}
+
+.splitter:hover,
+.splitter:active {
+  background: var(--accent-a);
+}
+
+.sidebar,
+.main,
+.scratch {
+  grid-row: 2;
 }
 
 /* ─── Sidebar ───────────────────────────────────────────────── */
@@ -95,20 +111,12 @@ button:disabled {
   flex-direction: column;
   gap: 12px;
   border-bottom: 1px solid var(--line);
-  -webkit-app-region: drag;
-  app-region: drag;
-}
-
-.sidebar__header > * {
-  -webkit-app-region: no-drag;
-  app-region: no-drag;
 }
 
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding-top: 18px;
 }
 
 .brand__mark {

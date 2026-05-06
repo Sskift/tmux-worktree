@@ -51,6 +51,41 @@ function App() {
     applyTheme(id);
     return id;
   });
+  const [cols, setCols] = useState<{ left: number; right: number }>(() => {
+    try {
+      const s = localStorage.getItem("tw-dashboard:cols");
+      if (s) return JSON.parse(s);
+    } catch {}
+    return { left: 240, right: 380 };
+  });
+
+  useEffect(() => {
+    localStorage.setItem("tw-dashboard:cols", JSON.stringify(cols));
+  }, [cols]);
+
+  const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = cols[col];
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      const w =
+        col === "left"
+          ? Math.max(180, Math.min(500, startW + dx))
+          : Math.max(220, Math.min(800, startW - dx));
+      setCols((prev) => ({ ...prev, [col]: w }));
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
 
   const refresh = useCallback(async () => {
     try {
@@ -75,8 +110,13 @@ function App() {
   const colorMap = new Map<string, string>();
 
   return (
-    <div className="app">
-      <div className="titlebar-drag" />
+    <div
+      className="app"
+      style={{
+        gridTemplateColumns: `${cols.left}px 5px 1fr 5px ${cols.right}px`,
+      }}
+    >
+      <div className="titlebar" data-tauri-drag-region />
       <aside className="sidebar">
         <header className="sidebar__header">
           <div className="brand">
@@ -156,6 +196,12 @@ function App() {
         </footer>
       </aside>
 
+      <div
+        className="splitter"
+        onMouseDown={startResize("left")}
+        aria-label="resize sidebar"
+      />
+
       <main className="main">
         {selected ? (
           <div className="pane pane--term">
@@ -177,6 +223,12 @@ function App() {
           </div>
         )}
       </main>
+
+      <div
+        className="splitter"
+        onMouseDown={startResize("right")}
+        aria-label="resize scratch"
+      />
 
       <aside className="scratch">
         <div className="pane pane--term">
