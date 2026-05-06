@@ -306,6 +306,27 @@ fn kill_session(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn session_cwd(name: String) -> Result<String, String> {
+    let output = std::process::Command::new("tmux")
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &name,
+            "#{pane_current_path}",
+        ])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux display-message failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[tauri::command]
 fn pty_open(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
@@ -460,6 +481,7 @@ pub fn run() {
             list_projects,
             create_worktree,
             kill_session,
+            session_cwd,
             pty_open,
             pty_write,
             pty_resize,

@@ -44,6 +44,7 @@ function colorForProject(map: Map<string, string>, project: string): string {
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
+  const [scratchCwd, setScratchCwd] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
@@ -106,6 +107,24 @@ function App() {
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!selected) {
+      setScratchCwd(null);
+      return;
+    }
+    let cancelled = false;
+    invoke<string>("session_cwd", { name: selected })
+      .then((cwd) => {
+        if (!cancelled) setScratchCwd(cwd || null);
+      })
+      .catch(() => {
+        if (!cancelled) setScratchCwd(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selected]);
 
   const colorMap = new Map<string, string>();
 
@@ -231,15 +250,26 @@ function App() {
       />
 
       <aside className="scratch">
-        <div className="pane pane--term">
-          <div className="pane__bar">
-            <span className="pane__title">scratch</span>
-            <span className="pane__hint dim">zsh</span>
+        {selected && scratchCwd ? (
+          <div className="pane pane--term">
+            <div className="pane__bar">
+              <span className="pane__title">scratch</span>
+              <span className="pane__hint dim">zsh</span>
+            </div>
+            <div className="pane__body">
+              <Terminal
+                key={selected}
+                cmd="/bin/zsh"
+                args={["-l"]}
+                cwd={scratchCwd}
+              />
+            </div>
           </div>
-          <div className="pane__body">
-            <Terminal cmd="/bin/zsh" args={["-l"]} />
+        ) : (
+          <div className="pane pane--empty">
+            <div className="pane__hint">scratch</div>
           </div>
-        </div>
+        )}
       </aside>
 
       {showNew && (
