@@ -133,7 +133,6 @@ function App() {
                   className="session__kill"
                   onClick={async (e) => {
                     e.stopPropagation();
-                    if (!confirm(`kill session "${s.name}"?`)) return;
                     try {
                       await invoke("kill_session", { name: s.name });
                       refresh();
