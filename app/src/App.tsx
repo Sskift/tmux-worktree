@@ -2,6 +2,8 @@ import { useEffect, useState, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
+import { ThemePicker } from "./ThemePicker";
+import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import "./App.css";
 
 type Session = {
@@ -44,6 +46,11 @@ function App() {
   const [selected, setSelected] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [theme, setTheme] = useState<ThemeId>(() => {
+    const id = loadTheme();
+    applyTheme(id);
+    return id;
+  });
 
   const refresh = useCallback(async () => {
     try {
@@ -146,6 +153,7 @@ function App() {
 
         <footer className="sidebar__footer">
           <span className="dim">{sessions.length} session{sessions.length === 1 ? "" : "s"}</span>
+          <ThemePicker current={theme} onChange={setTheme} />
         </footer>
       </aside>
 
