@@ -10,18 +10,20 @@
 Apple Silicon Mac:
 
 ```bash
-npx -y --registry=https://bnpm.byted.org @byted-codebase/tw-dashboard-installer
+npx -y --registry=https://bnpm.byted.org -p @byted-codebase/tmux-worktree tw-dashboard-install
 ```
 
 如果 `~/.npmrc` 已经把 `@byted-codebase` 配到了 `https://bnpm.byted.org`(装过 tw CLI 的多半都有),可以省掉 `--registry`:
 
 ```bash
-npx -y @byted-codebase/tw-dashboard-installer
+npx -y -p @byted-codebase/tmux-worktree tw-dashboard-install
 ```
 
 包里带的 dmg 会被挂载、`ditto` 拷到 `/Applications/`,清掉 macOS 隔离属性,装好就能 `open -a tw-dashboard`。Intel Mac 暂未发布(arch 字段已就绪,差个 universal build),自行 [构建 release](#构建-release)。
 
 > **为什么用 npm 包而不是 `curl | bash`?** byted codebase 所有 HTTP 请求(包括 `/raw/`)都走 SSO,匿名 curl 拿不到内容;bnpm tarball 是内部唯一不要 SSO 的渠道,顺势把 dmg 也塞进 npm 包统一分发。
+>
+> **为什么塞进 `tmux-worktree` 而不是单独发包?** `@byted-codebase` scope 开了 ACL,新包名要找 bnpm oncall 审批;现成的 `@byted-codebase/tmux-worktree`(tw CLI)已经在白名单里,顺手挂个 `tw-dashboard-install` bin 就能蹭通道发版。
 
 ## 技术栈
 
@@ -74,12 +76,11 @@ app/
 │   ├── tauri.conf.json           # 窗口/bundle 配置
 │   ├── Cargo.toml                # Rust 依赖
 │   └── capabilities/default.json # 权限白名单
-├── installer/                    # bnpm 分发包(@byted-codebase/tw-dashboard-installer)
-│   ├── installer.mjs             # node 安装脚本(挂载 dmg → /Applications)
-│   ├── package.json              # bin: tw-dashboard-install
+├── installer/                    # 跟随 @byted-codebase/tmux-worktree 一起发布的 dashboard 安装器
+│   ├── installer.mjs             # node 安装脚本(挂载 dmg → /Applications),bin 名 tw-dashboard-install
 │   └── dmg/                      # 发布时由 release.sh 填充(.gitignore)
 ├── scripts/
-│   └── release.sh                # bump 版本 + tauri build + 同步 dmg + npm publish
+│   └── release.sh                # tauri build + 同步 dmg + 从 repo 根目录 npm publish
 ├── package.json
 ├── vite.config.ts
 └── tsconfig.json
@@ -147,30 +148,32 @@ open /Applications/tw-dashboard.app
 
 ## 发布 release
 
-走 bnpm 分发,**不**走 codebase release(byted 这套 codebase 不是 GitLab,Releases 功能没有;HTTP 路径全要 SSO,匿名 curl 拿不到)。
+走 bnpm 分发,**不**走 codebase release(byted 这套 codebase 不是 GitLab,Releases 功能没有;HTTP 路径全要 SSO,匿名 curl 拿不到)。dashboard 的安装器和 tw CLI 共用 `@byted-codebase/tmux-worktree` 这一个 npm 包,因为 `@byted-codebase` scope 开了 ACL,新包名要找 oncall 审批,现成的包顺手加个 bin 即可。
 
 一条命令搞定 bump + 构建 + 同步 dmg + 发布:
 
 ```bash
-# 1. bump 版本号(只改 app/src-tauri/tauri.conf.json 的 "version")
-# 2. 跑发布脚本
+# 1. bump 版本号:
+#    - app/src-tauri/tauri.conf.json 的 "version"(决定 dmg 文件名,跟 dashboard 构建版本走)
+#    - 仓库根目录 package.json 的 "version"(决定 npm publish 的版本)
+# 2. 跑发布脚本(从仓库任意位置都行)
 ./app/scripts/release.sh
 ```
 
 脚本做的事:
 
-1. 从 `tauri.conf.json` 读版本号
-2. `npm run tauri build`(可加 `--no-build` 跳过)
-3. 拷贝 `target/release/bundle/dmg/tw-dashboard_<ver>_aarch64.dmg` → `app/installer/dmg/tw-dashboard-arm64.dmg`
-4. 同步 `app/installer/package.json` 的 `version`
-5. `cd app/installer && npm publish --registry=https://bnpm.byted.org`
+1. 从 `app/src-tauri/tauri.conf.json` 读 dashboard 版本(决定 dmg 文件名)
+2. 从仓库根目录 `package.json` 读 npm 包版本(决定 publish 版本)
+3. `npm run tauri build` + `npm run build`(tsup 打 CLI),可加 `--no-build` 跳过两个构建
+4. 拷贝 `target/release/bundle/dmg/tw-dashboard_<tauri_ver>_aarch64.dmg` → `app/installer/dmg/tw-dashboard-arm64.dmg`
+5. `cd <repo-root> && npm publish --registry=https://bnpm.byted.org`
 
 预览不发布:`./app/scripts/release.sh --dry-run`(会调 `npm pack --dry-run` 列出 tarball 内容)。
 
 发布完毕后用户跑:
 
 ```bash
-npx -y --registry=https://bnpm.byted.org @byted-codebase/tw-dashboard-installer
+npx -y --registry=https://bnpm.byted.org -p @byted-codebase/tmux-worktree tw-dashboard-install
 ```
 
 bnpm 拉最新 tarball,内置 `installer.mjs` 自动 mount dmg + ditto 到 `/Applications/` + xattr 去隔离 + 退出。

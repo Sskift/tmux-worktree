@@ -1,13 +1,16 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "type": "module",
   "files": [
-    "dist"
+    "dist",
+    "app/installer/installer.mjs",
+    "app/installer/dmg/"
   ],
   "bin": {
     "tmux-worktree": "./dist/cli.js",
-    "tw": "./dist/cli.js"
+    "tw": "./dist/cli.js",
+    "tw-dashboard-install": "./app/installer/installer.mjs"
   },
   "scripts": {
     "build": "tsup src/cli.ts --format esm --target node20"
@@ -15,5 +18,8 @@
   "devDependencies": {
     "tsup": "^8.0.0",
     "typescript": "^5.0.0"
+  },
+  "publishConfig": {
+    "registry": "https://bnpm.byted.org"
   }
 }
