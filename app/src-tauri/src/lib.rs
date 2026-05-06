@@ -134,37 +134,169 @@ struct CreateArgs {
     name: Option<String>,
 }
 
-#[tauri::command]
-fn create_worktree(args: CreateArgs) -> Result<String, String> {
-    let before: std::collections::HashSet<String> =
-        list_sessions()?.into_iter().map(|s| s.name).collect();
+fn run_check(args: &[&str]) -> Result<String, String> {
+    let output = std::process::Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", args[0]))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} failed ({}): {}",
+            args[0],
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
-    let mut tw_args = vec![args.ai_cmd.clone(), args.project.clone()];
-    if let Some(n) = args.name.as_ref() {
-        let trimmed = n.trim();
-        if !trimmed.is_empty() {
-            tw_args.push(trimmed.to_string());
+fn run_quiet(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(args[0])
+        .args(&args[1..])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn detect_default_branch(repo: &str) -> String {
+    if let Some(s) = run_quiet(&[
+        "git",
+        "-C",
+        repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+    ]) {
+        if let Some(b) = s.strip_prefix("refs/remotes/origin/") {
+            return b.to_string();
         }
     }
+    if run_quiet(&[
+        "git",
+        "-C",
+        repo,
+        "ls-remote",
+        "--heads",
+        "origin",
+        "master",
+    ])
+    .map(|s| !s.is_empty())
+    .unwrap_or(false)
+    {
+        return "master".to_string();
+    }
+    "main".to_string()
+}
 
-    let output = std::process::Command::new("tw")
-        .args(&tw_args)
-        .output()
-        .map_err(|e| format!("spawn tw: {e}"))?;
+fn unique_session_name(base: &str) -> String {
+    let mut name = base.to_string();
+    let mut i = 1;
+    while run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
+        name = format!("{}-{}", base, i);
+        i += 1;
+    }
+    name
+}
 
-    let after = list_sessions()?;
-    if let Some(s) = after.iter().find(|s| !before.contains(&s.name)) {
-        return Ok(s.name.clone());
+fn random_id() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    id.chars().take(5).collect()
+}
+
+#[tauri::command]
+fn create_worktree(args: CreateArgs) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let config_text = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&config_text).map_err(|e| format!("parse config: {e}"))?;
+
+    let project_dir = config
+        .get("projects")
+        .and_then(|v| v.get(&args.project))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("project '{}' not in ~/.tmux-worktree.json", args.project))?
+        .to_string();
+
+    if !std::path::Path::new(&project_dir).exists() {
+        return Err(format!("project dir does not exist: {project_dir}"));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(format!(
-        "tw exited {} — stderr: {} stdout: {}",
-        output.status,
-        stderr.trim(),
-        stdout.trim()
-    ))
+    let worktree_base = config
+        .get("worktreeBase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/private/tmp/tmux-worktree/projects")
+        .to_string();
+
+    let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
+    let base_session = if trimmed_name.is_empty() {
+        args.project.clone()
+    } else {
+        format!("{}-{}", args.project, trimmed_name)
+    };
+    let session = unique_session_name(&base_session);
+
+    let work_dir = if run_quiet(&[
+        "git",
+        "-C",
+        &project_dir,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ])
+    .as_deref()
+        == Some("true")
+    {
+        let default_branch = detect_default_branch(&project_dir);
+        let _ = run_quiet(&[
+            "git",
+            "-C",
+            &project_dir,
+            "fetch",
+            "origin",
+            &default_branch,
+            "--quiet",
+        ]);
+
+        let branch_id = random_id();
+        let branch_name = format!("{}-{}", session, branch_id);
+        let project_worktree_root = format!("{}/{}", worktree_base, args.project);
+        std::fs::create_dir_all(&project_worktree_root)
+            .map_err(|e| format!("mkdir {project_worktree_root}: {e}"))?;
+        let worktree_dir = format!("{}/{}", project_worktree_root, branch_name);
+
+        run_check(&[
+            "git",
+            "-C",
+            &project_dir,
+            "worktree",
+            "add",
+            "-b",
+            &branch_name,
+            &worktree_dir,
+            &format!("origin/{}", default_branch),
+            "--quiet",
+        ])?;
+
+        worktree_dir
+    } else {
+        project_dir
+    };
+
+    run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
+    run_check(&[
+        "tmux",
+        "send-keys",
+        "-t",
+        &session,
+        &args.ai_cmd,
+        "C-m",
+    ])?;
+
+    Ok(session)
 }
 
 #[tauri::command]
