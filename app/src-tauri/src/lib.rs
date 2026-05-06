@@ -412,6 +412,100 @@ struct GitFile {
     path: String,
 }
 
+#[derive(Serialize, Clone)]
+struct GitCommit {
+    hash: String,
+    short: String,
+    parents: Vec<String>,
+    subject: String,
+    author: String,
+    rel_time: String,
+    refs: Vec<String>,
+}
+
+#[tauri::command]
+fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
+    let inside = run_quiet(&[
+        "git",
+        "-C",
+        &cwd,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ]);
+    if inside.as_deref() != Some("true") {
+        return Ok(vec![]);
+    }
+
+    let n = limit.unwrap_or(80).min(500);
+    let n_str = n.to_string();
+    let fmt = "%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ar\x1f%D";
+    let pretty = format!("--pretty=format:{}", fmt);
+    let output = std::process::Command::new("git")
+        .args([
+            "-C",
+            &cwd,
+            "log",
+            "--all",
+            "--topo-order",
+            "--decorate=short",
+            "-n",
+            &n_str,
+            &pretty,
+        ])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not have any commits yet") {
+            return Ok(vec![]);
+        }
+        return Err(format!("git log failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commits = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(7, '\x1f');
+            let hash = parts.next()?.to_string();
+            let short = parts.next()?.to_string();
+            let parents_raw = parts.next()?;
+            let subject = parts.next()?.to_string();
+            let author = parts.next()?.to_string();
+            let rel_time = parts.next()?.to_string();
+            let refs_raw = parts.next().unwrap_or("");
+            let parents = if parents_raw.is_empty() {
+                Vec::new()
+            } else {
+                parents_raw
+                    .split(' ')
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            let refs = if refs_raw.is_empty() {
+                Vec::new()
+            } else {
+                refs_raw
+                    .split(", ")
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            Some(GitCommit {
+                hash,
+                short,
+                parents,
+                subject,
+                author,
+                rel_time,
+                refs,
+            })
+        })
+        .collect();
+
+    Ok(commits)
+}
+
 #[tauri::command]
 fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
     let inside = run_quiet(&[
@@ -656,6 +750,7 @@ pub fn run() {
             kill_session,
             session_cwd,
             git_status,
+            git_log,
             pty_open,
             pty_write,
             pty_resize,
