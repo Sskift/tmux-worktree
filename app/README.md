@@ -5,6 +5,16 @@
 > 用户向说明见飞书文档:<https://bytedance.larkoffice.com/wiki/OYn6whuokihNJUkdirhc2zhmnid>
 > CLI 版 tw 文档:<https://bytedance.larkoffice.com/wiki/HmcSwP0jZizIVkkGvi5cWHPZnBz>
 
+## 快速安装
+
+Apple Silicon Mac:
+
+```bash
+curl -fsSL https://code.byted.org/jiangyunong/tmux-worktree/-/raw/feat/tauri-dashboard/app/scripts/install.sh | bash
+```
+
+脚本会从 codebase release 拉最新 dmg,挂载,把 `.app` 拷到 `/Applications`,清掉 macOS 隔离属性,然后 `open -a tw-dashboard` 就能用。Intel Mac 暂未发布,自行 [构建 release](#构建-release)。
+
 ## 技术栈
 
 | 层 | 选型 |
@@ -121,6 +131,31 @@ xattr -dr com.apple.quarantine /Applications/tw-dashboard.app
 open /Applications/tw-dashboard.app
 ```
 
+## 发布 release
+
+`app/scripts/install.sh` 通过 codebase release 的 `permalink/latest` URL 拉 dmg,所以新版本要走 release 流程。
+
+```bash
+# 1. bump 版本号(app/src-tauri/tauri.conf.json 的 "version" 字段、app/package.json 也同步一下)
+# 2. 重新构建
+cd app && npm run tauri build
+
+# 3. 打 tag 并 push
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+然后去 codebase web UI:
+
+1. 项目页 → **Deployments → Releases → New release**,选刚 push 的 tag
+2. **Release assets → Asset links → Add another link**:
+   - URL:先把 dmg 上传到 release 描述里(markdown 上传得到一个 `/-/project/uploads/<hash>/...` 链接)
+   - Link title:随便,例如 `tw-dashboard.dmg`
+   - Type:`Package`
+   - **Direct asset path:`/downloads/tw-dashboard.dmg`** ← 必须是这个路径,`install.sh` 才能从 `permalink/latest/downloads/tw-dashboard.dmg` 拿到
+
+文件名固定为 `tw-dashboard.dmg`(不带版本号),让 install 脚本可以稳定指向最新版。
+
 ## 跨架构构建
 
 默认只构建当前架构。Apple Silicon 上是 `aarch64-apple-darwin`,要做 universal:
@@ -156,7 +191,7 @@ Tauri 2 默认不放开 `window.startDragging` 和 dialog 插件,在 `src-tauri/
 
 - **Tauri 版本错位**: `@tauri-apps/api` 和 Rust crate `tauri` 的 minor 版本必须对齐,否则 `tauri build` 报错(dev 仅警告)。改一边就 `cargo update -p tauri --precise <版本>` 或 `npm install @tauri-apps/api@<版本>`。
 - **Linux 未验证**:目前只在 macOS arm64 上验过。
-- **没有 codesign**:dmg 跨机器分发要么手动 `xattr -dr`,要么走完整 `codesign --deep --force --options runtime ...` + notarize。
+- **没有 codesign**:dmg 跨机器分发会被 macOS Gatekeeper 标记隔离属性,首次打开会被拒。`install.sh` 会自动 `xattr -dr` 处理掉;手动安装的话也可以执行同样的命令,或者走完整 `codesign --deep --force --options runtime ...` + notarize 流程。
 
 ## Roadmap
 
