@@ -657,18 +657,40 @@ fn pty_open(
     let app_for_thread = app.clone();
     thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut pending: Vec<u8> = Vec::new();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
-                    let _ = app_for_thread.emit(
-                        &format!("pty:{}", id_for_thread),
-                        PtyChunk {
-                            id: id_for_thread.clone(),
-                            data: chunk,
-                        },
-                    );
+                    pending.extend_from_slice(&buf[..n]);
+                    let valid_up_to = match std::str::from_utf8(&pending) {
+                        Ok(_) => pending.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid_up_to > 0 {
+                        let valid: Vec<u8> = pending.drain(..valid_up_to).collect();
+                        let chunk = String::from_utf8(valid).expect("validated above");
+                        let _ = app_for_thread.emit(
+                            &format!("pty:{}", id_for_thread),
+                            PtyChunk {
+                                id: id_for_thread.clone(),
+                                data: chunk,
+                            },
+                        );
+                    }
+                    // Max valid UTF-8 sequence is 4 bytes; anything longer in pending
+                    // is genuine garbage, not a chunk boundary — flush lossy and reset.
+                    if pending.len() > 4 {
+                        let chunk = String::from_utf8_lossy(&pending).to_string();
+                        let _ = app_for_thread.emit(
+                            &format!("pty:{}", id_for_thread),
+                            PtyChunk {
+                                id: id_for_thread.clone(),
+                                data: chunk,
+                            },
+                        );
+                        pending.clear();
+                    }
                 }
                 Err(_) => break,
             }
