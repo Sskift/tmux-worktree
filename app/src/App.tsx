@@ -5,6 +5,7 @@ import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal } from "./NewTerminalModal";
 import { ThemePicker } from "./ThemePicker";
 import { GitStatusPanel } from "./GitStatusPanel";
+import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import "./App.css";
 
@@ -80,6 +81,7 @@ function App() {
   });
   const [gitHeight, setGitHeight] = useState<number>(LAYOUT_DEFAULTS.gitHeight);
   const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
+  const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
@@ -106,12 +108,15 @@ function App() {
         }
       })
       .catch(() => {});
-    invoke<Record<string, number>>("load_layout")
+    invoke<Record<string, unknown>>("load_layout")
       .then((lay) => {
-        if (lay.left) setCols((c) => ({ ...c, left: lay.left }));
-        if (lay.right) setCols((c) => ({ ...c, right: lay.right }));
-        if (lay.gitHeight) setGitHeight(lay.gitHeight);
-        if (lay.sectionSplit) setSectionSplit(lay.sectionSplit);
+        if (typeof lay.left === "number") setCols((c) => ({ ...c, left: lay.left as number }));
+        if (typeof lay.right === "number") setCols((c) => ({ ...c, right: lay.right as number }));
+        if (typeof lay.gitHeight === "number") setGitHeight(lay.gitHeight as number);
+        if (typeof lay.sectionSplit === "number") setSectionSplit(lay.sectionSplit as number);
+        if (Array.isArray(lay.sessionOrder)) {
+          setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
+        }
       })
       .catch(() => {});
   }, []);
@@ -127,11 +132,11 @@ function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit },
+        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
@@ -205,9 +210,19 @@ function App() {
     document.addEventListener("mouseup", onUp);
   };
 
+  const sessionOrderRef = useRef(sessionOrder);
+  sessionOrderRef.current = sessionOrder;
+
   const refresh = useCallback(async () => {
     try {
       const list = await invoke<Session[]>("list_sessions");
+      const order = sessionOrderRef.current;
+      const orderMap = new Map(order.map((n, i) => [n, i]));
+      list.sort((a, b) => {
+        const ai = orderMap.get(a.name) ?? Infinity;
+        const bi = orderMap.get(b.name) ?? Infinity;
+        return ai - bi;
+      });
       setSessions(list);
       setError(null);
       const live = new Set(list.map((s) => s.name));
@@ -275,6 +290,19 @@ function App() {
   const colorMap = new Map<string, string>();
   const totalCount = sessions.length + terminals.length;
 
+  const sessionSortable = useSortable(
+    sessions,
+    (reordered) => {
+      setSessions(reordered);
+      setSessionOrder(reordered.map((s) => s.name));
+    },
+  );
+
+  const terminalSortable = useSortable(
+    terminals,
+    (reordered) => setTerminals(reordered),
+  );
+
   return (
     <div
       className="app"
@@ -318,12 +346,12 @@ function App() {
                 <span className="section-label__text">worktrees</span>
                 <span className="section-label__line" />
               </div>
-              <nav className="sidebar__sessions">
+              <nav className="sidebar__sessions" ref={sessionSortable.listRef as React.RefObject<HTMLElement>}>
                 {sessions.length === 0 && !error && (
                   <div className="empty empty--small">no sessions</div>
                 )}
                 {error && <div className="empty empty--error">{error}</div>}
-                {sessions.map((s) => {
+                {sessions.map((s, i) => {
                   const key = projectKey(s.name);
                   const color = colorForProject(colorMap, key);
                   const dash = s.name.indexOf("-");
@@ -331,13 +359,16 @@ function App() {
                   const tail = dash > 0 ? s.name.slice(dash) : "";
                   const isSelected =
                     selection?.kind === "session" && selection.name === s.name;
+                  const isDragging = sessionSortable.dragIndex === i;
+                  const isDragOver = sessionSortable.dragIndex !== null && sessionSortable.overIndex === i && sessionSortable.dragIndex !== i;
                   return (
                     <div
                       key={s.name}
-                      className={`session ${isSelected ? "session--selected" : ""}`}
+                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
                       onClick={() =>
                         setSelection({ kind: "session", name: s.name })
                       }
+                      onPointerDown={sessionSortable.onPointerDown(i)}
                       role="button"
                       tabIndex={0}
                       onKeyDown={(e) => {
@@ -359,11 +390,22 @@ function App() {
                       <button
                         type="button"
                         className="session__kill"
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={async (e) => {
                           e.stopPropagation();
                           try {
                             await invoke("kill_session", { name: s.name });
-                            refresh();
+                            setSessions((prev) => prev.filter((x) => x.name !== s.name));
+                            setOpenedSessions((prev) => prev.filter((n) => n !== s.name));
+                            setSessionOrder((prev) => prev.filter((n) => n !== s.name));
+                            if (isSelected) {
+                              const remaining = sessions.filter((x) => x.name !== s.name);
+                              setSelection(
+                                remaining.length > 0
+                                  ? { kind: "session", name: remaining[0].name }
+                                  : null,
+                              );
+                            }
                           } catch (err) {
                             setError(String(err));
                           }
@@ -391,20 +433,23 @@ function App() {
                 <span className="section-label__text">terminals</span>
                 <span className="section-label__line" />
               </div>
-              <nav className="sidebar__sessions">
+              <nav className="sidebar__sessions" ref={terminalSortable.listRef as React.RefObject<HTMLElement>}>
                 {terminals.length === 0 && (
                   <div className="empty empty--small">no terminals</div>
                 )}
-                {terminals.map((t) => {
+                {terminals.map((t, i) => {
                   const isSelected =
                     selection?.kind === "terminal" && selection.id === t.id;
+                  const isDragging = terminalSortable.dragIndex === i;
+                  const isDragOver = terminalSortable.dragIndex !== null && terminalSortable.overIndex === i && terminalSortable.dragIndex !== i;
                   return (
                     <div
                       key={t.id}
-                      className={`session ${isSelected ? "session--selected" : ""}`}
+                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
                       onClick={() =>
                         setSelection({ kind: "terminal", id: t.id })
                       }
+                      onPointerDown={terminalSortable.onPointerDown(i)}
                       role="button"
                       tabIndex={0}
                       onKeyDown={(e) => {
@@ -420,6 +465,7 @@ function App() {
                       <button
                         type="button"
                         className="session__kill"
+                        onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
                           invoke("kill_plain_terminal", { name: t.tmuxName }).catch(() => {});

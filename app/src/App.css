@@ -609,7 +609,24 @@ button:disabled {
   text-align: left;
   width: 100%;
   cursor: pointer;
-  transition: background 100ms ease;
+  transition: background 100ms ease, opacity 100ms ease;
+  position: relative;
+}
+
+.session--dragging {
+  opacity: 0.35;
+}
+
+.session--drag-over::before {
+  content: "";
+  position: absolute;
+  top: -1px;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  background: var(--accent-a);
+  border-radius: 1px;
+  pointer-events: none;
 }
 
 .session:hover {
