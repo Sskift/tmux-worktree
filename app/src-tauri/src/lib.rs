@@ -2,9 +2,63 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tauri::{Emitter, Manager, State};
+
+/// macOS .app 包启动时环境变量极少，从用户登录 shell 继承完整环境
+/// （PATH、TMUX_TMPDIR、LANG 等），这样 tmux/git 子进程才能正常工作。
+fn inherit_shell_env() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "env -0"])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for entry in stdout.split('\0') {
+        if let Some((key, val)) = entry.split_once('=') {
+            if matches!(key, "PWD" | "OLDPWD" | "_" | "SHLVL") {
+                continue;
+            }
+            unsafe { std::env::set_var(key, val); }
+        }
+    }
+}
+
+fn tmux_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        "tmux".to_string()
+    })
+}
+
+fn git_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        for p in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        "git".to_string()
+    })
+}
+
+fn resolve_cmd(name: &str) -> &str {
+    match name {
+        "tmux" => tmux_bin(),
+        "git" => git_bin(),
+        _ => name,
+    }
+}
 
 #[derive(Serialize, Clone)]
 struct Session {
@@ -57,7 +111,7 @@ struct OpenArgs {
 #[tauri::command]
 fn list_sessions() -> Result<Vec<Session>, String> {
     let fmt = "#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}";
-    let output = std::process::Command::new("tmux")
+    let output = std::process::Command::new(tmux_bin())
         .args(["list-sessions", "-F", fmt])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
@@ -136,7 +190,8 @@ struct CreateArgs {
 }
 
 fn run_check(args: &[&str]) -> Result<String, String> {
-    let output = std::process::Command::new(args[0])
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
         .args(&args[1..])
         .output()
         .map_err(|e| format!("spawn {}: {e}", args[0]))?;
@@ -153,7 +208,8 @@ fn run_check(args: &[&str]) -> Result<String, String> {
 }
 
 fn run_quiet(args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(args[0])
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
         .args(&args[1..])
         .output()
         .ok()?;
@@ -368,7 +424,7 @@ fn kill_session(name: String) -> Result<(), String> {
 
 #[tauri::command]
 fn session_cwd(name: String) -> Result<String, String> {
-    let output = std::process::Command::new("tmux")
+    let output = std::process::Command::new(tmux_bin())
         .args([
             "display-message",
             "-p",
@@ -481,7 +537,7 @@ fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
     let n_str = n.to_string();
     let fmt = "%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ar\x1f%D";
     let pretty = format!("--pretty=format:{}", fmt);
-    let output = std::process::Command::new("git")
+    let output = std::process::Command::new(git_bin())
         .args([
             "-C",
             &cwd,
@@ -560,7 +616,7 @@ fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
         return Ok(None);
     }
 
-    let output = std::process::Command::new("git")
+    let output = std::process::Command::new(git_bin())
         .args(["-C", &cwd, "status", "--porcelain=v2", "--branch"])
         .output()
         .map_err(|e| format!("spawn git: {e}"))?;
@@ -648,7 +704,8 @@ fn pty_open(
         })
         .map_err(|e| format!("openpty: {e}"))?;
 
-    let mut cmd = CommandBuilder::new(&args.cmd);
+    let resolved_cmd = resolve_cmd(&args.cmd);
+    let mut cmd = CommandBuilder::new(resolved_cmd);
     for a in &args.args {
         cmd.arg(a);
     }
@@ -797,8 +854,85 @@ fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn create_plain_terminal(cwd: String) -> Result<String, String> {
+    let name = format!("tw-term-{}", random_id());
+    run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    setup_clipboard_bindings();
+    Ok(name)
+}
+
+#[tauri::command]
+fn ensure_terminal_session(name: String, cwd: String) -> Result<(), String> {
+    if run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
+        return Ok(());
+    }
+    run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    setup_clipboard_bindings();
+    Ok(())
+}
+
+#[tauri::command]
+fn kill_plain_terminal(name: String) -> Result<(), String> {
+    let _ = run_quiet(&["tmux", "kill-session", "-t", &format!("={}", name)]);
+    Ok(())
+}
+
+fn terminals_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".tw-dashboard-terminals.json")
+}
+
+fn layout_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".tw-dashboard-layout.json")
+}
+
+#[tauri::command]
+fn load_terminals() -> Result<Vec<serde_json::Value>, String> {
+    let p = terminals_path();
+    if !p.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(arr)
+}
+
+#[tauri::command]
+fn save_terminals(terminals: Vec<serde_json::Value>) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(&terminals).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(terminals_path(), text).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_layout() -> Result<serde_json::Value, String> {
+    let p = layout_path();
+    if !p.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(val)
+}
+
+#[tauri::command]
+fn save_layout(layout: serde_json::Value) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(layout_path(), text).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    inherit_shell_env();
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
@@ -816,6 +950,13 @@ pub fn run() {
             cancel_copy_mode,
             git_status,
             git_log,
+            create_plain_terminal,
+            ensure_terminal_session,
+            kill_plain_terminal,
+            load_terminals,
+            save_terminals,
+            load_layout,
+            save_layout,
             pty_open,
             pty_write,
             pty_resize,
