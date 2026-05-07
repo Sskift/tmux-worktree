@@ -25,6 +25,22 @@ function shExec(cmd: string): void {
   execSync(cmd, { stdio: "inherit", timeout: 30000 });
 }
 
+// 优化 tmux 鼠标选择体验（server-global，幂等）：
+//  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
+//  2. MouseDown1Pane → cancel：点击任意位置退出 copy-mode，清除选区
+function setupClipboardBindings(): void {
+  const copyCmd = process.platform === "darwin" ? "pbcopy" : "";
+  if (!copyCmd) return;
+  for (const table of ["copy-mode-vi", "copy-mode"]) {
+    sh(
+      `tmux bind-key -T ${table} MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "${copyCmd}"`
+    );
+    sh(
+      `tmux bind-key -T ${table} MouseDown1Pane select-pane '\\;' send-keys -X cancel`
+    );
+  }
+}
+
 // --- 配置 ---
 interface Config {
   projects: Record<string, string>;
@@ -308,6 +324,7 @@ export async function run() {
 
   // 创建 session，初始窗口运行 status (最左栏固定宽度)
   shExec(`tmux new-session -d -s ${session} -c ${workDir}`);
+  setupClipboardBindings();
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
   shExec(`tmux send-keys -t '${session}.1' 'node "${cliPath}" status' C-m`);
 

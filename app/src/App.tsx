@@ -298,6 +298,7 @@ function App() {
                     cmd="tmux"
                     args={["attach-session", "-t", name]}
                     active={name === selected}
+                    tmuxSession={name}
                   />
                 </div>
               ))}
