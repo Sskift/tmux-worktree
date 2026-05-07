@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
+import { NewTerminalModal } from "./NewTerminalModal";
 import { ThemePicker } from "./ThemePicker";
 import { GitStatusPanel } from "./GitStatusPanel";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
@@ -14,6 +15,17 @@ type Session = {
   created: number;
   activity: number;
 };
+
+type PlainTerminal = {
+  id: string;
+  label: string;
+  cwd: string;
+};
+
+type Selection =
+  | { kind: "session"; name: string }
+  | { kind: "terminal"; id: string }
+  | null;
 
 const REFRESH_MS = 2000;
 
@@ -42,15 +54,18 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
+let termIdCounter = 0;
+
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
+  const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
+  const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
-  const [cwdsBySession, setCwdsBySession] = useState<Record<string, string>>(
-    {},
-  );
+  const [openedTerminals, setOpenedTerminals] = useState<string[]>([]);
+  const [cwdsBySession, setCwdsBySession] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
-  const [showNew, setShowNew] = useState(false);
+  const [showNewWorktree, setShowNewWorktree] = useState(false);
+  const [showNewTerminal, setShowNewTerminal] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
     const id = loadTheme();
     applyTheme(id);
@@ -68,8 +83,14 @@ function App() {
     const n = s ? parseInt(s, 10) : NaN;
     return Number.isFinite(n) ? n : 220;
   });
+  const [sectionSplit, setSectionSplit] = useState<number>(() => {
+    const s = localStorage.getItem("tw-dashboard:section-split");
+    const n = s ? parseFloat(s) : NaN;
+    return Number.isFinite(n) ? n : 0.5;
+  });
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
+  const sessionsListRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     localStorage.setItem("tw-dashboard:cols", JSON.stringify(cols));
@@ -78,6 +99,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem("tw-dashboard:git-height", String(gitHeight));
   }, [gitHeight]);
+
+  useEffect(() => {
+    localStorage.setItem("tw-dashboard:section-split", String(sectionSplit));
+  }, [sectionSplit]);
 
   const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -103,7 +128,7 @@ function App() {
     document.addEventListener("mouseup", onUp);
   };
 
-  const startSidebarSplit = (e: React.MouseEvent) => {
+  const startGitSplit = (e: React.MouseEvent) => {
     e.preventDefault();
     const container = sidebarSplitRef.current;
     if (!container) return;
@@ -114,6 +139,28 @@ function App() {
       const dy = ev.clientY - startY;
       const h = Math.max(80, Math.min(total - 120, startH - dy));
       setGitHeight(h);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const startSectionSplit = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const listContainer = sessionsListRef.current;
+    if (!listContainer) return;
+    const containerRect = listContainer.getBoundingClientRect();
+    const onMove = (ev: MouseEvent) => {
+      const relY = ev.clientY - containerRect.top;
+      const ratio = Math.max(0.15, Math.min(0.85, relY / containerRect.height));
+      setSectionSplit(ratio);
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -141,9 +188,11 @@ function App() {
         }
         return next;
       });
-      setSelected((cur) => {
-        if (cur && live.has(cur)) return cur;
-        return list[0]?.name ?? null;
+      setSelection((cur) => {
+        if (cur?.kind === "terminal") return cur;
+        if (cur?.kind === "session" && live.has(cur.name)) return cur;
+        if (list.length > 0) return { kind: "session", name: list[0].name };
+        return null;
       });
     } catch (e) {
       setError(String(e));
@@ -156,24 +205,44 @@ function App() {
     return () => clearInterval(id);
   }, [refresh]);
 
+  // Lazy-open session terminals
   useEffect(() => {
-    if (!selected) return;
+    if (selection?.kind !== "session") return;
+    const name = selection.name;
     setOpenedSessions((prev) =>
-      prev.includes(selected) ? prev : [...prev, selected],
+      prev.includes(name) ? prev : [...prev, name],
     );
-    if (cwdsBySession[selected] || cwdRequested.current.has(selected)) return;
-    cwdRequested.current.add(selected);
-    invoke<string>("session_cwd", { name: selected })
+    if (cwdsBySession[name] || cwdRequested.current.has(name)) return;
+    cwdRequested.current.add(name);
+    invoke<string>("session_cwd", { name })
       .then((cwd) => {
-        if (cwd) setCwdsBySession((prev) => ({ ...prev, [selected]: cwd }));
+        if (cwd) setCwdsBySession((prev) => ({ ...prev, [name]: cwd }));
       })
       .catch(() => {})
       .finally(() => {
-        cwdRequested.current.delete(selected);
+        cwdRequested.current.delete(name);
       });
-  }, [selected, cwdsBySession]);
+  }, [selection, cwdsBySession]);
+
+  // Lazy-open plain terminals
+  useEffect(() => {
+    if (selection?.kind !== "terminal") return;
+    const id = selection.id;
+    setOpenedTerminals((prev) =>
+      prev.includes(id) ? prev : [...prev, id],
+    );
+  }, [selection]);
+
+  // Resolve current cwd for selected item
+  const selectedCwd: string | null =
+    selection?.kind === "session"
+      ? cwdsBySession[selection.name] ?? null
+      : selection?.kind === "terminal"
+        ? terminals.find((t) => t.id === selection.id)?.cwd ?? null
+        : null;
 
   const colorMap = new Map<string, string>();
+  const totalCount = sessions.length + terminals.length;
 
   return (
     <div
@@ -189,87 +258,184 @@ function App() {
             <span className="brand__mark" />
             <span className="brand__text">tmux-worktree</span>
           </div>
-          <button
-            className="btn btn--primary"
-            type="button"
-            onClick={() => setShowNew(true)}
-          >
-            + new worktree
-          </button>
+          <div className="sidebar__buttons">
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => setShowNewWorktree(true)}
+            >
+              + worktree
+            </button>
+            <button
+              className="btn btn--primary"
+              type="button"
+              onClick={() => setShowNewTerminal(true)}
+            >
+              + terminal
+            </button>
+          </div>
         </header>
 
         <div className="sidebar__split" ref={sidebarSplitRef}>
-          <nav className="sidebar__sessions">
-            {sessions.length === 0 && !error && (
-              <div className="empty">no tmux sessions</div>
-            )}
-            {error && <div className="empty empty--error">{error}</div>}
-            {sessions.map((s) => {
-              const key = projectKey(s.name);
-              const color = colorForProject(colorMap, key);
-              const dash = s.name.indexOf("-");
-              const head = dash > 0 ? s.name.slice(0, dash) : s.name;
-              const tail = dash > 0 ? s.name.slice(dash) : "";
-              const isSelected = s.name === selected;
-              return (
-                <div
-                  key={s.name}
-                  className={`session ${isSelected ? "session--selected" : ""}`}
-                  onClick={() => setSelected(s.name)}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") setSelected(s.name);
-                  }}
-                >
-                  <span
-                    className={`session__dot ${s.attached ? "session__dot--attached" : ""}`}
-                    style={{ background: color }}
-                  />
-                  <span className="session__name">
-                    <span className="session__head" style={{ color }}>
-                      {head}
-                    </span>
-                    <span className="session__tail">{tail}</span>
-                  </span>
-                  <span className="session__meta">
-                    {s.window_count}w
-                  </span>
-                  <button
-                    type="button"
-                    className="session__kill"
-                    onClick={async (e) => {
-                      e.stopPropagation();
-                      try {
-                        await invoke("kill_session", { name: s.name });
-                        refresh();
-                      } catch (err) {
-                        setError(String(err));
+          <div className="sidebar__lists" ref={sessionsListRef}>
+            {/* ── Worktrees section ── */}
+            <div
+              className="sidebar__section"
+              style={{ flex: `${sectionSplit} 1 0` }}
+            >
+              <div className="section-label">
+                <span className="section-label__text">worktrees</span>
+                <span className="section-label__line" />
+              </div>
+              <nav className="sidebar__sessions">
+                {sessions.length === 0 && !error && (
+                  <div className="empty empty--small">no sessions</div>
+                )}
+                {error && <div className="empty empty--error">{error}</div>}
+                {sessions.map((s) => {
+                  const key = projectKey(s.name);
+                  const color = colorForProject(colorMap, key);
+                  const dash = s.name.indexOf("-");
+                  const head = dash > 0 ? s.name.slice(0, dash) : s.name;
+                  const tail = dash > 0 ? s.name.slice(dash) : "";
+                  const isSelected =
+                    selection?.kind === "session" && selection.name === s.name;
+                  return (
+                    <div
+                      key={s.name}
+                      className={`session ${isSelected ? "session--selected" : ""}`}
+                      onClick={() =>
+                        setSelection({ kind: "session", name: s.name })
                       }
-                    }}
-                    title="kill session"
-                    aria-label={`kill session ${s.name}`}
-                  >
-                    ×
-                  </button>
-                </div>
-              );
-            })}
-          </nav>
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ")
+                          setSelection({ kind: "session", name: s.name });
+                      }}
+                    >
+                      <span
+                        className={`session__dot ${s.attached ? "session__dot--attached" : ""}`}
+                        style={{ background: color }}
+                      />
+                      <span className="session__name">
+                        <span className="session__head" style={{ color }}>
+                          {head}
+                        </span>
+                        <span className="session__tail">{tail}</span>
+                      </span>
+                      <span className="session__meta">{s.window_count}w</span>
+                      <button
+                        type="button"
+                        className="session__kill"
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          try {
+                            await invoke("kill_session", { name: s.name });
+                            refresh();
+                          } catch (err) {
+                            setError(String(err));
+                          }
+                        }}
+                        title="kill session"
+                        aria-label={`kill session ${s.name}`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </nav>
+            </div>
+
+            {/* ── Section divider ── */}
+            <div
+              className="splitter--section"
+              onMouseDown={startSectionSplit}
+              aria-label="resize sections"
+            />
+
+            {/* ── Terminals section ── */}
+            <div
+              className="sidebar__section"
+              style={{ flex: `${1 - sectionSplit} 1 0` }}
+            >
+              <div className="section-label">
+                <span className="section-label__text">terminals</span>
+                <span className="section-label__line" />
+              </div>
+              <nav className="sidebar__sessions">
+                {terminals.length === 0 && (
+                  <div className="empty empty--small">no terminals</div>
+                )}
+                {terminals.map((t) => {
+                  const isSelected =
+                    selection?.kind === "terminal" && selection.id === t.id;
+                  return (
+                    <div
+                      key={t.id}
+                      className={`session ${isSelected ? "session--selected" : ""}`}
+                      onClick={() =>
+                        setSelection({ kind: "terminal", id: t.id })
+                      }
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ")
+                          setSelection({ kind: "terminal", id: t.id });
+                      }}
+                    >
+                      <span className="session__dot" style={{ background: "var(--text-faint)" }} />
+                      <span className="session__name">
+                        <span className="session__head">{t.label}</span>
+                      </span>
+                      <span className="session__meta dim">zsh</span>
+                      <button
+                        type="button"
+                        className="session__kill"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setTerminals((prev) =>
+                            prev.filter((x) => x.id !== t.id),
+                          );
+                          setOpenedTerminals((prev) =>
+                            prev.filter((x) => x !== t.id),
+                          );
+                          if (isSelected) {
+                            setSelection(
+                              sessions.length > 0
+                                ? { kind: "session", name: sessions[0].name }
+                                : null,
+                            );
+                          }
+                        }}
+                        title="close terminal"
+                        aria-label={`close terminal ${t.label}`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  );
+                })}
+              </nav>
+            </div>
+          </div>
 
           <div
             className="splitter splitter--horizontal"
-            onMouseDown={startSidebarSplit}
+            onMouseDown={startGitSplit}
             aria-label="resize git panel"
           />
 
           <div className="sidebar__git" style={{ height: gitHeight }}>
-            <GitStatusPanel cwd={selected ? cwdsBySession[selected] ?? null : null} />
+            <GitStatusPanel cwd={selectedCwd} />
           </div>
         </div>
 
         <footer className="sidebar__footer">
-          <span className="dim">{sessions.length} session{sessions.length === 1 ? "" : "s"}</span>
+          <span className="dim">
+            {totalCount} item{totalCount === 1 ? "" : "s"}
+          </span>
           <ThemePicker current={theme} onChange={setTheme} />
         </footer>
       </aside>
@@ -281,32 +447,75 @@ function App() {
       />
 
       <main className="main">
-        {selected ? (
+        {selection ? (
           <div className="pane pane--term">
             <div className="pane__bar">
-              <span className="pane__title">{selected}</span>
-              <span className="pane__hint dim">tmux attach</span>
+              <span className="pane__title">
+                {selection.kind === "session"
+                  ? selection.name
+                  : terminals.find((t) => t.id === selection.id)?.label ??
+                    selection.id}
+              </span>
+              <span className="pane__hint dim">
+                {selection.kind === "session" ? "tmux attach" : "zsh"}
+              </span>
             </div>
             <div className="pane__body pane__body--stack">
+              {/* tmux session terminals */}
               {openedSessions.map((name) => (
                 <div
-                  key={name}
+                  key={`s:${name}`}
                   className="term-slot"
-                  style={{ display: name === selected ? "flex" : "none" }}
+                  style={{
+                    display:
+                      selection?.kind === "session" && selection.name === name
+                        ? "flex"
+                        : "none",
+                  }}
                 >
                   <Terminal
                     cmd="tmux"
                     args={["attach-session", "-t", name]}
-                    active={name === selected}
+                    active={
+                      selection?.kind === "session" && selection.name === name
+                    }
                     tmuxSession={name}
                   />
                 </div>
               ))}
+              {/* plain terminals */}
+              {openedTerminals.map((id) => {
+                const t = terminals.find((x) => x.id === id);
+                if (!t) return null;
+                return (
+                  <div
+                    key={`t:${id}`}
+                    className="term-slot"
+                    style={{
+                      display:
+                        selection?.kind === "terminal" && selection.id === id
+                          ? "flex"
+                          : "none",
+                    }}
+                  >
+                    <Terminal
+                      cmd="/bin/zsh"
+                      args={["-l"]}
+                      cwd={t.cwd}
+                      active={
+                        selection?.kind === "terminal" && selection.id === id
+                      }
+                    />
+                  </div>
+                );
+              })}
             </div>
           </div>
         ) : (
           <div className="pane pane--empty">
-            <div className="pane__hint">选一个 session 或新建一个 worktree</div>
+            <div className="pane__hint">
+              select a session or create a new worktree / terminal
+            </div>
           </div>
         )}
       </main>
@@ -318,27 +527,61 @@ function App() {
       />
 
       <aside className="scratch">
-        {selected ? (
+        {selection && selectedCwd ? (
           <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
               <span className="pane__hint dim">zsh</span>
             </div>
             <div className="pane__body pane__body--stack">
+              {/* scratch for sessions */}
               {openedSessions.map((name) => {
                 const cwd = cwdsBySession[name];
                 if (!cwd) return null;
                 return (
                   <div
-                    key={name}
+                    key={`s:${name}`}
                     className="term-slot"
-                    style={{ display: name === selected ? "flex" : "none" }}
+                    style={{
+                      display:
+                        selection?.kind === "session" && selection.name === name
+                          ? "flex"
+                          : "none",
+                    }}
                   >
                     <Terminal
                       cmd="/bin/zsh"
                       args={["-l"]}
                       cwd={cwd}
-                      active={name === selected}
+                      active={
+                        selection?.kind === "session" && selection.name === name
+                      }
+                    />
+                  </div>
+                );
+              })}
+              {/* scratch for plain terminals */}
+              {openedTerminals.map((id) => {
+                const t = terminals.find((x) => x.id === id);
+                if (!t) return null;
+                return (
+                  <div
+                    key={`t:${id}`}
+                    className="term-slot"
+                    style={{
+                      display:
+                        selection?.kind === "terminal" && selection.id === id
+                          ? "flex"
+                          : "none",
+                    }}
+                  >
+                    <Terminal
+                      cmd="/bin/zsh"
+                      args={["-l"]}
+                      cwd={t.cwd}
+                      active={
+                        selection?.kind === "terminal" && selection.id === id
+                      }
                     />
                   </div>
                 );
@@ -352,13 +595,25 @@ function App() {
         )}
       </aside>
 
-      {showNew && (
+      {showNewWorktree && (
         <NewWorktreeModal
-          onClose={() => setShowNew(false)}
+          onClose={() => setShowNewWorktree(false)}
           onCreated={(sessionName) => {
-            setShowNew(false);
-            setSelected(sessionName);
+            setShowNewWorktree(false);
+            setSelection({ kind: "session", name: sessionName });
             refresh();
+          }}
+        />
+      )}
+
+      {showNewTerminal && (
+        <NewTerminalModal
+          onClose={() => setShowNewTerminal(false)}
+          onCreated={(label, cwd) => {
+            const id = `term-${++termIdCounter}`;
+            setTerminals((prev) => [...prev, { id, label, cwd }]);
+            setShowNewTerminal(false);
+            setSelection({ kind: "terminal", id });
           }}
         />
       )}
