@@ -76,6 +76,10 @@ export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Pr
               placeholder="/path/to/dir"
               disabled={busy}
               autoFocus
+              autoComplete="off"
+              autoCorrect="off"
+              autoCapitalize="off"
+              spellCheck={false}
             />
             <button
               type="button"
@@ -97,6 +101,10 @@ export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Pr
             onChange={(e) => setLabel(e.target.value)}
             placeholder="(optional, defaults to directory name)"
             disabled={busy}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
           />
         </label>
 

@@ -141,6 +141,10 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
                   onChange={(e) => setCustomPath(e.target.value)}
                   placeholder="/path/to/repo"
                   disabled={busy}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
                 <button
                   type="button"
@@ -173,6 +177,10 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
                   onChange={(e) => setCustomName(e.target.value)}
                   placeholder="short id, used as session prefix"
                   disabled={busy}
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
               </label>
             )}
@@ -189,6 +197,10 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
             placeholder="claude"
             disabled={busy}
             autoFocus
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
           />
         </label>
 
@@ -201,6 +213,10 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
             onChange={(e) => setName(e.target.value)}
             placeholder="(optional, defaults to project)"
             disabled={busy}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
           />
         </label>
 
