@@ -15,9 +15,10 @@ type Props = {
   args: string[];
   cwd?: string;
   active?: boolean;
+  tmuxSession?: string;
 };
 
-export function Terminal({ cmd, args, cwd, active = true }: Props) {
+export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -45,6 +46,14 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
     term.open(host);
     termRef.current = term;
     fitRef.current = fit;
+
+    let blurHandler: (() => void) | null = null;
+    if (tmuxSession) {
+      blurHandler = () => {
+        invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
+      };
+      host.addEventListener("focusout", blurHandler);
+    }
 
     const safeFit = () => {
       try {
@@ -107,6 +116,7 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
     return () => {
       cancelled = true;
       ro.disconnect();
+      if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       unlistenChunk?.();
       unlistenExit?.();
@@ -115,7 +125,7 @@ export function Terminal({ cmd, args, cwd, active = true }: Props) {
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [cmd, args.join("\x1f"), cwd]);
+  }, [cmd, args.join("\x1f"), cwd, tmuxSession]);
 
   useEffect(() => {
     if (!active) return;

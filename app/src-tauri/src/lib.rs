@@ -163,6 +163,46 @@ fn run_quiet(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+// 优化 tmux 鼠标选择体验（server-global，幂等）：
+//  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
+//  2. MouseDown1Pane → cancel：点击任意位置退出 copy-mode，清除选区
+fn setup_clipboard_bindings() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for table in ["copy-mode-vi", "copy-mode"] {
+        let _ = run_quiet(&[
+            "tmux",
+            "bind-key",
+            "-T",
+            table,
+            "MouseDragEnd1Pane",
+            "send-keys",
+            "-X",
+            "copy-pipe-no-clear",
+            "pbcopy",
+        ]);
+        let _ = run_quiet(&[
+            "tmux",
+            "bind-key",
+            "-T",
+            table,
+            "MouseDown1Pane",
+            "select-pane",
+            "\\;",
+            "send-keys",
+            "-X",
+            "cancel",
+        ]);
+    }
+}
+
+#[tauri::command]
+fn cancel_copy_mode(name: String) -> Result<(), String> {
+    let _ = run_quiet(&["tmux", "send-keys", "-t", &name, "-X", "cancel"]);
+    Ok(())
+}
+
 fn detect_default_branch(repo: &str) -> String {
     if let Some(s) = run_quiet(&[
         "git",
@@ -307,6 +347,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
     };
 
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
+    setup_clipboard_bindings();
     run_check(&[
         "tmux",
         "send-keys",
@@ -762,6 +803,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(Arc::new(PtyState::default()));
+            setup_clipboard_bindings();
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -771,6 +813,7 @@ pub fn run() {
             create_worktree,
             kill_session,
             session_cwd,
+            cancel_copy_mode,
             git_status,
             git_log,
             pty_open,
