@@ -2,11 +2,12 @@ import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 
 type Props = {
+  existingLabels?: string[];
   onClose: () => void;
   onCreated: (label: string, cwd: string) => void;
 };
 
-export function NewTerminalModal({ onClose, onCreated }: Props) {
+export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Props) {
   const [path, setPath] = useState("");
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
@@ -42,9 +43,13 @@ export function NewTerminalModal({ onClose, onCreated }: Props) {
     e.preventDefault();
     const p = path.trim();
     if (!p) return;
+    const l = label.trim() || p.split("/").filter(Boolean).pop() || "terminal";
+    if (existingLabels.includes(l)) {
+      setError(`A terminal named "${l}" already exists`);
+      return;
+    }
     setBusy(true);
     setError(null);
-    const l = label.trim() || p.split("/").filter(Boolean).pop() || "terminal";
     onCreated(l, p);
   };
 

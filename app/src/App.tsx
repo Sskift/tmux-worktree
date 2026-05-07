@@ -20,6 +20,7 @@ type PlainTerminal = {
   id: string;
   label: string;
   cwd: string;
+  tmuxName: string;
 };
 
 type Selection =
@@ -54,6 +55,8 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
+const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 0.5 };
+
 let termIdCounter = 0;
 
 function App() {
@@ -71,38 +74,66 @@ function App() {
     applyTheme(id);
     return id;
   });
-  const [cols, setCols] = useState<{ left: number; right: number }>(() => {
-    try {
-      const s = localStorage.getItem("tw-dashboard:cols");
-      if (s) return JSON.parse(s);
-    } catch {}
-    return { left: 240, right: 380 };
+  const [cols, setCols] = useState<{ left: number; right: number }>({
+    left: LAYOUT_DEFAULTS.left,
+    right: LAYOUT_DEFAULTS.right,
   });
-  const [gitHeight, setGitHeight] = useState<number>(() => {
-    const s = localStorage.getItem("tw-dashboard:git-height");
-    const n = s ? parseInt(s, 10) : NaN;
-    return Number.isFinite(n) ? n : 220;
-  });
-  const [sectionSplit, setSectionSplit] = useState<number>(() => {
-    const s = localStorage.getItem("tw-dashboard:section-split");
-    const n = s ? parseFloat(s) : NaN;
-    return Number.isFinite(n) ? n : 0.5;
-  });
+  const [gitHeight, setGitHeight] = useState<number>(LAYOUT_DEFAULTS.gitHeight);
+  const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
 
+  // Load persisted data on mount
   useEffect(() => {
-    localStorage.setItem("tw-dashboard:cols", JSON.stringify(cols));
-  }, [cols]);
+    invoke<PlainTerminal[]>("load_terminals")
+      .then(async (saved) => {
+        if (saved.length > 0) {
+          const maxNum = saved.reduce((max, t) => {
+            const m = t.id.match(/^term-(\d+)$/);
+            return m ? Math.max(max, parseInt(m[1], 10)) : max;
+          }, 0);
+          termIdCounter = maxNum;
+          for (const t of saved) {
+            if (t.tmuxName) {
+              await invoke("ensure_terminal_session", {
+                name: t.tmuxName,
+                cwd: t.cwd,
+              }).catch(() => {});
+            }
+          }
+          setTerminals(saved.filter((t) => t.tmuxName));
+        }
+      })
+      .catch(() => {});
+    invoke<Record<string, number>>("load_layout")
+      .then((lay) => {
+        if (lay.left) setCols((c) => ({ ...c, left: lay.left }));
+        if (lay.right) setCols((c) => ({ ...c, right: lay.right }));
+        if (lay.gitHeight) setGitHeight(lay.gitHeight);
+        if (lay.sectionSplit) setSectionSplit(lay.sectionSplit);
+      })
+      .catch(() => {});
+  }, []);
 
+  // Persist terminals
+  const terminalsRef = useRef(terminals);
+  terminalsRef.current = terminals;
   useEffect(() => {
-    localStorage.setItem("tw-dashboard:git-height", String(gitHeight));
-  }, [gitHeight]);
+    invoke("save_terminals", { terminals }).catch(() => {});
+  }, [terminals]);
 
+  // Persist layout (debounced)
   useEffect(() => {
-    localStorage.setItem("tw-dashboard:section-split", String(sectionSplit));
-  }, [sectionSplit]);
+    const t = setTimeout(() => {
+      invoke("save_layout", {
+        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit },
+      }).catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  }, [cols, gitHeight, sectionSplit]);
+
+  const anyModalOpen = showNewWorktree || showNewTerminal;
 
   const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
     e.preventDefault();
@@ -348,19 +379,15 @@ function App() {
               </nav>
             </div>
 
-            {/* ── Section divider ── */}
-            <div
-              className="splitter--section"
-              onMouseDown={startSectionSplit}
-              aria-label="resize sections"
-            />
-
             {/* ── Terminals section ── */}
             <div
               className="sidebar__section"
               style={{ flex: `${1 - sectionSplit} 1 0` }}
             >
-              <div className="section-label">
+              <div
+                className="section-label section-label--draggable"
+                onMouseDown={startSectionSplit}
+              >
                 <span className="section-label__text">terminals</span>
                 <span className="section-label__line" />
               </div>
@@ -395,6 +422,7 @@ function App() {
                         className="session__kill"
                         onClick={(e) => {
                           e.stopPropagation();
+                          invoke("kill_plain_terminal", { name: t.tmuxName }).catch(() => {});
                           setTerminals((prev) =>
                             prev.filter((x) => x.id !== t.id),
                           );
@@ -477,6 +505,7 @@ function App() {
                     cmd="tmux"
                     args={["attach-session", "-t", name]}
                     active={
+                      !anyModalOpen &&
                       selection?.kind === "session" && selection.name === name
                     }
                     tmuxSession={name}
@@ -499,12 +528,13 @@ function App() {
                     }}
                   >
                     <Terminal
-                      cmd="/bin/zsh"
-                      args={["-l"]}
-                      cwd={t.cwd}
+                      cmd="tmux"
+                      args={["attach-session", "-t", t.tmuxName]}
                       active={
+                        !anyModalOpen &&
                         selection?.kind === "terminal" && selection.id === id
                       }
+                      tmuxSession={t.tmuxName}
                     />
                   </div>
                 );
@@ -554,6 +584,7 @@ function App() {
                       args={["-l"]}
                       cwd={cwd}
                       active={
+                        !anyModalOpen &&
                         selection?.kind === "session" && selection.name === name
                       }
                     />
@@ -580,6 +611,7 @@ function App() {
                       args={["-l"]}
                       cwd={t.cwd}
                       active={
+                        !anyModalOpen &&
                         selection?.kind === "terminal" && selection.id === id
                       }
                     />
@@ -608,12 +640,19 @@ function App() {
 
       {showNewTerminal && (
         <NewTerminalModal
+          existingLabels={terminals.map((t) => t.label)}
           onClose={() => setShowNewTerminal(false)}
-          onCreated={(label, cwd) => {
-            const id = `term-${++termIdCounter}`;
-            setTerminals((prev) => [...prev, { id, label, cwd }]);
-            setShowNewTerminal(false);
-            setSelection({ kind: "terminal", id });
+          onCreated={async (label, cwd) => {
+            try {
+              const tmuxName = await invoke<string>("create_plain_terminal", { cwd });
+              const id = `term-${++termIdCounter}`;
+              setTerminals((prev) => [...prev, { id, label, cwd, tmuxName }]);
+              setShowNewTerminal(false);
+              setSelection({ kind: "terminal", id });
+            } catch (e) {
+              setError(String(e));
+              setShowNewTerminal(false);
+            }
           }}
         />
       )}

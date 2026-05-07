@@ -128,10 +128,18 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) 
   }, [cmd, args.join("\x1f"), cwd, tmuxSession]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) {
+      const ta = termRef.current?.textarea;
+      if (ta) {
+        ta.blur();
+        ta.disabled = true;
+      }
+      return;
+    }
     const term = termRef.current;
     const fit = fitRef.current;
     if (!term || !fit) return;
+    if (term.textarea) term.textarea.disabled = false;
     requestAnimationFrame(() => {
       try {
         fit.fit();

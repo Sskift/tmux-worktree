@@ -232,25 +232,12 @@ button:disabled {
   background: var(--line);
 }
 
-/* ─── Section splitter (subtle) ────────────────────────────── */
-
-.splitter--section {
-  height: 1px;
-  background: var(--line);
+.section-label--draggable {
   cursor: row-resize;
-  flex-shrink: 0;
-  margin: 0 14px;
-  position: relative;
-  transition: background 120ms ease;
+  user-select: none;
 }
 
-.splitter--section::before {
-  content: "";
-  position: absolute;
-  inset: -4px 0;
-}
-
-.splitter--section:hover {
+.section-label--draggable:hover .section-label__line {
   background: var(--accent-a);
 }
 
