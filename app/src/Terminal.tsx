@@ -75,6 +75,15 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) 
 
     const start = async () => {
       try {
+        if (tmuxSession) {
+          const history = await invoke<string>("capture_pane_history", {
+            name: tmuxSession,
+          }).catch(() => "");
+          if (history) {
+            term.write(history + "\r\n");
+          }
+        }
+
         const { cols, rows } = term;
         const id = await invoke<string>("pty_open", {
           args: { cmd, args, cwd, cols, rows },

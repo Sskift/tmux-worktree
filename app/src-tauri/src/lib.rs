@@ -131,6 +131,9 @@ fn list_sessions() -> Result<Vec<Session>, String> {
         .filter_map(|line| {
             let mut parts = line.split('\x1f');
             let name = parts.next()?.to_string();
+            if name.starts_with("tw-term-") {
+                return None;
+            }
             let attached = parts.next()? == "1";
             let window_count = parts.next()?.parse().ok()?;
             let created = parts.next()?.parse().ok()?;
@@ -418,7 +421,8 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 
 #[tauri::command]
 fn kill_session(name: String) -> Result<(), String> {
-    run_check(&["tmux", "kill-session", "-t", &name])?;
+    let exact = format!("={}", name);
+    run_check(&["tmux", "kill-session", "-t", &exact])?;
     Ok(())
 }
 
@@ -863,6 +867,21 @@ fn create_plain_terminal(cwd: String) -> Result<String, String> {
 }
 
 #[tauri::command]
+fn capture_pane_history(name: String) -> Result<String, String> {
+    let exact = format!("={}", name);
+    let output = std::process::Command::new(tmux_bin())
+        .args(["capture-pane", "-p", "-e", "-S", "-5000", "-t", &exact])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = text.trim_end_matches('\n');
+    Ok(trimmed.to_string())
+}
+
+#[tauri::command]
 fn ensure_terminal_session(name: String, cwd: String) -> Result<(), String> {
     if run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
         return Ok(());
@@ -948,6 +967,7 @@ pub fn run() {
             kill_session,
             session_cwd,
             cancel_copy_mode,
+            capture_pane_history,
             git_status,
             git_log,
             create_plain_terminal,
