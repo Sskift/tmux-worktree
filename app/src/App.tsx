@@ -177,7 +177,7 @@ function App() {
     const total = container.getBoundingClientRect().height;
     const onMove = (ev: MouseEvent) => {
       const dy = ev.clientY - startY;
-      const h = Math.max(80, Math.min(total - 120, startH - dy));
+      const h = Math.max(80, Math.min(total - sectionSplit - 40, startH - dy));
       setGitHeight(h);
     };
     const onUp = () => {
