@@ -253,7 +253,6 @@ button:disabled {
   display: flex;
   flex-direction: column;
   min-height: 80px;
-  border-top: 1px solid var(--line);
   flex-shrink: 0;
 }
 
@@ -623,10 +622,22 @@ button:disabled {
   opacity: 0.35;
 }
 
-.session--drag-over::before {
+.session--drag-over-before::before {
   content: "";
   position: absolute;
   top: -1px;
+  left: 6px;
+  right: 6px;
+  height: 2px;
+  background: var(--accent-a);
+  border-radius: 1px;
+  pointer-events: none;
+}
+
+.session--drag-over-after::after {
+  content: "";
+  position: absolute;
+  bottom: -1px;
   left: 6px;
   right: 6px;
   height: 2px;
