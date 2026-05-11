@@ -56,7 +56,7 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
-const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 0.5 };
+const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
 
 let termIdCounter = 0;
 
@@ -113,7 +113,10 @@ function App() {
         if (typeof lay.left === "number") setCols((c) => ({ ...c, left: lay.left as number }));
         if (typeof lay.right === "number") setCols((c) => ({ ...c, right: lay.right as number }));
         if (typeof lay.gitHeight === "number") setGitHeight(lay.gitHeight as number);
-        if (typeof lay.sectionSplit === "number") setSectionSplit(lay.sectionSplit as number);
+        if (typeof lay.sectionSplit === "number") {
+          const v = lay.sectionSplit as number;
+          setSectionSplit(v < 1 ? LAYOUT_DEFAULTS.sectionSplit : v);
+        }
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
@@ -192,11 +195,13 @@ function App() {
     e.preventDefault();
     const listContainer = sessionsListRef.current;
     if (!listContainer) return;
-    const containerRect = listContainer.getBoundingClientRect();
+    const startY = e.clientY;
+    const startH = sectionSplit;
+    const containerH = listContainer.getBoundingClientRect().height;
     const onMove = (ev: MouseEvent) => {
-      const relY = ev.clientY - containerRect.top;
-      const ratio = Math.max(0.15, Math.min(0.85, relY / containerRect.height));
-      setSectionSplit(ratio);
+      const dy = ev.clientY - startY;
+      const h = Math.max(40, Math.min(containerH - 40, startH + dy));
+      setSectionSplit(h);
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -340,7 +345,7 @@ function App() {
             {/* ── Worktrees section ── */}
             <div
               className="sidebar__section"
-              style={{ flex: `${sectionSplit} 1 0` }}
+              style={{ height: sectionSplit, flexShrink: 0 }}
             >
               <div className="section-label">
                 <span className="section-label__text">worktrees</span>
@@ -361,10 +366,13 @@ function App() {
                     selection?.kind === "session" && selection.name === s.name;
                   const isDragging = sessionSortable.dragIndex === i;
                   const isDragOver = sessionSortable.dragIndex !== null && sessionSortable.overIndex === i && sessionSortable.dragIndex !== i;
+                  const dragOverClass = isDragOver
+                    ? sessionSortable.dragIndex! > i ? "session--drag-over-before" : "session--drag-over-after"
+                    : "";
                   return (
                     <div
                       key={s.name}
-                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
+                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${dragOverClass}`}
                       onClick={() => {
                         if (sessionSortable.draggingRef.current) return;
                         setSelection({ kind: "session", name: s.name });
@@ -425,7 +433,7 @@ function App() {
             {/* ── Terminals section ── */}
             <div
               className="sidebar__section"
-              style={{ flex: `${1 - sectionSplit} 1 0` }}
+              style={{ flex: "1 1 0", minHeight: 40 }}
             >
               <div
                 className="section-label section-label--draggable"
@@ -443,10 +451,13 @@ function App() {
                     selection?.kind === "terminal" && selection.id === t.id;
                   const isDragging = terminalSortable.dragIndex === i;
                   const isDragOver = terminalSortable.dragIndex !== null && terminalSortable.overIndex === i && terminalSortable.dragIndex !== i;
+                  const dragOverClass = isDragOver
+                    ? terminalSortable.dragIndex! > i ? "session--drag-over-before" : "session--drag-over-after"
+                    : "";
                   return (
                     <div
                       key={t.id}
-                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
+                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${dragOverClass}`}
                       onClick={() => {
                         if (terminalSortable.draggingRef.current) return;
                         setSelection({ kind: "terminal", id: t.id });
@@ -497,13 +508,14 @@ function App() {
             </div>
           </div>
 
-          <div
-            className="splitter splitter--horizontal"
-            onMouseDown={startGitSplit}
-            aria-label="resize git panel"
-          />
-
           <div className="sidebar__git" style={{ height: gitHeight }}>
+            <div
+              className="section-label section-label--draggable"
+              onMouseDown={startGitSplit}
+            >
+              <span className="section-label__text">git</span>
+              <span className="section-label__line" />
+            </div>
             <GitStatusPanel cwd={selectedCwd} />
           </div>
         </div>
