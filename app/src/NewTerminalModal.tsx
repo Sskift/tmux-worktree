@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
 type Props = {
@@ -12,6 +13,16 @@ export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Pr
   const [label, setLabel] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<string>("home_dir")
+      .then((home) => {
+        const desktop = `${home}/Desktop`;
+        setPath(desktop);
+        setLabel("Desktop");
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

@@ -346,7 +346,7 @@ function App() {
                 <span className="section-label__text">worktrees</span>
                 <span className="section-label__line" />
               </div>
-              <nav className="sidebar__sessions" ref={sessionSortable.listRef as React.RefObject<HTMLElement>}>
+              <nav className={`sidebar__sessions ${sessionSortable.dragIndex !== null ? "sidebar__sessions--dragging" : ""}`} ref={sessionSortable.listRef as React.RefObject<HTMLElement>}>
                 {sessions.length === 0 && !error && (
                   <div className="empty empty--small">no sessions</div>
                 )}
@@ -365,9 +365,10 @@ function App() {
                     <div
                       key={s.name}
                       className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
-                      onClick={() =>
-                        setSelection({ kind: "session", name: s.name })
-                      }
+                      onClick={() => {
+                        if (sessionSortable.draggingRef.current) return;
+                        setSelection({ kind: "session", name: s.name });
+                      }}
                       onPointerDown={sessionSortable.onPointerDown(i)}
                       role="button"
                       tabIndex={0}
@@ -433,7 +434,7 @@ function App() {
                 <span className="section-label__text">terminals</span>
                 <span className="section-label__line" />
               </div>
-              <nav className="sidebar__sessions" ref={terminalSortable.listRef as React.RefObject<HTMLElement>}>
+              <nav className={`sidebar__sessions ${terminalSortable.dragIndex !== null ? "sidebar__sessions--dragging" : ""}`} ref={terminalSortable.listRef as React.RefObject<HTMLElement>}>
                 {terminals.length === 0 && (
                   <div className="empty empty--small">no terminals</div>
                 )}
@@ -446,9 +447,10 @@ function App() {
                     <div
                       key={t.id}
                       className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${isDragOver ? "session--drag-over" : ""}`}
-                      onClick={() =>
-                        setSelection({ kind: "terminal", id: t.id })
-                      }
+                      onClick={() => {
+                        if (terminalSortable.draggingRef.current) return;
+                        setSelection({ kind: "terminal", id: t.id });
+                      }}
                       onPointerDown={terminalSortable.onPointerDown(i)}
                       role="button"
                       tabIndex={0}

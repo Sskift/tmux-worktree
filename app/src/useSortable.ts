@@ -9,6 +9,7 @@ export function useSortable<T>(
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const pendingRef = useRef<{ index: number; startY: number } | null>(null);
+  const draggingRef = useRef(false);
   const listRef = useRef<HTMLElement | null>(null);
   const itemsRef = useRef(items);
   itemsRef.current = items;
@@ -32,6 +33,7 @@ export function useSortable<T>(
         if (Math.abs(e.clientY - pending.startY) >= DRAG_THRESHOLD) {
           setDragIndex(pending.index);
           setOverIndex(pending.index);
+          draggingRef.current = true;
           document.body.style.userSelect = "none";
           document.body.style.cursor = "grabbing";
           pendingRef.current = null;
@@ -76,6 +78,7 @@ export function useSortable<T>(
         setOverIndex(null);
         document.body.style.userSelect = "";
         document.body.style.cursor = "";
+        requestAnimationFrame(() => { draggingRef.current = false; });
       }
     };
 
@@ -87,5 +90,5 @@ export function useSortable<T>(
     };
   }, [dragIndex, overIndex]);
 
-  return { listRef, onPointerDown, dragIndex, overIndex };
+  return { listRef, onPointerDown, dragIndex, overIndex, draggingRef };
 }

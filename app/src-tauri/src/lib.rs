@@ -942,6 +942,13 @@ fn load_layout() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
+fn home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| "home dir not found".into())
+}
+
+#[tauri::command]
 fn save_layout(layout: serde_json::Value) -> Result<(), String> {
     let text =
         serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
@@ -977,6 +984,7 @@ pub fn run() {
             save_terminals,
             load_layout,
             save_layout,
+            home_dir,
             pty_open,
             pty_write,
             pty_resize,

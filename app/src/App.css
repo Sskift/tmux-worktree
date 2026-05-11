@@ -187,6 +187,10 @@ button:disabled {
   min-height: 80px;
 }
 
+.sidebar__sessions--dragging > * {
+  pointer-events: none;
+}
+
 .sidebar__split {
   flex: 1;
   display: flex;
@@ -611,6 +615,8 @@ button:disabled {
   cursor: pointer;
   transition: background 100ms ease, opacity 100ms ease;
   position: relative;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .session--dragging {
