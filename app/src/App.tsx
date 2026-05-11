@@ -82,6 +82,7 @@ function App() {
   const [gitHeight, setGitHeight] = useState<number>(LAYOUT_DEFAULTS.gitHeight);
   const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
+  const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
@@ -471,8 +472,33 @@ function App() {
                       }}
                     >
                       <span className="session__dot" style={{ background: "var(--text-faint)" }} />
-                      <span className="session__name">
-                        <span className="session__head">{t.label}</span>
+                      <span className="session__name" onDoubleClick={() => setRenamingTerminal(t.id)}>
+                        {renamingTerminal === t.id ? (
+                          <input
+                            className="session__rename-input"
+                            defaultValue={t.label}
+                            autoFocus
+                            spellCheck={false}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => e.stopPropagation()}
+                            onKeyDown={(e) => {
+                              if (e.key === "Escape") {
+                                setRenamingTerminal(null);
+                              } else if (e.key === "Enter") {
+                                (e.target as HTMLInputElement).blur();
+                              }
+                            }}
+                            onBlur={(e) => {
+                              const val = e.target.value.trim();
+                              if (val && val !== t.label && !terminals.some((x) => x.id !== t.id && x.label === val)) {
+                                setTerminals((prev) => prev.map((x) => x.id === t.id ? { ...x, label: val } : x));
+                              }
+                              setRenamingTerminal(null);
+                            }}
+                          />
+                        ) : (
+                          <span className="session__head">{t.label}</span>
+                        )}
                       </span>
                       <span className="session__meta dim">zsh</span>
                       <button
