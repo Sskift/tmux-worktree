@@ -714,6 +714,20 @@ button:disabled {
   white-space: nowrap;
 }
 
+.session__rename-input {
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--accent-a);
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text);
+  padding: 0;
+  margin: 0;
+}
+
 .session__head {
   font-weight: 500;
 }
