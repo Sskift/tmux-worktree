@@ -306,10 +306,6 @@ function App() {
         ? `t:${selection.id}`
         : null;
 
-  const currentScratchList = selectionKey
-    ? scratchTerminals.get(selectionKey)?.list ?? null
-    : null;
-
   const ensureScratch = useCallback((key: string) => {
     setScratchTerminals((prev) => {
       if (prev.has(key)) return prev;
@@ -749,7 +745,7 @@ function App() {
       />
 
       <aside className="scratch">
-        {selection && selectedCwd && currentScratchList ? (
+        {scratchTerminals.size > 0 ? (
           <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
@@ -761,36 +757,56 @@ function App() {
                 +
               </button>
             </div>
-            <div className="scratch__sections" ref={scratchSectionsRef}>
-              {currentScratchList.map((st, i) => (
-                <div key={st.id} className="scratch__section">
-                  <div
-                    className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
-                    onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
-                  >
-                    <span className="section-label__text">{st.label}</span>
-                    <div className="section-label__line" />
-                    {currentScratchList.length > 1 && (
-                      <button
-                        className="scratch__close"
-                        type="button"
-                        onClick={() => removeScratchTerminal(st.id)}
+            {Array.from(scratchTerminals.entries()).map(([key, state]) => {
+              const isActive = key === selectionKey;
+              const cwdForKey = (() => {
+                if (key.startsWith("s:")) {
+                  return cwdsBySession[key.slice(2)] ?? null;
+                }
+                if (key.startsWith("t:")) {
+                  return terminals.find((t) => t.id === key.slice(2))?.cwd ?? null;
+                }
+                return null;
+              })();
+              if (!cwdForKey) return null;
+              return (
+                <div
+                  key={key}
+                  className="scratch__sections"
+                  ref={isActive ? scratchSectionsRef : undefined}
+                  style={{ display: isActive ? "flex" : "none" }}
+                >
+                  {state.list.map((st, i) => (
+                    <div key={st.id} className="scratch__section">
+                      <div
+                        className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
+                        onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
                       >
-                        ×
-                      </button>
-                    )}
-                  </div>
-                  <div className="scratch__term">
-                    <Terminal
-                      cmd="/bin/zsh"
-                      args={["-l"]}
-                      cwd={selectedCwd}
-                      active={!anyModalOpen && !!selection}
-                    />
-                  </div>
+                        <span className="section-label__text">{st.label}</span>
+                        <div className="section-label__line" />
+                        {state.list.length > 1 && (
+                          <button
+                            className="scratch__close"
+                            type="button"
+                            onClick={() => removeScratchTerminal(st.id)}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                      <div className="scratch__term">
+                        <Terminal
+                          cmd="/bin/zsh"
+                          args={["-l"]}
+                          cwd={cwdForKey}
+                          active={isActive && !anyModalOpen}
+                        />
+                      </div>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
+              );
+            })}
           </div>
         ) : (
           <div className="pane pane--empty">
