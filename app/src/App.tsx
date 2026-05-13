@@ -56,9 +56,13 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
+type ScratchTerm = { id: string; label: string };
+type ScratchState = { list: ScratchTerm[]; nextNum: number };
+
 const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
 
 let termIdCounter = 0;
+let scratchIdCounter = 0;
 
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -83,6 +87,8 @@ function App() {
   const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
+  const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
+  const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
@@ -292,6 +298,106 @@ function App() {
       : selection?.kind === "terminal"
         ? terminals.find((t) => t.id === selection.id)?.cwd ?? null
         : null;
+
+  const selectionKey =
+    selection?.kind === "session"
+      ? `s:${selection.name}`
+      : selection?.kind === "terminal"
+        ? `t:${selection.id}`
+        : null;
+
+  const currentScratchList = selectionKey
+    ? scratchTerminals.get(selectionKey)?.list ?? null
+    : null;
+
+  const ensureScratch = useCallback((key: string) => {
+    setScratchTerminals((prev) => {
+      if (prev.has(key)) return prev;
+      const next = new Map(prev);
+      next.set(key, {
+        list: [{ id: `scratch-${++scratchIdCounter}`, label: "zsh 1" }],
+        nextNum: 2,
+      });
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (selectionKey) ensureScratch(selectionKey);
+  }, [selectionKey, ensureScratch]);
+
+  const addScratchTerminal = useCallback(() => {
+    if (!selectionKey) return;
+    setScratchTerminals((prev) => {
+      const state = prev.get(selectionKey) ?? { list: [], nextNum: 1 };
+      const num = state.nextNum;
+      const next = new Map(prev);
+      next.set(selectionKey, {
+        list: [...state.list, { id: `scratch-${++scratchIdCounter}`, label: `zsh ${num}` }],
+        nextNum: num + 1,
+      });
+      return next;
+    });
+    // Reset inline flex so all sections share space equally
+    const container = scratchSectionsRef.current;
+    if (container) {
+      for (const child of Array.from(container.children) as HTMLElement[]) {
+        child.style.flex = "";
+      }
+    }
+  }, [selectionKey]);
+
+  const removeScratchTerminal = useCallback((scratchId: string) => {
+    if (!selectionKey) return;
+    setScratchTerminals((prev) => {
+      const state = prev.get(selectionKey);
+      if (!state || state.list.length <= 1) return prev;
+      const next = new Map(prev);
+      next.set(selectionKey, {
+        ...state,
+        list: state.list.filter((s) => s.id !== scratchId),
+      });
+      return next;
+    });
+    // Reset inline flex so remaining sections share space equally
+    const container = scratchSectionsRef.current;
+    if (container) {
+      for (const child of Array.from(container.children) as HTMLElement[]) {
+        child.style.flex = "";
+      }
+    }
+  }, [selectionKey]);
+
+  const startScratchSplit = (index: number) => (e: React.MouseEvent) => {
+    e.preventDefault();
+    const container = scratchSectionsRef.current;
+    if (!container) return;
+    const sections = Array.from(container.children) as HTMLElement[];
+    if (index < 1 || index >= sections.length) return;
+    const prevSection = sections[index - 1];
+    const currSection = sections[index];
+    const startY = e.clientY;
+    const startPrevH = prevSection.getBoundingClientRect().height;
+    const startCurrH = currSection.getBoundingClientRect().height;
+    const totalH = startPrevH + startCurrH;
+    const onMove = (ev: MouseEvent) => {
+      const dy = ev.clientY - startY;
+      const newPrevH = Math.max(60, Math.min(totalH - 60, startPrevH + dy));
+      const newCurrH = totalH - newPrevH;
+      prevSection.style.flex = `0 0 ${newPrevH}px`;
+      currSection.style.flex = `0 0 ${newCurrH}px`;
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
 
   const colorMap = new Map<string, string>();
   const totalCount = sessions.length + terminals.length;
@@ -643,67 +749,47 @@ function App() {
       />
 
       <aside className="scratch">
-        {selection && selectedCwd ? (
+        {selection && selectedCwd && currentScratchList ? (
           <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
-              <span className="pane__hint dim">zsh</span>
+              <button
+                className="btn btn--small"
+                type="button"
+                onClick={addScratchTerminal}
+              >
+                +
+              </button>
             </div>
-            <div className="pane__body pane__body--stack">
-              {/* scratch for sessions */}
-              {openedSessions.map((name) => {
-                const cwd = cwdsBySession[name];
-                if (!cwd) return null;
-                return (
+            <div className="scratch__sections" ref={scratchSectionsRef}>
+              {currentScratchList.map((st, i) => (
+                <div key={st.id} className="scratch__section">
                   <div
-                    key={`s:${name}`}
-                    className="term-slot"
-                    style={{
-                      display:
-                        selection?.kind === "session" && selection.name === name
-                          ? "flex"
-                          : "none",
-                    }}
+                    className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
+                    onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
                   >
+                    <span className="section-label__text">{st.label}</span>
+                    <div className="section-label__line" />
+                    {currentScratchList.length > 1 && (
+                      <button
+                        className="scratch__close"
+                        type="button"
+                        onClick={() => removeScratchTerminal(st.id)}
+                      >
+                        ×
+                      </button>
+                    )}
+                  </div>
+                  <div className="scratch__term">
                     <Terminal
                       cmd="/bin/zsh"
                       args={["-l"]}
-                      cwd={cwd}
-                      active={
-                        !anyModalOpen &&
-                        selection?.kind === "session" && selection.name === name
-                      }
+                      cwd={selectedCwd}
+                      active={!anyModalOpen && !!selection}
                     />
                   </div>
-                );
-              })}
-              {/* scratch for plain terminals */}
-              {openedTerminals.map((id) => {
-                const t = terminals.find((x) => x.id === id);
-                if (!t) return null;
-                return (
-                  <div
-                    key={`t:${id}`}
-                    className="term-slot"
-                    style={{
-                      display:
-                        selection?.kind === "terminal" && selection.id === id
-                          ? "flex"
-                          : "none",
-                    }}
-                  >
-                    <Terminal
-                      cmd="/bin/zsh"
-                      args={["-l"]}
-                      cwd={t.cwd}
-                      active={
-                        !anyModalOpen &&
-                        selection?.kind === "terminal" && selection.id === id
-                      }
-                    />
-                  </div>
-                );
-              })}
+                </div>
+              ))}
             </div>
           </div>
         ) : (

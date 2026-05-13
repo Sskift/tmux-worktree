@@ -948,6 +948,78 @@ button:disabled {
   border-radius: 3px;
 }
 
+/* ─── Scratch multi-terminal ──────────────────────────────── */
+
+.btn--small {
+  height: 22px;
+  width: 22px;
+  padding: 0;
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-faint);
+  background: transparent;
+  border: 1px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms ease, color 120ms ease;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.btn--small:hover {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+}
+
+.scratch__sections {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.scratch__section {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 60px;
+  overflow: hidden;
+}
+
+.scratch__term {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  padding: 0 4px 4px;
+}
+
+.scratch__close {
+  width: 18px;
+  height: 18px;
+  border-radius: 4px;
+  font-size: 13px;
+  line-height: 1;
+  color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 100ms ease, background 100ms ease, color 100ms ease;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.scratch__section:hover .scratch__close {
+  opacity: 1;
+}
+
+.scratch__close:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text);
+}
+
 /* ─── Modal ─────────────────────────────────────────────────── */
 
 .modal-backdrop {
