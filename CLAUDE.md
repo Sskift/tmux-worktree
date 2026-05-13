@@ -51,6 +51,7 @@ A Tauri v2 desktop app (React + Rust) that replaces the terminal-based status pa
 **Backend** (`app/src-tauri/src/lib.rs`): Single-file Rust backend. All logic is in Tauri commands:
 - Session management: `list_sessions`, `create_worktree`, `kill_session` — shells out to tmux/git
 - PTY management: `pty_open`, `pty_write`, `pty_resize`, `pty_kill` — uses `portable-pty` crate, streams output via Tauri events (`pty:{id}`, `pty-exit:{id}`)
+- Clipboard: `setup_clipboard_bindings` configures tmux MouseDragEnd→pbcopy; `copy_tmux_selection` provides Cmd+C support by reading tmux's paste buffer; `cancel_copy_mode` exits tmux copy-mode on focusout
 - Git: `git_status` (porcelain v2 parser), `git_log` (custom format parser)
 - Persistence: layout and terminal state saved to `~/.tw-dashboard-layout.json` and `~/.tw-dashboard-terminals.json`
 - Utility: `home_dir` — exposes the user's home directory to the frontend (used by NewTerminalModal to default to ~/Desktop)
