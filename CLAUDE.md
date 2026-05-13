@@ -46,7 +46,7 @@ Built with `tsup` → `dist/cli.js` (single ESM bundle, no runtime deps).
 ### Dashboard App (`app/`)
 A Tauri v2 desktop app (React + Rust) that replaces the terminal-based status panel with a full GUI.
 
-**Frontend** (`app/src/`): React 19 + Vite + xterm.js. `App.tsx` is the main component with a 3-column resizable layout: sidebar (session list + git status) | terminal (tmux attach via PTY) | scratch panel. The scratch panel supports multiple terminals per selection with add/close buttons and draggable section dividers. Sessions and plain terminals are in separate sidebar sections with drag-to-reorder (via `useSortable` hook with directional before/after indicators). Terminal labels support inline rename via double-click.
+**Frontend** (`app/src/`): React 19 + Vite + xterm.js. `App.tsx` is the main component with a 3-column resizable layout: sidebar (session list + git status) | terminal (tmux attach via PTY) | scratch panel. The scratch panel supports multiple terminals per selection with add/close buttons and draggable section dividers; scratch terminals persist across session switches (hidden via `display: none`, not unmounted). Sessions and plain terminals are in separate sidebar sections with drag-to-reorder (via `useSortable` hook with directional before/after indicators). Terminal labels support inline rename via double-click.
 
 **Backend** (`app/src-tauri/src/lib.rs`): Single-file Rust backend. All logic is in Tauri commands:
 - Session management: `list_sessions`, `create_worktree`, `kill_session` — shells out to tmux/git
