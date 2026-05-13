@@ -224,7 +224,7 @@ fn run_quiet(args: &[&str]) -> Option<String> {
 
 // 优化 tmux 鼠标选择体验（server-global，幂等）：
 //  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
-//  2. MouseDown1Pane → cancel：点击任意位置退出 copy-mode，清除选区
+//  2. MouseDown1Pane → clear selection but stay in copy-mode (don't cancel/jump to bottom)
 fn setup_clipboard_bindings() {
     if !cfg!(target_os = "macos") {
         return;
@@ -251,7 +251,7 @@ fn setup_clipboard_bindings() {
             "\\;",
             "send-keys",
             "-X",
-            "cancel",
+            "clear-selection",
         ]);
     }
 }
@@ -260,6 +260,27 @@ fn setup_clipboard_bindings() {
 fn cancel_copy_mode(name: String) -> Result<(), String> {
     let _ = run_quiet(&["tmux", "send-keys", "-t", &name, "-X", "cancel"]);
     Ok(())
+}
+
+#[tauri::command]
+fn copy_tmux_selection(name: String) -> Result<bool, String> {
+    let output = std::process::Command::new("tmux")
+        .args(["save-buffer", "-"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(false);
+    }
+    let mut pbcopy = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = pbcopy.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&output.stdout);
+    }
+    let _ = pbcopy.wait();
+    Ok(true)
 }
 
 fn detect_default_branch(repo: &str) -> String {
@@ -974,6 +995,7 @@ pub fn run() {
             kill_session,
             session_cwd,
             cancel_copy_mode,
+            copy_tmux_selection,
             capture_pane_history,
             git_status,
             git_log,

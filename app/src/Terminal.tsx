@@ -53,6 +53,19 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) 
         invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
       };
       host.addEventListener("focusout", blurHandler);
+
+      term.attachCustomKeyEventHandler((e) => {
+        if (e.type === "keydown" && e.metaKey && e.key === "c") {
+          if (term.hasSelection()) return true;
+          invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
+            if (!copied) {
+              invoke("pty_write", { id: ptyId, data: "\x03" }).catch(() => {});
+            }
+          }).catch(() => {});
+          return false;
+        }
+        return true;
+      });
     }
 
     const safeFit = () => {
