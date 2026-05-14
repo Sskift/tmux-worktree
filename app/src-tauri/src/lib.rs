@@ -61,6 +61,16 @@ fn resolve_cmd(name: &str) -> &str {
 }
 
 #[derive(Serialize, Clone)]
+struct DirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_symlink: bool,
+    is_hidden: bool,
+    size: u64,
+}
+
+#[derive(Serialize, Clone)]
 struct Session {
     name: String,
     attached: bool,
@@ -977,6 +987,56 @@ fn save_layout(layout: serde_json::Value) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
+    let mut entries = Vec::new();
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let entry_path = entry.path().to_string_lossy().to_string();
+        let is_symlink = std::fs::symlink_metadata(entry.path())
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        let (is_dir, size) = match entry.metadata() {
+            Ok(m) => (m.is_dir(), m.len()),
+            Err(_) => continue,
+        };
+        let is_hidden = name.starts_with('.');
+        entries.push(DirEntry { name, path: entry_path, is_dir, is_symlink, is_hidden, size });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+#[tauri::command]
+fn read_file(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| format!("metadata: {e}"))?;
+    if meta.len() > 5 * 1024 * 1024 {
+        return Err("file too large (>5 MB)".into());
+    }
+    std::fs::read_to_string(p).map_err(|e| format!("read: {e}"))
+}
+
+#[tauri::command]
+fn write_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("write: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     inherit_shell_env();
@@ -1011,6 +1071,9 @@ pub fn run() {
             pty_write,
             pty_resize,
             pty_kill,
+            read_dir,
+            read_file,
+            write_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

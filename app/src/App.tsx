@@ -1,10 +1,13 @@
 import { useEffect, useState, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal } from "./NewTerminalModal";
 import { ThemePicker } from "./ThemePicker";
 import { GitStatusPanel } from "./GitStatusPanel";
+import { FileTree } from "./FileTree";
+import { FileEditor } from "./FileEditor";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import "./App.css";
@@ -88,10 +91,59 @@ function App() {
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
+  const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
+  const [editingFile, setEditingFile] = useState<string | null>(null);
+  const [homeDir, setHomeDir] = useState<string | null>(null);
+  const [fileTreeWidth, setFileTreeWidth] = useState(280);
+  const [editorWidth, setEditorWidth] = useState(420);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const appRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = appRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) setContainerWidth(e.contentRect.width);
+    });
+    ro.observe(el);
+    setContainerWidth(el.getBoundingClientRect().width);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    invoke<string>("home_dir").then(setHomeDir).catch(() => {});
+  }, []);
+
+  const fileTreeWidthRef = useRef(fileTreeWidth);
+  fileTreeWidthRef.current = fileTreeWidth;
+  const editorWidthRef = useRef(editorWidth);
+  editorWidthRef.current = editorWidth;
+  const prevColumnsRef = useRef({ fileBrowser: false, editor: false });
+
+  useEffect(() => {
+    const prev = prevColumnsRef.current;
+    const curr = { fileBrowser: fileBrowserOpen, editor: !!editingFile };
+    let delta = 0;
+    if (curr.fileBrowser && !prev.fileBrowser) delta += fileTreeWidthRef.current + 1;
+    if (!curr.fileBrowser && prev.fileBrowser) delta -= fileTreeWidthRef.current + 1;
+    if (curr.editor && !prev.editor) delta += editorWidthRef.current + 1;
+    if (!curr.editor && prev.editor) delta -= editorWidthRef.current + 1;
+    prevColumnsRef.current = curr;
+    if (delta !== 0) {
+      (async () => {
+        const win = getCurrentWindow();
+        const size = await win.innerSize();
+        const factor = await win.scaleFactor();
+        const lw = size.width / factor + delta;
+        const lh = size.height / factor;
+        await win.setSize(new LogicalSize(Math.max(800, lw), lh));
+      })();
+    }
+  }, [fileBrowserOpen, editingFile]);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -153,14 +205,55 @@ function App() {
   const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
-    const startW = cols[col];
+    const startLeft = cols[col];
     const onMove = (ev: MouseEvent) => {
       const dx = ev.clientX - startX;
-      const w =
-        col === "left"
-          ? Math.max(180, Math.min(500, startW + dx))
-          : Math.max(220, Math.min(800, startW - dx));
-      setCols((prev) => ({ ...prev, [col]: w }));
+      if (col === "left") {
+        setCols((prev) => ({ ...prev, left: Math.max(180, Math.min(500, startLeft + dx)) }));
+      } else {
+        setCols((prev) => ({ ...prev, right: Math.max(220, Math.min(800, startLeft - dx)) }));
+      }
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const startResizeFileTree = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startW = fileTreeWidth;
+    const onMove = (ev: MouseEvent) => {
+      setFileTreeWidth(Math.max(180, Math.min(600, startW + (ev.clientX - startX))));
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const startResizeEditor = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startRight = cols.right;
+    const startEditor = editorWidth;
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      setCols((prev) => ({ ...prev, right: Math.max(220, startRight + dx) }));
+      setEditorWidth(Math.max(250, startEditor - dx));
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -299,6 +392,8 @@ function App() {
         ? terminals.find((t) => t.id === selection.id)?.cwd ?? null
         : null;
 
+  const fileBrowserRoot = selectedCwd ?? homeDir ?? "/";
+
   const selectionKey =
     selection?.kind === "session"
       ? `s:${selection.name}`
@@ -411,19 +506,42 @@ function App() {
     (reordered) => setTerminals(reordered),
   );
 
+  const SPLITTER_W = 1;
+  const numSplitters = 2 + (fileBrowserOpen ? 1 : 0) + (editingFile ? 1 : 0);
+  const mainWidth = Math.max(200, containerWidth - cols.left - cols.right
+    - (fileBrowserOpen ? fileTreeWidth : 0)
+    - (editingFile ? editorWidth : 0)
+    - numSplitters * SPLITTER_W);
+
+  const gridCols = (() => {
+    let g = `${cols.left}px ${SPLITTER_W}px`;
+    if (fileBrowserOpen) g += ` ${fileTreeWidth}px ${SPLITTER_W}px`;
+    g += ` ${mainWidth}px ${SPLITTER_W}px ${cols.right}px`;
+    if (editingFile) g += ` ${SPLITTER_W}px ${editorWidth}px`;
+    return g;
+  })();
+
   return (
-    <div
-      className="app"
-      style={{
-        gridTemplateColumns: `${cols.left}px 5px 1fr 5px ${cols.right}px`,
-      }}
-    >
+    <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
       <div className="titlebar" data-tauri-drag-region />
+
+      {/* ── Sidebar (always visible) ── */}
       <aside className="sidebar">
         <header className="sidebar__header">
           <div className="brand">
             <span className="brand__mark" />
             <span className="brand__text">tmux-worktree</span>
+            <button
+              className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
+              type="button"
+              onClick={() => setFileBrowserOpen((prev) => !prev)}
+              title="toggle file browser"
+              aria-label="toggle file browser"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M1.5 13.5V2.5C1.5 2.1 1.9 1.5 2.5 1.5H6L8 3.5H13.5C14.1 3.5 14.5 4 14.5 4.5V13.5C14.5 14 14.1 14.5 13.5 14.5H2.5C1.9 14.5 1.5 14 1.5 13.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
+              </svg>
+            </button>
           </div>
           <div className="sidebar__buttons">
             <button
@@ -656,12 +774,32 @@ function App() {
         </footer>
       </aside>
 
+      {/* ── Left splitter (always visible) ── */}
       <div
         className="splitter"
         onMouseDown={startResize("left")}
         aria-label="resize sidebar"
       />
 
+      {/* ── File tree column (inserted when open) ── */}
+      {fileBrowserOpen && (
+        <>
+          <aside className="file-tree-panel">
+            <FileTree
+              root={fileBrowserRoot}
+              selectedFile={editingFile}
+              onFileSelect={(path) => setEditingFile(path)}
+            />
+          </aside>
+          <div
+            className="splitter"
+            onMouseDown={startResizeFileTree}
+            aria-label="resize file tree"
+          />
+        </>
+      )}
+
+      {/* ── Main terminal (always visible) ── */}
       <main className="main">
         {selection ? (
           <div className="pane pane--term">
@@ -677,7 +815,6 @@ function App() {
               </span>
             </div>
             <div className="pane__body pane__body--stack">
-              {/* tmux session terminals */}
               {openedSessions.map((name) => (
                 <div
                   key={`s:${name}`}
@@ -700,7 +837,6 @@ function App() {
                   />
                 </div>
               ))}
-              {/* plain terminals */}
               {openedTerminals.map((id) => {
                 const t = terminals.find((x) => x.id === id);
                 if (!t) return null;
@@ -738,12 +874,14 @@ function App() {
         )}
       </main>
 
+      {/* ── Right splitter (always visible) ── */}
       <div
         className="splitter"
         onMouseDown={startResize("right")}
         aria-label="resize scratch"
       />
 
+      {/* ── Scratch panel (always visible) ── */}
       <aside className="scratch">
         {scratchTerminals.size > 0 ? (
           <div className="pane pane--term">
@@ -814,6 +952,20 @@ function App() {
           </div>
         )}
       </aside>
+
+      {/* ── Editor column (appended when a file is selected) ── */}
+      {editingFile && (
+        <>
+          <div
+            className="splitter"
+            onMouseDown={startResizeEditor}
+            aria-label="resize editor"
+          />
+          <aside className="editor-panel">
+            <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} />
+          </aside>
+        </>
+      )}
 
       {showNewWorktree && (
         <NewWorktreeModal
