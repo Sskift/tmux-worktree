@@ -1,6 +1,6 @@
 # @byted-codebase/tmux-worktree
 
-AI + tmux + git worktree development environment, with a TUI status dashboard.
+AI + tmux + git worktree development environment, with a native macOS dashboard app.
 
 ## Install
 
@@ -13,6 +13,29 @@ Or run directly with npx (no install needed):
 ```bash
 npx @byted-codebase/tmux-worktree claude coco
 ```
+
+## Dashboard App
+
+A native macOS (Tauri) app for managing tmux sessions, worktrees, and files.
+
+```bash
+# Install the dashboard after npm install
+tw-dashboard-install
+
+# Launch
+open -a tw-dashboard
+```
+
+### Features
+
+- **Session management**: view, switch, kill tmux sessions with drag-and-drop reordering
+- **Plain terminals**: create standalone zsh terminals with custom labels
+- **File browser**: browse project files with tree navigation
+- **File editor**: syntax-highlighted code editing (CodeMirror 6), Markdown preview, image preview
+- **Project search**: full-text content search and filename search across the project
+- **Git status**: live staged/unstaged/untracked file counts and commit log
+- **Scratch terminals**: per-session scratch shells with resizable splits
+- **Theme picker**: multiple dark themes
 
 ## Configuration
 

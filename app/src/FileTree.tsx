@@ -10,6 +10,13 @@ export type DirEntry = {
   size: number;
 };
 
+type SearchResult = {
+  path: string;
+  file_name: string;
+  line_number: number | null;
+  line_content: string | null;
+};
+
 type Props = {
   root: string;
   selectedFile: string | null;
@@ -44,11 +51,27 @@ const FileIcon = () => (
   </svg>
 );
 
+const SearchIcon = () => (
+  <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
+    <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.3"/>
+    <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
+  </svg>
+);
+
 export function FileTree({ root, selectedFile, onFileSelect, showHidden = false }: Props) {
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [dirContents, setDirContents] = useState<Map<string, DirEntry[]>>(new Map());
   const [loading, setLoading] = useState<Set<string>>(new Set());
   const rootRef = useRef(root);
+
+  // Search state
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMode, setSearchMode] = useState<"content" | "filename">("content");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searching, setSearching] = useState(false);
+  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
 
   const loadDir = useCallback(async (dirPath: string) => {
     setLoading((prev) => new Set(prev).add(dirPath));
@@ -96,6 +119,63 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = false 
     },
     [dirContents, loadDir],
   );
+
+  // Search logic
+  const doSearch = useCallback(async (query: string, mode: string) => {
+    if (!query.trim()) {
+      setSearchResults([]);
+      setSearching(false);
+      return;
+    }
+    setSearching(true);
+    try {
+      const results = await invoke<SearchResult[]>("search_files", {
+        root: rootRef.current,
+        query: query.trim(),
+        mode,
+      });
+      setSearchResults(results);
+    } catch {
+      setSearchResults([]);
+    } finally {
+      setSearching(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!searchOpen) return;
+    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    searchTimerRef.current = setTimeout(() => {
+      doSearch(searchQuery, searchMode);
+    }, 300);
+    return () => {
+      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+    };
+  }, [searchQuery, searchMode, searchOpen, doSearch]);
+
+  useEffect(() => {
+    if (searchOpen && searchInputRef.current) {
+      searchInputRef.current.focus();
+    }
+  }, [searchOpen]);
+
+  const toggleSearch = () => {
+    setSearchOpen((v) => {
+      if (v) {
+        setSearchQuery("");
+        setSearchResults([]);
+      }
+      return !v;
+    });
+  };
+
+  const handleSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Escape") {
+      setSearchOpen(false);
+      setSearchQuery("");
+      setSearchResults([]);
+    }
+  };
 
   const renderEntries = (parentPath: string, depth: number): React.ReactNode[] => {
     const entries = dirContents.get(parentPath);
@@ -160,16 +240,94 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = false 
     return nodes;
   };
 
+  const renderSearchResults = () => {
+    if (searching) {
+      return <div className="file-tree__loading" style={{ paddingLeft: 12 }}>searching...</div>;
+    }
+    if (!searchQuery.trim()) {
+      return <div className="file-tree__loading" style={{ paddingLeft: 12 }}>type to search</div>;
+    }
+    if (searchResults.length === 0) {
+      return <div className="file-tree__loading" style={{ paddingLeft: 12 }}>no results</div>;
+    }
+
+    return searchResults.map((r, i) => {
+      const relPath = r.path.startsWith(root) ? r.path.slice(root.length + 1) : r.path;
+      return (
+        <div
+          key={`${r.path}:${r.line_number ?? 0}:${i}`}
+          className="file-tree__item file-tree__search-result"
+          onClick={() => onFileSelect(r.path)}
+          role="button"
+          tabIndex={0}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") onFileSelect(r.path);
+          }}
+        >
+          {searchMode === "content" ? (
+            <div className="search-result__content">
+              <span className="search-result__file">{relPath}</span>
+              <span className="search-result__line-num">:{r.line_number}</span>
+              <div className="search-result__text">{r.line_content}</div>
+            </div>
+          ) : (
+            <div className="search-result__content">
+              <span className="search-result__icon"><FileIcon /></span>
+              <span className="search-result__path">{relPath}</span>
+            </div>
+          )}
+        </div>
+      );
+    });
+  };
+
   const rootName = root.split("/").filter(Boolean).pop() ?? root;
 
   return (
     <div className="file-tree">
-      <div className="section-label file-tree__header">
-        <span className="section-label__text" title={root}>{rootName}</span>
-        <span className="section-label__line" />
+      <div className="file-tree__header">
+        <span className="pane__title" title={root}>{rootName}</span>
+        <button
+          className={`file-tree__search-btn${searchOpen ? " file-tree__search-btn--active" : ""}`}
+          onClick={toggleSearch}
+          title="search (⌘F)"
+          type="button"
+        >
+          <SearchIcon />
+        </button>
       </div>
+      {searchOpen && (
+        <div className="file-tree__search-panel">
+          <input
+            ref={searchInputRef}
+            className="file-tree__search-input"
+            type="text"
+            placeholder={searchMode === "content" ? "Search in files..." : "Search file name..."}
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onKeyDown={handleSearchKeyDown}
+            spellCheck={false}
+          />
+          <div className="file-tree__search-tabs">
+            <button
+              className={`file-tree__search-tab${searchMode === "content" ? " file-tree__search-tab--active" : ""}`}
+              onClick={() => setSearchMode("content")}
+              type="button"
+            >
+              content
+            </button>
+            <button
+              className={`file-tree__search-tab${searchMode === "filename" ? " file-tree__search-tab--active" : ""}`}
+              onClick={() => setSearchMode("filename")}
+              type="button"
+            >
+              filename
+            </button>
+          </div>
+        </div>
+      )}
       <div className="file-tree__list">
-        {renderEntries(root, 0)}
+        {searchOpen ? renderSearchResults() : renderEntries(root, 0)}
       </div>
     </div>
   );
