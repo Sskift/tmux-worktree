@@ -1037,6 +1037,113 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| format!("write: {e}"))
 }
 
+#[derive(Serialize, Clone)]
+struct SearchResult {
+    path: String,
+    file_name: String,
+    line_number: Option<usize>,
+    line_content: Option<String>,
+}
+
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".DS_Store", "dist", "__pycache__", ".next", ".turbo"];
+
+fn walk_search(
+    dir: &std::path::Path,
+    query_lower: &str,
+    mode: &str,
+    root: &std::path::Path,
+    results: &mut Vec<SearchResult>,
+    limit: usize,
+) {
+    if results.len() >= limit {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if is_dir {
+            dirs.push(path);
+        } else {
+            files.push((path, name));
+        }
+    }
+    for (path, name) in files {
+        if results.len() >= limit {
+            return;
+        }
+        let rel_path = path.to_string_lossy().to_string();
+        let file_name = name;
+        if mode == "filename" {
+            if file_name.to_lowercase().contains(query_lower) {
+                results.push(SearchResult {
+                    path: rel_path,
+                    file_name,
+                    line_number: None,
+                    line_content: None,
+                });
+            }
+        } else {
+            // content mode
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > 1024 * 1024 {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            for (i, line) in text.lines().enumerate() {
+                if results.len() >= limit {
+                    return;
+                }
+                if line.to_lowercase().contains(query_lower) {
+                    let trimmed = if line.len() > 200 { &line[..200] } else { line };
+                    results.push(SearchResult {
+                        path: rel_path.clone(),
+                        file_name: file_name.clone(),
+                        line_number: Some(i + 1),
+                        line_content: Some(trimmed.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    for d in dirs {
+        if results.len() >= limit {
+            return;
+        }
+        walk_search(&d, query_lower, mode, root, results, limit);
+    }
+}
+
+#[tauri::command]
+fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchResult>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err(format!("not a directory: {root}"));
+    }
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+    walk_search(root_path, &query_lower, &mode, root_path, &mut results, 100);
+    Ok(results)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     inherit_shell_env();
@@ -1074,6 +1181,7 @@ pub fn run() {
             read_dir,
             read_file,
             write_file,
+            search_files,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

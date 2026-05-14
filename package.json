@@ -1,7 +1,6 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-
-  "version": "0.6.1",
+  "version": "0.7.1",
   "type": "module",
   "files": [
     "dist",
@@ -9,9 +8,9 @@
     "app/installer/dmg/"
   ],
   "bin": {
-    "tmux-worktree": "./dist/cli.js",
-    "tw": "./dist/cli.js",
-    "tw-dashboard-install": "./app/installer/installer.mjs"
+    "tmux-worktree": "dist/cli.js",
+    "tw": "dist/cli.js",
+    "tw-dashboard-install": "app/installer/installer.mjs"
   },
   "scripts": {
     "build": "tsup src/cli.ts --format esm --target node20"
