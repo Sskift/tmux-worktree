@@ -55,6 +55,11 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) 
       host.addEventListener("focusout", blurHandler);
 
       term.attachCustomKeyEventHandler((e) => {
+        if (e.type === "keydown" && e.key === "Escape") {
+          e.preventDefault();
+          invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
+          return false;
+        }
         if (e.type === "keydown" && e.metaKey && e.key === "c") {
           if (term.hasSelection()) return true;
           invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
