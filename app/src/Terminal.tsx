@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { Terminal as XTerm } from "@xterm/xterm";
+import { Terminal as XTerm, type ILinkProvider, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -8,6 +8,7 @@ import {
   getCurrentPalette,
   type TerminalPalette,
 } from "./themes";
+import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser } from "./linkDetect";
 import "@xterm/xterm/css/xterm.css";
 
 type Props = {
@@ -16,9 +17,10 @@ type Props = {
   cwd?: string;
   active?: boolean;
   tmuxSession?: string;
+  onOpenFile?: (path: string, line?: number, col?: number) => void;
 };
 
-export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) {
+export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFile }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -44,6 +46,42 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession }: Props) 
     const fit = new FitAddon();
     term.loadAddon(fit);
     term.open(host);
+
+    // Register link provider for CMD+click support
+    const linkProvider: ILinkProvider = {
+      provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
+        const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1);
+        if (!bufferLine) { callback(undefined); return; }
+        const lineText = bufferLine.translateToString(true);
+        const detected = detectLinks(lineText);
+        if (detected.length === 0) { callback(undefined); return; }
+
+        const links: ILink[] = detected.map((match) => ({
+          range: {
+            start: { x: match.startIndex + 1, y: bufferLineNumber },
+            end: { x: match.endIndex, y: bufferLineNumber },
+          },
+          text: match.text,
+          decorations: { underline: true, pointerCursor: true },
+          activate(event: MouseEvent, _text: string) {
+            if (!event.metaKey) return;
+            if (match.kind === "url") {
+              openUrlInBrowser(match.url);
+            } else if (match.kind === "file" && cwd) {
+              const resolved = resolvePath(match.path, cwd);
+              checkFileExists(resolved).then((exists) => {
+                if (exists && onOpenFile) {
+                  onOpenFile(resolved, match.line, match.col);
+                }
+              });
+            }
+          },
+        }));
+        callback(links);
+      },
+    };
+    term.registerLinkProvider(linkProvider);
+
     termRef.current = term;
     fitRef.current = fit;
 
