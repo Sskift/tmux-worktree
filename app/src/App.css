@@ -944,16 +944,12 @@ button:disabled {
 }
 
 .term .xterm-viewport::-webkit-scrollbar {
-  width: 6px;
+  width: 0;
+  display: none;
 }
 
-.term .xterm-viewport::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.term .xterm-viewport::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 3px;
+.term .xterm-viewport {
+  scrollbar-width: none;
 }
 
 /* ─── Scratch multi-terminal ──────────────────────────────── */
