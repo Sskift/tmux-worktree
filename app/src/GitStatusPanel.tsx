@@ -26,6 +26,7 @@ export type GitCommit = {
 
 type Props = {
   cwd: string | null;
+  onFileClick?: (filePath: string) => void;
 };
 
 type Tab = "files" | "log";
@@ -64,7 +65,7 @@ function classifyRef(raw: string): { kind: RefKind; label: string } {
   return { kind: "branch", label: r };
 }
 
-export function GitStatusPanel({ cwd }: Props) {
+export function GitStatusPanel({ cwd, onFileClick }: Props) {
   const [tab, setTab] = useState<Tab>("files");
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [log, setLog] = useState<GitCommit[] | null>(null);
@@ -213,7 +214,11 @@ export function GitStatusPanel({ cwd }: Props) {
           {status.files.map((f) => {
             const kind = categorize(f.code);
             return (
-              <div key={f.code + f.path} className={`git__file git__file--${kind}`}>
+              <div
+                key={f.code + f.path}
+                className={`git__file git__file--${kind}${onFileClick ? " git__file--clickable" : ""}`}
+                onClick={() => onFileClick?.(f.path)}
+              >
                 <span className="git__code">{shortCode(f.code)}</span>
                 <span className="git__path" title={f.path}>
                   {f.path}

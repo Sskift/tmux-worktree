@@ -724,6 +724,49 @@ fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
 }
 
 #[tauri::command]
+fn git_diff(cwd: String, path: String) -> Result<String, String> {
+    // Try unstaged diff first
+    let output = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--", &path])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+
+    if !diff.trim().is_empty() {
+        return Ok(diff);
+    }
+
+    // Try staged diff
+    let output2 = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--cached", "--", &path])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+
+    let staged = String::from_utf8_lossy(&output2.stdout).to_string();
+
+    if !staged.trim().is_empty() {
+        return Ok(staged);
+    }
+
+    // For untracked files, show entire file as addition
+    let full_path = std::path::Path::new(&cwd).join(&path);
+    let full_path_str = full_path.to_string_lossy().to_string();
+    let output3 = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--no-index", "/dev/null", &full_path_str])
+        .output();
+
+    if let Ok(o) = output3 {
+        let untracked = String::from_utf8_lossy(&o.stdout).to_string();
+        if !untracked.trim().is_empty() {
+            return Ok(untracked);
+        }
+    }
+
+    Ok(String::new())
+}
+
+#[tauri::command]
 fn pty_open(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
@@ -1166,6 +1209,7 @@ pub fn run() {
             capture_pane_history,
             git_status,
             git_log,
+            git_diff,
             create_plain_terminal,
             ensure_terminal_session,
             kill_plain_terminal,

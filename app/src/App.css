@@ -1700,3 +1700,109 @@ select.field__input {
   font-family: monospace;
   font-size: 11px;
 }
+
+/* ─── Git file clickable ────────────────────────────────────── */
+
+.git__file--clickable {
+  cursor: pointer;
+}
+
+.git__file--clickable:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* ─── Diff viewer ───────────────────────────────────────────── */
+
+.diff-viewer {
+  flex: 1;
+  overflow: auto;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, ui-monospace, monospace;
+  font-size: 12px;
+  line-height: 20px;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 40px 40px 1fr;
+  align-items: start;
+  min-height: 20px;
+}
+
+.diff-line--add {
+  background: rgba(46, 160, 67, 0.25);
+}
+
+.diff-line--add .diff-line__content {
+  color: #56d364;
+}
+
+.diff-line--del {
+  background: rgba(248, 81, 73, 0.25);
+}
+
+.diff-line--del .diff-line__content {
+  color: #ff7b72;
+}
+
+.diff-line--hunk {
+  background: rgba(130, 80, 223, 0.12);
+  color: var(--accent-a);
+  padding: 2px 0;
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+.diff-line--hunk .diff-line__content {
+  color: var(--accent-a);
+}
+
+.diff-line--header {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+.diff-line--header .diff-line__content {
+  color: var(--text-faint);
+}
+
+.diff-line--context .diff-line__content {
+  color: var(--text-dim);
+}
+
+.diff-line__num {
+  text-align: right;
+  padding: 0 6px;
+  color: var(--text-faint);
+  user-select: none;
+  font-size: 11px;
+  opacity: 0.6;
+  border-right: 1px solid var(--line);
+}
+
+.diff-line__num:first-child {
+  border-right: none;
+}
+
+.diff-line__content {
+  padding: 0 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.diff-viewer::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.diff-viewer::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.diff-viewer::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 3px;
+}
+
+.diff-viewer:hover::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+}

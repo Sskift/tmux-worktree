@@ -8,6 +8,7 @@ import { ThemePicker } from "./ThemePicker";
 import { GitStatusPanel } from "./GitStatusPanel";
 import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
+import { DiffViewer } from "./DiffViewer";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import "./App.css";
@@ -93,6 +94,7 @@ function App() {
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
   const [editingFile, setEditingFile] = useState<string | null>(null);
+  const [diffFile, setDiffFile] = useState<{ path: string; cwd: string } | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
@@ -126,7 +128,7 @@ function App() {
 
   useEffect(() => {
     const prev = prevColumnsRef.current;
-    const curr = { fileBrowser: fileBrowserOpen, editor: !!editingFile };
+    const curr = { fileBrowser: fileBrowserOpen, editor: !!(editingFile || diffFile) };
     let delta = 0;
     if (curr.fileBrowser && !prev.fileBrowser) delta += fileTreeWidthRef.current + 1;
     if (!curr.fileBrowser && prev.fileBrowser) delta -= fileTreeWidthRef.current + 1;
@@ -143,7 +145,7 @@ function App() {
         await win.setSize(new LogicalSize(Math.max(800, lw), lh));
       })();
     }
-  }, [fileBrowserOpen, editingFile]);
+  }, [fileBrowserOpen, editingFile, diffFile]);
 
   // Load persisted data on mount
   useEffect(() => {
@@ -506,18 +508,19 @@ function App() {
     (reordered) => setTerminals(reordered),
   );
 
+  const editorPanelOpen = !!(editingFile || diffFile);
   const SPLITTER_W = 1;
-  const numSplitters = 2 + (fileBrowserOpen ? 1 : 0) + (editingFile ? 1 : 0);
+  const numSplitters = 2 + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
   const mainWidth = Math.max(200, containerWidth - cols.left - cols.right
     - (fileBrowserOpen ? fileTreeWidth : 0)
-    - (editingFile ? editorWidth : 0)
+    - (editorPanelOpen ? editorWidth : 0)
     - numSplitters * SPLITTER_W);
 
   const gridCols = (() => {
     let g = `${cols.left}px ${SPLITTER_W}px`;
     if (fileBrowserOpen) g += ` ${fileTreeWidth}px ${SPLITTER_W}px`;
     g += ` ${mainWidth}px ${SPLITTER_W}px ${cols.right}px`;
-    if (editingFile) g += ` ${SPLITTER_W}px ${editorWidth}px`;
+    if (editorPanelOpen) g += ` ${SPLITTER_W}px ${editorWidth}px`;
     return g;
   })();
 
@@ -762,7 +765,15 @@ function App() {
               <span className="section-label__text">git</span>
               <span className="section-label__line" />
             </div>
-            <GitStatusPanel cwd={selectedCwd} />
+            <GitStatusPanel
+              cwd={selectedCwd}
+              onFileClick={(filePath) => {
+                if (selectedCwd) {
+                  setEditingFile(null);
+                  setDiffFile({ path: filePath, cwd: selectedCwd });
+                }
+              }}
+            />
           </div>
         </div>
 
@@ -788,7 +799,7 @@ function App() {
             <FileTree
               root={fileBrowserRoot}
               selectedFile={editingFile}
-              onFileSelect={(path) => setEditingFile(path)}
+              onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
             />
           </aside>
           <div
@@ -954,7 +965,7 @@ function App() {
       </aside>
 
       {/* ── Editor column (appended when a file is selected) ── */}
-      {editingFile && (
+      {editorPanelOpen && (
         <>
           <div
             className="splitter"
@@ -962,7 +973,15 @@ function App() {
             aria-label="resize editor"
           />
           <aside className="editor-panel">
-            <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} />
+            {diffFile ? (
+              <DiffViewer
+                cwd={diffFile.cwd}
+                filePath={diffFile.path}
+                onClose={() => setDiffFile(null)}
+              />
+            ) : editingFile ? (
+              <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} />
+            ) : null}
           </aside>
         </>
       )}
