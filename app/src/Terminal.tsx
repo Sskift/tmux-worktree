@@ -52,14 +52,27 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
       provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
         const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1);
         if (!bufferLine) { callback(undefined); return; }
-        const lineText = bufferLine.translateToString(true);
+
+        // Build char-index to cell-x mapping to handle wide characters correctly
+        const cols = term.cols;
+        let lineText = "";
+        const charToCell: number[] = []; // charToCell[i] = 1-based cell x of char i
+        for (let cell = 0; cell < cols; cell++) {
+          const bufCell = bufferLine.getCell(cell);
+          if (!bufCell) break;
+          const ch = bufCell.getChars();
+          if (ch === "") continue; // right half of wide char
+          charToCell.push(cell + 1); // 1-based
+          lineText += ch;
+        }
+
         const detected = detectLinks(lineText);
         if (detected.length === 0) { callback(undefined); return; }
 
         const links: ILink[] = detected.map((match) => ({
           range: {
-            start: { x: match.startIndex + 1, y: bufferLineNumber },
-            end: { x: match.endIndex, y: bufferLineNumber },
+            start: { x: charToCell[match.startIndex] ?? (match.startIndex + 1), y: bufferLineNumber },
+            end: { x: charToCell[match.endIndex - 1] ?? match.endIndex, y: bufferLineNumber },
           },
           text: match.text,
           decorations: { underline: true, pointerCursor: true },
