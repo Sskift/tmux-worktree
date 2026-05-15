@@ -1080,6 +1080,20 @@ fn write_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, &content).map_err(|e| format!("write: {e}"))
 }
 
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("open url: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
 #[derive(Serialize, Clone)]
 struct SearchResult {
     path: String,
@@ -1226,6 +1240,8 @@ pub fn run() {
             read_file,
             write_file,
             search_files,
+            open_url,
+            file_exists,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

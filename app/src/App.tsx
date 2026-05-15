@@ -396,6 +396,11 @@ function App() {
 
   const fileBrowserRoot = selectedCwd ?? homeDir ?? "/";
 
+  const handleOpenFile = useCallback((path: string, _line?: number, _col?: number) => {
+    setDiffFile(null);
+    setEditingFile(path);
+  }, []);
+
   const selectionKey =
     selection?.kind === "session"
       ? `s:${selection.name}`
@@ -840,11 +845,13 @@ function App() {
                   <Terminal
                     cmd="tmux"
                     args={["attach-session", "-t", name]}
+                    cwd={cwdsBySession[name]}
                     active={
                       !anyModalOpen &&
                       selection?.kind === "session" && selection.name === name
                     }
                     tmuxSession={name}
+                    onOpenFile={handleOpenFile}
                   />
                 </div>
               ))}
@@ -865,11 +872,13 @@ function App() {
                     <Terminal
                       cmd="tmux"
                       args={["attach-session", "-t", t.tmuxName]}
+                      cwd={t.cwd}
                       active={
                         !anyModalOpen &&
                         selection?.kind === "terminal" && selection.id === id
                       }
                       tmuxSession={t.tmuxName}
+                      onOpenFile={handleOpenFile}
                     />
                   </div>
                 );
@@ -949,6 +958,7 @@ function App() {
                           args={["-l"]}
                           cwd={cwdForKey}
                           active={isActive && !anyModalOpen}
+                          onOpenFile={handleOpenFile}
                         />
                       </div>
                     </div>
@@ -980,7 +990,7 @@ function App() {
                 onClose={() => setDiffFile(null)}
               />
             ) : editingFile ? (
-              <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} />
+              <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} onOpenFile={handleOpenFile} />
             ) : null}
           </aside>
         </>

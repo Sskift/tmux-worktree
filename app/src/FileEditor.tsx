@@ -8,10 +8,12 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getFileCategory, getLanguageExtension } from "./fileUtils";
+import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser } from "./linkDetect";
 
 type Props = {
   filePath: string;
   onClose: () => void;
+  onOpenFile?: (path: string, line?: number, col?: number) => void;
 };
 
 /* ── Image Preview ──────────────────────────────────────────── */
@@ -39,7 +41,7 @@ function ImagePreview({ filePath, onClose }: Props) {
 
 /* ── Code / Markdown Editor ─────────────────────────────────── */
 
-function CodeEditor({ filePath, onClose, isMarkdown }: Props & { isMarkdown: boolean }) {
+function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isMarkdown: boolean }) {
   const [content, setContent] = useState("");
   const [originalContent, setOriginalContent] = useState("");
   const [loading, setLoading] = useState(true);
@@ -132,6 +134,33 @@ function CodeEditor({ filePath, onClose, isMarkdown }: Props & { isMarkdown: boo
           "&": { height: "100%" },
           ".cm-scroller": { overflow: "auto" },
         }),
+        EditorView.domEventHandlers({
+          click(event: MouseEvent, view: EditorView) {
+            if (!event.metaKey) return false;
+            const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+            if (pos === null) return false;
+            const line = view.state.doc.lineAt(pos);
+            const colInLine = pos - line.from;
+            const links = detectLinks(line.text);
+            const clicked = links.find(
+              (l) => colInLine >= l.startIndex && colInLine < l.endIndex,
+            );
+            if (!clicked) return false;
+            if (clicked.kind === "url") {
+              openUrlInBrowser(clicked.url);
+            } else if (clicked.kind === "file") {
+              const dir = filePath.split("/").slice(0, -1).join("/");
+              const resolved = resolvePath(clicked.path, dir);
+              checkFileExists(resolved).then((exists) => {
+                if (exists && onOpenFile) {
+                  onOpenFile(resolved, clicked.line, clicked.col);
+                }
+              });
+            }
+            event.preventDefault();
+            return true;
+          },
+        }),
       ];
 
       if (langExt) extensions.push(langExt);
@@ -212,7 +241,7 @@ function CodeEditor({ filePath, onClose, isMarkdown }: Props & { isMarkdown: boo
 
 /* ── Main Export ─────────────────────────────────────────────── */
 
-export function FileEditor({ filePath, onClose }: Props) {
+export function FileEditor({ filePath, onClose, onOpenFile }: Props) {
   const category = getFileCategory(filePath);
 
   if (category === "image") {
@@ -223,6 +252,7 @@ export function FileEditor({ filePath, onClose }: Props) {
     <CodeEditor
       filePath={filePath}
       onClose={onClose}
+      onOpenFile={onOpenFile}
       isMarkdown={category === "markdown"}
     />
   );
