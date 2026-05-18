@@ -444,6 +444,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
     };
 
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
+    run_check(&["tmux", "set-option", "-t", &session, "window-size", "latest"])?;
     setup_clipboard_bindings();
     run_check(&[
         "tmux",
@@ -614,6 +615,7 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
 
     let session = unique_session_name(&args.name);
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &args.path])?;
+    run_check(&["tmux", "set-option", "-t", &session, "window-size", "latest"])?;
     setup_clipboard_bindings();
 
     if !args.ai_cmd.is_empty() {
@@ -1102,6 +1104,7 @@ fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
 fn create_plain_terminal(cwd: String) -> Result<String, String> {
     let name = format!("tw-term-{}", random_id());
     run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    run_check(&["tmux", "set-option", "-t", &name, "window-size", "latest"])?;
     setup_clipboard_bindings();
     Ok(name)
 }
@@ -1127,6 +1130,7 @@ fn ensure_terminal_session(name: String, cwd: String) -> Result<(), String> {
         return Ok(());
     }
     run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    run_check(&["tmux", "set-option", "-t", &name, "window-size", "latest"])?;
     setup_clipboard_bindings();
     Ok(())
 }
