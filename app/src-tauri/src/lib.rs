@@ -193,6 +193,13 @@ fn list_projects() -> Result<Vec<Project>, String> {
     Ok(projects)
 }
 
+#[derive(Serialize, Clone)]
+struct OrphanedWorktree {
+    project: String,
+    path: String,
+    name: String,
+}
+
 #[derive(Deserialize)]
 struct CreateArgs {
     project: Option<String>,
@@ -454,7 +461,166 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 fn kill_session(name: String) -> Result<(), String> {
     let exact = format!("={}", name);
     run_check(&["tmux", "kill-session", "-t", &exact])?;
+
+    // Remove the worktree directory in a background thread to avoid blocking UI
+    let session_name = name.clone();
+    std::thread::spawn(move || {
+        let home = dirs::home_dir().unwrap_or_default();
+        let config_path = home.join(".tmux-worktree.json");
+        let worktree_base = if config_path.exists() {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|v| v.get("worktreeBase").and_then(|b| b.as_str()).map(String::from))
+                .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
+        } else {
+            return;
+        };
+
+        let base_path = std::path::Path::new(&worktree_base);
+        if !base_path.exists() {
+            return;
+        }
+
+        let project_dirs = match std::fs::read_dir(base_path) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+
+        for project_entry in project_dirs.flatten() {
+            if !project_entry.path().is_dir() {
+                continue;
+            }
+            let wt_dirs = match std::fs::read_dir(project_entry.path()) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for wt_entry in wt_dirs.flatten() {
+                if !wt_entry.path().is_dir() {
+                    continue;
+                }
+                let dirname = wt_entry.file_name().to_string_lossy().to_string();
+                if derive_session_name(&dirname) == session_name {
+                    let wt_path = wt_entry.path().to_string_lossy().to_string();
+                    let _ = std::process::Command::new(git_bin())
+                        .args(["worktree", "remove", "--force", &wt_path])
+                        .output();
+                    if wt_entry.path().exists() {
+                        let _ = std::fs::remove_dir_all(wt_entry.path());
+                    }
+                }
+            }
+        }
+    });
+
     Ok(())
+}
+
+/// Strip trailing `-{5 hex chars}` random suffix to recover session name.
+fn derive_session_name(dirname: &str) -> String {
+    let bytes = dirname.as_bytes();
+    if bytes.len() > 6 && bytes[bytes.len() - 6] == b'-' {
+        let suffix = &dirname[dirname.len() - 5..];
+        if suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return dirname[..dirname.len() - 6].to_string();
+        }
+    }
+    dirname.to_string()
+}
+
+#[tauri::command]
+fn list_orphaned_worktrees() -> Result<Vec<OrphanedWorktree>, String> {
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let config: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read config: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        return Ok(vec![]);
+    };
+
+    let worktree_base = config
+        .get("worktreeBase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/private/tmp/tmux-worktree/projects")
+        .to_string();
+
+    let base_path = std::path::Path::new(&worktree_base);
+    if !base_path.exists() {
+        return Ok(vec![]);
+    }
+
+    // Collect live tmux session names
+    let live_sessions: std::collections::HashSet<String> = list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+    let mut orphans = Vec::new();
+
+    let project_dirs = std::fs::read_dir(base_path)
+        .map_err(|e| format!("read worktreeBase: {e}"))?;
+
+    for project_entry in project_dirs.flatten() {
+        if !project_entry.path().is_dir() {
+            continue;
+        }
+        let project = project_entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+
+        let worktree_dirs = match std::fs::read_dir(project_entry.path()) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+
+        for wt_entry in worktree_dirs.flatten() {
+            if !wt_entry.path().is_dir() {
+                continue;
+            }
+            let dirname = wt_entry.file_name().to_string_lossy().to_string();
+            let session_name = derive_session_name(&dirname);
+
+            if !live_sessions.contains(&session_name) {
+                orphans.push(OrphanedWorktree {
+                    project: project.clone(),
+                    path: wt_entry.path().to_string_lossy().to_string(),
+                    name: session_name,
+                });
+            }
+        }
+    }
+
+    Ok(orphans)
+}
+
+#[derive(Deserialize)]
+struct RestoreArgs {
+    path: String,
+    name: String,
+    #[serde(rename = "aiCmd", default)]
+    ai_cmd: String,
+}
+
+#[tauri::command]
+fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
+    let dir = std::path::Path::new(&args.path);
+    if !dir.exists() {
+        return Err(format!("directory does not exist: {}", args.path));
+    }
+
+    let session = unique_session_name(&args.name);
+    run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &args.path])?;
+    setup_clipboard_bindings();
+
+    if !args.ai_cmd.is_empty() {
+        run_check(&["tmux", "send-keys", "-t", &session, &args.ai_cmd, "C-m"])?;
+    }
+
+    Ok(session)
 }
 
 #[tauri::command]
@@ -1217,6 +1383,8 @@ pub fn run() {
             add_project,
             create_worktree,
             kill_session,
+            list_orphaned_worktrees,
+            restore_worktree,
             session_cwd,
             cancel_copy_mode,
             copy_tmux_selection,

@@ -185,6 +185,17 @@ function App() {
       .catch(() => {});
   }, []);
 
+  // Auto-restore orphaned worktrees on mount
+  useEffect(() => {
+    invoke<{ project: string; path: string; name: string }[]>("list_orphaned_worktrees")
+      .then(async (orphans) => {
+        for (const o of orphans) {
+          await invoke("restore_worktree", { args: { path: o.path, name: o.name, aiCmd: "" } }).catch(() => {});
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   // Persist terminals
   const terminalsRef = useRef(terminals);
   terminalsRef.current = terminals;

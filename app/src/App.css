@@ -1095,6 +1095,45 @@ button:disabled {
   margin-top: 4px;
 }
 
+.modal__divider {
+  font-size: 11px;
+  color: var(--text-faint);
+  text-align: center;
+  margin: 4px 0;
+}
+
+.orphan-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+.orphan-item {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  text-align: left;
+  font-size: 12px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  width: 100%;
+}
+
+.orphan-item__project {
+  color: var(--text-dim);
+}
+
+.orphan-item__sep {
+  color: var(--text-faint);
+  margin: 0 2px;
+}
+
+.orphan-item__name {
+  color: var(--text);
+}
+
 .field {
   display: flex;
   flex-direction: column;
