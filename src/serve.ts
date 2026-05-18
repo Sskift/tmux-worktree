@@ -495,6 +495,7 @@ mobile = '${mobileId}'
 pane_idx = '${paneIndex}'
 
 subprocess.run([tmux, 'new-session', '-d', '-t', session, '-s', mobile], check=True)
+subprocess.run([tmux, 'set-option', '-t', session, 'window-size', 'latest'])
 subprocess.run([tmux, 'set', '-t', mobile, 'status', 'off'])
 if pane_idx != '0':
     subprocess.run([tmux, 'select-pane', '-t', mobile + ':.' + pane_idx])

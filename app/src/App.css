@@ -862,6 +862,45 @@ button:disabled {
   min-height: 0;
 }
 
+.scratch--collapsed {
+  align-items: center;
+  justify-content: center;
+  border-left: 1px solid var(--line);
+}
+
+.scratch__expand-btn {
+  all: unset;
+  cursor: pointer;
+  writing-mode: vertical-rl;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  padding: 8px 4px;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.scratch__expand-btn:hover {
+  color: var(--text);
+  background: var(--bg-2);
+}
+
+.scratch__collapse-btn {
+  flex-shrink: 0;
+}
+
+.scratch__collapse-btn--corner {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+
+.pane__bar-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .pane {
   flex: 1;
   display: flex;
@@ -871,6 +910,7 @@ button:disabled {
 }
 
 .pane--empty {
+  position: relative;
   align-items: center;
   justify-content: center;
   padding: 14px;
