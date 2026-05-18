@@ -1,8 +1,8 @@
 [package]
 name = "app"
-version = "0.8.5"
+version = "0.8.6"
 description = "tmux-worktree dashboard"
-authors = ["jiangyunong"]
+authors = ["jiangyunong", "liusa"]
 edition = "2021"
 
 [lib]
