@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
 type Project = { name: string; path: string };
+type Orphan = { project: string; path: string; name: string };
 
 type Props = {
   onClose: () => void;
@@ -13,6 +14,7 @@ const CUSTOM = "__custom__";
 
 export function NewWorktreeModal({ onClose, onCreated }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [orphans, setOrphans] = useState<Orphan[]>([]);
   const [project, setProject] = useState<string>(CUSTOM);
   const [customPath, setCustomPath] = useState<string>("");
   const [customName, setCustomName] = useState<string>("");
@@ -29,6 +31,9 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
         if (list.length > 0) setProject(list[0].name);
       })
       .catch((e) => setError(String(e)));
+    invoke<Orphan[]>("list_orphaned_worktrees")
+      .then(setOrphans)
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -57,6 +62,20 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
       }
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const restoreOrphan = async (orphan: Orphan) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const sessionName = await invoke<string>("restore_worktree", {
+        args: { path: orphan.path, name: orphan.name, aiCmd: aiCmd.trim() || "" },
+      });
+      onCreated(sessionName);
+    } catch (err) {
+      setError(String(err));
+      setBusy(false);
     }
   };
 
@@ -111,6 +130,31 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
         onSubmit={submit}
       >
         <div className="modal__title">new worktree</div>
+
+        {orphans.length > 0 && (
+          <div className="field">
+            <span className="field__label">restore existing</span>
+            <div className="orphan-list">
+              {orphans.map((o) => (
+                <button
+                  key={o.path}
+                  type="button"
+                  className="btn btn--ghost orphan-item"
+                  disabled={busy}
+                  onClick={() => restoreOrphan(o)}
+                >
+                  <span className="orphan-item__project">{o.project}</span>
+                  <span className="orphan-item__sep">/</span>
+                  <span className="orphan-item__name">{o.name}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {orphans.length > 0 && (
+          <div className="modal__divider">or create new</div>
+        )}
 
         <label className="field">
           <span className="field__label">project</span>
