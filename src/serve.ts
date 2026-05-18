@@ -2,9 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { execSync, spawn as cpSpawn } from "node:child_process";
 import { networkInterfaces } from "node:os";
 import { randomBytes } from "node:crypto";
+import { writeFileSync, unlinkSync } from "node:fs";
 import { WebSocketServer, type WebSocket } from "ws";
 
-const DEFAULT_PORT = 7890;
+const DEFAULT_PORT = 8311;
 
 function sh(cmd: string): string {
   try {
@@ -121,6 +122,15 @@ function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
     return true;
   }
 
+  const cancelMatch = path.match(/^\/api\/sessions\/([^/]+)\/cancel-copy-mode$/);
+  if (cancelMatch && req.method === "POST") {
+    const name = decodeURIComponent(cancelMatch[1]);
+    const tmux = tmuxBin();
+    sh(`${tmux} send-keys -t '=${name}' -X cancel`);
+    json(res, { ok: true });
+    return true;
+  }
+
   return false;
 }
 
@@ -143,10 +153,10 @@ const HTML = /* html */ `<!DOCTYPE html>
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { height: 100%; font-family: -apple-system, "SF Pro", system-ui, sans-serif; background: var(--bg); color: var(--text); overflow: hidden; -webkit-font-smoothing: antialiased; }
-body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); position: relative; }
 
-.view { display: none; flex-direction: column; height: 100%; }
-.view.active { display: flex; }
+.view { position: absolute; inset: 0; display: flex; flex-direction: column; height: 100%; opacity: 0; pointer-events: none; transition: opacity 0.18s ease; will-change: opacity; }
+.view.active { opacity: 1; pointer-events: auto; }
 
 .header { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px 12px; flex-shrink: 0; }
 .header h1 { font-size: 20px; font-weight: 700; background: linear-gradient(135deg, var(--accent), var(--accent2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
@@ -171,7 +181,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 #terminal-container { position: absolute; inset: 0; background: var(--bg); }
 #terminal-container .xterm { height: 100%; padding: 4px; }
 
-.action-bar { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; padding: 6px 10px; background: rgba(20,22,26,0.85); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 12px; z-index: 10; }
+.action-bar { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); display: flex; gap: 8px; padding: 6px 10px; background: rgba(20,22,26,0.85); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); border: 1px solid var(--line); border-radius: 12px; z-index: 10; overflow-x: auto; max-width: 90vw; -webkit-overflow-scrolling: touch; }
 .action-btn { min-width: 40px; height: 34px; border: none; background: var(--bg2); color: var(--dim); border-radius: 8px; font-size: 12px; font-family: "SF Mono", Menlo, monospace; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0 10px; white-space: nowrap; }
 .action-btn:active { background: var(--bg3); color: var(--text); }
 
@@ -181,17 +191,31 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 </head>
 <body>
 
-<div id="list-view" class="view active">
+<div id="auth-view" class="view active">
   <div class="header">
     <h1>tw-dashboard</h1>
-    <button class="btn-icon" onclick="loadSessions()" aria-label="refresh">&#x21bb;</button>
+  </div>
+  <div class="scroll-area" style="display:flex;align-items:center;justify-content:center;">
+    <div style="text-align:center;width:260px;">
+      <p style="color:var(--dim);margin-bottom:16px;font-size:14px;">Enter token to connect</p>
+      <input id="auth-input" type="text" autocomplete="off" autocorrect="off" spellcheck="false" style="width:100%;padding:12px 14px;border-radius:var(--radius);border:1px solid var(--line);background:var(--bg1);color:var(--text);font-size:16px;font-family:'SF Mono',Menlo,monospace;text-align:center;outline:none;" placeholder="token">
+      <button id="auth-btn" style="width:100%;margin-top:12px;padding:12px;border:none;border-radius:var(--radius);background:var(--accent);color:#000;font-size:15px;font-weight:600;cursor:pointer;">Connect</button>
+      <p id="auth-error" style="color:var(--accent2);margin-top:12px;font-size:13px;display:none;"></p>
+    </div>
+  </div>
+</div>
+
+<div id="list-view" class="view">
+  <div class="header">
+    <h1>tw-dashboard</h1>
+    <button class="btn-icon" onclick="loadSessions()" aria-label="refresh">R</button>
   </div>
   <div id="sessions" class="scroll-area"><div class="loading">Loading...</div></div>
 </div>
 
 <div id="pane-view" class="view">
   <div class="toolbar">
-    <button class="btn-back" onclick="showView('list')" aria-label="back">&#x2190;</button>
+    <button class="btn-back" onclick="showView('list')" aria-label="back">&lt;</button>
     <span id="pane-title" class="toolbar-title"></span>
   </div>
   <div id="panes" class="scroll-area"></div>
@@ -199,20 +223,23 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 
 <div id="term-view" class="view">
   <div class="toolbar">
-    <button class="btn-back" onclick="disconnect()" aria-label="back">&#x2190;</button>
+    <button class="btn-back" onclick="disconnect()" aria-label="back">&lt;</button>
     <span id="toolbar-title" class="toolbar-title"></span>
   </div>
   <div class="term-wrapper">
     <div id="terminal-container"></div>
     <div class="action-bar" id="action-bar">
-      <button class="action-btn" id="btn-interrupt">&#x25a0; interrupt</button>
+      <button class="action-btn" id="btn-tab">Tab</button>
+      <button class="action-btn" id="btn-ctrl-c">C-c</button>
+      <button class="action-btn" id="btn-ctrl-d">C-d</button>
+      <button class="action-btn" id="btn-ctrl-z">C-z</button>
     </div>
   </div>
 </div>
 
 <script>
 (function() {
-  var views = { list: document.getElementById("list-view"), pane: document.getElementById("pane-view"), term: document.getElementById("term-view") };
+  var views = { auth: document.getElementById("auth-view"), list: document.getElementById("list-view"), pane: document.getElementById("pane-view"), term: document.getElementById("term-view") };
   var sessionsEl = document.getElementById("sessions");
   var panesEl = document.getElementById("panes");
   var paneTitleEl = document.getElementById("pane-title");
@@ -222,11 +249,61 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 
   var term = null, fitAddon = null, ws = null, ro = null, xtermLoaded = null;
   var currentSession = null;
+  var authToken = localStorage.getItem("tw-token") || "";
 
   function showView(name) {
     for (var k in views) views[k].classList.toggle("active", k === name);
   }
   window.showView = showView;
+
+  function authHeaders() {
+    return { "Authorization": "Bearer " + authToken };
+  }
+
+  function authFetch(url, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({}, opts.headers || {}, authHeaders());
+    return fetch(url, opts);
+  }
+
+  // --- Auth ---
+  function tryAuth(token) {
+    return fetch("/api/auth", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ token: token }) })
+      .then(function(r) { return r.json(); })
+      .then(function(d) { return d.ok === true; });
+  }
+
+  document.getElementById("auth-btn").addEventListener("click", function() {
+    var input = document.getElementById("auth-input");
+    var err = document.getElementById("auth-error");
+    var val = input.value.trim();
+    if (!val) { err.textContent = "Please enter token"; err.style.display = "block"; return; }
+    tryAuth(val).then(function(ok) {
+      if (ok) {
+        authToken = val;
+        localStorage.setItem("tw-token", val);
+        err.style.display = "none";
+        showView("list");
+        loadSessions();
+      } else {
+        err.textContent = "Invalid token"; err.style.display = "block";
+      }
+    }).catch(function() {
+      err.textContent = "Connection failed"; err.style.display = "block";
+    });
+  });
+
+  document.getElementById("auth-input").addEventListener("keydown", function(e) {
+    if (e.key === "Enter") document.getElementById("auth-btn").click();
+  });
+
+  // Auto-login if token in localStorage
+  if (authToken) {
+    tryAuth(authToken).then(function(ok) {
+      if (ok) { showView("list"); loadSessions(); }
+      else { localStorage.removeItem("tw-token"); authToken = ""; }
+    });
+  }
 
   function ago(ts) {
     var s = Math.floor(Date.now() / 1000 - ts);
@@ -254,7 +331,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
   // --- Session list ---
   window.loadSessions = function() {
     sessionsEl.innerHTML = '<div class="loading">Loading...</div>';
-    fetch("/api/sessions").then(function(r) { return r.json(); }).then(function(sessions) {
+    authFetch("/api/sessions").then(function(r) { return r.json(); }).then(function(sessions) {
       if (!sessions.length) {
         sessionsEl.innerHTML = '<div class="empty">No tmux sessions</div>';
         return;
@@ -285,8 +362,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     paneTitleEl.textContent = name;
     panesEl.innerHTML = '<div class="loading">Loading panes...</div>';
     showView("pane");
-
-    fetch("/api/sessions/" + encodeURIComponent(name) + "/panes").then(function(r) { return r.json(); }).then(function(panes) {
+    authFetch("/api/sessions/" + encodeURIComponent(name) + "/panes").then(function(r) { return r.json(); }).then(function(panes) {
       if (panes.length === 1) {
         connectPane(name, panes[0].index);
         return;
@@ -367,7 +443,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
       term.focus();
 
       var proto = location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(proto + "//" + location.host + "/ws?session=" + encodeURIComponent(name) + "&pane=" + paneIndex);
+      ws = new WebSocket(proto + "//" + location.host + "/ws?session=" + encodeURIComponent(name) + "&pane=" + paneIndex + "&token=" + encodeURIComponent(authToken));
 
       ws.onopen = function() {
         ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
@@ -387,13 +463,52 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
         if (term) term.write("\\r\\n\\x1b[2m[disconnected]\\x1b[0m\\r\\n");
       };
 
-      term.onData(function(data) { if (ws && ws.readyState === 1) ws.send(data); });
+      // --- Input micro-buffer (16ms ~1 frame) + IME composition ---
+      var inputBuffer = "";
+      var inputFlushTimer = null;
+      var composing = false;
+
+      function flushInput() {
+        inputFlushTimer = null;
+        if (composing) return;
+        if (inputBuffer && ws && ws.readyState === 1) {
+          ws.send(inputBuffer);
+          inputBuffer = "";
+        }
+      }
+
+      term.onData(function(data) {
+        if (!ws || ws.readyState !== 1) return;
+        inputBuffer += data;
+        if (!inputFlushTimer) {
+          inputFlushTimer = setTimeout(flushInput, 16);
+        }
+      });
+
+      termContainer.addEventListener("compositionstart", function() { composing = true; });
+      termContainer.addEventListener("compositionend", function() { composing = false; flushInput(); });
+
       term.onResize(function(size) {
         if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "resize", cols: size.cols, rows: size.rows }));
       });
 
       ro = new ResizeObserver(function() { try { fitAddon.fit(); } catch(e) {} });
       ro.observe(termContainer);
+
+      // Make xterm's hidden textarea focusable on mobile to trigger virtual keyboard
+      var xtermTextarea = termContainer.querySelector(".xterm-helper-textarea");
+      if (xtermTextarea) {
+        xtermTextarea.setAttribute("readonly", "false");
+        xtermTextarea.removeAttribute("readonly");
+        // Mobile browsers need a minimum visible size to allow keyboard popup
+        xtermTextarea.style.cssText = "position:absolute;left:0;top:0;width:1px;height:1px;opacity:0.01;z-index:-1;font-size:16px;";
+      }
+
+      // Tap on terminal area to focus and bring up keyboard
+      termContainer.addEventListener("touchend", function(e) {
+        if (e.target.closest(".action-bar")) return;
+        focusTerminal();
+      });
 
       setupTouchScroll();
     }).catch(function(err) {
@@ -402,39 +517,119 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
   }
 
   // --- Touch scroll → tmux mouse wheel (natural scroll: finger up = see history) ---
+  // Note: tmux scrolls in whole lines, so we batch and throttle to avoid choppiness.
+  // We send scroll events at a controlled rate for smoother visual updates.
   function setupTouchScroll() {
-    var startY = 0;
     var accum = 0;
-    var THRESHOLD = 30;
+    var THRESHOLD = 20;
+    var lastY = 0;
+    var lastMoveTime = 0;
+    var velocity = 0;
+    var momentumRAF = null;
+    var FRICTION = 0.88;
+    var MIN_VELOCITY = 0.08;
+    var scrollInterval = null;
+
+    function sendScroll(dir) {
+      if (!ws || ws.readyState !== 1) return;
+      var seq = dir > 0 ? "\\x1b[<64;1;1M" : "\\x1b[<65;1;1M";
+      ws.send(seq);
+    }
+
+    function startScrollInterval() {
+      if (scrollInterval) return;
+      scrollInterval = setInterval(function() {
+        if (accum >= THRESHOLD) {
+          sendScroll(1);
+          accum -= THRESHOLD;
+        } else if (accum <= -THRESHOLD) {
+          sendScroll(-1);
+          accum += THRESHOLD;
+        } else {
+          stopScrollInterval();
+        }
+      }, 30);
+    }
+
+    function stopScrollInterval() {
+      if (scrollInterval) { clearInterval(scrollInterval); scrollInterval = null; }
+    }
+
+    function stopMomentum() {
+      if (momentumRAF) { cancelAnimationFrame(momentumRAF); momentumRAF = null; }
+      velocity = 0;
+      stopScrollInterval();
+    }
+
+    function momentumTick() {
+      velocity *= FRICTION;
+      if (Math.abs(velocity) < MIN_VELOCITY) { stopMomentum(); return; }
+      accum += velocity * 6;
+      startScrollInterval();
+      momentumRAF = requestAnimationFrame(momentumTick);
+    }
 
     termContainer.addEventListener("touchstart", function(e) {
       if (e.touches.length === 1) {
-        startY = e.touches[0].clientY;
+        stopMomentum();
+        lastY = e.touches[0].clientY;
+        lastMoveTime = Date.now();
         accum = 0;
       }
     }, { passive: true });
 
     termContainer.addEventListener("touchmove", function(e) {
       if (e.touches.length !== 1 || !ws || ws.readyState !== 1) return;
-      var dy = e.touches[0].clientY - startY;
+      var now = Date.now();
+      var currentY = e.touches[0].clientY;
+      var dy = currentY - lastY;
+      var dt = now - lastMoveTime;
+      if (dt > 0) velocity = dy / dt;
+      lastY = currentY;
+      lastMoveTime = now;
+
       accum += dy;
-      startY = e.touches[0].clientY;
-      while (accum >= THRESHOLD) {
-        accum -= THRESHOLD;
-        ws.send("\\x1b[<64;1;1M");
-      }
-      while (accum <= -THRESHOLD) {
-        accum += THRESHOLD;
-        ws.send("\\x1b[<65;1;1M");
-      }
+      startScrollInterval();
       e.preventDefault();
     }, { passive: false });
+
+    termContainer.addEventListener("touchend", function() {
+      if (Math.abs(velocity) > MIN_VELOCITY) {
+        momentumRAF = requestAnimationFrame(momentumTick);
+      } else {
+        stopScrollInterval();
+      }
+    }, { passive: true });
   }
 
-  // --- Interrupt button ---
-  document.getElementById("btn-interrupt").addEventListener("click", function() {
-    if (ws && ws.readyState === 1) ws.send("\\x03");
-    if (term) term.focus();
+  // --- Shortcut buttons ---
+  var shortcuts = {
+    "btn-tab": "\\t",
+    "btn-ctrl-c": "\\x03",
+    "btn-ctrl-d": "\\x04",
+    "btn-ctrl-z": "\\x1a"
+  };
+  // Helper: focus xterm textarea in a mobile-friendly way (triggers keyboard)
+  function focusTerminal() {
+    var ta = termContainer.querySelector(".xterm-helper-textarea");
+    if (ta) {
+      // Temporarily make textarea "visible enough" for mobile browsers to open keyboard
+      var prev = ta.style.cssText;
+      ta.style.cssText = "position:fixed;left:0;bottom:0;width:4px;height:4px;opacity:0.01;font-size:16px;z-index:9999;";
+      ta.focus();
+      setTimeout(function() { ta.style.cssText = prev; }, 50);
+    } else if (term) {
+      term.focus();
+    }
+  }
+
+  document.getElementById("action-bar").addEventListener("touchend", function(e) {
+    var btn = e.target.closest(".action-btn");
+    if (!btn) return;
+    e.preventDefault();
+    var seq = shortcuts[btn.id];
+    if (seq && ws && ws.readyState === 1) ws.send(seq);
+    focusTerminal();
   });
 
   // --- Disconnect ---
@@ -443,15 +638,14 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     if (term) { term.dispose(); term = null; fitAddon = null; }
     if (ro) { ro.disconnect(); ro = null; }
     termContainer.innerHTML = "";
-    if (currentSession) {
-      selectSession(currentSession);
-    } else {
-      showView("list");
-      loadSessions();
-    }
+    currentSession = null;
+    showView("list");
+    loadSessions();
   };
 
   loadSessions();
+  // Preload xterm.js in background so terminal opens instantly
+  setTimeout(function() { loadXterm(); }, 500);
 })();
 </script>
 </body>
@@ -466,8 +660,52 @@ export async function run() {
       ? parseInt(process.argv[portIdx + 1])
       : DEFAULT_PORT;
 
+  const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
+
+  function checkAuth(req: IncomingMessage): boolean {
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const qToken = url.searchParams.get("token");
+    if (qToken === token) return true;
+    const auth = req.headers.authorization;
+    if (auth === `Bearer ${token}`) return true;
+    return false;
+  }
+
   const server = createServer((req, res) => {
-    if (handleApi(req, res)) return;
+    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    const path = url.pathname;
+
+    // Auth endpoint - no token required
+    if (path === "/api/auth" && req.method === "POST") {
+      let body = "";
+      req.on("data", (c: Buffer) => { body += c.toString(); });
+      req.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data.token === token) {
+            json(res, { ok: true });
+          } else {
+            json(res, { ok: false, error: "invalid token" }, 401);
+          }
+        } catch {
+          json(res, { ok: false, error: "bad request" }, 400);
+        }
+      });
+      return;
+    }
+
+    // All other API routes require auth
+    if (path.startsWith("/api/")) {
+      if (!checkAuth(req)) {
+        json(res, { error: "unauthorized" }, 401);
+        return;
+      }
+      if (handleApi(req, res)) return;
+      json(res, { error: "not found" }, 404);
+      return;
+    }
+
+    // HTML page - always served (contains auth UI)
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(HTML);
   });
@@ -475,6 +713,12 @@ export async function run() {
   const wss = new WebSocketServer({ server, path: "/ws" });
 
   wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
+    // Check token for WebSocket
+    if (!checkAuth(req)) {
+      socket.close(4001, "unauthorized");
+      return;
+    }
+
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
     const sessionName = url.searchParams.get("session");
     if (!sessionName) {
@@ -485,14 +729,16 @@ export async function run() {
 
     const tmux = tmuxBin();
     const mobileId = "tw-mobile-" + randomBytes(4).toString("hex");
+    const resizeFile = `/tmp/tw-resize-${mobileId}`;
 
     const pyScript = `
-import pty, os, sys, select, struct, fcntl, termios, signal, json, subprocess
+import pty, os, sys, select, struct, fcntl, termios, signal, subprocess
 
 tmux = '${tmux}'
 session = '${sessionName.replace(/'/g, "\\'")}'
 mobile = '${mobileId}'
 pane_idx = '${paneIndex}'
+resize_file = '${resizeFile}'
 
 subprocess.run([tmux, 'new-session', '-d', '-t', session, '-s', mobile], check=True)
 subprocess.run([tmux, 'set', '-t', mobile, 'status', 'off'])
@@ -516,9 +762,19 @@ fcntl.fcntl(master, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 fl_in = fcntl.fcntl(0, fcntl.F_GETFL)
 fcntl.fcntl(0, fcntl.F_SETFL, fl_in | os.O_NONBLOCK)
 sys.stdout = os.fdopen(1, 'wb', 0)
-def handle_resize(signum, frame):
-    pass
-signal.signal(signal.SIGWINCH, handle_resize)
+
+def on_winch(signum, frame):
+    try:
+        with open(resize_file, 'r') as f:
+            parts = f.read().strip().split(',')
+        cols, rows = int(parts[0]), int(parts[1])
+        winsize = struct.pack('HHHH', rows, cols, 0, 0)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+        os.kill(pid, signal.SIGWINCH)
+    except:
+        pass
+signal.signal(signal.SIGWINCH, on_winch)
+
 try:
     while True:
         r, _, _ = select.select([master, 0], [], [], 1)
@@ -527,15 +783,6 @@ try:
                 data = os.read(0, 65536)
                 if not data:
                     break
-                try:
-                    msg = json.loads(data)
-                    if msg.get('t') == 'r':
-                        winsize = struct.pack('HHHH', msg['rows'], msg['cols'], 0, 0)
-                        fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
-                        os.kill(pid, signal.SIGWINCH)
-                        continue
-                except (json.JSONDecodeError, KeyError):
-                    pass
                 os.write(master, data)
             except OSError:
                 break
@@ -562,6 +809,10 @@ finally:
         os.waitpid(pid, 0)
     except:
         pass
+    try:
+        os.unlink(resize_file)
+    except:
+        pass
     subprocess.run([tmux, 'kill-session', '-t', mobile], capture_output=True)
     sys.exit(0)
 `;
@@ -570,6 +821,15 @@ finally:
       stdio: ["pipe", "pipe", "pipe"],
       env: { ...process.env, TERM: "xterm-256color" },
     });
+
+    let cleaned = false;
+    function cleanup() {
+      if (cleaned) return;
+      cleaned = true;
+      try { child.kill(); } catch {}
+      sh(`${tmux} kill-session -t '${mobileId}'`);
+      try { unlinkSync(resizeFile); } catch {}
+    }
 
     child.stdout!.on("data", (data: Buffer) => {
       if (socket.readyState === socket.OPEN) {
@@ -580,6 +840,7 @@ finally:
     child.stderr!.on("data", (_data: Buffer) => {});
 
     child.on("close", (code: number | null) => {
+      cleanup();
       if (socket.readyState === socket.OPEN) {
         socket.send(JSON.stringify({ type: "exit", code: code ?? 0 }));
         socket.close();
@@ -591,7 +852,9 @@ finally:
       try {
         const parsed = JSON.parse(msg);
         if (parsed.type === "resize") {
-          child.stdin!.write(JSON.stringify({ t: "r", cols: parsed.cols, rows: parsed.rows }) + "\n");
+          // Write size to temp file and signal python to ioctl resize the PTY
+          writeFileSync(resizeFile, `${parsed.cols},${parsed.rows}`);
+          try { child.kill("SIGWINCH"); } catch {}
           return;
         }
       } catch {}
@@ -599,8 +862,7 @@ finally:
     });
 
     socket.on("close", () => {
-      try { child.kill(); } catch {}
-      sh(`${tmux} kill-session -t '${mobileId}'`);
+      cleanup();
     });
   });
 
@@ -608,7 +870,8 @@ finally:
     const ip = getLanIp();
     console.log(`\ntw-dashboard web server running at:\n`);
     console.log(`  Local:   http://localhost:${port}`);
-    console.log(`  Network: http://${ip}:${port}\n`);
-    console.log(`Open the Network URL on your phone to connect.\n`);
+    console.log(`  Network: http://${ip}:${port}`);
+    console.log(`  Token:   ${token}\n`);
+    console.log(`Open the Network URL on your phone and enter the token to connect.\n`);
   });
 }
