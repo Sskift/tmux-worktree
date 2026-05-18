@@ -631,7 +631,7 @@ fn session_cwd(name: String) -> Result<String, String> {
             "-p",
             "-t",
             &name,
-            "#{pane_current_path}",
+            "#{session_path}",
         ])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
