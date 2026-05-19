@@ -92,8 +92,12 @@ function App() {
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
-  const [scratchCollapsed, setScratchCollapsed] = useState(false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
+  const [remoteActive, setRemoteActive] = useState(false);
+  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
+  const [remoteToken, setRemoteToken] = useState("");
+  const [remotePopover, setRemotePopover] = useState(false);
+  const [remoteLoading, setRemoteLoading] = useState(false);
   const [editingFile, setEditingFile] = useState<string | null>(null);
   const [diffFile, setDiffFile] = useState<{ path: string; cwd: string } | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
@@ -182,9 +186,6 @@ function App() {
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
-        if (typeof lay.scratchCollapsed === "boolean") {
-          setScratchCollapsed(lay.scratchCollapsed as boolean);
-        }
       })
       .catch(() => {});
   }, []);
@@ -211,11 +212,11 @@ function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed },
+        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
@@ -372,6 +373,59 @@ function App() {
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  // Remote tunnel helpers
+  const checkRemoteStatus = useCallback(async () => {
+    try {
+      const status = await invoke<{ active: boolean; url: string | null; token: string }>("remote_status");
+      setRemoteActive(status.active);
+      setRemoteUrl(status.url);
+      setRemoteToken(status.token);
+      return status;
+    } catch {
+      return { active: false, url: null, token: "" };
+    }
+  }, []);
+
+  const handleRemoteToggle = useCallback(async () => {
+    if (remoteActive) {
+      setRemotePopover(true);
+    } else {
+      setRemoteLoading(true);
+      setRemotePopover(true);
+      try {
+        await invoke("remote_start");
+        // Poll for URL
+        let attempts = 0;
+        const poll = setInterval(async () => {
+          attempts++;
+          const status = await invoke<{ active: boolean; url: string | null; token: string }>("remote_status");
+          if (status.active && status.url) {
+            clearInterval(poll);
+            setRemoteActive(true);
+            setRemoteUrl(status.url);
+            setRemoteToken(status.token);
+            setRemoteLoading(false);
+          } else if (attempts > 30) {
+            clearInterval(poll);
+            setRemoteLoading(false);
+          }
+        }, 1000);
+      } catch {
+        setRemoteLoading(false);
+      }
+    }
+  }, [remoteActive]);
+
+  const handleRemoteDisconnect = useCallback(async () => {
+    await invoke("remote_stop");
+    setRemoteActive(false);
+    setRemoteUrl(null);
+    setRemotePopover(false);
+  }, []);
+
+  // Check remote status on mount
+  useEffect(() => { checkRemoteStatus(); }, [checkRemoteStatus]);
 
   // Lazy-open session terminals
   useEffect(() => {
@@ -530,10 +584,8 @@ function App() {
 
   const editorPanelOpen = !!(editingFile || diffFile);
   const SPLITTER_W = 1;
-  const SCRATCH_COLLAPSED_W = 36;
-  const scratchWidth = scratchCollapsed ? SCRATCH_COLLAPSED_W : cols.right;
-  const numSplitters = 1 + (scratchCollapsed ? 0 : 1) + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
-  const mainWidth = Math.max(200, containerWidth - cols.left - scratchWidth
+  const numSplitters = 2 + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
+  const mainWidth = Math.max(200, containerWidth - cols.left - cols.right
     - (fileBrowserOpen ? fileTreeWidth : 0)
     - (editorPanelOpen ? editorWidth : 0)
     - numSplitters * SPLITTER_W);
@@ -541,7 +593,7 @@ function App() {
   const gridCols = (() => {
     let g = `${cols.left}px ${SPLITTER_W}px`;
     if (fileBrowserOpen) g += ` ${fileTreeWidth}px ${SPLITTER_W}px`;
-    g += ` ${mainWidth}px ${scratchCollapsed ? "" : `${SPLITTER_W}px `}${scratchWidth}px`;
+    g += ` ${mainWidth}px ${SPLITTER_W}px ${cols.right}px`;
     if (editorPanelOpen) g += ` ${SPLITTER_W}px ${editorWidth}px`;
     return g;
   })();
@@ -556,6 +608,45 @@ function App() {
           <div className="brand">
             <span className="brand__mark" />
             <span className="brand__text">tmux-worktree</span>
+            <div style={{ position: "relative" }}>
+              <button
+                className={`brand__file-btn${remoteActive ? " brand__file-btn--active" : ""}`}
+                type="button"
+                onClick={handleRemoteToggle}
+                title="remote access"
+                aria-label="remote access"
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2"/>
+                  <ellipse cx="8" cy="8" rx="3" ry="6.5" stroke="currentColor" strokeWidth="1.2"/>
+                  <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="currentColor" strokeWidth="1.2"/>
+                </svg>
+              </button>
+              {remotePopover && (
+                <div className="remote-popover">
+                  {remoteLoading ? (
+                    <p className="remote-popover__text">Starting tunnel...</p>
+                  ) : remoteUrl ? (
+                    <>
+                      <p className="remote-popover__label">Remote URL</p>
+                      <div className="remote-popover__row">
+                        <p className="remote-popover__url">{remoteUrl}</p>
+                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(remoteUrl)} title="Copy URL">⎘</button>
+                      </div>
+                      <p className="remote-popover__label">Token</p>
+                      <div className="remote-popover__row">
+                        <p className="remote-popover__url">{remoteToken}</p>
+                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(remoteToken)} title="Copy Token">⎘</button>
+                      </div>
+                      <button className="remote-popover__disconnect" onClick={handleRemoteDisconnect}>Disconnect</button>
+                    </>
+                  ) : (
+                    <p className="remote-popover__text">Failed to start tunnel</p>
+                  )}
+                  <button className="remote-popover__close" onClick={() => setRemotePopover(false)}>Close</button>
+                </div>
+              )}
+            </div>
             <button
               className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
               type="button"
@@ -911,48 +1002,26 @@ function App() {
         )}
       </main>
 
-      {/* ── Right splitter (always visible when not collapsed) ── */}
-      {!scratchCollapsed && (
-        <div
-          className="splitter"
-          onMouseDown={startResize("right")}
-          aria-label="resize scratch"
-        />
-      )}
+      {/* ── Right splitter (always visible) ── */}
+      <div
+        className="splitter"
+        onMouseDown={startResize("right")}
+        aria-label="resize scratch"
+      />
 
       {/* ── Scratch panel (always visible) ── */}
-      <aside className={`scratch${scratchCollapsed ? " scratch--collapsed" : ""}`}>
-        {scratchCollapsed && (
-          <button
-            className="scratch__expand-btn"
-            type="button"
-            onClick={() => setScratchCollapsed(false)}
-            title="展开 scratch"
-          >
-            ‹
-          </button>
-        )}
+      <aside className="scratch">
         {scratchTerminals.size > 0 ? (
-          <div className="pane pane--term" style={{ display: scratchCollapsed ? "none" : undefined }}>
+          <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
-              <div className="pane__bar-actions">
-                <button
-                  className="btn btn--small"
-                  type="button"
-                  onClick={addScratchTerminal}
-                >
-                  +
-                </button>
-                <button
-                  className="btn btn--small scratch__collapse-btn"
-                  type="button"
-                  onClick={() => setScratchCollapsed(true)}
-                  title="收起 scratch"
-                >
-                  ›
-                </button>
-              </div>
+              <button
+                className="btn btn--small"
+                type="button"
+                onClick={addScratchTerminal}
+              >
+                +
+              </button>
             </div>
             {Array.from(scratchTerminals.entries()).map(([key, state]) => {
               const isActive = key === selectionKey;
@@ -1007,15 +1076,7 @@ function App() {
             })}
           </div>
         ) : (
-          <div className="pane pane--empty" style={{ display: scratchCollapsed ? "none" : undefined }}>
-            <button
-              className="btn btn--small scratch__collapse-btn scratch__collapse-btn--corner"
-              type="button"
-              onClick={() => setScratchCollapsed(true)}
-              title="收起 scratch"
-            >
-              ›
-            </button>
+          <div className="pane pane--empty">
             <div className="pane__hint">scratch</div>
           </div>
         )}
