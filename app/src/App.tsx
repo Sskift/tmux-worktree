@@ -608,7 +608,7 @@ function App() {
           <div className="brand">
             <span className="brand__mark" />
             <span className="brand__text">tmux-worktree</span>
-            <div style={{ position: "relative" }}>
+            <div style={{ position: "relative", marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
               <button
                 className={`brand__file-btn${remoteActive ? " brand__file-btn--active" : ""}`}
                 type="button"
@@ -620,6 +620,17 @@ function App() {
                   <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2"/>
                   <ellipse cx="8" cy="8" rx="3" ry="6.5" stroke="currentColor" strokeWidth="1.2"/>
                   <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="currentColor" strokeWidth="1.2"/>
+                </svg>
+              </button>
+              <button
+                className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
+                type="button"
+                onClick={() => setFileBrowserOpen((prev) => !prev)}
+                title="toggle file browser"
+                aria-label="toggle file browser"
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M1.5 13.5V2.5C1.5 2.1 1.9 1.5 2.5 1.5H6L8 3.5H13.5C14.1 3.5 14.5 4 14.5 4.5V13.5C14.5 14 14.1 14.5 13.5 14.5H2.5C1.9 14.5 1.5 14 1.5 13.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
                 </svg>
               </button>
               {remotePopover && (
@@ -647,17 +658,6 @@ function App() {
                 </div>
               )}
             </div>
-            <button
-              className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
-              type="button"
-              onClick={() => setFileBrowserOpen((prev) => !prev)}
-              title="toggle file browser"
-              aria-label="toggle file browser"
-            >
-              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M1.5 13.5V2.5C1.5 2.1 1.9 1.5 2.5 1.5H6L8 3.5H13.5C14.1 3.5 14.5 4 14.5 4.5V13.5C14.5 14 14.1 14.5 13.5 14.5H2.5C1.9 14.5 1.5 14 1.5 13.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
-              </svg>
-            </button>
           </div>
           <div className="sidebar__buttons">
             <button

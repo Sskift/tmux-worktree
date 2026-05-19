@@ -661,6 +661,9 @@ export async function run() {
       : DEFAULT_PORT;
 
   const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
+  // Write token to file so Tauri app can read it
+  const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
+  writeFileSync(tokenFile, token, { mode: 0o600 });
   const remote = process.argv.includes("--remote");
 
   function checkAuth(req: IncomingMessage): boolean {

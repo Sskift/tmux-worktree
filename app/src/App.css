@@ -1247,7 +1247,6 @@ select.field__input {
 /* ─── File browser toggle button ────────────────────────────── */
 
 .brand__file-btn {
-  margin-left: auto;
   width: 24px;
   height: 24px;
   border-radius: 4px;
