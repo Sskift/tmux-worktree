@@ -18,13 +18,13 @@ npx tmux-worktree claude myproject
 
 ```bash
 # 创建开发 session（tmux + worktree + AI agent）
-tw claude coco
+tw claude <repo>
 
 # 带自定义 session 名称
-tw claude coco fix-auth-bug
+tw claude <repo> fix-auth-bug
 
 # 自定义 AI 命令参数
-tw "claude --model opus" coco refactor
+tw "claude --model opus" <repo> refactor
 
 # 交互模式（无参数，逐步选择）
 tw
@@ -40,10 +40,10 @@ tw
 2. 自动创建 git worktree 分支
 3. 启动 tmux session，三栏布局：
    - 左栏：`tw status` 状态面板
-   - 中栏：AI agent（claude / coco / aider / codex 等）
+   - 中栏：AI agent（claude / aider / codex 等）
    - 右栏：普通终端
 
-支持的 AI 命令示例：`claude`, `coco`, `aider`, `codex`, 或任意自定义命令。
+支持的 AI 命令示例：`claude`, `aider`, `codex`, 或任意自定义命令。
 
 ### `tw status`
 
@@ -183,9 +183,6 @@ npm run tauri build     # 构建发布包
 # 发布到 npmjs
 npm run build
 npm publish
-
-# 发布到内部 registry（bnpm）
-./scripts/publish-bnpm.sh
 ```
 
 ## 技术栈

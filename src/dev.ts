@@ -9,8 +9,8 @@ import { createInterface } from "node:readline";
 // dev.ts — AI + tmux + git worktree 开发环境
 //
 // 用法: npx tmux-worktree <ai-command> <project> [session-name]
-// 示例: npx tmux-worktree claude coco fix-auth
-//       npx tmux-worktree "claude --model opus" coco
+// 示例: npx tmux-worktree claude myproject fix-auth
+//       npx tmux-worktree "claude --model opus" myproject
 // ============================================
 
 function sh(cmd: string): string {
@@ -113,10 +113,10 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
     console.log("🚀 tmux-worktree 交互模式\n");
 
     // --- AI 命令 ---
-    console.log("输入要在左栏启动的 AI 命令，如 coco, claude, aider 等");
+    console.log("输入要在左栏启动的 AI 命令，如 claude, aider, codex 等");
     console.log("也可以带参数，如 \"claude --model opus\"");
-    const aiInput = (await prompt(rl, `AI 命令 (默认 coco): `)).trim();
-    const aiCmd = aiInput || "coco";
+    const aiInput = (await prompt(rl, `AI 命令 (默认 claude): `)).trim();
+    const aiCmd = aiInput || "claude";
 
     // --- 项目 ---
     const projectEntries = Object.entries(projects);
@@ -221,8 +221,8 @@ function parseArgs(projects: Record<string, string>): RunParams {
   session-name  可选，tmux session 显示名 (默认同 project)
 
 示例:
-  tw claude coco
-  tw claude coco fix-auth-bug
+  tw claude myproject
+  tw claude myproject fix-auth-bug
   tw claude ~/some/dir
   tw                           # 交互模式`);
     process.exit(1);

@@ -19,8 +19,7 @@
     "tw-dashboard-install": "app/installer/installer.mjs"
   },
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --target node20",
-    "publish:bnpm": "scripts/publish-bnpm.sh"
+    "build": "tsup src/cli.ts --format esm --target node20"
   },
   "dependencies": {
     "ws": "^8.18.0"
