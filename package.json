@@ -1,7 +1,13 @@
 {
-  "name": "@byted-codebase/tmux-worktree",
+  "name": "tmux-worktree",
   "version": "0.9.3",
   "type": "module",
+  "description": "AI + tmux + git worktree integrated development environment with a native macOS dashboard app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sskift/tmux-worktree.git"
+  },
+  "license": "MIT",
   "files": [
     "dist",
     "app/installer/installer.mjs",
@@ -13,7 +19,8 @@
     "tw-dashboard-install": "app/installer/installer.mjs"
   },
   "scripts": {
-    "build": "tsup src/cli.ts --format esm --target node20"
+    "build": "tsup src/cli.ts --format esm --target node20",
+    "publish:bnpm": "scripts/publish-bnpm.sh"
   },
   "dependencies": {
     "ws": "^8.18.0"
@@ -22,8 +29,5 @@
     "@types/ws": "^8.5.0",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0"
-  },
-  "publishConfig": {
-    "registry": "https://bnpm.byted.org"
   }
 }
