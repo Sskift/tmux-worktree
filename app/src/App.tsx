@@ -92,6 +92,7 @@ function App() {
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
+  const [scratchCollapsed, setScratchCollapsed] = useState(false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
   const [remoteActive, setRemoteActive] = useState(false);
   const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
@@ -186,6 +187,9 @@ function App() {
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
+        if (typeof lay.scratchCollapsed === "boolean") {
+          setScratchCollapsed(lay.scratchCollapsed as boolean);
+        }
       })
       .catch(() => {});
   }, []);
@@ -212,11 +216,11 @@ function App() {
   useEffect(() => {
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder },
+        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
@@ -584,8 +588,10 @@ function App() {
 
   const editorPanelOpen = !!(editingFile || diffFile);
   const SPLITTER_W = 1;
-  const numSplitters = 2 + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
-  const mainWidth = Math.max(200, containerWidth - cols.left - cols.right
+  const SCRATCH_COLLAPSED_W = 36;
+  const scratchWidth = scratchCollapsed ? SCRATCH_COLLAPSED_W : cols.right;
+  const numSplitters = 1 + (scratchCollapsed ? 0 : 1) + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
+  const mainWidth = Math.max(200, containerWidth - cols.left - scratchWidth
     - (fileBrowserOpen ? fileTreeWidth : 0)
     - (editorPanelOpen ? editorWidth : 0)
     - numSplitters * SPLITTER_W);
@@ -593,7 +599,7 @@ function App() {
   const gridCols = (() => {
     let g = `${cols.left}px ${SPLITTER_W}px`;
     if (fileBrowserOpen) g += ` ${fileTreeWidth}px ${SPLITTER_W}px`;
-    g += ` ${mainWidth}px ${SPLITTER_W}px ${cols.right}px`;
+    g += ` ${mainWidth}px ${scratchCollapsed ? "" : `${SPLITTER_W}px `}${scratchWidth}px`;
     if (editorPanelOpen) g += ` ${SPLITTER_W}px ${editorWidth}px`;
     return g;
   })();
@@ -1002,26 +1008,48 @@ function App() {
         )}
       </main>
 
-      {/* ── Right splitter (always visible) ── */}
-      <div
-        className="splitter"
-        onMouseDown={startResize("right")}
-        aria-label="resize scratch"
-      />
+      {/* ── Right splitter (always visible when not collapsed) ── */}
+      {!scratchCollapsed && (
+        <div
+          className="splitter"
+          onMouseDown={startResize("right")}
+          aria-label="resize scratch"
+        />
+      )}
 
       {/* ── Scratch panel (always visible) ── */}
-      <aside className="scratch">
+      <aside className={`scratch${scratchCollapsed ? " scratch--collapsed" : ""}`}>
+        {scratchCollapsed && (
+          <button
+            className="scratch__expand-btn"
+            type="button"
+            onClick={() => setScratchCollapsed(false)}
+            title="展开 scratch"
+          >
+            ‹
+          </button>
+        )}
         {scratchTerminals.size > 0 ? (
-          <div className="pane pane--term">
+          <div className="pane pane--term" style={{ display: scratchCollapsed ? "none" : undefined }}>
             <div className="pane__bar">
               <span className="pane__title">scratch</span>
-              <button
-                className="btn btn--small"
-                type="button"
-                onClick={addScratchTerminal}
-              >
-                +
-              </button>
+              <div className="pane__bar-actions">
+                <button
+                  className="btn btn--small"
+                  type="button"
+                  onClick={addScratchTerminal}
+                >
+                  +
+                </button>
+                <button
+                  className="btn btn--small scratch__collapse-btn"
+                  type="button"
+                  onClick={() => setScratchCollapsed(true)}
+                  title="收起 scratch"
+                >
+                  ›
+                </button>
+              </div>
             </div>
             {Array.from(scratchTerminals.entries()).map(([key, state]) => {
               const isActive = key === selectionKey;
@@ -1076,7 +1104,15 @@ function App() {
             })}
           </div>
         ) : (
-          <div className="pane pane--empty">
+          <div className="pane pane--empty" style={{ display: scratchCollapsed ? "none" : undefined }}>
+            <button
+              className="btn btn--small scratch__collapse-btn scratch__collapse-btn--corner"
+              type="button"
+              onClick={() => setScratchCollapsed(true)}
+              title="收起 scratch"
+            >
+              ›
+            </button>
             <div className="pane__hint">scratch</div>
           </div>
         )}
