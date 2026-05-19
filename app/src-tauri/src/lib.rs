@@ -1385,9 +1385,10 @@ fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchR
 
 // ── Remote tunnel (cloudflared) ──
 
-fn gen_token() -> String {
-    // Use uuid v4 (already a dependency) and take first 8 hex chars
-    uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+fn read_serve_token() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!("{home}/.tw-serve-token");
+    std::fs::read_to_string(&path).unwrap_or_default().trim().to_string()
 }
 
 #[derive(Serialize, Clone)]
@@ -1404,14 +1405,44 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         return Ok(());
     }
 
-    // Generate token
-    let tok = gen_token();
+    // Ensure serve process is running on port 8311
+    if std::net::TcpStream::connect("127.0.0.1:8311").is_err() {
+        let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "node".to_string());
+        let cli_js = format!("{}/../../dist/cli.js", env!("CARGO_MANIFEST_DIR"));
+        let serve_arg = "serve".to_string();
+        std::process::Command::new(&node)
+            .args([&cli_js, &serve_arg])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start serve: {e}"))?;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if std::net::TcpStream::connect("127.0.0.1:8311").is_ok() {
+                break;
+            }
+        }
+    }
+
+    // Read token from serve process
+    let tok = read_serve_token();
     {
         let mut t = state.token.lock().unwrap();
         *t = tok;
     }
 
-    let mut child = std::process::Command::new("cloudflared")
+    let cf_bin = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "cloudflared".to_string());
+
+    let mut child = std::process::Command::new(&cf_bin)
         .args(["tunnel", "--url", "http://localhost:8311"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1430,21 +1461,25 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         std::thread::spawn(move || {
             use std::io::BufRead;
             let reader = std::io::BufReader::new(stderr);
+            let mut found = false;
             for line in reader.lines() {
                 let line = match line {
                     Ok(l) => l,
                     Err(_) => break,
                 };
-                if let Some(start) = line.find("https://") {
-                    let rest = &line[start..];
-                    if rest.contains(".trycloudflare.com") {
-                        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-                        let url = &rest[..end];
-                        let mut u = tunnel_state.url.lock().unwrap();
-                        *u = Some(url.to_string());
-                        break;
+                if !found {
+                    if let Some(start) = line.find("https://") {
+                        let rest = &line[start..];
+                        if rest.contains(".trycloudflare.com") {
+                            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                            let url = &rest[..end];
+                            let mut u = tunnel_state.url.lock().unwrap();
+                            *u = Some(url.to_string());
+                            found = true;
+                        }
                     }
                 }
+                // Keep draining stderr so cloudflared doesn't get SIGPIPE
             }
         });
     }
@@ -1467,7 +1502,25 @@ fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
 
 #[tauri::command]
 fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
-    let proc = state.process.lock().unwrap();
+    let mut proc = state.process.lock().unwrap();
+    // Check if process has exited
+    if let Some(ref mut child) = *proc {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Process exited, clean up
+                *proc = None;
+                let mut url = state.url.lock().unwrap();
+                *url = None;
+                let token = state.token.lock().unwrap();
+                return TunnelStatus {
+                    active: false,
+                    url: None,
+                    token: token.clone(),
+                };
+            }
+            _ => {}
+        }
+    }
     let url = state.url.lock().unwrap();
     let token = state.token.lock().unwrap();
     TunnelStatus {
