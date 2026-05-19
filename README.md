@@ -1,17 +1,17 @@
-# @byted-codebase/tmux-worktree
+# tmux-worktree
 
 AI + tmux + git worktree 一体化开发环境，附带 macOS 原生桌面 Dashboard 应用。
 
 ## 安装
 
 ```bash
-npm install -g @byted-codebase/tmux-worktree --registry=https://bnpm.byted.org
+npm install -g tmux-worktree
 ```
 
 或者通过 npx 直接使用（无需安装）：
 
 ```bash
-npx @byted-codebase/tmux-worktree claude coco
+npx tmux-worktree claude myproject
 ```
 
 ## 快速开始
@@ -147,8 +147,8 @@ open -a tw-dashboard
 ```json
 {
   "projects": {
-    "coco": "/Users/me/go/src/code.byted.org/nextcode/coco",
-    "vecode": "/Users/me/go/src/code.byted.org/vecode/vecode"
+    "myapp": "/Users/me/projects/myapp",
+    "backend": "/Users/me/projects/backend"
   },
   "worktreeBase": "/private/tmp/tmux-worktree/projects",
   "notesBase": "/private/tmp/tmux-worktree/notes"
@@ -180,8 +180,12 @@ npm run tauri build     # 构建发布包
 ## 发布
 
 ```bash
+# 发布到 npmjs
 npm run build
-npm publish --access public --registry=https://bnpm.byted.org
+npm publish
+
+# 发布到内部 registry（bnpm）
+./scripts/publish-bnpm.sh
 ```
 
 ## 技术栈
@@ -193,4 +197,4 @@ npm publish --access public --registry=https://bnpm.byted.org
 
 ## License
 
-Internal use only.
+MIT
