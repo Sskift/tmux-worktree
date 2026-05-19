@@ -8,6 +8,9 @@ if (sub === "status") {
 } else if (sub === "serve") {
   const { run } = await import("./serve.js");
   await run();
+} else if (sub === "setup") {
+  const { run } = await import("./setup.js");
+  await run();
 } else {
   const { run } = await import("./dev.js");
   await run();

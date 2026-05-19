@@ -33,6 +33,7 @@ macOS 原生桌面应用，管理 AI 编程 session —— 集成 tmux、git wor
 - **孤儿 worktree 恢复**：检测无关联 session 的 worktree，可一键恢复
 - **Kill 自动清理**：删除 session 时自动清除对应 git worktree
 - **Shell 环境继承**：从 login shell 继承完整环境变量
+- **ESC 聚焦**：当光标在 tmux 位置或进入 copy mode 时，按 ESC 一键聚焦到 AI 对话框
 
 ## Remote（手机远程访问）
 
@@ -55,7 +56,14 @@ macOS 原生桌面应用，管理 AI 编程 session —— 集成 tmux、git wor
 除了桌面应用，也提供命令行工具：
 
 ```bash
-npm install -g tmux-worktree
+# 从源码安装
+git clone https://github.com/Sskift/tmux-worktree.git
+cd tmux-worktree
+npm install && npm run build
+npm link          # 全局注册 tw 命令
+
+# 检查系统依赖
+tw setup
 ```
 
 ### `tw <ai-command> <project> [session-name]`
