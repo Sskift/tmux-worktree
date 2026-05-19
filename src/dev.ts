@@ -324,7 +324,6 @@ export async function run() {
 
   // 创建 session，初始窗口运行 status (最左栏固定宽度)
   shExec(`tmux new-session -d -s ${session} -c ${workDir}`);
-  shExec(`tmux set-option -t '${session}' window-size latest`);
   setupClipboardBindings();
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
   shExec(`tmux send-keys -t '${session}.1' 'node "${cliPath}" status' C-m`);

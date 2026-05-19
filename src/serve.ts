@@ -661,6 +661,7 @@ export async function run() {
       : DEFAULT_PORT;
 
   const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
+  const remote = process.argv.includes("--remote");
 
   function checkAuth(req: IncomingMessage): boolean {
     const url = new URL(req.url || "/", `http://${req.headers.host}`);
@@ -741,7 +742,6 @@ pane_idx = '${paneIndex}'
 resize_file = '${resizeFile}'
 
 subprocess.run([tmux, 'new-session', '-d', '-t', session, '-s', mobile], check=True)
-subprocess.run([tmux, 'set-option', '-t', session, 'window-size', 'latest'])
 subprocess.run([tmux, 'set', '-t', mobile, 'status', 'off'])
 if pane_idx != '0':
     subprocess.run([tmux, 'select-pane', '-t', mobile + ':.' + pane_idx])
@@ -873,6 +873,40 @@ finally:
     console.log(`  Local:   http://localhost:${port}`);
     console.log(`  Network: http://${ip}:${port}`);
     console.log(`  Token:   ${token}\n`);
-    console.log(`Open the Network URL on your phone and enter the token to connect.\n`);
+
+    if (remote) {
+      console.log(`  Starting cloudflare tunnel...\n`);
+      const cf = cpSpawn("cloudflared", ["tunnel", "--url", `http://localhost:${port}`], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let urlFound = false;
+      cf.stderr?.on("data", (chunk: Buffer) => {
+        const line = chunk.toString();
+        const match = line.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/);
+        if (match && !urlFound) {
+          urlFound = true;
+          console.log(`  Remote:  ${match[0]}\n`);
+          console.log(`Open the Remote URL on your phone and enter the token to connect.\n`);
+        }
+      });
+
+      cf.on("error", (err: Error) => {
+        console.error(`\n  [remote] Failed to start cloudflared: ${err.message}`);
+        console.error(`  Install: brew install cloudflared\n`);
+      });
+
+      cf.on("close", (code: number | null) => {
+        if (!urlFound) {
+          console.error(`\n  [remote] cloudflared exited (code ${code}) without producing a URL`);
+        }
+      });
+
+      process.on("exit", () => { try { cf.kill(); } catch {} });
+      process.on("SIGINT", () => { try { cf.kill(); } catch {} process.exit(0); });
+      process.on("SIGTERM", () => { try { cf.kill(); } catch {} process.exit(0); });
+    } else {
+      console.log(`Open the Network URL on your phone and enter the token to connect.\n`);
+    }
   });
 }

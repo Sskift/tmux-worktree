@@ -96,6 +96,22 @@ struct PtyState {
     ptys: Mutex<HashMap<String, PtyHandle>>,
 }
 
+struct TunnelState {
+    process: Mutex<Option<std::process::Child>>,
+    url: Mutex<Option<String>>,
+    token: Mutex<String>,
+}
+
+impl Default for TunnelState {
+    fn default() -> Self {
+        Self {
+            process: Mutex::new(None),
+            url: Mutex::new(None),
+            token: Mutex::new(String::new()),
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 struct PtyChunk {
     id: String,
@@ -444,7 +460,6 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
     };
 
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
-    run_check(&["tmux", "set-option", "-t", &session, "window-size", "latest"])?;
     setup_clipboard_bindings();
     run_check(&[
         "tmux",
@@ -615,7 +630,6 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
 
     let session = unique_session_name(&args.name);
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &args.path])?;
-    run_check(&["tmux", "set-option", "-t", &session, "window-size", "latest"])?;
     setup_clipboard_bindings();
 
     if !args.ai_cmd.is_empty() {
@@ -633,7 +647,7 @@ fn session_cwd(name: String) -> Result<String, String> {
             "-p",
             "-t",
             &name,
-            "#{session_path}",
+            "#{pane_current_path}",
         ])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
@@ -1104,7 +1118,6 @@ fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
 fn create_plain_terminal(cwd: String) -> Result<String, String> {
     let name = format!("tw-term-{}", random_id());
     run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
-    run_check(&["tmux", "set-option", "-t", &name, "window-size", "latest"])?;
     setup_clipboard_bindings();
     Ok(name)
 }
@@ -1130,7 +1143,6 @@ fn ensure_terminal_session(name: String, cwd: String) -> Result<(), String> {
         return Ok(());
     }
     run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
-    run_check(&["tmux", "set-option", "-t", &name, "window-size", "latest"])?;
     setup_clipboard_bindings();
     Ok(())
 }
@@ -1371,6 +1383,100 @@ fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchR
     Ok(results)
 }
 
+// ── Remote tunnel (cloudflared) ──
+
+fn gen_token() -> String {
+    // Use uuid v4 (already a dependency) and take first 8 hex chars
+    uuid::Uuid::new_v4().to_string().replace('-', "")[..8].to_string()
+}
+
+#[derive(Serialize, Clone)]
+struct TunnelStatus {
+    active: bool,
+    url: Option<String>,
+    token: String,
+}
+
+#[tauri::command]
+fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+    let mut proc = state.process.lock().unwrap();
+    if proc.is_some() {
+        return Ok(());
+    }
+
+    // Generate token
+    let tok = gen_token();
+    {
+        let mut t = state.token.lock().unwrap();
+        *t = tok;
+    }
+
+    let mut child = std::process::Command::new("cloudflared")
+        .args(["tunnel", "--url", "http://localhost:8311"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start cloudflared: {e}. Install: brew install cloudflared"))?;
+
+    // Take stderr before storing child
+    let stderr = child.stderr.take();
+    *proc = Some(child);
+    drop(proc);
+
+    // Spawn a thread to read stderr and capture the URL
+    if let Some(stderr) = stderr {
+        let tunnel_state = Arc::clone(state.inner());
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if let Some(start) = line.find("https://") {
+                    let rest = &line[start..];
+                    if rest.contains(".trycloudflare.com") {
+                        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                        let url = &rest[..end];
+                        let mut u = tunnel_state.url.lock().unwrap();
+                        *u = Some(url.to_string());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+    let mut proc = state.process.lock().unwrap();
+    if let Some(ref mut child) = *proc {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *proc = None;
+    let mut url = state.url.lock().unwrap();
+    *url = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
+    let proc = state.process.lock().unwrap();
+    let url = state.url.lock().unwrap();
+    let token = state.token.lock().unwrap();
+    TunnelStatus {
+        active: proc.is_some(),
+        url: url.clone(),
+        token: token.clone(),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     inherit_shell_env();
@@ -1378,6 +1484,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(Arc::new(PtyState::default()));
+            app.manage(Arc::new(TunnelState::default()));
             setup_clipboard_bindings();
             Ok(())
         })
@@ -1414,6 +1521,9 @@ pub fn run() {
             search_files,
             open_url,
             file_exists,
+            remote_start,
+            remote_stop,
+            remote_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
