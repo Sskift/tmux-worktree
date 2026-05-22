@@ -1,8 +1,9 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execSync, spawn as cpSpawn } from "node:child_process";
-import { networkInterfaces } from "node:os";
+import { networkInterfaces, homedir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, unlinkSync } from "node:fs";
+import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
 const DEFAULT_PORT = 8311;
@@ -56,6 +57,17 @@ function listSessions(): Session[] {
   }).filter(s => !s.name.startsWith("tw-term-") && !s.name.startsWith("tw-mobile-"));
 }
 
+type PlainTerminal = { id: string; label: string; cwd: string; tmuxName: string };
+
+function listTerminals(): PlainTerminal[] {
+  const file = join(homedir(), ".tw-dashboard-terminals.json");
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
 function listPanes(sessionName: string): Pane[] {
   const tmux = tmuxBin();
   const fmt = "#{pane_index}\x1f#{pane_width}\x1f#{pane_height}\x1f#{pane_current_command}\x1f#{pane_title}\x1f#{pane_active}";
@@ -104,6 +116,11 @@ function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
 
   if (path === "/api/sessions") {
     json(res, listSessions());
+    return true;
+  }
+
+  if (path === "/api/terminals") {
+    json(res, listTerminals());
     return true;
   }
 
@@ -171,6 +188,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 .session-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
 .empty { text-align: center; color: var(--faint); padding: 60px 20px; font-size: 14px; }
 .loading { text-align: center; color: var(--dim); padding: 60px 20px; font-size: 14px; }
+.section-label { font-size: 11px; font-weight: 600; color: var(--faint); text-transform: uppercase; letter-spacing: 0.5px; padding: 12px 0 6px; }
 
 .toolbar { display: flex; align-items: center; padding: 10px 16px; gap: 12px; flex-shrink: 0; background: var(--bg1); border-bottom: 1px solid var(--line); }
 .btn-back { width: 32px; height: 32px; border: none; background: var(--bg2); color: var(--dim); border-radius: 8px; font-size: 16px; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
@@ -210,7 +228,12 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     <h1>tw-dashboard</h1>
     <button class="btn-icon" onclick="loadSessions()" aria-label="refresh">R</button>
   </div>
-  <div id="sessions" class="scroll-area"><div class="loading">Loading...</div></div>
+  <div class="scroll-area">
+    <div class="section-label">Worktrees</div>
+    <div id="sessions"><div class="loading">Loading...</div></div>
+    <div class="section-label" id="terminals-label" style="display:none;">Terminals</div>
+    <div id="terminals"></div>
+  </div>
 </div>
 
 <div id="pane-view" class="view">
@@ -241,6 +264,8 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 (function() {
   var views = { auth: document.getElementById("auth-view"), list: document.getElementById("list-view"), pane: document.getElementById("pane-view"), term: document.getElementById("term-view") };
   var sessionsEl = document.getElementById("sessions");
+  var terminalsEl = document.getElementById("terminals");
+  var terminalsLabel = document.getElementById("terminals-label");
   var panesEl = document.getElementById("panes");
   var paneTitleEl = document.getElementById("pane-title");
   var titleEl = document.getElementById("toolbar-title");
@@ -349,11 +374,37 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     }).catch(function() {
       sessionsEl.innerHTML = '<div class="empty">Failed to load sessions</div>';
     });
+    // Load terminals
+    authFetch("/api/terminals").then(function(r) { return r.json(); }).then(function(terminals) {
+      if (!terminals.length) {
+        terminalsLabel.style.display = "none";
+        terminalsEl.innerHTML = "";
+        return;
+      }
+      terminalsLabel.style.display = "";
+      var html = "";
+      for (var i = 0; i < terminals.length; i++) {
+        var t = terminals[i];
+        html += '<div class="card" data-tmux="' + esc(t.tmuxName) + '">'
+          + '<div class="card-title"><span class="session-dot" style="background:#81e6d9"></span>' + esc(t.label) + '</div>'
+          + '<div class="card-meta">' + esc(t.cwd) + '</div>'
+          + '</div>';
+      }
+      terminalsEl.innerHTML = html;
+    }).catch(function() {
+      terminalsEl.innerHTML = "";
+      terminalsLabel.style.display = "none";
+    });
   };
 
   sessionsEl.addEventListener("click", function(e) {
     var card = e.target.closest(".card");
     if (card) selectSession(card.getAttribute("data-name"));
+  });
+
+  terminalsEl.addEventListener("click", function(e) {
+    var card = e.target.closest(".card");
+    if (card) connectPane(card.getAttribute("data-tmux"), 0);
   });
 
   // --- Pane picker ---
