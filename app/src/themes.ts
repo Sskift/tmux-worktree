@@ -473,26 +473,26 @@ export const THEMES: Record<ThemeId, Theme> = {
     id: "one-dark",
     label: "one dark",
     ui: {
-      "--bg": "#282c34",
-      "--bg-1": "#21252b",
-      "--bg-2": "#2c313a",
-      "--bg-3": "#353b45",
-      "--line": "rgba(171, 178, 191, 0.08)",
-      "--line-2": "rgba(171, 178, 191, 0.14)",
-      "--text": "#abb2bf",
-      "--text-dim": "#828997",
-      "--text-faint": "#5c6370",
+      "--bg": "#1e2228",
+      "--bg-1": "#171a20",
+      "--bg-2": "#252b35",
+      "--bg-3": "#303847",
+      "--line": "rgba(215, 218, 224, 0.1)",
+      "--line-2": "rgba(215, 218, 224, 0.18)",
+      "--text": "#d7dae0",
+      "--text-dim": "#a9b2c1",
+      "--text-faint": "#687385",
       "--accent-a": "#61afef",
       "--accent-b": "#c678dd",
       "--accent-c": "#98c379",
     },
     term: {
-      background: "#282c34",
+      background: "#1e2228",
       foreground: "#abb2bf",
       cursor: "#528bff",
-      cursorAccent: "#282c34",
+      cursorAccent: "#1e2228",
       selectionBackground: "rgba(97, 175, 239, 0.3)",
-      black: "#282c34",
+      black: "#171a20",
       red: "#e06c75",
       green: "#98c379",
       yellow: "#e5c07b",
@@ -514,26 +514,26 @@ export const THEMES: Record<ThemeId, Theme> = {
     id: "everforest",
     label: "everforest",
     ui: {
-      "--bg": "#2d353b",
-      "--bg-1": "#272e33",
-      "--bg-2": "#343f44",
-      "--bg-3": "#3d484d",
-      "--line": "rgba(211, 198, 170, 0.07)",
-      "--line-2": "rgba(211, 198, 170, 0.13)",
-      "--text": "#d3c6aa",
-      "--text-dim": "#9da9a0",
-      "--text-faint": "#859289",
+      "--bg": "#1e2326",
+      "--bg-1": "#232a2e",
+      "--bg-2": "#2b3338",
+      "--bg-3": "#364047",
+      "--line": "rgba(225, 211, 184, 0.1)",
+      "--line-2": "rgba(225, 211, 184, 0.18)",
+      "--text": "#e1d3b8",
+      "--text-dim": "#b9c0ab",
+      "--text-faint": "#77847a",
       "--accent-a": "#a7c080",
       "--accent-b": "#e67e80",
       "--accent-c": "#dbbc7f",
     },
     term: {
-      background: "#2d353b",
+      background: "#1e2326",
       foreground: "#d3c6aa",
       cursor: "#d3c6aa",
-      cursorAccent: "#2d353b",
+      cursorAccent: "#1e2326",
       selectionBackground: "rgba(167, 192, 128, 0.3)",
-      black: "#343f44",
+      black: "#232a2e",
       red: "#e67e80",
       green: "#a7c080",
       yellow: "#dbbc7f",
@@ -650,6 +650,23 @@ export function getCurrentPalette(): TerminalPalette {
   return THEMES[currentTheme].term;
 }
 
+function toRgba(color: string, alpha: number) {
+  const hex = color.trim().replace(/^#/, "");
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+    const r = parseInt(hex.slice(0, 2), 16);
+    const g = parseInt(hex.slice(2, 4), 16);
+    const b = parseInt(hex.slice(4, 6), 16);
+    return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+  }
+
+  const rgb = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (rgb) {
+    return `rgba(${rgb[1]}, ${rgb[2]}, ${rgb[3]}, ${alpha})`;
+  }
+
+  return `rgba(255, 255, 255, ${alpha})`;
+}
+
 export function applyTheme(id: ThemeId) {
   const theme = THEMES[id];
   currentTheme = id;
@@ -657,6 +674,20 @@ export function applyTheme(id: ThemeId) {
   for (const [key, value] of Object.entries(theme.ui)) {
     root.style.setProperty(key, value);
   }
+  root.style.setProperty("--divider-subtle", toRgba(theme.ui["--text-dim"], 0.14));
+  root.style.setProperty("--divider", toRgba(theme.ui["--text-dim"], 0.24));
+  root.style.setProperty("--divider-strong", toRgba(theme.ui["--text-dim"], 0.34));
+  root.style.setProperty("--border", toRgba(theme.ui["--text-dim"], 0.28));
+  root.style.setProperty("--surface-muted", toRgba(theme.ui["--text-dim"], 0.08));
+  root.style.setProperty("--surface-hover", toRgba(theme.ui["--accent-a"], 0.1));
+  root.style.setProperty("--surface-hover-strong", toRgba(theme.ui["--accent-a"], 0.16));
+  root.style.setProperty("--surface-selected", toRgba(theme.ui["--accent-a"], 0.18));
+  root.style.setProperty("--surface-selected-hover", toRgba(theme.ui["--accent-a"], 0.24));
+  root.style.setProperty("--surface-accent-soft", toRgba(theme.ui["--accent-a"], 0.12));
+  root.style.setProperty("--surface-warn-soft", toRgba(theme.ui["--accent-c"], 0.14));
+  root.style.setProperty("--scrollbar", toRgba(theme.ui["--text-dim"], 0.18));
+  root.style.setProperty("--scrollbar-hover", toRgba(theme.ui["--text-dim"], 0.3));
+  root.style.setProperty("--accent-a-glow", toRgba(theme.ui["--accent-a"], 0.38));
   localStorage.setItem(STORAGE_KEY, id);
   window.dispatchEvent(
     new CustomEvent<TerminalPalette>(THEME_CHANGED_EVENT, {

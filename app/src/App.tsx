@@ -34,6 +34,7 @@ type Selection =
   | null;
 
 const REFRESH_MS = 2000;
+const WINDOW_MIN_SIZE = { width: 960, height: 600 };
 
 const PROJECT_COLORS = [
   "#f687b3",
@@ -62,6 +63,7 @@ function colorForProject(map: Map<string, string>, project: string): string {
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
+type WindowSize = { width: number; height: number };
 
 const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
 
@@ -105,11 +107,13 @@ function App() {
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
   const [containerWidth, setContainerWidth] = useState(0);
+  const [windowSize, setWindowSize] = useState<WindowSize | null>(null);
   const appRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
+  const layoutLoadedRef = useRef(false);
 
   useEffect(() => {
     const el = appRef.current;
@@ -124,6 +128,32 @@ function App() {
 
   useEffect(() => {
     invoke<string>("home_dir").then(setHomeDir).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+
+    (async () => {
+      const win = getCurrentWindow();
+      const updateSize = async () => {
+        const size = await win.innerSize();
+        const factor = await win.scaleFactor();
+        if (cancelled) return;
+        setWindowSize({
+          width: Math.round(size.width / factor),
+          height: Math.round(size.height / factor),
+        });
+      };
+
+      unlisten = await win.onResized(updateSize);
+      await updateSize();
+    })().catch(() => {});
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, []);
 
   const fileTreeWidthRef = useRef(fileTreeWidth);
@@ -190,8 +220,26 @@ function App() {
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
         }
+        const savedWindowSize = lay.windowSize;
+        if (
+          savedWindowSize &&
+          typeof savedWindowSize === "object" &&
+          typeof (savedWindowSize as Record<string, unknown>).width === "number" &&
+          typeof (savedWindowSize as Record<string, unknown>).height === "number"
+        ) {
+          const { width, height } = savedWindowSize as WindowSize;
+          const next = {
+            width: Math.max(WINDOW_MIN_SIZE.width, width),
+            height: Math.max(WINDOW_MIN_SIZE.height, height),
+          };
+          setWindowSize(next);
+          getCurrentWindow().setSize(new LogicalSize(next.width, next.height)).catch(() => {});
+        }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        layoutLoadedRef.current = true;
+      });
   }, []);
 
   // Auto-restore orphaned worktrees on mount
@@ -214,13 +262,14 @@ function App() {
 
   // Persist layout (debounced)
   useEffect(() => {
+    if (!layoutLoadedRef.current) return;
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed },
+        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowSize },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowSize]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 

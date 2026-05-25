@@ -1,6 +1,6 @@
 {
   "name": "tmux-worktree",
-  "version": "0.9.3",
+  "version": "0.9.6",
   "type": "module",
   "description": "AI + tmux + git worktree integrated development environment with a native macOS dashboard app",
   "repository": {
