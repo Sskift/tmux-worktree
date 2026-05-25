@@ -1,0 +1,32 @@
+{
+  "name": "tmux-worktree",
+  "version": "0.9.4",
+  "type": "module",
+  "description": "AI + tmux + git worktree integrated development environment with a native macOS dashboard app",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Sskift/tmux-worktree.git"
+  },
+  "license": "MIT",
+  "files": [
+    "dist",
+    "app/installer/installer.mjs",
+    "app/installer/dmg/"
+  ],
+  "bin": {
+    "tmux-worktree": "dist/cli.js",
+    "tw": "dist/cli.js",
+    "tw-dashboard-install": "app/installer/installer.mjs"
+  },
+  "scripts": {
+    "build": "tsup src/cli.ts --format esm --target node20"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.5.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.0.0"
+  }
+}

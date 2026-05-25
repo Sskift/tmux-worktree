@@ -1,0 +1,1583 @@
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use tauri::{Emitter, Manager, State};
+
+/// macOS .app 包启动时环境变量极少，从用户登录 shell 继承完整环境
+/// （PATH、TMUX_TMPDIR、LANG 等），这样 tmux/git 子进程才能正常工作。
+fn inherit_shell_env() {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let output = std::process::Command::new(&shell)
+        .args(["-l", "-c", "env -0"])
+        .output();
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for entry in stdout.split('\0') {
+        if let Some((key, val)) = entry.split_once('=') {
+            if matches!(key, "PWD" | "OLDPWD" | "_" | "SHLVL") {
+                continue;
+            }
+            unsafe { std::env::set_var(key, val); }
+        }
+    }
+}
+
+fn tmux_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        "tmux".to_string()
+    })
+}
+
+fn git_bin() -> &'static str {
+    static BIN: OnceLock<String> = OnceLock::new();
+    BIN.get_or_init(|| {
+        for p in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+            if std::path::Path::new(p).exists() {
+                return p.to_string();
+            }
+        }
+        "git".to_string()
+    })
+}
+
+fn resolve_cmd(name: &str) -> &str {
+    match name {
+        "tmux" => tmux_bin(),
+        "git" => git_bin(),
+        _ => name,
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct DirEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_symlink: bool,
+    is_hidden: bool,
+    size: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct Session {
+    name: String,
+    attached: bool,
+    window_count: u32,
+    created: u64,
+    activity: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct Project {
+    name: String,
+    path: String,
+}
+
+struct PtyHandle {
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+#[derive(Default)]
+struct PtyState {
+    ptys: Mutex<HashMap<String, PtyHandle>>,
+}
+
+struct TunnelState {
+    process: Mutex<Option<std::process::Child>>,
+    url: Mutex<Option<String>>,
+    token: Mutex<String>,
+}
+
+impl Default for TunnelState {
+    fn default() -> Self {
+        Self {
+            process: Mutex::new(None),
+            url: Mutex::new(None),
+            token: Mutex::new(String::new()),
+        }
+    }
+}
+
+#[derive(Serialize, Clone)]
+struct PtyChunk {
+    id: String,
+    data: String,
+}
+
+#[derive(Serialize, Clone)]
+struct PtyExit {
+    id: String,
+    code: i32,
+}
+
+#[derive(Deserialize)]
+struct OpenArgs {
+    cmd: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    cols: u16,
+    rows: u16,
+    env: Option<HashMap<String, String>>,
+}
+
+#[tauri::command]
+fn list_sessions() -> Result<Vec<Session>, String> {
+    let fmt = "#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}";
+    let output = std::process::Command::new(tmux_bin())
+        .args(["list-sessions", "-F", fmt])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("no server running") || stderr.contains("no current server") {
+            return Ok(vec![]);
+        }
+        return Err(format!("tmux exited {}: {}", output.status, stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let sessions = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let name = parts.next()?.to_string();
+            if name.starts_with("tw-term-") {
+                return None;
+            }
+            let attached = parts.next()? == "1";
+            let window_count = parts.next()?.parse().ok()?;
+            let created = parts.next()?.parse().ok()?;
+            let activity = parts.next()?.parse().ok()?;
+            Some(Session {
+                name,
+                attached,
+                window_count,
+                created,
+                activity,
+            })
+        })
+        .collect();
+
+    Ok(sessions)
+}
+
+#[tauri::command]
+fn list_projects() -> Result<Vec<Project>, String> {
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+
+    if !config_path.exists() {
+        return Ok(vec![]);
+    }
+
+    let content = std::fs::read_to_string(&config_path)
+        .map_err(|e| format!("read config: {e}"))?;
+    let config: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|e| format!("parse config: {e}"))?;
+
+    let projects = config
+        .get("projects")
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(name, path)| {
+                    Some(Project {
+                        name: name.clone(),
+                        path: path.as_str()?.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(projects)
+}
+
+#[derive(Serialize, Clone)]
+struct OrphanedWorktree {
+    project: String,
+    path: String,
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct CreateArgs {
+    project: Option<String>,
+    path: Option<String>,
+    #[serde(rename = "aiCmd")]
+    ai_cmd: String,
+    name: Option<String>,
+}
+
+fn run_check(args: &[&str]) -> Result<String, String> {
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
+        .args(&args[1..])
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", args[0]))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} failed ({}): {}",
+            args[0],
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_quiet(args: &[&str]) -> Option<String> {
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
+        .args(&args[1..])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+// 优化 tmux 鼠标选择体验（server-global，幂等）：
+//  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
+//  2. MouseDown1Pane → clear selection but stay in copy-mode (don't cancel/jump to bottom)
+fn setup_clipboard_bindings() {
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    for table in ["copy-mode-vi", "copy-mode"] {
+        let _ = run_quiet(&[
+            "tmux",
+            "bind-key",
+            "-T",
+            table,
+            "MouseDragEnd1Pane",
+            "send-keys",
+            "-X",
+            "copy-pipe-no-clear",
+            "pbcopy",
+        ]);
+        let _ = run_quiet(&[
+            "tmux",
+            "bind-key",
+            "-T",
+            table,
+            "MouseDown1Pane",
+            "select-pane",
+            "\\;",
+            "send-keys",
+            "-X",
+            "clear-selection",
+        ]);
+    }
+}
+
+#[tauri::command]
+fn cancel_copy_mode(name: String) -> Result<(), String> {
+    let _ = run_quiet(&["tmux", "send-keys", "-t", &name, "-X", "cancel"]);
+    Ok(())
+}
+
+#[tauri::command]
+fn copy_tmux_selection(name: String) -> Result<bool, String> {
+    let output = std::process::Command::new("tmux")
+        .args(["save-buffer", "-"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return Ok(false);
+    }
+    let mut pbcopy = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    if let Some(mut stdin) = pbcopy.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&output.stdout);
+    }
+    let _ = pbcopy.wait();
+    Ok(true)
+}
+
+fn detect_default_branch(repo: &str) -> String {
+    if let Some(s) = run_quiet(&[
+        "git",
+        "-C",
+        repo,
+        "symbolic-ref",
+        "refs/remotes/origin/HEAD",
+    ]) {
+        if let Some(b) = s.strip_prefix("refs/remotes/origin/") {
+            return b.to_string();
+        }
+    }
+    if run_quiet(&[
+        "git",
+        "-C",
+        repo,
+        "ls-remote",
+        "--heads",
+        "origin",
+        "master",
+    ])
+    .map(|s| !s.is_empty())
+    .unwrap_or(false)
+    {
+        return "master".to_string();
+    }
+    "main".to_string()
+}
+
+fn unique_session_name(base: &str) -> String {
+    let mut name = base.to_string();
+    let mut i = 1;
+    while run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
+        name = format!("{}-{}", base, i);
+        i += 1;
+    }
+    name
+}
+
+fn random_id() -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    id.chars().take(5).collect()
+}
+
+#[tauri::command]
+fn create_worktree(args: CreateArgs) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let config: serde_json::Value = if config_path.exists() {
+        let config_text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+        serde_json::from_str(&config_text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        serde_json::json!({})
+    };
+
+    let (project_label, project_dir) = if let Some(name) = args.project.as_deref() {
+        let dir = config
+            .get("projects")
+            .and_then(|v| v.get(name))
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("project '{name}' not in ~/.tmux-worktree.json"))?
+            .to_string();
+        (name.to_string(), dir)
+    } else if let Some(path) = args.path.as_deref() {
+        let p = path.trim();
+        if p.is_empty() {
+            return Err("project or path required".into());
+        }
+        let label = std::path::Path::new(p)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        (label, p.to_string())
+    } else {
+        return Err("project or path required".into());
+    };
+
+    if !std::path::Path::new(&project_dir).exists() {
+        return Err(format!("project dir does not exist: {project_dir}"));
+    }
+
+    let worktree_base = config
+        .get("worktreeBase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/private/tmp/tmux-worktree/projects")
+        .to_string();
+
+    let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
+    let base_session = if trimmed_name.is_empty() {
+        project_label.clone()
+    } else {
+        format!("{}-{}", project_label, trimmed_name)
+    };
+    let session = unique_session_name(&base_session);
+
+    let work_dir = if run_quiet(&[
+        "git",
+        "-C",
+        &project_dir,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ])
+    .as_deref()
+        == Some("true")
+    {
+        let default_branch = detect_default_branch(&project_dir);
+        let _ = run_quiet(&[
+            "git",
+            "-C",
+            &project_dir,
+            "fetch",
+            "origin",
+            &default_branch,
+            "--quiet",
+        ]);
+
+        let branch_id = random_id();
+        let branch_name = format!("{}-{}", session, branch_id);
+        let project_worktree_root = format!("{}/{}", worktree_base, project_label);
+        std::fs::create_dir_all(&project_worktree_root)
+            .map_err(|e| format!("mkdir {project_worktree_root}: {e}"))?;
+        let worktree_dir = format!("{}/{}", project_worktree_root, branch_name);
+
+        run_check(&[
+            "git",
+            "-C",
+            &project_dir,
+            "worktree",
+            "add",
+            "-b",
+            &branch_name,
+            &worktree_dir,
+            &format!("origin/{}", default_branch),
+            "--quiet",
+        ])?;
+
+        worktree_dir
+    } else {
+        project_dir
+    };
+
+    run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
+    setup_clipboard_bindings();
+    run_check(&[
+        "tmux",
+        "send-keys",
+        "-t",
+        &session,
+        &args.ai_cmd,
+        "C-m",
+    ])?;
+
+    Ok(session)
+}
+
+#[tauri::command]
+fn kill_session(name: String) -> Result<(), String> {
+    let exact = format!("={}", name);
+    run_check(&["tmux", "kill-session", "-t", &exact])?;
+
+    // Remove the worktree directory in a background thread to avoid blocking UI
+    let session_name = name.clone();
+    std::thread::spawn(move || {
+        let home = dirs::home_dir().unwrap_or_default();
+        let config_path = home.join(".tmux-worktree.json");
+        let worktree_base = if config_path.exists() {
+            std::fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+                .and_then(|v| v.get("worktreeBase").and_then(|b| b.as_str()).map(String::from))
+                .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
+        } else {
+            return;
+        };
+
+        let base_path = std::path::Path::new(&worktree_base);
+        if !base_path.exists() {
+            return;
+        }
+
+        let project_dirs = match std::fs::read_dir(base_path) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+
+        for project_entry in project_dirs.flatten() {
+            if !project_entry.path().is_dir() {
+                continue;
+            }
+            let wt_dirs = match std::fs::read_dir(project_entry.path()) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for wt_entry in wt_dirs.flatten() {
+                if !wt_entry.path().is_dir() {
+                    continue;
+                }
+                let dirname = wt_entry.file_name().to_string_lossy().to_string();
+                if derive_session_name(&dirname) == session_name {
+                    let wt_path = wt_entry.path().to_string_lossy().to_string();
+                    let _ = std::process::Command::new(git_bin())
+                        .args(["worktree", "remove", "--force", &wt_path])
+                        .output();
+                    if wt_entry.path().exists() {
+                        let _ = std::fs::remove_dir_all(wt_entry.path());
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// Strip trailing `-{5 hex chars}` random suffix to recover session name.
+fn derive_session_name(dirname: &str) -> String {
+    let bytes = dirname.as_bytes();
+    if bytes.len() > 6 && bytes[bytes.len() - 6] == b'-' {
+        let suffix = &dirname[dirname.len() - 5..];
+        if suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            return dirname[..dirname.len() - 6].to_string();
+        }
+    }
+    dirname.to_string()
+}
+
+#[tauri::command]
+fn list_orphaned_worktrees() -> Result<Vec<OrphanedWorktree>, String> {
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let config: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read config: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        return Ok(vec![]);
+    };
+
+    let worktree_base = config
+        .get("worktreeBase")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/private/tmp/tmux-worktree/projects")
+        .to_string();
+
+    let base_path = std::path::Path::new(&worktree_base);
+    if !base_path.exists() {
+        return Ok(vec![]);
+    }
+
+    // Collect live tmux session names
+    let live_sessions: std::collections::HashSet<String> = list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+    let mut orphans = Vec::new();
+
+    let project_dirs = std::fs::read_dir(base_path)
+        .map_err(|e| format!("read worktreeBase: {e}"))?;
+
+    for project_entry in project_dirs.flatten() {
+        if !project_entry.path().is_dir() {
+            continue;
+        }
+        let project = project_entry
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+
+        let worktree_dirs = match std::fs::read_dir(project_entry.path()) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+
+        for wt_entry in worktree_dirs.flatten() {
+            if !wt_entry.path().is_dir() {
+                continue;
+            }
+            let dirname = wt_entry.file_name().to_string_lossy().to_string();
+            let session_name = derive_session_name(&dirname);
+
+            if !live_sessions.contains(&session_name) {
+                orphans.push(OrphanedWorktree {
+                    project: project.clone(),
+                    path: wt_entry.path().to_string_lossy().to_string(),
+                    name: session_name,
+                });
+            }
+        }
+    }
+
+    Ok(orphans)
+}
+
+#[derive(Deserialize)]
+struct RestoreArgs {
+    path: String,
+    name: String,
+    #[serde(rename = "aiCmd", default)]
+    ai_cmd: String,
+}
+
+#[tauri::command]
+fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
+    let dir = std::path::Path::new(&args.path);
+    if !dir.exists() {
+        return Err(format!("directory does not exist: {}", args.path));
+    }
+
+    let session = unique_session_name(&args.name);
+    run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &args.path])?;
+    setup_clipboard_bindings();
+
+    if !args.ai_cmd.is_empty() {
+        run_check(&["tmux", "send-keys", "-t", &session, &args.ai_cmd, "C-m"])?;
+    }
+
+    Ok(session)
+}
+
+#[tauri::command]
+fn session_cwd(name: String) -> Result<String, String> {
+    let output = std::process::Command::new(tmux_bin())
+        .args([
+            "display-message",
+            "-p",
+            "-t",
+            &name,
+            "#{pane_current_path}",
+        ])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux display-message failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[derive(Deserialize)]
+struct AddProjectArgs {
+    name: String,
+    path: String,
+}
+
+#[tauri::command]
+fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
+    let name = args.name.trim();
+    let path = args.path.trim();
+    if name.is_empty() {
+        return Err("name required".into());
+    }
+    if path.is_empty() {
+        return Err("path required".into());
+    }
+    if !std::path::Path::new(path).is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+
+    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+
+    let mut config: serde_json::Value = if config_path.exists() {
+        let text = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("read config: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        serde_json::json!({ "projects": {} })
+    };
+
+    let projects = config
+        .as_object_mut()
+        .ok_or("config root is not an object")?
+        .entry("projects")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or("projects is not an object")?;
+    projects.insert(name.to_string(), serde_json::Value::String(path.to_string()));
+
+    let pretty = serde_json::to_string_pretty(&config)
+        .map_err(|e| format!("serialize config: {e}"))?;
+    std::fs::write(&config_path, pretty).map_err(|e| format!("write config: {e}"))?;
+
+    list_projects()
+}
+
+#[derive(Serialize, Clone)]
+struct GitStatus {
+    branch: String,
+    upstream: Option<String>,
+    ahead: u32,
+    behind: u32,
+    staged: u32,
+    unstaged: u32,
+    untracked: u32,
+    conflicts: u32,
+    files: Vec<GitFile>,
+}
+
+#[derive(Serialize, Clone)]
+struct GitFile {
+    code: String,
+    path: String,
+}
+
+#[derive(Serialize, Clone)]
+struct GitCommit {
+    hash: String,
+    short: String,
+    parents: Vec<String>,
+    subject: String,
+    author: String,
+    rel_time: String,
+    refs: Vec<String>,
+}
+
+#[tauri::command]
+fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
+    let inside = run_quiet(&[
+        "git",
+        "-C",
+        &cwd,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ]);
+    if inside.as_deref() != Some("true") {
+        return Ok(vec![]);
+    }
+
+    let n = limit.unwrap_or(80).min(500);
+    let n_str = n.to_string();
+    let fmt = "%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ar\x1f%D";
+    let pretty = format!("--pretty=format:{}", fmt);
+    let output = std::process::Command::new(git_bin())
+        .args([
+            "-C",
+            &cwd,
+            "log",
+            "--all",
+            "--topo-order",
+            "--decorate=short",
+            "-n",
+            &n_str,
+            &pretty,
+        ])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not have any commits yet") {
+            return Ok(vec![]);
+        }
+        return Err(format!("git log failed: {}", stderr.trim()));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let commits = stdout
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|line| {
+            let mut parts = line.splitn(7, '\x1f');
+            let hash = parts.next()?.to_string();
+            let short = parts.next()?.to_string();
+            let parents_raw = parts.next()?;
+            let subject = parts.next()?.to_string();
+            let author = parts.next()?.to_string();
+            let rel_time = parts.next()?.to_string();
+            let refs_raw = parts.next().unwrap_or("");
+            let parents = if parents_raw.is_empty() {
+                Vec::new()
+            } else {
+                parents_raw
+                    .split(' ')
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            let refs = if refs_raw.is_empty() {
+                Vec::new()
+            } else {
+                refs_raw
+                    .split(", ")
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            Some(GitCommit {
+                hash,
+                short,
+                parents,
+                subject,
+                author,
+                rel_time,
+                refs,
+            })
+        })
+        .collect();
+
+    Ok(commits)
+}
+
+#[tauri::command]
+fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
+    let inside = run_quiet(&[
+        "git",
+        "-C",
+        &cwd,
+        "rev-parse",
+        "--is-inside-work-tree",
+    ]);
+    if inside.as_deref() != Some("true") {
+        return Ok(None);
+    }
+
+    let output = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "status", "--porcelain=v2", "--branch"])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut status = GitStatus {
+        branch: String::new(),
+        upstream: None,
+        ahead: 0,
+        behind: 0,
+        staged: 0,
+        unstaged: 0,
+        untracked: 0,
+        conflicts: 0,
+        files: Vec::new(),
+    };
+
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("# branch.head ") {
+            status.branch = rest.to_string();
+        } else if let Some(rest) = line.strip_prefix("# branch.upstream ") {
+            status.upstream = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("# branch.ab ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(a) = parts.next() {
+                status.ahead = a.trim_start_matches('+').parse().unwrap_or(0);
+            }
+            if let Some(b) = parts.next() {
+                status.behind = b.trim_start_matches('-').parse().unwrap_or(0);
+            }
+        } else if let Some(rest) = line.strip_prefix("1 ") {
+            // 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+            let mut parts = rest.splitn(8, ' ');
+            let xy = parts.next().unwrap_or("..");
+            let path = parts.nth(6).unwrap_or("").to_string();
+            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
+            if x != '.' { status.staged += 1; }
+            if y != '.' { status.unstaged += 1; }
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("2 ") {
+            // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X-score> <path><tab><origPath>
+            let mut parts = rest.splitn(9, ' ');
+            let xy = parts.next().unwrap_or("..");
+            let tail = parts.nth(7).unwrap_or("");
+            let path = tail.split('\t').next().unwrap_or("").to_string();
+            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
+            if x != '.' { status.staged += 1; }
+            if y != '.' { status.unstaged += 1; }
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("u ") {
+            // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+            let mut parts = rest.splitn(10, ' ');
+            let xy = parts.next().unwrap_or("UU");
+            let path = parts.nth(8).unwrap_or("").to_string();
+            status.conflicts += 1;
+            status.files.push(GitFile { code: xy.to_string(), path });
+        } else if let Some(rest) = line.strip_prefix("? ") {
+            status.untracked += 1;
+            status.files.push(GitFile { code: "??".to_string(), path: rest.to_string() });
+        }
+    }
+
+    Ok(Some(status))
+}
+
+#[tauri::command]
+fn git_diff(cwd: String, path: String) -> Result<String, String> {
+    // Try unstaged diff first
+    let output = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--", &path])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+
+    if !diff.trim().is_empty() {
+        return Ok(diff);
+    }
+
+    // Try staged diff
+    let output2 = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--cached", "--", &path])
+        .output()
+        .map_err(|e| format!("spawn git: {e}"))?;
+
+    let staged = String::from_utf8_lossy(&output2.stdout).to_string();
+
+    if !staged.trim().is_empty() {
+        return Ok(staged);
+    }
+
+    // For untracked files, show entire file as addition
+    let full_path = std::path::Path::new(&cwd).join(&path);
+    let full_path_str = full_path.to_string_lossy().to_string();
+    let output3 = std::process::Command::new(git_bin())
+        .args(["-C", &cwd, "diff", "--no-index", "/dev/null", &full_path_str])
+        .output();
+
+    if let Ok(o) = output3 {
+        let untracked = String::from_utf8_lossy(&o.stdout).to_string();
+        if !untracked.trim().is_empty() {
+            return Ok(untracked);
+        }
+    }
+
+    Ok(String::new())
+}
+
+#[tauri::command]
+fn pty_open(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<PtyState>>,
+    args: OpenArgs,
+) -> Result<String, String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: args.rows,
+            cols: args.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+
+    let resolved_cmd = resolve_cmd(&args.cmd);
+    let mut cmd = CommandBuilder::new(resolved_cmd);
+    for a in &args.args {
+        cmd.arg(a);
+    }
+    if let Some(cwd) = args.cwd.as_ref() {
+        cmd.cwd(cwd);
+    } else if let Some(home) = dirs::home_dir() {
+        cmd.cwd(home);
+    }
+
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    if let Some(env) = args.env {
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn: {e}"))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take writer: {e}"))?;
+
+    let id = uuid::Uuid::new_v4().to_string();
+
+    let handle = PtyHandle {
+        master: pair.master,
+        writer,
+        child,
+    };
+    state
+        .ptys
+        .lock()
+        .unwrap()
+        .insert(id.clone(), handle);
+
+    let id_for_thread = id.clone();
+    let app_for_thread = app.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut pending: Vec<u8> = Vec::new();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    pending.extend_from_slice(&buf[..n]);
+                    let valid_up_to = match std::str::from_utf8(&pending) {
+                        Ok(_) => pending.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if valid_up_to > 0 {
+                        let valid: Vec<u8> = pending.drain(..valid_up_to).collect();
+                        let chunk = String::from_utf8(valid).expect("validated above");
+                        let _ = app_for_thread.emit(
+                            &format!("pty:{}", id_for_thread),
+                            PtyChunk {
+                                id: id_for_thread.clone(),
+                                data: chunk,
+                            },
+                        );
+                    }
+                    // Max valid UTF-8 sequence is 4 bytes; anything longer in pending
+                    // is genuine garbage, not a chunk boundary — flush lossy and reset.
+                    if pending.len() > 4 {
+                        let chunk = String::from_utf8_lossy(&pending).to_string();
+                        let _ = app_for_thread.emit(
+                            &format!("pty:{}", id_for_thread),
+                            PtyChunk {
+                                id: id_for_thread.clone(),
+                                data: chunk,
+                            },
+                        );
+                        pending.clear();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let state = app_for_thread.state::<Arc<PtyState>>();
+        let mut map = state.ptys.lock().unwrap();
+        let code = map
+            .get_mut(&id_for_thread)
+            .and_then(|h| h.child.try_wait().ok().flatten())
+            .map(|s| s.exit_code() as i32)
+            .unwrap_or(0);
+        map.remove(&id_for_thread);
+        let _ = app_for_thread.emit(
+            &format!("pty-exit:{}", id_for_thread),
+            PtyExit {
+                id: id_for_thread.clone(),
+                code,
+            },
+        );
+    });
+
+    Ok(id)
+}
+
+#[tauri::command]
+fn pty_write(state: State<'_, Arc<PtyState>>, id: String, data: String) -> Result<(), String> {
+    let mut map = state.ptys.lock().unwrap();
+    let handle = map.get_mut(&id).ok_or("pty not found")?;
+    handle
+        .writer
+        .write_all(data.as_bytes())
+        .map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_resize(
+    state: State<'_, Arc<PtyState>>,
+    id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let map = state.ptys.lock().unwrap();
+    let handle = map.get(&id).ok_or("pty not found")?;
+    handle
+        .master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("resize: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
+    let mut map = state.ptys.lock().unwrap();
+    if let Some(mut handle) = map.remove(&id) {
+        let _ = handle.child.kill();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn create_plain_terminal(cwd: String) -> Result<String, String> {
+    let name = format!("tw-term-{}", random_id());
+    run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    setup_clipboard_bindings();
+    Ok(name)
+}
+
+#[tauri::command]
+fn capture_pane_history(name: String) -> Result<String, String> {
+    let exact = format!("={}", name);
+    let output = std::process::Command::new(tmux_bin())
+        .args(["capture-pane", "-p", "-e", "-S", "-5000", "-t", &exact])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let trimmed = text.trim_end_matches('\n');
+    Ok(trimmed.to_string())
+}
+
+#[tauri::command]
+fn ensure_terminal_session(name: String, cwd: String) -> Result<(), String> {
+    if run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
+        return Ok(());
+    }
+    run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
+    setup_clipboard_bindings();
+    Ok(())
+}
+
+#[tauri::command]
+fn kill_plain_terminal(name: String) -> Result<(), String> {
+    let _ = run_quiet(&["tmux", "kill-session", "-t", &format!("={}", name)]);
+    Ok(())
+}
+
+fn terminals_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".tw-dashboard-terminals.json")
+}
+
+fn layout_path() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join(".tw-dashboard-layout.json")
+}
+
+#[tauri::command]
+fn load_terminals() -> Result<Vec<serde_json::Value>, String> {
+    let p = terminals_path();
+    if !p.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+    let arr: Vec<serde_json::Value> =
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(arr)
+}
+
+#[tauri::command]
+fn save_terminals(terminals: Vec<serde_json::Value>) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(&terminals).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(terminals_path(), text).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn load_layout() -> Result<serde_json::Value, String> {
+    let p = layout_path();
+    if !p.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let text = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
+    let val: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    Ok(val)
+}
+
+#[tauri::command]
+fn home_dir() -> Result<String, String> {
+    dirs::home_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .ok_or_else(|| "home dir not found".into())
+}
+
+#[tauri::command]
+fn save_layout(layout: serde_json::Value) -> Result<(), String> {
+    let text =
+        serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(layout_path(), text).map_err(|e| format!("write: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    let rd = std::fs::read_dir(dir).map_err(|e| format!("read_dir: {e}"))?;
+    let mut entries = Vec::new();
+    for entry in rd {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        let entry_path = entry.path().to_string_lossy().to_string();
+        let is_symlink = std::fs::symlink_metadata(entry.path())
+            .map(|m| m.is_symlink())
+            .unwrap_or(false);
+        let (is_dir, size) = match entry.metadata() {
+            Ok(m) => (m.is_dir(), m.len()),
+            Err(_) => continue,
+        };
+        let is_hidden = name.starts_with('.');
+        entries.push(DirEntry { name, path: entry_path, is_dir, is_symlink, is_hidden, size });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir.cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+#[tauri::command]
+fn read_file(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let meta = std::fs::metadata(p).map_err(|e| format!("metadata: {e}"))?;
+    if meta.len() > 5 * 1024 * 1024 {
+        return Err("file too large (>5 MB)".into());
+    }
+    std::fs::read_to_string(p).map_err(|e| format!("read: {e}"))
+}
+
+#[tauri::command]
+fn write_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, &content).map_err(|e| format!("write: {e}"))
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(&url)
+        .spawn()
+        .map_err(|e| format!("open url: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
+#[derive(Serialize, Clone)]
+struct SearchResult {
+    path: String,
+    file_name: String,
+    line_number: Option<usize>,
+    line_content: Option<String>,
+}
+
+const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".DS_Store", "dist", "__pycache__", ".next", ".turbo"];
+
+fn walk_search(
+    dir: &std::path::Path,
+    query_lower: &str,
+    mode: &str,
+    root: &std::path::Path,
+    results: &mut Vec<SearchResult>,
+    limit: usize,
+) {
+    if results.len() >= limit {
+        return;
+    }
+    let rd = match std::fs::read_dir(dir) {
+        Ok(r) => r,
+        Err(_) => return,
+    };
+    let mut dirs = Vec::new();
+    let mut files = Vec::new();
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let path = entry.path();
+        let is_dir = path.is_dir();
+        if is_dir {
+            dirs.push(path);
+        } else {
+            files.push((path, name));
+        }
+    }
+    for (path, name) in files {
+        if results.len() >= limit {
+            return;
+        }
+        let rel_path = path.to_string_lossy().to_string();
+        let file_name = name;
+        if mode == "filename" {
+            if file_name.to_lowercase().contains(query_lower) {
+                results.push(SearchResult {
+                    path: rel_path,
+                    file_name,
+                    line_number: None,
+                    line_content: None,
+                });
+            }
+        } else {
+            // content mode
+            let meta = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.len() > 1024 * 1024 {
+                continue;
+            }
+            let text = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            for (i, line) in text.lines().enumerate() {
+                if results.len() >= limit {
+                    return;
+                }
+                if line.to_lowercase().contains(query_lower) {
+                    let trimmed = if line.len() > 200 { &line[..200] } else { line };
+                    results.push(SearchResult {
+                        path: rel_path.clone(),
+                        file_name: file_name.clone(),
+                        line_number: Some(i + 1),
+                        line_content: Some(trimmed.to_string()),
+                    });
+                }
+            }
+        }
+    }
+    for d in dirs {
+        if results.len() >= limit {
+            return;
+        }
+        walk_search(&d, query_lower, mode, root, results, limit);
+    }
+}
+
+#[tauri::command]
+fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchResult>, String> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let root_path = std::path::Path::new(&root);
+    if !root_path.is_dir() {
+        return Err(format!("not a directory: {root}"));
+    }
+    let query_lower = query.to_lowercase();
+    let mut results = Vec::new();
+    walk_search(root_path, &query_lower, &mode, root_path, &mut results, 100);
+    Ok(results)
+}
+
+// ── Remote tunnel (cloudflared) ──
+
+fn read_serve_token() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let path = format!("{home}/.tw-serve-token");
+    std::fs::read_to_string(&path).unwrap_or_default().trim().to_string()
+}
+
+#[derive(Serialize, Clone)]
+struct TunnelStatus {
+    active: bool,
+    url: Option<String>,
+    token: String,
+}
+
+#[tauri::command]
+fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+    let mut proc = state.process.lock().unwrap();
+    if proc.is_some() {
+        return Ok(());
+    }
+
+    // Ensure serve process is running on port 8311
+    if std::net::TcpStream::connect("127.0.0.1:8311").is_err() {
+        let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "node".to_string());
+        let cli_js = format!("{}/../../dist/cli.js", env!("CARGO_MANIFEST_DIR"));
+        let serve_arg = "serve".to_string();
+        std::process::Command::new(&node)
+            .args([&cli_js, &serve_arg])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to start serve: {e}"))?;
+        for _ in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            if std::net::TcpStream::connect("127.0.0.1:8311").is_ok() {
+                break;
+            }
+        }
+    }
+
+    // Read token from serve process
+    let tok = read_serve_token();
+    {
+        let mut t = state.token.lock().unwrap();
+        *t = tok;
+    }
+
+    let cf_bin = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]
+        .iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "cloudflared".to_string());
+
+    let mut child = std::process::Command::new(&cf_bin)
+        .args(["tunnel", "--url", "http://localhost:8311"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start cloudflared: {e}. Install: brew install cloudflared"))?;
+
+    // Take stderr before storing child
+    let stderr = child.stderr.take();
+    *proc = Some(child);
+    drop(proc);
+
+    // Spawn a thread to read stderr and capture the URL
+    if let Some(stderr) = stderr {
+        let tunnel_state = Arc::clone(state.inner());
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(stderr);
+            let mut found = false;
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if !found {
+                    if let Some(start) = line.find("https://") {
+                        let rest = &line[start..];
+                        if rest.contains(".trycloudflare.com") {
+                            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+                            let url = &rest[..end];
+                            let mut u = tunnel_state.url.lock().unwrap();
+                            *u = Some(url.to_string());
+                            found = true;
+                        }
+                    }
+                }
+                // Keep draining stderr so cloudflared doesn't get SIGPIPE
+            }
+        });
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+    let mut proc = state.process.lock().unwrap();
+    if let Some(ref mut child) = *proc {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *proc = None;
+    let mut url = state.url.lock().unwrap();
+    *url = None;
+    Ok(())
+}
+
+#[tauri::command]
+fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
+    let mut proc = state.process.lock().unwrap();
+    // Check if process has exited
+    if let Some(ref mut child) = *proc {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                // Process exited, clean up
+                *proc = None;
+                let mut url = state.url.lock().unwrap();
+                *url = None;
+                let token = state.token.lock().unwrap();
+                return TunnelStatus {
+                    active: false,
+                    url: None,
+                    token: token.clone(),
+                };
+            }
+            _ => {}
+        }
+    }
+    let url = state.url.lock().unwrap();
+    let token = state.token.lock().unwrap();
+    TunnelStatus {
+        active: proc.is_some(),
+        url: url.clone(),
+        token: token.clone(),
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    inherit_shell_env();
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            app.manage(Arc::new(PtyState::default()));
+            app.manage(Arc::new(TunnelState::default()));
+            setup_clipboard_bindings();
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            list_sessions,
+            list_projects,
+            add_project,
+            create_worktree,
+            kill_session,
+            list_orphaned_worktrees,
+            restore_worktree,
+            session_cwd,
+            cancel_copy_mode,
+            copy_tmux_selection,
+            capture_pane_history,
+            git_status,
+            git_log,
+            git_diff,
+            create_plain_terminal,
+            ensure_terminal_session,
+            kill_plain_terminal,
+            load_terminals,
+            save_terminals,
+            load_layout,
+            save_layout,
+            home_dir,
+            pty_open,
+            pty_write,
+            pty_resize,
+            pty_kill,
+            read_dir,
+            read_file,
+            write_file,
+            search_files,
+            open_url,
+            file_exists,
+            remote_start,
+            remote_stop,
+            remote_status,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
