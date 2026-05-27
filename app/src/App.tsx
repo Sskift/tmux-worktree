@@ -154,7 +154,7 @@ function App() {
     if (!windowRestoreReady) return;
     const win = getCurrentWindow();
     let disposed = false;
-    let timer: ReturnType<typeof window.setTimeout> | null = null;
+    let timer: number | null = null;
     let unlistenResized: (() => void) | undefined;
     let unlistenMoved: (() => void) | undefined;
 
