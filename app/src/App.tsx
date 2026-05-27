@@ -81,6 +81,26 @@ function isWindowLayout(value: unknown): value is WindowLayout {
   );
 }
 
+function isSelection(value: unknown): value is Selection {
+  if (value === null) return true;
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.kind === "session" && typeof candidate.name === "string") ||
+    (candidate.kind === "terminal" && typeof candidate.id === "string")
+  );
+}
+
+function isDiffFile(value: unknown): value is { path: string; cwd: string } {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return typeof candidate.path === "string" && typeof candidate.cwd === "string";
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
 
@@ -134,6 +154,7 @@ function App() {
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
   const layoutLoadedRef = useRef(false);
+  const autoResizeColumnsReadyRef = useRef(false);
 
   useEffect(() => {
     const el = appRef.current;
@@ -227,6 +248,11 @@ function App() {
   useEffect(() => {
     const prev = prevColumnsRef.current;
     const curr = { fileBrowser: fileBrowserOpen, editor: !!(editingFile || diffFile) };
+    if (!autoResizeColumnsReadyRef.current) {
+      prevColumnsRef.current = curr;
+      if (layoutLoadedRef.current) autoResizeColumnsReadyRef.current = true;
+      return;
+    }
     let delta = 0;
     if (curr.fileBrowser && !prev.fileBrowser) delta += fileTreeWidthRef.current + 1;
     if (!curr.fileBrowser && prev.fileBrowser) delta -= fileTreeWidthRef.current + 1;
@@ -269,9 +295,23 @@ function App() {
       .catch(() => {});
     invoke<Record<string, unknown>>("load_layout")
       .then((lay) => {
+        const restoredFileBrowserOpen =
+          typeof lay.fileBrowserOpen === "boolean" ? (lay.fileBrowserOpen as boolean) : false;
+        const restoredEditorOpen = isDiffFile(lay.diffFile) || typeof lay.editingFile === "string";
+        prevColumnsRef.current = {
+          fileBrowser: restoredFileBrowserOpen,
+          editor: restoredEditorOpen,
+        };
+        autoResizeColumnsReadyRef.current = true;
         if (typeof lay.left === "number") setCols((c) => ({ ...c, left: lay.left as number }));
         if (typeof lay.right === "number") setCols((c) => ({ ...c, right: lay.right as number }));
         if (typeof lay.gitHeight === "number") setGitHeight(lay.gitHeight as number);
+        if (typeof lay.fileTreeWidth === "number") {
+          setFileTreeWidth(clamp(lay.fileTreeWidth as number, 180, 600));
+        }
+        if (typeof lay.editorWidth === "number") {
+          setEditorWidth(clamp(lay.editorWidth as number, 250, 900));
+        }
         if (typeof lay.sectionSplit === "number") {
           const v = lay.sectionSplit as number;
           setSectionSplit(v < 1 ? LAYOUT_DEFAULTS.sectionSplit : v);
@@ -282,10 +322,23 @@ function App() {
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
         }
+        setFileBrowserOpen(restoredFileBrowserOpen);
+        if (isDiffFile(lay.diffFile)) {
+          setDiffFile(lay.diffFile);
+          setEditingFile(null);
+        } else if (typeof lay.editingFile === "string") {
+          setEditingFile(lay.editingFile);
+          setDiffFile(null);
+        }
+        if (isSelection(lay.selection)) {
+          setSelection(lay.selection);
+        }
         if (isWindowLayout(lay.window)) setWindowLayout(lay.window);
         setWindowRestoreReady(true);
       })
       .catch(() => {
+        prevColumnsRef.current = { fileBrowser: false, editor: false };
+        autoResizeColumnsReadyRef.current = true;
         setWindowRestoreReady(true);
       })
       .finally(() => {
@@ -294,8 +347,6 @@ function App() {
   }, []);
 
   // Persist terminals
-  const terminalsRef = useRef(terminals);
-  terminalsRef.current = terminals;
   useEffect(() => {
     invoke("save_terminals", { terminals }).catch(() => {});
   }, [terminals]);
@@ -312,12 +363,31 @@ function App() {
           sectionSplit,
           sessionOrder,
           scratchCollapsed,
+          fileBrowserOpen,
+          fileTreeWidth,
+          editorWidth,
+          selection,
+          editingFile,
+          diffFile,
           ...(windowLayout ? { window: windowLayout } : {}),
         },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowLayout]);
+  }, [
+    cols,
+    gitHeight,
+    sectionSplit,
+    sessionOrder,
+    scratchCollapsed,
+    fileBrowserOpen,
+    fileTreeWidth,
+    editorWidth,
+    selection,
+    editingFile,
+    diffFile,
+    windowLayout,
+  ]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
@@ -983,10 +1053,11 @@ function App() {
             </div>
             <GitStatusPanel
               cwd={selectedCwd}
-              onFileClick={(filePath) => {
-                if (selectedCwd) {
+              sessionName={selection?.kind === "session" ? selection.name : undefined}
+              onFileClick={(filePath, cwd) => {
+                if (cwd) {
                   setEditingFile(null);
-                  setDiffFile({ path: filePath, cwd: selectedCwd });
+                  setDiffFile({ path: filePath, cwd });
                 }
               }}
             />
