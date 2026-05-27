@@ -788,17 +788,37 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
 
 #[tauri::command]
 fn session_cwd(name: String) -> Result<String, String> {
+    let exact = format!("={}", name);
+    let fmt = "#{pane_active}\x1f#{pane_current_path}";
     let output = std::process::Command::new(tmux_bin())
-        .args(["display-message", "-p", "-t", &name, "#{pane_current_path}"])
+        .args(["list-panes", "-t", &exact, "-F", fmt])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
     if !output.status.success() {
         return Err(format!(
-            "tmux display-message failed: {}",
+            "tmux list-panes failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut first_path: Option<String> = None;
+    for line in stdout.lines() {
+        let mut parts = line.splitn(2, '\x1f');
+        let active = parts.next().unwrap_or_default() == "1";
+        let path = parts.next().unwrap_or_default().trim();
+        if path.is_empty() {
+            continue;
+        }
+        if first_path.is_none() {
+            first_path = Some(path.to_string());
+        }
+        if active {
+            return Ok(path.to_string());
+        }
+    }
+
+    first_path.ok_or_else(|| format!("tmux session has no panes: {name}"))
 }
 
 #[derive(Deserialize)]
@@ -1790,13 +1810,11 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
-        .run(|_, event| {
-            match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    cleanup_pending_worktrees();
-                }
-                _ => {}
+        .run(|_, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                cleanup_pending_worktrees();
             }
+            _ => {}
         });
 }
 

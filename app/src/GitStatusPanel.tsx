@@ -26,7 +26,8 @@ export type GitCommit = {
 
 type Props = {
   cwd: string | null;
-  onFileClick?: (filePath: string) => void;
+  sessionName?: string;
+  onFileClick?: (filePath: string, cwd: string) => void;
 };
 
 type Tab = "files" | "log";
@@ -65,15 +66,28 @@ function classifyRef(raw: string): { kind: RefKind; label: string } {
   return { kind: "branch", label: r };
 }
 
-export function GitStatusPanel({ cwd, onFileClick }: Props) {
+export function GitStatusPanel({ cwd, sessionName, onFileClick }: Props) {
   const [tab, setTab] = useState<Tab>("files");
   const [status, setStatus] = useState<GitStatus | null>(null);
+  const [statusCwd, setStatusCwd] = useState<string | null>(null);
   const [log, setLog] = useState<GitCommit[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const resolveCwd = useCallback(async () => {
+    if (!sessionName) return cwd;
+    try {
+      const liveCwd = await invoke<string>("session_cwd", { name: sessionName });
+      return liveCwd || cwd;
+    } catch {
+      return cwd;
+    }
+  }, [cwd, sessionName]);
+
   const refresh = useCallback(async () => {
-    if (!cwd) {
+    const gitCwd = await resolveCwd();
+    setStatusCwd(gitCwd);
+    if (!gitCwd) {
       setStatus(null);
       setLog(null);
       setError(null);
@@ -82,10 +96,10 @@ export function GitStatusPanel({ cwd, onFileClick }: Props) {
     setLoading(true);
     try {
       if (tab === "files") {
-        const s = await invoke<GitStatus | null>("git_status", { cwd });
+        const s = await invoke<GitStatus | null>("git_status", { cwd: gitCwd });
         setStatus(s);
       } else {
-        const cs = await invoke<GitCommit[]>("git_log", { cwd, limit: 100 });
+        const cs = await invoke<GitCommit[]>("git_log", { cwd: gitCwd, limit: 100 });
         setLog(cs);
       }
       setError(null);
@@ -94,14 +108,14 @@ export function GitStatusPanel({ cwd, onFileClick }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [cwd, tab]);
+  }, [resolveCwd, tab]);
 
   useEffect(() => {
     refresh();
-    if (!cwd) return;
+    if (!cwd && !sessionName) return;
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
-  }, [refresh, cwd]);
+  }, [refresh, cwd, sessionName]);
 
   const tabs = (
     <div className="git__tabs">
@@ -122,7 +136,7 @@ export function GitStatusPanel({ cwd, onFileClick }: Props) {
     </div>
   );
 
-  if (!cwd) {
+  if (!cwd && !sessionName) {
     return (
       <div className="git">
         <div className="git__header">
@@ -217,7 +231,9 @@ export function GitStatusPanel({ cwd, onFileClick }: Props) {
               <div
                 key={f.code + f.path}
                 className={`git__file git__file--${kind}${onFileClick ? " git__file--clickable" : ""}`}
-                onClick={() => onFileClick?.(f.path)}
+                onClick={() => {
+                  if (statusCwd) onFileClick?.(f.path, statusCwd);
+                }}
               >
                 <span className="git__code">{shortCode(f.code)}</span>
                 <span className="git__path" title={f.path}>
