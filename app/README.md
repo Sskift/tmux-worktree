@@ -122,6 +122,34 @@ npm run tauri dev      # 启动 dev,热更新 + Rust debug 编译
 
 首次启动会编译全部 Rust 依赖,1–3 分钟;后续增量秒级。改 React/CSS 立即生效;改 Rust 自动重启。
 
+如果本机已经装了正式版 `tw-dashboard.app`, 需要单独拉起一个不冲突的 dev app 供调试 / Computer Use:
+
+```bash
+cd app
+npm run tauri:dev:isolated
+```
+
+这个脚本适合日常开发和热更新。它会：
+
+- 生成唯一的 `productName` / `identifier`
+- 用临时 `TW_DASHBOARD_HOME` 启动 app，避免污染正式版状态文件
+- 复制 `~/.tmux-worktree.json`、dashboard layout / terminals 等必要状态到临时 `HOME`
+- 打印临时 `HOME` 和覆盖配置路径，便于 smoke test 后检查和清理
+
+如果要做 GUI smoke test / Computer Use，推荐直接装一个隔离的 debug app bundle，而不是依赖裸 `target/debug/app` 进程：
+
+```bash
+cd app
+npm run tauri:dev:install
+```
+
+这个脚本会：
+
+- 构建一个唯一命名的 debug `.app`
+- 安装到 `/Applications/<productName>.app`
+- 在 bundle 内包装启动器，固定注入 `TW_DASHBOARD_HOME=<temp>`
+- 自动打开这个 dev app，并打印卸载和清理命令
+
 ## 构建 release
 
 ```bash

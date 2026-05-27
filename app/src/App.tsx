@@ -33,7 +33,16 @@ type Selection =
   | { kind: "terminal"; id: string }
   | null;
 
+type WindowLayout = {
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  maximized: boolean;
+};
+
 const REFRESH_MS = 2000;
+const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
 const PROJECT_COLORS = [
   "#f687b3",
@@ -58,6 +67,18 @@ function colorForProject(map: Map<string, string>, project: string): string {
     map.set(project, PROJECT_COLORS[map.size % PROJECT_COLORS.length]);
   }
   return map.get(project)!;
+}
+
+function isWindowLayout(value: unknown): value is WindowLayout {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.width === "number" &&
+    typeof candidate.height === "number" &&
+    typeof candidate.x === "number" &&
+    typeof candidate.y === "number" &&
+    typeof candidate.maximized === "boolean"
+  );
 }
 
 type ScratchTerm = { id: string; label: string };
@@ -105,11 +126,14 @@ function App() {
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
   const [containerWidth, setContainerWidth] = useState(0);
+  const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
+  const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const appRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
+  const layoutLoadedRef = useRef(false);
 
   useEffect(() => {
     const el = appRef.current;
@@ -125,6 +149,74 @@ function App() {
   useEffect(() => {
     invoke<string>("home_dir").then(setHomeDir).catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!windowRestoreReady) return;
+    const win = getCurrentWindow();
+    let disposed = false;
+    let timer: number | null = null;
+    let unlistenResized: (() => void) | undefined;
+    let unlistenMoved: (() => void) | undefined;
+
+    const capture = async () => {
+      try {
+        const maximized = await win.isMaximized();
+        if (disposed) return;
+        if (maximized) {
+          setWindowLayout((prev) =>
+            prev
+              ? { ...prev, maximized: true }
+              : {
+                  width: WINDOW_DEFAULTS.width,
+                  height: WINDOW_DEFAULTS.height,
+                  x: 0,
+                  y: 0,
+                  maximized: true,
+                },
+          );
+          return;
+        }
+
+        const [size, position, factor] = await Promise.all([
+          win.innerSize(),
+          win.outerPosition(),
+          win.scaleFactor(),
+        ]);
+        if (disposed) return;
+        setWindowLayout({
+          width: Math.round(size.width / factor),
+          height: Math.round(size.height / factor),
+          x: Math.round(position.x / factor),
+          y: Math.round(position.y / factor),
+          maximized: false,
+        });
+      } catch {
+        // Ignore platform/window-manager errors; persistence is best-effort.
+      }
+    };
+
+    const scheduleCapture = () => {
+      if (timer) clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void capture();
+      }, 150);
+    };
+
+    void capture();
+    void win.onResized(scheduleCapture).then((fn) => {
+      unlistenResized = fn;
+    });
+    void win.onMoved(scheduleCapture).then((fn) => {
+      unlistenMoved = fn;
+    });
+
+    return () => {
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      unlistenResized?.();
+      unlistenMoved?.();
+    };
+  }, [windowRestoreReady]);
 
   const fileTreeWidthRef = useRef(fileTreeWidth);
   fileTreeWidthRef.current = fileTreeWidth;
@@ -190,19 +282,15 @@ function App() {
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
         }
+        if (isWindowLayout(lay.window)) setWindowLayout(lay.window);
+        setWindowRestoreReady(true);
       })
-      .catch(() => {});
-  }, []);
-
-  // Auto-restore orphaned worktrees on mount
-  useEffect(() => {
-    invoke<{ project: string; path: string; name: string }[]>("list_orphaned_worktrees")
-      .then(async (orphans) => {
-        for (const o of orphans) {
-          await invoke("restore_worktree", { args: { path: o.path, name: o.name, aiCmd: "" } }).catch(() => {});
-        }
+      .catch(() => {
+        setWindowRestoreReady(true);
       })
-      .catch(() => {});
+      .finally(() => {
+        layoutLoadedRef.current = true;
+      });
   }, []);
 
   // Persist terminals
@@ -214,13 +302,22 @@ function App() {
 
   // Persist layout (debounced)
   useEffect(() => {
+    if (!layoutLoadedRef.current) return;
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed },
+        layout: {
+          left: cols.left,
+          right: cols.right,
+          gitHeight,
+          sectionSplit,
+          sessionOrder,
+          scratchCollapsed,
+          ...(windowLayout ? { window: windowLayout } : {}),
+        },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowLayout]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
