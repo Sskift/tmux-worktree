@@ -120,6 +120,13 @@ npm run tauri:dev:isolated
 npm run tauri:dev:install
 ```
 
+本地 dev 版本有两种常用方式：
+
+- `npm run tauri:dev:isolated`：启动热更新 dev app，使用临时 `TW_DASHBOARD_HOME`，适合日常开发调试。
+- `npm run tauri:dev:install`：构建一个唯一命名的 debug `.app` 并安装到 `/Applications`，适合 GUI smoke test 或需要从 Finder/open 启动的场景。
+
+`tauri:dev:install` 会在输出中打印卸载和临时状态目录清理命令。验证结束后按输出清理，避免 `/Applications` 和 `/tmp` 堆积旧 dev app。
+
 ## 发布
 
 CLI 和 Dashboard installer 共用根目录 npm 包发布：
@@ -141,6 +148,144 @@ npm 包只包含：
 - `dist`
 - `app/installer/installer.mjs`
 - `app/installer/dmg/`
+
+### Feat/Bugfix 完成后的标准工作流
+
+每次完成一个 feature 或 bugfix 后，按下面顺序推进。不要跳过构建测试，也不要在测试失败时 bump 或发布。
+
+1. 确认工作区和分支。
+
+```bash
+git status --short --branch
+git diff --check
+```
+
+2. 构建和测试。
+
+```bash
+npm install
+npm run build
+
+cd app
+npm install
+npm run build
+
+cd src-tauri
+cargo fmt --check
+cargo check
+cargo test
+```
+
+3. 及时更新文档。
+
+代码行为、发布步骤、配置、运行时状态或开发/发布边界发生变化时，必须同步更新：
+
+- `README.md`：用户使用、开发、发布和操作流程。
+- `ARCHITECTURE.md`：代码结构、开发/发布边界、状态文件和关键 command 分组。
+
+不要新增重复文档；优先维护这两份。
+
+4. Bump 版本号。
+
+需要同步更新：
+
+- `package.json`：npm 包版本，决定 bnpm 发布版本。
+- `app/src-tauri/tauri.conf.json`：Dashboard 构建版本，决定 DMG 文件名。
+- `app/src-tauri/Cargo.toml`：Rust crate 版本，保持本地构建元数据一致。
+
+`app/package.json` 是私有前端工程版本，默认不作为发布版本来源，除非明确需要一起维护。
+
+5. 提交并同步 feature/bugfix 分支到两个远端。
+
+```bash
+git add <changed-files>
+git commit -m "fix: ..."
+git push origin HEAD:<branch>
+git push github HEAD:<branch>
+```
+
+6. 合入 `origin/master`。
+
+在 Codebase 创建 MR：`<branch> -> master`。确认 diff、checks 和 mergeability 后再合入。
+
+```bash
+codebase mr create -R jiangyunong/tmux-worktree --source <branch> --target master --title "<title>" --body "<summary>"
+codebase mr status -R jiangyunong/tmux-worktree -N <mr>
+codebase mr checks list -R jiangyunong/tmux-worktree -N <mr>
+```
+
+如果是自己负责的小改动且明确不需要人工 review，可以按仓库当前流程 skip review：
+
+```bash
+codebase mr bypass -R jiangyunong/tmux-worktree -N <mr> --review --reason no_need_for_review --yes
+codebase mr merge -R jiangyunong/tmux-worktree -N <mr> --merge --no-delete-branch --yes
+```
+
+7. 同步 `github/master`。
+
+```bash
+git fetch origin master
+git push github origin/master:master
+git fetch github master
+```
+
+确认两边主分支一致：
+
+```bash
+git rev-parse --short origin/master github/master
+git log --oneline --left-right --cherry-pick origin/master...github/master
+```
+
+8. 构建本地 dev/debug app 做 smoke test。
+
+如需热更新调试：
+
+```bash
+cd app
+npm run tauri:dev:isolated
+```
+
+如需安装一个独立 debug app 到 `/Applications` 验证真实启动行为：
+
+```bash
+cd app
+npm run tauri:dev:install
+```
+
+确认关键功能后，按命令输出中的 `uninstall` 和 `cleanup state` 清理本地 dev app。
+
+9. 构建安装包并发布 release。
+
+先预览包内容：
+
+```bash
+./app/scripts/release.sh --dry-run
+```
+
+确认无误后发布：
+
+```bash
+./app/scripts/release.sh
+```
+
+10. 更新本地验证仓库。
+
+```bash
+cd ~/Desktop/test/tmux-worktree
+git fetch origin master
+git fetch github master
+git merge --ff-only origin/master
+git status --short --branch
+```
+
+11. 更新本机已安装的 Dashboard App。
+
+发布到 bnpm 后，用正式安装器更新 `/Applications/tw-dashboard.app`：
+
+```bash
+npx -y --registry=https://bnpm.byted.org -p @byted-codebase/tmux-worktree tw-dashboard-install
+open -a tw-dashboard
+```
 
 ## License
 
