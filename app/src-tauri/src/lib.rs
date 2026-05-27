@@ -1748,6 +1748,7 @@ pub fn run() {
             app.manage(Arc::new(PtyState::default()));
             app.manage(Arc::new(TunnelState::default()));
             setup_clipboard_bindings();
+            restore_window_layout(&app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1787,10 +1788,6 @@ pub fn run() {
             remote_stop,
             remote_status,
         ])
-        .setup(|app| {
-            restore_window_layout(&app.handle());
-            Ok(())
-        })
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|_, event| {

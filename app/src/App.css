@@ -278,7 +278,6 @@ button:disabled {
   flex-direction: column;
   min-height: 80px;
   flex-shrink: 0;
-  border-top: 1px solid var(--divider);
 }
 
 /* ─── Git panel ─────────────────────────────────────────────── */
