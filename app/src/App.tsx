@@ -347,8 +347,6 @@ function App() {
   }, []);
 
   // Persist terminals
-  const terminalsRef = useRef(terminals);
-  terminalsRef.current = terminals;
   useEffect(() => {
     invoke("save_terminals", { terminals }).catch(() => {});
   }, [terminals]);
