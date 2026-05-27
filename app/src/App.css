@@ -769,7 +769,6 @@ button:disabled {
 
 .sidebar__footer {
   padding: 10px 14px;
-  border-top: 1px solid var(--divider);
   font-size: 11px;
   display: flex;
   align-items: center;

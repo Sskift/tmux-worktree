@@ -1,6 +1,6 @@
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -23,15 +23,32 @@ fn inherit_shell_env() {
             if matches!(key, "PWD" | "OLDPWD" | "_" | "SHLVL") {
                 continue;
             }
-            unsafe { std::env::set_var(key, val); }
+            unsafe {
+                std::env::set_var(key, val);
+            }
         }
     }
+}
+
+fn app_home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("TW_DASHBOARD_HOME")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+fn app_home_dir_or_tmp() -> std::path::PathBuf {
+    app_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
 }
 
 fn tmux_bin() -> &'static str {
     static BIN: OnceLock<String> = OnceLock::new();
     BIN.get_or_init(|| {
-        for p in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+        for p in [
+            "/opt/homebrew/bin/tmux",
+            "/usr/local/bin/tmux",
+            "/usr/bin/tmux",
+        ] {
             if std::path::Path::new(p).exists() {
                 return p.to_string();
             }
@@ -43,7 +60,11 @@ fn tmux_bin() -> &'static str {
 fn git_bin() -> &'static str {
     static BIN: OnceLock<String> = OnceLock::new();
     BIN.get_or_init(|| {
-        for p in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"] {
+        for p in [
+            "/opt/homebrew/bin/git",
+            "/usr/local/bin/git",
+            "/usr/bin/git",
+        ] {
             if std::path::Path::new(p).exists() {
                 return p.to_string();
             }
@@ -179,17 +200,16 @@ fn list_sessions() -> Result<Vec<Session>, String> {
 
 #[tauri::command]
 fn list_projects() -> Result<Vec<Project>, String> {
-    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
 
     if !config_path.exists() {
         return Ok(vec![]);
     }
 
-    let content = std::fs::read_to_string(&config_path)
-        .map_err(|e| format!("read config: {e}"))?;
-    let config: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|e| format!("parse config: {e}"))?;
+    let content = std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| format!("parse config: {e}"))?;
 
     let projects = config
         .get("projects")
@@ -209,7 +229,7 @@ fn list_projects() -> Result<Vec<Project>, String> {
     Ok(projects)
 }
 
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
 struct OrphanedWorktree {
     project: String,
     path: String,
@@ -255,6 +275,217 @@ fn run_quiet(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn worktree_base_dir() -> String {
+    let home = match app_home_dir() {
+        Some(home) => home,
+        None => return "/private/tmp/tmux-worktree/projects".to_string(),
+    };
+    let config_path = home.join(".tmux-worktree.json");
+    if !config_path.exists() {
+        return "/private/tmp/tmux-worktree/projects".to_string();
+    }
+    std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| {
+            v.get("worktreeBase")
+                .and_then(|b| b.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
+}
+
+fn pending_cleanup_path() -> std::path::PathBuf {
+    app_home_dir_or_tmp().join(".tw-dashboard-pending-worktree-cleanup.json")
+}
+
+fn load_pending_cleanup() -> Vec<OrphanedWorktree> {
+    let path = pending_cleanup_path();
+    if !path.exists() {
+        return vec![];
+    }
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Vec<OrphanedWorktree>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn save_pending_cleanup(entries: &[OrphanedWorktree]) {
+    let path = pending_cleanup_path();
+    if entries.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(entries) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+fn upsert_pending_cleanup(entries: Vec<OrphanedWorktree>) {
+    let mut pending = load_pending_cleanup();
+    for entry in entries {
+        if !pending.iter().any(|p| p.path == entry.path) {
+            pending.push(entry);
+        }
+    }
+    save_pending_cleanup(&pending);
+}
+
+fn remove_pending_cleanup_path(path: &str) {
+    let mut pending = load_pending_cleanup();
+    pending.retain(|entry| entry.path != path);
+    save_pending_cleanup(&pending);
+}
+
+fn live_session_names() -> HashSet<String> {
+    list_sessions()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .collect()
+}
+
+fn orphaned_worktrees(
+    base_path: &std::path::Path,
+    live_sessions: &HashSet<String>,
+) -> Vec<OrphanedWorktree> {
+    if !base_path.exists() {
+        return vec![];
+    }
+
+    let project_dirs = match std::fs::read_dir(base_path) {
+        Ok(rd) => rd,
+        Err(_) => return vec![],
+    };
+
+    let mut orphans = Vec::new();
+    for project_entry in project_dirs.flatten() {
+        if !project_entry.path().is_dir() {
+            continue;
+        }
+        let project = project_entry.file_name().to_string_lossy().to_string();
+        let wt_dirs = match std::fs::read_dir(project_entry.path()) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for wt_entry in wt_dirs.flatten() {
+            let wt_path = wt_entry.path();
+            if !wt_path.is_dir() {
+                continue;
+            }
+            let dirname = wt_entry.file_name().to_string_lossy().to_string();
+            let session_name = derive_session_name(&dirname);
+            if live_sessions.contains(&session_name) {
+                continue;
+            }
+            orphans.push(OrphanedWorktree {
+                project: project.clone(),
+                path: wt_path.to_string_lossy().to_string(),
+                name: session_name,
+            });
+        }
+    }
+    orphans
+}
+
+fn worktrees_for_session(base_path: &std::path::Path, session_name: &str) -> Vec<OrphanedWorktree> {
+    if !base_path.exists() {
+        return vec![];
+    }
+
+    let project_dirs = match std::fs::read_dir(base_path) {
+        Ok(rd) => rd,
+        Err(_) => return vec![],
+    };
+
+    let mut matches = Vec::new();
+    for project_entry in project_dirs.flatten() {
+        if !project_entry.path().is_dir() {
+            continue;
+        }
+        let project = project_entry.file_name().to_string_lossy().to_string();
+        let wt_dirs = match std::fs::read_dir(project_entry.path()) {
+            Ok(rd) => rd,
+            Err(_) => continue,
+        };
+        for wt_entry in wt_dirs.flatten() {
+            let wt_path = wt_entry.path();
+            if !wt_path.is_dir() {
+                continue;
+            }
+            let dirname = wt_entry.file_name().to_string_lossy().to_string();
+            if derive_session_name(&dirname) != session_name {
+                continue;
+            }
+            matches.push(OrphanedWorktree {
+                project: project.clone(),
+                path: wt_path.to_string_lossy().to_string(),
+                name: session_name.to_string(),
+            });
+        }
+    }
+    matches
+}
+
+fn repo_root_for_worktree(path: &str) -> Option<String> {
+    let common_dir = run_check(&[
+        "git",
+        "-C",
+        path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ])
+    .ok()?;
+    let common_path = std::path::Path::new(&common_dir);
+    if common_path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+        return common_path
+            .parent()
+            .map(|p| p.to_string_lossy().to_string());
+    }
+    None
+}
+
+fn try_cleanup_worktree(path: &str) -> bool {
+    let worktree_path = std::path::Path::new(path);
+    if !worktree_path.exists() {
+        return true;
+    }
+    let Some(repo_root) = repo_root_for_worktree(path) else {
+        return false;
+    };
+    let output = std::process::Command::new(git_bin())
+        .args(["-C", &repo_root, "worktree", "remove", "--force", path])
+        .output();
+    let Ok(output) = output else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    if worktree_path.exists() {
+        let _ = std::fs::remove_dir_all(worktree_path);
+    }
+    !worktree_path.exists()
+}
+
+fn cleanup_pending_worktrees() {
+    let live_sessions = live_session_names();
+    let mut remaining = Vec::new();
+    for entry in load_pending_cleanup() {
+        if !std::path::Path::new(&entry.path).exists() {
+            continue;
+        }
+        if live_sessions.contains(&entry.name) {
+            continue;
+        }
+        if !try_cleanup_worktree(&entry.path) {
+            remaining.push(entry);
+        }
+    }
+    save_pending_cleanup(&remaining);
+}
+
 // 优化 tmux 鼠标选择体验（server-global，幂等）：
 //  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
 //  2. MouseDown1Pane → clear selection but stay in copy-mode (don't cancel/jump to bottom)
@@ -296,7 +527,7 @@ fn cancel_copy_mode(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn copy_tmux_selection(name: String) -> Result<bool, String> {
+fn copy_tmux_selection(_name: String) -> Result<bool, String> {
     let output = std::process::Command::new("tmux")
         .args(["save-buffer", "-"])
         .output()
@@ -362,7 +593,7 @@ fn random_id() -> String {
 
 #[tauri::command]
 fn create_worktree(args: CreateArgs) -> Result<String, String> {
-    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
     let config: serde_json::Value = if config_path.exists() {
         let config_text = std::fs::read_to_string(&config_path)
@@ -461,14 +692,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 
     run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &work_dir])?;
     setup_clipboard_bindings();
-    run_check(&[
-        "tmux",
-        "send-keys",
-        "-t",
-        &session,
-        &args.ai_cmd,
-        "C-m",
-    ])?;
+    run_check(&["tmux", "send-keys", "-t", &session, &args.ai_cmd, "C-m"])?;
 
     Ok(session)
 }
@@ -478,55 +702,15 @@ fn kill_session(name: String) -> Result<(), String> {
     let exact = format!("={}", name);
     run_check(&["tmux", "kill-session", "-t", &exact])?;
 
-    // Remove the worktree directory in a background thread to avoid blocking UI
     let session_name = name.clone();
     std::thread::spawn(move || {
-        let home = dirs::home_dir().unwrap_or_default();
-        let config_path = home.join(".tmux-worktree.json");
-        let worktree_base = if config_path.exists() {
-            std::fs::read_to_string(&config_path)
-                .ok()
-                .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                .and_then(|v| v.get("worktreeBase").and_then(|b| b.as_str()).map(String::from))
-                .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
-        } else {
-            return;
-        };
-
-        let base_path = std::path::Path::new(&worktree_base);
-        if !base_path.exists() {
+        let base_path = std::path::Path::new(&worktree_base_dir()).to_path_buf();
+        let targets = worktrees_for_session(&base_path, &session_name);
+        if targets.is_empty() {
             return;
         }
-
-        let project_dirs = match std::fs::read_dir(base_path) {
-            Ok(rd) => rd,
-            Err(_) => return,
-        };
-
-        for project_entry in project_dirs.flatten() {
-            if !project_entry.path().is_dir() {
-                continue;
-            }
-            let wt_dirs = match std::fs::read_dir(project_entry.path()) {
-                Ok(rd) => rd,
-                Err(_) => continue,
-            };
-            for wt_entry in wt_dirs.flatten() {
-                if !wt_entry.path().is_dir() {
-                    continue;
-                }
-                let dirname = wt_entry.file_name().to_string_lossy().to_string();
-                if derive_session_name(&dirname) == session_name {
-                    let wt_path = wt_entry.path().to_string_lossy().to_string();
-                    let _ = std::process::Command::new(git_bin())
-                        .args(["worktree", "remove", "--force", &wt_path])
-                        .output();
-                    if wt_entry.path().exists() {
-                        let _ = std::fs::remove_dir_all(wt_entry.path());
-                    }
-                }
-            }
-        }
+        upsert_pending_cleanup(targets);
+        cleanup_pending_worktrees();
     });
 
     Ok(())
@@ -546,11 +730,11 @@ fn derive_session_name(dirname: &str) -> String {
 
 #[tauri::command]
 fn list_orphaned_worktrees() -> Result<Vec<OrphanedWorktree>, String> {
-    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
     let config: serde_json::Value = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("read config: {e}"))?;
+        let text =
+            std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
         serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
     } else {
         return Ok(vec![]);
@@ -563,54 +747,7 @@ fn list_orphaned_worktrees() -> Result<Vec<OrphanedWorktree>, String> {
         .to_string();
 
     let base_path = std::path::Path::new(&worktree_base);
-    if !base_path.exists() {
-        return Ok(vec![]);
-    }
-
-    // Collect live tmux session names
-    let live_sessions: std::collections::HashSet<String> = list_sessions()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-
-    let mut orphans = Vec::new();
-
-    let project_dirs = std::fs::read_dir(base_path)
-        .map_err(|e| format!("read worktreeBase: {e}"))?;
-
-    for project_entry in project_dirs.flatten() {
-        if !project_entry.path().is_dir() {
-            continue;
-        }
-        let project = project_entry
-            .file_name()
-            .to_string_lossy()
-            .to_string();
-
-        let worktree_dirs = match std::fs::read_dir(project_entry.path()) {
-            Ok(rd) => rd,
-            Err(_) => continue,
-        };
-
-        for wt_entry in worktree_dirs.flatten() {
-            if !wt_entry.path().is_dir() {
-                continue;
-            }
-            let dirname = wt_entry.file_name().to_string_lossy().to_string();
-            let session_name = derive_session_name(&dirname);
-
-            if !live_sessions.contains(&session_name) {
-                orphans.push(OrphanedWorktree {
-                    project: project.clone(),
-                    path: wt_entry.path().to_string_lossy().to_string(),
-                    name: session_name,
-                });
-            }
-        }
-    }
-
-    Ok(orphans)
+    Ok(orphaned_worktrees(base_path, &live_session_names()))
 }
 
 #[derive(Deserialize)]
@@ -629,12 +766,22 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
     }
 
     let session = unique_session_name(&args.name);
-    run_check(&["tmux", "new-session", "-d", "-s", &session, "-c", &args.path])?;
+    run_check(&[
+        "tmux",
+        "new-session",
+        "-d",
+        "-s",
+        &session,
+        "-c",
+        &args.path,
+    ])?;
     setup_clipboard_bindings();
 
     if !args.ai_cmd.is_empty() {
         run_check(&["tmux", "send-keys", "-t", &session, &args.ai_cmd, "C-m"])?;
     }
+
+    remove_pending_cleanup_path(&args.path);
 
     Ok(session)
 }
@@ -642,13 +789,7 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
 #[tauri::command]
 fn session_cwd(name: String) -> Result<String, String> {
     let output = std::process::Command::new(tmux_bin())
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &name,
-            "#{pane_current_path}",
-        ])
+        .args(["display-message", "-p", "-t", &name, "#{pane_current_path}"])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
     if !output.status.success() {
@@ -680,12 +821,12 @@ fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
         return Err(format!("not a directory: {path}"));
     }
 
-    let home = dirs::home_dir().ok_or("home dir not found")?;
+    let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
 
     let mut config: serde_json::Value = if config_path.exists() {
-        let text = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("read config: {e}"))?;
+        let text =
+            std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
         serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
     } else {
         serde_json::json!({ "projects": {} })
@@ -698,10 +839,13 @@ fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
         .or_insert_with(|| serde_json::json!({}))
         .as_object_mut()
         .ok_or("projects is not an object")?;
-    projects.insert(name.to_string(), serde_json::Value::String(path.to_string()));
+    projects.insert(
+        name.to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
 
-    let pretty = serde_json::to_string_pretty(&config)
-        .map_err(|e| format!("serialize config: {e}"))?;
+    let pretty =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
     std::fs::write(&config_path, pretty).map_err(|e| format!("write config: {e}"))?;
 
     list_projects()
@@ -739,13 +883,7 @@ struct GitCommit {
 
 #[tauri::command]
 fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
-    let inside = run_quiet(&[
-        "git",
-        "-C",
-        &cwd,
-        "rev-parse",
-        "--is-inside-work-tree",
-    ]);
+    let inside = run_quiet(&["git", "-C", &cwd, "rev-parse", "--is-inside-work-tree"]);
     if inside.as_deref() != Some("true") {
         return Ok(vec![]);
     }
@@ -792,18 +930,12 @@ fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
             let parents = if parents_raw.is_empty() {
                 Vec::new()
             } else {
-                parents_raw
-                    .split(' ')
-                    .map(|s| s.to_string())
-                    .collect()
+                parents_raw.split(' ').map(|s| s.to_string()).collect()
             };
             let refs = if refs_raw.is_empty() {
                 Vec::new()
             } else {
-                refs_raw
-                    .split(", ")
-                    .map(|s| s.to_string())
-                    .collect()
+                refs_raw.split(", ").map(|s| s.to_string()).collect()
             };
             Some(GitCommit {
                 hash,
@@ -822,13 +954,7 @@ fn git_log(cwd: String, limit: Option<u32>) -> Result<Vec<GitCommit>, String> {
 
 #[tauri::command]
 fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
-    let inside = run_quiet(&[
-        "git",
-        "-C",
-        &cwd,
-        "rev-parse",
-        "--is-inside-work-tree",
-    ]);
+    let inside = run_quiet(&["git", "-C", &cwd, "rev-parse", "--is-inside-work-tree"]);
     if inside.as_deref() != Some("true") {
         return Ok(None);
     }
@@ -875,30 +1001,56 @@ fn git_status(cwd: String) -> Result<Option<GitStatus>, String> {
             let mut parts = rest.splitn(8, ' ');
             let xy = parts.next().unwrap_or("..");
             let path = parts.nth(6).unwrap_or("").to_string();
-            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
-            if x != '.' { status.staged += 1; }
-            if y != '.' { status.unstaged += 1; }
-            status.files.push(GitFile { code: xy.to_string(), path });
+            let (x, y) = (
+                xy.chars().next().unwrap_or('.'),
+                xy.chars().nth(1).unwrap_or('.'),
+            );
+            if x != '.' {
+                status.staged += 1;
+            }
+            if y != '.' {
+                status.unstaged += 1;
+            }
+            status.files.push(GitFile {
+                code: xy.to_string(),
+                path,
+            });
         } else if let Some(rest) = line.strip_prefix("2 ") {
             // 2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X-score> <path><tab><origPath>
             let mut parts = rest.splitn(9, ' ');
             let xy = parts.next().unwrap_or("..");
             let tail = parts.nth(7).unwrap_or("");
             let path = tail.split('\t').next().unwrap_or("").to_string();
-            let (x, y) = (xy.chars().next().unwrap_or('.'), xy.chars().nth(1).unwrap_or('.'));
-            if x != '.' { status.staged += 1; }
-            if y != '.' { status.unstaged += 1; }
-            status.files.push(GitFile { code: xy.to_string(), path });
+            let (x, y) = (
+                xy.chars().next().unwrap_or('.'),
+                xy.chars().nth(1).unwrap_or('.'),
+            );
+            if x != '.' {
+                status.staged += 1;
+            }
+            if y != '.' {
+                status.unstaged += 1;
+            }
+            status.files.push(GitFile {
+                code: xy.to_string(),
+                path,
+            });
         } else if let Some(rest) = line.strip_prefix("u ") {
             // u <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
             let mut parts = rest.splitn(10, ' ');
             let xy = parts.next().unwrap_or("UU");
             let path = parts.nth(8).unwrap_or("").to_string();
             status.conflicts += 1;
-            status.files.push(GitFile { code: xy.to_string(), path });
+            status.files.push(GitFile {
+                code: xy.to_string(),
+                path,
+            });
         } else if let Some(rest) = line.strip_prefix("? ") {
             status.untracked += 1;
-            status.files.push(GitFile { code: "??".to_string(), path: rest.to_string() });
+            status.files.push(GitFile {
+                code: "??".to_string(),
+                path: rest.to_string(),
+            });
         }
     }
 
@@ -935,7 +1087,14 @@ fn git_diff(cwd: String, path: String) -> Result<String, String> {
     let full_path = std::path::Path::new(&cwd).join(&path);
     let full_path_str = full_path.to_string_lossy().to_string();
     let output3 = std::process::Command::new(git_bin())
-        .args(["-C", &cwd, "diff", "--no-index", "/dev/null", &full_path_str])
+        .args([
+            "-C",
+            &cwd,
+            "diff",
+            "--no-index",
+            "/dev/null",
+            &full_path_str,
+        ])
         .output();
 
     if let Ok(o) = output3 {
@@ -971,7 +1130,7 @@ fn pty_open(
     }
     if let Some(cwd) = args.cwd.as_ref() {
         cmd.cwd(cwd);
-    } else if let Some(home) = dirs::home_dir() {
+    } else if let Some(home) = app_home_dir() {
         cmd.cwd(home);
     }
 
@@ -1005,11 +1164,7 @@ fn pty_open(
         writer,
         child,
     };
-    state
-        .ptys
-        .lock()
-        .unwrap()
-        .insert(id.clone(), handle);
+    state.ptys.lock().unwrap().insert(id.clone(), handle);
 
     let id_for_thread = id.clone();
     let app_for_thread = app.clone();
@@ -1154,15 +1309,47 @@ fn kill_plain_terminal(name: String) -> Result<(), String> {
 }
 
 fn terminals_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join(".tw-dashboard-terminals.json")
+    app_home_dir_or_tmp().join(".tw-dashboard-terminals.json")
 }
 
 fn layout_path() -> std::path::PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-        .join(".tw-dashboard-layout.json")
+    app_home_dir_or_tmp().join(".tw-dashboard-layout.json")
+}
+
+#[derive(Deserialize)]
+struct SavedWindowLayout {
+    width: f64,
+    height: f64,
+    x: f64,
+    y: f64,
+    maximized: bool,
+}
+
+fn restore_window_layout(app: &tauri::AppHandle) {
+    let Some(window) = app.get_webview_window("main") else {
+        return;
+    };
+    let path = layout_path();
+    if !path.exists() {
+        return;
+    }
+    let Some(saved) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("window").cloned())
+        .and_then(|value| serde_json::from_value::<SavedWindowLayout>(value).ok())
+    else {
+        return;
+    };
+
+    let _ = window.set_size(tauri::LogicalSize::new(
+        saved.width.max(960.0),
+        saved.height.max(600.0),
+    ));
+    let _ = window.set_position(tauri::LogicalPosition::new(saved.x, saved.y));
+    if saved.maximized {
+        let _ = window.maximize();
+    }
 }
 
 #[tauri::command]
@@ -1179,8 +1366,7 @@ fn load_terminals() -> Result<Vec<serde_json::Value>, String> {
 
 #[tauri::command]
 fn save_terminals(terminals: Vec<serde_json::Value>) -> Result<(), String> {
-    let text =
-        serde_json::to_string_pretty(&terminals).map_err(|e| format!("serialize: {e}"))?;
+    let text = serde_json::to_string_pretty(&terminals).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(terminals_path(), text).map_err(|e| format!("write: {e}"))?;
     Ok(())
 }
@@ -1192,22 +1378,20 @@ fn load_layout() -> Result<serde_json::Value, String> {
         return Ok(serde_json::json!({}));
     }
     let text = std::fs::read_to_string(&p).map_err(|e| format!("read: {e}"))?;
-    let val: serde_json::Value =
-        serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
+    let val: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))?;
     Ok(val)
 }
 
 #[tauri::command]
 fn home_dir() -> Result<String, String> {
-    dirs::home_dir()
+    app_home_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "home dir not found".into())
 }
 
 #[tauri::command]
 fn save_layout(layout: serde_json::Value) -> Result<(), String> {
-    let text =
-        serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
+    let text = serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
     std::fs::write(layout_path(), text).map_err(|e| format!("write: {e}"))?;
     Ok(())
 }
@@ -1235,10 +1419,18 @@ fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
             Err(_) => continue,
         };
         let is_hidden = name.starts_with('.');
-        entries.push(DirEntry { name, path: entry_path, is_dir, is_symlink, is_hidden, size });
+        entries.push(DirEntry {
+            name,
+            path: entry_path,
+            is_dir,
+            is_symlink,
+            is_hidden,
+            size,
+        });
     }
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir)
+        b.is_dir
+            .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
@@ -1284,7 +1476,16 @@ struct SearchResult {
     line_content: Option<String>,
 }
 
-const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".DS_Store", "dist", "__pycache__", ".next", ".turbo"];
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".DS_Store",
+    "dist",
+    "__pycache__",
+    ".next",
+    ".turbo",
+];
 
 fn walk_search(
     dir: &std::path::Path,
@@ -1388,7 +1589,10 @@ fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchR
 fn read_serve_token() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let path = format!("{home}/.tw-serve-token");
-    std::fs::read_to_string(&path).unwrap_or_default().trim().to_string()
+    std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 #[derive(Serialize, Clone)]
@@ -1436,11 +1640,14 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         *t = tok;
     }
 
-    let cf_bin = ["/opt/homebrew/bin/cloudflared", "/usr/local/bin/cloudflared"]
-        .iter()
-        .find(|p| std::path::Path::new(p).exists())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| "cloudflared".to_string());
+    let cf_bin = [
+        "/opt/homebrew/bin/cloudflared",
+        "/usr/local/bin/cloudflared",
+    ]
+    .iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .map(|s| s.to_string())
+    .unwrap_or_else(|| "cloudflared".to_string());
 
     let mut child = std::process::Command::new(&cf_bin)
         .args(["tunnel", "--url", "http://localhost:8311"])
@@ -1448,7 +1655,9 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Failed to start cloudflared: {e}. Install: brew install cloudflared"))?;
+        .map_err(|e| {
+            format!("Failed to start cloudflared: {e}. Install: brew install cloudflared")
+        })?;
 
     // Take stderr before storing child
     let stderr = child.stderr.take();
@@ -1578,6 +1787,166 @@ pub fn run() {
             remote_stop,
             remote_status,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .setup(|app| {
+            restore_window_layout(&app.handle());
+            Ok(())
+        })
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_, event| {
+            match event {
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                    cleanup_pending_worktrees();
+                }
+                _ => {}
+            }
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cleanup_pending_worktrees, derive_session_name, load_pending_cleanup, orphaned_worktrees,
+        save_pending_cleanup, worktrees_for_session, OrphanedWorktree,
+    };
+    use std::collections::HashSet;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn git(args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .status()
+            .expect("spawn git");
+        assert!(status.success(), "git command failed: {:?}", args);
+    }
+
+    #[test]
+    fn derive_session_name_strips_random_suffix() {
+        assert_eq!(derive_session_name("demo-abc12"), "demo");
+        assert_eq!(derive_session_name("demo"), "demo");
+        assert_eq!(derive_session_name("demo-nothex"), "demo-nothex");
+    }
+
+    #[test]
+    fn orphaned_worktrees_excludes_live_sessions() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("proj");
+        fs::create_dir_all(project_dir.join("live-abc12")).expect("create live");
+        fs::create_dir_all(project_dir.join("orphan-def34")).expect("create orphan");
+        fs::write(project_dir.join("README.txt"), "ignore").expect("write file");
+
+        let live_sessions = HashSet::from([String::from("live")]);
+        let mut orphans = orphaned_worktrees(temp.path(), &live_sessions);
+        orphans.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].project, "proj");
+        assert_eq!(orphans[0].name, "orphan");
+        assert!(orphans[0].path.ends_with("/proj/orphan-def34"));
+    }
+
+    #[test]
+    fn worktrees_for_session_returns_only_matching_session() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let project_dir = temp.path().join("proj");
+        fs::create_dir_all(project_dir.join("demo-abc12")).expect("create demo");
+        fs::create_dir_all(project_dir.join("other-def34")).expect("create other");
+
+        let matches = worktrees_for_session(temp.path(), "demo");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].project, "proj");
+        assert_eq!(matches[0].name, "demo");
+        assert!(matches[0].path.ends_with("/proj/demo-abc12"));
+    }
+
+    #[test]
+    fn cleanup_pending_worktrees_removes_registered_worktree() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("home");
+
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        git(&["init", repo.to_str().expect("repo str")]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.name",
+            "test",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
+        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        let worktree = temp.path().join("wt-cleanup");
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "worktree",
+            "add",
+            "-b",
+            "ghost-branch",
+            worktree.to_str().expect("worktree str"),
+        ]);
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+        }
+        save_pending_cleanup(&[OrphanedWorktree {
+            project: "demo".to_string(),
+            path: worktree.to_string_lossy().to_string(),
+            name: "ghost".to_string(),
+        }]);
+
+        cleanup_pending_worktrees();
+
+        assert!(!Path::new(&worktree).exists());
+        assert!(load_pending_cleanup().is_empty());
+        let list = std::process::Command::new("git")
+            .args([
+                "-C",
+                repo.to_str().expect("repo str"),
+                "worktree",
+                "list",
+                "--porcelain",
+            ])
+            .output()
+            .expect("git worktree list");
+        let stdout = String::from_utf8_lossy(&list.stdout);
+        assert!(!stdout.contains("wt-cleanup"));
+
+        if let Some(home) = original_home {
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+    }
 }

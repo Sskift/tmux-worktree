@@ -33,8 +33,16 @@ type Selection =
   | { kind: "terminal"; id: string }
   | null;
 
+type WindowLayout = {
+  width: number;
+  height: number;
+  x: number;
+  y: number;
+  maximized: boolean;
+};
+
 const REFRESH_MS = 2000;
-const WINDOW_MIN_SIZE = { width: 960, height: 600 };
+const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
 const PROJECT_COLORS = [
   "#f687b3",
@@ -61,9 +69,20 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
+function isWindowLayout(value: unknown): value is WindowLayout {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.width === "number" &&
+    typeof candidate.height === "number" &&
+    typeof candidate.x === "number" &&
+    typeof candidate.y === "number" &&
+    typeof candidate.maximized === "boolean"
+  );
+}
+
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
-type WindowSize = { width: number; height: number };
 
 const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
 
@@ -107,7 +126,8 @@ function App() {
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
   const [containerWidth, setContainerWidth] = useState(0);
-  const [windowSize, setWindowSize] = useState<WindowSize | null>(null);
+  const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
+  const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const appRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
@@ -131,30 +151,72 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let cancelled = false;
+    if (!windowRestoreReady) return;
+    const win = getCurrentWindow();
+    let disposed = false;
+    let timer: ReturnType<typeof window.setTimeout> | null = null;
+    let unlistenResized: (() => void) | undefined;
+    let unlistenMoved: (() => void) | undefined;
 
-    (async () => {
-      const win = getCurrentWindow();
-      const updateSize = async () => {
-        const size = await win.innerSize();
-        const factor = await win.scaleFactor();
-        if (cancelled) return;
-        setWindowSize({
+    const capture = async () => {
+      try {
+        const maximized = await win.isMaximized();
+        if (disposed) return;
+        if (maximized) {
+          setWindowLayout((prev) =>
+            prev
+              ? { ...prev, maximized: true }
+              : {
+                  width: WINDOW_DEFAULTS.width,
+                  height: WINDOW_DEFAULTS.height,
+                  x: 0,
+                  y: 0,
+                  maximized: true,
+                },
+          );
+          return;
+        }
+
+        const [size, position, factor] = await Promise.all([
+          win.innerSize(),
+          win.outerPosition(),
+          win.scaleFactor(),
+        ]);
+        if (disposed) return;
+        setWindowLayout({
           width: Math.round(size.width / factor),
           height: Math.round(size.height / factor),
+          x: Math.round(position.x / factor),
+          y: Math.round(position.y / factor),
+          maximized: false,
         });
-      };
+      } catch {
+        // Ignore platform/window-manager errors; persistence is best-effort.
+      }
+    };
 
-      unlisten = await win.onResized(updateSize);
-      await updateSize();
-    })().catch(() => {});
+    const scheduleCapture = () => {
+      if (timer) clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void capture();
+      }, 150);
+    };
+
+    void capture();
+    void win.onResized(scheduleCapture).then((fn) => {
+      unlistenResized = fn;
+    });
+    void win.onMoved(scheduleCapture).then((fn) => {
+      unlistenMoved = fn;
+    });
 
     return () => {
-      cancelled = true;
-      unlisten?.();
+      disposed = true;
+      if (timer) clearTimeout(timer);
+      unlistenResized?.();
+      unlistenMoved?.();
     };
-  }, []);
+  }, [windowRestoreReady]);
 
   const fileTreeWidthRef = useRef(fileTreeWidth);
   fileTreeWidthRef.current = fileTreeWidth;
@@ -220,37 +282,15 @@ function App() {
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
         }
-        const savedWindowSize = lay.windowSize;
-        if (
-          savedWindowSize &&
-          typeof savedWindowSize === "object" &&
-          typeof (savedWindowSize as Record<string, unknown>).width === "number" &&
-          typeof (savedWindowSize as Record<string, unknown>).height === "number"
-        ) {
-          const { width, height } = savedWindowSize as WindowSize;
-          const next = {
-            width: Math.max(WINDOW_MIN_SIZE.width, width),
-            height: Math.max(WINDOW_MIN_SIZE.height, height),
-          };
-          setWindowSize(next);
-          getCurrentWindow().setSize(new LogicalSize(next.width, next.height)).catch(() => {});
-        }
+        if (isWindowLayout(lay.window)) setWindowLayout(lay.window);
+        setWindowRestoreReady(true);
       })
-      .catch(() => {})
+      .catch(() => {
+        setWindowRestoreReady(true);
+      })
       .finally(() => {
         layoutLoadedRef.current = true;
       });
-  }, []);
-
-  // Auto-restore orphaned worktrees on mount
-  useEffect(() => {
-    invoke<{ project: string; path: string; name: string }[]>("list_orphaned_worktrees")
-      .then(async (orphans) => {
-        for (const o of orphans) {
-          await invoke("restore_worktree", { args: { path: o.path, name: o.name, aiCmd: "" } }).catch(() => {});
-        }
-      })
-      .catch(() => {});
   }, []);
 
   // Persist terminals
@@ -265,11 +305,19 @@ function App() {
     if (!layoutLoadedRef.current) return;
     const t = setTimeout(() => {
       invoke("save_layout", {
-        layout: { left: cols.left, right: cols.right, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowSize },
+        layout: {
+          left: cols.left,
+          right: cols.right,
+          gitHeight,
+          sectionSplit,
+          sessionOrder,
+          scratchCollapsed,
+          ...(windowLayout ? { window: windowLayout } : {}),
+        },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
-  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowSize]);
+  }, [cols, gitHeight, sectionSplit, sessionOrder, scratchCollapsed, windowLayout]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
 
