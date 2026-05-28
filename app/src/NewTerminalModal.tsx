@@ -24,14 +24,6 @@ export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Pr
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, busy]);
-
   const browse = async () => {
     try {
       const picked = await open({
@@ -65,7 +57,7 @@ export function NewTerminalModal({ existingLabels = [], onClose, onCreated }: Pr
   };
 
   return (
-    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
+    <div className="modal-backdrop">
       <form
         className="modal"
         onClick={(e) => e.stopPropagation()}

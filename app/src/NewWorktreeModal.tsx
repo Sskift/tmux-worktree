@@ -37,14 +37,6 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
       .catch(() => {});
   }, []);
 
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, busy]);
-
   const isCustom = project === CUSTOM;
 
   const browse = async () => {
@@ -128,7 +120,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
   };
 
   return (
-    <div className="modal-backdrop" onClick={busy ? undefined : onClose}>
+    <div className="modal-backdrop">
       <form
         className="modal"
         onClick={(e) => e.stopPropagation()}
