@@ -105,6 +105,7 @@ interface RunParams {
   sessionName: string;
   useWorktree: boolean;
   projectKey?: string; // 项目在配置中的 key，用于 worktree 路径
+  branch?: string; // 目标分支，未指定时自动探测默认分支
 }
 
 async function interactiveSelect(projects: Record<string, string>): Promise<RunParams> {
@@ -190,8 +191,16 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
       sessionName = sessInput;
     }
 
+    // --- 目标分支 ---
+    let branch: string | undefined;
+    if (useWorktree) {
+      console.log(`\n输入 worktree 的目标分支，留空自动探测默认分支 (通常是 master 或 main)`);
+      const branchInput = (await prompt(rl, `目标分支: `)).trim();
+      if (branchInput) branch = branchInput;
+    }
+
     console.log();
-    return { aiCmd, projectDir, sessionName: sessionName.slice(0, SESSION_NAME_MAX_LEN), useWorktree, projectKey };
+    return { aiCmd, projectDir, sessionName: sessionName.slice(0, SESSION_NAME_MAX_LEN), useWorktree, projectKey, branch };
   } finally {
     rl.close();
   }
@@ -210,19 +219,35 @@ function resolveSessionName(base: string): string {
 }
 
 function parseArgs(projects: Record<string, string>): RunParams {
-  const [aiCmd, project, sessionArg] = process.argv.slice(2);
+  // 提取 --branch / -b <name> flag，支持出现在任意位置
+  const argv = process.argv.slice(2);
+  let branch: string | undefined;
+  const positional: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--branch" || a === "-b") {
+      branch = argv[++i];
+    } else if (a.startsWith("--branch=")) {
+      branch = a.slice("--branch=".length);
+    } else {
+      positional.push(a);
+    }
+  }
+  const [aiCmd, project, sessionArg] = positional;
 
   if (!aiCmd || !project) {
-    console.log(`用法: tw <ai-command> <project|path> [session-name]
+    console.log(`用法: tw <ai-command> <project|path> [session-name] [--branch <name>]
 
 参数:
-  ai-command    要在左栏运行的命令 (如 claude, aider, codex)
-  project       项目名称 (${Object.keys(projects).join(", ")}) 或目录路径
-  session-name  可选，tmux session 显示名 (默认同 project)
+  ai-command       要在左栏运行的命令 (如 claude, aider, codex)
+  project          项目名称 (${Object.keys(projects).join(", ")}) 或目录路径
+  session-name     可选，tmux session 显示名 (默认同 project)
+  --branch, -b     可选，目标分支 (默认自动探测，通常是 master 或 main)
 
 示例:
   tw claude myproject
   tw claude myproject fix-auth-bug
+  tw claude myproject fix-auth-bug --branch develop
   tw claude ~/some/dir
   tw                           # 交互模式`);
     process.exit(1);
@@ -232,7 +257,7 @@ function parseArgs(projects: Record<string, string>): RunParams {
   if (mappedDir) {
     // 项目在映射中
     const sessionName = sessionArg ? `${project}-${sessionArg}`.slice(0, SESSION_NAME_MAX_LEN) : project;
-    return { aiCmd, projectDir: mappedDir, sessionName, useWorktree: true, projectKey: project };
+    return { aiCmd, projectDir: mappedDir, sessionName, useWorktree: true, projectKey: project, branch };
   }
 
   // 不在映射中，当作目录路径
@@ -240,7 +265,7 @@ function parseArgs(projects: Record<string, string>): RunParams {
   if (existsSync(resolved)) {
     const dirName = resolved.split("/").filter(Boolean).pop() || "session";
     const sessionName = (sessionArg ?? dirName).slice(0, SESSION_NAME_MAX_LEN);
-    return { aiCmd, projectDir: resolved, sessionName, useWorktree: false };
+    return { aiCmd, projectDir: resolved, sessionName, useWorktree: false, branch };
   }
 
   console.error(`错误: 未知项目 '${project}'，且路径不存在`);
@@ -256,7 +281,7 @@ export async function run() {
   // --- 参数解析 ---
   const hasArgs = process.argv.length > 2;
   const params = hasArgs ? parseArgs(PROJECT_DIRS) : await interactiveSelect(PROJECT_DIRS);
-  const { aiCmd, projectDir, useWorktree, projectKey } = params;
+  const { aiCmd, projectDir, useWorktree, projectKey, branch } = params;
 
   if (!existsSync(projectDir)) {
     console.error(`错误: 目录不存在: ${projectDir}`);
@@ -278,22 +303,25 @@ export async function run() {
 
     console.log(`📦 项目: ${label} (${projectDir})`);
 
-    // 动态检测默认分支
-    let defaultBranch = sh(
-      `git -C ${projectDir} symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`
-    )
-      ?.replace("refs/remotes/origin/", "")
-      ?.trim();
-    if (!defaultBranch) {
-      // fallback: 检查 main 或 master
-      const hasMaster = sh(
-        `git -C ${projectDir} ls-remote --heads origin master 2>/dev/null`
-      );
-      defaultBranch = hasMaster ? "master" : "main";
+    // 确定目标分支：优先使用入参，否则动态探测默认分支
+    let targetBranch = branch;
+    if (!targetBranch) {
+      targetBranch = sh(
+        `git -C ${projectDir} symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`
+      )
+        ?.replace("refs/remotes/origin/", "")
+        ?.trim();
+      if (!targetBranch) {
+        // fallback: 检查 main 或 master
+        const hasMaster = sh(
+          `git -C ${projectDir} ls-remote --heads origin master 2>/dev/null`
+        );
+        targetBranch = hasMaster ? "master" : "main";
+      }
     }
 
-    console.log(`🔄 正在从远程拉取最新代码 (${defaultBranch})...`);
-    shExec(`git -C ${projectDir} fetch origin ${defaultBranch} --quiet`);
+    console.log(`🔄 正在从远程拉取最新代码 (${targetBranch})...`);
+    shExec(`git -C ${projectDir} fetch origin ${targetBranch} --quiet`);
 
     // 创建 worktree
     const branchId = Math.random().toString(36).slice(2, 7);
@@ -304,7 +332,7 @@ export async function run() {
     console.log(`🌿 创建 worktree 分支: ${branchName}`);
     console.log(`   路径: ${worktreeDir}`);
     shExec(
-      `git -C ${projectDir} worktree add -b ${branchName} ${worktreeDir} origin/${defaultBranch} --quiet`
+      `git -C ${projectDir} worktree add -b ${branchName} ${worktreeDir} origin/${targetBranch} --quiet`
     );
     workDir = worktreeDir;
   } else {
