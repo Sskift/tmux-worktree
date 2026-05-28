@@ -44,11 +44,7 @@ fs.writeFileSync(
   wrapperPath,
   `#!/bin/sh
 REAL_SHELL=${JSON.stringify(shell)}
-TEMP_HOME=${JSON.stringify(isolated.tempHome)}
-export TEMP_HOME
-if [ "$1" = "-l" ] && [ "$2" = "-c" ] && [ "$3" = "env -0" ]; then
-  exec "$REAL_SHELL" -l -c 'HOME="$TEMP_HOME" env -0'
-fi
+export SHELL="$REAL_SHELL"
 exec "$REAL_SHELL" "$@"
 `,
   { mode: 0o755 },

@@ -101,6 +101,14 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
+async function getWindowExpandedState(win: ReturnType<typeof getCurrentWindow>) {
+  const [fullscreen, maximized] = await Promise.all([
+    win.isFullscreen().catch(() => false),
+    win.isMaximized().catch(() => false),
+  ]);
+  return { fullscreen, maximized };
+}
+
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
 
@@ -181,8 +189,21 @@ function App() {
 
     const capture = async () => {
       try {
-        const maximized = await win.isMaximized();
+        const { fullscreen, maximized } = await getWindowExpandedState(win);
         if (disposed) return;
+        if (fullscreen) {
+          setWindowLayout(
+            (prev) =>
+              prev ?? {
+                width: WINDOW_DEFAULTS.width,
+                height: WINDOW_DEFAULTS.height,
+                x: 0,
+                y: 0,
+                maximized: false,
+              },
+          );
+          return;
+        }
         if (maximized) {
           setWindowLayout((prev) =>
             prev
@@ -261,12 +282,18 @@ function App() {
     prevColumnsRef.current = curr;
     if (delta !== 0) {
       (async () => {
-        const win = getCurrentWindow();
-        const size = await win.innerSize();
-        const factor = await win.scaleFactor();
-        const lw = size.width / factor + delta;
-        const lh = size.height / factor;
-        await win.setSize(new LogicalSize(Math.max(800, lw), lh));
+        try {
+          const win = getCurrentWindow();
+          const { fullscreen, maximized } = await getWindowExpandedState(win);
+          if (fullscreen || maximized) return;
+          const size = await win.innerSize();
+          const factor = await win.scaleFactor();
+          const lw = size.width / factor + delta;
+          const lh = size.height / factor;
+          await win.setSize(new LogicalSize(Math.max(800, lw), lh));
+        } catch {
+          // Window resizing is a convenience; keep column toggles functional if it fails.
+        }
       })();
     }
   }, [fileBrowserOpen, editingFile, diffFile]);
@@ -607,7 +634,7 @@ function App() {
     );
     if (cwdsBySession[name] || cwdRequested.current.has(name)) return;
     cwdRequested.current.add(name);
-    invoke<string>("session_cwd", { name })
+    invoke<string>("session_root", { name })
       .then((cwd) => {
         if (cwd) setCwdsBySession((prev) => ({ ...prev, [name]: cwd }));
       })

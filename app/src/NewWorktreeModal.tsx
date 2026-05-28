@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
-type Project = { name: string; path: string };
+type Project = { name: string; path: string; branch?: string | null };
 type Orphan = { project: string; path: string; name: string };
 
 type Props = {
@@ -21,6 +21,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
   const [savePreset, setSavePreset] = useState(false);
   const [aiCmd, setAiCmd] = useState<string>("claude");
   const [name, setName] = useState<string>("");
+  const [branch, setBranch] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -90,6 +91,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
         path?: string;
         aiCmd: string;
         name: string | null;
+        branch?: string;
       } = {
         aiCmd: aiCmd.trim(),
         name: name.trim() || null,
@@ -110,6 +112,9 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
         }
       } else {
         createArgs.project = project;
+      }
+      if (branch.trim()) {
+        createArgs.branch = branch.trim();
       }
 
       const sessionName = await invoke<string>("create_worktree", {
@@ -230,6 +235,26 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
             )}
           </>
         )}
+
+        <label className="field">
+          <span className="field__label">target branch</span>
+          <input
+            className="field__input"
+            type="text"
+            value={branch}
+            onChange={(e) => setBranch(e.target.value)}
+            placeholder={
+              !isCustom && projects.find((p) => p.name === project)?.branch
+                ? `default: ${projects.find((p) => p.name === project)?.branch}`
+                : "auto-detect origin HEAD"
+            }
+            disabled={busy}
+            autoComplete="off"
+            autoCorrect="off"
+            autoCapitalize="off"
+            spellCheck={false}
+          />
+        </label>
 
         <label className="field">
           <span className="field__label">ai command</span>
