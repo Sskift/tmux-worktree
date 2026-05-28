@@ -104,6 +104,7 @@ struct Session {
 struct Project {
     name: String,
     path: String,
+    branch: Option<String>,
 }
 
 struct PtyHandle {
@@ -211,22 +212,7 @@ fn list_projects() -> Result<Vec<Project>, String> {
     let config: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("parse config: {e}"))?;
 
-    let projects = config
-        .get("projects")
-        .and_then(|v| v.as_object())
-        .map(|obj| {
-            obj.iter()
-                .filter_map(|(name, path)| {
-                    Some(Project {
-                        name: name.clone(),
-                        path: path.as_str()?.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    Ok(projects)
+    Ok(projects_from_config(&config))
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -243,6 +229,81 @@ struct CreateArgs {
     #[serde(rename = "aiCmd")]
     ai_cmd: String,
     name: Option<String>,
+    branch: Option<String>,
+}
+
+fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
+    names
+        .iter()
+        .find_map(|name| value.get(name).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn project_from_value(name: String, value: &serde_json::Value) -> Option<Project> {
+    if let Some(path) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(Project {
+            name,
+            path: path.to_string(),
+            branch: None,
+        });
+    }
+
+    let path = string_field(value, &["path", "dir", "directory", "root"])?;
+    let branch =
+        string_field(value, &["branch", "targetBranch", "target_branch"]).map(ToString::to_string);
+    Some(Project {
+        name,
+        path: path.to_string(),
+        branch,
+    })
+}
+
+fn projects_from_config(config: &serde_json::Value) -> Vec<Project> {
+    match config.get("projects") {
+        Some(serde_json::Value::Object(obj)) => obj
+            .iter()
+            .filter_map(|(name, value)| project_from_value(name.clone(), value))
+            .collect(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|value| {
+                let name = string_field(value, &["name", "key", "id"])?.to_string();
+                project_from_value(name, value)
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+fn project_from_config(config: &serde_json::Value, name: &str) -> Option<Project> {
+    config.get("projects").and_then(|projects| match projects {
+        serde_json::Value::Object(obj) => obj
+            .get(name)
+            .and_then(|value| project_from_value(name.to_string(), value)),
+        serde_json::Value::Array(items) => items.iter().find_map(|value| {
+            let project_name = string_field(value, &["name", "key", "id"])?;
+            if project_name == name {
+                project_from_value(name.to_string(), value)
+            } else {
+                None
+            }
+        }),
+        _ => None,
+    })
+}
+
+fn config_worktree_base(config: &serde_json::Value) -> Option<String> {
+    string_field(
+        config,
+        &[
+            "worktreeBase",
+            "worktree_base",
+            "worktreeDir",
+            "worktreeRoot",
+        ],
+    )
+    .map(ToString::to_string)
 }
 
 fn run_check(args: &[&str]) -> Result<String, String> {
@@ -287,11 +348,7 @@ fn worktree_base_dir() -> String {
     std::fs::read_to_string(&config_path)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|v| {
-            v.get("worktreeBase")
-                .and_then(|b| b.as_str())
-                .map(String::from)
-        })
+        .and_then(|v| config_worktree_base(&v))
         .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
 }
 
@@ -603,14 +660,10 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
         serde_json::json!({})
     };
 
-    let (project_label, project_dir) = if let Some(name) = args.project.as_deref() {
-        let dir = config
-            .get("projects")
-            .and_then(|v| v.get(name))
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| format!("project '{name}' not in ~/.tmux-worktree.json"))?
-            .to_string();
-        (name.to_string(), dir)
+    let (project_label, project_dir, project_branch) = if let Some(name) = args.project.as_deref() {
+        let project = project_from_config(&config, name)
+            .ok_or_else(|| format!("project '{name}' not in ~/.tmux-worktree.json"))?;
+        (project.name, project.path, project.branch)
     } else if let Some(path) = args.path.as_deref() {
         let p = path.trim();
         if p.is_empty() {
@@ -621,7 +674,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
             .and_then(|s| s.to_str())
             .unwrap_or("project")
             .to_string();
-        (label, p.to_string())
+        (label, p.to_string(), None)
     } else {
         return Err("project or path required".into());
     };
@@ -630,11 +683,8 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
         return Err(format!("project dir does not exist: {project_dir}"));
     }
 
-    let worktree_base = config
-        .get("worktreeBase")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/private/tmp/tmux-worktree/projects")
-        .to_string();
+    let worktree_base = config_worktree_base(&config)
+        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string());
 
     let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
     let base_session = if trimmed_name.is_empty() {
@@ -654,14 +704,21 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
     .as_deref()
         == Some("true")
     {
-        let default_branch = detect_default_branch(&project_dir);
+        let target_branch = args
+            .branch
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(ToString::to_string)
+            .or(project_branch)
+            .unwrap_or_else(|| detect_default_branch(&project_dir));
         let _ = run_quiet(&[
             "git",
             "-C",
             &project_dir,
             "fetch",
             "origin",
-            &default_branch,
+            &target_branch,
             "--quiet",
         ]);
 
@@ -681,7 +738,7 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
             "-b",
             &branch_name,
             &worktree_dir,
-            &format!("origin/{}", default_branch),
+            &format!("origin/{}", target_branch),
             "--quiet",
         ])?;
 
@@ -740,11 +797,8 @@ fn list_orphaned_worktrees() -> Result<Vec<OrphanedWorktree>, String> {
         return Ok(vec![]);
     };
 
-    let worktree_base = config
-        .get("worktreeBase")
-        .and_then(|v| v.as_str())
-        .unwrap_or("/private/tmp/tmux-worktree/projects")
-        .to_string();
+    let worktree_base = config_worktree_base(&config)
+        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string());
 
     let base_path = std::path::Path::new(&worktree_base);
     Ok(orphaned_worktrees(base_path, &live_session_names()))
@@ -819,6 +873,33 @@ fn session_cwd(name: String) -> Result<String, String> {
     }
 
     first_path.ok_or_else(|| format!("tmux session has no panes: {name}"))
+}
+
+#[tauri::command]
+fn session_root(name: String) -> Result<String, String> {
+    let fmt = "#{session_name}\x1f#{session_path}";
+    let output = std::process::Command::new(tmux_bin())
+        .args(["list-sessions", "-F", fmt])
+        .output()
+        .map_err(|e| format!("spawn tmux: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "tmux list-sessions failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.splitn(2, '\x1f');
+        let session_name = parts.next().unwrap_or_default();
+        let path = parts.next().unwrap_or_default().trim();
+        if session_name == name && !path.is_empty() {
+            return Ok(path.to_string());
+        }
+    }
+
+    session_cwd(name)
 }
 
 #[derive(Deserialize)]
@@ -1780,6 +1861,7 @@ pub fn run() {
             list_orphaned_worktrees,
             restore_worktree,
             session_cwd,
+            session_root,
             cancel_copy_mode,
             copy_tmux_selection,
             capture_pane_history,
