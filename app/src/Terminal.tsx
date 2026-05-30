@@ -20,6 +20,49 @@ type Props = {
   onOpenFile?: (path: string, line?: number, col?: number) => void;
 };
 
+type BufferPosition = { x: number; y: number };
+type LogicalLine = {
+  text: string;
+  charToCell: BufferPosition[];
+};
+
+const MAX_WRAPPED_LINK_LINES = 20;
+
+function buildLogicalLine(term: XTerm, lineIndex: number): LogicalLine | null {
+  const buffer = term.buffer.active;
+  const cols = term.cols;
+  let start = lineIndex;
+  while (start > 0 && buffer.getLine(start)?.isWrapped) {
+    start--;
+  }
+
+  let end = lineIndex;
+  while (
+    end + 1 < buffer.length &&
+    buffer.getLine(end + 1)?.isWrapped &&
+    end - start + 1 < MAX_WRAPPED_LINK_LINES
+  ) {
+    end++;
+  }
+
+  let text = "";
+  const charToCell: BufferPosition[] = [];
+  for (let y = start; y <= end; y++) {
+    const line = buffer.getLine(y);
+    if (!line) continue;
+    for (let cell = 0; cell < cols; cell++) {
+      const bufCell = line.getCell(cell);
+      if (!bufCell) break;
+      const ch = bufCell.getChars();
+      if (ch === "") continue; // right half of wide char
+      charToCell.push({ x: cell + 1, y: y + 1 });
+      text += ch;
+    }
+  }
+
+  return text ? { text, charToCell } : null;
+}
+
 export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFile }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -50,46 +93,38 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
     // Register link provider for CMD+click support
     const linkProvider: ILinkProvider = {
       provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
-        const bufferLine = term.buffer.active.getLine(bufferLineNumber - 1);
-        if (!bufferLine) { callback(undefined); return; }
+        const logicalLine = buildLogicalLine(term, bufferLineNumber - 1);
+        if (!logicalLine) { callback(undefined); return; }
 
-        // Build char-index to cell-x mapping to handle wide characters correctly
-        const cols = term.cols;
-        let lineText = "";
-        const charToCell: number[] = []; // charToCell[i] = 1-based cell x of char i
-        for (let cell = 0; cell < cols; cell++) {
-          const bufCell = bufferLine.getCell(cell);
-          if (!bufCell) break;
-          const ch = bufCell.getChars();
-          if (ch === "") continue; // right half of wide char
-          charToCell.push(cell + 1); // 1-based
-          lineText += ch;
-        }
-
-        const detected = detectLinks(lineText);
+        const detected = detectLinks(logicalLine.text);
         if (detected.length === 0) { callback(undefined); return; }
 
-        const links: ILink[] = detected.map((match) => ({
-          range: {
-            start: { x: charToCell[match.startIndex] ?? (match.startIndex + 1), y: bufferLineNumber },
-            end: { x: charToCell[match.endIndex - 1] ?? match.endIndex, y: bufferLineNumber },
-          },
-          text: match.text,
-          decorations: { underline: true, pointerCursor: true },
-          activate(event: MouseEvent, _text: string) {
-            if (!event.metaKey) return;
-            if (match.kind === "url") {
-              openUrlInBrowser(match.url);
-            } else if (match.kind === "file" && cwd) {
-              const resolved = resolvePath(match.path, cwd);
-              checkFileExists(resolved).then((exists) => {
-                if (exists && onOpenFile) {
-                  onOpenFile(resolved, match.line, match.col);
-                }
-              });
-            }
-          },
-        }));
+        const links: ILink[] = [];
+        for (const match of detected) {
+          const start = logicalLine.charToCell[match.startIndex];
+          const end = logicalLine.charToCell[match.endIndex - 1];
+          if (!start || !end) continue;
+          if (bufferLineNumber < start.y || bufferLineNumber > end.y) continue;
+          links.push({
+            range: { start, end },
+            text: match.text,
+            decorations: { underline: true, pointerCursor: true },
+            activate(event: MouseEvent, _text: string) {
+              if (!event.metaKey) return;
+              if (match.kind === "url") {
+                openUrlInBrowser(match.url);
+              } else if (match.kind === "file" && cwd) {
+                const resolved = resolvePath(match.path, cwd);
+                checkFileExists(resolved).then((exists) => {
+                  if (exists && onOpenFile) {
+                    onOpenFile(resolved, match.line, match.col);
+                  }
+                });
+              }
+            },
+          });
+        }
+        if (links.length === 0) { callback(undefined); return; }
         callback(links);
       },
     };
