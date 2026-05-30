@@ -1,9 +1,17 @@
 import { execSync, spawn } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 import { createInterface } from "node:readline";
+import {
+  CONFIG_PATH,
+  type Config,
+  type ProjectConfig,
+  expandHomePath,
+  loadConfigFile,
+  normalizeConfig,
+} from "./config";
 
 // ============================================
 // dev.ts — AI + tmux + git worktree 开发环境
@@ -41,14 +49,6 @@ function setupClipboardBindings(): void {
   }
 }
 
-// --- 配置 ---
-interface Config {
-  projects: Record<string, string>;
-  worktreeBase?: string;
-}
-
-const CONFIG_PATH = join(homedir(), ".tmux-worktree.json");
-
 function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => rl.question(question, resolve));
 }
@@ -66,7 +66,7 @@ async function initConfigInteractive(): Promise<Config> {
       if (!name) break;
       const path = (await prompt(rl, "  仓库路径: ")).trim();
       if (!path) break;
-      projects[name] = path.replace(/^~/, homedir());
+      projects[name] = expandHomePath(path);
     }
 
     if (Object.keys(projects).length === 0) {
@@ -80,20 +80,19 @@ async function initConfigInteractive(): Promise<Config> {
     const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
 
     const config: Config = { projects };
-    if (worktreeInput) config.worktreeBase = worktreeInput.replace(/^~/, homedir());
+    if (worktreeInput) config.worktreeBase = expandHomePath(worktreeInput);
 
     writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
     console.log(`\n✅ 已保存到 ${CONFIG_PATH}\n`);
-    return config;
+    return normalizeConfig(config);
   } finally {
     rl.close();
   }
 }
 
 async function loadConfig(): Promise<Config> {
-  if (existsSync(CONFIG_PATH)) {
-    return JSON.parse(readFileSync(CONFIG_PATH, "utf-8"));
-  }
+  const config = loadConfigFile();
+  if (config) return config;
   return initConfigInteractive();
 }
 
@@ -108,7 +107,7 @@ interface RunParams {
   branch?: string; // 目标分支，未指定时自动探测默认分支
 }
 
-async function interactiveSelect(projects: Record<string, string>): Promise<RunParams> {
+async function interactiveSelect(projects: Record<string, ProjectConfig>): Promise<RunParams> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     console.log("🚀 tmux-worktree 交互模式\n");
@@ -122,9 +121,10 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
     // --- 项目 ---
     const projectEntries = Object.entries(projects);
     console.log("\n选择项目 (将在 git worktree 中工作):");
-    projectEntries.forEach(([name, path], i) => {
-      const display = path.replace(homedir(), "~");
-      console.log(`  ${i + 1}) ${name.padEnd(12)} ${display}`);
+    projectEntries.forEach(([name, project], i) => {
+      const display = project.path.replace(homedir(), "~");
+      const branch = project.branch ? `  [${project.branch}]` : "";
+      console.log(`  ${i + 1}) ${name.padEnd(12)} ${display}${branch}`);
     });
     console.log(`  0) 自定义目录        输入任意路径，跳过 worktree`);
     console.log(`  也可以直接输入项目名或目录路径`);
@@ -134,19 +134,21 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
     let sessionName: string;
     let useWorktree: boolean;
     let projectKey: string | undefined;
+    let projectBranch: string | undefined;
 
     const projIdx = parseInt(projInput, 10);
     if (!projInput) {
       // 默认第一个项目
-      const [key, dir] = projectEntries[0];
+      const [key, project] = projectEntries[0];
       projectKey = key;
-      projectDir = dir;
+      projectDir = project.path;
+      projectBranch = project.branch;
       sessionName = key;
       useWorktree = true;
     } else if (projIdx === 0) {
       // 自定义目录
       console.log("\n输入目录的绝对路径，支持 ~ 开头");
-      const customPath = (await prompt(rl, `目录路径: `)).trim().replace(/^~/, homedir());
+      const customPath = expandHomePath((await prompt(rl, `目录路径: `)).trim());
       if (!customPath || !existsSync(customPath)) {
         console.error(`\n错误: 目录不存在: ${customPath || "(空)"}`);
         process.exit(1);
@@ -155,9 +157,10 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
       sessionName = customPath.split("/").filter(Boolean).pop() || "session";
       useWorktree = false;
     } else if (projIdx >= 1 && projIdx <= projectEntries.length) {
-      const [key, dir] = projectEntries[projIdx - 1];
+      const [key, project] = projectEntries[projIdx - 1];
       projectKey = key;
-      projectDir = dir;
+      projectDir = project.path;
+      projectBranch = project.branch;
       sessionName = key;
       useWorktree = true;
     } else {
@@ -165,11 +168,12 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
       const key = projInput;
       if (projects[key]) {
         projectKey = key;
-        projectDir = projects[key];
+        projectDir = projects[key].path;
+        projectBranch = projects[key].branch;
         sessionName = key;
         useWorktree = true;
       } else {
-        const resolved = projInput.replace(/^~/, homedir());
+        const resolved = expandHomePath(projInput);
         if (existsSync(resolved)) {
           projectDir = resolved;
           sessionName = resolved.split("/").filter(Boolean).pop() || "session";
@@ -194,9 +198,10 @@ async function interactiveSelect(projects: Record<string, string>): Promise<RunP
     // --- 目标分支 ---
     let branch: string | undefined;
     if (useWorktree) {
-      console.log(`\n输入 worktree 的目标分支，留空自动探测默认分支 (通常是 master 或 main)`);
+      const suffix = projectBranch ? `，留空使用配置中的 ${projectBranch}` : "，留空自动探测默认分支 (通常是 master 或 main)";
+      console.log(`\n输入 worktree 的目标分支${suffix}`);
       const branchInput = (await prompt(rl, `目标分支: `)).trim();
-      if (branchInput) branch = branchInput;
+      branch = branchInput || projectBranch;
     }
 
     console.log();
@@ -218,7 +223,7 @@ function resolveSessionName(base: string): string {
   return name;
 }
 
-function parseArgs(projects: Record<string, string>): RunParams {
+function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
   // 提取 --branch / -b <name> flag，支持出现在任意位置
   const argv = process.argv.slice(2);
   let branch: string | undefined;
@@ -253,15 +258,22 @@ function parseArgs(projects: Record<string, string>): RunParams {
     process.exit(1);
   }
 
-  const mappedDir = projects[project];
-  if (mappedDir) {
+  const mappedProject = projects[project];
+  if (mappedProject) {
     // 项目在映射中
     const sessionName = sessionArg ? `${project}-${sessionArg}`.slice(0, SESSION_NAME_MAX_LEN) : project;
-    return { aiCmd, projectDir: mappedDir, sessionName, useWorktree: true, projectKey: project, branch };
+    return {
+      aiCmd,
+      projectDir: mappedProject.path,
+      sessionName,
+      useWorktree: true,
+      projectKey: project,
+      branch: branch ?? mappedProject.branch,
+    };
   }
 
   // 不在映射中，当作目录路径
-  const resolved = project.replace(/^~/, homedir());
+  const resolved = expandHomePath(project);
   if (existsSync(resolved)) {
     const dirName = resolved.split("/").filter(Boolean).pop() || "session";
     const sessionName = (sessionArg ?? dirName).slice(0, SESSION_NAME_MAX_LEN);

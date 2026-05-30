@@ -7,7 +7,8 @@
 #
 # Steps:
 #   1. Read tauri.conf.json version → locate dmg
-#   2. Build (skip with --no-build)
+#   2. Build (skip with --no-build). Tauri beforeBuild also builds root dist
+#      so the Dashboard bundle includes the tw serve backend.
 #   3. Copy dmg into app/installer/dmg/tw-dashboard-arm64.dmg
 #   4. Read root package.json version (user bumps this manually)
 #   5. npm publish from repo root
@@ -55,8 +56,6 @@ dmg_src="$APP_DIR/src-tauri/target/release/bundle/dmg/tw-dashboard_${tauri_versi
 if [[ "$skip_build" -eq 0 ]]; then
   info "running tauri build (--no-build to skip)"
   ( cd "$APP_DIR" && npm run tauri build )
-  info "running CLI build (tsup)"
-  ( cd "$REPO_ROOT" && npm run build )
 fi
 [[ -f "$dmg_src" ]] || die "dmg not found at $dmg_src — drop --no-build, or check the build output"
 

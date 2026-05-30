@@ -44,6 +44,28 @@ CLI 和 Dashboard 共用 `~/.tmux-worktree.json`：
 - `projects`：项目名到 git 仓库路径的映射，供 CLI 和 Dashboard 新建 worktree 使用。
 - `worktreeBase`：自动创建 worktree 的父目录。
 
+兼容旧版 CLI 和手写配置，下面这些形态也会被正确读取：
+
+```json
+{
+  "projects": {
+    "myapp": { "path": "~/code/myapp", "branch": "develop" }
+  },
+  "worktreeRoot": "/private/tmp/tmux-worktree/projects"
+}
+```
+
+```json
+{
+  "repositories": [
+    { "name": "backend", "repoPath": "/path/to/backend", "targetBranch": "master" }
+  ],
+  "worktreeRoot": "/private/tmp/tmux-worktree/projects"
+}
+```
+
+项目字段支持 `path`、`dir`、`directory`、`root`、`repoPath` 等别名；分支字段支持 `branch`、`targetBranch`、`defaultBranch` 等别名；worktree 根目录支持 `worktreeBase`、`worktreeDir`、`worktreeRoot`、`worktreesDir`、`worktreesRoot`。
+
 Dashboard 额外状态文件：
 
 - `~/.tw-dashboard-layout.json`：窗口、栏目、当前选择、文件树、编辑器/diff、侧边栏布局。
@@ -79,6 +101,13 @@ tw
 4. 打开文件树后，可以浏览项目并打开编辑器或 diff 栏。
 5. 点击 remote access，通过 Cloudflare Quick Tunnel 在手机或其他设备访问 Web 终端。
 
+Remote 运行时：
+
+- Dashboard 包会内置 `tw serve` 所需的 CLI JS，优先使用内置资源启动后端。
+- 如果内置资源不可用，会兼容用户已经全局安装的 `tw` / `tmux-worktree` 命令。
+- `cloudflared` 优先使用本机已有安装；缺失时 Dashboard 会自动下载 Cloudflare 官方 macOS 二进制到用户目录。自动下载失败时再提示 `brew install cloudflared`。
+- Remote 后端仍需要 Node.js 20+ 来运行 `tw serve`。
+
 布局行为：
 
 - 首次打开是默认三栏：侧边栏、主终端、scratch。
@@ -94,7 +123,7 @@ tw
 - Xcode Command Line Tools
 - tmux
 - git
-- cloudflared，可选，仅远程访问需要
+- cloudflared，可选，仅远程访问需要；Dashboard 会在缺失时尝试自动下载
 
 CLI：
 
@@ -139,7 +168,7 @@ CLI 和 Dashboard installer 共用根目录 npm 包发布：
 发布脚本会：
 
 1. 构建 Tauri Dashboard DMG。
-2. 构建根目录 CLI 到 `dist/cli.js`。
+2. 构建根目录 CLI 到单文件 `dist/cli.js`，并把它打进 Dashboard app resources，供 remote serve 使用。
 3. 复制 DMG 到 `app/installer/dmg/tw-dashboard-arm64.dmg`。
 4. 发布根目录 npm 包到 bnpm。
 

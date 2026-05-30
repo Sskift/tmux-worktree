@@ -23,6 +23,7 @@
 | 文件 | 作用 | 发布状态 |
 |---|---|---|
 | `src/cli.ts` | CLI 路由，分发 `status`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
+| `src/config.ts` | 读取并归一化 `~/.tmux-worktree.json`，兼容旧版 CLI 字符串映射、对象映射、数组项目和字段别名 | 打包 |
 | `src/dev.ts` | 创建 git worktree 和 tmux session，并启动 AI 命令 | 打包 |
 | `src/status.ts` | CLI session 左侧 tmux TUI 状态面板 | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
@@ -37,9 +38,10 @@
 发布路径：
 
 1. `app/src` 和 `app/src-tauri`
-2. `npm run tauri build`
-3. DMG 复制到 `app/installer/dmg/tw-dashboard-arm64.dmg`
-4. `app/installer/installer.mjs` 挂载 DMG 并安装 `tw-dashboard.app`
+2. `npm run tauri build`，Tauri `beforeBuildCommand` 同时构建根目录 `dist/cli.js`
+3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，供 Dashboard remote 启动 `tw serve`
+4. DMG 复制到 `app/installer/dmg/tw-dashboard-arm64.dmg`
+5. `app/installer/installer.mjs` 挂载 DMG 并安装 `tw-dashboard.app`
 
 发布文件：
 
@@ -80,7 +82,7 @@ Rust 后端：
 |---|---|
 | `app/src-tauri/src/main.rs` | 原生应用入口 |
 | `app/src-tauri/src/lib.rs` | 所有 Tauri commands、PTY 状态、git/tmux/file 操作、remote tunnel 生命周期 |
-| `app/src-tauri/tauri.conf.json` | App 身份、bundle 配置、窗口默认值 |
+| `app/src-tauri/tauri.conf.json` | App 身份、bundle 配置、CLI resource、窗口默认值 |
 | `app/src-tauri/capabilities/default.json` | Tauri v2 权限白名单 |
 | `app/src-tauri/icons/` | App 图标 |
 
@@ -92,6 +94,13 @@ Rust 后端：
 - 独立终端：`create_plain_terminal`、`ensure_terminal_session`、`kill_plain_terminal`、`load_terminals`、`save_terminals`。
 - 布局和文件：`load_layout`、`save_layout`、`read_dir`、`read_file`、`write_file`、`search_files`、`file_exists`。
 - Remote：`remote_start`、`remote_stop`、`remote_status`。
+
+Remote 启动顺序：
+
+1. 如果 `127.0.0.1:8311` 已经有 `tw serve`，直接复用。
+2. 否则优先使用 `.app` resources 内置的 `tw-cli/cli.js` 启动 `serve`。
+3. 如果内置资源不可用，回退到用户全局安装的 `tw` / `tmux-worktree` 命令，兼容已安装 CLI 后端的用户。
+4. `cloudflared` 优先使用本机已有安装；缺失时自动下载 Cloudflare 官方 macOS `cloudflared-darwin-{arm64,amd64}.tgz` 到用户目录。
 
 ## 仅开发使用
 
@@ -123,6 +132,15 @@ Rust 后端：
 | `~/.tw-dashboard-terminals.json` | Dashboard | 独立终端定义 |
 | `~/.tw-dashboard-pending-worktree-cleanup.json` | Dashboard | session kill 后待清理 worktree |
 | `~/.tw-serve-token` | CLI serve / Dashboard remote | Web 终端认证 token |
+
+`~/.tmux-worktree.json` 兼容格式：
+
+- `projects` / `repositories` / `repos`
+- 对象映射：`"name": "/repo/path"` 或 `"name": { "path": "/repo/path", "branch": "develop" }`
+- 数组：`[{ "name": "name", "path": "/repo/path" }]`
+- 路径别名：`path`、`dir`、`directory`、`root`、`repoPath`
+- 分支别名：`branch`、`targetBranch`、`defaultBranch`
+- worktree 根目录别名：`worktreeBase`、`worktreeDir`、`worktreeRoot`、`worktreesDir`、`worktreesRoot`
 
 ## 文档维护规则
 

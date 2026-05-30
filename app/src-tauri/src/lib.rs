@@ -2,6 +2,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use tauri::{Emitter, Manager, State};
@@ -39,6 +40,20 @@ fn app_home_dir() -> Option<std::path::PathBuf> {
 
 fn app_home_dir_or_tmp() -> std::path::PathBuf {
     app_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+}
+
+fn expand_home_path(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed == "~" {
+        return app_home_dir_or_tmp().to_string_lossy().to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return app_home_dir_or_tmp()
+            .join(rest)
+            .to_string_lossy()
+            .to_string();
+    }
+    trimmed.to_string()
 }
 
 fn tmux_bin() -> &'static str {
@@ -120,16 +135,20 @@ struct PtyState {
 
 struct TunnelState {
     process: Mutex<Option<std::process::Child>>,
+    serve_process: Mutex<Option<std::process::Child>>,
     url: Mutex<Option<String>>,
     token: Mutex<String>,
+    last_error: Mutex<Option<String>>,
 }
 
 impl Default for TunnelState {
     fn default() -> Self {
         Self {
             process: Mutex::new(None),
+            serve_process: Mutex::new(None),
             url: Mutex::new(None),
             token: Mutex::new(String::new()),
+            last_error: Mutex::new(None),
         }
     }
 }
@@ -244,23 +263,53 @@ fn project_from_value(name: String, value: &serde_json::Value) -> Option<Project
     if let Some(path) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
         return Some(Project {
             name,
-            path: path.to_string(),
+            path: expand_home_path(path),
             branch: None,
         });
     }
 
-    let path = string_field(value, &["path", "dir", "directory", "root"])?;
-    let branch =
-        string_field(value, &["branch", "targetBranch", "target_branch"]).map(ToString::to_string);
+    let path = string_field(
+        value,
+        &[
+            "path",
+            "dir",
+            "directory",
+            "root",
+            "repo",
+            "repoPath",
+            "repository",
+            "repositoryPath",
+        ],
+    )?;
+    let branch = string_field(
+        value,
+        &[
+            "branch",
+            "targetBranch",
+            "target_branch",
+            "defaultBranch",
+            "default_branch",
+        ],
+    )
+    .map(ToString::to_string);
     Some(Project {
         name,
-        path: path.to_string(),
+        path: expand_home_path(path),
         branch,
     })
 }
 
+fn projects_value(config: &serde_json::Value) -> Option<&serde_json::Value> {
+    if config.is_array() {
+        return Some(config);
+    }
+    ["projects", "repositories", "repos"]
+        .iter()
+        .find_map(|key| config.get(key))
+}
+
 fn projects_from_config(config: &serde_json::Value) -> Vec<Project> {
-    match config.get("projects") {
+    match projects_value(config) {
         Some(serde_json::Value::Object(obj)) => obj
             .iter()
             .filter_map(|(name, value)| project_from_value(name.clone(), value))
@@ -268,7 +317,20 @@ fn projects_from_config(config: &serde_json::Value) -> Vec<Project> {
         Some(serde_json::Value::Array(items)) => items
             .iter()
             .filter_map(|value| {
-                let name = string_field(value, &["name", "key", "id"])?.to_string();
+                if let Some(path) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                    let expanded = expand_home_path(path);
+                    let name = Path::new(&expanded)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(&expanded)
+                        .to_string();
+                    return Some(Project {
+                        name,
+                        path: expanded,
+                        branch: None,
+                    });
+                }
+                let name = string_field(value, &["name", "key", "id", "label"])?.to_string();
                 project_from_value(name, value)
             })
             .collect(),
@@ -277,12 +339,12 @@ fn projects_from_config(config: &serde_json::Value) -> Vec<Project> {
 }
 
 fn project_from_config(config: &serde_json::Value, name: &str) -> Option<Project> {
-    config.get("projects").and_then(|projects| match projects {
+    projects_value(config).and_then(|projects| match projects {
         serde_json::Value::Object(obj) => obj
             .get(name)
             .and_then(|value| project_from_value(name.to_string(), value)),
         serde_json::Value::Array(items) => items.iter().find_map(|value| {
-            let project_name = string_field(value, &["name", "key", "id"])?;
+            let project_name = string_field(value, &["name", "key", "id", "label"])?;
             if project_name == name {
                 project_from_value(name.to_string(), value)
             } else {
@@ -301,9 +363,11 @@ fn config_worktree_base(config: &serde_json::Value) -> Option<String> {
             "worktree_base",
             "worktreeDir",
             "worktreeRoot",
+            "worktreesDir",
+            "worktreesRoot",
         ],
     )
-    .map(ToString::to_string)
+    .map(expand_home_path)
 }
 
 fn run_check(args: &[&str]) -> Result<String, String> {
@@ -933,17 +997,39 @@ fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
         serde_json::json!({ "projects": {} })
     };
 
-    let projects = config
+    let root = config
         .as_object_mut()
-        .ok_or("config root is not an object")?
-        .entry("projects")
+        .ok_or("config root is not an object")?;
+    let projects_key = if root.contains_key("projects") {
+        "projects"
+    } else if root.contains_key("repositories") {
+        "repositories"
+    } else if root.contains_key("repos") {
+        "repos"
+    } else {
+        "projects"
+    };
+    match root
+        .entry(projects_key)
         .or_insert_with(|| serde_json::json!({}))
-        .as_object_mut()
-        .ok_or("projects is not an object")?;
-    projects.insert(
-        name.to_string(),
-        serde_json::Value::String(path.to_string()),
-    );
+    {
+        serde_json::Value::Object(projects) => {
+            projects.insert(
+                name.to_string(),
+                serde_json::Value::String(path.to_string()),
+            );
+        }
+        serde_json::Value::Array(projects) => {
+            if let Some(existing) = projects.iter_mut().find(|item| {
+                string_field(item, &["name", "key", "id", "label"]).as_deref() == Some(name)
+            }) {
+                *existing = serde_json::json!({ "name": name, "path": path });
+            } else {
+                projects.push(serde_json::json!({ "name": name, "path": path }));
+            }
+        }
+        _ => return Err("projects is not an object or array".into()),
+    }
 
     let pretty =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
@@ -1696,42 +1782,294 @@ fn read_serve_token() -> String {
         .to_string()
 }
 
+fn tcp_port_open(port: u16) -> bool {
+    std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
+fn executable_exists(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn which_cmd(name: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/bin/which")
+        .arg(name)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+fn first_existing_command(candidates: &[&str], name: &str) -> Option<String> {
+    candidates
+        .iter()
+        .find(|path| executable_exists(Path::new(path)))
+        .map(|path| path.to_string())
+        .or_else(|| which_cmd(name))
+}
+
+fn node_bin() -> Option<String> {
+    first_existing_command(
+        &[
+            "/opt/homebrew/bin/node",
+            "/usr/local/bin/node",
+            "/usr/bin/node",
+        ],
+        "node",
+    )
+}
+
+fn bundled_cli_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(path) = std::env::var_os("TW_DASHBOARD_CLI").filter(|v| !v.is_empty()) {
+        paths.push(PathBuf::from(path));
+    }
+    if let Ok(resources) = app.path().resource_dir() {
+        paths.push(resources.join("tw-cli").join("cli.js"));
+        paths.push(resources.join("dist").join("cli.js"));
+        paths.push(resources.join("cli.js"));
+    }
+    paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/cli.js"));
+    paths
+}
+
+fn bundled_cli_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    bundled_cli_candidates(app)
+        .into_iter()
+        .find(|path| executable_exists(path))
+}
+
+fn installed_tw_command() -> Option<String> {
+    first_existing_command(
+        &[
+            "/opt/homebrew/bin/tw",
+            "/usr/local/bin/tw",
+            "/opt/homebrew/bin/tmux-worktree",
+            "/usr/local/bin/tmux-worktree",
+        ],
+        "tw",
+    )
+    .or_else(|| which_cmd("tmux-worktree"))
+}
+
+fn wait_for_serve(mut child: std::process::Child) -> Option<std::process::Child> {
+    for _ in 0..40 {
+        if tcp_port_open(8311) {
+            return Some(child);
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+fn spawn_serve(app: &tauri::AppHandle) -> Result<std::process::Child, String> {
+    let mut failures = Vec::new();
+
+    if let Some(cli) = bundled_cli_path(app) {
+        if let Some(node) = node_bin() {
+            let cli_arg = cli.to_string_lossy().to_string();
+            match std::process::Command::new(&node)
+                .args([cli_arg.as_str(), "serve"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => {
+                    if let Some(child) = wait_for_serve(child) {
+                        return Ok(child);
+                    }
+                    failures.push(format!(
+                        "bundled CLI did not open port 8311: {}",
+                        cli.display()
+                    ));
+                }
+                Err(err) => failures.push(format!("spawn bundled CLI: {err}")),
+            }
+        } else {
+            failures.push("Node.js not found for bundled CLI".to_string());
+        }
+    } else {
+        failures.push("bundled CLI resource not found".to_string());
+    }
+
+    if let Some(tw) = installed_tw_command() {
+        match std::process::Command::new(&tw)
+            .arg("serve")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(child) => {
+                if let Some(child) = wait_for_serve(child) {
+                    return Ok(child);
+                }
+                failures.push(format!("installed tw did not open port 8311: {tw}"));
+            }
+            Err(err) => failures.push(format!("spawn installed tw: {err}")),
+        }
+    } else {
+        failures.push("installed tw/tmux-worktree command not found".to_string());
+    }
+
+    Err(format!(
+        "Failed to start remote serve backend. {}. Install Node.js 20+ or run `npm i -g @byted-codebase/tmux-worktree --registry=https://bnpm.byted.org`.",
+        failures.join("; ")
+    ))
+}
+
+fn managed_cloudflared_path() -> PathBuf {
+    let base = if std::env::var_os("TW_DASHBOARD_HOME").is_some() {
+        app_home_dir_or_tmp().join(".tw-dashboard")
+    } else {
+        dirs::data_local_dir()
+            .unwrap_or_else(app_home_dir_or_tmp)
+            .join("tw-dashboard")
+    };
+    base.join("bin").join("cloudflared")
+}
+
+fn find_cloudflared() -> Option<String> {
+    let managed = managed_cloudflared_path();
+    if executable_exists(&managed) {
+        return Some(managed.to_string_lossy().to_string());
+    }
+    first_existing_command(
+        &[
+            "/opt/homebrew/bin/cloudflared",
+            "/usr/local/bin/cloudflared",
+            "/usr/bin/cloudflared",
+        ],
+        "cloudflared",
+    )
+}
+
+fn download_cloudflared() -> Result<String, String> {
+    if std::env::consts::OS != "macos" {
+        return Err("automatic cloudflared download is only supported on macOS".into());
+    }
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => return Err(format!("unsupported macOS arch for cloudflared: {other}")),
+    };
+    let url = format!(
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-{arch}.tgz"
+    );
+    let bin_path = managed_cloudflared_path();
+    let bin_dir = bin_path
+        .parent()
+        .ok_or_else(|| "invalid managed cloudflared path".to_string())?;
+    std::fs::create_dir_all(bin_dir).map_err(|e| format!("mkdir {}: {e}", bin_dir.display()))?;
+    let archive = bin_dir.join(format!("cloudflared-darwin-{arch}.tgz"));
+    let curl = first_existing_command(&["/usr/bin/curl", "/opt/homebrew/bin/curl"], "curl")
+        .unwrap_or_else(|| "curl".to_string());
+    let archive_arg = archive.to_string_lossy().to_string();
+    let curl_output = std::process::Command::new(&curl)
+        .args(["-fsSL", "--retry", "2", "-o", archive_arg.as_str(), &url])
+        .output()
+        .map_err(|e| format!("spawn curl: {e}"))?;
+    if !curl_output.status.success() {
+        return Err(format!(
+            "download cloudflared failed: {}",
+            String::from_utf8_lossy(&curl_output.stderr).trim()
+        ));
+    }
+
+    let tar = first_existing_command(&["/usr/bin/tar"], "tar").unwrap_or_else(|| "tar".to_string());
+    let bin_dir_arg = bin_dir.to_string_lossy().to_string();
+    let tar_output = std::process::Command::new(&tar)
+        .args(["-xzf", archive_arg.as_str(), "-C", bin_dir_arg.as_str()])
+        .output()
+        .map_err(|e| format!("spawn tar: {e}"))?;
+    if !tar_output.status.success() {
+        return Err(format!(
+            "unpack cloudflared failed: {}",
+            String::from_utf8_lossy(&tar_output.stderr).trim()
+        ));
+    }
+
+    if !bin_path.exists() {
+        return Err(format!(
+            "cloudflared was not found after unpacking {}",
+            archive.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&bin_path)
+            .map_err(|e| format!("metadata {}: {e}", bin_path.display()))?
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&bin_path, permissions)
+            .map_err(|e| format!("chmod {}: {e}", bin_path.display()))?;
+    }
+    let _ = std::fs::remove_file(&archive);
+    Ok(bin_path.to_string_lossy().to_string())
+}
+
+fn ensure_cloudflared() -> Result<String, String> {
+    if let Some(path) = find_cloudflared() {
+        return Ok(path);
+    }
+    download_cloudflared().map_err(|err| {
+        format!(
+            "Failed to prepare cloudflared automatically: {err}. You can also install it with `brew install cloudflared`."
+        )
+    })
+}
+
+fn set_tunnel_error(state: &TunnelState, message: Option<String>) {
+    let mut last_error = state.last_error.lock().unwrap();
+    *last_error = message;
+}
+
+fn stop_managed_serve(state: &TunnelState) {
+    let mut serve_proc = state.serve_process.lock().unwrap();
+    if let Some(ref mut child) = *serve_proc {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    *serve_proc = None;
+}
+
 #[derive(Serialize, Clone)]
 struct TunnelStatus {
     active: bool,
     url: Option<String>,
     token: String,
+    error: Option<String>,
 }
 
 #[tauri::command]
-fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+fn remote_start(app: tauri::AppHandle, state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+    set_tunnel_error(state.inner(), None);
     let mut proc = state.process.lock().unwrap();
     if proc.is_some() {
         return Ok(());
     }
 
     // Ensure serve process is running on port 8311
-    if std::net::TcpStream::connect("127.0.0.1:8311").is_err() {
-        let node = ["/opt/homebrew/bin/node", "/usr/local/bin/node"]
-            .iter()
-            .find(|p| std::path::Path::new(p).exists())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "node".to_string());
-        let cli_js = format!("{}/../../dist/cli.js", env!("CARGO_MANIFEST_DIR"));
-        let serve_arg = "serve".to_string();
-        std::process::Command::new(&node)
-            .args([&cli_js, &serve_arg])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|e| format!("Failed to start serve: {e}"))?;
-        for _ in 0..20 {
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            if std::net::TcpStream::connect("127.0.0.1:8311").is_ok() {
-                break;
-            }
-        }
+    if !tcp_port_open(8311) {
+        let child = spawn_serve(&app).map_err(|err| {
+            set_tunnel_error(state.inner(), Some(err.clone()));
+            err
+        })?;
+        let mut serve = state.serve_process.lock().unwrap();
+        *serve = Some(child);
     }
 
     // Read token from serve process
@@ -1741,14 +2079,11 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         *t = tok;
     }
 
-    let cf_bin = [
-        "/opt/homebrew/bin/cloudflared",
-        "/usr/local/bin/cloudflared",
-    ]
-    .iter()
-    .find(|p| std::path::Path::new(p).exists())
-    .map(|s| s.to_string())
-    .unwrap_or_else(|| "cloudflared".to_string());
+    let cf_bin = ensure_cloudflared().map_err(|err| {
+        set_tunnel_error(state.inner(), Some(err.clone()));
+        stop_managed_serve(state.inner());
+        err
+    })?;
 
     let mut child = std::process::Command::new(&cf_bin)
         .args(["tunnel", "--url", "http://localhost:8311"])
@@ -1757,7 +2092,10 @@ fn remote_start(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| {
-            format!("Failed to start cloudflared: {e}. Install: brew install cloudflared")
+            let message = format!("Failed to start cloudflared: {e}");
+            set_tunnel_error(state.inner(), Some(message.clone()));
+            stop_managed_serve(state.inner());
+            message
         })?;
 
     // Take stderr before storing child
@@ -1805,8 +2143,10 @@ fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
         let _ = child.wait();
     }
     *proc = None;
+    stop_managed_serve(state.inner());
     let mut url = state.url.lock().unwrap();
     *url = None;
+    set_tunnel_error(state.inner(), None);
     Ok(())
 }
 
@@ -1822,10 +2162,12 @@ fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
                 let mut url = state.url.lock().unwrap();
                 *url = None;
                 let token = state.token.lock().unwrap();
+                let error = state.last_error.lock().unwrap();
                 return TunnelStatus {
                     active: false,
                     url: None,
                     token: token.clone(),
+                    error: error.clone(),
                 };
             }
             _ => {}
@@ -1833,10 +2175,12 @@ fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
     }
     let url = state.url.lock().unwrap();
     let token = state.token.lock().unwrap();
+    let error = state.last_error.lock().unwrap();
     TunnelStatus {
         active: proc.is_some(),
         url: url.clone(),
         token: token.clone(),
+        error: error.clone(),
     }
 }
 
@@ -1903,8 +2247,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_pending_worktrees, derive_session_name, load_pending_cleanup, orphaned_worktrees,
-        save_pending_cleanup, worktrees_for_session, OrphanedWorktree,
+        cleanup_pending_worktrees, config_worktree_base, derive_session_name, load_pending_cleanup,
+        orphaned_worktrees, project_from_config, projects_from_config, save_pending_cleanup,
+        worktrees_for_session, OrphanedWorktree,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -1929,6 +2274,58 @@ mod tests {
         assert_eq!(derive_session_name("demo-abc12"), "demo");
         assert_eq!(derive_session_name("demo"), "demo");
         assert_eq!(derive_session_name("demo-nothex"), "demo-nothex");
+    }
+
+    #[test]
+    fn config_parses_legacy_string_projects() {
+        let config = serde_json::json!({
+            "projects": {
+                "frontend": "/repo/frontend"
+            },
+            "worktreeBase": "/tmp/tw"
+        });
+
+        let projects = projects_from_config(&config);
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "frontend");
+        assert_eq!(projects[0].path, "/repo/frontend");
+        assert_eq!(projects[0].branch, None);
+        assert_eq!(config_worktree_base(&config).as_deref(), Some("/tmp/tw"));
+    }
+
+    #[test]
+    fn config_parses_object_projects_with_aliases() {
+        let config = serde_json::json!({
+            "repositories": {
+                "api": {
+                    "repoPath": "/repo/api",
+                    "target_branch": "develop"
+                }
+            },
+            "worktreeRoot": "/tmp/worktrees"
+        });
+
+        let project = project_from_config(&config, "api").expect("project");
+        assert_eq!(project.path, "/repo/api");
+        assert_eq!(project.branch.as_deref(), Some("develop"));
+        assert_eq!(
+            config_worktree_base(&config).as_deref(),
+            Some("/tmp/worktrees")
+        );
+    }
+
+    #[test]
+    fn config_parses_array_projects() {
+        let config = serde_json::json!({
+            "projects": [
+                { "key": "web", "directory": "/repo/web", "defaultBranch": "main" }
+            ]
+        });
+
+        let project = project_from_config(&config, "web").expect("project");
+        assert_eq!(project.name, "web");
+        assert_eq!(project.path, "/repo/web");
+        assert_eq!(project.branch.as_deref(), Some("main"));
     }
 
     #[test]
