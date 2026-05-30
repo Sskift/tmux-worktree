@@ -58,7 +58,7 @@ const SearchIcon = () => (
   </svg>
 );
 
-export function FileTree({ root, selectedFile, onFileSelect, showHidden = false }: Props) {
+export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }: Props) {
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [dirContents, setDirContents] = useState<Map<string, DirEntry[]>>(new Map());
   const [loading, setLoading] = useState<Set<string>>(new Set());
