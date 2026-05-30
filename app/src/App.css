@@ -1344,6 +1344,8 @@ select.field__input {
   font-size: 12px;
   color: var(--text-dim);
   margin-bottom: 8px;
+  line-height: 1.4;
+  word-break: break-word;
 }
 
 .remote-popover__label {

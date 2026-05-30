@@ -148,6 +148,7 @@ function App() {
   const [remoteToken, setRemoteToken] = useState("");
   const [remotePopover, setRemotePopover] = useState(false);
   const [remoteLoading, setRemoteLoading] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
   const [editingFile, setEditingFile] = useState<string | null>(null);
   const [diffFile, setDiffFile] = useState<{ path: string; cwd: string } | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
@@ -575,13 +576,14 @@ function App() {
   // Remote tunnel helpers
   const checkRemoteStatus = useCallback(async () => {
     try {
-      const status = await invoke<{ active: boolean; url: string | null; token: string }>("remote_status");
+      const status = await invoke<{ active: boolean; url: string | null; token: string; error?: string | null }>("remote_status");
       setRemoteActive(status.active);
       setRemoteUrl(status.url);
       setRemoteToken(status.token);
+      setRemoteError(status.error ?? null);
       return status;
     } catch {
-      return { active: false, url: null, token: "" };
+      return { active: false, url: null, token: "", error: null };
     }
   }, []);
 
@@ -591,13 +593,15 @@ function App() {
     } else {
       setRemoteLoading(true);
       setRemotePopover(true);
+      setRemoteError(null);
       try {
         await invoke("remote_start");
         // Poll for URL
         let attempts = 0;
         const poll = setInterval(async () => {
           attempts++;
-          const status = await invoke<{ active: boolean; url: string | null; token: string }>("remote_status");
+          const status = await invoke<{ active: boolean; url: string | null; token: string; error?: string | null }>("remote_status");
+          setRemoteError(status.error ?? null);
           if (status.active && status.url) {
             clearInterval(poll);
             setRemoteActive(true);
@@ -606,10 +610,12 @@ function App() {
             setRemoteLoading(false);
           } else if (attempts > 30) {
             clearInterval(poll);
+            setRemoteError(status.error ?? "Timed out waiting for tunnel URL");
             setRemoteLoading(false);
           }
         }, 1000);
-      } catch {
+      } catch (err) {
+        setRemoteError(String(err));
         setRemoteLoading(false);
       }
     }
@@ -619,6 +625,7 @@ function App() {
     await invoke("remote_stop");
     setRemoteActive(false);
     setRemoteUrl(null);
+    setRemoteError(null);
     setRemotePopover(false);
   }, []);
 
@@ -850,6 +857,11 @@ function App() {
                         <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(remoteToken)} title="Copy Token">⎘</button>
                       </div>
                       <button className="remote-popover__disconnect" onClick={handleRemoteDisconnect}>Disconnect</button>
+                    </>
+                  ) : remoteError ? (
+                    <>
+                      <p className="remote-popover__label">Remote failed</p>
+                      <p className="remote-popover__text">{remoteError}</p>
                     </>
                   ) : (
                     <p className="remote-popover__text">Failed to start tunnel</p>

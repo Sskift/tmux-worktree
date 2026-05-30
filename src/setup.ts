@@ -1,5 +1,6 @@
 import { execSync } from "child_process";
 import { createInterface } from "readline";
+import { CONFIG_PATH, loadConfigFile } from "./config";
 
 interface Dep {
   name: string;
@@ -91,9 +92,29 @@ export async function run() {
   }
 
   console.log();
+  try {
+    const config = loadConfigFile();
+    if (config) {
+      const count = Object.keys(config.projects).length;
+      console.log(`  \x1b[32m✓\x1b[0m config         ${CONFIG_PATH}`);
+      console.log(`    projects: ${count}`);
+      console.log(`    worktreeBase: ${config.worktreeBase || "/private/tmp/tmux-worktree/projects"}`);
+    } else {
+      console.log(`  \x1b[33m-\x1b[0m config         未找到 ${CONFIG_PATH}`);
+    }
+  } catch (err) {
+    console.log(`  \x1b[31m✗\x1b[0m config         读取失败: ${err instanceof Error ? err.message : String(err)}`);
+    allRequiredOk = false;
+  }
 
-  if (missing.length === 0) {
+  console.log();
+
+  if (missing.length === 0 && allRequiredOk) {
     console.log("  \x1b[32m所有依赖已就绪。\x1b[0m\n");
+    return;
+  }
+  if (missing.length === 0) {
+    process.exitCode = 1;
     return;
   }
 
