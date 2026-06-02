@@ -114,6 +114,15 @@ button:disabled {
   background: var(--accent-a);
 }
 
+.splitter--disabled {
+  cursor: default;
+}
+
+.splitter--disabled:hover,
+.splitter--disabled:active {
+  background: var(--divider-strong);
+}
+
 .splitter--horizontal {
   grid-row: auto;
   height: 5px;
@@ -131,6 +140,76 @@ button:disabled {
 .main,
 .scratch {
   grid-row: 2;
+}
+
+.layout-column {
+  position: relative;
+  min-width: 0;
+}
+
+.layout-column--draggable .pane__bar,
+.layout-column--draggable .file-tree__header {
+  padding-left: 30px;
+}
+
+.column-drag-handle {
+  position: absolute;
+  top: 9px;
+  left: 7px;
+  width: 14px;
+  height: 20px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  cursor: grab;
+  z-index: 8;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.column-drag-handle span {
+  width: 2px;
+  height: 12px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.65;
+}
+
+.column-drag-handle:hover {
+  color: var(--text);
+  background: var(--surface-hover-strong);
+}
+
+.column-drag-handle:active {
+  cursor: grabbing;
+}
+
+.layout-column--dragging {
+  opacity: 0.62;
+}
+
+.layout-column--drop-before::before,
+.layout-column--drop-after::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent-a);
+  box-shadow: 0 0 10px var(--accent-a-glow);
+  z-index: 7;
+  pointer-events: none;
+}
+
+.layout-column--drop-before::before {
+  left: -1px;
+}
+
+.layout-column--drop-after::after {
+  right: -1px;
 }
 
 /* ─── Sidebar ───────────────────────────────────────────────── */
@@ -876,37 +955,10 @@ button:disabled {
   min-height: 0;
 }
 
-.scratch--collapsed {
-  align-items: center;
-  justify-content: center;
-  border-left: 1px solid var(--divider-strong);
-}
-
-.scratch__expand-btn {
-  all: unset;
-  cursor: pointer;
-  writing-mode: vertical-rl;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-2);
-  padding: 8px 4px;
-  border-radius: 4px;
-  transition: color 0.15s, background 0.15s;
-}
-
-.scratch__expand-btn:hover {
-  color: var(--text);
-  background: var(--bg-2);
-}
-
-.scratch__collapse-btn {
+.scratch__toggle-btn {
   flex-shrink: 0;
-}
-
-.scratch__collapse-btn--corner {
-  position: absolute;
-  top: 8px;
-  right: 8px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .pane__bar-actions {

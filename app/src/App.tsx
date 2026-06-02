@@ -111,11 +111,67 @@ async function getWindowExpandedState(win: ReturnType<typeof getCurrentWindow>) 
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
+type LayoutColumn = "file" | "main" | "scratch" | "editor";
+type ResizableColumn = Exclude<LayoutColumn, "main">;
 
 const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
+const DEFAULT_COLUMN_ORDER: LayoutColumn[] = ["file", "main", "scratch", "editor"];
+const COLUMN_DRAG_THRESHOLD = 5;
+const COLUMN_WIDTH_LIMITS: Record<ResizableColumn, { min: number; max: number }> = {
+  file: { min: 180, max: 600 },
+  scratch: { min: 220, max: 800 },
+  editor: { min: 250, max: 900 },
+};
 
 let termIdCounter = 0;
 let scratchIdCounter = 0;
+
+function isLayoutColumn(value: unknown): value is LayoutColumn {
+  return value === "file" || value === "main" || value === "scratch" || value === "editor";
+}
+
+function normalizeColumnOrder(value: unknown): LayoutColumn[] {
+  const seen = new Set<LayoutColumn>();
+  const restored = Array.isArray(value)
+    ? value.filter((item): item is LayoutColumn => {
+        if (!isLayoutColumn(item) || seen.has(item)) return false;
+        seen.add(item);
+        return true;
+      })
+    : [];
+  return [...restored, ...DEFAULT_COLUMN_ORDER.filter((column) => !seen.has(column))];
+}
+
+function reorderActiveColumns(
+  currentOrder: LayoutColumn[],
+  activeOrder: LayoutColumn[],
+  from: LayoutColumn,
+  to: LayoutColumn,
+): LayoutColumn[] {
+  const fromIndex = activeOrder.indexOf(from);
+  const toIndex = activeOrder.indexOf(to);
+  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return currentOrder;
+
+  const reorderedActive = [...activeOrder];
+  const [moved] = reorderedActive.splice(fromIndex, 1);
+  reorderedActive.splice(toIndex, 0, moved);
+
+  const activeSet = new Set(activeOrder);
+  const queue = [...reorderedActive];
+  return currentOrder.map((column) => (activeSet.has(column) ? queue.shift()! : column));
+}
+
+function placeScratchAfterMain(order: LayoutColumn[]): LayoutColumn[] {
+  const normalized = normalizeColumnOrder(order);
+  const withoutScratch = normalized.filter((column) => column !== "scratch");
+  const mainIndex = withoutScratch.indexOf("main");
+  const insertAt = mainIndex < 0 ? withoutScratch.length : mainIndex + 1;
+  return [
+    ...withoutScratch.slice(0, insertAt),
+    "scratch",
+    ...withoutScratch.slice(insertAt),
+  ];
+}
 
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -154,10 +210,16 @@ function App() {
   const [homeDir, setHomeDir] = useState<string | null>(null);
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
+  const [columnOrder, setColumnOrder] = useState<LayoutColumn[]>(DEFAULT_COLUMN_ORDER);
+  const [columnDrag, setColumnDrag] = useState<{ from: LayoutColumn; over: LayoutColumn } | null>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const appRef = useRef<HTMLDivElement | null>(null);
+  const columnRefs = useRef<Map<LayoutColumn, HTMLElement>>(new Map());
+  const activeColumnOrderRef = useRef<LayoutColumn[]>(DEFAULT_COLUMN_ORDER);
+  const pendingColumnDragRef = useRef<{ column: LayoutColumn; startX: number; startY: number } | null>(null);
+  const columnDragRef = useRef<{ from: LayoutColumn; over: LayoutColumn } | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
@@ -347,6 +409,7 @@ function App() {
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
+        setColumnOrder(normalizeColumnOrder(lay.columnOrder));
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
         }
@@ -390,6 +453,7 @@ function App() {
           gitHeight,
           sectionSplit,
           sessionOrder,
+          columnOrder,
           scratchCollapsed,
           fileBrowserOpen,
           fileTreeWidth,
@@ -407,6 +471,7 @@ function App() {
     gitHeight,
     sectionSplit,
     sessionOrder,
+    columnOrder,
     scratchCollapsed,
     fileBrowserOpen,
     fileTreeWidth,
@@ -418,19 +483,91 @@ function App() {
   ]);
 
   const anyModalOpen = showNewWorktree || showNewTerminal;
+  const editorPanelOpen = !!(editingFile || diffFile);
 
-  const startResize = (col: "left" | "right") => (e: React.MouseEvent) => {
+  const startSidebarResize = (e: React.MouseEvent) => {
     e.preventDefault();
     const startX = e.clientX;
-    const startLeft = cols[col];
+    const startLeft = cols.left;
     const onMove = (ev: MouseEvent) => {
       const dx = ev.clientX - startX;
-      if (col === "left") {
-        setCols((prev) => ({ ...prev, left: Math.max(180, Math.min(500, startLeft + dx)) }));
-      } else {
-        setCols((prev) => ({ ...prev, right: Math.max(220, Math.min(800, startLeft - dx)) }));
+      setCols((prev) => ({ ...prev, left: clamp(startLeft + dx, 180, 500) }));
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const isResizableColumn = (column: LayoutColumn): column is ResizableColumn => {
+    if (column === "file") return fileBrowserOpen;
+    if (column === "scratch") return !scratchCollapsed;
+    return column === "editor" && editorPanelOpen;
+  };
+
+  const getColumnWidth = (column: ResizableColumn): number => {
+    if (column === "file") return fileTreeWidth;
+    if (column === "scratch") return cols.right;
+    return editorWidth;
+  };
+
+  const setColumnWidth = (column: ResizableColumn, value: number) => {
+    const next = Math.round(value);
+    if (column === "file") {
+      setFileTreeWidth(next);
+    } else if (column === "scratch") {
+      setCols((prev) => ({ ...prev, right: next }));
+    } else {
+      setEditorWidth(next);
+    }
+  };
+
+  const canResizeColumns = (left: LayoutColumn, right: LayoutColumn) =>
+    isResizableColumn(left) || isResizableColumn(right);
+
+  const startColumnResize = (left: LayoutColumn, right: LayoutColumn) => (e: React.MouseEvent) => {
+    const leftResizable = isResizableColumn(left) ? left : null;
+    const rightResizable = isResizableColumn(right) ? right : null;
+    if (!leftResizable && !rightResizable) return;
+
+    e.preventDefault();
+    const startX = e.clientX;
+    const startLeft = leftResizable ? getColumnWidth(leftResizable) : null;
+    const startRight = rightResizable ? getColumnWidth(rightResizable) : null;
+
+    const onMove = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      if (leftResizable && rightResizable && startLeft !== null && startRight !== null) {
+        const leftLimits = COLUMN_WIDTH_LIMITS[leftResizable];
+        const rightLimits = COLUMN_WIDTH_LIMITS[rightResizable];
+        const total = startLeft + startRight;
+        const minLeft = Math.max(leftLimits.min, total - rightLimits.max);
+        const maxLeft = Math.min(leftLimits.max, total - rightLimits.min);
+
+        if (minLeft <= maxLeft) {
+          const nextLeft = clamp(startLeft + dx, minLeft, maxLeft);
+          setColumnWidth(leftResizable, nextLeft);
+          setColumnWidth(rightResizable, total - nextLeft);
+          return;
+        }
+
+        setColumnWidth(leftResizable, clamp(startLeft + dx, leftLimits.min, leftLimits.max));
+        setColumnWidth(rightResizable, clamp(startRight - dx, rightLimits.min, rightLimits.max));
+      } else if (leftResizable && startLeft !== null) {
+        const limits = COLUMN_WIDTH_LIMITS[leftResizable];
+        setColumnWidth(leftResizable, clamp(startLeft + dx, limits.min, limits.max));
+      } else if (rightResizable && startRight !== null) {
+        const limits = COLUMN_WIDTH_LIMITS[rightResizable];
+        setColumnWidth(rightResizable, clamp(startRight - dx, limits.min, limits.max));
       }
     };
+
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
@@ -443,46 +580,95 @@ function App() {
     document.addEventListener("mouseup", onUp);
   };
 
-  const startResizeFileTree = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startW = fileTreeWidth;
-    const onMove = (ev: MouseEvent) => {
-      setFileTreeWidth(Math.max(180, Math.min(600, startW + (ev.clientX - startX))));
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
+  const setColumnRef = useCallback(
+    (column: LayoutColumn) => (element: HTMLElement | null) => {
+      if (element) {
+        columnRefs.current.set(column, element);
+      } else {
+        columnRefs.current.delete(column);
+      }
+    },
+    [],
+  );
 
-  const startResizeEditor = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startRight = cols.right;
-    const startEditor = editorWidth;
-    const onMove = (ev: MouseEvent) => {
-      const dx = ev.clientX - startX;
-      setCols((prev) => ({ ...prev, right: Math.max(220, startRight + dx) }));
-      setEditorWidth(Math.max(250, startEditor - dx));
+  const startColumnDrag = useCallback(
+    (column: LayoutColumn) => (e: React.PointerEvent<HTMLButtonElement>) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pendingColumnDragRef.current = { column, startX: e.clientX, startY: e.clientY };
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const onMove = (e: globalThis.PointerEvent) => {
+      const pending = pendingColumnDragRef.current;
+      if (pending && !columnDragRef.current) {
+        const dx = e.clientX - pending.startX;
+        const dy = e.clientY - pending.startY;
+        if (Math.hypot(dx, dy) >= COLUMN_DRAG_THRESHOLD) {
+          const next = { from: pending.column, over: pending.column };
+          columnDragRef.current = next;
+          setColumnDrag(next);
+          document.body.style.userSelect = "none";
+          document.body.style.cursor = "grabbing";
+          pendingColumnDragRef.current = null;
+        }
+        return;
+      }
+
+      const drag = columnDragRef.current;
+      if (!drag) return;
+
+      let best = drag.over;
+      let bestDist = Infinity;
+      for (const column of activeColumnOrderRef.current) {
+        const element = columnRefs.current.get(column);
+        if (!element) continue;
+        const rect = element.getBoundingClientRect();
+        const mid = rect.left + rect.width / 2;
+        const dist = Math.abs(e.clientX - mid);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = column;
+        }
+      }
+
+      if (best !== drag.over) {
+        const next = { ...drag, over: best };
+        columnDragRef.current = next;
+        setColumnDrag(next);
+      }
     };
+
     const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
+      pendingColumnDragRef.current = null;
+      const drag = columnDragRef.current;
+      if (!drag) return;
+
+      if (drag.from !== drag.over) {
+        const activeOrder = activeColumnOrderRef.current;
+        setColumnOrder((currentOrder) =>
+          reorderActiveColumns(currentOrder, activeOrder, drag.from, drag.over),
+        );
+      }
+
+      columnDragRef.current = null;
+      setColumnDrag(null);
       document.body.style.userSelect = "";
+      document.body.style.cursor = "";
     };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
+
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    return () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+  }, []);
 
   const startGitSplit = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -771,6 +957,11 @@ function App() {
     document.addEventListener("mouseup", onUp);
   };
 
+  const openScratch = useCallback(() => {
+    setColumnOrder((order) => placeScratchAfterMain(order));
+    setScratchCollapsed(false);
+  }, []);
+
   const colorMap = new Map<string, string>();
   const totalCount = sessions.length + terminals.length;
 
@@ -787,23 +978,80 @@ function App() {
     (reordered) => setTerminals(reordered),
   );
 
-  const editorPanelOpen = !!(editingFile || diffFile);
   const SPLITTER_W = 1;
-  const SCRATCH_COLLAPSED_W = 36;
-  const scratchWidth = scratchCollapsed ? SCRATCH_COLLAPSED_W : cols.right;
-  const numSplitters = 1 + (scratchCollapsed ? 0 : 1) + (fileBrowserOpen ? 1 : 0) + (editorPanelOpen ? 1 : 0);
-  const mainWidth = Math.max(200, containerWidth - cols.left - scratchWidth
-    - (fileBrowserOpen ? fileTreeWidth : 0)
-    - (editorPanelOpen ? editorWidth : 0)
-    - numSplitters * SPLITTER_W);
+  const scratchWidth = cols.right;
+  const isColumnActive = (column: LayoutColumn) => {
+    if (column === "file") return fileBrowserOpen;
+    if (column === "scratch") return !scratchCollapsed;
+    if (column === "editor") return editorPanelOpen;
+    return true;
+  };
+  const activeColumnOrder = columnOrder.filter(isColumnActive);
+  activeColumnOrderRef.current = activeColumnOrder;
 
-  const gridCols = (() => {
-    let g = `${cols.left}px ${SPLITTER_W}px`;
-    if (fileBrowserOpen) g += ` ${fileTreeWidth}px ${SPLITTER_W}px`;
-    g += ` ${mainWidth}px ${scratchCollapsed ? "" : `${SPLITTER_W}px `}${scratchWidth}px`;
-    if (editorPanelOpen) g += ` ${SPLITTER_W}px ${editorWidth}px`;
-    return g;
-  })();
+  const fixedColumnsWidth = activeColumnOrder.reduce((total, column) => {
+    if (column === "file") return total + fileTreeWidth;
+    if (column === "scratch") return total + scratchWidth;
+    if (column === "editor") return total + editorWidth;
+    return total;
+  }, 0);
+  const mainWidth = Math.max(
+    200,
+    containerWidth - cols.left - fixedColumnsWidth - activeColumnOrder.length * SPLITTER_W,
+  );
+
+  const columnTrackWidth = (column: LayoutColumn) => {
+    if (column === "file") return fileTreeWidth;
+    if (column === "scratch") return scratchWidth;
+    if (column === "editor") return editorWidth;
+    return mainWidth;
+  };
+  const gridCols = `${cols.left}px ${SPLITTER_W}px ${activeColumnOrder
+    .map((column) => `${columnTrackWidth(column)}px`)
+    .join(` ${SPLITTER_W}px `)}`;
+
+  const columnGridColumn = (column: LayoutColumn) => {
+    const index = activeColumnOrder.indexOf(column);
+    return index < 0 ? undefined : 3 + index * 2;
+  };
+
+  const columnClass = (column: LayoutColumn, base: string) => {
+    let cls = `${base} layout-column layout-column--draggable`;
+    if (columnDrag?.from === column) cls += " layout-column--dragging";
+    if (columnDrag && columnDrag.over === column && columnDrag.from !== column) {
+      const fromIndex = activeColumnOrder.indexOf(columnDrag.from);
+      const overIndex = activeColumnOrder.indexOf(column);
+      cls += fromIndex > overIndex ? " layout-column--drop-before" : " layout-column--drop-after";
+    }
+    return cls;
+  };
+
+  const renderColumnHandle = (column: LayoutColumn, label: string) => (
+    <button
+      className="column-drag-handle"
+      type="button"
+      onPointerDown={startColumnDrag(column)}
+      title={`reorder ${label}`}
+      aria-label={`reorder ${label}`}
+    >
+      <span />
+      <span />
+    </button>
+  );
+
+  const columnSplitters = activeColumnOrder.slice(1).map((right, index) => {
+    const left = activeColumnOrder[index];
+    const resizable = canResizeColumns(left, right);
+    return (
+      <div
+        key={`${left}-${right}`}
+        className={`splitter${resizable ? "" : " splitter--disabled"}`}
+        style={{ gridColumn: 4 + index * 2 }}
+        onMouseDown={resizable ? startColumnResize(left, right) : undefined}
+        aria-label={`resize ${left} and ${right}`}
+      />
+    );
+  });
 
   return (
     <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
@@ -1114,30 +1362,35 @@ function App() {
       {/* ── Left splitter (always visible) ── */}
       <div
         className="splitter"
-        onMouseDown={startResize("left")}
+        style={{ gridColumn: 2 }}
+        onMouseDown={startSidebarResize}
         aria-label="resize sidebar"
       />
+      {columnSplitters}
 
       {/* ── File tree column (inserted when open) ── */}
       {fileBrowserOpen && (
-        <>
-          <aside className="file-tree-panel">
-            <FileTree
-              root={fileBrowserRoot}
-              selectedFile={editingFile}
-              onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
-            />
-          </aside>
-          <div
-            className="splitter"
-            onMouseDown={startResizeFileTree}
-            aria-label="resize file tree"
+        <aside
+          className={columnClass("file", "file-tree-panel")}
+          ref={setColumnRef("file")}
+          style={{ gridColumn: columnGridColumn("file") }}
+        >
+          {renderColumnHandle("file", "file tree")}
+          <FileTree
+            root={fileBrowserRoot}
+            selectedFile={editingFile}
+            onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
           />
-        </>
+        </aside>
       )}
 
       {/* ── Main terminal (always visible) ── */}
-      <main className="main">
+      <main
+        className={columnClass("main", "main")}
+        ref={setColumnRef("main")}
+        style={{ gridColumn: columnGridColumn("main") }}
+      >
+        {renderColumnHandle("main", "main terminal")}
         {selection ? (
           <div className="pane pane--term">
             <div className="pane__bar">
@@ -1147,9 +1400,30 @@ function App() {
                   : terminals.find((t) => t.id === selection.id)?.label ??
                     selection.id}
               </span>
-              <span className="pane__hint dim">
-                {selection.kind === "session" ? "tmux attach" : "zsh"}
-              </span>
+              <div className="pane__bar-actions">
+                <span className="pane__hint dim">
+                  {selection.kind === "session" ? "tmux attach" : "zsh"}
+                </span>
+                <button
+                  className={`brand__file-btn scratch__toggle-btn${scratchCollapsed ? "" : " brand__file-btn--active"}`}
+                  type="button"
+                  onClick={() => {
+                    if (scratchCollapsed) {
+                      openScratch();
+                    } else {
+                      setScratchCollapsed(true);
+                    }
+                  }}
+                  title={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
+                  aria-label={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
+                >
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" strokeWidth="1.2"/>
+                    <path d="M9.5 2.5V13.5" stroke="currentColor" strokeWidth="1.2"/>
+                    <path d="M11.4 6L9.8 8L11.4 10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+                  </svg>
+                </button>
+              </div>
             </div>
             <div className="pane__body pane__body--stack">
               {openedSessions.map((name) => (
@@ -1215,136 +1489,106 @@ function App() {
         )}
       </main>
 
-      {/* ── Right splitter (always visible when not collapsed) ── */}
+      {/* ── Scratch panel ── */}
       {!scratchCollapsed && (
-        <div
-          className="splitter"
-          onMouseDown={startResize("right")}
-          aria-label="resize scratch"
-        />
-      )}
-
-      {/* ── Scratch panel (always visible) ── */}
-      <aside className={`scratch${scratchCollapsed ? " scratch--collapsed" : ""}`}>
-        {scratchCollapsed && (
-          <button
-            className="scratch__expand-btn"
-            type="button"
-            onClick={() => setScratchCollapsed(false)}
-            title="展开 scratch"
-          >
-            ‹
-          </button>
-        )}
-        {scratchTerminals.size > 0 ? (
-          <div className="pane pane--term" style={{ display: scratchCollapsed ? "none" : undefined }}>
-            <div className="pane__bar">
-              <span className="pane__title">scratch</span>
-              <div className="pane__bar-actions">
-                <button
-                  className="btn btn--small"
-                  type="button"
-                  onClick={addScratchTerminal}
-                >
-                  +
-                </button>
-                <button
-                  className="btn btn--small scratch__collapse-btn"
-                  type="button"
-                  onClick={() => setScratchCollapsed(true)}
-                  title="收起 scratch"
-                >
-                  ›
-                </button>
-              </div>
-            </div>
-            {Array.from(scratchTerminals.entries()).map(([key, state]) => {
-              const isActive = key === selectionKey;
-              const cwdForKey = (() => {
-                if (key.startsWith("s:")) {
-                  return cwdsBySession[key.slice(2)] ?? null;
-                }
-                if (key.startsWith("t:")) {
-                  return terminals.find((t) => t.id === key.slice(2))?.cwd ?? null;
-                }
-                return null;
-              })();
-              if (!cwdForKey) return null;
-              return (
-                <div
-                  key={key}
-                  className="scratch__sections"
-                  ref={isActive ? scratchSectionsRef : undefined}
-                  style={{ display: isActive ? "flex" : "none" }}
-                >
-                  {state.list.map((st, i) => (
-                    <div key={st.id} className="scratch__section">
-                      <div
-                        className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
-                        onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
-                      >
-                        <span className="section-label__text">{st.label}</span>
-                        <div className="section-label__line" />
-                        {state.list.length > 1 && (
-                          <button
-                            className="scratch__close"
-                            type="button"
-                            onClick={() => removeScratchTerminal(st.id)}
-                          >
-                            ×
-                          </button>
-                        )}
-                      </div>
-                      <div className="scratch__term">
-                        <Terminal
-                          cmd="/bin/zsh"
-                          args={["-l"]}
-                          cwd={cwdForKey}
-                          active={isActive && !anyModalOpen}
-                          onOpenFile={handleOpenFile}
-                        />
-                      </div>
-                    </div>
-                  ))}
+        <aside
+          className={columnClass("scratch", "scratch")}
+          ref={setColumnRef("scratch")}
+          style={{ gridColumn: columnGridColumn("scratch") }}
+        >
+          {renderColumnHandle("scratch", "scratch")}
+          {scratchTerminals.size > 0 ? (
+            <div className="pane pane--term">
+              <div className="pane__bar">
+                <span className="pane__title">scratch</span>
+                <div className="pane__bar-actions">
+                  <button
+                    className="btn btn--small"
+                    type="button"
+                    onClick={addScratchTerminal}
+                  >
+                    +
+                  </button>
                 </div>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="pane pane--empty" style={{ display: scratchCollapsed ? "none" : undefined }}>
-            <button
-              className="btn btn--small scratch__collapse-btn scratch__collapse-btn--corner"
-              type="button"
-              onClick={() => setScratchCollapsed(true)}
-              title="收起 scratch"
-            >
-              ›
-            </button>
-            <div className="pane__hint">scratch</div>
-          </div>
-        )}
-      </aside>
+              </div>
+              {Array.from(scratchTerminals.entries()).map(([key, state]) => {
+                const isActive = key === selectionKey;
+                const cwdForKey = (() => {
+                  if (key.startsWith("s:")) {
+                    return cwdsBySession[key.slice(2)] ?? null;
+                  }
+                  if (key.startsWith("t:")) {
+                    return terminals.find((t) => t.id === key.slice(2))?.cwd ?? null;
+                  }
+                  return null;
+                })();
+                if (!cwdForKey) return null;
+                return (
+                  <div
+                    key={key}
+                    className="scratch__sections"
+                    ref={isActive ? scratchSectionsRef : undefined}
+                    style={{ display: isActive ? "flex" : "none" }}
+                  >
+                    {state.list.map((st, i) => (
+                      <div key={st.id} className="scratch__section">
+                        <div
+                          className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
+                          onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
+                        >
+                          <span className="section-label__text">{st.label}</span>
+                          <div className="section-label__line" />
+                          {state.list.length > 1 && (
+                            <button
+                              className="scratch__close"
+                              type="button"
+                              onClick={() => removeScratchTerminal(st.id)}
+                            >
+                              ×
+                            </button>
+                          )}
+                        </div>
+                        <div className="scratch__term">
+                          <Terminal
+                            cmd="/bin/zsh"
+                            args={["-l"]}
+                            cwd={cwdForKey}
+                            active={isActive && !anyModalOpen}
+                            onOpenFile={handleOpenFile}
+                          />
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="pane pane--empty">
+              <div className="pane__hint">scratch</div>
+            </div>
+          )}
+        </aside>
+      )}
 
       {/* ── Editor column (appended when a file is selected) ── */}
       {editorPanelOpen && (
-        <>
-          <div
-            className="splitter"
-            onMouseDown={startResizeEditor}
-            aria-label="resize editor"
-          />
-          <aside className="editor-panel">
-            {diffFile ? (
-              <DiffViewer
-                cwd={diffFile.cwd}
-                filePath={diffFile.path}
-                onClose={() => setDiffFile(null)}
-              />
-            ) : editingFile ? (
-              <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} onOpenFile={handleOpenFile} />
-            ) : null}
-          </aside>
-        </>
+        <aside
+          className={columnClass("editor", "editor-panel")}
+          ref={setColumnRef("editor")}
+          style={{ gridColumn: columnGridColumn("editor") }}
+        >
+          {renderColumnHandle("editor", "editor")}
+          {diffFile ? (
+            <DiffViewer
+              cwd={diffFile.cwd}
+              filePath={diffFile.path}
+              onClose={() => setDiffFile(null)}
+            />
+          ) : editingFile ? (
+            <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} onOpenFile={handleOpenFile} />
+          ) : null}
+        </aside>
       )}
 
       {showNewWorktree && (
