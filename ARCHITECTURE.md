@@ -62,7 +62,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、session 选择、modal 和 remote 控制 |
+| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、栏目拖拽排序、session 选择、modal 和 remote 控制 |
 | `app/src/App.css` | Dashboard 样式 |
 | `app/src/Terminal.tsx` | xterm.js 包装和 Tauri PTY 事件桥接 |
 | `app/src/GitStatusPanel.tsx` | Git files/log 面板；按 tmux 实时 cwd 跟踪 session 分支 |
@@ -74,7 +74,7 @@
 | `app/src/ThemePicker.tsx` / `themes.ts` | 主题选择和 CSS 变量 |
 | `app/src/linkDetect.ts` | 终端/编辑器链接识别、打开文件和 URL |
 | `app/src/fileUtils.ts` | 文件类型和 CodeMirror language helper |
-| `app/src/useSortable.ts` | 侧边栏拖拽排序 |
+| `app/src/useSortable.ts` | 侧边栏 worktree/terminal 列表拖拽排序 |
 
 Rust 后端：
 
@@ -128,7 +128,7 @@ Remote 启动顺序：
 | 文件 | 所属 | 作用 |
 |---|---|---|
 | `~/.tmux-worktree.json` | CLI 和 Dashboard | 项目映射和 worktree 根目录 |
-| `~/.tw-dashboard-layout.json` | Dashboard | 窗口、栏目、选择、文件树、编辑器/diff、侧边栏布局 |
+| `~/.tw-dashboard-layout.json` | Dashboard | 窗口、栏目顺序和宽度、选择、文件树、编辑器/diff、侧边栏布局 |
 | `~/.tw-dashboard-terminals.json` | Dashboard | 独立终端定义 |
 | `~/.tw-dashboard-pending-worktree-cleanup.json` | Dashboard | session kill 后待清理 worktree |
 | `~/.tw-serve-token` | CLI serve / Dashboard remote | Web 终端认证 token |
