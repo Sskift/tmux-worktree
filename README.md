@@ -18,6 +18,8 @@ npx -y --registry=https://bnpm.byted.org -p @byted-codebase/tmux-worktree tw-das
 open -a tw-dashboard
 ```
 
+> 如果之前全局装过 `@byted-codebase/tmux-worktree`，`npx` 会优先用旧的全局包（连同里面打包的旧 DMG），装上的可能不是最新版。先升级再装：`npm i -g @byted-codebase/tmux-worktree@latest --registry=https://bnpm.byted.org`。
+
 如果已经有 DMG，也可以手动拖入 `/Applications` 安装。
 
 ### CLI
@@ -311,11 +313,21 @@ git status --short --branch
 
 11. 更新本机已安装的 Dashboard App。
 
-发布到 bnpm 后，用正式安装器更新 `/Applications/tw-dashboard.app`：
+发布到 bnpm 后，用正式安装器更新 `/Applications/tw-dashboard.app`。
+
+DMG 是打包在 npm 包里的，而 `npx` 会优先用已经装好的全局 bin，而不是去拉最新版。如果本机已经全局装过 `@byted-codebase/tmux-worktree`（比如装过 CLI），直接 `npx ... tw-dashboard-install` 会挂载**旧版全局包里的旧 DMG**，装上的还是旧版本。所以先把全局包升到最新，再用它自带的安装器：
 
 ```bash
-npx -y --registry=https://bnpm.byted.org -p @byted-codebase/tmux-worktree tw-dashboard-install
+npm i -g @byted-codebase/tmux-worktree@latest --registry=https://bnpm.byted.org
+tw-dashboard-install
 open -a tw-dashboard
+```
+
+确认装上的版本和刚发布的一致（两条命令输出应当相同）：
+
+```bash
+/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' /Applications/tw-dashboard.app/Contents/Info.plist
+npm view @byted-codebase/tmux-worktree version --registry=https://bnpm.byted.org
 ```
 
 ## License
