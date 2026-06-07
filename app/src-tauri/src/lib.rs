@@ -1468,7 +1468,16 @@ fn create_plain_terminal(cwd: String) -> Result<String, String> {
 fn capture_pane_history(name: String) -> Result<String, String> {
     let exact = format!("={}", name);
     let output = std::process::Command::new(tmux_bin())
-        .args(["capture-pane", "-p", "-e", "-J", "-S", "-5000", "-t", &exact])
+        .args([
+            "capture-pane",
+            "-p",
+            "-e",
+            "-J",
+            "-S",
+            "-5000",
+            "-t",
+            &exact,
+        ])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
     if !output.status.success() {
