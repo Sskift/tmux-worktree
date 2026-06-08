@@ -336,7 +336,11 @@ export async function run() {
     shExec(`git -C ${projectDir} fetch origin ${targetBranch} --quiet`);
 
     // 创建 worktree
-    const branchId = Math.random().toString(36).slice(2, 7);
+    // 5 位十六进制后缀：dashboard 的 derive_session_name 只在后缀全为 hex 时
+    // 才能剥离还原 session 名（用于 orphan 恢复和 kill 时自动清理）。
+    const branchId = Math.floor(Math.random() * 0x100000)
+      .toString(16)
+      .padStart(5, "0");
     const branchName = `${params.sessionName}-${branchId}`;
     const worktreeDir = `${WORKTREE_BASE}/${label}/${branchName}`;
     mkdirSync(`${WORKTREE_BASE}/${label}`, { recursive: true });

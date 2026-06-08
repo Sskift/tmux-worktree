@@ -58,6 +58,7 @@ function collectSessions(): SessionInfo[] {
   return sessionList
     .split("\n")
     .filter(Boolean)
+    .filter((name) => !name.startsWith("tw-term-") && !name.startsWith("tw-mobile-"))
     .map((name) => ({ name, isCurrent: name === currentSession }));
 }
 
