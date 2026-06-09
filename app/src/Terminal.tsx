@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm, type ILinkProvider, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { invoke } from "@tauri-apps/api/core";
@@ -8,6 +8,10 @@ import {
   getCurrentPalette,
   type TerminalPalette,
 } from "./themes";
+import {
+  TMUX_RECONNECT_DELAY_MS,
+  shouldReconnectTmuxAttach,
+} from "./terminalLifecycle";
 import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser, type LinkMatch } from "./linkDetect";
 import "@xterm/xterm/css/xterm.css";
 
@@ -207,6 +211,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
+  const [reconnectSeq, setReconnectSeq] = useState(0);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -215,6 +220,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
     let ptyId: string | null = null;
     let unlistenChunk: UnlistenFn | null = null;
     let unlistenExit: UnlistenFn | null = null;
+    let reconnectTimer: number | null = null;
     let cancelled = false;
 
     const term = new XTerm({
@@ -337,7 +343,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
         if (e.type === "keydown" && e.metaKey && e.key === "c") {
           if (term.hasSelection()) return true;
           invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
-            if (!copied) {
+            if (!copied && ptyId) {
               invoke("pty_write", { id: ptyId, data: "\x03" }).catch(() => {});
             }
           }).catch(() => {});
@@ -392,7 +398,27 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
         );
         unlistenExit = await listen<{ id: string; code: number }>(
           `pty-exit:${id}`,
-          (e) => {
+          async (e) => {
+            if (e.payload.id !== id) return;
+            ptyId = null;
+            const sessionStillExists = tmuxSession
+              ? await invoke<boolean>("tmux_session_exists", {
+                  name: tmuxSession,
+                }).catch(() => false)
+              : false;
+            if (
+              shouldReconnectTmuxAttach({
+                cancelled,
+                hasTmuxSession: !!tmuxSession,
+                sessionStillExists,
+              })
+            ) {
+              term.write("\r\n\x1b[2m[tmux detached, reconnecting]\x1b[0m\r\n");
+              reconnectTimer = window.setTimeout(() => {
+                if (!cancelled) setReconnectSeq((value) => value + 1);
+              }, TMUX_RECONNECT_DELAY_MS);
+              return;
+            }
             term.write(`\r\n\x1b[2m[exit ${e.payload.code}]\x1b[0m\r\n`);
           },
         );
@@ -416,6 +442,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
 
     return () => {
       cancelled = true;
+      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       ro.disconnect();
       host.removeEventListener("mousedown", onMetaMouseDown, true);
       host.removeEventListener("mouseup", onMetaMouseUp, true);
@@ -428,7 +455,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [cmd, args.join("\x1f"), cwd, tmuxSession]);
+  }, [cmd, args.join("\x1f"), cwd, tmuxSession, reconnectSeq]);
 
   useEffect(() => {
     if (!active) {

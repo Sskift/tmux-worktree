@@ -219,6 +219,12 @@ fn list_sessions() -> Result<Vec<Session>, String> {
 }
 
 #[tauri::command]
+fn tmux_session_exists(name: String) -> Result<bool, String> {
+    let exact = format!("={}", name);
+    Ok(run_quiet(&["tmux", "has-session", "-t", &exact]).is_some())
+}
+
+#[tauri::command]
 fn list_projects() -> Result<Vec<Project>, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
@@ -1416,14 +1422,16 @@ fn pty_open(
                 Err(_) => break,
             }
         }
-        let state = app_for_thread.state::<Arc<PtyState>>();
-        let mut map = state.ptys.lock().unwrap();
-        let code = map
-            .get_mut(&id_for_thread)
-            .and_then(|h| h.child.try_wait().ok().flatten())
+        let mut handle = {
+            let state = app_for_thread.state::<Arc<PtyState>>();
+            let mut map = state.ptys.lock().unwrap();
+            map.remove(&id_for_thread)
+        };
+        let code = handle
+            .as_mut()
+            .and_then(|h| h.child.wait().ok())
             .map(|s| s.exit_code() as i32)
             .unwrap_or(0);
-        map.remove(&id_for_thread);
         let _ = app_for_thread.emit(
             &format!("pty-exit:{}", id_for_thread),
             PtyExit {
@@ -2228,6 +2236,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_sessions,
+            tmux_session_exists,
             list_projects,
             add_project,
             create_worktree,

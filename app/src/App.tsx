@@ -11,6 +11,12 @@ import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
+import {
+  SIDEBAR_GIT_MIN_HEIGHT,
+  SIDEBAR_TERMINALS_MIN_HEIGHT,
+  SIDEBAR_WORKTREES_MIN_HEIGHT,
+  normalizeSidebarSplits,
+} from "./sidebarLayout";
 import "./App.css";
 
 type Session = {
@@ -226,6 +232,10 @@ function App() {
   const sessionsListRef = useRef<HTMLDivElement | null>(null);
   const layoutLoadedRef = useRef(false);
   const autoResizeColumnsReadyRef = useRef(false);
+  const gitHeightValueRef = useRef(gitHeight);
+  const sectionSplitValueRef = useRef(sectionSplit);
+  gitHeightValueRef.current = gitHeight;
+  sectionSplitValueRef.current = sectionSplit;
 
   useEffect(() => {
     const el = appRef.current;
@@ -237,6 +247,46 @@ function App() {
     setContainerWidth(el.getBoundingClientRect().width);
     return () => ro.disconnect();
   }, []);
+
+  useEffect(() => {
+    const el = sidebarSplitRef.current;
+    if (!el) return;
+
+    const normalizeForHeight = (totalHeight: number) => {
+      const next = normalizeSidebarSplits({
+        totalHeight,
+        sectionSplit: sectionSplitValueRef.current,
+        gitHeight: gitHeightValueRef.current,
+      });
+      if (next.sectionSplit !== sectionSplitValueRef.current) {
+        sectionSplitValueRef.current = next.sectionSplit;
+        setSectionSplit(next.sectionSplit);
+      }
+      if (next.gitHeight !== gitHeightValueRef.current) {
+        gitHeightValueRef.current = next.gitHeight;
+        setGitHeight(next.gitHeight);
+      }
+    };
+
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) normalizeForHeight(e.contentRect.height);
+    });
+    ro.observe(el);
+    normalizeForHeight(el.getBoundingClientRect().height);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const el = sidebarSplitRef.current;
+    if (!el) return;
+    const next = normalizeSidebarSplits({
+      totalHeight: el.getBoundingClientRect().height,
+      sectionSplit,
+      gitHeight,
+    });
+    if (next.sectionSplit !== sectionSplit) setSectionSplit(next.sectionSplit);
+    if (next.gitHeight !== gitHeight) setGitHeight(next.gitHeight);
+  }, [sectionSplit, gitHeight]);
 
   useEffect(() => {
     invoke<string>("home_dir").then(setHomeDir).catch(() => {});
@@ -679,7 +729,11 @@ function App() {
     const total = container.getBoundingClientRect().height;
     const onMove = (ev: MouseEvent) => {
       const dy = ev.clientY - startY;
-      const h = Math.max(80, Math.min(total - sectionSplit - 40, startH - dy));
+      const maxGit = Math.max(
+        SIDEBAR_GIT_MIN_HEIGHT,
+        total - sectionSplitValueRef.current - SIDEBAR_TERMINALS_MIN_HEIGHT,
+      );
+      const h = clamp(startH - dy, SIDEBAR_GIT_MIN_HEIGHT, maxGit);
       setGitHeight(h);
     };
     const onUp = () => {
@@ -703,7 +757,11 @@ function App() {
     const containerH = listContainer.getBoundingClientRect().height;
     const onMove = (ev: MouseEvent) => {
       const dy = ev.clientY - startY;
-      const h = Math.max(40, Math.min(containerH - 40, startH + dy));
+      const maxSection = Math.max(
+        SIDEBAR_WORKTREES_MIN_HEIGHT,
+        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT,
+      );
+      const h = clamp(startH + dy, SIDEBAR_WORKTREES_MIN_HEIGHT, maxSection);
       setSectionSplit(h);
     };
     const onUp = () => {
