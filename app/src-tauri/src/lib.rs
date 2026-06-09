@@ -198,7 +198,7 @@ fn list_sessions() -> Result<Vec<Session>, String> {
         .filter_map(|line| {
             let mut parts = line.split('\x1f');
             let name = parts.next()?.to_string();
-            if name.starts_with("tw-term-") {
+            if name.starts_with("tw-term-") || name.starts_with("tw-mobile-") {
                 return None;
             }
             let attached = parts.next()? == "1";
@@ -494,6 +494,9 @@ fn orphaned_worktrees(
             if !wt_path.is_dir() {
                 continue;
             }
+            if !is_git_worktree_dir(&wt_path) {
+                continue;
+            }
             let dirname = wt_entry.file_name().to_string_lossy().to_string();
             let session_name = derive_session_name(&dirname);
             if live_sessions.contains(&session_name) {
@@ -532,6 +535,9 @@ fn worktrees_for_session(base_path: &std::path::Path, session_name: &str) -> Vec
         for wt_entry in wt_dirs.flatten() {
             let wt_path = wt_entry.path();
             if !wt_path.is_dir() {
+                continue;
+            }
+            if !is_git_worktree_dir(&wt_path) {
                 continue;
             }
             let dirname = wt_entry.file_name().to_string_lossy().to_string();
@@ -712,6 +718,9 @@ fn random_id() -> String {
     id.chars().take(5).collect()
 }
 
+/// tmux session 名的最大长度，与 CLI (`src/dev.ts` 的 `SESSION_NAME_MAX_LEN`) 对齐。
+const SESSION_NAME_MAX_LEN: usize = 20;
+
 #[tauri::command]
 fn create_worktree(args: CreateArgs) -> Result<String, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
@@ -756,6 +765,9 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
     } else {
         format!("{}-{}", project_label, trimmed_name)
     };
+    // 截断到 SESSION_NAME_MAX_LEN，与 CLI (src/dev.ts) 对齐，否则两边对同一
+    // project+title 生成的 session/分支名会分叉，破坏 session↔worktree 关联。
+    let base_session: String = base_session.chars().take(SESSION_NAME_MAX_LEN).collect();
     let session = unique_session_name(&base_session);
 
     let work_dir = if run_quiet(&[
@@ -835,6 +847,15 @@ fn kill_session(name: String) -> Result<(), String> {
     });
 
     Ok(())
+}
+
+/// A worktree directory is a real git worktree if it contains a `.git` entry
+/// (a file for linked worktrees, a directory for a plain clone). Plain
+/// subdirectories that merely live under the worktree base (e.g. a checked-out
+/// repo's own `app/` or `src/`) have no `.git` and must not be treated as
+/// worktrees, otherwise they pollute orphan recovery and risk wrong cleanup.
+fn is_git_worktree_dir(path: &std::path::Path) -> bool {
+    path.join(".git").exists()
 }
 
 /// Strip trailing `-{5 hex chars}` random suffix to recover session name.
@@ -2256,9 +2277,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_pending_worktrees, config_worktree_base, derive_session_name, load_pending_cleanup,
-        orphaned_worktrees, project_from_config, projects_from_config, save_pending_cleanup,
-        worktrees_for_session, OrphanedWorktree,
+        cleanup_pending_worktrees, config_worktree_base, derive_session_name, is_git_worktree_dir,
+        load_pending_cleanup, orphaned_worktrees, project_from_config, projects_from_config,
+        save_pending_cleanup, worktrees_for_session, OrphanedWorktree,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -2342,7 +2363,12 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_dir = temp.path().join("proj");
         fs::create_dir_all(project_dir.join("live-abc12")).expect("create live");
+        fs::write(project_dir.join("live-abc12").join(".git"), "gitdir: x").expect("live .git");
         fs::create_dir_all(project_dir.join("orphan-def34")).expect("create orphan");
+        fs::write(project_dir.join("orphan-def34").join(".git"), "gitdir: x").expect("orphan .git");
+        // A plain subdirectory without `.git` (e.g. a checked-out repo's own
+        // `src/`) must NOT be treated as a worktree.
+        fs::create_dir_all(project_dir.join("src")).expect("create src");
         fs::write(project_dir.join("README.txt"), "ignore").expect("write file");
 
         let live_sessions = HashSet::from([String::from("live")]);
@@ -2360,13 +2386,35 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let project_dir = temp.path().join("proj");
         fs::create_dir_all(project_dir.join("demo-abc12")).expect("create demo");
+        fs::write(project_dir.join("demo-abc12").join(".git"), "gitdir: x").expect("demo .git");
         fs::create_dir_all(project_dir.join("other-def34")).expect("create other");
+        fs::write(project_dir.join("other-def34").join(".git"), "gitdir: x").expect("other .git");
 
         let matches = worktrees_for_session(temp.path(), "demo");
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].project, "proj");
         assert_eq!(matches[0].name, "demo");
         assert!(matches[0].path.ends_with("/proj/demo-abc12"));
+    }
+
+    #[test]
+    fn is_git_worktree_dir_requires_git_entry() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // Linked worktree: `.git` is a file.
+        let linked = temp.path().join("linked");
+        fs::create_dir_all(&linked).expect("linked");
+        fs::write(linked.join(".git"), "gitdir: /repo/.git/worktrees/linked").expect("git file");
+        assert!(is_git_worktree_dir(&linked));
+
+        // Plain clone: `.git` is a directory.
+        let clone = temp.path().join("clone");
+        fs::create_dir_all(clone.join(".git")).expect("git dir");
+        assert!(is_git_worktree_dir(&clone));
+
+        // Plain subdirectory: no `.git`.
+        let plain = temp.path().join("src");
+        fs::create_dir_all(&plain).expect("plain");
+        assert!(!is_git_worktree_dir(&plain));
     }
 
     #[test]
