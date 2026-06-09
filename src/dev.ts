@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,6 +12,18 @@ import {
   loadConfigFile,
   normalizeConfig,
 } from "./config";
+import {
+  CliError,
+  exec,
+  query,
+  gitQuery,
+  isGitRepo,
+  removeWorktree,
+  deleteBranch,
+  tmuxBin,
+  sessionExists,
+  insideTmux,
+} from "./tmux";
 
 // ============================================
 // dev.ts — AI + tmux + git worktree 开发环境
@@ -19,33 +31,22 @@ import {
 // 用法: npx tmux-worktree <ai-command> <project> [session-name]
 // 示例: npx tmux-worktree claude myproject fix-auth
 //       npx tmux-worktree "claude --model opus" myproject
+//
+// 所有 git / tmux 调用都经 ./tmux 的 execFile 包装，不拼 shell 字符串，
+// 因此路径 / 分支名含空格或特殊字符都安全。
 // ============================================
-
-function sh(cmd: string): string {
-  try {
-    return execSync(cmd, { encoding: "utf-8", timeout: 10000 }).trim();
-  } catch {
-    return "";
-  }
-}
-
-function shExec(cmd: string): void {
-  execSync(cmd, { stdio: "inherit", timeout: 30000 });
-}
 
 // 优化 tmux 鼠标选择体验（server-global，幂等）：
 //  1. MouseDragEnd1Pane → copy-pipe-no-clear "pbcopy"：松手保留高亮 + 进系统剪贴板
 //  2. MouseDown1Pane → cancel：点击任意位置退出 copy-mode，清除选区
+// 这些是 best-effort 配置，失败不应中断 session 创建，故用不抛错的 query。
 function setupClipboardBindings(): void {
-  const copyCmd = process.platform === "darwin" ? "pbcopy" : "";
-  if (!copyCmd) return;
+  if (process.platform !== "darwin") return;
+  const tmux = tmuxBin();
   for (const table of ["copy-mode-vi", "copy-mode"]) {
-    sh(
-      `tmux bind-key -T ${table} MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "${copyCmd}"`
-    );
-    sh(
-      `tmux bind-key -T ${table} MouseDown1Pane select-pane '\\;' send-keys -X cancel`
-    );
+    query(tmux, ["bind-key", "-T", table, "MouseDragEnd1Pane", "send-keys", "-X", "copy-pipe-no-clear", "pbcopy"]);
+    // bind-key 命令列表用 "\;" 作分隔符（tmux 自身解析，execFile 无 shell 转义）
+    query(tmux, ["bind-key", "-T", table, "MouseDown1Pane", "select-pane", "\\;", "send-keys", "-X", "cancel"]);
   }
 }
 
@@ -79,12 +80,13 @@ async function initConfigInteractive(): Promise<Config> {
 
     const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
 
-    const config: Config = { projects };
-    if (worktreeInput) config.worktreeBase = expandHomePath(worktreeInput);
+    // 写入磁盘的是原始格式 {projects:{name:"path"}}，由 normalizeConfig 解析为 Config
+    const rawConfig: { projects: Record<string, string>; worktreeBase?: string } = { projects };
+    if (worktreeInput) rawConfig.worktreeBase = expandHomePath(worktreeInput);
 
-    writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2) + "\n");
+    writeFileSync(CONFIG_PATH, JSON.stringify(rawConfig, null, 2) + "\n");
     console.log(`\n✅ 已保存到 ${CONFIG_PATH}\n`);
-    return normalizeConfig(config);
+    return normalizeConfig(rawConfig);
   } finally {
     rl.close();
   }
@@ -214,9 +216,7 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
 function resolveSessionName(base: string): string {
   let name = base;
   let i = 1;
-  while (true) {
-    const rc = sh(`tmux has-session -t '=${name}' 2>/dev/null && echo ok`);
-    if (rc !== "ok") break;
+  while (sessionExists(name)) {
     name = `${base}-${i}`;
     i++;
   }
@@ -296,44 +296,39 @@ export async function run() {
   const { aiCmd, projectDir, useWorktree, projectKey, branch } = params;
 
   if (!existsSync(projectDir)) {
-    console.error(`错误: 目录不存在: ${projectDir}`);
-    process.exit(1);
+    throw new CliError(`目录不存在: ${projectDir}`);
   }
+
+  const tmux = tmuxBin();
 
   // --- 确定工作目录 ---
   let workDir: string;
+  // 记录已创建的 worktree，便于后续 tmux 失败时回滚
+  let createdWorktree: { repoDir: string; path: string; branch: string } | null = null;
 
   if (useWorktree) {
-    // 确保是 git 仓库
-    const gitOk = sh(`git -C ${projectDir} rev-parse --is-inside-work-tree`);
-    if (gitOk !== "true") {
-      console.error(`错误: ${projectDir} 不是 git 仓库`);
-      process.exit(1);
+    if (!isGitRepo(projectDir)) {
+      throw new CliError(`${projectDir} 不是 git 仓库`);
     }
 
     const label = projectKey ?? params.sessionName;
-
     console.log(`📦 项目: ${label} (${projectDir})`);
 
     // 确定目标分支：优先使用入参，否则动态探测默认分支
     let targetBranch = branch;
     if (!targetBranch) {
-      targetBranch = sh(
-        `git -C ${projectDir} symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`
-      )
-        ?.replace("refs/remotes/origin/", "")
-        ?.trim();
+      targetBranch = gitQuery(projectDir, ["symbolic-ref", "refs/remotes/origin/HEAD"])
+        .replace("refs/remotes/origin/", "")
+        .trim();
       if (!targetBranch) {
-        // fallback: 检查 main 或 master
-        const hasMaster = sh(
-          `git -C ${projectDir} ls-remote --heads origin master 2>/dev/null`
-        );
+        // fallback: 检查 master 是否存在，否则用 main
+        const hasMaster = gitQuery(projectDir, ["ls-remote", "--heads", "origin", "master"]);
         targetBranch = hasMaster ? "master" : "main";
       }
     }
 
     console.log(`🔄 正在从远程拉取最新代码 (${targetBranch})...`);
-    shExec(`git -C ${projectDir} fetch origin ${targetBranch} --quiet`);
+    exec("git", ["-C", projectDir, "fetch", "origin", targetBranch, "--quiet"]);
 
     // 创建 worktree
     // 5 位十六进制后缀：dashboard 的 derive_session_name 只在后缀全为 hex 时
@@ -347,9 +342,11 @@ export async function run() {
 
     console.log(`🌿 创建 worktree 分支: ${branchName}`);
     console.log(`   路径: ${worktreeDir}`);
-    shExec(
-      `git -C ${projectDir} worktree add -b ${branchName} ${worktreeDir} origin/${targetBranch} --quiet`
-    );
+    exec("git", [
+      "-C", projectDir,
+      "worktree", "add", "-b", branchName, worktreeDir, `origin/${targetBranch}`, "--quiet",
+    ]);
+    createdWorktree = { repoDir: projectDir, path: worktreeDir, branch: branchName };
     workDir = worktreeDir;
   } else {
     console.log(`📂 使用自定义目录 (跳过 git worktree):`);
@@ -366,31 +363,46 @@ export async function run() {
   console.log(`   AI 命令:  ${aiCmd}`);
   console.log();
 
-  // 创建 session，初始窗口运行 status (最左栏固定宽度)
-  shExec(`tmux new-session -d -s ${session} -c ${workDir}`);
-  setupClipboardBindings();
   const cliPath = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
-  shExec(`tmux send-keys -t '${session}.1' 'node "${cliPath}" status' C-m`);
 
-  // 右侧：AI 命令
-  shExec(`tmux split-window -h -t '${session}.1' -c ${workDir}`);
-  shExec(`tmux send-keys -t '${session}.2' '${aiCmd}' C-m`);
+  try {
+    // 创建 session，初始窗口运行 status (最左栏固定宽度)
+    exec(tmux, ["new-session", "-d", "-s", session, "-c", workDir]);
+    setupClipboardBindings();
+    exec(tmux, ["send-keys", "-t", `${session}.1`, `node "${cliPath}" status`, "C-m"]);
 
-  // AI 命令右侧再分出 40% 给终端
-  shExec(`tmux split-window -h -t '${session}.2' -c ${workDir} -l 40%`);
+    // 右侧：AI 命令
+    exec(tmux, ["split-window", "-h", "-t", `${session}.1`, "-c", workDir]);
+    exec(tmux, ["send-keys", "-t", `${session}.2`, aiCmd, "C-m"]);
 
-  // 聚焦到 AI 命令栏
-  shExec(`tmux select-pane -t '${session}.2'`);
+    // AI 命令右侧再分出 40% 给终端
+    exec(tmux, ["split-window", "-h", "-t", `${session}.2`, "-c", workDir, "-l", "40%"]);
+
+    // 聚焦到 AI 命令栏
+    exec(tmux, ["select-pane", "-t", `${session}.2`]);
+  } catch (err) {
+    // tmux 建 session 失败：回滚刚创建的 worktree，避免留下孤儿
+    if (createdWorktree) {
+      console.error(`\n⚠️  tmux session 创建失败，正在回滚 worktree ${createdWorktree.path} ...`);
+      try {
+        removeWorktree(createdWorktree.repoDir, createdWorktree.path, true);
+        // 刚从 origin 新建、无本地提交，强删分支安全
+        deleteBranch(createdWorktree.repoDir, createdWorktree.branch, true);
+        console.error(`   已清理 worktree 和分支 ${createdWorktree.branch}`);
+      } catch (cleanupErr) {
+        const detail = cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr);
+        console.error(`   ⚠️  回滚失败，请手动清理: ${createdWorktree.path}\n   ${detail}`);
+      }
+    }
+    throw err instanceof CliError ? err : new CliError(String(err));
+  }
 
   // 连接：如果已在 tmux 中则 switch-client，否则 attach
   console.log(`✅ 环境就绪，正在连接 tmux session "${session}"...`);
-  const inTmux = !!process.env.TMUX;
-  if (inTmux) {
-    shExec(`tmux switch-client -t '${session}'`);
+  if (insideTmux()) {
+    exec(tmux, ["switch-client", "-t", session]);
   } else {
-    const child = spawn("tmux", ["attach", "-t", session], {
-      stdio: "inherit",
-    });
+    const child = spawn(tmux, ["attach", "-t", session], { stdio: "inherit" });
     const exitCode = await new Promise<number>((resolve) => {
       child.on("exit", (code) => resolve(code ?? 0));
     });
@@ -398,5 +410,5 @@ export async function run() {
   }
 
   // 调整左侧大小
-  shExec(`tmux resize-pane -t '${session}:1.1' -x 30`);
+  exec(tmux, ["resize-pane", "-t", `${session}:1.1`, "-x", "30"]);
 }
