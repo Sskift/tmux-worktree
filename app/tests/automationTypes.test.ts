@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  automationScheduleLabel,
   automationFromRecord,
   automationRunFromRecord,
   automationSaveInputFromDraft,
   automationStatusLabel,
+  buildAutomationSchedule,
   createAutomationDraft,
   formatAutomationRunSummary,
+  parseAutomationSchedule,
   shouldRunAutomationSchedule,
   triggerLabel,
   updateAutomationDraft,
@@ -23,7 +26,43 @@ test("triggerLabel shows manual automations when no schedule is set", () => {
 });
 
 test("triggerLabel includes a trimmed schedule", () => {
-  assert.equal(triggerLabel({ schedule: "  0 9 * * 1-5 " }), "schedule · 0 9 * * 1-5");
+  assert.equal(triggerLabel({ schedule: "  0 9 * * 1-5 " }), "schedule · Weekdays at 09:00");
+});
+
+test("automation schedule helpers parse presets and build cron strings", () => {
+  assert.deepEqual(parseAutomationSchedule(""), {
+    kind: "manual",
+    hour: 9,
+    minute: 0,
+    custom: "0 9 * * *",
+  });
+  assert.deepEqual(parseAutomationSchedule("0/5 * * * *"), {
+    kind: "every-5-minutes",
+    hour: 9,
+    minute: 0,
+    custom: "0/5 * * * *",
+  });
+  assert.deepEqual(parseAutomationSchedule("30 8 * * 1-5"), {
+    kind: "weekdays",
+    hour: 8,
+    minute: 30,
+    custom: "30 8 * * 1-5",
+  });
+  assert.equal(buildAutomationSchedule("manual", 9, 0), "");
+  assert.equal(buildAutomationSchedule("every-15-minutes", 9, 0), "*/15 * * * *");
+  assert.equal(buildAutomationSchedule("daily", 13, 30), "30 13 * * *");
+  assert.equal(buildAutomationSchedule("weekdays", 18, 0), "0 18 * * 1-5");
+  assert.equal(buildAutomationSchedule("weekly", 9, 15), "15 9 * * 1");
+  assert.equal(buildAutomationSchedule("custom", 9, 0, "  0/5 * * * *  "), "0/5 * * * *");
+});
+
+test("automationScheduleLabel formats common schedules", () => {
+  assert.equal(automationScheduleLabel(""), "manual");
+  assert.equal(automationScheduleLabel("*/5 * * * *"), "Every 5 minutes");
+  assert.equal(automationScheduleLabel("0 * * * *"), "Hourly");
+  assert.equal(automationScheduleLabel("30 13 * * *"), "Daily at 13:30");
+  assert.equal(automationScheduleLabel("15 18 * * 1-5"), "Weekdays at 18:15");
+  assert.equal(automationScheduleLabel("45 23 * * 1"), "Weekly at 23:45");
 });
 
 test("automationStatusLabel maps active state to user-facing labels", () => {

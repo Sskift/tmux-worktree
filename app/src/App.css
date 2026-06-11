@@ -1020,6 +1020,46 @@ button:disabled {
   min-height: 0;
 }
 
+.automation-target-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.automation-schedule-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(116px, 0.45fr);
+  gap: 6px;
+  align-items: center;
+}
+
+.automation-schedule-grid > :only-child {
+  grid-column: 1 / -1;
+}
+
+.automation-select {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  line-height: 30px;
+  text-overflow: ellipsis;
+}
+
+.automation-input--mono {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", monospace;
+}
+
+.automation-field-hint {
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1.35;
+  min-height: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .automation-panel .modal__actions {
   flex-wrap: wrap;
   justify-content: flex-start;
@@ -1351,6 +1391,7 @@ select.field__input {
   background-size: 5px 5px;
   background-repeat: no-repeat;
   padding-right: 28px;
+  line-height: 30px;
 }
 
 .btn--ghost {

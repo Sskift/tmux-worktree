@@ -1,6 +1,22 @@
 export type AutomationStatus = "idle" | "queued" | "running" | "success" | "failed" | "skipped";
 export type AutomationTriggerType = "manual" | "schedule";
 export type AutomationOverlap = "queue" | "skip";
+export type AutomationScheduleKind =
+  | "manual"
+  | "every-5-minutes"
+  | "every-15-minutes"
+  | "hourly"
+  | "daily"
+  | "weekdays"
+  | "weekly"
+  | "custom";
+
+export type ParsedAutomationSchedule = {
+  kind: AutomationScheduleKind;
+  hour: number;
+  minute: number;
+  custom: string;
+};
 
 export type Automation = {
   id: string;
@@ -90,8 +106,8 @@ export type DraftValidation = {
 };
 
 export function triggerLabel(value: Pick<AutomationDraft, "schedule"> | Pick<Automation, "schedule">): string {
-  const schedule = value.schedule.trim();
-  return schedule ? `schedule · ${schedule}` : "manual";
+  const label = automationScheduleLabel(value.schedule);
+  return label === "manual" ? label : `schedule · ${label}`;
 }
 
 export function automationStatusLabel(value: Pick<AutomationDraft, "active"> | Pick<Automation, "active">): string {
@@ -109,6 +125,151 @@ export function createAutomationDraft(automation?: Automation): AutomationDraft 
     allowOverlap: automation?.allowOverlap ?? false,
     active: automation?.active ?? true,
   };
+}
+
+const DEFAULT_SCHEDULE_HOUR = 9;
+const DEFAULT_SCHEDULE_MINUTE = 0;
+
+function cronNumber(value: string): number | null {
+  return /^\d+$/.test(value) ? Number(value) : null;
+}
+
+function isValidClock(hour: number | null, minute: number | null): boolean {
+  return hour != null && minute != null && hour >= 0 && hour <= 23 && minute >= 0 && minute <= 59;
+}
+
+function normalizeSchedule(schedule: string): string {
+  return schedule
+    .trim()
+    .replace(/\s+/g, " ")
+    .replace(/^(?:0)\/(\d+) /, "*/$1 ");
+}
+
+function clampClockPart(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) return fallback;
+  return Math.max(min, Math.min(max, Math.trunc(value)));
+}
+
+export function formatAutomationClockTime(hour: number, minute: number): string {
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+export function parseAutomationClockTime(value: string): { hour: number; minute: number } | null {
+  const match = value.trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  return isValidClock(hour, minute) ? { hour, minute } : null;
+}
+
+export function parseAutomationSchedule(schedule: string): ParsedAutomationSchedule {
+  const trimmed = schedule.trim();
+  const custom = trimmed || "0 9 * * *";
+  const normalized = normalizeSchedule(trimmed);
+  if (!trimmed) {
+    return {
+      kind: "manual",
+      hour: DEFAULT_SCHEDULE_HOUR,
+      minute: DEFAULT_SCHEDULE_MINUTE,
+      custom,
+    };
+  }
+  if (normalized === "*/5 * * * *") {
+    return {
+      kind: "every-5-minutes",
+      hour: DEFAULT_SCHEDULE_HOUR,
+      minute: DEFAULT_SCHEDULE_MINUTE,
+      custom,
+    };
+  }
+  if (normalized === "*/15 * * * *") {
+    return {
+      kind: "every-15-minutes",
+      hour: DEFAULT_SCHEDULE_HOUR,
+      minute: DEFAULT_SCHEDULE_MINUTE,
+      custom,
+    };
+  }
+
+  const parts = trimmed.split(/\s+/);
+  if (parts.length !== 5) {
+    return {
+      kind: "custom",
+      hour: DEFAULT_SCHEDULE_HOUR,
+      minute: DEFAULT_SCHEDULE_MINUTE,
+      custom,
+    };
+  }
+
+  const [minutePart, hourPart, dayOfMonth, month, dayOfWeek] = parts;
+  const minute = cronNumber(minutePart);
+  const hour = cronNumber(hourPart);
+
+  if (minute != null && hourPart === "*" && dayOfMonth === "*" && month === "*" && dayOfWeek === "*") {
+    return { kind: "hourly", hour: DEFAULT_SCHEDULE_HOUR, minute, custom };
+  }
+  if (
+    hour == null ||
+    minute == null ||
+    !isValidClock(hour, minute) ||
+    dayOfMonth !== "*" ||
+    month !== "*"
+  ) {
+    return {
+      kind: "custom",
+      hour: DEFAULT_SCHEDULE_HOUR,
+      minute: DEFAULT_SCHEDULE_MINUTE,
+      custom,
+    };
+  }
+  if (dayOfWeek === "*") return { kind: "daily", hour, minute, custom };
+  if (dayOfWeek === "1-5" || dayOfWeek === "1,2,3,4,5") {
+    return { kind: "weekdays", hour, minute, custom };
+  }
+  if (/^[0-7]$/.test(dayOfWeek)) return { kind: "weekly", hour, minute, custom };
+  return { kind: "custom", hour, minute, custom };
+}
+
+export function buildAutomationSchedule(
+  kind: AutomationScheduleKind,
+  hour: number,
+  minute: number,
+  custom = "",
+): string {
+  if (kind === "manual") return "";
+  if (kind === "custom") return custom.trim();
+  if (kind === "every-5-minutes") return "*/5 * * * *";
+  if (kind === "every-15-minutes") return "*/15 * * * *";
+  if (kind === "hourly") return "0 * * * *";
+
+  const safeHour = clampClockPart(hour, 0, 23, DEFAULT_SCHEDULE_HOUR);
+  const safeMinute = clampClockPart(minute, 0, 59, DEFAULT_SCHEDULE_MINUTE);
+  if (kind === "daily") return `${safeMinute} ${safeHour} * * *`;
+  if (kind === "weekdays") return `${safeMinute} ${safeHour} * * 1-5`;
+  return `${safeMinute} ${safeHour} * * 1`;
+}
+
+export function automationScheduleLabel(schedule: string): string {
+  const trimmed = schedule.trim();
+  if (!trimmed) return "manual";
+  const normalized = normalizeSchedule(trimmed);
+  if (normalized === "*/5 * * * *") return "Every 5 minutes";
+  if (normalized === "*/15 * * * *") return "Every 15 minutes";
+
+  const parts = trimmed.split(/\s+/);
+  if (parts.length !== 5) return trimmed;
+  const [minutePart, hourPart, dayOfMonth, month, dayOfWeek] = parts;
+  const minute = cronNumber(minutePart);
+  const hour = cronNumber(hourPart);
+  if (minute != null && hourPart === "*" && dayOfMonth === "*" && month === "*" && dayOfWeek === "*") {
+    return "Hourly";
+  }
+  if (minute == null || hour == null || dayOfMonth !== "*" || month !== "*") return trimmed;
+  const clock = formatAutomationClockTime(hour, minute);
+  if (dayOfWeek === "*") return `Daily at ${clock}`;
+  if (dayOfWeek === "1-5" || dayOfWeek === "1,2,3,4,5") return `Weekdays at ${clock}`;
+  if (/^[0-7]$/.test(dayOfWeek)) return `Weekly at ${clock}`;
+  return trimmed;
 }
 
 export function updateAutomationDraft(

@@ -1,14 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  automationScheduleLabel,
   automationStatusLabel,
+  buildAutomationSchedule,
   createAutomationDraft,
+  formatAutomationClockTime,
   formatAutomationRunSummary,
+  parseAutomationClockTime,
+  parseAutomationSchedule,
   triggerLabel,
   updateAutomationDraft,
   validateAutomationDraft,
   type Automation,
   type AutomationDraft,
   type AutomationRun,
+  type AutomationScheduleKind,
 } from "./automationTypes";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 
@@ -65,11 +71,21 @@ const rowStyle: React.CSSProperties = {
   gap: 8,
 };
 
-const hintStyle: React.CSSProperties = {
-  color: "var(--text-faint)",
-  fontSize: 11,
-  lineHeight: 1.4,
-};
+const SCHEDULE_KIND_OPTIONS: Array<{ value: AutomationScheduleKind; label: string }> = [
+  { value: "manual", label: "Manual" },
+  { value: "every-5-minutes", label: "Every 5 minutes" },
+  { value: "every-15-minutes", label: "Every 15 minutes" },
+  { value: "hourly", label: "Hourly" },
+  { value: "daily", label: "Daily" },
+  { value: "weekdays", label: "Weekdays" },
+  { value: "weekly", label: "Weekly" },
+  { value: "custom", label: "Custom cron" },
+];
+
+const OVERLAP_OPTIONS = [
+  { value: "skip", label: "skip" },
+  { value: "queue", label: "queue" },
+];
 
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
@@ -188,6 +204,8 @@ export function AutomationPanel({
 
   const normalizedDraft = updateAutomationDraft(draft, draft);
   const validation = validateAutomationDraft(normalizedDraft);
+  const parsedSchedule = useMemo(() => parseAutomationSchedule(draft.schedule), [draft.schedule]);
+  const scheduleTime = formatAutomationClockTime(parsedSchedule.hour, parsedSchedule.minute);
   const visibleRuns = selected
     ? runs.filter((run) => run.automationId === selected.id).slice(0, 6)
     : [];
@@ -218,6 +236,29 @@ export function AutomationPanel({
     value: AutomationDraft[Key],
   ) => {
     setDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const setSchedule = (schedule: string) => {
+    setDraftField("schedule", schedule);
+  };
+
+  const handleScheduleKindChange = (kind: AutomationScheduleKind) => {
+    setSchedule(
+      buildAutomationSchedule(kind, parsedSchedule.hour, parsedSchedule.minute, parsedSchedule.custom),
+    );
+  };
+
+  const handleScheduleTimeChange = (value: string) => {
+    const parsedTime = parseAutomationClockTime(value);
+    if (!parsedTime) return;
+    setSchedule(
+      buildAutomationSchedule(
+        parsedSchedule.kind,
+        parsedTime.hour,
+        parsedTime.minute,
+        parsedSchedule.custom,
+      ),
+    );
   };
 
   const handleProjectChange = (value: string) => {
@@ -358,11 +399,6 @@ export function AutomationPanel({
       )}
 
       <form style={detailStyle} onSubmit={handleSubmit}>
-        <div className="section-label" style={{ padding: 0 }}>
-          <span className="section-label__text">{isCreating ? "new automation" : "details"}</span>
-          <span className="section-label__line" />
-        </div>
-
         <label className="field">
           <span className="field__label">name</span>
           <input
@@ -406,25 +442,53 @@ export function AutomationPanel({
             {submitAttempted && <FieldError message={validation.errors.aiCmd} />}
           </label>
 
-          <label className="field">
+          <label className="field automation-schedule-field">
             <span className="field__label">schedule</span>
-            <input
-              className="field__input"
-              type="text"
-              value={draft.schedule}
-              onChange={(event) => setDraftField("schedule", event.target.value)}
-              placeholder="manual or cron"
-              autoComplete="off"
-              spellCheck={false}
-            />
+            <div className="automation-schedule-grid">
+              <select
+                className="field__input automation-select"
+                value={parsedSchedule.kind}
+                onChange={(event) => handleScheduleKindChange(event.target.value as AutomationScheduleKind)}
+              >
+                {SCHEDULE_KIND_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              {parsedSchedule.kind === "custom" ? (
+                <input
+                  className="field__input automation-input--mono"
+                  type="text"
+                  value={parsedSchedule.custom}
+                  onChange={(event) => setSchedule(event.target.value)}
+                  placeholder="0 9 * * *"
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              ) : parsedSchedule.kind === "manual" ||
+                parsedSchedule.kind === "hourly" ||
+                parsedSchedule.kind === "every-5-minutes" ||
+                parsedSchedule.kind === "every-15-minutes" ? null : (
+                <input
+                  className="field__input"
+                  type="time"
+                  value={scheduleTime}
+                  onChange={(event) => handleScheduleTimeChange(event.target.value)}
+                />
+              )}
+            </div>
+            <span className="automation-field-hint">
+              {automationScheduleLabel(draft.schedule)}
+            </span>
           </label>
         </div>
 
-        <div style={rowStyle}>
+        <div className="automation-target-grid">
           <label className="field">
             <span className="field__label">project</span>
             <select
-              className="field__input"
+              className="field__input automation-select"
               value={draft.project}
               onChange={(event) => handleProjectChange(event.target.value)}
             >
@@ -466,28 +530,37 @@ export function AutomationPanel({
         </div>
         {submitAttempted && <FieldError message={validation.errors.target} />}
 
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={draft.allowOverlap}
-              onChange={(event) => setDraftField("allowOverlap", event.target.checked)}
-            />
-            <span>allow overlapping runs</span>
+        <div style={rowStyle}>
+          <label className="field">
+            <span className="field__label">overlap</span>
+            <select
+              className="field__input automation-select"
+              value={draft.allowOverlap ? "queue" : "skip"}
+              onChange={(event) => setDraftField("allowOverlap", event.target.value === "queue")}
+            >
+              {OVERLAP_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <span className="automation-field-hint">
+              {draft.allowOverlap ? "queue overlapping runs" : "skip when a run is active"}
+            </span>
           </label>
 
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={draft.active}
-              onChange={(event) => setDraftField("active", event.target.checked)}
-            />
-            <span>{automationStatusLabel(draft)}</span>
+          <label className="field">
+            <span className="field__label">status</span>
+            <select
+              className="field__input automation-select"
+              value={draft.active ? "active" : "paused"}
+              onChange={(event) => setDraftField("active", event.target.value === "active")}
+            >
+              <option value="active">active</option>
+              <option value="paused">paused</option>
+            </select>
+            <span className="automation-field-hint">{automationStatusLabel(draft)}</span>
           </label>
-        </div>
-
-        <div style={hintStyle}>
-          {triggerLabel(draft)} · {draft.allowOverlap ? "overlap allowed" : "single run"}
         </div>
 
         {formError && <div className="modal__error">{formError}</div>}
