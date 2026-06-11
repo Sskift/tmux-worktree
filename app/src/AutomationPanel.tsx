@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   automationScheduleLabel,
   automationStatusLabel,
@@ -110,10 +110,30 @@ function AutomationMenuSelect({
   onChange: (value: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const selected = options.find((option) => option.value === value) ?? options[0];
+
+  useEffect(() => {
+    if (!open) return;
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && rootRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [open]);
 
   return (
     <div
+      ref={rootRef}
       className="automation-menu-select"
       onBlur={(event) => {
         if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
@@ -129,10 +149,12 @@ function AutomationMenuSelect({
         aria-label={ariaLabel}
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="automation-menu-select__label">{selected?.label ?? ""}</span>
-        {selected?.detail ? (
-          <span className="automation-menu-select__detail">{selected.detail}</span>
-        ) : null}
+        <span className="automation-menu-select__value">
+          <span className="automation-menu-select__label">{selected?.label ?? ""}</span>
+          {selected?.detail ? (
+            <span className="automation-menu-select__detail">{selected.detail}</span>
+          ) : null}
+        </span>
         <span className="automation-menu-select__chevron">⌄</span>
       </button>
       {open && (
