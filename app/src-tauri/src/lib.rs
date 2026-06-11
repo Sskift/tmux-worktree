@@ -257,6 +257,353 @@ struct CreateArgs {
     branch: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AutomationTriggerType {
+    Manual,
+    Schedule,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AutomationOverlap {
+    Queue,
+    Skip,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum AutomationStatus {
+    Idle,
+    Queued,
+    Running,
+    Success,
+    Failed,
+    Skipped,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct Automation {
+    id: String,
+    name: String,
+    enabled: bool,
+    trigger_type: AutomationTriggerType,
+    schedule: Option<String>,
+    timezone: Option<String>,
+    project: Option<String>,
+    path: Option<String>,
+    ai_cmd: String,
+    instruction: String,
+    overlap: AutomationOverlap,
+    last_run_at: Option<String>,
+    last_status: AutomationStatus,
+    last_session: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AutomationRun {
+    id: String,
+    automation_id: String,
+    started_at: String,
+    finished_at: Option<String>,
+    status: AutomationStatus,
+    session_name: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SaveAutomationInput {
+    id: Option<String>,
+    name: Option<String>,
+    enabled: Option<bool>,
+    trigger_type: Option<AutomationTriggerType>,
+    schedule: Option<Option<String>>,
+    timezone: Option<Option<String>>,
+    project: Option<Option<String>>,
+    path: Option<Option<String>>,
+    ai_cmd: Option<String>,
+    instruction: Option<String>,
+    overlap: Option<AutomationOverlap>,
+}
+
+struct UpsertAutomationResult {
+    automations: Vec<Automation>,
+    automation: Automation,
+}
+
+const AUTOMATION_RUN_LIMIT: usize = 200;
+
+fn automations_path() -> std::path::PathBuf {
+    app_home_dir_or_tmp().join(".tw-dashboard-automations.json")
+}
+
+fn automation_runs_path() -> std::path::PathBuf {
+    app_home_dir_or_tmp().join(".tw-dashboard-automation-runs.json")
+}
+
+fn trimmed_non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn optional_string_patch(
+    existing: Option<String>,
+    patch: Option<Option<String>>,
+) -> Option<String> {
+    match patch {
+        Some(Some(value)) => trimmed_non_empty(value),
+        Some(None) => None,
+        None => existing,
+    }
+}
+
+fn new_prefixed_id(prefix: &str) -> String {
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    format!("{}-{}", prefix, &id[..12])
+}
+
+fn unix_seconds_to_rfc3339(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let seconds_of_day = secs % 86_400;
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+fn now_rfc3339() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    unix_seconds_to_rfc3339(secs)
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+fn automation_command_with_instruction(ai_cmd: &str, instruction: &str) -> String {
+    let command = ai_cmd.trim();
+    let instruction = instruction.trim();
+    if instruction.is_empty() {
+        return command.to_string();
+    }
+    if command.is_empty() {
+        return shell_quote(instruction);
+    }
+    format!("{} {}", command, shell_quote(instruction))
+}
+
+fn should_skip_automation_overlap(automation: &Automation, session_exists: bool) -> bool {
+    automation.overlap == AutomationOverlap::Skip
+        && matches!(
+            automation.last_status,
+            AutomationStatus::Queued | AutomationStatus::Running
+        )
+        && automation.last_session.is_some()
+        && session_exists
+}
+
+fn upsert_automation_from_input(
+    mut automations: Vec<Automation>,
+    input: SaveAutomationInput,
+    now: &str,
+) -> Result<UpsertAutomationResult, String> {
+    let input_id = input.id.and_then(trimmed_non_empty);
+    let existing_index = input_id.as_deref().and_then(|id| {
+        automations
+            .iter()
+            .position(|automation| automation.id == id)
+    });
+    let existing = existing_index.map(|index| automations[index].clone());
+
+    let id = existing
+        .as_ref()
+        .map(|automation| automation.id.clone())
+        .or(input_id)
+        .unwrap_or_else(|| new_prefixed_id("auto"));
+    let name = input
+        .name
+        .and_then(trimmed_non_empty)
+        .or_else(|| existing.as_ref().map(|automation| automation.name.clone()))
+        .unwrap_or_else(|| "Untitled automation".to_string());
+    let enabled = input
+        .enabled
+        .or_else(|| existing.as_ref().map(|automation| automation.enabled))
+        .unwrap_or(true);
+    let trigger_type = input
+        .trigger_type
+        .or_else(|| existing.as_ref().map(|automation| automation.trigger_type))
+        .unwrap_or(AutomationTriggerType::Manual);
+    let schedule = optional_string_patch(
+        existing
+            .as_ref()
+            .and_then(|automation| automation.schedule.clone()),
+        input.schedule,
+    );
+    let timezone = optional_string_patch(
+        existing
+            .as_ref()
+            .and_then(|automation| automation.timezone.clone()),
+        input.timezone,
+    );
+    let project = optional_string_patch(
+        existing
+            .as_ref()
+            .and_then(|automation| automation.project.clone()),
+        input.project,
+    );
+    let path = optional_string_patch(
+        existing
+            .as_ref()
+            .and_then(|automation| automation.path.clone()),
+        input.path,
+    );
+    let ai_cmd = input
+        .ai_cmd
+        .and_then(trimmed_non_empty)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|automation| automation.ai_cmd.clone())
+        })
+        .unwrap_or_else(|| "claude".to_string());
+    let instruction = input
+        .instruction
+        .map(|value| value.trim().to_string())
+        .or_else(|| {
+            existing
+                .as_ref()
+                .map(|automation| automation.instruction.clone())
+        })
+        .unwrap_or_default();
+    let overlap = input
+        .overlap
+        .or_else(|| existing.as_ref().map(|automation| automation.overlap))
+        .unwrap_or(AutomationOverlap::Queue);
+    let created_at = existing
+        .as_ref()
+        .map(|automation| automation.created_at.clone())
+        .unwrap_or_else(|| now.to_string());
+
+    let automation = Automation {
+        id,
+        name,
+        enabled,
+        trigger_type,
+        schedule,
+        timezone,
+        project,
+        path,
+        ai_cmd,
+        instruction,
+        overlap,
+        last_run_at: existing
+            .as_ref()
+            .and_then(|automation| automation.last_run_at.clone()),
+        last_status: existing
+            .as_ref()
+            .map(|automation| automation.last_status)
+            .unwrap_or(AutomationStatus::Idle),
+        last_session: existing
+            .as_ref()
+            .and_then(|automation| automation.last_session.clone()),
+        created_at,
+        updated_at: now.to_string(),
+    };
+
+    if let Some(index) = existing_index {
+        automations[index] = automation.clone();
+    } else {
+        automations.push(automation.clone());
+    }
+
+    Ok(UpsertAutomationResult {
+        automations,
+        automation,
+    })
+}
+
+fn delete_automation_from_list(mut automations: Vec<Automation>, id: &str) -> Vec<Automation> {
+    automations.retain(|automation| automation.id != id);
+    automations
+}
+
+fn append_automation_run(runs: &mut Vec<AutomationRun>, run: AutomationRun) {
+    runs.insert(0, run);
+    runs.truncate(AUTOMATION_RUN_LIMIT);
+}
+
+fn load_automations_from_disk() -> Result<Vec<Automation>, String> {
+    let path = automations_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+fn save_automations_to_disk(automations: &[Automation]) -> Result<(), String> {
+    let path = automations_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(automations).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("write: {e}"))
+}
+
+fn load_automation_runs_from_disk() -> Result<Vec<AutomationRun>, String> {
+    let path = automation_runs_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("read: {e}"))?;
+    serde_json::from_str(&text).map_err(|e| format!("parse: {e}"))
+}
+
+fn save_automation_runs_to_disk(runs: &[AutomationRun]) -> Result<(), String> {
+    let path = automation_runs_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+    }
+    let text = serde_json::to_string_pretty(runs).map_err(|e| format!("serialize: {e}"))?;
+    std::fs::write(path, text).map_err(|e| format!("write: {e}"))
+}
+
 fn string_field<'a>(value: &'a serde_json::Value, names: &[&str]) -> Option<&'a str> {
     names
         .iter()
@@ -1622,6 +1969,114 @@ fn save_layout(layout: serde_json::Value) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn list_automations() -> Result<Vec<Automation>, String> {
+    load_automations_from_disk()
+}
+
+#[tauri::command]
+fn save_automation(input: SaveAutomationInput) -> Result<Automation, String> {
+    let automations = load_automations_from_disk()?;
+    let now = now_rfc3339();
+    let result = upsert_automation_from_input(automations, input, &now)?;
+    save_automations_to_disk(&result.automations)?;
+    Ok(result.automation)
+}
+
+#[tauri::command]
+fn delete_automation(id: String) -> Result<(), String> {
+    let automations = load_automations_from_disk()?;
+    let next = delete_automation_from_list(automations, id.trim());
+    save_automations_to_disk(&next)
+}
+
+#[tauri::command]
+fn trigger_automation(id: String) -> Result<AutomationRun, String> {
+    let mut automations = load_automations_from_disk()?;
+    let index = automations
+        .iter()
+        .position(|automation| automation.id == id)
+        .ok_or_else(|| format!("automation not found: {id}"))?;
+    let automation = automations[index].clone();
+    let now = now_rfc3339();
+    let session_exists = automation
+        .last_session
+        .as_ref()
+        .map(|session| tmux_session_exists(session.clone()).unwrap_or(false))
+        .unwrap_or(false);
+
+    if should_skip_automation_overlap(&automation, session_exists) {
+        let run = AutomationRun {
+            id: new_prefixed_id("run"),
+            automation_id: automation.id.clone(),
+            started_at: now.clone(),
+            finished_at: Some(now),
+            status: AutomationStatus::Skipped,
+            session_name: automation.last_session.clone(),
+            error: Some("automation already has a live running session".to_string()),
+        };
+        let mut runs = load_automation_runs_from_disk()?;
+        append_automation_run(&mut runs, run.clone());
+        save_automation_runs_to_disk(&runs)?;
+        return Ok(run);
+    }
+
+    let ai_cmd = automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
+    let start_result = create_worktree(CreateArgs {
+        project: automation.project.clone().and_then(trimmed_non_empty),
+        path: automation.path.clone().and_then(trimmed_non_empty),
+        ai_cmd,
+        name: Some(automation.name.clone()),
+        branch: None,
+    });
+
+    let mut runs = load_automation_runs_from_disk()?;
+    let run = match start_result {
+        Ok(session) => {
+            automations[index].last_run_at = Some(now.clone());
+            automations[index].last_status = AutomationStatus::Running;
+            automations[index].last_session = Some(session.clone());
+            AutomationRun {
+                id: new_prefixed_id("run"),
+                automation_id: automation.id,
+                started_at: now,
+                finished_at: None,
+                status: AutomationStatus::Running,
+                session_name: Some(session),
+                error: None,
+            }
+        }
+        Err(error) => {
+            automations[index].last_run_at = Some(now.clone());
+            automations[index].last_status = AutomationStatus::Failed;
+            AutomationRun {
+                id: new_prefixed_id("run"),
+                automation_id: automation.id,
+                started_at: now.clone(),
+                finished_at: Some(now),
+                status: AutomationStatus::Failed,
+                session_name: None,
+                error: Some(error),
+            }
+        }
+    };
+
+    append_automation_run(&mut runs, run.clone());
+    save_automations_to_disk(&automations)?;
+    save_automation_runs_to_disk(&runs)?;
+    Ok(run)
+}
+
+#[tauri::command]
+fn list_automation_runs(automation_id: Option<String>) -> Result<Vec<AutomationRun>, String> {
+    let mut runs = load_automation_runs_from_disk()?;
+    if let Some(id) = automation_id.and_then(trimmed_non_empty) {
+        runs.retain(|run| run.automation_id == id);
+    }
+    runs.truncate(AUTOMATION_RUN_LIMIT);
+    Ok(runs)
+}
+
+#[tauri::command]
 fn read_dir(path: String) -> Result<Vec<DirEntry>, String> {
     let dir = std::path::Path::new(&path);
     if !dir.is_dir() {
@@ -2258,6 +2713,11 @@ pub fn run() {
             save_terminals,
             load_layout,
             save_layout,
+            list_automations,
+            save_automation,
+            delete_automation,
+            trigger_automation,
+            list_automation_runs,
             home_dir,
             pty_open,
             pty_write,
@@ -2286,9 +2746,14 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_pending_worktrees, config_worktree_base, derive_session_name, is_git_worktree_dir,
-        load_pending_cleanup, orphaned_worktrees, project_from_config, projects_from_config,
-        save_pending_cleanup, worktrees_for_session, OrphanedWorktree,
+        append_automation_run, automation_command_with_instruction, cleanup_pending_worktrees,
+        config_worktree_base, delete_automation_from_list, derive_session_name,
+        is_git_worktree_dir, list_automation_runs, load_pending_cleanup, orphaned_worktrees,
+        project_from_config, projects_from_config, run_check, save_automation,
+        save_pending_cleanup, should_skip_automation_overlap, tmux_session_exists,
+        trigger_automation, upsert_automation_from_input, worktrees_for_session, Automation,
+        AutomationOverlap, AutomationRun, AutomationStatus, AutomationTriggerType,
+        OrphanedWorktree, SaveAutomationInput, AUTOMATION_RUN_LIMIT,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -2306,6 +2771,349 @@ mod tests {
             .status()
             .expect("spawn git");
         assert!(status.success(), "git command failed: {:?}", args);
+    }
+
+    fn restore_env(name: &str, value: Option<String>) {
+        if let Some(value) = value {
+            unsafe {
+                std::env::set_var(name, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
+
+    fn sample_automation() -> Automation {
+        Automation {
+            id: "auto-1".to_string(),
+            name: "Nightly".to_string(),
+            enabled: true,
+            trigger_type: AutomationTriggerType::Manual,
+            schedule: None,
+            timezone: None,
+            project: None,
+            path: Some("/repo/app".to_string()),
+            ai_cmd: "codex".to_string(),
+            instruction: String::new(),
+            overlap: AutomationOverlap::Queue,
+            last_run_at: None,
+            last_status: AutomationStatus::Idle,
+            last_session: None,
+            created_at: "2026-06-11T00:00:00Z".to_string(),
+            updated_at: "2026-06-11T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn automation_serializes_with_frontend_contract_field_names() {
+        let automation = Automation {
+            trigger_type: AutomationTriggerType::Schedule,
+            schedule: Some("0 9 * * *".to_string()),
+            timezone: Some("Asia/Shanghai".to_string()),
+            project: Some("dashboard".to_string()),
+            path: None,
+            ai_cmd: "claude".to_string(),
+            instruction: "Summarize failures".to_string(),
+            overlap: AutomationOverlap::Skip,
+            last_run_at: Some("2026-06-11T01:00:00Z".to_string()),
+            last_status: AutomationStatus::Running,
+            last_session: Some("dashboard-nightly".to_string()),
+            ..sample_automation()
+        };
+
+        let value = serde_json::to_value(&automation).expect("serialize automation");
+
+        assert_eq!(value["id"], "auto-1");
+        assert_eq!(value["triggerType"], "schedule");
+        assert_eq!(value["aiCmd"], "claude");
+        assert_eq!(value["lastRunAt"], "2026-06-11T01:00:00Z");
+        assert_eq!(value["lastStatus"], "running");
+        assert_eq!(value["lastSession"], "dashboard-nightly");
+        assert_eq!(value["createdAt"], "2026-06-11T00:00:00Z");
+        assert_eq!(value["updatedAt"], "2026-06-11T00:00:00Z");
+    }
+
+    #[test]
+    fn upsert_automation_defaults_create_and_preserves_created_at_on_update() {
+        let created = upsert_automation_from_input(
+            Vec::new(),
+            SaveAutomationInput {
+                id: Some("auto-1".to_string()),
+                name: Some("Nightly".to_string()),
+                path: Some(Some("/repo/app".to_string())),
+                ai_cmd: Some("codex".to_string()),
+                ..Default::default()
+            },
+            "2026-06-11T00:00:00Z",
+        )
+        .expect("create automation");
+
+        assert_eq!(created.automation.id, "auto-1");
+        assert_eq!(created.automation.name, "Nightly");
+        assert!(created.automation.enabled);
+        assert_eq!(
+            created.automation.trigger_type,
+            AutomationTriggerType::Manual
+        );
+        assert_eq!(created.automation.path.as_deref(), Some("/repo/app"));
+        assert_eq!(created.automation.ai_cmd, "codex");
+        assert_eq!(created.automation.overlap, AutomationOverlap::Queue);
+        assert_eq!(created.automation.last_status, AutomationStatus::Idle);
+        assert_eq!(created.automation.created_at, "2026-06-11T00:00:00Z");
+        assert_eq!(created.automation.updated_at, "2026-06-11T00:00:00Z");
+
+        let updated = upsert_automation_from_input(
+            created.automations,
+            SaveAutomationInput {
+                id: Some("auto-1".to_string()),
+                name: Some("Weekday schedule".to_string()),
+                trigger_type: Some(AutomationTriggerType::Schedule),
+                schedule: Some(Some("0 9 * * 1-5".to_string())),
+                timezone: Some(Some("Asia/Shanghai".to_string())),
+                overlap: Some(AutomationOverlap::Skip),
+                ..Default::default()
+            },
+            "2026-06-11T02:00:00Z",
+        )
+        .expect("update automation");
+
+        assert_eq!(updated.automations.len(), 1);
+        assert_eq!(updated.automation.name, "Weekday schedule");
+        assert_eq!(
+            updated.automation.trigger_type,
+            AutomationTriggerType::Schedule
+        );
+        assert_eq!(updated.automation.schedule.as_deref(), Some("0 9 * * 1-5"));
+        assert_eq!(
+            updated.automation.timezone.as_deref(),
+            Some("Asia/Shanghai")
+        );
+        assert_eq!(updated.automation.overlap, AutomationOverlap::Skip);
+        assert_eq!(updated.automation.ai_cmd, "codex");
+        assert_eq!(updated.automation.created_at, "2026-06-11T00:00:00Z");
+        assert_eq!(updated.automation.updated_at, "2026-06-11T02:00:00Z");
+    }
+
+    #[test]
+    fn delete_automation_from_list_removes_only_matching_id() {
+        let other = Automation {
+            id: "auto-2".to_string(),
+            name: "Other".to_string(),
+            ..sample_automation()
+        };
+
+        let remaining = delete_automation_from_list(vec![sample_automation(), other], "auto-1");
+
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "auto-2");
+    }
+
+    #[test]
+    fn automation_command_shell_quotes_non_empty_instruction() {
+        let command =
+            automation_command_with_instruction("codex", "Fix Bob's bug && rm -rf /tmp/demo");
+
+        assert_eq!(command, "codex 'Fix Bob'\\''s bug && rm -rf /tmp/demo'");
+        assert_eq!(automation_command_with_instruction("codex", "  "), "codex");
+    }
+
+    #[test]
+    fn overlap_skip_requires_running_or_queued_status_with_live_session() {
+        let running = Automation {
+            overlap: AutomationOverlap::Skip,
+            last_status: AutomationStatus::Running,
+            last_session: Some("dashboard-nightly".to_string()),
+            ..sample_automation()
+        };
+        let queued = Automation {
+            last_status: AutomationStatus::Queued,
+            ..running.clone()
+        };
+        let failed = Automation {
+            last_status: AutomationStatus::Failed,
+            ..running.clone()
+        };
+
+        assert!(should_skip_automation_overlap(&running, true));
+        assert!(should_skip_automation_overlap(&queued, true));
+        assert!(!should_skip_automation_overlap(&running, false));
+        assert!(!should_skip_automation_overlap(&failed, true));
+        assert!(!should_skip_automation_overlap(
+            &Automation {
+                overlap: AutomationOverlap::Queue,
+                ..running
+            },
+            true,
+        ));
+    }
+
+    #[test]
+    fn append_automation_run_keeps_newest_first_and_bounded() {
+        let mut runs = (0..AUTOMATION_RUN_LIMIT)
+            .map(|index| AutomationRun {
+                id: format!("run-{index}"),
+                automation_id: "auto-1".to_string(),
+                started_at: format!("2026-06-11T00:{index:02}:00Z"),
+                finished_at: None,
+                status: AutomationStatus::Running,
+                session_name: None,
+                error: None,
+            })
+            .collect::<Vec<_>>();
+        let newest = AutomationRun {
+            id: "run-new".to_string(),
+            automation_id: "auto-1".to_string(),
+            started_at: "2026-06-11T02:00:00Z".to_string(),
+            finished_at: Some("2026-06-11T02:01:00Z".to_string()),
+            status: AutomationStatus::Failed,
+            session_name: Some("dashboard-nightly".to_string()),
+            error: Some("start failed".to_string()),
+        };
+
+        append_automation_run(&mut runs, newest.clone());
+
+        assert_eq!(runs.len(), AUTOMATION_RUN_LIMIT);
+        assert_eq!(runs[0], newest);
+        assert_eq!(runs.last().expect("last").id, "run-198");
+    }
+
+    #[test]
+    #[ignore = "starts a real tmux session and git worktree; run manually for smoke validation"]
+    fn automation_trigger_smoke_creates_real_tmux_session_and_run_record() {
+        let _guard = test_env_lock().lock().expect("lock");
+        if std::process::Command::new("tmux")
+            .arg("-V")
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true)
+        {
+            panic!("tmux is required for automation smoke validation");
+        }
+
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let remote = temp.path().join("remote.git");
+        let repo = temp.path().join("repo");
+        let worktree_base = temp.path().join("worktrees");
+        let marker = temp.path().join("automation-smoke-marker");
+        fs::create_dir_all(&home).expect("home");
+
+        git(&["init", "--bare", remote.to_str().expect("remote str")]);
+        git(&[
+            "clone",
+            remote.to_str().expect("remote str"),
+            repo.to_str().expect("repo str"),
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.name",
+            "test",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
+        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "commit",
+            "-m",
+            "init",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "branch",
+            "-M",
+            "main",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "push",
+            "-u",
+            "origin",
+            "main",
+        ]);
+
+        let config = serde_json::json!({
+            "projects": {
+                "smoke": repo.to_string_lossy()
+            },
+            "worktreeBase": worktree_base.to_string_lossy()
+        });
+        fs::write(
+            home.join(".tmux-worktree.json"),
+            serde_json::to_string_pretty(&config).expect("config json"),
+        )
+        .expect("write config");
+
+        unsafe {
+            std::env::set_var("TW_DASHBOARD_HOME", &home);
+            std::env::set_var("HOME", &home);
+        }
+
+        let saved = save_automation(SaveAutomationInput {
+            id: Some("auto-smoke".to_string()),
+            name: Some("Smoke".to_string()),
+            enabled: Some(true),
+            trigger_type: Some(AutomationTriggerType::Manual),
+            schedule: Some(None),
+            timezone: Some(None),
+            project: Some(Some("smoke".to_string())),
+            path: Some(None),
+            ai_cmd: Some(format!("touch {}", marker.to_string_lossy())),
+            instruction: Some(String::new()),
+            overlap: Some(AutomationOverlap::Skip),
+        })
+        .expect("save automation");
+
+        let run = trigger_automation(saved.id.clone()).expect("trigger automation");
+        let session = run.session_name.clone().expect("session name");
+        assert_eq!(run.status, AutomationStatus::Running);
+        assert!(tmux_session_exists(session.clone()).expect("tmux session exists check"));
+
+        for _ in 0..20 {
+            if marker.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(marker.exists(), "automation command did not create marker");
+
+        let runs = list_automation_runs(Some(saved.id.clone())).expect("list runs");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, run.id);
+        assert_eq!(runs[0].status, AutomationStatus::Running);
+
+        let cwd = run_check(&[
+            "tmux",
+            "display-message",
+            "-p",
+            "-t",
+            &session,
+            "#{pane_current_path}",
+        ])
+        .expect("pane cwd");
+        assert!(Path::new(&cwd).join(".git").exists());
+
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={session}")])
+            .status();
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
     }
 
     #[test]

@@ -9,9 +9,24 @@ import { GitStatusPanel } from "./GitStatusPanel";
 import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
+import { AutomationPanel } from "./AutomationPanel";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import {
+  automationFromRecord,
+  automationRunFromRecord,
+  automationSaveInputFromDraft,
+  createAutomationDraft,
+  shouldRunAutomationSchedule,
+  triggerLabel,
+  type Automation,
+  type AutomationDraft,
+  type AutomationRecord,
+  type AutomationRun,
+  type AutomationRunRecord,
+} from "./automationTypes";
+import {
+  SIDEBAR_AUTOMATIONS_HEIGHT,
   SIDEBAR_GIT_MIN_HEIGHT,
   SIDEBAR_TERMINALS_MIN_HEIGHT,
   SIDEBAR_WORKTREES_MIN_HEIGHT,
@@ -37,6 +52,7 @@ type PlainTerminal = {
 type Selection =
   | { kind: "session"; name: string }
   | { kind: "terminal"; id: string }
+  | { kind: "automation"; id: string }
   | null;
 
 type WindowLayout = {
@@ -75,6 +91,19 @@ function colorForProject(map: Map<string, string>, project: string): string {
   return map.get(project)!;
 }
 
+function automationDotColor(automation: Automation): string {
+  if (!automation.active) return "var(--text-faint)";
+  if (automation.status === "failed") return "#ff8272";
+  if (automation.status === "running" || automation.status === "queued") return "#90cdf4";
+  if (automation.status === "skipped") return "#f6ad55";
+  return "#9ae6b4";
+}
+
+function automationMetaLabel(automation: Automation): string {
+  if (!automation.active) return "paused";
+  return automation.status && automation.status !== "idle" ? automation.status : "active";
+}
+
 function isWindowLayout(value: unknown): value is WindowLayout {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Record<string, unknown>;
@@ -93,7 +122,8 @@ function isSelection(value: unknown): value is Selection {
   const candidate = value as Record<string, unknown>;
   return (
     (candidate.kind === "session" && typeof candidate.name === "string") ||
-    (candidate.kind === "terminal" && typeof candidate.id === "string")
+    (candidate.kind === "terminal" && typeof candidate.id === "string") ||
+    (candidate.kind === "automation" && typeof candidate.id === "string")
   );
 }
 
@@ -182,6 +212,9 @@ function placeScratchAfterMain(order: LayoutColumn[]): LayoutColumn[] {
 function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
+  const [automations, setAutomations] = useState<Automation[]>([]);
+  const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
+  const [automationError, setAutomationError] = useState<string | null>(null);
   const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
   const [openedTerminals, setOpenedTerminals] = useState<string[]>([]);
@@ -234,8 +267,11 @@ function App() {
   const autoResizeColumnsReadyRef = useRef(false);
   const gitHeightValueRef = useRef(gitHeight);
   const sectionSplitValueRef = useRef(sectionSplit);
+  const automationsRef = useRef<Automation[]>([]);
+  const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   gitHeightValueRef.current = gitHeight;
   sectionSplitValueRef.current = sectionSplit;
+  automationsRef.current = automations;
 
   useEffect(() => {
     const el = appRef.current;
@@ -257,6 +293,7 @@ function App() {
         totalHeight,
         sectionSplit: sectionSplitValueRef.current,
         gitHeight: gitHeightValueRef.current,
+        automationHeight: SIDEBAR_AUTOMATIONS_HEIGHT,
       });
       if (next.sectionSplit !== sectionSplitValueRef.current) {
         sectionSplitValueRef.current = next.sectionSplit;
@@ -283,6 +320,7 @@ function App() {
       totalHeight: el.getBoundingClientRect().height,
       sectionSplit,
       gitHeight,
+      automationHeight: SIDEBAR_AUTOMATIONS_HEIGHT,
     });
     if (next.sectionSplit !== sectionSplit) setSectionSplit(next.sectionSplit);
     if (next.gitHeight !== gitHeight) setGitHeight(next.gitHeight);
@@ -532,6 +570,40 @@ function App() {
     windowLayout,
   ]);
 
+  const loadAutomations = useCallback(async () => {
+    try {
+      const [records, runRecords] = await Promise.all([
+        invoke<AutomationRecord[]>("list_automations"),
+        invoke<AutomationRunRecord[]>("list_automation_runs", { automationId: null }),
+      ]);
+      const nextAutomations = records.map(automationFromRecord);
+      const automationsById = new Map(
+        nextAutomations.map((automation) => [automation.id, automation]),
+      );
+      const nextRuns = runRecords.map((run) =>
+        automationRunFromRecord(run, automationsById.get(run.automationId)),
+      );
+
+      setAutomations(nextAutomations);
+      setAutomationRuns(nextRuns);
+      setAutomationError(null);
+      setSelection((current) => {
+        if (current?.kind !== "automation" || !current.id || automationsById.has(current.id)) {
+          return current;
+        }
+        return nextAutomations[0] ? { kind: "automation", id: nextAutomations[0].id } : null;
+      });
+      return nextAutomations;
+    } catch (err) {
+      setAutomationError(String(err));
+      return automationsRef.current;
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadAutomations();
+  }, [loadAutomations]);
+
   const anyModalOpen = showNewWorktree || showNewTerminal;
   const editorPanelOpen = !!(editingFile || diffFile);
 
@@ -731,7 +803,10 @@ function App() {
       const dy = ev.clientY - startY;
       const maxGit = Math.max(
         SIDEBAR_GIT_MIN_HEIGHT,
-        total - sectionSplitValueRef.current - SIDEBAR_TERMINALS_MIN_HEIGHT,
+        total -
+          sectionSplitValueRef.current -
+          SIDEBAR_TERMINALS_MIN_HEIGHT -
+          SIDEBAR_AUTOMATIONS_HEIGHT,
       );
       const h = clamp(startH - dy, SIDEBAR_GIT_MIN_HEIGHT, maxGit);
       setGitHeight(h);
@@ -759,7 +834,7 @@ function App() {
       const dy = ev.clientY - startY;
       const maxSection = Math.max(
         SIDEBAR_WORKTREES_MIN_HEIGHT,
-        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT,
+        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT - SIDEBAR_AUTOMATIONS_HEIGHT,
       );
       const h = clamp(startH + dy, SIDEBAR_WORKTREES_MIN_HEIGHT, maxSection);
       setSectionSplit(h);
@@ -801,6 +876,7 @@ function App() {
         return next;
       });
       setSelection((cur) => {
+        if (cur?.kind === "automation") return cur;
         if (cur?.kind === "terminal") return cur;
         if (cur?.kind === "session" && live.has(cur.name)) return cur;
         if (list.length > 0) return { kind: "session", name: list[0].name };
@@ -816,6 +892,87 @@ function App() {
     const id = setInterval(refresh, REFRESH_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  const handleAutomationCreate = useCallback(
+    async (draft: AutomationDraft) => {
+      const record = await invoke<AutomationRecord>("save_automation", {
+        input: automationSaveInputFromDraft(draft),
+      });
+      const automation = automationFromRecord(record);
+      setSelection({ kind: "automation", id: automation.id });
+      await loadAutomations();
+    },
+    [loadAutomations],
+  );
+
+  const handleAutomationSave = useCallback(
+    async (id: string, draft: AutomationDraft) => {
+      const record = await invoke<AutomationRecord>("save_automation", {
+        input: automationSaveInputFromDraft(draft, id),
+      });
+      const automation = automationFromRecord(record);
+      setSelection({ kind: "automation", id: automation.id });
+      await loadAutomations();
+    },
+    [loadAutomations],
+  );
+
+  const handleAutomationToggle = useCallback(
+    async (id: string, active: boolean) => {
+      const automation = automationsRef.current.find((item) => item.id === id);
+      if (!automation) return;
+      await invoke<AutomationRecord>("save_automation", {
+        input: automationSaveInputFromDraft(
+          { ...createAutomationDraft(automation), active },
+          id,
+        ),
+      });
+      await loadAutomations();
+    },
+    [loadAutomations],
+  );
+
+  const handleAutomationDelete = useCallback(
+    async (id: string) => {
+      await invoke("delete_automation", { id });
+      setAutomationRuns((prev) => prev.filter((run) => run.automationId !== id));
+      setSelection((current) =>
+        current?.kind === "automation" && current.id === id ? { kind: "automation", id: "" } : current,
+      );
+      await loadAutomations();
+    },
+    [loadAutomations],
+  );
+
+  const handleAutomationRun = useCallback(
+    async (id: string) => {
+      const automation = automationsRef.current.find((item) => item.id === id);
+      const runRecord = await invoke<AutomationRunRecord>("trigger_automation", { id });
+      const run = automationRunFromRecord(runRecord, automation);
+      setAutomationRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
+      await Promise.all([loadAutomations(), refresh()]);
+    },
+    [loadAutomations, refresh],
+  );
+
+  useEffect(() => {
+    const tick = () => {
+      const now = new Date();
+      const minute = now.toISOString().slice(0, 16);
+      for (const automation of automationsRef.current) {
+        if (!shouldRunAutomationSchedule(automation, now)) continue;
+        const key = `${automation.id}:${minute}`;
+        if (scheduledAutomationMinuteRef.current.has(key)) continue;
+        scheduledAutomationMinuteRef.current.add(key);
+        void handleAutomationRun(automation.id).catch((err) => {
+          setAutomationError(String(err));
+        });
+      }
+    };
+
+    const id = setInterval(tick, 30_000);
+    return () => clearInterval(id);
+  }, [handleAutomationRun]);
 
   // Remote tunnel helpers
   const checkRemoteStatus = useCallback(async () => {
@@ -905,11 +1062,17 @@ function App() {
   }, [selection]);
 
   // Resolve current cwd for selected item
+  const selectedAutomation =
+    selection?.kind === "automation"
+      ? automations.find((automation) => automation.id === selection.id) ?? null
+      : null;
   const selectedCwd: string | null =
     selection?.kind === "session"
       ? cwdsBySession[selection.name] ?? null
       : selection?.kind === "terminal"
         ? terminals.find((t) => t.id === selection.id)?.cwd ?? null
+        : selection?.kind === "automation"
+          ? selectedAutomation?.path || null
         : null;
 
   const fileBrowserRoot = selectedCwd ?? homeDir ?? "/";
@@ -1021,7 +1184,7 @@ function App() {
   }, []);
 
   const colorMap = new Map<string, string>();
-  const totalCount = sessions.length + terminals.length;
+  const totalCount = sessions.length + terminals.length + automations.length;
 
   const sessionSortable = useSortable(
     sessions,
@@ -1285,6 +1448,56 @@ function App() {
               </nav>
             </div>
 
+            {/* ── Automations section ── */}
+            <div className="sidebar__section sidebar__section--automations">
+              <div className="section-label">
+                <span className="section-label__text">automations</span>
+                <span className="section-label__line" />
+                <button
+                  className="btn btn--small"
+                  type="button"
+                  onClick={() => setSelection({ kind: "automation", id: "" })}
+                  title="new automation"
+                  aria-label="new automation"
+                >
+                  +
+                </button>
+              </div>
+              <nav className="sidebar__sessions sidebar__sessions--compact">
+                {automationError && <div className="empty empty--error">{automationError}</div>}
+                {automations.length === 0 && !automationError && (
+                  <div className="empty empty--small">no automations</div>
+                )}
+                {automations.map((automation) => {
+                  const isSelected =
+                    selection?.kind === "automation" && selection.id === automation.id;
+                  return (
+                    <div
+                      key={automation.id}
+                      className={`session ${isSelected ? "session--selected" : ""}`}
+                      onClick={() => setSelection({ kind: "automation", id: automation.id })}
+                      role="button"
+                      tabIndex={0}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" || e.key === " ")
+                          setSelection({ kind: "automation", id: automation.id });
+                      }}
+                    >
+                      <span
+                        className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
+                        style={{ background: automationDotColor(automation) }}
+                      />
+                      <span className="session__name" title={automation.name}>
+                        <span className="session__head">{automation.name || "(unnamed)"}</span>
+                        <span className="session__tail"> · {triggerLabel(automation)}</span>
+                      </span>
+                      <span className="session__meta">{automationMetaLabel(automation)}</span>
+                    </div>
+                  );
+                })}
+              </nav>
+            </div>
+
             {/* ── Terminals section ── */}
             <div
               className="sidebar__section"
@@ -1449,7 +1662,35 @@ function App() {
         style={{ gridColumn: columnGridColumn("main") }}
       >
         {renderColumnHandle("main", "main terminal")}
-        {selection ? (
+        {selection?.kind === "automation" ? (
+          <div className="pane pane--automation">
+            <div className="pane__bar">
+              <span className="pane__title">
+                {selectedAutomation?.name || "new automation"}
+              </span>
+              <div className="pane__bar-actions">
+                <span className="pane__hint dim">
+                  {selectedAutomation ? triggerLabel(selectedAutomation) : "draft"}
+                </span>
+              </div>
+            </div>
+            <div className="pane__body pane__body--automation">
+              {automationError && <div className="modal__error">{automationError}</div>}
+              <AutomationPanel
+                automations={automations}
+                selectedId={selection.id || null}
+                runs={automationRuns}
+                onSelect={(id) => setSelection({ kind: "automation", id })}
+                onCreate={handleAutomationCreate}
+                onToggle={handleAutomationToggle}
+                onRun={handleAutomationRun}
+                onDelete={handleAutomationDelete}
+                onSave={handleAutomationSave}
+                showList={false}
+              />
+            </div>
+          </div>
+        ) : selection ? (
           <div className="pane pane--term">
             <div className="pane__bar">
               <span className="pane__title">
@@ -1541,7 +1782,7 @@ function App() {
         ) : (
           <div className="pane pane--empty">
             <div className="pane__hint">
-              select a session or create a new worktree / terminal
+              select a session, terminal, or automation
             </div>
           </div>
         )}

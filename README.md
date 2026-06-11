@@ -3,7 +3,7 @@
 `tmux-worktree` 提供两套工具，用于管理 AI 编程 session：
 
 - `tw`：Node.js CLI，创建独立 git worktree、启动 tmux session，并运行指定 AI 命令。
-- `tw-dashboard`：macOS Tauri 桌面端，管理 tmux session、worktree、终端、文件、Git 状态和远程访问。
+- `tw-dashboard`：macOS Tauri 桌面端，管理 tmux session、worktree、终端、本地 automation、文件、Git 状态和远程访问。
 
 仓库代码结构、开发/发布边界见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
@@ -72,6 +72,8 @@ Dashboard 额外状态文件：
 
 - `~/.tw-dashboard-layout.json`：窗口、栏目、当前选择、文件树、编辑器/diff、侧边栏布局。
 - `~/.tw-dashboard-terminals.json`：独立终端列表。
+- `~/.tw-dashboard-automations.json`：Dashboard 本地 automation 定义。
+- `~/.tw-dashboard-automation-runs.json`：Dashboard 本地 automation 运行历史，最多保留 200 条。
 - `~/.tw-dashboard-pending-worktree-cleanup.json`：延迟清理的 worktree 记录。
 
 ## CLI 使用
@@ -101,7 +103,8 @@ tw
 2. 在左侧选择 session，主区域会 attach 到对应 tmux。
 3. 左下角 Git 面板查看分支、文件变更和 commit 历史。
 4. 打开文件树后，可以浏览项目并打开编辑器或 diff 栏。
-5. 点击 remote access，通过 Cloudflare Quick Tunnel 在手机或其他设备访问 Web 终端。
+5. 在左侧 Automations 区域创建可手动或 cron 调度的本地 automation；运行时会复用 worktree 创建链路启动新的 tmux session。
+6. 点击 remote access，通过 Cloudflare Quick Tunnel 在手机或其他设备访问 Web 终端。
 
 Remote 运行时：
 
@@ -114,6 +117,7 @@ Remote 运行时：
 
 - 首次打开是默认三栏：侧边栏、主终端、scratch。
 - 侧边栏固定在最左侧；文件树、主终端、scratch、编辑器/diff 等右侧栏目可以拖动标题栏左侧握把重排。
+- Automations 固定在左侧 worktrees 和 terminals 之间；选中后主区域显示配置、Run now、pause/activate、delete 和运行历史。
 - 如果关闭前打开了文件树、编辑器或 diff 栏，重启后会恢复这些栏目、顺序和宽度。
 - scratch 的展开/收起按钮在主终端标题栏右侧。收起后 scratch 整列隐藏；再次展开时默认回到主终端右侧。
 - Git 面板会跟随当前 tmux session 的 active pane cwd，因此 agent 在 tmux 中切换目录或分支后，面板分支也会刷新。

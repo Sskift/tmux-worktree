@@ -12,6 +12,8 @@ export const stateFiles = [
   ".tmux-worktree.json",
   ".tw-dashboard-layout.json",
   ".tw-dashboard-terminals.json",
+  ".tw-dashboard-automations.json",
+  ".tw-dashboard-automation-runs.json",
   ".tw-dashboard-pending-worktree-cleanup.json",
   ".tw-serve-token",
 ];

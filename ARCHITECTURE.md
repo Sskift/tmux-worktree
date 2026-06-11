@@ -62,8 +62,10 @@
 
 | 文件 | 作用 |
 |---|---|
-| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、栏目拖拽排序、session 选择、modal 和 remote 控制 |
+| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、栏目拖拽排序、session/automation 选择、modal 和 remote 控制 |
 | `app/src/App.css` | Dashboard 样式 |
+| `app/src/AutomationPanel.tsx` | 本地 automation 管理面板，负责新建/编辑、Run now、pause/activate、delete 和运行历史展示 |
+| `app/src/automationTypes.ts` | automation 前后端契约转换、表单校验和 cron 调度匹配 helper |
 | `app/src/Terminal.tsx` | xterm.js 包装和 Tauri PTY 事件桥接 |
 | `app/src/GitStatusPanel.tsx` | Git files/log 面板；按 tmux 实时 cwd 跟踪 session 分支 |
 | `app/src/FileTree.tsx` | 文件树、文件名搜索、内容搜索 |
@@ -92,8 +94,16 @@ Rust 后端：
 - Git：`git_status`、`git_log`、`git_diff`。
 - PTY：`pty_open`、`pty_write`、`pty_resize`、`pty_kill`、`capture_pane_history`。
 - 独立终端：`create_plain_terminal`、`ensure_terminal_session`、`kill_plain_terminal`、`load_terminals`、`save_terminals`。
+- Automation：`list_automations`、`save_automation`、`delete_automation`、`trigger_automation`、`list_automation_runs`。
 - 布局和文件：`load_layout`、`save_layout`、`read_dir`、`read_file`、`write_file`、`search_files`、`file_exists`。
 - Remote：`remote_start`、`remote_stop`、`remote_status`。
+
+Automation 设计：
+
+- Dashboard 使用本地 JSON 文件保存 automation 定义和 run 历史，不引入服务端数据库。
+- `trigger_automation` 复用现有 `create_worktree` 流程：解析 project/path，创建 git worktree，启动 tmux session，并把 instruction 追加到 `aiCmd`。
+- `overlap=skip` 时，如果上一次 running/queued session 仍存在，则记录 `skipped` run；`overlap=queue` 时允许再次启动新 session。
+- cron schedule 由前端 Dashboard 运行时按本机本地时间轮询触发；Dashboard 关闭时不会执行后台调度。
 
 Remote 启动顺序：
 
@@ -130,6 +140,8 @@ Remote 启动顺序：
 | `~/.tmux-worktree.json` | CLI 和 Dashboard | 项目映射和 worktree 根目录 |
 | `~/.tw-dashboard-layout.json` | Dashboard | 窗口、栏目顺序和宽度、选择、文件树、编辑器/diff、侧边栏布局 |
 | `~/.tw-dashboard-terminals.json` | Dashboard | 独立终端定义 |
+| `~/.tw-dashboard-automations.json` | Dashboard | 本地 automation 定义 |
+| `~/.tw-dashboard-automation-runs.json` | Dashboard | 本地 automation 运行历史，最多保留 200 条 |
 | `~/.tw-dashboard-pending-worktree-cleanup.json` | Dashboard | session kill 后待清理 worktree |
 | `~/.tw-serve-token` | CLI serve / Dashboard remote | Web 终端认证 token |
 
