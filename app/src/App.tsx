@@ -51,6 +51,12 @@ type PlainTerminal = {
   tmuxName: string;
 };
 
+type ProjectPreset = {
+  name: string;
+  path: string;
+  branch?: string | null;
+};
+
 type Selection =
   | { kind: "session"; name: string }
   | { kind: "terminal"; id: string }
@@ -223,10 +229,13 @@ function App() {
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
+  const [projectPresets, setProjectPresets] = useState<ProjectPreset[]>([]);
   const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
   const [openedTerminals, setOpenedTerminals] = useState<string[]>([]);
   const [cwdsBySession, setCwdsBySession] = useState<Record<string, string>>({});
+  const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
+  const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
   const [showNewTerminal, setShowNewTerminal] = useState(false);
@@ -347,6 +356,19 @@ function App() {
   useEffect(() => {
     invoke<string>("home_dir").then(setHomeDir).catch(() => {});
   }, []);
+
+  const loadProjectPresets = useCallback(async () => {
+    try {
+      const list = await invoke<ProjectPreset[]>("list_projects");
+      setProjectPresets(list);
+    } catch {
+      setProjectPresets([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadProjectPresets();
+  }, [loadProjectPresets]);
 
   useEffect(() => {
     if (!windowRestoreReady) return;
@@ -1130,16 +1152,61 @@ function App() {
     selection?.kind === "automation"
       ? automations.find((automation) => automation.id === selection.id) ?? null
       : null;
+  const selectedAutomationProjectPath =
+    selectedAutomation?.project.trim()
+      ? projectPresets.find((project) => project.name === selectedAutomation.project)?.path.trim() || null
+      : null;
   const selectedCwd: string | null =
     selection?.kind === "session"
       ? cwdsBySession[selection.name] ?? null
       : selection?.kind === "terminal"
         ? terminals.find((t) => t.id === selection.id)?.cwd ?? null
         : selection?.kind === "automation"
-          ? selectedAutomation?.path || null
+          ? selectedAutomation?.path || selectedAutomationProjectPath
         : null;
 
-  const fileBrowserRoot = selectedCwd ?? homeDir ?? "/";
+  const desktopRoot = homeDir ? `${homeDir.replace(/\/+$/, "")}/Desktop` : null;
+  const fileBrowserRoot =
+    selection?.kind === "automation"
+      ? selectedCwd ?? desktopRoot
+      : selectedCwd ?? homeDir ?? "/";
+
+  const projectPresetForSession = useCallback(
+    (sessionName: string): string | null => {
+      const key = projectKey(sessionName);
+      return projectPresets.some((project) => project.name === key) ? key : null;
+    },
+    [projectPresets],
+  );
+
+  useEffect(() => {
+    if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd) {
+      setLastAutomationContextPath(selectedCwd);
+      setLastAutomationContextProject(
+        selection.kind === "session" ? projectPresetForSession(selection.name) : null,
+      );
+    }
+  }, [projectPresetForSession, selection, selectedCwd]);
+
+  const handleNewAutomation = useCallback(() => {
+    if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd) {
+      setLastAutomationContextPath(selectedCwd);
+      setLastAutomationContextProject(
+        selection.kind === "session" ? projectPresetForSession(selection.name) : null,
+      );
+    } else if (selection?.kind === "session") {
+      const name = selection.name;
+      void invoke<string>("session_root", { name })
+        .then((cwd) => {
+          if (cwd) {
+            setLastAutomationContextPath(cwd);
+            setLastAutomationContextProject(projectPresetForSession(name));
+          }
+        })
+        .catch(() => {});
+    }
+    setSelection({ kind: "automation", id: "" });
+  }, [projectPresetForSession, selection, selectedCwd]);
 
   const handleOpenFile = useCallback((path: string, _line?: number, _col?: number) => {
     setDiffFile(null);
@@ -1526,7 +1593,7 @@ function App() {
                 <button
                   className="btn btn--small"
                   type="button"
-                  onClick={() => setSelection({ kind: "automation", id: "" })}
+                  onClick={handleNewAutomation}
                   title="new automation"
                   aria-label="new automation"
                 >
@@ -1717,11 +1784,15 @@ function App() {
           style={{ gridColumn: columnGridColumn("file") }}
         >
           {renderColumnHandle("file", "file tree")}
-          <FileTree
-            root={fileBrowserRoot}
-            selectedFile={editingFile}
-            onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
-          />
+          {fileBrowserRoot ? (
+            <FileTree
+              root={fileBrowserRoot}
+              selectedFile={editingFile}
+              onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
+            />
+          ) : (
+            <div className="empty empty--small">loading home directory</div>
+          )}
         </aside>
       )}
 
@@ -1736,11 +1807,11 @@ function App() {
           <div className="pane pane--automation">
             <div className="pane__bar">
               <span className="pane__title">
-                {selectedAutomation?.name || "new automation"}
+                {selectedAutomation?.name || "automations"}
               </span>
               <div className="pane__bar-actions">
                 <span className="pane__hint dim">
-                  {selectedAutomation ? triggerLabel(selectedAutomation) : "draft"}
+                  {selectedAutomation ? triggerLabel(selectedAutomation) : "new"}
                 </span>
               </div>
             </div>
@@ -1750,6 +1821,9 @@ function App() {
                 automations={automations}
                 selectedId={selection.id || null}
                 runs={automationRuns}
+                projectOptions={projectPresets}
+                recentPath={lastAutomationContextPath}
+                recentProject={lastAutomationContextProject}
                 onSelect={(id) => setSelection({ kind: "automation", id })}
                 onCreate={handleAutomationCreate}
                 onToggle={handleAutomationToggle}
@@ -1966,6 +2040,7 @@ function App() {
           onCreated={(sessionName) => {
             setShowNewWorktree(false);
             setSelection({ kind: "session", name: sessionName });
+            void loadProjectPresets();
             refresh();
           }}
         />

@@ -25,6 +25,7 @@
 | `src/cli.ts` | CLI 路由，分发 `status`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
 | `src/config.ts` | 读取并归一化 `~/.tmux-worktree.json`，兼容旧版 CLI 字符串映射、对象映射、数组项目和字段别名 | 打包 |
 | `src/dev.ts` | 创建 git worktree 和 tmux session，并启动 AI 命令 | 打包 |
+| `src/automation.ts` | 管理 Dashboard 共用的 `~/.tw-dashboard-automations.json`，提供 `tw automation`/`tw auto` 的 list/create/delete | 打包 |
 | `src/status.ts` | CLI session 左侧 tmux TUI 状态面板 | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
 | `src/setup.ts` | 系统依赖检查和可选安装 | 打包 |
@@ -101,6 +102,8 @@ Rust 后端：
 Automation 设计：
 
 - Dashboard 使用本地 JSON 文件保存 automation 定义和 run 历史，不引入服务端数据库。
+- CLI `tw automation create` 直接写入同一个本地定义文件，字段名与 Tauri `Automation` 的 camelCase JSON 契约一致；run 历史仍由 Dashboard 触发执行时维护。
+- Dashboard 表单复用 App 现有上下文：project 下拉来自 `~/.tmux-worktree.json`，新建 automation 会优先继承当前 session 对应的 project，其次继承最近 cwd；AI command 与新建 worktree 弹窗共享本地偏好；Automation 视图的文件树优先打开 automation 的 project/path，创建态默认落到 `~/Desktop` 而不是 `/`。
 - `trigger_automation` 复用现有 `create_worktree` 流程：解析 project/path，创建 git worktree，启动 tmux session，并把 instruction 追加到 `aiCmd`。
 - `overlap=skip` 时，如果上一次 running/queued session 仍存在，则记录 `skipped` run；`overlap=queue` 时允许再次启动新 session。
 - cron schedule 由前端 Dashboard 运行时按本机本地时间轮询触发；Dashboard 关闭时不会执行后台调度。

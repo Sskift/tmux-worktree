@@ -94,6 +94,15 @@ tw
 - `tw status`：tmux 内的 session 状态面板。
 - `tw serve`：启动本地 WebSocket 终端服务。
 - `tw serve --remote`：本地终端服务加 Cloudflare Quick Tunnel。
+- `tw automation ls` / `tw auto ls`：列出 Dashboard 可见的本地 automation。
+- `tw automation create --instruction <text> [--name <name>] [--cmd <ai-cmd>] [--project <name> | --path <path>] [--schedule <cron>] [--timezone <tz>] [--overlap skip|queue] [--disabled]`：写入 `~/.tw-dashboard-automations.json`，可用 `add` / `new` 作为 `create` 别名。
+- `tw automation rm <id|name>`：删除 automation，可用 `delete` 作为别名。
+
+Automation create 目标推断：
+
+- 传 `--project` 时必须命中 `~/.tmux-worktree.json` 里的项目配置。
+- 传 `--path` 时保存该路径。
+- 都不传时，如果当前目录位于某个配置项目路径下，则保存该 project；否则保存当前目录 path。
 
 ## Dashboard 使用
 

@@ -10,13 +10,23 @@ import {
   type AutomationDraft,
   type AutomationRun,
 } from "./automationTypes";
+import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 
 type MaybePromise = unknown | Promise<unknown>;
+
+export type AutomationProjectOption = {
+  name: string;
+  path: string;
+  branch?: string | null;
+};
 
 export type AutomationPanelProps = {
   automations: Automation[];
   selectedId: string | null;
   runs: AutomationRun[];
+  projectOptions?: AutomationProjectOption[];
+  recentPath?: string | null;
+  recentProject?: string | null;
   onSelect: (id: string) => MaybePromise;
   onCreate: (draft: AutomationDraft) => MaybePromise;
   onToggle: (id: string, active: boolean) => MaybePromise;
@@ -66,10 +76,51 @@ function FieldError({ message }: { message?: string }) {
   return <span style={{ color: "#ff8272", fontSize: 11 }}>{message}</span>;
 }
 
+function normalizeRecentPath(path?: string | null): string {
+  return path?.trim() ?? "";
+}
+
+function pathMatchesProject(path: string, projectPath: string): boolean {
+  const normalizedPath = path.replace(/\/+$/, "");
+  const normalizedProjectPath = projectPath.replace(/\/+$/, "");
+  return normalizedPath === normalizedProjectPath || normalizedPath.startsWith(`${normalizedProjectPath}/`);
+}
+
+function recentProjectName(
+  recentPath: string,
+  recentProject: string | null | undefined,
+  projectOptions: AutomationProjectOption[],
+): string {
+  const project = recentProject?.trim();
+  if (project && projectOptions.some((option) => option.name === project)) return project;
+  if (!recentPath) return "";
+  return (
+    projectOptions.find((option) => option.path.trim() && pathMatchesProject(recentPath, option.path))
+      ?.name ?? ""
+  );
+}
+
+function createNewAutomationDraft(
+  recentPath: string | null | undefined,
+  recentProject: string | null | undefined,
+  projectOptions: AutomationProjectOption[],
+): AutomationDraft {
+  const path = normalizeRecentPath(recentPath);
+  const project = recentProjectName(path, recentProject, projectOptions);
+  return {
+    ...createAutomationDraft(),
+    aiCmd: loadLastAiCmd(),
+    ...(project ? { project } : path ? { path } : {}),
+  };
+}
+
 export function AutomationPanel({
   automations,
   selectedId,
   runs,
+  projectOptions = [],
+  recentPath = null,
+  recentProject = null,
   onSelect,
   onCreate,
   onToggle,
@@ -82,39 +133,116 @@ export function AutomationPanel({
     () => automations.find((automation) => automation.id === selectedId) ?? null,
     [automations, selectedId],
   );
-  const [creating, setCreating] = useState(automations.length === 0);
+  const [creating, setCreating] = useState(selectedId === null || automations.length === 0);
   const [draft, setDraft] = useState<AutomationDraft>(() =>
-    selected ? createAutomationDraft(selected) : createAutomationDraft(),
+    selected ? createAutomationDraft(selected) : createNewAutomationDraft(recentPath, recentProject, projectOptions),
   );
   const [saving, setSaving] = useState(false);
   const [actionId, setActionId] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const isCreating = creating || !selected;
+  const recentPathValue = normalizeRecentPath(recentPath);
+  const recentProjectValue = recentProjectName(recentPathValue, recentProject, projectOptions);
 
   useEffect(() => {
-    if (creating) return;
-    if (selected) setDraft(createAutomationDraft(selected));
-  }, [creating, selected]);
+    if (selected) {
+      setCreating(false);
+      setSubmitAttempted(false);
+      setFormError(null);
+      setDraft(createAutomationDraft(selected));
+    } else if (selectedId === null) {
+      setCreating(true);
+      setSubmitAttempted(false);
+      setFormError(null);
+      setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
+    }
+  }, [selected, selectedId]);
 
   useEffect(() => {
     if (automations.length === 0) {
       setCreating(true);
-      setDraft(createAutomationDraft());
+      setDraft((current) => {
+        if (
+          current.name.trim() ||
+          current.instruction.trim() ||
+          current.project.trim() ||
+          current.path.trim()
+        ) {
+          return current;
+        }
+        return createNewAutomationDraft(recentPath, recentProject, projectOptions);
+      });
     }
-  }, [automations.length]);
+  }, [automations.length, recentPath, recentProject, projectOptions]);
+
+  useEffect(() => {
+    if (!isCreating || (!recentPathValue && !recentProjectValue)) return;
+    setDraft((current) => {
+      if (current.project.trim() || current.path.trim()) return current;
+      return recentProjectValue
+        ? { ...current, project: recentProjectValue }
+        : { ...current, path: recentPathValue };
+    });
+  }, [isCreating, recentPathValue, recentProjectValue]);
 
   const normalizedDraft = updateAutomationDraft(draft, draft);
   const validation = validateAutomationDraft(normalizedDraft);
-  const isCreating = creating || !selected;
   const visibleRuns = selected
     ? runs.filter((run) => run.automationId === selected.id).slice(0, 6)
     : [];
+  const projectSelectOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const options: AutomationProjectOption[] = [];
+    const currentProject = draft.project.trim();
+    if (
+      currentProject &&
+      !projectOptions.some((option) => option.name === currentProject)
+    ) {
+      seen.add(currentProject);
+      options.push({ name: currentProject, path: "" });
+    }
+    for (const option of projectOptions) {
+      const name = option.name.trim();
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      options.push({ name, path: option.path, branch: option.branch });
+    }
+    return options;
+  }, [draft.project, projectOptions]);
+  const selectedProjectPath =
+    projectOptions.find((option) => option.name === draft.project)?.path.trim() ?? "";
 
   const setDraftField = <Key extends keyof AutomationDraft>(
     key: Key,
     value: AutomationDraft[Key],
   ) => {
     setDraft((current) => ({ ...current, [key]: value }));
+  };
+
+  const handleProjectChange = (value: string) => {
+    setDraft((current) => ({
+      ...current,
+      project: value,
+      path: value ? "" : current.path,
+    }));
+  };
+
+  const handlePathChange = (value: string) => {
+    setDraft((current) => ({
+      ...current,
+      project: value.trim() ? "" : current.project,
+      path: value,
+    }));
+  };
+
+  const handleUseRecentPath = () => {
+    if (!recentPathValue) return;
+    setDraft((current) => ({
+      ...current,
+      project: "",
+      path: recentPathValue,
+    }));
   };
 
   const handleSelect = async (automation: Automation) => {
@@ -129,7 +257,7 @@ export function AutomationPanel({
     setCreating(true);
     setSubmitAttempted(false);
     setFormError(null);
-    setDraft(createAutomationDraft());
+    setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
   };
 
   const handleSubmit = async (event: React.FormEvent) => {
@@ -142,10 +270,11 @@ export function AutomationPanel({
     try {
       if (isCreating) {
         await onCreate(normalizedDraft);
-        setDraft(createAutomationDraft());
+        setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
       } else if (selected) {
         await onSave(selected.id, normalizedDraft);
       }
+      saveLastAiCmd(normalizedDraft.aiCmd);
       setCreating(false);
     } catch (error) {
       setFormError(String(error));
@@ -168,62 +297,64 @@ export function AutomationPanel({
 
   return (
     <div className="automation-panel" style={panelStyle}>
-      <div className="section-label">
-        <span className="section-label__text">automations</span>
-        <span className="section-label__line" />
-        <button type="button" className="btn btn--ghost" onClick={handleNew}>
-          + automation
-        </button>
-      </div>
-
       {showList && (
-        <nav className="sidebar__sessions" style={listStyle} aria-label="automations">
-          {automations.length === 0 && <div className="empty empty--small">no automations</div>}
-          {automations.map((automation) => {
-            const selectedClass =
-              !creating && automation.id === selected?.id ? " session--selected" : "";
-            return (
-              <div
-                key={automation.id}
-                className={`session${selectedClass}`}
-                onClick={() => {
-                  void handleSelect(automation);
-                }}
-                role="button"
-                tabIndex={0}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
+        <>
+          <div className="section-label">
+            <span className="section-label__text">automations</span>
+            <span className="section-label__line" />
+            <button type="button" className="btn btn--ghost" onClick={handleNew}>
+              + automation
+            </button>
+          </div>
+
+          <nav className="sidebar__sessions" style={listStyle} aria-label="automations">
+            {automations.length === 0 && <div className="empty empty--small">no automations</div>}
+            {automations.map((automation) => {
+              const selectedClass =
+                !creating && automation.id === selected?.id ? " session--selected" : "";
+              return (
+                <div
+                  key={automation.id}
+                  className={`session${selectedClass}`}
+                  onClick={() => {
                     void handleSelect(automation);
-                  }
-                }}
-              >
-                <span
-                  className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
-                  style={{ background: automation.active ? "#9ae6b4" : "var(--text-faint)" }}
-                />
-                <span className="session__name" title={automation.name}>
-                  <span className="session__head">{automation.name || "(unnamed)"}</span>
-                  <span className="session__tail"> · {triggerLabel(automation)}</span>
-                </span>
-                <span className="session__meta">{automationStatusLabel(automation)}</span>
-                <button
-                  type="button"
-                  className="session__kill"
-                  title={`delete ${automation.name}`}
-                  aria-label={`delete ${automation.name}`}
-                  disabled={actionId === automation.id}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    void runAction(automation.id, () => onDelete(automation.id));
+                  }}
+                  role="button"
+                  tabIndex={0}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      void handleSelect(automation);
+                    }
                   }}
                 >
-                  ×
-                </button>
-              </div>
-            );
-          })}
-        </nav>
+                  <span
+                    className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
+                    style={{ background: automation.active ? "#9ae6b4" : "var(--text-faint)" }}
+                  />
+                  <span className="session__name" title={automation.name}>
+                    <span className="session__head">{automation.name || "(unnamed)"}</span>
+                    <span className="session__tail"> · {triggerLabel(automation)}</span>
+                  </span>
+                  <span className="session__meta">{automationStatusLabel(automation)}</span>
+                  <button
+                    type="button"
+                    className="session__kill"
+                    title={`delete ${automation.name}`}
+                    aria-label={`delete ${automation.name}`}
+                    disabled={actionId === automation.id}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void runAction(automation.id, () => onDelete(automation.id));
+                    }}
+                  >
+                    ×
+                  </button>
+                </div>
+              );
+            })}
+          </nav>
+        </>
       )}
 
       <form style={detailStyle} onSubmit={handleSubmit}>
@@ -292,28 +423,45 @@ export function AutomationPanel({
         <div style={rowStyle}>
           <label className="field">
             <span className="field__label">project</span>
-            <input
+            <select
               className="field__input"
-              type="text"
               value={draft.project}
-              onChange={(event) => setDraftField("project", event.target.value)}
-              placeholder="preset name"
-              autoComplete="off"
-              spellCheck={false}
-            />
+              onChange={(event) => handleProjectChange(event.target.value)}
+            >
+              <option value="">custom path</option>
+              {projectSelectOptions.map((project) => (
+                <option key={project.name} value={project.name}>
+                  {project.path
+                    ? `${project.name} - ${project.path}${project.branch ? ` @ ${project.branch}` : ""}`
+                    : project.name}
+                </option>
+              ))}
+            </select>
           </label>
 
           <label className="field">
             <span className="field__label">path</span>
-            <input
-              className="field__input"
-              type="text"
-              value={draft.path}
-              onChange={(event) => setDraftField("path", event.target.value)}
-              placeholder="/path/to/repo"
-              autoComplete="off"
-              spellCheck={false}
-            />
+            <div className="field__row">
+              <input
+                className="field__input"
+                type="text"
+                value={draft.path}
+                onChange={(event) => handlePathChange(event.target.value)}
+                placeholder={selectedProjectPath || "/path/to/repo"}
+                autoComplete="off"
+                spellCheck={false}
+              />
+              {recentPathValue && (
+                <button
+                  type="button"
+                  className="btn btn--ghost"
+                  onClick={handleUseRecentPath}
+                  title={recentPathValue}
+                >
+                  use cwd
+                </button>
+              )}
+            </div>
           </label>
         </div>
         {submitAttempted && <FieldError message={validation.errors.target} />}

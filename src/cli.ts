@@ -39,6 +39,13 @@ Worktree:
   tw worktree rm <name|path> [--force]   删除某个 worktree 及其分支
   tw worktree prune [--dry-run] [--force]  清理无对应 session 的孤儿 worktree
 
+Automation:
+  tw automation ls            列出 Dashboard 可见的 automation（别名: tw auto ls）
+  tw automation create --instruction <text> [--name <name>] [--cmd <ai-cmd>]
+                              [--project <name> | --path <path>] [--schedule <cron>]
+                              [--timezone <tz>] [--overlap skip|queue] [--disabled]
+  tw automation rm <id|name>  删除 automation（别名: delete；create 别名: add/new）
+
 其它:
   tw serve [--port N]         启动网页终端（手机可访问）
   tw setup                    安装 / 配置向导
@@ -51,6 +58,7 @@ Worktree:
   tw claude myproject fix-auth-bug --branch develop
   tw ls
   tw worktree prune --dry-run
+  tw automation create --name nightly --instruction "review open changes" --project myproject
   tw rm myproject-fix-auth --worktree`);
 }
 
@@ -105,6 +113,12 @@ async function main() {
     case "wt": {
       const { worktreeCmd } = await import("./commands.js");
       await worktreeCmd(process.argv.slice(3));
+      return;
+    }
+    case "automation":
+    case "auto": {
+      const { automationCmd } = await import("./automation.js");
+      await automationCmd(process.argv.slice(3));
       return;
     }
     case "doctor": {

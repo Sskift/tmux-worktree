@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
+import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 
 type Project = { name: string; path: string; branch?: string | null };
 type Orphan = { project: string; path: string; name: string };
@@ -11,27 +12,6 @@ type Props = {
 };
 
 const CUSTOM = "__custom__";
-
-// Remember the last AI command across sessions so users who default to a
-// non-claude tool don't have to retype it every time.
-const LAST_AI_CMD_KEY = "tw-dashboard:last-ai-cmd";
-
-function loadLastAiCmd(): string {
-  try {
-    return localStorage.getItem(LAST_AI_CMD_KEY)?.trim() || "claude";
-  } catch {
-    return "claude";
-  }
-}
-
-function saveLastAiCmd(cmd: string): void {
-  try {
-    const trimmed = cmd.trim();
-    if (trimmed) localStorage.setItem(LAST_AI_CMD_KEY, trimmed);
-  } catch {
-    /* ignore quota/availability errors */
-  }
-}
 
 export function NewWorktreeModal({ onClose, onCreated }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
