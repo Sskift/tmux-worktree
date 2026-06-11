@@ -120,7 +120,7 @@ Remote 启动顺序：
 |---|---|
 | `app/scripts/dev-common.mjs` | 隔离 dev app 的公共 helper |
 | `app/scripts/dev-isolated.mjs` | 使用临时状态启动 Tauri dev app |
-| `app/scripts/dev-install.mjs` | 构建并安装一个隔离的 debug `.app` |
+| `app/scripts/dev-install.mjs` | 构建并安装一个隔离的 debug `.app`；只用于必须验证 Finder/open 真实启动行为的场景，日常本地验证用 `npm run tauri dev` |
 | `app/package.json` | Dashboard 开发/构建依赖和脚本 |
 | `app/vite.config.ts` | Dashboard Vite 配置 |
 | `app/tsconfig*.json` | Dashboard TypeScript 配置 |

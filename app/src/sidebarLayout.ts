@@ -17,6 +17,15 @@ type NormalizedSidebarSplits = {
   gitHeight: number;
 };
 
+type WorktreeAutomationSplit = {
+  sectionSplit: number;
+  automationHeight: number;
+};
+
+type ResizeWorktreeAutomationSplitArgs = WorktreeAutomationSplit & {
+  deltaY: number;
+};
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -116,5 +125,27 @@ export function normalizeSidebarSplits({
     sectionSplit: nextSection,
     automationHeight: nextAutomation,
     gitHeight: nextGit,
+  };
+}
+
+export function resizeWorktreeAutomationSplit({
+  sectionSplit,
+  automationHeight,
+  deltaY,
+}: ResizeWorktreeAutomationSplitArgs): WorktreeAutomationSplit {
+  const total = Math.max(0, finiteOr(sectionSplit, 0) + finiteOr(automationHeight, 0));
+  const maxSection = Math.max(
+    SIDEBAR_WORKTREES_MIN_HEIGHT,
+    total - SIDEBAR_AUTOMATIONS_MIN_HEIGHT,
+  );
+  const nextSection = clamp(
+    finiteOr(sectionSplit, SIDEBAR_WORKTREES_MIN_HEIGHT) + finiteOr(deltaY, 0),
+    SIDEBAR_WORKTREES_MIN_HEIGHT,
+    maxSection,
+  );
+
+  return {
+    sectionSplit: nextSection,
+    automationHeight: Math.max(0, total - nextSection),
   };
 }

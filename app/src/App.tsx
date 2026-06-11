@@ -32,6 +32,7 @@ import {
   SIDEBAR_TERMINALS_MIN_HEIGHT,
   SIDEBAR_WORKTREES_MIN_HEIGHT,
   normalizeSidebarSplits,
+  resizeWorktreeAutomationSplit,
 } from "./sidebarLayout";
 import "./App.css";
 
@@ -852,9 +853,21 @@ function App() {
     if (!listContainer) return;
     const startY = e.clientY;
     const startH = sectionSplit;
+    const startAutomationH = automationHeight;
     const containerH = listContainer.getBoundingClientRect().height;
     const onMove = (ev: MouseEvent) => {
       const dy = ev.clientY - startY;
+      if (startAutomationH > 0) {
+        const next = resizeWorktreeAutomationSplit({
+          sectionSplit: startH,
+          automationHeight: startAutomationH,
+          deltaY: dy,
+        });
+        setSectionSplit(next.sectionSplit);
+        setAutomationHeight(next.automationHeight);
+        return;
+      }
+
       const maxSection = Math.max(
         SIDEBAR_WORKTREES_MIN_HEIGHT,
         containerH - SIDEBAR_TERMINALS_MIN_HEIGHT - automationHeightValueRef.current,

@@ -7,6 +7,7 @@ import {
   SIDEBAR_TERMINALS_MIN_HEIGHT,
   SIDEBAR_WORKTREES_MIN_HEIGHT,
   normalizeSidebarSplits,
+  resizeWorktreeAutomationSplit,
 } from "../src/sidebarLayout.ts";
 
 test("normalizeSidebarSplits shrinks git to keep terminals visible after height shrinks", () => {
@@ -78,4 +79,27 @@ test("normalizeSidebarSplits shrinks worktrees when git minimum would crowd term
   assert.equal(result.gitHeight, SIDEBAR_GIT_MIN_HEIGHT);
   assert.equal(result.sectionSplit, totalHeight - SIDEBAR_GIT_MIN_HEIGHT - SIDEBAR_TERMINALS_MIN_HEIGHT);
   assert.ok(result.sectionSplit >= SIDEBAR_WORKTREES_MIN_HEIGHT);
+});
+
+test("resizeWorktreeAutomationSplit preserves the terminals boundary", () => {
+  const result = resizeWorktreeAutomationSplit({
+    sectionSplit: 200,
+    automationHeight: 132,
+    deltaY: 30,
+  });
+
+  assert.equal(result.sectionSplit, 230);
+  assert.equal(result.automationHeight, 102);
+  assert.equal(result.sectionSplit + result.automationHeight, 332);
+});
+
+test("resizeWorktreeAutomationSplit clamps automation at its minimum height", () => {
+  const result = resizeWorktreeAutomationSplit({
+    sectionSplit: 200,
+    automationHeight: 132,
+    deltaY: 400,
+  });
+
+  assert.equal(result.automationHeight, SIDEBAR_AUTOMATIONS_MIN_HEIGHT);
+  assert.equal(result.sectionSplit + result.automationHeight, 332);
 });

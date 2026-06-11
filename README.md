@@ -149,20 +149,18 @@ npm install
 npm run tauri dev
 ```
 
-如果本机已经安装正式版 `tw-dashboard.app`，建议用隔离 dev app：
+本地验证默认只用 `npm run tauri dev`。它不会在 `/Applications` 下生成带 hash 的 dev app，也能直接反映当前工作区代码。
+
+如果需要隔离 Dashboard 状态，可以用热更新 dev app：
 
 ```bash
 cd app
 npm run tauri:dev:isolated
-npm run tauri:dev:install
 ```
 
-本地 dev 版本有两种常用方式：
+`npm run tauri:dev:install` 会构建一个唯一命名的 debug `.app` 并安装到 `/Applications`，只应在必须验证 Finder/open 真实启动行为时使用。日常本地调试和功能验收不要用它，避免堆积多个 `tw-dashboard-dev-<hash>.app`。
 
-- `npm run tauri:dev:isolated`：启动热更新 dev app，使用临时 `TW_DASHBOARD_HOME`，适合日常开发调试。
-- `npm run tauri:dev:install`：构建一个唯一命名的 debug `.app` 并安装到 `/Applications`，适合 GUI smoke test 或需要从 Finder/open 启动的场景。
-
-`tauri:dev:install` 会在输出中打印卸载和临时状态目录清理命令。验证结束后按输出清理，避免 `/Applications` 和 `/tmp` 堆积旧 dev app。
+如果确实运行了 `tauri:dev:install`，必须按输出中的 `uninstall` 和 `cleanup state` 命令立即清理。
 
 ## 发布
 
@@ -273,23 +271,21 @@ git rev-parse --short origin/master github/master
 git log --oneline --left-right --cherry-pick origin/master...github/master
 ```
 
-8. 构建本地 dev/debug app 做 smoke test。
+8. 启动本地 Dashboard 做 smoke test。
 
-如需热更新调试：
+```bash
+cd app
+npm run tauri dev
+```
+
+如需隔离状态验证，可改用热更新隔离 dev app：
 
 ```bash
 cd app
 npm run tauri:dev:isolated
 ```
 
-如需安装一个独立 debug app 到 `/Applications` 验证真实启动行为：
-
-```bash
-cd app
-npm run tauri:dev:install
-```
-
-确认关键功能后，按命令输出中的 `uninstall` 和 `cleanup state` 清理本地 dev app。
+只有在必须验证 Finder/open 真实启动行为时才使用 `npm run tauri:dev:install`。该命令会在 `/Applications` 生成 `tw-dashboard-dev-<hash>.app`；验证后必须按输出中的 `uninstall` 和 `cleanup state` 清理。
 
 9. 构建安装包并发布 release。
 
