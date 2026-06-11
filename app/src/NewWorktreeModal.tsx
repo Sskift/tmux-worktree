@@ -12,6 +12,27 @@ type Props = {
 
 const CUSTOM = "__custom__";
 
+// Remember the last AI command across sessions so users who default to a
+// non-claude tool don't have to retype it every time.
+const LAST_AI_CMD_KEY = "tw-dashboard:last-ai-cmd";
+
+function loadLastAiCmd(): string {
+  try {
+    return localStorage.getItem(LAST_AI_CMD_KEY)?.trim() || "claude";
+  } catch {
+    return "claude";
+  }
+}
+
+function saveLastAiCmd(cmd: string): void {
+  try {
+    const trimmed = cmd.trim();
+    if (trimmed) localStorage.setItem(LAST_AI_CMD_KEY, trimmed);
+  } catch {
+    /* ignore quota/availability errors */
+  }
+}
+
 export function NewWorktreeModal({ onClose, onCreated }: Props) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [orphans, setOrphans] = useState<Orphan[]>([]);
@@ -19,7 +40,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
   const [customPath, setCustomPath] = useState<string>("");
   const [customName, setCustomName] = useState<string>("");
   const [savePreset, setSavePreset] = useState(false);
-  const [aiCmd, setAiCmd] = useState<string>("claude");
+  const [aiCmd, setAiCmd] = useState<string>(loadLastAiCmd);
   const [name, setName] = useState<string>("");
   const [branch, setBranch] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -65,6 +86,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
       const sessionName = await invoke<string>("restore_worktree", {
         args: { path: orphan.path, name: orphan.name, aiCmd: aiCmd.trim() || "" },
       });
+      saveLastAiCmd(aiCmd);
       onCreated(sessionName);
     } catch (err) {
       setError(String(err));
@@ -112,6 +134,7 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
       const sessionName = await invoke<string>("create_worktree", {
         args: createArgs,
       });
+      saveLastAiCmd(aiCmd);
       onCreated(sessionName);
     } catch (err) {
       setError(String(err));
