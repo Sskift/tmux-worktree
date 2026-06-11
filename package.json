@@ -1,6 +1,6 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "0.10.10",
+  "version": "0.10.11",
   "type": "module",
   "description": "AI + tmux + git worktree integrated development environment with a native macOS dashboard app",
   "repository": {
