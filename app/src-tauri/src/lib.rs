@@ -406,22 +406,6 @@ fn run_quiet(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-fn worktree_base_dir() -> String {
-    let home = match app_home_dir() {
-        Some(home) => home,
-        None => return "/private/tmp/tmux-worktree/projects".to_string(),
-    };
-    let config_path = home.join(".tmux-worktree.json");
-    if !config_path.exists() {
-        return "/private/tmp/tmux-worktree/projects".to_string();
-    }
-    std::fs::read_to_string(&config_path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|v| config_worktree_base(&v))
-        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string())
-}
-
 fn pending_cleanup_path() -> std::path::PathBuf {
     app_home_dir_or_tmp().join(".tw-dashboard-pending-worktree-cleanup.json")
 }
@@ -446,16 +430,6 @@ fn save_pending_cleanup(entries: &[OrphanedWorktree]) {
     if let Ok(text) = serde_json::to_string_pretty(entries) {
         let _ = std::fs::write(path, text);
     }
-}
-
-fn upsert_pending_cleanup(entries: Vec<OrphanedWorktree>) {
-    let mut pending = load_pending_cleanup();
-    for entry in entries {
-        if !pending.iter().any(|p| p.path == entry.path) {
-            pending.push(entry);
-        }
-    }
-    save_pending_cleanup(&pending);
 }
 
 fn remove_pending_cleanup_path(path: &str) {
@@ -518,6 +492,7 @@ fn orphaned_worktrees(
     orphans
 }
 
+#[cfg(test)]
 fn worktrees_for_session(base_path: &std::path::Path, session_name: &str) -> Vec<OrphanedWorktree> {
     if !base_path.exists() {
         return vec![];
@@ -579,7 +554,7 @@ fn repo_root_for_worktree(path: &str) -> Option<String> {
     None
 }
 
-fn try_cleanup_worktree(path: &str) -> bool {
+fn try_cleanup_worktree(path: &str, force: bool) -> bool {
     let worktree_path = std::path::Path::new(path);
     if !worktree_path.exists() {
         return true;
@@ -587,9 +562,12 @@ fn try_cleanup_worktree(path: &str) -> bool {
     let Some(repo_root) = repo_root_for_worktree(path) else {
         return false;
     };
-    let output = std::process::Command::new(git_bin())
-        .args(["-C", &repo_root, "worktree", "remove", "--force", path])
-        .output();
+    let mut args = vec!["-C", &repo_root, "worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(path);
+    let output = std::process::Command::new(git_bin()).args(args).output();
     let Ok(output) = output else {
         return false;
     };
@@ -612,7 +590,7 @@ fn cleanup_pending_worktrees() {
         if live_sessions.contains(&entry.name) {
             continue;
         }
-        if !try_cleanup_worktree(&entry.path) {
+        if !try_cleanup_worktree(&entry.path, false) {
             remaining.push(entry);
         }
     }
@@ -840,18 +818,6 @@ fn create_worktree(args: CreateArgs) -> Result<String, String> {
 fn kill_session(name: String) -> Result<(), String> {
     let exact = format!("={}", name);
     run_check(&["tmux", "kill-session", "-t", &exact])?;
-
-    let session_name = name.clone();
-    std::thread::spawn(move || {
-        let base_path = std::path::Path::new(&worktree_base_dir()).to_path_buf();
-        let targets = worktrees_for_session(&base_path, &session_name);
-        if targets.is_empty() {
-            return;
-        }
-        upsert_pending_cleanup(targets);
-        cleanup_pending_worktrees();
-    });
-
     Ok(())
 }
 
@@ -903,6 +869,13 @@ struct RestoreArgs {
     ai_cmd: String,
 }
 
+#[derive(Deserialize)]
+struct DeleteWorktreeArgs {
+    path: String,
+    #[serde(default)]
+    force: bool,
+}
+
 #[tauri::command]
 fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
     let dir = std::path::Path::new(&args.path);
@@ -929,6 +902,19 @@ fn restore_worktree(args: RestoreArgs) -> Result<String, String> {
     remove_pending_cleanup_path(&args.path);
 
     Ok(session)
+}
+
+#[tauri::command]
+fn delete_worktree(args: DeleteWorktreeArgs) -> Result<(), String> {
+    if try_cleanup_worktree(&args.path, args.force) {
+        remove_pending_cleanup_path(&args.path);
+        return Ok(());
+    }
+    if args.force {
+        Err(format!("failed to delete worktree: {}", args.path))
+    } else {
+        Err(format!("worktree has uncommitted changes: {}", args.path))
+    }
 }
 
 #[tauri::command]
@@ -2243,6 +2229,7 @@ pub fn run() {
             kill_session,
             list_orphaned_worktrees,
             restore_worktree,
+            delete_worktree,
             session_cwd,
             session_root,
             cancel_copy_mode,
@@ -2286,9 +2273,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        cleanup_pending_worktrees, config_worktree_base, derive_session_name, is_git_worktree_dir,
-        load_pending_cleanup, orphaned_worktrees, project_from_config, projects_from_config,
-        save_pending_cleanup, worktrees_for_session, OrphanedWorktree,
+        cleanup_pending_worktrees, config_worktree_base, delete_worktree, derive_session_name,
+        is_git_worktree_dir, kill_session, load_pending_cleanup, orphaned_worktrees,
+        project_from_config, projects_from_config, save_pending_cleanup, try_cleanup_worktree,
+        worktrees_for_session, DeleteWorktreeArgs, OrphanedWorktree,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -2424,6 +2412,220 @@ mod tests {
         let plain = temp.path().join("src");
         fs::create_dir_all(&plain).expect("plain");
         assert!(!is_git_worktree_dir(&plain));
+    }
+
+    #[test]
+    fn try_cleanup_worktree_refuses_dirty_without_force() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        git(&["init", repo.to_str().expect("repo str")]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.name",
+            "test",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
+        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        let worktree = temp.path().join("wt-dirty");
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "worktree",
+            "add",
+            "-b",
+            "dirty-branch",
+            worktree.to_str().expect("worktree str"),
+        ]);
+        fs::write(worktree.join("dirty.txt"), "uncommitted\n").expect("dirty file");
+
+        let path = worktree.to_string_lossy().to_string();
+        assert!(!try_cleanup_worktree(&path, false));
+        assert!(Path::new(&worktree).exists());
+        assert!(try_cleanup_worktree(&path, true));
+        assert!(!Path::new(&worktree).exists());
+    }
+
+    #[test]
+    fn kill_session_does_not_register_worktree_for_cleanup() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_tw_home = std::env::var("TW_DASHBOARD_HOME").ok();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        let base = temp.path().join("worktrees");
+        fs::create_dir_all(&home).expect("home");
+        fs::create_dir_all(&base).expect("base");
+        fs::write(
+            home.join(".tmux-worktree.json"),
+            serde_json::json!({ "projects": {}, "worktreeBase": base }).to_string(),
+        )
+        .expect("config");
+
+        let session = format!("tw-test-{}", uuid::Uuid::new_v4().simple());
+        let session: String = session.chars().take(20).collect();
+        let worktree = base.join("demo").join(format!("{session}-abc12"));
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::write(worktree.join(".git"), "gitdir: /not/a/repo").expect(".git");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("TW_DASHBOARD_HOME", &home);
+        }
+
+        git(&["init", temp.path().join("repo").to_str().expect("repo str")]);
+        let tmux_status = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                temp.path().to_str().expect("temp path"),
+            ])
+            .status()
+            .expect("spawn tmux");
+        assert!(tmux_status.success(), "tmux new-session failed");
+
+        kill_session(session.clone()).expect("kill session");
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        assert!(load_pending_cleanup().is_empty());
+
+        let _ = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &format!("={session}")])
+            .status();
+        if let Some(home) = original_home {
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        if let Some(home) = original_tw_home {
+            unsafe {
+                std::env::set_var("TW_DASHBOARD_HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("TW_DASHBOARD_HOME");
+            }
+        }
+    }
+
+    #[test]
+    fn delete_worktree_requires_force_for_dirty_worktree() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_tw_home = std::env::var("TW_DASHBOARD_HOME").ok();
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let home = temp.path().join("home");
+        fs::create_dir_all(&home).expect("home");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo");
+        git(&["init", repo.to_str().expect("repo str")]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.name",
+            "test",
+        ]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "config",
+            "user.email",
+            "test@example.com",
+        ]);
+        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
+        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "commit",
+            "-m",
+            "init",
+        ]);
+        let worktree = temp.path().join("wt-delete-dirty");
+        git(&[
+            "-C",
+            repo.to_str().expect("repo str"),
+            "worktree",
+            "add",
+            "-b",
+            "delete-dirty",
+            worktree.to_str().expect("worktree str"),
+        ]);
+        fs::write(worktree.join("dirty.txt"), "uncommitted\n").expect("dirty file");
+
+        unsafe {
+            std::env::set_var("HOME", &home);
+            std::env::set_var("TW_DASHBOARD_HOME", &home);
+        }
+        let path = worktree.to_string_lossy().to_string();
+        save_pending_cleanup(&[OrphanedWorktree {
+            project: "demo".to_string(),
+            path: path.clone(),
+            name: "delete-dirty".to_string(),
+        }]);
+
+        let err = delete_worktree(DeleteWorktreeArgs {
+            path: path.clone(),
+            force: false,
+        })
+        .expect_err("dirty delete should require force");
+        assert!(err.contains("uncommitted changes"));
+        assert!(Path::new(&worktree).exists());
+        assert_eq!(load_pending_cleanup().len(), 1);
+
+        delete_worktree(DeleteWorktreeArgs {
+            path: path.clone(),
+            force: true,
+        })
+        .expect("forced delete");
+        assert!(!Path::new(&worktree).exists());
+        assert!(load_pending_cleanup().is_empty());
+
+        if let Some(home) = original_home {
+            unsafe {
+                std::env::set_var("HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("HOME");
+            }
+        }
+        if let Some(home) = original_tw_home {
+            unsafe {
+                std::env::set_var("TW_DASHBOARD_HOME", home);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("TW_DASHBOARD_HOME");
+            }
+        }
     }
 
     #[test]

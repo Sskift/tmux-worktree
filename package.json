@@ -19,7 +19,8 @@
     "tw-dashboard-install": "app/installer/installer.mjs"
   },
   "scripts": {
-    "build": "tsup"
+    "build": "tsup",
+    "test:cli": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

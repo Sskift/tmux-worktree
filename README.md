@@ -29,6 +29,12 @@ npm i -g @byted-codebase/tmux-worktree --registry=https://bnpm.byted.org
 tw setup
 ```
 
+更新 CLI 和 Dashboard：
+
+```bash
+tw update
+```
+
 ## 配置
 
 CLI 和 Dashboard 共用 `~/.tmux-worktree.json`：
@@ -92,6 +98,7 @@ tw
 - `tw status`：tmux 内的 session 状态面板。
 - `tw serve`：启动本地 WebSocket 终端服务。
 - `tw serve --remote`：本地终端服务加 Cloudflare Quick Tunnel。
+- `tw update`：更新全局 CLI 包，并重新安装最新版 Dashboard。
 
 ## Dashboard 使用
 

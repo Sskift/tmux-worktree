@@ -94,6 +94,41 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
     }
   };
 
+  const deleteOrphan = async (orphan: Orphan) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await invoke("delete_worktree", {
+        args: { path: orphan.path, force: false },
+      });
+      setOrphans((prev) => prev.filter((item) => item.path !== orphan.path));
+    } catch (err) {
+      const message = String(err);
+      if (!message.includes("uncommitted changes")) {
+        setError(message);
+        setBusy(false);
+        return;
+      }
+      const confirmed = window.confirm(
+        `Worktree "${orphan.name}" has uncommitted changes. Delete it anyway?`,
+      );
+      if (!confirmed) {
+        setBusy(false);
+        return;
+      }
+      try {
+        await invoke("delete_worktree", {
+          args: { path: orphan.path, force: true },
+        });
+        setOrphans((prev) => prev.filter((item) => item.path !== orphan.path));
+      } catch (forceErr) {
+        setError(String(forceErr));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!aiCmd.trim()) return;
@@ -156,17 +191,28 @@ export function NewWorktreeModal({ onClose, onCreated }: Props) {
             <span className="field__label">restore existing</span>
             <div className="orphan-list">
               {orphans.map((o) => (
-                <button
-                  key={o.path}
-                  type="button"
-                  className="btn btn--ghost orphan-item"
-                  disabled={busy}
-                  onClick={() => restoreOrphan(o)}
-                >
-                  <span className="orphan-item__project">{o.project}</span>
-                  <span className="orphan-item__sep">/</span>
-                  <span className="orphan-item__name">{o.name}</span>
-                </button>
+                <div key={o.path} className="orphan-row">
+                  <button
+                    type="button"
+                    className="btn btn--ghost orphan-item"
+                    disabled={busy}
+                    onClick={() => restoreOrphan(o)}
+                  >
+                    <span className="orphan-item__project">{o.project}</span>
+                    <span className="orphan-item__sep">/</span>
+                    <span className="orphan-item__name">{o.name}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn--ghost orphan-delete"
+                    disabled={busy}
+                    onClick={() => deleteOrphan(o)}
+                    title={`delete ${o.name}`}
+                    aria-label={`delete ${o.name}`}
+                  >
+                    ×
+                  </button>
+                </div>
               ))}
             </div>
           </div>
