@@ -12,6 +12,7 @@ import {
   TMUX_RECONNECT_DELAY_MS,
   shouldReconnectTmuxAttach,
 } from "./terminalLifecycle";
+import { terminalEscapeAction } from "./terminalInput";
 import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser, type LinkMatch } from "./linkDetect";
 import "@xterm/xterm/css/xterm.css";
 
@@ -211,7 +212,12 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
+  const activeRef = useRef(active);
   const [reconnectSeq, setReconnectSeq] = useState(0);
+
+  useEffect(() => {
+    activeRef.current = active;
+  }, [active]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -327,6 +333,30 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
     termRef.current = term;
     fitRef.current = fit;
 
+    const isTerminalEventTarget = (target: EventTarget | null) =>
+      target instanceof Node && host.contains(target);
+    const targetHandlesEscape = (target: EventTarget | null) => {
+      if (!(target instanceof Element)) return false;
+      return Boolean(
+        target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']"),
+      );
+    };
+    const focusOnlyEscapeHandler = (event: KeyboardEvent) => {
+      const action = terminalEscapeAction({
+        key: event.key,
+        type: event.type,
+        terminalActive: activeRef.current,
+        terminalFocused: isTerminalEventTarget(event.target),
+        targetHandlesEscape: targetHandlesEscape(event.target),
+      });
+      if (action !== "focus-terminal") return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      term.focus();
+    };
+    document.addEventListener("keydown", focusOnlyEscapeHandler, true);
+
     let blurHandler: (() => void) | null = null;
     if (tmuxSession) {
       blurHandler = () => {
@@ -337,7 +367,29 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
       term.attachCustomKeyEventHandler((e) => {
         if (e.type === "keydown" && e.key === "Escape") {
           e.preventDefault();
-          invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
+          const currentPtyId = ptyId;
+          invoke<boolean>("tmux_pane_in_mode", { name: tmuxSession })
+            .then((tmuxPaneInMode) => {
+              const action = terminalEscapeAction({
+                key: e.key,
+                type: e.type,
+                terminalActive: activeRef.current,
+                terminalFocused: true,
+                tmuxPaneInMode,
+              });
+              if (action === "cancel-copy-mode") {
+                return invoke("cancel_copy_mode", { name: tmuxSession });
+              }
+              if (action === "send-to-terminal" && currentPtyId) {
+                return invoke("pty_write", { id: currentPtyId, data: "\x1b" });
+              }
+              return undefined;
+            })
+            .catch(() => {
+              if (currentPtyId) {
+                invoke("pty_write", { id: currentPtyId, data: "\x1b" }).catch(() => {});
+              }
+            });
           return false;
         }
         if (e.type === "keydown" && e.metaKey && e.key === "c") {
@@ -446,6 +498,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
       ro.disconnect();
       host.removeEventListener("mousedown", onMetaMouseDown, true);
       host.removeEventListener("mouseup", onMetaMouseUp, true);
+      document.removeEventListener("keydown", focusOnlyEscapeHandler, true);
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       unlistenChunk?.();

@@ -225,6 +225,19 @@ fn tmux_session_exists(name: String) -> Result<bool, String> {
 }
 
 #[tauri::command]
+fn tmux_pane_in_mode(name: String) -> Result<bool, String> {
+    let value = run_check(&[
+        "tmux",
+        "display-message",
+        "-p",
+        "-t",
+        &name,
+        "#{pane_in_mode}",
+    ])?;
+    Ok(value.trim() == "1")
+}
+
+#[tauri::command]
 fn list_projects() -> Result<Vec<Project>, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
@@ -2692,6 +2705,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_sessions,
             tmux_session_exists,
+            tmux_pane_in_mode,
             list_projects,
             add_project,
             create_worktree,
