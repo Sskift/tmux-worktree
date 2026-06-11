@@ -26,7 +26,8 @@ import {
   type AutomationRunRecord,
 } from "./automationTypes";
 import {
-  SIDEBAR_AUTOMATIONS_HEIGHT,
+  SIDEBAR_AUTOMATIONS_DEFAULT_HEIGHT,
+  SIDEBAR_AUTOMATIONS_MIN_HEIGHT,
   SIDEBAR_GIT_MIN_HEIGHT,
   SIDEBAR_TERMINALS_MIN_HEIGHT,
   SIDEBAR_WORKTREES_MIN_HEIGHT,
@@ -150,7 +151,13 @@ type ScratchState = { list: ScratchTerm[]; nextNum: number };
 type LayoutColumn = "file" | "main" | "scratch" | "editor";
 type ResizableColumn = Exclude<LayoutColumn, "main">;
 
-const LAYOUT_DEFAULTS = { left: 240, right: 380, gitHeight: 220, sectionSplit: 200 };
+const LAYOUT_DEFAULTS = {
+  left: 240,
+  right: 380,
+  gitHeight: 220,
+  sectionSplit: 200,
+  automationHeight: SIDEBAR_AUTOMATIONS_DEFAULT_HEIGHT,
+};
 const DEFAULT_COLUMN_ORDER: LayoutColumn[] = ["file", "main", "scratch", "editor"];
 const COLUMN_DRAG_THRESHOLD = 5;
 const COLUMN_WIDTH_LIMITS: Record<ResizableColumn, { min: number; max: number }> = {
@@ -233,6 +240,9 @@ function App() {
   });
   const [gitHeight, setGitHeight] = useState<number>(LAYOUT_DEFAULTS.gitHeight);
   const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
+  const [automationHeight, setAutomationHeight] = useState<number>(
+    LAYOUT_DEFAULTS.automationHeight,
+  );
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
@@ -267,10 +277,12 @@ function App() {
   const autoResizeColumnsReadyRef = useRef(false);
   const gitHeightValueRef = useRef(gitHeight);
   const sectionSplitValueRef = useRef(sectionSplit);
+  const automationHeightValueRef = useRef(automationHeight);
   const automationsRef = useRef<Automation[]>([]);
   const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   gitHeightValueRef.current = gitHeight;
   sectionSplitValueRef.current = sectionSplit;
+  automationHeightValueRef.current = automationHeight;
   automationsRef.current = automations;
 
   useEffect(() => {
@@ -293,11 +305,15 @@ function App() {
         totalHeight,
         sectionSplit: sectionSplitValueRef.current,
         gitHeight: gitHeightValueRef.current,
-        automationHeight: SIDEBAR_AUTOMATIONS_HEIGHT,
+        automationHeight: automationHeightValueRef.current,
       });
       if (next.sectionSplit !== sectionSplitValueRef.current) {
         sectionSplitValueRef.current = next.sectionSplit;
         setSectionSplit(next.sectionSplit);
+      }
+      if (next.automationHeight !== automationHeightValueRef.current) {
+        automationHeightValueRef.current = next.automationHeight;
+        setAutomationHeight(next.automationHeight);
       }
       if (next.gitHeight !== gitHeightValueRef.current) {
         gitHeightValueRef.current = next.gitHeight;
@@ -320,11 +336,12 @@ function App() {
       totalHeight: el.getBoundingClientRect().height,
       sectionSplit,
       gitHeight,
-      automationHeight: SIDEBAR_AUTOMATIONS_HEIGHT,
+      automationHeight,
     });
     if (next.sectionSplit !== sectionSplit) setSectionSplit(next.sectionSplit);
+    if (next.automationHeight !== automationHeight) setAutomationHeight(next.automationHeight);
     if (next.gitHeight !== gitHeight) setGitHeight(next.gitHeight);
-  }, [sectionSplit, gitHeight]);
+  }, [sectionSplit, automationHeight, gitHeight]);
 
   useEffect(() => {
     invoke<string>("home_dir").then(setHomeDir).catch(() => {});
@@ -494,6 +511,10 @@ function App() {
           const v = lay.sectionSplit as number;
           setSectionSplit(v < 1 ? LAYOUT_DEFAULTS.sectionSplit : v);
         }
+        if (typeof lay.automationHeight === "number") {
+          const v = lay.automationHeight as number;
+          setAutomationHeight(v < 1 ? LAYOUT_DEFAULTS.automationHeight : v);
+        }
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
@@ -540,6 +561,7 @@ function App() {
           right: cols.right,
           gitHeight,
           sectionSplit,
+          automationHeight,
           sessionOrder,
           columnOrder,
           scratchCollapsed,
@@ -558,6 +580,7 @@ function App() {
     cols,
     gitHeight,
     sectionSplit,
+    automationHeight,
     sessionOrder,
     columnOrder,
     scratchCollapsed,
@@ -806,7 +829,7 @@ function App() {
         total -
           sectionSplitValueRef.current -
           SIDEBAR_TERMINALS_MIN_HEIGHT -
-          SIDEBAR_AUTOMATIONS_HEIGHT,
+          automationHeightValueRef.current,
       );
       const h = clamp(startH - dy, SIDEBAR_GIT_MIN_HEIGHT, maxGit);
       setGitHeight(h);
@@ -834,10 +857,38 @@ function App() {
       const dy = ev.clientY - startY;
       const maxSection = Math.max(
         SIDEBAR_WORKTREES_MIN_HEIGHT,
-        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT - SIDEBAR_AUTOMATIONS_HEIGHT,
+        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT - automationHeightValueRef.current,
       );
       const h = clamp(startH + dy, SIDEBAR_WORKTREES_MIN_HEIGHT, maxSection);
       setSectionSplit(h);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    document.body.style.cursor = "row-resize";
+    document.body.style.userSelect = "none";
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const startAutomationSplit = (e: React.MouseEvent) => {
+    e.preventDefault();
+    const listContainer = sessionsListRef.current;
+    if (!listContainer) return;
+    const startY = e.clientY;
+    const startH = automationHeight;
+    const containerH = listContainer.getBoundingClientRect().height;
+    const onMove = (ev: MouseEvent) => {
+      const dy = ev.clientY - startY;
+      const maxAutomation = Math.max(
+        SIDEBAR_AUTOMATIONS_MIN_HEIGHT,
+        containerH - sectionSplitValueRef.current - SIDEBAR_TERMINALS_MIN_HEIGHT,
+      );
+      const h = clamp(startH + dy, SIDEBAR_AUTOMATIONS_MIN_HEIGHT, maxAutomation);
+      setAutomationHeight(h);
     };
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
@@ -1449,8 +1500,14 @@ function App() {
             </div>
 
             {/* ── Automations section ── */}
-            <div className="sidebar__section sidebar__section--automations">
-              <div className="section-label">
+            <div
+              className="sidebar__section sidebar__section--automations"
+              style={{ flex: `0 0 ${automationHeight}px` }}
+            >
+              <div
+                className="section-label section-label--draggable"
+                onMouseDown={startSectionSplit}
+              >
                 <span className="section-label__text">automations</span>
                 <span className="section-label__line" />
                 <button
@@ -1505,7 +1562,7 @@ function App() {
             >
               <div
                 className="section-label section-label--draggable"
-                onMouseDown={startSectionSplit}
+                onMouseDown={startAutomationSplit}
               >
                 <span className="section-label__text">terminals</span>
                 <span className="section-label__line" />
