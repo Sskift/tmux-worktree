@@ -1216,6 +1216,12 @@ button:disabled {
   overflow-y: auto;
 }
 
+.orphan-row {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+}
+
 .orphan-item {
   display: flex;
   align-items: center;
@@ -1224,11 +1230,25 @@ button:disabled {
   font-size: 12px;
   padding: 4px 8px;
   border-radius: 4px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
+}
+
+.orphan-delete {
+  width: 28px;
+  min-width: 28px;
+  padding: 0;
+  border-radius: 4px;
+  color: var(--text-faint);
+  font-size: 16px;
+  line-height: 1;
 }
 
 .orphan-item__project {
   color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .orphan-item__sep {
@@ -1238,6 +1258,9 @@ button:disabled {
 
 .orphan-item__name {
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .field {

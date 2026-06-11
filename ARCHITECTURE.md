@@ -28,6 +28,7 @@
 | `src/status.ts` | CLI session 左侧 tmux TUI 状态面板 | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
 | `src/setup.ts` | 系统依赖检查和可选安装 | 打包 |
+| `src/update.ts` | `tw update`，更新全局 npm CLI 包并重新安装 Dashboard | 打包 |
 
 ### Dashboard installer npm binary
 
@@ -101,6 +102,21 @@ Remote 启动顺序：
 2. 否则优先使用 `.app` resources 内置的 `tw-cli/cli.js` 启动 `serve`。
 3. 如果内置资源不可用，回退到用户全局安装的 `tw` / `tmux-worktree` 命令，兼容已安装 CLI 后端的用户。
 4. `cloudflared` 优先使用本机已有安装；缺失时自动下载 Cloudflare 官方 macOS `cloudflared-darwin-{arm64,amd64}.tgz` 到用户目录。
+
+Update 命令：
+
+1. `tw update` 默认运行 `npm i -g @byted-codebase/tmux-worktree@latest --registry=https://bnpm.byted.org`。
+2. npm 包更新完成后运行 PATH 中的 `tw-dashboard-install`，用最新包内置 DMG 覆盖安装 `/Applications/tw-dashboard.app`。
+3. `tw update --dry-run` 只打印将执行的命令；`--cli-only` 和 `--dashboard-only` 用于分步排查。
+
+## Session Layout Profiles
+
+CLI 和 Dashboard 故意创建不同的 tmux 布局，但共享命名和 worktree 约定。
+
+- CLI profile：`tw <ai> <project>` 创建 status pane、AI pane 和 shell pane，面向纯终端使用。
+- Dashboard profile：`create_worktree` 创建单 pane tmux session，因为 Dashboard 用原生 UI 提供 status、Git、文件树、编辑器和 scratch terminal。
+
+两个 profile 必须保持 session 名截断、分支随机后缀、worktree 路径结构和 orphan 检测兼容。
 
 ## 仅开发使用
 
