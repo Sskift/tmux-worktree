@@ -87,9 +87,82 @@ const OVERLAP_OPTIONS = [
   { value: "queue", label: "queue" },
 ];
 
+type MenuOption = {
+  value: string;
+  label: string;
+  detail?: string;
+};
+
 function FieldError({ message }: { message?: string }) {
   if (!message) return null;
   return <span style={{ color: "#ff8272", fontSize: 11 }}>{message}</span>;
+}
+
+function AutomationMenuSelect({
+  ariaLabel,
+  value,
+  options,
+  onChange,
+}: {
+  ariaLabel: string;
+  value: string;
+  options: MenuOption[];
+  onChange: (value: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const selected = options.find((option) => option.value === value) ?? options[0];
+
+  return (
+    <div
+      className="automation-menu-select"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setOpen(false);
+        }
+      }}
+    >
+      <button
+        type="button"
+        className={`automation-menu-select__button${open ? " automation-menu-select__button--open" : ""}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={ariaLabel}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className="automation-menu-select__label">{selected?.label ?? ""}</span>
+        {selected?.detail ? (
+          <span className="automation-menu-select__detail">{selected.detail}</span>
+        ) : null}
+        <span className="automation-menu-select__chevron">⌄</span>
+      </button>
+      {open && (
+        <div className="automation-menu-select__menu" role="listbox" aria-label={ariaLabel}>
+          {options.map((option) => {
+            const active = option.value === value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="option"
+                aria-selected={active}
+                className={`automation-menu-select__option${active ? " automation-menu-select__option--active" : ""}`}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  onChange(option.value);
+                  setOpen(false);
+                }}
+              >
+                <span className="automation-menu-select__option-label">{option.label}</span>
+                {option.detail ? (
+                  <span className="automation-menu-select__option-detail">{option.detail}</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function normalizeRecentPath(path?: string | null): string {
@@ -157,6 +230,8 @@ export function AutomationPanel({
   const [actionId, setActionId] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [scheduleKindOverride, setScheduleKindOverride] =
+    useState<AutomationScheduleKind | null>(null);
   const isCreating = creating || !selected;
   const recentPathValue = normalizeRecentPath(recentPath);
   const recentProjectValue = recentProjectName(recentPathValue, recentProject, projectOptions);
@@ -166,11 +241,13 @@ export function AutomationPanel({
       setCreating(false);
       setSubmitAttempted(false);
       setFormError(null);
+      setScheduleKindOverride(null);
       setDraft(createAutomationDraft(selected));
     } else if (selectedId === null) {
       setCreating(true);
       setSubmitAttempted(false);
       setFormError(null);
+      setScheduleKindOverride(null);
       setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
     }
   }, [selected, selectedId]);
@@ -205,6 +282,7 @@ export function AutomationPanel({
   const normalizedDraft = updateAutomationDraft(draft, draft);
   const validation = validateAutomationDraft(normalizedDraft);
   const parsedSchedule = useMemo(() => parseAutomationSchedule(draft.schedule), [draft.schedule]);
+  const scheduleKind = scheduleKindOverride ?? parsedSchedule.kind;
   const scheduleTime = formatAutomationClockTime(parsedSchedule.hour, parsedSchedule.minute);
   const visibleRuns = selected
     ? runs.filter((run) => run.automationId === selected.id).slice(0, 6)
@@ -228,6 +306,30 @@ export function AutomationPanel({
     }
     return options;
   }, [draft.project, projectOptions]);
+  const projectMenuOptions = useMemo<MenuOption[]>(() => {
+    return [
+      { value: "", label: "custom path" },
+      ...projectSelectOptions.map((project) => ({
+        value: project.name,
+        label: project.name,
+        detail: project.path
+          ? `${project.path}${project.branch ? ` @ ${project.branch}` : ""}`
+          : undefined,
+      })),
+    ];
+  }, [projectSelectOptions]);
+  const scheduleMenuOptions = useMemo<MenuOption[]>(
+    () => SCHEDULE_KIND_OPTIONS.map((option) => ({ value: option.value, label: option.label })),
+    [],
+  );
+  const overlapMenuOptions = useMemo<MenuOption[]>(() => OVERLAP_OPTIONS, []);
+  const statusMenuOptions = useMemo<MenuOption[]>(
+    () => [
+      { value: "active", label: "active" },
+      { value: "paused", label: "paused" },
+    ],
+    [],
+  );
   const selectedProjectPath =
     projectOptions.find((option) => option.name === draft.project)?.path.trim() ?? "";
 
@@ -243,6 +345,8 @@ export function AutomationPanel({
   };
 
   const handleScheduleKindChange = (kind: AutomationScheduleKind) => {
+    setScheduleKindOverride(kind === "custom" ? "custom" : null);
+    if (kind === "custom") return;
     setSchedule(
       buildAutomationSchedule(kind, parsedSchedule.hour, parsedSchedule.minute, parsedSchedule.custom),
     );
@@ -253,7 +357,7 @@ export function AutomationPanel({
     if (!parsedTime) return;
     setSchedule(
       buildAutomationSchedule(
-        parsedSchedule.kind,
+        scheduleKind,
         parsedTime.hour,
         parsedTime.minute,
         parsedSchedule.custom,
@@ -298,6 +402,7 @@ export function AutomationPanel({
     setCreating(true);
     setSubmitAttempted(false);
     setFormError(null);
+    setScheduleKindOverride(null);
     setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
   };
 
@@ -445,31 +550,26 @@ export function AutomationPanel({
           <label className="field automation-schedule-field">
             <span className="field__label">schedule</span>
             <div className="automation-schedule-grid">
-              <select
-                className="field__input automation-select"
-                value={parsedSchedule.kind}
-                onChange={(event) => handleScheduleKindChange(event.target.value as AutomationScheduleKind)}
-              >
-                {SCHEDULE_KIND_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              {parsedSchedule.kind === "custom" ? (
+              <AutomationMenuSelect
+                ariaLabel="Schedule"
+                value={scheduleKind}
+                options={scheduleMenuOptions}
+                onChange={(value) => handleScheduleKindChange(value as AutomationScheduleKind)}
+              />
+              {scheduleKind === "custom" ? (
                 <input
                   className="field__input automation-input--mono"
                   type="text"
-                  value={parsedSchedule.custom}
+                  value={draft.schedule}
                   onChange={(event) => setSchedule(event.target.value)}
                   placeholder="0 9 * * *"
                   autoComplete="off"
                   spellCheck={false}
                 />
-              ) : parsedSchedule.kind === "manual" ||
-                parsedSchedule.kind === "hourly" ||
-                parsedSchedule.kind === "every-5-minutes" ||
-                parsedSchedule.kind === "every-15-minutes" ? null : (
+              ) : scheduleKind === "manual" ||
+                scheduleKind === "hourly" ||
+                scheduleKind === "every-5-minutes" ||
+                scheduleKind === "every-15-minutes" ? null : (
                 <input
                   className="field__input"
                   type="time"
@@ -487,20 +587,12 @@ export function AutomationPanel({
         <div className="automation-target-grid">
           <label className="field">
             <span className="field__label">project</span>
-            <select
-              className="field__input automation-select"
+            <AutomationMenuSelect
+              ariaLabel="Project"
               value={draft.project}
-              onChange={(event) => handleProjectChange(event.target.value)}
-            >
-              <option value="">custom path</option>
-              {projectSelectOptions.map((project) => (
-                <option key={project.name} value={project.name}>
-                  {project.path
-                    ? `${project.name} - ${project.path}${project.branch ? ` @ ${project.branch}` : ""}`
-                    : project.name}
-                </option>
-              ))}
-            </select>
+              options={projectMenuOptions}
+              onChange={handleProjectChange}
+            />
           </label>
 
           <label className="field">
@@ -533,17 +625,12 @@ export function AutomationPanel({
         <div style={rowStyle}>
           <label className="field">
             <span className="field__label">overlap</span>
-            <select
-              className="field__input automation-select"
+            <AutomationMenuSelect
+              ariaLabel="Overlap"
               value={draft.allowOverlap ? "queue" : "skip"}
-              onChange={(event) => setDraftField("allowOverlap", event.target.value === "queue")}
-            >
-              {OVERLAP_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
+              options={overlapMenuOptions}
+              onChange={(value) => setDraftField("allowOverlap", value === "queue")}
+            />
             <span className="automation-field-hint">
               {draft.allowOverlap ? "queue overlapping runs" : "skip when a run is active"}
             </span>
@@ -551,14 +638,12 @@ export function AutomationPanel({
 
           <label className="field">
             <span className="field__label">status</span>
-            <select
-              className="field__input automation-select"
+            <AutomationMenuSelect
+              ariaLabel="Status"
               value={draft.active ? "active" : "paused"}
-              onChange={(event) => setDraftField("active", event.target.value === "active")}
-            >
-              <option value="active">active</option>
-              <option value="paused">paused</option>
-            </select>
+              options={statusMenuOptions}
+              onChange={(value) => setDraftField("active", value === "active")}
+            />
             <span className="automation-field-hint">{automationStatusLabel(draft)}</span>
           </label>
         </div>
