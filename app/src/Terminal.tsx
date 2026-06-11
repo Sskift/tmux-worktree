@@ -336,9 +336,12 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, onOpenFil
 
       term.attachCustomKeyEventHandler((e) => {
         if (e.type === "keydown" && e.key === "Escape") {
-          e.preventDefault();
-          invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
-          return false;
+          // Let ESC reach the PTY so TUIs (vim/less/fzf) receive it, and in
+          // parallel ask tmux to exit copy-mode *only if* the pane is actually
+          // in a mode (scrolled-up history). When not in copy-mode this is a
+          // no-op, so normal apps keep their ESC. Do not swallow the key.
+          invoke("copy_mode_cancel_if_active", { name: tmuxSession }).catch(() => {});
+          return true;
         }
         if (e.type === "keydown" && e.metaKey && e.key === "c") {
           if (term.hasSelection()) return true;

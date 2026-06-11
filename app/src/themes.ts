@@ -1087,6 +1087,124 @@ function toRgba(color: string, alpha: number) {
   return `rgba(255, 255, 255, ${alpha})`;
 }
 
+// ─── contrast-aware color derivation ───
+// Status colors and accent-as-text were originally hardcoded for dark themes,
+// so on light themes they became light-on-light and vanished. We instead derive
+// readable variants at apply time: parse the color, and if its WCAG contrast
+// against the actual background is too low, blend it toward black (on light bg)
+// or white (on dark bg) until it clears the target. One place fixes every theme.
+
+type RGB = [number, number, number];
+
+function parseRgb(color: string): RGB {
+  const hex = color.trim().replace(/^#/, "");
+  if (/^[0-9a-fA-F]{6}$/.test(hex)) {
+    return [
+      parseInt(hex.slice(0, 2), 16),
+      parseInt(hex.slice(2, 4), 16),
+      parseInt(hex.slice(4, 6), 16),
+    ];
+  }
+  if (/^[0-9a-fA-F]{3}$/.test(hex)) {
+    return [
+      parseInt(hex[0] + hex[0], 16),
+      parseInt(hex[1] + hex[1], 16),
+      parseInt(hex[2] + hex[2], 16),
+    ];
+  }
+  const m = color.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+  if (m) return [+m[1], +m[2], +m[3]];
+  return [255, 255, 255];
+}
+
+function relLuminance([r, g, b]: RGB): number {
+  const f = (v: number) => {
+    const s = v / 255;
+    return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+  };
+  return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b);
+}
+
+function contrastRatio(a: RGB, b: RGB): number {
+  const la = relLuminance(a);
+  const lb = relLuminance(b);
+  const hi = Math.max(la, lb);
+  const lo = Math.min(la, lb);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+function mix(a: RGB, b: RGB, t: number): RGB {
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t),
+  ];
+}
+
+function toHex([r, g, b]: RGB): string {
+  const h = (v: number) => v.toString(16).padStart(2, "0");
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+const isLightBg = (bg: RGB) => relLuminance(bg) > 0.4;
+
+/** Return `color` adjusted to meet `target` contrast against `bg`, by blending
+ *  toward black (light bg) or white (dark bg). Already-readable colors are
+ *  returned unchanged so vivid themes keep their character. */
+function ink(color: string, bg: RGB, target = 4.5): string {
+  const base = parseRgb(color);
+  if (contrastRatio(base, bg) >= target) return toHex(base);
+  const towards: RGB = isLightBg(bg) ? [0, 0, 0] : [255, 255, 255];
+  let best = base;
+  for (let t = 0.1; t <= 1.0001; t += 0.1) {
+    best = mix(base, towards, t);
+    if (contrastRatio(best, bg) >= target) break;
+  }
+  return toHex(best);
+}
+
+/** Compute all derived CSS custom properties for a theme. Single source of
+ *  truth shared by applyTheme() (runtime) and the offline preview generator. */
+export function deriveThemeVars(theme: Theme): Record<string, string> {
+  const ui = theme.ui;
+  const bg = parseRgb(ui["--bg"]);
+  const light = isLightBg(bg);
+  const vars: Record<string, string> = {
+    "--divider-subtle": toRgba(ui["--text-dim"], 0.14),
+    "--divider": toRgba(ui["--text-dim"], 0.24),
+    "--divider-strong": toRgba(ui["--text-dim"], 0.34),
+    "--border": toRgba(ui["--text-dim"], 0.28),
+    "--surface-muted": toRgba(ui["--text-dim"], 0.08),
+    "--surface-hover": toRgba(ui["--accent-a"], 0.1),
+    "--surface-hover-strong": toRgba(ui["--accent-a"], 0.16),
+    "--surface-selected": toRgba(ui["--accent-a"], 0.18),
+    "--surface-selected-hover": toRgba(ui["--accent-a"], 0.24),
+    "--surface-accent-soft": toRgba(ui["--accent-a"], 0.12),
+    "--surface-warn-soft": toRgba(ui["--accent-c"], 0.14),
+    "--scrollbar": toRgba(ui["--text-dim"], 0.18),
+    "--scrollbar-hover": toRgba(ui["--text-dim"], 0.3),
+    "--accent-a-glow": toRgba(ui["--accent-a"], 0.38),
+    // Accent used as small text (commit hash, ahead/behind counters): keep the
+    // vivid accent for fills/gradients, but ink a readable version for text.
+    "--accent-a-ink": ink(ui["--accent-a"], bg, 4.0),
+    "--accent-c-ink": ink(ui["--accent-c"], bg, 4.0),
+  };
+  // Theme-adaptive semantic status colors, inked against the real --bg so they
+  // stay legible on both light and dark themes.
+  const status: Record<string, string> = {
+    "--danger": ink("#e5564b", bg, 4.0),
+    "--ok": ink("#2f9e63", bg, 3.6),
+    "--warn": ink("#d98a2b", bg, 3.6),
+    "--info": ink("#3a8ed0", bg, 3.6),
+  };
+  for (const [key, val] of Object.entries(status)) {
+    vars[key] = val;
+    vars[`${key}-soft`] = toRgba(val, light ? 0.16 : 0.12);
+    vars[`${key}-line`] = toRgba(val, 0.3);
+  }
+  return vars;
+}
+
 export function applyTheme(id: ThemeId) {
   const theme = THEMES[id];
   currentTheme = id;
@@ -1094,20 +1212,10 @@ export function applyTheme(id: ThemeId) {
   for (const [key, value] of Object.entries(theme.ui)) {
     root.style.setProperty(key, value);
   }
-  root.style.setProperty("--divider-subtle", toRgba(theme.ui["--text-dim"], 0.14));
-  root.style.setProperty("--divider", toRgba(theme.ui["--text-dim"], 0.24));
-  root.style.setProperty("--divider-strong", toRgba(theme.ui["--text-dim"], 0.34));
-  root.style.setProperty("--border", toRgba(theme.ui["--text-dim"], 0.28));
-  root.style.setProperty("--surface-muted", toRgba(theme.ui["--text-dim"], 0.08));
-  root.style.setProperty("--surface-hover", toRgba(theme.ui["--accent-a"], 0.1));
-  root.style.setProperty("--surface-hover-strong", toRgba(theme.ui["--accent-a"], 0.16));
-  root.style.setProperty("--surface-selected", toRgba(theme.ui["--accent-a"], 0.18));
-  root.style.setProperty("--surface-selected-hover", toRgba(theme.ui["--accent-a"], 0.24));
-  root.style.setProperty("--surface-accent-soft", toRgba(theme.ui["--accent-a"], 0.12));
-  root.style.setProperty("--surface-warn-soft", toRgba(theme.ui["--accent-c"], 0.14));
-  root.style.setProperty("--scrollbar", toRgba(theme.ui["--text-dim"], 0.18));
-  root.style.setProperty("--scrollbar-hover", toRgba(theme.ui["--text-dim"], 0.3));
-  root.style.setProperty("--accent-a-glow", toRgba(theme.ui["--accent-a"], 0.38));
+  for (const [key, value] of Object.entries(deriveThemeVars(theme))) {
+    root.style.setProperty(key, value);
+  }
+
   localStorage.setItem(STORAGE_KEY, id);
   window.dispatchEvent(
     new CustomEvent<TerminalPalette>(THEME_CHANGED_EVENT, {

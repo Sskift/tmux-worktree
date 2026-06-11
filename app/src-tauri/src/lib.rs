@@ -637,6 +637,27 @@ fn cancel_copy_mode(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Exit tmux copy-mode only if the pane is actually in a mode. Returns whether a
+/// cancel was issued, so the frontend can tell "ESC consumed by copy-mode" apart
+/// from "ESC should reach the TUI app running inside the pane".
+#[tauri::command]
+fn copy_mode_cancel_if_active(name: String) -> Result<bool, String> {
+    let in_mode = run_quiet(&[
+        "tmux",
+        "display-message",
+        "-p",
+        "-t",
+        &name,
+        "#{pane_in_mode}",
+    ])
+    .map(|s| s.trim() == "1")
+    .unwrap_or(false);
+    if in_mode {
+        let _ = run_quiet(&["tmux", "send-keys", "-t", &name, "-X", "cancel"]);
+    }
+    Ok(in_mode)
+}
+
 #[tauri::command]
 fn copy_tmux_selection(_name: String) -> Result<bool, String> {
     let output = std::process::Command::new("tmux")
@@ -2233,6 +2254,7 @@ pub fn run() {
             session_cwd,
             session_root,
             cancel_copy_mode,
+            copy_mode_cancel_if_active,
             copy_tmux_selection,
             capture_pane_history,
             git_status,
