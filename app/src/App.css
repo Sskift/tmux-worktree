@@ -401,7 +401,7 @@ button:disabled {
 
 .git__counter {
   font-size: 11px;
-  color: var(--accent-a);
+  color: var(--accent-a-ink);
   font-variant-numeric: tabular-nums;
   text-transform: none;
 }
@@ -422,13 +422,13 @@ button:disabled {
 }
 
 .git__chip--staged {
-  color: #9ae6b4;
-  background: rgba(154, 230, 180, 0.1);
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .git__chip--unstaged {
-  color: #f6ad55;
-  background: rgba(246, 173, 85, 0.1);
+  color: var(--warn);
+  background: var(--warn-soft);
 }
 
 .git__chip--untracked {
@@ -436,8 +436,8 @@ button:disabled {
 }
 
 .git__chip--conflict {
-  color: #ff8272;
-  background: rgba(255, 130, 114, 0.12);
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .git__clean {
@@ -476,11 +476,11 @@ button:disabled {
 }
 
 .git__file--staged .git__code {
-  color: #9ae6b4;
+  color: var(--ok);
 }
 
 .git__file--unstaged .git__code {
-  color: #f6ad55;
+  color: var(--warn);
 }
 
 .git__file--untracked .git__code {
@@ -488,7 +488,7 @@ button:disabled {
 }
 
 .git__file--conflict .git__code {
-  color: #ff8272;
+  color: var(--danger);
 }
 
 .git__path {
@@ -513,7 +513,7 @@ button:disabled {
 }
 
 .git__empty--error {
-  color: #ff8272;
+  color: var(--danger);
   white-space: pre-wrap;
 }
 
@@ -614,8 +614,8 @@ button:disabled {
 .git__hash {
   font-family: monospace;
   font-size: 11px;
-  color: var(--accent-c);
-  background: var(--surface-warn-soft);
+  color: var(--warn);
+  background: var(--warn-soft);
   padding: 1px 5px;
   border-radius: 3px;
   flex-shrink: 0;
@@ -623,7 +623,7 @@ button:disabled {
 }
 
 .git__hash--merge {
-  color: var(--accent-a);
+  color: var(--accent-a-ink);
   background: var(--surface-accent-soft);
 }
 
@@ -643,18 +643,18 @@ button:disabled {
 }
 
 .git__ref--branch {
-  color: #9ae6b4;
-  background: rgba(154, 230, 180, 0.14);
+  color: var(--ok);
+  background: var(--ok-soft);
 }
 
 .git__ref--remote {
-  color: #90cdf4;
-  background: rgba(144, 205, 244, 0.12);
+  color: var(--info);
+  background: var(--info-soft);
 }
 
 .git__ref--tag {
-  color: #f6ad55;
-  background: rgba(246, 173, 85, 0.14);
+  color: var(--warn);
+  background: var(--warn-soft);
 }
 
 .git__ref--other {
@@ -698,7 +698,7 @@ button:disabled {
 }
 
 .empty--error {
-  color: #ff8272;
+  color: var(--danger);
   font-family: monospace;
   white-space: pre-wrap;
   text-align: left;
@@ -781,8 +781,8 @@ button:disabled {
 }
 
 .session__kill:hover {
-  background: rgba(255, 130, 114, 0.15);
-  color: #ff8272;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .session__dot {
@@ -1182,12 +1182,12 @@ button:disabled {
 }
 
 .modal__error {
-  color: #ff8272;
+  color: var(--danger);
   font-size: 11px;
   font-family: monospace;
   white-space: pre-wrap;
-  background: rgba(255, 130, 114, 0.06);
-  border: 1px solid rgba(255, 130, 114, 0.2);
+  background: var(--danger-soft);
+  border: 1px solid var(--danger-line);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
   max-height: 120px;
@@ -1203,7 +1203,7 @@ button:disabled {
 
 .modal__divider {
   font-size: 11px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   text-align: center;
   margin: 4px 0;
 }
@@ -1275,7 +1275,7 @@ button:disabled {
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  color: var(--text-faint);
+  color: var(--text-dim);
 }
 
 .field__input {
@@ -1932,7 +1932,7 @@ select.field__input {
 }
 
 .file-editor__status--error {
-  color: #ff8272;
+  color: var(--danger);
   white-space: pre-wrap;
   font-family: monospace;
   font-size: 11px;
