@@ -10,6 +10,10 @@ import {
   resizeWorktreeAutomationSplit,
 } from "../src/sidebarLayout.ts";
 
+test("automation can collapse to the terminal minimum height", () => {
+  assert.equal(SIDEBAR_AUTOMATIONS_MIN_HEIGHT, SIDEBAR_TERMINALS_MIN_HEIGHT);
+});
+
 test("normalizeSidebarSplits shrinks git to keep terminals visible after height shrinks", () => {
   const totalHeight = 360;
   const result = normalizeSidebarSplits({
@@ -47,7 +51,7 @@ test("normalizeSidebarSplits reserves resizable automation space when present", 
 });
 
 test("normalizeSidebarSplits clamps automation height before terminals disappear", () => {
-  const totalHeight = 260;
+  const totalHeight = 200;
   const result = normalizeSidebarSplits({
     totalHeight,
     sectionSplit: 80,
