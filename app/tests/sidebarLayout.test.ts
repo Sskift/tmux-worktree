@@ -91,6 +91,16 @@ test("remote scratch terminals start on the selected host cwd", () => {
   assert.doesNotMatch(app, /if \(session\?\.hostId\) return homeDir \?\? "\/";/);
 });
 
+test("worktree project groups can persist collapsed state without breaking sort indices", () => {
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const sortable = readFileSync(new URL("../src/useSortable.ts", import.meta.url), "utf8");
+
+  assert.match(app, /collapsedProjects/);
+  assert.match(app, /session-project__toggle/);
+  assert.match(app, /data-sort-index=\{i\}/);
+  assert.ok(sortable.includes('querySelectorAll<HTMLElement>("[data-sort-index]")'));
+});
+
 test("normalizeSidebarSplits shrinks git to keep terminals visible after height shrinks", () => {
   const totalHeight = 360;
   const result = normalizeSidebarSplits({

@@ -376,11 +376,6 @@ export async function doctorCmd(): Promise<void> {
   // node
   ok(`node: ${process.version}`);
 
-  // cloudflared（可选，仅远程访问需要）
-  const cf = which("cloudflared");
-  if (cf) ok(`cloudflared: ${cf}  (远程访问可用)`);
-  else warn("cloudflared: 未安装（仅 tw serve 远程访问需要，缺失时会自动下载）");
-
   // 配置文件
   const config = loadConfigFile();
   if (!config) {

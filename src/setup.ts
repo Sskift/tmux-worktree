@@ -16,7 +16,6 @@ const deps: Dep[] = [
   { name: "git", required: true, versionCmd: "git --version", desc: "版本控制", brew: "git", apt: "git" },
   { name: "tmux", required: true, versionCmd: "tmux -V", desc: "终端复用", brew: "tmux", apt: "tmux" },
   { name: "node", required: true, versionCmd: "node --version", desc: "JS 运行时 (≥20)", brew: "node", manual: "https://nodejs.org 或 nvm" },
-  { name: "cloudflared", required: false, versionCmd: "cloudflared --version", desc: "远程隧道 (可选)", brew: "cloudflared", manual: "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/" },
   { name: "python3", required: false, versionCmd: "python3 --version", desc: "Web 终端桥接 (可选)", brew: "python3", apt: "python3" },
 ];
 

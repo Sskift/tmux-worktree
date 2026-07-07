@@ -121,6 +121,15 @@ type SessionGroup = {
   sessions: Session[];
 };
 
+type MobileRelayStatus = {
+  active: boolean;
+  relayUrl: string;
+  hostId: string;
+  secret: string;
+  token: string;
+  error?: string | null;
+};
+
 const REFRESH_MS = 2000;
 const HOST_STATUS_REFRESH_MS = 15000;
 const PRELOAD_HISTORY_LINES = 300;
@@ -300,7 +309,6 @@ function sameSessionActivity(
       (left.outputSignature ?? null) === (right.outputSignature ?? null);
   });
 }
-
 function colorForProject(map: Map<string, string>, project: string): string {
   if (!map.has(project)) {
     map.set(project, PROJECT_COLORS[map.size % PROJECT_COLORS.length]);
@@ -480,12 +488,13 @@ function App() {
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
   const [scratchCollapsed, setScratchCollapsed] = useState(false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
-  const [remoteActive, setRemoteActive] = useState(false);
-  const [remoteUrl, setRemoteUrl] = useState<string | null>(null);
-  const [remoteToken, setRemoteToken] = useState("");
-  const [remotePopover, setRemotePopover] = useState(false);
-  const [remoteLoading, setRemoteLoading] = useState(false);
-  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [mobileRelayActive, setMobileRelayActive] = useState(false);
+  const [mobileRelayUrl, setMobileRelayUrl] = useState("wss://relay.example.com");
+  const [mobileRelayHostId, setMobileRelayHostId] = useState("mac-admin");
+  const [mobileRelaySecret, setMobileRelaySecret] = useState("");
+  const [mobileRelayPopover, setMobileRelayPopover] = useState(false);
+  const [mobileRelayLoading, setMobileRelayLoading] = useState(false);
+  const [mobileRelayError, setMobileRelayError] = useState<string | null>(null);
   const [editingFile, setEditingFile] = useState<string | null>(null);
   const [diffFile, setDiffFile] = useState<{ path: string; cwd: string; hostId?: string | null } | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
@@ -835,6 +844,13 @@ function App() {
         if (Array.isArray(lay.sessionOrder)) {
           setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
         }
+        if (Array.isArray(lay.collapsedProjects)) {
+          setCollapsedProjects(
+            (lay.collapsedProjects as unknown[]).filter(
+              (project): project is string => typeof project === "string" && project.length > 0,
+            ),
+          );
+        }
         setColumnOrder(normalizeColumnOrder(lay.columnOrder));
         if (typeof lay.scratchCollapsed === "boolean") {
           setScratchCollapsed(lay.scratchCollapsed as boolean);
@@ -882,6 +898,7 @@ function App() {
           sectionSplit,
           automationHeight,
           sessionOrder,
+          collapsedProjects,
           columnOrder,
           scratchCollapsed,
           fileBrowserOpen,
@@ -901,6 +918,7 @@ function App() {
     sectionSplit,
     automationHeight,
     sessionOrder,
+    collapsedProjects,
     columnOrder,
     scratchCollapsed,
     fileBrowserOpen,
@@ -1441,64 +1459,64 @@ function App() {
     return () => clearInterval(id);
   }, [handleAutomationRun]);
 
-  // Remote tunnel helpers
-  const checkRemoteStatus = useCallback(async () => {
+  // Mobile relay connector helpers
+  const applyMobileRelayStatus = useCallback((status: MobileRelayStatus) => {
+    setMobileRelayActive(status.active);
+    setMobileRelayUrl(status.relayUrl);
+    setMobileRelayHostId(status.hostId);
+    setMobileRelaySecret(status.secret);
+    setMobileRelayError(status.error ?? null);
+  }, []);
+
+  const checkMobileRelayStatus = useCallback(async () => {
     try {
-      const status = await invoke<{ active: boolean; url: string | null; token: string; error?: string | null }>("remote_status");
-      setRemoteActive(status.active);
-      setRemoteUrl(status.url);
-      setRemoteToken(status.token);
-      setRemoteError(status.error ?? null);
+      const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+      applyMobileRelayStatus(status);
       return status;
     } catch {
-      return { active: false, url: null, token: "", error: null };
+      return { active: false, relayUrl: "wss://relay.example.com", hostId: "mac-admin", secret: "", token: "", error: null };
     }
-  }, []);
+  }, [applyMobileRelayStatus]);
 
-  const handleRemoteToggle = useCallback(async () => {
-    if (remoteActive) {
-      setRemotePopover(true);
+  const handleMobileRelayToggle = useCallback(async () => {
+    if (mobileRelayActive) {
+      setMobileRelayPopover(true);
     } else {
-      setRemoteLoading(true);
-      setRemotePopover(true);
-      setRemoteError(null);
+      setMobileRelayLoading(true);
+      setMobileRelayPopover(true);
+      setMobileRelayError(null);
       try {
-        await invoke("remote_start");
-        // Poll for URL
-        let attempts = 0;
-        const poll = setInterval(async () => {
-          attempts++;
-          const status = await invoke<{ active: boolean; url: string | null; token: string; error?: string | null }>("remote_status");
-          setRemoteError(status.error ?? null);
-          if (status.active && status.url) {
-            clearInterval(poll);
-            setRemoteActive(true);
-            setRemoteUrl(status.url);
-            setRemoteToken(status.token);
-            setRemoteLoading(false);
-          } else if (attempts > 30) {
-            clearInterval(poll);
-            setRemoteError(status.error ?? "Timed out waiting for tunnel URL");
-            setRemoteLoading(false);
-          }
-        }, 1000);
+        await invoke("mobile_relay_start");
+        const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+        applyMobileRelayStatus(status);
       } catch (err) {
-        setRemoteError(String(err));
-        setRemoteLoading(false);
+        setMobileRelayError(String(err));
+      } finally {
+        setMobileRelayLoading(false);
       }
     }
-  }, [remoteActive]);
+  }, [applyMobileRelayStatus, mobileRelayActive]);
 
-  const handleRemoteDisconnect = useCallback(async () => {
-    await invoke("remote_stop");
-    setRemoteActive(false);
-    setRemoteUrl(null);
-    setRemoteError(null);
-    setRemotePopover(false);
-  }, []);
+  const handleMobileRelayStop = useCallback(async () => {
+    await invoke("mobile_relay_stop");
+    const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+    applyMobileRelayStatus(status);
+    setMobileRelayPopover(false);
+    setMobileRelayError(null);
+  }, [applyMobileRelayStatus]);
 
-  // Check remote status on mount
-  useEffect(() => { checkRemoteStatus(); }, [checkRemoteStatus]);
+  const copyMobileLaunch = useCallback(() => {
+    const command = [
+      "adb shell am start -n com.tmuxworktree.mobile/.MainActivity",
+      `  --es relayUrl '${mobileRelayUrl}'`,
+      `  --es hostId '${mobileRelayHostId}'`,
+      mobileRelaySecret ? `  --es relaySecret '${mobileRelaySecret}'` : "  --es relaySecret '<TW_RELAY_SECRET>'",
+      "  --ez autoConnect true",
+    ].join(" \\\n");
+    void navigator.clipboard.writeText(command);
+  }, [mobileRelayHostId, mobileRelaySecret, mobileRelayUrl]);
+
+  useEffect(() => { checkMobileRelayStatus(); }, [checkMobileRelayStatus]);
 
   // Lazily attach live PTYs; startup preloads snapshots instead.
   useEffect(() => {
@@ -1928,11 +1946,11 @@ function App() {
             <span className="brand__text">tmux-worktree</span>
             <div style={{ position: "relative", marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
               <button
-                className={`brand__file-btn${remoteActive ? " brand__file-btn--active" : ""}`}
+                className={`brand__file-btn${mobileRelayActive ? " brand__file-btn--active" : ""}`}
                 type="button"
-                onClick={handleRemoteToggle}
-                title="remote access"
-                aria-label="remote access"
+                onClick={handleMobileRelayToggle}
+                title="mobile relay"
+                aria-label="mobile relay"
               >
                 <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
                   <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2"/>
@@ -1951,33 +1969,39 @@ function App() {
                   <path d="M1.5 13.5V2.5C1.5 2.1 1.9 1.5 2.5 1.5H6L8 3.5H13.5C14.1 3.5 14.5 4 14.5 4.5V13.5C14.5 14 14.1 14.5 13.5 14.5H2.5C1.9 14.5 1.5 14 1.5 13.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
                 </svg>
               </button>
-              {remotePopover && (
+              {mobileRelayPopover && (
                 <div className="remote-popover">
-                  {remoteLoading ? (
-                    <p className="remote-popover__text">Starting tunnel...</p>
-                  ) : remoteUrl ? (
-                    <>
-                      <p className="remote-popover__label">Remote URL</p>
-                      <div className="remote-popover__row">
-                        <p className="remote-popover__url">{remoteUrl}</p>
-                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(remoteUrl)} title="Copy URL">⎘</button>
-                      </div>
-                      <p className="remote-popover__label">Token</p>
-                      <div className="remote-popover__row">
-                        <p className="remote-popover__url">{remoteToken}</p>
-                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(remoteToken)} title="Copy Token">⎘</button>
-                      </div>
-                      <button className="remote-popover__disconnect" onClick={handleRemoteDisconnect}>Disconnect</button>
-                    </>
-                  ) : remoteError ? (
-                    <>
-                      <p className="remote-popover__label">Remote failed</p>
-                      <p className="remote-popover__text">{remoteError}</p>
-                    </>
+                  {mobileRelayLoading ? (
+                    <p className="remote-popover__text">Starting mobile relay...</p>
                   ) : (
-                    <p className="remote-popover__text">Failed to start tunnel</p>
+                    <>
+                      <p className="remote-popover__label">Mobile Relay</p>
+                      <p className="remote-popover__text">Android pairs with this Mac admin connector. Devbox stays the broker and can also appear as a remote scope.</p>
+                      <p className="remote-popover__label">Broker</p>
+                      <div className="remote-popover__row">
+                        <p className="remote-popover__url">{mobileRelayUrl}</p>
+                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelayUrl)} title="Copy broker">⎘</button>
+                      </div>
+                      <p className="remote-popover__label">Mac Admin Host</p>
+                      <div className="remote-popover__row">
+                        <p className="remote-popover__url">{mobileRelayHostId}</p>
+                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelayHostId)} title="Copy host id">⎘</button>
+                      </div>
+                      <p className="remote-popover__label">Android Identity Token</p>
+                      <div className="remote-popover__row">
+                        <p className="remote-popover__url">{mobileRelaySecret || "Set TW_RELAY_SECRET before starting"}</p>
+                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelaySecret)} title="Copy token" disabled={!mobileRelaySecret}>⎘</button>
+                      </div>
+                      {mobileRelayError && (
+                        <p className="remote-popover__text">{mobileRelayError}</p>
+                      )}
+                      <button className="remote-popover__copy" onClick={copyMobileLaunch}>Copy Android launch</button>
+                      {mobileRelayActive && (
+                        <button className="remote-popover__disconnect" onClick={handleMobileRelayStop}>Stop connector</button>
+                      )}
+                    </>
                   )}
-                  <button className="remote-popover__close" onClick={() => setRemotePopover(false)}>Close</button>
+                  <button className="remote-popover__close" onClick={() => setMobileRelayPopover(false)}>Close</button>
                 </div>
               )}
             </div>

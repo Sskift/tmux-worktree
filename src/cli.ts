@@ -54,8 +54,10 @@ Automation:
 
 其它:
   tw serve [--port N]         启动网页终端（手机可访问）
+  tw relay-server             启动实验性远程 relay 服务
+  tw relay-host               连接 relay 并转发本机 tw serve
   tw setup                    安装 / 配置向导
-  tw doctor                   检查 tmux/git/node/cloudflared 与配置是否就绪
+  tw doctor                   检查 tmux/git/node 与配置是否就绪
   tw update                   更新 tw CLI 和 tw-dashboard
   tw version | -v             显示版本
   tw help | -h                显示本帮助
@@ -92,6 +94,16 @@ async function main() {
     }
     case "serve": {
       const { run } = await import("./serve.js");
+      await run();
+      return;
+    }
+    case "relay-server": {
+      const { run } = await import("./relayServer.js");
+      await run();
+      return;
+    }
+    case "relay-host": {
+      const { run } = await import("./relayHost.js");
       await run();
       return;
     }

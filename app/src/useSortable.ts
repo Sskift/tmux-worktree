@@ -44,9 +44,15 @@ export function useSortable<T>(
       if (dragIndex === null) return;
       const list = listRef.current;
       if (!list) return;
-      const children = Array.from(list.children) as HTMLElement[];
+      const indexedChildren = Array.from(
+        list.querySelectorAll<HTMLElement>("[data-sort-index]"),
+      );
+      const children =
+        indexedChildren.length > 0
+          ? indexedChildren
+          : (Array.from(list.children) as HTMLElement[]);
       const y = e.clientY;
-      let best = 0;
+      let best = dragIndex;
       let bestDist = Infinity;
       for (let i = 0; i < children.length; i++) {
         const rect = children[i].getBoundingClientRect();
@@ -54,7 +60,8 @@ export function useSortable<T>(
         const dist = Math.abs(y - mid);
         if (dist < bestDist) {
           bestDist = dist;
-          best = i;
+          const sortIndex = children[i].dataset.sortIndex;
+          best = sortIndex === undefined ? i : Number(sortIndex);
         }
       }
       setOverIndex(best);

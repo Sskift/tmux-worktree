@@ -243,20 +243,24 @@ struct PtyState {
     ptys: Mutex<HashMap<String, PtyHandle>>,
 }
 
-struct TunnelState {
+struct MobileRelayState {
     process: Mutex<Option<std::process::Child>>,
     serve_process: Mutex<Option<std::process::Child>>,
-    url: Mutex<Option<String>>,
+    relay_url: Mutex<String>,
+    host_id: Mutex<String>,
+    secret: Mutex<String>,
     token: Mutex<String>,
     last_error: Mutex<Option<String>>,
 }
 
-impl Default for TunnelState {
+impl Default for MobileRelayState {
     fn default() -> Self {
         Self {
             process: Mutex::new(None),
             serve_process: Mutex::new(None),
-            url: Mutex::new(None),
+            relay_url: Mutex::new("wss://relay.example.com".to_string()),
+            host_id: Mutex::new("mac-admin".to_string()),
+            secret: Mutex::new(String::new()),
             token: Mutex::new(String::new()),
             last_error: Mutex::new(None),
         }
@@ -326,7 +330,13 @@ fn list_sessions_blocking() -> Result<Vec<Session>, String> {
 }
 
 fn list_local_sessions() -> Result<Vec<Session>, String> {
-    let fmt = "#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}";
+    let config_path = app_home_dir_or_tmp().join(".tmux-worktree.json");
+    let worktree_base = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|config| config_worktree_base(&config))
+        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string());
+    let fmt = "#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}\x1f#{pane_current_path}";
     let output = std::process::Command::new(tmux_bin())
         .args(["list-sessions", "-F", fmt])
         .output()
@@ -358,6 +368,10 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
             let window_count = parts.next()?.parse().ok()?;
             let created = parts.next()?.parse().ok()?;
             let activity = parts.next()?.parse().ok()?;
+            let cwd = parts.next()?.to_string();
+            if !is_managed_worktree_session(&name, &cwd, &worktree_base) {
+                return None;
+            }
             let output_signature = pane_output_signature(&session_id);
             let agent_running = session_agent_running(&session_id);
             Some(Session {
@@ -708,6 +722,27 @@ fn list_remote_tmux_terminals_via_tmux(host: &HostConfig) -> Result<Vec<TmuxTerm
             })
         })
         .collect())
+}
+
+fn is_managed_worktree_session(name: &str, cwd: &str, worktree_base: &str) -> bool {
+    if cwd.trim().is_empty() {
+        return false;
+    }
+    let cwd_path = std::path::Path::new(cwd);
+    if !is_git_worktree_dir(cwd_path) {
+        return false;
+    }
+
+    let base = worktree_base.trim_end_matches('/');
+    let under_base = cwd == base || cwd.starts_with(&format!("{base}/"));
+    if !under_base && !cwd.contains("/.tmux-worktree/worktrees/") {
+        return false;
+    }
+
+    let Some(dirname) = cwd_path.file_name().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    tw_session_name_from_worktree_dir(dirname).is_some_and(|session_name| session_name == name)
 }
 
 fn pane_output_signature(name: &str) -> Option<String> {
@@ -2781,14 +2816,18 @@ fn is_git_worktree_dir(path: &std::path::Path) -> bool {
 
 /// Strip trailing `-{5 hex chars}` random suffix to recover session name.
 fn derive_session_name(dirname: &str) -> String {
+    tw_session_name_from_worktree_dir(dirname).unwrap_or_else(|| dirname.to_string())
+}
+
+fn tw_session_name_from_worktree_dir(dirname: &str) -> Option<String> {
     let bytes = dirname.as_bytes();
     if bytes.len() > 6 && bytes[bytes.len() - 6] == b'-' {
         let suffix = &dirname[dirname.len() - 5..];
         if suffix.chars().all(|c| c.is_ascii_hexdigit()) {
-            return dirname[..dirname.len() - 6].to_string();
+            return Some(dirname[..dirname.len() - 6].to_string());
         }
     }
-    dirname.to_string()
+    None
 }
 
 #[tauri::command]
@@ -3961,16 +4000,7 @@ fn capture_pane_history(name: String, lines: Option<u16>) -> Result<String, Stri
     let (host_id, raw_name) = parse_session_key(&name);
     let exact = format!("={}", raw_name);
     let start = format!("-{}", lines.unwrap_or(5000).clamp(1, 5000));
-    let args = &[
-        "capture-pane",
-        "-p",
-        "-e",
-        "-J",
-        "-S",
-        &start,
-        "-t",
-        &exact,
-    ];
+    let args = &["capture-pane", "-p", "-e", "-J", "-S", &start, "-t", &exact];
 
     let text = match host_id {
         Some(hid) => {
@@ -4429,7 +4459,7 @@ fn search_files(root: String, query: String, mode: String) -> Result<Vec<SearchR
     Ok(results)
 }
 
-// ── Remote tunnel (cloudflared) ──
+// ── Mobile relay connector ──
 
 fn read_serve_token() -> String {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -4583,119 +4613,17 @@ fn spawn_serve(app: &tauri::AppHandle) -> Result<std::process::Child, String> {
     }
 
     Err(format!(
-        "Failed to start remote serve backend. {}. Install Node.js 20+ or run `npm i -g tmux-worktree --registry=https://registry.npmjs.org`.",
+        "Failed to start mobile relay serve backend. {}. Install Node.js 20+ or run `npm i -g tmux-worktree@latest --registry=https://registry.npmjs.org`.",
         failures.join("; ")
     ))
 }
 
-fn managed_cloudflared_path() -> PathBuf {
-    let base = if std::env::var_os("TW_DASHBOARD_HOME").is_some() {
-        app_home_dir_or_tmp().join(".tw-dashboard")
-    } else {
-        dirs::data_local_dir()
-            .unwrap_or_else(app_home_dir_or_tmp)
-            .join("tw-dashboard")
-    };
-    base.join("bin").join("cloudflared")
-}
-
-fn find_cloudflared() -> Option<String> {
-    let managed = managed_cloudflared_path();
-    if executable_exists(&managed) {
-        return Some(managed.to_string_lossy().to_string());
-    }
-    first_existing_command(
-        &[
-            "/opt/homebrew/bin/cloudflared",
-            "/usr/local/bin/cloudflared",
-            "/usr/bin/cloudflared",
-        ],
-        "cloudflared",
-    )
-}
-
-fn download_cloudflared() -> Result<String, String> {
-    if std::env::consts::OS != "macos" {
-        return Err("automatic cloudflared download is only supported on macOS".into());
-    }
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "amd64",
-        other => return Err(format!("unsupported macOS arch for cloudflared: {other}")),
-    };
-    let url = format!(
-        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-{arch}.tgz"
-    );
-    let bin_path = managed_cloudflared_path();
-    let bin_dir = bin_path
-        .parent()
-        .ok_or_else(|| "invalid managed cloudflared path".to_string())?;
-    std::fs::create_dir_all(bin_dir).map_err(|e| format!("mkdir {}: {e}", bin_dir.display()))?;
-    let archive = bin_dir.join(format!("cloudflared-darwin-{arch}.tgz"));
-    let curl = first_existing_command(&["/usr/bin/curl", "/opt/homebrew/bin/curl"], "curl")
-        .unwrap_or_else(|| "curl".to_string());
-    let archive_arg = archive.to_string_lossy().to_string();
-    let curl_output = std::process::Command::new(&curl)
-        .args(["-fsSL", "--retry", "2", "-o", archive_arg.as_str(), &url])
-        .output()
-        .map_err(|e| format!("spawn curl: {e}"))?;
-    if !curl_output.status.success() {
-        return Err(format!(
-            "download cloudflared failed: {}",
-            String::from_utf8_lossy(&curl_output.stderr).trim()
-        ));
-    }
-
-    let tar = first_existing_command(&["/usr/bin/tar"], "tar").unwrap_or_else(|| "tar".to_string());
-    let bin_dir_arg = bin_dir.to_string_lossy().to_string();
-    let tar_output = std::process::Command::new(&tar)
-        .args(["-xzf", archive_arg.as_str(), "-C", bin_dir_arg.as_str()])
-        .output()
-        .map_err(|e| format!("spawn tar: {e}"))?;
-    if !tar_output.status.success() {
-        return Err(format!(
-            "unpack cloudflared failed: {}",
-            String::from_utf8_lossy(&tar_output.stderr).trim()
-        ));
-    }
-
-    if !bin_path.exists() {
-        return Err(format!(
-            "cloudflared was not found after unpacking {}",
-            archive.display()
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&bin_path)
-            .map_err(|e| format!("metadata {}: {e}", bin_path.display()))?
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&bin_path, permissions)
-            .map_err(|e| format!("chmod {}: {e}", bin_path.display()))?;
-    }
-    let _ = std::fs::remove_file(&archive);
-    Ok(bin_path.to_string_lossy().to_string())
-}
-
-fn ensure_cloudflared() -> Result<String, String> {
-    if let Some(path) = find_cloudflared() {
-        return Ok(path);
-    }
-    download_cloudflared().map_err(|err| {
-        format!(
-            "Failed to prepare cloudflared automatically: {err}. You can also install it with `brew install cloudflared`."
-        )
-    })
-}
-
-fn set_tunnel_error(state: &TunnelState, message: Option<String>) {
+fn set_mobile_relay_error(state: &MobileRelayState, message: Option<String>) {
     let mut last_error = state.last_error.lock().unwrap();
     *last_error = message;
 }
 
-fn stop_managed_serve(state: &TunnelState) {
+fn stop_managed_serve(state: &MobileRelayState) {
     let mut serve_proc = state.serve_process.lock().unwrap();
     if let Some(ref mut child) = *serve_proc {
         let _ = child.kill();
@@ -4705,96 +4633,152 @@ fn stop_managed_serve(state: &TunnelState) {
 }
 
 #[derive(Serialize, Clone)]
-struct TunnelStatus {
+#[serde(rename_all = "camelCase")]
+struct MobileRelayStatus {
     active: bool,
-    url: Option<String>,
+    relay_url: String,
+    host_id: String,
+    secret: String,
     token: String,
     error: Option<String>,
 }
 
+fn mobile_relay_config() -> (String, String, String, String) {
+    let relay_url = std::env::var("TW_RELAY_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "wss://relay.example.com".to_string());
+    let host_id = std::env::var("TW_RELAY_HOST_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "mac-admin".to_string());
+    let display_name = std::env::var("TW_RELAY_DISPLAY_NAME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "Mac Admin".to_string());
+    let secret = std::env::var("TW_RELAY_SECRET").unwrap_or_default();
+    (relay_url, host_id, display_name, secret)
+}
+
+fn spawn_relay_host(
+    app: &tauri::AppHandle,
+    relay_url: &str,
+    host_id: &str,
+    display_name: &str,
+    secret: &str,
+    token: &str,
+) -> Result<std::process::Child, String> {
+    let mut failures = Vec::new();
+    let args = [
+        "relay-host",
+        "--relay",
+        relay_url,
+        "--host-id",
+        host_id,
+        "--display-name",
+        display_name,
+        "--local",
+        "http://127.0.0.1:8311",
+    ];
+
+    if let Some(cli) = bundled_cli_path(app) {
+        if let Some(node) = node_bin() {
+            let cli_arg = cli.to_string_lossy().to_string();
+            let mut command = std::process::Command::new(&node);
+            command
+                .arg(cli_arg)
+                .args(args)
+                .env("TW_RELAY_SECRET", secret)
+                .env("TW_TOKEN", token)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match command.spawn() {
+                Ok(child) => return Ok(child),
+                Err(err) => failures.push(format!("spawn bundled relay-host: {err}")),
+            }
+        } else {
+            failures.push("Node.js not found for bundled CLI".to_string());
+        }
+    } else {
+        failures.push("bundled CLI resource not found".to_string());
+    }
+
+    if let Some(tw) = installed_tw_command() {
+        let mut command = std::process::Command::new(&tw);
+        command
+            .args(args)
+            .env("TW_RELAY_SECRET", secret)
+            .env("TW_TOKEN", token)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(err) => failures.push(format!("spawn installed relay-host: {err}")),
+        }
+    } else {
+        failures.push("installed tw/tmux-worktree command not found".to_string());
+    }
+
+    Err(format!(
+        "Failed to start mobile relay connector. {}",
+        failures.join("; ")
+    ))
+}
+
 #[tauri::command]
-fn remote_start(app: tauri::AppHandle, state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
-    set_tunnel_error(state.inner(), None);
+fn mobile_relay_start(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<MobileRelayState>>,
+) -> Result<(), String> {
+    set_mobile_relay_error(state.inner(), None);
     let mut proc = state.process.lock().unwrap();
     if proc.is_some() {
         return Ok(());
     }
 
-    // Ensure serve process is running on port 8311
     if !tcp_port_open(8311) {
         let child = spawn_serve(&app).map_err(|err| {
-            set_tunnel_error(state.inner(), Some(err.clone()));
+            set_mobile_relay_error(state.inner(), Some(err.clone()));
             err
         })?;
         let mut serve = state.serve_process.lock().unwrap();
         *serve = Some(child);
     }
 
-    // Read token from serve process
     let tok = read_serve_token();
     {
         let mut t = state.token.lock().unwrap();
-        *t = tok;
+        *t = tok.clone();
     }
 
-    let cf_bin = ensure_cloudflared().map_err(|err| {
-        set_tunnel_error(state.inner(), Some(err.clone()));
+    let (relay_url, host_id, display_name, secret) = mobile_relay_config();
+    if secret.trim().is_empty() {
+        let message =
+            "TW_RELAY_SECRET is required to pair Android with this Mac admin connector".to_string();
+        set_mobile_relay_error(state.inner(), Some(message.clone()));
         stop_managed_serve(state.inner());
-        err
-    })?;
+        return Err(message);
+    }
 
-    let mut child = std::process::Command::new(&cf_bin)
-        .args(["tunnel", "--url", "http://localhost:8311"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            let message = format!("Failed to start cloudflared: {e}");
-            set_tunnel_error(state.inner(), Some(message.clone()));
+    let child = spawn_relay_host(&app, &relay_url, &host_id, &display_name, &secret, &tok)
+        .map_err(|err| {
+            set_mobile_relay_error(state.inner(), Some(err.clone()));
             stop_managed_serve(state.inner());
-            message
+            err
         })?;
 
-    // Take stderr before storing child
-    let stderr = child.stderr.take();
+    *state.relay_url.lock().unwrap() = relay_url;
+    *state.host_id.lock().unwrap() = host_id;
+    *state.secret.lock().unwrap() = secret;
     *proc = Some(child);
-    drop(proc);
-
-    // Spawn a thread to read stderr and capture the URL
-    if let Some(stderr) = stderr {
-        let tunnel_state = Arc::clone(state.inner());
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(stderr);
-            let mut found = false;
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => break,
-                };
-                if !found {
-                    if let Some(start) = line.find("https://") {
-                        let rest = &line[start..];
-                        if rest.contains(".trycloudflare.com") {
-                            let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
-                            let url = &rest[..end];
-                            let mut u = tunnel_state.url.lock().unwrap();
-                            *u = Some(url.to_string());
-                            found = true;
-                        }
-                    }
-                }
-                // Keep draining stderr so cloudflared doesn't get SIGPIPE
-            }
-        });
-    }
 
     Ok(())
 }
 
 #[tauri::command]
-fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
+fn mobile_relay_stop(state: State<'_, Arc<MobileRelayState>>) -> Result<(), String> {
     let mut proc = state.process.lock().unwrap();
     if let Some(ref mut child) = *proc {
         let _ = child.kill();
@@ -4802,41 +4786,44 @@ fn remote_stop(state: State<'_, Arc<TunnelState>>) -> Result<(), String> {
     }
     *proc = None;
     stop_managed_serve(state.inner());
-    let mut url = state.url.lock().unwrap();
-    *url = None;
-    set_tunnel_error(state.inner(), None);
+    set_mobile_relay_error(state.inner(), None);
     Ok(())
 }
 
 #[tauri::command]
-fn remote_status(state: State<'_, Arc<TunnelState>>) -> TunnelStatus {
+fn mobile_relay_status(state: State<'_, Arc<MobileRelayState>>) -> MobileRelayStatus {
     let mut proc = state.process.lock().unwrap();
-    // Check if process has exited
     if let Some(ref mut child) = *proc {
         match child.try_wait() {
             Ok(Some(_)) => {
-                // Process exited, clean up
                 *proc = None;
-                let mut url = state.url.lock().unwrap();
-                *url = None;
-                let token = state.token.lock().unwrap();
-                let error = state.last_error.lock().unwrap();
-                return TunnelStatus {
-                    active: false,
-                    url: None,
-                    token: token.clone(),
-                    error: error.clone(),
-                };
             }
             _ => {}
         }
     }
-    let url = state.url.lock().unwrap();
+    let (default_relay_url, default_host_id, _display_name, default_secret) = mobile_relay_config();
+    let relay_url = state.relay_url.lock().unwrap();
+    let host_id = state.host_id.lock().unwrap();
+    let secret = state.secret.lock().unwrap();
     let token = state.token.lock().unwrap();
     let error = state.last_error.lock().unwrap();
-    TunnelStatus {
+    MobileRelayStatus {
         active: proc.is_some(),
-        url: url.clone(),
+        relay_url: if relay_url.is_empty() {
+            default_relay_url
+        } else {
+            relay_url.clone()
+        },
+        host_id: if host_id.is_empty() {
+            default_host_id
+        } else {
+            host_id.clone()
+        },
+        secret: if secret.is_empty() {
+            default_secret
+        } else {
+            secret.clone()
+        },
         token: token.clone(),
         error: error.clone(),
     }
@@ -4849,7 +4836,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             app.manage(Arc::new(PtyState::default()));
-            app.manage(Arc::new(TunnelState::default()));
+            app.manage(Arc::new(MobileRelayState::default()));
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
             setup_clipboard_bindings();
@@ -4902,9 +4889,6 @@ pub fn run() {
             search_files,
             open_url,
             file_exists,
-            remote_start,
-            remote_stop,
-            remote_status,
             list_hosts,
             list_ssh_host_candidates,
             add_host,
@@ -4915,6 +4899,9 @@ pub fn run() {
             list_remote_projects,
             remote_home_dir,
             remote_read_dir,
+            mobile_relay_start,
+            mobile_relay_stop,
+            mobile_relay_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -4934,19 +4921,19 @@ mod tests {
         create_remote_worktree, create_terminal, create_worktree, delete_automation_from_list,
         delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
         finish_git_fetch_target, git_fetch_args, hosts_from_config, install_host_tw,
-        is_git_worktree_dir, kill_plain_terminal, kill_session, list_automation_runs,
-        list_remote_sessions, list_remote_tmux_terminals, load_hosts, load_pending_cleanup,
-        orphaned_worktrees, parse_session_key, project_from_config, projects_from_config,
-        projects_from_config_with_home, remote_home_dir_for_host, remote_read_dirs_for_host,
-        reserve_git_fetch_target, restore_worktree, run_check, save_automation, save_hosts_config,
-        save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
-        stable_output_signature, test_host, tmux_session_exists, trigger_automation,
-        try_cleanup_worktree, upsert_automation_from_input, worktree_has_uncommitted_changes,
-        worktrees_for_session, AddHostArgs, Automation, AutomationOverlap, AutomationRun,
-        AutomationStatus, AutomationTriggerType, CreateArgs, CreateTerminalArgs,
-        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, HostConfig, OrphanedWorktree,
-        Project, RestoreArgs, SaveAutomationInput, AUTOMATION_RUN_LIMIT,
-        GIT_FETCH_INTERVAL_SECONDS,
+        is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
+        list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
+        load_pending_cleanup, orphaned_worktrees, parse_session_key, project_from_config,
+        projects_from_config, projects_from_config_with_home, remote_home_dir_for_host,
+        remote_read_dirs_for_host, reserve_git_fetch_target, restore_worktree, run_check,
+        save_automation, save_hosts_config, save_pending_cleanup, should_skip_automation_overlap,
+        ssh_host_candidates_from_config_text, stable_output_signature, test_host,
+        tmux_session_exists, trigger_automation, try_cleanup_worktree,
+        upsert_automation_from_input, worktree_has_uncommitted_changes, worktrees_for_session,
+        AddHostArgs, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
+        AutomationTriggerType, CreateArgs, CreateTerminalArgs, DeleteWorktreeArgs,
+        EnsureTerminalArgs, GitFetchTracker, HostConfig, OrphanedWorktree, Project, RestoreArgs,
+        SaveAutomationInput, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -5403,6 +5390,48 @@ mod tests {
         assert_eq!(derive_session_name("demo-abc12"), "demo");
         assert_eq!(derive_session_name("demo"), "demo");
         assert_eq!(derive_session_name("demo-nothex"), "demo-nothex");
+    }
+
+    #[test]
+    fn managed_worktree_session_requires_tw_name_and_git_worktree_shape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let base = temp.path().join("worktrees");
+        let project = base.join("demo");
+        let managed = project.join("demo-task-abc12");
+        let plain = project.join("demo-task");
+        let mismatched = project.join("other-task-abc12");
+        fs::create_dir_all(&managed).expect("managed");
+        fs::create_dir_all(&plain).expect("plain");
+        fs::create_dir_all(&mismatched).expect("mismatched");
+        fs::write(
+            managed.join(".git"),
+            "gitdir: /repo/.git/worktrees/demo-task-abc12",
+        )
+        .expect("managed git file");
+        fs::write(plain.join(".git"), "gitdir: /repo/.git/worktrees/demo-task")
+            .expect("plain git file");
+        fs::write(
+            mismatched.join(".git"),
+            "gitdir: /repo/.git/worktrees/other-task-abc12",
+        )
+        .expect("mismatched git file");
+
+        let base = base.to_string_lossy().to_string();
+        assert!(is_managed_worktree_session(
+            "demo-task",
+            managed.to_str().expect("managed path"),
+            &base,
+        ));
+        assert!(!is_managed_worktree_session(
+            "demo-task",
+            plain.to_str().expect("plain path"),
+            &base,
+        ));
+        assert!(!is_managed_worktree_session(
+            "demo-task",
+            mismatched.to_str().expect("mismatched path"),
+            &base,
+        ));
     }
 
     #[test]
@@ -7317,7 +7346,7 @@ done
 printf '%s\n' "$*" >> "$log"
 
 case "$1" in
-  *"'npm'"*"'install'"*"'tmux-worktree@0.12.4'"*"'--registry=https://registry.npmjs.org'"*)
+  *"'npm'"*"'install'"*"'tmux-worktree@0.12.5'"*"'--registry=https://registry.npmjs.org'"*)
     printf 'installed\n'
     exit 0
     ;;
@@ -7560,6 +7589,9 @@ Host jump-proxy
             .iter()
             .map(|host| host.id.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["remote-dev", "build-cloud", "ssh-host", "gpu-worker"]);
+        assert_eq!(
+            ids,
+            vec!["remote-dev", "build-cloud", "ssh-host", "gpu-worker"]
+        );
     }
 }

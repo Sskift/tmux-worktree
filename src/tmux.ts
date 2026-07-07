@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
+import { loadConfigFile } from "./config";
 
 // ============================================
 // tmux.ts — 安全执行 git / tmux 的底层模块
@@ -19,9 +20,23 @@ export function isInternalSession(name: string): boolean {
 
 let cachedTmux: string | null = null;
 
+function isRunnableReference(value: string): boolean {
+  return !value.includes("/") || existsSync(value);
+}
+
 /** 解析 tmux 可执行文件路径（缓存）。 */
 export function tmuxBin(): string {
   if (cachedTmux) return cachedTmux;
+  const envTmux = process.env.TW_TMUX?.trim();
+  if (envTmux && isRunnableReference(envTmux)) {
+    cachedTmux = envTmux;
+    return cachedTmux;
+  }
+  const configuredTmux = loadConfigFile()?.tmuxPath?.trim();
+  if (configuredTmux && isRunnableReference(configuredTmux)) {
+    cachedTmux = configuredTmux;
+    return cachedTmux;
+  }
   for (const p of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
     if (existsSync(p)) {
       cachedTmux = p;

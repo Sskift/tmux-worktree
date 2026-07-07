@@ -105,7 +105,7 @@ Common commands:
 - `tw setup`: check local dependencies.
 - `tw status`: tmux status panel.
 - `tw serve`: local WebSocket terminal service.
-- `tw serve --remote`: local terminal service with a Cloudflare Quick Tunnel.
+- `tw relay-server` / `tw relay-host`: stable Android relay broker and Mac admin connector.
 - `tw update`: update the global CLI package and reinstall the latest Dashboard.
 - `tw rpc list`: print live `tw`-managed sessions as JSON.
 - `tw rpc create-worktree (--path <path> | --project <name>) --ai-command <cmd> [--name <name>] [--branch <name>]`: create a Dashboard-managed worktree session.
@@ -123,7 +123,7 @@ Typical flow:
 3. Use the Git panel to inspect branch, file changes, and commit history.
 4. Open the file tree to browse, edit, and diff project files.
 5. Create local automations from the Automations section.
-6. Use remote access to expose the web terminal through a Cloudflare Quick Tunnel.
+6. Use the mobile relay button to start or inspect the Mac admin connector for Android pairing.
 
 Remote host behavior:
 
@@ -133,6 +133,16 @@ Remote host behavior:
 - Remote worktree creation prefers `tw rpc create-worktree` on the remote host.
 - If compatible RPC is unavailable, the Dashboard falls back to direct SSH + git/tmux commands.
 - Remote scratch terminals start on the selected host and current remote cwd without sourcing login profiles.
+
+Mobile Relay runtime:
+
+- The Dashboard bundle includes the CLI JS needed to start `tw serve` and prefers that bundled resource.
+- If the bundled resource is unavailable, it falls back to a globally installed `tw` / `tmux-worktree` command.
+- `relay-server` runs on an always-reachable machine as a broker only.
+- `relay-host` runs on the Mac admin machine, reads the same local Dashboard config, and aggregates local plus configured remote scopes over SSH.
+- Android pairs with the Mac admin connector through the broker and sees the same TW-managed WorkTrees/Terminals as the Mac Dashboard.
+- Plain tmux sessions are not part of the managed mobile surface.
+- Mobile Relay still needs Node.js 20+ for `tw serve` and `tw relay-host`.
 
 Layout behavior:
 
@@ -151,7 +161,6 @@ Requirements:
 - Xcode Command Line Tools
 - tmux
 - git
-- `cloudflared` is optional; the Dashboard can download the official macOS binary when remote access is used.
 
 CLI:
 
@@ -168,6 +177,17 @@ cd app
 npm install
 npm run tauri dev
 ```
+
+Local validation should usually use `npm run tauri dev`. It reflects the current workspace directly and avoids generating hashed debug apps under `/Applications`.
+
+Use the isolated dev app only when state isolation is required:
+
+```bash
+cd app
+npm run tauri:dev:isolated
+```
+
+`npm run tauri:dev:install` installs a uniquely named debug `.app` under `/Applications`; use it only when Finder/open launch behavior must be tested, and clean it up afterward with the command printed by the script.
 
 Useful checks:
 

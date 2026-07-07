@@ -41,7 +41,7 @@
 
 1. `app/src` 和 `app/src-tauri`
 2. `npm run tauri build`，Tauri `beforeBuildCommand` 同时构建根目录 `dist/cli.js`
-3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，供 Dashboard remote 启动 `tw serve`
+3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，供 Dashboard Mobile Relay 启动 `tw serve` / `tw relay-host`
 4. DMG 复制到 `app/installer/dmg/tw-dashboard-arm64.dmg`
 5. `app/installer/installer.mjs` 挂载 DMG 并安装 `tw-dashboard.app`
 
@@ -64,7 +64,7 @@
 
 | 文件 | 作用 |
 |---|---|
-| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、栏目拖拽排序、session/automation 选择、modal 和 remote 控制 |
+| `app/src/App.tsx` | Dashboard 根组件，负责布局持久化、栏目拖拽排序、session/automation 选择、modal 和 Mobile Relay 控制 |
 | `app/src/App.css` | Dashboard 样式 |
 | `app/src/AutomationPanel.tsx` | 本地 automation 管理面板，负责新建/编辑、Run now、pause/activate、delete 和运行历史展示 |
 | `app/src/automationTypes.ts` | automation 前后端契约转换、表单校验和 cron 调度匹配 helper |
@@ -85,7 +85,7 @@ Rust 后端：
 | 文件 | 作用 |
 |---|---|
 | `app/src-tauri/src/main.rs` | 原生应用入口 |
-| `app/src-tauri/src/lib.rs` | 所有 Tauri commands、PTY 状态、git/tmux/file 操作、remote tunnel 生命周期 |
+| `app/src-tauri/src/lib.rs` | 所有 Tauri commands、PTY 状态、git/tmux/file 操作、Mobile Relay connector 生命周期 |
 | `app/src-tauri/tauri.conf.json` | App 身份、bundle 配置、CLI resource、窗口默认值 |
 | `app/src-tauri/capabilities/default.json` | Tauri v2 权限白名单 |
 | `app/src-tauri/icons/` | App 图标 |
@@ -98,7 +98,7 @@ Rust 后端：
 - 独立终端：`create_plain_terminal`、`ensure_terminal_session`、`kill_plain_terminal`、`load_terminals`、`save_terminals`。
 - Automation：`list_automations`、`save_automation`、`delete_automation`、`trigger_automation`、`list_automation_runs`。
 - 布局和文件：`load_layout`、`save_layout`、`read_dir`、`read_file`、`write_file`、`search_files`、`file_exists`。
-- Remote：`remote_start`、`remote_stop`、`remote_status`。
+- Mobile Relay：`mobile_relay_start`、`mobile_relay_stop`、`mobile_relay_status`。
 
 Remote TW runtime：
 
@@ -117,12 +117,12 @@ Automation 设计：
 - `overlap=skip` 时，如果上一次 running/queued session 仍存在，则记录 `skipped` run；`overlap=queue` 时允许再次启动新 session。
 - cron schedule 由前端 Dashboard 运行时按本机本地时间轮询触发；Dashboard 关闭时不会执行后台调度。
 
-Remote 启动顺序：
+Mobile Relay 启动顺序：
 
 1. 如果 `127.0.0.1:8311` 已经有 `tw serve`，直接复用。
 2. 否则优先使用 `.app` resources 内置的 `tw-cli/cli.js` 启动 `serve`。
-3. 如果内置资源不可用，回退到用户全局安装的 `tw` / `tmux-worktree` 命令，兼容已安装 CLI 后端的用户。
-4. `cloudflared` 优先使用本机已有安装；缺失时自动下载 Cloudflare 官方 macOS `cloudflared-darwin-{arm64,amd64}.tgz` 到用户目录。
+3. 启动 `tw relay-host`，连接外部 broker 上的 `relay-server`，默认 host id 为 `mac-admin`；host 只暴露 `tw rpc list` 中的 TW-managed worktree，或严格匹配 `<worktreeBase>/<project>/<session>-<5 hex>` 且带 `.git` 的 legacy worktree，普通 tmux session 不暴露。
+4. 如果内置资源不可用，回退到用户全局安装的 `tw` / `tmux-worktree` 命令，兼容已安装 CLI 后端的用户。
 
 Update 命令：
 
