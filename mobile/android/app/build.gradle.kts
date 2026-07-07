@@ -10,8 +10,8 @@ android {
         applicationId = "com.tmuxworktree.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1205
-        versionName = "0.12.5"
+        versionCode = 1206
+        versionName = "0.12.6"
     }
 
     compileOptions {

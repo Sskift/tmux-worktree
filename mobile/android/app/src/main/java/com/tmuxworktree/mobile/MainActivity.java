@@ -5,6 +5,7 @@ import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.graphics.Rect;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
@@ -153,6 +154,8 @@ public class MainActivity extends Activity {
     private boolean terminalFlushScheduled = false;
     private int reconnectAttempt = 0;
     private long lastRefreshAt = 0;
+    private int lastVisibleRootHeight = 0;
+    private boolean keyboardVisible = false;
     private Runnable reconnectRunnable;
 
     // Lifecycle
@@ -210,15 +213,40 @@ public class MainActivity extends Activity {
         root.setBackgroundColor(BG);
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             v.setPadding(0, insets.getSystemWindowInsetTop(), 0, insets.getSystemWindowInsetBottom());
+            requestTerminalFitBurst();
             return insets;
         });
         setContentView(root);
+        installViewportChangeWatcher(root);
 
         buildAppBar(root);
         buildTabBar(root);
         buildTabContent(root);
         if (tabBarView != null) tabBarView.setVisibility(View.GONE);
         if (tabDividerView != null) tabDividerView.setVisibility(View.GONE);
+    }
+
+    private void installViewportChangeWatcher(View root) {
+        root.getViewTreeObserver().addOnGlobalLayoutListener(() -> {
+            Rect visibleFrame = new Rect();
+            root.getWindowVisibleDisplayFrame(visibleFrame);
+            int visibleHeight = Math.max(0, visibleFrame.height());
+            int rootHeight = Math.max(0, root.getRootView().getHeight());
+            if (visibleHeight == lastVisibleRootHeight) return;
+            lastVisibleRootHeight = visibleHeight;
+
+            int hiddenHeight = Math.max(0, rootHeight - visibleHeight);
+            boolean nextKeyboardVisible = hiddenHeight > Math.max(dp(120), rootHeight / 5);
+            boolean keyboardClosed = keyboardVisible && !nextKeyboardVisible;
+            keyboardVisible = nextKeyboardVisible;
+
+            if (terminalMode) {
+                if (keyboardClosed && terminalWebView != null) {
+                    terminalWebView.requestFocus();
+                }
+                requestTerminalFitBurst();
+            }
+        });
     }
 
     private void buildAppBar(LinearLayout parent) {
@@ -581,7 +609,7 @@ public class MainActivity extends Activity {
         terminalFrame.setBackgroundColor(TERM_BG);
         terminalFrame.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
             if (terminalMode && (right - left != oldRight - oldLeft || bottom - top != oldBottom - oldTop)) {
-                requestTerminalFit();
+                requestTerminalFitBurst();
             }
         });
         LinearLayout.LayoutParams frameLp = new LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1);
@@ -1109,7 +1137,7 @@ public class MainActivity extends Activity {
         if (shortcutBar != null) shortcutBar.setVisibility(collapsed ? View.GONE : View.VISIBLE);
         if (shortcutCollapsedButton != null) shortcutCollapsedButton.setVisibility(collapsed ? View.VISIBLE : View.GONE);
         updateTerminalChromePadding();
-        requestTerminalFit();
+        requestTerminalFitBurst();
     }
 
     private void toggleComposer() {
@@ -1123,7 +1151,7 @@ public class MainActivity extends Activity {
             hideKeyboard();
         }
         updateTerminalChromePadding();
-        requestTerminalFit();
+        requestTerminalFitBurst();
     }
 
     private void focusMessageInput() {
@@ -1143,9 +1171,9 @@ public class MainActivity extends Activity {
                 imm.showSoftInput(messageInput, InputMethodManager.SHOW_IMPLICIT);
             }
             updateTerminalChromePadding();
-            requestTerminalFit();
+            requestTerminalFitBurst();
         }, 40);
-        messageInput.postDelayed(this::requestTerminalFit, 320);
+        messageInput.postDelayed(this::requestTerminalFitBurst, 320);
     }
 
     private void hideKeyboard() {
@@ -1161,7 +1189,7 @@ public class MainActivity extends Activity {
             terminalWebView.requestFocus();
         }
         updateTerminalChromePadding();
-        if (terminalFrame != null) terminalFrame.postDelayed(this::requestTerminalFit, 220);
+        if (terminalFrame != null) terminalFrame.postDelayed(this::requestTerminalFitBurst, 220);
     }
 
     private void showSessionActions(RelaySession session) {
@@ -1759,7 +1787,7 @@ public class MainActivity extends Activity {
             "streamId", activeStreamId,
             "session", selectedSession
         ));
-        requestTerminalFit();
+        requestTerminalFitBurst();
         if (pendingAutoCommand != null && !pendingAutoCommand.isEmpty()) {
             String command = pendingAutoCommand;
             pendingAutoCommand = null;
@@ -1830,6 +1858,18 @@ public class MainActivity extends Activity {
         );
     }
 
+    private void requestTerminalFitBurst() {
+        if (terminalWebView == null || !terminalReady) return;
+        int[] delays = new int[] { 0, 60, 160, 320, 640 };
+        for (int delay : delays) {
+            terminalWebView.postDelayed(() -> {
+                if (terminalMode && terminalWebView != null && terminalReady) {
+                    terminalWebView.evaluateJavascript("window.fitTerminal&&window.fitTerminal();", null);
+                }
+            }, delay);
+        }
+    }
+
     private void updateTerminalChromePadding() {
         if (terminalWebView == null || !terminalReady) return;
         int bottomPadding = shortcutsCollapsed ? 14 : 64;
@@ -1837,6 +1877,7 @@ public class MainActivity extends Activity {
             bottomPadding = 132;
         }
         terminalWebView.evaluateJavascript("window.setTerminalChrome&&window.setTerminalChrome(" + bottomPadding + ");", null);
+        requestTerminalFitBurst();
     }
 
     private void enterTerminalMode() {
@@ -1862,6 +1903,7 @@ public class MainActivity extends Activity {
         composerVisible = false;
         if (composerPanel != null) composerPanel.setVisibility(View.GONE);
         updateTerminalChromePadding();
+        requestTerminalFitBurst();
     }
 
     private void exitTerminalMode() {
@@ -1897,10 +1939,10 @@ public class MainActivity extends Activity {
     private void loadTerminalHtml() {
         terminalReady = false;
         String html = "<!doctype html><html><head>"
-            + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no\">"
+            + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover\">"
             + "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css\">"
             + "<style>"
-            + "html,body,#terminal{margin:0;width:100%;height:100%;background:#0d0e10;overflow:hidden;}"
+            + "html,body,#terminal{margin:0;width:100%;height:var(--app-height,100%);background:#0d0e10;overflow:hidden;}"
             + "body{touch-action:none;-webkit-user-select:none;user-select:none;}"
             + "#terminal .xterm{height:100%;padding:6px 4px 64px 4px;box-sizing:border-box;}"
             + ".xterm-viewport{background:#0d0e10!important;}"
@@ -1908,21 +1950,29 @@ public class MainActivity extends Activity {
             + "<script src=\"https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js\"></script>"
             + "<script src=\"https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js\"></script>"
             + "<script>"
-            + "var term,fitAddon,ready=false,pending=[];"
-            + "function fit(){try{fitAddon.fit();TwBridge.resize(term.cols,term.rows);}catch(e){}}"
-            + "function setBottomPadding(px){var el=document.querySelector('#terminal .xterm');if(el){el.style.paddingBottom=px+'px';setTimeout(fit,0);}}"
+            + "var term,fitAddon,ready=false,pending=[],lastCols=0,lastRows=0,lastViewportHeight=0;"
+            + "function viewportHeight(){var v=window.visualViewport;return Math.max(1,Math.round((v&&v.height)||window.innerHeight||document.documentElement.clientHeight||document.body.clientHeight||1));}"
+            + "function syncViewportHeight(){var h=viewportHeight();if(h!==lastViewportHeight){lastViewportHeight=h;document.documentElement.style.setProperty('--app-height',h+'px');}}"
+            + "function fit(){try{if(!ready||!term||!fitAddon)return;syncViewportHeight();fitAddon.fit();if(term.cols&&term.rows){lastCols=term.cols;lastRows=term.rows;TwBridge.resize(term.cols,term.rows);}}catch(e){}}"
+            + "function fitSoon(delay){setTimeout(function(){if(window.requestAnimationFrame){requestAnimationFrame(fit);}else{fit();}},delay||0);}"
+            + "function fitBurst(){syncViewportHeight();[0,40,120,260,520].forEach(fitSoon);}"
+            + "function setBottomPadding(px){var el=document.querySelector('#terminal .xterm');if(el){el.style.paddingBottom=px+'px';fitBurst();}}"
             + "function init(){"
+            + "syncViewportHeight();"
             + "term=new Terminal({fontFamily:'SF Mono,Menlo,ui-monospace,monospace',fontSize:12,lineHeight:1.12,cursorBlink:true,scrollback:5000,allowTransparency:false,"
             + "theme:{background:'#0d0e10',foreground:'#e6e6e8',cursor:'#b794f6',cursorAccent:'#0d0e10',selectionBackground:'rgba(183,148,246,0.3)',black:'#1a1d23',red:'#ff8272',green:'#9ae6b4',yellow:'#f6ad55',blue:'#90cdf4',magenta:'#d6bcfa',cyan:'#81e6d9',white:'#e6e6e8',brightBlack:'#5a5d68',brightRed:'#feb2b2',brightGreen:'#9ae6b4',brightYellow:'#fbd38d',brightBlue:'#90cdf4',brightMagenta:'#b794f6',brightCyan:'#81e6d9',brightWhite:'#ffffff'}});"
             + "fitAddon=new FitAddon.FitAddon();term.loadAddon(fitAddon);term.open(document.getElementById('terminal'));"
-            + "term.onData(function(d){TwBridge.input(d);});term.onResize(function(s){TwBridge.resize(s.cols,s.rows);});"
-            + "window.addEventListener('resize',function(){setTimeout(fit,40);});"
-            + "ready=true;fit();term.focus();for(var i=0;i<pending.length;i++)term.write(pending[i]);pending=[];TwBridge.ready();"
+            + "term.onData(function(d){TwBridge.input(d);});term.onResize(function(s){lastCols=s.cols;lastRows=s.rows;TwBridge.resize(s.cols,s.rows);});"
+            + "window.addEventListener('resize',fitBurst);"
+            + "if(window.visualViewport){visualViewport.addEventListener('resize',fitBurst);visualViewport.addEventListener('scroll',fitBurst);}"
+            + "if(window.ResizeObserver){var ro=new ResizeObserver(fitBurst);ro.observe(document.documentElement);ro.observe(document.body);ro.observe(document.getElementById('terminal'));}"
+            + "document.addEventListener('visibilitychange',function(){if(!document.hidden)fitBurst();});"
+            + "ready=true;fitBurst();term.focus();for(var i=0;i<pending.length;i++)term.write(pending[i]);pending=[];TwBridge.ready();"
             + "}"
             + "window.writeTerminal=function(d){if(ready)term.write(d);else pending.push(d);};"
             + "window.resetTerminal=function(d){if(ready){term.reset();if(d)term.write(d);term.focus();}else{pending=[d||''];}};"
             + "window.sendInput=function(d){if(ready){term.write(d);TwBridge.input(d);}};"
-            + "window.fitTerminal=function(){if(ready)setTimeout(fit,0);};"
+            + "window.fitTerminal=function(){if(ready)fitBurst();};"
             + "window.setTerminalChrome=function(px){if(ready)setBottomPadding(px);};"
             + "if(window.Terminal&&window.FitAddon){init();}else{document.body.textContent='Loading xterm failed';TwBridge.ready();}"
             + "</script></body></html>";
@@ -1976,7 +2026,7 @@ public class MainActivity extends Activity {
                 }
                 pendingTerminalWrites.clear();
                 updateTerminalChromePadding();
-                if (activeStreamId != null) requestTerminalFit();
+                if (activeStreamId != null) requestTerminalFitBurst();
             });
         }
 
