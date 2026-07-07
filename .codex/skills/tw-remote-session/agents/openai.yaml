@@ -1,0 +1,4 @@
+interface:
+  display_name: "TW Remote Session"
+  short_description: "Create Dashboard-friendly TW sessions on remote hosts"
+  default_prompt: "Use $tw-remote-session to create a Dashboard-managed TW worktree session on a remote host."
