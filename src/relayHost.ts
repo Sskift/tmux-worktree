@@ -764,8 +764,43 @@ if pid == 0:
 os.close(slave)
 fcntl.fcntl(master, fcntl.F_SETFL, fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)
 fcntl.fcntl(0, fcntl.F_SETFL, fcntl.fcntl(0, fcntl.F_GETFL) | os.O_NONBLOCK)
-stdout = os.fdopen(1, 'wb', 0)
 stopping = False
+
+def read_chunk(fd):
+    while True:
+        try:
+            data = os.read(fd, 65536)
+            return data if data else None
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            return b''
+        except OSError:
+            return None
+
+def wait_writable(fd):
+    try:
+        select.select([], [fd], [], 0.05)
+    except InterruptedError:
+        pass
+    except OSError:
+        pass
+
+def write_all(fd, data):
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(fd, data[offset:])
+            if written <= 0:
+                return False
+            offset += written
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            wait_writable(fd)
+        except OSError:
+            return False
+    return True
 
 def apply_resize():
     try:
@@ -792,24 +827,30 @@ apply_resize()
 
 try:
     while not stopping:
-        readable, _, _ = select.select([master, 0], [], [], 1)
+        try:
+            readable, _, _ = select.select([master, 0], [], [], 1)
+        except InterruptedError:
+            continue
+        except OSError:
+            break
         if 0 in readable:
-            try:
-                data = os.read(0, 65536)
-                if not data:
-                    break
-                os.write(master, data)
-            except OSError:
+            data = read_chunk(0)
+            if data is None:
+                break
+            if data and not write_all(master, data):
                 break
         if master in readable:
-            try:
-                data = os.read(master, 65536)
-                if not data:
-                    break
-                stdout.write(data)
-            except OSError:
+            data = read_chunk(master)
+            if data is None:
                 break
-        result = os.waitpid(pid, os.WNOHANG)
+            if data and not write_all(1, data):
+                break
+        try:
+            result = os.waitpid(pid, os.WNOHANG)
+        except InterruptedError:
+            continue
+        except ChildProcessError:
+            break
         if result[0] != 0:
             break
 except Exception:
@@ -854,6 +895,8 @@ async function openRemoteStream(
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, TERM: "xterm-256color" },
   });
+  let lastResizeCols = 0;
+  let lastResizeRows = 0;
   let cleaned = false;
   const cleanup = () => {
     if (cleaned) return;
@@ -869,6 +912,9 @@ async function openRemoteStream(
     resize: (cols, rows) => {
       const safeCols = Math.max(20, Math.min(300, Math.floor(cols)));
       const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
+      if (safeCols === lastResizeCols && safeRows === lastResizeRows) return;
+      lastResizeCols = safeCols;
+      lastResizeRows = safeRows;
       writeFileSync(resizeFile, `${safeCols},${safeRows}`);
       try { child.kill("SIGWINCH"); } catch {}
     },

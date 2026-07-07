@@ -73,3 +73,10 @@ test("remote stream resize does not reference removed mobile mirror state", () =
   const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /resize-pane[^`]+\\$\\{mobile\\}/s);
 });
+
+test("remote pty wrapper survives resize signal interruptions", () => {
+  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
+
+  assert.match(source, /except InterruptedError:\n\s+continue/);
+  assert.match(source, /if \(safeCols === lastResizeCols && safeRows === lastResizeRows\) return/);
+});

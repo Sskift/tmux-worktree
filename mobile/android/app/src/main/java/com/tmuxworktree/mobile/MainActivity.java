@@ -1957,7 +1957,7 @@ public class MainActivity extends Activity {
             + "<script src=\"https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js\"></script>"
             + "<script>"
             + "var term,fitAddon,ready=false,pending=[],lastCols=0,lastRows=0;"
-            + "function fit(){try{if(!ready||!term||!fitAddon)return;fitAddon.fit();if(term.cols&&term.rows){lastCols=term.cols;lastRows=term.rows;TwBridge.resize(term.cols,term.rows);}}catch(e){}}"
+            + "function fit(){try{if(!ready||!term||!fitAddon)return;fitAddon.fit();if(term.cols&&term.rows&&(term.cols!==lastCols||term.rows!==lastRows)){lastCols=term.cols;lastRows=term.rows;TwBridge.resize(term.cols,term.rows);}}catch(e){}}"
             + "function fitSoon(delay){setTimeout(function(){if(window.requestAnimationFrame){requestAnimationFrame(fit);}else{fit();}},delay||0);}"
             + "function fitBurst(){[0,40,120,260,520].forEach(fitSoon);}"
             + "function setBottomPadding(px){var el=document.querySelector('#terminal .xterm');if(el){el.style.paddingBottom=px+'px';fitBurst();}}"
