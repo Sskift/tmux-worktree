@@ -7346,7 +7346,7 @@ done
 printf '%s\n' "$*" >> "$log"
 
 case "$1" in
-  *"'npm'"*"'install'"*"'tmux-worktree@0.12.5'"*"'--registry=https://registry.npmjs.org'"*)
+  *"'npm'"*"'install'"*"'tmux-worktree@0.12.6'"*"'--registry=https://registry.npmjs.org'"*)
     printf 'installed\n'
     exit 0
     ;;

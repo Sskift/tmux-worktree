@@ -10,6 +10,7 @@ execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 const {
   isManagedWorktreeRow,
   isRpcManagedWorktreeSession,
+  remoteAttachCommand,
   sessionNameFromTwWorktreeDir,
 } = await import("../dist/relayHost.js");
 
@@ -55,4 +56,15 @@ test("relay host accepts TW-managed CLI and Dashboard worktree profiles from rpc
   assert.equal(isRpcManagedWorktreeSession({ kind: "terminal", profile: "dashboard", name: "tw-term-1" }), false);
   assert.equal(isRpcManagedWorktreeSession({ kind: "worktree", profile: "unknown", name: "other" }), false);
   assert.equal(isRpcManagedWorktreeSession({ kind: "worktree", profile: "dashboard" }), false);
+});
+
+test("remote attach connects directly without creating a grouped mirror session", () => {
+  const scope = { id: "mew-dev", label: "mew-dev", kind: "ssh", tmuxPath: "~/.local/bin/tmux" };
+  const command = remoteAttachCommand(scope, "x-cloud", "0");
+  assert.match(command, /export TERM=xterm-256color/);
+  assert.match(command, /has-session -t '=x-cloud'/);
+  assert.match(command, /attach-session -t '=x-cloud'/);
+  assert.doesNotMatch(command, /new-session/);
+  assert.doesNotMatch(command, /kill-session/);
+  assert.doesNotMatch(command, /tw-mobile-/);
 });

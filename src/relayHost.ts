@@ -138,12 +138,18 @@ function printHelp(): void {
 }
 
 function readServeToken(): string {
-  if (process.env.TW_TOKEN) return process.env.TW_TOKEN;
   try {
-    return readFileSync(`${homedir()}/.tw-serve-token`, "utf8").trim();
+    const token = readFileSync(`${homedir()}/.tw-serve-token`, "utf8").trim();
+    if (token) return token;
   } catch {
-    return "";
   }
+  return process.env.TW_TOKEN || "";
+}
+
+function requireServeToken(): string {
+  const token = readServeToken();
+  if (!token) throw new CliError("找不到 tw serve token。请先启动 `tw serve`，或设置 TW_TOKEN。");
+  return token;
 }
 
 function relayUrl(opts: RelayHostOptions): string {
@@ -707,20 +713,18 @@ async function killSession(session: string): Promise<void> {
   await sshOutput(scope.host!, `${remoteTmux(scope)} kill-session -t ${shQuote(`=${rawName}`)}`);
 }
 
-function remoteAttachCommand(scope: AdminScope, mobile: string, rawName: string, paneIndex: string): string {
+export function remoteAttachCommand(scope: AdminScope, rawName: string, paneIndex: string): string {
   const tmux = remoteTmux(scope);
+  const target = `=${rawName}`;
   const parts = [
     "set -e",
-    `cleanup() { ${tmux} kill-session -t ${shQuote(`=${mobile}`)} 2>/dev/null || true; }`,
-    "trap cleanup EXIT",
-    `trap ${shQuote("cleanup; exit 0")} HUP INT TERM`,
-    `${tmux} new-session -d -t ${shQuote(`=${rawName}`)} -s ${shQuote(mobile)}`,
-    `${tmux} set -t ${shQuote(mobile)} status off`,
+    "export TERM=xterm-256color",
+    `${tmux} has-session -t ${shQuote(target)}`,
   ];
-  if (paneIndex !== "0") parts.push(`${tmux} select-pane -t ${shQuote(`${mobile}:.${paneIndex}`)} 2>/dev/null || true`);
+  if (paneIndex !== "0") parts.push(`${tmux} select-pane -t ${shQuote(`${target}:.${paneIndex}`)} 2>/dev/null || true`);
   parts.push(
     "set +e",
-    `${tmux} attach-session -t ${shQuote(mobile)}`,
+    `${tmux} attach-session -t ${shQuote(target)}`,
     "status=$?",
     "exit $status",
   );
@@ -737,8 +741,7 @@ async function openRemoteStream(
   pane: string | number | undefined,
 ): Promise<void> {
   const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-  const mobile = `tw-mobile-${Math.random().toString(16).slice(2, 10)}`;
-  const child = spawn("ssh", ["-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, mobile, rawName, paneIndex)], {
+  const child = spawn("ssh", ["-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)], {
     stdio: ["pipe", "pipe", "pipe"],
   });
   const stream: LocalStream = {
@@ -808,8 +811,7 @@ async function openLocalStream(
 }
 
 async function runConnection(opts: RelayHostOptions): Promise<boolean> {
-  const token = readServeToken();
-  if (!token) throw new CliError("找不到 tw serve token。请先启动 `tw serve`，或设置 TW_TOKEN。");
+  requireServeToken();
 
   const relaySocket = new WebSocket(relayUrl(opts), {
     headers: { Authorization: `Bearer ${opts.secret}` },
@@ -844,13 +846,13 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
     const clientId = message.clientId;
     try {
       if (message.type === "list_sessions") {
-        const sessions = await listAdminSessions(opts.local, token);
+        const sessions = await listAdminSessions(opts.local, requireServeToken());
         sendJson(relaySocket, { type: "sessions", clientId, requestId: message.requestId, sessions });
         return;
       }
 
       if (message.type === "list_scope_statuses") {
-        const scopes = await listScopeStatuses(opts.local, token);
+        const scopes = await listScopeStatuses(opts.local, requireServeToken());
         sendJson(relaySocket, { type: "scope_statuses", clientId, requestId: message.requestId, scopes });
         return;
       }
@@ -877,7 +879,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 
         const { scope, rawName } = scopeForSession(message.session);
         if (scope.kind === "local") {
-          await openLocalStream(relaySocket, streams, opts.local, token, clientId, message.streamId, rawName, message.pane);
+          await openLocalStream(relaySocket, streams, opts.local, requireServeToken(), clientId, message.streamId, rawName, message.pane);
         } else {
           await openRemoteStream(relaySocket, streams, clientId, message.streamId, scope, rawName, message.pane);
         }
