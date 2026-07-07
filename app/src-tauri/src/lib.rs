@@ -135,6 +135,10 @@ struct HostConfig {
     identity_file: Option<String>,
     #[serde(default)]
     worktree_base: Option<String>,
+    #[serde(default)]
+    tmux_path: Option<String>,
+    #[serde(default)]
+    tw_path: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -435,7 +439,7 @@ fn list_remote_sessions_from_tw_rpc(host: &HostConfig) -> Result<Vec<Session>, S
 }
 
 fn remote_tw_rpc_list(host: &HostConfig) -> Result<TwRpcListResponse, String> {
-    let output = run_remote_cmd_check(host, &["tw", "rpc", "list"])?;
+    let output = run_remote_tw_check(host, &["rpc", "list"])?;
     let response: TwRpcListResponse =
         serde_json::from_str(&output).map_err(|e| format!("parse tw rpc list: {e}"))?;
     if response.protocol_version != 1 {
@@ -1463,6 +1467,42 @@ fn shell_join(args: &[&str]) -> String {
         .join(" ")
 }
 
+fn remote_path_expr(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let escaped = rest
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('$', "\\$")
+            .replace('`', "\\`");
+        return format!("\"$HOME/{escaped}\"");
+    }
+    shell_quote(trimmed)
+}
+
+fn remote_tmux_cmd(host: &HostConfig) -> String {
+    remote_path_expr(host.tmux_path.as_deref().unwrap_or("tmux"))
+}
+
+fn remote_tw_cmd(host: &HostConfig) -> String {
+    remote_path_expr(host.tw_path.as_deref().unwrap_or("tw"))
+}
+
+fn has_custom_tmux_path(host: &HostConfig) -> bool {
+    host.tmux_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+}
+
+fn has_custom_tw_path(host: &HostConfig) -> bool {
+    host.tw_path
+        .as_deref()
+        .is_some_and(|path| !path.trim().is_empty())
+}
+
 /// Build an SSH command for interactive PTY use (no BatchMode, force TTY with -tt).
 #[allow(dead_code)]
 fn ssh_command_interactive(host: &HostConfig, remote_cmd: &[&str]) -> std::process::Command {
@@ -1520,12 +1560,44 @@ fn run_remote_cmd_quiet(host: &HostConfig, remote_cmd: &[&str]) -> Option<String
     run_remote_cmd_check(host, remote_cmd).ok()
 }
 
+/// Run a tw subcommand on a remote host and return stdout.
+fn run_remote_tw_check(host: &HostConfig, tw_args: &[&str]) -> Result<String, String> {
+    if !has_custom_tmux_path(host) && !has_custom_tw_path(host) {
+        let mut full_args = Vec::with_capacity(tw_args.len() + 1);
+        full_args.push("tw");
+        full_args.extend_from_slice(tw_args);
+        return run_remote_cmd_check(host, &full_args);
+    }
+
+    let mut command = String::new();
+    if has_custom_tmux_path(host) {
+        command.push_str("TW_TMUX=");
+        command.push_str(&remote_tmux_cmd(host));
+        command.push(' ');
+    }
+    command.push_str(&remote_tw_cmd(host));
+    for arg in tw_args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    run_remote_cmd_check(host, &["sh", "-c", &command])
+}
+
 /// Run a tmux subcommand on a remote host and return stdout.
 fn run_remote_tmux_check(host: &HostConfig, tmux_args: &[&str]) -> Result<String, String> {
-    let mut full_args = Vec::with_capacity(tmux_args.len() + 1);
-    full_args.push("tmux");
-    full_args.extend_from_slice(tmux_args);
-    run_remote_cmd_check(host, &full_args)
+    if !has_custom_tmux_path(host) {
+        let mut full_args = Vec::with_capacity(tmux_args.len() + 1);
+        full_args.push("tmux");
+        full_args.extend_from_slice(tmux_args);
+        return run_remote_cmd_check(host, &full_args);
+    }
+
+    let mut command = remote_tmux_cmd(host);
+    for arg in tmux_args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    run_remote_cmd_check(host, &["sh", "-c", &command])
 }
 
 /// Quiet variant that returns None on failure.
@@ -1576,6 +1648,8 @@ fn host_from_alias(alias: &str) -> Option<HostConfig> {
         port: None,
         identity_file: None,
         worktree_base: None,
+        tmux_path: None,
+        tw_path: None,
     })
 }
 
@@ -3119,6 +3193,8 @@ fn add_host(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
             .filter(|p| !p.trim().is_empty())
             .map(|p| expand_home_path(p.trim())),
         worktree_base: None,
+        tmux_path: None,
+        tw_path: None,
     };
 
     configured_hosts.push(new_host);
@@ -3135,7 +3211,7 @@ fn remove_host(id: String) -> Result<Vec<HostConfig>, String> {
 }
 
 fn remote_tw_version(host: &HostConfig) -> Result<String, String> {
-    run_remote_cmd_check(host, &["tw", "version"])
+    run_remote_tw_check(host, &["version"])
         .map(|version| version.lines().next().unwrap_or("").trim().to_string())
 }
 
@@ -3305,6 +3381,8 @@ fn test_host(args: AddHostArgs) -> Result<HostStatus, String> {
             .filter(|p| !p.trim().is_empty())
             .map(|p| expand_home_path(p.trim())),
         worktree_base: None,
+        tmux_path: None,
+        tw_path: None,
     };
     Ok(probe_host_status(&host))
 }
@@ -4926,14 +5004,15 @@ mod tests {
         load_pending_cleanup, orphaned_worktrees, parse_session_key, project_from_config,
         projects_from_config, projects_from_config_with_home, remote_home_dir_for_host,
         remote_read_dirs_for_host, reserve_git_fetch_target, restore_worktree, run_check,
-        save_automation, save_hosts_config, save_pending_cleanup, should_skip_automation_overlap,
-        ssh_host_candidates_from_config_text, stable_output_signature, test_host,
-        tmux_session_exists, trigger_automation, try_cleanup_worktree,
-        upsert_automation_from_input, worktree_has_uncommitted_changes, worktrees_for_session,
-        AddHostArgs, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
-        AutomationTriggerType, CreateArgs, CreateTerminalArgs, DeleteWorktreeArgs,
-        EnsureTerminalArgs, GitFetchTracker, HostConfig, OrphanedWorktree, Project, RestoreArgs,
-        SaveAutomationInput, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+        run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
+        save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
+        stable_output_signature, test_host, tmux_session_exists, trigger_automation,
+        try_cleanup_worktree, upsert_automation_from_input, worktree_has_uncommitted_changes,
+        worktrees_for_session, AddHostArgs, Automation, AutomationOverlap, AutomationRun,
+        AutomationStatus, AutomationTriggerType, CreateArgs, CreateTerminalArgs,
+        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, HostConfig, OrphanedWorktree,
+        Project, RestoreArgs, SaveAutomationInput, AUTOMATION_RUN_LIMIT,
+        GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -4964,6 +5043,83 @@ mod tests {
                 std::env::remove_var(name);
             }
         }
+    }
+
+    #[test]
+    fn remote_commands_use_configured_tmux_and_tw_paths() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        let log_path = temp.path().join("ssh.log");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ssh_path = bin_dir.join("ssh");
+        fs::write(
+            &ssh_path,
+            r#"#!/bin/sh
+log="${TW_FAKE_SSH_LOG:?}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    break
+  fi
+  shift
+done
+printf '%s\n' "$*" >> "$log"
+case "$1" in
+  *'.local/bin/tmux'*'has-session'*)
+    exit 0
+    ;;
+  *'TW_TMUX='*'.local/bin/tmux'*'.local/bin/tw'*'version'*)
+    printf '0.12.6\n'
+    exit 0
+    ;;
+esac
+printf 'unexpected remote command: %s\n' "$*" >&2
+exit 12
+"#,
+        )
+        .expect("ssh shim");
+        let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ssh_path, perms).expect("ssh executable");
+
+        let original_path = std::env::var("PATH").ok();
+        let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.to_string_lossy(),
+                    original_path.clone().unwrap_or_default()
+                ),
+            );
+            std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
+        }
+
+        let host = HostConfig {
+            id: "dev".to_string(),
+            label: "Dev".to_string(),
+            host: "ssh-host".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: Some("~/.local/bin/tmux".to_string()),
+            tw_path: Some("~/.local/bin/tw".to_string()),
+        };
+
+        run_remote_tmux_check(&host, &["has-session", "-t", "=x-cloud"]).expect("configured tmux");
+        let version = run_remote_tw_check(&host, &["version"]).expect("configured tw");
+
+        assert_eq!(version, "0.12.6");
+        let log = fs::read_to_string(&log_path).expect("ssh log");
+        assert!(log.contains("$HOME/.local/bin/tmux"), "ssh log:\n{log}");
+        assert!(log.contains("$HOME/.local/bin/tw"), "ssh log:\n{log}");
+        assert!(log.contains("TW_TMUX="), "ssh log:\n{log}");
+
+        restore_env("PATH", original_path);
+        restore_env("TW_FAKE_SSH_LOG", original_log);
     }
 
     fn sample_automation() -> Automation {
@@ -6196,6 +6352,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: Some("/tmp/tmux-worktree/projects".to_string()),
+            tmux_path: None,
+            tw_path: None,
         };
         let session = create_remote_worktree(
             &host,
@@ -6303,6 +6461,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
         let session = create_remote_worktree(
             &host,
@@ -6400,6 +6560,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
         let session = create_remote_worktree(
             &host,
@@ -6494,6 +6656,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
         let err = create_remote_worktree(
             &host,
@@ -6596,6 +6760,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
 
         let sessions = list_remote_sessions(&host).expect("remote sessions");
@@ -6685,6 +6851,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
 
         let sessions = list_remote_sessions(&host).expect("remote rpc sessions");
@@ -6796,6 +6964,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
 
         let worktrees = list_remote_sessions(&host).expect("remote worktrees");
@@ -6881,6 +7051,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
 
         let terminals = list_remote_tmux_terminals(&host).expect("remote rpc terminals");
@@ -6965,6 +7137,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
 
         let home = remote_home_dir_for_host(&host).expect("remote home");
@@ -7060,6 +7234,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         };
         save_hosts_config(&[host]).expect("save hosts");
 
@@ -7152,6 +7328,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         }])
         .expect("save hosts");
 
@@ -7393,6 +7571,8 @@ exit 12
             port: None,
             identity_file: None,
             worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         }])
         .expect("save hosts");
 

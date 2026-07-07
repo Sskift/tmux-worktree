@@ -63,6 +63,8 @@ type HostConfig = {
   port?: number | null;
   identityFile?: string | null;
   worktreeBase?: string | null;
+  tmuxPath?: string | null;
+  twPath?: string | null;
 };
 
 type HostStatus = {
@@ -197,21 +199,32 @@ function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
   }
   const target = host.user ? `${host.user}@${host.host}` : host.host;
   const exact = `=${rawName}`;
+  const exactArg = shellQuoteArg(exact);
+  const tmux = remoteShellPathExpr(host.tmuxPath || "tmux");
   args.push(
     target,
     "--",
-    "tmux",
-    "set-option",
-    "-t",
-    exact,
-    "mouse",
-    "on",
-    "\\;",
-    "attach-session",
-    "-t",
-    exact,
+    [
+      "set -e",
+      "export TERM=xterm-256color",
+      `${tmux} has-session -t ${exactArg}`,
+      `exec ${tmux} attach-session -t ${exactArg}`,
+    ].join("; "),
   );
   return args;
+}
+
+function remoteShellPathExpr(value: string): string {
+  const trimmed = value.trim() || "tmux";
+  if (trimmed === "~") return '"$HOME"';
+  if (trimmed.startsWith("~/")) {
+    const escapedPath = trimmed
+      .slice(2)
+      .replace(/["\\$]/g, "\\$&")
+      .replace(/`/g, "\\`");
+    return `"$HOME/${escapedPath}"`;
+  }
+  return shellQuoteArg(trimmed);
 }
 
 function shellQuoteArg(value: string): string {

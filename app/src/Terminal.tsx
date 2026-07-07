@@ -469,6 +469,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
                 cancelled,
                 hasTmuxSession: !!tmuxSession,
                 sessionStillExists,
+                isRemote: !!hostId,
               })
             ) {
               const reconnectDelay = hostId ? 2000 : TMUX_RECONNECT_DELAY_MS;

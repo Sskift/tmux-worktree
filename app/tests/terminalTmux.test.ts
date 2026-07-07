@@ -7,11 +7,12 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
 
   assert.match(appSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
-  assert.match(appSource, /"set-option"/);
-  assert.match(appSource, /"mouse"/);
-  assert.match(appSource, /"on"/);
-  assert.match(appSource, /"\\\\;"/);
-  assert.match(appSource, /"attach-session"/);
+  assert.match(appSource, /export TERM=xterm-256color/);
+  assert.match(appSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
+  assert.match(appSource, /\$\{tmux\} has-session -t/);
+  assert.match(appSource, /exec \$\{tmux\} attach-session -t/);
+  assert.doesNotMatch(appSource, /tmux",\s*"set-option"/s);
+  assert.doesNotMatch(appSource, /"mouse",\s*"on"/s);
   assert.doesNotMatch(terminalSource, /tmux_scroll/);
   assert.doesNotMatch(terminalSource, /onTmuxWheel/);
   assert.doesNotMatch(terminalSource, /host\.addEventListener\("wheel"/);

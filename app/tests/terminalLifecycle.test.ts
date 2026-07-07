@@ -34,3 +34,15 @@ test("shouldReconnectTmuxAttach does not reconnect plain non-tmux ptys", () => {
     false,
   );
 });
+
+test("shouldReconnectTmuxAttach does not loop reconnect remote ssh attaches", () => {
+  assert.equal(
+    shouldReconnectTmuxAttach({
+      cancelled: false,
+      hasTmuxSession: true,
+      sessionStillExists: true,
+      isRemote: true,
+    }),
+    false,
+  );
+});

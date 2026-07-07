@@ -2,6 +2,7 @@ type ReconnectInput = {
   cancelled: boolean;
   hasTmuxSession: boolean;
   sessionStillExists: boolean;
+  isRemote?: boolean;
 };
 
 export const TMUX_RECONNECT_DELAY_MS = 200;
@@ -10,6 +11,7 @@ export function shouldReconnectTmuxAttach({
   cancelled,
   hasTmuxSession,
   sessionStillExists,
+  isRemote = false,
 }: ReconnectInput): boolean {
-  return !cancelled && hasTmuxSession && sessionStillExists;
+  return !isRemote && !cancelled && hasTmuxSession && sessionStillExists;
 }
