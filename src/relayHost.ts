@@ -741,6 +741,7 @@ async function openRemoteStream(
   pane: string | number | undefined,
 ): Promise<void> {
   const paneIndex = await resolvePaneIndex(scope, rawName, pane);
+  const paneTarget = `=${rawName}:.${paneIndex}`;
   const child = spawn("ssh", ["-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)], {
     stdio: ["pipe", "pipe", "pipe"],
   });
@@ -754,7 +755,7 @@ async function openRemoteStream(
       const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
       void sshOutput(
         scope.host!,
-        `${remoteTmux(scope)} resize-pane -t ${shQuote(`${mobile}:.${paneIndex}`)} -x ${safeCols} -y ${safeRows} 2>/dev/null || true`,
+        `${remoteTmux(scope)} resize-pane -t ${shQuote(paneTarget)} -x ${safeCols} -y ${safeRows} 2>/dev/null || true`,
         3000,
       ).catch(() => {});
     },

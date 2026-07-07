@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -67,4 +67,9 @@ test("remote attach connects directly without creating a grouped mirror session"
   assert.doesNotMatch(command, /new-session/);
   assert.doesNotMatch(command, /kill-session/);
   assert.doesNotMatch(command, /tw-mobile-/);
+});
+
+test("remote stream resize does not reference removed mobile mirror state", () => {
+  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /resize-pane[^`]+\\$\\{mobile\\}/s);
 });
