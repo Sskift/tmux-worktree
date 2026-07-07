@@ -20,3 +20,15 @@ test("Android package version matches current release line", () => {
   assert.match(gradle, /versionCode = 1206/);
   assert.match(gradle, /versionName = "0\.12\.6"/);
 });
+
+test("Android app declares a launcher icon", () => {
+  const manifest = readFileSync("mobile/android/app/src/main/AndroidManifest.xml", "utf8");
+  const foreground = readFileSync("mobile/android/app/src/main/res/drawable/ic_launcher_foreground.xml", "utf8");
+  const adaptive = readFileSync("mobile/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml", "utf8");
+
+  assert.match(manifest, /android:icon="@mipmap\/ic_launcher"/);
+  assert.match(manifest, /android:roundIcon="@mipmap\/ic_launcher_round"/);
+  assert.match(foreground, /<vector /);
+  assert.match(adaptive, /<adaptive-icon/);
+  assert.match(adaptive, /@drawable\/ic_launcher_foreground/);
+});
