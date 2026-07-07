@@ -11,7 +11,9 @@ test("Android terminal refits after keyboard viewport changes", () => {
   assert.match(source, /window\.visualViewport/);
   assert.match(source, /visualViewport\.addEventListener\('resize',fitBurst\)/);
   assert.match(source, /new ResizeObserver\(fitBurst\)/);
-  assert.match(source, /--app-height/);
+  assert.match(source, /html,body,#terminal\{margin:0;width:100%;height:100%;/);
+  assert.doesNotMatch(source, /--app-height/);
+  assert.doesNotMatch(source, /visualViewport\.height/);
 });
 
 test("Android package version matches current release line", () => {

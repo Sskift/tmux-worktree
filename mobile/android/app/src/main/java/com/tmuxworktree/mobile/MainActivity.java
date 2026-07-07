@@ -241,8 +241,14 @@ public class MainActivity extends Activity {
             keyboardVisible = nextKeyboardVisible;
 
             if (terminalMode) {
-                if (keyboardClosed && terminalWebView != null) {
-                    terminalWebView.requestFocus();
+                if (keyboardClosed) {
+                    if (composerVisible && composerPanel != null && composerPanel.getVisibility() == View.VISIBLE) {
+                        composerVisible = false;
+                        composerPanel.setVisibility(View.GONE);
+                        if (messageInput != null) messageInput.clearFocus();
+                        updateTerminalChromePadding();
+                    }
+                    if (terminalWebView != null) terminalWebView.requestFocus();
                 }
                 requestTerminalFitBurst();
             }
@@ -1942,7 +1948,7 @@ public class MainActivity extends Activity {
             + "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover\">"
             + "<link rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css\">"
             + "<style>"
-            + "html,body,#terminal{margin:0;width:100%;height:var(--app-height,100%);background:#0d0e10;overflow:hidden;}"
+            + "html,body,#terminal{margin:0;width:100%;height:100%;background:#0d0e10;overflow:hidden;}"
             + "body{touch-action:none;-webkit-user-select:none;user-select:none;}"
             + "#terminal .xterm{height:100%;padding:6px 4px 64px 4px;box-sizing:border-box;}"
             + ".xterm-viewport{background:#0d0e10!important;}"
@@ -1950,15 +1956,12 @@ public class MainActivity extends Activity {
             + "<script src=\"https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js\"></script>"
             + "<script src=\"https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js\"></script>"
             + "<script>"
-            + "var term,fitAddon,ready=false,pending=[],lastCols=0,lastRows=0,lastViewportHeight=0;"
-            + "function viewportHeight(){var v=window.visualViewport;return Math.max(1,Math.round((v&&v.height)||window.innerHeight||document.documentElement.clientHeight||document.body.clientHeight||1));}"
-            + "function syncViewportHeight(){var h=viewportHeight();if(h!==lastViewportHeight){lastViewportHeight=h;document.documentElement.style.setProperty('--app-height',h+'px');}}"
-            + "function fit(){try{if(!ready||!term||!fitAddon)return;syncViewportHeight();fitAddon.fit();if(term.cols&&term.rows){lastCols=term.cols;lastRows=term.rows;TwBridge.resize(term.cols,term.rows);}}catch(e){}}"
+            + "var term,fitAddon,ready=false,pending=[],lastCols=0,lastRows=0;"
+            + "function fit(){try{if(!ready||!term||!fitAddon)return;fitAddon.fit();if(term.cols&&term.rows){lastCols=term.cols;lastRows=term.rows;TwBridge.resize(term.cols,term.rows);}}catch(e){}}"
             + "function fitSoon(delay){setTimeout(function(){if(window.requestAnimationFrame){requestAnimationFrame(fit);}else{fit();}},delay||0);}"
-            + "function fitBurst(){syncViewportHeight();[0,40,120,260,520].forEach(fitSoon);}"
+            + "function fitBurst(){[0,40,120,260,520].forEach(fitSoon);}"
             + "function setBottomPadding(px){var el=document.querySelector('#terminal .xterm');if(el){el.style.paddingBottom=px+'px';fitBurst();}}"
             + "function init(){"
-            + "syncViewportHeight();"
             + "term=new Terminal({fontFamily:'SF Mono,Menlo,ui-monospace,monospace',fontSize:12,lineHeight:1.12,cursorBlink:true,scrollback:5000,allowTransparency:false,"
             + "theme:{background:'#0d0e10',foreground:'#e6e6e8',cursor:'#b794f6',cursorAccent:'#0d0e10',selectionBackground:'rgba(183,148,246,0.3)',black:'#1a1d23',red:'#ff8272',green:'#9ae6b4',yellow:'#f6ad55',blue:'#90cdf4',magenta:'#d6bcfa',cyan:'#81e6d9',white:'#e6e6e8',brightBlack:'#5a5d68',brightRed:'#feb2b2',brightGreen:'#9ae6b4',brightYellow:'#fbd38d',brightBlue:'#90cdf4',brightMagenta:'#b794f6',brightCyan:'#81e6d9',brightWhite:'#ffffff'}});"
             + "fitAddon=new FitAddon.FitAddon();term.loadAddon(fitAddon);term.open(document.getElementById('terminal'));"

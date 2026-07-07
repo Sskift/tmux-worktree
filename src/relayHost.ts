@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, hostname } from "node:os";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname } from "node:path";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { promisify } from "node:util";
@@ -40,7 +40,10 @@ type LocalStream = {
   socket?: WebSocket;
   process?: ChildProcessWithoutNullStreams;
   pending: string[];
+  opening?: boolean;
+  pendingResize?: { cols: number; rows: number };
   resize?: (cols: number, rows: number) => void;
+  cleanup?: () => void;
 };
 
 type PlainTerminal = {
@@ -625,6 +628,7 @@ function streamKey(clientId: string, streamId: string): string {
 function closeStream(stream: LocalStream): void {
   try { stream.socket?.close(); } catch {}
   try { stream.process?.kill(); } catch {}
+  try { stream.cleanup?.(); } catch {}
 }
 
 function closeClientStreams(streams: Map<string, LocalStream>, clientId: string): void {
@@ -637,6 +641,11 @@ function closeClientStreams(streams: Map<string, LocalStream>, clientId: string)
 }
 
 function sendToStream(stream: LocalStream, payload: string): "sent" | "queued" | "closed" {
+  if (stream.opening) {
+    stream.pending.push(payload);
+    return "queued";
+  }
+
   if (stream.socket) {
     if (stream.socket.readyState === WebSocket.OPEN) {
       stream.socket.send(payload);
@@ -731,6 +740,100 @@ export function remoteAttachCommand(scope: AdminScope, rawName: string, paneInde
   return parts.join("; ");
 }
 
+function remotePtyPythonScript(): string {
+  return `
+import fcntl, os, pty, select, signal, struct, sys, termios
+
+resize_file = sys.argv[1]
+ssh_args = sys.argv[2:]
+if not ssh_args:
+    sys.exit(2)
+
+master, slave = pty.openpty()
+pid = os.fork()
+if pid == 0:
+    os.setsid()
+    os.dup2(slave, 0)
+    os.dup2(slave, 1)
+    os.dup2(slave, 2)
+    os.close(master)
+    os.close(slave)
+    os.environ['TERM'] = 'xterm-256color'
+    os.execvp(ssh_args[0], ssh_args)
+
+os.close(slave)
+fcntl.fcntl(master, fcntl.F_SETFL, fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)
+fcntl.fcntl(0, fcntl.F_SETFL, fcntl.fcntl(0, fcntl.F_GETFL) | os.O_NONBLOCK)
+stdout = os.fdopen(1, 'wb', 0)
+stopping = False
+
+def apply_resize():
+    try:
+        with open(resize_file, 'r') as f:
+            parts = f.read().strip().split(',')
+        cols, rows = int(parts[0]), int(parts[1])
+        winsize = struct.pack('HHHH', rows, cols, 0, 0)
+        fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
+        os.kill(pid, signal.SIGWINCH)
+    except Exception:
+        pass
+
+def on_winch(signum, frame):
+    apply_resize()
+
+def on_stop(signum, frame):
+    global stopping
+    stopping = True
+
+signal.signal(signal.SIGWINCH, on_winch)
+signal.signal(signal.SIGTERM, on_stop)
+signal.signal(signal.SIGINT, on_stop)
+apply_resize()
+
+try:
+    while not stopping:
+        readable, _, _ = select.select([master, 0], [], [], 1)
+        if 0 in readable:
+            try:
+                data = os.read(0, 65536)
+                if not data:
+                    break
+                os.write(master, data)
+            except OSError:
+                break
+        if master in readable:
+            try:
+                data = os.read(master, 65536)
+                if not data:
+                    break
+                stdout.write(data)
+            except OSError:
+                break
+        result = os.waitpid(pid, os.WNOHANG)
+        if result[0] != 0:
+            break
+except Exception:
+    pass
+finally:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    try:
+        os.close(master)
+    except Exception:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    try:
+        os.unlink(resize_file)
+    except Exception:
+        pass
+`;
+}
+
 async function openRemoteStream(
   relaySocket: WebSocket,
   streams: Map<string, LocalStream>,
@@ -741,26 +844,36 @@ async function openRemoteStream(
   pane: string | number | undefined,
 ): Promise<void> {
   const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-  const paneTarget = `=${rawName}:.${paneIndex}`;
-  const child = spawn("ssh", ["-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)], {
+  const key = streamKey(clientId, streamId);
+  const existing = streams.get(key);
+  const pending = existing?.pending.splice(0) ?? [];
+  const pendingResize = existing?.pendingResize;
+  const resizeFile = `${tmpdir()}/tw-relay-resize-${clientId.replace(/[^a-zA-Z0-9_-]/g, "")}-${streamId.replace(/[^a-zA-Z0-9_-]/g, "")}-${randomId(6)}`;
+  const sshArgs = ["ssh", "-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)];
+  const child = spawn("python3", ["-u", "-c", remotePtyPythonScript(), resizeFile, ...sshArgs], {
     stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, TERM: "xterm-256color" },
   });
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
+    try { unlinkSync(resizeFile); } catch {}
+  };
   const stream: LocalStream = {
     clientId,
     streamId,
     process: child,
     pending: [],
+    cleanup,
     resize: (cols, rows) => {
       const safeCols = Math.max(20, Math.min(300, Math.floor(cols)));
       const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
-      void sshOutput(
-        scope.host!,
-        `${remoteTmux(scope)} resize-pane -t ${shQuote(paneTarget)} -x ${safeCols} -y ${safeRows} 2>/dev/null || true`,
-        3000,
-      ).catch(() => {});
+      writeFileSync(resizeFile, `${safeCols},${safeRows}`);
+      try { child.kill("SIGWINCH"); } catch {}
     },
   };
-  streams.set(streamKey(clientId, streamId), stream);
+  streams.set(key, stream);
   child.stdout.on("data", (data) => {
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: data.toString("utf8") });
   });
@@ -770,13 +883,17 @@ async function openRemoteStream(
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: text });
   });
   child.on("close", (code) => {
-    streams.delete(streamKey(clientId, streamId));
+    streams.delete(key);
+    cleanup();
     sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: code ?? 0 });
   });
   child.on("error", (err) => {
-    streams.delete(streamKey(clientId, streamId));
+    streams.delete(key);
+    cleanup();
     sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
   });
+  if (pendingResize) stream.resize?.(pendingResize.cols, pendingResize.rows);
+  for (const payload of pending) sendToStream(stream, payload);
 }
 
 async function openLocalStream(
@@ -790,11 +907,18 @@ async function openLocalStream(
   pane: string | number | undefined,
 ): Promise<void> {
   const paneIndex = await resolvePaneIndex({ id: "local", label: "local", kind: "local" }, rawName, pane);
+  const key = streamKey(clientId, streamId);
+  const existing = streams.get(key);
+  const pending = existing?.pending.splice(0) ?? [];
+  const pendingResize = existing?.pendingResize;
   const localSocket = new WebSocket(localWsUrl(localBase, rawName, paneIndex, token));
-  const stream: LocalStream = { clientId, streamId, socket: localSocket, pending: [] };
-  streams.set(streamKey(clientId, streamId), stream);
+  const stream: LocalStream = { clientId, streamId, socket: localSocket, pending };
+  streams.set(key, stream);
 
   localSocket.on("open", () => {
+    if (pendingResize) {
+      localSocket.send(JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows } satisfies RelayClientMessage));
+    }
     for (const payload of stream.pending.splice(0)) localSocket.send(payload);
   });
   localSocket.on("message", (chunk) => {
@@ -802,11 +926,11 @@ async function openLocalStream(
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data });
   });
   localSocket.on("close", () => {
-    streams.delete(streamKey(clientId, streamId));
+    streams.delete(key);
     sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: 0 });
   });
   localSocket.on("error", (err) => {
-    streams.delete(streamKey(clientId, streamId));
+    streams.delete(key);
     sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
   });
 }
@@ -877,12 +1001,18 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
           closeStream(previous);
           streams.delete(key);
         }
+        streams.set(key, { clientId, streamId: message.streamId, pending: [], opening: true });
 
         const { scope, rawName } = scopeForSession(message.session);
-        if (scope.kind === "local") {
-          await openLocalStream(relaySocket, streams, opts.local, requireServeToken(), clientId, message.streamId, rawName, message.pane);
-        } else {
-          await openRemoteStream(relaySocket, streams, clientId, message.streamId, scope, rawName, message.pane);
+        try {
+          if (scope.kind === "local") {
+            await openLocalStream(relaySocket, streams, opts.local, requireServeToken(), clientId, message.streamId, rawName, message.pane);
+          } else {
+            await openRemoteStream(relaySocket, streams, clientId, message.streamId, scope, rawName, message.pane);
+          }
+        } catch (err) {
+          streams.delete(key);
+          throw err;
         }
         return;
       }
@@ -923,6 +1053,10 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
           sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         }
       } else if (message.type === "resize") {
+        if (stream.opening) {
+          stream.pendingResize = { cols: message.cols, rows: message.rows };
+          return;
+        }
         if (stream.resize) {
           stream.resize(message.cols, message.rows);
           return;
