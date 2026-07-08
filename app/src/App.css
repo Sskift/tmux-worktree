@@ -1812,7 +1812,7 @@ select.field__input {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  width: min(300px, calc(100vw - 24px));
+  width: min(340px, calc(100vw - 24px));
   padding: 10px;
   background: var(--bg-2);
   border: 1px solid var(--border);
@@ -1956,22 +1956,23 @@ select.field__input {
 }
 
 .remote-popover__actions {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
 }
 
 .remote-popover__action {
-  flex: 1;
-  min-width: 74px;
+  min-width: 0;
   height: 28px;
   padding: 0 9px;
+  overflow: hidden;
   border-radius: 6px;
   background: var(--surface-muted);
   border: 1px solid var(--divider-subtle);
   color: var(--text);
   font-size: 12px;
   font-weight: 500;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
@@ -1990,7 +1991,6 @@ select.field__input {
 }
 
 .remote-popover__action--danger {
-  flex: 0 0 58px;
   color: var(--accent-b);
 }
 

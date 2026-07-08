@@ -2225,7 +2225,7 @@ function App() {
                           onClick={copyMobileLaunch}
                           disabled={!mobileRelaySecret}
                         >
-                          Copy Android Launch
+                          Copy Launch
                         </button>
                         <button
                           className="remote-popover__action remote-popover__action--primary"
@@ -2233,7 +2233,7 @@ function App() {
                           onClick={handleMobileRelayStartBroker}
                           disabled={mobileRelayBrokerStarting || mobileRelayLoading || mobileRelaySaving || !mobileRelayBrokerHostId}
                         >
-                          Switch Broker
+                          Switch
                         </button>
                         <button
                           className="remote-popover__action remote-popover__action--danger"
