@@ -1569,6 +1569,7 @@ function App() {
 
   const handleMobileRelayStartBroker = useCallback(async () => {
     if (!mobileRelayBrokerHostId) return;
+    const wasActive = mobileRelayActive;
     setMobileRelayBrokerStarting(true);
     setMobileRelayError(null);
     try {
@@ -1576,6 +1577,9 @@ function App() {
         args: { hostId: mobileRelayBrokerHostId, port: 8787 },
       });
       applyMobileRelayStatus(status);
+      if (wasActive) {
+        await invoke("mobile_relay_stop");
+      }
       await invoke("mobile_relay_start");
       const activeStatus = await invoke<MobileRelayStatus>("mobile_relay_status");
       applyMobileRelayStatus(activeStatus);
@@ -1584,7 +1588,7 @@ function App() {
     } finally {
       setMobileRelayBrokerStarting(false);
     }
-  }, [applyMobileRelayStatus, mobileRelayBrokerHostId]);
+  }, [applyMobileRelayStatus, mobileRelayActive, mobileRelayBrokerHostId]);
 
   const handleMobileRelayStop = useCallback(async () => {
     await invoke("mobile_relay_stop");
@@ -2101,7 +2105,7 @@ function App() {
                         className="remote-popover__input"
                         value={mobileRelayBrokerHostId}
                         onChange={(event) => setMobileRelayBrokerHostId(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || hosts.length === 0}
+                        disabled={mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || hosts.length === 0}
                       >
                         {hosts.length === 0 ? (
                           <option value="">No SSH hosts</option>
@@ -2191,6 +2195,14 @@ function App() {
                           disabled={!mobileRelaySecret}
                         >
                           Copy Android Launch
+                        </button>
+                        <button
+                          className="remote-popover__action remote-popover__action--primary"
+                          type="button"
+                          onClick={handleMobileRelayStartBroker}
+                          disabled={mobileRelayBrokerStarting || mobileRelayLoading || mobileRelaySaving || !mobileRelayBrokerHostId}
+                        >
+                          Switch Broker
                         </button>
                         <button
                           className="remote-popover__action remote-popover__action--danger"
