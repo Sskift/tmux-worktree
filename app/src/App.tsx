@@ -538,6 +538,8 @@ function App() {
   const [mobileRelayLoading, setMobileRelayLoading] = useState(false);
   const [mobileRelaySaving, setMobileRelaySaving] = useState(false);
   const [mobileRelayBrokerStarting, setMobileRelayBrokerStarting] = useState(false);
+  const [mobileRelayStopping, setMobileRelayStopping] = useState(false);
+  const [mobileRelayCopied, setMobileRelayCopied] = useState(false);
   const [mobileRelayError, setMobileRelayError] = useState<string | null>(null);
   const [editingFile, setEditingFile] = useState<string | null>(null);
   const [diffFile, setDiffFile] = useState<{ path: string; cwd: string; hostId?: string | null } | null>(null);
@@ -1600,7 +1602,6 @@ function App() {
 
   const handleMobileRelayStartBroker = useCallback(async () => {
     if (!mobileRelayBrokerHostId) return;
-    const wasActive = mobileRelayActive;
     setMobileRelayBrokerStarting(true);
     setMobileRelayError(null);
     try {
@@ -1608,9 +1609,6 @@ function App() {
         args: { hostId: mobileRelayBrokerHostId, port: 8787 },
       });
       applyMobileRelayStatus(status);
-      if (wasActive) {
-        await invoke("mobile_relay_stop");
-      }
       await invoke("mobile_relay_start");
       const activeStatus = await invoke<MobileRelayStatus>("mobile_relay_status");
       applyMobileRelayStatus(activeStatus);
@@ -1619,14 +1617,21 @@ function App() {
     } finally {
       setMobileRelayBrokerStarting(false);
     }
-  }, [applyMobileRelayStatus, mobileRelayActive, mobileRelayBrokerHostId]);
+  }, [applyMobileRelayStatus, mobileRelayBrokerHostId]);
 
   const handleMobileRelayStop = useCallback(async () => {
-    await invoke("mobile_relay_stop");
-    const status = await invoke<MobileRelayStatus>("mobile_relay_status");
-    applyMobileRelayStatus(status);
-    setMobileRelayPopover(false);
+    setMobileRelayStopping(true);
     setMobileRelayError(null);
+    try {
+      await invoke("mobile_relay_stop");
+      const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+      applyMobileRelayStatus(status);
+      setMobileRelayPopover(false);
+    } catch (err) {
+      setMobileRelayError(String(err));
+    } finally {
+      setMobileRelayStopping(false);
+    }
   }, [applyMobileRelayStatus]);
 
   const copyMobileLaunch = useCallback(() => {
@@ -1638,6 +1643,8 @@ function App() {
       "  --ez autoConnect true",
     ].join(" \\\n");
     void navigator.clipboard.writeText(command);
+    setMobileRelayCopied(true);
+    window.setTimeout(() => setMobileRelayCopied(false), 1200);
   }, [mobileRelayHostId, mobileRelaySecret, mobileRelayUrl]);
 
   const copyMobileRelayValue = useCallback((value: string) => {
@@ -2068,10 +2075,19 @@ function App() {
     );
   };
 
-  const mobileRelayStatus = mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting ? "starting" : mobileRelayActive ? "running" : "stopped";
-  const mobileRelayStatusText = mobileRelayBrokerStarting ? "Starting broker" : mobileRelayLoading ? "Starting" : mobileRelaySaving ? "Saving" : mobileRelayActive ? "Running" : "Stopped";
+  const mobileRelayBusy = mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || mobileRelayStopping;
+  const mobileRelayStatus = mobileRelayBusy ? "starting" : mobileRelayActive ? "running" : "stopped";
+  const mobileRelayStatusText = mobileRelayBrokerStarting
+    ? "Starting broker"
+    : mobileRelayLoading
+      ? "Starting"
+      : mobileRelaySaving
+        ? "Saving"
+        : mobileRelayStopping
+          ? "Stopping"
+          : mobileRelayActive ? "Running" : "Stopped";
   const mobileRelayTokenState = mobileRelaySecret ? "Configured" : "Missing";
-  const mobileRelayButtonActive = mobileRelayActive || mobileRelayPopover || mobileRelayLoading || mobileRelayBrokerStarting;
+  const mobileRelayButtonActive = mobileRelayActive || mobileRelayPopover || mobileRelayBusy;
 
   return (
     <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
@@ -2136,7 +2152,7 @@ function App() {
                         className="remote-popover__input"
                         value={mobileRelayBrokerHostId}
                         onChange={(event) => setMobileRelayBrokerHostId(event.target.value)}
-                        disabled={mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || hosts.length === 0}
+                        disabled={mobileRelayBusy || mobileRelayActive || hosts.length === 0}
                       >
                         {hosts.length === 0 ? (
                           <option value="">No SSH hosts</option>
@@ -2156,7 +2172,7 @@ function App() {
                         className="remote-popover__input"
                         value={mobileRelayDraftUrl}
                         onChange={(event) => setMobileRelayDraftUrl(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayLoading || mobileRelaySaving}
+                        disabled={mobileRelayActive || mobileRelayBusy}
                         spellCheck={false}
                       />
                       <button
@@ -2175,7 +2191,7 @@ function App() {
                         className="remote-popover__input"
                         value={mobileRelayDraftHostId}
                         onChange={(event) => setMobileRelayDraftHostId(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayLoading || mobileRelaySaving}
+                        disabled={mobileRelayActive || mobileRelayBusy}
                         spellCheck={false}
                       />
                       <button
@@ -2195,7 +2211,7 @@ function App() {
                         type="password"
                         value={mobileRelayDraftSecret}
                         onChange={(event) => setMobileRelayDraftSecret(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayLoading || mobileRelaySaving}
+                        disabled={mobileRelayActive || mobileRelayBusy}
                         placeholder={mobileRelayTokenState}
                         spellCheck={false}
                       />
@@ -2216,31 +2232,24 @@ function App() {
                     <div className="remote-popover__error">{mobileRelayError}</div>
                   )}
 
-                  <div className="remote-popover__actions">
+                  <div className={`remote-popover__actions${mobileRelayActive ? " remote-popover__actions--active" : ""}`}>
                     {mobileRelayActive ? (
                       <>
                         <button
                           className="remote-popover__action"
                           type="button"
                           onClick={copyMobileLaunch}
-                          disabled={!mobileRelaySecret}
+                          disabled={!mobileRelaySecret || mobileRelayBusy}
                         >
-                          Copy Launch
-                        </button>
-                        <button
-                          className="remote-popover__action remote-popover__action--primary"
-                          type="button"
-                          onClick={handleMobileRelayStartBroker}
-                          disabled={mobileRelayBrokerStarting || mobileRelayLoading || mobileRelaySaving || !mobileRelayBrokerHostId}
-                        >
-                          Switch
+                          {mobileRelayCopied ? "Copied" : "Copy Launch"}
                         </button>
                         <button
                           className="remote-popover__action remote-popover__action--danger"
                           type="button"
                           onClick={handleMobileRelayStop}
+                          disabled={mobileRelayBusy}
                         >
-                          Stop
+                          {mobileRelayStopping ? "Stopping" : "Stop"}
                         </button>
                       </>
                     ) : (
@@ -2249,25 +2258,25 @@ function App() {
                           className="remote-popover__action"
                           type="button"
                           onClick={handleMobileRelayStartBroker}
-                          disabled={mobileRelayBrokerStarting || mobileRelayLoading || mobileRelaySaving || !mobileRelayBrokerHostId}
+                          disabled={mobileRelayBusy || !mobileRelayBrokerHostId}
                         >
-                          Start Broker
+                          {mobileRelayBrokerStarting ? "Starting" : "Start Broker"}
                         </button>
                         <button
                           className="remote-popover__action"
                           type="button"
                           onClick={handleMobileRelaySave}
-                          disabled={mobileRelaySaving || mobileRelayLoading || mobileRelayBrokerStarting}
+                          disabled={mobileRelayBusy}
                         >
-                          Save
+                          {mobileRelaySaving ? "Saving" : "Save"}
                         </button>
                         <button
                           className="remote-popover__action remote-popover__action--primary"
                           type="button"
                           onClick={handleMobileRelayStart}
-                          disabled={mobileRelaySaving || mobileRelayLoading || mobileRelayBrokerStarting || !mobileRelayDraftSecret.trim()}
+                          disabled={mobileRelayBusy || !mobileRelayDraftSecret.trim()}
                         >
-                          Start
+                          {mobileRelayLoading ? "Starting" : "Start"}
                         </button>
                       </>
                     )}
