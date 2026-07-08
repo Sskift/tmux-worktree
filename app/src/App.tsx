@@ -261,6 +261,30 @@ function terminalSessionKey(terminal: PlainTerminal): string {
   return terminal.hostId ? `${terminal.hostId}:${terminalRawName(terminal)}` : terminalRawName(terminal);
 }
 
+function isInternalTerminalName(value: string | null | undefined): boolean {
+  return !!value && value.startsWith("tw-term-");
+}
+
+function basenameFromPath(value: string | null | undefined): string {
+  const parts = (value ?? "").split("/").filter(Boolean);
+  return parts[parts.length - 1] ?? "";
+}
+
+function normalizePlainTerminal(terminal: PlainTerminal): PlainTerminal {
+  const hostId = terminal.hostId === "local" ? null : terminal.hostId ?? null;
+  const rawName = terminal.rawName || terminalRawName({ ...terminal, hostId });
+  const fallbackLabel = basenameFromPath(terminal.cwd) || "terminal";
+  const label = !terminal.label || isInternalTerminalName(terminal.label)
+    ? fallbackLabel
+    : terminal.label;
+  return { ...terminal, hostId, rawName, label };
+}
+
+function isLocalDiscoveredInternalTerminal(terminal: PlainTerminal): boolean {
+  if (terminal.hostId) return false;
+  return isInternalTerminalName(terminal.rawName) || isInternalTerminalName(terminal.tmuxName);
+}
+
 function sameStringArray(a: string[], b: string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
@@ -461,6 +485,7 @@ function App() {
   const [sessions, setSessions] = useState<Session[]>([]);
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
   const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
+  const [terminalsRestoreReady, setTerminalsRestoreReady] = useState(false);
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -810,29 +835,31 @@ function App() {
   useEffect(() => {
     invoke<PlainTerminal[]>("load_terminals")
       .then(async (saved) => {
-        if (saved.length > 0) {
-          const maxNum = saved.reduce((max, t) => {
+        const restored = saved
+          .filter((t) => t.tmuxName)
+          .map(normalizePlainTerminal);
+        if (restored.length > 0) {
+          const maxNum = restored.reduce((max, t) => {
             const m = t.id.match(/^term-(\d+)$/);
             return m ? Math.max(max, parseInt(m[1], 10)) : max;
           }, 0);
           termIdCounter = maxNum;
-          for (const t of saved) {
-            if (t.tmuxName) {
-              await invoke("ensure_terminal_session", {
-                args: {
-                  name: t.tmuxName,
-                  cwd: t.cwd,
-                  aiCmd: t.aiCmd ?? "",
-                  hostId: t.hostId ?? null,
-                  rawName: t.rawName ?? null,
-                },
-              }).catch(() => {});
-            }
+          for (const t of restored) {
+            await invoke("ensure_terminal_session", {
+              args: {
+                name: t.tmuxName,
+                cwd: t.cwd,
+                aiCmd: t.aiCmd ?? "",
+                hostId: t.hostId ?? null,
+                rawName: t.rawName ?? null,
+              },
+            }).catch(() => {});
           }
-          setTerminals(saved.filter((t) => t.tmuxName));
+          setTerminals(restored);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setTerminalsRestoreReady(true));
     invoke<Record<string, unknown>>("load_layout")
       .then((lay) => {
         const restoredFileBrowserOpen =
@@ -900,8 +927,9 @@ function App() {
 
   // Persist terminals
   useEffect(() => {
+    if (!terminalsRestoreReady) return;
     invoke("save_terminals", { terminals }).catch(() => {});
-  }, [terminals]);
+  }, [terminals, terminalsRestoreReady]);
 
   // Persist layout (debounced)
   useEffect(() => {
@@ -1279,7 +1307,10 @@ function App() {
     const persistedKeys = new Set(terminals.map(terminalSessionKey));
     return [
       ...terminals,
-      ...discoveredTerminals.filter((terminal) => !persistedKeys.has(terminalSessionKey(terminal))),
+      ...discoveredTerminals
+        .filter((terminal) => !isLocalDiscoveredInternalTerminal(terminal))
+        .filter((terminal) => !persistedKeys.has(terminalSessionKey(terminal)))
+        .map(normalizePlainTerminal),
     ];
   }, [terminals, discoveredTerminals]);
 

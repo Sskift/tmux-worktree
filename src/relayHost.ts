@@ -232,7 +232,7 @@ function registerDashboardTerminal(scope: AdminScope, name: string, cwd: string,
     id: `term-${Date.now()}-${randomId(4)}`,
     label: label || basename(cwd) || name,
     cwd,
-    hostId: scope.id,
+    ...(scope.kind === "ssh" ? { hostId: scope.id } : {}),
     rawName: name,
     tmuxName: name,
   });
