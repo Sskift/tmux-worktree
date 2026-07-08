@@ -191,6 +191,15 @@ function isPositionInRange(pos: BufferPosition, start: BufferPosition, end: Buff
 }
 
 function getBufferPositionFromMouse(term: XTerm, event: MouseEvent): BufferPosition | null {
+  const viewportPos = getViewportPositionFromMouse(term, event);
+  if (!viewportPos) return null;
+  return {
+    x: viewportPos.x,
+    y: term.buffer.active.viewportY + viewportPos.y,
+  };
+}
+
+function getViewportPositionFromMouse(term: XTerm, event: MouseEvent): BufferPosition | null {
   const screen = term.element?.querySelector(".xterm-screen") as HTMLElement | null;
   if (!screen) return null;
 
@@ -217,8 +226,12 @@ function getBufferPositionFromMouse(term: XTerm, event: MouseEvent): BufferPosit
 
   return {
     x,
-    y: term.buffer.active.viewportY + viewportY,
+    y: viewportY,
   };
+}
+
+function sgrMouseWheel(button: 64 | 65, pos: BufferPosition): string {
+  return `\x1b[<${button};${pos.x};${pos.y}M`;
 }
 
 function getLinkAtPosition(term: XTerm, pos: BufferPosition): ResolvedLink | null {
@@ -376,6 +389,43 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     host.addEventListener("mousedown", onMetaMouseDown, true);
     host.addEventListener("mouseup", onMetaMouseUp, true);
 
+    let wheelAccum = 0;
+    const handleRemoteWheel = (event: WheelEvent): boolean => {
+      if (!hostId || !ptyId || event.deltaY === 0) return true;
+      const pos = getViewportPositionFromMouse(term, event);
+      if (!pos) return true;
+
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+
+      const deltaLines = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL
+        ? event.deltaY / 35
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? event.deltaY * Math.max(1, term.rows)
+          : event.deltaY;
+      wheelAccum += deltaLines;
+
+      const steps = Math.min(12, Math.floor(Math.abs(wheelAccum)));
+      if (steps <= 0) return false;
+      const button: 64 | 65 = wheelAccum > 0 ? 65 : 64;
+      wheelAccum -= Math.sign(wheelAccum) * steps;
+
+      let data = "";
+      for (let i = 0; i < steps; i++) {
+        data += sgrMouseWheel(button, pos);
+      }
+      invoke("pty_write", { id: ptyId, data }).catch(() => {});
+      return false;
+    };
+    const onRemoteWheel = (event: WheelEvent) => {
+      handleRemoteWheel(event);
+    };
+    if (hostId) {
+      term.attachCustomWheelEventHandler(handleRemoteWheel);
+      host.addEventListener("wheel", onRemoteWheel, { capture: true, passive: false });
+    }
+
     termRef.current = term;
     fitRef.current = fit;
 
@@ -525,6 +575,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
       ro.disconnect();
       host.removeEventListener("mousedown", onMetaMouseDown, true);
       host.removeEventListener("mouseup", onMetaMouseUp, true);
+      if (hostId) host.removeEventListener("wheel", onRemoteWheel, true);
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       unlistenChunk?.();

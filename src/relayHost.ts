@@ -265,6 +265,39 @@ export function sessionNameFromTwWorktreeDir(dirname: string): string | null {
   return null;
 }
 
+function firstPathSegment(value: string): string | undefined {
+  return value.split("/").find((part) => part.trim().length > 0);
+}
+
+export function projectNameFromTwWorktreePath(cwd: string, worktreeBase?: string): string | undefined {
+  const normalized = cwd.trim().replace(/\/+$/, "");
+  if (!normalized) return undefined;
+  const baseCandidates = [];
+  const base = worktreeBase?.trim().replace(/\/+$/, "");
+  if (base) {
+    baseCandidates.push(base);
+    if (base.startsWith("~/")) baseCandidates.push(base.slice(1));
+  }
+
+  for (const candidate of baseCandidates) {
+    if (!candidate) continue;
+    if (normalized.startsWith(`${candidate}/`)) {
+      return firstPathSegment(normalized.slice(candidate.length + 1));
+    }
+    const index = normalized.indexOf(`${candidate}/`);
+    if (index >= 0) {
+      return firstPathSegment(normalized.slice(index + candidate.length + 1));
+    }
+  }
+
+  const marker = "/.tmux-worktree/worktrees/";
+  const markerIndex = normalized.indexOf(marker);
+  if (markerIndex >= 0) {
+    return firstPathSegment(normalized.slice(markerIndex + marker.length));
+  }
+  return undefined;
+}
+
 function isWorktreeCwd(cwd: string, scope: AdminScope): boolean {
   if (!cwd) return false;
   if (scope.worktreeBase) {
@@ -288,13 +321,17 @@ async function remotePathHasGitEntry(scope: AdminScope, cwd: string): Promise<bo
   return stdout.trim() === "yes";
 }
 
-function relaySession(scope: AdminScope, row: TmuxRow, kind: "worktree" | "terminal", label?: string): RelaySession {
+function relaySession(scope: AdminScope, row: TmuxRow, kind: "worktree" | "terminal", label?: string, project?: string): RelaySession {
+  const inferredProject = kind === "worktree"
+    ? project?.trim() || projectNameFromTwWorktreePath(row.cwd, scope.worktreeBase)
+    : undefined;
   return {
     name: sessionKey(scope, row.name),
     rawName: row.name,
     scopeId: scope.id,
     scopeLabel: scope.label,
     kind,
+    project: inferredProject,
     label: label || row.name,
     cwd: row.cwd,
     attached: row.attached,
@@ -398,7 +435,7 @@ async function rpcSessions(scope: AdminScope): Promise<RelaySession[] | null> {
       created: Number(session.created) || 0,
       activity: Number(session.activity) || 0,
       cwd,
-    }, "worktree", session.name)];
+    }, "worktree", session.name, session.project)];
   });
 }
 
@@ -596,7 +633,7 @@ async function createWorktreeSession(message: Extract<RelayClientMessage, { type
     created: Math.floor(Date.now() / 1000),
     activity: Math.floor(Date.now() / 1000),
     cwd: parsed.worktreePath || target.path,
-  }, "worktree", parsed.session);
+  }, "worktree", parsed.session, target.projectName);
 }
 
 async function createPlainTerminalSession(message: Extract<RelayClientMessage, { type: "create_terminal" }>): Promise<RelaySession> {
@@ -729,6 +766,7 @@ export function remoteAttachCommand(scope: AdminScope, rawName: string, paneInde
     "set -e",
     "export TERM=xterm-256color",
     `${tmux} has-session -t ${shQuote(target)}`,
+    `${tmux} set-option -g mouse on >/dev/null 2>&1 || true`,
   ];
   if (paneIndex !== "0") parts.push(`${tmux} select-pane -t ${shQuote(`${target}:.${paneIndex}`)} 2>/dev/null || true`);
   parts.push(

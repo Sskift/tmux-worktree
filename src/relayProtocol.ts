@@ -4,6 +4,7 @@ export type RelaySession = {
   scopeId?: string;
   scopeLabel?: string;
   kind?: "session" | "worktree" | "terminal";
+  project?: string;
   label?: string;
   cwd?: string;
   attached: boolean;

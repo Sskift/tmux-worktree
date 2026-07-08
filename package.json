@@ -1,6 +1,6 @@
 {
   "name": "tmux-worktree",
-  "version": "0.12.7",
+  "version": "0.12.8",
   "type": "module",
   "description": "AI + tmux + git worktree workspace manager with a macOS Dashboard, local sessions, automations, and SSH remote TW-managed worktrees",
   "repository": {

@@ -40,6 +40,7 @@ import org.json.JSONObject;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -773,22 +774,38 @@ public class MainActivity extends Activity {
     private void renderSessionRows() {
         if (dashboardList == null) return;
         dashboardList.removeAllViews();
-        int worktrees = 0;
         int terminals = 0;
+        Map<String, List<RelaySession>> worktreeGroups = new LinkedHashMap<>();
+        Map<String, String> worktreeGroupTitles = new LinkedHashMap<>();
         for (RelaySession session : sessions) {
             if ("terminal".equals(session.kind)) {
                 terminals++;
             } else {
-                addDashboardSessionRow(session);
-                worktrees++;
+                String key = worktreeGroupKey(session);
+                List<RelaySession> group = worktreeGroups.get(key);
+                if (group == null) {
+                    group = new ArrayList<>();
+                    worktreeGroups.put(key, group);
+                    worktreeGroupTitles.put(key, worktreeGroupTitle(session));
+                }
+                group.add(session);
             }
         }
-        if (worktrees == 0) {
+        if (worktreeGroups.isEmpty()) {
             dashboardList.addView(emptyInlineText(isConnected ? "No WorkTrees" : "Connecting..."), matchWrapMargin(0, 8, 0, 8));
+        } else {
+            boolean firstGroup = true;
+            for (Map.Entry<String, List<RelaySession>> entry : worktreeGroups.entrySet()) {
+                addWorktreeGroupHeader(worktreeGroupTitles.get(entry.getKey()), entry.getValue().size(), firstGroup);
+                firstGroup = false;
+                for (RelaySession session : entry.getValue()) {
+                    addDashboardSessionRow(session);
+                }
+            }
         }
 
         TextView terminalsLabel = smallLabel("Terminals");
-        terminalsLabel.setPadding(0, worktrees == 0 ? dp(10) : dp(8), 0, dp(2));
+        terminalsLabel.setPadding(0, worktreeGroups.isEmpty() ? dp(10) : dp(8), 0, dp(2));
         dashboardList.addView(terminalsLabel, matchWrap());
 
         if (terminals == 0) {
@@ -800,6 +817,48 @@ public class MainActivity extends Activity {
                 addDashboardSessionRow(session);
             }
         }
+    }
+
+    private void addWorktreeGroupHeader(String title, int count, boolean firstGroup) {
+        TextView header = new TextView(this);
+        String safeTitle = title == null || title.isEmpty() ? "WorkTrees" : title;
+        header.setText(safeTitle + "  " + count);
+        header.setTextSize(12);
+        header.setTypeface(Typeface.DEFAULT_BOLD);
+        header.setTextColor(TEXT_SECOND);
+        header.setSingleLine(true);
+        header.setEllipsize(TextUtils.TruncateAt.END);
+        header.setPadding(dp(2), firstGroup ? dp(2) : dp(9), dp(2), dp(3));
+        dashboardList.addView(header, matchWrap());
+    }
+
+    private String worktreeGroupKey(RelaySession session) {
+        return session.hostId + "\u001f" + session.scopeId + "\u001f" + sessionProject(session);
+    }
+
+    private String worktreeGroupTitle(RelaySession session) {
+        String project = sessionProject(session);
+        String scope = session.scopeLabel.isEmpty() ? session.hostName : session.scopeLabel;
+        if (project.isEmpty()) return scope.isEmpty() ? "WorkTrees" : scope;
+        if (scope.isEmpty() || "local".equals(scope)) return project;
+        return project + " / " + scope;
+    }
+
+    private String sessionProject(RelaySession session) {
+        if (session == null) return "";
+        if (!session.project.isEmpty()) return session.project;
+        return inferProjectFromCwd(session.cwd);
+    }
+
+    private static String inferProjectFromCwd(String cwd) {
+        if (cwd == null || cwd.isEmpty()) return "";
+        String marker = "/.tmux-worktree/worktrees/";
+        int index = cwd.indexOf(marker);
+        if (index < 0) return "";
+        String rest = cwd.substring(index + marker.length());
+        int slash = rest.indexOf("/");
+        String project = slash >= 0 ? rest.substring(0, slash) : rest;
+        return project.trim();
     }
 
     private void addDashboardSessionRow(RelaySession session) {
@@ -2250,6 +2309,7 @@ public class MainActivity extends Activity {
             item.optString("scopeId"),
             item.optString("scopeLabel"),
             item.optString("kind", "session"),
+            item.optString("project"),
             item.optString("label"),
             item.optString("cwd"),
             item.optBoolean("attached"),
@@ -2506,6 +2566,7 @@ public class MainActivity extends Activity {
         final String scopeId;
         final String scopeLabel;
         final String kind;
+        final String project;
         final String label;
         final String cwd;
         final boolean attached;
@@ -2513,7 +2574,7 @@ public class MainActivity extends Activity {
         final long created;
         final long activity;
 
-        RelaySession(String hostId, String hostName, String name, String rawName, String scopeId, String scopeLabel, String kind, String label, String cwd, boolean attached, int windows, long created, long activity) {
+        RelaySession(String hostId, String hostName, String name, String rawName, String scopeId, String scopeLabel, String kind, String project, String label, String cwd, boolean attached, int windows, long created, long activity) {
             this.hostId = hostId == null ? "" : hostId;
             this.hostName = hostName == null || hostName.isEmpty() ? this.hostId : hostName;
             this.name = name == null ? "" : name;
@@ -2521,6 +2582,7 @@ public class MainActivity extends Activity {
             this.scopeId = scopeId == null ? "" : scopeId;
             this.scopeLabel = scopeLabel == null ? "" : scopeLabel;
             this.kind = kind == null || kind.isEmpty() ? "session" : kind;
+            this.project = project == null ? "" : project;
             this.label = label == null ? "" : label;
             this.cwd = cwd == null ? "" : cwd;
             this.attached = attached;

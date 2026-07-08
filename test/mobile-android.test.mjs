@@ -20,8 +20,19 @@ test("Android terminal refits after keyboard viewport changes", () => {
 test("Android package version matches current release line", () => {
   const gradle = readFileSync("mobile/android/app/build.gradle.kts", "utf8");
 
-  assert.match(gradle, /versionCode = 1206/);
-  assert.match(gradle, /versionName = "0\.12\.6"/);
+  assert.match(gradle, /versionCode = 1208/);
+  assert.match(gradle, /versionName = "0\.12\.8"/);
+});
+
+test("Android worktree list groups sessions by project", () => {
+  const source = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
+
+  assert.match(source, /import java\.util\.LinkedHashMap;/);
+  assert.match(source, /item\.optString\("project"\)/);
+  assert.match(source, /final String project;/);
+  assert.match(source, /worktreeGroupKey\(RelaySession session\)/);
+  assert.match(source, /sessionProject\(RelaySession session\)/);
+  assert.match(source, /\/\.tmux-worktree\/worktrees\//);
 });
 
 test("Android app declares a launcher icon", () => {

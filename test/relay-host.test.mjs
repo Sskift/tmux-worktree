@@ -10,6 +10,7 @@ execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 const {
   isManagedWorktreeRow,
   isRpcManagedWorktreeSession,
+  projectNameFromTwWorktreePath,
   remoteAttachCommand,
   sessionNameFromTwWorktreeDir,
 } = await import("../dist/relayHost.js");
@@ -39,6 +40,8 @@ test("relay host fallback only accepts TW-shaped managed worktree sessions", () 
     });
 
     assert.equal(sessionNameFromTwWorktreeDir("demo-task-abc12"), "demo-task");
+    assert.equal(projectNameFromTwWorktreePath(managed, base), "demo");
+    assert.equal(projectNameFromTwWorktreePath("/home/dev/.tmux-worktree/worktrees/api/api-fix-abc12", "~/.tmux-worktree/worktrees"), "api");
     assert.equal(sessionNameFromTwWorktreeDir("demo-task"), null);
     assert.equal(isManagedWorktreeRow(scope, row("demo-task", managed)), true);
     assert.equal(isManagedWorktreeRow(scope, row("demo-task", noSuffix)), false);
@@ -63,10 +66,22 @@ test("remote attach connects directly without creating a grouped mirror session"
   const command = remoteAttachCommand(scope, "x-cloud", "0");
   assert.match(command, /export TERM=xterm-256color/);
   assert.match(command, /has-session -t '=x-cloud'/);
+  assert.match(command, /set-option -g mouse on/);
   assert.match(command, /attach-session -t '=x-cloud'/);
   assert.doesNotMatch(command, /new-session/);
   assert.doesNotMatch(command, /kill-session/);
   assert.doesNotMatch(command, /tw-mobile-/);
+});
+
+test("dashboard remote terminal forwards wheel events as tmux mouse input", () => {
+  const terminalSource = readFileSync(new URL("../app/src/Terminal.tsx", import.meta.url), "utf8");
+  const appSource = readFileSync(new URL("../app/src/App.tsx", import.meta.url), "utf8");
+
+  assert.match(appSource, /set-option -g mouse on/);
+  assert.match(terminalSource, /function sgrMouseWheel/);
+  assert.match(terminalSource, /attachCustomWheelEventHandler\(handleRemoteWheel\)/);
+  assert.match(terminalSource, /addEventListener\("wheel", onRemoteWheel/);
+  assert.match(terminalSource, /WheelEvent\.DOM_DELTA_PIXEL/);
 });
 
 test("remote stream resize does not reference removed mobile mirror state", () => {

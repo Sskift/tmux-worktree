@@ -210,6 +210,7 @@ function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
       "set -e",
       "export TERM=xterm-256color",
       `${tmux} has-session -t ${exactArg}`,
+      `${tmux} set-option -g mouse on >/dev/null 2>&1 || true`,
       `exec ${tmux} attach-session -t ${exactArg}`,
     ].join("; "),
   );
