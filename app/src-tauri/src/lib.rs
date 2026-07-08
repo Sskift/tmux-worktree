@@ -4721,21 +4721,236 @@ struct MobileRelayStatus {
     error: Option<String>,
 }
 
-fn mobile_relay_config() -> (String, String, String, String) {
-    let relay_url = std::env::var("TW_RELAY_URL")
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileRelayConfigInput {
+    relay_url: String,
+    host_id: String,
+    secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MobileRelayBrokerInput {
+    host_id: String,
+    port: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct MobileRelayConfig {
+    relay_url: String,
+    host_id: String,
+    display_name: String,
+    secret: String,
+}
+
+fn config_string_field(config: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    let object = config.as_object()?;
+    fields.iter().find_map(|field| {
+        object
+            .get(*field)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn mobile_relay_config_from_value(config: &serde_json::Value) -> MobileRelayConfig {
+    let relay = config
+        .get("mobileRelay")
+        .or_else(|| config.get("relay"))
+        .unwrap_or(config);
+    MobileRelayConfig {
+        relay_url: config_string_field(relay, &["relayUrl", "url", "broker", "brokerUrl"])
+            .or_else(|| config_string_field(config, &["mobileRelayUrl", "relayUrl"]))
+            .unwrap_or_default(),
+        host_id: config_string_field(relay, &["hostId", "host", "adminHostId"])
+            .or_else(|| config_string_field(config, &["mobileRelayHostId", "relayHostId"]))
+            .unwrap_or_default(),
+        display_name: config_string_field(relay, &["displayName", "name", "label"])
+            .or_else(|| config_string_field(config, &["mobileRelayDisplayName", "relayDisplayName"]))
+            .unwrap_or_default(),
+        secret: config_string_field(relay, &["secret", "token", "relaySecret"])
+            .or_else(|| config_string_field(config, &["mobileRelaySecret", "relaySecret"]))
+            .unwrap_or_default(),
+    }
+}
+
+fn load_mobile_relay_config_file() -> MobileRelayConfig {
+    let Some(home) = app_home_dir() else {
+        return MobileRelayConfig::default();
+    };
+    let config_path = home.join(".tmux-worktree.json");
+    let Ok(content) = std::fs::read_to_string(config_path) else {
+        return MobileRelayConfig::default();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return MobileRelayConfig::default();
+    };
+    mobile_relay_config_from_value(&config)
+}
+
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
         .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "wss://relay.example.com".to_string());
-    let host_id = std::env::var("TW_RELAY_HOST_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "mac-admin".to_string());
-    let display_name = std::env::var("TW_RELAY_DISPLAY_NAME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn config_or_default(value: &str, default: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        default.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn mobile_relay_config() -> MobileRelayConfig {
+    let file = load_mobile_relay_config_file();
+    MobileRelayConfig {
+        relay_url: env_non_empty("TW_RELAY_URL")
+            .unwrap_or_else(|| config_or_default(&file.relay_url, "wss://relay.example.com")),
+        host_id: env_non_empty("TW_RELAY_HOST_ID")
+            .unwrap_or_else(|| config_or_default(&file.host_id, "mac-admin")),
+        display_name: env_non_empty("TW_RELAY_DISPLAY_NAME")
+            .unwrap_or_else(|| config_or_default(&file.display_name, "Mac Admin")),
+        secret: env_non_empty("TW_RELAY_SECRET").unwrap_or_else(|| file.secret.trim().to_string()),
+    }
+}
+
+fn save_mobile_relay_config_file(args: &MobileRelayConfigInput) -> Result<MobileRelayConfig, String> {
+    let home = app_home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let mut config: serde_json::Value = if config_path.exists() {
+        let text =
+            std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?
+    } else {
+        serde_json::json!({})
+    };
+    let root = config
+        .as_object_mut()
+        .ok_or("config root is not an object")?;
+    let existing_display_name = root
+        .get("mobileRelay")
+        .and_then(|value| config_string_field(value, &["displayName", "name", "label"]))
         .unwrap_or_else(|| "Mac Admin".to_string());
-    let secret = std::env::var("TW_RELAY_SECRET").unwrap_or_default();
-    (relay_url, host_id, display_name, secret)
+    root.insert(
+        "mobileRelay".to_string(),
+        serde_json::json!({
+            "relayUrl": args.relay_url.trim(),
+            "hostId": args.host_id.trim(),
+            "displayName": existing_display_name,
+            "secret": args.secret.trim(),
+        }),
+    );
+    let pretty =
+        serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
+    std::fs::write(&config_path, format!("{pretty}\n")).map_err(|e| format!("write config: {e}"))?;
+    Ok(MobileRelayConfig {
+        relay_url: args.relay_url.trim().to_string(),
+        host_id: args.host_id.trim().to_string(),
+        display_name: existing_display_name,
+        secret: args.secret.trim().to_string(),
+    })
+}
+
+fn mobile_relay_secret() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn scp_remote_target(host: &HostConfig, remote_path: &str) -> String {
+    let target = match &host.user {
+        Some(user) => format!("{user}@{}", host.host),
+        None => host.host.clone(),
+    };
+    format!("{target}:{remote_path}")
+}
+
+fn scp_cli_to_host(host: &HostConfig, cli: &Path, remote_path: &str) -> Result<(), String> {
+    let mut cmd = std::process::Command::new("scp");
+    cmd.arg("-q")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=accept-new")
+        .arg("-o")
+        .arg("ConnectTimeout=5");
+    if let Some(port) = host.port {
+        cmd.arg("-P").arg(port.to_string());
+    }
+    if let Some(key) = &host.identity_file {
+        cmd.arg("-i").arg(key);
+    }
+    cmd.arg(cli)
+        .arg(scp_remote_target(host, remote_path));
+    let output = cmd.output().map_err(|e| format!("scp spawn: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("scp to {} failed: {}", host.label, stderr.trim()));
+    }
+    Ok(())
+}
+
+fn mobile_relay_url_for_host(host: &HostConfig, port: u16) -> String {
+    let target = host.host.trim();
+    let host_part = if target.contains(':') && !target.starts_with('[') {
+        format!("[{target}]")
+    } else {
+        target.to_string()
+    };
+    format!("ws://{host_part}:{port}")
+}
+
+fn start_mobile_relay_broker_on_host(
+    app: &tauri::AppHandle,
+    host: &HostConfig,
+    port: u16,
+    secret: &str,
+) -> Result<(), String> {
+    if port == 0 {
+        return Err("relay broker port must be greater than zero".to_string());
+    }
+    let cli = bundled_cli_path(app).ok_or("bundled CLI resource not found")?;
+    run_remote_cmd_check_strings(
+        host,
+        &[
+            "sh".into(),
+            "-lc".into(),
+            "mkdir -p \"$HOME/.tmux-worktree\"".into(),
+        ],
+    )?;
+    scp_cli_to_host(host, &cli, ".tmux-worktree/tw-cli.js")?;
+    let script = format!(
+        r#"set -e
+mkdir -p "$HOME/.tmux-worktree"
+printf %s {} > "$HOME/.tmux-worktree/relay-secret"
+chmod 600 "$HOME/.tmux-worktree/relay-secret"
+cat > "$HOME/.tmux-worktree/relay-server.sh" <<'EOF'
+#!/bin/sh
+export TW_RELAY_SECRET="$(cat "$HOME/.tmux-worktree/relay-secret")"
+exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.js" relay-server --host 0.0.0.0 --port {}
+EOF
+chmod 700 "$HOME/.tmux-worktree/relay-server.sh"
+{} kill-session -t tw-relay-server 2>/dev/null || true
+{} new-session -d -s tw-relay-server "$HOME/.tmux-worktree/relay-server.sh"
+sleep 1
+{} has-session -t tw-relay-server
+"#,
+        shell_quote(secret),
+        port,
+        remote_tmux_cmd(host),
+        remote_tmux_cmd(host),
+        remote_tmux_cmd(host),
+    );
+    run_remote_cmd_check_strings(host, &["sh".into(), "-lc".into(), script])?;
+    Ok(())
 }
 
 fn spawn_relay_host(
@@ -4831,28 +5046,73 @@ fn mobile_relay_start(
         *t = tok.clone();
     }
 
-    let (relay_url, host_id, display_name, secret) = mobile_relay_config();
-    if secret.trim().is_empty() {
-        let message =
-            "TW_RELAY_SECRET is required to pair Android with this Mac admin connector".to_string();
+    let config = mobile_relay_config();
+    if config.secret.trim().is_empty() {
+        let message = "Relay token is required before Android can connect".to_string();
         set_mobile_relay_error(state.inner(), Some(message.clone()));
         stop_managed_serve(state.inner());
         return Err(message);
     }
 
-    let child = spawn_relay_host(&app, &relay_url, &host_id, &display_name, &secret, &tok)
-        .map_err(|err| {
-            set_mobile_relay_error(state.inner(), Some(err.clone()));
-            stop_managed_serve(state.inner());
-            err
-        })?;
+    let child = spawn_relay_host(
+        &app,
+        &config.relay_url,
+        &config.host_id,
+        &config.display_name,
+        &config.secret,
+        &tok,
+    )
+    .map_err(|err| {
+        set_mobile_relay_error(state.inner(), Some(err.clone()));
+        stop_managed_serve(state.inner());
+        err
+    })?;
 
-    *state.relay_url.lock().unwrap() = relay_url;
-    *state.host_id.lock().unwrap() = host_id;
-    *state.secret.lock().unwrap() = secret;
+    *state.relay_url.lock().unwrap() = config.relay_url;
+    *state.host_id.lock().unwrap() = config.host_id;
+    *state.secret.lock().unwrap() = config.secret;
     *proc = Some(child);
 
     Ok(())
+}
+
+#[tauri::command]
+fn mobile_relay_save_config(
+    args: MobileRelayConfigInput,
+    state: State<'_, Arc<MobileRelayState>>,
+) -> Result<MobileRelayStatus, String> {
+    let config = save_mobile_relay_config_file(&args)?;
+    *state.relay_url.lock().unwrap() = config.relay_url;
+    *state.host_id.lock().unwrap() = config.host_id;
+    *state.secret.lock().unwrap() = config.secret;
+    set_mobile_relay_error(state.inner(), None);
+    Ok(mobile_relay_status(state))
+}
+
+#[tauri::command]
+fn mobile_relay_start_broker(
+    app: tauri::AppHandle,
+    args: MobileRelayBrokerInput,
+    state: State<'_, Arc<MobileRelayState>>,
+) -> Result<MobileRelayStatus, String> {
+    let host = find_host(args.host_id.trim())?;
+    let port = args.port.unwrap_or(8787);
+    let secret = mobile_relay_secret();
+    start_mobile_relay_broker_on_host(&app, &host, port, &secret).map_err(|err| {
+        set_mobile_relay_error(state.inner(), Some(err.clone()));
+        err
+    })?;
+    let config = MobileRelayConfigInput {
+        relay_url: mobile_relay_url_for_host(&host, port),
+        host_id: "mac-admin".to_string(),
+        secret,
+    };
+    let saved = save_mobile_relay_config_file(&config)?;
+    *state.relay_url.lock().unwrap() = saved.relay_url;
+    *state.host_id.lock().unwrap() = saved.host_id;
+    *state.secret.lock().unwrap() = saved.secret;
+    set_mobile_relay_error(state.inner(), None);
+    Ok(mobile_relay_status(state))
 }
 
 #[tauri::command]
@@ -4879,7 +5139,7 @@ fn mobile_relay_status(state: State<'_, Arc<MobileRelayState>>) -> MobileRelaySt
             _ => {}
         }
     }
-    let (default_relay_url, default_host_id, _display_name, default_secret) = mobile_relay_config();
+    let default_config = mobile_relay_config();
     let relay_url = state.relay_url.lock().unwrap();
     let host_id = state.host_id.lock().unwrap();
     let secret = state.secret.lock().unwrap();
@@ -4888,17 +5148,17 @@ fn mobile_relay_status(state: State<'_, Arc<MobileRelayState>>) -> MobileRelaySt
     MobileRelayStatus {
         active: proc.is_some(),
         relay_url: if relay_url.is_empty() {
-            default_relay_url
+            default_config.relay_url
         } else {
             relay_url.clone()
         },
         host_id: if host_id.is_empty() {
-            default_host_id
+            default_config.host_id
         } else {
             host_id.clone()
         },
         secret: if secret.is_empty() {
-            default_secret
+            default_config.secret
         } else {
             secret.clone()
         },
@@ -4978,6 +5238,8 @@ pub fn run() {
             remote_home_dir,
             remote_read_dir,
             mobile_relay_start,
+            mobile_relay_start_broker,
+            mobile_relay_save_config,
             mobile_relay_stop,
             mobile_relay_status,
         ])
@@ -5001,12 +5263,13 @@ mod tests {
         finish_git_fetch_target, git_fetch_args, hosts_from_config, install_host_tw,
         is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
         list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
-        load_pending_cleanup, orphaned_worktrees, parse_session_key, project_from_config,
-        projects_from_config, projects_from_config_with_home, remote_home_dir_for_host,
-        remote_read_dirs_for_host, reserve_git_fetch_target, restore_worktree, run_check,
-        run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
-        save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
-        stable_output_signature, test_host, tmux_session_exists, trigger_automation,
+        load_pending_cleanup, mobile_relay_config_from_value, orphaned_worktrees,
+        parse_session_key, project_from_config, projects_from_config, projects_from_config_with_home,
+        remote_home_dir_for_host, remote_read_dirs_for_host, reserve_git_fetch_target,
+        restore_worktree, run_check, run_remote_tmux_check, run_remote_tw_check, save_automation,
+        save_hosts_config, save_pending_cleanup, should_skip_automation_overlap,
+        ssh_host_candidates_from_config_text, stable_output_signature, test_host,
+        tmux_session_exists, trigger_automation,
         try_cleanup_worktree, upsert_automation_from_input, worktree_has_uncommitted_changes,
         worktrees_for_session, AddHostArgs, Automation, AutomationOverlap, AutomationRun,
         AutomationStatus, AutomationTriggerType, CreateArgs, CreateTerminalArgs,
@@ -7773,5 +8036,30 @@ Host jump-proxy
             ids,
             vec!["remote-dev", "build-cloud", "ssh-host", "gpu-worker"]
         );
+    }
+
+    #[test]
+    fn mobile_relay_config_accepts_nested_and_flat_fields() {
+        let nested = mobile_relay_config_from_value(&serde_json::json!({
+            "mobileRelay": {
+                "relayUrl": "wss://relay.example.net",
+                "hostId": "macbook",
+                "displayName": "Desk Mac",
+                "secret": "token-1"
+            }
+        }));
+        assert_eq!(nested.relay_url, "wss://relay.example.net");
+        assert_eq!(nested.host_id, "macbook");
+        assert_eq!(nested.display_name, "Desk Mac");
+        assert_eq!(nested.secret, "token-1");
+
+        let flat = mobile_relay_config_from_value(&serde_json::json!({
+            "mobileRelayUrl": "wss://relay.example.org",
+            "mobileRelayHostId": "laptop",
+            "mobileRelaySecret": "token-2"
+        }));
+        assert_eq!(flat.relay_url, "wss://relay.example.org");
+        assert_eq!(flat.host_id, "laptop");
+        assert_eq!(flat.secret, "token-2");
     }
 }

@@ -143,6 +143,8 @@ Mobile Relay runtime:
 - Android pairs with the Mac admin connector through the broker and sees the same TW-managed WorkTrees/Terminals as the Mac Dashboard.
 - Plain tmux sessions are not part of the managed mobile surface.
 - Mobile Relay still needs Node.js 20+ for `tw serve` and `tw relay-host`.
+- The relay broker can run persistently on a devbox with systemd or a dedicated tmux session; see `docs/remote-relay-android.md`.
+- The Dashboard remote menu can start the broker on a configured SSH host and saves `mobileRelay.relayUrl`, `mobileRelay.hostId`, and `mobileRelay.secret` into `~/.tmux-worktree.json`.
 
 Layout behavior:
 
