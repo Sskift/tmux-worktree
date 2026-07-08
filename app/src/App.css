@@ -1807,96 +1807,155 @@ select.field__input {
 .remote-popover {
   position: absolute;
   top: calc(100% + 8px);
-  left: 0;
+  right: 0;
   z-index: 200;
-  background: var(--bg-1);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: min(300px, calc(100vw - 24px));
+  padding: 10px;
+  background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: 8px;
-  padding: 12px;
-  width: 260px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  box-shadow: var(--shadow);
 }
 
-.remote-popover__text {
+.remote-popover__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--divider-subtle);
+}
+
+.remote-popover__title {
+  color: var(--text);
   font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.remote-popover__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 4px;
   color: var(--text-dim);
-  margin-bottom: 8px;
-  line-height: 1.4;
-  word-break: break-word;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.remote-popover__status span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+
+.remote-popover__status--running span {
+  background: #9ae6b4;
+  box-shadow: 0 0 8px rgba(154, 230, 180, 0.4);
+}
+
+.remote-popover__status--starting span {
+  background: var(--accent-c);
+}
+
+.remote-popover__fields {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.remote-popover__field {
+  display: grid;
+  grid-template-columns: 58px minmax(0, 1fr) 24px;
+  align-items: center;
+  gap: 8px;
+  min-height: 28px;
+  padding: 5px 6px;
+  border: 1px solid var(--divider-subtle);
+  border-radius: 6px;
+  background: var(--surface-muted);
 }
 
 .remote-popover__label {
   font-size: 11px;
   color: var(--text-faint);
-  margin-bottom: 2px;
 }
 
-.remote-popover__url {
+.remote-popover__value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: 11px;
-  font-family: var(--font-mono);
   color: var(--text);
-  word-break: break-all;
-  margin-bottom: 10px;
-  line-height: 1.4;
-  flex: 1;
+  font-variant-numeric: tabular-nums;
 }
 
-.remote-popover__row {
+.remote-popover__value--muted {
+  color: var(--text-faint);
+}
+
+.remote-popover__icon-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  color: var(--text-dim);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+}
+
+.remote-popover__icon-btn:not(:disabled):hover {
+  background: var(--surface-hover-strong);
+  color: var(--text);
+}
+
+.remote-popover__error {
+  padding: 7px 8px;
+  border-radius: 6px;
+  background: rgba(246, 135, 179, 0.12);
+  color: var(--accent-b);
+  font-size: 11px;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.remote-popover__actions {
   display: flex;
-  align-items: flex-start;
   gap: 6px;
 }
 
-.remote-popover__copy {
-  flex-shrink: 0;
-  width: 22px;
-  height: 22px;
-  border: none;
-  border-radius: 4px;
+.remote-popover__action {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 6px;
   background: var(--surface-muted);
-  color: var(--text-dim);
-  font-size: 14px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-}
-
-.remote-popover__copy:hover {
-  background: var(--surface-hover-strong);
+  border: 1px solid var(--divider-subtle);
   color: var(--text);
-}
-
-.remote-popover__disconnect {
-  width: 100%;
-  padding: 6px;
-  border: none;
-  border-radius: 4px;
-  background: rgba(246, 135, 179, 0.15);
-  color: #f687b3;
   font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  margin-bottom: 6px;
+  font-weight: 500;
+  white-space: nowrap;
 }
 
-.remote-popover__disconnect:hover {
-  background: rgba(246, 135, 179, 0.25);
-}
-
-.remote-popover__close {
-  width: 100%;
-  padding: 6px;
-  border: none;
-  border-radius: 4px;
-  background: var(--surface-muted);
-  color: var(--text-dim);
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.remote-popover__close:hover {
+.remote-popover__action:not(:disabled):hover {
   background: var(--surface-hover-strong);
+}
+
+.remote-popover__action--danger {
+  flex: 0 0 58px;
+  color: var(--accent-b);
+}
+
+.remote-popover__action--danger:not(:disabled):hover {
+  background: rgba(246, 135, 179, 0.16);
 }
 
 /* ─── File tree ────────────────────────────────────────────── */

@@ -1529,6 +1529,10 @@ function App() {
     void navigator.clipboard.writeText(command);
   }, [mobileRelayHostId, mobileRelaySecret, mobileRelayUrl]);
 
+  const copyMobileRelayValue = useCallback((value: string) => {
+    if (value) void navigator.clipboard.writeText(value);
+  }, []);
+
   useEffect(() => { checkMobileRelayStatus(); }, [checkMobileRelayStatus]);
 
   // Lazily attach live PTYs; startup preloads snapshots instead.
@@ -1947,6 +1951,10 @@ function App() {
     );
   };
 
+  const mobileRelayStatus = mobileRelayLoading ? "starting" : mobileRelayActive ? "running" : "stopped";
+  const mobileRelayStatusText = mobileRelayLoading ? "Starting" : mobileRelayActive ? "Running" : "Stopped";
+  const mobileRelayTokenState = mobileRelaySecret ? "Configured" : "Missing";
+
   return (
     <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
       <div className="titlebar" data-tauri-drag-region />
@@ -1984,37 +1992,93 @@ function App() {
               </button>
               {mobileRelayPopover && (
                 <div className="remote-popover">
-                  {mobileRelayLoading ? (
-                    <p className="remote-popover__text">Starting mobile relay...</p>
-                  ) : (
-                    <>
-                      <p className="remote-popover__label">Mobile Relay</p>
-                      <p className="remote-popover__text">Android pairs with this Mac admin connector. Devbox stays the broker and can also appear as a remote scope.</p>
-                      <p className="remote-popover__label">Broker</p>
-                      <div className="remote-popover__row">
-                        <p className="remote-popover__url">{mobileRelayUrl}</p>
-                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelayUrl)} title="Copy broker">⎘</button>
+                  <div className="remote-popover__header">
+                    <div>
+                      <div className="remote-popover__title">Mobile Relay</div>
+                      <div className={`remote-popover__status remote-popover__status--${mobileRelayStatus}`}>
+                        <span />
+                        {mobileRelayStatusText}
                       </div>
-                      <p className="remote-popover__label">Mac Admin Host</p>
-                      <div className="remote-popover__row">
-                        <p className="remote-popover__url">{mobileRelayHostId}</p>
-                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelayHostId)} title="Copy host id">⎘</button>
-                      </div>
-                      <p className="remote-popover__label">Android Identity Token</p>
-                      <div className="remote-popover__row">
-                        <p className="remote-popover__url">{mobileRelaySecret || "Set TW_RELAY_SECRET before starting"}</p>
-                        <button className="remote-popover__copy" onClick={() => navigator.clipboard.writeText(mobileRelaySecret)} title="Copy token" disabled={!mobileRelaySecret}>⎘</button>
-                      </div>
-                      {mobileRelayError && (
-                        <p className="remote-popover__text">{mobileRelayError}</p>
-                      )}
-                      <button className="remote-popover__copy" onClick={copyMobileLaunch}>Copy Android launch</button>
-                      {mobileRelayActive && (
-                        <button className="remote-popover__disconnect" onClick={handleMobileRelayStop}>Stop connector</button>
-                      )}
-                    </>
+                    </div>
+                    <button
+                      className="remote-popover__icon-btn"
+                      type="button"
+                      onClick={() => setMobileRelayPopover(false)}
+                      title="Close"
+                      aria-label="Close mobile relay menu"
+                    >
+                      ×
+                    </button>
+                  </div>
+
+                  <div className="remote-popover__fields">
+                    <div className="remote-popover__field">
+                      <span className="remote-popover__label">Relay URL</span>
+                      <span className="remote-popover__value" title={mobileRelayUrl}>{mobileRelayUrl}</span>
+                      <button
+                        className="remote-popover__icon-btn"
+                        type="button"
+                        onClick={() => copyMobileRelayValue(mobileRelayUrl)}
+                        title="Copy relay URL"
+                        aria-label="Copy relay URL"
+                      >
+                        ⎘
+                      </button>
+                    </div>
+                    <div className="remote-popover__field">
+                      <span className="remote-popover__label">Host</span>
+                      <span className="remote-popover__value" title={mobileRelayHostId}>{mobileRelayHostId}</span>
+                      <button
+                        className="remote-popover__icon-btn"
+                        type="button"
+                        onClick={() => copyMobileRelayValue(mobileRelayHostId)}
+                        title="Copy host"
+                        aria-label="Copy host"
+                      >
+                        ⎘
+                      </button>
+                    </div>
+                    <div className="remote-popover__field">
+                      <span className="remote-popover__label">Token</span>
+                      <span className={`remote-popover__value ${mobileRelaySecret ? "" : "remote-popover__value--muted"}`}>
+                        {mobileRelayTokenState}
+                      </span>
+                      <button
+                        className="remote-popover__icon-btn"
+                        type="button"
+                        onClick={() => copyMobileRelayValue(mobileRelaySecret)}
+                        title="Copy token"
+                        aria-label="Copy token"
+                        disabled={!mobileRelaySecret}
+                      >
+                        ⎘
+                      </button>
+                    </div>
+                  </div>
+
+                  {mobileRelayError && (
+                    <div className="remote-popover__error">{mobileRelayError}</div>
                   )}
-                  <button className="remote-popover__close" onClick={() => setMobileRelayPopover(false)}>Close</button>
+
+                  <div className="remote-popover__actions">
+                    <button
+                      className="remote-popover__action"
+                      type="button"
+                      onClick={copyMobileLaunch}
+                      disabled={!mobileRelaySecret}
+                    >
+                      Copy Android Launch
+                    </button>
+                    {mobileRelayActive && (
+                      <button
+                        className="remote-popover__action remote-popover__action--danger"
+                        type="button"
+                        onClick={handleMobileRelayStop}
+                      >
+                        Stop
+                      </button>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
