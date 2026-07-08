@@ -53,6 +53,7 @@ type Session = {
   agent_running?: boolean | null;
   hostId?: string | null;
   rawName?: string;
+  project?: string | null;
 };
 
 type HostConfig = {
@@ -160,8 +161,9 @@ function sessionDisplayName(s: Session): string {
   return s.rawName ?? s.name;
 }
 
-/** Get the project key for coloring (uses raw name for remote sessions) */
+/** Get the project key for grouping/coloring, preferring TW managed metadata. */
 function sessionProjectKey(s: Session): string {
+  if (s.project?.trim()) return s.project.trim();
   return projectKey(sessionDisplayName(s));
 }
 
@@ -307,7 +309,8 @@ function sameSessions(a: Session[], b: Session[]): boolean {
       (left.output_signature ?? null) === (right.output_signature ?? null) &&
       (left.agent_running ?? null) === (right.agent_running ?? null) &&
       (left.hostId ?? null) === (right.hostId ?? null) &&
-      (left.rawName ?? "") === (right.rawName ?? "")
+      (left.rawName ?? "") === (right.rawName ?? "") &&
+      (left.project ?? "") === (right.project ?? "")
     );
   });
 }

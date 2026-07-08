@@ -123,6 +123,8 @@ struct Session {
     host_id: Option<String>,
     #[serde(default, rename = "rawName")]
     raw_name: String,
+    #[serde(default)]
+    project: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -186,6 +188,8 @@ struct TwRpcListResponse {
 struct TwRpcSession {
     name: String,
     kind: String,
+    #[serde(default)]
+    project: Option<String>,
     attached: bool,
     windows: u32,
     created: u64,
@@ -334,6 +338,55 @@ fn list_sessions_blocking() -> Result<Vec<Session>, String> {
     Ok(all)
 }
 
+fn trimmed_non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn local_managed_projects_by_session() -> HashMap<String, String> {
+    let path = app_home_dir_or_tmp()
+        .join(".tmux-worktree")
+        .join("state.json");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return HashMap::new();
+    };
+    let Some(sessions) = value.get("sessions").and_then(|value| value.as_array()) else {
+        return HashMap::new();
+    };
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let name = session.get("name")?.as_str()?;
+            let project = session.get("project")?.as_str()?;
+            Some((name.to_string(), trimmed_non_empty_string(project)?))
+        })
+        .collect()
+}
+
+fn project_from_worktree_path(path: &str, worktree_base: &str) -> Option<String> {
+    let normalized = path.trim_end_matches('/');
+    let base = worktree_base.trim_end_matches('/');
+    if !base.is_empty() {
+        let prefix = format!("{base}/");
+        if let Some(rest) = normalized.strip_prefix(&prefix) {
+            return rest.split('/').next().and_then(trimmed_non_empty_string);
+        }
+    }
+
+    let marker = "/.tmux-worktree/worktrees/";
+    normalized
+        .split_once(marker)
+        .and_then(|(_, rest)| rest.split('/').next())
+        .and_then(trimmed_non_empty_string)
+}
+
 fn list_local_sessions() -> Result<Vec<Session>, String> {
     let config_path = app_home_dir_or_tmp().join(".tmux-worktree.json");
     let worktree_base = std::fs::read_to_string(&config_path)
@@ -341,6 +394,7 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|config| config_worktree_base(&config))
         .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string());
+    let managed_projects = local_managed_projects_by_session();
     let fmt = "#{session_id}\x1f#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}\x1f#{pane_current_path}";
     let output = std::process::Command::new(tmux_bin())
         .args(["list-sessions", "-F", fmt])
@@ -379,6 +433,10 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
             }
             let output_signature = pane_output_signature(&session_id);
             let agent_running = session_agent_running(&session_id);
+            let project = managed_projects
+                .get(&name)
+                .cloned()
+                .or_else(|| project_from_worktree_path(&cwd, &worktree_base));
             Some(Session {
                 name: name.clone(),
                 attached,
@@ -389,6 +447,7 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
                 agent_running,
                 host_id: None,
                 raw_name: name,
+                project,
             })
         })
         .collect();
@@ -434,6 +493,9 @@ fn list_remote_sessions_from_tw_rpc(host: &HostConfig) -> Result<Vec<Session>, S
                 agent_running: activity.agent_running,
                 host_id: Some(host.id.clone()),
                 raw_name: session.name,
+                project: session
+                    .project
+                    .and_then(|project| trimmed_non_empty_string(&project)),
             }
         })
         .collect())
@@ -455,6 +517,11 @@ fn remote_tw_rpc_list(host: &HostConfig) -> Result<TwRpcListResponse, String> {
 fn list_remote_sessions_via_tmux(host: &HostConfig) -> Result<Vec<Session>, String> {
     let fmt = "#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}";
     let output = run_remote_tmux_check(host, &["list-sessions", "-F", fmt])?;
+    let remote_worktree_base = host
+        .worktree_base
+        .as_deref()
+        .unwrap_or("/tmp/tmux-worktree/projects")
+        .to_string();
 
     let rows = output
         .lines()
@@ -486,6 +553,9 @@ fn list_remote_sessions_via_tmux(host: &HostConfig) -> Result<Vec<Session>, Stri
         .map(|(raw_name, attached, window_count, created, activity)| {
             let activity_sample = activity_samples.get(&raw_name).cloned().unwrap_or_default();
             let composite_name = format!("{}:{}", host.id, raw_name);
+            let project = remote_session_active_cwd(host, &raw_name)
+                .and_then(|cwd| remote_git_root(host, &cwd))
+                .and_then(|git_root| project_from_worktree_path(&git_root, &remote_worktree_base));
             Session {
                 name: composite_name,
                 attached,
@@ -496,6 +566,7 @@ fn list_remote_sessions_via_tmux(host: &HostConfig) -> Result<Vec<Session>, Stri
                 agent_running: activity_sample.agent_running,
                 host_id: Some(host.id.clone()),
                 raw_name,
+                project,
             }
         })
         .collect();
@@ -5384,7 +5455,7 @@ mod tests {
         is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
         list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
         load_pending_cleanup, mobile_relay_config_from_value, orphaned_worktrees,
-        parse_session_key, project_from_config, projects_from_config,
+        parse_session_key, project_from_config, project_from_worktree_path, projects_from_config,
         projects_from_config_with_home, remote_home_dir_for_host, remote_read_dirs_for_host,
         reserve_git_fetch_target, restore_worktree, run_check, run_remote_tmux_check,
         run_remote_tw_check, save_automation, save_hosts_config, save_pending_cleanup,
@@ -5929,6 +6000,26 @@ exit 12
         assert_eq!(derive_session_name("demo-abc12"), "demo");
         assert_eq!(derive_session_name("demo"), "demo");
         assert_eq!(derive_session_name("demo-nothex"), "demo-nothex");
+    }
+
+    #[test]
+    fn project_from_worktree_path_reads_project_segment() {
+        assert_eq!(
+            project_from_worktree_path(
+                "/tmp/tmux-worktree/projects/coco/fix-auth-abc12",
+                "/tmp/tmux-worktree/projects",
+            )
+            .as_deref(),
+            Some("coco"),
+        );
+        assert_eq!(
+            project_from_worktree_path(
+                "/home/dev/.tmux-worktree/worktrees/api/refactor-def34",
+                "/tmp/other",
+            )
+            .as_deref(),
+            Some("api"),
+        );
     }
 
     #[test]
@@ -7246,6 +7337,7 @@ exit 12
         assert_eq!(sessions[0].raw_name, "managed-cli");
         assert_eq!(sessions[0].window_count, 3);
         assert_eq!(sessions[0].host_id.as_deref(), Some("dev"));
+        assert_eq!(sessions[0].project.as_deref(), Some("coco"));
         assert_eq!(
             sessions[0].output_signature.as_deref(),
             Some("remote:123:45")
