@@ -11,8 +11,10 @@ import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
 import android.util.Log;
 import android.view.Gravity;
@@ -106,6 +108,7 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private TextView toolbarTitle;
     private TextView backButton;
+    private TextView identityToggleButton;
     private TextView refreshButton;
     private LinearLayout appBarView;
     private View tabBarView;
@@ -149,10 +152,12 @@ public class MainActivity extends Activity {
     private boolean terminalMode = false;
     private boolean composerVisible = false;
     private boolean shortcutsCollapsed = false;
+    private boolean identityExpanded = true;
     private boolean userDisconnectRequested = true;
     private boolean reconnectScheduled = false;
     private boolean savedAutoConnect = false;
     private boolean terminalFlushScheduled = false;
+    private boolean terminalStreamReopenScheduled = false;
     private int reconnectAttempt = 0;
     private long lastRefreshAt = 0;
     private int lastVisibleRootHeight = 0;
@@ -175,8 +180,10 @@ public class MainActivity extends Activity {
             && relayInput.getText().length() > 0
             && tokenInput.getText().length() > 0;
         if (canAutoConnect) {
+            setIdentityExpanded(false);
             relayInput.postDelayed(this::connect, 500);
         } else {
+            setIdentityExpanded(true);
             relayInput.postDelayed(this::showIdentityDialog, 250);
         }
     }
@@ -305,6 +312,19 @@ public class MainActivity extends Activity {
         LinearLayout.LayoutParams titleLp = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1);
         bar.addView(toolbarTitle, titleLp);
 
+        identityToggleButton = new TextView(this);
+        identityToggleButton.setText("ID");
+        identityToggleButton.setTextSize(12);
+        identityToggleButton.setTypeface(Typeface.DEFAULT_BOLD);
+        identityToggleButton.setTextColor(ACCENT);
+        identityToggleButton.setGravity(Gravity.CENTER);
+        identityToggleButton.setPadding(dp(7), dp(3), dp(7), dp(3));
+        identityToggleButton.setBackground(roundBg(SURFACE_2, dp(8), BORDER));
+        identityToggleButton.setOnClickListener(v -> setIdentityExpanded(!identityExpanded));
+        LinearLayout.LayoutParams identityLp = new LinearLayout.LayoutParams(dp(34), dp(30));
+        identityLp.setMargins(dp(6), 0, 0, 0);
+        bar.addView(identityToggleButton, identityLp);
+
         refreshButton = new TextView(this);
         refreshButton.setText("↻");
         refreshButton.setTextSize(15);
@@ -399,6 +419,17 @@ public class MainActivity extends Activity {
         consoleTabContent.setVisibility(!isConnect ? View.VISIBLE : View.GONE);
     }
 
+    private void setIdentityExpanded(boolean expanded) {
+        identityExpanded = expanded;
+        if (identityCardView != null) {
+            identityCardView.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        }
+        if (identityToggleButton != null) {
+            identityToggleButton.setTextColor(expanded ? ACCENT : TEXT_SECOND);
+            identityToggleButton.setBackground(roundBg(expanded ? Color.rgb(34, 44, 62) : SURFACE_2, dp(8), BORDER));
+        }
+    }
+
     private void buildTabContent(LinearLayout parent) {
         // Use a FrameLayout-like approach: both children in the same space, one visible at a time
         LinearLayout contentArea = new LinearLayout(this);
@@ -429,7 +460,7 @@ public class MainActivity extends Activity {
         // Identity card
         LinearLayout identityCard = card(content, "Identity");
         identityCardView = identityCard;
-        identityCard.setVisibility(View.GONE);
+        identityCard.setVisibility(identityExpanded ? View.VISIBLE : View.GONE);
 
         // Relay URL field
         TextView relayLabel = smallLabel("Relay URL");
@@ -441,6 +472,7 @@ public class MainActivity extends Activity {
             "wss://relay.example.com",
             false
         );
+        installIdentityEditStopper(relayInput);
         identityCard.addView(relayInput, matchWrapMargin(0, 2, 0, 10));
 
         // Token field
@@ -453,6 +485,7 @@ public class MainActivity extends Activity {
             "bearer token",
             true
         );
+        installIdentityEditStopper(tokenInput);
         identityCard.addView(tokenInput, matchWrapMargin(0, 2, 0, 12));
 
         // Action buttons
@@ -464,16 +497,20 @@ public class MainActivity extends Activity {
         btnConnect.setOnClickListener(v -> connect());
         btnRow.addView(btnConnect, weightLp(1, 0, 0, 6, 0));
 
-        TextView btnRefresh = secondaryButton("Refresh");
-        btnRefresh.setOnClickListener(v -> refreshDashboard());
-        btnRow.addView(btnRefresh, weightLp(1, 6, 0, 6, 0));
-
-        TextView btnDisconnect = dangerButton("Disconnect");
-        btnDisconnect.setOnClickListener(v -> {
+        TextView btnStop = secondaryButton("Stop");
+        btnStop.setOnClickListener(v -> {
             disconnectAndForget();
             setStatusUi("Disconnected", ERROR_C);
         });
-        btnRow.addView(btnDisconnect, weightLp(1, 6, 0, 0, 0));
+        btnRow.addView(btnStop, weightLp(1, 6, 0, 6, 0));
+
+        TextView btnClear = dangerButton("Clear");
+        btnClear.setOnClickListener(v -> {
+            disconnectAndForget();
+            clearSavedIdentity();
+            setStatusUi("Connection cleared", WARNING);
+        });
+        btnRow.addView(btnClear, weightLp(1, 6, 0, 0, 0));
 
         // Devices card
         LinearLayout devicesCard = card(content, "Devices");
@@ -1530,7 +1567,7 @@ public class MainActivity extends Activity {
         String relay = getIntent().getStringExtra("relayUrl");
         String token = getIntent().getStringExtra("relaySecret");
         String hostId = getIntent().getStringExtra("hostId");
-        if (relay == null || relay.isEmpty()) relay = prefs.getString("relayUrl", "wss://relay.example.com");
+        if (relay == null || relay.isEmpty()) relay = prefs.getString("relayUrl", "");
         if (token == null || token.isEmpty()) token = prefs.getString("relaySecret", "");
         if ((pendingAutoHostId == null || pendingAutoHostId.isEmpty()) && hostId != null && !hostId.isEmpty()) {
             pendingAutoHostId = hostId;
@@ -1557,6 +1594,30 @@ public class MainActivity extends Activity {
         savedAutoConnect = true;
     }
 
+    private void clearSavedIdentity() {
+        getSharedPreferences(PREFS_IDENTITY, MODE_PRIVATE)
+            .edit()
+            .remove("relayUrl")
+            .remove("relaySecret")
+            .remove("hostId")
+            .putBoolean("autoConnect", false)
+            .apply();
+        savedAutoConnect = false;
+        pendingAutoHostId = "";
+        pendingAutoOpenSession = null;
+        selectedHostId = "";
+        selectedSession = "";
+        hosts.clear();
+        sessions.clear();
+        if (relayInput != null) relayInput.setText("");
+        if (tokenInput != null) tokenInput.setText("");
+        setIdentityExpanded(true);
+        if (hostAdapter != null) hostAdapter.notifyDataSetChanged();
+        updateSelectedHostBadge();
+        updateSelectedSessionBadge();
+        notifySessionAdapters();
+    }
+
     private void savePreferredHost(String hostId) {
         if (hostId == null || hostId.isEmpty()) return;
         getSharedPreferences(PREFS_IDENTITY, MODE_PRIVATE)
@@ -1575,6 +1636,7 @@ public class MainActivity extends Activity {
 
     private void showIdentityDialog() {
         if (isFinishing()) return;
+        setIdentityExpanded(true);
         LinearLayout form = new LinearLayout(this);
         form.setOrientation(LinearLayout.VERTICAL);
         form.setPadding(dp(18), dp(8), dp(18), 0);
@@ -1624,22 +1686,60 @@ public class MainActivity extends Activity {
         dialog.show();
     }
 
+    private void installIdentityEditStopper(EditText field) {
+        field.setOnFocusChangeListener((v, hasFocus) -> {
+            if (hasFocus) stopReconnectForIdentityEdit();
+        });
+        field.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                if (field.hasFocus()) stopReconnectForIdentityEdit();
+            }
+
+            @Override public void afterTextChanged(Editable s) {}
+        });
+    }
+
+    private void stopReconnectForIdentityEdit() {
+        if (userDisconnectRequested && !reconnectScheduled && webSocket == null) return;
+        disconnectAndForget();
+        setStatusUi("Editing connection", WARNING);
+    }
+
     // Protocol Methods
 
     private void connect() {
         userDisconnectRequested = false;
         cancelReconnect();
-        ignoredSocket = webSocket;
-        closeRelaySocket("reconnect");
         setStatusUi("Connecting...", WARNING);
         String relay = relayInput.getText().toString().trim().replaceAll("/+$", "");
         String token = tokenInput.getText().toString().trim();
-        saveIdentity(relay, token);
+        if (relay.isEmpty() || token.isEmpty()) {
+            userDisconnectRequested = true;
+            setSavedAutoConnect(false);
+            setIdentityExpanded(true);
+            setStatusUi("Relay and token required", WARNING);
+            return;
+        }
 
-        Request request = new Request.Builder()
-            .url(relay + "/client")
-            .header("Authorization", "Bearer " + token)
-            .build();
+        Request request;
+        try {
+            request = new Request.Builder()
+                .url(relay + "/client")
+                .header("Authorization", "Bearer " + token)
+                .build();
+        } catch (IllegalArgumentException e) {
+            userDisconnectRequested = true;
+            setSavedAutoConnect(false);
+            setIdentityExpanded(true);
+            setStatusUi("Invalid relay URL", ERROR_C);
+            return;
+        }
+
+        ignoredSocket = webSocket;
+        closeRelaySocket("reconnect");
+        saveIdentity(relay, token);
 
         webSocket = httpClient.newWebSocket(request, new WebSocketListener() {
             @Override
@@ -1649,6 +1749,7 @@ public class MainActivity extends Activity {
                     Log.i(TAG, "relay websocket open");
                     isConnected = true;
                     reconnectAttempt = 0;
+                    setIdentityExpanded(false);
                     setStatusUi("Connected. Loading devices...", SUCCESS);
                     listHosts();
                 });
@@ -1670,6 +1771,7 @@ public class MainActivity extends Activity {
                     if (socket != webSocket && webSocket != null) return;
                     isConnected = false;
                     activeStreamId = null;
+                    terminalStreamReopenScheduled = false;
                     webSocket = null;
                     rememberTerminalForReconnect();
                     if (userDisconnectRequested) {
@@ -1691,11 +1793,13 @@ public class MainActivity extends Activity {
                     Log.e(TAG, "relay websocket failure", t);
                     isConnected = false;
                     activeStreamId = null;
+                    terminalStreamReopenScheduled = false;
                     webSocket = null;
                     rememberTerminalForReconnect();
                     if (response != null && (response.code() == 401 || response.code() == 403)) {
                         userDisconnectRequested = true;
                         setSavedAutoConnect(false);
+                        setIdentityExpanded(true);
                         setStatusUi("Authentication failed", ERROR_C);
                         showIdentityDialog();
                         return;
@@ -1714,6 +1818,7 @@ public class MainActivity extends Activity {
         closeRelaySocket("user disconnect");
         isConnected = false;
         activeStreamId = null;
+        terminalStreamReopenScheduled = false;
         sessionRequests.clear();
         killRequests.clear();
     }
@@ -1840,12 +1945,25 @@ public class MainActivity extends Activity {
         if (selectedHostId.isEmpty() || selectedSession.isEmpty()) return;
         savePreferredHost(selectedHostId);
 
+        if (!openTerminalStream(true)) return;
+        if (pendingAutoCommand != null && !pendingAutoCommand.isEmpty()) {
+            String command = pendingAutoCommand;
+            pendingAutoCommand = null;
+            terminalWebView.postDelayed(() -> sendAgentMessage(command), 1000);
+        }
+    }
+
+    private boolean openTerminalStream(boolean resetDisplay) {
+        if (!isConnected || selectedHostId.isEmpty() || selectedSession.isEmpty()) return false;
         activeStreamId = UUID.randomUUID().toString();
-        pendingTerminalWrites.clear();
+        terminalStreamReopenScheduled = false;
+        if (resetDisplay) pendingTerminalWrites.clear();
         updateSelectedSessionBadge();
         enterTerminalMode();
         Log.i(TAG, "open terminal host=" + selectedHostId + " session=" + selectedSession + " streamId=" + activeStreamId);
-        resetTerminal("Opening " + selectedHostId + " / " + selectedSession + "\\r\\n");
+        if (resetDisplay) {
+            resetTerminal("Opening " + selectedHostId + " / " + selectedSession + "\\r\\n");
+        }
         sendJson(json(
             "type", "open_terminal",
             "hostId", selectedHostId,
@@ -1853,11 +1971,23 @@ public class MainActivity extends Activity {
             "session", selectedSession
         ));
         requestTerminalFitBurst();
-        if (pendingAutoCommand != null && !pendingAutoCommand.isEmpty()) {
-            String command = pendingAutoCommand;
-            pendingAutoCommand = null;
-            terminalWebView.postDelayed(() -> sendAgentMessage(command), 1000);
-        }
+        return true;
+    }
+
+    private void scheduleTerminalStreamReopen(String reason) {
+        if (terminalStreamReopenScheduled || !terminalMode || !isConnected) return;
+        if (selectedHostId.isEmpty() || selectedSession.isEmpty()) return;
+        terminalStreamReopenScheduled = true;
+        activeStreamId = null;
+        setStatusUi(compact(reason, 34), WARNING);
+        writeTerminal("\r\n[" + reason + "]\r\n");
+        mainHandler.postDelayed(() -> {
+            if (!terminalMode || !isConnected || selectedHostId.isEmpty() || selectedSession.isEmpty()) {
+                terminalStreamReopenScheduled = false;
+                return;
+            }
+            openTerminalStream(false);
+        }, 180);
     }
 
     private void sendAgentMessage() {
@@ -1897,7 +2027,9 @@ public class MainActivity extends Activity {
     }
 
     private void sendTerminalInput(String data) {
-        if (activeStreamId == null) return;
+        if (activeStreamId == null) {
+            if (!openTerminalStream(false) || activeStreamId == null) return;
+        }
         sendJson(json(
             "type", "terminal_input",
             "streamId", activeStreamId,
@@ -1951,6 +2083,7 @@ public class MainActivity extends Activity {
         if (tabDividerView != null) tabDividerView.setVisibility(View.GONE);
         if (contextBarView != null) contextBarView.setVisibility(View.GONE);
         if (backButton != null) backButton.setVisibility(View.VISIBLE);
+        if (identityToggleButton != null) identityToggleButton.setVisibility(View.GONE);
         if (refreshButton != null) refreshButton.setVisibility(View.GONE);
         if (statusDot != null) statusDot.setVisibility(View.GONE);
         if (statusText != null) statusText.setVisibility(View.GONE);
@@ -1979,11 +2112,13 @@ public class MainActivity extends Activity {
             activeStreamId = null;
         }
         terminalMode = false;
+        terminalStreamReopenScheduled = false;
         pendingTerminalWrites.clear();
         if (tabBarView != null) tabBarView.setVisibility(View.GONE);
         if (tabDividerView != null) tabDividerView.setVisibility(View.GONE);
         if (contextBarView != null) contextBarView.setVisibility(View.VISIBLE);
         if (backButton != null) backButton.setVisibility(View.GONE);
+        if (identityToggleButton != null) identityToggleButton.setVisibility(View.VISIBLE);
         if (refreshButton != null) refreshButton.setVisibility(View.VISIBLE);
         if (statusDot != null) statusDot.setVisibility(View.VISIBLE);
         if (statusText != null) statusText.setVisibility(View.VISIBLE);
@@ -2020,10 +2155,18 @@ public class MainActivity extends Activity {
             + "function fitSoon(delay){setTimeout(function(){if(window.requestAnimationFrame){requestAnimationFrame(fit);}else{fit();}},delay||0);}"
             + "function fitBurst(){[0,40,120,260,520].forEach(fitSoon);}"
             + "function setBottomPadding(px){var el=document.querySelector('#terminal .xterm');if(el){el.style.paddingBottom=px+'px';fitBurst();}}"
+            + "function terminalLineHeight(){var row=document.querySelector('#terminal .xterm-rows>div');var h=row?row.getBoundingClientRect().height:0;return h||14;}"
+            + "function installTouchScroll(){var el=document.getElementById('terminal');var sx=0,sy=0,ly=0,acc=0,scrolling=false;"
+            + "el.addEventListener('touchstart',function(e){if(e.touches.length!==1)return;sx=e.touches[0].clientX;sy=e.touches[0].clientY;ly=sy;acc=0;scrolling=false;},{passive:true,capture:true});"
+            + "el.addEventListener('touchmove',function(e){if(!ready||!term||e.touches.length!==1)return;var x=e.touches[0].clientX,y=e.touches[0].clientY;var dx=Math.abs(x-sx),dy=y-ly,totalY=Math.abs(y-sy);if(!scrolling&&totalY>8&&totalY>dx*1.2)scrolling=true;if(!scrolling)return;e.preventDefault();ly=y;acc+=dy;var lh=terminalLineHeight();var lines=acc/lh;if(Math.abs(lines)>=1){var whole=lines>0?Math.floor(lines):Math.ceil(lines);term.scrollLines(-whole);acc-=whole*lh;}},{passive:false,capture:true});"
+            + "el.addEventListener('touchend',function(){scrolling=false;acc=0;},{passive:true,capture:true});"
+            + "el.addEventListener('touchcancel',function(){scrolling=false;acc=0;},{passive:true,capture:true});"
+            + "}"
             + "function init(){"
             + "term=new Terminal({fontFamily:'SF Mono,Menlo,ui-monospace,monospace',fontSize:12,lineHeight:1.12,cursorBlink:true,scrollback:5000,allowTransparency:false,"
             + "theme:{background:'#0d0e10',foreground:'#e6e6e8',cursor:'#b794f6',cursorAccent:'#0d0e10',selectionBackground:'rgba(183,148,246,0.3)',black:'#1a1d23',red:'#ff8272',green:'#9ae6b4',yellow:'#f6ad55',blue:'#90cdf4',magenta:'#d6bcfa',cyan:'#81e6d9',white:'#e6e6e8',brightBlack:'#5a5d68',brightRed:'#feb2b2',brightGreen:'#9ae6b4',brightYellow:'#fbd38d',brightBlue:'#90cdf4',brightMagenta:'#b794f6',brightCyan:'#81e6d9',brightWhite:'#ffffff'}});"
             + "fitAddon=new FitAddon.FitAddon();term.loadAddon(fitAddon);term.open(document.getElementById('terminal'));"
+            + "installTouchScroll();"
             + "term.onData(function(d){TwBridge.input(d);});term.onResize(function(s){lastCols=s.cols;lastRows=s.rows;TwBridge.resize(s.cols,s.rows);});"
             + "window.addEventListener('resize',fitBurst);"
             + "if(window.visualViewport){visualViewport.addEventListener('resize',fitBurst);visualViewport.addEventListener('scroll',fitBurst);}"
@@ -2076,6 +2219,13 @@ public class MainActivity extends Activity {
 
     private boolean isActiveStream(String streamId) {
         return streamId == null || streamId.isEmpty() || (activeStreamId != null && streamId.equals(activeStreamId));
+    }
+
+    private boolean isRecoverableTerminalStreamError(String error) {
+        String normalized = error == null ? "" : error.toLowerCase(Locale.ROOT);
+        return normalized.contains("terminal stream is not open")
+            || normalized.contains("terminal stream closed")
+            || normalized.contains("host reconnected");
     }
 
     private final class TerminalBridge {
@@ -2262,10 +2412,13 @@ public class MainActivity extends Activity {
                 }
                 if (failedKill != null) {
                     setStatusUi("Kill failed: " + compact(error, 24), ERROR_C);
+                } else if (isRecoverableTerminalStreamError(error) && terminalMode && !streamId.isEmpty() && streamId.equals(activeStreamId)) {
+                    Log.i(TAG, "recovering terminal stream streamId=" + streamId + " message=" + error);
+                    scheduleTerminalStreamReopen("Reopening terminal stream");
                 } else {
                     setStatusUi("Error: " + error, ERROR_C);
+                    if (terminalMode) writeTerminal("\r\n[error] " + error + "\r\n");
                 }
-                if (terminalMode) writeTerminal("\r\n[error] " + error + "\r\n");
             });
         }
     }

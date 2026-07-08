@@ -35,6 +35,52 @@ test("Android worktree list groups sessions by project", () => {
   assert.match(source, /\/\.tmux-worktree\/worktrees\//);
 });
 
+test("Android connection profile can be edited and cleared after auto reconnect", () => {
+  const source = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
+
+  assert.match(source, /installIdentityEditStopper\(relayInput\)/);
+  assert.match(source, /installIdentityEditStopper\(tokenInput\)/);
+  assert.match(source, /identityToggleButton/);
+  assert.match(source, /setIdentityExpanded\(!identityExpanded\)/);
+  assert.match(source, /setIdentityExpanded\(false\)/);
+  assert.match(source, /identityCard\.setVisibility\(identityExpanded \? View\.VISIBLE : View\.GONE\)/);
+  assert.match(source, /stopReconnectForIdentityEdit\(\)/);
+  assert.match(source, /clearSavedIdentity\(\)/);
+  assert.match(source, /\.remove\("relayUrl"\)/);
+  assert.match(source, /\.remove\("relaySecret"\)/);
+  assert.match(source, /\.remove\("hostId"\)/);
+  assert.match(source, /putBoolean\("autoConnect", false\)/);
+  assert.match(source, /setStatusUi\("Relay and token required", WARNING\)/);
+  assert.match(source, /setStatusUi\("Invalid relay URL", ERROR_C\)/);
+  assert.doesNotMatch(source, /identityCard\.setVisibility\(View\.GONE\)/);
+});
+
+test("Android terminal stream errors reopen the active session", () => {
+  const source = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
+
+  assert.match(source, /private boolean openTerminalStream\(boolean resetDisplay\)/);
+  assert.match(source, /private void scheduleTerminalStreamReopen\(String reason\)/);
+  assert.match(source, /terminalStreamReopenScheduled/);
+  assert.match(source, /activeStreamId = UUID\.randomUUID\(\)\.toString\(\)/);
+  assert.match(source, /isRecoverableTerminalStreamError\(error\)/);
+  assert.match(source, /normalized\.contains\("terminal stream is not open"\)/);
+  assert.match(source, /scheduleTerminalStreamReopen\("Reopening terminal stream"\)/);
+  assert.match(source, /if \(activeStreamId == null\) \{\s*if \(!openTerminalStream\(false\) \|\| activeStreamId == null\) return;\s*\}/s);
+});
+
+test("Android terminal supports touch scrolling through xterm scrollback", () => {
+  const source = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
+
+  assert.match(source, /scrollback:5000/);
+  assert.match(source, /function installTouchScroll\(\)/);
+  assert.match(source, /touchstart/);
+  assert.match(source, /touchmove/);
+  assert.match(source, /passive:false,capture:true/);
+  assert.match(source, /e\.preventDefault\(\)/);
+  assert.match(source, /term\.scrollLines\(-whole\)/);
+  assert.match(source, /installTouchScroll\(\);/);
+});
+
 test("Android app declares a launcher icon", () => {
   const manifest = readFileSync("mobile/android/app/src/main/AndroidManifest.xml", "utf8");
   const foreground = readFileSync("mobile/android/app/src/main/res/drawable/ic_launcher_foreground.xml", "utf8");

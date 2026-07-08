@@ -95,3 +95,17 @@ test("remote pty wrapper survives resize signal interruptions", () => {
   assert.match(source, /except InterruptedError:\n\s+continue/);
   assert.match(source, /if \(safeCols === lastResizeCols && safeRows === lastResizeRows\) return/);
 });
+
+test("relay host can reopen routed terminal streams after transient remote close", () => {
+  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
+
+  assert.match(source, /type StreamRoute/);
+  assert.match(source, /const streamRoutes = new Map<string, StreamRoute>\(\)/);
+  assert.match(source, /streamRoutes\.set\(key, \{ clientId, streamId: message\.streamId, scope, rawName, pane: message\.pane \}\)/);
+  assert.match(source, /reopenRoutedStream\(relaySocket, streams, opts, route, message\.data\)/);
+  assert.match(source, /reopenRoutedStream\(relaySocket, streams, opts, route, undefined, \{ cols: message\.cols, rows: message\.rows \}\)/);
+  assert.match(source, /child\.stdin\.on\("error", \(\) => \{\}\)/);
+  assert.match(source, /const isCurrent = streams\.get\(key\) === stream/);
+  assert.match(source, /if \(isCurrent\) sendJson\(relaySocket, \{ type: "terminal_exit"/);
+  assert.match(source, /try \{\n\s+stream\.process\.stdin\.write\(payload\);/);
+});

@@ -46,6 +46,14 @@ type LocalStream = {
   cleanup?: () => void;
 };
 
+type StreamRoute = {
+  clientId: string;
+  streamId: string;
+  scope: AdminScope;
+  rawName: string;
+  pane?: string | number;
+};
+
 type PlainTerminal = {
   id?: string;
   label?: string;
@@ -677,6 +685,12 @@ function closeClientStreams(streams: Map<string, LocalStream>, clientId: string)
   }
 }
 
+function closeClientRoutes(routes: Map<string, StreamRoute>, clientId: string): void {
+  for (const [key, route] of routes) {
+    if (route.clientId === clientId) routes.delete(key);
+  }
+}
+
 function sendToStream(stream: LocalStream, payload: string): "sent" | "queued" | "closed" {
   if (stream.opening) {
     stream.pending.push(payload);
@@ -696,8 +710,12 @@ function sendToStream(stream: LocalStream, payload: string): "sent" | "queued" |
   }
 
   if (stream.process && !stream.process.killed && stream.process.stdin.writable) {
-    stream.process.stdin.write(payload);
-    return "sent";
+    try {
+      stream.process.stdin.write(payload);
+      return "sent";
+    } catch {
+      return "closed";
+    }
   }
   return "closed";
 }
@@ -958,6 +976,9 @@ async function openRemoteStream(
     },
   };
   streams.set(key, stream);
+  child.stdin.on("error", () => {});
+  child.stdout.on("error", () => {});
+  child.stderr.on("error", () => {});
   child.stdout.on("data", (data) => {
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: data.toString("utf8") });
   });
@@ -967,14 +988,16 @@ async function openRemoteStream(
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: text });
   });
   child.on("close", (code) => {
-    streams.delete(key);
+    const isCurrent = streams.get(key) === stream;
+    if (isCurrent) streams.delete(key);
     cleanup();
-    sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: code ?? 0 });
+    if (isCurrent) sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: code ?? 0 });
   });
   child.on("error", (err) => {
-    streams.delete(key);
+    const isCurrent = streams.get(key) === stream;
+    if (isCurrent) streams.delete(key);
     cleanup();
-    sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
+    if (isCurrent) sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
   });
   if (pendingResize) stream.resize?.(pendingResize.cols, pendingResize.rows);
   for (const payload of pending) sendToStream(stream, payload);
@@ -1010,13 +1033,66 @@ async function openLocalStream(
     sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data });
   });
   localSocket.on("close", () => {
-    streams.delete(key);
-    sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: 0 });
+    const isCurrent = streams.get(key) === stream;
+    if (isCurrent) streams.delete(key);
+    if (isCurrent) sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: 0 });
   });
   localSocket.on("error", (err) => {
-    streams.delete(key);
-    sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
+    const isCurrent = streams.get(key) === stream;
+    if (isCurrent) streams.delete(key);
+    if (isCurrent) sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
   });
+}
+
+async function openRouteStream(
+  relaySocket: WebSocket,
+  streams: Map<string, LocalStream>,
+  opts: RelayHostOptions,
+  route: StreamRoute,
+): Promise<void> {
+  if (route.scope.kind === "local") {
+    await openLocalStream(
+      relaySocket,
+      streams,
+      opts.local,
+      requireServeToken(),
+      route.clientId,
+      route.streamId,
+      route.rawName,
+      route.pane,
+    );
+    return;
+  }
+  await openRemoteStream(relaySocket, streams, route.clientId, route.streamId, route.scope, route.rawName, route.pane);
+}
+
+async function reopenRoutedStream(
+  relaySocket: WebSocket,
+  streams: Map<string, LocalStream>,
+  opts: RelayHostOptions,
+  route: StreamRoute,
+  pendingInput?: string,
+  pendingResize?: { cols: number; rows: number },
+): Promise<void> {
+  const key = streamKey(route.clientId, route.streamId);
+  const existing = streams.get(key);
+  if (existing?.opening) {
+    if (pendingInput) existing.pending.push(pendingInput);
+    if (pendingResize) existing.pendingResize = pendingResize;
+    return;
+  }
+  if (existing) {
+    closeStream(existing);
+    streams.delete(key);
+  }
+  streams.set(key, {
+    clientId: route.clientId,
+    streamId: route.streamId,
+    pending: pendingInput ? [pendingInput] : [],
+    pendingResize,
+    opening: true,
+  });
+  await openRouteStream(relaySocket, streams, opts, route);
 }
 
 async function runConnection(opts: RelayHostOptions): Promise<boolean> {
@@ -1026,6 +1102,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
     headers: { Authorization: `Bearer ${opts.secret}` },
   });
   const streams = new Map<string, LocalStream>();
+  const streamRoutes = new Map<string, StreamRoute>();
   let opened = false;
 
   await new Promise<void>((resolve, reject) => {
@@ -1048,6 +1125,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 
     if (message.type === "client_closed") {
       closeClientStreams(streams, message.clientId);
+      closeClientRoutes(streamRoutes, message.clientId);
       return;
     }
     if (!("clientId" in message) || !message.clientId) return;
@@ -1088,12 +1166,9 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
         streams.set(key, { clientId, streamId: message.streamId, pending: [], opening: true });
 
         const { scope, rawName } = scopeForSession(message.session);
+        streamRoutes.set(key, { clientId, streamId: message.streamId, scope, rawName, pane: message.pane });
         try {
-          if (scope.kind === "local") {
-            await openLocalStream(relaySocket, streams, opts.local, requireServeToken(), clientId, message.streamId, rawName, message.pane);
-          } else {
-            await openRemoteStream(relaySocket, streams, clientId, message.streamId, scope, rawName, message.pane);
-          }
+          await openRouteStream(relaySocket, streams, opts, { clientId, streamId: message.streamId, scope, rawName, pane: message.pane });
         } catch (err) {
           streams.delete(key);
           throw err;
@@ -1127,6 +1202,15 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
       const key = streamKey(clientId, message.streamId);
       const stream = streams.get(key);
       if (!stream) {
+        const route = streamRoutes.get(key);
+        if (route && message.type === "terminal_input") {
+          await reopenRoutedStream(relaySocket, streams, opts, route, message.data);
+          return;
+        }
+        if (route && message.type === "resize") {
+          await reopenRoutedStream(relaySocket, streams, opts, route, undefined, { cols: message.cols, rows: message.rows });
+          return;
+        }
         if (message.type === "resize" || message.type === "close_terminal") return;
         sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         return;
@@ -1134,6 +1218,11 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 
       if (message.type === "terminal_input") {
         if (sendToStream(stream, message.data) === "closed") {
+          const route = streamRoutes.get(key);
+          if (route) {
+            await reopenRoutedStream(relaySocket, streams, opts, route, message.data);
+            return;
+          }
           sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         }
       } else if (message.type === "resize") {
@@ -1147,10 +1236,16 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
         }
         const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows } satisfies RelayClientMessage);
         if (sendToStream(stream, resize) === "closed") {
+          const route = streamRoutes.get(key);
+          if (route) {
+            await reopenRoutedStream(relaySocket, streams, opts, route, undefined, { cols: message.cols, rows: message.rows });
+            return;
+          }
           sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         }
       } else if (message.type === "close_terminal") {
         streams.delete(key);
+        streamRoutes.delete(key);
         closeStream(stream);
       }
     } catch (err) {
