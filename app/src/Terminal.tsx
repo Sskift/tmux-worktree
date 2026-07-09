@@ -429,40 +429,50 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     termRef.current = term;
     fitRef.current = fit;
 
+    const writePty = (data: string) => {
+      if (ptyId) invoke("pty_write", { id: ptyId, data }).catch(() => {});
+    };
+
+    const copyTmuxOrInterrupt = () => {
+      if (!tmuxSession) return true;
+      if (term.hasSelection()) return true;
+      invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
+        if (!copied) writePty("\x03");
+      }).catch(() => writePty("\x03"));
+      return false;
+    };
+
+    const pasteClipboard = () => {
+      invoke<string>("read_clipboard_text").then((text) => {
+        if (text) term.paste(text);
+      }).catch(() => {});
+      return false;
+    };
+
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type === "keydown" && e.key === "Escape" && tmuxSession) {
+        // Let ESC reach the PTY so TUIs (vim/less/fzf) receive it, and in
+        // parallel ask tmux to exit copy-mode *only if* the pane is actually
+        // in a mode (scrolled-up history). When not in copy-mode this is a
+        // no-op, so normal apps keep their ESC. Do not swallow the key.
+        invoke("copy_mode_cancel_if_active", { name: tmuxSession }).catch(() => {});
+        return true;
+      }
+      if (e.type === "keydown" && e.metaKey && e.key.toLowerCase() === "c") {
+        return copyTmuxOrInterrupt();
+      }
+      if (e.type === "keydown" && e.metaKey && e.key.toLowerCase() === "v") {
+        return pasteClipboard();
+      }
+      return true;
+    });
+
     let blurHandler: (() => void) | null = null;
     if (tmuxSession) {
       blurHandler = () => {
         invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
       };
       host.addEventListener("focusout", blurHandler);
-
-      term.attachCustomKeyEventHandler((e) => {
-        if (e.type === "keydown" && e.key === "Escape") {
-          // Let ESC reach the PTY so TUIs (vim/less/fzf) receive it, and in
-          // parallel ask tmux to exit copy-mode *only if* the pane is actually
-          // in a mode (scrolled-up history). When not in copy-mode this is a
-          // no-op, so normal apps keep their ESC. Do not swallow the key.
-          invoke("copy_mode_cancel_if_active", { name: tmuxSession }).catch(() => {});
-          return true;
-        }
-        if (e.type === "keydown" && e.metaKey && e.key === "c") {
-          if (term.hasSelection()) return true;
-          if (hostId) {
-            // Remote: skip pbcopy (not supported over SSH), send Ctrl+C
-            if (ptyId) {
-              invoke("pty_write", { id: ptyId, data: "\x03" }).catch(() => {});
-            }
-          } else {
-            invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
-              if (!copied && ptyId) {
-                invoke("pty_write", { id: ptyId, data: "\x03" }).catch(() => {});
-              }
-            }).catch(() => {});
-          }
-          return false;
-        }
-        return true;
-      });
     }
 
     const safeFit = () => {

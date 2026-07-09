@@ -211,6 +211,8 @@ function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
       "export TERM=xterm-256color",
       `${tmux} has-session -t ${exactArg}`,
       `${tmux} set-option -g mouse on >/dev/null 2>&1 || true`,
+      `${tmux} bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
+      `${tmux} bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
       `exec ${tmux} attach-session -t ${exactArg}`,
     ].join("; "),
   );

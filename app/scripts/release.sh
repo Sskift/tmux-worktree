@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release tw-dashboard via npm.
+# Release tw-dashboard via bnpm.
 # Bundled into the tmux-worktree package alongside the tw CLI.
 #
 # Run from anywhere:  ./app/scripts/release.sh
@@ -10,7 +10,7 @@
 #      so the Dashboard bundle includes the tw serve backend.
 #   3. Copy dmg into app/installer/dmg/tw-dashboard-arm64.dmg
 #   4. Read root package.json version (user bumps this manually)
-#   5. npm publish from repo root
+#   5. npm publish to bnpm from repo root
 
 set -euo pipefail
 
@@ -19,7 +19,7 @@ APP_DIR="$REPO_ROOT/app"
 INSTALLER_DIR="$APP_DIR/installer"
 TAURI_CONF="$APP_DIR/src-tauri/tauri.conf.json"
 ROOT_PKG="$REPO_ROOT/package.json"
-REGISTRY="https://registry.npmjs.org"
+REGISTRY="https://bnpm.byted.org"
 
 c_red()   { printf '\033[31m%s\033[0m' "$*"; }
 c_green() { printf '\033[32m%s\033[0m' "$*"; }
@@ -72,9 +72,9 @@ fi
 
 info "publishing to $REGISTRY"
 ( cd "$REPO_ROOT" && npm publish --registry="$REGISTRY" )
-ok "published tmux-worktree@$pkg_version"
+ok "published @byted-codebase/tmux-worktree@$pkg_version"
 
 echo
 echo "  Verify install:"
-echo "    npx -y --registry=$REGISTRY -p tmux-worktree tw-dashboard-install"
+echo "    npx -y --registry=$REGISTRY -p @byted-codebase/tmux-worktree tw-dashboard-install"
 echo

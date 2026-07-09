@@ -1672,6 +1672,25 @@ fn run_remote_tmux_check(host: &HostConfig, tmux_args: &[&str]) -> Result<String
     run_remote_cmd_check(host, &["sh", "-c", &command])
 }
 
+fn run_remote_tmux_output(
+    host: &HostConfig,
+    tmux_args: &[&str],
+) -> Result<std::process::Output, String> {
+    if !has_custom_tmux_path(host) {
+        let mut full_args = Vec::with_capacity(tmux_args.len() + 1);
+        full_args.push("tmux");
+        full_args.extend_from_slice(tmux_args);
+        return run_remote_cmd_output(host, &full_args);
+    }
+
+    let mut command = remote_tmux_cmd(host);
+    for arg in tmux_args {
+        command.push(' ');
+        command.push_str(&shell_quote(arg));
+    }
+    run_remote_cmd_output(host, &["sh", "-c", &command])
+}
+
 /// Quiet variant that returns None on failure.
 fn run_remote_tmux_quiet(host: &HostConfig, tmux_args: &[&str]) -> Option<String> {
     run_remote_tmux_check(host, tmux_args).ok()
@@ -2383,28 +2402,70 @@ fn apply_tmux_theme(name: String, theme: TmuxStatusTheme) -> Result<(), String> 
 
 #[tauri::command]
 fn copy_tmux_selection(name: String) -> Result<bool, String> {
-    let (host_id, _raw_name) = parse_session_key(&name);
-    // Remote clipboard is not supported in MVP
-    if host_id.is_some() {
-        return Ok(false);
-    }
-    let output = std::process::Command::new("tmux")
-        .args(["save-buffer", "-"])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let (host_id, raw_name) = parse_session_key(&name);
+    let exact = format!("={raw_name}");
+    let output = match host_id {
+        Some(hid) => {
+            let host = find_host(hid)?;
+            let _ = run_remote_tmux_quiet(
+                &host,
+                &["send-keys", "-t", &exact, "-X", "copy-selection-no-clear"],
+            );
+            run_remote_tmux_output(&host, &["save-buffer", "-"])?
+        }
+        None => {
+            let _ = run_quiet(&[
+                "tmux",
+                "send-keys",
+                "-t",
+                &exact,
+                "-X",
+                "copy-selection-no-clear",
+            ]);
+            std::process::Command::new(tmux_bin())
+                .args(["save-buffer", "-"])
+                .output()
+                .map_err(|e| e.to_string())?
+        }
+    };
     if !output.status.success() || output.stdout.is_empty() {
         return Ok(false);
+    }
+    copy_bytes_to_clipboard(&output.stdout)?;
+    Ok(true)
+}
+
+fn copy_bytes_to_clipboard(bytes: &[u8]) -> Result<(), String> {
+    if !cfg!(target_os = "macos") {
+        return Err("system clipboard copy is only supported on macOS".to_string());
     }
     let mut pbcopy = std::process::Command::new("pbcopy")
         .stdin(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
     if let Some(mut stdin) = pbcopy.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(&output.stdout);
+        stdin.write_all(bytes).map_err(|e| e.to_string())?;
     }
-    let _ = pbcopy.wait();
-    Ok(true)
+    let status = pbcopy.wait().map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pbcopy exited {status}"))
+    }
+}
+
+#[tauri::command]
+fn read_clipboard_text() -> Result<String, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("system clipboard paste is only supported on macOS".to_string());
+    }
+    let output = std::process::Command::new("pbpaste")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!("pbpaste exited {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn detect_default_branch(repo: &str) -> String {
@@ -5386,6 +5447,7 @@ pub fn run() {
             copy_mode_cancel_if_active,
             apply_tmux_theme,
             copy_tmux_selection,
+            read_clipboard_text,
             capture_pane_history,
             git_status,
             git_fetch_project_roots,

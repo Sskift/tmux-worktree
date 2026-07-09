@@ -10,12 +10,27 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
   assert.match(appSource, /export TERM=xterm-256color/);
   assert.match(appSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
   assert.match(appSource, /\$\{tmux\} has-session -t/);
+  assert.match(appSource, /copy-selection-and-cancel/);
+  assert.match(appSource, /MouseDragEnd1Pane/);
+  assert.doesNotMatch(appSource, /MouseDown1Pane/);
   assert.match(appSource, /exec \$\{tmux\} attach-session -t/);
-  assert.doesNotMatch(appSource, /tmux",\s*"set-option"/s);
-  assert.doesNotMatch(appSource, /"mouse",\s*"on"/s);
   assert.doesNotMatch(terminalSource, /tmux_scroll/);
   assert.doesNotMatch(terminalSource, /onTmuxWheel/);
-  assert.doesNotMatch(terminalSource, /host\.addEventListener\("wheel"/);
+  assert.match(terminalSource, /attachCustomWheelEventHandler/);
+});
+
+test("remote tmux clipboard uses local macOS clipboard commands", () => {
+  const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+  assert.match(terminalSource, /invoke<boolean>\("copy_tmux_selection"/);
+  assert.match(terminalSource, /invoke<string>\("read_clipboard_text"/);
+  assert.match(terminalSource, /term\.paste\(text\)/);
+  assert.doesNotMatch(terminalSource, /Remote: skip pbcopy/);
+  assert.match(rustSource, /fn run_remote_tmux_output/);
+  assert.match(rustSource, /run_remote_tmux_output\(&host, &\["save-buffer", "-"\]\)/);
+  assert.match(rustSource, /copy_bytes_to_clipboard\(&output\.stdout\)/);
+  assert.match(rustSource, /std::process::Command::new\("pbpaste"\)/);
 });
 
 test("terminal subscribes to pty output before opening the pty", () => {
