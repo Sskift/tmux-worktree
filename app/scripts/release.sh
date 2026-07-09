@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Release tw-dashboard via bnpm.
-# Bundled into the tmux-worktree package alongside the tw CLI.
+# Build tmux-worktree release assets.
 #
 # Run from anywhere:  ./app/scripts/release.sh
 #
@@ -9,8 +8,7 @@
 #   2. Build (skip with --no-build). Tauri beforeBuild also builds root dist
 #      so the Dashboard bundle includes the tw serve backend.
 #   3. Copy dmg into app/installer/dmg/tw-dashboard-arm64.dmg
-#   4. Read root package.json version (user bumps this manually)
-#   5. npm publish to bnpm from repo root
+#   4. Leave upload/publishing to the release channel outside this script
 
 set -euo pipefail
 
@@ -18,8 +16,6 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 APP_DIR="$REPO_ROOT/app"
 INSTALLER_DIR="$APP_DIR/installer"
 TAURI_CONF="$APP_DIR/src-tauri/tauri.conf.json"
-ROOT_PKG="$REPO_ROOT/package.json"
-REGISTRY="https://bnpm.byted.org"
 
 c_red()   { printf '\033[31m%s\033[0m' "$*"; }
 c_green() { printf '\033[32m%s\033[0m' "$*"; }
@@ -40,13 +36,9 @@ for arg in "$@"; do
 done
 
 [[ -f "$TAURI_CONF" ]] || die "tauri.conf.json not found at $TAURI_CONF"
-[[ -f "$ROOT_PKG" ]]   || die "root package.json not found at $ROOT_PKG"
 tauri_version=$(node -p "require('$TAURI_CONF').version")
-pkg_version=$(node -p "require('$ROOT_PKG').version")
 [[ -n "$tauri_version" && "$tauri_version" != "undefined" ]] || die "could not read version from tauri.conf.json"
-[[ -n "$pkg_version"   && "$pkg_version"   != "undefined" ]] || die "could not read version from root package.json"
 info "tauri build version (dmg name): $tauri_version"
-info "npm package version (publish):  $pkg_version"
 
 arch=$(uname -m)
 [[ "$arch" == "arm64" ]] || die "release.sh currently only handles arm64 builds (running on $arch)"
@@ -64,17 +56,12 @@ cp -f "$dmg_src" "$dmg_dst"
 ok "copied dmg → $dmg_dst ($(du -h "$dmg_dst" | awk '{print $1}'))"
 
 if [[ "$dry_run" -eq 1 ]]; then
-  info "dry run — would now: cd $REPO_ROOT && npm publish --registry=$REGISTRY"
-  info "tarball preview:"
-  ( cd "$REPO_ROOT" && npm pack --dry-run 2>&1 | sed 's/^/    /' )
+  info "dry run — release assets are ready to upload from:"
+  info "  $dmg_dst"
   exit 0
 fi
 
-info "publishing to $REGISTRY"
-( cd "$REPO_ROOT" && npm publish --registry="$REGISTRY" )
-ok "published @byted-codebase/tmux-worktree@$pkg_version"
-
 echo
-echo "  Verify install:"
-echo "    npx -y --registry=$REGISTRY -p @byted-codebase/tmux-worktree tw-dashboard-install"
+echo "  Release asset:"
+echo "    $dmg_dst"
 echo

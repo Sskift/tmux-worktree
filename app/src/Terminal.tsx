@@ -442,13 +442,6 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
       return false;
     };
 
-    const pasteClipboard = () => {
-      invoke<string>("read_clipboard_text").then((text) => {
-        if (text) term.paste(text);
-      }).catch(() => {});
-      return false;
-    };
-
     term.attachCustomKeyEventHandler((e) => {
       if (e.type === "keydown" && e.key === "Escape" && tmuxSession) {
         // Let ESC reach the PTY so TUIs (vim/less/fzf) receive it, and in
@@ -460,9 +453,6 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
       }
       if (e.type === "keydown" && e.metaKey && e.key.toLowerCase() === "c") {
         return copyTmuxOrInterrupt();
-      }
-      if (e.type === "keydown" && e.metaKey && e.key.toLowerCase() === "v") {
-        return pasteClipboard();
       }
       return true;
     });

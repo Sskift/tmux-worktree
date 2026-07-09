@@ -4,25 +4,24 @@ This manual covers local macOS Dashboard setup and SSH remote host usage.
 
 ## Install On macOS
 
-Install the Dashboard app from npm:
+Download the Dashboard DMG from GitHub Releases:
+
+- https://github.com/Sskift/tmux-worktree/releases/latest
+
+Install it like a normal macOS app, then open it:
 
 ```bash
-npx -y -p tmux-worktree tw-dashboard-install
 open -a tw-dashboard
 ```
 
-If `tmux-worktree` was already installed globally, update it first so the installer uses the latest bundled DMG:
+Install the CLI from source on any machine that should create `tw`-managed sessions:
 
 ```bash
-npm i -g tmux-worktree@latest
-tw-dashboard-install
-open -a tw-dashboard
-```
-
-Install the CLI on any machine that should create `tw`-managed sessions:
-
-```bash
-npm i -g tmux-worktree@latest
+git clone https://github.com/Sskift/tmux-worktree.git
+cd tmux-worktree
+npm install
+npm run build
+npm link
 tw setup
 ```
 
@@ -65,7 +64,9 @@ Host remote-dev
 3. Install or update `tw` on the remote host. A user-local install is enough:
 
 ```bash
-ssh remote-dev -- 'mkdir -p ~/.local/bin && npm i -g --prefix ~/.local tmux-worktree@latest'
+ssh remote-dev -- 'mkdir -p ~/.local/src'
+ssh remote-dev -- 'git clone https://github.com/Sskift/tmux-worktree.git ~/.local/src/tmux-worktree'
+ssh remote-dev -- 'cd ~/.local/src/tmux-worktree && npm install && npm run build && npm link --prefix ~/.local'
 ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw version'
 ```
 
@@ -155,7 +156,7 @@ The skill tells the agent to use `tw rpc create-worktree`, not plain `tmux new-s
 
 - `bash: claude: command not found`: install Claude on the remote host and verify `PATH="$HOME/.local/bin:$PATH" claude --version`.
 - `bash: codex: command not found`: install Codex on the remote host and verify `PATH="$HOME/.local/bin:$PATH" codex --version`.
-- Host is reachable but the Dashboard says `tw` is missing: install remote `tw` with npm, then re-test the host.
+- Host is reachable but the Dashboard says `tw` is missing: install remote `tw` from the GitHub source checkout, then re-test the host.
 - Remote path picker is empty for `/home/<user>`: the host may use a symlinked home. Current Dashboard follows symlinked directories; update the app and remote `tw`.
 - Dashboard cannot see a remote tmux session: confirm it was created by `tw` and appears in `tw rpc list`.
 - Existing failed panes do not inherit newly installed commands. Recreate the session, or run `export PATH="$HOME/.local/bin:$PATH"` inside that pane before starting the command.

@@ -1,158 +1,293 @@
-# tmux-worktree
+<p align="center">
+  <img src="app/src-tauri/icons/icon.png" width="96" alt="tmux-worktree logo" />
+</p>
 
-`tmux-worktree` is a macOS desktop app and CLI for managing AI coding sessions with `tmux` and `git worktree`.
+<h1 align="center">tmux-worktree</h1>
 
-It provides:
+<p align="center">
+  A macOS Dashboard and CLI for running AI coding agents in isolated git worktrees, managed tmux sessions, SSH remote hosts, and Android relay clients.
+</p>
 
-- `tw`: a Node.js CLI that creates isolated git worktrees, starts tmux sessions, and runs an AI command.
-- `tw-dashboard`: a Tauri desktop app for managing worktrees, tmux sessions, terminals, automations, files, Git status, and SSH remote hosts.
+<p align="center">
+  <a href="https://github.com/Sskift/tmux-worktree/releases/tag/v1.0.0">
+    <img alt="Release" src="https://img.shields.io/github/v/release/Sskift/tmux-worktree?label=release" />
+  </a>
+  <a href="LICENSE">
+    <img alt="License" src="https://img.shields.io/badge/license-MIT-111827" />
+  </a>
+  <img alt="Platform" src="https://img.shields.io/badge/platform-macOS%20%7C%20Android-2563eb" />
+  <img alt="Node" src="https://img.shields.io/badge/node-%3E%3D20-16a34a" />
+  <img alt="Stack" src="https://img.shields.io/badge/Tauri%202%20%2B%20tmux-0f172a" />
+</p>
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the code map and runtime design. See [MANUAL.md](MANUAL.md) for setup and remote-host usage.
+<p align="center">
+  <a href="#install">Install</a>
+  <span> · </span>
+  <a href="#quick-start">Quick Start</a>
+  <span> · </span>
+  <a href="#dashboard">Dashboard</a>
+  <span> · </span>
+  <a href="#remote-hosts">Remote Hosts</a>
+  <span> · </span>
+  <a href="#android-relay">Android Relay</a>
+  <span> · </span>
+  <a href="MANUAL.md">Manual</a>
+</p>
+
+---
+
+## Why tmux-worktree
+
+AI agents are most useful when every task has its own branch, terminal, files, logs, and recoverable state. `tmux-worktree` turns that into a repeatable workflow:
+
+| Surface | What it gives you |
+| --- | --- |
+| `tw` CLI | Creates git worktrees, names branches, starts tmux, records managed session state, and runs an AI command. |
+| `tw-dashboard` | Native macOS control plane for worktrees, terminals, files, Git status, diffs, automations, and remote hosts. |
+| SSH remote runtime | Lets the local Dashboard create and attach to TW-managed sessions on devboxes over SSH. |
+| Android relay | Pairs a phone with the Mac admin connector so mobile can see the same managed sessions. |
+
+```text
+Mac Dashboard
+  |-- local tw -> git worktree + tmux + AI command
+  |-- ssh host -> remote tw -> remote worktree + tmux
+  `-- relay host -> broker -> Android client
+```
+
+## Highlights
+
+| Capability | Details |
+| --- | --- |
+| Isolated agent workspaces | Every task can run in its own git worktree and tmux session without disturbing the main checkout. |
+| Native terminal control | Dashboard attaches to tmux through a Tauri PTY bridge with resize, history capture, local clipboard paste, and remote tmux copy support. |
+| Remote sessions that feel local | Add SSH hosts, create worktrees remotely, attach to remote tmux, and use mouse selection plus `Cmd+C` / `Cmd+V` from the local app. |
+| Git and file context | Inspect branch state, changed files, history, diffs, file tree, editor, Markdown preview, and search beside the terminal. |
+| Automations | Save repeatable agent instructions, run them on demand, or schedule them with cron-style local Dashboard polling. |
+| Mobile visibility | Android connects through the relay broker and sees TW-managed worktrees and terminals from the Mac admin connector. |
 
 ## Install
 
-### Dashboard
+### macOS Dashboard
 
-Install from the npm package:
+Download the DMG from the GitHub release:
 
-```bash
-npx -y -p tmux-worktree tw-dashboard-install
-open -a tw-dashboard
-```
+[Download `tw-dashboard_1.0.0_aarch64.dmg`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.0/tw-dashboard_1.0.0_aarch64.dmg)
 
-If you already have `tmux-worktree` installed globally, update it first so the installer uses the latest bundled DMG:
+Then install it like a normal macOS app and open it:
 
 ```bash
-npm i -g tmux-worktree@latest
-tw-dashboard-install
 open -a tw-dashboard
 ```
-
-You can also install from a locally built DMG.
 
 ### CLI
 
+Install `tw` from source on every machine that should create or manage sessions:
+
 ```bash
-npm i -g tmux-worktree
+git clone https://github.com/Sskift/tmux-worktree.git
+cd tmux-worktree
+npm install
+npm run build
+npm link
 tw setup
 ```
 
-Update the CLI and Dashboard:
+### Android APK
 
-```bash
-tw update
+The Android binary is published as a separate GitHub release asset:
+
+[Download `tw-dashboard-mobile_1.0.0_release-debug-signed.apk`](https://github.com/Sskift/tmux-worktree/releases/download/android-v1.0.0-apk/tw-dashboard-mobile_1.0.0_release-debug-signed.apk)
+
+The APK is installable and debug-signed. Use it for direct device testing, not app-store distribution.
+
+## Quick Start
+
+Create a config file:
+
+```json
+{
+  "projects": {
+    "myapp": "/Users/me/code/myapp",
+    "backend": {
+      "path": "/Users/me/code/backend",
+      "branch": "develop"
+    }
+  },
+  "worktreeBase": "/Users/me/.tmux-worktree/worktrees",
+  "hosts": ["remote-dev"]
+}
 ```
 
-## Configuration
+Start a local AI coding session:
 
-The CLI and Dashboard share `~/.tmux-worktree.json`:
+```bash
+tw claude myapp
+tw codex backend fix-auth
+tw "claude --model opus" /Users/me/code/myapp
+```
+
+Open the Dashboard:
+
+```bash
+open -a tw-dashboard
+```
+
+Typical Dashboard flow:
+
+1. Click `+ worktree`.
+2. Choose a local project or SSH host.
+3. Enter an AI command such as `claude` or `codex`.
+4. Attach to the tmux terminal, inspect Git state, edit files, and keep scratch terminals nearby.
+
+## Dashboard
+
+The macOS app is built with Tauri 2, React, xterm.js, and a Rust PTY backend.
+
+| Area | Purpose |
+| --- | --- |
+| Worktrees | Create, restore, attach, and clean up TW-managed git worktrees. |
+| Terminals | Keep standalone tmux terminals next to agent sessions. |
+| Git panel | Track active branch, changed files, diffs, and recent commits for the selected session cwd. |
+| File tree and editor | Browse files, edit source, preview Markdown and images, and search by filename or content. |
+| Automations | Define reusable instructions, run them now, pause them, or schedule them. |
+| Layout | Persist window state, sidebar state, column order, editor state, and selected panes. |
+
+Runtime state is stored in user-local JSON files:
+
+| File | Owner | Purpose |
+| --- | --- | --- |
+| `~/.tmux-worktree.json` | CLI and Dashboard | Projects, SSH hosts, and worktree root. |
+| `~/.tmux-worktree/state.json` | CLI and Dashboard | TW-managed sessions and worktrees. |
+| `~/.tw-dashboard-layout.json` | Dashboard | Window, columns, file tree, editor, diff, and selection state. |
+| `~/.tw-dashboard-terminals.json` | Dashboard | Saved standalone terminals. |
+| `~/.tw-dashboard-automations.json` | Dashboard | Automation definitions. |
+| `~/.tw-dashboard-automation-runs.json` | Dashboard | Recent automation run history. |
+
+## CLI
+
+Common commands:
+
+```bash
+tw setup
+tw status
+tw serve
+tw relay-server
+tw relay-host
+tw rpc list
+tw rpc capabilities
+tw automation ls
+```
+
+Create managed sessions:
+
+```bash
+tw claude myapp
+tw claude myapp fix-auth
+tw codex ~/code/backend
+tw rpc create-worktree --project myapp --ai-command "claude" --name fix-auth
+```
+
+Manage automations:
+
+```bash
+tw automation create \
+  --name nightly-review \
+  --project myapp \
+  --cmd "codex" \
+  --instruction "Review recent changes and propose cleanup tasks" \
+  --schedule "0 9 * * 1-5" \
+  --timezone Asia/Shanghai
+
+tw automation ls
+tw automation rm nightly-review
+```
+
+## Remote Hosts
+
+Remote Dashboard support assumes the host is reachable by SSH and has `git`, `tmux`, Node.js 20+, npm, and `tw`.
+
+1. Add a normal SSH alias:
+
+```sshconfig
+Host remote-dev
+  HostName remote-dev.example.com
+  User alice
+```
+
+2. Install `tw` on the remote host:
+
+```bash
+ssh remote-dev -- 'mkdir -p ~/.local/src'
+ssh remote-dev -- 'git clone https://github.com/Sskift/tmux-worktree.git ~/.local/src/tmux-worktree'
+ssh remote-dev -- 'cd ~/.local/src/tmux-worktree && npm install && npm run build && npm link --prefix ~/.local'
+ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw version'
+```
+
+3. Configure remote projects on that host:
+
+```bash
+ssh remote-dev -- 'cat > ~/.tmux-worktree.json <<JSON
+{
+  "projects": {
+    "demo": "/home/alice/code/demo"
+  },
+  "worktreeBase": "/home/alice/.tmux-worktree/worktrees"
+}
+JSON'
+```
+
+4. Add the host in the Dashboard with `+ host`, then create remote worktrees from `+ worktree`.
+
+Remote sessions are created through `tw rpc create-worktree` when available. Older remote installs can still fall back to direct SSH + git/tmux behavior, but the best experience comes from keeping local and remote `tw` versions aligned.
+
+## Android Relay
+
+The mobile path has three pieces:
+
+| Piece | Runs on | Role |
+| --- | --- | --- |
+| `tw relay-server` | Always-reachable broker host | WebSocket broker only. |
+| `tw relay-host` | Mac admin machine | Aggregates local and configured remote TW-managed sessions. |
+| Android APK | Phone | Lists and attaches to sessions exposed through the broker. |
+
+The Dashboard can start or inspect the Mac admin connector. It saves relay settings such as `mobileRelay.relayUrl`, `mobileRelay.hostId`, and `mobileRelay.secret` into `~/.tmux-worktree.json`.
+
+For a persistent broker setup, see [docs/remote-relay-android.md](docs/remote-relay-android.md).
+
+## Configuration Reference
+
+`~/.tmux-worktree.json` accepts compact strings, objects, and common aliases:
 
 ```json
 {
   "projects": {
     "myapp": "/path/to/myapp",
-    "backend": "/path/to/backend"
+    "api": {
+      "path": "~/code/api",
+      "branch": "main"
+    }
   },
-  "hosts": ["remote-dev"],
+  "hosts": [
+    "remote-dev",
+    {
+      "name": "gpu-box",
+      "host": "gpu-box"
+    }
+  ],
   "worktreeBase": "/private/tmp/tmux-worktree/projects"
 }
 ```
 
-- `projects`: maps project names to git repository paths.
-- `hosts`: SSH hosts visible in the Dashboard. Values can be SSH config aliases or full host objects.
-- `worktreeBase`: parent directory for automatically created worktrees.
+Supported aliases:
 
-Project entries also support object and array forms:
+| Setting | Accepted keys |
+| --- | --- |
+| Project map | `projects`, `repositories`, `repos` |
+| Project path | `path`, `dir`, `directory`, `root`, `repoPath`, `repository`, `repositoryPath` |
+| Branch | `branch`, `targetBranch`, `target_branch`, `defaultBranch`, `default_branch` |
+| Worktree root | `worktreeBase`, `worktreeDir`, `worktreeRoot`, `worktreesDir`, `worktreesRoot` |
 
-```json
-{
-  "projects": {
-    "myapp": { "path": "~/code/myapp", "branch": "develop" }
-  },
-  "worktreeRoot": "/private/tmp/tmux-worktree/projects"
-}
-```
-
-Supported project path aliases include `path`, `dir`, `directory`, `root`, `repoPath`, `repository`, and `repositoryPath`.
-
-Supported branch aliases include `branch`, `targetBranch`, `target_branch`, `defaultBranch`, and `default_branch`.
-
-Supported worktree root aliases include `worktreeBase`, `worktreeDir`, `worktreeRoot`, `worktreesDir`, and `worktreesRoot`.
-
-Runtime state files:
-
-- `~/.tmux-worktree/state.json`: sessions and worktrees created by `tw`.
-- `~/.tw-dashboard-layout.json`: Dashboard layout and selected item state.
-- `~/.tw-dashboard-terminals.json`: saved standalone terminals.
-- `~/.tw-dashboard-automations.json`: automation definitions.
-- `~/.tw-dashboard-automation-runs.json`: recent automation run history.
-- `~/.tw-dashboard-pending-worktree-cleanup.json`: delayed worktree cleanup records.
-
-## CLI Usage
-
-Create an AI coding session:
-
-```bash
-tw claude myapp
-tw claude myapp fix-auth
-tw "claude --model opus" backend
-tw codex ~/some/repo
-tw
-```
-
-Common commands:
-
-- `tw setup`: check local dependencies.
-- `tw status`: tmux status panel.
-- `tw serve`: local WebSocket terminal service.
-- `tw relay-server` / `tw relay-host`: stable Android relay broker and Mac admin connector.
-- `tw update`: update the global CLI package and reinstall the latest Dashboard.
-- `tw rpc list`: print live `tw`-managed sessions as JSON.
-- `tw rpc create-worktree (--path <path> | --project <name>) --ai-command <cmd> [--name <name>] [--branch <name>]`: create a Dashboard-managed worktree session.
-- `tw rpc capabilities`: print supported RPC protocol and capabilities.
-- `tw automation ls`: list Dashboard automations.
-- `tw automation create --instruction <text> [--name <name>] [--cmd <ai-cmd>] [--project <name> | --path <path>] [--schedule <cron>] [--timezone <tz>] [--overlap skip|queue] [--disabled]`: create an automation.
-- `tw automation rm <id|name>`: delete an automation.
-
-## Dashboard Usage
-
-Typical flow:
-
-1. Click `+ worktree` to create or restore a worktree session.
-2. Select a session in the sidebar; the main terminal attaches to the matching tmux session.
-3. Use the Git panel to inspect branch, file changes, and commit history.
-4. Open the file tree to browse, edit, and diff project files.
-5. Create local automations from the Automations section.
-6. Use the mobile relay button to start or inspect the Mac admin connector for Android pairing.
-
-Remote host behavior:
-
-- Connected hosts come only from the explicit `hosts` config.
-- The `+ host` dialog shows non-wildcard aliases from `~/.ssh/config`.
-- The Dashboard checks SSH/tmux reachability and whether the remote `tw` CLI is available.
-- Remote worktree creation prefers `tw rpc create-worktree` on the remote host.
-- If compatible RPC is unavailable, the Dashboard falls back to direct SSH + git/tmux commands.
-- Remote scratch terminals start on the selected host and current remote cwd without sourcing login profiles.
-
-Mobile Relay runtime:
-
-- The Dashboard bundle includes the CLI JS needed to start `tw serve` and prefers that bundled resource.
-- If the bundled resource is unavailable, it falls back to a globally installed `tw` / `tmux-worktree` command.
-- `relay-server` runs on an always-reachable machine as a broker only.
-- `relay-host` runs on the Mac admin machine, reads the same local Dashboard config, and aggregates local plus configured remote scopes over SSH.
-- Android pairs with the Mac admin connector through the broker and sees the same TW-managed WorkTrees/Terminals as the Mac Dashboard.
-- Plain tmux sessions are not part of the managed mobile surface.
-- Mobile Relay still needs Node.js 20+ for `tw serve` and `tw relay-host`.
-- The relay broker can run persistently on a devbox with systemd or a dedicated tmux session; see `docs/remote-relay-android.md`.
-- The Dashboard remote menu can start the broker on a configured SSH host and saves `mobileRelay.relayUrl`, `mobileRelay.hostId`, and `mobileRelay.secret` into `~/.tmux-worktree.json`.
-
-Layout behavior:
-
-- The default layout is sidebar, main terminal, and scratch.
-- Sidebar stays on the left. Main, scratch, file tree, and editor/diff columns can be reordered.
-- Automations stay between worktrees and terminals in the sidebar.
-- The Dashboard restores window, column, sidebar, file tree, editor, and diff state after restart.
-- The Git panel follows the active pane cwd for the selected tmux session.
+Dashboard connected hosts come only from explicit `hosts` config. The `+ host` dialog can discover non-wildcard aliases from `~/.ssh/config`, but it does not auto-connect every SSH alias on the machine.
 
 ## Development
 
@@ -164,7 +299,7 @@ Requirements:
 - tmux
 - git
 
-CLI:
+Build the CLI:
 
 ```bash
 npm install
@@ -172,24 +307,13 @@ npm run build
 node dist/cli.js status --once
 ```
 
-Dashboard:
+Run the Dashboard:
 
 ```bash
 cd app
 npm install
 npm run tauri dev
 ```
-
-Local validation should usually use `npm run tauri dev`. It reflects the current workspace directly and avoids generating hashed debug apps under `/Applications`.
-
-Use the isolated dev app only when state isolation is required:
-
-```bash
-cd app
-npm run tauri:dev:isolated
-```
-
-`npm run tauri:dev:install` installs a uniquely named debug `.app` under `/Applications`; use it only when Finder/open launch behavior must be tested, and clean it up afterward with the command printed by the script.
 
 Useful checks:
 
@@ -207,9 +331,16 @@ cargo check
 cargo test
 ```
 
+Use the isolated dev app only when state isolation is required:
+
+```bash
+cd app
+npm run tauri:dev:isolated
+```
+
 ## Release
 
-Build and publish the CLI plus bundled Dashboard installer:
+Build the CLI plus bundled Dashboard installer assets:
 
 ```bash
 ./app/scripts/release.sh --dry-run
@@ -222,13 +353,21 @@ The release script:
 2. Builds the root CLI into `dist/cli.js`.
 3. Bundles `dist/cli.js` into the Dashboard app resources for remote serve fallback.
 4. Copies the DMG to `app/installer/dmg/tw-dashboard-arm64.dmg`.
-5. Publishes the root npm package.
+5. Leaves upload and channel-specific publishing outside the repository.
 
-The npm package includes:
+Generated asset inputs:
 
-- `dist`
-- `app/installer/installer.mjs`
-- `app/installer/dmg/`
+| Path | Purpose |
+| --- | --- |
+| `dist` | Built CLI. |
+| `app/installer/installer.mjs` | `tw-dashboard-install` entrypoint. |
+| `app/installer/dmg/` | Bundled macOS installer image. |
+
+## Documentation
+
+- [Manual](MANUAL.md): setup, local sessions, SSH remote hosts, mobile relay, and troubleshooting.
+- [Architecture](ARCHITECTURE.md): code map, runtime state, release boundaries, and maintenance rules.
+- [Android relay guide](docs/remote-relay-android.md): persistent broker and phone pairing details.
 
 ## License
 

@@ -36,10 +36,14 @@ If controlling the remote host from a local machine, prefix the same checks with
 If `tw` is missing or `tw rpc capabilities` does not include `create-worktree`, install or update the remote binary, then recheck:
 
 ```bash
-npm install -g tmux-worktree@latest --registry=https://registry.npmjs.org
+mkdir -p ~/.local/src
+git clone https://github.com/Sskift/tmux-worktree.git ~/.local/src/tmux-worktree
+cd ~/.local/src/tmux-worktree
+npm install
+npm run build
+npm link --prefix ~/.local
+PATH="$HOME/.local/bin:$PATH" tw version
 ```
-
-Use a specific package version instead of `latest` when the local Dashboard version is supplied by the user.
 
 ## Create
 

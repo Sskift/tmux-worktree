@@ -2454,20 +2454,6 @@ fn copy_bytes_to_clipboard(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-#[tauri::command]
-fn read_clipboard_text() -> Result<String, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("system clipboard paste is only supported on macOS".to_string());
-    }
-    let output = std::process::Command::new("pbpaste")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !output.status.success() {
-        return Err(format!("pbpaste exited {}", output.status));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
 fn detect_default_branch(repo: &str) -> String {
     if let Some(s) = run_quiet(&[
         "git",
@@ -3275,8 +3261,7 @@ struct AddHostArgs {
     identity_file: Option<String>,
 }
 
-const TW_NPM_PACKAGE: &str = "tmux-worktree";
-const TW_NPM_REGISTRY: &str = "https://registry.npmjs.org";
+const TW_GITHUB_REPO: &str = "https://github.com/Sskift/tmux-worktree.git";
 
 #[tauri::command]
 fn list_hosts() -> Result<Vec<HostConfig>, String> {
@@ -3523,18 +3508,28 @@ fn test_host(args: AddHostArgs) -> Result<HostStatus, String> {
 #[tauri::command]
 fn install_host_tw(host_id: String) -> Result<HostStatus, String> {
     let host = find_host(host_id.trim())?;
-    let package = format!("{}@{}", TW_NPM_PACKAGE, env!("CARGO_PKG_VERSION"));
-    run_remote_cmd_check(
-        &host,
-        &[
-            "npm",
-            "install",
-            "-g",
-            &package,
-            &format!("--registry={TW_NPM_REGISTRY}"),
-        ],
-    )
-    .map_err(|e| format!("install remote tw on {}: {e}", host.label))?;
+    let script = format!(
+        r#"set -e
+repo={}
+root="$HOME/.local/src/tmux-worktree"
+mkdir -p "$HOME/.local/src"
+if [ -d "$root/.git" ]; then
+  git -C "$root" fetch --all --tags --prune
+  git -C "$root" checkout master
+  git -C "$root" pull --ff-only
+else
+  rm -rf "$root"
+  git clone --depth 1 "$repo" "$root"
+fi
+cd "$root"
+npm install
+npm run build
+npm link --prefix "$HOME/.local"
+"#,
+        shell_quote(TW_GITHUB_REPO)
+    );
+    run_remote_cmd_check(&host, &["sh", "-lc", &script])
+        .map_err(|e| format!("install remote tw on {}: {e}", host.label))?;
     Ok(probe_host_status(&host))
 }
 
@@ -4833,7 +4828,7 @@ fn spawn_serve(app: &tauri::AppHandle) -> Result<std::process::Child, String> {
     }
 
     Err(format!(
-        "Failed to start mobile relay serve backend. {}. Install Node.js 20+ or run `npm i -g tmux-worktree@latest --registry=https://registry.npmjs.org`.",
+        "Failed to start mobile relay serve backend. {}. Install Node.js 20+ and install `tw` from https://github.com/Sskift/tmux-worktree.",
         failures.join("; ")
     ))
 }
@@ -5447,7 +5442,6 @@ pub fn run() {
             copy_mode_cancel_if_active,
             apply_tmux_theme,
             copy_tmux_selection,
-            read_clipboard_text,
             capture_pane_history,
             git_status,
             git_fetch_project_roots,
@@ -8040,7 +8034,7 @@ exit 12
     }
 
     #[test]
-    fn install_host_tw_uses_current_package_version_and_registry() {
+    fn install_host_tw_uses_github_source_install() {
         let _guard = test_env_lock().lock().expect("lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
@@ -8061,7 +8055,7 @@ done
 printf '%s\n' "$*" >> "$log"
 
 case "$1" in
-  *"'npm'"*"'install'"*"'tmux-worktree@0.12.6'"*"'--registry=https://registry.npmjs.org'"*)
+  *"git clone --depth 1"*"npm link --prefix"*)
     printf 'installed\n'
     exit 0
     ;;
@@ -8119,11 +8113,9 @@ exit 12
         assert_eq!(status.tw_version.as_deref(), Some("0.11.1"));
 
         let log = fs::read_to_string(&log_path).expect("ssh log");
-        assert!(log.contains(&format!(
-            "'npm' 'install' '-g' 'tmux-worktree@{}'",
-            env!("CARGO_PKG_VERSION")
-        )));
-        assert!(log.contains("'--registry=https://registry.npmjs.org'"));
+        assert!(log.contains("git clone --depth 1"));
+        assert!(log.contains("https://github.com/Sskift/tmux-worktree.git"));
+        assert!(log.contains("npm link --prefix"));
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);

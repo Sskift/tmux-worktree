@@ -4,9 +4,9 @@
 
 ## 发布物
 
-### CLI npm binary
+### CLI binary
 
-根目录 npm 包发布以下命令：
+根目录源码构建产出以下命令：
 
 - `tw`
 - `tmux-worktree`
@@ -16,7 +16,7 @@
 1. `src/*.ts`
 2. `npm run build`
 3. `dist/cli.js`
-4. npm package `bin`
+4. `package.json` 的 `bin` 映射用于本地 link/source install
 
 源码边界：
 
@@ -29,11 +29,11 @@
 | `src/status.ts` | CLI session 左侧 tmux TUI 状态面板 | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
 | `src/setup.ts` | 系统依赖检查和可选安装 | 打包 |
-| `src/update.ts` | `tw update`，更新全局 npm CLI 包并重新安装 Dashboard | 打包 |
+| `src/update.ts` | `tw update`，输出 GitHub Release 和 source checkout 更新步骤 | 打包 |
 
-### Dashboard installer npm binary
+### Dashboard installer
 
-根目录 npm 包发布以下命令：
+根目录保留以下安装器入口：
 
 - `tw-dashboard-install`
 
@@ -105,7 +105,7 @@ Remote TW runtime：
 - 远端可以安装 `tw` binary；Dashboard 通过 SSH 调用 `tw rpc list`，优先读取远端 `~/.tmux-worktree/state.json` 中登记的 managed session/worktree。
 - `tw rpc list` 默认输出 JSON，返回协议版本和 live managed sessions；Dashboard 只把 `kind=worktree` 的条目映射成 remote worktree session。
 - Dashboard 在远端创建 worktree 时优先通过 SSH 执行 `tw rpc create-worktree --path <path> --ai-command <cmd> ...`，由远端 `tw` 负责 git worktree、tmux session 和 managed state 写入；host 选择发生在 Dashboard/本地调用层，RPC JSON 只作为机器可读返回协议。
-- Host 状态探测分两层：先通过 `tmux -V` 判断 SSH/tmux 是否可达，再通过 `tw version` 判断远端 TW 是否可用。缺少 TW 时 Dashboard 可通过 SSH 执行 `npm install -g tmux-worktree@<dashboard-version> --registry=https://registry.npmjs.org` 安装与当前 Dashboard 对齐的 CLI。
+- Host 状态探测分两层：先通过 `tmux -V` 判断 SSH/tmux 是否可达，再通过 `tw version` 判断远端 TW 是否可用。缺少 TW 时 Dashboard 可通过 SSH 从 GitHub source checkout 构建并 link `tw`。
 - 如果远端没有兼容 `tw rpc list` / `tw rpc create-worktree`，Dashboard 暂时 fallback 到旧的 tmux/git 探测路径，用于兼容未升级远端。
 
 Automation 设计：
@@ -126,9 +126,9 @@ Mobile Relay 启动顺序：
 
 Update 命令：
 
-1. `tw update` 默认运行 `npm i -g tmux-worktree@latest --registry=https://registry.npmjs.org`。
-2. npm 包更新完成后运行 PATH 中的 `tw-dashboard-install`，用最新包内置 DMG 覆盖安装 `/Applications/tw-dashboard.app`。
-3. `tw update --dry-run` 只打印将执行的命令；`--cli-only` 和 `--dashboard-only` 用于分步排查。
+1. `tw update` 输出 GitHub Releases 下载地址和源码更新步骤。
+2. Dashboard 更新通过 GitHub Release DMG 完成。
+3. CLI 更新通过 GitHub source checkout 后 `npm install && npm run build && npm link` 完成。
 
 ## Session Layout Profiles
 
@@ -151,7 +151,7 @@ CLI 和 Dashboard 故意创建不同的 tmux 布局，但共享命名和 worktre
 
 ## 仅开发使用
 
-这些文件不进入 npm 包；根目录 `package.json` 的 `files` 字段不会包含它们。
+这些文件不进入发布资产；根目录 `package.json` 的 `files` 字段不会包含它们。
 
 | 路径 | 作用 |
 |---|---|
@@ -167,7 +167,7 @@ CLI 和 Dashboard 故意创建不同的 tmux 布局，但共享命名和 worktre
 
 | 路径 | 作用 |
 |---|---|
-| `app/scripts/release.sh` | 构建 CLI 和 Dashboard、复制 DMG、发布根目录 npm 包 |
+| `app/scripts/release.sh` | 构建 CLI 和 Dashboard、复制 DMG 到安装器目录；上传发布物由外部发布渠道处理 |
 | `app/installer/installer.mjs` | `tw-dashboard-install` 运行时安装器 |
 
 ## 运行时状态文件

@@ -1923,6 +1923,25 @@ select.field__input {
   color: var(--text-dim);
 }
 
+.remote-popover__menu-select {
+  min-width: 0;
+  width: 100%;
+}
+
+.remote-popover__menu-select .automation-menu-select__button {
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 11px;
+}
+
+.remote-popover__menu-select .automation-menu-select__button:disabled {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
 .remote-popover__icon-btn {
   flex-shrink: 0;
   width: 24px;

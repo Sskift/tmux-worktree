@@ -24,13 +24,13 @@ test("remote tmux clipboard uses local macOS clipboard commands", () => {
   const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
   assert.match(terminalSource, /invoke<boolean>\("copy_tmux_selection"/);
-  assert.match(terminalSource, /invoke<string>\("read_clipboard_text"/);
-  assert.match(terminalSource, /term\.paste\(text\)/);
+  assert.doesNotMatch(terminalSource, /invoke<string>\("read_clipboard_text"/);
+  assert.doesNotMatch(terminalSource, /term\.paste\(text\)/);
+  assert.doesNotMatch(terminalSource, /pasteClipboard/);
   assert.doesNotMatch(terminalSource, /Remote: skip pbcopy/);
   assert.match(rustSource, /fn run_remote_tmux_output/);
   assert.match(rustSource, /run_remote_tmux_output\(&host, &\["save-buffer", "-"\]\)/);
   assert.match(rustSource, /copy_bytes_to_clipboard\(&output\.stdout\)/);
-  assert.match(rustSource, /std::process::Command::new\("pbpaste"\)/);
 });
 
 test("terminal subscribes to pty output before opening the pty", () => {

@@ -11,6 +11,7 @@ import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
 import { AutomationPanel } from "./AutomationPanel";
+import { MenuSelect } from "./MenuSelect";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import {
@@ -2154,22 +2155,18 @@ function App() {
                   <div className="remote-popover__fields">
                     <div className="remote-popover__field">
                       <span className="remote-popover__label">Broker</span>
-                      <select
-                        className="remote-popover__input"
+                      <MenuSelect
+                        ariaLabel="Broker"
+                        className="remote-popover__menu-select"
                         value={mobileRelayBrokerHostId}
-                        onChange={(event) => setMobileRelayBrokerHostId(event.target.value)}
+                        onChange={setMobileRelayBrokerHostId}
                         disabled={mobileRelayBusy || mobileRelayActive || hosts.length === 0}
-                      >
-                        {hosts.length === 0 ? (
-                          <option value="">No SSH hosts</option>
-                        ) : (
-                          hosts.map((host) => (
-                            <option key={host.id} value={host.id}>
-                              {host.label || host.id}
-                            </option>
-                          ))
-                        )}
-                      </select>
+                        options={
+                          hosts.length === 0
+                            ? [{ value: "", label: "No SSH hosts" }]
+                            : hosts.map((host) => ({ value: host.id, label: host.label || host.id }))
+                        }
+                      />
                       <span className="remote-popover__spacer" />
                     </div>
                     <div className="remote-popover__field">
