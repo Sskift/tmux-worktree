@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Sskift/tmux-worktree/releases/tag/v1.0.0">
+  <a href="https://github.com/Sskift/tmux-worktree/releases/tag/v1.0.1">
     <img alt="Release" src="https://img.shields.io/github/v/release/Sskift/tmux-worktree?label=release" />
   </a>
   <a href="LICENSE">
@@ -71,7 +71,7 @@ Mac Dashboard
 
 Download the DMG from the GitHub release:
 
-[Download `tw-dashboard_1.0.0_aarch64.dmg`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.0/tw-dashboard_1.0.0_aarch64.dmg)
+[Download `tw-dashboard_1.0.1_aarch64.dmg`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.1/tw-dashboard_1.0.1_aarch64.dmg)
 
 Then install it like a normal macOS app and open it:
 
