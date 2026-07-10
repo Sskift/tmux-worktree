@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
 import { basename, dirname } from "node:path";
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -22,7 +22,10 @@ type RelayHostOptions = {
   displayName: string;
   secret: string;
   local: string;
+  statusFile: string;
 };
+
+type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopped";
 
 type AdminScope = {
   id: string;
@@ -108,6 +111,7 @@ function parseArgs(argv: string[]): RelayHostOptions {
   let displayName = process.env.TW_RELAY_DISPLAY_NAME || `${hostname()} admin`;
   let secret = process.env.TW_RELAY_SECRET || "";
   let local = process.env.TW_SERVE_URL || "http://127.0.0.1:8311";
+  let statusFile = process.env.TW_RELAY_STATUS_FILE || "";
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
@@ -121,6 +125,8 @@ function parseArgs(argv: string[]): RelayHostOptions {
       secret = argv[++i] || "";
     } else if (arg === "--local") {
       local = argv[++i] || local;
+    } else if (arg === "--status-file") {
+      statusFile = argv[++i] || "";
     } else if (arg === "-h" || arg === "--help") {
       printHelp();
       process.exit(0);
@@ -133,7 +139,7 @@ function parseArgs(argv: string[]): RelayHostOptions {
   if (!hostId || !isValidHostId(hostId)) throw new CliError("relay-host 需要合法 --host-id（字母、数字、点、下划线）");
   if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
 
-  return { relay, hostId, displayName, secret, local: local.replace(/\/+$/, "") };
+  return { relay, hostId, displayName, secret, local: local.replace(/\/+$/, ""), statusFile };
 }
 
 function printHelp(): void {
@@ -168,6 +174,31 @@ function relayUrl(opts: RelayHostOptions): string {
   base.pathname = "/host";
   base.searchParams.set("hostId", opts.hostId);
   return base.toString();
+}
+
+function writeRelayStatus(
+  opts: RelayHostOptions,
+  state: RelayHostConnectionState,
+  details: { error?: string; retryInMs?: number; connectedAt?: number } = {},
+): void {
+  if (!opts.statusFile) return;
+  const status = {
+    state,
+    relayUrl: opts.relay,
+    hostId: opts.hostId,
+    updatedAt: Date.now(),
+    ...(details.connectedAt ? { connectedAt: details.connectedAt } : {}),
+    ...(details.retryInMs ? { retryInMs: details.retryInMs } : {}),
+    ...(details.error ? { error: details.error } : {}),
+  };
+  const temp = `${opts.statusFile}.${process.pid}.tmp`;
+  try {
+    mkdirSync(dirname(opts.statusFile), { recursive: true });
+    writeFileSync(temp, `${JSON.stringify(status)}\n`, { encoding: "utf8", mode: 0o600 });
+    renameSync(temp, opts.statusFile);
+  } catch {
+    try { unlinkSync(temp); } catch {}
+  }
 }
 
 function localWsUrl(localBase: string, session: string, paneIndex: string, token: string): string {
@@ -1097,6 +1128,7 @@ async function reopenRoutedStream(
 
 async function runConnection(opts: RelayHostOptions): Promise<boolean> {
   requireServeToken();
+  writeRelayStatus(opts, "connecting");
 
   const relaySocket = new WebSocket(relayUrl(opts), {
     headers: { Authorization: `Bearer ${opts.secret}` },
@@ -1113,6 +1145,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
     relaySocket.once("error", reject);
   });
   console.log(`[relay-host] connected to ${opts.relay} as ${opts.hostId}`);
+  writeRelayStatus(opts, "connected", { connectedAt: Date.now() });
   sendJson(relaySocket, { type: "host_ready", hostId: opts.hostId, displayName: opts.displayName, version: "admin-v1" });
 
   relaySocket.on("message", async (raw) => {
@@ -1268,14 +1301,24 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 export async function run(): Promise<void> {
   const opts = parseArgs(process.argv.slice(3));
   let delay = 1000;
+  const stop = () => {
+    writeRelayStatus(opts, "stopped");
+    process.exit(0);
+  };
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+
   while (true) {
+    let retryError = "Relay connection closed";
     try {
       const opened = await runConnection(opts);
       delay = opened ? 1000 : Math.min(delay * 2, 15_000);
     } catch (err) {
-      console.error(`[relay-host] ${err instanceof Error ? err.message : String(err)}`);
+      retryError = err instanceof Error ? err.message : String(err);
+      console.error(`[relay-host] ${retryError}`);
       delay = Math.min(delay * 2, 15_000);
     }
+    writeRelayStatus(opts, "retrying", { error: retryError, retryInMs: delay });
     await new Promise((resolve) => setTimeout(resolve, delay));
   }
 }

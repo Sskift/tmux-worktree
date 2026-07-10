@@ -9,6 +9,14 @@ export type LinkMatch = {
   | { kind: "file"; path: string; line?: number; col?: number }
 );
 
+export function shouldActivateTerminalLink(
+  event: { metaKey: boolean; ctrlKey: boolean },
+  link: Pick<LinkMatch, "kind">,
+  isRemote: boolean,
+): boolean {
+  return event.metaKey || event.ctrlKey || (isRemote && link.kind === "url");
+}
+
 // Stop a URL only at whitespace, quotes, or angle brackets — parens/brackets are
 // allowed *inside* (e.g. wikipedia `/Foo_(bar)`) and balanced/trimmed afterwards.
 const URL_REGEX = /https?:\/\/[^\s'"<>`]+/g;

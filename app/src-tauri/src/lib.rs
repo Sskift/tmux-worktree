@@ -4854,6 +4854,7 @@ fn stop_mobile_relay_connector(state: &MobileRelayState) {
         let _ = child.wait();
     }
     *proc = None;
+    let _ = std::fs::remove_file(mobile_relay_status_file());
 }
 
 fn stop_mobile_relay_processes(state: &MobileRelayState) {
@@ -4865,10 +4866,27 @@ fn stop_mobile_relay_processes(state: &MobileRelayState) {
 #[serde(rename_all = "camelCase")]
 struct MobileRelayStatus {
     active: bool,
+    connected: bool,
+    connection_state: String,
     relay_url: String,
     host_id: String,
     secret: String,
     token: String,
+    connected_at: Option<u64>,
+    updated_at: Option<u64>,
+    retry_in_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct RelayHostRuntimeStatus {
+    state: String,
+    relay_url: String,
+    host_id: String,
+    connected_at: Option<u64>,
+    updated_at: Option<u64>,
+    retry_in_ms: Option<u64>,
     error: Option<String>,
 }
 
@@ -5021,6 +5039,17 @@ fn mobile_relay_secret() -> String {
     )
 }
 
+fn mobile_relay_status_file() -> PathBuf {
+    app_home_dir_or_tmp()
+        .join(".tmux-worktree")
+        .join("mobile-relay-status.json")
+}
+
+fn load_mobile_relay_runtime_status() -> Option<RelayHostRuntimeStatus> {
+    let content = std::fs::read_to_string(mobile_relay_status_file()).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 fn scp_remote_target(host: &HostConfig, remote_path: &str) -> String {
     let target = match &host.user {
         Some(user) => format!("{user}@{}", host.host),
@@ -5082,12 +5111,38 @@ fn local_lan_ip() -> Option<String> {
     }
 }
 
+fn normalize_local_mdns_name(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    let name = normalized.trim_end_matches(".local");
+    if name.is_empty()
+        || name.len() > 63
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    Some(format!("{name}.local"))
+}
+
+fn local_mdns_name() -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/scutil")
+        .args(["--get", "LocalHostName"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    normalize_local_mdns_name(&String::from_utf8_lossy(&output.stdout))
+}
+
 fn start_mobile_relay_ssh_forward(
     host: &HostConfig,
     bind_host: &str,
+    probe_host: &str,
     port: u16,
 ) -> Result<(), String> {
-    if tcp_addr_open(bind_host, port) {
+    if tcp_addr_open(probe_host, port) {
         return Ok(());
     }
 
@@ -5101,6 +5156,10 @@ fn start_mobile_relay_ssh_forward(
         .arg("StrictHostKeyChecking=accept-new")
         .arg("-o")
         .arg("ConnectTimeout=5")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
         .arg("-L")
         .arg(format!("{bind_host}:{port}:127.0.0.1:{port}"));
     if let Some(remote_port) = host.port {
@@ -5124,7 +5183,7 @@ fn start_mobile_relay_ssh_forward(
     }
 
     std::thread::sleep(Duration::from_millis(250));
-    if tcp_addr_open(bind_host, port) {
+    if tcp_addr_open(probe_host, port) {
         Ok(())
     } else {
         Err(format!(
@@ -5135,10 +5194,11 @@ fn start_mobile_relay_ssh_forward(
 }
 
 fn mobile_relay_forward_url_for_host(host: &HostConfig, port: u16) -> Result<String, String> {
-    let lan_ip = local_lan_ip()
-        .ok_or_else(|| "could not determine this Mac's LAN IP for Android relay URL".to_string())?;
-    start_mobile_relay_ssh_forward(host, &lan_ip, port)?;
-    Ok(format!("ws://{lan_ip}:{port}"))
+    let advertised_host = local_mdns_name().or_else(local_lan_ip).ok_or_else(|| {
+        "could not determine this Mac's local hostname or LAN IP for Android relay URL".to_string()
+    })?;
+    start_mobile_relay_ssh_forward(host, "0.0.0.0", "127.0.0.1", port)?;
+    Ok(format!("ws://{advertised_host}:{port}"))
 }
 
 fn should_preserve_mobile_relay_url(current: &str, host: &HostConfig, port: u16) -> bool {
@@ -5202,16 +5262,19 @@ fn spawn_relay_host(
     token: &str,
 ) -> Result<std::process::Child, String> {
     let mut failures = Vec::new();
-    let args = [
-        "relay-host",
-        "--relay",
-        relay_url,
-        "--host-id",
-        host_id,
-        "--display-name",
-        display_name,
-        "--local",
-        "http://127.0.0.1:8311",
+    let status_file = mobile_relay_status_file().to_string_lossy().to_string();
+    let args = vec![
+        "relay-host".to_string(),
+        "--relay".to_string(),
+        relay_url.to_string(),
+        "--host-id".to_string(),
+        host_id.to_string(),
+        "--display-name".to_string(),
+        display_name.to_string(),
+        "--local".to_string(),
+        "http://127.0.0.1:8311".to_string(),
+        "--status-file".to_string(),
+        status_file,
     ];
 
     if let Some(cli) = bundled_cli_path(app) {
@@ -5220,7 +5283,7 @@ fn spawn_relay_host(
             let mut command = std::process::Command::new(&node);
             command
                 .arg(cli_arg)
-                .args(args)
+                .args(&args)
                 .env("TW_RELAY_SECRET", secret)
                 .env("TW_TOKEN", token)
                 .stdin(std::process::Stdio::null())
@@ -5240,7 +5303,7 @@ fn spawn_relay_host(
     if let Some(tw) = installed_tw_command() {
         let mut command = std::process::Command::new(&tw);
         command
-            .args(args)
+            .args(&args)
             .env("TW_RELAY_SECRET", secret)
             .env("TW_TOKEN", token)
             .stdin(std::process::Stdio::null())
@@ -5293,6 +5356,8 @@ fn mobile_relay_start(
         stop_managed_serve(state.inner());
         return Err(message);
     }
+
+    let _ = std::fs::remove_file(mobile_relay_status_file());
 
     let child = spawn_relay_host(
         &app,
@@ -5376,39 +5441,69 @@ fn mobile_relay_stop(state: State<'_, Arc<MobileRelayState>>) -> Result<(), Stri
 #[tauri::command]
 fn mobile_relay_status(state: State<'_, Arc<MobileRelayState>>) -> MobileRelayStatus {
     let mut proc = state.process.lock().unwrap();
+    let mut process_error = None;
     if let Some(ref mut child) = *proc {
         match child.try_wait() {
-            Ok(Some(_)) => {
+            Ok(Some(status)) => {
                 *proc = None;
+                process_error = Some(format!("Mobile relay connector exited: {status}"));
             }
             _ => {}
         }
     }
+    if let Some(message) = process_error {
+        set_mobile_relay_error(state.inner(), Some(message));
+    }
+    let active = proc.is_some();
     let default_config = mobile_relay_config();
     let relay_url = state.relay_url.lock().unwrap();
     let host_id = state.host_id.lock().unwrap();
     let secret = state.secret.lock().unwrap();
     let token = state.token.lock().unwrap();
-    let error = state.last_error.lock().unwrap();
+    let resolved_relay_url = if relay_url.is_empty() {
+        default_config.relay_url
+    } else {
+        relay_url.clone()
+    };
+    let resolved_host_id = if host_id.is_empty() {
+        default_config.host_id
+    } else {
+        host_id.clone()
+    };
+    let runtime = active
+        .then(load_mobile_relay_runtime_status)
+        .flatten()
+        .filter(|status| {
+            status.relay_url == resolved_relay_url && status.host_id == resolved_host_id
+        });
+    let connection_state = if !active {
+        "stopped".to_string()
+    } else {
+        runtime
+            .as_ref()
+            .map(|status| status.state.clone())
+            .filter(|status| !status.is_empty())
+            .unwrap_or_else(|| "starting".to_string())
+    };
+    let connected = active && connection_state == "connected";
+    let runtime_error = runtime.as_ref().and_then(|status| status.error.clone());
+    let error = state.last_error.lock().unwrap().clone().or(runtime_error);
     MobileRelayStatus {
-        active: proc.is_some(),
-        relay_url: if relay_url.is_empty() {
-            default_config.relay_url
-        } else {
-            relay_url.clone()
-        },
-        host_id: if host_id.is_empty() {
-            default_config.host_id
-        } else {
-            host_id.clone()
-        },
+        active,
+        connected,
+        connection_state,
+        relay_url: resolved_relay_url,
+        host_id: resolved_host_id,
         secret: if secret.is_empty() {
             default_config.secret
         } else {
             secret.clone()
         },
         token: token.clone(),
-        error: error.clone(),
+        connected_at: runtime.as_ref().and_then(|status| status.connected_at),
+        updated_at: runtime.as_ref().and_then(|status| status.updated_at),
+        retry_in_ms: runtime.as_ref().and_then(|status| status.retry_in_ms),
+        error,
     }
 }
 
@@ -5510,12 +5605,12 @@ mod tests {
         finish_git_fetch_target, git_fetch_args, hosts_from_config, install_host_tw,
         is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
         list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
-        load_pending_cleanup, mobile_relay_config_from_value, orphaned_worktrees,
-        parse_session_key, project_from_config, project_from_worktree_path, projects_from_config,
-        projects_from_config_with_home, remote_home_dir_for_host, remote_read_dirs_for_host,
-        reserve_git_fetch_target, restore_worktree, run_check, run_remote_tmux_check,
-        run_remote_tw_check, save_automation, save_hosts_config, save_pending_cleanup,
-        should_skip_automation_overlap, ssh_host_candidates_from_config_text,
+        load_pending_cleanup, mobile_relay_config_from_value, normalize_local_mdns_name,
+        orphaned_worktrees, parse_session_key, project_from_config, project_from_worktree_path,
+        projects_from_config, projects_from_config_with_home, remote_home_dir_for_host,
+        remote_read_dirs_for_host, reserve_git_fetch_target, restore_worktree, run_check,
+        run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
+        save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
         stable_output_signature, test_host, tmux_session_exists, trigger_automation,
         try_cleanup_worktree, upsert_automation_from_input, worktree_has_uncommitted_changes,
         worktrees_for_session, AddHostArgs, Automation, AutomationOverlap, AutomationRun,
@@ -8327,5 +8422,18 @@ Host jump-proxy
         assert_eq!(flat.relay_url, "wss://relay.example.org");
         assert_eq!(flat.host_id, "laptop");
         assert_eq!(flat.secret, "token-2");
+    }
+
+    #[test]
+    fn mobile_relay_uses_a_stable_local_mdns_name() {
+        assert_eq!(
+            normalize_local_mdns_name("Desk-Mac\n"),
+            Some("desk-mac.local".to_string())
+        );
+        assert_eq!(
+            normalize_local_mdns_name("desk-mac.local"),
+            Some("desk-mac.local".to_string())
+        );
+        assert_eq!(normalize_local_mdns_name("bad host"), None);
     }
 }

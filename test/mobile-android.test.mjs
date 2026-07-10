@@ -20,8 +20,8 @@ test("Android terminal refits after keyboard viewport changes", () => {
 test("Android package version matches current release line", () => {
   const gradle = readFileSync("mobile/android/app/build.gradle.kts", "utf8");
 
-  assert.match(gradle, /versionCode = 10000/);
-  assert.match(gradle, /versionName = "1\.0\.0"/);
+  assert.match(gradle, /versionCode = 10002/);
+  assert.match(gradle, /versionName = "1\.0\.2"/);
 });
 
 test("Android worktree list groups sessions by project", () => {
@@ -66,6 +66,19 @@ test("Android terminal stream errors reopen the active session", () => {
   assert.match(source, /normalized\.contains\("terminal stream is not open"\)/);
   assert.match(source, /scheduleTerminalStreamReopen\("Reopening terminal stream"\)/);
   assert.match(source, /if \(activeStreamId == null\) \{\s*if \(!openTerminalStream\(false\) \|\| activeStreamId == null\) return;\s*\}/s);
+});
+
+test("mobile relay failures stay visible on Android and in the Dashboard", () => {
+  const android = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
+  const dashboard = readFileSync("app/src/App.tsx", "utf8");
+  const backend = readFileSync("app/src-tauri/src/lib.rs", "utf8");
+
+  assert.match(android, /if \(reconnectAttempt >= 3\) \{\s*setIdentityExpanded\(true\);\s*\}/s);
+  assert.match(dashboard, /setInterval\(refresh, 2000\)/);
+  assert.match(dashboard, /mobileRelayConnected\s*\? "Connected"/);
+  assert.match(backend, /connection_state: String/);
+  assert.match(backend, /load_mobile_relay_runtime_status/);
+  assert.match(backend, /status\.relay_url == resolved_relay_url && status\.host_id == resolved_host_id/);
 });
 
 test("Android terminal supports touch scrolling through xterm scrollback", () => {

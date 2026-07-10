@@ -97,10 +97,10 @@ ssh -fN -o ExitOnForwardFailure=yes \
   -L 127.0.0.1:8787:127.0.0.1:8787 devbox.example.net
 
 ssh -fN -o ExitOnForwardFailure=yes \
-  -L <mac-lan-ip>:8787:127.0.0.1:8787 devbox.example.net
+  -L 0.0.0.0:8787:127.0.0.1:8787 devbox.example.net
 ```
 
-Then set the Dashboard relay URL to `ws://<mac-lan-ip>:8787`. Android reaches the Mac, and the Mac forwards traffic to the devbox broker over SSH.
+Then set the Dashboard relay URL to `ws://<mac-local-name>.local:8787`. Android reaches the Mac, and the Mac forwards traffic to the devbox broker over SSH. The mDNS name stays stable when the Mac's DHCP or VPN address changes. This mode requires Android and the Mac to be on a network where `.local` discovery works.
 
 Start local terminal serving on the Mac:
 
@@ -147,13 +147,13 @@ From the Dashboard header, open the remote/mobile relay menu:
 4. Dashboard starts the local Mac connector with the generated URL and token.
 5. Click `Copy Android Launch` and run the copied command with `adb`.
 
-The generated broker URL defaults to:
+When the broker is only reachable over SSH, the generated relay URL defaults to the Mac's stable mDNS name:
 
 ```text
-ws://<selected-host>:8787
+ws://<mac-local-name>.local:8787
 ```
 
-Edit `Relay URL` before `Start` if Android needs a different DNS name, tunnel, or TLS URL such as `wss://devbox.example.net`.
+Edit `Relay URL` before `Start` if Android needs a cross-network DNS name or TLS URL such as `wss://devbox.example.net`.
 
 ## Android
 

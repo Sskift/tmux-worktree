@@ -1852,6 +1852,9 @@ public class MainActivity extends Activity {
         int delay = Math.min((int) Math.pow(2, Math.min(reconnectAttempt, 4)) * 1000, MAX_RECONNECT_DELAY_MS);
         reconnectAttempt++;
         reconnectScheduled = true;
+        if (reconnectAttempt >= 3) {
+            setIdentityExpanded(true);
+        }
         setStatusUi(compact(reason, 34) + " - retry in " + Math.max(1, delay / 1000) + "s", WARNING);
         reconnectRunnable = () -> {
             reconnectScheduled = false;

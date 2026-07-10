@@ -12,7 +12,14 @@ import {
   TMUX_RECONNECT_DELAY_MS,
   shouldReconnectTmuxAttach,
 } from "./terminalLifecycle";
-import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser, type LinkMatch } from "./linkDetect";
+import {
+  detectLinks,
+  resolvePath,
+  checkFileExists,
+  openUrlInBrowser,
+  shouldActivateTerminalLink,
+  type LinkMatch,
+} from "./linkDetect";
 import "@xterm/xterm/css/xterm.css";
 
 type Props = {
@@ -301,7 +308,11 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     term.loadAddon(fit);
     term.open(host);
 
-    // Register link provider for CMD+click support
+    const isActionableLink = (link: Pick<LinkMatch, "kind">) =>
+      link.kind === "url" || (!!cwd && !!onOpenFile);
+
+    // Remote tmux owns ordinary mouse events, so web links also support direct
+    // click there. Cmd/Ctrl+click remains available for every terminal link.
     const linkProvider: ILinkProvider = {
       provideLinks(bufferLineNumber: number, callback: (links: ILink[] | undefined) => void) {
         const logicalLine = buildLogicalLine(term, bufferLineNumber - 1);
@@ -312,6 +323,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
 
         const links: ILink[] = [];
         for (const match of detected) {
+          if (!isActionableLink(match)) continue;
           const start = logicalLine.charToCell[match.startIndex];
           const end = logicalLine.charToCell[match.endIndex - 1];
           if (!start || !end) continue;
@@ -321,9 +333,9 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
             text: match.text,
             decorations: { underline: true, pointerCursor: true },
             activate(event: MouseEvent, _text: string) {
-              if (!event.metaKey) return;
+              if (!shouldActivateTerminalLink(event, match, !!hostId)) return;
               if (match.kind === "url") {
-                openUrlInBrowser(match.url);
+                openUrlInBrowser(match.url).catch(() => {});
               } else if (match.kind === "file" && cwd) {
                 const resolved = resolvePath(match.path, cwd);
                 checkFileExists(resolved).then((exists) => {
@@ -341,8 +353,8 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     };
     term.registerLinkProvider(linkProvider);
 
-    let pendingMetaLink: ResolvedLink | null = null;
-    const consumeMetaMouseEvent = (event: MouseEvent) => {
+    let pendingLink: ResolvedLink | null = null;
+    const consumeLinkMouseEvent = (event: MouseEvent) => {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
@@ -350,7 +362,7 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     };
     const openResolvedLink = (link: ResolvedLink) => {
       if (link.kind === "url") {
-        openUrlInBrowser(link.url);
+        openUrlInBrowser(link.url).catch(() => {});
       } else if (link.kind === "file" && cwd) {
         const resolved = resolvePath(link.path, cwd);
         checkFileExists(resolved).then((exists) => {
@@ -360,34 +372,34 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
         });
       }
     };
-    const onMetaMouseDown = (event: MouseEvent) => {
-      if (!event.metaKey || event.button !== 0) {
-        pendingMetaLink = null;
+    const onLinkMouseDown = (event: MouseEvent) => {
+      if (event.button !== 0) {
+        pendingLink = null;
         return;
       }
       const pos = getBufferPositionFromMouse(term, event);
       const link = pos ? getLinkAtPosition(term, pos) : null;
-      if (!link) {
-        pendingMetaLink = null;
+      if (!link || !isActionableLink(link) || !shouldActivateTerminalLink(event, link, !!hostId)) {
+        pendingLink = null;
         return;
       }
-      pendingMetaLink = link;
-      consumeMetaMouseEvent(event);
+      pendingLink = link;
+      consumeLinkMouseEvent(event);
     };
-    const onMetaMouseUp = (event: MouseEvent) => {
-      const pending = pendingMetaLink;
-      pendingMetaLink = null;
-      if (!event.metaKey || event.button !== 0 || !pending) return;
+    const onLinkMouseUp = (event: MouseEvent) => {
+      const pending = pendingLink;
+      pendingLink = null;
+      if (event.button !== 0 || !pending || !shouldActivateTerminalLink(event, pending, !!hostId)) return;
 
       const pos = getBufferPositionFromMouse(term, event);
       const link = pos ? getLinkAtPosition(term, pos) : null;
-      consumeMetaMouseEvent(event);
+      consumeLinkMouseEvent(event);
       if (link && sameLink(pending, link)) {
         openResolvedLink(link);
       }
     };
-    host.addEventListener("mousedown", onMetaMouseDown, true);
-    host.addEventListener("mouseup", onMetaMouseUp, true);
+    host.addEventListener("mousedown", onLinkMouseDown, true);
+    host.addEventListener("mouseup", onLinkMouseUp, true);
 
     let wheelAccum = 0;
     const handleRemoteWheel = (event: WheelEvent): boolean => {
@@ -573,8 +585,8 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
       cancelled = true;
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       ro.disconnect();
-      host.removeEventListener("mousedown", onMetaMouseDown, true);
-      host.removeEventListener("mouseup", onMetaMouseUp, true);
+      host.removeEventListener("mousedown", onLinkMouseDown, true);
+      host.removeEventListener("mouseup", onLinkMouseUp, true);
       if (hostId) host.removeEventListener("wheel", onRemoteWheel, true);
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);

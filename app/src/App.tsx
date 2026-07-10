@@ -127,10 +127,15 @@ type SessionGroup = {
 
 type MobileRelayStatus = {
   active: boolean;
+  connected: boolean;
+  connectionState: string;
   relayUrl: string;
   hostId: string;
   secret: string;
   token: string;
+  connectedAt?: number | null;
+  updatedAt?: number | null;
+  retryInMs?: number | null;
   error?: string | null;
 };
 
@@ -535,6 +540,8 @@ function App() {
   const [scratchCollapsed, setScratchCollapsed] = useState(false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
   const [mobileRelayActive, setMobileRelayActive] = useState(false);
+  const [mobileRelayConnected, setMobileRelayConnected] = useState(false);
+  const [mobileRelayConnectionState, setMobileRelayConnectionState] = useState("stopped");
   const [mobileRelayUrl, setMobileRelayUrl] = useState("wss://relay.example.com");
   const [mobileRelayHostId, setMobileRelayHostId] = useState("mac-admin");
   const [mobileRelaySecret, setMobileRelaySecret] = useState("");
@@ -1519,14 +1526,18 @@ function App() {
   }, [handleAutomationRun]);
 
   // Mobile relay connector helpers
-  const applyMobileRelayStatus = useCallback((status: MobileRelayStatus) => {
+  const applyMobileRelayStatus = useCallback((status: MobileRelayStatus, syncDraft = true) => {
     setMobileRelayActive(status.active);
+    setMobileRelayConnected(status.connected);
+    setMobileRelayConnectionState(status.connectionState);
     setMobileRelayUrl(status.relayUrl);
     setMobileRelayHostId(status.hostId);
     setMobileRelaySecret(status.secret);
-    setMobileRelayDraftUrl(status.relayUrl);
-    setMobileRelayDraftHostId(status.hostId);
-    setMobileRelayDraftSecret(status.secret);
+    if (syncDraft) {
+      setMobileRelayDraftUrl(status.relayUrl);
+      setMobileRelayDraftHostId(status.hostId);
+      setMobileRelayDraftSecret(status.secret);
+    }
     setMobileRelayError(status.error ?? null);
   }, []);
 
@@ -1536,7 +1547,16 @@ function App() {
       applyMobileRelayStatus(status);
       return status;
     } catch {
-      return { active: false, relayUrl: "wss://relay.example.com", hostId: "mac-admin", secret: "", token: "", error: null };
+      return {
+        active: false,
+        connected: false,
+        connectionState: "stopped",
+        relayUrl: "wss://relay.example.com",
+        hostId: "mac-admin",
+        secret: "",
+        token: "",
+        error: null,
+      };
     }
   }, [applyMobileRelayStatus]);
 
@@ -1659,6 +1679,17 @@ function App() {
   }, []);
 
   useEffect(() => { checkMobileRelayStatus(); }, [checkMobileRelayStatus]);
+
+  useEffect(() => {
+    if (!mobileRelayActive && !mobileRelayPopover) return;
+    const refresh = () => {
+      void invoke<MobileRelayStatus>("mobile_relay_status")
+        .then((status) => applyMobileRelayStatus(status, false))
+        .catch(() => {});
+    };
+    const id = window.setInterval(refresh, 2000);
+    return () => window.clearInterval(id);
+  }, [applyMobileRelayStatus, mobileRelayActive, mobileRelayPopover]);
 
   useEffect(() => {
     if (mobileRelayBrokerHostId || hosts.length === 0) return;
@@ -2083,7 +2114,13 @@ function App() {
   };
 
   const mobileRelayBusy = mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || mobileRelayStopping;
-  const mobileRelayStatus = mobileRelayBusy ? "starting" : mobileRelayActive ? "running" : "stopped";
+  const mobileRelayStatus = mobileRelayBusy
+    ? "starting"
+    : mobileRelayConnected
+      ? "running"
+      : mobileRelayActive
+        ? "starting"
+        : "stopped";
   const mobileRelayStatusText = mobileRelayBrokerStarting
     ? "Starting broker"
     : mobileRelayLoading
@@ -2092,7 +2129,11 @@ function App() {
         ? "Saving"
         : mobileRelayStopping
           ? "Stopping"
-          : mobileRelayActive ? "Running" : "Stopped";
+          : mobileRelayConnected
+            ? "Connected"
+            : mobileRelayActive
+              ? mobileRelayConnectionState === "retrying" ? "Reconnecting" : "Connecting"
+              : "Stopped";
   const mobileRelayTokenState = mobileRelaySecret ? "Configured" : "Missing";
   const mobileRelayButtonActive = mobileRelayActive || mobileRelayPopover || mobileRelayBusy;
 

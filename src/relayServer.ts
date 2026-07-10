@@ -155,10 +155,7 @@ export async function run(): Promise<void> {
   const server = createServer((req, res) => {
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
     if (url.pathname === "/health") {
-      writeJson(res, {
-        ok: true,
-        hosts: hostInfos(hosts, clients),
-      });
+      writeJson(res, { ok: true });
       return;
     }
 

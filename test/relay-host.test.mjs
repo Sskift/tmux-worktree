@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -108,4 +109,91 @@ test("relay host can reopen routed terminal streams after transient remote close
   assert.match(source, /const isCurrent = streams\.get\(key\) === stream/);
   assert.match(source, /if \(isCurrent\) sendJson\(relaySocket, \{ type: "terminal_exit"/);
   assert.match(source, /try \{\n\s+stream\.process\.stdin\.write\(payload\);/);
+});
+
+test("relay host publishes connection failures without exposing credentials", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-relay-status-"));
+  const statusFile = join(root, "relay-status.json");
+  const secret = "test-secret-must-not-leak";
+  const child = spawn(process.execPath, [
+    "dist/cli.js",
+    "relay-host",
+    "--relay",
+    "ws://127.0.0.1:9",
+    "--host-id",
+    "test-host",
+    "--status-file",
+    statusFile,
+  ], {
+    env: { ...process.env, TW_RELAY_SECRET: secret, TW_TOKEN: "serve-token" },
+    stdio: "ignore",
+  });
+
+  try {
+    const deadline = Date.now() + 4000;
+    let status;
+    while (Date.now() < deadline) {
+      if (existsSync(statusFile)) {
+        status = JSON.parse(readFileSync(statusFile, "utf8"));
+        if (status.state === "retrying") break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.equal(status?.state, "retrying");
+    assert.equal(status?.relayUrl, "ws://127.0.0.1:9");
+    assert.equal(status?.hostId, "test-host");
+    assert.equal(typeof status?.updatedAt, "number");
+    assert.equal(typeof status?.retryInMs, "number");
+    assert.equal(JSON.stringify(status).includes(secret), false);
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("relay server keeps detailed host state behind authentication", async () => {
+  const probe = createServer();
+  await new Promise((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const address = probe.address();
+  const port = typeof address === "object" && address ? address.port : 0;
+  await new Promise((resolve) => probe.close(resolve));
+  assert.ok(port > 0);
+
+  const secret = "relay-health-test-secret";
+  const child = spawn(process.execPath, [
+    "dist/cli.js",
+    "relay-server",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    String(port),
+  ], {
+    env: { ...process.env, TW_RELAY_SECRET: secret },
+    stdio: "ignore",
+  });
+
+  try {
+    const deadline = Date.now() + 4000;
+    let healthResponse;
+    while (Date.now() < deadline) {
+      try {
+        healthResponse = await fetch(`http://127.0.0.1:${port}/health`);
+        if (healthResponse.ok) break;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.deepEqual(await healthResponse?.json(), { ok: true });
+
+    const unauthorized = await fetch(`http://127.0.0.1:${port}/api/hosts`);
+    assert.equal(unauthorized.status, 401);
+    const authorized = await fetch(`http://127.0.0.1:${port}/api/hosts`, {
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    assert.equal(authorized.status, 200);
+    assert.deepEqual(await authorized.json(), { ok: true, hosts: [] });
+  } finally {
+    child.kill("SIGTERM");
+    await new Promise((resolve) => child.once("exit", resolve));
+  }
 });
