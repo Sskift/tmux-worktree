@@ -76,12 +76,26 @@ const hostArgs = {
   host: "builder.internal",
   port: 22,
 };
+const addHostArgs = {
+  ...hostArgs,
+  identityFile: "~/.ssh/builder",
+  worktreeBase: "~/worktrees",
+  tmuxPath: "~/.local/bin/tmux",
+  twPath: "~/.local/bin/tw",
+};
+const updateHostArgs = {
+  ...hostArgs,
+  label: "Build host",
+  worktreeBase: "~/worktrees",
+  tmuxPath: "~/.local/bin/tmux",
+  twPath: "~/.local/bin/tw",
+};
 const relayArgs = {
   relayUrl: "wss://relay.example.test",
   hostId: "dashboard-host",
   secret: "test-secret",
 };
-const layout = { version: 2, sidebar: { width: 280 } };
+const layout = { schemaVersion: 2, sidebar: { width: 280 } };
 
 const commandCases: CommandCase[] = [
   {
@@ -405,14 +419,20 @@ const commandCases: CommandCase[] = [
   {
     label: "hosts.add",
     command: "add_host",
-    args: { args: hostArgs },
-    call: (backend) => backend.hosts.add(hostArgs),
+    args: { args: addHostArgs },
+    call: (backend) => backend.hosts.add(addHostArgs),
   },
   {
     label: "hosts.remove",
     command: "remove_host",
     args: { id: "host-1" },
     call: (backend) => backend.hosts.remove("host-1"),
+  },
+  {
+    label: "hosts.update",
+    command: "update_host",
+    args: { args: updateHostArgs },
+    call: (backend) => backend.hosts.update(updateHostArgs),
   },
   {
     label: "hosts.installTw",

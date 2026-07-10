@@ -8,6 +8,17 @@ import {
   useDashboardBackend,
 } from "./platform";
 import { useDashboardCatalog } from "./dashboard/hooks/useDashboardCatalog";
+import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
+import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
+import {
+  DEFAULT_COLUMN_ORDER,
+  normalizeColumnOrder,
+  type DiffFile,
+  type EditingFile,
+  type LayoutColumn,
+  type Selection,
+  type WindowLayout,
+} from "./dashboard/layoutPreferences";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
@@ -49,25 +60,6 @@ import {
 } from "./sidebarLayout";
 import "./App.css";
 
-type Selection =
-  | { kind: "session"; name: string }
-  | { kind: "terminal"; id: string }
-  | { kind: "automation"; id: string }
-  | null;
-
-type WindowLayout = {
-  width: number;
-  height: number;
-  x: number;
-  y: number;
-  maximized: boolean;
-};
-
-type EditingFile = {
-  path: string;
-  hostId?: string | null;
-};
-
 type SessionGroup = {
   key: string;
   project: string;
@@ -77,6 +69,9 @@ type SessionGroup = {
 };
 
 const REFRESH_MS = 2000;
+const HIDDEN_REFRESH_MS = 10_000;
+const RELAY_REFRESH_MS = 2_000;
+const RELAY_HIDDEN_REFRESH_MS = 15_000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
@@ -314,48 +309,6 @@ function automationMetaLabel(automation: Automation): string {
   return automation.status && automation.status !== "idle" ? automation.status : "active";
 }
 
-function isWindowLayout(value: unknown): value is WindowLayout {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.width === "number" &&
-    typeof candidate.height === "number" &&
-    typeof candidate.x === "number" &&
-    typeof candidate.y === "number" &&
-    typeof candidate.maximized === "boolean"
-  );
-}
-
-function isSelection(value: unknown): value is Selection {
-  if (value === null) return true;
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    (candidate.kind === "session" && typeof candidate.name === "string") ||
-    (candidate.kind === "terminal" && typeof candidate.id === "string") ||
-    (candidate.kind === "automation" && typeof candidate.id === "string")
-  );
-}
-
-function isDiffFile(value: unknown): value is { path: string; cwd: string; hostId?: string | null } {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.path === "string" &&
-    typeof candidate.cwd === "string" &&
-    (candidate.hostId === undefined || candidate.hostId === null || typeof candidate.hostId === "string")
-  );
-}
-
-function isEditingFile(value: unknown): value is EditingFile {
-  if (!value || typeof value !== "object") return false;
-  const candidate = value as Record<string, unknown>;
-  return (
-    typeof candidate.path === "string" &&
-    (candidate.hostId === undefined || candidate.hostId === null || typeof candidate.hostId === "string")
-  );
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -370,7 +323,6 @@ async function getWindowExpandedState(win: DashboardWindow) {
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
-type LayoutColumn = "file" | "main" | "scratch" | "editor";
 type ResizableColumn = Exclude<LayoutColumn, "main">;
 
 const LAYOUT_DEFAULTS = {
@@ -380,7 +332,6 @@ const LAYOUT_DEFAULTS = {
   sectionSplit: 200,
   automationHeight: SIDEBAR_AUTOMATIONS_DEFAULT_HEIGHT,
 };
-const DEFAULT_COLUMN_ORDER: LayoutColumn[] = ["file", "main", "scratch", "editor"];
 const COLUMN_DRAG_THRESHOLD = 5;
 const COLUMN_WIDTH_LIMITS: Record<ResizableColumn, { min: number; max: number }> = {
   file: { min: 180, max: 600 },
@@ -390,22 +341,6 @@ const COLUMN_WIDTH_LIMITS: Record<ResizableColumn, { min: number; max: number }>
 
 let termIdCounter = 0;
 let scratchIdCounter = 0;
-
-function isLayoutColumn(value: unknown): value is LayoutColumn {
-  return value === "file" || value === "main" || value === "scratch" || value === "editor";
-}
-
-function normalizeColumnOrder(value: unknown): LayoutColumn[] {
-  const seen = new Set<LayoutColumn>();
-  const restored = Array.isArray(value)
-    ? value.filter((item): item is LayoutColumn => {
-        if (!isLayoutColumn(item) || seen.has(item)) return false;
-        seen.add(item);
-        return true;
-      })
-    : [];
-  return [...restored, ...DEFAULT_COLUMN_ORDER.filter((column) => !seen.has(column))];
-}
 
 function reorderActiveColumns(
   currentOrder: LayoutColumn[],
@@ -440,6 +375,7 @@ function placeScratchAfterMain(order: LayoutColumn[]): LayoutColumn[] {
 
 function App() {
   const dashboardBackend = useDashboardBackend();
+  const { loadLayoutPreferences, saveLayoutPreferences } = useLayoutPreferences();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
   const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
@@ -507,7 +443,7 @@ function App() {
   const [mobileRelayCopied, setMobileRelayCopied] = useState(false);
   const [mobileRelayError, setMobileRelayError] = useState<string | null>(null);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
-  const [diffFile, setDiffFile] = useState<{ path: string; cwd: string; hostId?: string | null } | null>(null);
+  const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
   const [editorWidth, setEditorWidth] = useState(420);
@@ -753,63 +689,54 @@ function App() {
       })
       .catch(() => {})
       .finally(() => setTerminalsRestoreReady(true));
-    dashboardBackend.persistence.loadLayout()
+    loadLayoutPreferences()
       .then((lay) => {
-        const restoredFileBrowserOpen =
-          typeof lay.fileBrowserOpen === "boolean" ? (lay.fileBrowserOpen as boolean) : false;
-        const restoredEditorOpen =
-          isDiffFile(lay.diffFile) || isEditingFile(lay.editingFile) || typeof lay.editingFile === "string";
+        const restoredFileBrowserOpen = lay.fileBrowserOpen ?? false;
+        const restoredEditorOpen = !!lay.diffFile || !!lay.editingFile;
         prevColumnsRef.current = {
           fileBrowser: restoredFileBrowserOpen,
           editor: restoredEditorOpen,
         };
         autoResizeColumnsReadyRef.current = true;
-        if (typeof lay.left === "number") setCols((c) => ({ ...c, left: lay.left as number }));
-        if (typeof lay.right === "number") setCols((c) => ({ ...c, right: lay.right as number }));
-        if (typeof lay.gitHeight === "number") setGitHeight(lay.gitHeight as number);
-        if (typeof lay.fileTreeWidth === "number") {
-          setFileTreeWidth(clamp(lay.fileTreeWidth as number, 180, 600));
+        const restoredLeft = lay.left;
+        const restoredRight = lay.right;
+        if (restoredLeft !== undefined) setCols((current) => ({ ...current, left: restoredLeft }));
+        if (restoredRight !== undefined) setCols((current) => ({ ...current, right: restoredRight }));
+        if (lay.gitHeight !== undefined) setGitHeight(lay.gitHeight);
+        if (lay.fileTreeWidth !== undefined) {
+          setFileTreeWidth(clamp(lay.fileTreeWidth, 180, 600));
         }
-        if (typeof lay.editorWidth === "number") {
-          setEditorWidth(clamp(lay.editorWidth as number, 250, 900));
+        if (lay.editorWidth !== undefined) {
+          setEditorWidth(clamp(lay.editorWidth, 250, 900));
         }
-        if (typeof lay.sectionSplit === "number") {
-          const v = lay.sectionSplit as number;
-          setSectionSplit(v < 1 ? LAYOUT_DEFAULTS.sectionSplit : v);
+        if (lay.sectionSplit !== undefined) {
+          setSectionSplit(lay.sectionSplit);
         }
-        if (typeof lay.automationHeight === "number") {
-          const v = lay.automationHeight as number;
-          setAutomationHeight(v < 1 ? LAYOUT_DEFAULTS.automationHeight : v);
+        if (lay.automationHeight !== undefined) {
+          setAutomationHeight(lay.automationHeight);
         }
-        if (Array.isArray(lay.sessionOrder)) {
-          setSessionOrder((lay.sessionOrder as string[]).filter((n) => !n.startsWith("tw-term-")));
+        if (lay.sessionOrder) {
+          setSessionOrder(lay.sessionOrder.filter((name) => !name.startsWith("tw-term-")));
         }
-        if (Array.isArray(lay.collapsedProjects)) {
-          setCollapsedProjects(
-            (lay.collapsedProjects as unknown[]).filter(
-              (project): project is string => typeof project === "string" && project.length > 0,
-            ),
-          );
+        if (lay.collapsedProjects) {
+          setCollapsedProjects(lay.collapsedProjects);
         }
-        setColumnOrder(normalizeColumnOrder(lay.columnOrder));
-        if (typeof lay.scratchCollapsed === "boolean") {
-          setScratchCollapsed(lay.scratchCollapsed as boolean);
+        setColumnOrder(lay.columnOrder);
+        if (lay.scratchCollapsed !== undefined) {
+          setScratchCollapsed(lay.scratchCollapsed);
         }
         setFileBrowserOpen(restoredFileBrowserOpen);
-        if (isDiffFile(lay.diffFile)) {
+        if (lay.diffFile) {
           setDiffFile(lay.diffFile);
           setEditingFile(null);
-        } else if (isEditingFile(lay.editingFile)) {
+        } else if (lay.editingFile) {
           setEditingFile(lay.editingFile);
           setDiffFile(null);
-        } else if (typeof lay.editingFile === "string") {
-          setEditingFile({ path: lay.editingFile, hostId: null });
-          setDiffFile(null);
         }
-        if (isSelection(lay.selection)) {
+        if (lay.selection !== undefined) {
           setSelection(lay.selection);
         }
-        if (isWindowLayout(lay.window)) setWindowLayout(lay.window);
+        if (lay.window) setWindowLayout(lay.window);
         setWindowRestoreReady(true);
       })
       .catch(() => {
@@ -820,7 +747,7 @@ function App() {
       .finally(() => {
         layoutLoadedRef.current = true;
       });
-  }, []);
+  }, [dashboardBackend, loadLayoutPreferences]);
 
   // Persist terminals
   useEffect(() => {
@@ -834,23 +761,23 @@ function App() {
     const sidebarHeight = sidebarSplitRef.current?.getBoundingClientRect().height ?? 0;
     if (!isStableSidebarLayoutHeight(sidebarHeight)) return;
     const t = setTimeout(() => {
-      dashboardBackend.persistence.saveLayout({
-          left: cols.left,
-          right: cols.right,
-          gitHeight,
-          sectionSplit,
-          automationHeight,
-          sessionOrder,
-          collapsedProjects,
-          columnOrder,
-          scratchCollapsed,
-          fileBrowserOpen,
-          fileTreeWidth,
-          editorWidth,
-          selection,
-          editingFile,
-          diffFile,
-          ...(windowLayout ? { window: windowLayout } : {}),
+      saveLayoutPreferences({
+        left: cols.left,
+        right: cols.right,
+        gitHeight,
+        sectionSplit,
+        automationHeight,
+        sessionOrder,
+        collapsedProjects,
+        columnOrder,
+        scratchCollapsed,
+        fileBrowserOpen,
+        fileTreeWidth,
+        editorWidth,
+        selection,
+        editingFile,
+        diffFile,
+        ...(windowLayout ? { window: windowLayout } : {}),
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
@@ -870,6 +797,7 @@ function App() {
     editingFile,
     diffFile,
     windowLayout,
+    saveLayoutPreferences,
   ]);
 
   const loadAutomations = useCallback(async () => {
@@ -1314,13 +1242,12 @@ function App() {
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [dashboardBackend]);
 
-  useEffect(() => {
-    refresh();
-    const id = setInterval(refresh, REFRESH_MS);
-    return () => clearInterval(id);
-  }, [refresh]);
+  useVisibilityAwarePolling(refresh, {
+    visibleIntervalMs: REFRESH_MS,
+    hiddenIntervalMs: HIDDEN_REFRESH_MS,
+  });
 
   const handleAutomationCreate = useCallback(
     async (draft: AutomationDraft) => {
@@ -1559,16 +1486,16 @@ function App() {
 
   useEffect(() => { checkMobileRelayStatus(); }, [checkMobileRelayStatus]);
 
-  useEffect(() => {
-    if (!mobileRelayActive && !mobileRelayPopover) return;
-    const refresh = () => {
-      void dashboardBackend.relay.status()
-        .then((status) => applyMobileRelayStatus(status, false))
-        .catch(() => {});
-    };
-    const id = window.setInterval(refresh, 2000);
-    return () => window.clearInterval(id);
-  }, [applyMobileRelayStatus, mobileRelayActive, mobileRelayPopover]);
+  const refreshMobileRelayStatus = useCallback(async () => {
+    const status = await dashboardBackend.relay.status();
+    applyMobileRelayStatus(status, false);
+  }, [applyMobileRelayStatus, dashboardBackend]);
+  useVisibilityAwarePolling(refreshMobileRelayStatus, {
+    enabled: mobileRelayActive || mobileRelayPopover,
+    visibleIntervalMs: RELAY_REFRESH_MS,
+    hiddenIntervalMs: RELAY_HIDDEN_REFRESH_MS,
+    refreshKey: `${mobileRelayActive}\0${mobileRelayPopover}`,
+  });
 
   useEffect(() => {
     if (mobileRelayBrokerHostId || hosts.length === 0) return;

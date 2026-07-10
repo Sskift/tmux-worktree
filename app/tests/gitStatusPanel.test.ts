@@ -7,7 +7,10 @@ test("GitStatusPanel periodically triggers project root fetches", () => {
 
   assert.match(source, /PROJECT_FETCH_MS\s*=\s*5\s*\*\s*60_000/);
   assert.match(source, /dashboardBackend\.git\.fetchProjectRoots\(\)/);
-  assert.match(source, /setInterval\(triggerProjectFetch,\s*PROJECT_FETCH_MS\)/);
+  assert.match(source, /useVisibilityAwarePolling\(triggerProjectFetch, \{/);
+  assert.match(source, /visibleIntervalMs: PROJECT_FETCH_MS/);
+  assert.match(source, /hiddenIntervalMs: HIDDEN_PROJECT_FETCH_MS/);
+  assert.doesNotMatch(source, /setInterval\(/);
 });
 
 test("remote git status passes host identity through git commands", () => {

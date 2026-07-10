@@ -79,7 +79,10 @@ test("app polls host status separately from the main session refresh", () => {
   assert.match(catalog, /const HOST_STATUS_REFRESH_MS = /);
   assert.match(catalog, /const refreshHostStatuses = useCallback/);
   assert.match(catalog, /dashboardBackend\.hosts\.statuses\(\)/);
-  assert.match(catalog, /setInterval\(refreshHostStatuses, HOST_STATUS_REFRESH_MS\)/);
+  assert.match(catalog, /useVisibilityAwarePolling\(refreshHostStatuses, \{/);
+  assert.match(catalog, /visibleIntervalMs: HOST_STATUS_REFRESH_MS/);
+  assert.match(catalog, /hiddenIntervalMs: HOST_STATUS_HIDDEN_REFRESH_MS/);
+  assert.doesNotMatch(catalog, /setInterval\(/);
 
   const refreshStart = app.indexOf("const refresh = useCallback");
   const refreshEnd = app.indexOf("const handleAutomationCreate", refreshStart);

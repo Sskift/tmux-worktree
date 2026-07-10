@@ -74,7 +74,9 @@ test("mobile relay failures stay visible on Android and in the Dashboard", () =>
   const backend = readFileSync("app/src-tauri/src/lib.rs", "utf8");
 
   assert.match(android, /if \(reconnectAttempt >= 3\) \{\s*setIdentityExpanded\(true\);\s*\}/s);
-  assert.match(dashboard, /setInterval\(refresh, 2000\)/);
+  assert.match(dashboard, /useVisibilityAwarePolling\(refreshMobileRelayStatus/);
+  assert.match(dashboard, /const RELAY_REFRESH_MS = 2_000/);
+  assert.match(dashboard, /const RELAY_HIDDEN_REFRESH_MS = 15_000/);
   assert.match(dashboard, /mobileRelayConnected\s*\? "Connected"/);
   assert.match(backend, /connection_state: String/);
   assert.match(backend, /load_mobile_relay_runtime_status/);

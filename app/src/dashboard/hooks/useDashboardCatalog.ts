@@ -5,8 +5,10 @@ import {
   type ProjectPreset,
   useDashboardBackend,
 } from "../../platform";
+import { useVisibilityAwarePolling } from "./useVisibilityAwarePolling";
 
 const HOST_STATUS_REFRESH_MS = 15_000;
+const HOST_STATUS_HIDDEN_REFRESH_MS = 60_000;
 
 export function useDashboardCatalog() {
   const dashboardBackend = useDashboardBackend();
@@ -81,14 +83,14 @@ export function useDashboardCatalog() {
   }, [dashboardBackend]);
 
   useEffect(() => {
-    if (!hostIdsKey) {
-      setHostStatuses({});
-      return;
-    }
-    void refreshHostStatuses();
-    const id = window.setInterval(refreshHostStatuses, HOST_STATUS_REFRESH_MS);
-    return () => window.clearInterval(id);
-  }, [hostIdsKey, refreshHostStatuses]);
+    if (!hostIdsKey) setHostStatuses({});
+  }, [hostIdsKey]);
+  useVisibilityAwarePolling(refreshHostStatuses, {
+    enabled: !!hostIdsKey,
+    visibleIntervalMs: HOST_STATUS_REFRESH_MS,
+    hiddenIntervalMs: HOST_STATUS_HIDDEN_REFRESH_MS,
+    refreshKey: hostIdsKey,
+  });
 
   return {
     projectPresets,

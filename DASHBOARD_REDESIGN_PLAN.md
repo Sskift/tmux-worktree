@@ -439,6 +439,7 @@ app/src/dashboard/
 │   ├── IntegrationsSettings.tsx
 │   ├── AgentsSettings.tsx
 │   ├── HistorySettings.tsx
+│   ├── AutomationSettings.tsx
 │   └── AdvancedSettings.tsx
 ├── hooks/
 │   ├── useDashboardData.ts
@@ -680,7 +681,7 @@ Electron spike 必须复用同一 renderer、同一数据集做 A/B，并完成�
 
 ```json
 {
-  "version": 2,
+  "schemaVersion": 2,
   "sidebar": { "width": 280, "collapsed": false },
   "inspector": { "width": 420, "open": true, "tab": "git" },
   "workspace": { "mode": "terminal", "split": null },

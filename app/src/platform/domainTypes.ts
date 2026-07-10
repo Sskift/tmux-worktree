@@ -26,6 +26,11 @@ export type HostConfig = {
 export type HostInput = Pick<HostConfig, "id" | "label" | "host"> &
   Partial<Pick<HostConfig, "user" | "port" | "identityFile">>;
 
+export type AddHostInput = HostInput &
+  Partial<Pick<HostConfig, "worktreeBase" | "tmuxPath" | "twPath">>;
+
+export type UpdateHostInput = AddHostInput;
+
 export type HostStatus = {
   id: string;
   label: string;

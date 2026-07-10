@@ -10,6 +10,7 @@ import type {
   PtyOpenArgs,
 } from "./types";
 import type {
+  AddHostInput,
   AddProjectInput,
   CreateTerminalInput,
   CreatedTerminal,
@@ -34,6 +35,7 @@ import type {
   RestoreWorktreeInput,
   Session,
   TmuxStatusTheme,
+  UpdateHostInput,
 } from "./domainTypes";
 import type {
   AutomationRecord,
@@ -117,7 +119,8 @@ export interface DashboardBackend {
     candidates(): Promise<HostConfig[]>;
     statuses(): Promise<HostStatus[]>;
     test(args: HostInput): Promise<HostStatus>;
-    add(args: HostInput): Promise<HostConfig[]>;
+    add(args: AddHostInput): Promise<HostConfig[]>;
+    update(args: UpdateHostInput): Promise<HostConfig[]>;
     remove(id: string): Promise<HostConfig[]>;
     installTw(hostId: string): Promise<HostStatus>;
     remoteHome(hostId: string): Promise<string>;
@@ -335,6 +338,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       statuses: () => transport.invoke<HostStatus[]>("host_statuses"),
       test: (args) => transport.invoke<HostStatus>("test_host", { args }),
       add: (args) => transport.invoke<HostConfig[]>("add_host", { args }),
+      update: (args) => transport.invoke<HostConfig[]>("update_host", { args }),
       remove: (id) => transport.invoke<HostConfig[]>("remove_host", { id }),
       installTw: (hostId) => transport.invoke<HostStatus>("install_host_tw", { hostId }),
       remoteHome: (hostId) => transport.invoke<string>("remote_home_dir", { hostId }),

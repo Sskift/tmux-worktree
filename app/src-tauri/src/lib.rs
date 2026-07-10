@@ -45,6 +45,76 @@ fn app_home_dir_or_tmp() -> std::path::PathBuf {
     app_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
 }
 
+fn dashboard_config_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn dashboard_layout_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn atomic_write_file_with<F>(path: &Path, contents: &[u8], before_rename: F) -> Result<(), String>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid file path: {}", path.display()))?;
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+
+    let result = (|| -> Result<(), String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temp_path)
+            .map_err(|err| format!("create {}: {err}", temp_path.display()))?;
+        file.write_all(contents)
+            .map_err(|err| format!("write {}: {err}", temp_path.display()))?;
+        file.flush()
+            .map_err(|err| format!("flush {}: {err}", temp_path.display()))?;
+        file.sync_all()
+            .map_err(|err| format!("sync {}: {err}", temp_path.display()))?;
+        drop(file);
+
+        before_rename(&temp_path)?;
+        std::fs::rename(&temp_path, path).map_err(|err| {
+            format!(
+                "rename {} to {}: {err}",
+                temp_path.display(),
+                path.display()
+            )
+        })?;
+        if let Ok(directory) = std::fs::File::open(parent) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    result
+}
+
+fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
+    atomic_write_file_with(path, contents, |_| Ok(()))
+}
+
 fn expand_home_path_with_home(value: &str, home: &str) -> String {
     let trimmed = value.trim();
     if trimmed == "~" {
@@ -1980,7 +2050,15 @@ fn ssh_host_physical_target(block: &SshHostBlock, alias: &str) -> String {
 }
 
 /// Save hosts to ~/.tmux-worktree.json (read-modify-write).
+#[cfg(test)]
 fn save_hosts_config(hosts: &[HostConfig]) -> Result<(), String> {
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
+    save_hosts_config_unlocked(hosts)
+}
+
+fn save_hosts_config_unlocked(hosts: &[HostConfig]) -> Result<(), String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
     let mut config: serde_json::Value = if config_path.exists() {
@@ -1999,7 +2077,7 @@ fn save_hosts_config(hosts: &[HostConfig]) -> Result<(), String> {
     );
     let pretty =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
-    std::fs::write(&config_path, pretty).map_err(|e| format!("write config: {e}"))?;
+    atomic_write_file(&config_path, pretty.as_bytes()).map_err(|e| format!("write config: {e}"))?;
     Ok(())
 }
 
@@ -3228,6 +3306,9 @@ fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
 
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
 
     let mut config: serde_json::Value = if config_path.exists() {
         let text =
@@ -3273,7 +3354,7 @@ fn add_project(args: AddProjectArgs) -> Result<Vec<Project>, String> {
 
     let pretty =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
-    std::fs::write(&config_path, pretty).map_err(|e| format!("write config: {e}"))?;
+    atomic_write_file(&config_path, pretty.as_bytes()).map_err(|e| format!("write config: {e}"))?;
 
     list_projects()
 }
@@ -3292,6 +3373,32 @@ struct AddHostArgs {
     port: Option<u16>,
     #[serde(default)]
     identity_file: Option<String>,
+    #[serde(default)]
+    worktree_base: Option<String>,
+    #[serde(default)]
+    tmux_path: Option<String>,
+    #[serde(default)]
+    tw_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateHostArgs {
+    id: String,
+    label: String,
+    host: String,
+    #[serde(default)]
+    user: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    identity_file: Option<String>,
+    #[serde(default)]
+    worktree_base: Option<String>,
+    #[serde(default)]
+    tmux_path: Option<String>,
+    #[serde(default)]
+    tw_path: Option<String>,
 }
 
 const TW_GITHUB_REPO: &str = "https://github.com/Sskift/tmux-worktree.git";
@@ -3306,8 +3413,7 @@ fn list_ssh_host_candidates() -> Result<Vec<HostConfig>, String> {
     Ok(load_ssh_host_candidates())
 }
 
-#[tauri::command]
-fn add_host(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
+fn add_host_config(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
     let id = args.id.trim();
     let label = args.label.trim();
     let host = args.host.trim();
@@ -3324,11 +3430,13 @@ fn add_host(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
         return Err("host id cannot contain ':'".into());
     }
 
-    let existing_hosts = load_hosts()?;
-    if existing_hosts.iter().any(|h| h.id == id) {
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
+    let mut configured_hosts = load_configured_hosts()?;
+    if configured_hosts.iter().any(|h| h.id == id) {
         return Err(format!("host id '{id}' already exists"));
     }
-    let mut configured_hosts = load_configured_hosts()?;
 
     let new_host = HostConfig {
         id: id.to_string(),
@@ -3343,22 +3451,128 @@ fn add_host(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
             .identity_file
             .filter(|p| !p.trim().is_empty())
             .map(|p| expand_home_path(p.trim())),
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
+        worktree_base: args
+            .worktree_base
+            .as_deref()
+            .and_then(trimmed_non_empty_string),
+        tmux_path: args.tmux_path.as_deref().and_then(trimmed_non_empty_string),
+        tw_path: args.tw_path.as_deref().and_then(trimmed_non_empty_string),
     };
 
     configured_hosts.push(new_host);
-    save_hosts_config(&configured_hosts)?;
+    save_hosts_config_unlocked(&configured_hosts)?;
     load_hosts()
 }
 
+fn update_host_config(args: UpdateHostArgs) -> Result<Vec<HostConfig>, String> {
+    let id = args.id.trim();
+    let label = args.label.trim();
+    let host = args.host.trim();
+    if id.is_empty() {
+        return Err("host id required".into());
+    }
+    if label.is_empty() {
+        return Err("host label required".into());
+    }
+    if host.is_empty() {
+        return Err("host target required".into());
+    }
+    if id.contains(':') {
+        return Err("host id cannot contain ':'".into());
+    }
+
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
+    let mut hosts = load_configured_hosts()?;
+    let matching = hosts
+        .iter()
+        .filter(|configured| configured.id == id)
+        .count();
+    if matching == 0 {
+        return Err(format!("host id '{id}' not found"));
+    }
+    if matching > 1 {
+        return Err(format!("host id '{id}' is duplicated in config"));
+    }
+
+    let optional = |value: Option<String>| value.as_deref().and_then(trimmed_non_empty_string);
+    let identity_file = optional(args.identity_file).map(|path| expand_home_path(&path));
+    let updated = HostConfig {
+        id: id.to_string(),
+        label: label.to_string(),
+        host: host.to_string(),
+        user: optional(args.user),
+        port: args.port,
+        identity_file,
+        worktree_base: optional(args.worktree_base),
+        tmux_path: optional(args.tmux_path),
+        tw_path: optional(args.tw_path),
+    };
+    let index = hosts
+        .iter()
+        .position(|configured| configured.id == id)
+        .expect("matching host index");
+    hosts[index] = updated;
+    save_hosts_config_unlocked(&hosts)?;
+    load_hosts()
+}
+
+fn invalidate_host_status_cache(state: &HostState, id: &str) -> Result<(), String> {
+    state
+        .statuses
+        .lock()
+        .map_err(|_| "host status cache lock poisoned".to_string())?
+        .remove(id);
+    Ok(())
+}
+
+fn add_host_with_state(args: AddHostArgs, state: &HostState) -> Result<Vec<HostConfig>, String> {
+    let id = args.id.trim().to_string();
+    let hosts = add_host_config(args)?;
+    invalidate_host_status_cache(state, &id)?;
+    Ok(hosts)
+}
+
 #[tauri::command]
-fn remove_host(id: String) -> Result<Vec<HostConfig>, String> {
+fn add_host(
+    args: AddHostArgs,
+    state: State<'_, Arc<HostState>>,
+) -> Result<Vec<HostConfig>, String> {
+    add_host_with_state(args, state.inner().as_ref())
+}
+
+#[tauri::command]
+fn update_host(
+    args: UpdateHostArgs,
+    state: State<'_, Arc<HostState>>,
+) -> Result<Vec<HostConfig>, String> {
+    let id = args.id.trim().to_string();
+    let hosts = update_host_config(args)?;
+    invalidate_host_status_cache(state.inner().as_ref(), &id)?;
+    Ok(hosts)
+}
+
+fn remove_host_config(id: &str) -> Result<Vec<HostConfig>, String> {
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
     let mut hosts = load_configured_hosts()?;
     hosts.retain(|h| h.id != id);
-    save_hosts_config(&hosts)?;
+    save_hosts_config_unlocked(&hosts)?;
     load_hosts()
+}
+
+fn remove_host_with_state(id: String, state: &HostState) -> Result<Vec<HostConfig>, String> {
+    let id = id.trim().to_string();
+    let hosts = remove_host_config(&id)?;
+    invalidate_host_status_cache(state, &id)?;
+    Ok(hosts)
+}
+
+#[tauri::command]
+fn remove_host(id: String, state: State<'_, Arc<HostState>>) -> Result<Vec<HostConfig>, String> {
+    remove_host_with_state(id, state.inner().as_ref())
 }
 
 fn remote_tw_version(host: &HostConfig) -> Result<String, String> {
@@ -3531,9 +3745,12 @@ fn test_host(args: AddHostArgs) -> Result<HostStatus, String> {
             .identity_file
             .filter(|p| !p.trim().is_empty())
             .map(|p| expand_home_path(p.trim())),
-        worktree_base: None,
-        tmux_path: None,
-        tw_path: None,
+        worktree_base: args
+            .worktree_base
+            .as_deref()
+            .and_then(trimmed_non_empty_string),
+        tmux_path: args.tmux_path.as_deref().and_then(trimmed_non_empty_string),
+        tw_path: args.tw_path.as_deref().and_then(trimmed_non_empty_string),
     };
     Ok(probe_host_status(&host))
 }
@@ -4321,6 +4538,47 @@ fn layout_path() -> std::path::PathBuf {
     app_home_dir_or_tmp().join(".tw-dashboard-layout.json")
 }
 
+fn layout_backup_path(path: &Path, schema_version: u64) -> PathBuf {
+    path.with_extension(format!("v{schema_version}.backup.json"))
+}
+
+fn layout_schema_version(layout: &serde_json::Value) -> u64 {
+    ["schemaVersion", "version"]
+        .into_iter()
+        .find_map(|key| {
+            layout
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .filter(|version| *version > 0)
+        })
+        .unwrap_or(1)
+}
+
+fn backup_layout_before_schema_migration(
+    path: &Path,
+    next_layout: &serde_json::Value,
+) -> Result<Option<PathBuf>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let current_text =
+        std::fs::read_to_string(path).map_err(|e| format!("read layout for backup: {e}"))?;
+    let current_layout: serde_json::Value =
+        serde_json::from_str(&current_text).map_err(|e| format!("parse layout for backup: {e}"))?;
+    let current_version = layout_schema_version(&current_layout);
+    if layout_schema_version(next_layout) <= current_version {
+        return Ok(None);
+    }
+
+    let backup_path = layout_backup_path(path, current_version);
+    if !backup_path.exists() {
+        atomic_write_file(&backup_path, current_text.as_bytes())
+            .map_err(|e| format!("write layout migration backup: {e}"))?;
+    }
+    Ok(Some(backup_path))
+}
+
 #[derive(Deserialize)]
 struct SavedWindowLayout {
     width: f64,
@@ -4397,7 +4655,12 @@ fn home_dir() -> Result<String, String> {
 #[tauri::command]
 fn save_layout(layout: serde_json::Value) -> Result<(), String> {
     let text = serde_json::to_string_pretty(&layout).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(layout_path(), text).map_err(|e| format!("write: {e}"))?;
+    let _guard = dashboard_layout_write_lock()
+        .lock()
+        .map_err(|_| "dashboard layout write lock poisoned".to_string())?;
+    let path = layout_path();
+    backup_layout_before_schema_migration(&path, &layout)?;
+    atomic_write_file(&path, text.as_bytes()).map_err(|e| format!("write: {e}"))?;
     Ok(())
 }
 
@@ -5170,6 +5433,9 @@ fn save_mobile_relay_config_file(
 ) -> Result<MobileRelayConfig, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
     let mut config: serde_json::Value = if config_path.exists() {
         let text =
             std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
@@ -5195,7 +5461,7 @@ fn save_mobile_relay_config_file(
     );
     let pretty =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
-    std::fs::write(&config_path, format!("{pretty}\n"))
+    atomic_write_file(&config_path, format!("{pretty}\n").as_bytes())
         .map_err(|e| format!("write config: {e}"))?;
     Ok(MobileRelayConfig {
         relay_url: args.relay_url.trim().to_string(),
@@ -5748,6 +6014,7 @@ pub fn run() {
             list_hosts,
             list_ssh_host_candidates,
             add_host,
+            update_host,
             remove_host,
             test_host,
             install_host_tw,
@@ -5776,33 +6043,37 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        agent_running_from_pane_title, append_automation_run, automation_command_with_instruction,
-        cleanup_pending_worktrees, config_worktree_base, config_worktree_base_with_home,
-        create_remote_worktree, create_terminal, create_worktree, delete_automation_from_list,
-        delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
+        add_host_with_state, agent_running_from_pane_title, append_automation_run,
+        atomic_write_file_with, automation_command_with_instruction, cleanup_pending_worktrees,
+        config_worktree_base, config_worktree_base_with_home, create_remote_worktree,
+        create_terminal, create_worktree, delete_automation_from_list, delete_worktree,
+        derive_session_name, ensure_terminal_session, fetchable_project_paths,
         finish_git_fetch_target, git_fetch_args, hosts_from_config, install_host_tw,
-        is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
+        invalidate_host_status_cache, is_git_worktree_dir, is_managed_worktree_session,
+        kill_plain_terminal, kill_session, layout_backup_path, layout_schema_version,
         list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
         load_pending_cleanup, mobile_relay_config_from_value, normalize_local_mdns_name,
         orphaned_worktrees, parse_session_key, project_from_config, project_from_worktree_path,
         projects_from_config, projects_from_config_with_home, remote_file_exists_for_host,
         remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
-        remote_write_file_for_host, reserve_git_fetch_target, restore_worktree, run_check,
-        run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
-        save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
-        stable_output_signature, test_host, tmux_session_exists, trigger_automation,
-        try_cleanup_worktree, upsert_automation_from_input, worktree_has_uncommitted_changes,
-        worktrees_for_session, AddHostArgs, Automation, AutomationOverlap, AutomationRun,
-        AutomationStatus, AutomationTriggerType, CreateArgs, CreateTerminalArgs,
-        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, HostConfig, OrphanedWorktree,
-        Project, RestoreArgs, SaveAutomationInput, AUTOMATION_RUN_LIMIT,
-        GIT_FETCH_INTERVAL_SECONDS,
+        remote_write_file_for_host, remove_host_with_state, reserve_git_fetch_target,
+        restore_worktree, run_check, run_remote_tmux_check, run_remote_tw_check, save_automation,
+        save_hosts_config, save_layout, save_pending_cleanup, should_skip_automation_overlap,
+        ssh_host_candidates_from_config_text, stable_output_signature, test_host,
+        tmux_session_exists, trigger_automation, try_cleanup_worktree, update_host_config,
+        upsert_automation_from_input, worktree_has_uncommitted_changes, worktrees_for_session,
+        AddHostArgs, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
+        AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
+        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, HostConfig, HostState, HostStatus,
+        OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
+        AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
 
     fn test_env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -8318,6 +8589,9 @@ exit 12
             user: None,
             port: None,
             identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         })
         .expect("host status");
 
@@ -8387,6 +8661,9 @@ exit 12
             user: None,
             port: None,
             identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
         })
         .expect("host status");
 
@@ -8540,6 +8817,440 @@ exit 12
         assert_eq!(args.port, None);
         assert_eq!(args.user, None);
         assert_eq!(args.identity_file, None);
+        assert_eq!(args.worktree_base, None);
+        assert_eq!(args.tmux_path, None);
+        assert_eq!(args.tw_path, None);
+    }
+
+    #[test]
+    fn atomic_write_failure_preserves_existing_file_and_cleans_temp() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("state.json");
+        fs::write(&path, "old state").expect("write old state");
+
+        let error = atomic_write_file_with(&path, b"new state", |temp_path| {
+            assert_eq!(temp_path.parent(), path.parent());
+            assert_eq!(fs::read(temp_path).expect("read synced temp"), b"new state");
+            assert_eq!(
+                fs::metadata(temp_path)
+                    .expect("temp metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+            Err("injected failure before rename".to_string())
+        })
+        .expect_err("injected failure");
+
+        assert!(error.contains("injected failure before rename"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("old state intact"),
+            "old state"
+        );
+        let leftovers = fs::read_dir(temp.path())
+            .expect("read tempdir")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn update_host_is_transactional_preserves_other_config_and_is_idempotent() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+        }
+        let config_path = temp.path().join(".tmux-worktree.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "projects": {
+                    "dashboard": { "path": "/repo/dashboard" }
+                },
+                "mobileRelay": {
+                    "relayUrl": "wss://relay.example.test",
+                    "secret": "keep-me"
+                },
+                "hosts": [
+                    {
+                        "id": "builder",
+                        "label": "Old builder",
+                        "host": "old.example.test",
+                        "user": "old-user",
+                        "worktreeBase": "/old/worktrees",
+                        "tmuxPath": "/old/tmux",
+                        "twPath": "/old/tw"
+                    },
+                    {
+                        "id": "spare",
+                        "label": "Spare",
+                        "host": "spare.example.test"
+                    }
+                ]
+            }))
+            .expect("serialize initial config"),
+        )
+        .expect("write initial config");
+
+        let args = || UpdateHostArgs {
+            id: "builder".to_string(),
+            label: "  Build host  ".to_string(),
+            host: "  builder.example.test  ".to_string(),
+            user: Some("  alice  ".to_string()),
+            port: Some(2222),
+            identity_file: Some("  ~/keys/builder  ".to_string()),
+            worktree_base: Some("  ~/worktrees  ".to_string()),
+            tmux_path: Some("  ~/.local/bin/tmux  ".to_string()),
+            tw_path: Some("  ~/.local/bin/tw  ".to_string()),
+        };
+
+        let hosts = update_host_config(args()).expect("update host");
+        let builder = hosts
+            .iter()
+            .find(|host| host.id == "builder")
+            .expect("updated builder");
+        assert_eq!(builder.label, "Build host");
+        assert_eq!(builder.host, "builder.example.test");
+        assert_eq!(builder.user.as_deref(), Some("alice"));
+        assert_eq!(builder.port, Some(2222));
+        assert_eq!(
+            builder.identity_file.as_deref(),
+            Some(temp.path().join("keys/builder").to_string_lossy().as_ref())
+        );
+        assert_eq!(builder.worktree_base.as_deref(), Some("~/worktrees"));
+        assert_eq!(builder.tmux_path.as_deref(), Some("~/.local/bin/tmux"));
+        assert_eq!(builder.tw_path.as_deref(), Some("~/.local/bin/tw"));
+        assert!(hosts.iter().any(|host| host.id == "spare"));
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).expect("read updated config"))
+                .expect("parse updated config");
+        assert_eq!(saved["projects"]["dashboard"]["path"], "/repo/dashboard");
+        assert_eq!(saved["mobileRelay"]["secret"], "keep-me");
+
+        let first_write = fs::read(&config_path).expect("first update bytes");
+        assert_eq!(
+            fs::metadata(&config_path)
+                .expect("config metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        update_host_config(args()).expect("repeat update");
+        assert_eq!(
+            fs::read(&config_path).expect("second update bytes"),
+            first_write
+        );
+
+        let cleared = update_host_config(UpdateHostArgs {
+            id: "builder".to_string(),
+            label: "Build host".to_string(),
+            host: "builder.example.test".to_string(),
+            user: Some(" ".to_string()),
+            port: None,
+            identity_file: None,
+            worktree_base: Some("".to_string()),
+            tmux_path: None,
+            tw_path: Some("  ".to_string()),
+        })
+        .expect("clear optional host fields");
+        let builder = cleared
+            .iter()
+            .find(|host| host.id == "builder")
+            .expect("cleared builder");
+        assert_eq!(builder.user, None);
+        assert_eq!(builder.port, None);
+        assert_eq!(builder.identity_file, None);
+        assert_eq!(builder.worktree_base, None);
+        assert_eq!(builder.tmux_path, None);
+        assert_eq!(builder.tw_path, None);
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
+    }
+
+    #[test]
+    fn update_host_rejects_missing_and_duplicate_stable_ids_without_writing() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+        }
+        let config_path = temp.path().join(".tmux-worktree.json");
+        let host_value = serde_json::json!({
+            "id": "builder",
+            "label": "Builder",
+            "host": "builder.example.test"
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "other": { "preserved": true },
+                "hosts": [host_value.clone()]
+            }))
+            .expect("serialize config"),
+        )
+        .expect("write config");
+        let missing_before = fs::read(&config_path).expect("missing before");
+
+        let missing = update_host_config(UpdateHostArgs {
+            id: "missing".to_string(),
+            label: "Missing".to_string(),
+            host: "missing.example.test".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
+        })
+        .expect_err("missing id must fail");
+        assert_eq!(missing, "host id 'missing' not found");
+        assert_eq!(
+            fs::read(&config_path).expect("missing after"),
+            missing_before
+        );
+
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "other": { "preserved": true },
+                "hosts": [host_value.clone(), host_value]
+            }))
+            .expect("serialize duplicate config"),
+        )
+        .expect("write duplicate config");
+        let duplicate_before = fs::read(&config_path).expect("duplicate before");
+        let duplicate = update_host_config(UpdateHostArgs {
+            id: "builder".to_string(),
+            label: "Builder".to_string(),
+            host: "builder.example.test".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
+        })
+        .expect_err("duplicate id must fail");
+        assert_eq!(duplicate, "host id 'builder' is duplicated in config");
+        assert_eq!(
+            fs::read(&config_path).expect("duplicate after"),
+            duplicate_before
+        );
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
+    }
+
+    #[test]
+    fn update_host_invalidates_only_its_cached_status() {
+        let state = HostState::default();
+        let status = |id: &str| CachedHostStatus {
+            status: HostStatus {
+                id: id.to_string(),
+                label: id.to_string(),
+                reachable: true,
+                latency_ms: Some(1),
+                error: None,
+                tw_available: true,
+                tw_version: Some("1.0.3".to_string()),
+                tw_error: None,
+            },
+            checked_at: Instant::now(),
+        };
+        {
+            let mut statuses = state.statuses.lock().expect("cache lock");
+            statuses.insert("builder".to_string(), status("builder"));
+            statuses.insert("spare".to_string(), status("spare"));
+        }
+
+        invalidate_host_status_cache(&state, "builder").expect("invalidate builder");
+
+        let statuses = state.statuses.lock().expect("cache lock");
+        assert!(!statuses.contains_key("builder"));
+        assert!(statuses.contains_key("spare"));
+    }
+
+    #[test]
+    fn remove_then_readd_same_host_id_never_reuses_cached_status() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+        }
+        let config_path = temp.path().join(".tmux-worktree.json");
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hosts": [{
+                    "id": "builder",
+                    "label": "Old builder",
+                    "host": "old.example.test"
+                }]
+            }))
+            .expect("serialize config"),
+        )
+        .expect("write config");
+
+        let state = HostState::default();
+        let stale_status = || CachedHostStatus {
+            status: HostStatus {
+                id: "builder".to_string(),
+                label: "Old builder".to_string(),
+                reachable: false,
+                latency_ms: None,
+                error: Some("stale failure".to_string()),
+                tw_available: false,
+                tw_version: None,
+                tw_error: None,
+            },
+            checked_at: Instant::now(),
+        };
+        state
+            .statuses
+            .lock()
+            .expect("cache lock")
+            .insert("builder".to_string(), stale_status());
+
+        let after_remove =
+            remove_host_with_state(" builder ".to_string(), &state).expect("remove host");
+        assert!(after_remove.iter().all(|host| host.id != "builder"));
+        assert!(!state
+            .statuses
+            .lock()
+            .expect("cache lock")
+            .contains_key("builder"));
+
+        state
+            .statuses
+            .lock()
+            .expect("cache lock")
+            .insert("builder".to_string(), stale_status());
+        let after_add = add_host_with_state(
+            AddHostArgs {
+                id: " builder ".to_string(),
+                label: " New builder ".to_string(),
+                host: " new.example.test ".to_string(),
+                user: Some(" alice ".to_string()),
+                port: Some(2222),
+                identity_file: Some(" ~/.ssh/builder ".to_string()),
+                worktree_base: Some(" ~/worktrees ".to_string()),
+                tmux_path: Some(" ~/.local/bin/tmux ".to_string()),
+                tw_path: Some(" ~/.local/bin/tw ".to_string()),
+            },
+            &state,
+        )
+        .expect("re-add host");
+        let builder = after_add
+            .iter()
+            .find(|host| host.id == "builder")
+            .expect("new builder");
+        assert_eq!(builder.label, "New builder");
+        assert_eq!(builder.host, "new.example.test");
+        assert_eq!(builder.user.as_deref(), Some("alice"));
+        assert_eq!(builder.port, Some(2222));
+        assert_eq!(builder.worktree_base.as_deref(), Some("~/worktrees"));
+        assert_eq!(builder.tmux_path.as_deref(), Some("~/.local/bin/tmux"));
+        assert_eq!(builder.tw_path.as_deref(), Some("~/.local/bin/tw"));
+        assert!(!state
+            .statuses
+            .lock()
+            .expect("cache lock")
+            .contains_key("builder"));
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
+    }
+
+    #[test]
+    fn layout_schema_migration_backup_is_created_once_and_save_is_idempotent() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+        }
+        let path = temp.path().join(".tw-dashboard-layout.json");
+        let legacy = serde_json::json!({
+            "left": 240,
+            "selection": { "kind": "session", "name": "dashboard" }
+        });
+        let legacy_text = serde_json::to_string_pretty(&legacy).expect("serialize legacy");
+        fs::write(&path, &legacy_text).expect("write legacy layout");
+
+        let first_v2 = serde_json::json!({
+            "schemaVersion": 2,
+            "sidebar": { "width": 280 },
+            "selection": { "kind": "session", "id": "local:dashboard" }
+        });
+        assert_eq!(layout_schema_version(&first_v2), 2);
+        assert_eq!(
+            layout_schema_version(&serde_json::json!({ "version": 2 })),
+            2
+        );
+        save_layout(first_v2.clone()).expect("save migrated layout");
+        let backup_path = layout_backup_path(&path, 1);
+        assert_eq!(
+            backup_path.file_name().and_then(|name| name.to_str()),
+            Some(".tw-dashboard-layout.v1.backup.json")
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).expect("read migration backup"),
+            legacy_text
+        );
+        let backup_once = fs::read(&backup_path).expect("backup bytes");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(&path).expect("read v2 layout")
+            )
+            .expect("parse v2 layout"),
+            first_v2
+        );
+
+        let updated_v2 = serde_json::json!({
+            "schemaVersion": 2,
+            "sidebar": { "width": 300 },
+            "selection": { "kind": "session", "id": "local:dashboard" }
+        });
+        save_layout(updated_v2.clone()).expect("repeat v2 save");
+        save_layout(updated_v2.clone()).expect("idempotent v2 save");
+        assert_eq!(
+            fs::read(&backup_path).expect("backup unchanged"),
+            backup_once
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(&path).expect("read updated v2")
+            )
+            .expect("parse updated v2"),
+            updated_v2
+        );
+
+        fs::write(&path, "{ invalid layout").expect("write malformed layout");
+        let malformed_before = fs::read(&path).expect("malformed before");
+        let error = save_layout(serde_json::json!({ "schemaVersion": 3 }))
+            .expect_err("malformed source must block migration");
+        assert!(error.contains("parse layout for backup"));
+        assert_eq!(fs::read(&path).expect("malformed after"), malformed_before);
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
     }
 
     #[test]

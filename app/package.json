@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "tsx --test tests/*.test.ts",
-    "test:platform": "tsx --test tests/dashboardBackend.test.ts tests/dashboardBackendContext.test.ts tests/fakeBackend.test.ts tests/platformBoundary.test.ts tests/ptyBackend.test.ts tests/tauriTransportFactory.test.ts",
+    "test:platform": "tsx --test tests/dashboardBackend.test.ts tests/dashboardBackendContext.test.ts tests/fakeBackend.test.ts tests/platformBoundary.test.ts tests/previewBackend.test.ts tests/ptyBackend.test.ts tests/tauriTransportFactory.test.ts",
     "test:typecheck": "tsc --project tsconfig.tests.json",
     "preview": "vite preview",
     "tauri": "tauri",

@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback } from "react";
+import { useState, useCallback } from "react";
 import { type GitCommit, type GitStatus, useDashboardBackend } from "./platform";
+import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
 export type { GitCommit, GitFile, GitStatus } from "./platform";
 
 type Props = {
@@ -13,6 +14,8 @@ type Tab = "files" | "log";
 
 const REFRESH_MS = 4000;
 const PROJECT_FETCH_MS = 5 * 60_000;
+const HIDDEN_REFRESH_MS = 30_000;
+const HIDDEN_PROJECT_FETCH_MS = 15 * 60_000;
 
 function categorize(code: string): "staged" | "unstaged" | "untracked" | "conflict" {
   if (code === "??") return "untracked";
@@ -95,18 +98,16 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
     void dashboardBackend.git.fetchProjectRoots().catch(() => {});
   }, []);
 
-  useEffect(() => {
-    triggerProjectFetch();
-    const id = setInterval(triggerProjectFetch, PROJECT_FETCH_MS);
-    return () => clearInterval(id);
-  }, [triggerProjectFetch]);
-
-  useEffect(() => {
-    refresh();
-    if (!cwd && !sessionName) return;
-    const id = setInterval(refresh, REFRESH_MS);
-    return () => clearInterval(id);
-  }, [refresh, cwd, sessionName]);
+  useVisibilityAwarePolling(triggerProjectFetch, {
+    visibleIntervalMs: PROJECT_FETCH_MS,
+    hiddenIntervalMs: HIDDEN_PROJECT_FETCH_MS,
+  });
+  useVisibilityAwarePolling(refresh, {
+    enabled: !!cwd || !!sessionName,
+    visibleIntervalMs: REFRESH_MS,
+    hiddenIntervalMs: HIDDEN_REFRESH_MS,
+    refreshKey: `${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}`,
+  });
 
   const tabs = (
     <div className="git__tabs">
