@@ -46,9 +46,16 @@ arch=$(uname -m)
 dmg_src="$APP_DIR/src-tauri/target/release/bundle/dmg/tw-dashboard_${tauri_version}_aarch64.dmg"
 if [[ "$skip_build" -eq 0 ]]; then
   info "running tauri build (--no-build to skip)"
+  export APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:--}"
   ( cd "$APP_DIR" && npm run tauri build )
 fi
 [[ -f "$dmg_src" ]] || die "dmg not found at $dmg_src — drop --no-build, or check the build output"
+
+app_bundle="$APP_DIR/src-tauri/target/release/bundle/macos/tw-dashboard.app"
+[[ -d "$app_bundle" ]] || die "app bundle not found at $app_bundle"
+codesign --verify --deep --strict "$app_bundle" \
+  || die "app bundle signature or sealed resources are invalid"
+ok "verified app bundle signature and sealed resources"
 
 dmg_dst="$INSTALLER_DIR/dmg/tw-dashboard-arm64.dmg"
 mkdir -p "$INSTALLER_DIR/dmg"

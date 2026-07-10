@@ -20,8 +20,8 @@ test("Android terminal refits after keyboard viewport changes", () => {
 test("Android package version matches current release line", () => {
   const gradle = readFileSync("mobile/android/app/build.gradle.kts", "utf8");
 
-  assert.match(gradle, /versionCode = 10002/);
-  assert.match(gradle, /versionName = "1\.0\.2"/);
+  assert.match(gradle, /versionCode = 10003/);
+  assert.match(gradle, /versionName = "1\.0\.3"/);
 });
 
 test("Android worktree list groups sessions by project", () => {

@@ -96,7 +96,7 @@ tw setup
 
 The Android binary is published as a separate GitHub release asset:
 
-[Download `tw-dashboard-mobile_1.0.2_release-debug-signed.apk`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.2/tw-dashboard-mobile_1.0.2_release-debug-signed.apk)
+[Download `tw-dashboard-mobile_1.0.3_release-debug-signed.apk`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.3/tw-dashboard-mobile_1.0.3_release-debug-signed.apk)
 
 The APK is installable and debug-signed. Use it for direct device testing, not app-store distribution.
 
