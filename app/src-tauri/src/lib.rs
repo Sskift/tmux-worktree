@@ -228,6 +228,52 @@ struct HostStatus {
     tw_error: Option<String>,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct AgentProbeResult {
+    id: String,
+    label: String,
+    command: String,
+    available: bool,
+    executable_path: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct AgentProbeSpec {
+    id: &'static str,
+    label: &'static str,
+    command: &'static str,
+}
+
+const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
+    AgentProbeSpec {
+        id: "claude",
+        label: "Claude Code",
+        command: "claude",
+    },
+    AgentProbeSpec {
+        id: "codex",
+        label: "Codex",
+        command: "codex",
+    },
+    AgentProbeSpec {
+        id: "gemini",
+        label: "Gemini CLI",
+        command: "gemini",
+    },
+    AgentProbeSpec {
+        id: "opencode",
+        label: "OpenCode",
+        command: "opencode",
+    },
+    AgentProbeSpec {
+        id: "aider",
+        label: "Aider",
+        command: "aider",
+    },
+];
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TmuxTerminal {
@@ -278,11 +324,17 @@ struct TwRpcSession {
     cwd: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct TwRpcCreateWorktreeResponse {
     protocol_version: u32,
+    #[serde(default)]
+    kind: Option<String>,
     session: String,
+    #[serde(default)]
+    worktree_path: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -1032,7 +1084,7 @@ struct OrphanedWorktree {
     name: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
 struct CreateArgs {
     project: Option<String>,
     path: Option<String>,
@@ -1497,6 +1549,7 @@ fn projects_from_config_with_home(config: &serde_json::Value, home: Option<&str>
     }
 }
 
+#[cfg(test)]
 fn project_from_config(config: &serde_json::Value, name: &str) -> Option<Project> {
     project_from_config_with_home(config, name, None)
 }
@@ -2131,6 +2184,128 @@ fn find_host(host_id: &str) -> Result<HostConfig, String> {
         .ok_or_else(|| format!("unknown host: {host_id}"))
 }
 
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn probe_local_agents_in_paths(search_paths: &[PathBuf]) -> Vec<AgentProbeResult> {
+    AGENT_PROBE_SPECS
+        .iter()
+        .map(|spec| {
+            let executable_path = search_paths
+                .iter()
+                .map(|directory| directory.join(spec.command))
+                .find(|candidate| is_executable_file(candidate))
+                .map(|candidate| candidate.to_string_lossy().to_string());
+            AgentProbeResult {
+                id: spec.id.to_string(),
+                label: spec.label.to_string(),
+                command: spec.command.to_string(),
+                available: executable_path.is_some(),
+                executable_path,
+                error: None,
+            }
+        })
+        .collect()
+}
+
+fn probe_local_agents() -> Vec<AgentProbeResult> {
+    let search_paths = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default();
+    probe_local_agents_in_paths(&search_paths)
+}
+
+fn probe_remote_agents(host: &HostConfig) -> Result<Vec<AgentProbeResult>, String> {
+    // The script and every argument are fixed here. In particular, this never
+    // accepts the configured aiCmd or any other user-provided shell fragment.
+    const PROBE_SCRIPT: &str = r#"for agent_command do
+  agent_path=$(command -v "$agent_command" 2>/dev/null || true)
+  if [ -n "$agent_path" ]; then
+    printf '%s\t1\t%s\n' "$agent_command" "$agent_path"
+  else
+    printf '%s\t0\n' "$agent_command"
+  fi
+done"#;
+
+    let mut remote_command = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        PROBE_SCRIPT.to_string(),
+        "agent-probe".to_string(),
+    ];
+    remote_command.extend(
+        AGENT_PROBE_SPECS
+            .iter()
+            .map(|spec| spec.command.to_string()),
+    );
+    let output = run_remote_cmd_check_strings(host, &remote_command)?;
+    let discovered = output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '\t');
+            let command = fields.next()?.to_string();
+            let available = fields.next()? == "1";
+            let path = fields
+                .next()
+                .filter(|path| available && !path.is_empty())
+                .map(str::to_string);
+            Some((command, path))
+        })
+        .collect::<HashMap<_, _>>();
+
+    Ok(AGENT_PROBE_SPECS
+        .iter()
+        .map(|spec| {
+            let executable_path = discovered.get(spec.command).cloned().flatten();
+            AgentProbeResult {
+                id: spec.id.to_string(),
+                label: spec.label.to_string(),
+                command: spec.command.to_string(),
+                available: executable_path.is_some(),
+                executable_path,
+                error: None,
+            }
+        })
+        .collect())
+}
+
+fn probe_agents_for_host_id(host_id: Option<&str>) -> Result<Vec<AgentProbeResult>, String> {
+    match host_id {
+        Some(host_id) => {
+            let host_id = host_id.trim();
+            if host_id.is_empty() {
+                return Err("host id is empty".to_string());
+            }
+            let host = find_host(host_id)?;
+            probe_remote_agents(&host)
+        }
+        None => Ok(probe_local_agents()),
+    }
+}
+
+#[tauri::command]
+async fn probe_agents(host_id: Option<String>) -> Result<Vec<AgentProbeResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || probe_agents_for_host_id(host_id.as_deref()))
+        .await
+        .map_err(|error| format!("agent probe task failed: {error}"))?
+}
+
 const HOST_STATUS_CACHE_MS: u64 = 5000;
 
 fn pending_cleanup_path() -> std::path::PathBuf {
@@ -2606,49 +2781,10 @@ fn copy_bytes_to_clipboard(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-fn detect_default_branch(repo: &str) -> String {
-    if let Some(s) = run_quiet(&[
-        "git",
-        "-C",
-        repo,
-        "symbolic-ref",
-        "refs/remotes/origin/HEAD",
-    ]) {
-        if let Some(b) = s.strip_prefix("refs/remotes/origin/") {
-            return b.to_string();
-        }
-    }
-    if run_quiet(&[
-        "git",
-        "-C",
-        repo,
-        "ls-remote",
-        "--heads",
-        "origin",
-        "master",
-    ])
-    .map(|s| !s.is_empty())
-    .unwrap_or(false)
-    {
-        return "master".to_string();
-    }
-    "main".to_string()
-}
-
 fn unique_session_name(base: &str) -> String {
     let mut name = base.to_string();
     let mut i = 1;
     while run_quiet(&["tmux", "has-session", "-t", &format!("={}", name)]).is_some() {
-        name = format!("{}-{}", base, i);
-        i += 1;
-    }
-    name
-}
-
-fn remote_unique_session_name(host: &HostConfig, base: &str) -> String {
-    let mut name = base.to_string();
-    let mut i = 1;
-    while run_remote_tmux_quiet(host, &["has-session", "-t", &format!("={}", name)]).is_some() {
         name = format!("{}-{}", base, i);
         i += 1;
     }
@@ -2690,151 +2826,259 @@ fn start_dashboard_worktree_session(
     Ok(())
 }
 
-/// tmux session 名的最大长度，与 CLI (`src/dev.ts` 的 `SESSION_NAME_MAX_LEN`) 对齐。
-const SESSION_NAME_MAX_LEN: usize = 20;
-
-#[tauri::command]
-fn create_worktree(args: CreateArgs) -> Result<String, String> {
-    if let Some(host_id) = args.host_id.as_deref() {
-        let host = find_host(host_id)?;
-        return create_remote_worktree(&host, args);
-    }
-    create_local_worktree(args)
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LocalTwRpcRuntime {
+    Bundled { node: String, cli: PathBuf },
+    Installed { tw: String },
 }
 
-fn create_local_worktree(args: CreateArgs) -> Result<String, String> {
+impl LocalTwRpcRuntime {
+    fn audit_label(&self) -> &'static str {
+        match self {
+            Self::Bundled { .. } => "bundled same-version TW runtime",
+            Self::Installed { .. } => "installed same-version TW fallback",
+        }
+    }
+}
+
+fn local_worktree_base_for_rpc() -> Result<String, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
     let config: serde_json::Value = if config_path.exists() {
         let config_text = std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("read {}: {e}", config_path.display()))?;
-        serde_json::from_str(&config_text).map_err(|e| format!("parse config: {e}"))?
+            .map_err(|error| format!("read {}: {error}", config_path.display()))?;
+        serde_json::from_str(&config_text).map_err(|error| format!("parse config: {error}"))?
     } else {
         serde_json::json!({})
     };
+    Ok(config_worktree_base(&config)
+        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string()))
+}
 
-    let (project_label, project_dir, project_branch) = if let Some(name) = args.project.as_deref() {
-        let project = project_from_config(&config, name)
-            .ok_or_else(|| format!("project '{name}' not in ~/.tmux-worktree.json"))?;
-        (project.name, project.path, project.branch)
-    } else if let Some(path) = args.path.as_deref() {
-        let p = path.trim();
-        if p.is_empty() {
-            return Err("project or path required".into());
-        }
-        let label = std::path::Path::new(p)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("project")
-            .to_string();
-        (label, p.to_string(), None)
-    } else {
-        return Err("project or path required".into());
-    };
-
-    if !std::path::Path::new(&project_dir).exists() {
-        return Err(format!("project dir does not exist: {project_dir}"));
+fn build_local_worktree_rpc_args(
+    args: &CreateArgs,
+    worktree_base: &str,
+) -> Result<Vec<String>, String> {
+    let mut rpc_args = vec!["rpc".to_string(), "create-worktree".to_string()];
+    let path = args
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let project = args
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty());
+    if path.is_none() && project.is_none() {
+        return Err("project or path required".to_string());
+    }
+    if let Some(path) = path {
+        rpc_args.extend(["--path".to_string(), path.to_string()]);
+    }
+    if let Some(project) = project {
+        rpc_args.extend(["--project".to_string(), project.to_string()]);
     }
 
-    let worktree_base = config_worktree_base(&config)
-        .unwrap_or_else(|| "/private/tmp/tmux-worktree/projects".to_string());
-
-    let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
-    let base_session = if trimmed_name.is_empty() {
-        project_label.clone()
-    } else {
-        format!("{}-{}", project_label, trimmed_name)
-    };
-    // 截断到 SESSION_NAME_MAX_LEN，与 CLI (src/dev.ts) 对齐，否则两边对同一
-    // project+title 生成的 session/分支名会分叉，破坏 session↔worktree 关联。
-    let base_session: String = base_session.chars().take(SESSION_NAME_MAX_LEN).collect();
-    let session = unique_session_name(&base_session);
-
-    let mut created_worktree: Option<(String, String)> = None;
-    let work_dir = if run_quiet(&[
-        "git",
-        "-C",
-        &project_dir,
-        "rev-parse",
-        "--is-inside-work-tree",
-    ])
-    .as_deref()
-        == Some("true")
+    let ai_command = args.ai_cmd.trim();
+    if ai_command.is_empty() {
+        return Err("ai command required".to_string());
+    }
+    rpc_args.extend(["--ai-command".to_string(), ai_command.to_string()]);
+    if let Some(name) = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
     {
-        let target_branch = args
-            .branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|branch| !branch.is_empty())
-            .map(ToString::to_string)
-            .or(project_branch)
-            .unwrap_or_else(|| detect_default_branch(&project_dir));
-        let _ = run_quiet(&[
-            "git",
-            "-C",
-            &project_dir,
-            "fetch",
-            "origin",
-            &target_branch,
-            "--quiet",
-        ]);
+        rpc_args.extend(["--name".to_string(), name.to_string()]);
+    }
+    if let Some(branch) = args
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    {
+        rpc_args.extend(["--branch".to_string(), branch.to_string()]);
+    }
+    rpc_args.extend(["--worktree-base".to_string(), worktree_base.to_string()]);
+    Ok(rpc_args)
+}
 
-        let branch_id = random_id();
-        let branch_name = format!("{}-{}", session, branch_id);
-        let project_worktree_root = format!("{}/{}", worktree_base, project_label);
-        std::fs::create_dir_all(&project_worktree_root)
-            .map_err(|e| format!("mkdir {project_worktree_root}: {e}"))?;
-        let worktree_dir = format!("{}/{}", project_worktree_root, branch_name);
+fn parse_local_worktree_rpc_response(output: &str, runtime_label: &str) -> Result<String, String> {
+    let response: TwRpcCreateWorktreeResponse = serde_json::from_str(output.trim())
+        .map_err(|error| format!("parse {runtime_label} create-worktree response: {error}"))?;
+    if response.protocol_version != 1 {
+        return Err(format!(
+            "unsupported {runtime_label} TW RPC protocol: {}",
+            response.protocol_version
+        ));
+    }
+    if response
+        .kind
+        .as_deref()
+        .is_some_and(|kind| kind != "worktree")
+    {
+        return Err(format!(
+            "{runtime_label} returned unexpected create kind: {}",
+            response.kind.as_deref().unwrap_or_default()
+        ));
+    }
+    let session = response.session.trim();
+    if session.is_empty() {
+        return Err(format!(
+            "{runtime_label} returned an empty worktree session name"
+        ));
+    }
+    Ok(session.to_string())
+}
 
-        run_check(&[
-            "git",
-            "-C",
-            &project_dir,
-            "worktree",
-            "add",
-            "-b",
-            &branch_name,
-            &worktree_dir,
-            &format!("origin/{}", target_branch),
-            "--quiet",
-        ])?;
+fn installed_tw_version(program: &str, home: &Path) -> Result<String, String> {
+    let output = std::process::Command::new(program)
+        .arg("version")
+        .env("HOME", home)
+        .env("TW_DASHBOARD_HOME", home)
+        .output()
+        .map_err(|error| format!("run {program} version: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{program} version exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
-        created_worktree = Some((worktree_dir.clone(), branch_name.clone()));
-        worktree_dir
-    } else {
-        project_dir.clone()
-    };
-
-    if let Err(err) = start_dashboard_worktree_session(&session, &work_dir, &args.ai_cmd) {
-        let _ = run_quiet(&["tmux", "kill-session", "-t", &format!("={}", session)]);
-        if let Some((worktree_dir, branch_name)) = created_worktree {
-            let _ = try_cleanup_worktree(&worktree_dir, true);
-            let _ = run_quiet(&["git", "-C", &project_dir, "branch", "-D", &branch_name]);
-        }
-        return Err(err);
+fn select_local_tw_rpc_runtime(
+    bundled_cli: Option<PathBuf>,
+    node: Option<String>,
+    installed_tw: Option<String>,
+    home: &Path,
+) -> Result<LocalTwRpcRuntime, String> {
+    if let (Some(cli), Some(node)) = (bundled_cli.as_ref(), node.as_ref()) {
+        return Ok(LocalTwRpcRuntime::Bundled {
+            node: node.clone(),
+            cli: cli.clone(),
+        });
     }
 
-    Ok(session)
+    let mut failures = Vec::new();
+    if bundled_cli.is_none() {
+        failures.push("bundled CLI resource not found".to_string());
+    } else if node.is_none() {
+        failures.push("Node.js 20+ not found for bundled CLI".to_string());
+    }
+
+    if let Some(tw) = installed_tw {
+        match installed_tw_version(&tw, home) {
+            Ok(version) if version == env!("CARGO_PKG_VERSION") => {
+                return Ok(LocalTwRpcRuntime::Installed { tw });
+            }
+            Ok(version) => failures.push(format!(
+                "installed tw version {version:?} does not match Dashboard {}",
+                env!("CARGO_PKG_VERSION")
+            )),
+            Err(error) => failures.push(error),
+        }
+    } else {
+        failures.push("installed tw/tmux-worktree command not found".to_string());
+    }
+
+    Err(format!(
+        "Canonical local TW runtime unavailable: {}. The Rust worktree creator is intentionally disabled so Dashboard cannot silently create a different session contract. Install Node.js 20+ or install tw {}.",
+        failures.join("; "),
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+fn resolve_local_tw_rpc_runtime(
+    app: &tauri::AppHandle,
+    home: &Path,
+) -> Result<LocalTwRpcRuntime, String> {
+    select_local_tw_rpc_runtime(
+        bundled_cli_path(app),
+        node_bin(),
+        installed_tw_command(),
+        home,
+    )
+}
+
+fn create_local_worktree_via_runtime(
+    runtime: &LocalTwRpcRuntime,
+    args: CreateArgs,
+) -> Result<String, String> {
+    let home = app_home_dir().ok_or("home dir not found")?;
+    let worktree_base = local_worktree_base_for_rpc()?;
+    let rpc_args = build_local_worktree_rpc_args(&args, &worktree_base)?;
+    let mut command = match runtime {
+        LocalTwRpcRuntime::Bundled { node, cli } => {
+            let mut command = std::process::Command::new(node);
+            command.arg(cli);
+            command
+        }
+        LocalTwRpcRuntime::Installed { tw } => std::process::Command::new(tw),
+    };
+    let output = command
+        .args(&rpc_args)
+        // The bundled Node CLI uses os.homedir(), while isolated Dashboard
+        // tests and dev builds use TW_DASHBOARD_HOME. Keep both views aligned.
+        .env("HOME", &home)
+        .env("TW_DASHBOARD_HOME", &home)
+        .output()
+        .map_err(|error| format!("spawn {}: {error}", runtime.audit_label()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} create-worktree failed ({}): {}. No secondary creator was attempted.",
+            runtime.audit_label(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    parse_local_worktree_rpc_response(
+        &String::from_utf8_lossy(&output.stdout),
+        runtime.audit_label(),
+    )
+}
+
+fn create_local_worktree_via_tw_rpc(
+    app: &tauri::AppHandle,
+    args: CreateArgs,
+) -> Result<String, String> {
+    let home = app_home_dir().ok_or("home dir not found")?;
+    let runtime = resolve_local_tw_rpc_runtime(app, &home)?;
+    create_local_worktree_via_runtime(&runtime, args)
+}
+
+#[tauri::command]
+fn create_worktree(app: tauri::AppHandle, args: CreateArgs) -> Result<String, String> {
+    if let Some(host_id) = args.host_id.as_deref() {
+        let host = find_host(host_id)?;
+        return create_remote_worktree(&host, args);
+    }
+    create_local_worktree_via_tw_rpc(&app, args)
 }
 
 fn create_remote_worktree(host: &HostConfig, args: CreateArgs) -> Result<String, String> {
     match create_remote_worktree_via_tw_rpc(host, &args) {
         Ok(session) => Ok(session),
-        Err(err) if remote_tw_rpc_create_unavailable(&err) => {
-            create_remote_worktree_via_tmux(host, args)
-        }
+        Err(err) if remote_tw_rpc_create_unavailable(&err) => Err(format!(
+            "Remote host {} does not have a compatible `tw rpc create-worktree`. Install or upgrade remote tw to {} (the Dashboard version), then retry. Dashboard will not fall back to direct remote git/tmux creation. Original error: {err}",
+            host.label,
+            env!("CARGO_PKG_VERSION")
+        )),
         Err(err) => Err(err),
     }
 }
 
 fn remote_tw_rpc_create_unavailable(err: &str) -> bool {
     let lower = err.to_lowercase();
-    lower.contains("tw: command not found")
+    (lower.contains("tw") && lower.contains("command not found"))
         || lower.contains("tw: not found")
-        || lower.contains("command not found: tw")
-        || lower.contains("unknown rpc command")
+        || (lower.contains("unknown") && lower.contains("rpc"))
         || lower.contains("unknown create-worktree option")
         || lower.contains("unsupported tw rpc protocol")
+        || lower.contains("parse tw rpc create-worktree")
 }
 
 #[derive(Clone)]
@@ -2848,16 +3092,13 @@ struct RemoteWorktreeTarget {
 fn resolve_remote_worktree_target(
     host: &HostConfig,
     args: &CreateArgs,
-    include_config_worktree_base: bool,
 ) -> Result<RemoteWorktreeTarget, String> {
     let project_name = args
         .project
         .as_deref()
         .map(str::trim)
         .filter(|name| !name.is_empty());
-    let needs_config =
-        project_name.is_some() || (include_config_worktree_base && host.worktree_base.is_none());
-    let remote_config = if needs_config {
+    let remote_config = if project_name.is_some() {
         remote_config_for_host(host)?
     } else {
         None
@@ -2913,13 +3154,7 @@ fn resolve_remote_worktree_target(
                 .as_ref()
                 .and_then(|project| project.branch.clone())
         });
-    let worktree_base = host.worktree_base.clone().or_else(|| {
-        if !include_config_worktree_base {
-            return None;
-        }
-        let (config, home) = remote_config.as_ref()?;
-        config_worktree_base_with_home(config, Some(home.as_str()))
-    });
+    let worktree_base = host.worktree_base.clone();
 
     Ok(RemoteWorktreeTarget {
         label,
@@ -2933,10 +3168,9 @@ fn create_remote_worktree_via_tw_rpc(
     host: &HostConfig,
     args: &CreateArgs,
 ) -> Result<String, String> {
-    let target = resolve_remote_worktree_target(host, args, false)?;
+    let target = resolve_remote_worktree_target(host, args)?;
 
     let mut remote_cmd = vec![
-        "tw".to_string(),
         "rpc".to_string(),
         "create-worktree".to_string(),
         "--path".to_string(),
@@ -2964,7 +3198,8 @@ fn create_remote_worktree_via_tw_rpc(
         remote_cmd.push(branch.to_string());
     }
 
-    let output = run_remote_cmd_check_strings(host, &remote_cmd)?;
+    let remote_args = remote_cmd.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_remote_tw_check(host, &remote_args)?;
     let response: TwRpcCreateWorktreeResponse =
         serde_json::from_str(&output).map_err(|e| format!("parse tw rpc create-worktree: {e}"))?;
     if response.protocol_version != 1 {
@@ -2978,160 +3213,6 @@ fn create_remote_worktree_via_tw_rpc(
         return Err("tw rpc create-worktree returned empty session".to_string());
     }
     Ok(format!("{}:{}", host.id, session))
-}
-
-fn create_remote_worktree_via_tmux(host: &HostConfig, args: CreateArgs) -> Result<String, String> {
-    let target = resolve_remote_worktree_target(host, &args, true)?;
-    let project_dir = target.project_dir.as_str();
-    let worktree_base = target
-        .worktree_base
-        .as_deref()
-        .unwrap_or("/tmp/tmux-worktree/projects");
-
-    let trimmed_name = args.name.as_deref().map(str::trim).unwrap_or("");
-    let label = target.label.clone();
-    let base_session = if trimmed_name.is_empty() {
-        label.clone()
-    } else {
-        format!("{}-{}", label, trimmed_name)
-    };
-    let base_session: String = base_session.chars().take(SESSION_NAME_MAX_LEN).collect();
-    let session_name = remote_unique_session_name(host, &base_session);
-
-    // Check if project is a git repo on remote
-    let is_git = run_remote_cmd_check(
-        host,
-        &[
-            "git",
-            "-C",
-            project_dir,
-            "rev-parse",
-            "--is-inside-work-tree",
-        ],
-    )
-    .map(|s| s.trim() == "true")
-    .unwrap_or(false);
-
-    if is_git {
-        let branch_id = random_id();
-        let branch_name = format!("{}-{}", session_name, branch_id);
-        let project_worktree_root = format!("{}/{}", worktree_base, label);
-        let worktree_dir = format!("{}/{}", project_worktree_root, branch_name);
-
-        // Create worktree directory on remote
-        run_remote_cmd_check(host, &["mkdir", "-p", &project_worktree_root])
-            .map_err(|e| format!("mkdir on remote: {e}"))?;
-
-        // Detect default branch on remote
-        let target_branch = args
-            .branch
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .map(|s| s.to_string())
-            .or_else(|| target.branch.clone())
-            .unwrap_or_else(|| {
-                run_remote_cmd_quiet(
-                    host,
-                    &[
-                        "git",
-                        "-C",
-                        project_dir,
-                        "symbolic-ref",
-                        "refs/remotes/origin/HEAD",
-                    ],
-                )
-                .and_then(|s| {
-                    s.strip_prefix("refs/remotes/origin/")
-                        .map(|s| s.to_string())
-                })
-                .unwrap_or_else(|| "main".to_string())
-            });
-
-        // Fetch on remote
-        let _ = run_remote_cmd_quiet(
-            host,
-            &[
-                "git",
-                "-C",
-                project_dir,
-                "fetch",
-                "origin",
-                &target_branch,
-                "--quiet",
-            ],
-        );
-
-        // Create worktree on remote
-        run_remote_cmd_check(
-            host,
-            &[
-                "git",
-                "-C",
-                project_dir,
-                "worktree",
-                "add",
-                "-b",
-                &branch_name,
-                &worktree_dir,
-                &format!("origin/{}", target_branch),
-                "--quiet",
-            ],
-        )
-        .map_err(|e| format!("git worktree add on remote: {e}"))?;
-
-        // Start tmux session on remote
-        let ai_cmd = command_then_login_shell(&args.ai_cmd);
-        if let Err(err) = run_remote_tmux_check(
-            host,
-            &[
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-c",
-                &worktree_dir,
-                &ai_cmd,
-            ],
-        ) {
-            let _ =
-                run_remote_tmux_quiet(host, &["kill-session", "-t", &format!("={}", session_name)]);
-            let _ = run_remote_cmd_quiet(
-                host,
-                &[
-                    "git",
-                    "-C",
-                    project_dir,
-                    "worktree",
-                    "remove",
-                    "--force",
-                    &worktree_dir,
-                ],
-            );
-            let _ = run_remote_cmd_quiet(
-                host,
-                &["git", "-C", project_dir, "branch", "-D", &branch_name],
-            );
-            return Err(format!("tmux new-session on remote: {err}"));
-        }
-    } else {
-        let ai_cmd = command_then_login_shell(&args.ai_cmd);
-        run_remote_tmux_check(
-            host,
-            &[
-                "new-session",
-                "-d",
-                "-s",
-                &session_name,
-                "-c",
-                project_dir,
-                &ai_cmd,
-            ],
-        )
-        .map_err(|e| format!("tmux new-session on remote: {e}"))?;
-    }
-
-    Ok(format!("{}:{}", host.id, session_name))
 }
 
 #[tauri::command]
@@ -4727,7 +4808,14 @@ fn delete_automation(id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn trigger_automation(id: String) -> Result<AutomationRun, String> {
+fn trigger_automation(app: tauri::AppHandle, id: String) -> Result<AutomationRun, String> {
+    trigger_automation_with_creator(id, |args| create_worktree(app, args))
+}
+
+fn trigger_automation_with_creator<F>(id: String, create: F) -> Result<AutomationRun, String>
+where
+    F: FnOnce(CreateArgs) -> Result<String, String>,
+{
     let mut automations = load_automations_from_disk()?;
     let index = automations
         .iter()
@@ -4758,7 +4846,7 @@ fn trigger_automation(id: String) -> Result<AutomationRun, String> {
     }
 
     let ai_cmd = automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
-    let start_result = create_worktree(CreateArgs {
+    let start_result = create(CreateArgs {
         project: automation.project.clone().and_then(trimmed_non_empty),
         path: automation.path.clone().and_then(trimmed_non_empty),
         ai_cmd,
@@ -6064,6 +6152,7 @@ pub fn run() {
             list_remote_projects,
             remote_home_dir,
             remote_read_dir,
+            probe_agents,
             mobile_relay_start,
             mobile_relay_start_broker,
             mobile_relay_save_config,
@@ -6086,29 +6175,31 @@ pub fn run() {
 mod tests {
     use super::{
         add_host_with_state, agent_running_from_pane_title, append_automation_run,
-        atomic_write_file_with, automation_command_with_instruction, cleanup_pending_worktrees,
-        config_worktree_base, config_worktree_base_with_home, create_remote_worktree,
-        create_terminal, create_worktree, delete_automation_from_list, delete_worktree,
-        derive_session_name, ensure_terminal_session, fetchable_project_paths,
-        finish_git_fetch_target, git_fetch_args, hosts_from_config, install_host_tw,
-        invalidate_host_status_cache, is_git_worktree_dir, is_managed_worktree_session,
-        kill_plain_terminal, kill_session, layout_backup_path, layout_schema_version,
-        list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
-        load_pending_cleanup, mobile_relay_config_from_value, normalize_local_mdns_name,
-        orphaned_worktrees, parse_session_key, project_from_config, project_from_worktree_path,
-        projects_from_config, projects_from_config_with_home, remote_file_exists_for_host,
-        remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
-        remote_write_file_for_host, remove_host_with_state, reserve_git_fetch_target,
-        restore_worktree, run_check, run_remote_tmux_check, run_remote_tw_check, save_automation,
-        save_hosts_config, save_layout, save_pending_cleanup, should_skip_automation_overlap,
+        atomic_write_file_with, automation_command_with_instruction, build_local_worktree_rpc_args,
+        cleanup_pending_worktrees, config_worktree_base, config_worktree_base_with_home,
+        create_local_worktree_via_runtime, create_remote_worktree, create_terminal,
+        delete_automation_from_list, delete_worktree, derive_session_name, ensure_terminal_session,
+        fetchable_project_paths, finish_git_fetch_target, git_fetch_args, hosts_from_config,
+        install_host_tw, invalidate_host_status_cache, is_git_worktree_dir,
+        is_managed_worktree_session, kill_plain_terminal, kill_session, layout_backup_path,
+        layout_schema_version, list_automation_runs, list_remote_sessions,
+        list_remote_tmux_terminals, load_hosts, load_pending_cleanup,
+        mobile_relay_config_from_value, normalize_local_mdns_name, orphaned_worktrees,
+        parse_local_worktree_rpc_response, parse_session_key, probe_local_agents_in_paths,
+        project_from_config, project_from_worktree_path, projects_from_config,
+        projects_from_config_with_home, remote_file_exists_for_host, remote_home_dir_for_host,
+        remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
+        remove_host_with_state, reserve_git_fetch_target, restore_worktree, run_remote_tmux_check,
+        run_remote_tw_check, save_automation, save_hosts_config, save_layout, save_pending_cleanup,
+        select_local_tw_rpc_runtime, should_skip_automation_overlap,
         ssh_host_candidates_from_config_text, stable_output_signature, test_host,
-        tmux_session_exists, trigger_automation, try_cleanup_worktree, update_host_config,
+        trigger_automation_with_creator, try_cleanup_worktree, update_host_config,
         upsert_automation_from_input, worktree_has_uncommitted_changes, worktrees_for_session,
-        AddHostArgs, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
-        AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
+        AddHostArgs, AgentProbeResult, Automation, AutomationOverlap, AutomationRun,
+        AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
         DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, HostConfig, HostState, HostStatus,
-        OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
-        AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+        LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput,
+        UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -6140,6 +6231,50 @@ mod tests {
                 std::env::remove_var(name);
             }
         }
+    }
+
+    #[test]
+    fn agent_probe_uses_only_the_fixed_allowlist_and_checks_executable_bits() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let codex_path = temp.path().join("codex");
+        let custom_path = temp.path().join("custom-agent --unsafe");
+        fs::write(&codex_path, "#!/bin/sh\nexit 0\n").expect("write codex");
+        fs::write(&custom_path, "#!/bin/sh\nexit 0\n").expect("write custom agent");
+
+        let mut codex_permissions = fs::metadata(&codex_path)
+            .expect("codex metadata")
+            .permissions();
+        codex_permissions.set_mode(0o755);
+        fs::set_permissions(&codex_path, codex_permissions).expect("chmod codex");
+        let mut custom_permissions = fs::metadata(&custom_path)
+            .expect("custom metadata")
+            .permissions();
+        custom_permissions.set_mode(0o755);
+        fs::set_permissions(&custom_path, custom_permissions).expect("chmod custom agent");
+
+        let results = probe_local_agents_in_paths(&[temp.path().to_path_buf()]);
+        assert_eq!(
+            AGENT_PROBE_SPECS
+                .iter()
+                .map(|spec| spec.command)
+                .collect::<Vec<_>>(),
+            vec!["claude", "codex", "gemini", "opencode", "aider"]
+        );
+        assert_eq!(results.len(), AGENT_PROBE_SPECS.len());
+        assert_eq!(
+            results.iter().find(|result| result.id == "codex"),
+            Some(&AgentProbeResult {
+                id: "codex".into(),
+                label: "Codex".into(),
+                command: "codex".into(),
+                available: true,
+                executable_path: Some(codex_path.to_string_lossy().to_string()),
+                error: None,
+            })
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.command != "custom-agent --unsafe"));
     }
 
     #[test]
@@ -6502,84 +6637,13 @@ exit 12
     }
 
     #[test]
-    #[ignore = "starts a real tmux session and git worktree; run manually for smoke validation"]
-    fn automation_trigger_smoke_creates_real_tmux_session_and_run_record() {
+    fn automation_trigger_delegates_to_canonical_worktree_creator() {
         let _guard = test_env_lock().lock().expect("lock");
-        if std::process::Command::new("tmux")
-            .arg("-V")
-            .status()
-            .map(|status| !status.success())
-            .unwrap_or(true)
-        {
-            panic!("tmux is required for automation smoke validation");
-        }
-
         let original_home = std::env::var("HOME").ok();
         let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
-        let remote = temp.path().join("remote.git");
-        let repo = temp.path().join("repo");
-        let worktree_base = temp.path().join("worktrees");
-        let marker = temp.path().join("automation-smoke-marker");
         fs::create_dir_all(&home).expect("home");
-
-        git(&["init", "--bare", remote.to_str().expect("remote str")]);
-        git(&[
-            "clone",
-            remote.to_str().expect("remote str"),
-            repo.to_str().expect("repo str"),
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "config",
-            "user.name",
-            "test",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "config",
-            "user.email",
-            "test@example.com",
-        ]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
-        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "commit",
-            "-m",
-            "init",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "branch",
-            "-M",
-            "main",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "push",
-            "-u",
-            "origin",
-            "main",
-        ]);
-
-        let config = serde_json::json!({
-            "projects": {
-                "smoke": repo.to_string_lossy()
-            },
-            "worktreeBase": worktree_base.to_string_lossy()
-        });
-        fs::write(
-            home.join(".tmux-worktree.json"),
-            serde_json::to_string_pretty(&config).expect("config json"),
-        )
-        .expect("write config");
 
         unsafe {
             std::env::set_var("TW_DASHBOARD_HOME", &home);
@@ -6595,44 +6659,36 @@ exit 12
             timezone: Some(None),
             project: Some(Some("smoke".to_string())),
             path: Some(None),
-            ai_cmd: Some(format!("touch {}", marker.to_string_lossy())),
-            instruction: Some(String::new()),
+            ai_cmd: Some("codex --quiet".to_string()),
+            instruction: Some("review the current changes".to_string()),
             overlap: Some(AutomationOverlap::Skip),
         })
         .expect("save automation");
 
-        let run = trigger_automation(saved.id.clone()).expect("trigger automation");
-        let session = run.session_name.clone().expect("session name");
+        let captured_args = Mutex::new(None);
+        let run = trigger_automation_with_creator(saved.id.clone(), |args| {
+            *captured_args.lock().expect("captured args lock") = Some(args);
+            Ok("smoke-session".to_string())
+        })
+        .expect("trigger automation");
         assert_eq!(run.status, AutomationStatus::Running);
-        assert!(tmux_session_exists(session.clone()).expect("tmux session exists check"));
-
-        for _ in 0..20 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        assert!(marker.exists(), "automation command did not create marker");
+        assert_eq!(run.session_name.as_deref(), Some("smoke-session"));
+        assert_eq!(
+            captured_args.lock().expect("captured args lock").clone(),
+            Some(CreateArgs {
+                project: Some("smoke".to_string()),
+                path: None,
+                ai_cmd: "codex --quiet 'review the current changes'".to_string(),
+                name: Some("Smoke".to_string()),
+                branch: None,
+                host_id: None,
+            })
+        );
 
         let runs = list_automation_runs(Some(saved.id.clone())).expect("list runs");
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].id, run.id);
         assert_eq!(runs[0].status, AutomationStatus::Running);
-
-        let cwd = run_check(&[
-            "tmux",
-            "display-message",
-            "-p",
-            "-t",
-            &session,
-            "#{pane_current_path}",
-        ])
-        .expect("pane cwd");
-        assert!(Path::new(&cwd).join(".git").exists());
-
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &format!("={session}")])
-            .status();
 
         restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
         restore_env("HOME", original_home);
@@ -6935,7 +6991,102 @@ exit 12
     }
 
     #[test]
-    fn create_worktree_starts_dashboard_single_pane_session() {
+    fn local_tw_rpc_argument_and_response_contract_is_strict() {
+        let missing_target = build_local_worktree_rpc_args(
+            &CreateArgs {
+                project: Some("  ".to_string()),
+                path: None,
+                ai_cmd: "codex".to_string(),
+                name: None,
+                branch: None,
+                host_id: None,
+            },
+            "/tmp/worktrees",
+        )
+        .expect_err("missing project and path");
+        assert_eq!(missing_target, "project or path required");
+
+        let missing_command = build_local_worktree_rpc_args(
+            &CreateArgs {
+                project: Some("demo".to_string()),
+                path: None,
+                ai_cmd: "  ".to_string(),
+                name: None,
+                branch: None,
+                host_id: None,
+            },
+            "/tmp/worktrees",
+        )
+        .expect_err("missing ai command");
+        assert_eq!(missing_command, "ai command required");
+
+        assert_eq!(
+            parse_local_worktree_rpc_response(
+                r#"{"protocolVersion":1,"kind":"worktree","session":" demo-session ","worktreePath":"/tmp/demo"}"#,
+                "test runtime",
+            )
+            .expect("valid response"),
+            "demo-session"
+        );
+        assert!(parse_local_worktree_rpc_response(
+            r#"{"protocolVersion":2,"kind":"worktree","session":"demo"}"#,
+            "test runtime",
+        )
+        .expect_err("unsupported protocol")
+        .contains("unsupported test runtime TW RPC protocol: 2"));
+        assert!(parse_local_worktree_rpc_response(
+            r#"{"protocolVersion":1,"kind":"terminal","session":"demo"}"#,
+            "test runtime",
+        )
+        .expect_err("wrong kind")
+        .contains("unexpected create kind: terminal"));
+        assert!(parse_local_worktree_rpc_response(
+            r#"{"protocolVersion":1,"kind":"worktree","session":"  "}"#,
+            "test runtime",
+        )
+        .expect_err("empty session")
+        .contains("empty worktree session name"));
+    }
+
+    #[test]
+    fn local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let unavailable = select_local_tw_rpc_runtime(None, None, None, temp.path())
+            .expect_err("no canonical runtime");
+        assert!(unavailable.contains("Canonical local TW runtime unavailable"));
+        assert!(unavailable.contains("Rust worktree creator is intentionally disabled"));
+
+        let installed_tw = temp.path().join("tw");
+        fs::write(
+            &installed_tw,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"version\" ]; then\n  printf '%s\\n' '{}'\n  exit 0\nfi\nexit 2\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+        )
+        .expect("fake installed tw");
+        let mut permissions = fs::metadata(&installed_tw)
+            .expect("fake installed tw metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&installed_tw, permissions).expect("fake installed tw permissions");
+
+        assert_eq!(
+            select_local_tw_rpc_runtime(
+                None,
+                None,
+                Some(installed_tw.to_string_lossy().to_string()),
+                temp.path(),
+            )
+            .expect("same-version installed fallback"),
+            LocalTwRpcRuntime::Installed {
+                tw: installed_tw.to_string_lossy().to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn local_dashboard_create_delegates_every_field_to_bundled_tw_rpc() {
         let _guard = test_env_lock().lock().expect("lock");
         let original_home = std::env::var("HOME").ok();
         let original_tw_home = std::env::var("TW_DASHBOARD_HOME").ok();
@@ -6943,65 +7094,12 @@ exit 12
         let temp = tempfile::tempdir().expect("tempdir");
         let home = temp.path().join("home");
         let base = temp.path().join("worktrees");
-        let remote = temp.path().join("remote.git");
-        let repo = temp.path().join("repo");
         fs::create_dir_all(&home).expect("home");
         fs::create_dir_all(&base).expect("base");
-
-        git(&["init", "--bare", remote.to_str().expect("remote str")]);
-        git(&[
-            "clone",
-            remote.to_str().expect("remote str"),
-            repo.to_str().expect("repo str"),
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "checkout",
-            "-b",
-            "main",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "config",
-            "user.name",
-            "test",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "config",
-            "user.email",
-            "test@example.com",
-        ]);
-        fs::write(repo.join("README.md"), "hello\n").expect("write repo file");
-        git(&["-C", repo.to_str().expect("repo str"), "add", "README.md"]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "commit",
-            "-m",
-            "init",
-        ]);
-        git(&[
-            "-C",
-            repo.to_str().expect("repo str"),
-            "push",
-            "-u",
-            "origin",
-            "main",
-        ]);
 
         fs::write(
             home.join(".tmux-worktree.json"),
             serde_json::json!({
-                "projects": {
-                    "demo": {
-                        "path": repo,
-                        "branch": "main"
-                    }
-                },
                 "worktreeBase": base
             })
             .to_string(),
@@ -7013,78 +7111,69 @@ exit 12
             std::env::set_var("TW_DASHBOARD_HOME", &home);
         }
 
-        let marker = temp.path().join("ai-started");
-        let session = create_worktree(CreateArgs {
-            project: Some("demo".to_string()),
-            path: None,
-            ai_cmd: format!("touch {}", marker.to_string_lossy()),
-            name: Some("layout".to_string()),
-            branch: Some("main".to_string()),
-            host_id: None,
-        })
-        .expect("create worktree");
+        let fake_cli = temp.path().join("fake-tw-cli.sh");
+        fs::write(
+            &fake_cli,
+            r#"#!/bin/sh
+args_file="$HOME/rpc-args.txt"
+: > "$args_file"
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$args_file"
+done
+mkdir -p "$HOME/.tmux-worktree"
+printf '%s\n' '{"version":1,"sessions":[{"name":"demo-layout","kind":"worktree","profile":"dashboard","createdAt":"2026-07-11T00:00:00Z"}]}' > "$HOME/.tmux-worktree/state.json"
+printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-layout","worktreePath":"/tmp/demo-layout","branch":"develop"}'
+"#,
+        )
+        .expect("fake cli");
 
-        let project_worktrees = fs::read_dir(base.join("demo"))
-            .expect("worktree project dir")
-            .collect::<Result<Vec<_>, _>>()
-            .expect("worktree entries");
-        assert_eq!(project_worktrees.len(), 1);
-        let worktree_path = project_worktrees[0].path();
-        assert!(worktree_path.join(".git").exists());
+        let runtime = LocalTwRpcRuntime::Bundled {
+            node: "/bin/sh".to_string(),
+            cli: fake_cli,
+        };
+        let session = create_local_worktree_via_runtime(
+            &runtime,
+            CreateArgs {
+                project: Some("  demo  ".to_string()),
+                path: Some("  /repo/path  ".to_string()),
+                ai_cmd: "  codex --quiet  ".to_string(),
+                name: Some("  layout  ".to_string()),
+                branch: Some("  develop  ".to_string()),
+                host_id: None,
+            },
+        )
+        .expect("delegate create worktree");
 
-        for _ in 0..20 {
-            if marker.exists() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let ai_started = marker.exists();
-
-        let output = std::process::Command::new("tmux")
-            .args([
-                "list-panes",
-                "-t",
-                &format!("={session}"),
-                "-F",
-                "#{pane_current_path}",
-            ])
-            .output()
-            .expect("tmux list-panes");
-        assert!(
-            output.status.success(),
-            "tmux list-panes failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+        assert_eq!(session, "demo-layout");
+        let forwarded = fs::read_to_string(home.join("rpc-args.txt")).expect("forwarded args");
+        assert_eq!(
+            forwarded.lines().collect::<Vec<_>>(),
+            vec![
+                "rpc",
+                "create-worktree",
+                "--path",
+                "/repo/path",
+                "--project",
+                "demo",
+                "--ai-command",
+                "codex --quiet",
+                "--name",
+                "layout",
+                "--branch",
+                "develop",
+                "--worktree-base",
+                base.to_str().expect("base str"),
+            ]
         );
-        let panes = String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let pane_count = panes.len();
-        let expected_cwd = fs::canonicalize(&worktree_path).expect("canonical worktree");
-        let pane_cwds = panes
-            .iter()
-            .map(|cwd| fs::canonicalize(cwd).unwrap_or_else(|_| cwd.into()))
-            .collect::<Vec<_>>();
-        let panes_in_worktree = pane_cwds.iter().filter(|cwd| *cwd == &expected_cwd).count();
+        let state: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(home.join(".tmux-worktree/state.json")).expect("managed state"),
+        )
+        .expect("state json");
+        assert_eq!(state["sessions"][0]["name"], "demo-layout");
+        assert_eq!(state["sessions"][0]["profile"], "dashboard");
 
-        let _ = std::process::Command::new("tmux")
-            .args(["kill-session", "-t", &format!("={session}")])
-            .status();
         restore_env("TW_DASHBOARD_HOME", original_tw_home);
         restore_env("HOME", original_home);
-
-        assert_eq!(
-            pane_count, 1,
-            "dashboard-created worktrees should use a single tmux pane because Dashboard owns the layout"
-        );
-        assert!(
-            ai_started,
-            "AI command should start inside the new worktree"
-        );
-        assert!(
-            panes_in_worktree == 1,
-            "the Dashboard pane should start in the new worktree: {panes:?}"
-        );
     }
 
     #[test]
@@ -7393,7 +7482,7 @@ exit 12
     }
 
     #[test]
-    fn create_remote_worktree_starts_plain_session_with_single_tmux_prefix() {
+    fn create_remote_worktree_requires_remote_tw_rpc_when_tw_is_missing() {
         let _guard = test_env_lock().lock().expect("lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
@@ -7418,25 +7507,11 @@ if [ "$#" -eq 1 ]; then
       printf 'tw: command not found\n' >&2
       exit 127
       ;;
-    *"'tmux'"*"'has-session'"*)
-      exit 1
-      ;;
-    *"'git'"*"'rev-parse'"*)
-      exit 1
-      ;;
-    *"'tmux'"*"'new-session'"*)
-      exit 0
+    *"'git'"*|*"'tmux'"*)
+      printf 'dashboard must not use the legacy remote creator\n' >&2
+      exit 12
       ;;
   esac
-fi
-if [ "$1" = "tmux" ] && [ "$2" = "has-session" ]; then
-  exit 1
-fi
-if [ "$1" = "git" ] && [ "$4" = "rev-parse" ]; then
-  exit 1
-fi
-if [ "$1" = "tmux" ] && [ "$2" = "new-session" ]; then
-  exit 0
 fi
 printf 'unexpected remote command: %s\n' "$*" >&2
 exit 12
@@ -7472,7 +7547,7 @@ exit 12
             tmux_path: None,
             tw_path: None,
         };
-        let session = create_remote_worktree(
+        let err = create_remote_worktree(
             &host,
             CreateArgs {
                 project: None,
@@ -7483,22 +7558,25 @@ exit 12
                 host_id: Some("dev".to_string()),
             },
         )
-        .expect("remote worktree session");
+        .expect_err("missing remote tw must reject creation");
 
-        assert_eq!(session, "dev:app");
         let log = fs::read_to_string(&log_path).expect("ssh log");
-        assert!(log.contains("'git' '-C' '/remote/app' 'rev-parse' '--is-inside-work-tree'"));
-        assert!(log.contains("'tmux' 'has-session' '-t' '=app'"));
-        assert!(log.contains("'tmux' 'new-session' '-d' '-s' 'app' '-c' '/remote/app'"));
-        assert!(!log.contains("'tmux' 'tmux'"));
-        assert!(!log.contains("'tmux' 'git'"));
+        assert!(err.contains("does not have a compatible `tw rpc create-worktree`"));
+        assert!(err.contains(&format!(
+            "Install or upgrade remote tw to {}",
+            env!("CARGO_PKG_VERSION")
+        )));
+        assert!(err.contains("will not fall back to direct remote git/tmux creation"));
+        assert!(log.contains("'tw' 'rpc' 'create-worktree'"));
+        assert!(!log.contains("'git'"));
+        assert!(!log.contains("'tmux'"));
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);
     }
 
     #[test]
-    fn create_remote_worktree_fallback_uses_remote_config_project() {
+    fn create_remote_worktree_with_config_project_still_requires_remote_tw_rpc() {
         let _guard = test_env_lock().lock().expect("lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
@@ -7521,8 +7599,8 @@ printf '%s\n' "$*" >> "$log"
 if [ "$#" -eq 1 ]; then
   case "$1" in
     *"'tw'"*"'rpc'"*"'create-worktree'"*)
-      printf 'tw: command not found\n' >&2
-      exit 127
+      printf 'unknown rpc command: create-worktree\n' >&2
+      exit 2
       ;;
     *'pwd -P'*)
       printf '/home/dev'
@@ -7534,15 +7612,9 @@ if [ "$#" -eq 1 ]; then
 JSON
       exit 0
       ;;
-    *"'tmux'"*"'has-session'"*)
-      exit 1
-      ;;
-    *"'git'"*"'rev-parse'"*)
-      printf 'true\n'
-      exit 0
-      ;;
-    *"'mkdir'"*|*"'git'"*"'fetch'"*|*"'git'"*"'worktree'"*"'add'"*|*"'tmux'"*"'new-session'"*)
-      exit 0
+    *"'git'"*|*"'tmux'"*|*"'mkdir'"*)
+      printf 'dashboard must not use the legacy remote creator\n' >&2
+      exit 12
       ;;
   esac
 fi
@@ -7581,7 +7653,7 @@ exit 12
             tmux_path: None,
             tw_path: None,
         };
-        let session = create_remote_worktree(
+        let err = create_remote_worktree(
             &host,
             CreateArgs {
                 project: Some("demo".to_string()),
@@ -7592,19 +7664,16 @@ exit 12
                 host_id: Some("dev".to_string()),
             },
         )
-        .expect("remote config worktree session");
+        .expect_err("old remote tw must reject config-project creation");
 
-        assert_eq!(session, "dev:demo-fix");
         let log = fs::read_to_string(&log_path).expect("ssh log");
+        assert!(err.contains("does not have a compatible `tw rpc create-worktree`"));
         assert!(log.contains("'--path' '/home/dev/src/demo'"));
         assert!(log.contains("'--project' 'demo'"));
         assert!(log.contains("'--branch' 'develop'"));
-        assert!(
-            log.contains("'git' '-C' '/home/dev/src/demo' 'fetch' 'origin' 'develop' '--quiet'")
-        );
-        assert!(log.contains("'mkdir' '-p' '/home/dev/.tmux-worktree/worktrees/demo'"));
-        assert!(log.contains("'/home/dev/.tmux-worktree/worktrees/demo/demo-fix-"));
-        assert!(log.contains("'tmux' 'new-session' '-d' '-s' 'demo-fix' '-c' '/home/dev/.tmux-worktree/worktrees/demo/demo-fix-"));
+        assert!(!log.contains("'git'"));
+        assert!(!log.contains("'tmux'"));
+        assert!(!log.contains("'mkdir'"));
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);

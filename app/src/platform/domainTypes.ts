@@ -42,6 +42,26 @@ export type HostStatus = {
   twError: string | null;
 };
 
+export type AgentProbeId =
+  | "claude"
+  | "codex"
+  | "gemini"
+  | "opencode"
+  | "aider";
+
+export type AgentProbeTarget =
+  | { kind: "local" }
+  | { kind: "host"; hostId: string };
+
+export type AgentProbeResult = {
+  id: AgentProbeId;
+  label: string;
+  command: AgentProbeId;
+  available: boolean;
+  executablePath: string | null;
+  error: string | null;
+};
+
 export type PlainTerminal = {
   id: string;
   label: string;

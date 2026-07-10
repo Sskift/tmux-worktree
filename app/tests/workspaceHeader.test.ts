@@ -37,5 +37,6 @@ test("constrained headers preserve identity and primary actions while collapsing
   );
   assert.match(headerCss, /@container workspace-header \(max-width: 560px\)/);
   assert.match(header, />Scratch<\/span>/);
-  assert.match(header, />Inspector<\/span>/);
+  assert.match(header, />Git<\/span>/);
+  assert.doesNotMatch(header, />Inspector<\/span>/);
 });

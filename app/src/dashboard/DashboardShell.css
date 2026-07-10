@@ -68,11 +68,11 @@
   z-index: 40;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: stretch;
   height: 44px;
   min-width: 0;
   color: var(--shell-text-muted);
-  background: var(--shell-bg);
+  background: var(--shell-header);
   border-bottom: 1px solid var(--shell-border);
   user-select: none;
 }
@@ -108,9 +108,18 @@
 
 .tw-shell__center {
   display: grid;
-  grid-template-rows: 52px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
   background: var(--shell-workspace);
+}
+
+.tw-shell__center[data-has-header="true"] {
+  grid-template-rows: 52px minmax(0, 1fr);
+}
+
+.tw-shell__titlebar :where(button, a, input, select, textarea) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
 }
 
 .tw-shell__header {

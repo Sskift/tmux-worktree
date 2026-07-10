@@ -82,7 +82,7 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
   }, [filePath, hostId]);
 
   return (
-    <div className="pane pane--term">
+    <div className="pane pane--term file-editor">
       <div className="pane__bar">
         <span className="pane__title file-editor__title">{fileName}</span>
         <div className="file-editor__actions">
@@ -91,7 +91,7 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
           </button>
         </div>
       </div>
-      <div className="pane__body file-editor__image">
+      <div className="pane__body file-editor__body file-editor__image">
         {loading ? (
           <div className="file-editor__status">loading...</div>
         ) : error ? (
@@ -333,7 +333,7 @@ function CodeEditor({
   const fileName = filePath.split("/").pop() ?? filePath;
 
   return (
-    <div className="pane pane--term">
+    <div className="pane pane--term file-editor">
       <div className="pane__bar">
         <span className="pane__title file-editor__title">
           {fileName}
@@ -366,7 +366,7 @@ function CodeEditor({
           </button>
         </div>
       </div>
-      <div className="pane__body" style={{ padding: 0 }}>
+      <div className="pane__body file-editor__body">
         {effectiveLoading ? (
           <div className="file-editor__status">loading...</div>
         ) : error ? (

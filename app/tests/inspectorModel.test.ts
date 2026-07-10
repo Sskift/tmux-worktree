@@ -6,7 +6,7 @@ import {
 } from "../src/dashboard/inspectorModel.ts";
 
 test("inspector keyboard navigation follows the planned tabs and wraps", () => {
-  assert.deepEqual(INSPECTOR_TABS, ["files", "git", "diff", "automation", "feishu"]);
+  assert.deepEqual(INSPECTOR_TABS, ["files", "git", "diff", "feishu"]);
   assert.equal(moveInspectorTab("files", -1), "feishu");
   assert.equal(moveInspectorTab("files", 1), "git");
   assert.equal(moveInspectorTab("feishu", 1), "files");

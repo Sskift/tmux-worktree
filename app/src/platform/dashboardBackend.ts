@@ -12,6 +12,8 @@ import type {
 import type {
   AddHostInput,
   AddProjectInput,
+  AgentProbeResult,
+  AgentProbeTarget,
   CreateTerminalInput,
   CreatedTerminal,
   DashboardCatalogSnapshot,
@@ -128,6 +130,9 @@ export interface DashboardBackend {
     remove(id: string): Promise<HostConfig[]>;
     installTw(hostId: string): Promise<HostStatus>;
     remoteHome(hostId: string): Promise<string>;
+  };
+  agents: {
+    probe(target: AgentProbeTarget): Promise<AgentProbeResult[]>;
   };
   relay: {
     status(): Promise<MobileRelayStatus>;
@@ -350,6 +355,11 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       remove: (id) => transport.invoke<HostConfig[]>("remove_host", { id }),
       installTw: (hostId) => transport.invoke<HostStatus>("install_host_tw", { hostId }),
       remoteHome: (hostId) => transport.invoke<string>("remote_home_dir", { hostId }),
+    },
+    agents: {
+      probe: (target) => transport.invoke<AgentProbeResult[]>("probe_agents", {
+        hostId: target.kind === "host" ? target.hostId : null,
+      }),
     },
     relay: {
       status: () => transport.invoke<MobileRelayStatus>("mobile_relay_status"),

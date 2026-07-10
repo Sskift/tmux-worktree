@@ -6,12 +6,13 @@ import {
 } from "../src/platform/previewBackend.ts";
 
 test("preview backend supplies the dashboard startup state", async () => {
-  const [sessions, projects, hosts, statuses, terminals, layout] = await Promise.all([
+  const [sessions, projects, hosts, statuses, terminals, agents, layout] = await Promise.all([
     previewDashboardBackend.sessions.list(),
     previewDashboardBackend.projects.list(),
     previewDashboardBackend.hosts.list(),
     previewDashboardBackend.hosts.statuses(),
     previewDashboardBackend.terminals.listTmux(),
+    previewDashboardBackend.agents.probe({ kind: "local" }),
     previewDashboardBackend.persistence.loadLayout(),
   ]);
 
@@ -20,6 +21,14 @@ test("preview backend supplies the dashboard startup state", async () => {
   assert.equal(hosts[0]?.id, "builder-1");
   assert.equal(statuses[0]?.reachable, true);
   assert.ok(terminals.length >= 1);
+  assert.deepEqual(agents.map((agent) => agent.command), [
+    "claude",
+    "codex",
+    "gemini",
+    "opencode",
+    "aider",
+  ]);
+  assert.equal(agents.find((agent) => agent.id === "codex")?.available, true);
   assert.deepEqual(layout, {});
 });
 

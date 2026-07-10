@@ -1,9 +1,8 @@
 import {
   Columns2,
+  GitBranch,
   MoreHorizontal,
   PanelLeftOpen,
-  PanelRightClose,
-  PanelRightOpen,
   Server,
   TerminalSquare,
 } from "lucide-react";
@@ -19,13 +18,15 @@ export type WorkspaceHeaderProps = {
   hostLabel?: string | null;
   agentCommand?: string | null;
   status: WorkspaceStatus;
+  windowTitlebar?: boolean;
   sidebarDrawer?: boolean;
-  inspectorOpen: boolean;
   scratchOpen: boolean;
+  gitActive?: boolean;
+  gitAvailable?: boolean;
   canSplit?: boolean;
   onOpenSidebar?: () => void;
-  onToggleInspector: () => void;
   onToggleScratch: () => void;
+  onOpenGit?: () => void;
   onSplit?: () => void;
   onOpenMore?: () => void;
 };
@@ -38,13 +39,15 @@ export function WorkspaceHeader({
   hostLabel,
   agentCommand,
   status,
+  windowTitlebar = false,
   sidebarDrawer = false,
-  inspectorOpen,
   scratchOpen,
+  gitActive = false,
+  gitAvailable = true,
   canSplit = false,
   onOpenSidebar,
-  onToggleInspector,
   onToggleScratch,
+  onOpenGit,
   onSplit,
   onOpenMore,
 }: WorkspaceHeaderProps) {
@@ -52,8 +55,12 @@ export function WorkspaceHeader({
     .filter((value): value is string => Boolean(value?.trim()));
 
   return (
-    <div className="workspace-header">
-      <div className="workspace-header__layout">
+    <div
+      className="workspace-header"
+      data-window-titlebar={windowTitlebar ? true : undefined}
+      data-tauri-drag-region={windowTitlebar ? true : undefined}
+    >
+      <div className="workspace-header__layout" data-tauri-drag-region={windowTitlebar ? true : undefined}>
         <div className="workspace-header__identity">
           {sidebarDrawer && (
             <button
@@ -122,6 +129,19 @@ export function WorkspaceHeader({
               <span>Split</span>
             </button>
           )}
+          {onOpenGit && (
+            <button
+              className="workspace-header__action"
+              type="button"
+              onClick={onOpenGit}
+              aria-pressed={gitActive}
+              disabled={!gitAvailable}
+              title={gitAvailable ? "Open Git inspector" : "Select a worktree or terminal to inspect Git"}
+            >
+              <GitBranch aria-hidden="true" size={16} strokeWidth={1.7} />
+              <span>Git</span>
+            </button>
+          )}
           <button
             className="workspace-header__action"
             type="button"
@@ -131,22 +151,6 @@ export function WorkspaceHeader({
           >
             <TerminalSquare aria-hidden="true" size={16} strokeWidth={1.7} />
             <span>Scratch</span>
-          </button>
-          <button
-            className="workspace-header__action"
-            type="button"
-            onClick={onToggleInspector}
-            aria-pressed={inspectorOpen}
-            aria-expanded={inspectorOpen}
-            aria-controls="workspace-inspector"
-            title={inspectorOpen ? "Close inspector" : "Open inspector"}
-          >
-            {inspectorOpen ? (
-              <PanelRightClose aria-hidden="true" size={16} strokeWidth={1.7} />
-            ) : (
-              <PanelRightOpen aria-hidden="true" size={16} strokeWidth={1.7} />
-            )}
-            <span>Inspector</span>
           </button>
           {onOpenMore && (
             <button

@@ -1041,16 +1041,15 @@ button:disabled {
   font-size: 11px;
 }
 
-.theme__backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 60;
-}
-
 .theme__menu {
-  position: absolute;
-  bottom: calc(100% + 6px);
-  right: 0;
+  position: fixed;
+  z-index: 1200;
+  box-sizing: border-box;
+  max-width: calc(100vw - 16px);
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  color: var(--text);
   background: var(--bg-2);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -1058,8 +1057,10 @@ button:disabled {
   padding: 4px;
   display: flex;
   flex-direction: column;
-  min-width: 130px;
-  z-index: 70;
+  min-width: 160px;
+  font-family: var(--shell-font-sans);
+  scrollbar-color: var(--scrollbar) transparent;
+  scrollbar-width: thin;
 }
 
 .theme__item {
@@ -1074,9 +1075,15 @@ button:disabled {
   transition: background 100ms ease, color 100ms ease;
 }
 
-.theme__item:hover {
+.theme__item:hover,
+.theme__item:focus-visible {
   background: var(--surface-hover);
   color: var(--text);
+}
+
+.theme__item:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: -2px;
 }
 
 .theme__item--current {
@@ -2060,31 +2067,23 @@ select.field__input {
 
 /* ─── Dashboard shell integration ─────────────────────────── */
 
-.dashboard-titlebar {
-  display: flex;
-  max-width: min(46vw, 520px);
-  align-items: center;
-  overflow: hidden;
-  color: var(--shell-text-faint);
-  font: 600 11px/1 var(--shell-font-sans);
-  letter-spacing: 0.02em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.dashboard-titlebar span:last-child {
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 .dashboard-workspace {
   position: relative;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--shell-workspace);
+}
+
+.dashboard-workspace[data-scratch-open="true"] {
+  grid-template-columns:
+    minmax(280px, 1fr)
+    9px
+    minmax(0, var(--dashboard-scratch-width, 380px));
 }
 
 .dashboard-workspace__primary {
@@ -2097,8 +2096,13 @@ select.field__input {
   overflow: hidden;
 }
 
+.dashboard-workspace[data-scratch-open="true"] .dashboard-workspace__primary {
+  grid-column: 1;
+}
+
 .dashboard-workspace__primary > .terminal-deck,
 .dashboard-workspace__expanded,
+.dashboard-workspace__editor,
 .dashboard-expanded-content,
 .dashboard-inspector-view,
 .dashboard-workspace__automation {
@@ -2107,9 +2111,22 @@ select.field__input {
 }
 
 .dashboard-workspace__primary > .terminal-deck,
-.dashboard-workspace__expanded {
+.dashboard-workspace__expanded,
+.dashboard-workspace__editor {
   width: 100%;
   height: 100%;
+}
+
+.dashboard-workspace__editor {
+  display: flex;
+  overflow: hidden;
+  background: var(--shell-workspace);
+}
+
+.dashboard-workspace__editor > .pane {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
 }
 
 .dashboard-workspace__expanded {
@@ -2221,23 +2238,59 @@ select.field__input {
 }
 
 .dashboard-scratch {
-  position: absolute;
+  position: relative;
   z-index: 12;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  grid-column: 3;
+  grid-row: 1;
   display: grid;
   grid-template-rows: 38px minmax(0, 1fr);
-  width: min(400px, 46%);
-  min-width: 300px;
+  width: auto;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--shell-sidebar);
-  border-left: 1px solid var(--shell-border-strong);
-  box-shadow: -18px 0 36px rgb(0 0 0 / 24%);
+  box-shadow: none;
 }
 
 .dashboard-scratch[hidden] {
+  display: none;
+}
+
+.dashboard-scratch__resize-handle {
+  position: relative;
+  z-index: 14;
+  grid-column: 2;
+  grid-row: 1;
+  width: 9px;
+  min-width: 9px;
+  height: 100%;
+  padding: 0;
+  touch-action: none;
+  cursor: col-resize;
+  background: var(--shell-sidebar);
+  border: 0;
+}
+
+.dashboard-scratch__resize-handle::after {
+  position: absolute;
+  inset-block: 0;
+  left: 4px;
+  width: 1px;
+  background: var(--shell-border-strong);
+  content: "";
+}
+
+.dashboard-scratch__resize-handle:hover::after,
+.dashboard-scratch__resize-handle:focus-visible::after {
+  background: var(--shell-focus);
+}
+
+.dashboard-scratch__resize-handle:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: -2px;
+}
+
+.dashboard-scratch__resize-handle[hidden] {
   display: none;
 }
 
@@ -2291,10 +2344,39 @@ select.field__input {
   min-height: 0;
 }
 
+.dashboard-scratch__split-handle {
+  position: absolute;
+  z-index: 2;
+  top: -4px;
+  right: 0;
+  left: 0;
+  height: 9px;
+  padding: 0;
+  cursor: row-resize;
+  background: transparent;
+  border: 0;
+}
+
+.dashboard-scratch__split-handle::after {
+  position: absolute;
+  right: 0;
+  bottom: 4px;
+  left: 0;
+  height: 1px;
+  background: var(--shell-border);
+  content: "";
+}
+
+.scratch__section {
+  position: relative;
+}
+
 @media (max-width: 1099px) {
-  .dashboard-scratch {
-    width: min(400px, calc(100% - 32px));
-    min-width: 0;
+  .dashboard-workspace[data-scratch-open="true"] {
+    grid-template-columns:
+      minmax(240px, 1fr)
+      9px
+      minmax(0, min(var(--dashboard-scratch-width, 380px), 52vw));
   }
 }
 
@@ -2571,6 +2653,26 @@ select.field__input {
 
 /* ─── File editor ──────────────────────────────────────────── */
 
+.file-editor {
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  max-width: 100%;
+  max-height: 100%;
+  overflow: hidden;
+}
+
+.file-editor__body {
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  padding: 0;
+}
+
 .file-editor__title {
   display: flex;
   align-items: center;
@@ -2602,13 +2704,20 @@ select.field__input {
 /* ─── CodeMirror ───────────────────────────────────────────── */
 
 .file-editor__cm {
-  flex: 1;
+  flex: 1 1 auto;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
   min-height: 0;
   overflow: hidden;
 }
 
 .file-editor__cm .cm-editor {
+  width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   font-family: "JetBrains Mono", "SF Mono", Menlo, ui-monospace, monospace;
   font-size: 13px;
   line-height: 1.6;
@@ -2619,6 +2728,8 @@ select.field__input {
 }
 
 .file-editor__cm .cm-scroller {
+  min-width: 0;
+  min-height: 0;
   overflow: auto;
 }
 

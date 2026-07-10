@@ -1,5 +1,4 @@
 import {
-  Bot,
   FileCode2,
   Files,
   GitBranch,
@@ -30,7 +29,6 @@ const TAB_DEFINITIONS: readonly InspectorTabDefinition[] = [
   { id: "files", label: "Files", icon: Files },
   { id: "git", label: "Git", icon: GitBranch },
   { id: "diff", label: "Diff", icon: FileCode2 },
-  { id: "automation", label: "Automation", icon: Bot },
   { id: "feishu", label: "Feishu", icon: MessageSquare },
 ];
 

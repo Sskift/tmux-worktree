@@ -453,6 +453,18 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.hosts.remoteHome("host-1"),
   },
   {
+    label: "agents.probe local",
+    command: "probe_agents",
+    args: { hostId: null },
+    call: (backend) => backend.agents.probe({ kind: "local" }),
+  },
+  {
+    label: "agents.probe host",
+    command: "probe_agents",
+    args: { hostId: "host-1" },
+    call: (backend) => backend.agents.probe({ kind: "host", hostId: "host-1" }),
+  },
+  {
     label: "relay.status",
     command: "mobile_relay_status",
     args: undefined,

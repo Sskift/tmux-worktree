@@ -190,11 +190,13 @@ test("sidebar source uses the icon library and responsive accessible styling", (
 
   assert.match(source, /from "lucide-react"/);
   assert.match(source, />New worktree</);
-  assert.match(source, />No pinned worktrees</);
-  assert.match(source, /aria-label="Open Settings"/);
+  assert.match(source, />Pin a worktree or terminal for quick access\.</);
+  assert.match(source, /aria-label={`\$\{pinned \? "Unpin" : "Pin"\} worktree/);
+  assert.equal(source.match(/className="tw-dashboard-sidebar__connections"/g)?.length, 1);
   assert.match(source, /aria-label={`Close worktree \$\{displayName\}`}/);
   assert.match(source, /aria-label={`Close terminal \$\{terminal\.label\}`}/);
-  assert.match(source, /onOpenSettings\("connections"\)/);
+  assert.match(source, /onClick=\{\(\) => onOpenSettings\(\)\}/);
+  assert.match(source, /className="tw-dashboard-sidebar__connection-title">Settings</);
   assert.match(source, /localRuntimeState === "error"/);
   assert.match(source, /mobileRelay\.statusKnown/);
   assert.match(source, /data-relay=\{relayState\}/);

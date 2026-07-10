@@ -18,7 +18,7 @@ import { useMemo, type Ref } from "react";
 import { triggerLabel, type Automation } from "../automationTypes";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../platform";
 import type { SessionActivityInfo } from "../sessionActivity";
-import type { Selection } from "./layoutPreferences";
+import type { PinnedItem, Selection } from "./layoutPreferences";
 import {
   describeSidebarActivity,
   groupSessionsByHostProject,
@@ -56,6 +56,8 @@ export type DashboardSidebarProps = {
   selection: Selection;
   sessionActivity: Readonly<Record<string, SessionActivityInfo | undefined>>;
   collapsedProjects: readonly string[];
+  pinnedItems: readonly PinnedItem[];
+  automationSectionCollapsed: boolean;
   installingHostId?: string | null;
   sessionsError?: string | null;
   terminalsError?: string | null;
@@ -65,13 +67,15 @@ export type DashboardSidebarProps = {
   onCreateWorktree: () => void;
   onCreateTerminal: () => void;
   onOpenCommandPalette: () => void;
-  onOpenSettings: (section?: "connections") => void;
+  onOpenSettings: () => void;
   onToggleProjectCollapsed: (groupKey: string) => void;
+  onTogglePinned: (item: PinnedItem) => void;
+  onToggleAutomationSection: () => void;
+  onManageAutomations: () => void;
   onSelectSession: (sessionName: string) => void;
   onCloseSession: (sessionName: string) => void | Promise<void>;
   onSelectTerminal: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void | Promise<void>;
-  onCreateAutomation: () => void;
   onSelectAutomation: (automationId: string) => void;
   onInstallTw: (hostId: string) => void | Promise<void>;
 };
@@ -94,6 +98,10 @@ function terminalDescription(terminal: PlainTerminal, hostsById: ReadonlyMap<str
   if (terminal.cwd) return `${location} · ${terminal.cwd}`;
   return location;
 }
+
+type SidebarPinnedRow =
+  | { kind: "session"; item: Extract<PinnedItem, { kind: "session" }>; session: Session }
+  | { kind: "terminal"; item: Extract<PinnedItem, { kind: "terminal" }>; terminal: PlainTerminal };
 
 function SidebarSectionHeading({
   headingId,
@@ -139,6 +147,8 @@ export function DashboardSidebar({
   selection,
   sessionActivity,
   collapsedProjects,
+  pinnedItems,
+  automationSectionCollapsed,
   installingHostId = null,
   sessionsError,
   terminalsError,
@@ -150,11 +160,13 @@ export function DashboardSidebar({
   onOpenCommandPalette,
   onOpenSettings,
   onToggleProjectCollapsed,
+  onTogglePinned,
+  onToggleAutomationSection,
+  onManageAutomations,
   onSelectSession,
   onCloseSession,
   onSelectTerminal,
   onCloseTerminal,
-  onCreateAutomation,
   onSelectAutomation,
   onInstallTw,
 }: DashboardSidebarProps) {
@@ -201,6 +213,14 @@ export function DashboardSidebar({
       ? "warning"
       : connections.tone;
   const rootClassName = ["tw-dashboard-sidebar", className].filter(Boolean).join(" ");
+  const pinnedRows: SidebarPinnedRow[] = pinnedItems.flatMap<SidebarPinnedRow>((item) => {
+    if (item.kind === "session") {
+      const session = sessions.find((candidate) => candidate.name === item.name);
+      return session ? [{ kind: "session", item, session }] : [];
+    }
+    const terminal = terminals.find((candidate) => candidate.id === item.id);
+    return terminal ? [{ kind: "terminal", item, terminal }] : [];
+  });
 
   return (
     <div className={rootClassName} aria-label="Dashboard sidebar">
@@ -234,7 +254,71 @@ export function DashboardSidebar({
             <Pin aria-hidden="true" size={13} strokeWidth={1.8} />
             <h2 id="tw-sidebar-pinned-heading">Pinned</h2>
           </div>
-          <p className="tw-sidebar-section__empty">No pinned worktrees</p>
+          {pinnedRows.length === 0 ? (
+            <p className="tw-sidebar-section__empty">Pin a worktree or terminal for quick access.</p>
+          ) : (
+            <nav className="tw-sidebar-list" aria-label="Pinned workspaces">
+              {pinnedRows.map((row) => {
+                if (row.kind === "session") {
+                  const displayName = sessionDisplayName(row.session);
+                  const selected = selection?.kind === "session" && selection.name === row.session.name;
+                  return (
+                    <div className="tw-sidebar-row" data-selected={selected} data-pinned="true" key={`pinned-session:${row.session.name}`}>
+                      <button
+                        className="tw-sidebar-row__target"
+                        type="button"
+                        onClick={() => onSelectSession(row.session.name)}
+                        aria-current={selected ? "page" : undefined}
+                        title={`Pinned worktree ${displayName}`}
+                      >
+                        <FolderGit2 className="tw-sidebar-row__leading-icon" aria-hidden="true" size={14} strokeWidth={1.8} />
+                        <span className="tw-sidebar-row__copy">
+                          <span className="tw-sidebar-row__title">{displayName}</span>
+                          <span className="tw-sidebar-row__meta">{row.session.project || "Worktree"}</span>
+                        </span>
+                      </button>
+                      <button
+                        className="tw-sidebar-row__pin"
+                        type="button"
+                        onClick={() => onTogglePinned(row.item)}
+                        aria-label={`Unpin worktree ${displayName}`}
+                        title={`Unpin ${displayName}`}
+                      >
+                        <Pin aria-hidden="true" size={13} strokeWidth={1.8} fill="currentColor" />
+                      </button>
+                    </div>
+                  );
+                }
+                const selected = selection?.kind === "terminal" && selection.id === row.terminal.id;
+                return (
+                  <div className="tw-sidebar-row" data-selected={selected} data-pinned="true" key={`pinned-terminal:${row.terminal.id}`}>
+                    <button
+                      className="tw-sidebar-row__target"
+                      type="button"
+                      onClick={() => onSelectTerminal(row.terminal.id)}
+                      aria-current={selected ? "page" : undefined}
+                      title={`Pinned terminal ${row.terminal.label}`}
+                    >
+                      <SquareTerminal className="tw-sidebar-row__leading-icon" aria-hidden="true" size={14} strokeWidth={1.8} />
+                      <span className="tw-sidebar-row__copy">
+                        <span className="tw-sidebar-row__title">{row.terminal.label}</span>
+                        <span className="tw-sidebar-row__meta">{terminalDescription(row.terminal, hostsById)}</span>
+                      </span>
+                    </button>
+                    <button
+                      className="tw-sidebar-row__pin"
+                      type="button"
+                      onClick={() => onTogglePinned(row.item)}
+                      aria-label={`Unpin terminal ${row.terminal.label}`}
+                      title={`Unpin ${row.terminal.label}`}
+                    >
+                      <Pin aria-hidden="true" size={13} strokeWidth={1.8} fill="currentColor" />
+                    </button>
+                  </div>
+                );
+              })}
+            </nav>
+          )}
         </section>
 
         <section className="tw-sidebar-section" aria-labelledby="tw-sidebar-worktrees-heading">
@@ -289,10 +373,12 @@ export function DashboardSidebar({
                         );
                         const displayName = sessionDisplayName(session);
                         const selected = selection?.kind === "session" && selection.name === session.name;
+                        const pinned = pinnedItems.some((item) => item.kind === "session" && item.name === session.name);
                         return (
                           <div
                             className="tw-sidebar-row"
                             data-selected={selected}
+                            data-pinned={pinned}
                             data-status={activity.state}
                             key={session.name}
                           >
@@ -315,15 +401,27 @@ export function DashboardSidebar({
                                 <span className="tw-sidebar-row__meta">{activity.label}</span>
                               </span>
                             </button>
-                            <button
-                              className="tw-sidebar-row__close"
-                              type="button"
-                              onClick={() => void onCloseSession(session.name)}
-                              aria-label={`Close worktree ${displayName}`}
-                              title={`Close worktree ${displayName}`}
-                            >
-                              <X aria-hidden="true" size={14} strokeWidth={1.8} />
-                            </button>
+                            <span className="tw-sidebar-row__actions">
+                              <button
+                                className="tw-sidebar-row__pin"
+                                type="button"
+                                onClick={() => onTogglePinned({ kind: "session", name: session.name })}
+                                aria-pressed={pinned}
+                                aria-label={`${pinned ? "Unpin" : "Pin"} worktree ${displayName}`}
+                                title={`${pinned ? "Unpin" : "Pin"} ${displayName}`}
+                              >
+                                <Pin aria-hidden="true" size={13} strokeWidth={1.8} fill={pinned ? "currentColor" : "none"} />
+                              </button>
+                              <button
+                                className="tw-sidebar-row__close"
+                                type="button"
+                                onClick={() => void onCloseSession(session.name)}
+                                aria-label={`Close worktree ${displayName}`}
+                                title={`Close worktree ${displayName}`}
+                              >
+                                <X aria-hidden="true" size={14} strokeWidth={1.8} />
+                              </button>
+                            </span>
                           </div>
                         );
                       })}
@@ -351,8 +449,9 @@ export function DashboardSidebar({
             {terminals.map((terminal) => {
               const selected = selection?.kind === "terminal" && selection.id === terminal.id;
               const description = terminalDescription(terminal, hostsById);
+              const pinned = pinnedItems.some((item) => item.kind === "terminal" && item.id === terminal.id);
               return (
-                <div className="tw-sidebar-row" data-selected={selected} key={terminal.id}>
+                <div className="tw-sidebar-row" data-selected={selected} data-pinned={pinned} key={terminal.id}>
                   <button
                     className="tw-sidebar-row__target"
                     type="button"
@@ -371,34 +470,61 @@ export function DashboardSidebar({
                       <span className="tw-sidebar-row__meta">{description}</span>
                     </span>
                   </button>
-                  <button
-                    className="tw-sidebar-row__close"
-                    type="button"
-                    onClick={() => void onCloseTerminal(terminal.id)}
-                    aria-label={`Close terminal ${terminal.label}`}
-                    title={`Close terminal ${terminal.label}`}
-                  >
-                    <X aria-hidden="true" size={14} strokeWidth={1.8} />
-                  </button>
+                  <span className="tw-sidebar-row__actions">
+                    <button
+                      className="tw-sidebar-row__pin"
+                      type="button"
+                      onClick={() => onTogglePinned({ kind: "terminal", id: terminal.id })}
+                      aria-pressed={pinned}
+                      aria-label={`${pinned ? "Unpin" : "Pin"} terminal ${terminal.label}`}
+                      title={`${pinned ? "Unpin" : "Pin"} ${terminal.label}`}
+                    >
+                      <Pin aria-hidden="true" size={13} strokeWidth={1.8} fill={pinned ? "currentColor" : "none"} />
+                    </button>
+                    <button
+                      className="tw-sidebar-row__close"
+                      type="button"
+                      onClick={() => void onCloseTerminal(terminal.id)}
+                      aria-label={`Close terminal ${terminal.label}`}
+                      title={`Close terminal ${terminal.label}`}
+                    >
+                      <X aria-hidden="true" size={14} strokeWidth={1.8} />
+                    </button>
+                  </span>
                 </div>
               );
             })}
           </nav>
         </section>
 
-        <section className="tw-sidebar-section" aria-labelledby="tw-sidebar-automations-heading">
-          <SidebarSectionHeading
-            headingId="tw-sidebar-automations-heading"
-            icon={Workflow}
-            label="Automations"
-            actionLabel="New automation"
-            onAction={onCreateAutomation}
-          />
-          {automationsError && <p className="tw-sidebar-section__error" role="alert">{automationsError}</p>}
-          {!automationsError && automations.length === 0 && (
+        <section className="tw-sidebar-section" aria-label="Automations">
+          <div className="tw-sidebar-section__automation-heading">
+            <button
+              className="tw-sidebar-section__automation-toggle"
+              type="button"
+              onClick={onToggleAutomationSection}
+              aria-expanded={!automationSectionCollapsed}
+              title={automationSectionCollapsed ? "Show automation shortcuts" : "Hide automation shortcuts"}
+            >
+              <ChevronRight className="tw-sidebar-group__chevron" aria-hidden="true" size={14} strokeWidth={1.8} />
+              <Workflow aria-hidden="true" size={13} strokeWidth={1.8} />
+              <span>Automations</span>
+              <span className="tw-sidebar-section__count">{automations.length}</span>
+            </button>
+            <button
+              className="tw-sidebar-section__manage"
+              type="button"
+              onClick={onManageAutomations}
+              title="Manage automations"
+            >
+              Manage
+            </button>
+          </div>
+          {!automationSectionCollapsed && automationsError && <p className="tw-sidebar-section__error" role="alert">{automationsError}</p>}
+          {!automationSectionCollapsed && !automationsError && automations.length === 0 && (
             <p className="tw-sidebar-section__empty">No automations yet</p>
           )}
-          <nav className="tw-sidebar-list" aria-label="Automations">
+          {!automationSectionCollapsed && <nav className="tw-sidebar-list" aria-label="Automation shortcuts">
             {automations.map((automation) => {
               const selected = selection?.kind === "automation" && selection.id === automation.id;
               const status = automationStatus(automation);
@@ -433,37 +559,28 @@ export function DashboardSidebar({
                 </div>
               );
             })}
-          </nav>
+          </nav>}
         </section>
       </div>
 
       <footer className="tw-dashboard-sidebar__footer">
         <div className="tw-dashboard-sidebar__connection-row">
           <button
+            ref={settingsButtonRef}
             className="tw-dashboard-sidebar__connections"
             type="button"
-            onClick={() => onOpenSettings("connections")}
+            onClick={() => onOpenSettings()}
             data-tone={footerTone}
             data-relay={relayState}
             title={`${localRuntimeLabel}. ${hostsLabel}. ${hostsDetail}. Mobile Relay: ${relayLabel}${mobileRelay?.error ? ` — ${mobileRelay.error}` : ""}`}
           >
-            <Server aria-hidden="true" size={16} strokeWidth={1.8} />
+            <Settings aria-hidden="true" size={16} strokeWidth={1.8} />
             <span className="tw-dashboard-sidebar__connection-copy">
-              <span className="tw-dashboard-sidebar__connection-title">Connections</span>
+              <span className="tw-dashboard-sidebar__connection-title">Settings</span>
               <span className="tw-dashboard-sidebar__connection-detail">
                 {localRuntimeLabel} · {hostsLabel} · Relay {relayLabel}
               </span>
             </span>
-          </button>
-          <button
-            ref={settingsButtonRef}
-            className="tw-dashboard-sidebar__settings"
-            type="button"
-            onClick={() => onOpenSettings()}
-            aria-label="Open Settings"
-            title="Open Settings (⌘,)"
-          >
-            <Settings aria-hidden="true" size={17} strokeWidth={1.8} />
           </button>
         </div>
 

@@ -6,6 +6,10 @@ export type Selection =
   | { kind: "automation"; id: string }
   | null;
 
+export type PinnedItem =
+  | { kind: "session"; name: string }
+  | { kind: "terminal"; id: string };
+
 export type WindowLayout = {
   width: number;
   height: number;
@@ -26,7 +30,7 @@ export type DiffFile = {
 };
 
 export type LayoutColumn = "file" | "main" | "scratch" | "editor";
-export type PersistedInspectorTab = "files" | "git" | "diff" | "automation" | "feishu";
+export type PersistedInspectorTab = "files" | "git" | "diff" | "feishu";
 
 export const DEFAULT_COLUMN_ORDER: LayoutColumn[] = [
   "file",
@@ -43,8 +47,11 @@ export type DashboardLayoutPreferences = {
   automationHeight?: number;
   sessionOrder?: string[];
   collapsedProjects?: string[];
+  pinnedItems?: PinnedItem[];
+  automationSectionCollapsed?: boolean;
   columnOrder: LayoutColumn[];
   scratchCollapsed?: boolean;
+  scratchWidth?: number;
   fileBrowserOpen?: boolean;
   fileTreeWidth?: number;
   editorWidth?: number;
@@ -104,6 +111,18 @@ function isSelection(value: unknown): value is Selection {
   );
 }
 
+function isPinnedItem(value: unknown): value is PinnedItem {
+  if (!isRecord(value)) return false;
+  return (
+    (value.kind === "session" && typeof value.name === "string" && value.name.length > 0) ||
+    (value.kind === "terminal" && typeof value.id === "string" && value.id.length > 0)
+  );
+}
+
+function isPinnedItems(value: unknown): value is PinnedItem[] {
+  return Array.isArray(value) && value.every(isPinnedItem);
+}
+
 function isEditingFile(value: unknown): value is EditingFile {
   return isRecord(value) && typeof value.path === "string" && hasValidHostId(value);
 }
@@ -137,7 +156,6 @@ function isInspectorTab(value: unknown): value is PersistedInspectorTab {
     value === "files" ||
     value === "git" ||
     value === "diff" ||
-    value === "automation" ||
     value === "feishu"
   );
 }
@@ -187,7 +205,10 @@ export function isDashboardLayoutV2(value: unknown): value is DashboardLayoutV2 
     optionalField(value, "automationHeight", isPositiveFiniteNumber) &&
     optionalField(value, "sessionOrder", isStringArray) &&
     optionalField(value, "collapsedProjects", isNonEmptyStringArray) &&
+    optionalField(value, "pinnedItems", isPinnedItems) &&
+    optionalField(value, "automationSectionCollapsed", (field) => typeof field === "boolean") &&
     optionalField(value, "scratchCollapsed", (field) => typeof field === "boolean") &&
+    optionalField(value, "scratchWidth", isPositiveFiniteNumber) &&
     optionalField(value, "fileBrowserOpen", (field) => typeof field === "boolean") &&
     optionalField(value, "fileTreeWidth", isPositiveFiniteNumber) &&
     optionalField(value, "editorWidth", isPositiveFiniteNumber) &&
@@ -215,6 +236,7 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
     "gitHeight",
     "sectionSplit",
     "automationHeight",
+    "scratchWidth",
     "fileTreeWidth",
     "editorWidth",
     "sidebarWidth",
@@ -233,6 +255,19 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
     normalized.collapsedProjects = source.collapsedProjects.filter(
       (item): item is string => typeof item === "string" && item.length > 0,
     );
+  }
+  if (Array.isArray(source.pinnedItems)) {
+    const seen = new Set<string>();
+    normalized.pinnedItems = source.pinnedItems.filter((item): item is PinnedItem => {
+      if (!isPinnedItem(item)) return false;
+      const key = item.kind === "session" ? `session:${item.name}` : `terminal:${item.id}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+  if (typeof source.automationSectionCollapsed === "boolean") {
+    normalized.automationSectionCollapsed = source.automationSectionCollapsed;
   }
   if (typeof source.scratchCollapsed === "boolean") {
     normalized.scratchCollapsed = source.scratchCollapsed;

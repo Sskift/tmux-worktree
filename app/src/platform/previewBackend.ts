@@ -205,6 +205,17 @@ transport.handlers.set("test_host", value(hostStatuses[0]));
 transport.handlers.set("add_host", value(hosts));
 transport.handlers.set("remove_host", value([]));
 transport.handlers.set("remote_home_dir", value("/Users/dev"));
+transport.handlers.set("probe_agents", (payload) => {
+  const hostId = (payload as { hostId?: string | null } | undefined)?.hostId ?? null;
+  const binRoot = hostId ? "/usr/local/bin" : "/opt/homebrew/bin";
+  return [
+    { id: "claude", label: "Claude Code", command: "claude", available: false, executablePath: null, error: null },
+    { id: "codex", label: "Codex", command: "codex", available: true, executablePath: `${binRoot}/codex`, error: null },
+    { id: "gemini", label: "Gemini CLI", command: "gemini", available: hostId !== null, executablePath: hostId ? `${binRoot}/gemini` : null, error: null },
+    { id: "opencode", label: "OpenCode", command: "opencode", available: false, executablePath: null, error: null },
+    { id: "aider", label: "Aider", command: "aider", available: false, executablePath: null, error: null },
+  ];
+});
 transport.handlers.set("list_tmux_terminals", value(terminals));
 transport.handlers.set("load_terminals", value(terminals));
 transport.handlers.set("save_terminals", nothing);

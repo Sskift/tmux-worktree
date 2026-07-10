@@ -22,6 +22,17 @@
   font-family: var(--shell-font-sans);
 }
 
+.workspace-header[data-window-titlebar="true"] .workspace-header__layout {
+  padding-left: 82px;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+
+.workspace-header[data-window-titlebar="true"] :where(button) {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
 .workspace-header__identity,
 .workspace-header__title-line,
 .workspace-header__context,
@@ -179,6 +190,13 @@
   color: var(--shell-text);
   background: var(--shell-surface-hover);
   border-color: var(--shell-border-strong);
+}
+
+.workspace-header__action:disabled {
+  color: var(--shell-text-disabled);
+  background: transparent;
+  border-color: var(--shell-border);
+  cursor: default;
 }
 
 .workspace-header__action[aria-pressed="true"] {

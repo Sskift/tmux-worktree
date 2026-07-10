@@ -16,6 +16,7 @@ import {
   type CommandPaletteItem,
 } from "./dashboard/CommandPalette";
 import {
+  AgentsSettings,
   SettingsDialog,
   type SettingsSectionId,
 } from "./dashboard/Settings";
@@ -55,9 +56,18 @@ import {
   DEFAULT_COLUMN_ORDER,
   type DiffFile,
   type EditingFile,
+  type PinnedItem,
   type Selection,
   type WindowLayout,
 } from "./dashboard/layoutPreferences";
+import {
+  DEFAULT_SCRATCH_PANEL_WIDTH,
+  SCRATCH_PANEL_LIMITS,
+  clampScratchPanelWidth,
+  scratchPanelMaximumWidth,
+  scratchPanelWidthFromKey,
+  scratchPanelWidthFromPointer,
+} from "./dashboard/scratchPanelModel";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
@@ -79,6 +89,7 @@ import {
 } from "./terminalPersistence";
 import { createLatestRequestGate } from "./latestRequestGate";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
+import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import {
   automationSelectionIsCurrent,
   automationSubmitStillOwnsDraft,
@@ -283,6 +294,7 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
   const [layoutResetMessage, setLayoutResetMessage] = useState<string | null>(null);
+  const [defaultAgentCommand, setDefaultAgentCommand] = useState(loadLastAiCmd);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
     const id = loadTheme();
@@ -291,8 +303,11 @@ function App() {
   });
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([]);
+  const [pinnedItems, setPinnedItems] = useState<PinnedItem[]>([]);
+  const [automationSectionCollapsed, setAutomationSectionCollapsed] = useState(true);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
   const [scratchCollapsed, setScratchCollapsed] = useState(true);
+  const [scratchWidth, setScratchWidth] = useState(DEFAULT_SCRATCH_PANEL_WIDTH);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
@@ -315,7 +330,9 @@ function App() {
   const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const dashboardWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
+  const automationReturnSelectionRef = useRef<Selection>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const tmuxPreviewRequested = useRef<Set<string>>(new Set());
   const tmuxPreviewLiveRef = useRef<Set<string>>(new Set());
@@ -343,9 +360,7 @@ function App() {
   const editingFileKey = editingFileSourceKey(editingFile);
   const automationDraftKey = selection?.kind === "automation"
     ? `automation:${selection.id || "new"}`
-    : expandedInspectorTab === "automation"
-      ? "automation:new"
-      : null;
+    : null;
   editingFileRef.current = editingFile;
   if (editorDirtySnapshotRef.current.fileKey !== editingFileKey) {
     editorDirtySnapshotRef.current = {
@@ -455,6 +470,10 @@ function App() {
 
   useEffect(() => {
     const handleResize = () => {
+      setScratchWidth((current) => clampScratchPanelWidth(
+        current,
+        dashboardWorkspaceRef.current?.getBoundingClientRect().width ?? window.innerWidth,
+      ));
       const normalizedWidths = normalizeDashboardPanelWidths(
         window.innerWidth,
         panelWidthsRef.current.sidebarWidth,
@@ -645,15 +664,23 @@ function App() {
         if (lay.collapsedProjects) {
           setCollapsedProjects(lay.collapsedProjects);
         }
-        if (lay.scratchCollapsed !== undefined) {
-          setScratchCollapsed(lay.scratchCollapsed);
+        if (lay.pinnedItems) {
+          setPinnedItems(lay.pinnedItems);
+        }
+        if (lay.automationSectionCollapsed !== undefined) {
+          setAutomationSectionCollapsed(lay.automationSectionCollapsed);
+        }
+        const restoredScratchOpen = lay.scratchCollapsed === false;
+        if (lay.scratchCollapsed !== undefined) setScratchCollapsed(lay.scratchCollapsed);
+        if (lay.scratchWidth !== undefined) {
+          setScratchWidth(clampScratchPanelWidth(lay.scratchWidth, window.innerWidth));
         }
         const restoredInspectorTab = lay.inspectorTab ?? (lay.diffFile ? "diff" : "files");
         setInspectorTab(restoredInspectorTab);
         const currentViewportTier = viewportTierForWidth(window.innerWidth);
         const restoredSidebarOpen = lay.sidebarOpen ?? true;
-        const restoredInspectorOpen =
-          lay.inspectorOpen ?? lay.fileBrowserOpen ?? true;
+        const restoredInspectorOpen = !restoredScratchOpen &&
+          (lay.inspectorOpen ?? lay.fileBrowserOpen ?? true);
         sidebarOpenPreferenceRef.current = restoredSidebarOpen;
         inspectorOpenPreferenceRef.current = restoredInspectorOpen;
         if (currentViewportTier === "compact") {
@@ -750,8 +777,11 @@ function App() {
         inspectorTab,
         sessionOrder,
         collapsedProjects,
+        pinnedItems,
+        automationSectionCollapsed,
         columnOrder: DEFAULT_COLUMN_ORDER,
         scratchCollapsed,
+        scratchWidth,
         fileBrowserOpen: inspectorOpenPreferenceRef.current && inspectorTab === "files",
         selection,
         editingFile,
@@ -768,7 +798,10 @@ function App() {
     inspectorTab,
     sessionOrder,
     collapsedProjects,
+    pinnedItems,
+    automationSectionCollapsed,
     scratchCollapsed,
+    scratchWidth,
     selection,
     editingFile,
     diffFile,
@@ -835,6 +868,8 @@ function App() {
       setInspectorTab("files");
       setExpandedInspectorTab(null);
       setScratchCollapsed(true);
+      setScratchWidth(DEFAULT_SCRATCH_PANEL_WIDTH);
+      setAutomationSectionCollapsed(true);
       setEditingFile(null);
       setDiffFile(null);
       if (viewportTier === "compact") {
@@ -1094,7 +1129,6 @@ function App() {
         setEditingFile(null);
         setDiffFile(null);
         setExpandedInspectorTab(null);
-        setInspectorTab("automation");
         setSelection({ kind: "automation", id: automation.id });
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
@@ -1123,7 +1157,6 @@ function App() {
         setEditingFile(null);
         setDiffFile(null);
         setExpandedInspectorTab(null);
-        setInspectorTab("automation");
         setSelection({ kind: "automation", id: automation.id });
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
@@ -1319,6 +1352,9 @@ function App() {
   }, [projectPresetForSession, selection, selectedCwd, selectedGitHostId]);
 
   const handleNewAutomation = useCallback(() => requestEditorNavigation(() => {
+    if (selection?.kind === "session" || selection?.kind === "terminal") {
+      automationReturnSelectionRef.current = selection;
+    }
     if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd && !selectedGitHostId) {
       setLastAutomationContextPath(selectedCwd);
       setLastAutomationContextProject(
@@ -1342,7 +1378,7 @@ function App() {
     setEditingFile(null);
     setDiffFile(null);
     setExpandedInspectorTab(null);
-    setInspectorTab("automation");
+    setInspectorOpen(false);
     setSelection({ kind: "automation", id: "" });
   }), [
     dashboardBackend,
@@ -1475,7 +1511,72 @@ function App() {
   };
 
   const openScratch = useCallback(() => {
+    setInspectorOpen(false);
     setScratchCollapsed(false);
+  }, []);
+
+  const startScratchResize = useCallback((event: React.PointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const target = event.currentTarget;
+    const startX = event.clientX;
+    const startWidth = scratchWidth;
+    const containerWidth = dashboardWorkspaceRef.current?.getBoundingClientRect().width;
+    target.setPointerCapture?.(event.pointerId);
+    document.body.dataset.dashboardResizing = "scratch";
+
+    const handlePointerMove = (nextEvent: globalThis.PointerEvent) => {
+      setScratchWidth(
+        scratchPanelWidthFromPointer(
+          startWidth,
+          nextEvent.clientX - startX,
+          containerWidth,
+        ),
+      );
+    };
+    const finish = () => {
+      if (target.hasPointerCapture?.(event.pointerId)) {
+        target.releasePointerCapture(event.pointerId);
+      }
+      delete document.body.dataset.dashboardResizing;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+    };
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+  }, [scratchWidth]);
+
+  const resizeScratchFromKeyboard = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
+    const containerWidth = dashboardWorkspaceRef.current?.getBoundingClientRect().width;
+    const next = scratchPanelWidthFromKey(
+      scratchWidth,
+      event.key,
+      event.shiftKey,
+      containerWidth,
+    );
+    if (next === null) return;
+    event.preventDefault();
+    setScratchWidth(next);
+  }, [scratchWidth]);
+
+  const togglePinned = useCallback((item: PinnedItem) => {
+    const key = item.kind === "session" ? `session:${item.name}` : `terminal:${item.id}`;
+    setPinnedItems((current) => {
+      const exists = current.some((candidate) => (
+        candidate.kind === "session"
+          ? `session:${candidate.name}`
+          : `terminal:${candidate.id}`
+      ) === key);
+      return exists
+        ? current.filter((candidate) => (
+            candidate.kind === "session"
+              ? `session:${candidate.name}`
+              : `terminal:${candidate.id}`
+          ) !== key)
+        : [...current, item];
+    });
   }, []);
 
   const toggleProjectCollapsed = (projectKey: string) => {
@@ -1520,22 +1621,42 @@ function App() {
           expandedInspectorTab !== null,
         )
       ) {
-        setInspectorTab("automation");
         if (viewportTier === "compact") setSidebarOpen(false);
         return Promise.resolve(false);
       }
       return requestEditorNavigation(() => {
-      setPendingCatalogSelection(null);
-      setSelection({ kind: "automation", id });
-      setEditingFile(null);
-      setDiffFile(null);
-      setExpandedInspectorTab(null);
-      setInspectorTab("automation");
-      if (viewportTier === "compact") setSidebarOpen(false);
+        if (selection?.kind === "session" || selection?.kind === "terminal") {
+          automationReturnSelectionRef.current = selection;
+        }
+        setPendingCatalogSelection(null);
+        setSelection({ kind: "automation", id });
+        setEditingFile(null);
+        setDiffFile(null);
+        setExpandedInspectorTab(null);
+        setInspectorOpen(false);
+        if (viewportTier === "compact") setSidebarOpen(false);
       });
     },
     [expandedInspectorTab, requestEditorNavigation, selection, viewportTier],
   );
+
+  const returnFromAutomationManager = useCallback(() => requestEditorNavigation(() => {
+    const remembered = automationReturnSelectionRef.current;
+    const validRemembered = remembered?.kind === "session"
+      ? sessions.some((session) => session.name === remembered.name)
+      : remembered?.kind === "terminal"
+        ? allTerminals.some((terminal) => terminal.id === remembered.id)
+        : false;
+    const fallback: Selection = sessions[0]
+      ? { kind: "session", name: sessions[0].name }
+      : allTerminals[0]
+        ? { kind: "terminal", id: allTerminals[0].id }
+        : null;
+    setSelection(validRemembered ? remembered : fallback);
+    setEditingFile(null);
+    setDiffFile(null);
+    setExpandedInspectorTab(null);
+  }), [allTerminals, requestEditorNavigation, sessions]);
 
   const closeSession = useCallback(async (name: string) => {
     try {
@@ -1551,6 +1672,7 @@ function App() {
       setSessions((current) => current.filter((session) => session.name !== name));
       setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
       setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
+      setPinnedItems((current) => current.filter((item) => item.kind !== "session" || item.name !== name));
       setSelection((current) => {
         if (current?.kind !== "session" || current.name !== name) return current;
         const remainingSession = sessions.find((session) => session.name !== name);
@@ -1581,6 +1703,7 @@ function App() {
         setTerminals((current) => current.filter((candidate) => candidate.id !== id));
       }
       setOpenedTerminals((current) => current.filter((terminalId) => terminalId !== id));
+      setPinnedItems((current) => current.filter((item) => item.kind !== "terminal" || item.id !== id));
       setSelection((current) => {
         if (current?.kind !== "terminal" || current.id !== id) return current;
         const remainingTerminal = allTerminals.find((candidate) => candidate.id !== id);
@@ -1622,6 +1745,14 @@ function App() {
     return () => window.removeEventListener("keydown", handleNewWorktreeShortcut);
   }, [anyModalOpen]);
 
+  const openInspectorTab = useCallback((tab: InspectorTab) => {
+    setScratchCollapsed(true);
+    setInspectorTab(tab);
+    if (viewportTier === "wide") inspectorOpenPreferenceRef.current = true;
+    setInspectorOpen(true);
+    if (viewportTier === "compact") setSidebarOpen(false);
+  }, [viewportTier]);
+
   const commandPaletteItems = useMemo<CommandPaletteItem[]>(() => {
     const actions: CommandPaletteItem[] = [
       {
@@ -1652,6 +1783,32 @@ function App() {
     ];
 
     const navigate: CommandPaletteItem[] = [
+      {
+        id: "navigate-git-inspector",
+        group: "navigate" as const,
+        label: "Open Git inspector",
+        detail: "Status, history, and changed files for the active workspace",
+        keywords: ["git", "changes", "diff", "history"],
+        disabledReason:
+          selection?.kind === "session" || selection?.kind === "terminal"
+            ? undefined
+            : "Select a worktree or terminal first",
+        execute: () => openInspectorTab("git"),
+      },
+      ...(selection?.kind === "session" || selection?.kind === "terminal"
+        ? [{
+            id: "navigate-toggle-current-pin",
+            group: "navigate" as const,
+            label: pinnedItems.some((item) => (
+              selection.kind === "session"
+                ? item.kind === "session" && item.name === selection.name
+                : item.kind === "terminal" && item.id === selection.id
+            )) ? "Unpin current workspace" : "Pin current workspace",
+            detail: "Keep this workspace in the Pinned section",
+            keywords: ["pin", "favorite", "workspace"],
+            execute: () => togglePinned(selection),
+          }]
+        : []),
       ...sessions.map((session) => {
         const host = session.hostId
           ? hosts.find((candidate) => candidate.id === session.hostId)
@@ -1757,11 +1914,15 @@ function App() {
     handleNewAutomation,
     hosts,
     openSettings,
+    openInspectorTab,
     openedSessions,
     openedTerminals,
     selectSession,
     selectTerminal,
+    selection,
     sessions,
+    pinnedItems,
+    togglePinned,
   ]);
   const relaySettingsBindings = relaySettingsBindingsFromController(mobileRelay);
 
@@ -1949,30 +2110,6 @@ function App() {
           <strong>Diff expanded in workspace</strong>
         </div>
       ) : renderDiff(),
-    automation: (
-      <div className="dashboard-context-summary">
-        <strong>
-          {selectedAutomation?.name || String(automations.length) + " configured automations"}
-        </strong>
-        <span>
-          {selectedAutomation
-            ? triggerLabel(selectedAutomation)
-            : "Select an automation from the sidebar to edit or run it."}
-        </span>
-        <button
-          type="button"
-          onClick={() => {
-            if (selectedAutomation) {
-              void selectAutomation(selectedAutomation.id);
-            } else {
-              handleNewAutomation();
-            }
-          }}
-        >
-          {selectedAutomation ? "Open automation" : "New automation"}
-        </button>
-      </div>
-    ),
     feishu: (
       <div className="dashboard-context-summary">
         <strong>Feishu is not configured</strong>
@@ -2021,8 +2158,10 @@ function App() {
 
   const centralWorkspace = (
     <div
+      ref={dashboardWorkspaceRef}
       className="dashboard-workspace"
       data-scratch-open={!selectionMetadataPending && !scratchCollapsed && Boolean(selectionKey)}
+      style={{ "--dashboard-scratch-width": `${scratchWidth}px` } as React.CSSProperties}
     >
       <section className="dashboard-workspace__primary" aria-label="Active workspace">
         <TerminalDeck
@@ -2037,16 +2176,11 @@ function App() {
           metadataPending={selectionMetadataPending}
           visible={terminalViewVisible}
           blocked={workspaceInteractionBlocked}
-          scratchCollapsed={scratchCollapsed}
-          onToggleScratch={() => {
-            if (scratchCollapsed) openScratch();
-            else setScratchCollapsed(true);
-          }}
           onOpenFile={handleOpenFile}
         />
 
         {selectionMetadataPending ? null : editingFile ? (
-          <div className="dashboard-workspace__expanded">
+          <div className="dashboard-workspace__editor">
             <FileEditor
               filePath={editingFile.path}
               hostId={editingFile.hostId ?? null}
@@ -2061,11 +2195,22 @@ function App() {
           renderExpandedView("Git", renderGit())
         ) : expandedInspectorTab === "diff" ? (
           renderExpandedView("Diff", renderDiff())
-        ) : expandedInspectorTab === "automation" ? (
-          renderExpandedView("Automation", automationPanel)
         ) : selection?.kind === "automation" ? (
-          <div className="dashboard-workspace__expanded dashboard-workspace__automation">
-            {automationPanel}
+          <div className="dashboard-workspace__expanded">
+            <div className="dashboard-expanded-toolbar">
+              <strong>Automations</strong>
+              <button
+                type="button"
+                onClick={() => void returnFromAutomationManager()}
+                aria-label="Back to workspace"
+              >
+                <X aria-hidden="true" size={14} strokeWidth={1.8} />
+                <span>Back to workspace</span>
+              </button>
+            </div>
+            <div className="dashboard-expanded-content dashboard-workspace__automation">
+              {automationPanel}
+            </div>
           </div>
         ) : !selection ? (
           <div className="pane pane--empty">
@@ -2076,7 +2221,23 @@ function App() {
         ) : null}
       </section>
 
+      <button
+        className="dashboard-scratch__resize-handle"
+        type="button"
+        role="separator"
+        aria-label="Resize Scratch panel"
+        aria-controls="dashboard-scratch-panel"
+        aria-orientation="vertical"
+        aria-valuemin={Math.min(SCRATCH_PANEL_LIMITS.min, scratchPanelMaximumWidth(dashboardWorkspaceRef.current?.clientWidth))}
+        aria-valuemax={scratchPanelMaximumWidth(dashboardWorkspaceRef.current?.clientWidth)}
+        aria-valuenow={scratchWidth}
+        hidden={selectionMetadataPending || scratchCollapsed || !selectionKey}
+        onPointerDown={startScratchResize}
+        onKeyDown={resizeScratchFromKeyboard}
+      />
+
       <aside
+        id="dashboard-scratch-panel"
         className="dashboard-scratch"
         aria-label="Scratch terminals"
         hidden={selectionMetadataPending || scratchCollapsed || !selectionKey}
@@ -2134,10 +2295,17 @@ function App() {
               >
                 {state.list.map((scratch, index) => (
                   <div key={scratch.id} className="scratch__section">
-                    <div
-                      className="dashboard-scratch__terminal-header"
-                      onMouseDown={index > 0 ? startScratchSplit(index) : undefined}
-                    >
+                    {index > 0 && (
+                      <button
+                        className="dashboard-scratch__split-handle"
+                        type="button"
+                        role="separator"
+                        aria-label={`Resize ${scratch.label}`}
+                        aria-orientation="horizontal"
+                        onMouseDown={startScratchSplit(index)}
+                      />
+                    )}
+                    <div className="dashboard-scratch__terminal-header">
                       <span>{scratch.label}</span>
                       {state.list.length > 1 && (
                         <button
@@ -2189,6 +2357,16 @@ function App() {
         onSectionChange={setSettingsSection}
         onClose={() => setSettingsOpen(false)}
         content={{
+          agents: (
+            <AgentsSettings
+              hosts={hosts}
+              defaultAgentCommand={defaultAgentCommand}
+              onDefaultAgentCommandChange={(command) => {
+                saveLastAiCmd(command);
+                setDefaultAgentCommand(command);
+              }}
+            />
+          ),
           connections: (
             <ConnectionsSettings
               hosts={hosts}
@@ -2293,11 +2471,29 @@ function App() {
   return (
     <DashboardShell
       titlebar={
-        <div className="dashboard-titlebar" title={`tw · ${workspaceTitle}`}>
-          <span>tw</span>
-          <span aria-hidden="true"> · </span>
-          <span>{workspaceTitle}</span>
-        </div>
+        <WorkspaceHeader
+          title={workspaceTitle}
+          project={workspaceProject}
+          branch={workspaceBranch}
+          cwd={selectedCwd}
+          hostLabel={selectedHost?.label ?? selectedHostId}
+          agentCommand={workspaceAgentCommand}
+          status={workspaceStatus}
+          windowTitlebar
+          sidebarDrawer={viewportTier === "compact"}
+          scratchOpen={!scratchCollapsed}
+          gitActive={inspectorOpen && inspectorTab === "git"}
+          gitAvailable={selection?.kind === "session" || selection?.kind === "terminal"}
+          onOpenSidebar={() => {
+            setInspectorOpen(false);
+            setSidebarOpen(true);
+          }}
+          onOpenGit={() => openInspectorTab("git")}
+          onToggleScratch={() => {
+            if (scratchCollapsed) openScratch();
+            else setScratchCollapsed(true);
+          }}
+        />
       }
       sidebar={
         <DashboardSidebar
@@ -2318,6 +2514,8 @@ function App() {
           selection={selection}
           sessionActivity={sessionActivity}
           collapsedProjects={collapsedProjects}
+          pinnedItems={pinnedItems}
+          automationSectionCollapsed={automationSectionCollapsed}
           installingHostId={installingHostId}
           sessionsError={error}
           terminalsError={terminalPersistenceError}
@@ -2326,45 +2524,23 @@ function App() {
           onCreateWorktree={() => setShowNewWorktree(true)}
           onCreateTerminal={() => setShowNewTerminal(true)}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}
-          onOpenSettings={(section) => openSettings(section ?? "general")}
+          onOpenSettings={() => openSettings("general")}
           onToggleProjectCollapsed={toggleProjectCollapsed}
+          onTogglePinned={togglePinned}
+          onToggleAutomationSection={() => setAutomationSectionCollapsed((current) => !current)}
+          onManageAutomations={() => {
+            void selectAutomation(
+              selection?.kind === "automation"
+                ? selection.id
+                : automations[0]?.id ?? "",
+            );
+          }}
           onSelectSession={selectSession}
           onCloseSession={closeSession}
           onSelectTerminal={selectTerminal}
           onCloseTerminal={closeTerminal}
-          onCreateAutomation={handleNewAutomation}
           onSelectAutomation={selectAutomation}
           onInstallTw={installRemoteTw}
-        />
-      }
-      header={
-        <WorkspaceHeader
-          title={workspaceTitle}
-          project={workspaceProject}
-          branch={workspaceBranch}
-          cwd={selectedCwd}
-          hostLabel={selectedHost?.label ?? selectedHostId}
-          agentCommand={workspaceAgentCommand}
-          status={workspaceStatus}
-          sidebarDrawer={viewportTier === "compact"}
-          inspectorOpen={inspectorOpen}
-          scratchOpen={!scratchCollapsed}
-          onOpenSidebar={() => {
-            setInspectorOpen(false);
-            setSidebarOpen(true);
-          }}
-          onToggleInspector={() => {
-            setInspectorOpen((current) => {
-              const next = !current;
-              if (viewportTier === "wide") inspectorOpenPreferenceRef.current = next;
-              return next;
-            });
-            if (viewportTier === "compact") setSidebarOpen(false);
-          }}
-          onToggleScratch={() => {
-            if (scratchCollapsed) openScratch();
-            else setScratchCollapsed(true);
-          }}
         />
       }
       workspace={centralWorkspace}
@@ -2374,12 +2550,9 @@ function App() {
           content={inspectorContent}
           badges={{
             diff: diffFile ? 1 : null,
-            automation: automations.length || null,
           }}
           onTabChange={(tab) => {
-            setInspectorTab(tab);
-            if (viewportTier === "wide") inspectorOpenPreferenceRef.current = true;
-            setInspectorOpen(true);
+            openInspectorTab(tab);
           }}
           onClose={() => {
             if (viewportTier === "wide") inspectorOpenPreferenceRef.current = false;

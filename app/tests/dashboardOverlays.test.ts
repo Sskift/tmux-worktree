@@ -36,8 +36,9 @@ test("Host and Relay configuration live in Connections Settings", () => {
   assert.match(app, /connections:\s*\(\s*<ConnectionsSettings/);
   assert.match(app, /sshHostCandidates=\{sshHostCandidates\}/);
   assert.match(app, /relaySettingsBindingsFromController\(mobileRelay\)/);
-  assert.match(app, /onOpenSettings=\{\(section\) => openSettings\(section \?\? "general"\)\}/);
-  assert.match(sidebar, /onOpenSettings\("connections"\)/);
+  assert.match(app, /onOpenSettings=\{\(\) => openSettings\("general"\)\}/);
+  assert.match(sidebar, /className="tw-dashboard-sidebar__connection-title">Settings</);
+  assert.match(sidebar, /onClick=\{\(\) => onOpenSettings\(\)\}/);
   assert.doesNotMatch(app, /<AddHostModal/);
   assert.doesNotMatch(app, /className="remote-popover"/);
   assert.doesNotMatch(app, />\+ host</);

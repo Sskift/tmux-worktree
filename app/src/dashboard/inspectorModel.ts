@@ -2,7 +2,6 @@ export const INSPECTOR_TABS = [
   "files",
   "git",
   "diff",
-  "automation",
   "feishu",
 ] as const;
 

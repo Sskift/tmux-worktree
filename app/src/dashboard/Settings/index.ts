@@ -12,3 +12,4 @@ export {
   isSettingsSectionId,
   type SettingsSectionId,
 } from "./settingsModel";
+export { AgentsSettings, type AgentsSettingsProps } from "./AgentsSettings";

@@ -80,7 +80,9 @@ test("destructive sidebar and automation actions require confirmation", () => {
   assert.match(app, /title: "Delete automation\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?automations\.delete/);
 });
 
-test("expanded inspector views, including Automation, have a terminal return path", () => {
-  assert.match(app, /renderExpandedView\("Automation", automationPanel\)/);
+test("expanded inspector views and the Automation manager have a workspace return path", () => {
+  assert.match(app, /selection\?\.kind === "automation"[\s\S]*?>Back to workspace</);
+  assert.match(app, /returnFromAutomationManager/);
   assert.match(app, /Back to terminal/);
+  assert.doesNotMatch(app, /renderExpandedView\("Automation"/);
 });

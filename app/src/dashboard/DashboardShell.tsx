@@ -42,7 +42,7 @@ function drawerFocusableElements(drawer: HTMLElement): HTMLElement[] {
 export type DashboardShellProps = {
   titlebar?: ReactNode;
   sidebar: ReactNode;
-  header: ReactNode;
+  header?: ReactNode;
   workspace: ReactNode;
   inspector?: ReactNode;
   overlays?: ReactNode;
@@ -251,9 +251,10 @@ export function DashboardShell({
 
         <section
           className="tw-shell__center"
+          data-has-header={header ? true : undefined}
           inert={activeDrawer !== null}
         >
-          <header className="tw-shell__header">{header}</header>
+          {header && <header className="tw-shell__header">{header}</header>}
           <main className="tw-shell__workspace">{workspace}</main>
         </section>
 

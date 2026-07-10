@@ -1,4 +1,3 @@
-import { PanelRightClose, PanelRightOpen } from "lucide-react";
 import type { HostConfig, PlainTerminal, Session } from "../platform";
 import { Terminal } from "../Terminal";
 import type { Selection } from "./layoutPreferences";
@@ -22,8 +21,6 @@ type TerminalDeckProps = {
   metadataPending: boolean;
   visible: boolean;
   blocked: boolean;
-  scratchCollapsed: boolean;
-  onToggleScratch: () => void;
   onOpenFile: OpenFileHandler;
 };
 
@@ -93,45 +90,6 @@ export function terminalSessionKey(terminal: PlainTerminal): string {
     : terminalRawName(terminal);
 }
 
-function selectedTitle(
-  selection: Selection,
-  sessions: Session[],
-  terminals: PlainTerminal[],
-  hosts: HostConfig[],
-): string {
-  if (selection?.kind === "session") {
-    const session = sessions.find((candidate) => candidate.name === selection.name);
-    const displayName = session ? sessionDisplayName(session) : selection.name;
-    if (session?.hostId) {
-      const host = hosts.find((candidate) => candidate.id === session.hostId);
-      return host
-        ? `${host.label} › ${displayName}`
-        : `${session.hostId} › ${displayName}`;
-    }
-    return displayName;
-  }
-  if (selection?.kind === "terminal") {
-    return terminals.find((terminal) => terminal.id === selection.id)?.label ?? selection.id;
-  }
-  return "terminal";
-}
-
-function selectedAttachLabel(
-  selection: Selection,
-  sessions: Session[],
-  terminals: PlainTerminal[],
-): string {
-  if (selection?.kind === "session") {
-    const session = sessions.find((candidate) => candidate.name === selection.name);
-    return session?.hostId ? "ssh attach" : "tmux attach";
-  }
-  if (selection?.kind === "terminal") {
-    const terminal = terminals.find((candidate) => candidate.id === selection.id);
-    return terminal?.hostId ? "ssh attach" : "zsh";
-  }
-  return "";
-}
-
 /**
  * Keeps every lazily-opened PTY mounted for the lifetime of its catalog entry.
  * Non-terminal views only hide this deck and mark its terminals inactive.
@@ -148,8 +106,6 @@ export function TerminalDeck({
   metadataPending,
   visible,
   blocked,
-  scratchCollapsed,
-  onToggleScratch,
   onOpenFile,
 }: TerminalDeckProps) {
   return (
@@ -159,31 +115,6 @@ export function TerminalDeck({
       aria-hidden={!visible}
       style={{ display: visible ? undefined : "none" }}
     >
-      <div className="pane__bar">
-        <span className="pane__title">
-          {selectedTitle(selection, sessions, terminals, hosts)}
-        </span>
-        <div className="pane__bar-actions">
-          <span className="pane__hint dim">
-            {metadataPending
-              ? "waiting for metadata"
-              : selectedAttachLabel(selection, sessions, terminals)}
-          </span>
-          <button
-            className={`brand__file-btn scratch__toggle-btn${scratchCollapsed ? "" : " brand__file-btn--active"}`}
-            type="button"
-            onClick={onToggleScratch}
-            title={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
-            aria-label={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
-          >
-            {scratchCollapsed ? (
-              <PanelRightOpen size={14} strokeWidth={1.6} aria-hidden="true" />
-            ) : (
-              <PanelRightClose size={14} strokeWidth={1.6} aria-hidden="true" />
-            )}
-          </button>
-        </div>
-      </div>
       <div className="pane__body pane__body--stack">
         {metadataPending && (
           <div className="pane__hint" data-terminal-pending role="status">

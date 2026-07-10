@@ -79,6 +79,28 @@ test("shell sidebar and inspector preferences survive versioned normalization", 
   assert.equal(migrated.inspectorTab, "diff");
 });
 
+test("scratch, pinned, and collapsed automation preferences round-trip safely", () => {
+  const migrated = migrateDashboardLayout({
+    columnOrder: ["main"],
+    scratchWidth: 412,
+    automationSectionCollapsed: true,
+    pinnedItems: [
+      { kind: "session", name: "local:repo" },
+      { kind: "terminal", id: "terminal-1" },
+      { kind: "session", name: "local:repo" },
+      { kind: "automation", id: "not-pinnable" },
+    ],
+  });
+
+  assert.equal(migrated.scratchWidth, 412);
+  assert.equal(migrated.automationSectionCollapsed, true);
+  assert.deepEqual(migrated.pinnedItems, [
+    { kind: "session", name: "local:repo" },
+    { kind: "terminal", id: "terminal-1" },
+  ]);
+  assert.equal(isDashboardLayoutV2(migrated), true);
+});
+
 test("legacy string editor paths become host-aware editor records", () => {
   const migrated = migrateDashboardLayout({
     editingFile: "/repo/README.md",

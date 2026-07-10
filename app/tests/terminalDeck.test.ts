@@ -7,6 +7,10 @@ const deckSource = readFileSync(
   new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url),
   "utf8",
 );
+const headerSource = readFileSync(
+  new URL("../src/dashboard/WorkspaceHeader.tsx", import.meta.url),
+  "utf8",
+);
 
 test("main workspace keeps TerminalDeck mounted while automation owns the visible pane", () => {
   const workspaceStart = appSource.indexOf("const centralWorkspace");
@@ -63,12 +67,12 @@ test("display none hides the deck without removing terminal components from the 
   );
 });
 
-test("scratch toggle uses the shared Lucide icon system", () => {
-  assert.match(deckSource, /import \{ PanelRightClose, PanelRightOpen \} from "lucide-react"/);
-  assert.match(deckSource, /scratchCollapsed \? \(/);
-  assert.match(deckSource, /<PanelRightOpen size=\{14\}/);
-  assert.match(deckSource, /<PanelRightClose size=\{14\}/);
-  assert.doesNotMatch(deckSource, /<svg\b|<path\b|<rect\b/);
+test("scratch toggle lives in the unified titlebar and uses Lucide icons", () => {
+  assert.match(headerSource, /TerminalSquare/);
+  assert.match(headerSource, /onClick=\{onToggleScratch\}/);
+  assert.match(headerSource, /aria-pressed=\{scratchOpen\}/);
+  assert.doesNotMatch(headerSource, /<svg\b|<path\b|<rect\b/);
+  assert.doesNotMatch(deckSource, /pane__bar|scratchCollapsed|onToggleScratch/);
 });
 
 test("hidden or blocked decks preserve PTY identity while disabling input", () => {
