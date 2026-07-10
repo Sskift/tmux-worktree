@@ -35,10 +35,12 @@ import {
   DashboardShell,
   type DashboardDrawer,
 } from "./dashboard/DashboardShell";
-import { DashboardSidebar } from "./dashboard/DashboardSidebar";
+import {
+  DashboardSidebar,
+  type SidebarView,
+} from "./dashboard/DashboardSidebar";
 import { WorkspaceHeader } from "./dashboard/WorkspaceHeader";
 import { Inspector } from "./dashboard/Inspector";
-import type { InspectorTab } from "./dashboard/inspectorModel";
 import type { WorkspaceStatus } from "./dashboard/workspaceStatus";
 import {
   clampDashboardPanelWidthForViewport,
@@ -243,7 +245,7 @@ type ViewportTier = "compact" | "drawer" | "wide";
 
 function viewportTierForWidth(width: number): ViewportTier {
   if (width >= 1440) return "wide";
-  if (width >= 1100) return "drawer";
+  if (width >= 960) return "drawer";
   return "compact";
 }
 
@@ -318,12 +320,11 @@ function App() {
     sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
     inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
   });
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1100);
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 960);
   const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth >= 1440);
-  const sidebarOpenPreferenceRef = useRef(window.innerWidth >= 1100);
+  const sidebarOpenPreferenceRef = useRef(window.innerWidth >= 960);
   const inspectorOpenPreferenceRef = useRef(window.innerWidth >= 1440);
-  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("files");
-  const [expandedInspectorTab, setExpandedInspectorTab] = useState<InspectorTab | null>(null);
+  const [sidebarView, setSidebarView] = useState<SidebarView>("workspaces");
   const [viewportTier, setViewportTier] = useState<ViewportTier>(() =>
     viewportTierForWidth(window.innerWidth),
   );
@@ -492,7 +493,7 @@ function App() {
           setSidebarOpen(true);
           setInspectorOpen(false);
         } else {
-          setSidebarOpen(sidebarOpenPreferenceRef.current);
+          setSidebarOpen(true);
           setInspectorOpen(inspectorOpenPreferenceRef.current);
         }
         return nextTier;
@@ -675,12 +676,22 @@ function App() {
         if (lay.scratchWidth !== undefined) {
           setScratchWidth(clampScratchPanelWidth(lay.scratchWidth, window.innerWidth));
         }
-        const restoredInspectorTab = lay.inspectorTab ?? (lay.diffFile ? "diff" : "files");
-        setInspectorTab(restoredInspectorTab);
+        const restoredSidebarView: SidebarView = lay.sidebarView ?? (
+          lay.fileBrowserOpen === true ||
+          (lay.inspectorOpen === true && lay.inspectorTab === "files") ||
+          lay.editingFile
+            ? "files"
+            : "workspaces"
+        );
+        setSidebarView(restoredSidebarView);
         const currentViewportTier = viewportTierForWidth(window.innerWidth);
         const restoredSidebarOpen = lay.sidebarOpen ?? true;
-        const restoredInspectorOpen = !restoredScratchOpen &&
-          (lay.inspectorOpen ?? lay.fileBrowserOpen ?? true);
+        const restoredInspectorOpen = !restoredScratchOpen && (
+          lay.sidebarView !== undefined
+            ? lay.inspectorOpen ?? false
+            : (lay.inspectorTab === "git" || lay.inspectorTab === "diff") &&
+              (lay.inspectorOpen ?? false)
+        );
         sidebarOpenPreferenceRef.current = restoredSidebarOpen;
         inspectorOpenPreferenceRef.current = restoredInspectorOpen;
         if (currentViewportTier === "compact") {
@@ -690,7 +701,7 @@ function App() {
           setSidebarOpen(true);
           setInspectorOpen(false);
         } else {
-          setSidebarOpen(restoredSidebarOpen);
+          setSidebarOpen(true);
           setInspectorOpen(restoredInspectorOpen);
         }
         if (lay.diffFile) {
@@ -774,7 +785,7 @@ function App() {
         inspectorWidth,
         sidebarOpen: sidebarOpenPreferenceRef.current,
         inspectorOpen: inspectorOpenPreferenceRef.current,
-        inspectorTab,
+        sidebarView,
         sessionOrder,
         collapsedProjects,
         pinnedItems,
@@ -782,7 +793,7 @@ function App() {
         columnOrder: DEFAULT_COLUMN_ORDER,
         scratchCollapsed,
         scratchWidth,
-        fileBrowserOpen: inspectorOpenPreferenceRef.current && inspectorTab === "files",
+        fileBrowserOpen: sidebarView === "files",
         selection,
         editingFile,
         diffFile,
@@ -795,7 +806,7 @@ function App() {
     inspectorWidth,
     sidebarOpen,
     inspectorOpen,
-    inspectorTab,
+    sidebarView,
     sessionOrder,
     collapsedProjects,
     pinnedItems,
@@ -852,7 +863,7 @@ function App() {
   const resetDashboardLayout = useCallback(async () => {
     const confirmed = await dashboardBackend.dialog.confirm({
       title: "Reset dashboard layout?",
-      message: "This restores panel widths, visibility, the Inspector tab, and the scratch panel. Your sessions and connection settings stay unchanged.",
+      message: "This restores panel widths, the Workspaces view, Git visibility, and the Scratch panel. Your sessions and connection settings stay unchanged.",
     });
     if (!confirmed) return;
 
@@ -865,8 +876,7 @@ function App() {
         sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
         inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
       };
-      setInspectorTab("files");
-      setExpandedInspectorTab(null);
+      setSidebarView("workspaces");
       setScratchCollapsed(true);
       setScratchWidth(DEFAULT_SCRATCH_PANEL_WIDTH);
       setAutomationSectionCollapsed(true);
@@ -1128,7 +1138,6 @@ function App() {
       await requestEditorNavigation(() => {
         setEditingFile(null);
         setDiffFile(null);
-        setExpandedInspectorTab(null);
         setSelection({ kind: "automation", id: automation.id });
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
@@ -1156,7 +1165,6 @@ function App() {
       await requestEditorNavigation(() => {
         setEditingFile(null);
         setDiffFile(null);
-        setExpandedInspectorTab(null);
         setSelection({ kind: "automation", id: automation.id });
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
@@ -1377,7 +1385,6 @@ function App() {
     }
     setEditingFile(null);
     setDiffFile(null);
-    setExpandedInspectorTab(null);
     setInspectorOpen(false);
     setSelection({ kind: "automation", id: "" });
   }), [
@@ -1402,7 +1409,6 @@ function App() {
       }
       return requestEditorNavigation(() => {
         setDiffFile(null);
-        setExpandedInspectorTab(null);
         setEditingFile(nextFile);
       });
     },
@@ -1593,7 +1599,6 @@ function App() {
       setSelection({ kind: "session", name });
       setEditingFile(null);
       setDiffFile(null);
-      setExpandedInspectorTab(null);
       if (viewportTier === "compact") setSidebarOpen(false);
     }),
     [requestEditorNavigation, viewportTier],
@@ -1605,7 +1610,6 @@ function App() {
       setSelection({ kind: "terminal", id });
       setEditingFile(null);
       setDiffFile(null);
-      setExpandedInspectorTab(null);
       if (viewportTier === "compact") setSidebarOpen(false);
     }),
     [requestEditorNavigation, viewportTier],
@@ -1618,7 +1622,7 @@ function App() {
           selection?.kind === "automation" ? selection.id : null,
           id,
           editingFileRef.current !== null,
-          expandedInspectorTab !== null,
+          diffFile !== null,
         )
       ) {
         if (viewportTier === "compact") setSidebarOpen(false);
@@ -1632,12 +1636,11 @@ function App() {
         setSelection({ kind: "automation", id });
         setEditingFile(null);
         setDiffFile(null);
-        setExpandedInspectorTab(null);
         setInspectorOpen(false);
         if (viewportTier === "compact") setSidebarOpen(false);
       });
     },
-    [expandedInspectorTab, requestEditorNavigation, selection, viewportTier],
+    [diffFile, requestEditorNavigation, selection, viewportTier],
   );
 
   const returnFromAutomationManager = useCallback(() => requestEditorNavigation(() => {
@@ -1655,7 +1658,6 @@ function App() {
     setSelection(validRemembered ? remembered : fallback);
     setEditingFile(null);
     setDiffFile(null);
-    setExpandedInspectorTab(null);
   }), [allTerminals, requestEditorNavigation, sessions]);
 
   const closeSession = useCallback(async (name: string) => {
@@ -1745,10 +1747,16 @@ function App() {
     return () => window.removeEventListener("keydown", handleNewWorktreeShortcut);
   }, [anyModalOpen]);
 
-  const openInspectorTab = useCallback((tab: InspectorTab) => {
+  const openFiles = useCallback(() => {
+    sidebarOpenPreferenceRef.current = true;
+    setSidebarView("files");
+    setSidebarOpen(true);
+    if (viewportTier !== "wide") setInspectorOpen(false);
+  }, [viewportTier]);
+
+  const openGit = useCallback(() => {
     setScratchCollapsed(true);
-    setInspectorTab(tab);
-    if (viewportTier === "wide") inspectorOpenPreferenceRef.current = true;
+    inspectorOpenPreferenceRef.current = true;
     setInspectorOpen(true);
     if (viewportTier === "compact") setSidebarOpen(false);
   }, [viewportTier]);
@@ -1784,6 +1792,17 @@ function App() {
 
     const navigate: CommandPaletteItem[] = [
       {
+        id: "navigate-files",
+        group: "navigate" as const,
+        label: "Open file explorer",
+        detail: "Keep the workspace tree beside the editor",
+        keywords: ["files", "tree", "explorer", "edit"],
+        disabledReason: fileBrowserRoot
+          ? undefined
+          : "Select a workspace first",
+        execute: openFiles,
+      },
+      {
         id: "navigate-git-inspector",
         group: "navigate" as const,
         label: "Open Git inspector",
@@ -1793,7 +1812,7 @@ function App() {
           selection?.kind === "session" || selection?.kind === "terminal"
             ? undefined
             : "Select a worktree or terminal first",
-        execute: () => openInspectorTab("git"),
+        execute: openGit,
       },
       ...(selection?.kind === "session" || selection?.kind === "terminal"
         ? [{
@@ -1913,8 +1932,10 @@ function App() {
     handleAutomationRun,
     handleNewAutomation,
     hosts,
+    fileBrowserRoot,
+    openFiles,
+    openGit,
     openSettings,
-    openInspectorTab,
     openedSessions,
     openedTerminals,
     selectSession,
@@ -1959,7 +1980,7 @@ function App() {
         ? "Loading terminal…"
         : editingFile
           ? basenameFromPath(editingFile.path) || editingFile.path
-          : expandedInspectorTab === "diff" && diffFile
+          : diffFile
             ? basenameFromPath(diffFile.path) || diffFile.path
             : selectedSession
               ? sessionDisplayName(selectedSession)
@@ -1976,22 +1997,10 @@ function App() {
       requestEditorNavigation(() => {
         setEditingFile(null);
         setDiffFile({ path, cwd, hostId: hostId ?? null });
-        setExpandedInspectorTab(null);
-        setInspectorTab("diff");
-        if (viewportTierForWidth(window.innerWidth) === "wide") {
-          inspectorOpenPreferenceRef.current = true;
+        if (viewportTierForWidth(window.innerWidth) !== "wide") {
+          setInspectorOpen(false);
         }
-        setInspectorOpen(true);
       }),
-    [requestEditorNavigation],
-  );
-
-  const expandInspectorView = useCallback(
-    (tab: InspectorTab) => requestEditorNavigation(() => {
-      setExpandedInspectorTab(tab);
-      setEditingFile(null);
-      setInspectorOpen(false);
-    }),
     [requestEditorNavigation],
   );
 
@@ -2035,6 +2044,9 @@ function App() {
           cwd={selectedCwd}
           sessionName={selection?.kind === "session" ? selection.name : undefined}
           hostId={selectedGitHostId}
+          active={inspectorOpen && (
+            selection?.kind === "session" || selection?.kind === "terminal"
+          )}
           onFileClick={openGitDiff}
           onBranchChange={setWorkspaceBranch}
         />
@@ -2055,7 +2067,6 @@ function App() {
           hostId={diffFile.hostId ?? null}
           onClose={() => {
             setDiffFile(null);
-            setExpandedInspectorTab(null);
           }}
         />
       </div>
@@ -2086,71 +2097,11 @@ function App() {
     />
   );
 
-  const inspectorContent = {
-    files:
-      expandedInspectorTab === "files" ? (
-        <div className="dashboard-context-empty">
-          <strong>Files expanded in workspace</strong>
-          <span>Close the expanded view to return the tree here.</span>
-        </div>
-      ) : renderFiles(),
-    git:
-      expandedInspectorTab === "git" ? (
-        <div className="dashboard-context-empty">
-          <strong>Git expanded in workspace</strong>
-        </div>
-      ) : renderGit(),
-    diff:
-      expandedInspectorTab === "diff" ? (
-        <div className="dashboard-context-empty">
-          <strong>Diff expanded in workspace</strong>
-        </div>
-      ) : renderDiff(),
-    feishu: (
-      <div className="dashboard-context-summary">
-        <strong>Feishu is not configured</strong>
-        <span>
-          Connect Feishu from Integrations Settings when the integration is available.
-        </span>
-        <button type="button" onClick={() => openSettings("integrations")}>
-          Open Integrations Settings
-        </button>
-      </div>
-    ),
-  };
-
   const terminalViewVisible =
     selectionMetadataPending ||
     (!editingFile &&
-      expandedInspectorTab === null &&
+      !diffFile &&
       (selection?.kind === "session" || selection?.kind === "terminal"));
-
-  const renderExpandedView = (label: string, content: React.ReactNode) => (
-    <div className="dashboard-workspace__expanded">
-      <div className="dashboard-expanded-toolbar">
-        <strong>{label}</strong>
-        <button
-          type="button"
-          onClick={() => {
-            void requestEditorNavigation(() => {
-              setExpandedInspectorTab(null);
-              if (
-                viewportTierForWidth(window.innerWidth) === "wide" &&
-                inspectorOpenPreferenceRef.current
-              ) {
-                setInspectorOpen(true);
-              }
-            });
-          }}
-          aria-label={"Close expanded " + label + " view"}
-        >
-          <X aria-hidden="true" size={14} strokeWidth={1.8} />
-          <span>Back to terminal</span>
-        </button>
-      </div>
-      <div className="dashboard-expanded-content">{content}</div>
-    </div>
-  );
 
   const centralWorkspace = (
     <div
@@ -2185,12 +2136,10 @@ function App() {
               onDirtyChange={handleEditorDirtyChange}
             />
           </div>
-        ) : expandedInspectorTab === "files" ? (
-          renderExpandedView("Files", renderFiles())
-        ) : expandedInspectorTab === "git" ? (
-          renderExpandedView("Git", renderGit())
-        ) : expandedInspectorTab === "diff" ? (
-          renderExpandedView("Diff", renderDiff())
+        ) : diffFile ? (
+          <div className="dashboard-workspace__editor">
+            {renderDiff()}
+          </div>
         ) : selection?.kind === "automation" ? (
           <div className="dashboard-workspace__expanded">
             <div className="dashboard-expanded-toolbar">
@@ -2477,13 +2426,18 @@ function App() {
           windowTitlebar
           sidebarDrawer={viewportTier === "compact"}
           scratchOpen={!scratchCollapsed}
-          gitActive={inspectorOpen && inspectorTab === "git"}
+          filesActive={sidebarOpen && sidebarView === "files"}
+          filesAvailable={Boolean(fileBrowserRoot)}
+          gitActive={inspectorOpen}
           gitAvailable={selection?.kind === "session" || selection?.kind === "terminal"}
           onOpenSidebar={() => {
+            sidebarOpenPreferenceRef.current = true;
+            setSidebarView("workspaces");
             setInspectorOpen(false);
             setSidebarOpen(true);
           }}
-          onOpenGit={() => openInspectorTab("git")}
+          onOpenFiles={openFiles}
+          onOpenGit={openGit}
           onToggleScratch={() => {
             if (scratchCollapsed) openScratch();
             else setScratchCollapsed(true);
@@ -2516,6 +2470,14 @@ function App() {
           terminalsError={terminalPersistenceError}
           automationsError={automationError}
           settingsButtonRef={settingsTriggerRef}
+          activeView={sidebarView}
+          filesContent={renderFiles()}
+          onViewChange={(view) => {
+            sidebarOpenPreferenceRef.current = true;
+            setSidebarView(view);
+            setSidebarOpen(true);
+            if (viewportTier === "compact") setInspectorOpen(false);
+          }}
           onCreateWorktree={() => setShowNewWorktree(true)}
           onCreateTerminal={() => setShowNewTerminal(true)}
           onOpenCommandPalette={() => setCommandPaletteOpen(true)}
@@ -2541,20 +2503,10 @@ function App() {
       workspace={centralWorkspace}
       inspector={
         <Inspector
-          activeTab={inspectorTab}
-          content={inspectorContent}
-          badges={{
-            diff: diffFile ? 1 : null,
-          }}
-          onTabChange={(tab) => {
-            openInspectorTab(tab);
-          }}
+          content={renderGit()}
           onClose={() => {
-            if (viewportTier === "wide") inspectorOpenPreferenceRef.current = false;
+            inspectorOpenPreferenceRef.current = false;
             setInspectorOpen(false);
-          }}
-          onExpand={(tab) => {
-            void expandInspectorView(tab);
           }}
         />
       }

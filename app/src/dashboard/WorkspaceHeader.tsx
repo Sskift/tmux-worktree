@@ -1,4 +1,4 @@
-import { GitBranch, PanelLeftOpen, TerminalSquare } from "lucide-react";
+import { Files, GitBranch, PanelLeftOpen, TerminalSquare } from "lucide-react";
 import productIcon from "../../src-tauri/icons/128x128.png";
 import type { WorkspaceStatus } from "./workspaceStatus";
 import { workspaceStatusLabel } from "./workspaceStatus";
@@ -14,9 +14,12 @@ export type WorkspaceHeaderProps = {
   windowTitlebar?: boolean;
   sidebarDrawer?: boolean;
   scratchOpen: boolean;
+  filesActive?: boolean;
+  filesAvailable?: boolean;
   gitActive?: boolean;
   gitAvailable?: boolean;
   onOpenSidebar?: () => void;
+  onOpenFiles?: () => void;
   onToggleScratch: () => void;
   onOpenGit?: () => void;
 };
@@ -31,9 +34,12 @@ export function WorkspaceHeader({
   windowTitlebar = false,
   sidebarDrawer = false,
   scratchOpen,
+  filesActive = false,
+  filesAvailable = true,
   gitActive = false,
   gitAvailable = true,
   onOpenSidebar,
+  onOpenFiles,
   onToggleScratch,
   onOpenGit,
 }: WorkspaceHeaderProps) {
@@ -102,6 +108,19 @@ export function WorkspaceHeader({
         </div>
 
         <div className="workspace-header__actions">
+          {onOpenFiles && (
+            <button
+              className="workspace-header__action"
+              type="button"
+              onClick={onOpenFiles}
+              aria-pressed={filesActive}
+              disabled={!filesAvailable}
+              title={filesAvailable ? "Open file explorer" : "Select a workspace to browse files"}
+            >
+              <Files aria-hidden="true" size={16} strokeWidth={1.7} />
+              <span>Files</span>
+            </button>
+          )}
           {onOpenGit && (
             <button
               className="workspace-header__action"

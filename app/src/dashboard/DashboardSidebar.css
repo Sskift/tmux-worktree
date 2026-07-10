@@ -24,6 +24,92 @@
   outline-offset: -2px;
 }
 
+.tw-dashboard-sidebar__view-tabs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+  padding: 8px;
+  border-block-end: 1px solid var(--shell-border);
+}
+
+.tw-dashboard-sidebar__view-tab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 0;
+  min-block-size: 32px;
+  gap: 7px;
+  padding: 0 10px;
+  border: 1px solid transparent;
+  border-radius: var(--shell-radius-md);
+  color: var(--shell-text-muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 550;
+}
+
+.tw-dashboard-sidebar__view-tab:hover {
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-1);
+}
+
+.tw-dashboard-sidebar__view-tab[aria-selected="true"] {
+  border-color: var(--shell-border);
+  color: var(--shell-text);
+  background: var(--shell-surface-3);
+}
+
+.tw-dashboard-sidebar__view-tab > span {
+  min-inline-size: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tw-dashboard-sidebar__views,
+.tw-dashboard-sidebar__view {
+  min-inline-size: 0;
+  min-block-size: 0;
+  overflow: hidden;
+}
+
+.tw-dashboard-sidebar__views {
+  display: grid;
+}
+
+.tw-dashboard-sidebar__view {
+  grid-area: 1 / 1;
+}
+
+.tw-dashboard-sidebar__view[hidden] {
+  display: none;
+}
+
+.tw-dashboard-sidebar__view--workspaces {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.tw-dashboard-sidebar__view--files,
+.tw-dashboard-sidebar__files-content {
+  display: flex;
+  flex-direction: column;
+}
+
+.tw-dashboard-sidebar__files-content {
+  flex: 1;
+  min-inline-size: 0;
+  min-block-size: 0;
+  overflow: hidden;
+}
+
+.tw-dashboard-sidebar__files-content > * {
+  flex: 1;
+  min-inline-size: 0;
+  min-block-size: 0;
+}
+
 .tw-dashboard-sidebar__actions {
   display: grid;
   gap: 10px;
@@ -541,7 +627,7 @@
   }
 }
 
-@media (max-width: 1099px) {
+@media (max-width: 959px) {
   .tw-dashboard-sidebar {
     max-inline-size: none;
     box-shadow: var(--shell-shadow-float);

@@ -42,7 +42,7 @@ test("workspace header responds to its center track instead of the window", () =
   assert.doesNotMatch(headerCss, /@media \(max-width: 1279px\)/);
 });
 
-test("constrained headers preserve the product and primary actions", () => {
+test("Files, Git, and Scratch are independent primary actions", () => {
   assert.match(
     header,
     /branch && <span className="workspace-header__detail">/,
@@ -60,6 +60,9 @@ test("constrained headers preserve the product and primary actions", () => {
     /@container workspace-header \(max-width: 660px\)[\s\S]*?\.workspace-header__action span\s*\{[\s\S]*?display:\s*none/,
   );
   assert.match(headerCss, /@container workspace-header \(max-width: 500px\)/);
+  assert.match(header, /aria-pressed=\{filesActive\}/);
+  assert.match(header, /title=\{filesAvailable \? "Open file explorer"/);
+  assert.match(header, />Files<\/span>/);
   assert.match(header, />Scratch<\/span>/);
   assert.match(header, />Git<\/span>/);
   assert.doesNotMatch(header, />Inspector<\/span>/);

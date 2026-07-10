@@ -11,6 +11,7 @@ type Props = {
   cwd: string | null;
   sessionName?: string;
   hostId?: string | null;
+  active?: boolean;
   onFileClick?: (filePath: string, cwd: string, hostId?: string | null) => void;
   onBranchChange?: (branch: string | null) => void;
 };
@@ -67,6 +68,7 @@ export function GitStatusPanel({
   cwd,
   sessionName,
   hostId,
+  active = true,
   onFileClick,
   onBranchChange,
 }: Props) {
@@ -168,14 +170,15 @@ export function GitStatusPanel({
   }, [dashboardBackend.git]);
 
   useVisibilityAwarePolling(triggerProjectFetch, {
+    enabled: active,
     visibleIntervalMs: PROJECT_FETCH_MS,
     hiddenIntervalMs: HIDDEN_PROJECT_FETCH_MS,
   });
   useVisibilityAwarePolling(refresh, {
-    enabled: !!cwd || !!sessionName,
+    enabled: active && (!!cwd || !!sessionName),
     visibleIntervalMs: REFRESH_MS,
     hiddenIntervalMs: HIDDEN_REFRESH_MS,
-    refreshKey: `${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}`,
+    refreshKey: `${active}\0${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}`,
   });
 
   const currentResult: GitPanelResult = result.sourceKey === sourceKey

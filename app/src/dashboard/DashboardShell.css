@@ -2,6 +2,7 @@
 
 .tw-shell {
   --tw-sidebar-width: 280px;
+  --tw-sidebar-track: var(--tw-sidebar-width);
   --tw-inspector-width: 420px;
   --tw-inspector-track: var(--tw-inspector-width);
 
@@ -81,7 +82,7 @@
   position: relative;
   display: grid;
   grid-template-columns:
-    var(--tw-sidebar-width)
+    var(--tw-sidebar-track)
     minmax(640px, 1fr)
     var(--tw-inspector-track);
   width: 100%;
@@ -182,7 +183,7 @@
 }
 
 .tw-shell__resize-handle--sidebar {
-  left: calc(var(--tw-sidebar-width) - 4px);
+  left: calc(var(--tw-sidebar-track) - 4px);
 }
 
 .tw-shell__resize-handle--inspector {
@@ -232,7 +233,7 @@ body[data-dashboard-resizing] .tw-shell__body {
   }
 
   .tw-shell__body {
-    grid-template-columns: var(--tw-sidebar-width) minmax(640px, 1fr);
+    grid-template-columns: var(--tw-sidebar-track) minmax(640px, 1fr);
   }
 
   .tw-shell__inspector {
@@ -268,7 +269,13 @@ body[data-dashboard-resizing] .tw-shell__body {
   }
 }
 
-@media (max-width: 1099px) {
+@media (min-width: 960px) and (max-width: 1439px) {
+  .tw-shell {
+    --tw-sidebar-track: min(var(--tw-sidebar-width), calc(100vw - 640px));
+  }
+}
+
+@media (max-width: 959px) {
   .tw-shell__body {
     grid-template-columns: minmax(0, 1fr);
   }

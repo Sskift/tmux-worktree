@@ -210,6 +210,40 @@ test("sidebar source uses the icon library and responsive accessible styling", (
   assert.match(css, /font-size:\s*13px/);
   assert.match(css, /font-size:\s*11px/);
   assert.match(css, /button:focus-visible/);
-  assert.match(css, /@media \(max-width:\s*1099px\)/);
+  assert.match(css, /@media \(max-width:\s*959px\)/);
   assert.match(css, /@media \(prefers-reduced-motion:\s*reduce\)/);
+});
+
+test("sidebar keeps independent Workspaces and Files views mounted around a shared footer", () => {
+  const source = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
+  const css = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.css", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /export type \{ SidebarView \} from "\.\/layoutPreferences"/);
+  assert.match(source, /activeView: SidebarView/);
+  assert.match(source, /filesContent: ReactNode/);
+  assert.match(source, /onViewChange: \(view: SidebarView\) => void/);
+  assert.match(source, /role="tablist" aria-label="Sidebar view"/);
+  assert.match(source, />Workspaces</);
+  assert.match(source, />Files</);
+  assert.match(source, /onViewChange\("workspaces"\)/);
+  assert.match(source, /onViewChange\("files"\)/);
+  assert.match(source, /event\.key === "ArrowLeft" \|\| event\.key === "ArrowRight"/);
+  assert.match(source, /event\.key === "Home"/);
+  assert.match(source, /event\.key === "End"/);
+  assert.match(source, /viewTabRefs\.current\.get\(next\)\?\.focus\(\)/);
+  assert.equal(source.match(/role="tabpanel"/g)?.length, 2);
+  assert.equal(source.match(/\n\s+hidden=\{activeView !==/g)?.length, 2);
+  assert.equal(source.match(/inert=\{activeView !==/g)?.length, 2);
+  assert.equal(source.match(/aria-hidden=\{activeView !==/g)?.length, 2);
+  assert.match(source, /tw-dashboard-sidebar__files-content[\s\S]*\{filesContent\}/);
+  assert.equal(source.match(/<footer className="tw-dashboard-sidebar__footer">/g)?.length, 1);
+  assert.match(css, /\.tw-dashboard-sidebar__view\[hidden\]\s*\{[\s\S]*?display:\s*none/);
+  assert.match(css, /\.tw-dashboard-sidebar__view--workspaces\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0, 1fr\)/);
+  assert.match(css, /\.tw-dashboard-sidebar__files-content\s*\{[\s\S]*?flex:\s*1/);
 });

@@ -38,6 +38,29 @@ test("wide panel combinations always preserve a 640px workspace", () => {
   });
 });
 
+test("the docked sidebar preserves 640px from the native 960px minimum", () => {
+  assert.equal(
+    clampDashboardPanelWidthForViewport("sidebar", 360, 960, 480),
+    320,
+  );
+  assert.equal(
+    clampDashboardPanelWidthForViewport("sidebar", 360, 980, 480),
+    340,
+  );
+  assert.equal(
+    clampDashboardPanelWidthForViewport("sidebar", 360, 1000, 480),
+    360,
+  );
+  assert.deepEqual(normalizeDashboardPanelWidths(960, 360, 480), {
+    sidebarWidth: 320,
+    inspectorWidth: 480,
+  });
+  assert.deepEqual(normalizeDashboardPanelWidths(959, 360, 480), {
+    sidebarWidth: 360,
+    inspectorWidth: 480,
+  });
+});
+
 test("pointer resizing follows the physical edge for each panel", () => {
   assert.equal(dashboardPanelWidthFromPointer("sidebar", 280, 24), 304);
   assert.equal(dashboardPanelWidthFromPointer("inspector", 420, -24), 444);

@@ -187,8 +187,8 @@ test("App guards every editor-destructive routing entry point", () => {
   assert.match(app, /const selectTerminal = useCallback[\s\S]*?requestEditorNavigation/);
   assert.match(app, /const selectAutomation = useCallback[\s\S]*?requestEditorNavigation/);
   assert.match(app, /const openGitDiff = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const expandInspectorView = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const renderExpandedView[\s\S]*?requestEditorNavigation[\s\S]*?Back to terminal/);
+  assert.doesNotMatch(app, /expandInspectorView|renderExpandedView/);
+  assert.match(app, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
   assert.match(app, /onDirtyChange=\{handleEditorDirtyChange\}/);
   assert.match(app, /onDirtyChange=\{handleAutomationDirtyChange\}/);
   assert.match(app, /onNew=\{handleNewAutomation\}/);

@@ -30,6 +30,7 @@ export type DiffFile = {
 };
 
 export type LayoutColumn = "file" | "main" | "scratch" | "editor";
+export type SidebarView = "workspaces" | "files";
 export type PersistedInspectorTab = "files" | "git" | "diff" | "feishu";
 
 export const DEFAULT_COLUMN_ORDER: LayoutColumn[] = [
@@ -58,6 +59,7 @@ export type DashboardLayoutPreferences = {
   sidebarWidth?: number;
   inspectorWidth?: number;
   sidebarOpen?: boolean;
+  sidebarView?: SidebarView;
   inspectorOpen?: boolean;
   inspectorTab?: PersistedInspectorTab;
   selection?: Selection;
@@ -160,6 +162,10 @@ function isInspectorTab(value: unknown): value is PersistedInspectorTab {
   );
 }
 
+function isSidebarView(value: unknown): value is SidebarView {
+  return value === "workspaces" || value === "files";
+}
+
 export function normalizeColumnOrder(value: unknown): LayoutColumn[] {
   const seen = new Set<LayoutColumn>();
   const restored = Array.isArray(value)
@@ -215,6 +221,7 @@ export function isDashboardLayoutV2(value: unknown): value is DashboardLayoutV2 
     optionalField(value, "sidebarWidth", isPositiveFiniteNumber) &&
     optionalField(value, "inspectorWidth", isPositiveFiniteNumber) &&
     optionalField(value, "sidebarOpen", (field) => typeof field === "boolean") &&
+    optionalField(value, "sidebarView", isSidebarView) &&
     optionalField(value, "inspectorOpen", (field) => typeof field === "boolean") &&
     optionalField(value, "inspectorTab", isInspectorTab) &&
     optionalField(value, "selection", isSelection) &&
@@ -276,6 +283,7 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
     normalized.fileBrowserOpen = source.fileBrowserOpen;
   }
   if (typeof source.sidebarOpen === "boolean") normalized.sidebarOpen = source.sidebarOpen;
+  if (isSidebarView(source.sidebarView)) normalized.sidebarView = source.sidebarView;
   if (typeof source.inspectorOpen === "boolean") normalized.inspectorOpen = source.inspectorOpen;
   if (isInspectorTab(source.inspectorTab)) normalized.inspectorTab = source.inspectorTab;
   if (isSelection(source.selection)) normalized.selection = source.selection;

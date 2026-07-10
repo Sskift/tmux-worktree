@@ -1,6 +1,7 @@
 export type ResizablePanel = "sidebar" | "inspector";
 
 export const DASHBOARD_WIDE_BREAKPOINT = 1440;
+export const DASHBOARD_SIDEBAR_DOCK_BREAKPOINT = 960;
 export const DASHBOARD_MIN_WORKSPACE_WIDTH = 640;
 
 export const DASHBOARD_PANEL_LIMITS: Record<ResizablePanel, { min: number; max: number }> = {
@@ -13,6 +14,17 @@ export function clampDashboardPanelWidth(panel: ResizablePanel, width: number): 
   return Math.round(Math.max(limits.min, Math.min(limits.max, width)));
 }
 
+function clampSidebarWidthForViewport(width: number, viewportWidth: number): number {
+  const normalized = clampDashboardPanelWidth("sidebar", width);
+  if (
+    viewportWidth < DASHBOARD_SIDEBAR_DOCK_BREAKPOINT ||
+    viewportWidth >= DASHBOARD_WIDE_BREAKPOINT
+  ) {
+    return normalized;
+  }
+  return Math.min(normalized, viewportWidth - DASHBOARD_MIN_WORKSPACE_WIDTH);
+}
+
 export function clampDashboardPanelWidthForViewport(
   panel: ResizablePanel,
   requestedWidth: number,
@@ -20,7 +32,11 @@ export function clampDashboardPanelWidthForViewport(
   otherPanelWidth: number,
 ): number {
   const normalized = clampDashboardPanelWidth(panel, requestedWidth);
-  if (viewportWidth < DASHBOARD_WIDE_BREAKPOINT) return normalized;
+  if (viewportWidth < DASHBOARD_WIDE_BREAKPOINT) {
+    return panel === "sidebar"
+      ? clampSidebarWidthForViewport(normalized, viewportWidth)
+      : normalized;
+  }
 
   const otherPanel: ResizablePanel = panel === "sidebar" ? "inspector" : "sidebar";
   const normalizedOther = clampDashboardPanelWidth(otherPanel, otherPanelWidth);
@@ -39,6 +55,7 @@ export function normalizeDashboardPanelWidths(
   let sidebar = clampDashboardPanelWidth("sidebar", sidebarWidth);
   let inspector = clampDashboardPanelWidth("inspector", inspectorWidth);
   if (viewportWidth < DASHBOARD_WIDE_BREAKPOINT) {
+    sidebar = clampSidebarWidthForViewport(sidebar, viewportWidth);
     return { sidebarWidth: sidebar, inspectorWidth: inspector };
   }
 

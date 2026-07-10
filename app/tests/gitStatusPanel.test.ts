@@ -8,6 +8,7 @@ test("GitStatusPanel periodically triggers project root fetches", () => {
   assert.match(source, /PROJECT_FETCH_MS\s*=\s*5\s*\*\s*60_000/);
   assert.match(source, /dashboardBackend\.git\.fetchProjectRoots\(\)/);
   assert.match(source, /useVisibilityAwarePolling\(triggerProjectFetch, \{/);
+  assert.match(source, /enabled: active/);
   assert.match(source, /visibleIntervalMs: PROJECT_FETCH_MS/);
   assert.match(source, /hiddenIntervalMs: HIDDEN_PROJECT_FETCH_MS/);
   assert.doesNotMatch(source, /setInterval\(/);
@@ -36,9 +37,11 @@ test("remote git status passes host identity through git commands", () => {
     /diff: \(cwd, path, hostId\) =>\s*transport\.invoke<string>\("git_diff", \{ cwd, path, hostId: hostId \?\? null \}\)/s,
   );
   assert.match(app, /hostId=\{selectedGitHostId\}/);
+  assert.match(app, /active=\{inspectorOpen && \(/);
   assert.match(app, /const openGitDiff = useCallback/);
   assert.match(app, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
-  assert.match(app, /setInspectorTab\("diff"\)/);
+  assert.match(app, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.doesNotMatch(app, /setInspectorTab\("diff"\)/);
 });
 
 test("changed files use native buttons so keyboard activation opens the diff", () => {

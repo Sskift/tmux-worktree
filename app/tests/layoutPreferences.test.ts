@@ -66,6 +66,7 @@ test("shell sidebar and inspector preferences survive versioned normalization", 
     sidebarWidth: 296,
     inspectorWidth: 448,
     sidebarOpen: true,
+    sidebarView: "files",
     inspectorOpen: false,
     inspectorTab: "diff",
     columnOrder: ["main"],
@@ -75,8 +76,22 @@ test("shell sidebar and inspector preferences survive versioned normalization", 
   assert.equal(migrated.sidebarWidth, 296);
   assert.equal(migrated.inspectorWidth, 448);
   assert.equal(migrated.sidebarOpen, true);
+  assert.equal(migrated.sidebarView, "files");
   assert.equal(migrated.inspectorOpen, false);
   assert.equal(migrated.inspectorTab, "diff");
+});
+
+test("legacy files inspector state remains readable during sidebar migration", () => {
+  const migrated = migrateDashboardLayout({
+    columnOrder: ["main"],
+    inspectorOpen: true,
+    inspectorTab: "files",
+  });
+
+  assert.equal(migrated.inspectorOpen, true);
+  assert.equal(migrated.inspectorTab, "files");
+  assert.equal(migrated.sidebarView, undefined);
+  assert.equal(isDashboardLayoutV2(migrated), true);
 });
 
 test("scratch, pinned, and collapsed automation preferences round-trip safely", () => {
@@ -125,6 +140,7 @@ test("bad fields fall back safely without throwing or contaminating valid fields
       collapsedProjects: ["project", "", false],
       columnOrder: ["main", "main", "unknown"],
       scratchCollapsed: "yes",
+      sidebarView: "git",
       fileBrowserOpen: false,
       fileTreeWidth: -1,
       editorWidth: {},

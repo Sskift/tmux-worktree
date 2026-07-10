@@ -8,6 +8,7 @@ import { useEffect, useRef } from "react";
 import {
   DASHBOARD_PANEL_LIMITS,
   clampDashboardPanelWidth,
+  clampDashboardPanelWidthForViewport,
   dashboardPanelWidthFromKey,
   dashboardPanelWidthFromPointer,
   type ResizablePanel,
@@ -76,6 +77,12 @@ export function DashboardShell({
 }: DashboardShellProps) {
   const normalizedSidebarWidth = clampDashboardPanelWidth("sidebar", sidebarWidth);
   const normalizedInspectorWidth = clampDashboardPanelWidth("inspector", inspectorWidth);
+  const sidebarMaximumWidth = clampDashboardPanelWidthForViewport(
+    "sidebar",
+    DASHBOARD_PANEL_LIMITS.sidebar.max,
+    window.innerWidth,
+    normalizedInspectorWidth,
+  );
   const style: ShellStyle = {
     "--tw-sidebar-width": `${normalizedSidebarWidth}px`,
     "--tw-inspector-width": `${normalizedInspectorWidth}px`,
@@ -241,7 +248,7 @@ export function DashboardShell({
             aria-controls="dashboard-sidebar"
             aria-orientation="vertical"
             aria-valuemin={DASHBOARD_PANEL_LIMITS.sidebar.min}
-            aria-valuemax={DASHBOARD_PANEL_LIMITS.sidebar.max}
+            aria-valuemax={sidebarMaximumWidth}
             aria-valuenow={normalizedSidebarWidth}
             disabled={activeDrawer !== null || blocked}
             onPointerDown={startResize("sidebar", normalizedSidebarWidth, onSidebarWidthChange)}

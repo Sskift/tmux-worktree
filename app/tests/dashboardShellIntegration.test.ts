@@ -21,14 +21,18 @@ test("App renders the planned shell without legacy arbitrary columns", () => {
   assert.doesNotMatch(app, /sidebar__git|remote-popover|>\+ host</);
 });
 
-test("responsive shell keeps a 640px workspace and converts panels to drawers", () => {
+test("responsive shell docks the sidebar from 960px and keeps a 640px workspace", () => {
   assert.match(app, /if \(width >= 1440\) return "wide"/);
-  assert.match(app, /if \(width >= 1100\) return "drawer"/);
+  assert.match(app, /if \(width >= 960\) return "drawer"/);
   assert.match(app, /setSidebarOpen\(false\);\s*setInspectorOpen\(false\)/);
   assert.match(shellCss, /minmax\(640px, 1fr\)/);
   assert.match(shellCss, /@media \(max-width: 1439px\)/);
-  assert.match(shellCss, /@media \(max-width: 1099px\)/);
+  assert.match(shellCss, /@media \(min-width: 960px\) and \(max-width: 1439px\)/);
+  assert.match(shellCss, /calc\(100vw - 640px\)/);
+  assert.match(shellCss, /@media \(max-width: 959px\)/);
   assert.match(shell, /onDismissDrawers/);
+  assert.match(shell, /aria-valuemax=\{sidebarMaximumWidth\}/);
+  assert.match(shell, /clampDashboardPanelWidthForViewport\(/);
 });
 
 test("responsive drawers isolate terminal input and manage keyboard focus", () => {
@@ -58,17 +62,26 @@ test("panel resize feedback stays smooth without escaping modal drawer layering"
   );
 });
 
-test("real files and Git state route through inspector without losing host identity", () => {
+test("Files stay beside the editor while Git routes diffs into the workspace", () => {
   assert.match(app, /hostId=\{selectedGitHostId\}/);
   assert.match(app, /onFileSelect=\{\(path, hostId\) =>/);
   assert.match(app, /handleOpenFile\(path, undefined, undefined, hostId\)/);
-  assert.match(app, /setInspectorTab\("diff"\)/);
-  assert.match(app, /Back to terminal/);
+  assert.match(app, /activeView=\{sidebarView\}/);
+  assert.match(app, /filesContent=\{renderFiles\(\)\}/);
+  assert.match(app, /lay\.fileBrowserOpen === true \|\|[\s\S]*?lay\.inspectorOpen === true && lay\.inspectorTab === "files"/);
+  assert.match(app, /const openFiles = useCallback[\s\S]*?viewportTier !== "wide"[\s\S]*?setInspectorOpen\(false\)/);
+  assert.match(app, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
+  assert.match(app, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.doesNotMatch(app, /setInspectorTab\("diff"\)/);
 });
 
-test("Feishu state is honest and settings overlays block but do not unmount terminals", () => {
-  assert.match(app, /Feishu is not configured/);
-  assert.match(app, /openSettings\("integrations"\)/);
+test("unfinished integrations stay out of Git while overlays keep terminals mounted", () => {
+  const settings = readFileSync(
+    new URL("../src/dashboard/Settings/SettingsDialog.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.doesNotMatch(app, /Feishu is not configured/);
+  assert.match(settings, /label: "Integrations"/);
   assert.match(app, /blocked=\{anyModalOpen\}/);
   assert.equal(app.match(/<TerminalDeck\b/g)?.length, 1);
   assert.match(app, /event\.key\.toLowerCase\(\) !== "n"/);
@@ -80,9 +93,9 @@ test("destructive sidebar and automation actions require confirmation", () => {
   assert.match(app, /title: "Delete automation\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?automations\.delete/);
 });
 
-test("expanded inspector views and the Automation manager have a workspace return path", () => {
+test("Git is a focused side panel and Automation keeps a workspace return path", () => {
   assert.match(app, /selection\?\.kind === "automation"[\s\S]*?>Back to workspace</);
   assert.match(app, /returnFromAutomationManager/);
-  assert.match(app, /Back to terminal/);
-  assert.doesNotMatch(app, /renderExpandedView\("Automation"/);
+  assert.match(app, /<Inspector\s+content=\{renderGit\(\)\}/);
+  assert.doesNotMatch(app, /inspectorContent|expandedInspectorTab|renderExpandedView/);
 });

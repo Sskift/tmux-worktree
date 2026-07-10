@@ -2,7 +2,9 @@ import {
   ChevronRight,
   Circle,
   Download,
+  Files,
   FolderGit2,
+  LayoutDashboard,
   Laptop,
   LoaderCircle,
   Pin,
@@ -14,11 +16,17 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import { useMemo, type Ref } from "react";
+import {
+  useMemo,
+  useRef,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+  type Ref,
+} from "react";
 import { triggerLabel, type Automation } from "../automationTypes";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../platform";
 import type { SessionActivityInfo } from "../sessionActivity";
-import type { PinnedItem, Selection } from "./layoutPreferences";
+import type { PinnedItem, Selection, SidebarView } from "./layoutPreferences";
 import {
   describeSidebarActivity,
   groupSessionsByHostProject,
@@ -37,6 +45,8 @@ export type {
   SidebarConnectionTone,
   SidebarSessionGroup,
 } from "./DashboardSidebarModel";
+
+export type { SidebarView } from "./layoutPreferences";
 
 export type DashboardSidebarProps = {
   sessions: readonly Session[];
@@ -64,6 +74,9 @@ export type DashboardSidebarProps = {
   automationsError?: string | null;
   className?: string;
   settingsButtonRef?: Ref<HTMLButtonElement>;
+  activeView: SidebarView;
+  filesContent: ReactNode;
+  onViewChange: (view: SidebarView) => void;
   onCreateWorktree: () => void;
   onCreateTerminal: () => void;
   onOpenCommandPalette: () => void;
@@ -155,6 +168,9 @@ export function DashboardSidebar({
   automationsError,
   className,
   settingsButtonRef,
+  activeView,
+  filesContent,
+  onViewChange,
   onCreateWorktree,
   onCreateTerminal,
   onOpenCommandPalette,
@@ -221,34 +237,100 @@ export function DashboardSidebar({
     const terminal = terminals.find((candidate) => candidate.id === item.id);
     return terminal ? [{ kind: "terminal", item, terminal }] : [];
   });
+  const viewTabRefs = useRef(new Map<SidebarView, HTMLButtonElement>());
+  const handleViewTabKeyDown = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    current: SidebarView,
+  ) => {
+    const next = event.key === "Home"
+      ? "workspaces"
+      : event.key === "End"
+        ? "files"
+        : event.key === "ArrowLeft" || event.key === "ArrowRight"
+          ? current === "workspaces" ? "files" : "workspaces"
+          : null;
+    if (!next) return;
+    event.preventDefault();
+    if (next !== current) onViewChange(next);
+    viewTabRefs.current.get(next)?.focus();
+  };
 
   return (
     <div className={rootClassName} aria-label="Dashboard sidebar">
-      <div className="tw-dashboard-sidebar__actions">
+      <div className="tw-dashboard-sidebar__view-tabs" role="tablist" aria-label="Sidebar view">
         <button
-          className="tw-dashboard-sidebar__new-worktree"
+          id="tw-sidebar-workspaces-tab"
+          ref={(node) => {
+            if (node) viewTabRefs.current.set("workspaces", node);
+            else viewTabRefs.current.delete("workspaces");
+          }}
+          className="tw-dashboard-sidebar__view-tab"
           type="button"
-          onClick={onCreateWorktree}
+          role="tab"
+          aria-controls="tw-sidebar-workspaces-panel"
+          aria-selected={activeView === "workspaces"}
+          tabIndex={activeView === "workspaces" ? 0 : -1}
+          onClick={() => onViewChange("workspaces")}
+          onKeyDown={(event) => handleViewTabKeyDown(event, "workspaces")}
         >
-          <Plus aria-hidden="true" size={17} strokeWidth={2.2} />
-          <span>New worktree</span>
-          <kbd aria-label="Command N">⌘N</kbd>
+          <LayoutDashboard aria-hidden="true" size={14} strokeWidth={1.8} />
+          <span>Workspaces</span>
         </button>
-
         <button
-          className="tw-dashboard-sidebar__search"
+          id="tw-sidebar-files-tab"
+          ref={(node) => {
+            if (node) viewTabRefs.current.set("files", node);
+            else viewTabRefs.current.delete("files");
+          }}
+          className="tw-dashboard-sidebar__view-tab"
           type="button"
-          onClick={onOpenCommandPalette}
-          aria-label="Search sessions and commands"
-          title="Search sessions and commands (⌘K)"
+          role="tab"
+          aria-controls="tw-sidebar-files-panel"
+          aria-selected={activeView === "files"}
+          tabIndex={activeView === "files" ? 0 : -1}
+          onClick={() => onViewChange("files")}
+          onKeyDown={(event) => handleViewTabKeyDown(event, "files")}
         >
-          <Search aria-hidden="true" size={15} strokeWidth={1.8} />
-          <span>Search sessions and commands…</span>
-          <kbd aria-label="Command K">⌘K</kbd>
+          <Files aria-hidden="true" size={14} strokeWidth={1.8} />
+          <span>Files</span>
         </button>
       </div>
 
-      <div className="tw-dashboard-sidebar__scroll-region">
+      <div className="tw-dashboard-sidebar__views">
+        <section
+          id="tw-sidebar-workspaces-panel"
+          className="tw-dashboard-sidebar__view tw-dashboard-sidebar__view--workspaces"
+          role="tabpanel"
+          aria-labelledby="tw-sidebar-workspaces-tab"
+          aria-hidden={activeView !== "workspaces"}
+          hidden={activeView !== "workspaces"}
+          inert={activeView !== "workspaces"}
+        >
+          <div className="tw-dashboard-sidebar__actions">
+            <button
+              className="tw-dashboard-sidebar__new-worktree"
+              type="button"
+              onClick={onCreateWorktree}
+            >
+              <Plus aria-hidden="true" size={17} strokeWidth={2.2} />
+              <span>New worktree</span>
+              <kbd aria-label="Command N">⌘N</kbd>
+            </button>
+
+            <button
+              className="tw-dashboard-sidebar__search"
+              type="button"
+              onClick={onOpenCommandPalette}
+              aria-label="Search sessions and commands"
+              title="Search sessions and commands (⌘K)"
+            >
+              <Search aria-hidden="true" size={15} strokeWidth={1.8} />
+              <span>Search sessions and commands…</span>
+              <kbd aria-label="Command K">⌘K</kbd>
+            </button>
+          </div>
+
+          <div className="tw-dashboard-sidebar__scroll-region">
         <section className="tw-sidebar-section" aria-labelledby="tw-sidebar-pinned-heading">
           <div className="tw-sidebar-section__heading">
             <Pin aria-hidden="true" size={13} strokeWidth={1.8} />
@@ -560,6 +642,22 @@ export function DashboardSidebar({
               );
             })}
           </nav>}
+        </section>
+          </div>
+        </section>
+
+        <section
+          id="tw-sidebar-files-panel"
+          className="tw-dashboard-sidebar__view tw-dashboard-sidebar__view--files"
+          role="tabpanel"
+          aria-labelledby="tw-sidebar-files-tab"
+          aria-hidden={activeView !== "files"}
+          hidden={activeView !== "files"}
+          inert={activeView !== "files"}
+        >
+          <div className="tw-dashboard-sidebar__files-content">
+            {filesContent}
+          </div>
         </section>
       </div>
 
