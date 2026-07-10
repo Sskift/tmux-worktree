@@ -7,20 +7,64 @@ import { keymap } from "@codemirror/view";
 import { oneDark } from "@codemirror/theme-one-dark";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { getFileCategory, getLanguageExtension } from "./fileUtils";
+import { getFileCategory, getFileExtension, getLanguageExtension } from "./fileUtils";
 import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser } from "./linkDetect";
 
 type Props = {
   filePath: string;
+  hostId?: string | null;
   onClose: () => void;
-  onOpenFile?: (path: string, line?: number, col?: number) => void;
+  onOpenFile?: (path: string, line?: number, col?: number, hostId?: string | null) => void;
 };
 
 /* ── Image Preview ──────────────────────────────────────────── */
 
-function ImagePreview({ filePath, onClose }: Props) {
+function imageMimeType(filePath: string): string {
+  switch (getFileExtension(filePath)) {
+    case "jpg":
+    case "jpeg": return "image/jpeg";
+    case "svg": return "image/svg+xml";
+    case "webp": return "image/webp";
+    case "gif": return "image/gif";
+    case "bmp": return "image/bmp";
+    case "ico": return "image/x-icon";
+    case "avif": return "image/avif";
+    default: return "image/png";
+  }
+}
+
+function ImagePreview({ filePath, hostId, onClose }: Props) {
   const fileName = filePath.split("/").pop() ?? filePath;
-  const src = convertFileSrc(filePath);
+  const [src, setSrc] = useState(() => hostId ? "" : convertFileSrc(filePath));
+  const [loading, setLoading] = useState(!!hostId);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!hostId) {
+      setSrc(convertFileSrc(filePath));
+      setLoading(false);
+      setError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    setSrc("");
+    invoke<string>("remote_read_file_base64", { hostId, path: filePath })
+      .then((data) => {
+        if (!cancelled) setSrc(`data:${imageMimeType(filePath)};base64,${data}`);
+      })
+      .catch((e) => {
+        if (!cancelled) setError(String(e));
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [filePath, hostId]);
 
   return (
     <div className="pane pane--term">
@@ -33,7 +77,13 @@ function ImagePreview({ filePath, onClose }: Props) {
         </div>
       </div>
       <div className="pane__body file-editor__image">
-        <img src={src} alt={fileName} />
+        {loading ? (
+          <div className="file-editor__status">loading...</div>
+        ) : error ? (
+          <div className="file-editor__status file-editor__status--error">{error}</div>
+        ) : (
+          <img src={src} alt={fileName} />
+        )}
       </div>
     </div>
   );
@@ -41,7 +91,7 @@ function ImagePreview({ filePath, onClose }: Props) {
 
 /* ── Code / Markdown Editor ─────────────────────────────────── */
 
-function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isMarkdown: boolean }) {
+function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props & { isMarkdown: boolean }) {
   const [content, setContent] = useState("");
   const [originalContent, setOriginalContent] = useState("");
   const [loading, setLoading] = useState(true);
@@ -60,7 +110,9 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
     setError(null);
     setPreviewMode(false);
     try {
-      const text = await invoke<string>("read_file", { path });
+      const text = hostId
+        ? await invoke<string>("remote_read_file", { hostId, path })
+        : await invoke<string>("read_file", { path });
       if (pathRef.current === path) {
         setContent(text);
         setOriginalContent(text);
@@ -78,7 +130,7 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
         setLoading(false);
       }
     }
-  }, []);
+  }, [hostId]);
 
   useEffect(() => {
     pathRef.current = filePath;
@@ -90,7 +142,11 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
     if (saving || cur === originalContentRef.current) return;
     setSaving(true);
     try {
-      await invoke("write_file", { path: pathRef.current, content: cur });
+      if (hostId) {
+        await invoke("remote_write_file", { hostId, path: pathRef.current, content: cur });
+      } else {
+        await invoke("write_file", { path: pathRef.current, content: cur });
+      }
       setOriginalContent(cur);
       originalContentRef.current = cur;
       setError(null);
@@ -99,7 +155,7 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
     } finally {
       setSaving(false);
     }
-  }, [saving]);
+  }, [hostId, saving]);
 
   // CodeMirror setup
   useEffect(() => {
@@ -151,9 +207,9 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
             } else if (clicked.kind === "file") {
               const dir = filePath.split("/").slice(0, -1).join("/");
               const resolved = resolvePath(clicked.path, dir);
-              checkFileExists(resolved).then((exists) => {
+              checkFileExists(resolved, hostId).then((exists) => {
                 if (exists && onOpenFile) {
-                  onOpenFile(resolved, clicked.line, clicked.col);
+                  onOpenFile(resolved, clicked.line, clicked.col, hostId);
                 }
               });
             }
@@ -183,7 +239,7 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
       viewRef.current?.destroy();
       viewRef.current = null;
     };
-  }, [filePath, loading, error, previewMode, save]);
+  }, [filePath, hostId, loading, error, previewMode, save, onOpenFile]);
 
   const isDirty = content !== originalContent;
   const fileName = filePath.split("/").pop() ?? filePath;
@@ -241,16 +297,17 @@ function CodeEditor({ filePath, onClose, isMarkdown, onOpenFile }: Props & { isM
 
 /* ── Main Export ─────────────────────────────────────────────── */
 
-export function FileEditor({ filePath, onClose, onOpenFile }: Props) {
+export function FileEditor({ filePath, hostId, onClose, onOpenFile }: Props) {
   const category = getFileCategory(filePath);
 
   if (category === "image") {
-    return <ImagePreview filePath={filePath} onClose={onClose} />;
+    return <ImagePreview filePath={filePath} hostId={hostId} onClose={onClose} />;
   }
 
   return (
     <CodeEditor
       filePath={filePath}
+      hostId={hostId}
       onClose={onClose}
       onOpenFile={onOpenFile}
       isMarkdown={category === "markdown"}

@@ -117,6 +117,11 @@ type WindowLayout = {
   maximized: boolean;
 };
 
+type EditingFile = {
+  path: string;
+  hostId?: string | null;
+};
+
 type SessionGroup = {
   key: string;
   project: string;
@@ -411,6 +416,15 @@ function isDiffFile(value: unknown): value is { path: string; cwd: string; hostI
   );
 }
 
+function isEditingFile(value: unknown): value is EditingFile {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.path === "string" &&
+    (candidate.hostId === undefined || candidate.hostId === null || typeof candidate.hostId === "string")
+  );
+}
+
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
@@ -555,7 +569,7 @@ function App() {
   const [mobileRelayStopping, setMobileRelayStopping] = useState(false);
   const [mobileRelayCopied, setMobileRelayCopied] = useState(false);
   const [mobileRelayError, setMobileRelayError] = useState<string | null>(null);
-  const [editingFile, setEditingFile] = useState<string | null>(null);
+  const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
   const [diffFile, setDiffFile] = useState<{ path: string; cwd: string; hostId?: string | null } | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
   const [fileTreeWidth, setFileTreeWidth] = useState(280);
@@ -880,7 +894,8 @@ function App() {
       .then((lay) => {
         const restoredFileBrowserOpen =
           typeof lay.fileBrowserOpen === "boolean" ? (lay.fileBrowserOpen as boolean) : false;
-        const restoredEditorOpen = isDiffFile(lay.diffFile) || typeof lay.editingFile === "string";
+        const restoredEditorOpen =
+          isDiffFile(lay.diffFile) || isEditingFile(lay.editingFile) || typeof lay.editingFile === "string";
         prevColumnsRef.current = {
           fileBrowser: restoredFileBrowserOpen,
           editor: restoredEditorOpen,
@@ -921,8 +936,11 @@ function App() {
         if (isDiffFile(lay.diffFile)) {
           setDiffFile(lay.diffFile);
           setEditingFile(null);
-        } else if (typeof lay.editingFile === "string") {
+        } else if (isEditingFile(lay.editingFile)) {
           setEditingFile(lay.editingFile);
+          setDiffFile(null);
+        } else if (typeof lay.editingFile === "string") {
+          setEditingFile({ path: lay.editingFile, hostId: null });
           setDiffFile(null);
         }
         if (isSelection(lay.selection)) {
@@ -1810,9 +1828,9 @@ function App() {
     setSelection({ kind: "automation", id: "" });
   }, [projectPresetForSession, selection, selectedCwd, selectedGitHostId, selectedSessionIsRemote]);
 
-  const handleOpenFile = useCallback((path: string, _line?: number, _col?: number) => {
+  const handleOpenFile = useCallback((path: string, _line?: number, _col?: number, hostId?: string | null) => {
     setDiffFile(null);
-    setEditingFile(path);
+    setEditingFile({ path, hostId: hostId ?? null });
   }, []);
 
   const selectionKey =
@@ -2685,8 +2703,8 @@ function App() {
           {fileBrowserRoot ? (
             <FileTree
               root={fileBrowserRoot}
-              selectedFile={editingFile}
-              onFileSelect={(path) => { setDiffFile(null); setEditingFile(path); }}
+              selectedFile={editingFile?.hostId ? null : editingFile?.path ?? null}
+              onFileSelect={(path) => { setDiffFile(null); setEditingFile({ path, hostId: null }); }}
             />
           ) : (
             <div className="empty empty--small">loading home directory</div>
@@ -2807,6 +2825,7 @@ function App() {
                       cmd={termCmd}
                       args={termArgs}
                       cwd={isRemote ? undefined : cwdsBySession[name]}
+                      linkCwd={cwdsBySession[name]}
                       active={
                         !anyModalOpen &&
                         selection?.kind === "session" && selection.name === name
@@ -2814,7 +2833,7 @@ function App() {
                       tmuxSession={name}
                       hostId={sess?.hostId ?? null}
                       initialHistory={tmuxPreviews[name]}
-                      onOpenFile={isRemote ? undefined : handleOpenFile}
+                      onOpenFile={handleOpenFile}
                     />
                   </div>
                 );
@@ -2845,6 +2864,7 @@ function App() {
                           : ["attach-session", "-t", t.tmuxName]
                       }
                       cwd={t.hostId ? undefined : t.cwd}
+                      linkCwd={t.cwd}
                       active={
                         !anyModalOpen &&
                         selection?.kind === "terminal" && selection.id === id
@@ -2852,7 +2872,7 @@ function App() {
                       tmuxSession={sessionKey}
                       hostId={t.hostId ?? null}
                       initialHistory={tmuxPreviews[sessionKey]}
-                      onOpenFile={t.hostId ? undefined : handleOpenFile}
+                      onOpenFile={handleOpenFile}
                     />
                   </div>
                 );
@@ -2947,9 +2967,10 @@ function App() {
                                 : ["-l"]
                             }
                             cwd={scratchContext.host ? undefined : scratchContext.cwd}
+                            linkCwd={scratchContext.cwd}
                             active={isActive && !anyModalOpen}
                             hostId={scratchContext.host?.id ?? null}
-                            onOpenFile={scratchContext.host ? undefined : handleOpenFile}
+                            onOpenFile={handleOpenFile}
                           />
                         </div>
                       </div>
@@ -2982,7 +3003,12 @@ function App() {
               onClose={() => setDiffFile(null)}
             />
           ) : editingFile ? (
-            <FileEditor filePath={editingFile} onClose={() => setEditingFile(null)} onOpenFile={handleOpenFile} />
+            <FileEditor
+              filePath={editingFile.path}
+              hostId={editingFile.hostId ?? null}
+              onClose={() => setEditingFile(null)}
+              onOpenFile={handleOpenFile}
+            />
           ) : null}
         </aside>
       )}

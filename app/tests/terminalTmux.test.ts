@@ -33,6 +33,26 @@ test("remote tmux clipboard uses local macOS clipboard commands", () => {
   assert.match(rustSource, /copy_bytes_to_clipboard\(&output\.stdout\)/);
 });
 
+test("remote file links keep host identity through the SSH editor", () => {
+  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  const editorSource = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
+  const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+
+  assert.match(terminalSource, /linkCwd\?: string/);
+  assert.match(terminalSource, /checkFileExists\(resolved, hostId\)/);
+  assert.match(terminalSource, /openFile\(resolved, link\.line, link\.col, hostId\)/);
+  assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
+  assert.match(appSource, /setEditingFile\(\{ path, hostId: hostId \?\? null \}\)/);
+  assert.match(appSource, /hostId=\{editingFile\.hostId \?\? null\}/);
+  assert.match(editorSource, /invoke<string>\("remote_read_file"/);
+  assert.match(editorSource, /invoke\("remote_write_file"/);
+  assert.match(editorSource, /invoke<string>\("remote_read_file_base64"/);
+  assert.match(rustSource, /async fn remote_file_exists/);
+  assert.match(rustSource, /async fn remote_read_file/);
+  assert.match(rustSource, /async fn remote_write_file/);
+});
+
 test("terminal subscribes to pty output before opening the pty", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");

@@ -142,9 +142,14 @@ export function resolvePath(filePath: string, cwd: string): string {
   return `${cwd}/${clean}`;
 }
 
-export async function checkFileExists(absolutePath: string): Promise<boolean> {
+export async function checkFileExists(
+  absolutePath: string,
+  hostId?: string | null,
+): Promise<boolean> {
   try {
-    return await invoke<boolean>("file_exists", { path: absolutePath });
+    return hostId
+      ? await invoke<boolean>("remote_file_exists", { hostId, path: absolutePath })
+      : await invoke<boolean>("file_exists", { path: absolutePath });
   } catch {
     return false;
   }

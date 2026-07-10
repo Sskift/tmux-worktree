@@ -26,11 +26,12 @@ type Props = {
   cmd: string;
   args: string[];
   cwd?: string;
+  linkCwd?: string;
   active?: boolean;
   tmuxSession?: string;
   hostId?: string | null;
   initialHistory?: string;
-  onOpenFile?: (path: string, line?: number, col?: number) => void;
+  onOpenFile?: (path: string, line?: number, col?: number, hostId?: string | null) => void;
 };
 
 type BufferPosition = { x: number; y: number };
@@ -271,13 +272,17 @@ function createPtyId(): string {
     `pty-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, initialHistory, onOpenFile }: Props) {
+export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, hostId, initialHistory, onOpenFile }: Props) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
   const initialHistoryRef = useRef<string | undefined>(initialHistory);
   const activeRef = useRef(active);
+  const linkCwdRef = useRef(linkCwd ?? cwd);
+  const onOpenFileRef = useRef(onOpenFile);
   const [reconnectSeq, setReconnectSeq] = useState(0);
+  linkCwdRef.current = linkCwd ?? cwd;
+  onOpenFileRef.current = onOpenFile;
 
   useEffect(() => {
     if (initialHistory !== undefined) {
@@ -309,7 +314,17 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     term.open(host);
 
     const isActionableLink = (link: Pick<LinkMatch, "kind">) =>
-      link.kind === "url" || (!!cwd && !!onOpenFile);
+      link.kind === "url" || (!!linkCwdRef.current && !!onOpenFileRef.current);
+
+    const openFileLink = (link: Extract<LinkMatch, { kind: "file" }>) => {
+      const fileCwd = linkCwdRef.current;
+      const openFile = onOpenFileRef.current;
+      if (!fileCwd || !openFile) return;
+      const resolved = resolvePath(link.path, fileCwd);
+      checkFileExists(resolved, hostId).then((exists) => {
+        if (exists) openFile(resolved, link.line, link.col, hostId);
+      });
+    };
 
     // Remote tmux owns ordinary mouse events, so web links also support direct
     // click there. Cmd/Ctrl+click remains available for every terminal link.
@@ -336,13 +351,8 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
               if (!shouldActivateTerminalLink(event, match, !!hostId)) return;
               if (match.kind === "url") {
                 openUrlInBrowser(match.url).catch(() => {});
-              } else if (match.kind === "file" && cwd) {
-                const resolved = resolvePath(match.path, cwd);
-                checkFileExists(resolved).then((exists) => {
-                  if (exists && onOpenFile) {
-                    onOpenFile(resolved, match.line, match.col);
-                  }
-                });
+              } else if (match.kind === "file") {
+                openFileLink(match);
               }
             },
           });
@@ -363,13 +373,8 @@ export function Terminal({ cmd, args, cwd, active = true, tmuxSession, hostId, i
     const openResolvedLink = (link: ResolvedLink) => {
       if (link.kind === "url") {
         openUrlInBrowser(link.url).catch(() => {});
-      } else if (link.kind === "file" && cwd) {
-        const resolved = resolvePath(link.path, cwd);
-        checkFileExists(resolved).then((exists) => {
-          if (exists && onOpenFile) {
-            onOpenFile(resolved, link.line, link.col);
-          }
-        });
+      } else if (link.kind === "file") {
+        openFileLink(link);
       }
     };
     const onLinkMouseDown = (event: MouseEvent) => {

@@ -1,3 +1,4 @@
+use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1609,6 +1610,38 @@ fn run_remote_cmd_output(
     ssh_command(host, remote_cmd)
         .output()
         .map_err(|e| format!("ssh spawn: {e}"))
+}
+
+fn run_remote_cmd_with_input(
+    host: &HostConfig,
+    remote_cmd: &[&str],
+    input: &[u8],
+) -> Result<std::process::Output, String> {
+    let mut child = ssh_command(host, remote_cmd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh spawn: {e}"))?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "ssh stdin unavailable".to_string())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(input)
+                .map_err(|e| format!("write ssh stdin: {e}"))
+        });
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+
+    child
+        .wait_with_output()
+        .map_err(|e| format!("wait for ssh: {e}"))
 }
 
 fn run_remote_cmd_check(host: &HostConfig, remote_cmd: &[&str]) -> Result<String, String> {
@@ -4524,7 +4557,7 @@ fn read_file(path: String) -> Result<String, String> {
         return Err(format!("not a file: {path}"));
     }
     let meta = std::fs::metadata(p).map_err(|e| format!("metadata: {e}"))?;
-    if meta.len() > 5 * 1024 * 1024 {
+    if meta.len() > MAX_EDITABLE_FILE_SIZE {
         return Err("file too large (>5 MB)".into());
     }
     std::fs::read_to_string(p).map_err(|e| format!("read: {e}"))
@@ -4547,6 +4580,147 @@ fn open_url(url: String) -> Result<(), String> {
 #[tauri::command]
 fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
+}
+
+const MAX_EDITABLE_FILE_SIZE: u64 = 5 * 1024 * 1024;
+
+const REMOTE_READ_FILE_SCRIPT: &str = r#"path=$1
+if [ ! -f "$path" ]; then
+  printf 'not a file: %s\n' "$path" >&2
+  exit 44
+fi
+size=$(wc -c < "$path") || exit 45
+case "$size" in
+  ''|*[!0-9]*) printf 'invalid file size: %s\n' "$path" >&2; exit 45 ;;
+esac
+if [ "$size" -gt 5242880 ]; then
+  printf 'file too large (>5 MB): %s\n' "$path" >&2
+  exit 46
+fi
+cat "$path""#;
+
+const REMOTE_WRITE_FILE_SCRIPT: &str = r#"path=$1
+if [ -z "$path" ]; then
+  printf 'remote path required\n' >&2
+  exit 43
+fi
+if [ -e "$path" ] && [ ! -f "$path" ]; then
+  printf 'not a file: %s\n' "$path" >&2
+  exit 44
+fi
+dir=${path%/*}
+if [ "$dir" != "$path" ] && [ ! -d "$dir" ]; then
+  printf 'parent directory does not exist: %s\n' "$dir" >&2
+  exit 45
+fi
+tmp=$(mktemp "${path}.tw-dashboard-write.XXXXXX") || exit 46
+cleanup() { rm -f "$tmp"; }
+trap cleanup 0 HUP INT TERM
+if [ -e "$path" ]; then
+  cp -p "$path" "$tmp" || exit 46
+fi
+cat > "$tmp" || exit 47
+mv "$tmp" "$path" || exit 48
+trap - 0 HUP INT TERM"#;
+
+fn remote_file_error(host: &HostConfig, action: &str, output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        format!("{action} on {} failed with {}", host.label, output.status)
+    } else {
+        format!("{action} on {} failed: {detail}", host.label)
+    }
+}
+
+fn remote_file_exists_for_host(host: &HostConfig, path: &str) -> Result<bool, String> {
+    if path.trim().is_empty() {
+        return Ok(false);
+    }
+    let output = run_remote_cmd_output(host, &["sh", "-c", "test -f \"$1\"", "sh", path])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(remote_file_error(host, "check remote file", &output)),
+    }
+}
+
+fn remote_read_file_bytes_for_host(host: &HostConfig, path: &str) -> Result<Vec<u8>, String> {
+    if path.trim().is_empty() {
+        return Err("remote path required".to_string());
+    }
+    let output = run_remote_cmd_output(host, &["sh", "-c", REMOTE_READ_FILE_SCRIPT, "sh", path])?;
+    if !output.status.success() {
+        return Err(remote_file_error(host, "read remote file", &output));
+    }
+    if output.stdout.len() as u64 > MAX_EDITABLE_FILE_SIZE {
+        return Err("file too large (>5 MB)".to_string());
+    }
+    Ok(output.stdout)
+}
+
+fn remote_write_file_for_host(host: &HostConfig, path: &str, content: &[u8]) -> Result<(), String> {
+    if path.trim().is_empty() {
+        return Err("remote path required".to_string());
+    }
+    if content.len() as u64 > MAX_EDITABLE_FILE_SIZE {
+        return Err("file too large (>5 MB)".to_string());
+    }
+    let output = run_remote_cmd_with_input(
+        host,
+        &["sh", "-c", REMOTE_WRITE_FILE_SCRIPT, "sh", path],
+        content,
+    )?;
+    if !output.status.success() {
+        return Err(remote_file_error(host, "write remote file", &output));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn remote_file_exists(host_id: String, path: String) -> Result<bool, String> {
+    let host_id = host_id.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = find_host(&host_id)?;
+        remote_file_exists_for_host(&host, &path)
+    })
+    .await
+    .map_err(|e| format!("remote file check task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn remote_read_file(host_id: String, path: String) -> Result<String, String> {
+    let host_id = host_id.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = find_host(&host_id)?;
+        let bytes = remote_read_file_bytes_for_host(&host, &path)?;
+        String::from_utf8(bytes).map_err(|_| format!("remote file is not UTF-8: {path}"))
+    })
+    .await
+    .map_err(|e| format!("remote file read task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn remote_read_file_base64(host_id: String, path: String) -> Result<String, String> {
+    let host_id = host_id.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = find_host(&host_id)?;
+        let bytes = remote_read_file_bytes_for_host(&host, &path)?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+    })
+    .await
+    .map_err(|e| format!("remote image read task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn remote_write_file(host_id: String, path: String, content: String) -> Result<(), String> {
+    let host_id = host_id.trim().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        let host = find_host(&host_id)?;
+        remote_write_file_for_host(&host, &path, content.as_bytes())
+    })
+    .await
+    .map_err(|e| format!("remote file write task failed: {e}"))?
 }
 
 #[derive(Serialize, Clone)]
@@ -5564,9 +5738,13 @@ pub fn run() {
             read_dir,
             read_file,
             write_file,
+            remote_read_file,
+            remote_read_file_base64,
+            remote_write_file,
             search_files,
             open_url,
             file_exists,
+            remote_file_exists,
             list_hosts,
             list_ssh_host_candidates,
             add_host,
@@ -5607,8 +5785,9 @@ mod tests {
         list_automation_runs, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
         load_pending_cleanup, mobile_relay_config_from_value, normalize_local_mdns_name,
         orphaned_worktrees, parse_session_key, project_from_config, project_from_worktree_path,
-        projects_from_config, projects_from_config_with_home, remote_home_dir_for_host,
-        remote_read_dirs_for_host, reserve_git_fetch_target, restore_worktree, run_check,
+        projects_from_config, projects_from_config_with_home, remote_file_exists_for_host,
+        remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
+        remote_write_file_for_host, reserve_git_fetch_target, restore_worktree, run_check,
         run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
         save_pending_cleanup, should_skip_automation_overlap, ssh_host_candidates_from_config_text,
         stable_output_signature, test_host, tmux_session_exists, trigger_automation,
@@ -7795,6 +7974,101 @@ exit 12
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);
+    }
+
+    #[test]
+    fn remote_file_editor_checks_reads_and_writes_over_ssh() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        let input_path = temp.path().join("ssh-input");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ssh_path = bin_dir.join("ssh");
+        fs::write(
+            &ssh_path,
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    break
+  fi
+  shift
+done
+
+case "$1" in
+  *"test -f"*)
+    case "$1" in
+      *"/workspace/src/main.rs"*) exit 0 ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  *"tw-dashboard-write"*)
+    cat > "${TW_FAKE_SSH_INPUT:?}"
+    exit 0
+    ;;
+  *"wc -c"*)
+    printf 'fn main() { println!("remote"); }\n'
+    exit 0
+    ;;
+esac
+
+printf 'unexpected remote command: %s\n' "$1" >&2
+exit 12
+"#,
+        )
+        .expect("ssh shim");
+        let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ssh_path, perms).expect("ssh executable");
+
+        let original_path = std::env::var("PATH").ok();
+        let original_input = std::env::var("TW_FAKE_SSH_INPUT").ok();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.to_string_lossy(),
+                    original_path.clone().unwrap_or_default()
+                ),
+            );
+            std::env::set_var("TW_FAKE_SSH_INPUT", &input_path);
+        }
+
+        let host = HostConfig {
+            id: "dev".to_string(),
+            label: "Dev".to_string(),
+            host: "ssh-host".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
+        };
+
+        assert!(remote_file_exists_for_host(&host, "/workspace/src/main.rs")
+            .expect("existing remote file"));
+        assert!(
+            !remote_file_exists_for_host(&host, "/workspace/src/missing.rs")
+                .expect("missing remote file")
+        );
+        assert_eq!(
+            remote_read_file_bytes_for_host(&host, "/workspace/src/main.rs")
+                .expect("read remote file"),
+            b"fn main() { println!(\"remote\"); }\n"
+        );
+
+        let replacement = b"fn main() { println!(\"saved\"); }\n";
+        remote_write_file_for_host(&host, "/workspace/src/main.rs", replacement)
+            .expect("write remote file");
+        assert_eq!(
+            fs::read(&input_path).expect("captured ssh input"),
+            replacement
+        );
+
+        restore_env("PATH", original_path);
+        restore_env("TW_FAKE_SSH_INPUT", original_input);
     }
 
     #[test]
