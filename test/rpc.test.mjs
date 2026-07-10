@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
@@ -129,7 +132,6 @@ test("rpc worktree creation records a dashboard-managed remote session", () => {
       branch: "develop",
       worktreeBase: "/home/dev/.tmux-worktree/worktrees",
       profile: "dashboard",
-      layout: "dashboard",
       quiet: true,
     },
     {
@@ -201,4 +203,93 @@ test("shared worktree creation records managed state for cli and rpc consumers",
   assert.match(sessionSource, /saveManagedState/);
   assert.match(sessionSource, /profile:\s*params\.profile/);
   assert.match(sessionSource, /worktreePath:\s*createdWorktree\.path/);
+});
+
+test("CLI and Dashboard provenance use the same single-pane session contract", () => {
+  const capture = (profile) => {
+    const calls = [];
+    createManagedWorktreeSession(
+      {
+        aiCmd: "codex --quiet",
+        projectDir: "/repo/app",
+        sessionName: "app-fix",
+        useWorktree: false,
+        worktreeBase: "/unused",
+        profile,
+        quiet: true,
+      },
+      {
+        existsSync: () => true,
+        exec: (bin, args) => calls.push([bin, args]),
+        tmuxBin: () => "tmux",
+        sessionExists: () => false,
+        setupClipboardBindings: () => calls.push(["setupClipboardBindings", []]),
+      },
+    );
+    return calls;
+  };
+
+  const cliCalls = capture("cli");
+  const dashboardCalls = capture("dashboard");
+  assert.deepEqual(cliCalls, dashboardCalls);
+  assert.deepEqual(cliCalls, [
+    ["tmux", [
+      "new-session",
+      "-d",
+      "-s",
+      "app-fix",
+      "-c",
+      "/repo/app",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+    ]],
+    ["setupClipboardBindings", []],
+  ]);
+  assert.equal(cliCalls.some(([, args]) => args.includes("split-window")), false);
+  assert.equal(cliCalls.some(([, args]) => args.some((arg) => String(arg).includes(" status"))), false);
+});
+
+test("tw status remains a one-shot alias and legacy live sessions stay attachable", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-status-contract-"));
+  const fakeTmux = join(root, "tmux");
+  const callLog = join(root, "tmux.log");
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+case "$1" in
+  list-sessions)
+    printf 'legacy-cli\\0370\\0371\\0371760000000\\0371760000100\\037/tmp/legacy-worktree\\n'
+    ;;
+  has-session)
+    exit 0
+    ;;
+esac
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+  const env = {
+    ...process.env,
+    HOME: root,
+    TMUX: "",
+    TW_TMUX: fakeTmux,
+    TW_TEST_TMUX_LOG: callLog,
+  };
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+
+  const status = spawnSync(process.execPath, [cli, "status", "--once"], {
+    encoding: "utf8",
+    env,
+    timeout: 2_000,
+  });
+  assert.equal(status.status, 0, status.stderr);
+  assert.match(status.stdout, /legacy-cli/);
+  assert.doesNotMatch(status.stdout, /\x1b\[\?1049h|q quit/);
+
+  const attach = spawnSync(process.execPath, [cli, "attach", "legacy-cli"], {
+    encoding: "utf8",
+    env,
+    timeout: 2_000,
+  });
+  assert.equal(attach.status, 0, attach.stderr);
+  const calls = readFileSync(callLog, "utf8");
+  assert.match(calls, /has-session -t =legacy-cli/);
+  assert.match(calls, /attach -t legacy-cli/);
 });

@@ -22,11 +22,10 @@
 
 | 文件 | 作用 | 发布状态 |
 |---|---|---|
-| `src/cli.ts` | CLI 路由，分发 `status`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
+| `src/cli.ts` | CLI 路由，分发一次性 `status`/`ls`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
 | `src/config.ts` | 读取并归一化 `~/.tmux-worktree.json`，兼容旧版 CLI 字符串映射、对象映射、数组项目和字段别名 | 打包 |
 | `src/dev.ts` | 创建 git worktree 和 tmux session，并启动 AI 命令 | 打包 |
 | `src/automation.ts` | 管理 Dashboard 共用的 `~/.tw-dashboard-automations.json`，提供 `tw automation`/`tw auto` 的 list/create/delete | 打包 |
-| `src/status.ts` | CLI session 左侧 tmux TUI 状态面板 | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
 | `src/setup.ts` | 系统依赖检查和可选安装 | 打包 |
 | `src/update.ts` | `tw update`，输出 GitHub Release 和 source checkout 更新步骤 | 打包 |
@@ -41,7 +40,7 @@
 
 1. `app/src` 和 `app/src-tauri`
 2. `npm run tauri build`，Tauri `beforeBuildCommand` 同时构建根目录 `dist/cli.js`
-3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，供 Dashboard Mobile Relay 启动 `tw serve` / `tw relay-host`
+3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，既作为本地 worktree 的 canonical RPC creator，也供 Dashboard Mobile Relay 启动 `tw serve` / `tw relay-host`
 4. DMG 复制到 `app/installer/dmg/tw-dashboard-arm64.dmg`
 5. `app/installer/installer.mjs` 挂载 DMG 并安装 `tw-dashboard.app`
 
@@ -92,7 +91,7 @@ Rust 后端：
 
 主要 Tauri command 分组：
 
-- Session/worktree：`list_sessions`、`create_worktree`、`kill_session`、`list_orphaned_worktrees`、`restore_worktree`、`session_cwd`。
+- Session/worktree：`list_sessions`、`create_worktree`、`kill_session`、`list_orphaned_worktrees`、`restore_worktree`、`session_cwd`；本地 `create_worktree` 委托同版本 bundled `tw rpc create-worktree`，不再维护第二套 Rust creator。
 - Git：`git_status`、`git_log`、`git_diff`。
 - PTY：`pty_open`、`pty_write`、`pty_resize`、`pty_kill`、`capture_pane_history`。
 - 独立终端：`create_plain_terminal`、`ensure_terminal_session`、`kill_plain_terminal`、`load_terminals`、`save_terminals`。
@@ -104,7 +103,7 @@ Remote TW runtime：
 
 - 远端可以安装 `tw` binary；Dashboard 通过 SSH 调用 `tw rpc list`，优先读取远端 `~/.tmux-worktree/state.json` 中登记的 managed session/worktree。
 - `tw rpc list` 默认输出 JSON，返回协议版本和 live managed sessions；Dashboard 只把 `kind=worktree` 的条目映射成 remote worktree session。
-- Dashboard 在远端创建 worktree 时优先通过 SSH 执行 `tw rpc create-worktree --path <path> --ai-command <cmd> ...`，由远端 `tw` 负责 git worktree、tmux session 和 managed state 写入；host 选择发生在 Dashboard/本地调用层，RPC JSON 只作为机器可读返回协议。
+- Dashboard 在远端创建 worktree 时只通过 SSH 执行 `tw rpc create-worktree --path <path> --ai-command <cmd> ...`，由远端 `tw` 负责 git worktree、tmux session 和 managed state 写入；旧版或缺失 RPC 的 Host 必须先升级，不再静默回退到另一套 git/tmux creator。host 选择发生在 Dashboard/本地调用层，RPC JSON 只作为机器可读返回协议。
 - Host 状态探测分两层：先通过 `tmux -V` 判断 SSH/tmux 是否可达，再通过 `tw version` 判断远端 TW 是否可用。缺少 TW 时 Dashboard 可通过 SSH 从 GitHub source checkout 构建并 link `tw`。
 - 如果远端没有兼容 `tw rpc list` / `tw rpc create-worktree`，Dashboard 暂时 fallback 到旧的 tmux/git 探测路径，用于兼容未升级远端。
 
@@ -130,14 +129,11 @@ Update 命令：
 2. Dashboard 更新通过 GitHub Release DMG 完成。
 3. CLI 更新通过 GitHub source checkout 后 `npm install && npm run build && npm link` 完成。
 
-## Session Layout Profiles
+## Managed Session Contract
 
-CLI 和 Dashboard 故意创建不同的 tmux 布局，但共享命名和 worktree 约定。
+所有新建 worktree（CLI、RPC、Dashboard 本地和 Dashboard 远端）都使用同一套 single-pane tmux contract：AI 命令在唯一 pane 中运行，退出后回到 login shell。managed state 的 `profile=cli|dashboard` 只记录请求来源，不再选择不同布局。
 
-- CLI profile：`tw <ai> <project>` 创建 status pane、AI pane 和 shell pane，面向纯终端使用。
-- Dashboard profile：`create_worktree` 创建单 pane tmux session，因为 Dashboard 用原生 UI 提供 status、Git、文件树、编辑器和 scratch terminal。
-
-两个 profile 必须保持 session 名截断、分支随机后缀、worktree 路径结构和 orphan 检测兼容。
+旧版本已经存在的 multi-pane CLI session 不做原地改造，仍可被发现和 attach；新版本不会再创建 status pane、额外 shell pane，也不会启动 alternate-screen/mouse status TUI。`tw status` 是 `tw ls` 的一次性兼容别名。
 
 ## Agent Skills
 
@@ -145,7 +141,7 @@ CLI 和 Dashboard 故意创建不同的 tmux 布局，但共享命名和 worktre
 
 | 路径 | 作用 |
 |---|---|
-| `.codex/skills/tw-remote-session` | 指导 remote agent 在无 GUI 主机上用 `tw rpc create-worktree` 创建 Dashboard profile 的 managed worktree session，避免误用裸 `tw`、普通 tmux 或手写 git worktree |
+| `.codex/skills/tw-remote-session` | 指导 remote agent 在无 GUI 主机上用 `tw rpc create-worktree` 创建 headless managed worktree session，避免误用普通 tmux 或手写 git worktree |
 
 这些 skill 是给 agent 安装或显式引用的操作规程，不是运行时状态。要让 Codex 自动发现，需要复制到目标 agent 的 skills 目录，例如 `~/.codex/skills/`。
 

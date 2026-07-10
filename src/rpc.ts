@@ -152,7 +152,6 @@ export function buildRpcCreateWorktreeResponse(
     branch,
     worktreeBase,
     profile: "dashboard",
-    layout: "dashboard",
     quiet: true,
   });
 

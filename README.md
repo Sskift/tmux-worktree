@@ -126,6 +126,8 @@ tw codex backend fix-auth
 tw "claude --model opus" /Users/me/code/myapp
 ```
 
+New CLI and Dashboard worktree sessions use the same single-pane tmux contract. The AI command runs in that pane and returns to a login shell when it exits. Older multi-pane CLI sessions remain attachable until you close them; `tw` does not rewrite live sessions.
+
 Open the Dashboard:
 
 ```bash
@@ -169,7 +171,8 @@ Common commands:
 
 ```bash
 tw setup
-tw status
+tw ls
+tw status  # compatibility alias for the same one-shot list
 tw serve
 tw relay-server
 tw relay-host
@@ -186,6 +189,8 @@ tw claude myapp fix-auth
 tw codex ~/code/backend
 tw rpc create-worktree --project myapp --ai-command "claude" --name fix-auth
 ```
+
+`tw status` is non-interactive and exits after printing the current session list. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
 
 Manage automations:
 
@@ -304,7 +309,7 @@ Build the CLI:
 ```bash
 npm install
 npm run build
-node dist/cli.js status --once
+node dist/cli.js status
 ```
 
 Run the Dashboard:

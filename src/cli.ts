@@ -25,14 +25,14 @@ function printHelp(): void {
 
 用法:
   tw <ai-command> <project|path> [session] [--branch <name>]
-                              创建 worktree + tmux session 并进入
+                              创建 single-pane worktree session 并进入
   tw                          交互模式创建
 
 会话 (session):
   tw ls                       列出所有 session（项目、分支、worktree、是否在用）
   tw attach <session>         接入 / 切换到已有 session（别名: tw a）
   tw rm <session> [--worktree]  杀掉 session，加 --worktree 连带删除其 worktree
-  tw status                   左栏 session 列表 TUI（含 --once 单次输出）
+  tw status                   一次性列出 session（tw ls 的兼容别名）
 
 Worktree:
   tw worktree ls              列出所有 worktree（跨项目，标记孤儿）
@@ -88,8 +88,8 @@ async function main() {
       return;
 
     case "status": {
-      const { run } = await import("./status.js");
-      await run();
+      const { listCmd } = await import("./commands.js");
+      await listCmd();
       return;
     }
     case "serve": {

@@ -1,6 +1,5 @@
 import { existsSync as fsExistsSync, mkdirSync as fsMkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import {
   CliError,
   deleteBranch,
@@ -22,8 +21,6 @@ import {
 
 export const SESSION_NAME_MAX_LEN = 20;
 
-export type WorktreeSessionLayout = "cli" | "dashboard";
-
 export interface CreateManagedWorktreeSessionParams {
   aiCmd: string;
   projectDir: string;
@@ -32,8 +29,8 @@ export interface CreateManagedWorktreeSessionParams {
   worktreeBase: string;
   projectKey?: string;
   branch?: string;
+  /** Records which surface requested the session; it does not affect tmux layout. */
   profile: ManagedSessionProfile;
-  layout: WorktreeSessionLayout;
   quiet?: boolean;
 }
 
@@ -119,25 +116,12 @@ function detectTargetBranch(
   return hasMaster ? "master" : "main";
 }
 
-function startCliLayout(
-  tmux: string,
-  session: string,
-  workDir: string,
-  aiCmd: string,
-  exec: (bin: string, args: string[], timeout?: number) => void,
-  setupBindings: () => void,
-): void {
-  const cliPath = join(dirname(fileURLToPath(import.meta.url)), "cli.js");
-  exec(tmux, ["new-session", "-d", "-s", session, "-c", workDir]);
-  setupBindings();
-  exec(tmux, ["send-keys", "-t", `${session}.1`, `node "${cliPath}" status`, "C-m"]);
-  exec(tmux, ["split-window", "-h", "-t", `${session}.1`, "-c", workDir]);
-  exec(tmux, ["send-keys", "-t", `${session}.2`, aiCmd, "C-m"]);
-  exec(tmux, ["split-window", "-h", "-t", `${session}.2`, "-c", workDir, "-l", "40%"]);
-  exec(tmux, ["select-pane", "-t", `${session}.2`]);
-}
-
-function startDashboardLayout(
+/**
+ * Every new TW-managed worktree uses the same single-pane tmux contract.
+ * `profile` remains managed-state provenance for compatibility with existing
+ * CLI and Dashboard records; it must never select a different pane layout.
+ */
+function startManagedSession(
   tmux: string,
   session: string,
   workDir: string,
@@ -236,11 +220,7 @@ export function createManagedWorktreeSession(
   log();
 
   try {
-    if (params.layout === "cli") {
-      startCliLayout(tmux, session, workDir, params.aiCmd, exec, setupBindings);
-    } else {
-      startDashboardLayout(tmux, session, workDir, params.aiCmd, exec, setupBindings);
-    }
+    startManagedSession(tmux, session, workDir, params.aiCmd, exec, setupBindings);
   } catch (err) {
     if (createdWorktree) {
       console.error(`\n⚠️  tmux session 创建失败，正在回滚 worktree ${createdWorktree.path} ...`);

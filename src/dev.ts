@@ -95,7 +95,7 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
     console.log("🚀 tmux-worktree 交互模式\n");
 
     // --- AI 命令 ---
-    console.log("输入要在左栏启动的 AI 命令，如 claude, aider, codex 等");
+    console.log("输入要在 session 中启动的 AI 命令，如 claude, aider, codex 等");
     console.log("也可以带参数，如 \"claude --model opus\"");
     const aiInput = (await prompt(rl, `AI 命令 (默认 claude): `)).trim();
     const aiCmd = aiInput || "claude";
@@ -214,7 +214,7 @@ function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
     console.log(`用法: tw <ai-command> <project|path> [session-name] [--branch <name>]
 
 参数:
-  ai-command       要在左栏运行的命令 (如 claude, aider, codex)
+  ai-command       要在 session 中运行的命令 (如 claude, aider, codex)
   project          项目名称 (${Object.keys(projects).join(", ")}) 或目录路径
   session-name     可选，tmux session 显示名 (默认同 project)
   --branch, -b     可选，目标分支 (默认自动探测，通常是 master 或 main)
@@ -278,7 +278,6 @@ export async function run() {
     branch,
     worktreeBase: WORKTREE_BASE,
     profile: "cli",
-    layout: "cli",
   });
   const session = created.session;
   const tmux = tmuxBin();
@@ -294,7 +293,4 @@ export async function run() {
     });
     process.exitCode = exitCode;
   }
-
-  // 调整左侧大小
-  exec(tmux, ["resize-pane", "-t", `${session}:1.1`, "-x", "30"]);
 }

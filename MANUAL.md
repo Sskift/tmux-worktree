@@ -45,6 +45,8 @@ tw claude demo
 tw codex /Users/me/workspace/demo fix-auth
 ```
 
+New worktree sessions created by either command use the same single tmux pane as Dashboard-created sessions. The managed-state `profile` still records whether the request came from the CLI or Dashboard for compatibility, but it does not change the pane layout. Existing live sessions created by older releases keep their original panes and remain attachable.
+
 Create one from the Dashboard with `+ worktree`: choose `Local`, choose a configured project or browse a path, then enter an AI command such as `claude` or `codex`.
 
 ## SSH Remote Hosts
@@ -150,7 +152,7 @@ Then prompt the remote agent:
 Use $tw-remote-session to create a Dashboard-managed worktree on host remote-dev for /home/alice/workspace/demo. Use AI command "claude".
 ```
 
-The skill tells the agent to use `tw rpc create-worktree`, not plain `tmux new-session`, not manual `git worktree add`, and not bare `tw <ai-command> <project>` unless the user explicitly wants the CLI multi-pane profile.
+The skill tells the agent to use `tw rpc create-worktree`, not plain `tmux new-session` or a manual `git worktree add`, because RPC is headless, emits a machine-readable result, and records the session in TW managed state. Bare `tw <ai-command> <project>` now creates the same single-pane session contract, but it also attaches the invoking terminal for interactive CLI use.
 
 ## Troubleshooting
 
