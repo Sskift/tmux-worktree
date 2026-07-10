@@ -53,6 +53,13 @@ export type PlainTerminal = {
   discovered?: boolean;
 };
 
+export type DashboardCatalogSnapshot = {
+  sessions: Session[];
+  terminals: PlainTerminal[];
+  failedSessionHostIds: string[];
+  failedTerminalHostIds: string[];
+};
+
 export type CreatedTerminal = {
   tmuxName: string;
   hostId?: string | null;

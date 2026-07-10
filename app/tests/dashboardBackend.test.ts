@@ -99,6 +99,12 @@ const layout = { schemaVersion: 2, sidebar: { width: 280 } };
 
 const commandCases: CommandCase[] = [
   {
+    label: "catalog.list",
+    command: "list_dashboard_catalog",
+    args: undefined,
+    call: (backend) => backend.catalog!.list(),
+  },
+  {
     label: "sessions.list",
     command: "list_sessions",
     args: undefined,

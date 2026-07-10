@@ -265,6 +265,16 @@ function createPtyId(): string {
     `pty-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
+function canTerminalClaimFocus(host: HTMLElement | null): boolean {
+  const focused = document.activeElement;
+  return (
+    focused === null ||
+    focused === document.body ||
+    focused === document.documentElement ||
+    Boolean(host?.contains(focused))
+  );
+}
+
 export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, hostId, initialHistory, onOpenFile }: Props) {
   const dashboardBackend = useDashboardBackend();
   const hostRef = useRef<HTMLDivElement | null>(null);
@@ -485,7 +495,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     };
 
     safeFit();
-    term.focus();
+    if (activeRef.current && canTerminalClaimFocus(host)) term.focus();
 
     const onThemeChange = (e: Event) => {
       const detail = (e as CustomEvent<TerminalPalette>).detail;
@@ -610,7 +620,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       try {
         fit.fit();
       } catch {}
-      term.focus();
+      if (canTerminalClaimFocus(hostRef.current)) term.focus();
     });
   }, [active, tmuxSession]);
 

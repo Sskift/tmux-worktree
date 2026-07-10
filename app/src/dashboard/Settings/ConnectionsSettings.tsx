@@ -24,6 +24,7 @@ import {
   useRef,
   useState,
   type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 import { MenuSelect, type MenuOption } from "../../MenuSelect";
@@ -32,6 +33,10 @@ import { useDashboardBackend } from "../../platform";
 import type { MobileRelayController } from "../hooks/useMobileRelayController";
 import "../design/tokens.css";
 import "./ConnectionsSettings.css";
+import {
+  createConnectionsAsyncCoordinator,
+  hostCatalogFingerprint,
+} from "./connectionsAsyncCoordinator";
 import {
   calculateHostRemovalImpact,
   createEmptyHostDraft,
@@ -69,6 +74,7 @@ export interface RelaySettingsBusyState {
 }
 
 export interface RelaySettingsModel extends RelayDraft {
+  statusKnown: boolean;
   connectionState: RelayConnectionState;
   active: boolean;
   connected: boolean;
@@ -92,6 +98,7 @@ export interface RelaySettingsActions {
 export interface ConnectionsSettingsProps {
   hosts: readonly HostConfig[];
   hostStatuses: Readonly<Record<string, HostStatus>>;
+  hostCatalogError?: string | null;
   sshHostCandidates: readonly HostConfig[];
   sessions: readonly Session[];
   terminals: readonly PlainTerminal[];
@@ -122,6 +129,7 @@ export function relaySettingsBindingsFromController(
 
   return {
     relay: {
+      statusKnown: controller.statusKnown,
       relayUrl: controller.draftUrl,
       brokerHostId: controller.brokerHostId,
       hostId: controller.draftHostId,
@@ -173,6 +181,8 @@ const HOST_FIELDS: readonly HostFieldDefinition[] = [
 ] as const;
 
 const EMPTY_RELAY_ERRORS: RelayDraftErrors = {};
+const RELAY_BROKER_ID = "connection-relay-broker";
+const RELAY_BROKER_ERROR_ID = `${RELAY_BROKER_ID}-error`;
 
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -197,6 +207,7 @@ function HostStateIcon({ status }: { status: HostStatus | null }) {
 export function ConnectionsSettings({
   hosts,
   hostStatuses,
+  hostCatalogError,
   sshHostCandidates,
   sessions,
   terminals,
@@ -222,6 +233,10 @@ export function ConnectionsSettings({
   const [relayNotice, setRelayNotice] = useState<AsyncNotice | null>(null);
   const [copiedField, setCopiedField] = useState<RelayCopyField | null>(null);
   const copyTimerRef = useRef<number | null>(null);
+  const asyncCoordinatorRef = useRef(createConnectionsAsyncCoordinator());
+  const currentHostCatalogFingerprint = hostCatalogFingerprint(hosts);
+  const hostCatalogFingerprintRef = useRef(currentHostCatalogFingerprint);
+  const acceptedHostCatalogFingerprintRef = useRef<string | null>(null);
 
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? null;
   const selectedStatus = selectedHostId ? hostStatuses[selectedHostId] ?? null : null;
@@ -254,11 +269,31 @@ export function ConnectionsSettings({
   );
   const relaySummary = summarizeRelayStatus(relay);
   const relayBusy = Object.values(relay.busy).some(Boolean);
+  const relayDraftLocked = relayBusy || relay.active || !relay.statusKnown;
+  const relayActionLocked = relayBusy || !relay.statusKnown;
   const hostBusy = hostNotice?.tone === "pending";
 
   useEffect(() => () => {
+    asyncCoordinatorRef.current.invalidateAll();
     if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
   }, []);
+
+  useEffect(() => {
+    if (hostCatalogFingerprintRef.current === currentHostCatalogFingerprint) return;
+    hostCatalogFingerprintRef.current = currentHostCatalogFingerprint;
+
+    if (acceptedHostCatalogFingerprintRef.current === currentHostCatalogFingerprint) {
+      acceptedHostCatalogFingerprintRef.current = null;
+      return;
+    }
+
+    acceptedHostCatalogFingerprintRef.current = null;
+    asyncCoordinatorRef.current.invalidate("hostFeedback");
+    asyncCoordinatorRef.current.invalidate("hostCatalog");
+    setHostNotice((current) => current?.tone === "pending" ? null : current);
+    setTestedStatus(null);
+    setDeleteConfirmationOpen(false);
+  }, [currentHostCatalogFingerprint]);
 
   useEffect(() => {
     if (mode === "add") return;
@@ -269,12 +304,18 @@ export function ConnectionsSettings({
     }
 
     const nextHost = hosts[0] ?? null;
+    asyncCoordinatorRef.current.invalidate("hostFeedback");
     setSelectedHostId(nextHost?.id ?? null);
     setDraft(nextHost ? hostConfigToDraft(nextHost) : createEmptyHostDraft());
     setMode(nextHost ? "view" : "add");
+    setDraftErrors({});
+    setHostNotice(null);
+    setTestedStatus(null);
+    setDeleteConfirmationOpen(false);
   }, [hosts, mode, selectedHostId]);
 
   const resetFeedback = () => {
+    asyncCoordinatorRef.current.invalidate("hostFeedback");
     setDraftErrors({});
     setHostNotice(null);
     setTestedStatus(null);
@@ -314,6 +355,7 @@ export function ConnectionsSettings({
   };
 
   const updateDraft = (field: HostDraftField, value: string) => {
+    asyncCoordinatorRef.current.invalidate("hostFeedback");
     setDraft((current) => ({ ...current, [field]: value }));
     setDraftErrors((current) => ({ ...current, [field]: undefined }));
     setHostNotice(null);
@@ -322,6 +364,7 @@ export function ConnectionsSettings({
 
   const applyCandidate = () => {
     if (!selectedCandidate) return;
+    asyncCoordinatorRef.current.invalidate("hostFeedback");
     setDraft(sshCandidateToDraft(selectedCandidate));
     setDraftErrors({});
     setHostNotice({ tone: "success", message: `Prefilled from ${selectedCandidate.label || selectedCandidate.id}.` });
@@ -340,7 +383,28 @@ export function ConnectionsSettings({
     return validation;
   };
 
+  const issueHostFeedbackOperation = (
+    intent: "test" | "save" | "delete" | "install",
+    ...identity: ReadonlyArray<string | number | boolean | null | undefined>
+  ) => asyncCoordinatorRef.current.issue("hostFeedback", intent, ...identity);
+
+  const issueHostCatalogMutation = (
+    intent: "save" | "delete",
+    ...identity: ReadonlyArray<string | number | boolean | null | undefined>
+  ) => asyncCoordinatorRef.current.issue(
+    "hostCatalog",
+    intent,
+    hostCatalogFingerprintRef.current,
+    ...identity,
+  );
+
   const testConnection = async () => {
+    const feedbackRequest = issueHostFeedbackOperation(
+      "test",
+      selectedHostId,
+      mode,
+      JSON.stringify(draft),
+    );
     const validation = validateCurrentHost(false);
     if (!validation.valid) return;
 
@@ -348,6 +412,7 @@ export function ConnectionsSettings({
     setTestedStatus(null);
     try {
       const status = await dashboardBackend.hosts.test(validation.value);
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setTestedStatus(status);
       setHostNotice(status.reachable
         ? {
@@ -356,6 +421,7 @@ export function ConnectionsSettings({
           }
         : { tone: "error", message: status.error || "SSH connection failed." });
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setHostNotice({ tone: "error", message: errorMessage(error) });
     }
   };
@@ -363,55 +429,85 @@ export function ConnectionsSettings({
   const saveHost = async (event: FormEvent) => {
     event.preventDefault();
     if (mode === "view") return;
+    const feedbackRequest = issueHostFeedbackOperation(
+      "save",
+      selectedHostId,
+      mode,
+      JSON.stringify(draft),
+    );
     const validation = validateCurrentHost(true);
     if (!validation.valid) return;
+    const operationMode = mode;
+    const catalogRequest = issueHostCatalogMutation(
+      "save",
+      selectedHostId,
+      operationMode,
+      validation.value.id,
+    );
 
     setHostNotice({
       tone: "pending",
-      message: mode === "add" ? "Adding host…" : "Saving host changes…",
+      message: operationMode === "add" ? "Adding host…" : "Saving host changes…",
     });
     try {
-      const updatedHosts = mode === "add"
+      const updatedHosts = operationMode === "add"
         ? await dashboardBackend.hosts.add(validation.value)
         : await dashboardBackend.hosts.update(validation.value);
-      onHostsChange(updatedHosts);
+      if (asyncCoordinatorRef.current.isCurrent(catalogRequest)) {
+        acceptedHostCatalogFingerprintRef.current = hostCatalogFingerprint(updatedHosts);
+        onHostsChange(updatedHosts);
+      }
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setSelectedHostId(validation.value.id);
       setDraft(hostConfigToDraft(validation.value));
       setMode("view");
       setDraftErrors({});
       setHostNotice({
         tone: "success",
-        message: mode === "add" ? "Host added." : "Host changes saved.",
+        message: operationMode === "add" ? "Host added." : "Host changes saved.",
       });
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setHostNotice({ tone: "error", message: errorMessage(error) });
     }
   };
 
   const deleteHost = async () => {
     if (!selectedHost) return;
-    setHostNotice({ tone: "pending", message: `Removing ${selectedHost.label}…` });
+    const hostToDelete = selectedHost;
+    const feedbackRequest = issueHostFeedbackOperation("delete", hostToDelete.id);
+    const catalogRequest = issueHostCatalogMutation("delete", hostToDelete.id);
+    setHostNotice({ tone: "pending", message: `Removing ${hostToDelete.label}…` });
     try {
-      const updatedHosts = await dashboardBackend.hosts.remove(selectedHost.id);
-      onHostsChange(updatedHosts);
+      const updatedHosts = await dashboardBackend.hosts.remove(hostToDelete.id);
+      if (asyncCoordinatorRef.current.isCurrent(catalogRequest)) {
+        acceptedHostCatalogFingerprintRef.current = hostCatalogFingerprint(updatedHosts);
+        onHostsChange(updatedHosts);
+      }
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       const nextHost = updatedHosts[0] ?? null;
       setSelectedHostId(nextHost?.id ?? null);
       setDraft(nextHost ? hostConfigToDraft(nextHost) : createEmptyHostDraft());
       setMode(nextHost ? "view" : "add");
       setDeleteConfirmationOpen(false);
-      setHostNotice({ tone: "success", message: `${selectedHost.label} was removed.` });
+      setHostNotice({ tone: "success", message: `${hostToDelete.label} was removed.` });
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setHostNotice({ tone: "error", message: errorMessage(error) });
     }
   };
 
   const installTw = async () => {
     if (!selectedHost) return;
-    setHostNotice({ tone: "pending", message: `Installing tw on ${selectedHost.label}…` });
+    const hostToInstall = selectedHost;
+    const feedbackRequest = issueHostFeedbackOperation("install", hostToInstall.id);
+    setHostNotice({ tone: "pending", message: `Installing tw on ${hostToInstall.label}…` });
     try {
-      await onInstallTw(selectedHost.id);
+      await onInstallTw(hostToInstall.id);
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setHostNotice({ tone: "success", message: "tw installation finished. Status will refresh shortly." });
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setHostNotice({ tone: "error", message: errorMessage(error) });
     }
   };
@@ -420,6 +516,22 @@ export function ConnectionsSettings({
     intent: "save" | "start" | "startBroker" | "stop",
     action: () => RelayActionResult | Promise<RelayActionResult>,
   ) => {
+    if (intent !== "stop" && !relay.statusKnown) {
+      setRelayErrors({});
+      setRelayNotice({
+        tone: "error",
+        message: "Wait for Relay status before changing its configuration.",
+      });
+      return;
+    }
+    const request = asyncCoordinatorRef.current.issue(
+      "relay",
+      intent,
+      relay.relayUrl,
+      relay.brokerHostId,
+      relay.hostId,
+      relay.token,
+    );
     if (intent !== "stop") {
       const validation = validateRelayDraft(relay, intent);
       setRelayErrors(validation.errors);
@@ -447,6 +559,7 @@ export function ConnectionsSettings({
     setRelayNotice({ tone: "pending", message: pendingLabel[intent] });
     try {
       const completed = await action();
+      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
       if (completed === false) {
         setRelayNotice({
           tone: "error",
@@ -456,41 +569,76 @@ export function ConnectionsSettings({
       }
       setRelayNotice({ tone: "success", message: successLabel[intent] });
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
       setRelayNotice({ tone: "error", message: errorMessage(error) });
     }
   };
 
   const copyRelayValue = async (field: RelayCopyField, value: string) => {
     if (!value) return;
+    const request = asyncCoordinatorRef.current.issue("relay", "copy", field, value);
+    setRelayNotice(null);
     try {
       await relayActions.copy(field, value);
+      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
       setCopiedField(field);
       if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
       copyTimerRef.current = window.setTimeout(() => setCopiedField(null), 1_200);
     } catch (error) {
+      if (!asyncCoordinatorRef.current.isCurrent(request)) return;
       setRelayNotice({ tone: "error", message: errorMessage(error) });
     }
+  };
+
+  const handleConnectionTabKeyDown = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    currentTab: ConnectionTab,
+  ) => {
+    let nextTab: ConnectionTab | null = null;
+    if (event.key === "ArrowRight" || event.key === "ArrowDown") {
+      nextTab = currentTab === "hosts" ? "relay" : "hosts";
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowUp") {
+      nextTab = currentTab === "hosts" ? "relay" : "hosts";
+    } else if (event.key === "Home") {
+      nextTab = "hosts";
+    } else if (event.key === "End") {
+      nextTab = "relay";
+    }
+    if (!nextTab || nextTab === currentTab) return;
+    event.preventDefault();
+    setActiveTab(nextTab);
+    window.requestAnimationFrame(() => {
+      document.getElementById(`connections-tab-${nextTab}`)?.focus();
+    });
   };
 
   return (
     <div className="connections-settings">
       <div className="connections-tabs" role="tablist" aria-label="Connection settings">
         <button
+          id="connections-tab-hosts"
           type="button"
           role="tab"
           aria-selected={activeTab === "hosts"}
+          aria-controls="connections-active-panel"
+          tabIndex={activeTab === "hosts" ? 0 : -1}
           className="connections-tabs__item"
           onClick={() => setActiveTab("hosts")}
+          onKeyDown={(event) => handleConnectionTabKeyDown(event, "hosts")}
         >
           <Server aria-hidden="true" size={15} />
           Hosts
         </button>
         <button
+          id="connections-tab-relay"
           type="button"
           role="tab"
           aria-selected={activeTab === "relay"}
+          aria-controls="connections-active-panel"
+          tabIndex={activeTab === "relay" ? 0 : -1}
           className="connections-tabs__item"
           onClick={() => setActiveTab("relay")}
+          onKeyDown={(event) => handleConnectionTabKeyDown(event, "relay")}
         >
           <Radio aria-hidden="true" size={15} />
           Relay
@@ -498,7 +646,12 @@ export function ConnectionsSettings({
       </div>
 
       {activeTab === "hosts" ? (
-        <div className="connections-panel" role="tabpanel">
+        <div
+          id="connections-active-panel"
+          className="connections-panel"
+          role="tabpanel"
+          aria-labelledby="connections-tab-hosts"
+        >
           <div className="connections-heading-row">
             <div>
               <h3>SSH hosts</h3>
@@ -510,31 +663,38 @@ export function ConnectionsSettings({
             </button>
           </div>
 
+          {hostCatalogError && (
+            <div className="connections-notice connections-notice--error" role="alert">
+              <AlertCircle aria-hidden="true" size={15} />
+              <span>{hostCatalogError}</span>
+            </div>
+          )}
+
           {hosts.length > 0 && (
             <div className="connections-host-list" role="list" aria-label="Configured SSH hosts">
               {hosts.map((host) => {
                 const status = hostStatuses[host.id] ?? null;
                 const selected = selectedHostId === host.id && mode !== "add";
                 return (
-                  <button
-                    key={host.id}
-                    type="button"
-                    role="listitem"
-                    className="connections-host-row"
-                    aria-current={selected ? "true" : undefined}
-                    onClick={() => selectHost(host)}
-                  >
-                    <span className={`connections-host-row__icon connections-host-row__icon--${status?.reachable ? "online" : status ? "offline" : "unknown"}`}>
-                      <HostStateIcon status={status} />
-                    </span>
-                    <span className="connections-host-row__copy">
-                      <strong>{host.label}</strong>
-                      <span>{host.user ? `${host.user}@` : ""}{host.host}{host.port ? `:${host.port}` : ""}</span>
-                    </span>
-                    <span className="connections-host-row__state">
-                      {status?.reachable ? `${status.latencyMs ?? "—"} ms` : status ? "Offline" : "Unchecked"}
-                    </span>
-                  </button>
+                  <div key={host.id} className="connections-host-list__item" role="listitem">
+                    <button
+                      type="button"
+                      className="connections-host-row"
+                      aria-current={selected ? "true" : undefined}
+                      onClick={() => selectHost(host)}
+                    >
+                      <span className={`connections-host-row__icon connections-host-row__icon--${status?.reachable ? "online" : status ? "offline" : "unknown"}`}>
+                        <HostStateIcon status={status} />
+                      </span>
+                      <span className="connections-host-row__copy">
+                        <strong>{host.label}</strong>
+                        <span>{host.user ? `${host.user}@` : ""}{host.host}{host.port ? `:${host.port}` : ""}</span>
+                      </span>
+                      <span className="connections-host-row__state">
+                        {status?.reachable ? `${status.latencyMs ?? "—"} ms` : status ? "Offline" : "Unchecked"}
+                      </span>
+                    </button>
+                  </div>
                 );
               })}
             </div>
@@ -711,7 +871,12 @@ export function ConnectionsSettings({
           </form>
         </div>
       ) : (
-        <div className="connections-panel" role="tabpanel">
+        <div
+          id="connections-active-panel"
+          className="connections-panel"
+          role="tabpanel"
+          aria-labelledby="connections-tab-relay"
+        >
           <div className="connections-heading-row">
             <div>
               <h3>Mobile Relay</h3>
@@ -745,17 +910,25 @@ export function ConnectionsSettings({
               <div className={`connections-field connections-field--wide${relayErrors.brokerHostId ? " connections-field--error" : ""}`}>
                 <span>Broker</span>
                 <MenuSelect
+                  id={RELAY_BROKER_ID}
                   ariaLabel="Relay broker"
+                  ariaInvalid={Boolean(relayErrors.brokerHostId)}
+                  ariaDescribedBy={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
+                  ariaErrorMessage={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
                   className="connections-menu-select"
                   value={relay.brokerHostId}
                   options={brokerOptions}
-                  disabled={relayBusy || relay.active || hosts.length === 0}
+                  disabled={relayDraftLocked || hosts.length === 0}
                   onChange={(value) => {
                     relayActions.setBrokerHostId(value);
                     setRelayErrors((current) => ({ ...current, brokerHostId: undefined }));
                   }}
                 />
-                {relayErrors.brokerHostId && <small className="connections-field__error">{relayErrors.brokerHostId}</small>}
+                {relayErrors.brokerHostId && (
+                  <small id={RELAY_BROKER_ERROR_ID} className="connections-field__error">
+                    {relayErrors.brokerHostId}
+                  </small>
+                )}
               </div>
 
               <RelayField
@@ -764,7 +937,8 @@ export function ConnectionsSettings({
                 value={relay.relayUrl}
                 placeholder="wss://relay.example.com"
                 error={relayErrors.relayUrl}
-                disabled={relayBusy || relay.active}
+                disabled={relayDraftLocked}
+                copyDisabled={!relay.statusKnown}
                 copied={copiedField === "relayUrl"}
                 onChange={(value) => {
                   relayActions.setRelayUrl(value);
@@ -778,7 +952,8 @@ export function ConnectionsSettings({
                 value={relay.hostId}
                 placeholder="mac-admin"
                 error={relayErrors.hostId}
-                disabled={relayBusy || relay.active}
+                disabled={relayDraftLocked}
+                copyDisabled={!relay.statusKnown}
                 copied={copiedField === "hostId"}
                 onChange={(value) => {
                   relayActions.setHostId(value);
@@ -792,7 +967,8 @@ export function ConnectionsSettings({
                 value={relay.token}
                 placeholder={relay.tokenConfigured ? "Configured" : "Required to start Relay"}
                 error={relayErrors.token}
-                disabled={relayBusy || relay.active}
+                disabled={relayDraftLocked}
+                copyDisabled={!relay.statusKnown}
                 copied={copiedField === "token"}
                 secret
                 onChange={(value) => {
@@ -832,7 +1008,7 @@ export function ConnectionsSettings({
                   <button
                     type="button"
                     className="connections-button"
-                    disabled={relayBusy || !hosts.length}
+                    disabled={relayActionLocked || !hosts.length}
                     onClick={() => runRelayAction("startBroker", relayActions.startBroker)}
                   >
                     {relay.busy.startBroker
@@ -844,7 +1020,7 @@ export function ConnectionsSettings({
                   <button
                     type="button"
                     className="connections-button"
-                    disabled={relayBusy}
+                    disabled={relayActionLocked}
                     onClick={() => runRelayAction("save", relayActions.save)}
                   >
                     {relay.busy.save
@@ -855,7 +1031,7 @@ export function ConnectionsSettings({
                   <button
                     type="button"
                     className="connections-button connections-button--primary"
-                    disabled={relayBusy}
+                    disabled={relayActionLocked}
                     onClick={() => runRelayAction("start", relayActions.start)}
                   >
                     {relay.busy.start
@@ -880,6 +1056,7 @@ interface RelayFieldProps {
   placeholder: string;
   error?: string;
   disabled: boolean;
+  copyDisabled?: boolean;
   copied: boolean;
   secret?: boolean;
   onChange: (value: string) => void;
@@ -893,11 +1070,13 @@ function RelayField({
   placeholder,
   error,
   disabled,
+  copyDisabled = false,
   copied,
   secret = false,
   onChange,
   onCopy,
 }: RelayFieldProps) {
+  const errorId = `${id}-error`;
   return (
     <label className={`connections-field connections-field--wide${error ? " connections-field--error" : ""}`} htmlFor={id}>
       <span>{label}</span>
@@ -911,19 +1090,21 @@ function RelayField({
           autoComplete="off"
           spellCheck={false}
           aria-invalid={Boolean(error)}
+          aria-describedby={error ? errorId : undefined}
+          aria-errormessage={error ? errorId : undefined}
           onChange={(event) => onChange(event.target.value)}
         />
         <button
           type="button"
           className="connections-icon-button"
-          disabled={!value}
+          disabled={copyDisabled || !value}
           aria-label={copied ? `${label} copied` : `Copy ${label}`}
           onClick={onCopy}
         >
           {copied ? <Check aria-hidden="true" size={15} /> : <Clipboard aria-hidden="true" size={15} />}
         </button>
       </span>
-      {error && <small className="connections-field__error">{error}</small>}
+      {error && <small id={errorId} className="connections-field__error">{error}</small>}
     </label>
   );
 }

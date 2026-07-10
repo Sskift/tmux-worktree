@@ -1,24 +1,23 @@
-import { useEffect, useState, type KeyboardEvent } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type RefObject,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
+import { Folder } from "lucide-react";
+import { keepFocusInside } from "./dashboard/Settings/focusTrap";
 import type { DirEntry } from "./FileTree";
 import { useDashboardBackend } from "./platform";
 
 type Props = {
   hostId: string;
   initialPath?: string;
+  returnFocusRef?: RefObject<HTMLElement | null>;
   onClose: () => void;
   onSelect: (path: string) => void;
 };
-
-const FolderIcon = () => (
-  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-    <path
-      d="M1.5 12.5V3.5C1.5 3.1 1.9 2.5 2.5 2.5H6L7.5 4H13C13.6 4 14 4.4 14 5V12.5C14 13 13.6 13.5 13 13.5H2.5C1.9 13.5 1.5 13 1.5 12.5Z"
-      stroke="currentColor"
-      strokeWidth="1.1"
-      strokeLinejoin="round"
-    />
-  </svg>
-);
 
 function parentRemotePath(path: string) {
   const trimmed = path.trim().replace(/\/+$/, "");
@@ -28,8 +27,18 @@ function parentRemotePath(path: string) {
   return trimmed.slice(0, index);
 }
 
-export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }: Props) {
+export function RemoteDirectoryPicker({
+  hostId,
+  initialPath,
+  returnFocusRef,
+  onClose,
+  onSelect,
+}: Props) {
   const dashboardBackend = useDashboardBackend();
+  const dialogRef = useRef<HTMLElement>(null);
+  const initialFocusRef = useRef<HTMLInputElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const titleId = useId();
   const [pathInput, setPathInput] = useState("");
   const [currentPath, setCurrentPath] = useState("");
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -37,6 +46,22 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
   const [loadingDir, setLoadingDir] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const loading = loadingHome || loadingDir;
+
+  useEffect(() => {
+    previousFocusRef.current = returnFocusRef?.current ??
+      (document.activeElement instanceof HTMLElement ? document.activeElement : null);
+
+    return () => {
+      const focusTarget = previousFocusRef.current;
+      if (focusTarget?.isConnected) focusTarget.focus();
+    };
+  }, [returnFocusRef]);
+
+  useEffect(() => {
+    if (loadingHome) return;
+    const animationFrame = window.requestAnimationFrame(() => initialFocusRef.current?.focus());
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [loadingHome]);
 
   const goToPath = (nextPath: string) => {
     const trimmed = nextPath.trim();
@@ -104,11 +129,22 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
     };
   }, [hostId, currentPath]);
 
-  const handlePathKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+  const handlePathKeyDown = (event: ReactKeyboardEvent<HTMLInputElement>) => {
     if (event.key === "Enter") {
       event.preventDefault();
       goToPath(pathInput);
     }
+  };
+
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+
+    if (dialogRef.current) keepFocusInside(event.nativeEvent, dialogRef.current);
   };
 
   const selectedPath = (currentPath || pathInput).trim();
@@ -116,25 +152,28 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
   return (
     <div className="modal-backdrop modal-backdrop--nested" onClick={onClose}>
       <section
+        ref={dialogRef}
         className="modal remote-picker"
         role="dialog"
         aria-modal="true"
-        aria-label="Select remote directory"
+        aria-labelledby={titleId}
+        tabIndex={-1}
         onClick={(event) => event.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
       >
-        <div className="modal__title">select remote directory</div>
+        <div className="modal__title" id={titleId}>select remote directory</div>
 
         <label className="field">
           <span className="field__label">remote path</span>
           <div className="remote-picker__path-row">
             <input
+              ref={initialFocusRef}
               className="field__input"
               type="text"
               value={pathInput}
               onChange={(event) => setPathInput(event.target.value)}
               onKeyDown={handlePathKeyDown}
               disabled={loadingHome}
-              autoFocus
               autoComplete="off"
               autoCorrect="off"
               autoCapitalize="off"
@@ -173,7 +212,7 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
                 onClick={() => goToPath(entry.path)}
               >
                 <span className="remote-picker__icon">
-                  <FolderIcon />
+                  <Folder size={14} strokeWidth={1.5} aria-hidden="true" />
                 </span>
                 <span className="remote-picker__name">{entry.name}</span>
                 <span className="remote-picker__path">{entry.path}</span>

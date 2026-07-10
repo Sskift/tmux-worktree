@@ -1,5 +1,10 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
+import { X } from "lucide-react";
 import { useDashboardBackend } from "./platform";
+import {
+  createLatestRequestGate,
+  requestSourceKey,
+} from "./latestRequestGate";
 
 type Props = {
   cwd: string;
@@ -56,26 +61,47 @@ function parseDiff(raw: string): DiffLine[] {
 
 export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
   const dashboardBackend = useDashboardBackend();
-  const [diff, setDiff] = useState<string>("");
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-
-  const loadDiff = useCallback(async () => {
-    setLoading(true);
-    setError(null);
-    try {
-      const result = await dashboardBackend.git.diff(cwd, filePath, hostId);
-      setDiff(result);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  }, [cwd, filePath, hostId]);
+  const sourceKey = requestSourceKey(hostId ?? null, cwd, filePath);
+  const requestGateRef = useRef(createLatestRequestGate());
+  const [result, setResult] = useState<{
+    sourceKey: string;
+    diff: string;
+    loading: boolean;
+    error: string | null;
+  }>(() => ({ sourceKey, diff: "", loading: true, error: null }));
 
   useEffect(() => {
-    loadDiff();
-  }, [loadDiff]);
+    const requestGate = requestGateRef.current;
+    const request = requestGate.issue(sourceKey);
+    setResult((current) => ({
+      sourceKey,
+      diff: current.sourceKey === sourceKey ? current.diff : "",
+      loading: true,
+      error: null,
+    }));
+
+    void dashboardBackend.git.diff(cwd, filePath, hostId)
+      .then((diff) => {
+        if (!requestGate.isCurrent(request)) return;
+        setResult({ sourceKey, diff, loading: false, error: null });
+      })
+      .catch((error) => {
+        if (!requestGate.isCurrent(request)) return;
+        setResult({
+          sourceKey,
+          diff: "",
+          loading: false,
+          error: String(error),
+        });
+      });
+
+    return () => requestGate.cancel(request);
+  }, [cwd, dashboardBackend.git, filePath, hostId, sourceKey]);
+
+  const currentResult = result.sourceKey === sourceKey
+    ? result
+    : { sourceKey, diff: "", loading: true, error: null };
+  const { diff, loading, error } = currentResult;
 
   const fileName = filePath.split("/").pop() ?? filePath;
   const lines = parseDiff(diff);
@@ -86,8 +112,8 @@ export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
         <span className="pane__title file-editor__title">{fileName}</span>
         <span className="pane__hint dim">diff</span>
         <div className="file-editor__actions">
-          <button className="btn btn--small" type="button" onClick={onClose} title="close">
-            ×
+          <button className="btn btn--small" type="button" onClick={onClose} title="Close diff" aria-label="Close diff">
+            <X aria-hidden="true" size={13} strokeWidth={1.8} />
           </button>
         </div>
       </div>

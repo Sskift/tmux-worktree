@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useRef,
   useState,
   type Dispatch,
   type SetStateAction,
@@ -20,6 +21,102 @@ const DEFAULT_HOST_ID = "mac-admin";
 
 type MobileRelayIndicatorStatus = "running" | "starting" | "stopped";
 
+export type MobileRelayDraftField = "relayUrl" | "hostId" | "secret";
+export type MobileRelayDraftSyncPolicy = "untouched" | "submitted";
+
+export type MobileRelayStatusRequest = Readonly<{
+  generation: number;
+  draftSyncPolicy: MobileRelayDraftSyncPolicy;
+  draftRevisions: Readonly<Record<MobileRelayDraftField, number>>;
+}>;
+
+export type MobileRelayOperation = Readonly<{
+  generation: number;
+}>;
+
+export type MobileRelayAsyncCoordinator = {
+  markDraftEdited(field: MobileRelayDraftField): void;
+  issueStatusRequest(policy?: MobileRelayDraftSyncPolicy): MobileRelayStatusRequest;
+  isCurrentStatusRequest(request: MobileRelayStatusRequest): boolean;
+  acceptDraftSync(request: MobileRelayStatusRequest, field: MobileRelayDraftField): boolean;
+  beginOperation(): MobileRelayOperation;
+  isCurrentOperation(operation: MobileRelayOperation): boolean;
+  finishOperation(operation: MobileRelayOperation): void;
+  hasActiveOperation(): boolean;
+};
+
+/**
+ * Coordinates the two independent publications in a Relay response: live
+ * process status and editable connection drafts. A newer request owns live
+ * status, while a draft field is only synchronized when the user has not
+ * changed it. A submitted save may normalize the exact values it sent.
+ */
+export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator {
+  let statusGeneration = 0;
+  let operationGeneration = 0;
+  let activeOperationGeneration = 0;
+  const draftRevisions: Record<MobileRelayDraftField, number> = {
+    relayUrl: 0,
+    hostId: 0,
+    secret: 0,
+  };
+  const dirtyDrafts: Record<MobileRelayDraftField, boolean> = {
+    relayUrl: false,
+    hostId: false,
+    secret: false,
+  };
+
+  return {
+    markDraftEdited(field) {
+      draftRevisions[field] += 1;
+      dirtyDrafts[field] = true;
+    },
+
+    issueStatusRequest(draftSyncPolicy = "untouched") {
+      statusGeneration += 1;
+      return {
+        generation: statusGeneration,
+        draftSyncPolicy,
+        draftRevisions: { ...draftRevisions },
+      };
+    },
+
+    isCurrentStatusRequest(request) {
+      return request.generation === statusGeneration;
+    },
+
+    acceptDraftSync(request, field) {
+      if (request.generation !== statusGeneration) return false;
+      if (request.draftRevisions[field] !== draftRevisions[field]) return false;
+      if (request.draftSyncPolicy === "untouched" && dirtyDrafts[field]) return false;
+      dirtyDrafts[field] = false;
+      return true;
+    },
+
+    beginOperation() {
+      operationGeneration += 1;
+      activeOperationGeneration = operationGeneration;
+      // A mutation supersedes any status read that began before it.
+      statusGeneration += 1;
+      return { generation: operationGeneration };
+    },
+
+    isCurrentOperation(operation) {
+      return operation.generation === activeOperationGeneration;
+    },
+
+    finishOperation(operation) {
+      if (operation.generation === activeOperationGeneration) {
+        activeOperationGeneration = 0;
+      }
+    },
+
+    hasActiveOperation() {
+      return activeOperationGeneration !== 0;
+    },
+  };
+}
+
 export type MobileRelayViewState = {
   busy: boolean;
   indicatorStatus: MobileRelayIndicatorStatus;
@@ -29,6 +126,7 @@ export type MobileRelayViewState = {
 };
 
 export type MobileRelayController = MobileRelayViewState & {
+  statusKnown: boolean;
   active: boolean;
   connected: boolean;
   connectionState: string;
@@ -132,23 +230,15 @@ export function buildMobileRelayLaunchCommand({
   ].join(" \\\n");
 }
 
-function fallbackMobileRelayStatus(): MobileRelayStatus {
-  return {
-    active: false,
-    connected: false,
-    connectionState: "stopped",
-    relayUrl: DEFAULT_RELAY_URL,
-    hostId: DEFAULT_HOST_ID,
-    secret: "",
-    token: "",
-    error: null,
-  };
-}
-
 export function useMobileRelayController({
   hosts,
 }: UseMobileRelayControllerOptions): MobileRelayController {
   const dashboardBackend = useDashboardBackend();
+  const asyncCoordinatorRef = useRef<MobileRelayAsyncCoordinator | null>(null);
+  if (asyncCoordinatorRef.current === null) {
+    asyncCoordinatorRef.current = createMobileRelayAsyncCoordinator();
+  }
+  const asyncCoordinator = asyncCoordinatorRef.current;
   const [brokerHostId, setBrokerHostId] = useState("");
   const [active, setActive] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -156,9 +246,9 @@ export function useMobileRelayController({
   const [relayUrl, setRelayUrl] = useState(DEFAULT_RELAY_URL);
   const [hostId, setHostId] = useState(DEFAULT_HOST_ID);
   const [secret, setSecret] = useState("");
-  const [draftUrl, setDraftUrl] = useState(DEFAULT_RELAY_URL);
-  const [draftHostId, setDraftHostId] = useState(DEFAULT_HOST_ID);
-  const [draftSecret, setDraftSecret] = useState("");
+  const [draftUrl, setDraftUrlState] = useState(DEFAULT_RELAY_URL);
+  const [draftHostId, setDraftHostIdState] = useState(DEFAULT_HOST_ID);
+  const [draftSecret, setDraftSecretState] = useState("");
   const [popoverOpen, setPopoverOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -166,31 +256,73 @@ export function useMobileRelayController({
   const [stopping, setStopping] = useState(false);
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusKnown, setStatusKnown] = useState(false);
 
-  const applyStatus = useCallback((status: MobileRelayStatus, syncDraft = true) => {
+  const setDraftUrl = useCallback<Dispatch<SetStateAction<string>>>((value) => {
+    asyncCoordinator.markDraftEdited("relayUrl");
+    setDraftUrlState(value);
+  }, [asyncCoordinator]);
+  const setDraftHostId = useCallback<Dispatch<SetStateAction<string>>>((value) => {
+    asyncCoordinator.markDraftEdited("hostId");
+    setDraftHostIdState(value);
+  }, [asyncCoordinator]);
+  const setDraftSecret = useCallback<Dispatch<SetStateAction<string>>>((value) => {
+    asyncCoordinator.markDraftEdited("secret");
+    setDraftSecretState(value);
+  }, [asyncCoordinator]);
+
+  const requireKnownStatus = useCallback((): boolean => {
+    if (statusKnown) return true;
+    setPopoverOpen(true);
+    setError((current) => current ?? "Wait for Relay status before changing its configuration.");
+    return false;
+  }, [statusKnown]);
+
+  const applyStatus = useCallback((
+    status: MobileRelayStatus,
+    request: MobileRelayStatusRequest,
+  ): boolean => {
+    if (!asyncCoordinator.isCurrentStatusRequest(request)) return false;
+    setStatusKnown(true);
     setActive(status.active);
     setConnected(status.connected);
     setConnectionState(status.connectionState);
     setRelayUrl(status.relayUrl);
     setHostId(status.hostId);
     setSecret(status.secret);
-    if (syncDraft) {
-      setDraftUrl(status.relayUrl);
-      setDraftHostId(status.hostId);
-      setDraftSecret(status.secret);
+    if (asyncCoordinator.acceptDraftSync(request, "relayUrl")) {
+      setDraftUrlState(status.relayUrl);
+    }
+    if (asyncCoordinator.acceptDraftSync(request, "hostId")) {
+      setDraftHostIdState(status.hostId);
+    }
+    if (asyncCoordinator.acceptDraftSync(request, "secret")) {
+      setDraftSecretState(status.secret);
     }
     setError(status.error ?? null);
-  }, []);
+    return true;
+  }, [asyncCoordinator]);
 
-  const checkStatus = useCallback(async (): Promise<MobileRelayStatus> => {
+  const checkStatus = useCallback(async (
+    operation?: MobileRelayOperation,
+  ): Promise<MobileRelayStatus | null> => {
+    if (operation && !asyncCoordinator.isCurrentOperation(operation)) return null;
+    const request = asyncCoordinator.issueStatusRequest("untouched");
     try {
       const status = await dashboardBackend.relay.status();
-      applyStatus(status);
-      return status;
-    } catch {
-      return fallbackMobileRelayStatus();
+      if (operation && !asyncCoordinator.isCurrentOperation(operation)) return null;
+      return applyStatus(status, request) ? status : null;
+    } catch (nextError) {
+      if (
+        (!operation || asyncCoordinator.isCurrentOperation(operation)) &&
+        asyncCoordinator.isCurrentStatusRequest(request)
+      ) {
+        setStatusKnown(false);
+        setError(`Unable to read Relay status: ${String(nextError)}`);
+      }
+      return null;
     }
-  }, [applyStatus, dashboardBackend]);
+  }, [applyStatus, asyncCoordinator, dashboardBackend]);
 
   const toggle = useCallback(async () => {
     if (active) {
@@ -199,26 +331,37 @@ export function useMobileRelayController({
     }
 
     const status = await checkStatus();
+    if (!status) {
+      setPopoverOpen(true);
+      return;
+    }
     if (!status.secret.trim()) {
       setPopoverOpen(true);
       setError(null);
       return;
     }
 
+    const operation = asyncCoordinator.beginOperation();
     setLoading(true);
     setPopoverOpen(true);
     setError(null);
     try {
       await dashboardBackend.relay.start();
-      applyStatus(await dashboardBackend.relay.status());
+      if (!asyncCoordinator.isCurrentOperation(operation)) return;
+      await checkStatus(operation);
     } catch (nextError) {
-      setError(String(nextError));
+      if (asyncCoordinator.isCurrentOperation(operation)) {
+        setError(String(nextError));
+      }
     } finally {
+      asyncCoordinator.finishOperation(operation);
       setLoading(false);
     }
-  }, [active, applyStatus, checkStatus, dashboardBackend]);
+  }, [active, asyncCoordinator, checkStatus, dashboardBackend]);
 
-  const saveConfig = useCallback(async (): Promise<MobileRelayStatus> => {
+  const saveConfig = useCallback(async (
+    operation: MobileRelayOperation,
+  ): Promise<MobileRelayStatus | null> => {
     const args = {
       relayUrl: draftUrl.trim(),
       hostId: draftHostId.trim(),
@@ -227,80 +370,111 @@ export function useMobileRelayController({
     if (!args.relayUrl || !args.hostId) {
       throw new Error("Relay URL and host are required");
     }
+    if (!asyncCoordinator.isCurrentOperation(operation)) return null;
+    const request = asyncCoordinator.issueStatusRequest("submitted");
     const status = await dashboardBackend.relay.saveConfig(args);
-    applyStatus(status);
-    return status;
-  }, [applyStatus, dashboardBackend, draftHostId, draftSecret, draftUrl]);
+    if (!asyncCoordinator.isCurrentOperation(operation)) return null;
+    return applyStatus(status, request) ? status : null;
+  }, [applyStatus, asyncCoordinator, dashboardBackend, draftHostId, draftSecret, draftUrl]);
 
   const save = useCallback(async () => {
+    if (!requireKnownStatus()) return false;
+    const operation = asyncCoordinator.beginOperation();
     setSaving(true);
     setError(null);
     try {
-      await saveConfig();
-      return true;
+      return (await saveConfig(operation)) !== null;
     } catch (nextError) {
-      setError(String(nextError));
+      if (asyncCoordinator.isCurrentOperation(operation)) {
+        setError(String(nextError));
+      }
       return false;
     } finally {
+      asyncCoordinator.finishOperation(operation);
       setSaving(false);
     }
-  }, [saveConfig]);
+  }, [asyncCoordinator, requireKnownStatus, saveConfig]);
 
   const start = useCallback(async () => {
+    if (!requireKnownStatus()) return false;
+    const operation = asyncCoordinator.beginOperation();
     setLoading(true);
     setError(null);
     try {
-      const saved = await saveConfig();
+      const saved = await saveConfig(operation);
+      if (!saved) return false;
       if (!saved.secret.trim()) {
         throw new Error("Relay token is required before Android can connect");
       }
       await dashboardBackend.relay.start();
-      applyStatus(await dashboardBackend.relay.status());
-      return true;
+      if (!asyncCoordinator.isCurrentOperation(operation)) return false;
+      return (await checkStatus(operation)) !== null;
     } catch (nextError) {
-      setError(String(nextError));
+      if (asyncCoordinator.isCurrentOperation(operation)) {
+        setError(String(nextError));
+      }
       return false;
     } finally {
+      asyncCoordinator.finishOperation(operation);
       setLoading(false);
     }
-  }, [applyStatus, dashboardBackend, saveConfig]);
+  }, [asyncCoordinator, checkStatus, dashboardBackend, requireKnownStatus, saveConfig]);
 
   const startBroker = useCallback(async () => {
     if (!brokerHostId) return false;
+    if (!requireKnownStatus()) return false;
+    const operation = asyncCoordinator.beginOperation();
     setBrokerStarting(true);
     setError(null);
     try {
+      const request = asyncCoordinator.issueStatusRequest("untouched");
       const status = await dashboardBackend.relay.startBroker({
         hostId: brokerHostId,
         port: 8787,
       });
-      applyStatus(status);
+      if (!asyncCoordinator.isCurrentOperation(operation)) return false;
+      if (!applyStatus(status, request)) return false;
       await dashboardBackend.relay.start();
-      applyStatus(await dashboardBackend.relay.status());
-      return true;
+      if (!asyncCoordinator.isCurrentOperation(operation)) return false;
+      return (await checkStatus(operation)) !== null;
     } catch (nextError) {
-      setError(String(nextError));
+      if (asyncCoordinator.isCurrentOperation(operation)) {
+        setError(String(nextError));
+      }
       return false;
     } finally {
+      asyncCoordinator.finishOperation(operation);
       setBrokerStarting(false);
     }
-  }, [applyStatus, brokerHostId, dashboardBackend]);
+  }, [
+    applyStatus,
+    asyncCoordinator,
+    brokerHostId,
+    checkStatus,
+    dashboardBackend,
+    requireKnownStatus,
+  ]);
 
   const stop = useCallback(async () => {
+    const operation = asyncCoordinator.beginOperation();
     setStopping(true);
     setError(null);
     try {
       await dashboardBackend.relay.stop();
-      applyStatus(await dashboardBackend.relay.status());
+      if (!asyncCoordinator.isCurrentOperation(operation)) return false;
+      if (!(await checkStatus(operation))) return false;
       setPopoverOpen(false);
       return true;
     } catch (nextError) {
-      setError(String(nextError));
+      if (asyncCoordinator.isCurrentOperation(operation)) {
+        setError(String(nextError));
+      }
       return false;
     } finally {
+      asyncCoordinator.finishOperation(operation);
       setStopping(false);
     }
-  }, [applyStatus, dashboardBackend]);
+  }, [asyncCoordinator, checkStatus, dashboardBackend]);
 
   const copyLaunch = useCallback(() => {
     void navigator.clipboard.writeText(buildMobileRelayLaunchCommand({ relayUrl, hostId, secret }));
@@ -317,8 +491,9 @@ export function useMobileRelayController({
   }, [checkStatus]);
 
   const refreshStatus = useCallback(async () => {
-    applyStatus(await dashboardBackend.relay.status(), false);
-  }, [applyStatus, dashboardBackend]);
+    if (asyncCoordinator.hasActiveOperation()) return;
+    await checkStatus();
+  }, [asyncCoordinator, checkStatus]);
   useVisibilityAwarePolling(refreshStatus, {
     enabled: active || popoverOpen,
     visibleIntervalMs: MOBILE_RELAY_VISIBLE_REFRESH_MS,
@@ -345,6 +520,7 @@ export function useMobileRelayController({
   });
 
   return {
+    statusKnown,
     active,
     connected,
     connectionState,

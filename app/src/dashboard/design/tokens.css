@@ -7,6 +7,7 @@
   --shell-bg: #0d0d0e;
   --shell-sidebar: #121213;
   --shell-workspace: #0f0f10;
+  --shell-header: #151517;
   --shell-surface-1: #1a1a1c;
   --shell-surface-2: #1e1e21;
   --shell-surface-3: #232326;
@@ -26,9 +27,13 @@
   --shell-focus: #7abaff;
 
   --shell-success: #28c840;
+  --shell-success-soft: rgb(40 200 64 / 14%);
   --shell-warning: #febc2e;
+  --shell-warning-soft: rgb(254 188 46 / 14%);
   --shell-danger: #ff5f57;
   --shell-danger-soft: #7f1d1d;
+  --shell-danger-line: rgb(255 95 87 / 42%);
+  --shell-info-soft: rgb(58 139 255 / 14%);
 
   --shell-radius-sm: 6px;
   --shell-radius-md: 8px;

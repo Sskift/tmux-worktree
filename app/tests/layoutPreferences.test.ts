@@ -61,6 +61,24 @@ test("migration is idempotent and a valid v2 object is a no-op", () => {
   assert.equal(migrateDashboardLayout(v2WithForwardCompatibleMetadata), v2WithForwardCompatibleMetadata);
 });
 
+test("shell sidebar and inspector preferences survive versioned normalization", () => {
+  const migrated = migrateDashboardLayout({
+    sidebarWidth: 296,
+    inspectorWidth: 448,
+    sidebarOpen: true,
+    inspectorOpen: false,
+    inspectorTab: "diff",
+    columnOrder: ["main"],
+  });
+
+  assert.equal(isDashboardLayoutV2(migrated), true);
+  assert.equal(migrated.sidebarWidth, 296);
+  assert.equal(migrated.inspectorWidth, 448);
+  assert.equal(migrated.sidebarOpen, true);
+  assert.equal(migrated.inspectorOpen, false);
+  assert.equal(migrated.inspectorTab, "diff");
+});
+
 test("legacy string editor paths become host-aware editor records", () => {
   const migrated = migrateDashboardLayout({
     editingFile: "/repo/README.md",

@@ -195,11 +195,16 @@ test("sidebar source uses the icon library and responsive accessible styling", (
   assert.match(source, /aria-label={`Close worktree \$\{displayName\}`}/);
   assert.match(source, /aria-label={`Close terminal \$\{terminal\.label\}`}/);
   assert.match(source, /onOpenSettings\("connections"\)/);
+  assert.match(source, /localRuntimeState === "error"/);
+  assert.match(source, /mobileRelay\.statusKnown/);
+  assert.match(source, /data-relay=\{relayState\}/);
+  assert.match(source, /Relay \{relayLabel\}/);
+  assert.doesNotMatch(source, /Local ready ·/);
   assert.doesNotMatch(source, /relay-host · connected/);
   assert.doesNotMatch(source, /codex-5/);
   assert.doesNotMatch(source, /<svg\b/);
   assert.doesNotMatch(css, /linear-gradient|radial-gradient/);
-  assert.match(css, /max-inline-size:\s*280px/);
+  assert.match(css, /max-inline-size:\s*100%/);
   assert.match(css, /font-size:\s*13px/);
   assert.match(css, /font-size:\s*11px/);
   assert.match(css, /button:focus-visible/);

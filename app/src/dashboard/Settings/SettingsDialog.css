@@ -253,6 +253,27 @@
   text-align: center;
 }
 
+.settings-action-button {
+  flex: 0 0 auto;
+  min-height: 30px;
+  padding: 0 11px;
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border-strong);
+  border-radius: var(--shell-radius-sm);
+  cursor: pointer;
+  font: 500 11px/1 var(--shell-font-sans);
+}
+
+.settings-action-button:hover {
+  color: var(--shell-text);
+  background: var(--shell-surface-hover);
+}
+
+.settings-action-status {
+  color: var(--shell-success) !important;
+}
+
 .settings-dialog :where(button, [tabindex="0"]):focus-visible {
   outline: 2px solid var(--shell-focus);
   outline-offset: 2px;

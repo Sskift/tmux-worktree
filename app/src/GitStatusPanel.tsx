@@ -1,6 +1,10 @@
-import { useState, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { type GitCommit, type GitStatus, useDashboardBackend } from "./platform";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
+import {
+  createLatestRequestGate,
+  requestSourceKey,
+} from "./latestRequestGate";
 export type { GitCommit, GitFile, GitStatus } from "./platform";
 
 type Props = {
@@ -8,9 +12,19 @@ type Props = {
   sessionName?: string;
   hostId?: string | null;
   onFileClick?: (filePath: string, cwd: string, hostId?: string | null) => void;
+  onBranchChange?: (branch: string | null) => void;
 };
 
 type Tab = "files" | "log";
+
+type GitPanelResult = {
+  sourceKey: string;
+  status: GitStatus | null;
+  statusCwd: string | null;
+  log: GitCommit[] | null;
+  error: string | null;
+  loading: boolean;
+};
 
 const REFRESH_MS = 4000;
 const PROJECT_FETCH_MS = 5 * 60_000;
@@ -49,14 +63,25 @@ function classifyRef(raw: string): { kind: RefKind; label: string } {
   return { kind: "branch", label: r };
 }
 
-export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props) {
+export function GitStatusPanel({
+  cwd,
+  sessionName,
+  hostId,
+  onFileClick,
+  onBranchChange,
+}: Props) {
   const dashboardBackend = useDashboardBackend();
   const [tab, setTab] = useState<Tab>("files");
-  const [status, setStatus] = useState<GitStatus | null>(null);
-  const [statusCwd, setStatusCwd] = useState<string | null>(null);
-  const [log, setLog] = useState<GitCommit[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const sourceKey = requestSourceKey(hostId ?? null, cwd, sessionName, tab);
+  const requestGateRef = useRef(createLatestRequestGate());
+  const [result, setResult] = useState<GitPanelResult>(() => ({
+    sourceKey,
+    status: null,
+    statusCwd: null,
+    log: null,
+    error: null,
+    loading: true,
+  }));
 
   const resolveCwd = useCallback(async () => {
     if (!sessionName) return cwd;
@@ -66,37 +91,81 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
     } catch {
       return cwd;
     }
-  }, [cwd, sessionName]);
+  }, [cwd, dashboardBackend.sessions, sessionName]);
 
   const refresh = useCallback(async () => {
+    const requestGate = requestGateRef.current;
+    const request = requestGate.issue(sourceKey);
+    setResult((current) => ({
+      sourceKey,
+      status: current.sourceKey === sourceKey ? current.status : null,
+      statusCwd: current.sourceKey === sourceKey ? current.statusCwd : null,
+      log: current.sourceKey === sourceKey ? current.log : null,
+      error: null,
+      loading: true,
+    }));
+
     const gitCwd = await resolveCwd();
-    setStatusCwd(gitCwd);
+    if (!requestGate.isCurrent(request)) return;
     if (!gitCwd) {
-      setStatus(null);
-      setLog(null);
-      setError(null);
+      onBranchChange?.(null);
+      setResult({
+        sourceKey,
+        status: null,
+        statusCwd: null,
+        log: null,
+        error: null,
+        loading: false,
+      });
       return;
     }
-    setLoading(true);
+
     try {
       if (tab === "files") {
-        const s = await dashboardBackend.git.status(gitCwd, hostId);
-        setStatus(s);
+        const status = await dashboardBackend.git.status(gitCwd, hostId);
+        if (!requestGate.isCurrent(request)) return;
+        onBranchChange?.(status?.branch ?? null);
+        setResult({
+          sourceKey,
+          status,
+          statusCwd: gitCwd,
+          log: null,
+          error: null,
+          loading: false,
+        });
       } else {
-        const cs = await dashboardBackend.git.log(gitCwd, 100, hostId);
-        setLog(cs);
+        const log = await dashboardBackend.git.log(gitCwd, 100, hostId);
+        if (!requestGate.isCurrent(request)) return;
+        setResult({
+          sourceKey,
+          status: null,
+          statusCwd: gitCwd,
+          log,
+          error: null,
+          loading: false,
+        });
       }
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
+    } catch (error) {
+      if (!requestGate.isCurrent(request)) return;
+      onBranchChange?.(null);
+      setResult({
+        sourceKey,
+        status: null,
+        statusCwd: gitCwd,
+        log: null,
+        error: String(error),
+        loading: false,
+      });
     }
-  }, [resolveCwd, tab, hostId]);
+  }, [dashboardBackend.git, hostId, onBranchChange, resolveCwd, sourceKey, tab]);
+
+  useEffect(() => {
+    return () => requestGateRef.current.invalidate();
+  }, [sourceKey]);
 
   const triggerProjectFetch = useCallback(() => {
     void dashboardBackend.git.fetchProjectRoots().catch(() => {});
-  }, []);
+  }, [dashboardBackend.git]);
 
   useVisibilityAwarePolling(triggerProjectFetch, {
     visibleIntervalMs: PROJECT_FETCH_MS,
@@ -108,6 +177,18 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
     hiddenIntervalMs: HIDDEN_REFRESH_MS,
     refreshKey: `${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}`,
   });
+
+  const currentResult: GitPanelResult = result.sourceKey === sourceKey
+    ? result
+    : {
+        sourceKey,
+        status: null,
+        statusCwd: null,
+        log: null,
+        error: null,
+        loading: true,
+      };
+  const { status, statusCwd, log, error, loading } = currentResult;
 
   const tabs = (
     <div className="git__tabs">
@@ -210,7 +291,7 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
               )}
               {status.conflicts > 0 && (
                 <span className="git__chip git__chip--conflict">
-                  {status.conflicts} ✕
+                  {status.conflicts} conflicts
                 </span>
               )}
             </>
@@ -220,9 +301,12 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
           {status.files.map((f) => {
             const kind = categorize(f.code);
             return (
-              <div
+              <button
+                type="button"
                 key={f.code + f.path}
                 className={`git__file git__file--${kind}${onFileClick ? " git__file--clickable" : ""}`}
+                aria-label={`Open diff for ${f.path}`}
+                disabled={!onFileClick || !statusCwd}
                 onClick={() => {
                   if (statusCwd) onFileClick?.(f.path, statusCwd, hostId ?? null);
                 }}
@@ -231,7 +315,7 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
                 <span className="git__path" title={f.path}>
                   {f.path}
                 </span>
-              </div>
+              </button>
             );
           })}
         </div>

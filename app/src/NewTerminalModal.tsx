@@ -1,5 +1,13 @@
-import { useEffect, useState } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
+import { keepFocusInside } from "./dashboard/Settings/focusTrap";
+import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
 import { type HostConfig, useDashboardBackend } from "./platform";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
@@ -22,6 +30,14 @@ const LOCAL_HOST = "__local__";
 
 export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreated }: Props) {
   const dashboardBackend = useDashboardBackend();
+  const dialogRef = useRef<HTMLFormElement>(null);
+  const initialFocusRef = useRef<HTMLInputElement>(null);
+  const remoteBrowseButtonRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const homeDirectoryRequestGateRef = useRef(createLatestRequestGate());
+  const homeDefaultPublishGateRef = useRef(createLatestRequestGate());
+  const titleId = useId();
+  const descriptionId = useId();
   const [selectedHost, setSelectedHost] = useState(LOCAL_HOST);
   const [path, setPath] = useState("");
   const [label, setLabel] = useState("");
@@ -42,17 +58,48 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
   ];
 
   useEffect(() => {
-    dashboardBackend.persistence.homeDirectory()
+    previousFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const animationFrame = window.requestAnimationFrame(() => initialFocusRef.current?.focus());
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      const focusTarget = previousFocusRef.current;
+      if (focusTarget?.isConnected) focusTarget.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const requestGate = homeDirectoryRequestGateRef.current;
+    const publishGate = homeDefaultPublishGateRef.current;
+    const sourceKey = requestSourceKey("new-terminal-home-directory", LOCAL_HOST);
+    const requestToken = requestGate.issue(sourceKey);
+    const publishToken = publishGate.issue(sourceKey);
+
+    void dashboardBackend.persistence.homeDirectory()
       .then((home) => {
+        if (!requestGate.isCurrent(requestToken)) return;
         const desktop = `${home}/Desktop`;
         setLocalDefaultPath(desktop);
+        if (!publishGate.isCurrent(publishToken)) return;
         setPath(desktop);
         setLabel("Desktop");
       })
       .catch(() => {});
-  }, []);
+
+    return () => {
+      requestGate.cancel(requestToken);
+      publishGate.cancel(publishToken);
+    };
+  }, [dashboardBackend]);
+
+  const invalidatePendingHomeDefault = () => {
+    homeDefaultPublishGateRef.current.invalidate();
+  };
 
   const changeHost = (hostId: string) => {
+    invalidatePendingHomeDefault();
     setSelectedHost(hostId);
     setError(null);
     if (hostId === LOCAL_HOST) {
@@ -65,6 +112,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
   };
 
   const browse = async () => {
+    invalidatePendingHomeDefault();
     try {
       const picked = await dashboardBackend.dialog.selectDirectory({
         title: "Select directory",
@@ -113,15 +161,36 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
     }
   };
 
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLFormElement>) => {
+    if (event.key === "Escape" && !busy) {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+
+    if (dialogRef.current) keepFocusInside(event.nativeEvent, dialogRef.current);
+  };
+
   return (
     <div className="modal-backdrop">
       <form
+        ref={dialogRef}
         className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={descriptionId}
+        aria-busy={busy}
+        aria-hidden={showRemotePicker ? true : undefined}
+        inert={showRemotePicker}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
         onSubmit={submit}
       >
-        <div className="modal__title">new terminal</div>
-        <p className="modal__hint">
+        <div className="modal__title" id={titleId}>new terminal</div>
+        <p className="modal__hint" id={descriptionId}>
           Create a TW-managed tmux session and start the AI command in it.
         </p>
 
@@ -142,10 +211,12 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
           <span className="field__label">{isRemote ? "remote path" : "directory"}</span>
           <div className="field__row">
             <input
+              ref={initialFocusRef}
               className="field__input"
               type="text"
               value={path}
               onChange={(e) => {
+                invalidatePendingHomeDefault();
                 setPath(e.target.value);
                 if (!label.trim()) {
                   setLabel(e.target.value.split("/").filter(Boolean).pop() ?? "");
@@ -153,13 +224,13 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
               }}
               placeholder={isRemote ? "/path/on/host" : "/path/to/dir"}
               disabled={busy}
-              autoFocus
               autoComplete="off"
               autoCorrect="off"
               autoCapitalize="off"
               spellCheck={false}
             />
             <button
+              ref={remoteBrowseButtonRef}
               type="button"
               className="btn btn--ghost"
               onClick={() => isRemote ? setShowRemotePicker(true) : browse()}
@@ -169,21 +240,6 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
             </button>
           </div>
         </label>
-
-        {showRemotePicker && isRemote && (
-          <RemoteDirectoryPicker
-            hostId={selectedHost}
-            initialPath={path}
-            onClose={() => setShowRemotePicker(false)}
-            onSelect={(pickedPath) => {
-              setPath(pickedPath);
-              if (!label.trim()) {
-                setLabel(pickedPath.split("/").filter(Boolean).pop() ?? "");
-              }
-              setShowRemotePicker(false);
-            }}
-          />
-        )}
 
         <label className="field">
           <span className="field__label">ai command</span>
@@ -207,7 +263,10 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
             className="field__input"
             type="text"
             value={label}
-            onChange={(e) => setLabel(e.target.value)}
+            onChange={(e) => {
+              invalidatePendingHomeDefault();
+              setLabel(e.target.value);
+            }}
             placeholder="(optional, defaults to directory name)"
             disabled={busy}
             autoComplete="off"
@@ -237,6 +296,22 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
           </button>
         </div>
       </form>
+      {showRemotePicker && isRemote && (
+        <RemoteDirectoryPicker
+          hostId={selectedHost}
+          initialPath={path}
+          returnFocusRef={remoteBrowseButtonRef}
+          onClose={() => setShowRemotePicker(false)}
+          onSelect={(pickedPath) => {
+            invalidatePendingHomeDefault();
+            setPath(pickedPath);
+            if (!label.trim()) {
+              setLabel(pickedPath.split("/").filter(Boolean).pop() ?? "");
+            }
+            setShowRemotePicker(false);
+          }}
+        />
+      )}
     </div>
   );
 }

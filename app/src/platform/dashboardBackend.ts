@@ -14,6 +14,7 @@ import type {
   AddProjectInput,
   CreateTerminalInput,
   CreatedTerminal,
+  DashboardCatalogSnapshot,
   CreateWorktreeInput,
   DashboardLayout,
   DeleteWorktreeInput,
@@ -46,6 +47,9 @@ import type {
 type HostId = string | null | undefined;
 
 export interface DashboardBackend {
+  catalog?: {
+    list(): Promise<DashboardCatalogSnapshot>;
+  };
   sessions: {
     list(): Promise<Session[]>;
     exists(name: string): Promise<boolean>;
@@ -253,6 +257,10 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
   };
 
   return {
+    catalog: {
+      list: () =>
+        transport.invoke<DashboardCatalogSnapshot>("list_dashboard_catalog"),
+    },
     sessions: {
       list: () => transport.invoke<Session[]>("list_sessions"),
       exists: (name) => transport.invoke<boolean>("tmux_session_exists", { name }),

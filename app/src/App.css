@@ -10,22 +10,22 @@
   --divider-strong: rgba(149, 152, 163, 0.34);
   --border: rgba(149, 152, 163, 0.28);
   --surface-muted: rgba(149, 152, 163, 0.08);
-  --surface-hover: rgba(183, 148, 246, 0.1);
-  --surface-hover-strong: rgba(183, 148, 246, 0.16);
-  --surface-selected: rgba(183, 148, 246, 0.18);
-  --surface-selected-hover: rgba(183, 148, 246, 0.24);
-  --surface-accent-soft: rgba(183, 148, 246, 0.12);
+  --surface-hover: rgba(58, 139, 255, 0.1);
+  --surface-hover-strong: rgba(58, 139, 255, 0.16);
+  --surface-selected: rgba(58, 139, 255, 0.18);
+  --surface-selected-hover: rgba(58, 139, 255, 0.24);
+  --surface-accent-soft: rgba(58, 139, 255, 0.12);
   --surface-warn-soft: rgba(246, 173, 85, 0.14);
   --scrollbar: rgba(149, 152, 163, 0.18);
   --scrollbar-hover: rgba(149, 152, 163, 0.3);
-  --accent-a-glow: rgba(183, 148, 246, 0.38);
+  --accent-a-glow: rgba(58, 139, 255, 0.38);
   --text: #e6e6e8;
   --text-dim: #9598a3;
   --text-faint: #5a5d68;
-  --accent-a: #b794f6;
+  --accent-a: #3a8bff;
   --accent-b: #f687b3;
   --accent-c: #f6ad55;
-  --accent: linear-gradient(135deg, var(--accent-a), var(--accent-b) 50%, var(--accent-c));
+  --accent: var(--accent-a);
   --radius-sm: 6px;
   --radius: 10px;
   --radius-lg: 14px;
@@ -560,9 +560,11 @@ button:disabled {
   grid-template-columns: 14px 1fr;
   align-items: center;
   gap: 8px;
+  width: 100%;
   padding: 3px 6px;
   border-radius: 3px;
   font-size: 12px;
+  text-align: left;
 }
 
 .git__file:hover {
@@ -1081,11 +1083,10 @@ button:disabled {
   color: var(--text);
 }
 
-.theme__item--current::after {
-  content: "✓";
+.theme__check {
   margin-left: auto;
   color: var(--accent-a);
-  font-size: 11px;
+  flex: 0 0 auto;
 }
 
 /* ─── Main / Scratch panes ──────────────────────────────────── */
@@ -2057,6 +2058,254 @@ select.field__input {
   overflow: hidden;
 }
 
+/* ─── Dashboard shell integration ─────────────────────────── */
+
+.dashboard-titlebar {
+  display: flex;
+  max-width: min(46vw, 520px);
+  align-items: center;
+  overflow: hidden;
+  color: var(--shell-text-faint);
+  font: 600 11px/1 var(--shell-font-sans);
+  letter-spacing: 0.02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-titlebar span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dashboard-workspace {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--shell-workspace);
+}
+
+.dashboard-workspace__primary {
+  position: relative;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dashboard-workspace__primary > .terminal-deck,
+.dashboard-workspace__expanded,
+.dashboard-expanded-content,
+.dashboard-inspector-view,
+.dashboard-workspace__automation {
+  min-width: 0;
+  min-height: 0;
+}
+
+.dashboard-workspace__primary > .terminal-deck,
+.dashboard-workspace__expanded {
+  width: 100%;
+  height: 100%;
+}
+
+.dashboard-workspace__expanded {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--shell-workspace);
+}
+
+.dashboard-expanded-toolbar {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px 0 16px;
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-1);
+  border-bottom: 1px solid var(--shell-border);
+  font: 600 12px/1 var(--shell-font-sans);
+}
+
+.dashboard-expanded-toolbar button,
+.dashboard-context-summary button {
+  display: inline-flex;
+  min-height: 28px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius-sm);
+  font: 500 11px/1 var(--shell-font-sans);
+}
+
+.dashboard-expanded-toolbar button:hover,
+.dashboard-context-summary button:hover {
+  color: var(--shell-text);
+  background: var(--shell-surface-hover);
+  border-color: var(--shell-border-strong);
+}
+
+.dashboard-expanded-toolbar button:focus-visible,
+.dashboard-context-summary button:focus-visible,
+.dashboard-scratch button:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: 2px;
+}
+
+.dashboard-expanded-content {
+  display: flex;
+  overflow: hidden;
+}
+
+.dashboard-expanded-content > *,
+.dashboard-inspector-view > * {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.dashboard-workspace__automation {
+  padding: 10px;
+  overflow: hidden;
+}
+
+.dashboard-inspector-view {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.dashboard-inspector-view--git .git {
+  height: 100%;
+}
+
+.dashboard-inspector-view--diff .pane,
+.dashboard-expanded-content .pane,
+.dashboard-workspace__expanded > .pane {
+  height: 100%;
+}
+
+.dashboard-context-empty,
+.dashboard-context-summary {
+  display: grid;
+  min-height: 220px;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--shell-text-muted);
+  font: 400 11px/1.5 var(--shell-font-sans);
+  text-align: center;
+}
+
+.dashboard-context-empty strong,
+.dashboard-context-summary strong {
+  color: var(--shell-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.dashboard-context-empty span,
+.dashboard-context-summary span {
+  max-width: 280px;
+}
+
+.dashboard-scratch {
+  position: absolute;
+  z-index: 12;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  display: grid;
+  grid-template-rows: 38px minmax(0, 1fr);
+  width: min(400px, 46%);
+  min-width: 300px;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--shell-sidebar);
+  border-left: 1px solid var(--shell-border-strong);
+  box-shadow: -18px 0 36px rgb(0 0 0 / 24%);
+}
+
+.dashboard-scratch[hidden] {
+  display: none;
+}
+
+.dashboard-scratch__header,
+.dashboard-scratch__terminal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--shell-text-muted);
+  border-bottom: 1px solid var(--shell-border);
+  font: 600 11px/1 var(--shell-font-sans);
+}
+
+.dashboard-scratch__header {
+  padding: 0 8px 0 12px;
+}
+
+.dashboard-scratch__header > div {
+  display: flex;
+  gap: 2px;
+}
+
+.dashboard-scratch__header button,
+.dashboard-scratch__terminal-header button {
+  display: grid;
+  width: 26px;
+  height: 26px;
+  place-items: center;
+  color: var(--shell-text-muted);
+  border-radius: var(--shell-radius-sm);
+}
+
+.dashboard-scratch__header button:hover,
+.dashboard-scratch__terminal-header button:hover {
+  color: var(--shell-text);
+  background: var(--shell-surface-hover);
+}
+
+.dashboard-scratch > .scratch__sections {
+  min-height: 0;
+}
+
+.dashboard-scratch__terminal-header {
+  min-height: 30px;
+  padding: 0 5px 0 10px;
+  cursor: default;
+}
+
+.dashboard-scratch__terminal-header + .scratch__term {
+  min-height: 0;
+}
+
+@media (max-width: 1099px) {
+  .dashboard-scratch {
+    width: min(400px, calc(100% - 32px));
+    min-width: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-expanded-toolbar button,
+  .dashboard-context-summary button,
+  .dashboard-scratch button {
+    transition: none;
+  }
+}
+
 /* ─── File tree ────────────────────────────────────────────── */
 
 .file-tree {
@@ -2196,6 +2445,20 @@ select.field__input {
 
 .file-tree__search-btn--active {
   color: var(--accent-a, #b794f6);
+}
+
+.file-tree__remote-note {
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-tree__remote-note + .file-tree__search-btn {
+  margin-left: 0;
 }
 
 .file-tree__search-panel {
@@ -2505,6 +2768,48 @@ select.field__input {
 
 .git__file--clickable:hover {
   background: var(--surface-hover-strong);
+}
+
+.git__file--clickable:focus-visible {
+  outline: 1px solid var(--accent-a);
+  outline-offset: -1px;
+  background: var(--surface-hover-strong);
+}
+
+/* Automation rows keep selection and deletion as sibling native controls so
+   keyboard activation on Delete cannot also trigger row selection. */
+.automation-list__item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 0;
+  padding: 0;
+  cursor: default;
+}
+
+.automation-list__select {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 7px 4px 7px 10px;
+  border-radius: inherit;
+  text-align: left;
+}
+
+.automation-list__item .session__kill {
+  align-self: center;
+  margin-right: 6px;
+}
+
+.automation-list__item:focus-within .session__kill {
+  opacity: 1;
+}
+
+.automation-list__select:focus-visible,
+.automation-list__item .session__kill:focus-visible {
+  outline: 1px solid var(--accent-a);
+  outline-offset: -1px;
 }
 
 /* ─── Diff viewer ───────────────────────────────────────────── */

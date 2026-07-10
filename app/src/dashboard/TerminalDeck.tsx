@@ -19,6 +19,7 @@ type TerminalDeckProps = {
   openedTerminals: string[];
   cwdsBySession: Record<string, string>;
   tmuxPreviews: Record<string, string>;
+  metadataPending: boolean;
   visible: boolean;
   blocked: boolean;
   scratchCollapsed: boolean;
@@ -144,6 +145,7 @@ export function TerminalDeck({
   openedTerminals,
   cwdsBySession,
   tmuxPreviews,
+  metadataPending,
   visible,
   blocked,
   scratchCollapsed,
@@ -163,7 +165,9 @@ export function TerminalDeck({
         </span>
         <div className="pane__bar-actions">
           <span className="pane__hint dim">
-            {selectedAttachLabel(selection, sessions, terminals)}
+            {metadataPending
+              ? "waiting for metadata"
+              : selectedAttachLabel(selection, sessions, terminals)}
           </span>
           <button
             className={`brand__file-btn scratch__toggle-btn${scratchCollapsed ? "" : " brand__file-btn--active"}`}
@@ -181,13 +185,21 @@ export function TerminalDeck({
         </div>
       </div>
       <div className="pane__body pane__body--stack">
+        {metadataPending && (
+          <div className="pane__hint" data-terminal-pending role="status">
+            <strong>Loading workspace details…</strong>
+            <span>Waiting for session and host metadata before connecting.</span>
+          </div>
+        )}
         {openedSessions.map((name) => {
           const session = sessions.find((candidate) => candidate.name === name);
-          const isRemote = session?.hostId != null;
+          if (!session) return null;
+          const isRemote = session.hostId != null;
           const host = isRemote
             ? hosts.find((candidate) => candidate.id === session.hostId)
             : null;
-          const rawName = session?.rawName ?? name;
+          if (isRemote && !host) return null;
+          const rawName = session.rawName ?? name;
           const command = isRemote && host ? "ssh" : "tmux";
           const args = isRemote && host
             ? buildSshAttachArgs(host, rawName)

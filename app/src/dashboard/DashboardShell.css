@@ -5,6 +5,50 @@
   --tw-inspector-width: 420px;
   --tw-inspector-track: var(--tw-inspector-width);
 
+  /* Keep the legacy domain panels on the product-shell palette. The xterm
+     palette is passed directly from the selected terminal theme. */
+  --bg: var(--shell-bg);
+  --bg-1: var(--shell-sidebar);
+  --bg-2: var(--shell-surface-1);
+  --bg-3: var(--shell-surface-2);
+  --bg-elevated: var(--shell-surface-2);
+  --line: var(--shell-border);
+  --line-2: var(--shell-border-strong);
+  --divider-subtle: rgb(138 138 144 / 14%);
+  --divider: rgb(138 138 144 / 24%);
+  --divider-strong: var(--shell-border-strong);
+  --border: var(--shell-border);
+  --surface-muted: rgb(138 138 144 / 8%);
+  --surface-hover: var(--shell-surface-hover);
+  --surface-hover-strong: var(--shell-accent-soft);
+  --surface-selected: var(--shell-accent-soft);
+  --surface-selected-hover: rgb(58 139 255 / 24%);
+  --surface-accent-soft: var(--shell-info-soft);
+  --scrollbar: var(--shell-border-strong);
+  --scrollbar-hover: var(--shell-text-disabled);
+  --text: var(--shell-text);
+  --text-dim: var(--shell-text-muted);
+  --text-faint: var(--shell-text-faint);
+  --accent: var(--shell-accent);
+  --accent-a: var(--shell-accent);
+  --accent-b: var(--shell-focus);
+  --accent-c: var(--shell-warning);
+  --accent-a-glow: rgb(58 139 255 / 38%);
+  --accent-a-ink: var(--shell-focus);
+  --ok: var(--shell-success);
+  --ok-soft: var(--shell-success-soft);
+  --warn: var(--shell-warning);
+  --warn-soft: var(--shell-warning-soft);
+  --danger: var(--shell-danger);
+  --danger-soft: var(--shell-danger-soft);
+  --danger-line: var(--shell-danger-line);
+  --info: var(--shell-focus);
+  --info-soft: var(--shell-info-soft);
+  --font-mono: var(--shell-font-mono);
+  --radius-sm: var(--shell-radius-sm);
+  --radius-lg: var(--shell-radius-xl);
+  --shadow: var(--shell-shadow-float);
+
   position: relative;
   width: 100vw;
   height: 100vh;
@@ -58,7 +102,7 @@
 .tw-shell__sidebar {
   z-index: 30;
   overflow: hidden;
-  background: linear-gradient(180deg, var(--shell-workspace), #0a0a0b);
+  background: var(--shell-sidebar);
   border-right: 1px solid var(--shell-border);
 }
 
@@ -72,14 +116,14 @@
 .tw-shell__header {
   min-width: 0;
   overflow: hidden;
-  background: #151517;
+  background: var(--shell-header);
   border-bottom: 1px solid var(--shell-border);
 }
 
 .tw-shell__workspace {
   position: relative;
   overflow: hidden;
-  background: linear-gradient(180deg, var(--shell-surface-1), var(--shell-sidebar));
+  background: var(--shell-workspace);
 }
 
 .tw-shell__inspector {
@@ -92,6 +136,62 @@
   transition:
     opacity var(--shell-motion-fast) var(--shell-ease),
     visibility var(--shell-motion-fast) linear;
+}
+
+.tw-shell__resize-handle {
+  position: absolute;
+  z-index: 36;
+  top: 0;
+  bottom: 0;
+  width: 9px;
+  padding: 0;
+  touch-action: none;
+  cursor: col-resize;
+  background: transparent;
+  border: 0;
+}
+
+.tw-shell__resize-handle::after {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 4px;
+  width: 1px;
+  background: var(--shell-border);
+  content: "";
+  transition: background-color var(--shell-motion-fast) var(--shell-ease);
+}
+
+.tw-shell__resize-handle:hover::after,
+.tw-shell__resize-handle:focus-visible::after {
+  background: var(--shell-focus);
+}
+
+.tw-shell__resize-handle:focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: -2px;
+}
+
+.tw-shell__resize-handle--sidebar {
+  left: calc(var(--tw-sidebar-width) - 4px);
+}
+
+.tw-shell__resize-handle--inspector {
+  right: calc(var(--tw-inspector-track) - 5px);
+}
+
+body[data-dashboard-resizing] {
+  cursor: col-resize;
+  user-select: none;
+}
+
+body[data-dashboard-resizing] .tw-shell__body {
+  transition: none;
+}
+
+.tw-shell[data-modal-drawer] .tw-shell__resize-handle {
+  z-index: 15;
+  pointer-events: none;
 }
 
 .tw-shell[data-inspector-open="false"] .tw-shell__inspector {
@@ -110,6 +210,11 @@
   padding: 0;
   border: 0;
   background: rgb(0 0 0 / 48%);
+}
+
+.tw-shell[data-modal-drawer="inspector"] .tw-shell__sidebar,
+.tw-shell[data-modal-drawer="sidebar"] .tw-shell__inspector {
+  z-index: 10;
 }
 
 @media (max-width: 1439px) {
@@ -148,6 +253,10 @@
   .tw-shell[data-inspector-open="true"] .tw-shell__drawer-backdrop {
     display: block;
   }
+
+  .tw-shell__resize-handle--inspector {
+    display: none;
+  }
 }
 
 @media (max-width: 1099px) {
@@ -185,12 +294,20 @@
   .tw-shell[data-inspector-open="true"] .tw-shell__drawer-backdrop {
     display: block;
   }
+
+  .tw-shell__resize-handle--sidebar {
+    display: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .tw-shell__body,
   .tw-shell__sidebar,
   .tw-shell__inspector {
+    transition: none;
+  }
+
+  .tw-shell__resize-handle::after {
     transition: none;
   }
 }

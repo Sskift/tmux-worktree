@@ -49,11 +49,14 @@ test("remote file links keep host identity through the SSH editor", () => {
   assert.match(terminalSource, /checkFileExists\(dashboardBackend, resolved, hostId\)/);
   assert.match(terminalSource, /openFile\(resolved, link\.line, link\.col, hostId\)/);
   assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
-  assert.match(appSource, /setEditingFile\(\{ path, hostId: hostId \?\? null \}\)/);
+  assert.match(appSource, /const nextFile = \{ path, hostId: hostId \?\? null \}/);
+  assert.match(appSource, /setEditingFile\(nextFile\)/);
   assert.match(appSource, /hostId=\{editingFile\.hostId \?\? null\}/);
-  assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, path\)/);
+  assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, filePath\)/);
   assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, cur\)/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemoteBase64\(hostId, filePath\)/);
+  assert.match(editorSource, /requestSourceKey\(hostId \?\? null, filePath\)/);
+  assert.match(editorSource, /if \(!requestGate\.isCurrent\(request\)\) return;/);
   assert.match(
     backendSource,
     /readRemote: \(hostId, path\) =>\s*transport\.invoke<string>\("remote_read_file", \{ hostId, path \}\)/s,
@@ -81,6 +84,14 @@ test("terminal subscribes to pty output before opening the pty", () => {
   assert.match(terminalSource, /dashboardBackend\.pty\.connect\(\s*\{ id, cmd, args, cwd, cols, rows \}/s);
   assert.match(backendSource, /transport\.invoke<string>\("pty_open", \{ args \}\)/);
   assert.match(rustSource, /id: Option<String>/);
+});
+
+test("reactivating a terminal does not steal an overlay focus return", () => {
+  const source = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  assert.match(source, /function canTerminalClaimFocus/);
+  assert.match(source, /focused === document\.body/);
+  assert.match(source, /Boolean\(host\?\.contains\(focused\)\)/);
+  assert.match(source, /if \(canTerminalClaimFocus\(hostRef\.current\)\) term\.focus\(\)/);
 });
 
 test("tmux status bar receives the active dashboard terminal palette", () => {

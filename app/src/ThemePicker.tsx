@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Check } from "lucide-react";
 import { THEMES, type ThemeId, applyTheme } from "./themes";
 
 type Props = {
@@ -54,6 +55,14 @@ export function ThemePicker({ current, onChange }: Props) {
                   }}
                 />
                 <span className="theme__label">{t.label}</span>
+                {t.id === current ? (
+                  <Check
+                    className="theme__check"
+                    aria-hidden="true"
+                    size={13}
+                    strokeWidth={2}
+                  />
+                ) : null}
               </button>
             ))}
           </div>

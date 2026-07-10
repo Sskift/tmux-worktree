@@ -9,27 +9,26 @@ const deckSource = readFileSync(
 );
 
 test("main workspace keeps TerminalDeck mounted while automation owns the visible pane", () => {
-  const mainStart = appSource.indexOf("<main");
-  const deckIndex = appSource.indexOf("<TerminalDeck", mainStart);
+  const workspaceStart = appSource.indexOf("const centralWorkspace");
+  const deckIndex = appSource.indexOf("<TerminalDeck", workspaceStart);
   const automationIndex = appSource.indexOf('selection?.kind === "automation"', deckIndex);
-  const mainEnd = appSource.indexOf("</main>", automationIndex);
+  const workspaceEnd = appSource.indexOf("const overlays", automationIndex);
 
-  assert.ok(mainStart >= 0, "main workspace should exist");
-  assert.ok(deckIndex > mainStart, "TerminalDeck should be a direct workspace child");
+  assert.ok(workspaceStart >= 0, "central workspace should exist");
+  assert.ok(deckIndex > workspaceStart, "TerminalDeck should be a direct workspace child");
   assert.ok(
     automationIndex > deckIndex,
     "TerminalDeck should render before the conditional automation pane",
   );
-  assert.ok(mainEnd > automationIndex, "both panes should remain inside the main workspace");
+  assert.ok(workspaceEnd > automationIndex, "both panes should remain inside the central workspace");
   assert.equal(
     appSource.match(/<TerminalDeck\b/g)?.length,
     1,
     "App should have one unconditional terminal deck instance",
   );
-  assert.match(
-    appSource.slice(deckIndex, automationIndex),
-    /visible=\{selection\?\.kind === "session" \|\| selection\?\.kind === "terminal"\}/,
-  );
+  assert.match(appSource, /const terminalViewVisible =/);
+  assert.match(appSource.slice(deckIndex, automationIndex), /visible=\{terminalViewVisible\}/);
+  assert.match(appSource, /blocked=\{anyModalOpen\}/);
 });
 
 test("display none hides the deck without removing terminal components from the React tree", () => {
@@ -82,4 +81,43 @@ test("hidden or blocked decks preserve PTY identity while disabling input", () =
   assert.match(deckSource, /initialHistory=\{tmuxPreviews\[name\]\}/);
   assert.match(deckSource, /initialHistory=\{tmuxPreviews\[sessionKey\]\}/);
   assert.match(deckSource, /onOpenFile=\{onOpenFile\}/g);
+});
+
+test("scratch terminals stay mounted when the panel is collapsed", () => {
+  assert.match(appSource, /<aside[\s\S]*?className="dashboard-scratch"[\s\S]*?hidden=\{selectionMetadataPending \|\| scratchCollapsed \|\| !selectionKey\}/);
+  assert.match(appSource, /active=\{isActive && !scratchCollapsed && !workspaceInteractionBlocked\}/);
+  assert.doesNotMatch(appSource, /\{!scratchCollapsed && selectionKey && \(\s*<aside className="dashboard-scratch"/);
+});
+
+test("pending remote selections never fall back to local terminal or workspace commands", () => {
+  assert.match(appSource, /const selectionMetadataPending =/);
+  assert.match(
+    appSource,
+    /if \(!selectedSession \|\| selectionMetadataPending\) return;/,
+  );
+  assert.match(
+    appSource,
+    /if \(!selectedTerminal \|\| selectionMetadataPending\) return;/,
+  );
+  assert.match(appSource, /selectionMetadataPending\s*\? null\s*: selection\?\.kind === "session"/s);
+  assert.match(appSource, /<strong>Loading workspace details…<\/strong>/);
+  assert.match(appSource, /metadataPending=\{selectionMetadataPending\}/);
+  assert.match(appSource, /const terminalViewVisible =\s*selectionMetadataPending \|\|/s);
+  assert.match(appSource, /\{selectionMetadataPending \? null : editingFile \? \(/);
+  assert.match(appSource, /if \(!session \|\| !cwd\) return null;/);
+  assert.match(appSource, /useState<PendingCatalogSelection \| null>\(null\)/);
+  assert.match(
+    appSource,
+    /pendingCreatedCatalogSelection\(\s*\{ kind: "session", name: sessionName \},\s*catalogRefreshGenerationRef\.current\.started,\s*\)/s,
+  );
+  assert.match(
+    appSource,
+    /const catalogSelectionResolution = useMemo\(\s*\(\) => reconcileCatalogSelection/s,
+  );
+
+  assert.match(deckSource, /metadataPending: boolean;/);
+  assert.match(deckSource, /data-terminal-pending role="status"/);
+  assert.match(deckSource, /if \(!session\) return null;/);
+  assert.match(deckSource, /if \(isRemote && !host\) return null;/);
+  assert.doesNotMatch(deckSource, /const isRemote = session\?\.hostId/);
 });

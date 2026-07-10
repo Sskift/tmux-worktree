@@ -26,6 +26,7 @@ export type DiffFile = {
 };
 
 export type LayoutColumn = "file" | "main" | "scratch" | "editor";
+export type PersistedInspectorTab = "files" | "git" | "diff" | "automation" | "feishu";
 
 export const DEFAULT_COLUMN_ORDER: LayoutColumn[] = [
   "file",
@@ -47,6 +48,11 @@ export type DashboardLayoutPreferences = {
   fileBrowserOpen?: boolean;
   fileTreeWidth?: number;
   editorWidth?: number;
+  sidebarWidth?: number;
+  inspectorWidth?: number;
+  sidebarOpen?: boolean;
+  inspectorOpen?: boolean;
+  inspectorTab?: PersistedInspectorTab;
   selection?: Selection;
   editingFile?: EditingFile | null;
   diffFile?: DiffFile | null;
@@ -126,6 +132,16 @@ function isLayoutColumn(value: unknown): value is LayoutColumn {
   return value === "file" || value === "main" || value === "scratch" || value === "editor";
 }
 
+function isInspectorTab(value: unknown): value is PersistedInspectorTab {
+  return (
+    value === "files" ||
+    value === "git" ||
+    value === "diff" ||
+    value === "automation" ||
+    value === "feishu"
+  );
+}
+
 export function normalizeColumnOrder(value: unknown): LayoutColumn[] {
   const seen = new Set<LayoutColumn>();
   const restored = Array.isArray(value)
@@ -175,6 +191,11 @@ export function isDashboardLayoutV2(value: unknown): value is DashboardLayoutV2 
     optionalField(value, "fileBrowserOpen", (field) => typeof field === "boolean") &&
     optionalField(value, "fileTreeWidth", isPositiveFiniteNumber) &&
     optionalField(value, "editorWidth", isPositiveFiniteNumber) &&
+    optionalField(value, "sidebarWidth", isPositiveFiniteNumber) &&
+    optionalField(value, "inspectorWidth", isPositiveFiniteNumber) &&
+    optionalField(value, "sidebarOpen", (field) => typeof field === "boolean") &&
+    optionalField(value, "inspectorOpen", (field) => typeof field === "boolean") &&
+    optionalField(value, "inspectorTab", isInspectorTab) &&
     optionalField(value, "selection", isSelection) &&
     optionalField(value, "editingFile", (field) => field === null || isEditingFile(field)) &&
     optionalField(value, "diffFile", (field) => field === null || isDiffFile(field)) &&
@@ -196,6 +217,8 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
     "automationHeight",
     "fileTreeWidth",
     "editorWidth",
+    "sidebarWidth",
+    "inspectorWidth",
   ] as const) {
     const field = source[key];
     if (isPositiveFiniteNumber(field)) normalized[key] = field;
@@ -217,6 +240,9 @@ function normalizedPreferences(value: unknown): DashboardLayoutPreferences {
   if (typeof source.fileBrowserOpen === "boolean") {
     normalized.fileBrowserOpen = source.fileBrowserOpen;
   }
+  if (typeof source.sidebarOpen === "boolean") normalized.sidebarOpen = source.sidebarOpen;
+  if (typeof source.inspectorOpen === "boolean") normalized.inspectorOpen = source.inspectorOpen;
+  if (isInspectorTab(source.inspectorTab)) normalized.inspectorTab = source.inspectorTab;
   if (isSelection(source.selection)) normalized.selection = source.selection;
 
   if (source.editingFile === null) {

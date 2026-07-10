@@ -320,7 +320,7 @@ export function SettingsDialog({
                     id={`settings-tab-${section.id}`}
                     role="tab"
                     aria-selected={selected}
-                    aria-controls={`settings-panel-${section.id}`}
+                    aria-controls="settings-active-panel"
                     tabIndex={selected ? 0 : -1}
                     className="settings-dialog__nav-item"
                     onClick={() => selectSection(section.id)}
@@ -336,7 +336,7 @@ export function SettingsDialog({
 
           <main
             className="settings-dialog__panel"
-            id={`settings-panel-${activeSection}`}
+            id="settings-active-panel"
             role="tabpanel"
             aria-labelledby={`settings-tab-${activeSection}`}
             tabIndex={0}

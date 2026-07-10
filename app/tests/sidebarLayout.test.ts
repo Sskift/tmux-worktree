@@ -31,11 +31,16 @@ test("sidebar layout ignores transient tiny heights from window manager events",
   assert.equal(isStableSidebarLayoutHeight(SIDEBAR_STABLE_LAYOUT_MIN_HEIGHT), true);
 });
 
-test("dashboard guards sidebar normalize and persistence against unstable heights", () => {
+test("dashboard shell removes legacy height-coupled sidebar persistence", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const shellCss = readFileSync(
+    new URL("../src/dashboard/DashboardShell.css", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(app, /if \(!isStableSidebarLayoutHeight\(totalHeight\)\) return;/);
-  assert.match(app, /if \(!isStableSidebarLayoutHeight\(sidebarHeight\)\) return;/);
+  assert.doesNotMatch(app, /isStableSidebarLayoutHeight|normalizeSidebarSplits/);
+  assert.match(shellCss, /height:\s*calc\(100vh - 44px\)/);
+  assert.match(shellCss, /overflow:\s*hidden/);
 });
 
 test("worktree activity label shows status only with readable theme colors", () => {
@@ -66,15 +71,25 @@ test("worktree sidebar renders a single stable title span", () => {
 });
 
 test("worktree sidebar groups sessions by project with collapsible headers", () => {
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const css = readFileSync(new URL("../src/App.css", import.meta.url), "utf8");
+  const sidebar = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
+  const model = readFileSync(
+    new URL("../src/dashboard/DashboardSidebarModel.ts", import.meta.url),
+    "utf8",
+  );
+  const css = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.css", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(app, /function groupSessionsByProject\(sessions: Session\[\], hosts: HostConfig\[\]\): SessionGroup\[\]/);
-  assert.match(app, /const \[collapsedProjects, setCollapsedProjects\]/);
-  assert.match(app, /sessionGroups\.map\(\(group\) =>/);
-  assert.match(app, /className="session-project__toggle"/);
-  assert.match(css, /\.session-project__toggle\s*\{/);
-  assert.match(css, /\.session-project \.session\s*\{/);
+  assert.match(model, /export function groupSessionsByHostProject/);
+  assert.match(sidebar, /const collapsed = useMemo\(\(\) => new Set\(collapsedProjects\)/);
+  assert.match(sidebar, /groups\.map\(\(group\) =>/);
+  assert.match(sidebar, /className="tw-sidebar-group__toggle"/);
+  assert.match(css, /\.tw-sidebar-group__toggle\s*\{/);
+  assert.match(css, /\.tw-sidebar-group__items\s*\{/);
 });
 
 test("remote scratch terminals start on the selected host cwd", () => {
@@ -92,14 +107,17 @@ test("remote scratch terminals start on the selected host cwd", () => {
   assert.doesNotMatch(app, /if \(session\?\.hostId\) return homeDir \?\? "\/";/);
 });
 
-test("worktree project groups can persist collapsed state without breaking sort indices", () => {
+test("worktree project groups persist collapse keys without legacy arbitrary sorting", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const sortable = readFileSync(new URL("../src/useSortable.ts", import.meta.url), "utf8");
+  const sidebar = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
 
   assert.match(app, /collapsedProjects/);
-  assert.match(app, /session-project__toggle/);
-  assert.match(app, /data-sort-index=\{i\}/);
-  assert.ok(sortable.includes('querySelectorAll<HTMLElement>("[data-sort-index]")'));
+  assert.match(app, /saveLayoutPreferences\(\{[\s\S]*collapsedProjects/);
+  assert.match(sidebar, /onToggleProjectCollapsed\(group\.key\)/);
+  assert.doesNotMatch(app, /useSortable|data-sort-index|column-drag-handle/);
 });
 
 test("normalizeSidebarSplits shrinks git to keep terminals visible after height shrinks", () => {

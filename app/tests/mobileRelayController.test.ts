@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   MOBILE_RELAY_HIDDEN_REFRESH_MS,
   MOBILE_RELAY_VISIBLE_REFRESH_MS,
   buildMobileRelayLaunchCommand,
+  createMobileRelayAsyncCoordinator,
   deriveMobileRelayViewState,
 } from "../src/dashboard/hooks/useMobileRelayController.ts";
 
@@ -89,4 +91,71 @@ test("mobile relay derived status follows operation and connection priority", ()
 test("mobile relay keeps its visibility-aware polling cadence", () => {
   assert.equal(MOBILE_RELAY_VISIBLE_REFRESH_MS, 2_000);
   assert.equal(MOBILE_RELAY_HIDDEN_REFRESH_MS, 15_000);
+});
+
+test("an initial Relay response preserves every draft field edited while it was pending", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const initialStatus = coordinator.issueStatusRequest("untouched");
+
+  coordinator.markDraftEdited("relayUrl");
+  coordinator.markDraftEdited("hostId");
+  coordinator.markDraftEdited("secret");
+
+  assert.equal(coordinator.isCurrentStatusRequest(initialStatus), true);
+  assert.equal(coordinator.acceptDraftSync(initialStatus, "relayUrl"), false);
+  assert.equal(coordinator.acceptDraftSync(initialStatus, "hostId"), false);
+  assert.equal(coordinator.acceptDraftSync(initialStatus, "secret"), false);
+});
+
+test("a submitted Relay response only normalizes fields unchanged since submission", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  coordinator.markDraftEdited("relayUrl");
+  coordinator.markDraftEdited("hostId");
+  coordinator.markDraftEdited("secret");
+  const submitted = coordinator.issueStatusRequest("submitted");
+
+  coordinator.markDraftEdited("secret");
+
+  assert.equal(coordinator.acceptDraftSync(submitted, "relayUrl"), true);
+  assert.equal(coordinator.acceptDraftSync(submitted, "hostId"), true);
+  assert.equal(coordinator.acceptDraftSync(submitted, "secret"), false);
+
+  const laterPoll = coordinator.issueStatusRequest("untouched");
+  assert.equal(coordinator.acceptDraftSync(laterPoll, "relayUrl"), true);
+  assert.equal(coordinator.acceptDraftSync(laterPoll, "hostId"), true);
+  assert.equal(coordinator.acceptDraftSync(laterPoll, "secret"), false);
+});
+
+test("newer Relay reads and mutations reject stale live-status publications", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const initialRead = coordinator.issueStatusRequest();
+  const newerRead = coordinator.issueStatusRequest();
+
+  assert.equal(coordinator.isCurrentStatusRequest(initialRead), false);
+  assert.equal(coordinator.isCurrentStatusRequest(newerRead), true);
+  assert.equal(coordinator.acceptDraftSync(initialRead, "relayUrl"), false);
+
+  const operation = coordinator.beginOperation();
+  assert.equal(coordinator.isCurrentStatusRequest(newerRead), false);
+  assert.equal(coordinator.isCurrentOperation(operation), true);
+  assert.equal(coordinator.hasActiveOperation(), true);
+
+  coordinator.finishOperation(operation);
+  assert.equal(coordinator.hasActiveOperation(), false);
+});
+
+test("mobile relay exposes unknown and failed status instead of pretending to be stopped", () => {
+  const source = readFileSync(
+    new URL("../src/dashboard/hooks/useMobileRelayController.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(source, /const \[statusKnown, setStatusKnown\] = useState\(false\)/);
+  assert.match(source, /setStatusKnown\(true\)/);
+  assert.match(source, /setStatusKnown\(false\)/);
+  assert.match(source, /Unable to read Relay status/);
+  assert.match(source, /const requireKnownStatus = useCallback/);
+  assert.match(source, /if \(!requireKnownStatus\(\)\) return false;/);
+  assert.match(source, /Wait for Relay status before changing its configuration/);
+  assert.doesNotMatch(source, /function fallbackMobileRelayStatus/);
 });

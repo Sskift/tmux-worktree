@@ -47,6 +47,7 @@ export type RelayConnectionState =
 export type RelaySummaryTone = "neutral" | "progress" | "success" | "warning" | "danger";
 
 export interface RelayStatusSnapshot {
+  statusKnown?: boolean;
   connectionState: RelayConnectionState;
   active: boolean;
   connected: boolean;
@@ -204,6 +205,14 @@ export function summarizeRelayStatus(snapshot: RelayStatusSnapshot): RelayStatus
       label: "Error",
       detail: snapshot.error?.trim() || "Relay stopped after an unexpected error.",
       tone: "danger",
+    };
+  }
+
+  if (snapshot.statusKnown === false) {
+    return {
+      label: "Checking Relay",
+      detail: "Reading the saved configuration and current Relay process state.",
+      tone: "progress",
     };
   }
 

@@ -186,7 +186,7 @@
   cursor: pointer;
 }
 
-.connections-host-row + .connections-host-row {
+.connections-host-list__item + .connections-host-list__item {
   border-top: 1px solid var(--shell-border);
 }
 

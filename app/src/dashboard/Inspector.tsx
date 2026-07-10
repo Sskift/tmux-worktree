@@ -114,7 +114,7 @@ export function Inspector({
               type="button"
               role="tab"
               aria-selected={selected}
-              aria-controls={`inspector-panel-${tab.id}`}
+              aria-controls="inspector-active-panel"
               tabIndex={selected ? 0 : -1}
               onClick={() => onTabChange(tab.id)}
               onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
@@ -132,7 +132,7 @@ export function Inspector({
 
       <div
         className="workspace-inspector__panel"
-        id={`inspector-panel-${activeTab}`}
+        id="inspector-active-panel"
         role="tabpanel"
         aria-labelledby={`inspector-tab-${activeTab}`}
         tabIndex={0}

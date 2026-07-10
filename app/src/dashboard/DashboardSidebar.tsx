@@ -14,7 +14,7 @@ import {
   Workflow,
   X,
 } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, type Ref } from "react";
 import { triggerLabel, type Automation } from "../automationTypes";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../platform";
 import type { SessionActivityInfo } from "../sessionActivity";
@@ -44,6 +44,15 @@ export type DashboardSidebarProps = {
   automations: readonly Automation[];
   hosts: readonly HostConfig[];
   hostStatuses: Readonly<Record<string, HostStatus | undefined>>;
+  hostsError?: string | null;
+  mobileRelay?: {
+    statusKnown: boolean;
+    active: boolean;
+    connected: boolean;
+    statusText: string;
+    error?: string | null;
+  };
+  localRuntimeState?: "checking" | "ready" | "error";
   selection: Selection;
   sessionActivity: Readonly<Record<string, SessionActivityInfo | undefined>>;
   collapsedProjects: readonly string[];
@@ -52,6 +61,7 @@ export type DashboardSidebarProps = {
   terminalsError?: string | null;
   automationsError?: string | null;
   className?: string;
+  settingsButtonRef?: Ref<HTMLButtonElement>;
   onCreateWorktree: () => void;
   onCreateTerminal: () => void;
   onOpenCommandPalette: () => void;
@@ -123,6 +133,9 @@ export function DashboardSidebar({
   automations,
   hosts,
   hostStatuses,
+  hostsError,
+  mobileRelay,
+  localRuntimeState = "checking",
   selection,
   sessionActivity,
   collapsedProjects,
@@ -131,6 +144,7 @@ export function DashboardSidebar({
   terminalsError,
   automationsError,
   className,
+  settingsButtonRef,
   onCreateWorktree,
   onCreateTerminal,
   onOpenCommandPalette,
@@ -158,6 +172,34 @@ export function DashboardSidebar({
     [hostStatuses, hosts],
   );
   const installHost = connections.twMissingHosts[0] ?? null;
+  const hostsLabel = hostsError ? "Hosts unavailable" : connections.label;
+  const hostsDetail = hostsError ?? connections.detail;
+  const localRuntimeLabel = localRuntimeState === "ready"
+    ? "Local ready"
+    : localRuntimeState === "error"
+      ? "Local unavailable"
+      : "Local checking";
+  const relayState = !mobileRelay
+    ? "unknown"
+    : mobileRelay.error
+      ? "error"
+      : !mobileRelay.statusKnown
+        ? "unknown"
+        : mobileRelay.connected
+          ? "connected"
+          : mobileRelay.active
+            ? "starting"
+            : "stopped";
+  const relayLabel = relayState === "unknown"
+    ? "Checking"
+    : relayState === "error"
+      ? "Error"
+      : mobileRelay?.statusText ?? "Unknown";
+  const footerTone = localRuntimeState === "error" || relayState === "error" || hostsError
+    ? "danger"
+    : localRuntimeState === "checking" || relayState === "unknown"
+      ? "warning"
+      : connections.tone;
   const rootClassName = ["tw-dashboard-sidebar", className].filter(Boolean).join(" ");
 
   return (
@@ -177,10 +219,11 @@ export function DashboardSidebar({
           className="tw-dashboard-sidebar__search"
           type="button"
           onClick={onOpenCommandPalette}
-          aria-label="Search sessions, files, and commands"
+          aria-label="Search sessions and commands"
+          title="Search sessions and commands (⌘K)"
         >
           <Search aria-hidden="true" size={15} strokeWidth={1.8} />
-          <span>Search sessions, files…</span>
+          <span>Search sessions and commands…</span>
           <kbd aria-label="Command K">⌘K</kbd>
         </button>
       </div>
@@ -400,18 +443,20 @@ export function DashboardSidebar({
             className="tw-dashboard-sidebar__connections"
             type="button"
             onClick={() => onOpenSettings("connections")}
-            data-tone={connections.tone}
-            title={`${connections.label}. ${connections.detail}`}
+            data-tone={footerTone}
+            data-relay={relayState}
+            title={`${localRuntimeLabel}. ${hostsLabel}. ${hostsDetail}. Mobile Relay: ${relayLabel}${mobileRelay?.error ? ` — ${mobileRelay.error}` : ""}`}
           >
             <Server aria-hidden="true" size={16} strokeWidth={1.8} />
             <span className="tw-dashboard-sidebar__connection-copy">
               <span className="tw-dashboard-sidebar__connection-title">Connections</span>
               <span className="tw-dashboard-sidebar__connection-detail">
-                {connections.label} · {connections.detail}
+                {localRuntimeLabel} · {hostsLabel} · Relay {relayLabel}
               </span>
             </span>
           </button>
           <button
+            ref={settingsButtonRef}
             className="tw-dashboard-sidebar__settings"
             type="button"
             onClick={() => onOpenSettings()}
@@ -426,7 +471,9 @@ export function DashboardSidebar({
           <button
             className="tw-dashboard-sidebar__install"
             type="button"
-            onClick={() => void onInstallTw(installHost.id)}
+            onClick={() => {
+              void Promise.resolve(onInstallTw(installHost.id)).catch(() => {});
+            }}
             disabled={installingHostId === installHost.id}
             title={`Install tw on ${installHost.label || installHost.id}`}
           >

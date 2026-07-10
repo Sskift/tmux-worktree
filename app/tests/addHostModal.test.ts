@@ -53,6 +53,10 @@ test("add host modal shows the default SSH port when none is configured", () => 
 
 test("app loads ssh host candidates into Settings and keeps host status outside worktree list", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const sidebar = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
   const connections = readFileSync(
     new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
     "utf8",
@@ -71,11 +75,12 @@ test("app loads ssh host candidates into Settings and keeps host status outside 
   assert.match(connections, /hostStatuses:\s*Readonly<Record<string, HostStatus>>/);
   assert.match(connections, /const status = hostStatuses\[host\.id\]/);
   assert.doesNotMatch(app, /sshHosts=\{sshHostCandidates\}/);
-  const statusIndex = app.indexOf("sidebar__host-status");
-  const listsIndex = app.indexOf('className="sidebar__lists"');
-  assert.ok(statusIndex >= 0, "host status should render in its own header area");
-  assert.ok(listsIndex >= 0, "sidebar lists should still exist");
-  assert.ok(statusIndex < listsIndex, "host status should not sit above worktrees inside the list");
+  const listIndex = sidebar.indexOf("tw-dashboard-sidebar__scroll-region");
+  const connectionIndex = sidebar.indexOf("tw-dashboard-sidebar__connections");
+  assert.ok(listIndex >= 0, "sidebar navigation should exist");
+  assert.ok(connectionIndex > listIndex, "connection status should live in the footer after navigation");
+  assert.match(sidebar, /summarizeSidebarConnections\(hosts, hostStatuses\)/);
+  assert.doesNotMatch(app, /sidebar__host-status/);
 });
 
 test("app polls host status separately from the main session refresh", () => {
@@ -102,6 +107,14 @@ test("app polls host status separately from the main session refresh", () => {
 
 test("host status exposes remote tw version and install action", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const sidebar = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
+  const connections = readFileSync(
+    new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
+    "utf8",
+  );
   const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
   const catalog = readFileSync(
     new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
@@ -113,8 +126,9 @@ test("host status exposes remote tw version and install action", () => {
   assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twVersion:\s*string \| null/);
   assert.match(catalog, /dashboardBackend\.hosts\.installTw\(hostId\)/);
   assert.match(app, /installingHostId/);
-  assert.match(app, /const twLabel/);
-  assert.match(app, /st\.twVersion \?\? "ok"/);
+  assert.match(sidebar, /const installHost = connections\.twMissingHosts\[0\]/);
+  assert.match(sidebar, /onInstallTw\(installHost\.id\)/);
+  assert.match(connections, /\(testedStatus \?\? selectedStatus\)\?\.twVersion/);
   assert.match(modal, /type HostStatus/);
   assert.match(modal, /testResult\.twAvailable/);
   assert.match(modal, /testResult\.twVersion/);

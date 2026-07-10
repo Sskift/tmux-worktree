@@ -239,6 +239,15 @@ struct TmuxTerminal {
     raw_name: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardCatalogSnapshot {
+    sessions: Vec<Session>,
+    terminals: Vec<TmuxTerminal>,
+    failed_session_host_ids: Vec<String>,
+    failed_terminal_host_ids: Vec<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct CreatedTerminal {
@@ -396,6 +405,38 @@ async fn list_sessions() -> Result<Vec<Session>, String> {
     tauri::async_runtime::spawn_blocking(list_sessions_blocking)
         .await
         .map_err(|e| format!("list sessions task failed: {e}"))?
+}
+
+#[tauri::command]
+async fn list_dashboard_catalog() -> Result<DashboardCatalogSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(list_dashboard_catalog_blocking)
+        .await
+        .map_err(|e| format!("list dashboard catalog task failed: {e}"))?
+}
+
+fn list_dashboard_catalog_blocking() -> Result<DashboardCatalogSnapshot, String> {
+    let mut sessions = list_local_sessions()?;
+    let mut terminals = list_local_tmux_terminals()?;
+    let mut failed_session_host_ids = Vec::new();
+    let mut failed_terminal_host_ids = Vec::new();
+
+    for host in load_hosts()? {
+        match list_remote_sessions(&host) {
+            Ok(remote) => sessions.extend(remote),
+            Err(_) => failed_session_host_ids.push(host.id.clone()),
+        }
+        match list_remote_tmux_terminals(&host) {
+            Ok(remote) => terminals.extend(remote),
+            Err(_) => failed_terminal_host_ids.push(host.id.clone()),
+        }
+    }
+
+    Ok(DashboardCatalogSnapshot {
+        sessions,
+        terminals,
+        failed_session_host_ids,
+        failed_terminal_host_ids,
+    })
 }
 
 fn list_sessions_blocking() -> Result<Vec<Session>, String> {
@@ -5962,6 +6003,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            list_dashboard_catalog,
             list_sessions,
             tmux_session_exists,
             list_projects,

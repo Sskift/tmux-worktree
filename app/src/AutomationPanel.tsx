@@ -1,4 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { X } from "lucide-react";
+import {
+  automationDraftFingerprint,
+  shouldSyncAutomationDraft,
+} from "./automationDraftSync";
 import {
   automationScheduleLabel,
   automationStatusLabel,
@@ -35,11 +40,13 @@ export type AutomationPanelProps = {
   recentPath?: string | null;
   recentProject?: string | null;
   onSelect: (id: string) => MaybePromise;
+  onNew: () => MaybePromise;
   onCreate: (draft: AutomationDraft) => MaybePromise;
   onToggle: (id: string, active: boolean) => MaybePromise;
   onRun: (id: string) => MaybePromise;
   onDelete: (id: string) => MaybePromise;
   onSave: (id: string, draft: AutomationDraft) => MaybePromise;
+  onDirtyChange?: (dirty: boolean) => void;
   showList?: boolean;
 };
 
@@ -139,51 +146,116 @@ export function AutomationPanel({
   recentPath = null,
   recentProject = null,
   onSelect,
+  onNew,
   onCreate,
   onToggle,
   onRun,
   onDelete,
   onSave,
+  onDirtyChange,
   showList = true,
 }: AutomationPanelProps) {
   const selected = useMemo(
     () => automations.find((automation) => automation.id === selectedId) ?? null,
     [automations, selectedId],
   );
-  const [creating, setCreating] = useState(selectedId === null || automations.length === 0);
+  const [creating, setCreating] = useState(selectedId === null);
   const [draft, setDraft] = useState<AutomationDraft>(() =>
     selected ? createAutomationDraft(selected) : createNewAutomationDraft(recentPath, recentProject, projectOptions),
   );
+  const [draftDirty, setDraftDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [actionId, setActionId] = useState<string | null>(null);
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [scheduleKindOverride, setScheduleKindOverride] =
     useState<AutomationScheduleKind | null>(null);
+  const creatingRef = useRef(creating);
+  const draftDirtyRef = useRef(false);
+  const draftRevisionRef = useRef(0);
+  const syncedAutomationIdRef = useRef<string | null>(selected?.id ?? null);
+  const syncedSourceDraftRef = useRef<AutomationDraft | null>(
+    selected ? createAutomationDraft(selected) : null,
+  );
+  const latestSelectedIdRef = useRef<string | null>(selected?.id ?? null);
+  const latestSelectedDraftRef = useRef<AutomationDraft | null>(
+    selected ? createAutomationDraft(selected) : null,
+  );
   const isCreating = creating || !selected;
   const recentPathValue = normalizeRecentPath(recentPath);
   const recentProjectValue = recentProjectName(recentPathValue, recentProject, projectOptions);
+  const selectedSourceDraft = selected ? createAutomationDraft(selected) : null;
+  const selectedDraftKey = selectedSourceDraft
+    ? automationDraftFingerprint(selectedSourceDraft)
+    : null;
+
+  const setCreatingMode = (value: boolean) => {
+    creatingRef.current = value;
+    setCreating(value);
+  };
+
+  const setDraftClean = () => {
+    draftDirtyRef.current = false;
+    onDirtyChange?.(false);
+    setDraftDirty(false);
+  };
+
+  const markDraftDirty = () => {
+    draftRevisionRef.current += 1;
+    draftDirtyRef.current = true;
+    onDirtyChange?.(true);
+    setDraftDirty(true);
+  };
+
+  const resetFormFeedback = () => {
+    setSubmitAttempted(false);
+    setFormError(null);
+    setScheduleKindOverride(null);
+  };
 
   useEffect(() => {
-    if (selected) {
-      setCreating(false);
-      setSubmitAttempted(false);
-      setFormError(null);
-      setScheduleKindOverride(null);
-      setDraft(createAutomationDraft(selected));
-    } else if (selectedId === null) {
-      setCreating(true);
-      setSubmitAttempted(false);
-      setFormError(null);
-      setScheduleKindOverride(null);
-      setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
+    if (selected && selectedSourceDraft) {
+      latestSelectedIdRef.current = selected.id;
+      latestSelectedDraftRef.current = selectedSourceDraft;
+      if (
+        !shouldSyncAutomationDraft({
+          currentSelectionId: syncedAutomationIdRef.current,
+          nextSelectionId: selected.id,
+          currentSourceDraft: syncedSourceDraftRef.current,
+          nextSourceDraft: selectedSourceDraft,
+          dirty: draftDirtyRef.current,
+          creating: creatingRef.current,
+        })
+      ) {
+        return;
+      }
+
+      syncedAutomationIdRef.current = selected.id;
+      syncedSourceDraftRef.current = selectedSourceDraft;
+      draftRevisionRef.current += 1;
+      setCreatingMode(false);
+      setDraftClean();
+      resetFormFeedback();
+      setDraft(selectedSourceDraft);
+    } else if (!selectedId && syncedAutomationIdRef.current !== null) {
+      const nextDraft = createNewAutomationDraft(recentPath, recentProject, projectOptions);
+      latestSelectedIdRef.current = null;
+      latestSelectedDraftRef.current = null;
+      syncedAutomationIdRef.current = null;
+      syncedSourceDraftRef.current = null;
+      draftRevisionRef.current += 1;
+      setCreatingMode(true);
+      setDraftClean();
+      resetFormFeedback();
+      setDraft(nextDraft);
     }
-  }, [selected, selectedId]);
+  }, [selected?.id, selectedDraftKey, selectedId]);
 
   useEffect(() => {
-    if (automations.length === 0) {
-      setCreating(true);
+    if (automations.length === 0 && !selectedId) {
+      setCreatingMode(true);
       setDraft((current) => {
+        if (draftDirtyRef.current) return current;
         if (
           current.name.trim() ||
           current.instruction.trim() ||
@@ -265,6 +337,7 @@ export function AutomationPanel({
     key: Key,
     value: AutomationDraft[Key],
   ) => {
+    markDraftDirty();
     setDraft((current) => ({ ...current, [key]: value }));
   };
 
@@ -294,6 +367,7 @@ export function AutomationPanel({
   };
 
   const handleProjectChange = (value: string) => {
+    markDraftDirty();
     setDraft((current) => ({
       ...current,
       project: value,
@@ -302,6 +376,7 @@ export function AutomationPanel({
   };
 
   const handlePathChange = (value: string) => {
+    markDraftDirty();
     setDraft((current) => ({
       ...current,
       project: value.trim() ? "" : current.project,
@@ -311,6 +386,7 @@ export function AutomationPanel({
 
   const handleUseRecentPath = () => {
     if (!recentPathValue) return;
+    markDraftDirty();
     setDraft((current) => ({
       ...current,
       project: "",
@@ -319,18 +395,55 @@ export function AutomationPanel({
   };
 
   const handleSelect = async (automation: Automation) => {
-    setCreating(false);
-    setSubmitAttempted(false);
-    setFormError(null);
-    setDraft(createAutomationDraft(automation));
-    await onSelect(automation.id);
+    if (automation.id === selected?.id && !creatingRef.current) return;
+    const accepted = await onSelect(automation.id);
+    if (accepted === false) return;
+    const nextDraft = createAutomationDraft(automation);
+    latestSelectedIdRef.current = automation.id;
+    latestSelectedDraftRef.current = nextDraft;
+    syncedAutomationIdRef.current = automation.id;
+    syncedSourceDraftRef.current = nextDraft;
+    draftRevisionRef.current += 1;
+    setCreatingMode(false);
+    setDraftClean();
+    resetFormFeedback();
+    setDraft(nextDraft);
   };
 
-  const handleNew = () => {
-    setCreating(true);
-    setSubmitAttempted(false);
-    setFormError(null);
-    setScheduleKindOverride(null);
+  const handleNew = async () => {
+    const accepted = await onNew();
+    if (accepted === false) return;
+    draftRevisionRef.current += 1;
+    setCreatingMode(true);
+    setDraftClean();
+    resetFormFeedback();
+    setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
+  };
+
+  const handleCancel = () => {
+    const latestSelectedDraft =
+      selected && latestSelectedIdRef.current === selected.id
+        ? latestSelectedDraftRef.current ?? createAutomationDraft(selected)
+        : selected
+          ? createAutomationDraft(selected)
+          : null;
+
+    resetFormFeedback();
+    setDraftClean();
+    draftRevisionRef.current += 1;
+    if (selected && latestSelectedDraft) {
+      latestSelectedIdRef.current = selected.id;
+      latestSelectedDraftRef.current = latestSelectedDraft;
+      syncedAutomationIdRef.current = selected.id;
+      syncedSourceDraftRef.current = latestSelectedDraft;
+      setCreatingMode(false);
+      setDraft(latestSelectedDraft);
+      return;
+    }
+
+    syncedAutomationIdRef.current = null;
+    syncedSourceDraftRef.current = null;
+    setCreatingMode(true);
     setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
   };
 
@@ -340,16 +453,27 @@ export function AutomationPanel({
     setFormError(null);
     if (!validation.valid) return;
 
+    const submittedRevision = draftRevisionRef.current;
     setSaving(true);
     try {
       if (isCreating) {
         await onCreate(normalizedDraft);
-        setDraft(createNewAutomationDraft(recentPath, recentProject, projectOptions));
       } else if (selected) {
         await onSave(selected.id, normalizedDraft);
       }
       saveLastAiCmd(normalizedDraft.aiCmd);
-      setCreating(false);
+      if (draftRevisionRef.current === submittedRevision) {
+        if (!isCreating && selected) {
+          latestSelectedIdRef.current = selected.id;
+          latestSelectedDraftRef.current = normalizedDraft;
+          syncedAutomationIdRef.current = selected.id;
+          syncedSourceDraftRef.current = normalizedDraft;
+          draftRevisionRef.current += 1;
+          setDraft(normalizedDraft);
+        }
+        setDraftClean();
+        setCreatingMode(false);
+      }
     } catch (error) {
       setFormError(String(error));
     } finally {
@@ -381,36 +505,44 @@ export function AutomationPanel({
             </button>
           </div>
 
-          <nav className="sidebar__sessions" style={listStyle} aria-label="automations">
-            {automations.length === 0 && <div className="empty empty--small">no automations</div>}
+          <div
+            className="sidebar__sessions automation-list"
+            style={listStyle}
+            role="list"
+            aria-label="automations"
+          >
+            {automations.length === 0 && (
+              <div className="empty empty--small" role="listitem">
+                no automations
+              </div>
+            )}
             {automations.map((automation) => {
-              const selectedClass =
-                !creating && automation.id === selected?.id ? " session--selected" : "";
+              const isSelected = !creating && automation.id === selected?.id;
+              const selectedClass = isSelected ? " session--selected" : "";
               return (
                 <div
                   key={automation.id}
-                  className={`session${selectedClass}`}
-                  onClick={() => {
-                    void handleSelect(automation);
-                  }}
-                  role="button"
-                  tabIndex={0}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" || event.key === " ") {
-                      event.preventDefault();
-                      void handleSelect(automation);
-                    }
-                  }}
+                  className={`session automation-list__item${selectedClass}`}
+                  role="listitem"
                 >
-                  <span
-                    className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
-                    style={{ background: automation.active ? "#9ae6b4" : "var(--text-faint)" }}
-                  />
-                  <span className="session__name" title={automation.name}>
-                    <span className="session__head">{automation.name || "(unnamed)"}</span>
-                    <span className="session__tail"> · {triggerLabel(automation)}</span>
-                  </span>
-                  <span className="session__meta">{automationStatusLabel(automation)}</span>
+                  <button
+                    type="button"
+                    className="automation-list__select"
+                    aria-current={isSelected ? "true" : undefined}
+                    onClick={() => {
+                      void handleSelect(automation);
+                    }}
+                  >
+                    <span
+                      className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
+                      style={{ background: automation.active ? "var(--ok)" : "var(--text-faint)" }}
+                    />
+                    <span className="session__name" title={automation.name}>
+                      <span className="session__head">{automation.name || "(unnamed)"}</span>
+                      <span className="session__tail"> · {triggerLabel(automation)}</span>
+                    </span>
+                    <span className="session__meta">{automationStatusLabel(automation)}</span>
+                  </button>
                   <button
                     type="button"
                     className="session__kill"
@@ -422,16 +554,20 @@ export function AutomationPanel({
                       void runAction(automation.id, () => onDelete(automation.id));
                     }}
                   >
-                    ×
+                    <X aria-hidden="true" size={13} strokeWidth={1.8} />
                   </button>
                 </div>
               );
             })}
-          </nav>
+          </div>
         </>
       )}
 
-      <form style={detailStyle} onSubmit={handleSubmit}>
+      <form style={detailStyle} onSubmit={handleSubmit} aria-busy={saving}>
+        <fieldset
+          disabled={saving}
+          style={{ display: "contents", border: 0, margin: 0, padding: 0, minInlineSize: 0 }}
+        >
         <label className="field">
           <span className="field__label">name</span>
           <input
@@ -613,6 +749,11 @@ export function AutomationPanel({
               </button>
             </>
           )}
+          {(draftDirty || isCreating) && (
+            <button type="button" className="btn btn--ghost" disabled={saving} onClick={handleCancel}>
+              cancel
+            </button>
+          )}
           <button type="submit" className="btn btn--accent" disabled={saving || !validation.valid}>
             {isCreating ? "create" : "save"}
           </button>
@@ -638,6 +779,7 @@ export function AutomationPanel({
             </div>
           ))}
         </div>
+        </fieldset>
       </form>
     </div>
   );

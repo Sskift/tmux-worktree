@@ -1,97 +1,129 @@
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronRight, File, Folder, Search } from "lucide-react";
 import {
   type DirEntry,
-  type FileSearchMode,
   type FileSearchResult,
   useDashboardBackend,
 } from "./platform";
+import {
+  createFileTreeRequestGate,
+  fileTreeErrorMessage,
+  fileTreeSourceKey,
+  readFileTreeDirectory,
+} from "./fileTreeData";
+import {
+  createLatestRequestGate,
+  requestSourceKey,
+} from "./latestRequestGate";
 export type { DirEntry } from "./platform";
 
 type Props = {
   root: string;
+  hostId?: string | null;
   selectedFile: string | null;
-  onFileSelect: (path: string) => void;
+  onFileSelect: (path: string, hostId: string | null) => void;
   showHidden?: boolean;
 };
 
 const INDENT_PX = 20;
 
-const ChevronRight = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <path d="M3.5 2L6.5 5L3.5 8" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-);
+type FileTreeSearchState = {
+  sourceKey: string;
+  results: FileSearchResult[];
+  searching: boolean;
+};
 
-const ChevronDown = () => (
-  <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-    <path d="M2 3.5L5 6.5L8 3.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-  </svg>
-);
-
-const FolderIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
-    <path d="M1.5 12.5V3.5C1.5 3.1 1.9 2.5 2.5 2.5H6L7.5 4H13C13.6 4 14 4.4 14 5V12.5C14 13 13.6 13.5 13 13.5H2.5C1.9 13.5 1.5 13 1.5 12.5Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
-  </svg>
-);
-
-const FileIcon = () => (
-  <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
-    <path d="M4 1.5H10L13 4.5V14C13 14.3 12.8 14.5 12.5 14.5H4C3.7 14.5 3.5 14.3 3.5 14V2C3.5 1.7 3.7 1.5 4 1.5Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
-    <path d="M10 1.5V4.5H13" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round"/>
-  </svg>
-);
-
-const SearchIcon = () => (
-  <svg width="13" height="13" viewBox="0 0 16 16" fill="none">
-    <circle cx="7" cy="7" r="4.5" stroke="currentColor" strokeWidth="1.3"/>
-    <path d="M10.5 10.5L14 14" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round"/>
-  </svg>
-);
-
-export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }: Props) {
+export function FileTree({
+  root,
+  hostId = null,
+  selectedFile,
+  onFileSelect,
+  showHidden = true,
+}: Props) {
   const dashboardBackend = useDashboardBackend();
+  const sourceKey = fileTreeSourceKey(root, hostId);
+  const isRemote = hostId != null;
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [dirContents, setDirContents] = useState<Map<string, DirEntry[]>>(new Map());
   const [loading, setLoading] = useState<Set<string>>(new Set());
-  const rootRef = useRef(root);
+  const [errors, setErrors] = useState<Map<string, string>>(new Map());
+  const requestGateRef = useRef<ReturnType<typeof createFileTreeRequestGate> | null>(null);
+  const searchRequestGateRef = useRef(createLatestRequestGate());
+
+  if (!requestGateRef.current) {
+    requestGateRef.current = createFileTreeRequestGate(sourceKey);
+  }
+
+  useLayoutEffect(() => {
+    requestGateRef.current?.switchSource(sourceKey);
+  }, [sourceKey]);
 
   // Search state
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<"content" | "filename">("content");
-  const [searchResults, setSearchResults] = useState<FileSearchResult[]>([]);
-  const [searching, setSearching] = useState(false);
+  const searchSourceKey = requestSourceKey(sourceKey, searchQuery.trim(), searchMode);
+  const [searchState, setSearchState] = useState<FileTreeSearchState>(() => ({
+    sourceKey: searchSourceKey,
+    results: [],
+    searching: false,
+  }));
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const loadDir = useCallback(async (dirPath: string) => {
+    const requestGate = requestGateRef.current;
+    if (!requestGate) return;
+    const request = requestGate.issue(dirPath);
+
     setLoading((prev) => new Set(prev).add(dirPath));
+    setErrors((prev) => {
+      if (!prev.has(dirPath)) return prev;
+      const next = new Map(prev);
+      next.delete(dirPath);
+      return next;
+    });
     try {
-      const entries = await dashboardBackend.files.readDirectory(dirPath);
+      const entries = await readFileTreeDirectory(dashboardBackend.files, hostId, dirPath);
+      if (!requestGate.isCurrent(request)) return;
       setDirContents((prev) => {
         const next = new Map(prev);
         next.set(dirPath, entries);
         return next;
       });
-    } catch {
-      // silently ignore errors for inaccessible directories
+    } catch (error) {
+      if (!requestGate.isCurrent(request)) return;
+      setDirContents((prev) => {
+        if (!prev.has(dirPath)) return prev;
+        const next = new Map(prev);
+        next.delete(dirPath);
+        return next;
+      });
+      setErrors((prev) => new Map(prev).set(dirPath, fileTreeErrorMessage(error)));
     } finally {
+      if (!requestGate.isCurrent(request)) return;
       setLoading((prev) => {
         const next = new Set(prev);
         next.delete(dirPath);
         return next;
       });
     }
-  }, []);
+  }, [dashboardBackend.files, hostId]);
 
   useEffect(() => {
-    if (root !== rootRef.current) {
-      rootRef.current = root;
-      setExpandedDirs(new Set());
-      setDirContents(new Map());
-    }
+    setExpandedDirs(new Set());
+    setDirContents(new Map());
+    setLoading(new Set());
+    setErrors(new Map());
+    setSearchOpen(false);
+    setSearchQuery("");
+    setSearchState({
+      sourceKey: requestSourceKey(sourceKey, "", null),
+      results: [],
+      searching: false,
+    });
     loadDir(root);
-  }, [root, loadDir]);
+  }, [sourceKey, root, loadDir]);
 
   const toggleDir = useCallback(
     (dirPath: string) => {
@@ -111,38 +143,46 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
     [dirContents, loadDir],
   );
 
-  // Search logic
-  const doSearch = useCallback(async (query: string, mode: FileSearchMode) => {
-    if (!query.trim()) {
-      setSearchResults([]);
-      setSearching(false);
+  useEffect(() => {
+    const requestGate = searchRequestGateRef.current;
+    if (!searchOpen || isRemote || !searchQuery.trim()) {
+      requestGate.invalidate();
+      setSearchState({ sourceKey: searchSourceKey, results: [], searching: false });
       return;
     }
-    setSearching(true);
-    try {
-      const results = await dashboardBackend.files.search(
-        rootRef.current,
-        query.trim(),
-        mode,
-      );
-      setSearchResults(results);
-    } catch {
-      setSearchResults([]);
-    } finally {
-      setSearching(false);
-    }
-  }, []);
 
-  useEffect(() => {
-    if (!searchOpen) return;
+    const request = requestGate.issue(searchSourceKey);
+    setSearchState((current) => ({
+      sourceKey: searchSourceKey,
+      results: current.sourceKey === searchSourceKey ? current.results : [],
+      searching: true,
+    }));
     if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
     searchTimerRef.current = setTimeout(() => {
-      doSearch(searchQuery, searchMode);
+      void dashboardBackend.files.search(root, searchQuery.trim(), searchMode)
+        .then((results) => {
+          if (!requestGate.isCurrent(request)) return;
+          setSearchState({ sourceKey: searchSourceKey, results, searching: false });
+        })
+        .catch(() => {
+          if (!requestGate.isCurrent(request)) return;
+          setSearchState({ sourceKey: searchSourceKey, results: [], searching: false });
+        });
     }, 300);
+
     return () => {
       if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
+      requestGate.cancel(request);
     };
-  }, [searchQuery, searchMode, searchOpen, doSearch]);
+  }, [
+    dashboardBackend.files,
+    isRemote,
+    root,
+    searchMode,
+    searchOpen,
+    searchQuery,
+    searchSourceKey,
+  ]);
 
   useEffect(() => {
     if (searchOpen && searchInputRef.current) {
@@ -151,10 +191,11 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
   }, [searchOpen]);
 
   const toggleSearch = () => {
+    if (isRemote) return;
     setSearchOpen((v) => {
       if (v) {
         setSearchQuery("");
-        setSearchResults([]);
+        setSearchState({ sourceKey: searchSourceKey, results: [], searching: false });
       }
       return !v;
     });
@@ -164,7 +205,7 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
     if (e.key === "Escape") {
       setSearchOpen(false);
       setSearchQuery("");
-      setSearchResults([]);
+      setSearchState({ sourceKey: searchSourceKey, results: [], searching: false });
     }
   };
 
@@ -178,10 +219,41 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
           </div>,
         ];
       }
+      const error = errors.get(parentPath);
+      if (error) {
+        return [
+          <div
+            key={`error-${parentPath}`}
+            className="file-tree__loading file-tree__loading--error"
+            style={{ paddingLeft: depth * INDENT_PX + 12 }}
+            role="alert"
+          >
+            <span>couldn&apos;t load folder: {error}</span>{" "}
+            <button
+              type="button"
+              className="btn btn--ghost file-tree__retry"
+              onClick={() => loadDir(parentPath)}
+            >
+              retry
+            </button>
+          </div>,
+        ];
+      }
       return [];
     }
 
     const filtered = showHidden ? entries : entries.filter((e) => !e.is_hidden);
+    if (filtered.length === 0) {
+      return [
+        <div
+          key={`empty-${parentPath}`}
+          className="file-tree__loading file-tree__loading--empty"
+          style={{ paddingLeft: depth * INDENT_PX + 12 }}
+        >
+          {entries.length === 0 ? "empty folder" : "no visible files"}
+        </div>,
+      ];
+    }
     const nodes: React.ReactNode[] = [];
 
     for (const entry of filtered) {
@@ -198,24 +270,32 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
             if (entry.is_dir) {
               toggleDir(entry.path);
             } else {
-              onFileSelect(entry.path);
+              onFileSelect(entry.path, hostId);
             }
           }}
           role="button"
+          aria-expanded={entry.is_dir ? isExpanded : undefined}
+          aria-current={!entry.is_dir && isSelected ? "true" : undefined}
           tabIndex={0}
           onKeyDown={(e) => {
             if (e.key === "Enter" || e.key === " ") {
               e.preventDefault();
               if (entry.is_dir) toggleDir(entry.path);
-              else onFileSelect(entry.path);
+              else onFileSelect(entry.path, hostId);
             }
           }}
         >
           <span className="file-tree__chevron">
-            {entry.is_dir ? (isExpanded ? <ChevronDown /> : <ChevronRight />) : null}
+            {entry.is_dir ? (
+              isExpanded
+                ? <ChevronDown size={10} strokeWidth={1.5} aria-hidden="true" />
+                : <ChevronRight size={10} strokeWidth={1.5} aria-hidden="true" />
+            ) : null}
           </span>
           <span className="file-tree__icon">
-            {entry.is_dir ? <FolderIcon /> : <FileIcon />}
+            {entry.is_dir
+              ? <Folder size={15} strokeWidth={1.4} aria-hidden="true" />
+              : <File size={15} strokeWidth={1.4} aria-hidden="true" />}
           </span>
           <span className="file-tree__name" title={entry.name}>
             {entry.name}
@@ -232,6 +312,14 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
   };
 
   const renderSearchResults = () => {
+    const currentSearchState = searchState.sourceKey === searchSourceKey
+      ? searchState
+      : {
+          sourceKey: searchSourceKey,
+          results: [],
+          searching: searchOpen && !isRemote && !!searchQuery.trim(),
+        };
+    const { results: searchResults, searching } = currentSearchState;
     if (searching) {
       return <div className="file-tree__loading" style={{ paddingLeft: 12 }}>searching...</div>;
     }
@@ -248,11 +336,11 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
         <div
           key={`${r.path}:${r.line_number ?? 0}:${i}`}
           className="file-tree__item file-tree__search-result"
-          onClick={() => onFileSelect(r.path)}
+          onClick={() => onFileSelect(r.path, hostId)}
           role="button"
           tabIndex={0}
           onKeyDown={(e) => {
-            if (e.key === "Enter") onFileSelect(r.path);
+            if (e.key === "Enter") onFileSelect(r.path, hostId);
           }}
         >
           {searchMode === "content" ? (
@@ -263,7 +351,9 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
             </div>
           ) : (
             <div className="search-result__content">
-              <span className="search-result__icon"><FileIcon /></span>
+              <span className="search-result__icon">
+                <File size={15} strokeWidth={1.4} aria-hidden="true" />
+              </span>
               <span className="search-result__path">{relPath}</span>
             </div>
           )}
@@ -278,16 +368,21 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
     <div className="file-tree">
       <div className="file-tree__header">
         <span className="pane__title" title={root}>{rootName}</span>
+        {isRemote && (
+          <span className="file-tree__remote-note">Remote browse only</span>
+        )}
         <button
-          className={`file-tree__search-btn${searchOpen ? " file-tree__search-btn--active" : ""}`}
+          className={`file-tree__search-btn${searchOpen && !isRemote ? " file-tree__search-btn--active" : ""}`}
           onClick={toggleSearch}
-          title="search (⌘F)"
+          title={isRemote ? "Search is not available for remote files yet" : "search (⌘F)"}
+          aria-label={isRemote ? "Search unavailable for remote files" : "Search files"}
+          disabled={isRemote}
           type="button"
         >
-          <SearchIcon />
+          <Search size={13} strokeWidth={1.5} aria-hidden="true" />
         </button>
       </div>
-      {searchOpen && (
+      {searchOpen && !isRemote && (
         <div className="file-tree__search-panel">
           <input
             ref={searchInputRef}
@@ -318,7 +413,7 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
         </div>
       )}
       <div className="file-tree__list">
-        {searchOpen ? renderSearchResults() : renderEntries(root, 0)}
+        {searchOpen && !isRemote ? renderSearchResults() : renderEntries(root, 0)}
       </div>
     </div>
   );

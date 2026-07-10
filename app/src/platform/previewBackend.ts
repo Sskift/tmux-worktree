@@ -188,6 +188,12 @@ const nothing = () => undefined;
 
 transport.handlers.set("home_dir", value("/Users/demo"));
 transport.handlers.set("list_sessions", value(sessions));
+transport.handlers.set("list_dashboard_catalog", value({
+  sessions,
+  terminals,
+  failedSessionHostIds: [],
+  failedTerminalHostIds: [],
+}));
 transport.handlers.set("list_projects", value(projects));
 transport.handlers.set("list_remote_projects", value(projects.slice(1)));
 transport.handlers.set("list_orphaned_worktrees", value([]));

@@ -36,5 +36,21 @@ test("remote git status passes host identity through git commands", () => {
     /diff: \(cwd, path, hostId\) =>\s*transport\.invoke<string>\("git_diff", \{ cwd, path, hostId: hostId \?\? null \}\)/s,
   );
   assert.match(app, /hostId=\{selectedGitHostId\}/);
-  assert.match(app, /setDiffFile\(\{ path: filePath, cwd, hostId: hostId \?\? null \}\)/);
+  assert.match(app, /const openGitDiff = useCallback/);
+  assert.match(app, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
+  assert.match(app, /setInspectorTab\("diff"\)/);
+});
+
+test("changed files use native buttons so keyboard activation opens the diff", () => {
+  const source = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
+  const rowsStart = source.indexOf("status.files.map");
+  const rowsEnd = source.indexOf("</button>", rowsStart);
+  const rowSource = source.slice(rowsStart, rowsEnd);
+
+  assert.ok(rowsStart >= 0 && rowsEnd > rowsStart);
+  assert.match(rowSource, /<button/);
+  assert.match(rowSource, /type="button"/);
+  assert.match(rowSource, /aria-label=\{`Open diff for \$\{f\.path\}`\}/);
+  assert.match(rowSource, /onFileClick\?\.\(f\.path, statusCwd, hostId \?\? null\)/);
+  assert.doesNotMatch(rowSource, /role="button"|tabIndex=|onKeyDown=/);
 });

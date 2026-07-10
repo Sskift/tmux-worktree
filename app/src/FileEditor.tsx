@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef, useCallback } from "react";
+import { X } from "lucide-react";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -9,12 +10,25 @@ import { getFileCategory, getFileExtension, getLanguageExtension } from "./fileU
 import { detectLinks, resolvePath } from "./linkDetect";
 import { checkFileExists, openUrlInBrowser } from "./linkActions";
 import { useDashboardBackend } from "./platform";
+import {
+  createLatestRequestGate,
+  requestSourceKey,
+  type LatestRequestToken,
+} from "./latestRequestGate";
+import {
+  beginFileEditorLoad,
+  completeFileEditorLoad,
+  editFileEditorContent,
+  isFileEditorDirty,
+  markFileEditorSaved,
+} from "./fileEditorDirtyState";
 
 type Props = {
   filePath: string;
   hostId?: string | null;
   onClose: () => void;
   onOpenFile?: (path: string, line?: number, col?: number, hostId?: string | null) => void;
+  onDirtyChange?: (dirty: boolean) => void;
 };
 
 /* ── Image Preview ──────────────────────────────────────────── */
@@ -72,8 +86,8 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
       <div className="pane__bar">
         <span className="pane__title file-editor__title">{fileName}</span>
         <div className="file-editor__actions">
-          <button className="btn btn--small" type="button" onClick={onClose} title="close">
-            ×
+          <button className="btn btn--small" type="button" onClick={onClose} title="Close file" aria-label="Close file">
+            <X aria-hidden="true" size={13} strokeWidth={1.8} />
           </button>
         </div>
       </div>
@@ -92,76 +106,142 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
 
 /* ── Code / Markdown Editor ─────────────────────────────────── */
 
-function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props & { isMarkdown: boolean }) {
+function CodeEditor({
+  filePath,
+  hostId,
+  onClose,
+  isMarkdown,
+  onOpenFile,
+  onDirtyChange,
+}: Props & { isMarkdown: boolean }) {
   const dashboardBackend = useDashboardBackend();
+  const sourceKey = requestSourceKey(hostId ?? null, filePath);
   const [content, setContent] = useState("");
-  const [originalContent, setOriginalContent] = useState("");
+  const [, setOriginalContent] = useState("");
   const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
+  const [loadedSourceKey, setLoadedSourceKey] = useState<string | null>(null);
+  const [savingRequest, setSavingRequest] = useState<LatestRequestToken | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [previewMode, setPreviewMode] = useState(false);
 
   const pathRef = useRef(filePath);
+  const sourceKeyRef = useRef(sourceKey);
+  const loadRequestGateRef = useRef(createLatestRequestGate());
+  const saveRequestGateRef = useRef(createLatestRequestGate());
   const editorRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const contentRef = useRef("");
   const originalContentRef = useRef("");
+  const dirtyStateRef = useRef(beginFileEditorLoad(sourceKey));
+  const reportedDirtyRef = useRef(false);
+  const onDirtyChangeRef = useRef(onDirtyChange);
+  sourceKeyRef.current = sourceKey;
+  onDirtyChangeRef.current = onDirtyChange;
 
-  const loadFile = useCallback(async (path: string) => {
+  const publishDirty = useCallback((dirty: boolean) => {
+    if (reportedDirtyRef.current === dirty) return;
+    reportedDirtyRef.current = dirty;
+    onDirtyChangeRef.current?.(dirty);
+  }, []);
+
+  useEffect(() => {
+    const requestGate = loadRequestGateRef.current;
+    const request = requestGate.issue(sourceKey);
+    saveRequestGateRef.current.invalidate();
+    pathRef.current = filePath;
+    dirtyStateRef.current = beginFileEditorLoad(sourceKey);
+    publishDirty(false);
     setLoading(true);
     setError(null);
     setPreviewMode(false);
-    try {
-      const text = hostId
-        ? await dashboardBackend.files.readRemote(hostId, path)
-        : await dashboardBackend.files.read(path);
-      if (pathRef.current === path) {
+    const read = hostId
+      ? dashboardBackend.files.readRemote(hostId, filePath)
+      : dashboardBackend.files.read(filePath);
+
+    void read
+      .then((text) => {
+        if (!requestGate.isCurrent(request)) return;
         setContent(text);
         setOriginalContent(text);
         contentRef.current = text;
         originalContentRef.current = text;
-      }
-    } catch (e) {
-      if (pathRef.current === path) {
-        setError(String(e));
+        dirtyStateRef.current = completeFileEditorLoad(
+          dirtyStateRef.current,
+          sourceKey,
+          text,
+        );
+        publishDirty(isFileEditorDirty(dirtyStateRef.current));
+        setLoadedSourceKey(sourceKey);
+        setLoading(false);
+      })
+      .catch((nextError) => {
+        if (!requestGate.isCurrent(request)) return;
+        setError(String(nextError));
         setContent("");
         setOriginalContent("");
-      }
-    } finally {
-      if (pathRef.current === path) {
+        contentRef.current = "";
+        originalContentRef.current = "";
+        dirtyStateRef.current = completeFileEditorLoad(
+          dirtyStateRef.current,
+          sourceKey,
+          "",
+        );
+        publishDirty(isFileEditorDirty(dirtyStateRef.current));
+        setLoadedSourceKey(sourceKey);
         setLoading(false);
-      }
-    }
-  }, [hostId]);
+      });
 
-  useEffect(() => {
-    pathRef.current = filePath;
-    loadFile(filePath);
-  }, [filePath, loadFile]);
+    return () => requestGate.cancel(request);
+  }, [dashboardBackend.files, filePath, hostId, publishDirty, sourceKey]);
+
+  const sourceReady = loadedSourceKey === sourceKey;
+  const effectiveLoading = loading || !sourceReady;
+  const saving = savingRequest?.sourceKey === sourceKey;
 
   const save = useCallback(async () => {
     const cur = contentRef.current;
     if (saving || cur === originalContentRef.current) return;
-    setSaving(true);
+    const requestGate = saveRequestGateRef.current;
+    const request = requestGate.issue(sourceKey);
+    setSavingRequest(request);
     try {
       if (hostId) {
         await dashboardBackend.files.writeRemote(hostId, pathRef.current, cur);
       } else {
         await dashboardBackend.files.write(pathRef.current, cur);
       }
+      if (
+        !requestGate.isCurrent(request) ||
+        sourceKeyRef.current !== request.sourceKey
+      ) {
+        return;
+      }
       setOriginalContent(cur);
       originalContentRef.current = cur;
+      dirtyStateRef.current = markFileEditorSaved(
+        dirtyStateRef.current,
+        sourceKey,
+        cur,
+      );
+      publishDirty(isFileEditorDirty(dirtyStateRef.current));
       setError(null);
-    } catch (e) {
-      setError(String(e));
+    } catch (nextError) {
+      if (
+        requestGate.isCurrent(request) &&
+        sourceKeyRef.current === request.sourceKey
+      ) {
+        setError(String(nextError));
+      }
     } finally {
-      setSaving(false);
+      setSavingRequest((current) =>
+        current?.sequence === request.sequence ? null : current,
+      );
     }
-  }, [hostId, saving]);
+  }, [dashboardBackend.files, hostId, publishDirty, saving, sourceKey]);
 
   // CodeMirror setup
   useEffect(() => {
-    if (!editorRef.current || loading || error || previewMode) return;
+    if (!editorRef.current || effectiveLoading || error || previewMode) return;
 
     let destroyed = false;
 
@@ -176,6 +256,12 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
           if (update.docChanged) {
             const newContent = update.state.doc.toString();
             contentRef.current = newContent;
+            dirtyStateRef.current = editFileEditorContent(
+              dirtyStateRef.current,
+              sourceKey,
+              newContent,
+            );
+            publishDirty(isFileEditorDirty(dirtyStateRef.current));
             setContent(newContent);
           }
         }),
@@ -241,9 +327,9 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
       viewRef.current?.destroy();
       viewRef.current = null;
     };
-  }, [filePath, hostId, loading, error, previewMode, save, onOpenFile]);
+  }, [filePath, hostId, effectiveLoading, error, previewMode, publishDirty, save, onOpenFile, sourceKey]);
 
-  const isDirty = content !== originalContent;
+  const isDirty = sourceReady && isFileEditorDirty(dirtyStateRef.current);
   const fileName = filePath.split("/").pop() ?? filePath;
 
   return (
@@ -275,13 +361,13 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
               {saving ? "..." : "save"}
             </button>
           )}
-          <button className="btn btn--small" type="button" onClick={onClose} title="close">
-            ×
+          <button className="btn btn--small" type="button" onClick={onClose} title="Close file" aria-label="Close file">
+            <X aria-hidden="true" size={13} strokeWidth={1.8} />
           </button>
         </div>
       </div>
       <div className="pane__body" style={{ padding: 0 }}>
-        {loading ? (
+        {effectiveLoading ? (
           <div className="file-editor__status">loading...</div>
         ) : error ? (
           <div className="file-editor__status file-editor__status--error">{error}</div>
@@ -299,8 +385,13 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
 
 /* ── Main Export ─────────────────────────────────────────────── */
 
-export function FileEditor({ filePath, hostId, onClose, onOpenFile }: Props) {
+export function FileEditor({ filePath, hostId, onClose, onOpenFile, onDirtyChange }: Props) {
   const category = getFileCategory(filePath);
+
+  useEffect(() => {
+    if (category === "image") onDirtyChange?.(false);
+    return () => onDirtyChange?.(false);
+  }, [category, filePath, hostId, onDirtyChange]);
 
   if (category === "image") {
     return <ImagePreview filePath={filePath} hostId={hostId} onClose={onClose} />;
@@ -312,6 +403,7 @@ export function FileEditor({ filePath, hostId, onClose, onOpenFile }: Props) {
       hostId={hostId}
       onClose={onClose}
       onOpenFile={onOpenFile}
+      onDirtyChange={onDirtyChange}
       isMarkdown={category === "markdown"}
     />
   );

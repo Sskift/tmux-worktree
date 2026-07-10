@@ -1,5 +1,15 @@
-import { useEffect, useState, type FormEvent } from "react";
+import {
+  type FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+} from "react";
+import { X } from "lucide-react";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
+import { keepFocusInside } from "./dashboard/Settings/focusTrap";
+import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
 import {
   type CreateWorktreeInput,
@@ -19,8 +29,30 @@ type Props = {
 const CUSTOM = "__custom__";
 const LOCAL_HOST = "__local__";
 
+export type WorktreeCatalogDraftState = Readonly<{
+  source: string;
+  dirty: boolean;
+}>;
+
+export function shouldApplyWorktreeCatalogDefault(
+  draftState: WorktreeCatalogDraftState,
+  source: string,
+): boolean {
+  return draftState.source === source && !draftState.dirty;
+}
+
 export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
   const dashboardBackend = useDashboardBackend();
+  const dialogRef = useRef<HTMLFormElement>(null);
+  const initialFocusRef = useRef<HTMLInputElement>(null);
+  const remoteBrowseButtonRef = useRef<HTMLButtonElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const catalogRequestGateRef = useRef(createLatestRequestGate());
+  const catalogDraftStateRef = useRef<WorktreeCatalogDraftState>({
+    source: LOCAL_HOST,
+    dirty: false,
+  });
+  const titleId = useId();
   const [projects, setProjects] = useState<Project[]>([]);
   const [orphans, setOrphans] = useState<Orphan[]>([]);
   const [selectedHost, setSelectedHost] = useState<string>(LOCAL_HOST);
@@ -59,32 +91,100 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
   ];
 
   useEffect(() => {
+    previousFocusRef.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    const animationFrame = window.requestAnimationFrame(() => initialFocusRef.current?.focus());
+
+    return () => {
+      window.cancelAnimationFrame(animationFrame);
+      const focusTarget = previousFocusRef.current;
+      if (focusTarget?.isConnected) focusTarget.focus();
+    };
+  }, []);
+
+  useEffect(() => {
+    const requestGate = catalogRequestGateRef.current;
+    if (catalogDraftStateRef.current.source !== selectedHost) {
+      catalogDraftStateRef.current = { source: selectedHost, dirty: false };
+    }
+    const token = requestGate.issue(
+      requestSourceKey("new-worktree-catalog", selectedHost),
+    );
+    const mayApplyCatalogDefault = shouldApplyWorktreeCatalogDefault(
+      catalogDraftStateRef.current,
+      selectedHost,
+    );
+
+    if (mayApplyCatalogDefault) {
+      setProjects([]);
+      setProject(CUSTOM);
+    }
+    setOrphans([]);
+    setError(null);
+
     if (!isRemote) {
-      dashboardBackend.projects.list()
+      void dashboardBackend.projects.list()
         .then((list) => {
+          if (!requestGate.isCurrent(token)) return;
           setProjects(list);
-          setProject(list.length > 0 ? list[0].name : CUSTOM);
-        })
-        .catch((e) => setError(String(e)));
-      dashboardBackend.worktrees.listOrphaned()
-        .then(setOrphans)
-        .catch(() => {});
-    } else {
-      setOrphans([]);
-      dashboardBackend.projects.listRemote(selectedHost)
-        .then((list) => {
-          setProjects(list);
-          setProject(list.length > 0 ? list[0].name : CUSTOM);
+          if (
+            shouldApplyWorktreeCatalogDefault(catalogDraftStateRef.current, selectedHost)
+          ) {
+            setProject(list.length > 0 ? list[0].name : CUSTOM);
+          }
         })
         .catch((e) => {
+          if (requestGate.isCurrent(token)) setError(String(e));
+        });
+      void dashboardBackend.worktrees.listOrphaned()
+        .then((list) => {
+          if (requestGate.isCurrent(token)) setOrphans(list);
+        })
+        .catch(() => {});
+    } else {
+      void dashboardBackend.projects.listRemote(selectedHost)
+        .then((list) => {
+          if (!requestGate.isCurrent(token)) return;
+          setProjects(list);
+          if (
+            shouldApplyWorktreeCatalogDefault(catalogDraftStateRef.current, selectedHost)
+          ) {
+            setProject(list.length > 0 ? list[0].name : CUSTOM);
+          }
+        })
+        .catch((e) => {
+          if (!requestGate.isCurrent(token)) return;
           setProjects([]);
           setProject(CUSTOM);
           setError(String(e));
         });
     }
-  }, [isRemote, selectedHost]);
+
+    return () => requestGate.cancel(token);
+  }, [dashboardBackend, isRemote, selectedHost]);
+
+  const changeHost = (hostId: string) => {
+    catalogRequestGateRef.current.invalidate();
+    catalogDraftStateRef.current = { source: hostId, dirty: false };
+    setSelectedHost(hostId);
+    setProjects([]);
+    setProject(CUSTOM);
+    setOrphans([]);
+    setError(null);
+  };
+
+  const markCatalogDraftDirty = () => {
+    catalogDraftStateRef.current = { source: selectedHost, dirty: true };
+  };
+
+  const changeProject = (nextProject: string) => {
+    markCatalogDraftDirty();
+    setProject(nextProject);
+  };
 
   const browse = async () => {
+    markCatalogDraftDirty();
     try {
       const picked = await dashboardBackend.dialog.selectDirectory({
         title: "Select project directory",
@@ -184,14 +284,34 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
     }
   };
 
+  const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLFormElement>) => {
+    if (event.key === "Escape" && !busy) {
+      event.preventDefault();
+      event.stopPropagation();
+      onClose();
+      return;
+    }
+
+    if (dialogRef.current) keepFocusInside(event.nativeEvent, dialogRef.current);
+  };
+
   return (
     <div className="modal-backdrop">
       <form
+        ref={dialogRef}
         className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-busy={busy}
+        aria-hidden={showRemotePicker ? true : undefined}
+        inert={showRemotePicker}
+        tabIndex={-1}
         onClick={(e) => e.stopPropagation()}
+        onKeyDown={handleDialogKeyDown}
         onSubmit={submit}
       >
-        <div className="modal__title">new worktree</div>
+        <div className="modal__title" id={titleId}>new worktree</div>
 
         {orphans.length > 0 && !isRemote && (
           <div className="field">
@@ -217,7 +337,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
                     title={`delete ${o.name}`}
                     aria-label={`delete ${o.name}`}
                   >
-                    ×
+                    <X aria-hidden="true" size={13} strokeWidth={1.8} />
                   </button>
                 </div>
               ))}
@@ -236,7 +356,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
               ariaLabel="Host"
               value={selectedHost}
               options={hostMenuOptions}
-              onChange={setSelectedHost}
+              onChange={changeHost}
               disabled={busy}
             />
           </label>
@@ -249,7 +369,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
               ariaLabel="Project"
               value={project}
               options={projectMenuOptions}
-              onChange={setProject}
+              onChange={changeProject}
               disabled={busy}
             />
           </label>
@@ -264,7 +384,10 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
                   className="field__input"
                   type="text"
                   value={customPath}
-                  onChange={(e) => setCustomPath(e.target.value)}
+                  onChange={(e) => {
+                    markCatalogDraftDirty();
+                    setCustomPath(e.target.value);
+                  }}
                   placeholder={isRemote ? "/path/to/repo/on/remote" : "/path/to/repo"}
                   disabled={busy}
                   autoComplete="off"
@@ -273,9 +396,17 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
                   spellCheck={false}
                 />
                 <button
+                  ref={remoteBrowseButtonRef}
                   type="button"
                   className="btn btn--ghost"
-                  onClick={() => isRemote ? setShowRemotePicker(true) : browse()}
+                  onClick={() => {
+                    if (isRemote) {
+                      markCatalogDraftDirty();
+                      setShowRemotePicker(true);
+                    } else {
+                      void browse();
+                    }
+                  }}
                   disabled={busy}
                 >
                   browse
@@ -288,7 +419,10 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
               <input
                 type="checkbox"
                 checked={savePreset}
-                onChange={(e) => setSavePreset(e.target.checked)}
+                onChange={(e) => {
+                  markCatalogDraftDirty();
+                  setSavePreset(e.target.checked);
+                }}
                 disabled={busy}
               />
               <span>save to ~/.tmux-worktree.json for reuse</span>
@@ -302,7 +436,10 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
                   className="field__input"
                   type="text"
                   value={customName}
-                  onChange={(e) => setCustomName(e.target.value)}
+                  onChange={(e) => {
+                    markCatalogDraftDirty();
+                    setCustomName(e.target.value);
+                  }}
                   placeholder="short id, used as session prefix"
                   disabled={busy}
                   autoComplete="off"
@@ -313,21 +450,6 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
               </label>
             )}
           </>
-        )}
-
-        {showRemotePicker && isRemote && (
-          <RemoteDirectoryPicker
-            hostId={selectedHost}
-            initialPath={customPath}
-            onClose={() => setShowRemotePicker(false)}
-            onSelect={(path) => {
-              setCustomPath(path);
-              if (!customName.trim()) {
-                setCustomName(path.split("/").filter(Boolean).pop() ?? "");
-              }
-              setShowRemotePicker(false);
-            }}
-          />
         )}
 
         <label className="field">
@@ -353,13 +475,13 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         <label className="field">
           <span className="field__label">ai command</span>
           <input
+            ref={initialFocusRef}
             className="field__input"
             type="text"
             value={aiCmd}
             onChange={(e) => setAiCmd(e.target.value)}
             placeholder="claude"
             disabled={busy}
-            autoFocus
             autoComplete="off"
             autoCorrect="off"
             autoCapitalize="off"
@@ -409,6 +531,22 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
           </button>
         </div>
       </form>
+      {showRemotePicker && isRemote && (
+        <RemoteDirectoryPicker
+          hostId={selectedHost}
+          initialPath={customPath}
+          returnFocusRef={remoteBrowseButtonRef}
+          onClose={() => setShowRemotePicker(false)}
+          onSelect={(path) => {
+            markCatalogDraftDirty();
+            setCustomPath(path);
+            if (!customName.trim()) {
+              setCustomName(path.split("/").filter(Boolean).pop() ?? "");
+            }
+            setShowRemotePicker(false);
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -111,6 +111,19 @@ test("host removal impact counts only matching remote sessions and terminals", (
 
 test("Relay summary distinguishes stopped, starting, connected, retrying, and error", () => {
   assert.deepEqual(
+    summarizeRelayStatus({
+      statusKnown: false,
+      connectionState: "stopped",
+      active: false,
+      connected: false,
+    }),
+    {
+      label: "Checking Relay",
+      detail: "Reading the saved configuration and current Relay process state.",
+      tone: "progress",
+    },
+  );
+  assert.deepEqual(
     summarizeRelayStatus({ connectionState: "stopped", active: false, connected: false }),
     {
       label: "Stopped",

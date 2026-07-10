@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { FolderTree, Radio, Settings as SettingsIcon } from "lucide-react";
+import { Plus, X } from "lucide-react";
 import {
   type DashboardWindow,
   type HostConfig,
@@ -31,11 +31,30 @@ import {
   terminalSessionKey,
 } from "./dashboard/TerminalDeck";
 import {
+  DashboardShell,
+  type DashboardDrawer,
+} from "./dashboard/DashboardShell";
+import { DashboardSidebar } from "./dashboard/DashboardSidebar";
+import { WorkspaceHeader } from "./dashboard/WorkspaceHeader";
+import { Inspector } from "./dashboard/Inspector";
+import type { InspectorTab } from "./dashboard/inspectorModel";
+import type { WorkspaceStatus } from "./dashboard/workspaceStatus";
+import {
+  clampDashboardPanelWidthForViewport,
+  normalizeDashboardPanelWidths,
+} from "./dashboard/dashboardShellModel";
+import {
+  pendingCreatedCatalogSelection,
+  pendingRestoredCatalogSelection,
+  reconcileCatalogSelection,
+  sameCatalogSelection,
+  type PendingCatalogSelection,
+} from "./dashboard/catalogSelectionHydration";
+import { mergeDashboardCatalogSnapshot } from "./dashboard/dashboardCatalogSnapshot";
+import {
   DEFAULT_COLUMN_ORDER,
-  normalizeColumnOrder,
   type DiffFile,
   type EditingFile,
-  type LayoutColumn,
   type Selection,
   type WindowLayout,
 } from "./dashboard/layoutPreferences";
@@ -48,8 +67,23 @@ import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
 import { AutomationPanel } from "./AutomationPanel";
-import { useSortable } from "./useSortable";
+import {
+  editingFileSourceKey,
+  runGuardedWorkspaceNavigation,
+  type EditorDirtySnapshot,
+} from "./editorNavigationGuard";
+import {
+  allocateTerminalId,
+  createTerminalSaveCoordinator,
+  type TerminalSaveCoordinator,
+} from "./terminalPersistence";
+import { createLatestRequestGate } from "./latestRequestGate";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
+import {
+  automationSelectionIsCurrent,
+  automationSubmitStillOwnsDraft,
+  recordAutomationDirtySignal,
+} from "./automationDraftSync";
 import {
   automationFromRecord,
   automationRunFromRecord,
@@ -66,76 +100,16 @@ import {
   type PreviousSessionActivity,
   type SessionActivityInfo,
 } from "./sessionActivity";
-import {
-  SIDEBAR_AUTOMATIONS_DEFAULT_HEIGHT,
-  SIDEBAR_AUTOMATIONS_MIN_HEIGHT,
-  SIDEBAR_GIT_MIN_HEIGHT,
-  SIDEBAR_TERMINALS_MIN_HEIGHT,
-  SIDEBAR_WORKTREES_MIN_HEIGHT,
-  isStableSidebarLayoutHeight,
-  normalizeSidebarSplits,
-  resizeWorktreeAutomationSplit,
-} from "./sidebarLayout";
 import "./App.css";
-
-type SessionGroup = {
-  key: string;
-  project: string;
-  colorKey: string;
-  hostLabel: string | null;
-  sessions: Session[];
-};
 
 const REFRESH_MS = 2000;
 const HIDDEN_REFRESH_MS = 10_000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
-const PROJECT_COLORS = [
-  "#f687b3",
-  "#9ae6b4",
-  "#f6ad55",
-  "#90cdf4",
-  "#d6bcfa",
-  "#81e6d9",
-  "#fbd38d",
-  "#feb2b2",
-  "#9ae6b4",
-  "#b794f6",
-];
-
 function projectKey(name: string): string {
   const i = name.indexOf("-");
   return i > 0 ? name.slice(0, i) : name;
-}
-
-/** Get the project key for grouping/coloring, preferring TW managed metadata. */
-function sessionProjectKey(s: Session): string {
-  if (s.project?.trim()) return s.project.trim();
-  return projectKey(sessionDisplayName(s));
-}
-
-function groupSessionsByProject(sessions: Session[], hosts: HostConfig[]): SessionGroup[] {
-  const groups: SessionGroup[] = [];
-  const byKey = new Map<string, SessionGroup>();
-  const hostLabels = new Map(hosts.map((host) => [host.id, host.label]));
-
-  for (const session of sessions) {
-    const project = sessionProjectKey(session);
-    const hostId = session.hostId ?? null;
-    const hostLabel = hostId ? hostLabels.get(hostId) ?? hostId : null;
-    const colorKey = hostId ? `${hostId}:${project}` : project;
-    const key = hostId ? `ssh:${hostId}:${project}` : `local:${project}`;
-    let group = byKey.get(key);
-    if (!group) {
-      group = { key, project, colorKey, hostLabel, sessions: [] };
-      byKey.set(key, group);
-      groups.push(group);
-    }
-    group.sessions.push(session);
-  }
-
-  return groups;
 }
 
 function buildSshShellArgs(host: HostConfig, cwd: string): string[] {
@@ -241,30 +215,6 @@ function sameSessionActivity(
       (left.outputSignature ?? null) === (right.outputSignature ?? null);
   });
 }
-function colorForProject(map: Map<string, string>, project: string): string {
-  if (!map.has(project)) {
-    map.set(project, PROJECT_COLORS[map.size % PROJECT_COLORS.length]);
-  }
-  return map.get(project)!;
-}
-
-function automationDotColor(automation: Automation): string {
-  if (!automation.active) return "var(--text-faint)";
-  if (automation.status === "failed") return "#ff8272";
-  if (automation.status === "running" || automation.status === "queued") return "#90cdf4";
-  if (automation.status === "skipped") return "#f6ad55";
-  return "#9ae6b4";
-}
-
-function automationMetaLabel(automation: Automation): string {
-  if (!automation.active) return "paused";
-  return automation.status && automation.status !== "idle" ? automation.status : "active";
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
 async function getWindowExpandedState(win: DashboardWindow) {
   const [fullscreen, maximized] = await Promise.all([
     win.isFullscreen().catch(() => false),
@@ -275,55 +225,18 @@ async function getWindowExpandedState(win: DashboardWindow) {
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
-type ResizableColumn = Exclude<LayoutColumn, "main">;
+const DEFAULT_SIDEBAR_WIDTH = 280;
+const DEFAULT_INSPECTOR_WIDTH = 420;
 
-const LAYOUT_DEFAULTS = {
-  left: 240,
-  right: 380,
-  gitHeight: 220,
-  sectionSplit: 200,
-  automationHeight: SIDEBAR_AUTOMATIONS_DEFAULT_HEIGHT,
-};
-const COLUMN_DRAG_THRESHOLD = 5;
-const COLUMN_WIDTH_LIMITS: Record<ResizableColumn, { min: number; max: number }> = {
-  file: { min: 180, max: 600 },
-  scratch: { min: 220, max: 800 },
-  editor: { min: 250, max: 900 },
-};
+type ViewportTier = "compact" | "drawer" | "wide";
 
-let termIdCounter = 0;
+function viewportTierForWidth(width: number): ViewportTier {
+  if (width >= 1440) return "wide";
+  if (width >= 1100) return "drawer";
+  return "compact";
+}
+
 let scratchIdCounter = 0;
-
-function reorderActiveColumns(
-  currentOrder: LayoutColumn[],
-  activeOrder: LayoutColumn[],
-  from: LayoutColumn,
-  to: LayoutColumn,
-): LayoutColumn[] {
-  const fromIndex = activeOrder.indexOf(from);
-  const toIndex = activeOrder.indexOf(to);
-  if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return currentOrder;
-
-  const reorderedActive = [...activeOrder];
-  const [moved] = reorderedActive.splice(fromIndex, 1);
-  reorderedActive.splice(toIndex, 0, moved);
-
-  const activeSet = new Set(activeOrder);
-  const queue = [...reorderedActive];
-  return currentOrder.map((column) => (activeSet.has(column) ? queue.shift()! : column));
-}
-
-function placeScratchAfterMain(order: LayoutColumn[]): LayoutColumn[] {
-  const normalized = normalizeColumnOrder(order);
-  const withoutScratch = normalized.filter((column) => column !== "scratch");
-  const mainIndex = withoutScratch.indexOf("main");
-  const insertAt = mainIndex < 0 ? withoutScratch.length : mainIndex + 1;
-  return [
-    ...withoutScratch.slice(0, insertAt),
-    "scratch",
-    ...withoutScratch.slice(insertAt),
-  ];
-}
 
 function App() {
   const dashboardBackend = useDashboardBackend();
@@ -332,6 +245,14 @@ function App() {
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
   const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
   const [terminalsRestoreReady, setTerminalsRestoreReady] = useState(false);
+  const [terminalPersistenceWritable, setTerminalPersistenceWritable] = useState(false);
+  const [terminalPersistenceError, setTerminalPersistenceError] = useState<string | null>(null);
+  const [terminalPersistenceHydrationGeneration, setTerminalPersistenceHydrationGeneration] =
+    useState(0);
+  const terminalSaveCoordinatorRef = useRef<TerminalSaveCoordinator | null>(null);
+  const [catalogRefreshGeneration, setCatalogRefreshGeneration] = useState(0);
+  const [failedSessionHostIds, setFailedSessionHostIds] = useState<string[]>([]);
+  const [failedTerminalHostIds, setFailedTerminalHostIds] = useState<string[]>([]);
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -339,6 +260,8 @@ function App() {
     projectPresets,
     loadProjectPresets,
     hosts,
+    hostsHydrationGeneration,
+    hostsLoadError,
     setHosts,
     sshHostCandidates,
     hostStatuses,
@@ -359,125 +282,205 @@ function App() {
   const [showNewTerminal, setShowNewTerminal] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
+  const [layoutResetMessage, setLayoutResetMessage] = useState<string | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
     const id = loadTheme();
     applyTheme(id);
     return id;
   });
-  const [cols, setCols] = useState<{ left: number; right: number }>({
-    left: LAYOUT_DEFAULTS.left,
-    right: LAYOUT_DEFAULTS.right,
-  });
-  const [gitHeight, setGitHeight] = useState<number>(LAYOUT_DEFAULTS.gitHeight);
-  const [sectionSplit, setSectionSplit] = useState<number>(LAYOUT_DEFAULTS.sectionSplit);
-  const [automationHeight, setAutomationHeight] = useState<number>(
-    LAYOUT_DEFAULTS.automationHeight,
-  );
   const [sessionOrder, setSessionOrder] = useState<string[]>([]);
   const [collapsedProjects, setCollapsedProjects] = useState<string[]>([]);
-  const [renamingTerminal, setRenamingTerminal] = useState<string | null>(null);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
-  const [scratchCollapsed, setScratchCollapsed] = useState(false);
-  const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
+  const [scratchCollapsed, setScratchCollapsed] = useState(true);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
+  const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
-  const [fileTreeWidth, setFileTreeWidth] = useState(280);
-  const [editorWidth, setEditorWidth] = useState(420);
-  const [columnOrder, setColumnOrder] = useState<LayoutColumn[]>(DEFAULT_COLUMN_ORDER);
-  const [columnDrag, setColumnDrag] = useState<{ from: LayoutColumn; over: LayoutColumn } | null>(null);
-  const [containerWidth, setContainerWidth] = useState(0);
+  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
+  const [inspectorWidth, setInspectorWidth] = useState(DEFAULT_INSPECTOR_WIDTH);
+  const panelWidthsRef = useRef({
+    sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+    inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
+  });
+  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 1100);
+  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth >= 1440);
+  const sidebarOpenPreferenceRef = useRef(window.innerWidth >= 1100);
+  const inspectorOpenPreferenceRef = useRef(window.innerWidth >= 1440);
+  const [inspectorTab, setInspectorTab] = useState<InspectorTab>("files");
+  const [expandedInspectorTab, setExpandedInspectorTab] = useState<InspectorTab | null>(null);
+  const [viewportTier, setViewportTier] = useState<ViewportTier>(() =>
+    viewportTierForWidth(window.innerWidth),
+  );
   const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
-  const appRef = useRef<HTMLDivElement | null>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const columnRefs = useRef<Map<LayoutColumn, HTMLElement>>(new Map());
-  const activeColumnOrderRef = useRef<LayoutColumn[]>(DEFAULT_COLUMN_ORDER);
-  const pendingColumnDragRef = useRef<{ column: LayoutColumn; startX: number; startY: number } | null>(null);
-  const columnDragRef = useRef<{ from: LayoutColumn; over: LayoutColumn } | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const cwdRequested = useRef<Set<string>>(new Set());
   const tmuxPreviewRequested = useRef<Set<string>>(new Set());
   const tmuxPreviewLiveRef = useRef<Set<string>>(new Set());
-  const sidebarSplitRef = useRef<HTMLDivElement | null>(null);
-  const sessionsListRef = useRef<HTMLDivElement | null>(null);
   const layoutLoadedRef = useRef(false);
-  const autoResizeColumnsReadyRef = useRef(false);
-  const gitHeightValueRef = useRef(gitHeight);
-  const sectionSplitValueRef = useRef(sectionSplit);
-  const automationHeightValueRef = useRef(automationHeight);
   const automationsRef = useRef<Automation[]>([]);
   const sessionActivityRef = useRef<Map<string, PreviousSessionActivity>>(new Map());
+  const sessionsRef = useRef<Session[]>(sessions);
+  const discoveredTerminalsRef = useRef<PlainTerminal[]>(discoveredTerminals);
   const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
-  gitHeightValueRef.current = gitHeight;
-  sectionSplitValueRef.current = sectionSplit;
-  automationHeightValueRef.current = automationHeight;
-  automationsRef.current = automations;
-
-  useEffect(() => {
-    const el = appRef.current;
-    if (!el) return;
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) setContainerWidth(e.contentRect.width);
-    });
-    ro.observe(el);
-    setContainerWidth(el.getBoundingClientRect().width);
-    return () => ro.disconnect();
-  }, []);
-
-  useEffect(() => {
-    const el = sidebarSplitRef.current;
-    if (!el) return;
-
-    const normalizeForHeight = (totalHeight: number) => {
-      if (!isStableSidebarLayoutHeight(totalHeight)) return;
-      const next = normalizeSidebarSplits({
-        totalHeight,
-        sectionSplit: sectionSplitValueRef.current,
-        gitHeight: gitHeightValueRef.current,
-        automationHeight: automationHeightValueRef.current,
-      });
-      if (next.sectionSplit !== sectionSplitValueRef.current) {
-        sectionSplitValueRef.current = next.sectionSplit;
-        setSectionSplit(next.sectionSplit);
-      }
-      if (next.automationHeight !== automationHeightValueRef.current) {
-        automationHeightValueRef.current = next.automationHeight;
-        setAutomationHeight(next.automationHeight);
-      }
-      if (next.gitHeight !== gitHeightValueRef.current) {
-        gitHeightValueRef.current = next.gitHeight;
-        setGitHeight(next.gitHeight);
-      }
+  const [pendingCatalogSelection, setPendingCatalogSelection] =
+    useState<PendingCatalogSelection | null>(null);
+  const catalogRefreshGenerationRef = useRef({ started: 0, successful: 0 });
+  const editingFileRef = useRef<EditingFile | null>(editingFile);
+  const editorNavigationGateRef = useRef(createLatestRequestGate());
+  const editorDirtySnapshotRef = useRef<EditorDirtySnapshot>({
+    fileKey: editingFileSourceKey(editingFile),
+    dirty: false,
+    revision: 0,
+  });
+  const automationDirtySnapshotRef = useRef<EditorDirtySnapshot>({
+    fileKey: null,
+    dirty: false,
+    revision: 0,
+  });
+  const editingFileKey = editingFileSourceKey(editingFile);
+  const automationDraftKey = selection?.kind === "automation"
+    ? `automation:${selection.id || "new"}`
+    : expandedInspectorTab === "automation"
+      ? "automation:new"
+      : null;
+  editingFileRef.current = editingFile;
+  if (editorDirtySnapshotRef.current.fileKey !== editingFileKey) {
+    editorDirtySnapshotRef.current = {
+      fileKey: editingFileKey,
+      dirty: false,
+      revision: editorDirtySnapshotRef.current.revision + 1,
     };
+  }
+  if (automationDirtySnapshotRef.current.fileKey !== automationDraftKey) {
+    automationDirtySnapshotRef.current = {
+      fileKey: automationDraftKey,
+      dirty: false,
+      revision: automationDirtySnapshotRef.current.revision + 1,
+    };
+  }
+  panelWidthsRef.current = { sidebarWidth, inspectorWidth };
+  automationsRef.current = automations;
+  sessionsRef.current = sessions;
+  discoveredTerminalsRef.current = discoveredTerminals;
 
-    const ro = new ResizeObserver((entries) => {
-      for (const e of entries) normalizeForHeight(e.contentRect.height);
-    });
-    ro.observe(el);
-    normalizeForHeight(el.getBoundingClientRect().height);
-    return () => ro.disconnect();
+  const handleEditorDirtyChange = useCallback((dirty: boolean) => {
+    const current = editorDirtySnapshotRef.current;
+    if (current.dirty === dirty) return;
+    editorDirtySnapshotRef.current = {
+      ...current,
+      dirty,
+      revision: current.revision + 1,
+    };
   }, []);
 
-  useEffect(() => {
-    const el = sidebarSplitRef.current;
-    if (!el) return;
-    const totalHeight = el.getBoundingClientRect().height;
-    if (!isStableSidebarLayoutHeight(totalHeight)) return;
-    const next = normalizeSidebarSplits({
-      totalHeight,
-      sectionSplit,
-      gitHeight,
-      automationHeight,
-    });
-    if (next.sectionSplit !== sectionSplit) setSectionSplit(next.sectionSplit);
-    if (next.automationHeight !== automationHeight) setAutomationHeight(next.automationHeight);
-    if (next.gitHeight !== gitHeight) setGitHeight(next.gitHeight);
-  }, [sectionSplit, automationHeight, gitHeight]);
+  const handleAutomationDirtyChange = useCallback((dirty: boolean) => {
+    const current = automationDirtySnapshotRef.current;
+    const next = recordAutomationDirtySignal(current, dirty);
+    if (next === current) return;
+    automationDirtySnapshotRef.current = {
+      ...current,
+      ...next,
+    };
+  }, []);
+
+  const requestEditorNavigation = useCallback(
+    (
+      navigate: () => void,
+      options: { ignoreAutomationDirty?: boolean } = {},
+    ): Promise<boolean> => {
+      const editorSnapshot = editorDirtySnapshotRef.current;
+      const automationSnapshot = automationDirtySnapshotRef.current;
+      const fileName =
+        basenameFromPath(editingFileRef.current?.path) || "the open file";
+      return runGuardedWorkspaceNavigation({
+        gate: editorNavigationGateRef.current,
+        surfaces: [
+          {
+            key: editorSnapshot.fileKey,
+            dirty: editorSnapshot.dirty,
+            revision: editorSnapshot.revision,
+            getCurrent: () => ({
+              key: editorDirtySnapshotRef.current.fileKey,
+              dirty: editorDirtySnapshotRef.current.dirty,
+              revision: editorDirtySnapshotRef.current.revision,
+            }),
+            confirmDiscard: () =>
+              dashboardBackend.dialog.confirm({
+                title: "Discard unsaved changes?",
+                message: `Changes to ${fileName} have not been saved. Continue and discard them?`,
+              }),
+          },
+          {
+            key: automationSnapshot.fileKey,
+            dirty: options.ignoreAutomationDirty ? false : automationSnapshot.dirty,
+            revision: automationSnapshot.revision,
+            getCurrent: () => ({
+              key: automationDirtySnapshotRef.current.fileKey,
+              dirty: automationDirtySnapshotRef.current.dirty,
+              revision: automationDirtySnapshotRef.current.revision,
+            }),
+            confirmDiscard: () =>
+              dashboardBackend.dialog.confirm({
+                title: "Discard unsaved automation changes?",
+                message: "This automation draft has not been saved. Continue and discard it?",
+              }),
+          },
+        ],
+        navigate: () => {
+          const currentEditor = editorDirtySnapshotRef.current;
+          editorDirtySnapshotRef.current = {
+            ...currentEditor,
+            dirty: false,
+            revision: currentEditor.revision + 1,
+          };
+          const currentAutomation = automationDirtySnapshotRef.current;
+          automationDirtySnapshotRef.current = {
+            ...currentAutomation,
+            dirty: false,
+            revision: currentAutomation.revision + 1,
+          };
+          navigate();
+        },
+      });
+    },
+    [dashboardBackend],
+  );
 
   useEffect(() => {
     dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
+  }, [dashboardBackend]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      const normalizedWidths = normalizeDashboardPanelWidths(
+        window.innerWidth,
+        panelWidthsRef.current.sidebarWidth,
+        panelWidthsRef.current.inspectorWidth,
+      );
+      panelWidthsRef.current = normalizedWidths;
+      setSidebarWidth(normalizedWidths.sidebarWidth);
+      setInspectorWidth(normalizedWidths.inspectorWidth);
+      const nextTier = viewportTierForWidth(window.innerWidth);
+      setViewportTier((currentTier) => {
+        if (currentTier === nextTier) return currentTier;
+        if (nextTier === "compact") {
+          setSidebarOpen(false);
+          setInspectorOpen(false);
+        } else if (nextTier === "drawer") {
+          setSidebarOpen(true);
+          setInspectorOpen(false);
+        } else {
+          setSidebarOpen(sidebarOpenPreferenceRef.current);
+          setInspectorOpen(inspectorOpenPreferenceRef.current);
+        }
+        return nextTier;
+      });
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
   }, []);
 
   useEffect(() => {
@@ -563,108 +566,106 @@ function App() {
     };
   }, [windowRestoreReady]);
 
-  const fileTreeWidthRef = useRef(fileTreeWidth);
-  fileTreeWidthRef.current = fileTreeWidth;
-  const editorWidthRef = useRef(editorWidth);
-  editorWidthRef.current = editorWidth;
-  const prevColumnsRef = useRef({ fileBrowser: false, editor: false });
-
+  // Persisted terminal metadata is retried independently from the live tmux
+  // catalog. A failed read must never authorize saving an empty replacement.
   useEffect(() => {
-    const prev = prevColumnsRef.current;
-    const curr = { fileBrowser: fileBrowserOpen, editor: !!(editingFile || diffFile) };
-    if (!autoResizeColumnsReadyRef.current) {
-      prevColumnsRef.current = curr;
-      if (layoutLoadedRef.current) autoResizeColumnsReadyRef.current = true;
-      return;
-    }
-    let delta = 0;
-    if (curr.fileBrowser && !prev.fileBrowser) delta += fileTreeWidthRef.current + 1;
-    if (!curr.fileBrowser && prev.fileBrowser) delta -= fileTreeWidthRef.current + 1;
-    if (curr.editor && !prev.editor) delta += editorWidthRef.current + 1;
-    if (!curr.editor && prev.editor) delta -= editorWidthRef.current + 1;
-    prevColumnsRef.current = curr;
-    if (delta !== 0) {
-      (async () => {
-        try {
-          const win = dashboardBackend.window.current();
-          const { fullscreen, maximized } = await getWindowExpandedState(win);
-          if (fullscreen || maximized) return;
-          const size = await win.innerSize();
-          const factor = await win.scaleFactor();
-          const lw = size.width / factor + delta;
-          const lh = size.height / factor;
-          await win.setLogicalSize(Math.max(800, lw), lh);
-        } catch {
-          // Window resizing is a convenience; keep column toggles functional if it fails.
-        }
-      })();
-    }
-  }, [fileBrowserOpen, editingFile, diffFile]);
+    let disposed = false;
+    let retryTimer: number | null = null;
+    let hydrationSettled = false;
 
-  // Load persisted data on mount
-  useEffect(() => {
-    dashboardBackend.terminals.load()
-      .then(async (saved) => {
+    const settleHydration = () => {
+      if (hydrationSettled || disposed) return;
+      hydrationSettled = true;
+      setTerminalsRestoreReady(true);
+      setTerminalPersistenceHydrationGeneration((generation) => generation + 1);
+    };
+
+    const loadPersistedTerminals = async () => {
+      try {
+        const saved = await dashboardBackend.terminals.load();
         const restored = saved
-          .filter((t) => t.tmuxName)
+          .filter((terminal) => terminal.tmuxName)
           .map(normalizePlainTerminal);
-        if (restored.length > 0) {
-          const maxNum = restored.reduce((max, t) => {
-            const m = t.id.match(/^term-(\d+)$/);
-            return m ? Math.max(max, parseInt(m[1], 10)) : max;
-          }, 0);
-          termIdCounter = maxNum;
-          for (const t of restored) {
-            await dashboardBackend.terminals.ensure({
-              name: t.tmuxName,
-              cwd: t.cwd,
-              aiCmd: t.aiCmd ?? "",
-              hostId: t.hostId ?? null,
-              rawName: t.rawName ?? null,
-            }).catch(() => {});
-          }
-          setTerminals(restored);
-        }
-      })
-      .catch(() => {})
-      .finally(() => setTerminalsRestoreReady(true));
+
+        await Promise.all(restored.map((terminal) =>
+          dashboardBackend.terminals.ensure({
+            name: terminal.tmuxName,
+            cwd: terminal.cwd,
+            aiCmd: terminal.aiCmd ?? "",
+            hostId: terminal.hostId ?? null,
+            rawName: terminal.rawName ?? null,
+          }).catch(() => {}),
+        ));
+        if (disposed) return;
+
+        setTerminals((current) => {
+          const restoredKeys = new Set(restored.map(terminalSessionKey));
+          return [
+            ...restored,
+            ...current.filter((terminal) => !restoredKeys.has(terminalSessionKey(terminal))),
+          ];
+        });
+        setTerminalPersistenceWritable(true);
+        setTerminalPersistenceError(null);
+        settleHydration();
+      } catch (nextError) {
+        if (disposed) return;
+        setTerminalPersistenceError(`Terminal metadata could not be loaded: ${String(nextError)}`);
+        // Keep metadata hydration pending. Falling back while a retry can still
+        // restore the selected terminal would persist the wrong selection.
+        retryTimer = window.setTimeout(
+          () => void loadPersistedTerminals(),
+          document.hidden ? 15_000 : 3_000,
+        );
+      }
+    };
+
+    void loadPersistedTerminals();
+    return () => {
+      disposed = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [dashboardBackend]);
+
+  // Load layout data on mount.
+  useEffect(() => {
     loadLayoutPreferences()
       .then((lay) => {
-        const restoredFileBrowserOpen = lay.fileBrowserOpen ?? false;
-        const restoredEditorOpen = !!lay.diffFile || !!lay.editingFile;
-        prevColumnsRef.current = {
-          fileBrowser: restoredFileBrowserOpen,
-          editor: restoredEditorOpen,
-        };
-        autoResizeColumnsReadyRef.current = true;
-        const restoredLeft = lay.left;
-        const restoredRight = lay.right;
-        if (restoredLeft !== undefined) setCols((current) => ({ ...current, left: restoredLeft }));
-        if (restoredRight !== undefined) setCols((current) => ({ ...current, right: restoredRight }));
-        if (lay.gitHeight !== undefined) setGitHeight(lay.gitHeight);
-        if (lay.fileTreeWidth !== undefined) {
-          setFileTreeWidth(clamp(lay.fileTreeWidth, 180, 600));
-        }
-        if (lay.editorWidth !== undefined) {
-          setEditorWidth(clamp(lay.editorWidth, 250, 900));
-        }
-        if (lay.sectionSplit !== undefined) {
-          setSectionSplit(lay.sectionSplit);
-        }
-        if (lay.automationHeight !== undefined) {
-          setAutomationHeight(lay.automationHeight);
-        }
+        const restoredPanelWidths = normalizeDashboardPanelWidths(
+          window.innerWidth,
+          lay.sidebarWidth ?? lay.left ?? DEFAULT_SIDEBAR_WIDTH,
+          lay.inspectorWidth ?? DEFAULT_INSPECTOR_WIDTH,
+        );
+        panelWidthsRef.current = restoredPanelWidths;
+        setSidebarWidth(restoredPanelWidths.sidebarWidth);
+        setInspectorWidth(restoredPanelWidths.inspectorWidth);
         if (lay.sessionOrder) {
           setSessionOrder(lay.sessionOrder.filter((name) => !name.startsWith("tw-term-")));
         }
         if (lay.collapsedProjects) {
           setCollapsedProjects(lay.collapsedProjects);
         }
-        setColumnOrder(lay.columnOrder);
         if (lay.scratchCollapsed !== undefined) {
           setScratchCollapsed(lay.scratchCollapsed);
         }
-        setFileBrowserOpen(restoredFileBrowserOpen);
+        const restoredInspectorTab = lay.inspectorTab ?? (lay.diffFile ? "diff" : "files");
+        setInspectorTab(restoredInspectorTab);
+        const currentViewportTier = viewportTierForWidth(window.innerWidth);
+        const restoredSidebarOpen = lay.sidebarOpen ?? true;
+        const restoredInspectorOpen =
+          lay.inspectorOpen ?? lay.fileBrowserOpen ?? true;
+        sidebarOpenPreferenceRef.current = restoredSidebarOpen;
+        inspectorOpenPreferenceRef.current = restoredInspectorOpen;
+        if (currentViewportTier === "compact") {
+          setSidebarOpen(false);
+          setInspectorOpen(false);
+        } else if (currentViewportTier === "drawer") {
+          setSidebarOpen(true);
+          setInspectorOpen(false);
+        } else {
+          setSidebarOpen(restoredSidebarOpen);
+          setInspectorOpen(restoredInspectorOpen);
+        }
         if (lay.diffFile) {
           setDiffFile(lay.diffFile);
           setEditingFile(null);
@@ -673,14 +674,18 @@ function App() {
           setDiffFile(null);
         }
         if (lay.selection !== undefined) {
+          setPendingCatalogSelection(
+            pendingRestoredCatalogSelection(
+              lay.selection,
+              catalogRefreshGenerationRef.current.successful,
+            ),
+          );
           setSelection(lay.selection);
         }
         if (lay.window) setWindowLayout(lay.window);
         setWindowRestoreReady(true);
       })
       .catch(() => {
-        prevColumnsRef.current = { fileBrowser: false, editor: false };
-        autoResizeColumnsReadyRef.current = true;
         setWindowRestoreReady(true);
       })
       .finally(() => {
@@ -688,31 +693,66 @@ function App() {
       });
   }, [dashboardBackend, loadLayoutPreferences]);
 
-  // Persist terminals
+  // Persist terminal metadata serially. The coordinator keeps the newest
+  // snapshot queued and retries failed writes without allowing an older save
+  // to land after a newer one.
   useEffect(() => {
-    if (!terminalsRestoreReady) return;
-    dashboardBackend.terminals.save(terminals).catch(() => {});
-  }, [terminals, terminalsRestoreReady]);
+    if (!terminalsRestoreReady || !terminalPersistenceWritable) {
+      terminalSaveCoordinatorRef.current?.stop();
+      terminalSaveCoordinatorRef.current = null;
+      return;
+    }
+
+    const coordinator = createTerminalSaveCoordinator({
+      save: (snapshot) => dashboardBackend.terminals.save(snapshot),
+      schedule: (callback, delayMs) => {
+        const timer = window.setTimeout(callback, delayMs);
+        return () => window.clearTimeout(timer);
+      },
+      retryDelayMs: () => document.hidden ? 15_000 : 3_000,
+      onError: (nextError) => {
+        setTerminalPersistenceError(
+          `Terminal metadata could not be saved: ${String(nextError)}`,
+        );
+      },
+      onSaved: () => setTerminalPersistenceError(null),
+    });
+    terminalSaveCoordinatorRef.current = coordinator;
+
+    return () => {
+      coordinator.stop();
+      if (terminalSaveCoordinatorRef.current === coordinator) {
+        terminalSaveCoordinatorRef.current = null;
+      }
+    };
+  }, [dashboardBackend, terminalPersistenceWritable, terminalsRestoreReady]);
+
+  useEffect(() => {
+    if (!terminalsRestoreReady || !terminalPersistenceWritable) return;
+    const coordinator = terminalSaveCoordinatorRef.current;
+    if (!coordinator) return;
+    // Defer the enqueue one task so React StrictMode's synthetic mount cleanup
+    // can cancel it before any backend write begins.
+    const timer = window.setTimeout(() => coordinator.enqueue(terminals), 0);
+    return () => window.clearTimeout(timer);
+  }, [terminalPersistenceWritable, terminals, terminalsRestoreReady]);
 
   // Persist layout (debounced)
   useEffect(() => {
     if (!layoutLoadedRef.current) return;
-    const sidebarHeight = sidebarSplitRef.current?.getBoundingClientRect().height ?? 0;
-    if (!isStableSidebarLayoutHeight(sidebarHeight)) return;
     const t = setTimeout(() => {
       saveLayoutPreferences({
-        left: cols.left,
-        right: cols.right,
-        gitHeight,
-        sectionSplit,
-        automationHeight,
+        left: sidebarWidth,
+        sidebarWidth,
+        inspectorWidth,
+        sidebarOpen: sidebarOpenPreferenceRef.current,
+        inspectorOpen: inspectorOpenPreferenceRef.current,
+        inspectorTab,
         sessionOrder,
         collapsedProjects,
-        columnOrder,
+        columnOrder: DEFAULT_COLUMN_ORDER,
         scratchCollapsed,
-        fileBrowserOpen,
-        fileTreeWidth,
-        editorWidth,
+        fileBrowserOpen: inspectorOpenPreferenceRef.current && inspectorTab === "files",
         selection,
         editingFile,
         diffFile,
@@ -721,17 +761,14 @@ function App() {
     }, 500);
     return () => clearTimeout(t);
   }, [
-    cols,
-    gitHeight,
-    sectionSplit,
-    automationHeight,
+    sidebarWidth,
+    inspectorWidth,
+    sidebarOpen,
+    inspectorOpen,
+    inspectorTab,
     sessionOrder,
     collapsedProjects,
-    columnOrder,
     scratchCollapsed,
-    fileBrowserOpen,
-    fileTreeWidth,
-    editorWidth,
     selection,
     editingFile,
     diffFile,
@@ -779,6 +816,41 @@ function App() {
     setSettingsOpen(true);
   }, []);
 
+  const resetDashboardLayout = useCallback(async () => {
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Reset dashboard layout?",
+      message: "This restores panel widths, visibility, the Inspector tab, and the scratch panel. Your sessions and connection settings stay unchanged.",
+    });
+    if (!confirmed) return;
+
+    await requestEditorNavigation(() => {
+      sidebarOpenPreferenceRef.current = true;
+      inspectorOpenPreferenceRef.current = true;
+      setSidebarWidth(DEFAULT_SIDEBAR_WIDTH);
+      setInspectorWidth(DEFAULT_INSPECTOR_WIDTH);
+      panelWidthsRef.current = {
+        sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
+        inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
+      };
+      setInspectorTab("files");
+      setExpandedInspectorTab(null);
+      setScratchCollapsed(true);
+      setEditingFile(null);
+      setDiffFile(null);
+      if (viewportTier === "compact") {
+        setSidebarOpen(false);
+        setInspectorOpen(false);
+      } else if (viewportTier === "drawer") {
+        setSidebarOpen(true);
+        setInspectorOpen(false);
+      } else {
+        setSidebarOpen(true);
+        setInspectorOpen(true);
+      }
+      setLayoutResetMessage("Layout restored to defaults.");
+    });
+  }, [dashboardBackend, requestEditorNavigation, viewportTier]);
+
   useEffect(() => {
     const handleSettingsShortcut = (event: KeyboardEvent) => {
       if (
@@ -787,6 +859,8 @@ function App() {
         event.isComposing ||
         event.altKey ||
         event.shiftKey ||
+        showNewWorktree ||
+        showNewTerminal ||
         !event.metaKey ||
         event.key !== ","
       ) {
@@ -797,7 +871,7 @@ function App() {
     };
     window.addEventListener("keydown", handleSettingsShortcut);
     return () => window.removeEventListener("keydown", handleSettingsShortcut);
-  }, [openSettings, settingsOpen, settingsSection]);
+  }, [openSettings, settingsOpen, settingsSection, showNewTerminal, showNewWorktree]);
 
   useEffect(() => {
     mobileRelay.setPopoverOpen(settingsOpen && settingsSection === "connections");
@@ -808,296 +882,20 @@ function App() {
     showNewTerminal ||
     settingsOpen ||
     commandPaletteOpen;
-  const editorPanelOpen = !!(editingFile || diffFile);
-
-  const startSidebarResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const startX = e.clientX;
-    const startLeft = cols.left;
-    const onMove = (ev: MouseEvent) => {
-      const dx = ev.clientX - startX;
-      setCols((prev) => ({ ...prev, left: clamp(startLeft + dx, 180, 500) }));
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
-
-  const isResizableColumn = (column: LayoutColumn): column is ResizableColumn => {
-    if (column === "file") return fileBrowserOpen;
-    if (column === "scratch") return !scratchCollapsed;
-    return column === "editor" && editorPanelOpen;
-  };
-
-  const getColumnWidth = (column: ResizableColumn): number => {
-    if (column === "file") return fileTreeWidth;
-    if (column === "scratch") return cols.right;
-    return editorWidth;
-  };
-
-  const setColumnWidth = (column: ResizableColumn, value: number) => {
-    const next = Math.round(value);
-    if (column === "file") {
-      setFileTreeWidth(next);
-    } else if (column === "scratch") {
-      setCols((prev) => ({ ...prev, right: next }));
-    } else {
-      setEditorWidth(next);
-    }
-  };
-
-  const canResizeColumns = (left: LayoutColumn, right: LayoutColumn) =>
-    isResizableColumn(left) || isResizableColumn(right);
-
-  const startColumnResize = (left: LayoutColumn, right: LayoutColumn) => (e: React.MouseEvent) => {
-    const leftResizable = isResizableColumn(left) ? left : null;
-    const rightResizable = isResizableColumn(right) ? right : null;
-    if (!leftResizable && !rightResizable) return;
-
-    e.preventDefault();
-    const startX = e.clientX;
-    const startLeft = leftResizable ? getColumnWidth(leftResizable) : null;
-    const startRight = rightResizable ? getColumnWidth(rightResizable) : null;
-
-    const onMove = (ev: MouseEvent) => {
-      const dx = ev.clientX - startX;
-      if (leftResizable && rightResizable && startLeft !== null && startRight !== null) {
-        const leftLimits = COLUMN_WIDTH_LIMITS[leftResizable];
-        const rightLimits = COLUMN_WIDTH_LIMITS[rightResizable];
-        const total = startLeft + startRight;
-        const minLeft = Math.max(leftLimits.min, total - rightLimits.max);
-        const maxLeft = Math.min(leftLimits.max, total - rightLimits.min);
-
-        if (minLeft <= maxLeft) {
-          const nextLeft = clamp(startLeft + dx, minLeft, maxLeft);
-          setColumnWidth(leftResizable, nextLeft);
-          setColumnWidth(rightResizable, total - nextLeft);
-          return;
-        }
-
-        setColumnWidth(leftResizable, clamp(startLeft + dx, leftLimits.min, leftLimits.max));
-        setColumnWidth(rightResizable, clamp(startRight - dx, rightLimits.min, rightLimits.max));
-      } else if (leftResizable && startLeft !== null) {
-        const limits = COLUMN_WIDTH_LIMITS[leftResizable];
-        setColumnWidth(leftResizable, clamp(startLeft + dx, limits.min, limits.max));
-      } else if (rightResizable && startRight !== null) {
-        const limits = COLUMN_WIDTH_LIMITS[rightResizable];
-        setColumnWidth(rightResizable, clamp(startRight - dx, limits.min, limits.max));
-      }
-    };
-
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
-
-  const setColumnRef = useCallback(
-    (column: LayoutColumn) => (element: HTMLElement | null) => {
-      if (element) {
-        columnRefs.current.set(column, element);
-      } else {
-        columnRefs.current.delete(column);
-      }
-    },
-    [],
-  );
-
-  const startColumnDrag = useCallback(
-    (column: LayoutColumn) => (e: React.PointerEvent<HTMLButtonElement>) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      pendingColumnDragRef.current = { column, startX: e.clientX, startY: e.clientY };
-    },
-    [],
-  );
-
-  useEffect(() => {
-    const onMove = (e: globalThis.PointerEvent) => {
-      const pending = pendingColumnDragRef.current;
-      if (pending && !columnDragRef.current) {
-        const dx = e.clientX - pending.startX;
-        const dy = e.clientY - pending.startY;
-        if (Math.hypot(dx, dy) >= COLUMN_DRAG_THRESHOLD) {
-          const next = { from: pending.column, over: pending.column };
-          columnDragRef.current = next;
-          setColumnDrag(next);
-          document.body.style.userSelect = "none";
-          document.body.style.cursor = "grabbing";
-          pendingColumnDragRef.current = null;
-        }
-        return;
-      }
-
-      const drag = columnDragRef.current;
-      if (!drag) return;
-
-      let best = drag.over;
-      let bestDist = Infinity;
-      for (const column of activeColumnOrderRef.current) {
-        const element = columnRefs.current.get(column);
-        if (!element) continue;
-        const rect = element.getBoundingClientRect();
-        const mid = rect.left + rect.width / 2;
-        const dist = Math.abs(e.clientX - mid);
-        if (dist < bestDist) {
-          bestDist = dist;
-          best = column;
-        }
-      }
-
-      if (best !== drag.over) {
-        const next = { ...drag, over: best };
-        columnDragRef.current = next;
-        setColumnDrag(next);
-      }
-    };
-
-    const onUp = () => {
-      pendingColumnDragRef.current = null;
-      const drag = columnDragRef.current;
-      if (!drag) return;
-
-      if (drag.from !== drag.over) {
-        const activeOrder = activeColumnOrderRef.current;
-        setColumnOrder((currentOrder) =>
-          reorderActiveColumns(currentOrder, activeOrder, drag.from, drag.over),
-        );
-      }
-
-      columnDragRef.current = null;
-      setColumnDrag(null);
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
-    };
-
-    document.addEventListener("pointermove", onMove);
-    document.addEventListener("pointerup", onUp);
-    return () => {
-      document.removeEventListener("pointermove", onMove);
-      document.removeEventListener("pointerup", onUp);
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
-    };
-  }, []);
-
-  const startGitSplit = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const container = sidebarSplitRef.current;
-    if (!container) return;
-    const startY = e.clientY;
-    const startH = gitHeight;
-    const total = container.getBoundingClientRect().height;
-    const onMove = (ev: MouseEvent) => {
-      const dy = ev.clientY - startY;
-      const maxGit = Math.max(
-        SIDEBAR_GIT_MIN_HEIGHT,
-        total -
-          sectionSplitValueRef.current -
-          SIDEBAR_TERMINALS_MIN_HEIGHT -
-          automationHeightValueRef.current,
-      );
-      const h = clamp(startH - dy, SIDEBAR_GIT_MIN_HEIGHT, maxGit);
-      setGitHeight(h);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
-
-  const startSectionSplit = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const listContainer = sessionsListRef.current;
-    if (!listContainer) return;
-    const startY = e.clientY;
-    const startH = sectionSplit;
-    const startAutomationH = automationHeight;
-    const containerH = listContainer.getBoundingClientRect().height;
-    const onMove = (ev: MouseEvent) => {
-      const dy = ev.clientY - startY;
-      if (startAutomationH > 0) {
-        const next = resizeWorktreeAutomationSplit({
-          sectionSplit: startH,
-          automationHeight: startAutomationH,
-          deltaY: dy,
-        });
-        setSectionSplit(next.sectionSplit);
-        setAutomationHeight(next.automationHeight);
-        return;
-      }
-
-      const maxSection = Math.max(
-        SIDEBAR_WORKTREES_MIN_HEIGHT,
-        containerH - SIDEBAR_TERMINALS_MIN_HEIGHT - automationHeightValueRef.current,
-      );
-      const h = clamp(startH + dy, SIDEBAR_WORKTREES_MIN_HEIGHT, maxSection);
-      setSectionSplit(h);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
-
-  const startAutomationSplit = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const listContainer = sessionsListRef.current;
-    if (!listContainer) return;
-    const startY = e.clientY;
-    const startH = automationHeight;
-    const containerH = listContainer.getBoundingClientRect().height;
-    const onMove = (ev: MouseEvent) => {
-      const dy = ev.clientY - startY;
-      const maxAutomation = Math.max(
-        SIDEBAR_AUTOMATIONS_MIN_HEIGHT,
-        containerH - sectionSplitValueRef.current - SIDEBAR_TERMINALS_MIN_HEIGHT,
-      );
-      const h = clamp(startH + dy, SIDEBAR_AUTOMATIONS_MIN_HEIGHT, maxAutomation);
-      setAutomationHeight(h);
-    };
-    const onUp = () => {
-      document.removeEventListener("mousemove", onMove);
-      document.removeEventListener("mouseup", onUp);
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    document.addEventListener("mousemove", onMove);
-    document.addEventListener("mouseup", onUp);
-  };
+  const activeDrawer: DashboardDrawer =
+    viewportTier === "compact"
+      ? sidebarOpen
+        ? "sidebar"
+        : inspectorOpen
+          ? "inspector"
+          : null
+      : viewportTier === "drawer" && inspectorOpen
+        ? "inspector"
+        : null;
+  const workspaceInteractionBlocked = anyModalOpen || activeDrawer !== null;
 
   const sessionOrderRef = useRef(sessionOrder);
   sessionOrderRef.current = sessionOrder;
-  const terminalsRef = useRef(terminals);
-  terminalsRef.current = terminals;
 
   const allTerminals = useMemo(() => {
     const persistedKeys = new Set(terminals.map(terminalSessionKey));
@@ -1109,6 +907,54 @@ function App() {
         .map(normalizePlainTerminal),
     ];
   }, [terminals, discoveredTerminals]);
+
+  const catalogSelectionResolution = useMemo(
+    () => reconcileCatalogSelection({
+      selection,
+      pendingSelection: pendingCatalogSelection,
+      hydration: {
+        refreshGeneration: catalogRefreshGeneration,
+        terminalPersistenceGeneration: terminalPersistenceHydrationGeneration,
+        hostGeneration: hostsHydrationGeneration,
+      },
+      sessions,
+      terminals: allTerminals,
+      hostIds: new Set(hosts.map((host) => host.id)),
+      failedSessionHostIds: new Set(failedSessionHostIds),
+      failedTerminalHostIds: new Set(failedTerminalHostIds),
+    }),
+    [
+      allTerminals,
+      catalogRefreshGeneration,
+      hosts,
+      hostsHydrationGeneration,
+      failedSessionHostIds,
+      failedTerminalHostIds,
+      pendingCatalogSelection,
+      selection,
+      sessions,
+      terminalPersistenceHydrationGeneration,
+    ],
+  );
+
+  useEffect(() => {
+    if (pendingCatalogSelection !== catalogSelectionResolution.pendingSelection) {
+      setPendingCatalogSelection(catalogSelectionResolution.pendingSelection);
+    }
+    if (!sameCatalogSelection(selection, catalogSelectionResolution.selection)) {
+      setSelection(catalogSelectionResolution.selection);
+    }
+  }, [catalogSelectionResolution, pendingCatalogSelection, selection]);
+
+  const selectedSession =
+    selection?.kind === "session"
+      ? sessions.find((session) => session.name === selection.name) ?? null
+      : null;
+  const selectedTerminal =
+    selection?.kind === "terminal"
+      ? allTerminals.find((terminal) => terminal.id === selection.id) ?? null
+      : null;
+  const selectionMetadataPending = catalogSelectionResolution.metadataPending;
 
   useEffect(() => {
     const names = [
@@ -1147,11 +993,27 @@ function App() {
   }, [sessions, allTerminals]);
 
   const refresh = useCallback(async () => {
+    const refreshGeneration = ++catalogRefreshGenerationRef.current.started;
     try {
-      const [list, discovered] = await Promise.all([
-        dashboardBackend.sessions.list(),
-        dashboardBackend.terminals.listTmux().catch(() => [] as PlainTerminal[]),
-      ]);
+      const snapshot = dashboardBackend.catalog
+        ? await dashboardBackend.catalog.list()
+        : await Promise.all([
+          dashboardBackend.sessions.list(),
+          dashboardBackend.terminals.listTmux(),
+        ]).then(([nextSessions, nextTerminals]) => ({
+          sessions: nextSessions,
+          terminals: nextTerminals,
+          failedSessionHostIds: [],
+          failedTerminalHostIds: [],
+        }));
+      if (refreshGeneration < catalogRefreshGenerationRef.current.successful) return;
+      const mergedCatalog = mergeDashboardCatalogSnapshot(
+        sessionsRef.current,
+        discoveredTerminalsRef.current,
+        snapshot,
+      );
+      const list = mergedCatalog.sessions;
+      const discovered = mergedCatalog.terminals;
       const order = sessionOrderRef.current;
       const orderMap = new Map(order.map((n, i) => [n, i]));
       list.sort((a, b) => {
@@ -1181,12 +1043,15 @@ function App() {
       }
       sessionActivityRef.current = nextActivity;
       const nextDiscoveredTerminals = discovered.map((terminal) => ({ ...terminal, discovered: true }));
+      catalogRefreshGenerationRef.current.successful = refreshGeneration;
+      setFailedSessionHostIds(snapshot.failedSessionHostIds);
+      setFailedTerminalHostIds(snapshot.failedTerminalHostIds);
       setSessionActivity((prev) => sameSessionActivity(prev, nextActivityInfo) ? prev : nextActivityInfo);
       setSessions((prev) => sameSessions(prev, list) ? prev : list);
       setDiscoveredTerminals((prev) => samePlainTerminals(prev, nextDiscoveredTerminals) ? prev : nextDiscoveredTerminals);
-      setError(null);
+      setCatalogRefreshGeneration(refreshGeneration);
+      setError(mergedCatalog.partialError);
       const live = new Set(list.map((s) => s.name));
-      const currentTerminals = terminalsRef.current;
       setOpenedSessions((prev) => {
         const next = prev.filter((n) => live.has(n));
         return sameStringArray(prev, next) ? prev : next;
@@ -1197,20 +1062,6 @@ function App() {
           if (live.has(k)) next[k] = v;
         }
         return sameStringRecord(prev, next) ? prev : next;
-      });
-      setSelection((cur) => {
-        if (cur?.kind === "automation") return cur;
-        if (
-          cur?.kind === "terminal" &&
-          [...currentTerminals, ...discovered].some((terminal) => terminal.id === cur.id)
-        ) {
-          return cur;
-        }
-        if (cur?.kind === "session" && live.has(cur.name)) return cur;
-        if (list.length > 0) return { kind: "session", name: list[0].name };
-        if (currentTerminals.length > 0) return { kind: "terminal", id: currentTerminals[0].id };
-        if (discovered.length > 0) return { kind: "terminal", id: discovered[0].id };
-        return null;
       });
     } catch (e) {
       setError(String(e));
@@ -1224,26 +1075,60 @@ function App() {
 
   const handleAutomationCreate = useCallback(
     async (draft: AutomationDraft) => {
+      const originatingDraft = {
+        contextKey: automationDirtySnapshotRef.current.fileKey,
+        revision: automationDirtySnapshotRef.current.revision,
+      };
       const record = await dashboardBackend.automations.save(
         automationSaveInputFromDraft(draft),
       );
       const automation = automationFromRecord(record);
-      setSelection({ kind: "automation", id: automation.id });
+      if (!automationSubmitStillOwnsDraft(originatingDraft, {
+        contextKey: automationDirtySnapshotRef.current.fileKey,
+        revision: automationDirtySnapshotRef.current.revision,
+      })) {
+        await loadAutomations();
+        return;
+      }
+      await requestEditorNavigation(() => {
+        setEditingFile(null);
+        setDiffFile(null);
+        setExpandedInspectorTab(null);
+        setInspectorTab("automation");
+        setSelection({ kind: "automation", id: automation.id });
+      }, { ignoreAutomationDirty: true });
       await loadAutomations();
     },
-    [loadAutomations],
+    [loadAutomations, requestEditorNavigation],
   );
 
   const handleAutomationSave = useCallback(
     async (id: string, draft: AutomationDraft) => {
+      const originatingDraft = {
+        contextKey: automationDirtySnapshotRef.current.fileKey,
+        revision: automationDirtySnapshotRef.current.revision,
+      };
       const record = await dashboardBackend.automations.save(
         automationSaveInputFromDraft(draft, id),
       );
       const automation = automationFromRecord(record);
-      setSelection({ kind: "automation", id: automation.id });
+      if (!automationSubmitStillOwnsDraft(originatingDraft, {
+        contextKey: automationDirtySnapshotRef.current.fileKey,
+        revision: automationDirtySnapshotRef.current.revision,
+      })) {
+        await loadAutomations();
+        return;
+      }
+      await requestEditorNavigation(() => {
+        setEditingFile(null);
+        setDiffFile(null);
+        setExpandedInspectorTab(null);
+        setInspectorTab("automation");
+        setSelection({ kind: "automation", id: automation.id });
+      }, { ignoreAutomationDirty: true });
       await loadAutomations();
     },
-    [loadAutomations],
+    [loadAutomations, requestEditorNavigation],
   );
 
   const handleAutomationToggle = useCallback(
@@ -1263,6 +1148,12 @@ function App() {
 
   const handleAutomationDelete = useCallback(
     async (id: string) => {
+      const automation = automationsRef.current.find((item) => item.id === id);
+      const confirmed = await dashboardBackend.dialog.confirm({
+        title: "Delete automation?",
+        message: `This will remove ${automation?.name || "this automation"} and stop its future scheduled runs.`,
+      });
+      if (!confirmed) return;
       await dashboardBackend.automations.delete(id);
       setAutomationRuns((prev) => prev.filter((run) => run.automationId !== id));
       setSelection((current) =>
@@ -1270,7 +1161,7 @@ function App() {
       );
       await loadAutomations();
     },
-    [loadAutomations],
+    [dashboardBackend, loadAutomations],
   );
 
   const handleAutomationRun = useCallback(
@@ -1306,6 +1197,7 @@ function App() {
   // Lazily attach live PTYs; startup preloads snapshots instead.
   useEffect(() => {
     if (selection?.kind !== "session") return;
+    if (!selectedSession || selectionMetadataPending) return;
     const name = selection.name;
     setOpenedSessions((prev) =>
       prev.includes(name) ? prev : [...prev, name],
@@ -1320,16 +1212,17 @@ function App() {
       .finally(() => {
         cwdRequested.current.delete(name);
       });
-  }, [selection, cwdsBySession]);
+  }, [dashboardBackend, selection, selectedSession, selectionMetadataPending, cwdsBySession]);
 
   // Lazily attach plain tmux terminals too.
   useEffect(() => {
     if (selection?.kind !== "terminal") return;
+    if (!selectedTerminal || selectionMetadataPending) return;
     const id = selection.id;
     setOpenedTerminals((prev) =>
       prev.includes(id) ? prev : [...prev, id],
     );
-  }, [selection]);
+  }, [selection, selectedTerminal, selectionMetadataPending]);
 
   useEffect(() => {
     const liveTerminalIds = new Set(allTerminals.map((terminal) => terminal.id));
@@ -1348,23 +1241,19 @@ function App() {
     selectedAutomation?.project.trim()
       ? projectPresets.find((project) => project.name === selectedAutomation.project)?.path.trim() || null
       : null;
-  const selectedSession =
-    selection?.kind === "session"
-      ? sessions.find((session) => session.name === selection.name) ?? null
-      : null;
-  const selectedTerminal =
-    selection?.kind === "terminal"
-      ? allTerminals.find((terminal) => terminal.id === selection.id) ?? null
-      : null;
   const selectedSessionIsRemote = !!selectedSession?.hostId;
   const selectedGitHostId =
-    selection?.kind === "session"
+    selectionMetadataPending
+      ? null
+      : selection?.kind === "session"
       ? selectedSession?.hostId ?? null
       : selection?.kind === "terminal"
         ? selectedTerminal?.hostId ?? null
         : null;
   const selectedCwd: string | null =
-    selection?.kind === "session"
+    selectionMetadataPending
+      ? null
+      : selection?.kind === "session"
       ? cwdsBySession[selection.name] ?? null
       : selection?.kind === "terminal"
         ? selectedTerminal?.cwd ?? null
@@ -1373,11 +1262,44 @@ function App() {
           : null;
 
   const desktopRoot = homeDir ? `${homeDir.replace(/\/+$/, "")}/Desktop` : null;
-  const localSelectedCwd = selectedGitHostId ? null : selectedCwd;
   const fileBrowserRoot =
-    selection?.kind === "automation"
+    !selection
+      ? null
+      : selection.kind === "automation"
       ? selectedCwd ?? desktopRoot
-      : localSelectedCwd ?? homeDir ?? "/";
+      : selectedGitHostId
+        ? selectedCwd
+        : selectedCwd ?? homeDir ?? "/";
+
+  useEffect(() => {
+    let current = true;
+    setWorkspaceBranch(null);
+    if (
+      selectionMetadataPending ||
+      !selectedCwd ||
+      (selection?.kind !== "session" && selection?.kind !== "terminal")
+    ) {
+      return () => {
+        current = false;
+      };
+    }
+    void dashboardBackend.git.status(selectedCwd, selectedGitHostId)
+      .then((status) => {
+        if (current) setWorkspaceBranch(status?.branch || null);
+      })
+      .catch(() => {
+        if (current) setWorkspaceBranch(null);
+      });
+    return () => {
+      current = false;
+    };
+  }, [
+    dashboardBackend.git,
+    selectedCwd,
+    selectedGitHostId,
+    selection,
+    selectionMetadataPending,
+  ]);
 
   const projectPresetForSession = useCallback(
     (sessionName: string): string | null => {
@@ -1396,13 +1318,17 @@ function App() {
     }
   }, [projectPresetForSession, selection, selectedCwd, selectedGitHostId]);
 
-  const handleNewAutomation = useCallback(() => {
+  const handleNewAutomation = useCallback(() => requestEditorNavigation(() => {
     if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd && !selectedGitHostId) {
       setLastAutomationContextPath(selectedCwd);
       setLastAutomationContextProject(
         selection.kind === "session" ? projectPresetForSession(selection.name) : null,
       );
-    } else if (selection?.kind === "session" && !selectedSessionIsRemote) {
+    } else if (
+      selection?.kind === "session" &&
+      !selectionMetadataPending &&
+      !selectedSessionIsRemote
+    ) {
       const name = selection.name;
       void dashboardBackend.sessions.root(name)
         .then((cwd) => {
@@ -1413,13 +1339,44 @@ function App() {
         })
         .catch(() => {});
     }
-    setSelection({ kind: "automation", id: "" });
-  }, [projectPresetForSession, selection, selectedCwd, selectedGitHostId, selectedSessionIsRemote]);
-
-  const handleOpenFile = useCallback((path: string, _line?: number, _col?: number, hostId?: string | null) => {
+    setEditingFile(null);
     setDiffFile(null);
-    setEditingFile({ path, hostId: hostId ?? null });
-  }, []);
+    setExpandedInspectorTab(null);
+    setInspectorTab("automation");
+    setSelection({ kind: "automation", id: "" });
+  }), [
+    dashboardBackend,
+    projectPresetForSession,
+    requestEditorNavigation,
+    selection,
+    selectedCwd,
+    selectedGitHostId,
+    selectedSessionIsRemote,
+    selectionMetadataPending,
+  ]);
+
+  const handleOpenFile = useCallback(
+    (path: string, _line?: number, _col?: number, hostId?: string | null) => {
+      const nextFile = { path, hostId: hostId ?? null };
+      if (
+        editingFileSourceKey(editingFileRef.current) ===
+        editingFileSourceKey(nextFile)
+      ) {
+        return Promise.resolve(true);
+      }
+      return requestEditorNavigation(() => {
+        setDiffFile(null);
+        setExpandedInspectorTab(null);
+        setEditingFile(nextFile);
+      });
+    },
+    [requestEditorNavigation],
+  );
+
+  const closeEditingFile = useCallback(
+    () => requestEditorNavigation(() => setEditingFile(null)),
+    [requestEditorNavigation],
+  );
 
   const selectionKey =
     selection?.kind === "session"
@@ -1518,13 +1475,9 @@ function App() {
   };
 
   const openScratch = useCallback(() => {
-    setColumnOrder((order) => placeScratchAfterMain(order));
     setScratchCollapsed(false);
   }, []);
 
-  const colorMap = new Map<string, string>();
-  const sessionGroups = groupSessionsByProject(sessions, hosts);
-  const collapsedProjectSet = new Set(collapsedProjects);
   const toggleProjectCollapsed = (projectKey: string) => {
     setCollapsedProjects((prev) =>
       prev.includes(projectKey)
@@ -1532,192 +1485,142 @@ function App() {
         : [...prev, projectKey],
     );
   };
-  const totalCount = sessions.length + allTerminals.length + automations.length;
 
-  const sessionSortable = useSortable(
-    sessions,
-    (reordered) => {
-      setSessions(reordered);
-      setSessionOrder(reordered.map((s) => s.name));
+  const selectSession = useCallback(
+    (name: string) => requestEditorNavigation(() => {
+      setPendingCatalogSelection(null);
+      setSelection({ kind: "session", name });
+      setEditingFile(null);
+      setDiffFile(null);
+      setExpandedInspectorTab(null);
+      if (viewportTier === "compact") setSidebarOpen(false);
+    }),
+    [requestEditorNavigation, viewportTier],
+  );
+
+  const selectTerminal = useCallback(
+    (id: string) => requestEditorNavigation(() => {
+      setPendingCatalogSelection(null);
+      setSelection({ kind: "terminal", id });
+      setEditingFile(null);
+      setDiffFile(null);
+      setExpandedInspectorTab(null);
+      if (viewportTier === "compact") setSidebarOpen(false);
+    }),
+    [requestEditorNavigation, viewportTier],
+  );
+
+  const selectAutomation = useCallback(
+    (id: string) => {
+      if (
+        automationSelectionIsCurrent(
+          selection?.kind === "automation" ? selection.id : null,
+          id,
+          editingFileRef.current !== null,
+          expandedInspectorTab !== null,
+        )
+      ) {
+        setInspectorTab("automation");
+        if (viewportTier === "compact") setSidebarOpen(false);
+        return Promise.resolve(false);
+      }
+      return requestEditorNavigation(() => {
+      setPendingCatalogSelection(null);
+      setSelection({ kind: "automation", id });
+      setEditingFile(null);
+      setDiffFile(null);
+      setExpandedInspectorTab(null);
+      setInspectorTab("automation");
+      if (viewportTier === "compact") setSidebarOpen(false);
+      });
     },
+    [expandedInspectorTab, requestEditorNavigation, selection, viewportTier],
   );
 
-  const terminalSortable = useSortable(
-    terminals,
-    (reordered) => setTerminals(reordered),
-  );
-
-  const SPLITTER_W = 1;
-  const scratchWidth = cols.right;
-  const isColumnActive = (column: LayoutColumn) => {
-    if (column === "file") return fileBrowserOpen;
-    if (column === "scratch") return !scratchCollapsed;
-    if (column === "editor") return editorPanelOpen;
-    return true;
-  };
-  const activeColumnOrder = columnOrder.filter(isColumnActive);
-  activeColumnOrderRef.current = activeColumnOrder;
-
-  const fixedColumnsWidth = activeColumnOrder.reduce((total, column) => {
-    if (column === "file") return total + fileTreeWidth;
-    if (column === "scratch") return total + scratchWidth;
-    if (column === "editor") return total + editorWidth;
-    return total;
-  }, 0);
-  const mainWidth = Math.max(
-    200,
-    containerWidth - cols.left - fixedColumnsWidth - activeColumnOrder.length * SPLITTER_W,
-  );
-
-  const columnTrackWidth = (column: LayoutColumn) => {
-    if (column === "file") return fileTreeWidth;
-    if (column === "scratch") return scratchWidth;
-    if (column === "editor") return editorWidth;
-    return mainWidth;
-  };
-  const gridCols = `${cols.left}px ${SPLITTER_W}px ${activeColumnOrder
-    .map((column) => `${columnTrackWidth(column)}px`)
-    .join(` ${SPLITTER_W}px `)}`;
-
-  const columnGridColumn = (column: LayoutColumn) => {
-    const index = activeColumnOrder.indexOf(column);
-    return index < 0 ? undefined : 3 + index * 2;
-  };
-
-  const columnClass = (column: LayoutColumn, base: string) => {
-    let cls = `${base} layout-column layout-column--draggable`;
-    if (columnDrag?.from === column) cls += " layout-column--dragging";
-    if (columnDrag && columnDrag.over === column && columnDrag.from !== column) {
-      const fromIndex = activeColumnOrder.indexOf(columnDrag.from);
-      const overIndex = activeColumnOrder.indexOf(column);
-      cls += fromIndex > overIndex ? " layout-column--drop-before" : " layout-column--drop-after";
+  const closeSession = useCallback(async (name: string) => {
+    try {
+      const session = sessions.find((candidate) => candidate.name === name);
+      const confirmed = await dashboardBackend.dialog.confirm({
+        title: "Close worktree session?",
+        message:
+          `This will stop the tmux session for ${session ? sessionDisplayName(session) : name}. ` +
+          "The worktree and its files will not be deleted.",
+      });
+      if (!confirmed) return;
+      await dashboardBackend.sessions.kill(name);
+      setSessions((current) => current.filter((session) => session.name !== name));
+      setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
+      setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
+      setSelection((current) => {
+        if (current?.kind !== "session" || current.name !== name) return current;
+        const remainingSession = sessions.find((session) => session.name !== name);
+        if (remainingSession) return { kind: "session", name: remainingSession.name };
+        const remainingTerminal = allTerminals[0];
+        return remainingTerminal ? { kind: "terminal", id: remainingTerminal.id } : null;
+      });
+    } catch (nextError) {
+      setError(String(nextError));
     }
-    return cls;
-  };
+  }, [allTerminals, dashboardBackend, sessions]);
 
-  const renderColumnHandle = (column: LayoutColumn, label: string) => (
-    <button
-      className="column-drag-handle"
-      type="button"
-      onPointerDown={startColumnDrag(column)}
-      title={`reorder ${label}`}
-      aria-label={`reorder ${label}`}
-    >
-      <span />
-      <span />
-    </button>
-  );
+  const closeTerminal = useCallback(async (id: string) => {
+    const terminal = allTerminals.find((candidate) => candidate.id === id);
+    if (!terminal) return;
+    const sessionKey = terminalSessionKey(terminal);
+    try {
+      const confirmed = await dashboardBackend.dialog.confirm({
+        title: "Close terminal?",
+        message: `This will stop the tmux session for ${terminal.label}.`,
+      });
+      if (!confirmed) return;
+      if (terminal.discovered) {
+        await dashboardBackend.sessions.kill(sessionKey);
+        setDiscoveredTerminals((current) => current.filter((candidate) => candidate.id !== id));
+      } else {
+        await dashboardBackend.terminals.kill(sessionKey);
+        setTerminals((current) => current.filter((candidate) => candidate.id !== id));
+      }
+      setOpenedTerminals((current) => current.filter((terminalId) => terminalId !== id));
+      setSelection((current) => {
+        if (current?.kind !== "terminal" || current.id !== id) return current;
+        const remainingTerminal = allTerminals.find((candidate) => candidate.id !== id);
+        if (remainingTerminal) return { kind: "terminal", id: remainingTerminal.id };
+        const remainingSession = sessions[0];
+        return remainingSession ? { kind: "session", name: remainingSession.name } : null;
+      });
+    } catch (nextError) {
+      setError(String(nextError));
+    }
+  }, [allTerminals, dashboardBackend, sessions]);
 
-  const columnSplitters = activeColumnOrder.slice(1).map((right, index) => {
-    const left = activeColumnOrder[index];
-    const resizable = canResizeColumns(left, right);
-    return (
-      <div
-        key={`${left}-${right}`}
-        className={`splitter${resizable ? "" : " splitter--disabled"}`}
-        style={{ gridColumn: 4 + index * 2 }}
-        onMouseDown={resizable ? startColumnResize(left, right) : undefined}
-        aria-label={`resize ${left} and ${right}`}
-      />
-    );
-  });
-
-  const renderSessionRow = (s: Session, i: number) => {
-    const displayName = sessionDisplayName(s);
-    const key = sessionProjectKey(s);
-    const color = colorForProject(colorMap, s.hostId ? `${s.hostId}:${key}` : key);
-    const hostLabel = s.hostId ? hosts.find((h) => h.id === s.hostId)?.label ?? s.hostId : null;
-    const isSelected = selection?.kind === "session" && selection.name === s.name;
-    const isDragging = sessionSortable.dragIndex === i;
-    const isDragOver =
-      sessionSortable.dragIndex !== null &&
-      sessionSortable.overIndex === i &&
-      sessionSortable.dragIndex !== i;
-    const dragOverClass = isDragOver
-      ? sessionSortable.dragIndex! > i
-        ? "session--drag-over-before"
-        : "session--drag-over-after"
-      : "";
-    const activity = sessionActivity[s.name];
-    const activityState = activity?.state ?? "unknown";
-    const activityTitle =
-      activity?.state === "running"
-        ? "agent is running"
-        : activity?.state === "stopped"
-          ? activity.ageSeconds == null
-            ? "agent is stopped"
-            : `agent stopped ${activity.label} ago`
-          : "agent status unknown";
-
-    return (
-      <div
-        key={s.name}
-        data-sort-index={i}
-        className={`session session--activity-${activityState} ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${dragOverClass} ${s.hostId ? "session--remote" : ""}`}
-        onClick={() => {
-          if (sessionSortable.draggingRef.current) return;
-          setSelection({ kind: "session", name: s.name });
-        }}
-        onPointerDown={sessionSortable.onPointerDown(i)}
-        role="button"
-        tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            setSelection({ kind: "session", name: s.name });
-          }
-        }}
-        title={hostLabel ? `${hostLabel} - ${displayName}` : undefined}
-      >
-        <span
-          className={`session__dot ${s.attached ? "session__dot--attached" : ""} session__dot--activity-${activityState}`}
-          style={{ background: color }}
-        />
-        <span
-          className={`session__host-badge ${hostLabel ? "" : "session__host-badge--empty"}`}
-          title={hostLabel ?? undefined}
-        >
-          {hostLabel ? hostLabel.charAt(0).toUpperCase() : ""}
-        </span>
-        <span className="session__name">
-          <span className="session__head" style={{ color }}>
-            {displayName}
-          </span>
-        </span>
-        <span
-          className={`session__meta session__meta--activity-${activityState}`}
-          title={activityTitle}
-        >
-          {activity?.label ?? (s.hostId ? "" : "--")}
-        </span>
-        <button
-          type="button"
-          className="session__kill"
-          onPointerDown={(e) => e.stopPropagation()}
-          onClick={async (e) => {
-            e.stopPropagation();
-            try {
-              await dashboardBackend.sessions.kill(s.name);
-              setSessions((prev) => prev.filter((x) => x.name !== s.name));
-              setOpenedSessions((prev) => prev.filter((n) => n !== s.name));
-              setSessionOrder((prev) => prev.filter((n) => n !== s.name));
-              if (isSelected) {
-                const remaining = sessions.filter((x) => x.name !== s.name);
-                setSelection(
-                  remaining.length > 0 ? { kind: "session", name: remaining[0].name } : null,
-                );
-              }
-            } catch (err) {
-              setError(String(err));
-            }
-          }}
-          title="kill session"
-          aria-label={`kill session ${displayName}`}
-        >
-          ×
-        </button>
-      </div>
-    );
-  };
+  useEffect(() => {
+    const handleNewWorktreeShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const targetConsumesText =
+        target?.isContentEditable ||
+        target?.tagName === "INPUT" ||
+        target?.tagName === "TEXTAREA" ||
+        target?.tagName === "SELECT";
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        targetConsumesText ||
+        anyModalOpen ||
+        !event.metaKey ||
+        event.ctrlKey ||
+        event.altKey ||
+        event.shiftKey ||
+        event.key.toLowerCase() !== "n"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      setShowNewWorktree(true);
+    };
+    window.addEventListener("keydown", handleNewWorktreeShortcut);
+    return () => window.removeEventListener("keydown", handleNewWorktreeShortcut);
+  }, [anyModalOpen]);
 
   const commandPaletteItems = useMemo<CommandPaletteItem[]>(() => {
     const actions: CommandPaletteItem[] = [
@@ -1759,7 +1662,9 @@ function App() {
           label: sessionDisplayName(session),
           detail: [host?.label ?? session.hostId, session.project].filter(Boolean).join(" · ") || "Local worktree",
           keywords: ["worktree", "session", session.name, session.project ?? ""],
-          execute: () => setSelection({ kind: "session", name: session.name }),
+          execute: () => {
+            void selectSession(session.name);
+          },
         };
       }),
       ...allTerminals.map((terminal) => ({
@@ -1768,7 +1673,9 @@ function App() {
         label: terminal.label,
         detail: terminal.hostId ? `SSH · ${terminal.cwd}` : terminal.cwd,
         keywords: ["terminal", "shell", terminal.tmuxName],
-        execute: () => setSelection({ kind: "terminal", id: terminal.id }),
+        execute: () => {
+          void selectTerminal(terminal.id);
+        },
       })),
     ];
 
@@ -1793,7 +1700,9 @@ function App() {
               group: "recent" as const,
               label: sessionDisplayName(session),
               detail: "Recently opened worktree",
-              execute: () => setSelection({ kind: "session", name }),
+              execute: () => {
+                void selectSession(name);
+              },
             }]
           : [];
       }),
@@ -1805,7 +1714,9 @@ function App() {
               group: "recent" as const,
               label: terminal.label,
               detail: "Recently opened terminal",
-              execute: () => setSelection({ kind: "terminal", id }),
+              execute: () => {
+                void selectTerminal(id);
+              },
             }]
           : [];
       }),
@@ -1832,8 +1743,8 @@ function App() {
         id: "settings-advanced",
         group: "settings",
         label: "Advanced settings…",
-        detail: "Diagnostics and layout controls",
-        keywords: ["logs", "reset", "diagnostics"],
+        detail: "Reset dashboard layout",
+        keywords: ["layout", "reset", "panels"],
         execute: () => openSettings("advanced"),
       },
     ];
@@ -1848,416 +1759,272 @@ function App() {
     openSettings,
     openedSessions,
     openedTerminals,
+    selectSession,
+    selectTerminal,
     sessions,
   ]);
   const relaySettingsBindings = relaySettingsBindingsFromController(mobileRelay);
 
-  return (
-    <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
-      <div className="titlebar" data-tauri-drag-region />
+  const selectedHostId =
+    selectedSession?.hostId ?? selectedTerminal?.hostId ?? null;
+  const selectedHost = selectedHostId
+    ? hosts.find((host) => host.id === selectedHostId) ?? null
+    : null;
+  const selectedActivity =
+    selection?.kind === "session" ? sessionActivity[selection.name] : null;
+  const selectedHostStatus = selectedHostId ? hostStatuses[selectedHostId] : null;
 
-      {/* ── Sidebar (always visible) ── */}
-      <aside className="sidebar">
-        <header className="sidebar__header">
-          <div className="brand">
-            <span className="brand__mark" />
-            <span className="brand__text">tmux-worktree</span>
-            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
-              <button
-                className={`brand__file-btn${mobileRelay.buttonActive ? " brand__file-btn--active" : ""}`}
-                type="button"
-                onClick={() => openSettings("connections")}
-                title={`Mobile Relay: ${mobileRelay.statusText}`}
-                aria-label={`Open Mobile Relay settings. Status: ${mobileRelay.statusText}`}
-              >
-                <Radio aria-hidden="true" size={14} strokeWidth={1.8} />
-              </button>
-              <button
-                className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
-                type="button"
-                onClick={() => setFileBrowserOpen((prev) => !prev)}
-                title="toggle file browser"
-                aria-label="toggle file browser"
-              >
-                <FolderTree aria-hidden="true" size={14} strokeWidth={1.8} />
-              </button>
-            </div>
-          </div>
-          <div className="sidebar__buttons">
-            <button
-              className="btn btn--primary"
-              type="button"
-              onClick={() => setShowNewWorktree(true)}
-            >
-              + worktree
-            </button>
-            <button
-              className="btn btn--primary"
-              type="button"
-              onClick={() => setShowNewTerminal(true)}
-            >
-              + terminal
-            </button>
-          </div>
-          {hosts.length > 0 && (
-            <div className="sidebar__host-status hosts-bar">
-              {hosts.map((h) => {
-                const st = hostStatuses[h.id];
-                const reachable = st?.reachable ?? false;
-                const twAvailable = st?.twAvailable ?? false;
-                const twLabel = st
-                  ? twAvailable
-                    ? `tw ${st.twVersion ?? "ok"}`
-                    : reachable
-                      ? "tw missing"
-                      : ""
-                  : "";
-                return (
-                  <span
-                    key={h.id}
-                    className={`hosts-bar__item ${reachable ? "hosts-bar__item--up" : "hosts-bar__item--down"}`}
-                    title={st?.error ?? st?.twError ?? (reachable ? `connected (${st.latencyMs}ms)` : "connecting...")}
-                  >
-                    <span className="hosts-bar__dot" />
-                    <span>{h.label}</span>
-                    {twLabel && <span className="hosts-bar__tw">{twLabel}</span>}
-                    {reachable && st && !twAvailable && (
-                      <button
-                        type="button"
-                        className="hosts-bar__install"
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          void installRemoteTw(h.id);
-                        }}
-                        disabled={installingHostId === h.id}
-                        title={st.twError ?? "install remote tw"}
-                      >
-                        {installingHostId === h.id ? "installing" : "install"}
-                      </button>
-                    )}
-                  </span>
-                );
-              })}
-            </div>
-          )}
-        </header>
+  const workspaceStatus: WorkspaceStatus = (() => {
+    if (selectionMetadataPending) return "reconnecting";
+    if (selectedHostId && selectedHostStatus && !selectedHostStatus.reachable) return "offline";
+    if (selectedHostId && !selectedHostStatus) return "reconnecting";
+    if (selection?.kind === "automation") {
+      if (selectedAutomation?.status === "running") return "running";
+      if (selectedAutomation?.status === "queued") return "waiting";
+      if (selectedAutomation?.status === "failed" || !selectedAutomation?.active) return "stopped";
+      return selectedAutomation ? "waiting" : "unknown";
+    }
+    if (selection?.kind === "terminal") return selectedTerminal ? "running" : "unknown";
+    if (selectedActivity?.state === "running") return "running";
+    if (selectedActivity?.state === "stopped") return "stopped";
+    if (selectedSession && !selectedCwd) return "waiting";
+    return selectedSession ? "unknown" : "stopped";
+  })();
 
-        <div className="sidebar__split" ref={sidebarSplitRef}>
-          <div className="sidebar__lists" ref={sessionsListRef}>
-            {/* ── Worktrees section ── */}
-            <div
-              className="sidebar__section"
-              style={{ height: sectionSplit, flexShrink: 0 }}
-            >
-              <div className="section-label">
-                <span className="section-label__text">worktrees</span>
-                <span className="section-label__line" />
-              </div>
-              <nav className={`sidebar__sessions ${sessionSortable.dragIndex !== null ? "sidebar__sessions--dragging" : ""}`} ref={sessionSortable.listRef as React.RefObject<HTMLElement>}>
-                {sessions.length === 0 && !error && (
-                  <div className="empty empty--small">no sessions</div>
-                )}
-                {error && <div className="empty empty--error">{error}</div>}
-                {sessionGroups.map((group) => {
-                  const color = colorForProject(colorMap, group.colorKey);
-                  const collapsed = collapsedProjectSet.has(group.key);
-                  return (
-                    <div className="session-project" key={group.key}>
-                      <button
-                        type="button"
-                        className="session-project__toggle"
-                        onClick={() => toggleProjectCollapsed(group.key)}
-                        aria-expanded={!collapsed}
-                        title={`${collapsed ? "expand" : "collapse"} ${group.hostLabel ? `${group.hostLabel} / ` : ""}${group.project}`}
-                      >
-                        <span
-                          className={`session-project__chevron${collapsed ? "" : " session-project__chevron--open"}`}
-                          aria-hidden="true"
-                        />
-                        <span
-                          className="session-project__dot"
-                          style={{ background: color }}
-                          aria-hidden="true"
-                        />
-                        <span
-                          className={`session-project__host ${group.hostLabel ? "" : "session-project__host--empty"}`}
-                          title={group.hostLabel ?? undefined}
-                        >
-                          {group.hostLabel ? group.hostLabel.charAt(0).toUpperCase() : ""}
-                        </span>
-                        <span className="session-project__name" title={group.project}>
-                          {group.project}
-                        </span>
-                        <span className="session-project__count">{group.sessions.length}</span>
-                      </button>
-                      {!collapsed &&
-                        group.sessions.map((s) => renderSessionRow(s, sessions.indexOf(s)))}
-                    </div>
-                  );
-                })}
-              </nav>
-            </div>
+  const workspaceTitle =
+    selectionMetadataPending && selection?.kind === "session"
+      ? selection.name
+      : selectionMetadataPending && selection?.kind === "terminal"
+        ? "Loading terminal…"
+        : editingFile
+          ? basenameFromPath(editingFile.path) || editingFile.path
+          : expandedInspectorTab === "diff" && diffFile
+            ? basenameFromPath(diffFile.path) || diffFile.path
+            : selectedSession
+              ? sessionDisplayName(selectedSession)
+              : selectedTerminal?.label
+                ? selectedTerminal.label
+                : selectedAutomation?.name || "No workspace selected";
+  const workspaceProject =
+    selectedSession?.project?.trim() ||
+    selectedAutomation?.project?.trim() ||
+    null;
+  const workspaceAgentCommand =
+    selectedTerminal?.aiCmd?.trim() ||
+    selectedAutomation?.aiCmd?.trim() ||
+    null;
 
-            {/* ── Automations section ── */}
-            <div
-              className="sidebar__section sidebar__section--automations"
-              style={{ flex: `0 0 ${automationHeight}px` }}
-            >
-              <div
-                className="section-label section-label--draggable"
-                onMouseDown={startSectionSplit}
-              >
-                <span className="section-label__text">automations</span>
-                <span className="section-label__line" />
-                <button
-                  className="btn btn--small"
-                  type="button"
-                  onClick={handleNewAutomation}
-                  title="new automation"
-                  aria-label="new automation"
-                >
-                  +
-                </button>
-              </div>
-              <nav className="sidebar__sessions sidebar__sessions--compact">
-                {automationError && <div className="empty empty--error">{automationError}</div>}
-                {automations.length === 0 && !automationError && (
-                  <div className="empty empty--small">no automations</div>
-                )}
-                {automations.map((automation) => {
-                  const isSelected =
-                    selection?.kind === "automation" && selection.id === automation.id;
-                  return (
-                    <div
-                      key={automation.id}
-                      className={`session ${isSelected ? "session--selected" : ""}`}
-                      onClick={() => setSelection({ kind: "automation", id: automation.id })}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ")
-                          setSelection({ kind: "automation", id: automation.id });
-                      }}
-                    >
-                      <span
-                        className={`session__dot ${automation.active ? "session__dot--attached" : ""}`}
-                        style={{ background: automationDotColor(automation) }}
-                      />
-                      <span className="session__name" title={automation.name}>
-                        <span className="session__head">{automation.name || "(unnamed)"}</span>
-                        <span className="session__tail"> · {triggerLabel(automation)}</span>
-                      </span>
-                      <span className="session__meta">{automationMetaLabel(automation)}</span>
-                    </div>
-                  );
-                })}
-              </nav>
-            </div>
+  const openGitDiff = useCallback(
+    (path: string, cwd: string, hostId?: string | null) =>
+      requestEditorNavigation(() => {
+        setEditingFile(null);
+        setDiffFile({ path, cwd, hostId: hostId ?? null });
+        setExpandedInspectorTab(null);
+        setInspectorTab("diff");
+        if (viewportTierForWidth(window.innerWidth) === "wide") {
+          inspectorOpenPreferenceRef.current = true;
+        }
+        setInspectorOpen(true);
+      }),
+    [requestEditorNavigation],
+  );
 
-            {/* ── Terminals section ── */}
-            <div
-              className="sidebar__section"
-              style={{ flex: "1 1 0", minHeight: 40 }}
-            >
-              <div
-                className="section-label section-label--draggable"
-                onMouseDown={startAutomationSplit}
-              >
-                <span className="section-label__text">terminals</span>
-                <span className="section-label__line" />
-              </div>
-              <nav className={`sidebar__sessions ${terminalSortable.dragIndex !== null ? "sidebar__sessions--dragging" : ""}`} ref={terminalSortable.listRef as React.RefObject<HTMLElement>}>
-                {allTerminals.length === 0 && (
-                  <div className="empty empty--small">no terminals</div>
-                )}
-                {allTerminals.map((t, i) => {
-                  const isPersistedTerminal = !t.discovered;
-                  const isSelected =
-                    selection?.kind === "terminal" && selection.id === t.id;
-                  const isDragging = isPersistedTerminal && terminalSortable.dragIndex === i;
-                  const isDragOver = isPersistedTerminal && terminalSortable.dragIndex !== null && terminalSortable.overIndex === i && terminalSortable.dragIndex !== i;
-                  const dragOverClass = isDragOver
-                    ? terminalSortable.dragIndex! > i ? "session--drag-over-before" : "session--drag-over-after"
-                    : "";
-                  const terminalHostLabel = t.hostId ? hosts.find((h) => h.id === t.hostId)?.label ?? t.hostId : null;
-                  return (
-                    <div
-                      key={t.id}
-                      className={`session ${isSelected ? "session--selected" : ""} ${isDragging ? "session--dragging" : ""} ${dragOverClass} ${t.hostId ? "session--remote" : ""}`}
-                      onClick={() => {
-                        if (terminalSortable.draggingRef.current) return;
-                        setSelection({ kind: "terminal", id: t.id });
-                      }}
-                      onPointerDown={isPersistedTerminal ? terminalSortable.onPointerDown(i) : undefined}
-                      role="button"
-                      tabIndex={0}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter" || e.key === " ")
-                          setSelection({ kind: "terminal", id: t.id });
-                      }}
-                    >
-                      <span className="session__dot" style={{ background: "var(--text-faint)" }} />
-                      <span
-                        className={`session__host-badge ${terminalHostLabel ? "" : "session__host-badge--empty"}`}
-                        title={terminalHostLabel ?? undefined}
-                      >
-                        {terminalHostLabel ? terminalHostLabel.charAt(0).toUpperCase() : ""}
-                      </span>
-                      <span className="session__name" onDoubleClick={() => setRenamingTerminal(t.id)}>
-                        {isPersistedTerminal && renamingTerminal === t.id ? (
-                          <input
-                            className="session__rename-input"
-                            defaultValue={t.label}
-                            autoFocus
-                            spellCheck={false}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => e.stopPropagation()}
-                            onKeyDown={(e) => {
-                              if (e.key === "Escape") {
-                                setRenamingTerminal(null);
-                              } else if (e.key === "Enter") {
-                                (e.target as HTMLInputElement).blur();
-                              }
-                            }}
-                            onBlur={(e) => {
-                              const val = e.target.value.trim();
-                              if (val && val !== t.label && !terminals.some((x) => x.id !== t.id && x.label === val)) {
-                                setTerminals((prev) => prev.map((x) => x.id === t.id ? { ...x, label: val } : x));
-                              }
-                              setRenamingTerminal(null);
-                            }}
-                          />
-                        ) : (
-                          <span className="session__head">{t.label}</span>
-                        )}
-                      </span>
-                      <span className="session__meta dim">{terminalHostLabel ? "ssh" : "zsh"}</span>
-                      <button
-                        type="button"
-                        className="session__kill"
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          const killName = terminalSessionKey(t);
-                          const kill = isPersistedTerminal
-                            ? dashboardBackend.terminals.kill(killName)
-                            : dashboardBackend.sessions.kill(killName);
-                          kill.catch(() => {});
-                          if (isPersistedTerminal) {
-                            setTerminals((prev) =>
-                              prev.filter((x) => x.id !== t.id),
-                            );
-                          } else {
-                            setDiscoveredTerminals((prev) =>
-                              prev.filter((x) => x.id !== t.id),
-                            );
-                          }
-                          setOpenedTerminals((prev) =>
-                            prev.filter((x) => x !== t.id),
-                          );
-                          if (isSelected) {
-                            const remainingTerminals = allTerminals.filter((x) => x.id !== t.id);
-                            setSelection(
-                              remainingTerminals.length > 0
-                                ? { kind: "terminal", id: remainingTerminals[0].id }
-                                : sessions.length > 0
-                                  ? { kind: "session", name: sessions[0].name }
-                                  : null,
-                            );
-                          }
-                        }}
-                        title="close terminal"
-                        aria-label={`close terminal ${t.label}`}
-                      >
-                        ×
-                      </button>
-                    </div>
-                  );
-                })}
-              </nav>
-            </div>
-          </div>
+  const expandInspectorView = useCallback(
+    (tab: InspectorTab) => requestEditorNavigation(() => {
+      setExpandedInspectorTab(tab);
+      setEditingFile(null);
+      setInspectorOpen(false);
+    }),
+    [requestEditorNavigation],
+  );
 
-          <div className="sidebar__git" style={{ height: gitHeight }}>
-            <div
-              className="section-label section-label--draggable"
-              onMouseDown={startGitSplit}
-            >
-              <span className="section-label__text">git</span>
-              <span className="section-label__line" />
-            </div>
-            <GitStatusPanel
-              cwd={selectedCwd}
-              sessionName={
-                selection?.kind === "session"
-                  ? selection.name
-                  : undefined
-              }
-              hostId={selectedGitHostId}
-              onFileClick={(filePath, cwd, hostId) => {
-                if (cwd) {
-                  setEditingFile(null);
-                  setDiffFile({ path: filePath, cwd, hostId: hostId ?? null });
-                }
-              }}
-            />
-          </div>
+  const renderFiles = () =>
+    selectionMetadataPending ? (
+      <div className="dashboard-context-empty" role="status">
+        <strong>Loading workspace details…</strong>
+        <span>Files will appear after the session and host are resolved.</span>
+      </div>
+    ) : fileBrowserRoot ? (
+      <div className="dashboard-inspector-view dashboard-inspector-view--files">
+        <FileTree
+          root={fileBrowserRoot}
+          hostId={selectedGitHostId}
+          selectedFile={
+            (editingFile?.hostId ?? null) === selectedGitHostId
+              ? editingFile?.path ?? null
+              : null
+          }
+          onFileSelect={(path, hostId) => {
+            void handleOpenFile(path, undefined, undefined, hostId);
+          }}
+        />
+      </div>
+    ) : (
+      <div className="dashboard-context-empty">
+        <strong>No files context</strong>
+        <span>Select a worktree, terminal, or automation to browse its files.</span>
+      </div>
+    );
+
+  const renderGit = () =>
+    selectionMetadataPending ? (
+      <div className="dashboard-context-empty" role="status">
+        <strong>Loading workspace details…</strong>
+        <span>Git will connect after the session and host are resolved.</span>
+      </div>
+    ) : (
+      <div className="dashboard-inspector-view dashboard-inspector-view--git">
+        <GitStatusPanel
+          cwd={selectedCwd}
+          sessionName={selection?.kind === "session" ? selection.name : undefined}
+          hostId={selectedGitHostId}
+          onFileClick={openGitDiff}
+          onBranchChange={setWorkspaceBranch}
+        />
+      </div>
+    );
+
+  const renderDiff = () =>
+    selectionMetadataPending ? (
+      <div className="dashboard-context-empty" role="status">
+        <strong>Loading workspace details…</strong>
+        <span>Diff will appear after the session and host are resolved.</span>
+      </div>
+    ) : diffFile ? (
+      <div className="dashboard-inspector-view dashboard-inspector-view--diff">
+        <DiffViewer
+          cwd={diffFile.cwd}
+          filePath={diffFile.path}
+          hostId={diffFile.hostId ?? null}
+          onClose={() => {
+            setDiffFile(null);
+            setExpandedInspectorTab(null);
+          }}
+        />
+      </div>
+    ) : (
+      <div className="dashboard-context-empty">
+        <strong>No diff selected</strong>
+        <span>Select a changed file from the Git inspector.</span>
+      </div>
+    );
+
+  const automationPanel = (
+    <AutomationPanel
+      automations={automations}
+      selectedId={selection?.kind === "automation" ? selection.id || null : null}
+      runs={automationRuns}
+      projectOptions={projectPresets}
+      recentPath={lastAutomationContextPath}
+      recentProject={lastAutomationContextProject}
+      onSelect={selectAutomation}
+      onNew={handleNewAutomation}
+      onCreate={handleAutomationCreate}
+      onToggle={handleAutomationToggle}
+      onRun={handleAutomationRun}
+      onDelete={handleAutomationDelete}
+      onSave={handleAutomationSave}
+      onDirtyChange={handleAutomationDirtyChange}
+      showList
+    />
+  );
+
+  const inspectorContent = {
+    files:
+      expandedInspectorTab === "files" ? (
+        <div className="dashboard-context-empty">
+          <strong>Files expanded in workspace</strong>
+          <span>Close the expanded view to return the tree here.</span>
         </div>
-
-        <footer className="sidebar__footer">
-          <span className="dim">
-            {totalCount} item{totalCount === 1 ? "" : "s"}
-          </span>
-          <button
-            ref={settingsTriggerRef}
-            className="brand__file-btn"
-            type="button"
-            onClick={() => openSettings("general")}
-            title="Settings"
-            aria-label="Open settings"
-          >
-            <SettingsIcon aria-hidden="true" size={15} strokeWidth={1.8} />
-          </button>
-        </footer>
-      </aside>
-
-      {/* ── Left splitter (always visible) ── */}
-      <div
-        className="splitter"
-        style={{ gridColumn: 2 }}
-        onMouseDown={startSidebarResize}
-        aria-label="resize sidebar"
-      />
-
-      {columnSplitters}
-
-      {/* ── File tree column (inserted when open) ── */}
-      {fileBrowserOpen && (
-        <aside
-          className={columnClass("file", "file-tree-panel")}
-          ref={setColumnRef("file")}
-          style={{ gridColumn: columnGridColumn("file") }}
+      ) : renderFiles(),
+    git:
+      expandedInspectorTab === "git" ? (
+        <div className="dashboard-context-empty">
+          <strong>Git expanded in workspace</strong>
+        </div>
+      ) : renderGit(),
+    diff:
+      expandedInspectorTab === "diff" ? (
+        <div className="dashboard-context-empty">
+          <strong>Diff expanded in workspace</strong>
+        </div>
+      ) : renderDiff(),
+    automation: (
+      <div className="dashboard-context-summary">
+        <strong>
+          {selectedAutomation?.name || String(automations.length) + " configured automations"}
+        </strong>
+        <span>
+          {selectedAutomation
+            ? triggerLabel(selectedAutomation)
+            : "Select an automation from the sidebar to edit or run it."}
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            if (selectedAutomation) {
+              void selectAutomation(selectedAutomation.id);
+            } else {
+              handleNewAutomation();
+            }
+          }}
         >
-          {renderColumnHandle("file", "file tree")}
-          {fileBrowserRoot ? (
-            <FileTree
-              root={fileBrowserRoot}
-              selectedFile={editingFile?.hostId ? null : editingFile?.path ?? null}
-              onFileSelect={(path) => { setDiffFile(null); setEditingFile({ path, hostId: null }); }}
-            />
-          ) : (
-            <div className="empty empty--small">loading home directory</div>
-          )}
-        </aside>
-      )}
+          {selectedAutomation ? "Open automation" : "New automation"}
+        </button>
+      </div>
+    ),
+    feishu: (
+      <div className="dashboard-context-summary">
+        <strong>Feishu is not configured</strong>
+        <span>
+          Connect Feishu from Integrations Settings when the integration is available.
+        </span>
+        <button type="button" onClick={() => openSettings("integrations")}>
+          Open Integrations Settings
+        </button>
+      </div>
+    ),
+  };
 
-      {/* ── Main terminal (always visible) ── */}
-      <main
-        className={columnClass("main", "main")}
-        ref={setColumnRef("main")}
-        style={{ gridColumn: columnGridColumn("main") }}
-      >
-        {renderColumnHandle("main", "main terminal")}
+  const terminalViewVisible =
+    selectionMetadataPending ||
+    (!editingFile &&
+      expandedInspectorTab === null &&
+      (selection?.kind === "session" || selection?.kind === "terminal"));
+
+  const renderExpandedView = (label: string, content: React.ReactNode) => (
+    <div className="dashboard-workspace__expanded">
+      <div className="dashboard-expanded-toolbar">
+        <strong>{label}</strong>
+        <button
+          type="button"
+          onClick={() => {
+            void requestEditorNavigation(() => {
+              setExpandedInspectorTab(null);
+              if (
+                viewportTierForWidth(window.innerWidth) === "wide" &&
+                inspectorOpenPreferenceRef.current
+              ) {
+                setInspectorOpen(true);
+              }
+            });
+          }}
+          aria-label={"Close expanded " + label + " view"}
+        >
+          <X aria-hidden="true" size={14} strokeWidth={1.8} />
+          <span>Back to terminal</span>
+        </button>
+      </div>
+      <div className="dashboard-expanded-content">{content}</div>
+    </div>
+  );
+
+  const centralWorkspace = (
+    <div
+      className="dashboard-workspace"
+      data-scratch-open={!selectionMetadataPending && !scratchCollapsed && Boolean(selectionKey)}
+    >
+      <section className="dashboard-workspace__primary" aria-label="Active workspace">
         <TerminalDeck
           selection={selection}
           sessions={sessions}
@@ -2267,183 +2034,148 @@ function App() {
           openedTerminals={openedTerminals}
           cwdsBySession={cwdsBySession}
           tmuxPreviews={tmuxPreviews}
-          visible={selection?.kind === "session" || selection?.kind === "terminal"}
-          blocked={anyModalOpen}
+          metadataPending={selectionMetadataPending}
+          visible={terminalViewVisible}
+          blocked={workspaceInteractionBlocked}
           scratchCollapsed={scratchCollapsed}
           onToggleScratch={() => {
-            if (scratchCollapsed) {
-              openScratch();
-            } else {
-              setScratchCollapsed(true);
-            }
+            if (scratchCollapsed) openScratch();
+            else setScratchCollapsed(true);
           }}
           onOpenFile={handleOpenFile}
         />
-        {selection?.kind === "automation" ? (
-          <div className="pane pane--automation">
-            <div className="pane__bar">
-              <span className="pane__title">
-                {selectedAutomation?.name || "automations"}
-              </span>
-              <div className="pane__bar-actions">
-                <span className="pane__hint dim">
-                  {selectedAutomation ? triggerLabel(selectedAutomation) : "new"}
-                </span>
-              </div>
-            </div>
-            <div className="pane__body pane__body--automation">
-              {automationError && <div className="modal__error">{automationError}</div>}
-              <AutomationPanel
-                automations={automations}
-                selectedId={selection.id || null}
-                runs={automationRuns}
-                projectOptions={projectPresets}
-                recentPath={lastAutomationContextPath}
-                recentProject={lastAutomationContextProject}
-                onSelect={(id) => setSelection({ kind: "automation", id })}
-                onCreate={handleAutomationCreate}
-                onToggle={handleAutomationToggle}
-                onRun={handleAutomationRun}
-                onDelete={handleAutomationDelete}
-                onSave={handleAutomationSave}
-                showList={false}
-              />
-            </div>
+
+        {selectionMetadataPending ? null : editingFile ? (
+          <div className="dashboard-workspace__expanded">
+            <FileEditor
+              filePath={editingFile.path}
+              hostId={editingFile.hostId ?? null}
+              onClose={() => void closeEditingFile()}
+              onOpenFile={handleOpenFile}
+              onDirtyChange={handleEditorDirtyChange}
+            />
+          </div>
+        ) : expandedInspectorTab === "files" ? (
+          renderExpandedView("Files", renderFiles())
+        ) : expandedInspectorTab === "git" ? (
+          renderExpandedView("Git", renderGit())
+        ) : expandedInspectorTab === "diff" ? (
+          renderExpandedView("Diff", renderDiff())
+        ) : expandedInspectorTab === "automation" ? (
+          renderExpandedView("Automation", automationPanel)
+        ) : selection?.kind === "automation" ? (
+          <div className="dashboard-workspace__expanded dashboard-workspace__automation">
+            {automationPanel}
           </div>
         ) : !selection ? (
           <div className="pane pane--empty">
             <div className="pane__hint">
-              select a session, terminal, or automation
+              Select a worktree, terminal, or automation.
             </div>
           </div>
         ) : null}
-      </main>
+      </section>
 
-      {/* ── Scratch panel ── */}
-      {!scratchCollapsed && (
-        <aside
-          className={columnClass("scratch", "scratch")}
-          ref={setColumnRef("scratch")}
-          style={{ gridColumn: columnGridColumn("scratch") }}
-        >
-          {renderColumnHandle("scratch", "scratch")}
-          {scratchTerminals.size > 0 ? (
-            <div className="pane pane--term">
-              <div className="pane__bar">
-                <span className="pane__title">scratch</span>
-                <div className="pane__bar-actions">
-                  <button
-                    className="btn btn--small"
-                    type="button"
-                    onClick={addScratchTerminal}
-                  >
-                    +
-                  </button>
-                </div>
-              </div>
-              {Array.from(scratchTerminals.entries()).map(([key, state]) => {
-                const isActive = key === selectionKey;
-                const scratchContext = (() => {
-                  if (key.startsWith("s:")) {
-                    const sessionName = key.slice(2);
-                    const session = sessions.find((s) => s.name === sessionName);
-                    const cwd = cwdsBySession[sessionName] ?? null;
-                    if (!cwd) return null;
-                    if (!session?.hostId) return { cwd, host: null };
-                    const host = hosts.find((h) => h.id === session.hostId) ?? null;
-                    return host ? { cwd, host } : null;
-                  }
-                  if (key.startsWith("t:")) {
-                    const terminal = allTerminals.find((t) => t.id === key.slice(2));
-                    const cwd = terminal?.cwd ?? null;
-                    if (!cwd) return null;
-                    if (!terminal?.hostId) return { cwd, host: null };
-                    const host = hosts.find((h) => h.id === terminal.hostId) ?? null;
-                    return host ? { cwd, host } : null;
-                  }
-                  return null;
-                })();
-                if (!scratchContext) return null;
-                return (
-                  <div
-                    key={key}
-                    className="scratch__sections"
-                    ref={isActive ? scratchSectionsRef : undefined}
-                    style={{ display: isActive ? "flex" : "none" }}
-                  >
-                    {state.list.map((st, i) => (
-                      <div key={st.id} className="scratch__section">
-                        <div
-                          className={`section-label${i > 0 ? " section-label--draggable" : ""}`}
-                          onMouseDown={i > 0 ? startScratchSplit(i) : undefined}
+      <aside
+        className="dashboard-scratch"
+        aria-label="Scratch terminals"
+        hidden={selectionMetadataPending || scratchCollapsed || !selectionKey}
+      >
+          <div className="dashboard-scratch__header">
+            <strong>Scratch</strong>
+            <div>
+              <button
+                type="button"
+                onClick={addScratchTerminal}
+                aria-label="Add scratch terminal"
+                title="Add scratch terminal"
+              >
+                <Plus aria-hidden="true" size={15} strokeWidth={1.8} />
+              </button>
+              <button
+                type="button"
+                onClick={() => setScratchCollapsed(true)}
+                aria-label="Close scratch panel"
+                title="Close scratch panel"
+              >
+                <X aria-hidden="true" size={15} strokeWidth={1.8} />
+              </button>
+            </div>
+          </div>
+          {Array.from(scratchTerminals.entries()).map(([key, state]) => {
+            const isActive = key === selectionKey;
+            const scratchContext = (() => {
+              if (key.startsWith("s:")) {
+                const sessionName = key.slice(2);
+                const session = sessions.find((candidate) => candidate.name === sessionName);
+                const cwd = cwdsBySession[sessionName] ?? null;
+                if (!session || !cwd) return null;
+                if (!session.hostId) return { cwd, host: null };
+                const host = hosts.find((candidate) => candidate.id === session.hostId) ?? null;
+                return host ? { cwd, host } : null;
+              }
+              if (key.startsWith("t:")) {
+                const terminal = allTerminals.find((candidate) => candidate.id === key.slice(2));
+                const cwd = terminal?.cwd ?? null;
+                if (!cwd) return null;
+                if (!terminal?.hostId) return { cwd, host: null };
+                const host = hosts.find((candidate) => candidate.id === terminal.hostId) ?? null;
+                return host ? { cwd, host } : null;
+              }
+              return null;
+            })();
+            if (!scratchContext) return null;
+            return (
+              <div
+                key={key}
+                className="scratch__sections"
+                ref={isActive ? scratchSectionsRef : undefined}
+                style={{ display: isActive ? "flex" : "none" }}
+              >
+                {state.list.map((scratch, index) => (
+                  <div key={scratch.id} className="scratch__section">
+                    <div
+                      className="dashboard-scratch__terminal-header"
+                      onMouseDown={index > 0 ? startScratchSplit(index) : undefined}
+                    >
+                      <span>{scratch.label}</span>
+                      {state.list.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => removeScratchTerminal(scratch.id)}
+                          aria-label={"Close " + scratch.label}
+                          title={"Close " + scratch.label}
                         >
-                          <span className="section-label__text">{st.label}</span>
-                          <div className="section-label__line" />
-                          {state.list.length > 1 && (
-                            <button
-                              className="scratch__close"
-                              type="button"
-                              onClick={() => removeScratchTerminal(st.id)}
-                            >
-                              ×
-                            </button>
-                          )}
-                        </div>
-                        <div className="scratch__term">
-                          <Terminal
-                            cmd={scratchContext.host ? "ssh" : "/bin/zsh"}
-                            args={
-                              scratchContext.host
-                                ? buildSshShellArgs(scratchContext.host, scratchContext.cwd)
-                                : ["-l"]
-                            }
-                            cwd={scratchContext.host ? undefined : scratchContext.cwd}
-                            linkCwd={scratchContext.cwd}
-                            active={isActive && !anyModalOpen}
-                            hostId={scratchContext.host?.id ?? null}
-                            onOpenFile={handleOpenFile}
-                          />
-                        </div>
-                      </div>
-                    ))}
+                          <X aria-hidden="true" size={13} strokeWidth={1.8} />
+                        </button>
+                      )}
+                    </div>
+                    <div className="scratch__term">
+                      <Terminal
+                        cmd={scratchContext.host ? "ssh" : "/bin/zsh"}
+                        args={
+                          scratchContext.host
+                            ? buildSshShellArgs(scratchContext.host, scratchContext.cwd)
+                            : ["-l"]
+                        }
+                        cwd={scratchContext.host ? undefined : scratchContext.cwd}
+                        linkCwd={scratchContext.cwd}
+                        active={isActive && !scratchCollapsed && !workspaceInteractionBlocked}
+                        hostId={scratchContext.host?.id ?? null}
+                        onOpenFile={handleOpenFile}
+                      />
+                    </div>
                   </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="pane pane--empty">
-              <div className="pane__hint">scratch</div>
-            </div>
-          )}
-        </aside>
-      )}
+                ))}
+              </div>
+            );
+          })}
+      </aside>
+    </div>
+  );
 
-      {/* ── Editor column (appended when a file is selected) ── */}
-      {editorPanelOpen && (
-        <aside
-          className={columnClass("editor", "editor-panel")}
-          ref={setColumnRef("editor")}
-          style={{ gridColumn: columnGridColumn("editor") }}
-        >
-          {renderColumnHandle("editor", "editor")}
-          {diffFile ? (
-            <DiffViewer
-              cwd={diffFile.cwd}
-              filePath={diffFile.path}
-              hostId={diffFile.hostId ?? null}
-              onClose={() => setDiffFile(null)}
-            />
-          ) : editingFile ? (
-            <FileEditor
-              filePath={editingFile.path}
-              hostId={editingFile.hostId ?? null}
-              onClose={() => setEditingFile(null)}
-              onOpenFile={handleOpenFile}
-            />
-          ) : null}
-        </aside>
-      )}
-
+  const overlays = (
+    <>
       <CommandPalette
         open={commandPaletteOpen}
         items={commandPaletteItems}
@@ -2456,12 +2188,12 @@ function App() {
         initialSection={settingsSection}
         onSectionChange={setSettingsSection}
         onClose={() => setSettingsOpen(false)}
-        returnFocusRef={settingsTriggerRef}
         content={{
           connections: (
             <ConnectionsSettings
               hosts={hosts}
               hostStatuses={hostStatuses}
+              hostCatalogError={hostsLoadError}
               sshHostCandidates={sshHostCandidates}
               sessions={sessions}
               terminals={allTerminals}
@@ -2482,6 +2214,26 @@ function App() {
               </div>
             </div>
           ),
+          advanced: (
+            <div className="settings-info-list">
+              <div className="settings-info-row">
+                <div>
+                  <strong>Reset dashboard layout</strong>
+                  <span>Restore panel widths and visibility without changing sessions or connections.</span>
+                  {layoutResetMessage && (
+                    <span className="settings-action-status" role="status">{layoutResetMessage}</span>
+                  )}
+                </div>
+                <button
+                  className="settings-action-button"
+                  type="button"
+                  onClick={() => void resetDashboardLayout()}
+                >
+                  Reset layout
+                </button>
+              </div>
+            </div>
+          ),
         }}
       />
 
@@ -2491,9 +2243,17 @@ function App() {
           onClose={() => setShowNewWorktree(false)}
           onCreated={(sessionName) => {
             setShowNewWorktree(false);
-            setSelection({ kind: "session", name: sessionName });
-            void loadProjectPresets();
-            refresh();
+            void selectSession(sessionName).then((navigated) => {
+              if (!navigated) return;
+              setPendingCatalogSelection(
+                pendingCreatedCatalogSelection(
+                  { kind: "session", name: sessionName },
+                  catalogRefreshGenerationRef.current.started,
+                ),
+              );
+              void loadProjectPresets();
+              void refresh();
+            });
           }}
         />
       )}
@@ -2501,7 +2261,7 @@ function App() {
       {showNewTerminal && (
         <NewTerminalModal
           hosts={hosts}
-          existingLabels={allTerminals.map((t) => t.label)}
+          existingLabels={allTerminals.map((terminal) => terminal.label)}
           onClose={() => setShowNewTerminal(false)}
           onCreated={async (draft: TerminalDraft) => {
             const created = await dashboardBackend.terminals.create({
@@ -2509,9 +2269,9 @@ function App() {
               aiCmd: draft.aiCmd,
               hostId: draft.hostId ?? null,
             });
-            const id = `term-${++termIdCounter}`;
-            setTerminals((prev) => [
-              ...prev,
+            const id = allocateTerminalId(allTerminals);
+            setTerminals((current) => [
+              ...current,
               {
                 id,
                 label: draft.label,
@@ -2523,12 +2283,151 @@ function App() {
               },
             ]);
             setShowNewTerminal(false);
-            setSelection({ kind: "terminal", id });
+            await selectTerminal(id);
           }}
         />
       )}
+    </>
+  );
 
-    </div>
+  return (
+    <DashboardShell
+      titlebar={
+        <div className="dashboard-titlebar" title={`tw · ${workspaceTitle}`}>
+          <span>tw</span>
+          <span aria-hidden="true"> · </span>
+          <span>{workspaceTitle}</span>
+        </div>
+      }
+      sidebar={
+        <DashboardSidebar
+          sessions={sessions}
+          terminals={allTerminals}
+          automations={automations}
+          hosts={hosts}
+          hostStatuses={hostStatuses}
+          hostsError={hostsLoadError}
+          mobileRelay={{
+            statusKnown: mobileRelay.statusKnown,
+            connected: mobileRelay.connected,
+            active: mobileRelay.active,
+            statusText: mobileRelay.statusText,
+            error: mobileRelay.error,
+          }}
+          localRuntimeState={error ? "error" : catalogRefreshGeneration > 0 ? "ready" : "checking"}
+          selection={selection}
+          sessionActivity={sessionActivity}
+          collapsedProjects={collapsedProjects}
+          installingHostId={installingHostId}
+          sessionsError={error}
+          terminalsError={terminalPersistenceError}
+          automationsError={automationError}
+          settingsButtonRef={settingsTriggerRef}
+          onCreateWorktree={() => setShowNewWorktree(true)}
+          onCreateTerminal={() => setShowNewTerminal(true)}
+          onOpenCommandPalette={() => setCommandPaletteOpen(true)}
+          onOpenSettings={(section) => openSettings(section ?? "general")}
+          onToggleProjectCollapsed={toggleProjectCollapsed}
+          onSelectSession={selectSession}
+          onCloseSession={closeSession}
+          onSelectTerminal={selectTerminal}
+          onCloseTerminal={closeTerminal}
+          onCreateAutomation={handleNewAutomation}
+          onSelectAutomation={selectAutomation}
+          onInstallTw={installRemoteTw}
+        />
+      }
+      header={
+        <WorkspaceHeader
+          title={workspaceTitle}
+          project={workspaceProject}
+          branch={workspaceBranch}
+          cwd={selectedCwd}
+          hostLabel={selectedHost?.label ?? selectedHostId}
+          agentCommand={workspaceAgentCommand}
+          status={workspaceStatus}
+          sidebarDrawer={viewportTier === "compact"}
+          inspectorOpen={inspectorOpen}
+          scratchOpen={!scratchCollapsed}
+          onOpenSidebar={() => {
+            setInspectorOpen(false);
+            setSidebarOpen(true);
+          }}
+          onToggleInspector={() => {
+            setInspectorOpen((current) => {
+              const next = !current;
+              if (viewportTier === "wide") inspectorOpenPreferenceRef.current = next;
+              return next;
+            });
+            if (viewportTier === "compact") setSidebarOpen(false);
+          }}
+          onToggleScratch={() => {
+            if (scratchCollapsed) openScratch();
+            else setScratchCollapsed(true);
+          }}
+        />
+      }
+      workspace={centralWorkspace}
+      inspector={
+        <Inspector
+          activeTab={inspectorTab}
+          content={inspectorContent}
+          badges={{
+            diff: diffFile ? 1 : null,
+            automation: automations.length || null,
+          }}
+          onTabChange={(tab) => {
+            setInspectorTab(tab);
+            if (viewportTier === "wide") inspectorOpenPreferenceRef.current = true;
+            setInspectorOpen(true);
+          }}
+          onClose={() => {
+            if (viewportTier === "wide") inspectorOpenPreferenceRef.current = false;
+            setInspectorOpen(false);
+          }}
+          onExpand={(tab) => {
+            void expandInspectorView(tab);
+          }}
+        />
+      }
+      overlays={overlays}
+      sidebarWidth={sidebarWidth}
+      inspectorWidth={inspectorWidth}
+      onSidebarWidthChange={(width) => {
+        const nextWidth = clampDashboardPanelWidthForViewport(
+          "sidebar",
+          width,
+          window.innerWidth,
+          panelWidthsRef.current.inspectorWidth,
+        );
+        panelWidthsRef.current = {
+          ...panelWidthsRef.current,
+          sidebarWidth: nextWidth,
+        };
+        setSidebarWidth(nextWidth);
+      }}
+      onInspectorWidthChange={(width) => {
+        const nextWidth = clampDashboardPanelWidthForViewport(
+          "inspector",
+          width,
+          window.innerWidth,
+          panelWidthsRef.current.sidebarWidth,
+        );
+        panelWidthsRef.current = {
+          ...panelWidthsRef.current,
+          inspectorWidth: nextWidth,
+        };
+        setInspectorWidth(nextWidth);
+      }}
+      sidebarOpen={sidebarOpen}
+      inspectorOpen={inspectorOpen}
+      activeDrawer={activeDrawer}
+      blocked={anyModalOpen}
+      onDismissDrawers={() => {
+        if (viewportTier === "compact") setSidebarOpen(false);
+        setInspectorOpen(false);
+      }}
+    />
   );
 }
 
