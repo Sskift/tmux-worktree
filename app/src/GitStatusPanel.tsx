@@ -1,28 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
-
-export type GitFile = { code: string; path: string };
-export type GitStatus = {
-  branch: string;
-  upstream: string | null;
-  ahead: number;
-  behind: number;
-  staged: number;
-  unstaged: number;
-  untracked: number;
-  conflicts: number;
-  files: GitFile[];
-};
-
-export type GitCommit = {
-  hash: string;
-  short: string;
-  parents: string[];
-  subject: string;
-  author: string;
-  rel_time: string;
-  refs: string[];
-};
+import { type GitCommit, type GitStatus, useDashboardBackend } from "./platform";
+export type { GitCommit, GitFile, GitStatus } from "./platform";
 
 type Props = {
   cwd: string | null;
@@ -69,6 +47,7 @@ function classifyRef(raw: string): { kind: RefKind; label: string } {
 }
 
 export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [tab, setTab] = useState<Tab>("files");
   const [status, setStatus] = useState<GitStatus | null>(null);
   const [statusCwd, setStatusCwd] = useState<string | null>(null);
@@ -79,7 +58,7 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
   const resolveCwd = useCallback(async () => {
     if (!sessionName) return cwd;
     try {
-      const liveCwd = await invoke<string>("session_cwd", { name: sessionName });
+      const liveCwd = await dashboardBackend.sessions.cwd(sessionName);
       return liveCwd || cwd;
     } catch {
       return cwd;
@@ -98,10 +77,10 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
     setLoading(true);
     try {
       if (tab === "files") {
-        const s = await invoke<GitStatus | null>("git_status", { cwd: gitCwd, hostId: hostId ?? null });
+        const s = await dashboardBackend.git.status(gitCwd, hostId);
         setStatus(s);
       } else {
-        const cs = await invoke<GitCommit[]>("git_log", { cwd: gitCwd, limit: 100, hostId: hostId ?? null });
+        const cs = await dashboardBackend.git.log(gitCwd, 100, hostId);
         setLog(cs);
       }
       setError(null);
@@ -113,7 +92,7 @@ export function GitStatusPanel({ cwd, sessionName, hostId, onFileClick }: Props)
   }, [resolveCwd, tab, hostId]);
 
   const triggerProjectFetch = useCallback(() => {
-    void invoke<void>("git_fetch_project_roots").catch(() => {});
+    void dashboardBackend.git.fetchProjectRoots().catch(() => {});
   }, []);
 
   useEffect(() => {

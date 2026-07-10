@@ -1,5 +1,3 @@
-import { invoke } from "@tauri-apps/api/core";
-
 export type LinkMatch = {
   text: string;
   startIndex: number;
@@ -140,21 +138,4 @@ export function resolvePath(filePath: string, cwd: string): string {
   if (filePath.startsWith("/")) return filePath;
   const clean = filePath.startsWith("./") ? filePath.slice(2) : filePath;
   return `${cwd}/${clean}`;
-}
-
-export async function checkFileExists(
-  absolutePath: string,
-  hostId?: string | null,
-): Promise<boolean> {
-  try {
-    return hostId
-      ? await invoke<boolean>("remote_file_exists", { hostId, path: absolutePath })
-      : await invoke<boolean>("file_exists", { path: absolutePath });
-  } catch {
-    return false;
-  }
-}
-
-export async function openUrlInBrowser(url: string): Promise<void> {
-  await invoke("open_url", { url });
 }

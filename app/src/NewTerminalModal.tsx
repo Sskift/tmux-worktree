@@ -1,18 +1,8 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
+import { type HostConfig, useDashboardBackend } from "./platform";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
-
-type HostConfig = {
-  id: string;
-  label: string;
-  host: string;
-  user?: string | null;
-  port?: number | null;
-  identityFile?: string | null;
-};
 
 export type TerminalDraft = {
   label: string;
@@ -31,6 +21,7 @@ type Props = {
 const LOCAL_HOST = "__local__";
 
 export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreated }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [selectedHost, setSelectedHost] = useState(LOCAL_HOST);
   const [path, setPath] = useState("");
   const [label, setLabel] = useState("");
@@ -51,7 +42,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
   ];
 
   useEffect(() => {
-    invoke<string>("home_dir")
+    dashboardBackend.persistence.homeDirectory()
       .then((home) => {
         const desktop = `${home}/Desktop`;
         setLocalDefaultPath(desktop);
@@ -75,9 +66,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
 
   const browse = async () => {
     try {
-      const picked = await open({
-        directory: true,
-        multiple: false,
+      const picked = await dashboardBackend.dialog.selectDirectory({
         title: "Select directory",
       });
       if (typeof picked === "string") {

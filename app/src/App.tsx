@@ -1,6 +1,13 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
+import {
+  type DashboardWindow,
+  type HostConfig,
+  type MobileRelayStatus,
+  type PlainTerminal,
+  type Session,
+  useDashboardBackend,
+} from "./platform";
+import { useDashboardCatalog } from "./dashboard/hooks/useDashboardCatalog";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
@@ -23,9 +30,7 @@ import {
   triggerLabel,
   type Automation,
   type AutomationDraft,
-  type AutomationRecord,
   type AutomationRun,
-  type AutomationRunRecord,
 } from "./automationTypes";
 import {
   describeSessionActivity,
@@ -43,65 +48,6 @@ import {
   resizeWorktreeAutomationSplit,
 } from "./sidebarLayout";
 import "./App.css";
-
-type Session = {
-  name: string;
-  attached: boolean;
-  window_count: number;
-  created: number;
-  activity: number;
-  output_signature?: string | null;
-  agent_running?: boolean | null;
-  hostId?: string | null;
-  rawName?: string;
-  project?: string | null;
-};
-
-type HostConfig = {
-  id: string;
-  label: string;
-  host: string;
-  user?: string | null;
-  port?: number | null;
-  identityFile?: string | null;
-  worktreeBase?: string | null;
-  tmuxPath?: string | null;
-  twPath?: string | null;
-};
-
-type HostStatus = {
-  id: string;
-  label: string;
-  reachable: boolean;
-  latencyMs?: number;
-  error?: string;
-  twAvailable?: boolean;
-  twVersion?: string;
-  twError?: string;
-};
-
-type PlainTerminal = {
-  id: string;
-  label: string;
-  cwd: string;
-  tmuxName: string;
-  hostId?: string | null;
-  rawName?: string;
-  aiCmd?: string;
-  discovered?: boolean;
-};
-
-type CreatedTerminal = {
-  tmuxName: string;
-  hostId?: string | null;
-  rawName: string;
-};
-
-type ProjectPreset = {
-  name: string;
-  path: string;
-  branch?: string | null;
-};
 
 type Selection =
   | { kind: "session"; name: string }
@@ -130,22 +76,7 @@ type SessionGroup = {
   sessions: Session[];
 };
 
-type MobileRelayStatus = {
-  active: boolean;
-  connected: boolean;
-  connectionState: string;
-  relayUrl: string;
-  hostId: string;
-  secret: string;
-  token: string;
-  connectedAt?: number | null;
-  updatedAt?: number | null;
-  retryInMs?: number | null;
-  error?: string | null;
-};
-
 const REFRESH_MS = 2000;
-const HOST_STATUS_REFRESH_MS = 15000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
@@ -429,7 +360,7 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-async function getWindowExpandedState(win: ReturnType<typeof getCurrentWindow>) {
+async function getWindowExpandedState(win: DashboardWindow) {
   const [fullscreen, maximized] = await Promise.all([
     win.isFullscreen().catch(() => false),
     win.isMaximized().catch(() => false),
@@ -508,6 +439,7 @@ function placeScratchAfterMain(order: LayoutColumn[]): LayoutColumn[] {
 }
 
 function App() {
+  const dashboardBackend = useDashboardBackend();
   const [sessions, setSessions] = useState<Session[]>([]);
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
   const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
@@ -515,7 +447,16 @@ function App() {
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
-  const [projectPresets, setProjectPresets] = useState<ProjectPreset[]>([]);
+  const {
+    projectPresets,
+    loadProjectPresets,
+    hosts,
+    setHosts,
+    sshHostCandidates,
+    hostStatuses,
+    installingHostId,
+    installRemoteTw,
+  } = useDashboardCatalog();
   const [sessionActivity, setSessionActivity] = useState<Record<string, SessionActivityInfo>>({});
   const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
@@ -525,11 +466,7 @@ function App() {
   const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
   const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hosts, setHosts] = useState<HostConfig[]>([]);
-  const [sshHostCandidates, setSshHostCandidates] = useState<HostConfig[]>([]);
-  const [hostStatuses, setHostStatuses] = useState<Record<string, HostStatus>>({});
   const [mobileRelayBrokerHostId, setMobileRelayBrokerHostId] = useState("");
-  const [installingHostId, setInstallingHostId] = useState<string | null>(null);
   const [showAddHost, setShowAddHost] = useState(false);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
   const [showNewTerminal, setShowNewTerminal] = useState(false);
@@ -665,86 +602,12 @@ function App() {
   }, [sectionSplit, automationHeight, gitHeight]);
 
   useEffect(() => {
-    invoke<string>("home_dir").then(setHomeDir).catch(() => {});
+    dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
   }, []);
-
-  const loadProjectPresets = useCallback(async () => {
-    try {
-      const list = await invoke<ProjectPreset[]>("list_projects");
-      setProjectPresets(list);
-    } catch {
-      setProjectPresets([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadProjectPresets();
-  }, [loadProjectPresets]);
-
-  const loadHosts = useCallback(async () => {
-    try {
-      const [list, candidates] = await Promise.all([
-        invoke<HostConfig[]>("list_hosts"),
-        invoke<HostConfig[]>("list_ssh_host_candidates"),
-      ]);
-      setHosts(list);
-      setSshHostCandidates(candidates);
-    } catch {
-      setHosts([]);
-      setSshHostCandidates([]);
-    }
-  }, []);
-
-  useEffect(() => {
-    void loadHosts();
-  }, [loadHosts]);
-
-  const installRemoteTw = useCallback(async (hostId: string) => {
-    setInstallingHostId(hostId);
-    try {
-      const status = await invoke<HostStatus>("install_host_tw", { hostId });
-      setHostStatuses((prev) => ({ ...prev, [status.id]: status }));
-    } catch (err) {
-      setHostStatuses((prev) => {
-        const current = prev[hostId];
-        if (!current) return prev;
-        return {
-          ...prev,
-          [hostId]: {
-            ...current,
-            twAvailable: false,
-            twError: String(err),
-          },
-        };
-      });
-    } finally {
-      setInstallingHostId(null);
-    }
-  }, []);
-
-  const hostIdsKey = useMemo(() => hosts.map((host) => host.id).join("\0"), [hosts]);
-  const refreshHostStatuses = useCallback(async () => {
-    try {
-      const statuses = await invoke<HostStatus[]>("host_statuses");
-      setHostStatuses(Object.fromEntries(statuses.map((status) => [status.id, status])));
-    } catch {
-      setHostStatuses({});
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!hostIdsKey) {
-      setHostStatuses({});
-      return;
-    }
-    void refreshHostStatuses();
-    const id = setInterval(refreshHostStatuses, HOST_STATUS_REFRESH_MS);
-    return () => clearInterval(id);
-  }, [hostIdsKey, refreshHostStatuses]);
 
   useEffect(() => {
     if (!windowRestoreReady) return;
-    const win = getCurrentWindow();
+    const win = dashboardBackend.window.current();
     let disposed = false;
     let timer: number | null = null;
     let unlistenResized: (() => void) | undefined;
@@ -809,10 +672,12 @@ function App() {
 
     void capture();
     void win.onResized(scheduleCapture).then((fn) => {
-      unlistenResized = fn;
+      if (disposed) fn();
+      else unlistenResized = fn;
     });
     void win.onMoved(scheduleCapture).then((fn) => {
-      unlistenMoved = fn;
+      if (disposed) fn();
+      else unlistenMoved = fn;
     });
 
     return () => {
@@ -846,14 +711,14 @@ function App() {
     if (delta !== 0) {
       (async () => {
         try {
-          const win = getCurrentWindow();
+          const win = dashboardBackend.window.current();
           const { fullscreen, maximized } = await getWindowExpandedState(win);
           if (fullscreen || maximized) return;
           const size = await win.innerSize();
           const factor = await win.scaleFactor();
           const lw = size.width / factor + delta;
           const lh = size.height / factor;
-          await win.setSize(new LogicalSize(Math.max(800, lw), lh));
+          await win.setLogicalSize(Math.max(800, lw), lh);
         } catch {
           // Window resizing is a convenience; keep column toggles functional if it fails.
         }
@@ -863,7 +728,7 @@ function App() {
 
   // Load persisted data on mount
   useEffect(() => {
-    invoke<PlainTerminal[]>("load_terminals")
+    dashboardBackend.terminals.load()
       .then(async (saved) => {
         const restored = saved
           .filter((t) => t.tmuxName)
@@ -875,14 +740,12 @@ function App() {
           }, 0);
           termIdCounter = maxNum;
           for (const t of restored) {
-            await invoke("ensure_terminal_session", {
-              args: {
-                name: t.tmuxName,
-                cwd: t.cwd,
-                aiCmd: t.aiCmd ?? "",
-                hostId: t.hostId ?? null,
-                rawName: t.rawName ?? null,
-              },
+            await dashboardBackend.terminals.ensure({
+              name: t.tmuxName,
+              cwd: t.cwd,
+              aiCmd: t.aiCmd ?? "",
+              hostId: t.hostId ?? null,
+              rawName: t.rawName ?? null,
             }).catch(() => {});
           }
           setTerminals(restored);
@@ -890,7 +753,7 @@ function App() {
       })
       .catch(() => {})
       .finally(() => setTerminalsRestoreReady(true));
-    invoke<Record<string, unknown>>("load_layout")
+    dashboardBackend.persistence.loadLayout()
       .then((lay) => {
         const restoredFileBrowserOpen =
           typeof lay.fileBrowserOpen === "boolean" ? (lay.fileBrowserOpen as boolean) : false;
@@ -962,7 +825,7 @@ function App() {
   // Persist terminals
   useEffect(() => {
     if (!terminalsRestoreReady) return;
-    invoke("save_terminals", { terminals }).catch(() => {});
+    dashboardBackend.terminals.save(terminals).catch(() => {});
   }, [terminals, terminalsRestoreReady]);
 
   // Persist layout (debounced)
@@ -971,8 +834,7 @@ function App() {
     const sidebarHeight = sidebarSplitRef.current?.getBoundingClientRect().height ?? 0;
     if (!isStableSidebarLayoutHeight(sidebarHeight)) return;
     const t = setTimeout(() => {
-      invoke("save_layout", {
-        layout: {
+      dashboardBackend.persistence.saveLayout({
           left: cols.left,
           right: cols.right,
           gitHeight,
@@ -989,7 +851,6 @@ function App() {
           editingFile,
           diffFile,
           ...(windowLayout ? { window: windowLayout } : {}),
-        },
       }).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
@@ -1014,8 +875,8 @@ function App() {
   const loadAutomations = useCallback(async () => {
     try {
       const [records, runRecords] = await Promise.all([
-        invoke<AutomationRecord[]>("list_automations"),
-        invoke<AutomationRunRecord[]>("list_automation_runs", { automationId: null }),
+        dashboardBackend.automations.list(),
+        dashboardBackend.automations.listRuns(null),
       ]);
       const nextAutomations = records.map(automationFromRecord);
       const automationsById = new Map(
@@ -1370,10 +1231,9 @@ function App() {
       for (const name of names) {
         if (tmuxPreviewRequested.current.has(name)) continue;
         tmuxPreviewRequested.current.add(name);
-        const history = await invoke<string>("capture_pane_history", {
-          name,
-          lines: PRELOAD_HISTORY_LINES,
-        }).catch(() => "");
+        const history = await dashboardBackend.sessions
+          .captureHistory(name, PRELOAD_HISTORY_LINES)
+          .catch(() => "");
         if (!tmuxPreviewLiveRef.current.has(name)) {
           tmuxPreviewRequested.current.delete(name);
           continue;
@@ -1388,8 +1248,8 @@ function App() {
   const refresh = useCallback(async () => {
     try {
       const [list, discovered] = await Promise.all([
-        invoke<Session[]>("list_sessions"),
-        invoke<PlainTerminal[]>("list_tmux_terminals").catch(() => [] as PlainTerminal[]),
+        dashboardBackend.sessions.list(),
+        dashboardBackend.terminals.listTmux().catch(() => [] as PlainTerminal[]),
       ]);
       const order = sessionOrderRef.current;
       const orderMap = new Map(order.map((n, i) => [n, i]));
@@ -1464,9 +1324,9 @@ function App() {
 
   const handleAutomationCreate = useCallback(
     async (draft: AutomationDraft) => {
-      const record = await invoke<AutomationRecord>("save_automation", {
-        input: automationSaveInputFromDraft(draft),
-      });
+      const record = await dashboardBackend.automations.save(
+        automationSaveInputFromDraft(draft),
+      );
       const automation = automationFromRecord(record);
       setSelection({ kind: "automation", id: automation.id });
       await loadAutomations();
@@ -1476,9 +1336,9 @@ function App() {
 
   const handleAutomationSave = useCallback(
     async (id: string, draft: AutomationDraft) => {
-      const record = await invoke<AutomationRecord>("save_automation", {
-        input: automationSaveInputFromDraft(draft, id),
-      });
+      const record = await dashboardBackend.automations.save(
+        automationSaveInputFromDraft(draft, id),
+      );
       const automation = automationFromRecord(record);
       setSelection({ kind: "automation", id: automation.id });
       await loadAutomations();
@@ -1490,12 +1350,12 @@ function App() {
     async (id: string, active: boolean) => {
       const automation = automationsRef.current.find((item) => item.id === id);
       if (!automation) return;
-      await invoke<AutomationRecord>("save_automation", {
-        input: automationSaveInputFromDraft(
+      await dashboardBackend.automations.save(
+        automationSaveInputFromDraft(
           { ...createAutomationDraft(automation), active },
           id,
         ),
-      });
+      );
       await loadAutomations();
     },
     [loadAutomations],
@@ -1503,7 +1363,7 @@ function App() {
 
   const handleAutomationDelete = useCallback(
     async (id: string) => {
-      await invoke("delete_automation", { id });
+      await dashboardBackend.automations.delete(id);
       setAutomationRuns((prev) => prev.filter((run) => run.automationId !== id));
       setSelection((current) =>
         current?.kind === "automation" && current.id === id ? { kind: "automation", id: "" } : current,
@@ -1516,7 +1376,7 @@ function App() {
   const handleAutomationRun = useCallback(
     async (id: string) => {
       const automation = automationsRef.current.find((item) => item.id === id);
-      const runRecord = await invoke<AutomationRunRecord>("trigger_automation", { id });
+      const runRecord = await dashboardBackend.automations.trigger(id);
       const run = automationRunFromRecord(runRecord, automation);
       setAutomationRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
       await Promise.all([loadAutomations(), refresh()]);
@@ -1561,7 +1421,7 @@ function App() {
 
   const checkMobileRelayStatus = useCallback(async () => {
     try {
-      const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+      const status = await dashboardBackend.relay.status();
       applyMobileRelayStatus(status);
       return status;
     } catch {
@@ -1592,8 +1452,8 @@ function App() {
       setMobileRelayPopover(true);
       setMobileRelayError(null);
       try {
-        await invoke("mobile_relay_start");
-        const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+        await dashboardBackend.relay.start();
+        const status = await dashboardBackend.relay.status();
         applyMobileRelayStatus(status);
       } catch (err) {
         setMobileRelayError(String(err));
@@ -1612,7 +1472,7 @@ function App() {
     if (!args.relayUrl || !args.hostId) {
       throw new Error("Relay URL and host are required");
     }
-    const status = await invoke<MobileRelayStatus>("mobile_relay_save_config", { args });
+    const status = await dashboardBackend.relay.saveConfig(args);
     applyMobileRelayStatus(status);
     return status;
   }, [applyMobileRelayStatus, mobileRelayDraftHostId, mobileRelayDraftSecret, mobileRelayDraftUrl]);
@@ -1635,8 +1495,8 @@ function App() {
     try {
       const saved = await saveMobileRelayConfig();
       if (!saved.secret.trim()) throw new Error("Relay token is required before Android can connect");
-      await invoke("mobile_relay_start");
-      const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+      await dashboardBackend.relay.start();
+      const status = await dashboardBackend.relay.status();
       applyMobileRelayStatus(status);
     } catch (err) {
       setMobileRelayError(String(err));
@@ -1650,12 +1510,13 @@ function App() {
     setMobileRelayBrokerStarting(true);
     setMobileRelayError(null);
     try {
-      const status = await invoke<MobileRelayStatus>("mobile_relay_start_broker", {
-        args: { hostId: mobileRelayBrokerHostId, port: 8787 },
+      const status = await dashboardBackend.relay.startBroker({
+        hostId: mobileRelayBrokerHostId,
+        port: 8787,
       });
       applyMobileRelayStatus(status);
-      await invoke("mobile_relay_start");
-      const activeStatus = await invoke<MobileRelayStatus>("mobile_relay_status");
+      await dashboardBackend.relay.start();
+      const activeStatus = await dashboardBackend.relay.status();
       applyMobileRelayStatus(activeStatus);
     } catch (err) {
       setMobileRelayError(String(err));
@@ -1668,8 +1529,8 @@ function App() {
     setMobileRelayStopping(true);
     setMobileRelayError(null);
     try {
-      await invoke("mobile_relay_stop");
-      const status = await invoke<MobileRelayStatus>("mobile_relay_status");
+      await dashboardBackend.relay.stop();
+      const status = await dashboardBackend.relay.status();
       applyMobileRelayStatus(status);
       setMobileRelayPopover(false);
     } catch (err) {
@@ -1701,7 +1562,7 @@ function App() {
   useEffect(() => {
     if (!mobileRelayActive && !mobileRelayPopover) return;
     const refresh = () => {
-      void invoke<MobileRelayStatus>("mobile_relay_status")
+      void dashboardBackend.relay.status()
         .then((status) => applyMobileRelayStatus(status, false))
         .catch(() => {});
     };
@@ -1724,7 +1585,7 @@ function App() {
     );
     if (cwdsBySession[name] || cwdRequested.current.has(name)) return;
     cwdRequested.current.add(name);
-    invoke<string>("session_root", { name })
+    dashboardBackend.sessions.root(name)
       .then((cwd) => {
         if (cwd) setCwdsBySession((prev) => ({ ...prev, [name]: cwd }));
       })
@@ -1816,7 +1677,7 @@ function App() {
       );
     } else if (selection?.kind === "session" && !selectedSessionIsRemote) {
       const name = selection.name;
-      void invoke<string>("session_root", { name })
+      void dashboardBackend.sessions.root(name)
         .then((cwd) => {
           if (cwd) {
             setLastAutomationContextPath(cwd);
@@ -2108,7 +1969,7 @@ function App() {
           onClick={async (e) => {
             e.stopPropagation();
             try {
-              await invoke("kill_session", { name: s.name });
+              await dashboardBackend.sessions.kill(s.name);
               setSessions((prev) => prev.filter((x) => x.name !== s.name));
               setOpenedSessions((prev) => prev.filter((n) => n !== s.name));
               setSessionOrder((prev) => prev.filter((n) => n !== s.name));
@@ -2611,8 +2472,10 @@ function App() {
                         onClick={(e) => {
                           e.stopPropagation();
                           const killName = terminalSessionKey(t);
-                          const command = isPersistedTerminal ? "kill_plain_terminal" : "kill_session";
-                          invoke(command, { name: killName }).catch(() => {});
+                          const kill = isPersistedTerminal
+                            ? dashboardBackend.terminals.kill(killName)
+                            : dashboardBackend.sessions.kill(killName);
+                          kill.catch(() => {});
                           if (isPersistedTerminal) {
                             setTerminals((prev) =>
                               prev.filter((x) => x.id !== t.id),
@@ -3032,12 +2895,10 @@ function App() {
           existingLabels={allTerminals.map((t) => t.label)}
           onClose={() => setShowNewTerminal(false)}
           onCreated={async (draft: TerminalDraft) => {
-            const created = await invoke<CreatedTerminal>("create_terminal", {
-              args: {
-                cwd: draft.cwd,
-                aiCmd: draft.aiCmd,
-                hostId: draft.hostId ?? null,
-              },
+            const created = await dashboardBackend.terminals.create({
+              cwd: draft.cwd,
+              aiCmd: draft.aiCmd,
+              hostId: draft.hostId ?? null,
             });
             const id = `term-${++termIdCounter}`;
             setTerminals((prev) => [

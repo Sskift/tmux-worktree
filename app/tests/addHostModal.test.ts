@@ -53,8 +53,13 @@ test("add host modal shows the default SSH port when none is configured", () => 
 
 test("app loads ssh host candidates and keeps host status outside worktree list", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const catalog = readFileSync(
+    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(app, /invoke<HostConfig\[]>\("list_ssh_host_candidates"\)/);
+  assert.match(app, /useDashboardCatalog\(\)/);
+  assert.match(catalog, /dashboardBackend\.hosts\.candidates\(\)/);
   assert.match(app, /sshHostCandidates/);
   assert.match(app, /sshHosts=\{sshHostCandidates\}/);
   const statusIndex = app.indexOf("sidebar__host-status");
@@ -66,30 +71,40 @@ test("app loads ssh host candidates and keeps host status outside worktree list"
 
 test("app polls host status separately from the main session refresh", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const catalog = readFileSync(
+    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    "utf8",
+  );
 
-  assert.match(app, /const HOST_STATUS_REFRESH_MS = /);
-  assert.match(app, /const refreshHostStatuses = useCallback/);
-  assert.match(app, /invoke<HostStatus\[]>\("host_statuses"\)/);
-  assert.match(app, /setInterval\(refreshHostStatuses, HOST_STATUS_REFRESH_MS\)/);
+  assert.match(catalog, /const HOST_STATUS_REFRESH_MS = /);
+  assert.match(catalog, /const refreshHostStatuses = useCallback/);
+  assert.match(catalog, /dashboardBackend\.hosts\.statuses\(\)/);
+  assert.match(catalog, /setInterval\(refreshHostStatuses, HOST_STATUS_REFRESH_MS\)/);
 
   const refreshStart = app.indexOf("const refresh = useCallback");
   const refreshEnd = app.indexOf("const handleAutomationCreate", refreshStart);
   const refreshBlock = app.slice(refreshStart, refreshEnd);
   assert.ok(refreshStart >= 0 && refreshEnd > refreshStart, "refresh block should be found");
-  assert.doesNotMatch(refreshBlock, /host_statuses/);
+  assert.doesNotMatch(refreshBlock, /dashboardBackend\.hosts\.statuses/);
 });
 
 test("host status exposes remote tw version and install action", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
+  const catalog = readFileSync(
+    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    "utf8",
+  );
+  const domainTypes = readFileSync(new URL("../src/platform/domainTypes.ts", import.meta.url), "utf8");
 
-  assert.match(app, /twAvailable\?:\s*boolean/);
-  assert.match(app, /twVersion\?:\s*string/);
-  assert.match(app, /install_host_tw/);
+  assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twAvailable:\s*boolean/);
+  assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twVersion:\s*string \| null/);
+  assert.match(catalog, /dashboardBackend\.hosts\.installTw\(hostId\)/);
   assert.match(app, /installingHostId/);
   assert.match(app, /const twLabel/);
   assert.match(app, /st\.twVersion \?\? "ok"/);
-  assert.match(modal, /twAvailable\?:\s*boolean/);
-  assert.match(modal, /twVersion\?:\s*string/);
+  assert.match(modal, /type HostStatus/);
+  assert.match(modal, /testResult\.twAvailable/);
+  assert.match(modal, /testResult\.twVersion/);
   assert.match(modal, /Remote TW/);
 });

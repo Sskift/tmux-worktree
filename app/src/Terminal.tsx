@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm, type ILinkProvider, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { useDashboardBackend } from "./platform";
+import type { DashboardBackend, PtyConnection, TmuxStatusTheme } from "./platform";
 import {
   THEME_CHANGED_EVENT,
   getCurrentPalette,
@@ -15,11 +15,10 @@ import {
 import {
   detectLinks,
   resolvePath,
-  checkFileExists,
-  openUrlInBrowser,
   shouldActivateTerminalLink,
   type LinkMatch,
 } from "./linkDetect";
+import { checkFileExists, openUrlInBrowser } from "./linkActions";
 import "@xterm/xterm/css/xterm.css";
 
 type Props = {
@@ -54,15 +53,6 @@ const LINK_BREAK_CHAR = /[\s'")\]}>]/;
 const URL_AT_END_REGEX = /https?:\/\/[^\s'")\]}>]+$/;
 const URL_SCHEME_REGEX = /https?:\/\//;
 
-type TmuxStatusTheme = {
-  statusBg: string;
-  statusFg: string;
-  activeBg: string;
-  activeFg: string;
-  inactiveFg: string;
-  accent: string;
-};
-
 function hexColor(value: string, fallback: string): string {
   return /^#[0-9a-fA-F]{6}$/.test(value) ? value : fallback;
 }
@@ -83,12 +73,15 @@ function tmuxStatusThemeFromPalette(palette: TerminalPalette): TmuxStatusTheme {
   };
 }
 
-function applyTmuxStatusTheme(tmuxSession: string | undefined, palette: TerminalPalette) {
+function applyTmuxStatusTheme(
+  dashboardBackend: DashboardBackend,
+  tmuxSession: string | undefined,
+  palette: TerminalPalette,
+) {
   if (!tmuxSession) return;
-  invoke("apply_tmux_theme", {
-    name: tmuxSession,
-    theme: tmuxStatusThemeFromPalette(palette),
-  }).catch(() => {});
+  dashboardBackend.sessions
+    .applyTheme(tmuxSession, tmuxStatusThemeFromPalette(palette))
+    .catch(() => {});
 }
 
 function getBufferLineSlice(term: XTerm, lineIndex: number): BufferLineSlice | null {
@@ -273,6 +266,7 @@ function createPtyId(): string {
 }
 
 export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, hostId, initialHistory, onOpenFile }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
@@ -295,8 +289,8 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     if (!host) return;
 
     let ptyId: string | null = null;
-    let unlistenChunk: UnlistenFn | null = null;
-    let unlistenExit: UnlistenFn | null = null;
+    let ptyConnection: PtyConnection | null = null;
+    const ptyAbort = new AbortController();
     let reconnectTimer: number | null = null;
     let cancelled = false;
 
@@ -321,7 +315,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       const openFile = onOpenFileRef.current;
       if (!fileCwd || !openFile) return;
       const resolved = resolvePath(link.path, fileCwd);
-      checkFileExists(resolved, hostId).then((exists) => {
+      checkFileExists(dashboardBackend, resolved, hostId).then((exists) => {
         if (exists) openFile(resolved, link.line, link.col, hostId);
       });
     };
@@ -350,7 +344,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
             activate(event: MouseEvent, _text: string) {
               if (!shouldActivateTerminalLink(event, match, !!hostId)) return;
               if (match.kind === "url") {
-                openUrlInBrowser(match.url).catch(() => {});
+                openUrlInBrowser(dashboardBackend, match.url).catch(() => {});
               } else if (match.kind === "file") {
                 openFileLink(match);
               }
@@ -372,7 +366,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     };
     const openResolvedLink = (link: ResolvedLink) => {
       if (link.kind === "url") {
-        openUrlInBrowser(link.url).catch(() => {});
+        openUrlInBrowser(dashboardBackend, link.url).catch(() => {});
       } else if (link.kind === "file") {
         openFileLink(link);
       }
@@ -432,7 +426,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       for (let i = 0; i < steps; i++) {
         data += sgrMouseWheel(button, pos);
       }
-      invoke("pty_write", { id: ptyId, data }).catch(() => {});
+      ptyConnection?.write(data).catch(() => {});
       return false;
     };
     const onRemoteWheel = (event: WheelEvent) => {
@@ -447,13 +441,13 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     fitRef.current = fit;
 
     const writePty = (data: string) => {
-      if (ptyId) invoke("pty_write", { id: ptyId, data }).catch(() => {});
+      if (ptyId) ptyConnection?.write(data).catch(() => {});
     };
 
     const copyTmuxOrInterrupt = () => {
       if (!tmuxSession) return true;
       if (term.hasSelection()) return true;
-      invoke<boolean>("copy_tmux_selection", { name: tmuxSession }).then((copied) => {
+      dashboardBackend.sessions.copySelection(tmuxSession).then((copied) => {
         if (!copied) writePty("\x03");
       }).catch(() => writePty("\x03"));
       return false;
@@ -465,7 +459,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
         // parallel ask tmux to exit copy-mode *only if* the pane is actually
         // in a mode (scrolled-up history). When not in copy-mode this is a
         // no-op, so normal apps keep their ESC. Do not swallow the key.
-        invoke("copy_mode_cancel_if_active", { name: tmuxSession }).catch(() => {});
+        dashboardBackend.sessions.cancelCopyModeIfActive(tmuxSession).catch(() => {});
         return true;
       }
       if (e.type === "keydown" && e.metaKey && e.key.toLowerCase() === "c") {
@@ -477,7 +471,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     let blurHandler: (() => void) | null = null;
     if (tmuxSession) {
       blurHandler = () => {
-        invoke("cancel_copy_mode", { name: tmuxSession }).catch(() => {});
+        dashboardBackend.sessions.cancelCopyMode(tmuxSession).catch(() => {});
       };
       host.addEventListener("focusout", blurHandler);
     }
@@ -498,7 +492,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       if (!detail) return;
       if (!activeRef.current) return;
       term.options.theme = detail;
-      applyTmuxStatusTheme(tmuxSession, detail);
+      applyTmuxStatusTheme(dashboardBackend, tmuxSession, detail);
     };
     window.addEventListener(THEME_CHANGED_EVENT, onThemeChange);
 
@@ -508,7 +502,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
           const cachedHistory = initialHistoryRef.current;
           const history = cachedHistory !== undefined
             ? cachedHistory
-            : await invoke<string>("capture_pane_history", { name: tmuxSession }).catch(() => "");
+            : await dashboardBackend.sessions.captureHistory(tmuxSession).catch(() => "");
           if (history) {
             term.write(history + "\r\n");
           }
@@ -517,66 +511,57 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
         const { cols, rows } = term;
         const id = createPtyId();
 
-        unlistenChunk = await listen<{ id: string; data: string }>(
-          `pty:${id}`,
-          (e) => term.write(e.payload.data),
-        );
-        unlistenExit = await listen<{ id: string; code: number }>(
-          `pty-exit:${id}`,
-          async (e) => {
-            if (e.payload.id !== id) return;
-            ptyId = null;
-            const sessionStillExists = tmuxSession
-              ? await invoke<boolean>("tmux_session_exists", {
-                  name: tmuxSession,
-                }).catch(() => false)
-              : false;
-            if (
-              shouldReconnectTmuxAttach({
-                cancelled,
-                hasTmuxSession: !!tmuxSession,
-                sessionStillExists,
-                isRemote: !!hostId,
-              })
-            ) {
-              const reconnectDelay = hostId ? 2000 : TMUX_RECONNECT_DELAY_MS;
-              const msg = hostId
-                ? "\r\n\x1b[2m[ssh disconnected, reconnecting]\x1b[0m\r\n"
-                : "\r\n\x1b[2m[tmux detached, reconnecting]\x1b[0m\r\n";
-              term.write(msg);
-              reconnectTimer = window.setTimeout(() => {
-                if (!cancelled) setReconnectSeq((value) => value + 1);
-              }, reconnectDelay);
-              return;
-            }
-            term.write(`\r\n\x1b[2m[exit ${e.payload.code}]\x1b[0m\r\n`);
+        ptyConnection = await dashboardBackend.pty.connect(
+          { id, cmd, args, cwd, cols, rows },
+          {
+            onData: (event) => {
+              if (!cancelled) term.write(event.data);
+            },
+            onExit: async (event) => {
+              if (event.id !== id) return;
+              ptyId = null;
+              const sessionStillExists = tmuxSession
+                ? await dashboardBackend.sessions.exists(tmuxSession).catch(() => false)
+                : false;
+              if (cancelled) return;
+              if (
+                shouldReconnectTmuxAttach({
+                  cancelled,
+                  hasTmuxSession: !!tmuxSession,
+                  sessionStillExists,
+                  isRemote: !!hostId,
+                })
+              ) {
+                const reconnectDelay = hostId ? 2000 : TMUX_RECONNECT_DELAY_MS;
+                const msg = hostId
+                  ? "\r\n\x1b[2m[ssh disconnected, reconnecting]\x1b[0m\r\n"
+                  : "\r\n\x1b[2m[tmux detached, reconnecting]\x1b[0m\r\n";
+                term.write(msg);
+                reconnectTimer = window.setTimeout(() => {
+                  if (!cancelled) setReconnectSeq((value) => value + 1);
+                }, reconnectDelay);
+                return;
+              }
+              term.write(`\r\n\x1b[2m[exit ${event.code}]\x1b[0m\r\n`);
+            },
           },
+          ptyAbort.signal,
         );
 
-        const openedId = await invoke<string>("pty_open", {
-          args: { id, cmd, args, cwd, cols, rows },
-        });
-        if (openedId !== id) {
-          throw new Error(`pty id mismatch: expected ${id}, got ${openedId}`);
-        }
         if (cancelled) {
-          await invoke("pty_kill", { id }).catch(() => {});
+          await ptyConnection.close().catch(() => {});
           return;
         }
-        ptyId = id;
+        ptyId = ptyConnection.active ? id : null;
 
         term.onData((data) => {
-          if (ptyId) invoke("pty_write", { id: ptyId, data }).catch(() => {});
+          if (ptyId) ptyConnection?.write(data).catch(() => {});
         });
         term.onResize(({ cols, rows }) => {
-          if (ptyId)
-            invoke("pty_resize", { id: ptyId, cols, rows }).catch(() => {});
+          if (ptyId) ptyConnection?.resize(cols, rows).catch(() => {});
         });
       } catch (e) {
-        unlistenChunk?.();
-        unlistenChunk = null;
-        unlistenExit?.();
-        unlistenExit = null;
+        if (cancelled || (e instanceof Error && e.name === "AbortError")) return;
         term.write(`\r\n\x1b[31m[pty error] ${String(e)}\x1b[0m\r\n`);
       }
     };
@@ -588,6 +573,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
 
     return () => {
       cancelled = true;
+      ptyAbort.abort();
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       ro.disconnect();
       host.removeEventListener("mousedown", onLinkMouseDown, true);
@@ -595,9 +581,8 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       if (hostId) host.removeEventListener("wheel", onRemoteWheel, true);
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
-      unlistenChunk?.();
-      unlistenExit?.();
-      if (ptyId) invoke("pty_kill", { id: ptyId }).catch(() => {});
+      void ptyConnection?.close();
+      ptyId = null;
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
@@ -620,7 +605,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     if (term.textarea) term.textarea.disabled = false;
     const palette = getCurrentPalette();
     term.options.theme = palette;
-    applyTmuxStatusTheme(tmuxSession, palette);
+    applyTmuxStatusTheme(dashboardBackend, tmuxSession, palette);
     requestAnimationFrame(() => {
       try {
         fit.fit();

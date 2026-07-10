@@ -21,10 +21,15 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
 
 test("remote tmux clipboard uses local macOS clipboard commands", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
-  assert.match(terminalSource, /invoke<boolean>\("copy_tmux_selection"/);
-  assert.doesNotMatch(terminalSource, /invoke<string>\("read_clipboard_text"/);
+  assert.match(terminalSource, /dashboardBackend\.sessions\.copySelection\(tmuxSession\)/);
+  assert.match(
+    backendSource,
+    /copySelection: \(name\) =>\s*transport\.invoke<boolean>\("copy_tmux_selection", \{ name \}\)/s,
+  );
+  assert.doesNotMatch(terminalSource, /readClipboard|read_clipboard_text/);
   assert.doesNotMatch(terminalSource, /term\.paste\(text\)/);
   assert.doesNotMatch(terminalSource, /pasteClipboard/);
   assert.doesNotMatch(terminalSource, /Remote: skip pbcopy/);
@@ -37,17 +42,22 @@ test("remote file links keep host identity through the SSH editor", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const editorSource = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
+  const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
   assert.match(terminalSource, /linkCwd\?: string/);
-  assert.match(terminalSource, /checkFileExists\(resolved, hostId\)/);
+  assert.match(terminalSource, /checkFileExists\(dashboardBackend, resolved, hostId\)/);
   assert.match(terminalSource, /openFile\(resolved, link\.line, link\.col, hostId\)/);
   assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
   assert.match(appSource, /setEditingFile\(\{ path, hostId: hostId \?\? null \}\)/);
   assert.match(appSource, /hostId=\{editingFile\.hostId \?\? null\}/);
-  assert.match(editorSource, /invoke<string>\("remote_read_file"/);
-  assert.match(editorSource, /invoke\("remote_write_file"/);
-  assert.match(editorSource, /invoke<string>\("remote_read_file_base64"/);
+  assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, path\)/);
+  assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, cur\)/);
+  assert.match(editorSource, /dashboardBackend\.files\.readRemoteBase64\(hostId, filePath\)/);
+  assert.match(
+    backendSource,
+    /readRemote: \(hostId, path\) =>\s*transport\.invoke<string>\("remote_read_file", \{ hostId, path \}\)/s,
+  );
   assert.match(rustSource, /async fn remote_file_exists/);
   assert.match(rustSource, /async fn remote_read_file/);
   assert.match(rustSource, /async fn remote_write_file/);
@@ -55,28 +65,39 @@ test("remote file links keep host identity through the SSH editor", () => {
 
 test("terminal subscribes to pty output before opening the pty", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
   const idIndex = terminalSource.indexOf("const id = createPtyId();");
-  const listenIndex = terminalSource.indexOf("unlistenChunk = await listen", idIndex);
-  const openIndex = terminalSource.indexOf('const openedId = await invoke<string>("pty_open"', idIndex);
+  const connectIndex = terminalSource.indexOf("ptyConnection = await dashboardBackend.pty.connect", idIndex);
+  const listenDataIndex = backendSource.indexOf("unlistenData = await transport.listen<PtyDataEvent>");
+  const listenExitIndex = backendSource.indexOf("unlistenExit = await transport.listen<PtyExitEvent>", listenDataIndex);
+  const openIndex = backendSource.indexOf('const openedId = await transport.invoke<string>("pty_open"', listenExitIndex);
 
   assert.ok(idIndex >= 0, "terminal should create the pty id before opening");
-  assert.ok(listenIndex > idIndex, "terminal should register the output listener after creating the id");
-  assert.ok(openIndex > listenIndex, "terminal should open the pty after registering listeners");
-  assert.match(terminalSource, /args: \{ id, cmd, args, cwd, cols, rows \}/);
+  assert.ok(connectIndex > idIndex, "terminal should connect through the typed PTY facade after creating the id");
+  assert.ok(listenDataIndex >= 0, "the PTY facade should register its output listener");
+  assert.ok(listenExitIndex > listenDataIndex, "the PTY facade should register its exit listener after output");
+  assert.ok(openIndex > listenExitIndex, "the PTY facade should open the pty after registering listeners");
+  assert.match(terminalSource, /dashboardBackend\.pty\.connect\(\s*\{ id, cmd, args, cwd, cols, rows \}/s);
+  assert.match(backendSource, /transport\.invoke<string>\("pty_open", \{ args \}\)/);
   assert.match(rustSource, /id: Option<String>/);
 });
 
 test("tmux status bar receives the active dashboard terminal palette", () => {
   const source = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
+  const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rust = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
 
   assert.match(source, /function tmuxStatusThemeFromPalette\(palette: TerminalPalette\): TmuxStatusTheme/);
-  assert.match(source, /function applyTmuxStatusTheme\(tmuxSession: string \| undefined, palette: TerminalPalette\)/);
-  assert.match(source, /invoke\("apply_tmux_theme", \{/);
+  assert.match(source, /function applyTmuxStatusTheme\(\s*dashboardBackend: DashboardBackend,\s*tmuxSession: string \| undefined,\s*palette: TerminalPalette,/s);
+  assert.match(source, /\.applyTheme\(tmuxSession, tmuxStatusThemeFromPalette\(palette\)\)/);
+  assert.match(
+    backend,
+    /applyTheme: \(name, theme\) =>\s*transport\.invoke<void>\("apply_tmux_theme", \{ name, theme \}\)/s,
+  );
   assert.match(source, /if \(!activeRef\.current\) return;/);
-  assert.match(source, /applyTmuxStatusTheme\(tmuxSession, detail\)/);
-  assert.match(source, /applyTmuxStatusTheme\(tmuxSession, palette\)/);
+  assert.match(source, /applyTmuxStatusTheme\(dashboardBackend, tmuxSession, detail\)/);
+  assert.match(source, /applyTmuxStatusTheme\(dashboardBackend, tmuxSession, palette\)/);
   assert.match(rust, /fn apply_tmux_options\(host: Option<&HostConfig>, args: &\[&str\]\) -> Result<\(\), String>/);
   assert.match(rust, /"status-style",\s*&status_style,\s*";",\s*"set-option"/s);
   assert.doesNotMatch(rust, /for args in \[/);

@@ -1,21 +1,11 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { invoke } from "@tauri-apps/api/core";
-
-export type DirEntry = {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  is_symlink: boolean;
-  is_hidden: boolean;
-  size: number;
-};
-
-type SearchResult = {
-  path: string;
-  file_name: string;
-  line_number: number | null;
-  line_content: string | null;
-};
+import {
+  type DirEntry,
+  type FileSearchMode,
+  type FileSearchResult,
+  useDashboardBackend,
+} from "./platform";
+export type { DirEntry } from "./platform";
 
 type Props = {
   root: string;
@@ -59,6 +49,7 @@ const SearchIcon = () => (
 );
 
 export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set());
   const [dirContents, setDirContents] = useState<Map<string, DirEntry[]>>(new Map());
   const [loading, setLoading] = useState<Set<string>>(new Set());
@@ -68,7 +59,7 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMode, setSearchMode] = useState<"content" | "filename">("content");
-  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [searchResults, setSearchResults] = useState<FileSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -76,7 +67,7 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
   const loadDir = useCallback(async (dirPath: string) => {
     setLoading((prev) => new Set(prev).add(dirPath));
     try {
-      const entries = await invoke<DirEntry[]>("read_dir", { path: dirPath });
+      const entries = await dashboardBackend.files.readDirectory(dirPath);
       setDirContents((prev) => {
         const next = new Map(prev);
         next.set(dirPath, entries);
@@ -121,7 +112,7 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
   );
 
   // Search logic
-  const doSearch = useCallback(async (query: string, mode: string) => {
+  const doSearch = useCallback(async (query: string, mode: FileSearchMode) => {
     if (!query.trim()) {
       setSearchResults([]);
       setSearching(false);
@@ -129,11 +120,11 @@ export function FileTree({ root, selectedFile, onFileSelect, showHidden = true }
     }
     setSearching(true);
     try {
-      const results = await invoke<SearchResult[]>("search_files", {
-        root: rootRef.current,
-        query: query.trim(),
+      const results = await dashboardBackend.files.search(
+        rootRef.current,
+        query.trim(),
         mode,
-      });
+      );
       setSearchResults(results);
     } catch {
       setSearchResults([]);

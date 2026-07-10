@@ -1,6 +1,6 @@
 import { useEffect, useState, type KeyboardEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import type { DirEntry } from "./FileTree";
+import { useDashboardBackend } from "./platform";
 
 type Props = {
   hostId: string;
@@ -29,6 +29,7 @@ function parentRemotePath(path: string) {
 }
 
 export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [pathInput, setPathInput] = useState("");
   const [currentPath, setCurrentPath] = useState("");
   const [entries, setEntries] = useState<DirEntry[]>([]);
@@ -59,7 +60,7 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
     }
 
     setLoadingHome(true);
-    invoke<string>("remote_home_dir", { hostId })
+    dashboardBackend.hosts.remoteHome(hostId)
       .then((home) => {
         if (cancelled) return;
         const nextPath = home.trim() || "/";
@@ -84,7 +85,7 @@ export function RemoteDirectoryPicker({ hostId, initialPath, onClose, onSelect }
     let cancelled = false;
     setLoadingDir(true);
     setError(null);
-    invoke<DirEntry[]>("remote_read_dir", { hostId, path })
+    dashboardBackend.files.readRemoteDirectory(hostId, path)
       .then((list) => {
         if (!cancelled) setEntries(list);
       })

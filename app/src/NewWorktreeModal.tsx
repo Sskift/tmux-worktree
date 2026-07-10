@@ -1,20 +1,14 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open } from "@tauri-apps/plugin-dialog";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
+import {
+  type CreateWorktreeInput,
+  type HostConfig,
+  type OrphanedWorktree as Orphan,
+  type ProjectPreset as Project,
+  useDashboardBackend,
+} from "./platform";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
-
-type Project = { name: string; path: string; branch?: string | null };
-type Orphan = { project: string; path: string; name: string };
-type HostConfig = {
-  id: string;
-  label: string;
-  host: string;
-  user?: string | null;
-  port?: number | null;
-  identityFile?: string | null;
-};
 
 type Props = {
   hosts: HostConfig[];
@@ -26,6 +20,7 @@ const CUSTOM = "__custom__";
 const LOCAL_HOST = "__local__";
 
 export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [projects, setProjects] = useState<Project[]>([]);
   const [orphans, setOrphans] = useState<Orphan[]>([]);
   const [selectedHost, setSelectedHost] = useState<string>(LOCAL_HOST);
@@ -65,18 +60,18 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
 
   useEffect(() => {
     if (!isRemote) {
-      invoke<Project[]>("list_projects")
+      dashboardBackend.projects.list()
         .then((list) => {
           setProjects(list);
           setProject(list.length > 0 ? list[0].name : CUSTOM);
         })
         .catch((e) => setError(String(e)));
-      invoke<Orphan[]>("list_orphaned_worktrees")
+      dashboardBackend.worktrees.listOrphaned()
         .then(setOrphans)
         .catch(() => {});
     } else {
       setOrphans([]);
-      invoke<Project[]>("list_remote_projects", { hostId: selectedHost })
+      dashboardBackend.projects.listRemote(selectedHost)
         .then((list) => {
           setProjects(list);
           setProject(list.length > 0 ? list[0].name : CUSTOM);
@@ -91,9 +86,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
 
   const browse = async () => {
     try {
-      const picked = await open({
-        directory: true,
-        multiple: false,
+      const picked = await dashboardBackend.dialog.selectDirectory({
         title: "Select project directory",
       });
       if (typeof picked === "string") {
@@ -112,8 +105,10 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const sessionName = await invoke<string>("restore_worktree", {
-        args: { path: orphan.path, name: orphan.name, aiCmd: aiCmd.trim() || "" },
+      const sessionName = await dashboardBackend.worktrees.restore({
+        path: orphan.path,
+        name: orphan.name,
+        aiCmd: aiCmd.trim() || "",
       });
       saveLastAiCmd(aiCmd);
       onCreated(sessionName);
@@ -124,17 +119,16 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
   };
 
   const deleteOrphan = async (orphan: Orphan) => {
-    const confirmed = window.confirm(
-      `Delete worktree "${orphan.name}"? This will discard any uncommitted changes.`,
-    );
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Delete worktree",
+      message: `Delete worktree "${orphan.name}"? This will discard any uncommitted changes.`,
+    });
     if (!confirmed) return;
 
     setBusy(true);
     setError(null);
     try {
-      await invoke("delete_worktree", {
-        args: { path: orphan.path, force: true },
-      });
+      await dashboardBackend.worktrees.delete({ path: orphan.path, force: true });
       setOrphans((prev) => prev.filter((item) => item.path !== orphan.path));
     } catch (err) {
       setError(String(err));
@@ -149,14 +143,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const createArgs: {
-        project?: string;
-        path?: string;
-        aiCmd: string;
-        name: string | null;
-        branch?: string;
-        hostId?: string;
-      } = {
+      const createArgs: CreateWorktreeInput = {
         aiCmd: aiCmd.trim(),
         name: name.trim() || null,
       };
@@ -176,9 +163,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         if (savePreset) {
           const presetName = customName.trim();
           if (!presetName) throw new Error("preset name required");
-          await invoke<Project[]>("add_project", {
-            args: { name: presetName, path },
-          });
+          await dashboardBackend.projects.add({ name: presetName, path });
           createArgs.project = presetName;
         } else {
           createArgs.path = path;
@@ -190,9 +175,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         createArgs.branch = branch.trim();
       }
 
-      const sessionName = await invoke<string>("create_worktree", {
-        args: createArgs,
-      });
+      const sessionName = await dashboardBackend.worktrees.create(createArgs);
       saveLastAiCmd(aiCmd);
       onCreated(sessionName);
     } catch (err) {

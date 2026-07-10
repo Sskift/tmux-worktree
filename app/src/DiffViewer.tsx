@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { useDashboardBackend } from "./platform";
 
 type Props = {
   cwd: string;
@@ -55,6 +55,7 @@ function parseDiff(raw: string): DiffLine[] {
 }
 
 export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [diff, setDiff] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -63,7 +64,7 @@ export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
     setLoading(true);
     setError(null);
     try {
-      const result = await invoke<string>("git_diff", { cwd, path: filePath, hostId: hostId ?? null });
+      const result = await dashboardBackend.git.diff(cwd, filePath, hostId);
       setDiff(result);
     } catch (e) {
       setError(String(e));

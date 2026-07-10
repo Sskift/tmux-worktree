@@ -1,26 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
-
-type HostConfig = {
-  id: string;
-  label: string;
-  host: string;
-  user?: string | null;
-  port?: number | null;
-  identityFile?: string | null;
-};
-
-type HostStatus = {
-  id: string;
-  label: string;
-  reachable: boolean;
-  latencyMs?: number;
-  error?: string;
-  twAvailable?: boolean;
-  twVersion?: string;
-  twError?: string;
-};
+import { type HostConfig, type HostStatus, useDashboardBackend } from "./platform";
 
 type Props = {
   existingIds: string[];
@@ -38,6 +18,7 @@ const slugify = (s: string) =>
     .slice(0, 20);
 
 export function AddHostModal({ existingIds, sshHosts, onClose, onAdded }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const [selectedHost, setSelectedHost] = useState("");
   const [busy, setBusy] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -113,7 +94,7 @@ export function AddHostModal({ existingIds, sshHosts, onClose, onAdded }: Props)
     setError(null);
     setTestResult(null);
     try {
-      const result = await invoke<HostStatus>("test_host", { args });
+      const result = await dashboardBackend.hosts.test(args);
       setTestResult(result);
     } catch (e) {
       setError(String(e));
@@ -156,7 +137,7 @@ export function AddHostModal({ existingIds, sshHosts, onClose, onAdded }: Props)
     setBusy(true);
     setError(null);
     try {
-      const hosts = await invoke<HostConfig[]>("add_host", { args });
+      const hosts = await dashboardBackend.hosts.add(args);
       onAdded(hosts);
     } catch (err) {
       setError(String(err));

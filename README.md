@@ -323,7 +323,8 @@ node --test test/*.test.mjs
 
 cd app
 npm run build
-node --test tests/*.test.ts
+npm run test:typecheck
+npm test
 
 cd src-tauri
 cargo fmt --check

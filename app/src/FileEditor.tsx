@@ -1,6 +1,4 @@
 import { useEffect, useState, useRef, useCallback } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { EditorView, basicSetup } from "codemirror";
 import { EditorState } from "@codemirror/state";
 import { keymap } from "@codemirror/view";
@@ -8,7 +6,9 @@ import { oneDark } from "@codemirror/theme-one-dark";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { getFileCategory, getFileExtension, getLanguageExtension } from "./fileUtils";
-import { detectLinks, resolvePath, checkFileExists, openUrlInBrowser } from "./linkDetect";
+import { detectLinks, resolvePath } from "./linkDetect";
+import { checkFileExists, openUrlInBrowser } from "./linkActions";
+import { useDashboardBackend } from "./platform";
 
 type Props = {
   filePath: string;
@@ -34,14 +34,15 @@ function imageMimeType(filePath: string): string {
 }
 
 function ImagePreview({ filePath, hostId, onClose }: Props) {
+  const dashboardBackend = useDashboardBackend();
   const fileName = filePath.split("/").pop() ?? filePath;
-  const [src, setSrc] = useState(() => hostId ? "" : convertFileSrc(filePath));
+  const [src, setSrc] = useState(() => hostId ? "" : dashboardBackend.files.assetUrl(filePath));
   const [loading, setLoading] = useState(!!hostId);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!hostId) {
-      setSrc(convertFileSrc(filePath));
+      setSrc(dashboardBackend.files.assetUrl(filePath));
       setLoading(false);
       setError(null);
       return;
@@ -51,7 +52,7 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
     setLoading(true);
     setError(null);
     setSrc("");
-    invoke<string>("remote_read_file_base64", { hostId, path: filePath })
+    dashboardBackend.files.readRemoteBase64(hostId, filePath)
       .then((data) => {
         if (!cancelled) setSrc(`data:${imageMimeType(filePath)};base64,${data}`);
       })
@@ -92,6 +93,7 @@ function ImagePreview({ filePath, hostId, onClose }: Props) {
 /* ── Code / Markdown Editor ─────────────────────────────────── */
 
 function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props & { isMarkdown: boolean }) {
+  const dashboardBackend = useDashboardBackend();
   const [content, setContent] = useState("");
   const [originalContent, setOriginalContent] = useState("");
   const [loading, setLoading] = useState(true);
@@ -111,8 +113,8 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
     setPreviewMode(false);
     try {
       const text = hostId
-        ? await invoke<string>("remote_read_file", { hostId, path })
-        : await invoke<string>("read_file", { path });
+        ? await dashboardBackend.files.readRemote(hostId, path)
+        : await dashboardBackend.files.read(path);
       if (pathRef.current === path) {
         setContent(text);
         setOriginalContent(text);
@@ -143,9 +145,9 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
     setSaving(true);
     try {
       if (hostId) {
-        await invoke("remote_write_file", { hostId, path: pathRef.current, content: cur });
+        await dashboardBackend.files.writeRemote(hostId, pathRef.current, cur);
       } else {
-        await invoke("write_file", { path: pathRef.current, content: cur });
+        await dashboardBackend.files.write(pathRef.current, cur);
       }
       setOriginalContent(cur);
       originalContentRef.current = cur;
@@ -203,11 +205,11 @@ function CodeEditor({ filePath, hostId, onClose, isMarkdown, onOpenFile }: Props
             );
             if (!clicked) return false;
             if (clicked.kind === "url") {
-              openUrlInBrowser(clicked.url);
+              openUrlInBrowser(dashboardBackend, clicked.url);
             } else if (clicked.kind === "file") {
               const dir = filePath.split("/").slice(0, -1).join("/");
               const resolved = resolvePath(clicked.path, dir);
-              checkFileExists(resolved, hostId).then((exists) => {
+              checkFileExists(dashboardBackend, resolved, hostId).then((exists) => {
                 if (exists && onOpenFile) {
                   onOpenFile(resolved, clicked.line, clicked.col, hostId);
                 }
