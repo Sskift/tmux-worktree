@@ -1970,10 +1970,6 @@ function App() {
     selectedSession?.project?.trim() ||
     selectedAutomation?.project?.trim() ||
     null;
-  const workspaceAgentCommand =
-    selectedTerminal?.aiCmd?.trim() ||
-    selectedAutomation?.aiCmd?.trim() ||
-    null;
 
   const openGitDiff = useCallback(
     (path: string, cwd: string, hostId?: string | null) =>
@@ -2477,7 +2473,6 @@ function App() {
           branch={workspaceBranch}
           cwd={selectedCwd}
           hostLabel={selectedHost?.label ?? selectedHostId}
-          agentCommand={workspaceAgentCommand}
           status={workspaceStatus}
           windowTitlebar
           sidebarDrawer={viewportTier === "compact"}

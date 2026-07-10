@@ -1,11 +1,5 @@
-import {
-  Columns2,
-  GitBranch,
-  MoreHorizontal,
-  PanelLeftOpen,
-  Server,
-  TerminalSquare,
-} from "lucide-react";
+import { GitBranch, PanelLeftOpen, TerminalSquare } from "lucide-react";
+import productIcon from "../../src-tauri/icons/128x128.png";
 import type { WorkspaceStatus } from "./workspaceStatus";
 import { workspaceStatusLabel } from "./workspaceStatus";
 import "./WorkspaceHeader.css";
@@ -16,19 +10,15 @@ export type WorkspaceHeaderProps = {
   branch?: string | null;
   cwd?: string | null;
   hostLabel?: string | null;
-  agentCommand?: string | null;
   status: WorkspaceStatus;
   windowTitlebar?: boolean;
   sidebarDrawer?: boolean;
   scratchOpen: boolean;
   gitActive?: boolean;
   gitAvailable?: boolean;
-  canSplit?: boolean;
   onOpenSidebar?: () => void;
   onToggleScratch: () => void;
   onOpenGit?: () => void;
-  onSplit?: () => void;
-  onOpenMore?: () => void;
 };
 
 export function WorkspaceHeader({
@@ -37,22 +27,23 @@ export function WorkspaceHeader({
   branch,
   cwd,
   hostLabel,
-  agentCommand,
   status,
   windowTitlebar = false,
   sidebarDrawer = false,
   scratchOpen,
   gitActive = false,
   gitAvailable = true,
-  canSplit = false,
   onOpenSidebar,
   onToggleScratch,
   onOpenGit,
-  onSplit,
-  onOpenMore,
 }: WorkspaceHeaderProps) {
-  const metadata = [project, cwd, branch ? `branch: ${branch}` : null]
-    .filter((value): value is string => Boolean(value?.trim()));
+  const contextTitle = [
+    title,
+    project,
+    cwd,
+    branch ? `Branch: ${branch}` : null,
+    hostLabel ? `Host: ${hostLabel}` : null,
+  ].filter((value): value is string => Boolean(value?.trim()));
 
   return (
     <div
@@ -60,8 +51,14 @@ export function WorkspaceHeader({
       data-window-titlebar={windowTitlebar ? true : undefined}
       data-tauri-drag-region={windowTitlebar ? true : undefined}
     >
-      <div className="workspace-header__layout" data-tauri-drag-region={windowTitlebar ? true : undefined}>
-        <div className="workspace-header__identity">
+      <div
+        className="workspace-header__layout"
+        data-tauri-drag-region={windowTitlebar ? true : undefined}
+      >
+        <div
+          className="workspace-header__brand-area"
+          data-tauri-drag-region={windowTitlebar ? true : undefined}
+        >
           {sidebarDrawer && (
             <button
               className="workspace-header__icon-button workspace-header__sidebar-button"
@@ -75,60 +72,36 @@ export function WorkspaceHeader({
               <PanelLeftOpen aria-hidden="true" size={17} strokeWidth={1.7} />
             </button>
           )}
-
-          <div className="workspace-header__title-block">
-            <div className="workspace-header__title-line">
-              <h1 title={title}>{title}</h1>
-              <span
-                className="workspace-header__status"
-                data-status={status}
-                aria-label={`Workspace status: ${workspaceStatusLabel(status)}`}
-              >
-                <span aria-hidden="true" />
-                {workspaceStatusLabel(status)}
-              </span>
-            </div>
-            <div className="workspace-header__metadata">
-              {metadata.length > 0 ? (
-                metadata.map((value, index) => (
-                  <span key={`${value}-${index}`} title={value}>
-                    {value}
-                  </span>
-                ))
-              ) : (
-                <span>No workspace path</span>
-              )}
-            </div>
+          <div className="workspace-header__brand" aria-label="tmux-worktree">
+            <img src={productIcon} alt="" draggable={false} />
+            <span>tmux-worktree</span>
           </div>
         </div>
 
-        <div className="workspace-header__context" aria-label="Workspace context">
+        <div
+          className="workspace-header__context"
+          aria-label="Current workspace"
+          title={contextTitle.join(" · ")}
+          data-tauri-drag-region={windowTitlebar ? true : undefined}
+        >
+          <span
+            className="workspace-header__status-dot"
+            data-status={status}
+            aria-hidden="true"
+          />
+          <h1>{title}</h1>
+          <span className="workspace-header__status-label">
+            {workspaceStatusLabel(status)}
+          </span>
+          {branch && <span className="workspace-header__detail">{branch}</span>}
           {hostLabel && (
-            <span className="workspace-header__chip" title={`Host: ${hostLabel}`}>
-              <Server aria-hidden="true" size={14} strokeWidth={1.8} />
-              <span className="workspace-header__chip-copy">{hostLabel}</span>
-            </span>
-          )}
-          {agentCommand && (
-            <span className="workspace-header__chip" title={`Agent command: ${agentCommand}`}>
-              <TerminalSquare aria-hidden="true" size={14} strokeWidth={1.8} />
-              <span className="workspace-header__chip-copy">{agentCommand}</span>
+            <span className="workspace-header__detail workspace-header__host">
+              {hostLabel}
             </span>
           )}
         </div>
 
         <div className="workspace-header__actions">
-          {canSplit && onSplit && (
-            <button
-              className="workspace-header__action"
-              type="button"
-              onClick={onSplit}
-              title="Split terminal"
-            >
-              <Columns2 aria-hidden="true" size={16} strokeWidth={1.7} />
-              <span>Split</span>
-            </button>
-          )}
           {onOpenGit && (
             <button
               className="workspace-header__action"
@@ -152,17 +125,6 @@ export function WorkspaceHeader({
             <TerminalSquare aria-hidden="true" size={16} strokeWidth={1.7} />
             <span>Scratch</span>
           </button>
-          {onOpenMore && (
-            <button
-              className="workspace-header__icon-button"
-              type="button"
-              onClick={onOpenMore}
-              aria-label="More workspace actions"
-              title="More workspace actions"
-            >
-              <MoreHorizontal aria-hidden="true" size={18} strokeWidth={1.8} />
-            </button>
-          )}
         </div>
       </div>
     </div>
