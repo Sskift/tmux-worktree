@@ -70,14 +70,16 @@ test("Android terminal stream errors reopen the active session", () => {
 
 test("mobile relay failures stay visible on Android and in the Dashboard", () => {
   const android = readFileSync("mobile/android/app/src/main/java/com/tmuxworktree/mobile/MainActivity.java", "utf8");
-  const dashboard = readFileSync("app/src/App.tsx", "utf8");
+  const app = readFileSync("app/src/App.tsx", "utf8");
+  const dashboard = readFileSync("app/src/dashboard/hooks/useMobileRelayController.ts", "utf8");
   const backend = readFileSync("app/src-tauri/src/lib.rs", "utf8");
 
   assert.match(android, /if \(reconnectAttempt >= 3\) \{\s*setIdentityExpanded\(true\);\s*\}/s);
-  assert.match(dashboard, /useVisibilityAwarePolling\(refreshMobileRelayStatus/);
-  assert.match(dashboard, /const RELAY_REFRESH_MS = 2_000/);
-  assert.match(dashboard, /const RELAY_HIDDEN_REFRESH_MS = 15_000/);
-  assert.match(dashboard, /mobileRelayConnected\s*\? "Connected"/);
+  assert.match(app, /useMobileRelayController\(\{ hosts \}\)/);
+  assert.match(dashboard, /useVisibilityAwarePolling\(refreshStatus/);
+  assert.match(dashboard, /MOBILE_RELAY_VISIBLE_REFRESH_MS = 2_000/);
+  assert.match(dashboard, /MOBILE_RELAY_HIDDEN_REFRESH_MS = 15_000/);
+  assert.match(dashboard, /connected\s*\? "Connected"/);
   assert.match(backend, /connection_state: String/);
   assert.match(backend, /load_mobile_relay_runtime_status/);
   assert.match(backend, /status\.relay_url == resolved_relay_url && status\.host_id == resolved_host_id/);

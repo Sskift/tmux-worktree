@@ -1,0 +1,208 @@
+@import "./design/tokens.css";
+
+.workspace-header {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  height: 100%;
+  min-width: 0;
+  padding: 0 14px 0 20px;
+  color: var(--shell-text);
+  background: #151517;
+  font-family: var(--shell-font-sans);
+}
+
+.workspace-header__identity,
+.workspace-header__title-line,
+.workspace-header__context,
+.workspace-header__actions {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.workspace-header__identity {
+  gap: 10px;
+}
+
+.workspace-header__title-block {
+  min-width: 0;
+}
+
+.workspace-header__title-line {
+  gap: 9px;
+}
+
+.workspace-header h1 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--shell-text-secondary);
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-header__metadata {
+  display: flex;
+  min-width: 0;
+  overflow: hidden;
+  gap: 12px;
+  margin-top: 2px;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.workspace-header__metadata span {
+  min-width: 0;
+  max-width: min(48vw, 520px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-header__metadata span + span::before {
+  margin-right: 12px;
+  color: var(--shell-text-disabled);
+  content: "·";
+}
+
+.workspace-header__status {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 5px;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.workspace-header__status > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--shell-text-faint);
+}
+
+.workspace-header__status[data-status="running"] > span {
+  background: var(--shell-success);
+}
+
+.workspace-header__status[data-status="waiting"] > span,
+.workspace-header__status[data-status="reconnecting"] > span {
+  background: var(--shell-warning);
+}
+
+.workspace-header__status[data-status="offline"] > span {
+  background: var(--shell-danger);
+}
+
+.workspace-header__context {
+  justify-content: flex-end;
+  gap: 6px;
+  overflow: hidden;
+}
+
+.workspace-header__chip {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 160px;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  color: var(--shell-text-muted);
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius-sm);
+  font-size: 11px;
+  line-height: 15px;
+}
+
+.workspace-header__chip span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-header__actions {
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.workspace-header__action,
+.workspace-header__icon-button {
+  display: inline-flex;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 9px;
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-2);
+  border: 1px solid var(--shell-border);
+  border-radius: var(--shell-radius-sm);
+  font: 500 11px/1 var(--shell-font-sans);
+  cursor: pointer;
+  transition:
+    color var(--shell-motion-fast) var(--shell-ease),
+    background-color var(--shell-motion-fast) var(--shell-ease),
+    border-color var(--shell-motion-fast) var(--shell-ease);
+}
+
+.workspace-header__icon-button {
+  width: 30px;
+  padding: 0;
+}
+
+.workspace-header__action:hover,
+.workspace-header__icon-button:hover,
+.workspace-header__action[aria-pressed="true"] {
+  color: var(--shell-text);
+  background: var(--shell-surface-hover);
+  border-color: var(--shell-border-strong);
+}
+
+.workspace-header__action[aria-pressed="true"] {
+  color: var(--shell-focus);
+}
+
+.workspace-header :where(button):focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 1279px) {
+  .workspace-header {
+    grid-template-columns: minmax(160px, 1fr) auto;
+  }
+
+  .workspace-header__context {
+    display: none;
+  }
+}
+
+@media (max-width: 1040px) {
+  .workspace-header {
+    padding-left: 12px;
+  }
+
+  .workspace-header__action span {
+    display: none;
+  }
+
+  .workspace-header__action {
+    width: 30px;
+    padding: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-header__action,
+  .workspace-header__icon-button {
+    transition: none;
+  }
+}

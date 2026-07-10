@@ -15,6 +15,7 @@ test("new terminal modal supports host selection and ai command", () => {
 
 test("app creates persisted terminals through the host-aware command", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
   assert.match(
@@ -28,6 +29,6 @@ test("app creates persisted terminals through the host-aware command", () => {
   assert.doesNotMatch(backend, /"create_plain_terminal"/);
   assert.match(app, /dashboardBackend\.terminals\.ensure\(\{\s*name: t\.tmuxName,/s);
   assert.match(app, /aiCmd:\s*t\.aiCmd/);
-  assert.match(app, /function terminalSessionKey/);
+  assert.match(deck, /function terminalSessionKey/);
   assert.match(app, /persistedKeys/);
 });

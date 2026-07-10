@@ -79,9 +79,10 @@ test("worktree sidebar groups sessions by project with collapsible headers", () 
 
 test("remote scratch terminals start on the selected host cwd", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
 
   assert.match(app, /function buildSshShellArgs\(host: HostConfig, cwd: string\): string\[\]/);
-  assert.match(app, /function shellQuoteArg\(value: string\): string/);
+  assert.match(deck, /function shellQuoteArg\(value: string\): string/);
   assert.match(app, /buildSshShellArgs\(scratchContext\.host, scratchContext\.cwd\)/);
   assert.match(app, /hostId=\{scratchContext\.host\?\.id \?\? null\}/);
   assert.match(app, /`cd \$\{shellQuoteArg\(cwd\)\} && exec "\\\$\{SHELL:-\/bin\/sh\}"`/);

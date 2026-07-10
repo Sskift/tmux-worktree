@@ -1,0 +1,51 @@
+:root {
+  color-scheme: dark;
+
+  --shell-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, sans-serif;
+  --shell-font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;
+
+  --shell-bg: #0d0d0e;
+  --shell-sidebar: #121213;
+  --shell-workspace: #0f0f10;
+  --shell-surface-1: #1a1a1c;
+  --shell-surface-2: #1e1e21;
+  --shell-surface-3: #232326;
+  --shell-surface-hover: #2a2a2e;
+  --shell-border: #2a2a2e;
+  --shell-border-strong: #3a3a40;
+
+  --shell-text: #f5f5f7;
+  --shell-text-secondary: #d4d4d8;
+  --shell-text-muted: #8a8a90;
+  --shell-text-faint: #6a6a70;
+  --shell-text-disabled: #5a5a60;
+
+  --shell-accent: #3a8bff;
+  --shell-accent-hover: #4a90e2;
+  --shell-accent-soft: #2b3f66;
+  --shell-focus: #7abaff;
+
+  --shell-success: #28c840;
+  --shell-warning: #febc2e;
+  --shell-danger: #ff5f57;
+  --shell-danger-soft: #7f1d1d;
+
+  --shell-radius-sm: 6px;
+  --shell-radius-md: 8px;
+  --shell-radius-lg: 10px;
+  --shell-radius-xl: 14px;
+
+  --shell-shadow-float: 0 22px 64px rgb(0 0 0 / 55%);
+  --shell-shadow-dialog: 0 28px 80px rgb(0 0 0 / 65%);
+
+  --shell-motion-fast: 140ms;
+  --shell-motion-medium: 200ms;
+  --shell-ease: cubic-bezier(0.2, 0.75, 0.25, 1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --shell-motion-fast: 0ms;
+    --shell-motion-medium: 0ms;
+  }
+}

@@ -1,15 +1,35 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import { FolderTree, Radio, Settings as SettingsIcon } from "lucide-react";
 import {
   type DashboardWindow,
   type HostConfig,
-  type MobileRelayStatus,
   type PlainTerminal,
   type Session,
   useDashboardBackend,
 } from "./platform";
 import { useDashboardCatalog } from "./dashboard/hooks/useDashboardCatalog";
 import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
+import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
+import {
+  CommandPalette,
+  type CommandPaletteItem,
+} from "./dashboard/CommandPalette";
+import {
+  SettingsDialog,
+  type SettingsSectionId,
+} from "./dashboard/Settings";
+import {
+  ConnectionsSettings,
+  relaySettingsBindingsFromController,
+} from "./dashboard/Settings/ConnectionsSettings";
+import {
+  TerminalDeck,
+  sessionDisplayName,
+  shellQuoteArg,
+  terminalRawName,
+  terminalSessionKey,
+} from "./dashboard/TerminalDeck";
 import {
   DEFAULT_COLUMN_ORDER,
   normalizeColumnOrder,
@@ -22,14 +42,12 @@ import {
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
-import { AddHostModal } from "./AddHostModal";
 import { ThemePicker } from "./ThemePicker";
 import { GitStatusPanel } from "./GitStatusPanel";
 import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
 import { AutomationPanel } from "./AutomationPanel";
-import { MenuSelect } from "./MenuSelect";
 import { useSortable } from "./useSortable";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import {
@@ -70,8 +88,6 @@ type SessionGroup = {
 
 const REFRESH_MS = 2000;
 const HIDDEN_REFRESH_MS = 10_000;
-const RELAY_REFRESH_MS = 2_000;
-const RELAY_HIDDEN_REFRESH_MS = 15_000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 
@@ -91,11 +107,6 @@ const PROJECT_COLORS = [
 function projectKey(name: string): string {
   const i = name.indexOf("-");
   return i > 0 ? name.slice(0, i) : name;
-}
-
-/** Get the display name for a session (raw tmux name, not composite key) */
-function sessionDisplayName(s: Session): string {
-  return s.rawName ?? s.name;
 }
 
 /** Get the project key for grouping/coloring, preferring TW managed metadata. */
@@ -127,53 +138,6 @@ function groupSessionsByProject(sessions: Session[], hosts: HostConfig[]): Sessi
   return groups;
 }
 
-/** Build SSH attach args for a remote session */
-function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
-  const args: string[] = ["-tt", "-o", "StrictHostKeyChecking=accept-new"];
-  if (host.port) {
-    args.push("-p", String(host.port));
-  }
-  if (host.identityFile) {
-    args.push("-i", host.identityFile);
-  }
-  const target = host.user ? `${host.user}@${host.host}` : host.host;
-  const exact = `=${rawName}`;
-  const exactArg = shellQuoteArg(exact);
-  const tmux = remoteShellPathExpr(host.tmuxPath || "tmux");
-  args.push(
-    target,
-    "--",
-    [
-      "set -e",
-      "export TERM=xterm-256color",
-      `${tmux} has-session -t ${exactArg}`,
-      `${tmux} set-option -g mouse on >/dev/null 2>&1 || true`,
-      `${tmux} bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
-      `${tmux} bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
-      `exec ${tmux} attach-session -t ${exactArg}`,
-    ].join("; "),
-  );
-  return args;
-}
-
-function remoteShellPathExpr(value: string): string {
-  const trimmed = value.trim() || "tmux";
-  if (trimmed === "~") return '"$HOME"';
-  if (trimmed.startsWith("~/")) {
-    const escapedPath = trimmed
-      .slice(2)
-      .replace(/["\\$]/g, "\\$&")
-      .replace(/`/g, "\\`");
-    return `"$HOME/${escapedPath}"`;
-  }
-  return shellQuoteArg(trimmed);
-}
-
-function shellQuoteArg(value: string): string {
-  if (!value) return "''";
-  return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
 function buildSshShellArgs(host: HostConfig, cwd: string): string[] {
   const args: string[] = ["-tt", "-o", "StrictHostKeyChecking=accept-new"];
   if (host.port) {
@@ -189,18 +153,6 @@ function buildSshShellArgs(host: HostConfig, cwd: string): string[] {
     `cd ${shellQuoteArg(cwd)} && exec "\${SHELL:-/bin/sh}"`,
   );
   return args;
-}
-
-function terminalRawName(terminal: PlainTerminal): string {
-  if (terminal.rawName) return terminal.rawName;
-  if (terminal.hostId && terminal.tmuxName.startsWith(`${terminal.hostId}:`)) {
-    return terminal.tmuxName.slice(terminal.hostId.length + 1);
-  }
-  return terminal.tmuxName;
-}
-
-function terminalSessionKey(terminal: PlainTerminal): string {
-  return terminal.hostId ? `${terminal.hostId}:${terminalRawName(terminal)}` : terminalRawName(terminal);
 }
 
 function isInternalTerminalName(value: string | null | undefined): boolean {
@@ -393,6 +345,7 @@ function App() {
     installingHostId,
     installRemoteTw,
   } = useDashboardCatalog();
+  const mobileRelay = useMobileRelayController({ hosts });
   const [sessionActivity, setSessionActivity] = useState<Record<string, SessionActivityInfo>>({});
   const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
@@ -402,10 +355,11 @@ function App() {
   const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
   const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [mobileRelayBrokerHostId, setMobileRelayBrokerHostId] = useState("");
-  const [showAddHost, setShowAddHost] = useState(false);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
   const [showNewTerminal, setShowNewTerminal] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("general");
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [theme, setTheme] = useState<ThemeId>(() => {
     const id = loadTheme();
     applyTheme(id);
@@ -426,22 +380,6 @@ function App() {
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
   const [scratchCollapsed, setScratchCollapsed] = useState(false);
   const [fileBrowserOpen, setFileBrowserOpen] = useState(false);
-  const [mobileRelayActive, setMobileRelayActive] = useState(false);
-  const [mobileRelayConnected, setMobileRelayConnected] = useState(false);
-  const [mobileRelayConnectionState, setMobileRelayConnectionState] = useState("stopped");
-  const [mobileRelayUrl, setMobileRelayUrl] = useState("wss://relay.example.com");
-  const [mobileRelayHostId, setMobileRelayHostId] = useState("mac-admin");
-  const [mobileRelaySecret, setMobileRelaySecret] = useState("");
-  const [mobileRelayDraftUrl, setMobileRelayDraftUrl] = useState("wss://relay.example.com");
-  const [mobileRelayDraftHostId, setMobileRelayDraftHostId] = useState("mac-admin");
-  const [mobileRelayDraftSecret, setMobileRelayDraftSecret] = useState("");
-  const [mobileRelayPopover, setMobileRelayPopover] = useState(false);
-  const [mobileRelayLoading, setMobileRelayLoading] = useState(false);
-  const [mobileRelaySaving, setMobileRelaySaving] = useState(false);
-  const [mobileRelayBrokerStarting, setMobileRelayBrokerStarting] = useState(false);
-  const [mobileRelayStopping, setMobileRelayStopping] = useState(false);
-  const [mobileRelayCopied, setMobileRelayCopied] = useState(false);
-  const [mobileRelayError, setMobileRelayError] = useState<string | null>(null);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
@@ -453,6 +391,7 @@ function App() {
   const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const appRef = useRef<HTMLDivElement | null>(null);
+  const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const columnRefs = useRef<Map<LayoutColumn, HTMLElement>>(new Map());
   const activeColumnOrderRef = useRef<LayoutColumn[]>(DEFAULT_COLUMN_ORDER);
   const pendingColumnDragRef = useRef<{ column: LayoutColumn; startX: number; startY: number } | null>(null);
@@ -834,7 +773,41 @@ function App() {
     void loadAutomations();
   }, [loadAutomations]);
 
-  const anyModalOpen = showNewWorktree || showNewTerminal || showAddHost;
+  const openSettings = useCallback((section: SettingsSectionId = "general") => {
+    setCommandPaletteOpen(false);
+    setSettingsSection(section);
+    setSettingsOpen(true);
+  }, []);
+
+  useEffect(() => {
+    const handleSettingsShortcut = (event: KeyboardEvent) => {
+      if (
+        event.defaultPrevented ||
+        event.repeat ||
+        event.isComposing ||
+        event.altKey ||
+        event.shiftKey ||
+        !event.metaKey ||
+        event.key !== ","
+      ) {
+        return;
+      }
+      event.preventDefault();
+      openSettings(settingsOpen ? settingsSection : "general");
+    };
+    window.addEventListener("keydown", handleSettingsShortcut);
+    return () => window.removeEventListener("keydown", handleSettingsShortcut);
+  }, [openSettings, settingsOpen, settingsSection]);
+
+  useEffect(() => {
+    mobileRelay.setPopoverOpen(settingsOpen && settingsSection === "connections");
+  }, [mobileRelay.setPopoverOpen, settingsOpen, settingsSection]);
+
+  const anyModalOpen =
+    showNewWorktree ||
+    showNewTerminal ||
+    settingsOpen ||
+    commandPaletteOpen;
   const editorPanelOpen = !!(editingFile || diffFile);
 
   const startSidebarResize = (e: React.MouseEvent) => {
@@ -1330,179 +1303,6 @@ function App() {
     return () => clearInterval(id);
   }, [handleAutomationRun]);
 
-  // Mobile relay connector helpers
-  const applyMobileRelayStatus = useCallback((status: MobileRelayStatus, syncDraft = true) => {
-    setMobileRelayActive(status.active);
-    setMobileRelayConnected(status.connected);
-    setMobileRelayConnectionState(status.connectionState);
-    setMobileRelayUrl(status.relayUrl);
-    setMobileRelayHostId(status.hostId);
-    setMobileRelaySecret(status.secret);
-    if (syncDraft) {
-      setMobileRelayDraftUrl(status.relayUrl);
-      setMobileRelayDraftHostId(status.hostId);
-      setMobileRelayDraftSecret(status.secret);
-    }
-    setMobileRelayError(status.error ?? null);
-  }, []);
-
-  const checkMobileRelayStatus = useCallback(async () => {
-    try {
-      const status = await dashboardBackend.relay.status();
-      applyMobileRelayStatus(status);
-      return status;
-    } catch {
-      return {
-        active: false,
-        connected: false,
-        connectionState: "stopped",
-        relayUrl: "wss://relay.example.com",
-        hostId: "mac-admin",
-        secret: "",
-        token: "",
-        error: null,
-      };
-    }
-  }, [applyMobileRelayStatus]);
-
-  const handleMobileRelayToggle = useCallback(async () => {
-    if (mobileRelayActive) {
-      setMobileRelayPopover(true);
-    } else {
-      const status = await checkMobileRelayStatus();
-      if (!status.secret.trim()) {
-        setMobileRelayPopover(true);
-        setMobileRelayError(null);
-        return;
-      }
-      setMobileRelayLoading(true);
-      setMobileRelayPopover(true);
-      setMobileRelayError(null);
-      try {
-        await dashboardBackend.relay.start();
-        const status = await dashboardBackend.relay.status();
-        applyMobileRelayStatus(status);
-      } catch (err) {
-        setMobileRelayError(String(err));
-      } finally {
-        setMobileRelayLoading(false);
-      }
-    }
-  }, [applyMobileRelayStatus, checkMobileRelayStatus, mobileRelayActive]);
-
-  const saveMobileRelayConfig = useCallback(async () => {
-    const args = {
-      relayUrl: mobileRelayDraftUrl.trim(),
-      hostId: mobileRelayDraftHostId.trim(),
-      secret: mobileRelayDraftSecret.trim(),
-    };
-    if (!args.relayUrl || !args.hostId) {
-      throw new Error("Relay URL and host are required");
-    }
-    const status = await dashboardBackend.relay.saveConfig(args);
-    applyMobileRelayStatus(status);
-    return status;
-  }, [applyMobileRelayStatus, mobileRelayDraftHostId, mobileRelayDraftSecret, mobileRelayDraftUrl]);
-
-  const handleMobileRelaySave = useCallback(async () => {
-    setMobileRelaySaving(true);
-    setMobileRelayError(null);
-    try {
-      await saveMobileRelayConfig();
-    } catch (err) {
-      setMobileRelayError(String(err));
-    } finally {
-      setMobileRelaySaving(false);
-    }
-  }, [saveMobileRelayConfig]);
-
-  const handleMobileRelayStart = useCallback(async () => {
-    setMobileRelayLoading(true);
-    setMobileRelayError(null);
-    try {
-      const saved = await saveMobileRelayConfig();
-      if (!saved.secret.trim()) throw new Error("Relay token is required before Android can connect");
-      await dashboardBackend.relay.start();
-      const status = await dashboardBackend.relay.status();
-      applyMobileRelayStatus(status);
-    } catch (err) {
-      setMobileRelayError(String(err));
-    } finally {
-      setMobileRelayLoading(false);
-    }
-  }, [applyMobileRelayStatus, saveMobileRelayConfig]);
-
-  const handleMobileRelayStartBroker = useCallback(async () => {
-    if (!mobileRelayBrokerHostId) return;
-    setMobileRelayBrokerStarting(true);
-    setMobileRelayError(null);
-    try {
-      const status = await dashboardBackend.relay.startBroker({
-        hostId: mobileRelayBrokerHostId,
-        port: 8787,
-      });
-      applyMobileRelayStatus(status);
-      await dashboardBackend.relay.start();
-      const activeStatus = await dashboardBackend.relay.status();
-      applyMobileRelayStatus(activeStatus);
-    } catch (err) {
-      setMobileRelayError(String(err));
-    } finally {
-      setMobileRelayBrokerStarting(false);
-    }
-  }, [applyMobileRelayStatus, mobileRelayBrokerHostId]);
-
-  const handleMobileRelayStop = useCallback(async () => {
-    setMobileRelayStopping(true);
-    setMobileRelayError(null);
-    try {
-      await dashboardBackend.relay.stop();
-      const status = await dashboardBackend.relay.status();
-      applyMobileRelayStatus(status);
-      setMobileRelayPopover(false);
-    } catch (err) {
-      setMobileRelayError(String(err));
-    } finally {
-      setMobileRelayStopping(false);
-    }
-  }, [applyMobileRelayStatus]);
-
-  const copyMobileLaunch = useCallback(() => {
-    const command = [
-      "adb shell am start -n com.tmuxworktree.mobile/.MainActivity",
-      `  --es relayUrl '${mobileRelayUrl}'`,
-      `  --es hostId '${mobileRelayHostId}'`,
-      mobileRelaySecret ? `  --es relaySecret '${mobileRelaySecret}'` : "  --es relaySecret '<TW_RELAY_SECRET>'",
-      "  --ez autoConnect true",
-    ].join(" \\\n");
-    void navigator.clipboard.writeText(command);
-    setMobileRelayCopied(true);
-    window.setTimeout(() => setMobileRelayCopied(false), 1200);
-  }, [mobileRelayHostId, mobileRelaySecret, mobileRelayUrl]);
-
-  const copyMobileRelayValue = useCallback((value: string) => {
-    if (value) void navigator.clipboard.writeText(value);
-  }, []);
-
-  useEffect(() => { checkMobileRelayStatus(); }, [checkMobileRelayStatus]);
-
-  const refreshMobileRelayStatus = useCallback(async () => {
-    const status = await dashboardBackend.relay.status();
-    applyMobileRelayStatus(status, false);
-  }, [applyMobileRelayStatus, dashboardBackend]);
-  useVisibilityAwarePolling(refreshMobileRelayStatus, {
-    enabled: mobileRelayActive || mobileRelayPopover,
-    visibleIntervalMs: RELAY_REFRESH_MS,
-    hiddenIntervalMs: RELAY_HIDDEN_REFRESH_MS,
-    refreshKey: `${mobileRelayActive}\0${mobileRelayPopover}`,
-  });
-
-  useEffect(() => {
-    if (mobileRelayBrokerHostId || hosts.length === 0) return;
-    const preferred = hosts.find((host) => host.id === "devbox") ?? hosts[0];
-    setMobileRelayBrokerHostId(preferred.id);
-  }, [hosts, mobileRelayBrokerHostId]);
-
   // Lazily attach live PTYs; startup preloads snapshots instead.
   useEffect(() => {
     if (selection?.kind !== "session") return;
@@ -1919,29 +1719,138 @@ function App() {
     );
   };
 
-  const mobileRelayBusy = mobileRelayLoading || mobileRelaySaving || mobileRelayBrokerStarting || mobileRelayStopping;
-  const mobileRelayStatus = mobileRelayBusy
-    ? "starting"
-    : mobileRelayConnected
-      ? "running"
-      : mobileRelayActive
-        ? "starting"
-        : "stopped";
-  const mobileRelayStatusText = mobileRelayBrokerStarting
-    ? "Starting broker"
-    : mobileRelayLoading
-      ? "Starting"
-      : mobileRelaySaving
-        ? "Saving"
-        : mobileRelayStopping
-          ? "Stopping"
-          : mobileRelayConnected
-            ? "Connected"
-            : mobileRelayActive
-              ? mobileRelayConnectionState === "retrying" ? "Reconnecting" : "Connecting"
-              : "Stopped";
-  const mobileRelayTokenState = mobileRelaySecret ? "Configured" : "Missing";
-  const mobileRelayButtonActive = mobileRelayActive || mobileRelayPopover || mobileRelayBusy;
+  const commandPaletteItems = useMemo<CommandPaletteItem[]>(() => {
+    const actions: CommandPaletteItem[] = [
+      {
+        id: "action-new-worktree",
+        group: "actions",
+        label: "New worktree",
+        detail: "Create a managed worktree and tmux session",
+        keywords: ["create", "session", "branch"],
+        shortcut: ["⌘", "N"],
+        execute: () => setShowNewWorktree(true),
+      },
+      {
+        id: "action-new-terminal",
+        group: "actions",
+        label: "New terminal",
+        detail: "Open a local or SSH terminal",
+        keywords: ["shell", "tmux", "ssh"],
+        execute: () => setShowNewTerminal(true),
+      },
+      {
+        id: "action-new-automation",
+        group: "actions",
+        label: "New automation",
+        detail: "Configure a dashboard automation",
+        keywords: ["schedule", "run"],
+        execute: handleNewAutomation,
+      },
+    ];
+
+    const navigate: CommandPaletteItem[] = [
+      ...sessions.map((session) => {
+        const host = session.hostId
+          ? hosts.find((candidate) => candidate.id === session.hostId)
+          : null;
+        return {
+          id: `navigate-session-${session.name}`,
+          group: "navigate" as const,
+          label: sessionDisplayName(session),
+          detail: [host?.label ?? session.hostId, session.project].filter(Boolean).join(" · ") || "Local worktree",
+          keywords: ["worktree", "session", session.name, session.project ?? ""],
+          execute: () => setSelection({ kind: "session", name: session.name }),
+        };
+      }),
+      ...allTerminals.map((terminal) => ({
+        id: `navigate-terminal-${terminal.id}`,
+        group: "navigate" as const,
+        label: terminal.label,
+        detail: terminal.hostId ? `SSH · ${terminal.cwd}` : terminal.cwd,
+        keywords: ["terminal", "shell", terminal.tmuxName],
+        execute: () => setSelection({ kind: "terminal", id: terminal.id }),
+      })),
+    ];
+
+    const automationCommands: CommandPaletteItem[] = automations.map((automation) => ({
+      id: `automation-run-${automation.id}`,
+      group: "automation",
+      label: `Run ${automation.name || "unnamed automation"}`,
+      detail: triggerLabel(automation),
+      keywords: ["run", "schedule", automation.name],
+      disabledReason: automation.active ? undefined : "Automation is paused",
+      execute: () => handleAutomationRun(automation.id),
+    }));
+
+    const recentSessionNames = openedSessions.slice(-4).reverse();
+    const recentTerminalIds = openedTerminals.slice(-4).reverse();
+    const recent: CommandPaletteItem[] = [
+      ...recentSessionNames.flatMap((name) => {
+        const session = sessions.find((candidate) => candidate.name === name);
+        return session
+          ? [{
+              id: `recent-session-${name}`,
+              group: "recent" as const,
+              label: sessionDisplayName(session),
+              detail: "Recently opened worktree",
+              execute: () => setSelection({ kind: "session", name }),
+            }]
+          : [];
+      }),
+      ...recentTerminalIds.flatMap((id) => {
+        const terminal = allTerminals.find((candidate) => candidate.id === id);
+        return terminal
+          ? [{
+              id: `recent-terminal-${id}`,
+              group: "recent" as const,
+              label: terminal.label,
+              detail: "Recently opened terminal",
+              execute: () => setSelection({ kind: "terminal", id }),
+            }]
+          : [];
+      }),
+    ];
+
+    const settings: CommandPaletteItem[] = [
+      {
+        id: "settings-connections",
+        group: "settings",
+        label: "Manage connections…",
+        detail: "SSH Hosts and Mobile Relay",
+        keywords: ["settings", "host", "ssh", "relay"],
+        execute: () => openSettings("connections"),
+      },
+      {
+        id: "settings-appearance",
+        group: "settings",
+        label: "Appearance settings…",
+        detail: "Dashboard and terminal presentation",
+        keywords: ["theme", "font", "density"],
+        execute: () => openSettings("appearance"),
+      },
+      {
+        id: "settings-advanced",
+        group: "settings",
+        label: "Advanced settings…",
+        detail: "Diagnostics and layout controls",
+        keywords: ["logs", "reset", "diagnostics"],
+        execute: () => openSettings("advanced"),
+      },
+    ];
+
+    return [...actions, ...navigate, ...automationCommands, ...recent, ...settings];
+  }, [
+    allTerminals,
+    automations,
+    handleAutomationRun,
+    handleNewAutomation,
+    hosts,
+    openSettings,
+    openedSessions,
+    openedTerminals,
+    sessions,
+  ]);
+  const relaySettingsBindings = relaySettingsBindingsFromController(mobileRelay);
 
   return (
     <div className="app" ref={appRef} style={{ gridTemplateColumns: gridCols }}>
@@ -1953,19 +1862,15 @@ function App() {
           <div className="brand">
             <span className="brand__mark" />
             <span className="brand__text">tmux-worktree</span>
-            <div style={{ position: "relative", marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
+            <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: "2px" }}>
               <button
-                className={`brand__file-btn${mobileRelayButtonActive ? " brand__file-btn--active" : ""}`}
+                className={`brand__file-btn${mobileRelay.buttonActive ? " brand__file-btn--active" : ""}`}
                 type="button"
-                onClick={handleMobileRelayToggle}
-                title="mobile relay"
-                aria-label="mobile relay"
+                onClick={() => openSettings("connections")}
+                title={`Mobile Relay: ${mobileRelay.statusText}`}
+                aria-label={`Open Mobile Relay settings. Status: ${mobileRelay.statusText}`}
               >
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <circle cx="8" cy="8" r="6.5" stroke="currentColor" strokeWidth="1.2"/>
-                  <ellipse cx="8" cy="8" rx="3" ry="6.5" stroke="currentColor" strokeWidth="1.2"/>
-                  <line x1="1.5" y1="8" x2="14.5" y2="8" stroke="currentColor" strokeWidth="1.2"/>
-                </svg>
+                <Radio aria-hidden="true" size={14} strokeWidth={1.8} />
               </button>
               <button
                 className={`brand__file-btn${fileBrowserOpen ? " brand__file-btn--active" : ""}`}
@@ -1974,165 +1879,8 @@ function App() {
                 title="toggle file browser"
                 aria-label="toggle file browser"
               >
-                <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M1.5 13.5V2.5C1.5 2.1 1.9 1.5 2.5 1.5H6L8 3.5H13.5C14.1 3.5 14.5 4 14.5 4.5V13.5C14.5 14 14.1 14.5 13.5 14.5H2.5C1.9 14.5 1.5 14 1.5 13.5Z" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round"/>
-                </svg>
+                <FolderTree aria-hidden="true" size={14} strokeWidth={1.8} />
               </button>
-              {mobileRelayPopover && (
-                <div className="remote-popover">
-                  <div className="remote-popover__header">
-                    <div>
-                      <div className="remote-popover__title">Mobile Relay</div>
-                      <div className={`remote-popover__status remote-popover__status--${mobileRelayStatus}`}>
-                        <span />
-                        {mobileRelayStatusText}
-                      </div>
-                    </div>
-                    <button
-                      className="remote-popover__icon-btn"
-                      type="button"
-                      onClick={() => setMobileRelayPopover(false)}
-                      title="Close"
-                      aria-label="Close mobile relay menu"
-                    >
-                      ×
-                    </button>
-                  </div>
-
-                  <div className="remote-popover__fields">
-                    <div className="remote-popover__field">
-                      <span className="remote-popover__label">Broker</span>
-                      <MenuSelect
-                        ariaLabel="Broker"
-                        className="remote-popover__menu-select"
-                        value={mobileRelayBrokerHostId}
-                        onChange={setMobileRelayBrokerHostId}
-                        disabled={mobileRelayBusy || mobileRelayActive || hosts.length === 0}
-                        options={
-                          hosts.length === 0
-                            ? [{ value: "", label: "No SSH hosts" }]
-                            : hosts.map((host) => ({ value: host.id, label: host.label || host.id }))
-                        }
-                      />
-                      <span className="remote-popover__spacer" />
-                    </div>
-                    <div className="remote-popover__field">
-                      <span className="remote-popover__label">Relay URL</span>
-                      <input
-                        className="remote-popover__input"
-                        value={mobileRelayDraftUrl}
-                        onChange={(event) => setMobileRelayDraftUrl(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayBusy}
-                        spellCheck={false}
-                      />
-                      <button
-                        className="remote-popover__icon-btn"
-                        type="button"
-                        onClick={() => copyMobileRelayValue(mobileRelayDraftUrl)}
-                        title="Copy relay URL"
-                        aria-label="Copy relay URL"
-                      >
-                        ⎘
-                      </button>
-                    </div>
-                    <div className="remote-popover__field">
-                      <span className="remote-popover__label">Host</span>
-                      <input
-                        className="remote-popover__input"
-                        value={mobileRelayDraftHostId}
-                        onChange={(event) => setMobileRelayDraftHostId(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayBusy}
-                        spellCheck={false}
-                      />
-                      <button
-                        className="remote-popover__icon-btn"
-                        type="button"
-                        onClick={() => copyMobileRelayValue(mobileRelayDraftHostId)}
-                        title="Copy host"
-                        aria-label="Copy host"
-                      >
-                        ⎘
-                      </button>
-                    </div>
-                    <div className="remote-popover__field">
-                      <span className="remote-popover__label">Token</span>
-                      <input
-                        className="remote-popover__input"
-                        type="password"
-                        value={mobileRelayDraftSecret}
-                        onChange={(event) => setMobileRelayDraftSecret(event.target.value)}
-                        disabled={mobileRelayActive || mobileRelayBusy}
-                        placeholder={mobileRelayTokenState}
-                        spellCheck={false}
-                      />
-                      <button
-                        className="remote-popover__icon-btn"
-                        type="button"
-                        onClick={() => copyMobileRelayValue(mobileRelayDraftSecret)}
-                        title="Copy token"
-                        aria-label="Copy token"
-                        disabled={!mobileRelayDraftSecret}
-                      >
-                        ⎘
-                      </button>
-                    </div>
-                  </div>
-
-                  {mobileRelayError && (
-                    <div className="remote-popover__error">{mobileRelayError}</div>
-                  )}
-
-                  <div className={`remote-popover__actions${mobileRelayActive ? " remote-popover__actions--active" : ""}`}>
-                    {mobileRelayActive ? (
-                      <>
-                        <button
-                          className="remote-popover__action"
-                          type="button"
-                          onClick={copyMobileLaunch}
-                          disabled={!mobileRelaySecret || mobileRelayBusy}
-                        >
-                          {mobileRelayCopied ? "Copied" : "Copy Launch"}
-                        </button>
-                        <button
-                          className="remote-popover__action remote-popover__action--danger"
-                          type="button"
-                          onClick={handleMobileRelayStop}
-                          disabled={mobileRelayBusy}
-                        >
-                          {mobileRelayStopping ? "Stopping" : "Stop"}
-                        </button>
-                      </>
-                    ) : (
-                      <>
-                        <button
-                          className="remote-popover__action"
-                          type="button"
-                          onClick={handleMobileRelayStartBroker}
-                          disabled={mobileRelayBusy || !mobileRelayBrokerHostId}
-                        >
-                          {mobileRelayBrokerStarting ? "Starting" : "Start Broker"}
-                        </button>
-                        <button
-                          className="remote-popover__action"
-                          type="button"
-                          onClick={handleMobileRelaySave}
-                          disabled={mobileRelayBusy}
-                        >
-                          {mobileRelaySaving ? "Saving" : "Save"}
-                        </button>
-                        <button
-                          className="remote-popover__action remote-popover__action--primary"
-                          type="button"
-                          onClick={handleMobileRelayStart}
-                          disabled={mobileRelayBusy || !mobileRelayDraftSecret.trim()}
-                        >
-                          {mobileRelayLoading ? "Starting" : "Start"}
-                        </button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
           </div>
           <div className="sidebar__buttons">
@@ -2149,14 +1897,6 @@ function App() {
               onClick={() => setShowNewTerminal(true)}
             >
               + terminal
-            </button>
-            <button
-              className="btn btn--primary"
-              type="button"
-              onClick={() => setShowAddHost(true)}
-              title="add ssh host"
-            >
-              + host
             </button>
           </div>
           {hosts.length > 0 && (
@@ -2468,7 +2208,16 @@ function App() {
           <span className="dim">
             {totalCount} item{totalCount === 1 ? "" : "s"}
           </span>
-          <ThemePicker current={theme} onChange={setTheme} />
+          <button
+            ref={settingsTriggerRef}
+            className="brand__file-btn"
+            type="button"
+            onClick={() => openSettings("general")}
+            title="Settings"
+            aria-label="Open settings"
+          >
+            <SettingsIcon aria-hidden="true" size={15} strokeWidth={1.8} />
+          </button>
         </footer>
       </aside>
 
@@ -2509,6 +2258,27 @@ function App() {
         style={{ gridColumn: columnGridColumn("main") }}
       >
         {renderColumnHandle("main", "main terminal")}
+        <TerminalDeck
+          selection={selection}
+          sessions={sessions}
+          terminals={allTerminals}
+          hosts={hosts}
+          openedSessions={openedSessions}
+          openedTerminals={openedTerminals}
+          cwdsBySession={cwdsBySession}
+          tmuxPreviews={tmuxPreviews}
+          visible={selection?.kind === "session" || selection?.kind === "terminal"}
+          blocked={anyModalOpen}
+          scratchCollapsed={scratchCollapsed}
+          onToggleScratch={() => {
+            if (scratchCollapsed) {
+              openScratch();
+            } else {
+              setScratchCollapsed(true);
+            }
+          }}
+          onOpenFile={handleOpenFile}
+        />
         {selection?.kind === "automation" ? (
           <div className="pane pane--automation">
             <div className="pane__bar">
@@ -2540,142 +2310,13 @@ function App() {
               />
             </div>
           </div>
-        ) : selection ? (
-          <div className="pane pane--term">
-            <div className="pane__bar">
-              <span className="pane__title">
-                {selection.kind === "session"
-                  ? (() => {
-                      const sel = sessions.find((s) => s.name === selection.name);
-                      const dispName = sel ? sessionDisplayName(sel) : selection.name;
-                      if (sel?.hostId) {
-                        const h = hosts.find((h) => h.id === sel.hostId);
-                        return h ? `${h.label} › ${dispName}` : `${sel.hostId} › ${dispName}`;
-                      }
-                      return dispName;
-                    })()
-                  : allTerminals.find((t) => t.id === selection.id)?.label ??
-                    selection.id}
-              </span>
-              <div className="pane__bar-actions">
-                <span className="pane__hint dim">
-                  {selection.kind === "session"
-                    ? (() => {
-                        const sel = sessions.find((s) => s.name === selection.name);
-                        return sel?.hostId ? "ssh attach" : "tmux attach";
-                      })()
-                    : (() => {
-                        const terminal = allTerminals.find((t) => t.id === selection.id);
-                        return terminal?.hostId ? "ssh attach" : "zsh";
-                      })()}
-                </span>
-                <button
-                  className={`brand__file-btn scratch__toggle-btn${scratchCollapsed ? "" : " brand__file-btn--active"}`}
-                  type="button"
-                  onClick={() => {
-                    if (scratchCollapsed) {
-                      openScratch();
-                    } else {
-                      setScratchCollapsed(true);
-                    }
-                  }}
-                  title={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
-                  aria-label={scratchCollapsed ? "展开 scratch" : "收起 scratch"}
-                >
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <rect x="2" y="2.5" width="12" height="11" rx="1.5" stroke="currentColor" strokeWidth="1.2"/>
-                    <path d="M9.5 2.5V13.5" stroke="currentColor" strokeWidth="1.2"/>
-                    <path d="M11.4 6L9.8 8L11.4 10" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
-                  </svg>
-                </button>
-              </div>
-            </div>
-            <div className="pane__body pane__body--stack">
-              {openedSessions.map((name) => {
-                const sess = sessions.find((s) => s.name === name);
-                const isRemote = sess?.hostId != null;
-                const host = isRemote ? hosts.find((h) => h.id === sess!.hostId) : null;
-                const rawName = sess?.rawName ?? name;
-                const termCmd = isRemote && host ? "ssh" : "tmux";
-                const termArgs = isRemote && host
-                  ? buildSshAttachArgs(host, rawName)
-                  : ["attach-session", "-t", rawName];
-                return (
-                  <div
-                    key={`s:${name}`}
-                    className="term-slot"
-                    style={{
-                      display:
-                        selection?.kind === "session" && selection.name === name
-                          ? "flex"
-                          : "none",
-                    }}
-                  >
-                    <Terminal
-                      cmd={termCmd}
-                      args={termArgs}
-                      cwd={isRemote ? undefined : cwdsBySession[name]}
-                      linkCwd={cwdsBySession[name]}
-                      active={
-                        !anyModalOpen &&
-                        selection?.kind === "session" && selection.name === name
-                      }
-                      tmuxSession={name}
-                      hostId={sess?.hostId ?? null}
-                      initialHistory={tmuxPreviews[name]}
-                      onOpenFile={handleOpenFile}
-                    />
-                  </div>
-                );
-              })}
-              {openedTerminals.map((id) => {
-                const t = allTerminals.find((x) => x.id === id);
-                if (!t) return null;
-                const remoteHost = t.hostId ? hosts.find((h) => h.id === t.hostId) : null;
-                if (t.hostId && !remoteHost) return null;
-                const rawName = terminalRawName(t);
-                const sessionKey = terminalSessionKey(t);
-                return (
-                  <div
-                    key={`t:${id}`}
-                    className="term-slot"
-                    style={{
-                      display:
-                        selection?.kind === "terminal" && selection.id === id
-                          ? "flex"
-                          : "none",
-                    }}
-                  >
-                    <Terminal
-                      cmd={t.hostId ? "ssh" : "tmux"}
-                      args={
-                        t.hostId && remoteHost
-                          ? buildSshAttachArgs(remoteHost, rawName)
-                          : ["attach-session", "-t", t.tmuxName]
-                      }
-                      cwd={t.hostId ? undefined : t.cwd}
-                      linkCwd={t.cwd}
-                      active={
-                        !anyModalOpen &&
-                        selection?.kind === "terminal" && selection.id === id
-                      }
-                      tmuxSession={sessionKey}
-                      hostId={t.hostId ?? null}
-                      initialHistory={tmuxPreviews[sessionKey]}
-                      onOpenFile={handleOpenFile}
-                    />
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ) : (
+        ) : !selection ? (
           <div className="pane pane--empty">
             <div className="pane__hint">
               select a session, terminal, or automation
             </div>
           </div>
-        )}
+        ) : null}
       </main>
 
       {/* ── Scratch panel ── */}
@@ -2803,6 +2444,47 @@ function App() {
         </aside>
       )}
 
+      <CommandPalette
+        open={commandPaletteOpen}
+        items={commandPaletteItems}
+        onOpenChange={setCommandPaletteOpen}
+        enableHotkey={!settingsOpen && !showNewWorktree && !showNewTerminal}
+      />
+
+      <SettingsDialog
+        open={settingsOpen}
+        initialSection={settingsSection}
+        onSectionChange={setSettingsSection}
+        onClose={() => setSettingsOpen(false)}
+        returnFocusRef={settingsTriggerRef}
+        content={{
+          connections: (
+            <ConnectionsSettings
+              hosts={hosts}
+              hostStatuses={hostStatuses}
+              sshHostCandidates={sshHostCandidates}
+              sessions={sessions}
+              terminals={allTerminals}
+              onHostsChange={setHosts}
+              installingHostId={installingHostId}
+              onInstallTw={installRemoteTw}
+              {...relaySettingsBindings}
+            />
+          ),
+          appearance: (
+            <div className="settings-info-list">
+              <div className="settings-info-row">
+                <div>
+                  <strong>Terminal theme</strong>
+                  <span>Controls xterm colors and the synchronized tmux palette.</span>
+                </div>
+                <ThemePicker current={theme} onChange={setTheme} />
+              </div>
+            </div>
+          ),
+        }}
+      />
+
       {showNewWorktree && (
         <NewWorktreeModal
           hosts={hosts}
@@ -2846,18 +2528,6 @@ function App() {
         />
       )}
 
-      {showAddHost && (
-        <AddHostModal
-          existingIds={hosts.map((h) => h.id)}
-          sshHosts={sshHostCandidates}
-          onClose={() => setShowAddHost(false)}
-          onAdded={(newHosts) => {
-            setHosts(newHosts);
-            setShowAddHost(false);
-            void refresh();
-          }}
-        />
-      )}
     </div>
   );
 }

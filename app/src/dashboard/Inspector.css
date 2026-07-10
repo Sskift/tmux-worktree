@@ -1,0 +1,169 @@
+@import "./design/tokens.css";
+
+.workspace-inspector {
+  display: grid;
+  grid-template-rows: 46px 42px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  color: var(--shell-text);
+  background: var(--shell-sidebar);
+  font-family: var(--shell-font-sans);
+}
+
+.workspace-inspector__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 12px 0 16px;
+  border-bottom: 1px solid var(--shell-border);
+}
+
+.workspace-inspector__title,
+.workspace-inspector__actions,
+.workspace-inspector__tabs {
+  display: flex;
+  align-items: center;
+}
+
+.workspace-inspector__title {
+  min-width: 0;
+  gap: 8px;
+  color: var(--shell-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.workspace-inspector__title svg {
+  color: var(--shell-text-muted);
+}
+
+.workspace-inspector__actions {
+  gap: 3px;
+}
+
+.workspace-inspector__actions button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  padding: 0;
+  color: var(--shell-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--shell-radius-sm);
+  cursor: pointer;
+}
+
+.workspace-inspector__actions button:hover {
+  color: var(--shell-text);
+  background: var(--shell-surface-hover);
+  border-color: var(--shell-border);
+}
+
+.workspace-inspector__tabs {
+  gap: 2px;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--shell-border);
+  scrollbar-width: none;
+}
+
+.workspace-inspector__tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.workspace-inspector__tabs > button {
+  display: inline-flex;
+  min-width: 0;
+  height: 30px;
+  flex: 0 1 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  color: var(--shell-text-muted);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--shell-radius-sm);
+  font: 500 11px/1 var(--shell-font-sans);
+  cursor: pointer;
+}
+
+.workspace-inspector__tabs > button:hover {
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-2);
+}
+
+.workspace-inspector__tabs > button[aria-selected="true"] {
+  color: var(--shell-text);
+  background: var(--shell-surface-3);
+  border-color: var(--shell-border);
+}
+
+.workspace-inspector__badge {
+  min-width: 16px;
+  padding: 2px 4px;
+  color: var(--shell-text-secondary);
+  background: var(--shell-surface-hover);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 12px;
+  text-align: center;
+}
+
+.workspace-inspector__panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  outline: none;
+}
+
+.workspace-inspector__empty {
+  display: grid;
+  min-height: 240px;
+  place-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--shell-text-faint);
+  text-align: center;
+}
+
+.workspace-inspector__empty strong {
+  color: var(--shell-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.workspace-inspector__empty span {
+  max-width: 250px;
+  color: var(--shell-text-muted);
+  font-size: 11px;
+  line-height: 16px;
+}
+
+.workspace-inspector :where(button, [tabindex="0"]):focus-visible {
+  outline: 2px solid var(--shell-focus);
+  outline-offset: -2px;
+}
+
+@media (max-width: 390px) {
+  .workspace-inspector__tabs > button span:not(.workspace-inspector__badge) {
+    display: none;
+  }
+
+  .workspace-inspector__tabs > button {
+    flex: 1 0 40px;
+    justify-content: center;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .workspace-inspector__actions button,
+  .workspace-inspector__tabs > button {
+    transition: none;
+  }
+}

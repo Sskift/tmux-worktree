@@ -51,8 +51,12 @@ test("add host modal shows the default SSH port when none is configured", () => 
   assert.doesNotMatch(modal, /\{selectedCandidate\.port && <div>Port:/);
 });
 
-test("app loads ssh host candidates and keeps host status outside worktree list", () => {
+test("app loads ssh host candidates into Settings and keeps host status outside worktree list", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const connections = readFileSync(
+    new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
+    "utf8",
+  );
   const catalog = readFileSync(
     new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
     "utf8",
@@ -61,7 +65,12 @@ test("app loads ssh host candidates and keeps host status outside worktree list"
   assert.match(app, /useDashboardCatalog\(\)/);
   assert.match(catalog, /dashboardBackend\.hosts\.candidates\(\)/);
   assert.match(app, /sshHostCandidates/);
-  assert.match(app, /sshHosts=\{sshHostCandidates\}/);
+  assert.match(app, /sshHostCandidates=\{sshHostCandidates\}/);
+  assert.match(app, /hostStatuses=\{hostStatuses\}/);
+  assert.match(connections, /sshHostCandidates:\s*readonly HostConfig\[\]/);
+  assert.match(connections, /hostStatuses:\s*Readonly<Record<string, HostStatus>>/);
+  assert.match(connections, /const status = hostStatuses\[host\.id\]/);
+  assert.doesNotMatch(app, /sshHosts=\{sshHostCandidates\}/);
   const statusIndex = app.indexOf("sidebar__host-status");
   const listsIndex = app.indexOf('className="sidebar__lists"');
   assert.ok(statusIndex >= 0, "host status should render in its own header area");

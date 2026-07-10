@@ -1,0 +1,196 @@
+@import "./design/tokens.css";
+
+.tw-shell {
+  --tw-sidebar-width: 280px;
+  --tw-inspector-width: 420px;
+  --tw-inspector-track: var(--tw-inspector-width);
+
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--shell-text);
+  background: var(--shell-bg);
+  font-family: var(--shell-font-sans);
+}
+
+.tw-shell[data-inspector-open="false"] {
+  --tw-inspector-track: 0px;
+}
+
+.tw-shell__titlebar {
+  position: relative;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  min-width: 0;
+  color: var(--shell-text-muted);
+  background: var(--shell-bg);
+  border-bottom: 1px solid var(--shell-border);
+  user-select: none;
+}
+
+.tw-shell__body {
+  position: relative;
+  display: grid;
+  grid-template-columns:
+    var(--tw-sidebar-width)
+    minmax(640px, 1fr)
+    var(--tw-inspector-track);
+  width: 100%;
+  height: calc(100vh - 44px);
+  min-width: 0;
+  overflow: hidden;
+  transition: grid-template-columns var(--shell-motion-fast) var(--shell-ease);
+}
+
+.tw-shell__sidebar,
+.tw-shell__inspector,
+.tw-shell__center,
+.tw-shell__workspace {
+  min-width: 0;
+  min-height: 0;
+}
+
+.tw-shell__sidebar {
+  z-index: 30;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--shell-workspace), #0a0a0b);
+  border-right: 1px solid var(--shell-border);
+}
+
+.tw-shell__center {
+  display: grid;
+  grid-template-rows: 52px minmax(0, 1fr);
+  overflow: hidden;
+  background: var(--shell-workspace);
+}
+
+.tw-shell__header {
+  min-width: 0;
+  overflow: hidden;
+  background: #151517;
+  border-bottom: 1px solid var(--shell-border);
+}
+
+.tw-shell__workspace {
+  position: relative;
+  overflow: hidden;
+  background: linear-gradient(180deg, var(--shell-surface-1), var(--shell-sidebar));
+}
+
+.tw-shell__inspector {
+  z-index: 30;
+  overflow: hidden;
+  visibility: visible;
+  background: var(--shell-sidebar);
+  border-left: 1px solid var(--shell-border);
+  opacity: 1;
+  transition:
+    opacity var(--shell-motion-fast) var(--shell-ease),
+    visibility var(--shell-motion-fast) linear;
+}
+
+.tw-shell[data-inspector-open="false"] .tw-shell__inspector {
+  visibility: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tw-shell__drawer-backdrop {
+  display: none;
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  border: 0;
+  background: rgb(0 0 0 / 48%);
+}
+
+@media (max-width: 1439px) {
+  .tw-shell {
+    --tw-inspector-track: 0px;
+  }
+
+  .tw-shell__body {
+    grid-template-columns: var(--tw-sidebar-width) minmax(640px, 1fr);
+  }
+
+  .tw-shell__inspector {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: var(--tw-inspector-width);
+    max-width: calc(100vw - 32px);
+    visibility: visible;
+    opacity: 1;
+    transform: translateX(100%);
+    transition:
+      transform var(--shell-motion-fast) var(--shell-ease),
+      opacity var(--shell-motion-fast) var(--shell-ease),
+      visibility var(--shell-motion-fast) linear;
+  }
+
+  .tw-shell[data-inspector-open="true"] .tw-shell__inspector {
+    transform: translateX(0);
+  }
+
+  .tw-shell[data-inspector-open="false"] .tw-shell__inspector {
+    transform: translateX(100%);
+  }
+
+  .tw-shell[data-inspector-open="true"] .tw-shell__drawer-backdrop {
+    display: block;
+  }
+}
+
+@media (max-width: 1099px) {
+  .tw-shell__body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tw-shell__sidebar {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: var(--tw-sidebar-width);
+    max-width: calc(100vw - 32px);
+    visibility: visible;
+    opacity: 1;
+    transform: translateX(-100%);
+    transition:
+      transform var(--shell-motion-fast) var(--shell-ease),
+      opacity var(--shell-motion-fast) var(--shell-ease),
+      visibility var(--shell-motion-fast) linear;
+  }
+
+  .tw-shell[data-sidebar-open="true"] .tw-shell__sidebar {
+    transform: translateX(0);
+  }
+
+  .tw-shell[data-sidebar-open="false"] .tw-shell__sidebar {
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+  }
+
+  .tw-shell[data-sidebar-open="true"] .tw-shell__drawer-backdrop,
+  .tw-shell[data-inspector-open="true"] .tw-shell__drawer-backdrop {
+    display: block;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tw-shell__body,
+  .tw-shell__sidebar,
+  .tw-shell__inspector {
+    transition: none;
+  }
+}

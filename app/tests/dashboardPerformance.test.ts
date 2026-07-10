@@ -18,6 +18,7 @@ test("dashboard refresh preserves state identity when polled data is unchanged",
 
 test("dashboard preloads tmux snapshots without live-mounting every terminal", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
   const terminal = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rust = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
@@ -29,8 +30,8 @@ test("dashboard preloads tmux snapshots without live-mounting every terminal", (
     backend,
     /captureHistory: \(name, lines\) =>\s*transport\.invoke<string>\("capture_pane_history", \{ name, lines \}\)/s,
   );
-  assert.match(app, /initialHistory=\{tmuxPreviews\[name\]\}/);
-  assert.match(app, /initialHistory=\{tmuxPreviews\[sessionKey\]\}/);
+  assert.match(deck, /initialHistory=\{tmuxPreviews\[name\]\}/);
+  assert.match(deck, /initialHistory=\{tmuxPreviews\[sessionKey\]\}/);
   assert.match(app, /if \(selection\?\.kind !== "session"\) return;/);
   assert.match(app, /if \(selection\?\.kind !== "terminal"\) return;/);
   assert.doesNotMatch(app, /mergeOpenedItems/);

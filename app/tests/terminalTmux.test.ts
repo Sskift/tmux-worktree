@@ -3,17 +3,17 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 test("ssh tmux terminals use native tmux mouse scrolling", () => {
-  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const deckSource = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
 
-  assert.match(appSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
-  assert.match(appSource, /export TERM=xterm-256color/);
-  assert.match(appSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
-  assert.match(appSource, /\$\{tmux\} has-session -t/);
-  assert.match(appSource, /copy-selection-and-cancel/);
-  assert.match(appSource, /MouseDragEnd1Pane/);
-  assert.doesNotMatch(appSource, /MouseDown1Pane/);
-  assert.match(appSource, /exec \$\{tmux\} attach-session -t/);
+  assert.match(deckSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
+  assert.match(deckSource, /export TERM=xterm-256color/);
+  assert.match(deckSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
+  assert.match(deckSource, /\$\{tmux\} has-session -t/);
+  assert.match(deckSource, /copy-selection-and-cancel/);
+  assert.match(deckSource, /MouseDragEnd1Pane/);
+  assert.doesNotMatch(deckSource, /MouseDown1Pane/);
+  assert.match(deckSource, /exec \$\{tmux\} attach-session -t/);
   assert.doesNotMatch(terminalSource, /tmux_scroll/);
   assert.doesNotMatch(terminalSource, /onTmuxWheel/);
   assert.match(terminalSource, /attachCustomWheelEventHandler/);
