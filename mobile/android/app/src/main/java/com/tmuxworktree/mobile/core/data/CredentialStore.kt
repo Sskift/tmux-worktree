@@ -50,17 +50,17 @@ class AndroidKeystoreCredentialStore(context: Context) : CredentialStore {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, getOrCreateKey())
         val ciphertext = cipher.doFinal(secret.toByteArray(Charsets.UTF_8))
-        preferences.edit()
+        val persisted = preferences.edit()
             .putInt(KEY_VERSION, 1)
             .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
             .putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-            .apply()
-        check(read() == secret) { "Credential verification failed" }
+            .commit()
+        check(persisted && read() == secret) { "Credential persistence verification failed" }
     }
 
     @Synchronized
     override fun clear() {
-        preferences.edit().clear().apply()
+        check(preferences.edit().clear().commit()) { "Credential preferences could not be cleared" }
         val keyStore = loadKeyStore()
         if (keyStore.containsAlias(KEY_ALIAS)) keyStore.deleteEntry(KEY_ALIAS)
     }

@@ -91,6 +91,22 @@ class V2ViewModelProfileInstrumentedTest {
         assertTrue(container.repository.outbox.first().isEmpty())
     }
 
+    @Test
+    fun storedCleartextRelayProfileReturnsToPairingReview() = runBlocking {
+        container.preferences.saveProfile("ws://private-relay.example.com", "old-host", true)
+        container.credentials.write("old-secret")
+        val viewModel = createViewModel()
+
+        val review = awaitState(viewModel) {
+            it.initialized && it.pairingRequired && !it.pairingError.isNullOrBlank()
+        }
+
+        assertEquals("ws://private-relay.example.com", review.pairingRelayUrl)
+        assertEquals("old-host", review.pairingHostId)
+        assertTrue(review.pairingError.orEmpty().contains("Use wss://"))
+        assertFalse(review.isConnecting)
+    }
+
     private fun createViewModel(): V2ViewModel = ViewModelProvider(
         owner,
         V2ViewModel.factory(container, demoMode = false),

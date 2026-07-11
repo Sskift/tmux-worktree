@@ -95,6 +95,9 @@ class RelayV1ConnectionActor(
     private var selectedHostId: String = ""
     private var desiredTerminal: DesiredTerminal? = null
     private var pendingReopenGeneration: Long? = null
+    private val terminalOutputBuffer = StringBuilder()
+    private var terminalOutputStreamId: String? = null
+    private var terminalOutputFlushJob: Job? = null
 
     init {
         scope.launch {
@@ -310,6 +313,7 @@ class RelayV1ConnectionActor(
     private suspend fun handle(action: Action) {
         when (action) {
             is Action.Connect -> {
+                flushTerminalOutput()
                 val sameConfig = config == action.config
                 cancelHandshakeTimeout()
                 cancelTerminalOpenTimeout()
@@ -338,6 +342,7 @@ class RelayV1ConnectionActor(
                 transition(RelayTransportSignal.Start(clock()))
             }
             Action.PauseForNetwork -> {
+                flushTerminalOutput()
                 cancelHandshakeTimeout()
                 cancelTerminalOpenTimeout()
                 rejectPendingRequests(
@@ -362,6 +367,7 @@ class RelayV1ConnectionActor(
             }
             is Action.Disconnect -> {
                 try {
+                    flushTerminalOutput()
                     cancelHandshakeTimeout()
                     cancelTerminalOpenTimeout()
                     rejectPendingRequests(
@@ -400,6 +406,7 @@ class RelayV1ConnectionActor(
             is Action.HandshakeTimeout -> handshakeTimedOut(action)
             is Action.TerminalOpenTimeout -> terminalOpenTimedOut(action)
             is Action.RequestTimeout -> requestTimedOut(action)
+            is Action.FlushTerminalOutput -> flushTerminalOutput(action.streamId)
             Action.Shutdown -> shutdownFromActor()
             is Action.ReopenTerminal -> reopenTerminalNow(action)
             is Action.DelayedRefresh -> if (action.epoch == transport.epoch) {
@@ -530,6 +537,7 @@ class RelayV1ConnectionActor(
             "Connection failed before acknowledgement; delivery is ambiguous",
         )
         if (transport.phase == TransportPhase.AUTH_REQUIRED) {
+            flushTerminalOutput()
             cancelTerminalOpenTimeout()
             desiredTerminal = null
             streams.clear()
@@ -541,6 +549,7 @@ class RelayV1ConnectionActor(
     }
 
     private fun prepareTerminalForConnectionRecovery(reason: String) {
+        flushTerminalOutput()
         cancelTerminalOpenTimeout()
         val active = streams.clear()
         pendingReopenGeneration = null
@@ -773,6 +782,7 @@ class RelayV1ConnectionActor(
             mutateSnapshots(RelaySnapshotMutation.RemoveSession(hostId, sessionName, clock()))
             val desired = desiredTerminal
             if (desired?.hostId == hostId && desired.sessionName == sessionName) {
+                flushTerminalOutput()
                 cancelTerminalOpenTimeout()
                 desiredTerminal = null
                 streams.clear()
@@ -789,13 +799,14 @@ class RelayV1ConnectionActor(
         cancelTerminalOpenTimeout()
         streams.markOpen(active.streamId)
         _terminal.value = streams.state(ConnectionStatus.ONLINE)
-        if (event.data.isNotEmpty()) emit(RelayClientEvent.TerminalData(active.streamId, event.data))
+        if (event.data.isNotEmpty()) queueTerminalOutput(active.streamId, event.data)
     }
 
     private fun handleTerminalExit(event: RelayV1Event.TerminalExit) {
         if (!streams.accepts(event.streamId)) return
         cancelTerminalOpenTimeout()
         val active = streams.close(event.streamId) ?: return
+        flushTerminalOutput(active.streamId)
         _terminal.value = TerminalStreamState(
             streamId = null,
             sessionId = "${active.hostId}:${active.sessionName}",
@@ -827,6 +838,7 @@ class RelayV1ConnectionActor(
             normalized.contains("host reconnected")
         val active = streams.current()
         if (recoverable && active != null && streams.accepts(event.streamId)) {
+            flushTerminalOutput(active.streamId)
             cancelTerminalOpenTimeout()
             pendingReopenGeneration = active.generation
             streams.close(active.streamId)
@@ -854,6 +866,7 @@ class RelayV1ConnectionActor(
         pane: RelayV1Pane?,
         resetDisplay: Boolean,
     ) {
+        flushTerminalOutput()
         cancelTerminalOpenTimeout()
         val old = streams.current()
         if (old != null && old.streamId != streamId) {
@@ -910,6 +923,7 @@ class RelayV1ConnectionActor(
     }
 
     private fun closeTerminalNow() {
+        flushTerminalOutput()
         cancelTerminalOpenTimeout()
         streams.current()?.let { sendNow(RelayV1Command.CloseTerminal(it.streamId)) }
         streams.clear()
@@ -1081,6 +1095,7 @@ class RelayV1ConnectionActor(
     }
 
     private fun shutdownFromActor() {
+        flushTerminalOutput()
         cancelHandshakeTimeout()
         cancelTerminalOpenTimeout()
         retryJob?.cancel()
@@ -1110,6 +1125,36 @@ class RelayV1ConnectionActor(
 
     private fun emit(event: RelayClientEvent) {
         eventChannel.trySend(event).getOrThrow()
+    }
+
+    private fun queueTerminalOutput(streamId: String, data: String) {
+        if (terminalOutputStreamId != null && terminalOutputStreamId != streamId) {
+            flushTerminalOutput()
+        }
+        terminalOutputStreamId = streamId
+        terminalOutputBuffer.append(data)
+        if (terminalOutputBuffer.length >= MAX_TERMINAL_OUTPUT_BATCH_CHARS) {
+            flushTerminalOutput(streamId)
+            return
+        }
+        if (terminalOutputFlushJob == null) {
+            terminalOutputFlushJob = scope.launch {
+                delay(TERMINAL_OUTPUT_BATCH_MILLIS)
+                actions.send(Action.FlushTerminalOutput(streamId))
+            }
+        }
+    }
+
+    private fun flushTerminalOutput(expectedStreamId: String? = null) {
+        val streamId = terminalOutputStreamId ?: return
+        if (expectedStreamId != null && expectedStreamId != streamId) return
+        terminalOutputFlushJob?.cancel()
+        terminalOutputFlushJob = null
+        if (terminalOutputBuffer.isNotEmpty()) {
+            emit(RelayClientEvent.TerminalData(streamId, terminalOutputBuffer.toString()))
+        }
+        terminalOutputBuffer.clear()
+        terminalOutputStreamId = null
     }
 
     private data class DesiredTerminal(
@@ -1148,6 +1193,7 @@ class RelayV1ConnectionActor(
             val generation: Long,
         ) : Action
         data class RequestTimeout(val epoch: Long, val requestId: String) : Action
+        data class FlushTerminalOutput(val streamId: String) : Action
         data object Shutdown : Action
         data class ReopenTerminal(val epoch: Long, val generation: Long) : Action
         data class DelayedRefresh(val epoch: Long, val hostId: String) : Action
@@ -1156,6 +1202,8 @@ class RelayV1ConnectionActor(
     companion object {
         const val DEFAULT_HANDSHAKE_TIMEOUT_MILLIS = 10_000L
         const val DEFAULT_TERMINAL_OPEN_TIMEOUT_MILLIS = 10_000L
+        private const val TERMINAL_OUTPUT_BATCH_MILLIS = 16L
+        private const val MAX_TERMINAL_OUTPUT_BATCH_CHARS = 64 * 1024
 
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)

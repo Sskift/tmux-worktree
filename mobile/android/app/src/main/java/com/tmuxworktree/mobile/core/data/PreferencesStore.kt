@@ -73,8 +73,8 @@ class PreferencesStore(context: Context) {
         store.edit { it[Keys.autoConnect] = enabled }
     }
 
-    suspend fun setLegacyIdentityMigrated() {
-        store.edit { it[Keys.legacyMigrated] = true }
+    suspend fun setLegacyIdentityMigrated(migrated: Boolean = true) {
+        store.edit { it[Keys.legacyMigrated] = migrated }
     }
 
     suspend fun setNotificationPreference(kind: NotificationKind, enabled: Boolean) {

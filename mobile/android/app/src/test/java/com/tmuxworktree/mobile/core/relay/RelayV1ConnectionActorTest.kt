@@ -12,6 +12,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.take
@@ -119,6 +120,61 @@ class RelayV1ConnectionActorTest {
             val upgrade = server.takeRequest(5, TimeUnit.SECONDS)
             assertEquals("Bearer secret", upgrade?.getHeader("Authorization"))
             assertEquals("/client", upgrade?.path)
+        } finally {
+            actor.close()
+            actorScope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `terminal output is batched in order and flushed before exit`() = runBlocking {
+        val commands = CopyOnWriteArrayList<String>()
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                snapshotListener(commands) { webSocket, payload ->
+                    val streamId = payload.string("streamId")
+                    webSocket.send(
+                        "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"hello \"}",
+                    )
+                    webSocket.send(
+                        "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"world\"}",
+                    )
+                    webSocket.send(
+                        "{\"type\":\"terminal_exit\",\"streamId\":\"$streamId\",\"code\":0}",
+                    )
+                },
+            ),
+        )
+        server.start()
+        val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(actorScope)
+
+        try {
+            actor.connect(configFor(server))
+            withTimeout(5_000) { actor.snapshots.first { it.sessions.isNotEmpty() } }
+            val terminalEvents = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events
+                        .filter {
+                            it is RelayClientEvent.TerminalData ||
+                                it is RelayClientEvent.TerminalExit
+                        }
+                        .take(2)
+                        .toList()
+                }
+            }
+
+            val streamId = actor.openTerminal("mac-admin", "local:demo")
+            val events = terminalEvents.await()
+
+            val output = events[0] as RelayClientEvent.TerminalData
+            val exit = events[1] as RelayClientEvent.TerminalExit
+            assertEquals(streamId, output.streamId)
+            assertEquals("hello world", output.data)
+            assertEquals(streamId, exit.streamId)
+            assertEquals(0, exit.code)
         } finally {
             actor.close()
             actorScope.cancel()

@@ -892,6 +892,21 @@ class V2ViewModel(
         val token = credentials.read().orEmpty()
         if (relayUrl.isBlank() || token.isBlank()) return
         val hostId = state.activeHostId.ifBlank { state.pairingHostId }
+        val validationError = validatePairing(relayUrl, token, hostId)
+        if (validationError != null) {
+            connectedConfigKey = null
+            relay.disconnect()
+            _uiState.update {
+                it.copy(
+                    pairingRequired = true,
+                    pairingRelayUrl = relayUrl,
+                    pairingHostId = hostId,
+                    pairingError = "Saved connection needs review: $validationError",
+                    isConnecting = false,
+                )
+            }
+            return
+        }
         val configKey = "$relayUrl|$hostId|${token.hashCode()}"
         if (!force && configKey == connectedConfigKey && rawHealth.phase != TransportPhase.STOPPED) return
         connectedConfigKey = configKey
@@ -1214,7 +1229,11 @@ class V2ViewModel(
         )
     }
 
-    private fun validatePairing(relayUrl: String, token: String): String? {
+    private fun validatePairing(
+        relayUrl: String,
+        token: String,
+        hostId: String = _uiState.value.pairingHostId.trim(),
+    ): String? {
         if (relayUrl.isBlank()) return "Relay URL is required"
         if (relayUrl.length > MAX_RELAY_URL_LENGTH) return "Relay URL is too long"
         if (relayUrl.any { it.isISOControl() || it.isWhitespace() }) return "Relay URL contains invalid characters"
@@ -1242,8 +1261,7 @@ class V2ViewModel(
         if (token.any { it == '\u0000' || it == '\r' || it == '\n' }) {
             return "Pairing token contains invalid characters"
         }
-        val hostId = _uiState.value.pairingHostId.trim()
-        if (hostId.isNotEmpty() && !HOST_ID_PATTERN.matches(hostId)) {
+        if (hostId.trim().isNotEmpty() && !HOST_ID_PATTERN.matches(hostId.trim())) {
             return "Computer identifier is invalid"
         }
         return null

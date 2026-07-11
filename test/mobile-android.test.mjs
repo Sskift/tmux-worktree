@@ -9,6 +9,9 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   const webView = read(
     "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/terminal/TerminalWebView.kt",
   );
+  const relayActor = read(
+    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayV1ConnectionActor.kt",
+  );
 
   assert.match(html, /<script src="xterm\.js"><\/script>/);
   assert.match(html, /<script src="xterm-addon-fit\.js"><\/script>/);
@@ -16,6 +19,8 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   assert.match(html, /function fitBurst\(\)/);
   assert.match(html, /visualViewport\.addEventListener\('resize', fitBurst\)/);
   assert.match(html, /new ResizeObserver\(fitBurst\)/);
+  assert.match(html, /Content-Security-Policy/);
+  assert.match(html, /connect-src 'none'/);
   assert.match(
     html,
     /terminal\.cols !== lastCols \|\| terminal\.rows !== lastRows/,
@@ -25,10 +30,18 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   assert.match(webView, /settings\.allowContentAccess = false/);
   assert.match(webView, /settings\.mixedContentMode = WebSettings\.MIXED_CONTENT_NEVER_ALLOW/);
   assert.match(webView, /modifier = modifier\.clipToBounds\(\)/);
+  assert.match(relayActor, /terminalOutputBuffer\.append\(data\)/);
+  assert.match(relayActor, /delay\(TERMINAL_OUTPUT_BATCH_MILLIS\)/);
+  assert.match(relayActor, /MAX_TERMINAL_OUTPUT_BATCH_CHARS = 64 \* 1024/);
+  assert.match(
+    relayActor,
+    /handleTerminalExit[\s\S]*flushTerminalOutput\(active\.streamId\)[\s\S]*RelayClientEvent\.TerminalExit/,
+  );
 });
 
 test("Android package is on the V2 Compose line and V2Activity owns the launcher", () => {
   const gradle = read("mobile/android/app/build.gradle.kts");
+  const wrapper = read("mobile/android/gradle/wrapper/gradle-wrapper.properties");
   const manifest = read("mobile/android/app/src/main/AndroidManifest.xml");
   const activityBlocks = [
     ...manifest.matchAll(/<activity\b[^>]*\/>|<activity\b[^>]*>[\s\S]*?<\/activity>/g),
@@ -41,20 +54,20 @@ test("Android package is on the V2 Compose line and V2Activity owns the launcher
   );
   const versionCode = Number(gradle.match(/versionCode\s*=\s*(\d+)/)?.[1]);
   const versionName = gradle.match(/versionName\s*=\s*"([^"]+)"/)?.[1];
+  const repositoryVersion = JSON.parse(read("package.json")).version;
 
   assert.ok(versionCode >= 20000, `expected V2 versionCode, got ${versionCode}`);
-  assert.match(versionName ?? "", /^2\./);
+  assert.equal(versionName, repositoryVersion);
   assert.match(gradle, /id\("org\.jetbrains\.kotlin\.plugin\.compose"\)/);
   assert.match(gradle, /compose = true/);
   assert.match(gradle, /androidx\.room:room-runtime/);
+  assert.match(wrapper, /distributionSha256Sum=[a-f0-9]{64}/);
   assert.ok(v2Activity, "V2Activity must be declared");
   assert.match(v2Activity, /android:exported="true"/);
   assert.match(v2Activity, /android\.intent\.action\.MAIN/);
   assert.match(v2Activity, /android\.intent\.category\.LAUNCHER/);
-  assert.match(v2Activity, /android\.intent\.action\.VIEW/);
-  assert.match(v2Activity, /android\.intent\.category\.BROWSABLE/);
-  assert.match(v2Activity, /android:scheme="tmuxworktree"/);
-  assert.match(v2Activity, /android:host="pair"/);
+  assert.doesNotMatch(manifest, /android\.intent\.category\.BROWSABLE/);
+  assert.doesNotMatch(manifest, /android:scheme="tmuxworktree"/);
   assert.ok(legacyActivity, "legacy MainActivity must remain directly addressable internally");
   assert.doesNotMatch(legacyActivity, /android\.intent\.action\.MAIN/);
   assert.match(legacyActivity, /android:exported="false"/);
@@ -178,6 +191,9 @@ test("Android V2 connection profile is editable, clearable, and never persists p
   const importer = read(
     "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/LegacyIdentityImporter.kt",
   );
+  const viewModel = read(
+    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2ViewModel.kt",
+  );
 
   assert.match(pairing, /onRelayUrlChange: \(String\) -> Unit/);
   assert.match(pairing, /onTokenChange: \(String\) -> Unit/);
@@ -190,8 +206,20 @@ test("Android V2 connection profile is editable, clearable, and never persists p
   assert.match(credentials, /AndroidKeyStore/);
   assert.match(credentials, /AES\/GCM\/NoPadding/);
   assert.match(credentials, /KEY_CIPHERTEXT/);
-  assert.match(importer, /legacy\.edit\(\)\.remove\("relaySecret"\)/);
+  assert.match(credentials, /val persisted = preferences\.edit\(\)[\s\S]*\.commit\(\)/);
+  assert.doesNotMatch(credentials, /\.apply\(\)/);
+  assert.match(importer, /\.remove\("relaySecret"\)\.commit\(\)/);
+  assert.doesNotMatch(importer, /\.remove\("relaySecret"\)\.apply\(\)/);
+  assert.match(
+    importer,
+    /removeLingeringPlaintext\(legacy\)[\s\S]*preferencesStore\.setLegacyIdentityMigrated\(\)/,
+  );
+  assert.match(importer, /legacyIdentityMigrated\) \{[\s\S]*removeLingeringPlaintext\(legacy\)/);
   assert.match(importer, /Legacy plaintext credential was not removed/);
+  assert.match(
+    viewModel,
+    /private fun connectActiveProfile[\s\S]*validatePairing\(relayUrl, token, hostId\)[\s\S]*pairingRequired = true/,
+  );
 });
 
 test("Android V2 requires confirmation and clears credential-bound data before profile changes", () => {

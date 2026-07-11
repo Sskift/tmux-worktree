@@ -72,4 +72,108 @@ class PreferencesAndCredentialInstrumentedTest {
         assertNull(store.read())
         assertTrue(securePreferences.all.isEmpty())
     }
+
+    @Test
+    fun legacyIdentityMigrationMovesCredentialAndSynchronouslyRemovesPlaintext() = runTest {
+        val preferences = PreferencesStore(context)
+        val credentials = AndroidKeystoreCredentialStore(context)
+        val legacy = context.getSharedPreferences("identity", Context.MODE_PRIVATE)
+
+        preferences.clearProfile()
+        preferences.setLegacyIdentityMigrated(false)
+        credentials.clear()
+        assertTrue(
+            legacy.edit()
+                .clear()
+                .putString("relayUrl", "wss://relay.example.com")
+                .putString("relaySecret", "legacy-plaintext-token")
+                .putString("hostId", "mac-admin")
+                .putBoolean("autoConnect", true)
+                .commit(),
+        )
+
+        val imported = LegacyIdentityImporter(context, preferences, credentials).importIfNeeded()
+
+        assertTrue(imported)
+        assertEquals("legacy-plaintext-token", credentials.read())
+        assertFalse(legacy.contains("relaySecret"))
+        val migrated = preferences.values.first()
+        assertTrue(migrated.legacyIdentityMigrated)
+        assertEquals("wss://relay.example.com", migrated.relayUrl)
+        assertEquals("mac-admin", migrated.preferredHostId)
+        assertTrue(migrated.autoConnect)
+
+        credentials.clear()
+        assertTrue(legacy.edit().clear().commit())
+        preferences.clearProfile()
+        preferences.setLegacyIdentityMigrated(false)
+    }
+
+    @Test
+    fun legacyIdentityMigrationDoesNotMarkCompleteWhenPlaintextCommitFails() = runTest {
+        val preferences = PreferencesStore(context)
+        val credentials = AndroidKeystoreCredentialStore(context)
+        val legacy = context.getSharedPreferences("identity", Context.MODE_PRIVATE)
+
+        preferences.clearProfile()
+        preferences.setLegacyIdentityMigrated(false)
+        credentials.clear()
+        assertTrue(
+            legacy.edit()
+                .clear()
+                .putString("relayUrl", "wss://relay.example.com")
+                .putString("relaySecret", "legacy-plaintext-token")
+                .putString("hostId", "mac-admin")
+                .commit(),
+        )
+
+        try {
+            val error = runCatching {
+                LegacyIdentityImporter(
+                    context = context,
+                    preferencesStore = preferences,
+                    credentialStore = credentials,
+                    removeLegacySecret = { false },
+                ).importIfNeeded()
+            }.exceptionOrNull()
+
+            assertTrue(error is IllegalStateException)
+            assertTrue(legacy.contains("relaySecret"))
+            assertFalse(preferences.values.first().legacyIdentityMigrated)
+            assertEquals("legacy-plaintext-token", credentials.read())
+        } finally {
+            credentials.clear()
+            assertTrue(legacy.edit().clear().commit())
+            preferences.clearProfile()
+            preferences.setLegacyIdentityMigrated(false)
+        }
+    }
+
+    @Test
+    fun completedLegacyMigrationStillScrubsLingeringPlaintext() = runTest {
+        val preferences = PreferencesStore(context)
+        val credentials = AndroidKeystoreCredentialStore(context)
+        val legacy = context.getSharedPreferences("identity", Context.MODE_PRIVATE)
+
+        preferences.setLegacyIdentityMigrated(true)
+        assertTrue(
+            legacy.edit()
+                .clear()
+                .putString("relaySecret", "left-behind-by-interrupted-apply")
+                .commit(),
+        )
+
+        try {
+            val imported = LegacyIdentityImporter(context, preferences, credentials).importIfNeeded()
+
+            assertFalse(imported)
+            assertFalse(legacy.contains("relaySecret"))
+            assertTrue(preferences.values.first().legacyIdentityMigrated)
+        } finally {
+            credentials.clear()
+            assertTrue(legacy.edit().clear().commit())
+            preferences.clearProfile()
+            preferences.setLegacyIdentityMigrated(false)
+        }
+    }
 }
