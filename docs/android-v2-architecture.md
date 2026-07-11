@@ -1,0 +1,199 @@
+# Android V2 产品与架构方案
+
+## 结论
+
+Android 端需要大改，但不建议为了“大改”切换到 Flutter 或 React Native。当前问题的根因不是 Kotlin 本身，而是旧版入口、状态管理、连接生命周期和产品信息架构没有形成完整闭环。
+
+V2 采用原生 Kotlin + Jetpack Compose，桌面端继续 React + Tauri，双方通过版本化 Relay 协议协作。这样既能保留 Android 对 Keystore、网络切换、进程恢复、WebView 终端和系统无障碍能力的直接控制，也不用重写已经工作的桌面与 Relay 逻辑。
+
+如果未来确定要开发 iOS，可在 Relay v2 稳定后评估 Kotlin Multiplatform 共享协议模型、重连状态机和数据校验；现阶段直接引入跨端 UI 框架会同时放大协议和界面两类风险。
+
+## 产品信息架构
+
+V2 把高频任务和低频管理拆到不同层级，避免所有能力挤在同一个页面。
+
+```text
+应用
+├── 底部一级导航
+│   ├── Inbox：待处理状态、全部会话、快速回复
+│   ├── Workspaces：按电脑/Scope/项目浏览会话
+│   └── Settings：连接、配对、通知能力说明、诊断
+├── 设备抽屉
+│   ├── 当前电脑 / 多电脑切换
+│   ├── Connection health
+│   ├── New terminal
+│   └── Pair another computer
+└── 二三级任务流
+    ├── Session detail：时间线、回复、打开终端、结束会话
+    ├── New worktree：目标 → 配置 → 确认
+    ├── New terminal：电脑、Scope、工作目录、标签
+    ├── Terminal：输入、只读、字号、键盘、重连
+    └── Pairing：扫码/手输 → 核对 Relay 地址 → 确认切换
+```
+
+原型基准覆盖 Inbox、Session detail 和 Connection health。原型及逐轮对照截图属于设计过程产物，不随生产代码进入仓库；合入后的视觉验收以当前 master 构建重新生成。
+
+## 核心用户闭环
+
+### 1. 查看并回复 Agent
+
+1. 启动后先展示 Room 缓存，不等待网络白屏。
+2. Relay 在线后刷新电脑、Scope 和会话。
+3. 用户进入会话，时间线来自本地数据库；Relay v1 没有远端 Agent 时间线事件，因此 Stage A 只展示本机发起的出站消息及其投递状态，不伪造 Agent 回复。
+4. 回复先在同一个事务中写入 Outbox 和时间线，再发送到 Relay。
+5. 同一 host/session 同时只允许一条消息在途，收到严格匹配的 ACK 后才放行下一条；不同会话可以并行。
+6. 断网时保留可解释状态；无法确认是否送达时标记为 `AMBIGUOUS`，不盲目重复发送。
+
+### 2. 新建 Worktree 或 Terminal
+
+1. 先选择电脑，再只展示该电脑可达的 Scope。
+2. 表单在本地完成必填校验。
+3. 命令携带 requestId、hostId 和请求上下文。
+4. 成功后写入缓存并跳转到会话或终端；失败、断线和超时都会退出加载态并给出原因。
+
+### 3. 配对与切换电脑
+
+1. 二维码和深链只预填，不自动连接。
+2. 用户必须核对 Relay URL 并点击 Connect。
+3. 已配对时，URL、host 或 token 任一变化都需要二次确认。
+4. 切换前清除旧凭证、缓存、Outbox、草稿和终端队列，再写入新凭证，避免跨 Relay 串数据。
+
+## Android 分层
+
+```text
+Compose Screens
+      │  UiState / UiEffect
+      ▼
+V2ViewModel
+  ├── PreferencesStore ── DataStore
+  ├── CredentialStore  ── Android Keystore + AES-GCM
+  ├── TwRepository     ── Room
+  ├── NetworkMonitor  ── 默认网络 identity
+  └── RelayV1ConnectionActor
+          ├── 串行 IO actor
+          ├── epoch 防旧连接回调
+          ├── 握手/请求 watchdog
+          ├── request registry
+          ├── reconnect backoff
+          ├── terminal stream registry
+          └── terminal open watchdog
+```
+
+关键原则：
+
+- UI 不直接操作 WebSocket、数据库或凭证。
+- Relay 的可变协议状态只由单线程 actor 修改。
+- Room 是缓存、时间线和 Outbox 的持久化事实来源。
+- DataStore 只保存非敏感偏好；token 只保存在 Keystore 加密存储中。
+- 终端使用随 APK 打包的 xterm 资源，通过受限 `WebViewAssetLoader` 加载，不依赖 CDN。
+- Release 只接受 `wss://`；debug 仅允许模拟器与 loopback 的明文连接。
+
+## 首个 2.x 的迁移兼容层
+
+以下代码不是无用 legacy，首个 2.x 迁移版本必须保留：
+
+- `MainActivity`：non-exported 升级兼容 shim，只负责把仍恢复旧 Activity class 的安装跳转到 `V2Activity`。当支持的升级窗口内已没有旧 task/显式组件入口，并完成升级设备验证后，可以 sunset。
+- `LegacyIdentityImporter`：把旧 `identity` SharedPreferences 中的 Relay 配置迁移到 V2 偏好和 Android Keystore，并删除旧明文 token。只有支持的升级窗口结束、迁移完成标记稳定且不再支持从 1.x 直接升级时，才可以 sunset。
+
+`TerminalWebView`、`androidx.webkit` 和 APK 内的 xterm assets 是 Compose V2 终端的当前生产实现，不属于迁移层。
+
+## 连接状态机
+
+```text
+STOPPED
+  └─ connect ─▶ CONNECTING ─▶ HANDSHAKING ─▶ ONLINE
+                    │              │             │
+                    ├─ auth ───────┴──────────▶ AUTH_REQUIRED
+                    ├─ protocol ──────────────▶ INCOMPATIBLE
+                    └─ socket/error ───────────▶ RECOVERING
+                                                   │
+                                              backoff
+                                                   └────▶ CONNECTING
+
+ONLINE / RECOVERING ── network unavailable ──▶ WAITING_FOR_NETWORK
+WAITING_FOR_NETWORK ── new network identity ──▶ CONNECTING
+```
+
+每次连接递增 epoch，旧 socket 的回调不能修改新连接。重试次数只有在收到协议 `Ready` 后才清零，单纯打开 WebSocket 不视为恢复成功；服务端发起 `onClosing` 时客户端立即确认关闭并进入退避。握手、列表查询、创建命令和消息发送使用分类型超时，终端打开另有独立 watchdog。默认网络从 Wi-Fi 切到蜂窝、VPN 或新的局域网时，即使“仍然有网”，也会重建连接。
+
+## Outbox 语义
+
+```text
+QUEUED → SENDING → SUCCEEDED
+             ├── FAILED_RETRYABLE → SENDING
+             ├── FAILED_FINAL
+             └── AMBIGUOUS → EXPIRED / CANCELLED
+```
+
+- `FAILED_RETRYABLE`：确认命令没有写入或服务端明确拒绝，可自动重试。
+- `AMBIGUOUS`：连接在确认前中断，服务端可能已经执行；为避免重复输入，不自动重发。
+- Relay v1 的调度器按 host/session 串行投递；一条 `AMBIGUOUS` 消息会阻止该会话后续消息自动越过它，直到用户取消或 TTL 过期。
+- 非空 requestId 必须精确命中当前 in-flight 记录，未知 ID 一律按过期 ACK 忽略；仅兼容旧 Relay 完全省略 requestId 的情况，并且只在匹配的 host/session 内回退。
+- 应用重启，或 socket 在 ACK 前关闭时，原 `SENDING` / `ACCEPTED` / `CONFIRMING` 状态都会收敛为 `AMBIGUOUS`。
+- 所有非最终状态都有 TTL，Outbox 与用户可见时间线在同一事务中过期。
+- Relay v2 应增加幂等 commandId 和结果查询，使 `AMBIGUOUS` 可以自动收敛。
+
+## Relay 能力边界
+
+| 能力 | Relay v1 | V2 当前处理 | Relay v2 目标 |
+|---|---:|---|---|
+| 电脑、Scope、会话列表 | 支持 | 完整接入与缓存 | 增量事件 |
+| 新建 Worktree/Terminal | 支持 | requestId + 超时 | 幂等 commandId |
+| Agent 消息 | 仅支持发送与 ACK | 持久 Outbox；真实时间线只展示本机出站消息 | 服务端去重、结果查询与双向时间线事件 |
+| 终端流 | 支持 | stream generation + 打开 watchdog + 同配置/网络恢复后自动重开 | 可续传 offset |
+| Waiting/Failed/Completed | 不支持 | 明确显示“Relay v1 不提供” | 标准 agent-state 事件 |
+| 系统通知 | 无事件来源 | 开关禁用并解释原因 | 状态事件 + Android 通知通道 |
+
+V2 不会把 Relay v1 没有的数据伪造成完整功能。Agent 状态和通知必须在 Relay v2 协议落地后再启用。
+
+### Stage A 的 Relay v1 可靠性边界
+
+- **配对隔离**：Profile 切换、遗失凭证恢复和重新配对先向 Relay actor 投递带 barrierId 的断开动作。Actor 在旧连接已排队的 ACK、reject 和状态事件之后发出同一 barrier 的 `Disconnected`；ViewModel 等待该事件后才清理六类 Room 数据、草稿、凭证和内存状态，避免旧事件写入新 Profile。
+- **分维快照**：Hosts、Sessions、Scopes 各自以 requestId 和 revision 提交。Hosts 响应只更新 host 维度并级联移除已经消失的 host；某个 host 的 sessions/scopes 只有在各自完整响应到达后才替换，不会因为响应先后顺序短暂清空其他维度或其他 host 的缓存。
+- **严格响应归属**：所有带非空未知 requestId 的 hosts、sessions、scopes、created、killed、ACK 和 error 都视为旧响应并忽略。旧版 Relay 省略 ID 时，才按预期请求类型使用 registry 中最新的兼容请求上下文。
+- **终端恢复**：成功写入 `open_terminal` 后启动 10 秒 watchdog；首个 terminal data 证明流已打开并取消计时。超时会主动关闭旧 stream、产生明确错误并将终端置为 `UNKNOWN`，不会无限停在 `RECOVERING`。断线、同配置重连或网络暂停会清理 active stream 但保留 desired terminal，待网络恢复、session 快照确认目标仍存在后以新 generation 重开；切换到不同配置则清除 desired terminal。
+- **明确限制**：Stage A 没有 Relay v2 的幂等执行、远端命令结果查询、Agent 入站时间线、Agent 状态事件、通知事件或终端 offset 续传。这些能力不能由 Android 本地状态可靠推断。
+
+## 迁移计划
+
+### 阶段 A：Android V2 可用版（已实现）
+
+- Compose 信息架构和主要页面。
+- Room 缓存、Outbox、DataStore、Keystore。
+- Relay v1 全命令接入、重连、超时、终端恢复。
+- 二维码配对、WSS 校验、多电脑切换、诊断页面。
+- JVM、设备、Lint、桌面端兼容和模拟器真实 Relay 验收。
+
+#### Stage A 验收状态
+
+- 已完成 Compose 多级信息架构、Room/DataStore/Keystore 持久层、Relay v1 actor、每会话串行 Outbox、配对切换 barrier、分维快照和终端恢复闭环。
+- 已通过 54 项 Android JVM 测试、29 项 API 36 模拟器设备测试、Debug/Release Lint（0 error）、Debug APK 与 unsigned Release 构建；32 项根项目和 70 项桌面端测试保持通过。
+- 已在模拟器安装最终 Debug APK，连接真实本地 Relay，加载真实会话并向实际 tmux 终端输入命令；飞行模式下进入明确恢复态，网络恢复后 2 秒自动重开同一终端，输出未串屏。强制停止后可恢复加密 Profile 并在 1 秒内自动回到 Online，最终 Logcat 未发现 fatal exception 或 WebView error。
+- 已在开发分支完成 390×844 基准视口的同状态原型对照、核心流程交互检查与无障碍 QA；过程截图不进入生产仓库，rebase 后以 master 构建重新执行最终验收。
+- Stage A 的“已验收”仅指 Relay v1 兼容版可用性，不代表生产签名、TLS 基础设施、后台通知或 Relay v2 能力已经完成。
+
+### 阶段 B：Relay v2（规划中，未实现）
+
+Android、broker 与 relay-host 的 Relay v2 contract 工作稿定义了权威边界、command ledger、snapshot cursor、terminal resume、错误语义和双栈迁移；该 contract 暂不随 Android 重做提交合入，待本分支 rebase master 后由 Android 与桌面/SSH 双方共同复核并单独提交，对应协议代码仍待实现。
+
+- 握手时协商协议能力。
+- commandId 幂等、命令结果查询、增量 session 事件。
+- Agent 状态、摘要、等待回复和完成事件。
+- 终端 offset/重放与短期会话凭证。
+
+### 阶段 C：生产发布（待执行，未完成）
+
+- 受信任域名或企业反向代理提供 TLS。
+- Release 签名、崩溃与匿名连接指标、数据库清理策略。
+- 通知权限引导、后台限制策略和真实设备矩阵。
+
+## 验收门槛
+
+- 外部 Intent/QR 不能自动覆盖现有配对。
+- Profile 切换后六类 Room 数据、草稿和终端队列均无残留。
+- Wi-Fi/蜂窝/VPN identity 切换可自动恢复。
+- 多条 Outbox 乱序 ACK 或单条 reject 不互相污染。
+- Relay 不回复时，握手、创建和发送不会永久加载。
+- 终端高频输出不静默丢事件，切换会话不串屏。
+- 所有核心 CTA、返回、底部导航、抽屉、表单和终端控件可操作。
+- 390×844 基准视口与原型做并排截图检查，通过视觉和无障碍 QA。
