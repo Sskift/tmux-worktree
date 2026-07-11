@@ -25,6 +25,9 @@ import type {
   FileSearchMode,
   FileSearchResult,
   GitCommit,
+  GitGraphQuery,
+  GitGraphRefs,
+  GitGraphResponse,
   GitStatus,
   HostConfig,
   HostInput,
@@ -96,6 +99,8 @@ export interface DashboardBackend {
   git: {
     status(cwd: string, hostId?: HostId): Promise<GitStatus | null>;
     log(cwd: string, limit: number, hostId?: HostId): Promise<GitCommit[]>;
+    graphRefs(cwd: string, hostId?: HostId): Promise<GitGraphRefs>;
+    graph(cwd: string, query: GitGraphQuery, hostId?: HostId): Promise<GitGraphResponse>;
     diff(cwd: string, path: string, hostId?: HostId): Promise<string>;
     fetchProjectRoots(): Promise<void>;
   };
@@ -313,6 +318,14 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
         transport.invoke<GitStatus | null>("git_status", { cwd, hostId: hostId ?? null }),
       log: (cwd, limit, hostId) =>
         transport.invoke<GitCommit[]>("git_log", { cwd, limit, hostId: hostId ?? null }),
+      graphRefs: (cwd, hostId) =>
+        transport.invoke<GitGraphRefs>("git_graph_refs", { cwd, hostId: hostId ?? null }),
+      graph: (cwd, query, hostId) =>
+        transport.invoke<GitGraphResponse>("git_graph", {
+          cwd,
+          query,
+          hostId: hostId ?? null,
+        }),
       diff: (cwd, path, hostId) =>
         transport.invoke<string>("git_diff", { cwd, path, hostId: hostId ?? null }),
       fetchProjectRoots: () => transport.invoke<void>("git_fetch_project_roots"),

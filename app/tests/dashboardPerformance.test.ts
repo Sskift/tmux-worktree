@@ -49,4 +49,8 @@ test("tauri polling commands run blocking tmux and ssh work off the main thread"
   assert.match(rust, /spawn_blocking\(list_tmux_terminals_blocking\)/);
   assert.match(rust, /async fn host_statuses\(state: State<'_, Arc<HostState>>\) -> Result<Vec<HostStatus>, String> \{/);
   assert.match(rust, /spawn_blocking\(move \|\| host_statuses_blocking\(state\)\)/);
+  assert.match(rust, /async fn git_graph_refs\(cwd: String, host_id: Option<String>\) -> Result<GitGraphRefs, String> \{/);
+  assert.match(rust, /spawn_blocking\(move \|\| git_graph_refs_for\(&cwd, host_id\.as_deref\(\)\)\)/);
+  assert.match(rust, /async fn git_graph\([\s\S]*?\) -> Result<GitGraphResult, String> \{/);
+  assert.match(rust, /spawn_blocking\(move \|\| git_graph_for\(&cwd, host_id\.as_deref\(\), query\)\)/);
 });

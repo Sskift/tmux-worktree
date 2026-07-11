@@ -285,6 +285,34 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.git.log("/repo/dashboard", 100, "host-1"),
   },
   {
+    label: "git.graphRefs normalizes an absent host",
+    command: "git_graph_refs",
+    args: { cwd: "/repo/dashboard", hostId: null },
+    call: (backend) => backend.git.graphRefs("/repo/dashboard"),
+  },
+  {
+    label: "git.graph forwards the selected canonical refs",
+    command: "git_graph",
+    args: {
+      cwd: "/repo/dashboard",
+      query: {
+        preset: "current",
+        selectedRefs: ["refs/heads/feature/editor"],
+        limit: 120,
+      },
+      hostId: "host-1",
+    },
+    call: (backend) => backend.git.graph(
+      "/repo/dashboard",
+      {
+        preset: "current",
+        selectedRefs: ["refs/heads/feature/editor"],
+        limit: 120,
+      },
+      "host-1",
+    ),
+  },
+  {
     label: "git.diff normalizes an explicit null host",
     command: "git_diff",
     args: { cwd: "/repo/dashboard", path: "src/App.tsx", hostId: null },

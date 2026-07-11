@@ -311,6 +311,7 @@ function App() {
   const [scratchCollapsed, setScratchCollapsed] = useState(true);
   const [scratchWidth, setScratchWidth] = useState(DEFAULT_SCRATCH_PANEL_WIDTH);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
+  const [editorNavigationRevision, setEditorNavigationRevision] = useState(0);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
@@ -1399,12 +1400,24 @@ function App() {
   ]);
 
   const handleOpenFile = useCallback(
-    (path: string, _line?: number, _col?: number, hostId?: string | null) => {
-      const nextFile = { path, hostId: hostId ?? null };
+    (path: string, line?: number, col?: number, hostId?: string | null) => {
+      const nextFile: EditingFile = {
+        path,
+        hostId: hostId ?? null,
+        ...(line && line > 0 ? { line } : {}),
+        ...(col && col > 0 ? { column: col } : {}),
+      };
       if (
         editingFileSourceKey(editingFileRef.current) ===
         editingFileSourceKey(nextFile)
       ) {
+        if (nextFile.line !== undefined) {
+          // Replace the location as one unit so a line-only jump cannot retain
+          // the column from a previous result. The revision also lets an exact
+          // repeated jump move the cursor back after the user has navigated.
+          setEditingFile(nextFile);
+          setEditorNavigationRevision((current) => current + 1);
+        }
         return Promise.resolve(true);
       }
       return requestEditorNavigation(() => {
@@ -2021,7 +2034,9 @@ function App() {
               : null
           }
           onFileSelect={(path, hostId) => {
-            void handleOpenFile(path, undefined, undefined, hostId);
+            void handleOpenFile(path, undefined, undefined, hostId).then((opened) => {
+              if (opened && viewportTier === "compact") setSidebarOpen(false);
+            });
           }}
         />
       </div>
@@ -2131,6 +2146,9 @@ function App() {
             <FileEditor
               filePath={editingFile.path}
               hostId={editingFile.hostId ?? null}
+              initialLine={editingFile.line}
+              initialColumn={editingFile.column}
+              navigationRevision={editorNavigationRevision}
               onClose={() => void closeEditingFile()}
               onOpenFile={handleOpenFile}
               onDirtyChange={handleEditorDirtyChange}

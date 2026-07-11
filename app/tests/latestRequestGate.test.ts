@@ -86,7 +86,10 @@ test("async views wire host-aware keys and guard state publication", () => {
   const editor = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
   const tree = readFileSync(new URL("../src/FileTree.tsx", import.meta.url), "utf8");
 
-  assert.match(git, /requestSourceKey\(hostId \?\? null, cwd, sessionName, tab\)/);
+  assert.match(
+    git,
+    /requestSourceKey\(\s*hostId \?\? null,\s*cwd,\s*sessionName,\s*tab,\s*graphPreset,\s*selectedGraphRefsKey,\s*graphLimit,/s,
+  );
   assert.match(diff, /requestSourceKey\(hostId \?\? null, cwd, filePath\)/);
   assert.match(editor, /requestSourceKey\(hostId \?\? null, filePath\)/);
   assert.match(tree, /requestSourceKey\(sourceKey, searchQuery\.trim\(\), searchMode\)/);

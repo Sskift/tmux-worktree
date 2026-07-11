@@ -167,6 +167,47 @@ export type GitCommit = {
   refs: string[];
 };
 
+export type GitGraphPreset = "head" | "current" | "all";
+
+export type GitGraphRefKind = "head" | "local" | "remote" | "tag";
+
+export type GitGraphRef = {
+  /** Canonical ref name, for example refs/heads/main. */
+  name: string;
+  shortName: string;
+  kind: GitGraphRefKind;
+  current: boolean;
+  upstream: string | null;
+};
+
+export type GitGraphRefs = {
+  refs: GitGraphRef[];
+  current: string | null;
+  upstream: string | null;
+};
+
+export type GitGraphQuery = {
+  preset: GitGraphPreset;
+  selectedRefs: string[];
+  limit?: number;
+};
+
+export type GitGraphCommit = {
+  hash: string;
+  short: string;
+  parents: string[];
+  subject: string;
+  author: string;
+  relTime: string;
+  authoredAt?: string | null;
+  decorations: GitGraphRef[];
+};
+
+export type GitGraphResponse = GitGraphRefs & {
+  commits: GitGraphCommit[];
+  hasMore: boolean;
+};
+
 export type DirEntry = {
   name: string;
   path: string;

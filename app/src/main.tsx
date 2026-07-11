@@ -5,8 +5,11 @@ import { DashboardBackendProvider, type DashboardBackend } from "./platform";
 import { tauriDashboardBackend } from "./platform/tauriBackend";
 
 async function resolveDashboardBackend(): Promise<DashboardBackend> {
+  const localWebPreview =
+    window.location.hostname === "localhost" ||
+    window.location.hostname === "127.0.0.1";
   const previewRequested =
-    import.meta.env.DEV &&
+    (import.meta.env.DEV || localWebPreview) &&
     new URLSearchParams(window.location.search).get("backend") === "fake";
   if (!previewRequested) return tauriDashboardBackend;
   const preview = await import("./platform/previewBackend");

@@ -2,6 +2,10 @@ import type { AutomationRecord, AutomationRunRecord } from "../automationTypes";
 import { createFakeDashboardBackend } from "./fakeBackend";
 import type {
   GitCommit,
+  GitGraphCommit,
+  GitGraphRef,
+  GitGraphRefs,
+  GitGraphResponse,
   GitStatus,
   HostConfig,
   HostStatus,
@@ -164,6 +168,127 @@ const gitLog: GitCommit[] = [
   },
 ];
 
+const graphRefs: GitGraphRef[] = [
+  { name: "refs/heads/tmux-worktree-app-re-ddf7c", shortName: "tmux-worktree-app-re-ddf7c", kind: "local", current: true, upstream: "refs/remotes/origin/tmux-worktree-app-re-ddf7c" },
+  { name: "refs/heads/main", shortName: "main", kind: "local", current: false, upstream: "refs/remotes/origin/main" },
+  { name: "refs/heads/feature/renderer", shortName: "feature/renderer", kind: "local", current: false, upstream: null },
+  { name: "refs/remotes/origin/tmux-worktree-app-re-ddf7c", shortName: "origin/tmux-worktree-app-re-ddf7c", kind: "remote", current: false, upstream: null },
+  { name: "refs/remotes/origin/main", shortName: "origin/main", kind: "remote", current: false, upstream: null },
+  { name: "refs/tags/v1.0.3", shortName: "v1.0.3", kind: "tag", current: false, upstream: null },
+];
+
+const refByName = new Map(graphRefs.map((ref) => [ref.name, ref]));
+const decoration = (name: string): GitGraphRef => ({ ...refByName.get(name)! });
+const graphCommits: GitGraphCommit[] = [
+  { hash: "a1b2c3d000000000000000000000000000000001", short: "a1b2c3d", parents: ["b2c3d4e000000000000000000000000000000002"], subject: "feat(editor): refine CodeMirror workspace", author: "Dashboard Preview", relTime: "4 minutes ago", decorations: [{ name: "HEAD", shortName: "HEAD", kind: "head", current: true, upstream: null }, decoration("refs/heads/tmux-worktree-app-re-ddf7c")] },
+  { hash: "b2c3d4e000000000000000000000000000000002", short: "b2c3d4e", parents: ["c3d4e5f000000000000000000000000000000003", "f6a7b8c000000000000000000000000000000006"], subject: "merge: renderer graph into dashboard", author: "Dashboard Preview", relTime: "18 minutes ago", decorations: [decoration("refs/remotes/origin/tmux-worktree-app-re-ddf7c")] },
+  { hash: "c3d4e5f000000000000000000000000000000003", short: "c3d4e5f", parents: ["d4e5f6a000000000000000000000000000000004"], subject: "fix(editor): preserve cursor and undo history", author: "Maya Patel", relTime: "31 minutes ago", decorations: [] },
+  { hash: "d4e5f6a000000000000000000000000000000004", short: "d4e5f6a", parents: ["e5f6a7b000000000000000000000000000000005"], subject: "style(editor): align syntax palette with shell", author: "Maya Patel", relTime: "1 hour ago", decorations: [] },
+  { hash: "f6a7b8c000000000000000000000000000000006", short: "f6a7b8c", parents: ["a7b8c9d000000000000000000000000000000007"], subject: "feat(git): add compact commit topology", author: "Alex Chen", relTime: "44 minutes ago", decorations: [decoration("refs/heads/feature/renderer")] },
+  { hash: "a7b8c9d000000000000000000000000000000007", short: "a7b8c9d", parents: ["e5f6a7b000000000000000000000000000000005"], subject: "test(git): cover fork and merge lanes", author: "Alex Chen", relTime: "2 hours ago", decorations: [] },
+  { hash: "e5f6a7b000000000000000000000000000000005", short: "e5f6a7b", parents: ["c8d9e0f000000000000000000000000000000008"], subject: "refactor: separate files from Git workspace", author: "Dashboard Preview", relTime: "yesterday", decorations: [decoration("refs/heads/main"), decoration("refs/remotes/origin/main")] },
+  { hash: "c8d9e0f000000000000000000000000000000008", short: "c8d9e0f", parents: [], subject: "release: dashboard v1.0.3", author: "Release Bot", relTime: "2 days ago", decorations: [decoration("refs/tags/v1.0.3")] },
+];
+
+const gitGraphRefs: GitGraphRefs = {
+  refs: graphRefs,
+  current: "refs/heads/tmux-worktree-app-re-ddf7c",
+  upstream: "refs/remotes/origin/tmux-worktree-app-re-ddf7c",
+};
+
+const gitGraph: GitGraphResponse = {
+  ...gitGraphRefs,
+  commits: graphCommits,
+  hasMore: false,
+};
+
+const previewRoot = "/Users/demo/Code/tmux-worktree";
+const previewSource = [
+  'import { useMemo, useState } from "react";',
+  'import { GitBranch, RefreshCw } from "lucide-react";',
+  'import { layoutGitGraph } from "./gitGraphLayout";',
+  '',
+  'type Commit = {',
+  '  hash: string;',
+  '  parents: string[];',
+  '  subject: string;',
+  '};',
+  '',
+  'type Props = {',
+  '  commits: Commit[];',
+  '  onRefresh: () => void;',
+  '};',
+  '',
+  'export function GitGraphView({ commits, onRefresh }: Props) {',
+  '  const [selectedCommit, setSelectedCommit] = useState<string | null>(null);',
+  '  const layout = useMemo(() => layoutGitGraph(',
+  '    commits.map((commit) => ({',
+  '      id: commit.hash,',
+  '      parentIds: commit.parents,',
+  '    })),',
+  '  ), [commits]);',
+  '',
+  '  return (',
+  '    <section className="git-graph" aria-label="Git commit graph">',
+  '      <header className="git-graph__toolbar">',
+  '        <GitBranch aria-hidden="true" />',
+  '        <strong>Commit history</strong>',
+  '        <button type="button" onClick={onRefresh}>',
+  '          <RefreshCw aria-hidden="true" />',
+  '          Refresh',
+  '        </button>',
+  '      </header>',
+  '      <ol>',
+  '        {layout.nodes.map((node) => {',
+  '          const commit = commits[node.row];',
+  '          const selected = selectedCommit === commit.hash;',
+  '          return (',
+  '            <li key={commit.hash}>',
+  '              <button',
+  '                type="button"',
+  '                aria-pressed={selected}',
+  '                onClick={() => setSelectedCommit(commit.hash)}',
+  '              >',
+  '                {commit.subject}',
+  '              </button>',
+  '            </li>',
+  '          );',
+  '        })}',
+  '      </ol>',
+  '    </section>',
+  '  );',
+  '}',
+  '',
+].join("\n");
+
+const previewDirectories = new Map<string, Array<{
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  is_hidden: boolean;
+  size: number;
+}>>([
+  [previewRoot, [
+    { name: "app", path: `${previewRoot}/app`, is_dir: true, is_symlink: false, is_hidden: false, size: 0 },
+    { name: "README.md", path: `${previewRoot}/README.md`, is_dir: false, is_symlink: false, is_hidden: false, size: 4200 },
+  ]],
+  [`${previewRoot}/app`, [
+    { name: "src", path: `${previewRoot}/app/src`, is_dir: true, is_symlink: false, is_hidden: false, size: 0 },
+    { name: "package.json", path: `${previewRoot}/app/package.json`, is_dir: false, is_symlink: false, is_hidden: false, size: 1900 },
+  ]],
+  [`${previewRoot}/app/src`, [
+    { name: "dashboard", path: `${previewRoot}/app/src/dashboard`, is_dir: true, is_symlink: false, is_hidden: false, size: 0 },
+    { name: "FileEditor.tsx", path: `${previewRoot}/app/src/FileEditor.tsx`, is_dir: false, is_symlink: false, is_hidden: false, size: 18400 },
+    { name: "GitGraphView.tsx", path: `${previewRoot}/app/src/GitGraphView.tsx`, is_dir: false, is_symlink: false, is_hidden: false, size: 16200 },
+    { name: "gitGraphLayout.ts", path: `${previewRoot}/app/src/gitGraphLayout.ts`, is_dir: false, is_symlink: false, is_hidden: false, size: 4800 },
+  ]],
+  [`${previewRoot}/app/src/dashboard`, [
+    { name: "DashboardShell.tsx", path: `${previewRoot}/app/src/dashboard/DashboardShell.tsx`, is_dir: false, is_symlink: false, is_hidden: false, size: 12400 },
+    { name: "layoutPreferences.ts", path: `${previewRoot}/app/src/dashboard/layoutPreferences.ts`, is_dir: false, is_symlink: false, is_hidden: false, size: 7200 },
+  ]],
+]);
+
 const relayStatus = {
   active: false,
   connected: false,
@@ -181,7 +306,7 @@ const relayStatus = {
 const { backend, transport } = createFakeDashboardBackend();
 const openPtys = new Set<string>();
 
-transport.selectedDirectory = "/Users/demo/Code/tmux-worktree";
+transport.selectedDirectory = previewRoot;
 
 const value = (result: unknown) => () => result;
 const nothing = () => undefined;
@@ -258,6 +383,8 @@ transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
 transport.handlers.set("git_fetch_project_roots", nothing);
 transport.handlers.set("git_status", value(gitStatus));
 transport.handlers.set("git_log", value(gitLog));
+transport.handlers.set("git_graph_refs", value(gitGraphRefs));
+transport.handlers.set("git_graph", value(gitGraph));
 transport.handlers.set("git_diff", value([
   "diff --git a/app/src/App.tsx b/app/src/App.tsx",
   "--- a/app/src/App.tsx",
@@ -266,13 +393,18 @@ transport.handlers.set("git_diff", value([
   "+import { SettingsDialog } from \"./dashboard/Settings/SettingsDialog\";",
   " import { Terminal } from \"./Terminal\";",
 ].join("\n")));
-transport.handlers.set("read_dir", value([
-  { name: "app", path: "/Users/demo/Code/tmux-worktree/app", is_dir: true, is_symlink: false, is_hidden: false, size: 0 },
-  { name: "README.md", path: "/Users/demo/Code/tmux-worktree/README.md", is_dir: false, is_symlink: false, is_hidden: false, size: 4200 },
-]));
+transport.handlers.set("read_dir", (payload) => {
+  const { path } = payload as { path: string };
+  return previewDirectories.get(path) ?? [];
+});
 transport.handlers.set("remote_read_dir", value([]));
 transport.handlers.set("search_files", value([]));
-transport.handlers.set("read_file", value("# tmux-worktree\n\nDashboard preview content.\n"));
+transport.handlers.set("read_file", (payload) => {
+  const { path } = payload as { path: string };
+  if (path.endsWith("GitGraphView.tsx")) return previewSource;
+  if (path.endsWith("package.json")) return '{\n  "name": "tmux-worktree-dashboard",\n  "private": true\n}\n';
+  return "# tmux-worktree\n\nDashboard preview content.\n";
+});
 transport.handlers.set("remote_read_file", value("# Remote preview\n"));
 transport.handlers.set("remote_read_file_base64", value(""));
 transport.handlers.set("write_file", nothing);

@@ -49,11 +49,11 @@ test("remote file links keep host identity through the SSH editor", () => {
   assert.match(terminalSource, /checkFileExists\(dashboardBackend, resolved, hostId\)/);
   assert.match(terminalSource, /openFile\(resolved, link\.line, link\.col, hostId\)/);
   assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
-  assert.match(appSource, /const nextFile = \{ path, hostId: hostId \?\? null \}/);
+  assert.match(appSource, /const nextFile: EditingFile = \{\s*path,\s*hostId: hostId \?\? null,/s);
   assert.match(appSource, /setEditingFile\(nextFile\)/);
   assert.match(appSource, /hostId=\{editingFile\.hostId \?\? null\}/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, filePath\)/);
-  assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, cur\)/);
+  assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, currentContent\)/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemoteBase64\(hostId, filePath\)/);
   assert.match(editorSource, /requestSourceKey\(hostId \?\? null, filePath\)/);
   assert.match(editorSource, /if \(!requestGate\.isCurrent\(request\)\) return;/);
@@ -92,6 +92,8 @@ test("reactivating a terminal does not steal an overlay focus return", () => {
   assert.match(source, /focused === document\.body/);
   assert.match(source, /Boolean\(host\?\.contains\(focused\)\)/);
   assert.match(source, /if \(canTerminalClaimFocus\(hostRef\.current\)\) term\.focus\(\)/);
+  assert.match(source, /termRef\.current !== term \|\| fitRef\.current !== fit/);
+  assert.match(source, /return \(\) => cancelAnimationFrame\(animationFrame\)/);
 });
 
 test("tmux status bar receives the active dashboard terminal palette", () => {

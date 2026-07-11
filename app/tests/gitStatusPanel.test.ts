@@ -22,7 +22,12 @@ test("remote git status passes host identity through git commands", () => {
 
   assert.match(panel, /hostId\?: string \| null/);
   assert.match(panel, /dashboardBackend\.git\.status\(gitCwd, hostId\)/);
-  assert.match(panel, /dashboardBackend\.git\.log\(gitCwd, 100, hostId\)/);
+  assert.match(
+    panel,
+    /dashboardBackend\.git\.graph\([\s\S]*?gitCwd,[\s\S]*?selectedRefs: selectedGraphRefs,[\s\S]*?hostId,/,
+  );
+  assert.match(panel, /GRAPH_REFRESH_MS\s*=\s*30_000/);
+  assert.match(panel, /<GitGraphView/);
   assert.match(diff, /dashboardBackend\.git\.diff\(cwd, filePath, hostId\)/);
   assert.match(
     backend,
@@ -31,6 +36,14 @@ test("remote git status passes host identity through git commands", () => {
   assert.match(
     backend,
     /log: \(cwd, limit, hostId\) =>\s*transport\.invoke<GitCommit\[]>\("git_log", \{ cwd, limit, hostId: hostId \?\? null \}\)/s,
+  );
+  assert.match(
+    backend,
+    /graphRefs: \(cwd, hostId\) =>\s*transport\.invoke<GitGraphRefs>\("git_graph_refs", \{ cwd, hostId: hostId \?\? null \}\)/s,
+  );
+  assert.match(
+    backend,
+    /graph: \(cwd, query, hostId\) =>\s*transport\.invoke<GitGraphResponse>\("git_graph", \{[\s\S]*?cwd,[\s\S]*?query,[\s\S]*?hostId: hostId \?\? null/s,
   );
   assert.match(
     backend,
@@ -56,4 +69,11 @@ test("changed files use native buttons so keyboard activation opens the diff", (
   assert.match(rowSource, /aria-label=\{`Open diff for \$\{f\.path\}`\}/);
   assert.match(rowSource, /onFileClick\?\.\(f\.path, statusCwd, hostId \?\? null\)/);
   assert.doesNotMatch(rowSource, /role="button"|tabIndex=|onKeyDown=/);
+});
+
+test("Git view controls expose their selected state", () => {
+  const source = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
+  assert.match(source, /className="git__tabs" role="group" aria-label="Git view"/);
+  assert.match(source, /aria-pressed=\{tab === "files"\}/);
+  assert.match(source, /aria-pressed=\{tab === "log"\}/);
 });

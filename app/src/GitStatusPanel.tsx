@@ -1,6 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { type GitCommit, type GitStatus, useDashboardBackend } from "./platform";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type GitGraphPreset,
+  type GitGraphRefs,
+  type GitGraphResponse,
+  type GitStatus,
+  useDashboardBackend,
+} from "./platform";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
+import { GitGraphView } from "./GitGraphView";
 import {
   createLatestRequestGate,
   requestSourceKey,
@@ -22,12 +29,14 @@ type GitPanelResult = {
   sourceKey: string;
   status: GitStatus | null;
   statusCwd: string | null;
-  log: GitCommit[] | null;
+  graphRefs: GitGraphRefs | null;
+  graph: GitGraphResponse | null;
   error: string | null;
   loading: boolean;
 };
 
 const REFRESH_MS = 4000;
+const GRAPH_REFRESH_MS = 30_000;
 const PROJECT_FETCH_MS = 5 * 60_000;
 const HIDDEN_REFRESH_MS = 30_000;
 const HIDDEN_PROJECT_FETCH_MS = 15 * 60_000;
@@ -51,19 +60,6 @@ function shortCode(code: string): string {
   return "·";
 }
 
-type RefKind = "head" | "branch" | "remote" | "tag" | "other";
-
-function classifyRef(raw: string): { kind: RefKind; label: string } {
-  const r = raw.trim();
-  if (r.startsWith("HEAD ->")) {
-    return { kind: "head", label: r.slice("HEAD ->".length).trim() };
-  }
-  if (r === "HEAD") return { kind: "head", label: "HEAD" };
-  if (r.startsWith("tag:")) return { kind: "tag", label: r.slice(4).trim() };
-  if (r.includes("/")) return { kind: "remote", label: r };
-  return { kind: "branch", label: r };
-}
-
 export function GitStatusPanel({
   cwd,
   sessionName,
@@ -74,16 +70,39 @@ export function GitStatusPanel({
 }: Props) {
   const dashboardBackend = useDashboardBackend();
   const [tab, setTab] = useState<Tab>("files");
-  const sourceKey = requestSourceKey(hostId ?? null, cwd, sessionName, tab);
+  const [graphPreset, setGraphPreset] = useState<GitGraphPreset>("current");
+  const [selectedGraphRefs, setSelectedGraphRefs] = useState<string[]>([]);
+  const [graphLimit, setGraphLimit] = useState(160);
+  const selectedGraphRefsKey = useMemo(
+    () => [...selectedGraphRefs].sort().join("\0"),
+    [selectedGraphRefs],
+  );
+  const graphContextKey = requestSourceKey(hostId ?? null, cwd, sessionName);
+  const sourceKey = requestSourceKey(
+    hostId ?? null,
+    cwd,
+    sessionName,
+    tab,
+    graphPreset,
+    selectedGraphRefsKey,
+    graphLimit,
+  );
   const requestGateRef = useRef(createLatestRequestGate());
   const [result, setResult] = useState<GitPanelResult>(() => ({
     sourceKey,
     status: null,
     statusCwd: null,
-    log: null,
+    graphRefs: null,
+    graph: null,
     error: null,
     loading: true,
   }));
+
+  useEffect(() => {
+    setGraphPreset("current");
+    setSelectedGraphRefs([]);
+    setGraphLimit(160);
+  }, [graphContextKey]);
 
   const resolveCwd = useCallback(async () => {
     if (!sessionName) return cwd;
@@ -102,7 +121,8 @@ export function GitStatusPanel({
       sourceKey,
       status: current.sourceKey === sourceKey ? current.status : null,
       statusCwd: current.sourceKey === sourceKey ? current.statusCwd : null,
-      log: current.sourceKey === sourceKey ? current.log : null,
+      graphRefs: current.sourceKey === sourceKey ? current.graphRefs : null,
+      graph: current.sourceKey === sourceKey ? current.graph : null,
       error: null,
       loading: true,
     }));
@@ -115,7 +135,8 @@ export function GitStatusPanel({
         sourceKey,
         status: null,
         statusCwd: null,
-        log: null,
+        graphRefs: null,
+        graph: null,
         error: null,
         loading: false,
       });
@@ -131,35 +152,72 @@ export function GitStatusPanel({
           sourceKey,
           status,
           statusCwd: gitCwd,
-          log: null,
+          graphRefs: null,
+          graph: null,
           error: null,
           loading: false,
         });
       } else {
-        const log = await dashboardBackend.git.log(gitCwd, 100, hostId);
+        const graph = await dashboardBackend.git.graph(
+          gitCwd,
+          {
+            preset: graphPreset,
+            selectedRefs: selectedGraphRefs,
+            limit: graphLimit,
+          },
+          hostId,
+        );
         if (!requestGate.isCurrent(request)) return;
+        const currentBranch = graph.current?.replace(/^refs\/heads\//, "") ?? null;
+        onBranchChange?.(currentBranch);
         setResult({
           sourceKey,
           status: null,
           statusCwd: gitCwd,
-          log,
+          graphRefs: {
+            refs: graph.refs,
+            current: graph.current,
+            upstream: graph.upstream,
+          },
+          graph,
           error: null,
           loading: false,
         });
       }
     } catch (error) {
       if (!requestGate.isCurrent(request)) return;
+      const message = String(error);
+      if (selectedGraphRefs.length > 0 && /(?:unknown|invalid) git ref/i.test(message)) {
+        // A live tmux pane may have changed to another repository. Drop refs
+        // from the previous catalog and immediately let the new source key
+        // refresh, instead of trapping the panel in a permanent error state.
+        setGraphPreset("current");
+        setSelectedGraphRefs([]);
+        setGraphLimit(160);
+        return;
+      }
       onBranchChange?.(null);
       setResult({
         sourceKey,
         status: null,
         statusCwd: gitCwd,
-        log: null,
-        error: String(error),
+        graphRefs: null,
+        graph: null,
+        error: message,
         loading: false,
       });
     }
-  }, [dashboardBackend.git, hostId, onBranchChange, resolveCwd, sourceKey, tab]);
+  }, [
+    dashboardBackend.git,
+    graphPreset,
+    graphLimit,
+    hostId,
+    onBranchChange,
+    resolveCwd,
+    selectedGraphRefs,
+    sourceKey,
+    tab,
+  ]);
 
   useEffect(() => {
     return () => requestGateRef.current.invalidate();
@@ -176,9 +234,9 @@ export function GitStatusPanel({
   });
   useVisibilityAwarePolling(refresh, {
     enabled: active && (!!cwd || !!sessionName),
-    visibleIntervalMs: REFRESH_MS,
+    visibleIntervalMs: tab === "files" ? REFRESH_MS : GRAPH_REFRESH_MS,
     hiddenIntervalMs: HIDDEN_REFRESH_MS,
-    refreshKey: `${active}\0${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}`,
+    refreshKey: `${active}\0${cwd ?? ""}\0${sessionName ?? ""}\0${hostId ?? ""}\0${tab}\0${graphPreset}\0${selectedGraphRefsKey}\0${graphLimit}`,
   });
 
   const currentResult: GitPanelResult = result.sourceKey === sourceKey
@@ -187,17 +245,19 @@ export function GitStatusPanel({
         sourceKey,
         status: null,
         statusCwd: null,
-        log: null,
+        graphRefs: null,
+        graph: null,
         error: null,
         loading: true,
       };
-  const { status, statusCwd, log, error, loading } = currentResult;
+  const { status, statusCwd, graphRefs, graph, error, loading } = currentResult;
 
   const tabs = (
-    <div className="git__tabs">
+    <div className="git__tabs" role="group" aria-label="Git view">
       <button
         type="button"
         className={`git__tab ${tab === "files" ? "git__tab--active" : ""}`}
+        aria-pressed={tab === "files"}
         onClick={() => setTab("files")}
       >
         files
@@ -205,6 +265,7 @@ export function GitStatusPanel({
       <button
         type="button"
         className={`git__tab ${tab === "log" ? "git__tab--active" : ""}`}
+        aria-pressed={tab === "log"}
         onClick={() => setTab("log")}
       >
         log
@@ -224,7 +285,7 @@ export function GitStatusPanel({
     );
   }
 
-  if (error) {
+  if (error && tab === "files") {
     return (
       <div className="git">
         <div className="git__header">
@@ -326,66 +387,47 @@ export function GitStatusPanel({
     );
   }
 
-  if (!log) {
-    return (
-      <div className="git">
-        <div className="git__header">
-          <span className="git__branch dim">log</span>
-          {tabs}
-        </div>
-        <div className="git__empty">{loading ? "…" : "no commits"}</div>
-      </div>
-    );
-  }
-
   return (
     <div className="git">
       <div className="git__header">
-        <span className="git__branch dim">log · {log.length}</span>
+        <span className="git__branch dim">
+          {graph?.current?.replace(/^refs\/heads\//, "") ?? "history"}
+        </span>
         {tabs}
       </div>
-      <div className="git__commits">
-        {log.length === 0 ? (
-          <div className="git__empty">no commits</div>
-        ) : (
-          log.map((c) => {
-            const merge = c.parents.length > 1;
-            return (
-              <div key={c.hash} className="git__commit" title={c.hash}>
-                <div className="git__commit-row">
-                  <span
-                    className={`git__hash ${merge ? "git__hash--merge" : ""}`}
-                    title={merge ? `merge (${c.parents.length} parents)` : c.hash}
-                  >
-                    {merge ? "⑃ " : ""}
-                    {c.short}
-                  </span>
-                  {c.refs.map((r, i) => {
-                    const { kind, label } = classifyRef(r);
-                    return (
-                      <span
-                        key={i}
-                        className={`git__ref git__ref--${kind}`}
-                        title={r}
-                      >
-                        {label}
-                      </span>
-                    );
-                  })}
-                  <span className="git__subject" title={c.subject}>
-                    {c.subject}
-                  </span>
-                </div>
-                <div className="git__commit-meta">
-                  <span className="git__author">{c.author}</span>
-                  <span className="dim">·</span>
-                  <span className="git__time">{c.rel_time}</span>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
+      <GitGraphView
+        refs={graphRefs}
+        response={graph}
+        preset={graphPreset}
+        selectedRefs={selectedGraphRefs}
+        loading={loading}
+        error={error}
+        onPresetChange={(preset) => {
+          setGraphPreset(preset);
+          setGraphLimit(160);
+          setSelectedGraphRefs((current) => {
+            if (preset === "all") return [];
+            const implicit = new Set([
+              graphRefs?.current,
+              ...(preset === "current" ? [graphRefs?.upstream] : []),
+            ].filter((ref): ref is string => Boolean(ref)));
+            return current.filter((ref) => !implicit.has(ref));
+          });
+        }}
+        onAddRef={(ref) => {
+          setGraphLimit(160);
+          setSelectedGraphRefs((current) => current.includes(ref) ? current : [...current, ref]);
+        }}
+        onRemoveRef={(ref) => {
+          setGraphLimit(160);
+          setSelectedGraphRefs((current) => current.filter((candidate) => candidate !== ref));
+        }}
+        onRefresh={() => void refresh()}
+        onLoadMore={graph?.hasMore && graphLimit < 2000
+          ? () => setGraphLimit((current) => Math.min(2000, current + 160))
+          : undefined}
+        onSelectCommit={() => {}}
+      />
     </div>
   );
 }

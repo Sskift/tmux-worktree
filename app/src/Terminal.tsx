@@ -616,12 +616,14 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     const palette = getCurrentPalette();
     term.options.theme = palette;
     applyTmuxStatusTheme(dashboardBackend, tmuxSession, palette);
-    requestAnimationFrame(() => {
+    const animationFrame = requestAnimationFrame(() => {
+      if (!activeRef.current || termRef.current !== term || fitRef.current !== fit) return;
       try {
         fit.fit();
       } catch {}
       if (canTerminalClaimFocus(hostRef.current)) term.focus();
     });
+    return () => cancelAnimationFrame(animationFrame);
   }, [active, tmuxSession]);
 
   return <div ref={hostRef} className="term" />;

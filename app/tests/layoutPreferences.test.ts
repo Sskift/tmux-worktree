@@ -126,6 +126,30 @@ test("legacy string editor paths become host-aware editor records", () => {
   assert.deepEqual(migrated.columnOrder, ["main", "file", "scratch", "editor"]);
 });
 
+test("editor cursor locations round-trip only when they are positive integers", () => {
+  const valid = migrateDashboardLayout({
+    columnOrder: ["main"],
+    editingFile: {
+      path: "/repo/src/App.tsx",
+      hostId: "builder",
+      line: 42,
+      column: 7,
+    },
+  });
+  assert.deepEqual(valid.editingFile, {
+    path: "/repo/src/App.tsx",
+    hostId: "builder",
+    line: 42,
+    column: 7,
+  });
+
+  const invalid = migrateDashboardLayout({
+    columnOrder: ["main"],
+    editingFile: { path: "/repo/src/App.tsx", line: 0, column: 1.5 },
+  });
+  assert.equal(invalid.editingFile, undefined);
+});
+
 test("bad fields fall back safely without throwing or contaminating valid fields", () => {
   let migrated: ReturnType<typeof migrateDashboardLayout> | undefined;
   assert.doesNotThrow(() => {

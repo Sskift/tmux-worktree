@@ -21,6 +21,9 @@ export type WindowLayout = {
 export type EditingFile = {
   path: string;
   hostId?: string | null;
+  /** One-based location requested by search results or detected file links. */
+  line?: number;
+  column?: number;
 };
 
 export type DiffFile = {
@@ -126,7 +129,13 @@ function isPinnedItems(value: unknown): value is PinnedItem[] {
 }
 
 function isEditingFile(value: unknown): value is EditingFile {
-  return isRecord(value) && typeof value.path === "string" && hasValidHostId(value);
+  if (!isRecord(value) || typeof value.path !== "string" || !hasValidHostId(value)) {
+    return false;
+  }
+  const validLocation = (field: unknown) =>
+    field === undefined ||
+    (typeof field === "number" && Number.isInteger(field) && field > 0);
+  return validLocation(value.line) && validLocation(value.column);
 }
 
 function isDiffFile(value: unknown): value is DiffFile {
