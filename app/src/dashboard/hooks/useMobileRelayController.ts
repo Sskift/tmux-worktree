@@ -148,6 +148,7 @@ export type MobileRelayController = MobileRelayViewState & {
   brokerStarting: boolean;
   stopping: boolean;
   copied: boolean;
+  v1PairingPayload: string | null;
   error: string | null;
   toggle: () => Promise<void>;
   save: () => Promise<boolean>;
@@ -222,12 +223,72 @@ export function buildMobileRelayLaunchCommand({
   secret,
 }: Pick<MobileRelayStatus, "relayUrl" | "hostId" | "secret">): string {
   return [
-    "adb shell am start -n com.tmuxworktree.mobile/.MainActivity",
-    `  --es relayUrl '${relayUrl}'`,
-    `  --es hostId '${hostId}'`,
-    secret ? `  --es relaySecret '${secret}'` : "  --es relaySecret '<TW_RELAY_SECRET>'",
-    "  --ez autoConnect true",
+    "adb shell am start -n com.tmuxworktree.mobile/.V2Activity",
+    `  --es relayUrl ${quoteAdbShellArgument(relayUrl)}`,
+    `  --es hostId ${quoteAdbShellArgument(hostId)}`,
+    `  --es relaySecret ${quoteAdbShellArgument(secret || "<TW_RELAY_SECRET>")}`,
   ].join(" \\\n");
+}
+
+export function shellSingleQuote(value: string): string {
+  const escapedQuote = `'"'"'`;
+  return `'${value.replace(/'/g, escapedQuote)}'`;
+}
+
+/**
+ * `adb shell COMMAND...` is parsed twice: first by the desktop shell and then
+ * again by Android's shell. Preserve the inner single-quoted word through the
+ * first parse so credentials can never become remote shell syntax.
+ */
+export function quoteAdbShellArgument(value: string): string {
+  const remoteQuotedWord = shellSingleQuote(value);
+  const desktopEscapedWord = remoteQuotedWord.replace(
+    /["\\$`]/g,
+    (character) => `\\${character}`,
+  );
+  return `"${desktopEscapedWord}"`;
+}
+
+export function buildMobileRelayV1PairingPayload({
+  relayUrl,
+  hostId,
+  secret,
+}: Pick<MobileRelayStatus, "relayUrl" | "hostId" | "secret">): string | null {
+  const normalizedRelayUrl = relayUrl.trim();
+  const normalizedHostId = hostId.trim();
+  const normalizedSecret = secret.trim();
+  if (!normalizedRelayUrl || !normalizedHostId || !normalizedSecret) return null;
+  if (
+    normalizedRelayUrl.length > 2_048 ||
+    normalizedSecret.length > 4_096 ||
+    /[\0\r\n]/.test(normalizedSecret) ||
+    !/^[A-Za-z0-9._-]{1,80}$/.test(normalizedHostId)
+  ) return null;
+
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(normalizedRelayUrl);
+  } catch {
+    return null;
+  }
+  if (
+    parsedUrl.protocol !== "wss:" ||
+    !parsedUrl.hostname ||
+    parsedUrl.username ||
+    parsedUrl.password ||
+    parsedUrl.pathname !== "/" ||
+    parsedUrl.search ||
+    parsedUrl.hash
+  ) return null;
+
+  return [
+    "tmuxworktree://pair?relayUrl=",
+    encodeURIComponent(normalizedRelayUrl),
+    "&token=",
+    encodeURIComponent(normalizedSecret),
+    "&hostId=",
+    encodeURIComponent(normalizedHostId),
+  ].join("");
 }
 
 export function useMobileRelayController({
@@ -518,6 +579,9 @@ export function useMobileRelayController({
     brokerStarting,
     stopping,
   });
+  const v1PairingPayload = statusKnown && active
+    ? buildMobileRelayV1PairingPayload({ relayUrl, hostId, secret })
+    : null;
 
   return {
     statusKnown,
@@ -542,6 +606,7 @@ export function useMobileRelayController({
     brokerStarting,
     stopping,
     copied,
+    v1PairingPayload,
     error,
     toggle,
     save,

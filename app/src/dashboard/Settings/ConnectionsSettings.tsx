@@ -8,6 +8,7 @@ import {
   Play,
   PlugZap,
   Plus,
+  QrCode,
   Radio,
   RotateCcw,
   Save,
@@ -27,6 +28,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
+import QRCode from "qrcode";
 import { MenuSelect, type MenuOption } from "../../MenuSelect";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../../platform";
 import { useDashboardBackend } from "../../platform";
@@ -79,6 +81,7 @@ export interface RelaySettingsModel extends RelayDraft {
   active: boolean;
   connected: boolean;
   tokenConfigured: boolean;
+  v1PairingPayload: string | null;
   launchCopied: boolean;
   error?: string | null;
   busy: RelaySettingsBusyState;
@@ -137,6 +140,7 @@ export function relaySettingsBindingsFromController(
       hostId: controller.draftHostId,
       token: controller.draftSecret,
       tokenConfigured: controller.tokenState === "Configured",
+      v1PairingPayload: controller.v1PairingPayload,
       launchCopied: controller.copied,
       connectionState,
       active: controller.active,
@@ -983,6 +987,27 @@ export function ConnectionsSettings({
               />
             </div>
 
+            <div className="connections-relay-pairing">
+              <div className="connections-relay-pairing__copy">
+                <span className="connections-relay-pairing__icon">
+                  <QrCode aria-hidden="true" size={17} />
+                </span>
+                <div>
+                  <strong>Relay v1 profile</strong>
+                  <span>
+                    {relay.v1PairingPayload
+                      ? "Contains the current shared Relay v1 token. Scan only on a trusted Android device and review before saving. This is not a Relay v2 capability."
+                      : relay.active && relay.tokenConfigured
+                        ? "The Relay v1 QR requires an Android-compatible wss:// URL and Host ID. Use Copy Android launch for local ws:// debugging."
+                        : "Start Relay with a configured v1 token to create an Android profile."}
+                  </span>
+                </div>
+              </div>
+              {relay.v1PairingPayload && (
+                <MobileRelayV1ProfileQrCode payload={relay.v1PairingPayload} />
+              )}
+            </div>
+
             {(relay.error || relayNotice) && (
               <div
                 className={`connections-notice connections-notice--${relay.error ? "error" : relayNotice?.tone}`}
@@ -1006,7 +1031,7 @@ export function ConnectionsSettings({
                     {relay.launchCopied
                       ? <Check aria-hidden="true" size={14} />
                       : <Clipboard aria-hidden="true" size={14} />}
-                    {relay.launchCopied ? "Launch copied" : "Copy Android launch"}
+                    {relay.launchCopied ? "v1 launch copied" : "Copy Android v1 launch"}
                   </button>
                   <span className="connections-actions__spacer" />
                   <button
@@ -1064,6 +1089,41 @@ export function ConnectionsSettings({
         </div>
       )}
     </div>
+  );
+}
+
+function MobileRelayV1ProfileQrCode({ payload }: { payload: string }) {
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    let active = true;
+    void QRCode.toCanvas(canvas, payload, {
+      width: 156,
+      margin: 1,
+      errorCorrectionLevel: "M",
+      color: {
+        dark: "#111113",
+        light: "#ffffff",
+      },
+    }).catch(() => {
+      if (!active) return;
+      canvas.width = 0;
+      canvas.height = 0;
+    });
+    return () => {
+      active = false;
+    };
+  }, [payload]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      className="connections-relay-pairing__qr"
+      aria-label="Android Relay v1 profile QR code"
+      role="img"
+    />
   );
 }
 

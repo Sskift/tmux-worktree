@@ -8,7 +8,7 @@ The relay design has three roles:
 - `relay-host` runs on the Mac that already acts as the Dashboard admin. It reads the same local Dashboard config and aggregates local plus configured SSH remote scopes.
 - Android connects to the broker as a mobile Dashboard client paired with that Mac admin connector.
 
-The Mac remains the trust boundary. It owns the Dashboard state, the `tw serve` terminal backend, and the SSH credentials used to inspect or attach to remote tmux sessions. Running `relay-host` on a remote machine would make the phone see that remote machine's tmux namespace instead of the same admin view as the Mac Dashboard.
+The Mac remains the business authority. It owns the Dashboard state, the `tw serve` terminal backend, and the SSH credentials used to inspect or attach to remote tmux sessions. The Relay v1 broker is still a trusted transport because it authenticates with the shared token and forwards terminal traffic in plaintext inside TLS. Running `relay-host` on a remote machine would make the phone see that remote machine's tmux namespace instead of the same admin view as the Mac Dashboard.
 
 ```text
 Android app
@@ -39,7 +39,7 @@ TW_RELAY_SECRET=<secret> tw relay-server --host 0.0.0.0 --port 8787
 
 The broker should run on a machine that both the Mac and Android can reach. A devbox is a good fit because it can stay online while the Mac and phone reconnect.
 
-Use one shared relay token for all three peers:
+Relay v1 uses one shared relay token for all three peers:
 
 - `relay-server` on the devbox
 - `relay-host` launched by the Mac Dashboard
@@ -88,7 +88,7 @@ Expose the broker through a stable URL. Prefer TLS and use the WebSocket URL in 
 wss://devbox.example.net
 ```
 
-For a private network or SSH tunnel, `ws://devbox.example.net:8787` also works if the Android network policy allows cleartext WebSockets.
+Production Android builds require `wss://`. Debug builds allow `ws://` only for emulator/loopback hosts such as `10.0.2.2`, `127.0.0.1`, or `localhost`; private-network cleartext URLs are intentionally rejected because they expose the shared Relay v1 token and terminal traffic.
 
 If the devbox only accepts SSH and does not expose port `8787` directly, keep the broker on the devbox and forward it through the Mac:
 
@@ -100,7 +100,7 @@ ssh -fN -o ExitOnForwardFailure=yes \
   -L 0.0.0.0:8787:127.0.0.1:8787 devbox.example.net
 ```
 
-Then set the Dashboard relay URL to `ws://<mac-local-name>.local:8787`. Android reaches the Mac, and the Mac forwards traffic to the devbox broker over SSH. The mDNS name stays stable when the Mac's DHCP or VPN address changes. This mode requires Android and the Mac to be on a network where `.local` discovery works.
+The forward can still be useful for local relay-host testing, but production Android cannot pair to `ws://<mac-local-name>.local:8787`. Put TLS in front of the forwarded broker and configure its `wss://` URL before pairing.
 
 Start local terminal serving on the Mac:
 
@@ -139,21 +139,29 @@ The Dashboard mobile relay menu can save the same `mobileRelay` block for you. E
 
 ## Dashboard Flow
 
-From the Dashboard header, open the remote/mobile relay menu:
+Open **Settings → Connections → Relay**:
 
 1. Pick a configured SSH host in `Broker`.
 2. Click `Start Broker`.
 3. Dashboard copies its bundled CLI to that host, starts `tw relay-server` in a remote tmux session named `tw-relay-server`, generates a relay token, and saves `mobileRelay` in `~/.tmux-worktree.json`.
 4. Dashboard starts the local Mac connector with the generated URL and token.
-5. Click `Copy Android Launch` and run the copied command with `adb`.
+5. Use `Copy Android v1 launch` for an adb handoff, or scan the Relay v1 profile shown for an active saved `wss://` configuration.
 
-When the broker is only reachable over SSH, the generated relay URL defaults to the Mac's stable mDNS name:
+The **Relay v1 profile** QR contains the current shared Relay v1 token, not a role-scoped Relay v2 capability. Scan it only on a trusted Android device. Its canonical payload is:
+
+```text
+tmuxworktree://pair?relayUrl=<percent-encoded-relay-url>&token=<percent-encoded-token>&hostId=<percent-encoded-host-id>
+```
+
+Scanning or launching only prefills the V2 review screen; Android does not save or connect until the user confirms. Relay v2 pairing will be added separately after the broker/host capability issuer exists and must not reuse this shared secret as though it were a v2 token.
+
+When the broker is only reachable over SSH, Dashboard may initially suggest the Mac's mDNS address:
 
 ```text
 ws://<mac-local-name>.local:8787
 ```
 
-Edit `Relay URL` before `Start` if Android needs a cross-network DNS name or TLS URL such as `wss://devbox.example.net`.
+That cleartext URL is for local setup only. Before pairing a production Android build, put TLS in front of the broker and edit `Relay URL` to a trusted `wss://` address such as `wss://devbox.example.net`. An upgraded 1.x profile that still contains `ws://` is returned to the V2 pairing review instead of entering an endless reconnect loop.
 
 ## Android
 
@@ -161,7 +169,7 @@ Build the APK:
 
 ```bash
 ANDROID_HOME=$HOME/Library/Android/sdk \
-  gradle -p mobile/android :app:assembleDebug
+  ./mobile/android/gradlew -p mobile/android :app:assembleDebug
 ```
 
 Install on an emulator or device:
@@ -174,9 +182,12 @@ $ANDROID_HOME/platform-tools/adb install -r \
 Launch with a paired identity:
 
 ```bash
-adb shell "am start -n com.tmuxworktree.mobile/.MainActivity \
-  --es relayUrl 'wss://relay.example.com' \
-  --es hostId 'mac-admin' \
-  --es relaySecret '<secret>' \
-  --ez autoConnect true"
+adb shell am start -n com.tmuxworktree.mobile/.V2Activity \
+  --es relayUrl "'wss://relay.example.com'" \
+  --es hostId "'mac-admin'" \
+  --es relaySecret "'<secret>'"
 ```
+
+The nested quoting is intentional because `adb shell` is parsed once on the desktop and again on Android; Dashboard's copied command escapes arbitrary configured values for both shells. The launch command opens a reviewable pairing screen, while the `tmuxworktree://pair?...` payload is consumed by the app's built-in QR scanner. The custom scheme is intentionally not registered as a browsable Android deep link because another app could claim the same scheme and steal the Relay v1 token. Neither path enables `autoConnect`.
+
+The source currently keeps `versionName=1.0.3` aligned with the repository and uses the higher `versionCode=20000` for Android upgrade ordering. `:app:assembleRelease` produces an **unsigned build-verification artifact** only. This source merge does not start a 2.0 release or produce a production-distributable APK; version bumps and signing happen in the unified release process.

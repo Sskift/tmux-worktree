@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   MOBILE_RELAY_HIDDEN_REFRESH_MS,
   MOBILE_RELAY_VISIBLE_REFRESH_MS,
   buildMobileRelayLaunchCommand,
+  buildMobileRelayV1PairingPayload,
   createMobileRelayAsyncCoordinator,
   deriveMobileRelayViewState,
+  quoteAdbShellArgument,
+  shellSingleQuote,
 } from "../src/dashboard/hooks/useMobileRelayController.ts";
 
 const idleViewState = {
@@ -24,16 +28,15 @@ const idleViewState = {
 test("mobile relay launch command preserves configured and placeholder token forms", () => {
   assert.equal(
     buildMobileRelayLaunchCommand({
-      relayUrl: "wss://relay.example.test/client",
+      relayUrl: "wss://relay.example.test",
       hostId: "mac-admin",
       secret: "relay-token",
     }),
     [
-      "adb shell am start -n com.tmuxworktree.mobile/.MainActivity",
-      "  --es relayUrl 'wss://relay.example.test/client'",
-      "  --es hostId 'mac-admin'",
-      "  --es relaySecret 'relay-token'",
-      "  --ez autoConnect true",
+      "adb shell am start -n com.tmuxworktree.mobile/.V2Activity",
+      `  --es relayUrl "'wss://relay.example.test'"`,
+      `  --es hostId "'mac-admin'"`,
+      `  --es relaySecret "'relay-token'"`,
     ].join(" \\\n"),
   );
 
@@ -43,8 +46,59 @@ test("mobile relay launch command preserves configured and placeholder token for
       hostId: "mac-admin",
       secret: "",
     }),
-    /--es relaySecret '<TW_RELAY_SECRET>'/,
+    /--es relaySecret "'<TW_RELAY_SECRET>'"/,
   );
+  assert.equal(shellSingleQuote("value'with'quotes"), "'value'\"'\"'with'\"'\"'quotes'");
+  const hostileValue = "token'; printf PWNED; '";
+  const androidShellWord = execFileSync(
+    "/bin/sh",
+    ["-c", `printf %s ${quoteAdbShellArgument(hostileValue)}`],
+    { encoding: "utf8" },
+  );
+  assert.equal(androidShellWord, shellSingleQuote(hostileValue));
+  assert.equal(
+    execFileSync("/bin/sh", ["-c", `printf %s ${androidShellWord}`], { encoding: "utf8" }),
+    hostileValue,
+  );
+  assert.doesNotMatch(
+    buildMobileRelayLaunchCommand({
+      relayUrl: "wss://relay.example.test/client",
+      hostId: "mac-admin",
+      secret: "token'; echo pwned; '",
+    }),
+    /--ez autoConnect|\.MainActivity/,
+  );
+});
+
+test("mobile relay builds an explicit WSS-only Relay v1 profile payload", () => {
+  assert.equal(
+    buildMobileRelayV1PairingPayload({
+      relayUrl: " wss://relay.example.test ",
+      hostId: " mac-admin ",
+      secret: " token value ",
+    }),
+    "tmuxworktree://pair?relayUrl=wss%3A%2F%2Frelay.example.test&token=token%20value&hostId=mac-admin",
+  );
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "ws://relay.example.test",
+    hostId: "mac-admin",
+    secret: "token",
+  }), null);
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "wss://user:password@relay.example.test",
+    hostId: "mac-admin",
+    secret: "token",
+  }), null);
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "wss://relay.example.test/client",
+    hostId: "mac-admin",
+    secret: "token",
+  }), null);
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "wss://relay.example.test",
+    hostId: "mac/admin",
+    secret: "token",
+  }), null);
 });
 
 test("mobile relay derived status follows operation and connection priority", () => {

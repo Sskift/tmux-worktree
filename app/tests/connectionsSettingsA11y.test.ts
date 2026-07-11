@@ -29,6 +29,6 @@ test("Relay Settings preserves the Android launch handoff", () => {
   assert.match(source, /launchCopied: controller\.copied/);
   assert.match(source, /copyLaunch: controller\.copyLaunch/);
   assert.match(source, /onClick=\{\(\) => void relayActions\.copyLaunch\(\)\}/);
-  assert.match(source, /Copy Android launch/);
+  assert.match(source, /Copy Android v1 launch/);
   assert.match(source, /disabled=\{relayBusy \|\| !relay\.statusKnown \|\| !relay\.tokenConfigured\}/);
 });
