@@ -109,9 +109,9 @@ export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
   return (
     <div className="pane pane--term">
       <div className="pane__bar">
-        <span className="pane__title file-editor__title">{fileName}</span>
+        <span className="pane__title diff-viewer__title">{fileName}</span>
         <span className="pane__hint dim">diff</span>
-        <div className="file-editor__actions">
+        <div className="diff-viewer__actions">
           <button className="btn btn--small" type="button" onClick={onClose} title="Close diff" aria-label="Close diff">
             <X aria-hidden="true" size={13} strokeWidth={1.8} />
           </button>
@@ -119,11 +119,11 @@ export function DiffViewer({ cwd, filePath, hostId, onClose }: Props) {
       </div>
       <div className="pane__body" style={{ padding: 0 }}>
         {loading ? (
-          <div className="file-editor__status">loading diff...</div>
+          <div className="diff-viewer__status">loading diff...</div>
         ) : error ? (
-          <div className="file-editor__status file-editor__status--error">{error}</div>
+          <div className="diff-viewer__status diff-viewer__status--error">{error}</div>
         ) : diff.trim() === "" ? (
-          <div className="file-editor__status">no changes</div>
+          <div className="diff-viewer__status">no changes</div>
         ) : (
           <div className="diff-viewer">
             {lines.map((line, i) => (

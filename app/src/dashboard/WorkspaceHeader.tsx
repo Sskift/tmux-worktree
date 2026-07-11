@@ -128,7 +128,7 @@ export function WorkspaceHeader({
               onClick={onOpenGit}
               aria-pressed={gitActive}
               disabled={!gitAvailable}
-              title={gitAvailable ? "Open Git inspector" : "Select a worktree or terminal to inspect Git"}
+              title={gitAvailable ? "Open Git panel" : "Select a worktree or terminal to inspect Git"}
             >
               <GitBranch aria-hidden="true" size={16} strokeWidth={1.7} />
               <span>Git</span>

@@ -9,7 +9,9 @@ import {
   type TerminalPalette,
 } from "./themes";
 import {
+  REMOTE_RECONNECT_MAX_ATTEMPTS,
   TMUX_RECONNECT_DELAY_MS,
+  remoteReconnectDelayMs,
   shouldReconnectTmuxAttach,
 } from "./terminalLifecycle";
 import {
@@ -284,6 +286,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
   const activeRef = useRef(active);
   const linkCwdRef = useRef(linkCwd ?? cwd);
   const onOpenFileRef = useRef(onOpenFile);
+  const remoteReconnectAttemptRef = useRef(0);
   const [reconnectSeq, setReconnectSeq] = useState(0);
   linkCwdRef.current = linkCwd ?? cwd;
   onOpenFileRef.current = onOpenFile;
@@ -302,6 +305,8 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     let ptyConnection: PtyConnection | null = null;
     const ptyAbort = new AbortController();
     let reconnectTimer: number | null = null;
+    let reconnectStabilityTimer: number | null = null;
+    let remoteRetryAvailable = false;
     let cancelled = false;
 
     const term = new XTerm({
@@ -464,6 +469,17 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     };
 
     term.attachCustomKeyEventHandler((e) => {
+      if (
+        e.type === "keydown" &&
+        e.key === "Enter" &&
+        hostId &&
+        remoteRetryAvailable
+      ) {
+        remoteRetryAvailable = false;
+        remoteReconnectAttemptRef.current = 0;
+        setReconnectSeq((value) => value + 1);
+        return false;
+      }
       if (e.type === "keydown" && e.key === "Escape" && tmuxSession) {
         // Let ESC reach the PTY so TUIs (vim/less/fzf) receive it, and in
         // parallel ask tmux to exit copy-mode *only if* the pane is actually
@@ -525,31 +541,75 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
           { id, cmd, args, cwd, cols, rows },
           {
             onData: (event) => {
-              if (!cancelled) term.write(event.data);
+              if (cancelled) return;
+              term.write(event.data);
+              if (
+                hostId &&
+                remoteReconnectAttemptRef.current > 0 &&
+                reconnectStabilityTimer === null
+              ) {
+                // SSH failures can emit stderr before exiting. Only reset the
+                // retry budget if the PTY remains alive after producing data.
+                reconnectStabilityTimer = window.setTimeout(() => {
+                  reconnectStabilityTimer = null;
+                  if (!cancelled && ptyId === id) {
+                    remoteReconnectAttemptRef.current = 0;
+                  }
+                }, 2_000);
+              }
             },
             onExit: async (event) => {
               if (event.id !== id) return;
               ptyId = null;
-              const sessionStillExists = tmuxSession
-                ? await dashboardBackend.sessions.exists(tmuxSession).catch(() => false)
-                : false;
+              if (reconnectStabilityTimer !== null) {
+                window.clearTimeout(reconnectStabilityTimer);
+                reconnectStabilityTimer = null;
+              }
+              let sessionStillExists = false;
+              let sessionProbeFailed = false;
+              if (tmuxSession) {
+                try {
+                  sessionStillExists = await dashboardBackend.sessions.exists(tmuxSession);
+                } catch {
+                  sessionProbeFailed = true;
+                }
+              }
               if (cancelled) return;
+              const remoteReconnectAttempt = hostId
+                ? remoteReconnectAttemptRef.current
+                : 0;
               if (
                 shouldReconnectTmuxAttach({
                   cancelled,
                   hasTmuxSession: !!tmuxSession,
                   sessionStillExists,
+                  sessionProbeFailed,
                   isRemote: !!hostId,
+                  remoteReconnectAttempt,
                 })
               ) {
-                const reconnectDelay = hostId ? 2000 : TMUX_RECONNECT_DELAY_MS;
+                const reconnectDelay = hostId
+                  ? remoteReconnectDelayMs(remoteReconnectAttempt)
+                  : TMUX_RECONNECT_DELAY_MS;
+                if (hostId) {
+                  remoteReconnectAttemptRef.current = remoteReconnectAttempt + 1;
+                }
                 const msg = hostId
-                  ? "\r\n\x1b[2m[ssh disconnected, reconnecting]\x1b[0m\r\n"
+                  ? `\r\n\x1b[2m[ssh disconnected, reconnecting in ${Math.ceil(reconnectDelay / 1000)}s]\x1b[0m\r\n`
                   : "\r\n\x1b[2m[tmux detached, reconnecting]\x1b[0m\r\n";
                 term.write(msg);
                 reconnectTimer = window.setTimeout(() => {
                   if (!cancelled) setReconnectSeq((value) => value + 1);
                 }, reconnectDelay);
+                return;
+              }
+              if (
+                hostId &&
+                (sessionStillExists || sessionProbeFailed) &&
+                remoteReconnectAttempt >= REMOTE_RECONNECT_MAX_ATTEMPTS
+              ) {
+                remoteRetryAvailable = true;
+                term.write("\r\n\x1b[33m[remote terminal unavailable; press Enter to retry]\x1b[0m\r\n");
                 return;
               }
               term.write(`\r\n\x1b[2m[exit ${event.code}]\x1b[0m\r\n`);
@@ -573,6 +633,10 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       } catch (e) {
         if (cancelled || (e instanceof Error && e.name === "AbortError")) return;
         term.write(`\r\n\x1b[31m[pty error] ${String(e)}\x1b[0m\r\n`);
+        if (hostId) {
+          remoteRetryAvailable = true;
+          term.write("\x1b[33m[press Enter to retry]\x1b[0m\r\n");
+        }
       }
     };
 
@@ -585,6 +649,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       cancelled = true;
       ptyAbort.abort();
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+      if (reconnectStabilityTimer !== null) window.clearTimeout(reconnectStabilityTimer);
       ro.disconnect();
       host.removeEventListener("mousedown", onLinkMouseDown, true);
       host.removeEventListener("mouseup", onLinkMouseUp, true);

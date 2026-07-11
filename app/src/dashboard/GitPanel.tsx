@@ -1,22 +1,22 @@
 import { GitBranch, X } from "lucide-react";
 import type { ReactNode } from "react";
-import "./Inspector.css";
+import "./GitPanel.css";
 
-export type InspectorProps = {
+export type GitPanelProps = {
   content: ReactNode;
   onClose: () => void;
 };
 
-export function Inspector({ content, onClose }: InspectorProps) {
+export function GitPanel({ content, onClose }: GitPanelProps) {
   return (
-    <section className="workspace-inspector" aria-label="Git">
-      <header className="workspace-inspector__header">
-        <div className="workspace-inspector__title">
+    <section className="workspace-git-panel" aria-label="Git">
+      <header className="workspace-git-panel__header">
+        <div className="workspace-git-panel__title">
           <GitBranch aria-hidden="true" size={16} strokeWidth={1.8} />
           <span>Git</span>
         </div>
         <button
-          className="workspace-inspector__close"
+          className="workspace-git-panel__close"
           type="button"
           onClick={onClose}
           aria-label="Close Git panel"
@@ -26,7 +26,7 @@ export function Inspector({ content, onClose }: InspectorProps) {
         </button>
       </header>
 
-      <div className="workspace-inspector__panel">{content}</div>
+      <div className="workspace-git-panel__panel">{content}</div>
     </section>
   );
 }

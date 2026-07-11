@@ -79,6 +79,7 @@ export interface RelaySettingsModel extends RelayDraft {
   active: boolean;
   connected: boolean;
   tokenConfigured: boolean;
+  launchCopied: boolean;
   error?: string | null;
   busy: RelaySettingsBusyState;
 }
@@ -92,6 +93,7 @@ export interface RelaySettingsActions {
   start: () => RelayActionResult | Promise<RelayActionResult>;
   startBroker: () => RelayActionResult | Promise<RelayActionResult>;
   stop: () => RelayActionResult | Promise<RelayActionResult>;
+  copyLaunch: () => void | Promise<void>;
   copy: (field: RelayCopyField, value: string) => void | Promise<void>;
 }
 
@@ -135,6 +137,7 @@ export function relaySettingsBindingsFromController(
       hostId: controller.draftHostId,
       token: controller.draftSecret,
       tokenConfigured: controller.tokenState === "Configured",
+      launchCopied: controller.copied,
       connectionState,
       active: controller.active,
       connected: controller.connected,
@@ -155,6 +158,7 @@ export function relaySettingsBindingsFromController(
       start: controller.start,
       startBroker: controller.startBroker,
       stop: controller.stop,
+      copyLaunch: controller.copyLaunch,
       copy: (_field, value) => controller.copyValue(value),
     },
   };
@@ -992,17 +996,31 @@ export function ConnectionsSettings({
 
             <div className="connections-actions connections-actions--relay">
               {relay.active ? (
-                <button
-                  type="button"
-                  className="connections-button connections-button--danger"
-                  disabled={relayBusy}
-                  onClick={() => runRelayAction("stop", relayActions.stop)}
-                >
-                  {relay.busy.stop
-                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-                    : <Square aria-hidden="true" size={14} />}
-                  {relay.busy.stop ? "Stopping" : "Stop"}
-                </button>
+                <>
+                  <button
+                    type="button"
+                    className="connections-button"
+                    disabled={relayBusy || !relay.statusKnown || !relay.tokenConfigured}
+                    onClick={() => void relayActions.copyLaunch()}
+                  >
+                    {relay.launchCopied
+                      ? <Check aria-hidden="true" size={14} />
+                      : <Clipboard aria-hidden="true" size={14} />}
+                    {relay.launchCopied ? "Launch copied" : "Copy Android launch"}
+                  </button>
+                  <span className="connections-actions__spacer" />
+                  <button
+                    type="button"
+                    className="connections-button connections-button--danger"
+                    disabled={relayBusy}
+                    onClick={() => runRelayAction("stop", relayActions.stop)}
+                  >
+                    {relay.busy.stop
+                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                      : <Square aria-hidden="true" size={14} />}
+                    {relay.busy.stop ? "Stopping" : "Stop"}
+                  </button>
+                </>
               ) : (
                 <>
                   <button

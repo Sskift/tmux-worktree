@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { basename } from "node:path";
 import { createInterface } from "node:readline";
 import {
   CONFIG_PATH,
@@ -13,8 +14,9 @@ import {
 import {
   CliError,
   exec,
-  tmuxBin,
   insideTmux,
+  isGitRepo,
+  tmuxBin,
 } from "./tmux";
 import {
   createManagedWorktreeSession,
@@ -84,7 +86,6 @@ interface RunParams {
   aiCmd: string;
   projectDir: string;
   sessionName: string;
-  useWorktree: boolean;
   projectKey?: string; // 项目在配置中的 key，用于 worktree 路径
   branch?: string; // 目标分支，未指定时自动探测默认分支
 }
@@ -108,13 +109,12 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
       const branch = project.branch ? `  [${project.branch}]` : "";
       console.log(`  ${i + 1}) ${name.padEnd(12)} ${display}${branch}`);
     });
-    console.log(`  0) 自定义目录        输入任意路径，跳过 worktree`);
-    console.log(`  也可以直接输入项目名或目录路径`);
+    console.log(`  0) Git 仓库路径      输入未配置的本地仓库`);
+    console.log(`  也可以直接输入项目名或 Git 仓库路径`);
     const projInput = (await prompt(rl, `\n选择项目 (默认 1): `)).trim();
 
     let projectDir: string;
     let sessionName: string;
-    let useWorktree: boolean;
     let projectKey: string | undefined;
     let projectBranch: string | undefined;
 
@@ -126,25 +126,23 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
       projectDir = project.path;
       projectBranch = project.branch;
       sessionName = key;
-      useWorktree = true;
     } else if (projIdx === 0) {
-      // 自定义目录
-      console.log("\n输入目录的绝对路径，支持 ~ 开头");
-      const customPath = expandHomePath((await prompt(rl, `目录路径: `)).trim());
+      // 未配置的本地 git 仓库
+      console.log("\n输入 Git 仓库的绝对路径，支持 ~ 开头");
+      const customPath = expandHomePath((await prompt(rl, `Git 仓库路径: `)).trim());
       if (!customPath || !existsSync(customPath)) {
         console.error(`\n错误: 目录不存在: ${customPath || "(空)"}`);
         process.exit(1);
       }
       projectDir = customPath;
-      sessionName = customPath.split("/").filter(Boolean).pop() || "session";
-      useWorktree = false;
+      projectKey = basename(customPath) || "project";
+      sessionName = projectKey;
     } else if (projIdx >= 1 && projIdx <= projectEntries.length) {
       const [key, project] = projectEntries[projIdx - 1];
       projectKey = key;
       projectDir = project.path;
       projectBranch = project.branch;
       sessionName = key;
-      useWorktree = true;
     } else {
       // 非数字输入：先查项目名，再当路径
       const key = projInput;
@@ -153,13 +151,12 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
         projectDir = projects[key].path;
         projectBranch = projects[key].branch;
         sessionName = key;
-        useWorktree = true;
       } else {
         const resolved = expandHomePath(projInput);
         if (existsSync(resolved)) {
           projectDir = resolved;
-          sessionName = resolved.split("/").filter(Boolean).pop() || "session";
-          useWorktree = false;
+          projectKey = basename(resolved) || "project";
+          sessionName = projectKey;
         } else {
           console.error(`\n错误: 未知项目 '${projInput}'，且该路径不存在`);
           console.error(`可用项目: ${Object.keys(projects).join(", ")}`);
@@ -178,16 +175,13 @@ async function interactiveSelect(projects: Record<string, ProjectConfig>): Promi
     }
 
     // --- 目标分支 ---
-    let branch: string | undefined;
-    if (useWorktree) {
-      const suffix = projectBranch ? `，留空使用配置中的 ${projectBranch}` : "，留空自动探测默认分支 (通常是 master 或 main)";
-      console.log(`\n输入 worktree 的目标分支${suffix}`);
-      const branchInput = (await prompt(rl, `目标分支: `)).trim();
-      branch = branchInput || projectBranch;
-    }
+    const suffix = projectBranch ? `，留空使用配置中的 ${projectBranch}` : "，留空自动探测默认分支 (通常是 master 或 main)";
+    console.log(`\n输入 worktree 的目标分支${suffix}`);
+    const branchInput = (await prompt(rl, `目标分支: `)).trim();
+    const branch = branchInput || projectBranch;
 
     console.log();
-    return { aiCmd, projectDir, sessionName: sessionName.slice(0, SESSION_NAME_MAX_LEN), useWorktree, projectKey, branch };
+    return { aiCmd, projectDir, sessionName: sessionName.slice(0, SESSION_NAME_MAX_LEN), projectKey, branch };
   } finally {
     rl.close();
   }
@@ -215,7 +209,7 @@ function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
 
 参数:
   ai-command       要在 session 中运行的命令 (如 claude, aider, codex)
-  project          项目名称 (${Object.keys(projects).join(", ")}) 或目录路径
+  project          项目名称 (${Object.keys(projects).join(", ")}) 或 Git 仓库路径
   session-name     可选，tmux session 显示名 (默认同 project)
   --branch, -b     可选，目标分支 (默认自动探测，通常是 master 或 main)
 
@@ -223,7 +217,7 @@ function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
   tw claude myproject
   tw claude myproject fix-auth-bug
   tw claude myproject fix-auth-bug --branch develop
-  tw claude ~/some/dir
+  tw claude ~/src/some-repo
   tw                           # 交互模式`);
     process.exit(1);
   }
@@ -236,18 +230,19 @@ function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
       aiCmd,
       projectDir: mappedProject.path,
       sessionName,
-      useWorktree: true,
       projectKey: project,
       branch: branch ?? mappedProject.branch,
     };
   }
 
-  // 不在映射中，当作目录路径
+  // 不在映射中，当作未配置的本地 git 仓库路径。路径入口与
+  // Dashboard/RPC 一样始终创建 managed worktree，不再退化为普通 tmux session。
   const resolved = expandHomePath(project);
   if (existsSync(resolved)) {
-    const dirName = resolved.split("/").filter(Boolean).pop() || "session";
-    const sessionName = (sessionArg ?? dirName).slice(0, SESSION_NAME_MAX_LEN);
-    return { aiCmd, projectDir: resolved, sessionName, useWorktree: false, branch };
+    const projectKey = basename(resolved) || "project";
+    const sessionName = (sessionArg ? `${projectKey}-${sessionArg}` : projectKey)
+      .slice(0, SESSION_NAME_MAX_LEN);
+    return { aiCmd, projectDir: resolved, sessionName, projectKey, branch };
   }
 
   console.error(`错误: 未知项目 '${project}'，且路径不存在`);
@@ -256,24 +251,34 @@ function parseArgs(projects: Record<string, ProjectConfig>): RunParams {
 }
 
 export async function run() {
-  const config = await loadConfig();
+  const hasArgs = process.argv.length > 2;
+  // An explicit repository path does not require pre-existing project config.
+  // Keep the setup wizard for the no-argument interactive flow only.
+  const config = hasArgs
+    ? loadConfigFile() ?? normalizeConfig({})
+    : await loadConfig();
   const PROJECT_DIRS = config.projects;
   const WORKTREE_BASE = config.worktreeBase ?? "/private/tmp/tmux-worktree/projects";
 
   // --- 参数解析 ---
-  const hasArgs = process.argv.length > 2;
   const params = hasArgs ? parseArgs(PROJECT_DIRS) : await interactiveSelect(PROJECT_DIRS);
-  const { aiCmd, projectDir, useWorktree, projectKey, branch } = params;
+  const { aiCmd, projectDir, projectKey, branch } = params;
 
   if (!existsSync(projectDir)) {
     throw new CliError(`目录不存在: ${projectDir}`);
+  }
+  if (!isGitRepo(projectDir)) {
+    throw new CliError(
+      `目录不是 git 仓库: ${projectDir}\n` +
+      "`tw <ai-command> <project|path>` 只创建 managed git worktree；请传入 git 仓库路径。",
+    );
   }
 
   const created = createManagedWorktreeSession({
     aiCmd,
     projectDir,
     sessionName: params.sessionName,
-    useWorktree,
+    useWorktree: true,
     projectKey,
     branch,
     worktreeBase: WORKTREE_BASE,

@@ -24,3 +24,11 @@ test("Relay field errors are programmatically associated with their controls", (
   assert.match(source, /aria-errormessage=\{error \? errorId : undefined\}/);
   assert.match(source, /<small id=\{errorId\}/);
 });
+
+test("Relay Settings preserves the Android launch handoff", () => {
+  assert.match(source, /launchCopied: controller\.copied/);
+  assert.match(source, /copyLaunch: controller\.copyLaunch/);
+  assert.match(source, /onClick=\{\(\) => void relayActions\.copyLaunch\(\)\}/);
+  assert.match(source, /Copy Android launch/);
+  assert.match(source, /disabled=\{relayBusy \|\| !relay\.statusKnown \|\| !relay\.tokenConfigured\}/);
+});

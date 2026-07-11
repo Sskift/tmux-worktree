@@ -1,21 +1,21 @@
 ---
 name: tw-remote-session
-description: Create Dashboard-managed tmux-worktree sessions on remote, usually headless, SSH hosts. Use when configuring or instructing an agent to create a TW worktree/session that the local macOS Dashboard can discover and attach to correctly, especially when the remote host has no GUI and the session must use the dashboard profile rather than the CLI multi-pane profile.
+description: Create Dashboard-managed tmux-worktree sessions on remote, usually headless, SSH hosts. Use when configuring or instructing an agent to create a TW worktree/session that the local macOS Dashboard can discover and attach to correctly, especially when the remote host has no GUI.
 ---
 
 # TW Remote Session
 
 ## Overview
 
-Create TW-managed worktree sessions on a remote host without launching Dashboard there. The result must be a `dashboard` profile session recorded in the remote `~/.tmux-worktree/state.json`, so the local Dashboard can discover it through SSH and `tw rpc list`.
+Create TW-managed worktree sessions on a remote host without launching Dashboard there. `tw rpc create-worktree` records a `dashboard` profile session in remote `~/.tmux-worktree/state.json`, so the local Dashboard can discover it through SSH and `tw rpc list`. CLI and Dashboard profiles now share the same single-pane tmux layout; the profile records provenance only.
 
 ## Rules
 
 - Do not launch Dashboard on the remote host.
 - Do not create plain tmux sessions with `tmux new-session`.
 - Do not manually run `git worktree add` for Dashboard-visible sessions.
-- Do not use bare `tw <ai-command> <project|path>` unless the user explicitly wants the CLI multi-pane profile.
-- Use `tw rpc create-worktree` for Dashboard-friendly sessions.
+- Prefer `tw rpc create-worktree` for headless or automated creation because it returns a machine-readable result and does not immediately attach a local terminal client.
+- Bare `tw <ai-command> <project|path>` uses the same managed single-pane session contract, but is intended for an interactive shell and records `profile: "cli"`.
 - Use paths that exist on the remote host, not local macOS paths.
 - Put the command that should start Claude, Codex, or another agent in `--ai-command`.
 

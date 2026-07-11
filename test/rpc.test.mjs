@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -203,6 +203,109 @@ test("shared worktree creation records managed state for cli and rpc consumers",
   assert.match(sessionSource, /saveManagedState/);
   assert.match(sessionSource, /profile:\s*params\.profile/);
   assert.match(sessionSource, /worktreePath:\s*createdWorktree\.path/);
+});
+
+test("CLI git-repository paths create a managed single-pane worktree", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-cli-path-worktree-"));
+  const home = join(root, "home");
+  const origin = join(root, "origin.git");
+  const repo = join(root, "sample-app");
+  const worktreeBase = join(root, "worktrees");
+  const fakeTmux = join(root, "tmux");
+  const tmuxLog = join(root, "tmux.log");
+  mkdirSync(home, { recursive: true });
+
+  execFileSync("git", ["init", "--bare", "--initial-branch=main", origin], { stdio: "ignore" });
+  execFileSync("git", ["clone", origin, repo], { stdio: "ignore" });
+  execFileSync("git", ["-C", repo, "config", "user.email", "tw-test@example.invalid"]);
+  execFileSync("git", ["-C", repo, "config", "user.name", "TW Test"]);
+  writeFileSync(join(repo, "README.md"), "# sample\n");
+  execFileSync("git", ["-C", repo, "add", "README.md"]);
+  execFileSync("git", ["-C", repo, "commit", "-m", "initial"], { stdio: "ignore" });
+  execFileSync("git", ["-C", repo, "push", "-u", "origin", "main"], { stdio: "ignore" });
+
+  writeFileSync(
+    join(home, ".tmux-worktree.json"),
+    JSON.stringify({ projects: {}, worktreeBase }, null, 2),
+  );
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+if [ "$1" = "has-session" ]; then
+  exit 1
+fi
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(
+    process.execPath,
+    [cli, "codex", repo, "fix", "--branch", "main"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: home,
+        TMUX: "",
+        TW_TMUX: fakeTmux,
+        TW_TEST_TMUX_LOG: tmuxLog,
+      },
+      timeout: 10_000,
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+
+  const state = JSON.parse(readFileSync(join(home, ".tmux-worktree", "state.json"), "utf8"));
+  assert.equal(state.version, 1);
+  assert.equal(state.sessions.length, 1);
+  assert.equal(state.sessions[0].name, "sample-app-fix");
+  assert.equal(state.sessions[0].kind, "worktree");
+  assert.equal(state.sessions[0].profile, "cli");
+  assert.equal(state.sessions[0].project, "sample-app");
+  assert.equal(state.sessions[0].repoPath, repo);
+  assert.match(state.sessions[0].branch, /^sample-app-fix-[0-9a-f]{5}$/);
+  assert.equal(state.sessions[0].worktreePath, join(worktreeBase, "sample-app", state.sessions[0].branch));
+  assert.equal(existsSync(join(state.sessions[0].worktreePath, ".git")), true);
+
+  const calls = readFileSync(tmuxLog, "utf8");
+  assert.match(calls, /new-session -d -s sample-app-fix -c /);
+  assert.doesNotMatch(calls, /split-window| status(?: |$)/);
+});
+
+test("CLI rejects non-git path targets before creating tmux or managed state", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-cli-non-git-path-"));
+  const home = join(root, "home");
+  const plainDir = join(root, "plain-directory");
+  const fakeTmux = join(root, "tmux");
+  const tmuxLog = join(root, "tmux.log");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(plainDir, { recursive: true });
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [cli, "codex", plainDir], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      TMUX: "",
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+    },
+    timeout: 5_000,
+  });
+
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /目录不是 git 仓库/);
+  assert.match(result.stderr, /只创建 managed git worktree/);
+  assert.doesNotMatch(result.stdout, /开始初始化|添加项目/);
+  assert.equal(existsSync(join(home, ".tmux-worktree.json")), false);
+  assert.equal(existsSync(join(home, ".tmux-worktree", "state.json")), false);
+  assert.equal(existsSync(tmuxLog), false);
 });
 
 test("CLI and Dashboard provenance use the same single-pane session contract", () => {

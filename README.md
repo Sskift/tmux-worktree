@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Sskift/tmux-worktree/releases/tag/v1.0.1">
+  <a href="https://github.com/Sskift/tmux-worktree/releases/latest">
     <img alt="Release" src="https://img.shields.io/github/v/release/Sskift/tmux-worktree?label=release" />
   </a>
   <a href="LICENSE">
@@ -69,15 +69,17 @@ Mac Dashboard
 
 ### macOS Dashboard
 
-Download the DMG from the GitHub release:
+Download the DMG from the latest GitHub release:
 
-[Download `tw-dashboard_1.0.1_aarch64.dmg`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.1/tw-dashboard_1.0.1_aarch64.dmg)
+[Download the latest `tw-dashboard` DMG](https://github.com/Sskift/tmux-worktree/releases/latest)
 
 Then install it like a normal macOS app and open it:
 
 ```bash
 open -a tw-dashboard
 ```
+
+When a repository or its main Git checkout lives in Desktop, Documents, or Downloads, macOS asks for access the first time the Dashboard opens its files or Git metadata. Allow that folder so worktree Git status and diffs can resolve the linked main repository.
 
 ### CLI
 
@@ -126,7 +128,7 @@ tw codex backend fix-auth
 tw "claude --model opus" /Users/me/code/myapp
 ```
 
-New CLI and Dashboard worktree sessions use the same single-pane tmux contract. The AI command runs in that pane and returns to a login shell when it exits. Older multi-pane CLI sessions remain attachable until you close them; `tw` does not rewrite live sessions.
+New CLI and Dashboard worktree sessions use the same managed, single-pane tmux contract. A configured project name or a direct git repository path always creates a worktree and records it in `~/.tmux-worktree/state.json`; non-git paths are rejected. The AI command runs in the single pane and returns to a login shell when it exits. Older multi-pane CLI sessions remain attachable until you close them; `tw` does not rewrite live sessions.
 
 Open the Dashboard:
 
@@ -136,7 +138,7 @@ open -a tw-dashboard
 
 Typical Dashboard flow:
 
-1. Click `+ worktree`.
+1. Click `New worktree`.
 2. Choose a local project or SSH host.
 3. Enter an AI command such as `claude` or `codex`.
 4. Attach to the tmux terminal, inspect Git state, edit files, and keep scratch terminals nearby.
@@ -241,9 +243,9 @@ ssh remote-dev -- 'cat > ~/.tmux-worktree.json <<JSON
 JSON'
 ```
 
-4. Add the host in the Dashboard with `+ host`, then create remote worktrees from `+ worktree`.
+4. Open `Settings → Connections → Add host`, then create remote worktrees from `New worktree`.
 
-Remote sessions are created through `tw rpc create-worktree` when available. Older remote installs can still fall back to direct SSH + git/tmux behavior, but the best experience comes from keeping local and remote `tw` versions aligned.
+Remote sessions are created only through `tw rpc create-worktree`. Discovery merges managed RPC state with strict tmux/git shape checks so older live sessions and Dashboard-created remote terminals remain visible; creation never falls back to a second SSH + git/tmux implementation. Upgrade remote `tw` when `rpc create-worktree` is unavailable or incompatible.
 
 ## Android Relay
 
@@ -292,7 +294,7 @@ Supported aliases:
 | Branch | `branch`, `targetBranch`, `target_branch`, `defaultBranch`, `default_branch` |
 | Worktree root | `worktreeBase`, `worktreeDir`, `worktreeRoot`, `worktreesDir`, `worktreesRoot` |
 
-Dashboard connected hosts come only from explicit `hosts` config. The `+ host` dialog can discover non-wildcard aliases from `~/.ssh/config`, but it does not auto-connect every SSH alias on the machine.
+Dashboard connected hosts come only from explicit `hosts` config. `Settings → Connections → Add host` can discover non-wildcard aliases from `~/.ssh/config`, but it does not auto-connect every SSH alias on the machine.
 
 ## Development
 
@@ -357,9 +359,11 @@ The release script:
 
 1. Builds the Tauri Dashboard DMG.
 2. Builds the root CLI into `dist/cli.js`.
-3. Bundles `dist/cli.js` into the Dashboard app resources for remote serve fallback.
+3. Bundles the built CLI modules into the Dashboard app resources for canonical local worktree creation and remote serve fallback.
 4. Copies the DMG to `app/installer/dmg/tw-dashboard-arm64.dmg`.
 5. Leaves upload and channel-specific publishing outside the repository.
+
+Before publishing, assign one new version consistently across the root npm package, Dashboard npm package, Tauri config, Rust package, and Android package. Do not rebuild an existing Git tag with different code.
 
 Generated asset inputs:
 

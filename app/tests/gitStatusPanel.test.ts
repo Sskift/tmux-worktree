@@ -35,10 +35,6 @@ test("remote git status passes host identity through git commands", () => {
   );
   assert.match(
     backend,
-    /log: \(cwd, limit, hostId\) =>\s*transport\.invoke<GitCommit\[]>\("git_log", \{ cwd, limit, hostId: hostId \?\? null \}\)/s,
-  );
-  assert.match(
-    backend,
     /graphRefs: \(cwd, hostId\) =>\s*transport\.invoke<GitGraphRefs>\("git_graph_refs", \{ cwd, hostId: hostId \?\? null \}\)/s,
   );
   assert.match(

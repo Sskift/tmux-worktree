@@ -1,6 +1,6 @@
 @import "./design/tokens.css";
 
-.workspace-inspector {
+.workspace-git-panel {
   display: grid;
   grid-template-rows: 46px minmax(0, 1fr);
   width: 100%;
@@ -12,7 +12,7 @@
   font-family: var(--shell-font-sans);
 }
 
-.workspace-inspector__header {
+.workspace-git-panel__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -21,7 +21,7 @@
   border-bottom: 1px solid var(--shell-border);
 }
 
-.workspace-inspector__title {
+.workspace-git-panel__title {
   display: flex;
   min-width: 0;
   align-items: center;
@@ -31,11 +31,11 @@
   font-weight: 600;
 }
 
-.workspace-inspector__title svg {
+.workspace-git-panel__title svg {
   color: var(--shell-text-muted);
 }
 
-.workspace-inspector__close {
+.workspace-git-panel__close {
   display: grid;
   width: 28px;
   height: 28px;
@@ -48,25 +48,25 @@
   cursor: pointer;
 }
 
-.workspace-inspector__close:hover {
+.workspace-git-panel__close:hover {
   color: var(--shell-text);
   background: var(--shell-surface-hover);
   border-color: var(--shell-border);
 }
 
-.workspace-inspector__close:focus-visible {
+.workspace-git-panel__close:focus-visible {
   outline: 2px solid var(--shell-focus);
   outline-offset: -2px;
 }
 
-.workspace-inspector__panel {
+.workspace-git-panel__panel {
   min-width: 0;
   min-height: 0;
   overflow: auto;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .workspace-inspector__close {
+  .workspace-git-panel__close {
     transition: none;
   }
 }

@@ -105,6 +105,12 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.catalog!.list(),
   },
   {
+    label: "catalog.listLocal",
+    command: "list_local_dashboard_catalog",
+    args: undefined,
+    call: (backend) => backend.catalog!.listLocal!(),
+  },
+  {
     label: "sessions.list",
     command: "list_sessions",
     args: undefined,
@@ -277,12 +283,6 @@ const commandCases: CommandCase[] = [
     command: "git_status",
     args: { cwd: "/repo/dashboard", hostId: "host-1" },
     call: (backend) => backend.git.status("/repo/dashboard", "host-1"),
-  },
-  {
-    label: "git.log",
-    command: "git_log",
-    args: { cwd: "/repo/dashboard", limit: 100, hostId: "host-1" },
-    call: (backend) => backend.git.log("/repo/dashboard", 100, "host-1"),
   },
   {
     label: "git.graphRefs normalizes an absent host",

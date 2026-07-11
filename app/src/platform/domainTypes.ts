@@ -157,16 +157,6 @@ export type GitStatus = {
   files: GitFile[];
 };
 
-export type GitCommit = {
-  hash: string;
-  short: string;
-  parents: string[];
-  subject: string;
-  author: string;
-  rel_time: string;
-  refs: string[];
-};
-
 export type GitGraphPreset = "head" | "current" | "all";
 
 export type GitGraphRefKind = "head" | "local" | "remote" | "tag";

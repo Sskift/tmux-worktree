@@ -1,23 +1,6 @@
+import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import assert from "node:assert/strict";
-
-test("add host modal only offers ssh config candidates", () => {
-  const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
-
-  assert.match(modal, /import \{ MenuSelect, type MenuOption \} from "\.\/MenuSelect";/);
-  assert.match(modal, /sshHosts:\s*HostConfig\[\]/);
-  assert.match(modal, /const hostOptions\s*:\s*MenuOption\[\]/);
-  assert.doesNotMatch(modal, /CUSTOM_HOST_VALUE/);
-  assert.doesNotMatch(modal, /label:\s*"Custom"/);
-  assert.doesNotMatch(modal, /onChange=\{\(e\) => setHost\(e\.target\.value\)\}/);
-  assert.doesNotMatch(modal, /onChange=\{\(e\) => setUser\(e\.target\.value\)\}/);
-  assert.doesNotMatch(modal, /onChange=\{\(e\) => setPort\(e\.target\.value\.replace/);
-  assert.doesNotMatch(modal, /onChange=\{\(e\) => setIdentityFile\(e\.target\.value\)\}/);
-  assert.match(modal, /applySshHostCandidate/);
-  assert.match(modal, /<MenuSelect\s+ariaLabel="SSH host"/);
-  assert.match(modal, /disabled=\{busy \|\| hostOptions\.length === 0\}/);
-});
 
 test("shared menu select closes from pointer down before webview click handling", () => {
   const select = readFileSync(new URL("../src/MenuSelect.tsx", import.meta.url), "utf8");
@@ -27,28 +10,6 @@ test("shared menu select closes from pointer down before webview click handling"
   assert.match(select, /event\.preventDefault\(\);/);
   assert.match(select, /selectOption\(option\.value\);/);
   assert.doesNotMatch(select, /onMouseDown=\{\(event\) => event\.preventDefault\(\)\}/);
-});
-
-test("add host modal omits empty optional fields from tauri args", () => {
-  const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
-
-  assert.match(modal, /const args: HostConfig = \{/);
-  assert.match(modal, /if \(selectedCandidate\.user\?\.trim\(\)\) \{/);
-  assert.match(modal, /if \(typeof selectedCandidate\.port === "number"\) \{/);
-  assert.match(modal, /if \(selectedCandidate\.identityFile\?\.trim\(\)\) \{/);
-  assert.doesNotMatch(modal, /port:\s*selectedCandidate\.port/);
-  assert.doesNotMatch(modal, /selectedCandidate\.port !== undefined/);
-  assert.doesNotMatch(modal, /user:\s*selectedCandidate\.user\?\.trim\(\) \|\| undefined/);
-});
-
-test("add host modal shows the default SSH port when none is configured", () => {
-  const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
-
-  assert.match(modal, /const selectedPort = typeof selectedCandidate\?\.port === "number" \? selectedCandidate\.port : undefined;/);
-  assert.match(modal, /const displayPort = selectedPort \?\? 22;/);
-  assert.match(modal, /Port: <code>\{displayPort\}<\/code>/);
-  assert.match(modal, /\{selectedPort === undefined && <span> \(default\)<\/span>\}/);
-  assert.doesNotMatch(modal, /\{selectedCandidate\.port && <div>Port:/);
 });
 
 test("app loads ssh host candidates into Settings and keeps host status outside worktree list", () => {
@@ -105,7 +66,7 @@ test("app polls host status separately from the main session refresh", () => {
   assert.doesNotMatch(refreshBlock, /dashboardBackend\.hosts\.statuses/);
 });
 
-test("host status exposes remote tw version and install action", () => {
+test("host status exposes remote tw version and install action from Settings", () => {
   const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const sidebar = readFileSync(
     new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
@@ -115,7 +76,6 @@ test("host status exposes remote tw version and install action", () => {
     new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
     "utf8",
   );
-  const modal = readFileSync(new URL("../src/AddHostModal.tsx", import.meta.url), "utf8");
   const catalog = readFileSync(
     new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
     "utf8",
@@ -129,8 +89,6 @@ test("host status exposes remote tw version and install action", () => {
   assert.match(sidebar, /const installHost = connections\.twMissingHosts\[0\]/);
   assert.match(sidebar, /onInstallTw\(installHost\.id\)/);
   assert.match(connections, /\(testedStatus \?\? selectedStatus\)\?\.twVersion/);
-  assert.match(modal, /type HostStatus/);
-  assert.match(modal, /testResult\.twAvailable/);
-  assert.match(modal, /testResult\.twVersion/);
-  assert.match(modal, /Remote TW/);
+  assert.match(connections, /Installing/);
+  assert.match(connections, /Install tw/);
 });

@@ -247,3 +247,24 @@ test("sidebar keeps independent Workspaces and Files views mounted around a shar
   assert.match(css, /\.tw-dashboard-sidebar__view--workspaces\s*\{[\s\S]*?grid-template-rows:\s*auto minmax\(0, 1fr\)/);
   assert.match(css, /\.tw-dashboard-sidebar__files-content\s*\{[\s\S]*?flex:\s*1/);
 });
+
+test("persisted terminals expose inline rename without enabling it for discovered tmux sessions", () => {
+  const source = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.tsx", import.meta.url),
+    "utf8",
+  );
+  const css = readFileSync(
+    new URL("../src/dashboard/DashboardSidebar.css", import.meta.url),
+    "utf8",
+  );
+  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+
+  assert.match(source, /onRenameTerminal: \(terminalId: string, label: string\)/);
+  assert.match(source, /onDoubleClick=\{!terminal\.discovered \?/);
+  assert.match(source, /className="tw-sidebar-row__rename"/);
+  assert.match(source, /event\.key === "Escape"/);
+  assert.match(source, /event\.key === "Enter"[\s\S]*event\.currentTarget\.blur\(\)/);
+  assert.match(css, /\.tw-sidebar-row__rename\s*\{/);
+  assert.match(app, /renamePersistedTerminal\(current, allTerminals, id, label\)/);
+  assert.match(app, /onRenameTerminal=\{renameTerminal\}/);
+});

@@ -270,8 +270,8 @@ export function DashboardShell({
             className="tw-shell__resize-handle tw-shell__resize-handle--inspector"
             type="button"
             role="separator"
-            aria-label="Resize workspace inspector"
-            aria-controls="workspace-inspector"
+            aria-label="Resize Git panel"
+            aria-controls="workspace-git-panel"
             aria-orientation="vertical"
             aria-valuemin={DASHBOARD_PANEL_LIMITS.inspector.min}
             aria-valuemax={DASHBOARD_PANEL_LIMITS.inspector.max}
@@ -284,9 +284,9 @@ export function DashboardShell({
 
         <aside
           ref={inspectorRef}
-          id="workspace-inspector"
+          id="workspace-git-panel"
           className="tw-shell__inspector"
-          aria-label="Workspace inspector"
+          aria-label="Git panel"
           aria-modal={activeDrawer === "inspector" ? true : undefined}
           role={activeDrawer === "inspector" ? "dialog" : undefined}
           tabIndex={activeDrawer === "inspector" ? -1 : undefined}

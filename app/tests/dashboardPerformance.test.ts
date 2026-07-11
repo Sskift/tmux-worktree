@@ -45,6 +45,8 @@ test("tauri polling commands run blocking tmux and ssh work off the main thread"
 
   assert.match(rust, /async fn list_sessions\(\) -> Result<Vec<Session>, String> \{/);
   assert.match(rust, /spawn_blocking\(list_sessions_blocking\)/);
+  assert.match(rust, /async fn list_local_dashboard_catalog\(\) -> Result<DashboardCatalogSnapshot, String> \{/);
+  assert.match(rust, /spawn_blocking\(list_local_dashboard_catalog_blocking\)/);
   assert.match(rust, /async fn list_tmux_terminals\(\) -> Result<Vec<TmuxTerminal>, String> \{/);
   assert.match(rust, /spawn_blocking\(list_tmux_terminals_blocking\)/);
   assert.match(rust, /async fn host_statuses\(state: State<'_, Arc<HostState>>\) -> Result<Vec<HostStatus>, String> \{/);
@@ -53,4 +55,10 @@ test("tauri polling commands run blocking tmux and ssh work off the main thread"
   assert.match(rust, /spawn_blocking\(move \|\| git_graph_refs_for\(&cwd, host_id\.as_deref\(\)\)\)/);
   assert.match(rust, /async fn git_graph\([\s\S]*?\) -> Result<GitGraphResult, String> \{/);
   assert.match(rust, /spawn_blocking\(move \|\| git_graph_for\(&cwd, host_id\.as_deref\(\), query\)\)/);
+  assert.match(rust, /async fn git_fetch_project_roots\(state: State<'_, Arc<GitFetchState>>\) -> Result<\(\), String> \{/);
+  assert.match(rust, /spawn_blocking\(move \|\| git_fetch_project_roots_blocking\(state\)\)/);
+  assert.match(rust, /async fn git_status\(cwd: String, host_id: Option<String>\) -> Result<Option<GitStatus>, String> \{/);
+  assert.match(rust, /spawn_blocking\(move \|\| git_status_for\(&cwd, host_id\.as_deref\(\)\)\)/);
+  assert.match(rust, /async fn git_diff\(cwd: String, path: String, host_id: Option<String>\) -> Result<String, String> \{/);
+  assert.match(rust, /spawn_blocking\(move \|\| git_diff_for\(&cwd, &path, host_id\.as_deref\(\)\)\)/);
 });

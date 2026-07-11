@@ -40,7 +40,7 @@ import {
   type SidebarView,
 } from "./dashboard/DashboardSidebar";
 import { WorkspaceHeader } from "./dashboard/WorkspaceHeader";
-import { Inspector } from "./dashboard/Inspector";
+import { GitPanel } from "./dashboard/GitPanel";
 import type { WorkspaceStatus } from "./dashboard/workspaceStatus";
 import {
   clampDashboardPanelWidthForViewport,
@@ -87,6 +87,7 @@ import {
 import {
   allocateTerminalId,
   createTerminalSaveCoordinator,
+  renamePersistedTerminal,
   type TerminalSaveCoordinator,
 } from "./terminalPersistence";
 import { createLatestRequestGate } from "./latestRequestGate";
@@ -1041,8 +1042,42 @@ function App() {
   const refresh = useCallback(async () => {
     const refreshGeneration = ++catalogRefreshGenerationRef.current.started;
     try {
-      const snapshot = dashboardBackend.catalog
-        ? await dashboardBackend.catalog.list()
+      const catalog = dashboardBackend.catalog;
+      if (catalog?.listLocal && catalogRefreshGenerationRef.current.successful === 0) {
+        const localSnapshot = await catalog.listLocal().catch(() => null);
+        if (
+          localSnapshot &&
+          refreshGeneration >= catalogRefreshGenerationRef.current.successful
+        ) {
+          const mergedLocalCatalog = mergeDashboardCatalogSnapshot(
+            sessionsRef.current,
+            discoveredTerminalsRef.current,
+            localSnapshot,
+          );
+          const localSessions = mergedLocalCatalog.sessions;
+          const order = sessionOrderRef.current;
+          const orderMap = new Map(order.map((name, index) => [name, index]));
+          localSessions.sort((a, b) =>
+            (orderMap.get(a.name) ?? Infinity) - (orderMap.get(b.name) ?? Infinity),
+          );
+          const localTerminals = mergedLocalCatalog.terminals.map((terminal) => ({
+            ...terminal,
+            discovered: true,
+          }));
+          catalogRefreshGenerationRef.current.successful = refreshGeneration;
+          setFailedSessionHostIds(localSnapshot.failedSessionHostIds);
+          setFailedTerminalHostIds(localSnapshot.failedTerminalHostIds);
+          setSessions((previous) => sameSessions(previous, localSessions) ? previous : localSessions);
+          setDiscoveredTerminals((previous) =>
+            samePlainTerminals(previous, localTerminals) ? previous : localTerminals,
+          );
+          setCatalogRefreshGeneration(refreshGeneration);
+          setError(null);
+        }
+      }
+
+      const snapshot = catalog
+        ? await catalog.list()
         : await Promise.all([
           dashboardBackend.sessions.list(),
           dashboardBackend.terminals.listTmux(),
@@ -1731,6 +1766,12 @@ function App() {
     }
   }, [allTerminals, dashboardBackend, sessions]);
 
+  const renameTerminal = useCallback((id: string, label: string) => {
+    setTerminals((current) => (
+      renamePersistedTerminal(current, allTerminals, id, label)
+    ));
+  }, [allTerminals]);
+
   useEffect(() => {
     const handleNewWorktreeShortcut = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -1816,9 +1857,9 @@ function App() {
         execute: openFiles,
       },
       {
-        id: "navigate-git-inspector",
+        id: "navigate-git-panel",
         group: "navigate" as const,
-        label: "Open Git inspector",
+        label: "Open Git panel",
         detail: "Status, history, and changed files for the active workspace",
         keywords: ["git", "changes", "diff", "history"],
         disabledReason:
@@ -2088,7 +2129,7 @@ function App() {
     ) : (
       <div className="dashboard-context-empty">
         <strong>No diff selected</strong>
-        <span>Select a changed file from the Git inspector.</span>
+        <span>Select a changed file from the Git panel.</span>
       </div>
     );
 
@@ -2513,6 +2554,7 @@ function App() {
           onSelectSession={selectSession}
           onCloseSession={closeSession}
           onSelectTerminal={selectTerminal}
+          onRenameTerminal={renameTerminal}
           onCloseTerminal={closeTerminal}
           onSelectAutomation={selectAutomation}
           onInstallTw={installRemoteTw}
@@ -2520,7 +2562,7 @@ function App() {
       }
       workspace={centralWorkspace}
       inspector={
-        <Inspector
+        <GitPanel
           content={renderGit()}
           onClose={() => {
             inspectorOpenPreferenceRef.current = false;

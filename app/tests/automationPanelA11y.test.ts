@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import test from "node:test";
 import { AutomationPanel } from "../src/AutomationPanel";
-import type { Automation } from "../src/automationTypes";
+import type { Automation, AutomationRun } from "../src/automationTypes";
 
 const automation: Automation = {
   id: "daily-review",
@@ -46,4 +47,41 @@ test("automation selection and deletion are sibling native buttons", () => {
     "Delete is a sibling button, so its Enter/Space event cannot bubble into the selection control",
   );
   assert.doesNotMatch(markup, /role="button"/);
+});
+
+test("automation run history owns its styles instead of depending on legacy Git log classes", () => {
+  const run: AutomationRun = {
+    id: "daily-review-2026-07-11",
+    automationId: automation.id,
+    status: "running",
+    startedAt: "2026-07-11T09:00:00.000Z",
+    finishedAt: null,
+    target: "dashboard",
+    sessionName: "tw-dashboard-daily-review",
+    message: null,
+  };
+  const markup = renderToStaticMarkup(
+    createElement(AutomationPanel, {
+      automations: [automation],
+      selectedId: automation.id,
+      runs: [run],
+      onSelect: () => {},
+      onNew: () => {},
+      onCreate: () => {},
+      onToggle: () => {},
+      onRun: () => {},
+      onDelete: () => {},
+      onSave: () => {},
+    }),
+  );
+
+  assert.match(markup, /class="automation-run"/);
+  assert.match(markup, /class="automation-run__status automation-run__status--running"/);
+  assert.match(markup, /class="automation-run__summary"/);
+  assert.doesNotMatch(markup, /class="[^"]*git__/);
+
+  const styles = readFileSync(new URL("../src/App.css", import.meta.url), "utf8");
+  assert.match(styles, /\.automation-run\s*\{/);
+  assert.match(styles, /\.automation-run__status--running\s*\{/);
+  assert.match(styles, /\.automation-run__summary\s*\{/);
 });

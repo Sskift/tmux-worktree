@@ -80,7 +80,6 @@ test("app creates persisted terminals through the host-aware command", () => {
     backend,
     /create: \(args\) => transport\.invoke<CreatedTerminal>\("create_terminal", \{ args \}\)/,
   );
-  assert.doesNotMatch(backend, /"create_plain_terminal"/);
   assert.match(
     app,
     /restored\.map\(\(terminal\) =>\s*dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s,

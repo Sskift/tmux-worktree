@@ -506,7 +506,7 @@ export function AutomationPanel({
           </div>
 
           <div
-            className="sidebar__sessions automation-list"
+            className="automation-list"
             style={listStyle}
             role="list"
             aria-label="automations"
@@ -763,18 +763,20 @@ export function AutomationPanel({
           <span className="section-label__text">runs</span>
           <span className="section-label__line" />
         </div>
-        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <div className="automation-runs">
           {!selected && <div className="empty empty--small">select an automation</div>}
           {selected && visibleRuns.length === 0 && (
             <div className="empty empty--small">no runs</div>
           )}
           {visibleRuns.map((run) => (
-            <div key={run.id} className="git__commit" title={run.id}>
-              <div className="git__commit-row">
-                <span className={`git__hash ${run.status === "running" ? "git__hash--merge" : ""}`}>
+            <div key={run.id} className="automation-run" title={run.id}>
+              <div className="automation-run__row">
+                <span
+                  className={`automation-run__status${run.status === "running" ? " automation-run__status--running" : ""}`}
+                >
                   {run.status}
                 </span>
-                <span className="git__subject">{formatAutomationRunSummary(run)}</span>
+                <span className="automation-run__summary">{formatAutomationRunSummary(run)}</span>
               </div>
             </div>
           ))}

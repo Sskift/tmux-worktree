@@ -24,7 +24,6 @@ import type {
   EnsureTerminalInput,
   FileSearchMode,
   FileSearchResult,
-  GitCommit,
   GitGraphQuery,
   GitGraphRefs,
   GitGraphResponse,
@@ -54,6 +53,7 @@ type HostId = string | null | undefined;
 export interface DashboardBackend {
   catalog?: {
     list(): Promise<DashboardCatalogSnapshot>;
+    listLocal?(): Promise<DashboardCatalogSnapshot>;
   };
   sessions: {
     list(): Promise<Session[]>;
@@ -98,7 +98,6 @@ export interface DashboardBackend {
   };
   git: {
     status(cwd: string, hostId?: HostId): Promise<GitStatus | null>;
-    log(cwd: string, limit: number, hostId?: HostId): Promise<GitCommit[]>;
     graphRefs(cwd: string, hostId?: HostId): Promise<GitGraphRefs>;
     graph(cwd: string, query: GitGraphQuery, hostId?: HostId): Promise<GitGraphResponse>;
     diff(cwd: string, path: string, hostId?: HostId): Promise<string>;
@@ -270,6 +269,8 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     catalog: {
       list: () =>
         transport.invoke<DashboardCatalogSnapshot>("list_dashboard_catalog"),
+      listLocal: () =>
+        transport.invoke<DashboardCatalogSnapshot>("list_local_dashboard_catalog"),
     },
     sessions: {
       list: () => transport.invoke<Session[]>("list_sessions"),
@@ -316,8 +317,6 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     git: {
       status: (cwd, hostId) =>
         transport.invoke<GitStatus | null>("git_status", { cwd, hostId: hostId ?? null }),
-      log: (cwd, limit, hostId) =>
-        transport.invoke<GitCommit[]>("git_log", { cwd, limit, hostId: hostId ?? null }),
       graphRefs: (cwd, hostId) =>
         transport.invoke<GitGraphRefs>("git_graph_refs", { cwd, hostId: hostId ?? null }),
       graph: (cwd, query, hostId) =>

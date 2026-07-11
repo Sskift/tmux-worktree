@@ -16,7 +16,7 @@ test("App renders the planned shell without legacy arbitrary columns", () => {
   assert.match(app, /return \(\s*<DashboardShell/);
   assert.match(app, /<DashboardSidebar/);
   assert.match(app, /<WorkspaceHeader/);
-  assert.match(app, /<Inspector/);
+  assert.match(app, /<GitPanel/);
   assert.doesNotMatch(app, /className="sidebar"|column-drag-handle|useSortable/);
   assert.doesNotMatch(app, /sidebar__git|remote-popover|>\+ host</);
 });
@@ -96,6 +96,6 @@ test("destructive sidebar and automation actions require confirmation", () => {
 test("Git is a focused side panel and Automation keeps a workspace return path", () => {
   assert.match(app, /selection\?\.kind === "automation"[\s\S]*?>Back to workspace</);
   assert.match(app, /returnFromAutomationManager/);
-  assert.match(app, /<Inspector\s+content=\{renderGit\(\)\}/);
+  assert.match(app, /<GitPanel\s+content=\{renderGit\(\)\}/);
   assert.doesNotMatch(app, /inspectorContent|expandedInspectorTab|renderExpandedView/);
 });

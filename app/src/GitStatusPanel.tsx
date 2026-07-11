@@ -12,7 +12,7 @@ import {
   createLatestRequestGate,
   requestSourceKey,
 } from "./latestRequestGate";
-export type { GitCommit, GitFile, GitStatus } from "./platform";
+export type { GitFile, GitStatus } from "./platform";
 
 type Props = {
   cwd: string | null;

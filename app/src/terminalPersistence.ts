@@ -22,6 +22,38 @@ function copyTerminalSnapshot(terminals: readonly PlainTerminal[]): PlainTermina
   return terminals.map((terminal) => ({ ...terminal }));
 }
 
+/**
+ * Applies the user-facing label change to persisted terminal metadata only.
+ * Discovered tmux sessions keep their runtime-derived names, and labels must
+ * stay unique across both persisted and discovered terminals.
+ */
+export function renamePersistedTerminal(
+  terminals: PlainTerminal[],
+  allTerminals: readonly PlainTerminal[],
+  terminalId: string,
+  input: string,
+): PlainTerminal[] {
+  const nextLabel = input.trim();
+  const terminal = terminals.find((candidate) => candidate.id === terminalId);
+  if (
+    !terminal
+    || terminal.discovered
+    || !nextLabel
+    || nextLabel === terminal.label
+  ) {
+    return terminals;
+  }
+
+  const duplicate = [...terminals, ...allTerminals].some(
+    (candidate) => candidate.id !== terminalId && candidate.label.trim() === nextLabel,
+  );
+  if (duplicate) return terminals;
+
+  return terminals.map((candidate) => (
+    candidate.id === terminalId ? { ...candidate, label: nextLabel } : candidate
+  ));
+}
+
 function randomTerminalIdEntropy(): string {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   const words = new Uint32Array(4);

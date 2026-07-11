@@ -4,6 +4,7 @@ import type { PlainTerminal } from "../src/platform/index.ts";
 import {
   allocateTerminalId,
   createTerminalSaveCoordinator,
+  renamePersistedTerminal,
 } from "../src/terminalPersistence.ts";
 
 function terminal(id: string, label = id): PlainTerminal {
@@ -40,6 +41,29 @@ test("terminal ID allocation retries the negligible in-memory UUID collision", (
     allocateTerminalId([terminal("term-v2-duplicate")], () => entropy.shift()!),
     "term-v2-unique",
   );
+});
+
+test("persisted terminal rename trims labels and preserves terminal metadata", () => {
+  const original = [terminal("term-v2-a", "Old label")];
+  const renamed = renamePersistedTerminal(original, [], "term-v2-a", "  New label  ");
+
+  assert.notEqual(renamed, original);
+  assert.deepEqual(renamed, [{ ...original[0], label: "New label" }]);
+});
+
+test("persisted terminal rename rejects blank, duplicate, discovered, and unknown targets", () => {
+  const original = [
+    terminal("term-v2-a", "Alpha"),
+    terminal("term-v2-b", "Beta"),
+    { ...terminal("term-v2-discovered", "Runtime"), discovered: true },
+  ];
+  const discovered = [{ ...terminal("runtime", "Remote shell"), discovered: true }];
+
+  assert.equal(renamePersistedTerminal(original, discovered, "term-v2-a", "  "), original);
+  assert.equal(renamePersistedTerminal(original, discovered, "term-v2-a", "Beta"), original);
+  assert.equal(renamePersistedTerminal(original, discovered, "term-v2-a", " Remote shell "), original);
+  assert.equal(renamePersistedTerminal(original, discovered, "term-v2-discovered", "Renamed"), original);
+  assert.equal(renamePersistedTerminal(original, discovered, "missing", "Renamed"), original);
 });
 
 test("failed terminal metadata saves retry and publish recovery", async () => {

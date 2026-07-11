@@ -17,8 +17,10 @@ import {
   X,
 } from "lucide-react";
 import {
+  useEffect,
   useMemo,
   useRef,
+  useState,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type Ref,
@@ -88,6 +90,7 @@ export type DashboardSidebarProps = {
   onSelectSession: (sessionName: string) => void;
   onCloseSession: (sessionName: string) => void | Promise<void>;
   onSelectTerminal: (terminalId: string) => void;
+  onRenameTerminal: (terminalId: string, label: string) => void | Promise<void>;
   onCloseTerminal: (terminalId: string) => void | Promise<void>;
   onSelectAutomation: (automationId: string) => void;
   onInstallTw: (hostId: string) => void | Promise<void>;
@@ -182,6 +185,7 @@ export function DashboardSidebar({
   onSelectSession,
   onCloseSession,
   onSelectTerminal,
+  onRenameTerminal,
   onCloseTerminal,
   onSelectAutomation,
   onInstallTw,
@@ -238,6 +242,49 @@ export function DashboardSidebar({
     return terminal ? [{ kind: "terminal", item, terminal }] : [];
   });
   const viewTabRefs = useRef(new Map<SidebarView, HTMLButtonElement>());
+  const renameCommitSuppressedRef = useRef(false);
+  const [renamingTerminalId, setRenamingTerminalId] = useState<string | null>(null);
+  const [terminalRenameDraft, setTerminalRenameDraft] = useState("");
+
+  useEffect(() => {
+    if (
+      renamingTerminalId
+      && !terminals.some((terminal) => (
+        terminal.id === renamingTerminalId && !terminal.discovered
+      ))
+    ) {
+      renameCommitSuppressedRef.current = false;
+      setRenamingTerminalId(null);
+      setTerminalRenameDraft("");
+    }
+  }, [renamingTerminalId, terminals]);
+
+  const beginTerminalRename = (terminal: PlainTerminal) => {
+    if (terminal.discovered) return;
+    renameCommitSuppressedRef.current = false;
+    setRenamingTerminalId(terminal.id);
+    setTerminalRenameDraft(terminal.label);
+  };
+
+  const clearTerminalRename = () => {
+    setRenamingTerminalId(null);
+    setTerminalRenameDraft("");
+  };
+
+  const cancelTerminalRename = () => {
+    renameCommitSuppressedRef.current = true;
+    clearTerminalRename();
+  };
+
+  const commitTerminalRename = (terminal: PlainTerminal) => {
+    const suppressed = renameCommitSuppressedRef.current;
+    renameCommitSuppressedRef.current = false;
+    const nextLabel = terminalRenameDraft.trim();
+    clearTerminalRename();
+    if (suppressed || !nextLabel || nextLabel === terminal.label) return;
+    void Promise.resolve(onRenameTerminal(terminal.id, nextLabel)).catch(() => {});
+  };
+
   const handleViewTabKeyDown = (
     event: ReactKeyboardEvent<HTMLButtonElement>,
     current: SidebarView,
@@ -532,26 +579,62 @@ export function DashboardSidebar({
               const selected = selection?.kind === "terminal" && selection.id === terminal.id;
               const description = terminalDescription(terminal, hostsById);
               const pinned = pinnedItems.some((item) => item.kind === "terminal" && item.id === terminal.id);
+              const renaming = renamingTerminalId === terminal.id && !terminal.discovered;
               return (
                 <div className="tw-sidebar-row" data-selected={selected} data-pinned={pinned} key={terminal.id}>
-                  <button
-                    className="tw-sidebar-row__target"
-                    type="button"
-                    onClick={() => onSelectTerminal(terminal.id)}
-                    aria-current={selected ? "page" : undefined}
-                    title={`${terminal.label} — ${description}`}
-                  >
-                    <SquareTerminal
-                      className="tw-sidebar-row__leading-icon"
-                      aria-hidden="true"
-                      size={15}
-                      strokeWidth={1.8}
-                    />
-                    <span className="tw-sidebar-row__copy">
-                      <span className="tw-sidebar-row__title">{terminal.label}</span>
-                      <span className="tw-sidebar-row__meta">{description}</span>
-                    </span>
-                  </button>
+                  {renaming ? (
+                    <div className="tw-sidebar-row__target tw-sidebar-row__target--renaming">
+                      <SquareTerminal
+                        className="tw-sidebar-row__leading-icon"
+                        aria-hidden="true"
+                        size={15}
+                        strokeWidth={1.8}
+                      />
+                      <span className="tw-sidebar-row__copy">
+                        <input
+                          className="tw-sidebar-row__rename"
+                          value={terminalRenameDraft}
+                          aria-label={`Rename terminal ${terminal.label}`}
+                          autoFocus
+                          spellCheck={false}
+                          onChange={(event) => setTerminalRenameDraft(event.currentTarget.value)}
+                          onFocus={(event) => event.currentTarget.select()}
+                          onBlur={() => commitTerminalRename(terminal)}
+                          onKeyDown={(event) => {
+                            event.stopPropagation();
+                            if (event.key === "Escape") {
+                              event.preventDefault();
+                              cancelTerminalRename();
+                            } else if (event.key === "Enter") {
+                              event.preventDefault();
+                              event.currentTarget.blur();
+                            }
+                          }}
+                        />
+                        <span className="tw-sidebar-row__meta">{description}</span>
+                      </span>
+                    </div>
+                  ) : (
+                    <button
+                      className="tw-sidebar-row__target"
+                      type="button"
+                      onClick={() => onSelectTerminal(terminal.id)}
+                      onDoubleClick={!terminal.discovered ? () => beginTerminalRename(terminal) : undefined}
+                      aria-current={selected ? "page" : undefined}
+                      title={`${terminal.label} — ${description}${terminal.discovered ? "" : " · Double-click to rename"}`}
+                    >
+                      <SquareTerminal
+                        className="tw-sidebar-row__leading-icon"
+                        aria-hidden="true"
+                        size={15}
+                        strokeWidth={1.8}
+                      />
+                      <span className="tw-sidebar-row__copy">
+                        <span className="tw-sidebar-row__title">{terminal.label}</span>
+                        <span className="tw-sidebar-row__meta">{description}</span>
+                      </span>
+                    </button>
+                  )}
                   <span className="tw-sidebar-row__actions">
                     <button
                       className="tw-sidebar-row__pin"

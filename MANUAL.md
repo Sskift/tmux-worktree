@@ -14,6 +14,8 @@ Install it like a normal macOS app, then open it:
 open -a tw-dashboard
 ```
 
+If a repository or its linked main checkout is under Desktop, Documents, or Downloads, allow the macOS folder-access prompt on first use. Git worktrees keep their actual Git metadata in the main checkout, so denying that folder prevents Git status and diffs from loading.
+
 Install the CLI from source on any machine that should create `tw`-managed sessions:
 
 ```bash
@@ -38,16 +40,16 @@ The local CLI and Dashboard both read `~/.tmux-worktree.json`:
 }
 ```
 
-Create a local worktree from the CLI:
+Create a local worktree from the CLI using either a configured project name or a git repository path:
 
 ```bash
 tw claude demo
 tw codex /Users/me/workspace/demo fix-auth
 ```
 
-New worktree sessions created by either command use the same single tmux pane as Dashboard-created sessions. The managed-state `profile` still records whether the request came from the CLI or Dashboard for compatibility, but it does not change the pane layout. Existing live sessions created by older releases keep their original panes and remain attachable.
+Both forms always create a managed git worktree and write `~/.tmux-worktree/state.json`; a path that is not a git repository is rejected instead of becoming an untracked plain tmux session. New worktree sessions use the same single tmux pane as Dashboard-created sessions. The managed-state `profile` still records whether the request came from the CLI or Dashboard for compatibility, but it does not change the pane layout. Existing live sessions created by older releases keep their original panes and remain attachable.
 
-Create one from the Dashboard with `+ worktree`: choose `Local`, choose a configured project or browse a path, then enter an AI command such as `claude` or `codex`.
+Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then enter an AI command such as `claude` or `codex`.
 
 ## SSH Remote Hosts
 
@@ -61,7 +63,7 @@ Host remote-dev
   User alice
 ```
 
-2. In the Dashboard, click `+ host`, choose the SSH alias from the list, test it, then add it. The Dashboard saves selected SSH config candidates into `~/.tmux-worktree.json`.
+2. In the Dashboard, open `Settings → Connections → Add host`, choose the SSH alias from the list, test it, then add it. The Dashboard saves selected SSH config candidates into `~/.tmux-worktree.json`.
 
 3. Install or update `tw` on the remote host. A user-local install is enough:
 
@@ -125,13 +127,13 @@ For Dashboard-created sessions, entering `claude`, `codex`, or another command i
 
 ## Create Remote Worktrees From Dashboard
 
-1. Click `+ worktree`.
+1. Click `New worktree`.
 2. Choose the remote host.
 3. Choose a configured remote project, use `browse`, or type a remote repository path.
 4. Enter the AI command, for example `claude` or `codex`.
 5. Create the worktree.
 
-The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. The Dashboard only shows sessions recorded by `tw`.
+The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. For discovery, the Dashboard merges this managed state with strict tmux/git checks so older live worktrees and Dashboard-created remote terminals remain attachable.
 
 ## Create Remote Terminals From Dashboard
 

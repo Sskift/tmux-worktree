@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import packageMetadata from "../package.json";
 import { CliError } from "./tmux";
 
 // ============================================
@@ -12,12 +10,9 @@ import { CliError } from "./tmux";
 // ============================================
 
 function readVersion(): string {
-  try {
-    const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "package.json");
-    return JSON.parse(readFileSync(pkgPath, "utf-8")).version ?? "unknown";
-  } catch {
-    return "unknown";
-  }
+  return typeof packageMetadata.version === "string" && packageMetadata.version.trim()
+    ? packageMetadata.version
+    : "unknown";
 }
 
 function printHelp(): void {

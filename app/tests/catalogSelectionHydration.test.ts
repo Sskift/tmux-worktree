@@ -309,13 +309,19 @@ test("a post-create partial refresh cannot fall back from the new remote session
   assert.equal(result.metadataPending, true);
 });
 
-test("App advances refresh readiness only after both catalog requests succeed", () => {
+test("App publishes the local catalog before the slower remote-aware snapshot", () => {
   const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
   const refreshStart = appSource.indexOf("const refresh = useCallback");
   const refreshEnd = appSource.indexOf("useVisibilityAwarePolling(refresh", refreshStart);
   const refreshSource = appSource.slice(refreshStart, refreshEnd);
 
   assert.match(refreshSource, /const refreshGeneration = \+\+catalogRefreshGenerationRef\.current\.started/);
+  assert.match(refreshSource, /catalog\?\.listLocal/);
+  assert.match(refreshSource, /await catalog\.listLocal\(\)\.catch\(\(\) => null\)/);
+  assert.ok(
+    refreshSource.indexOf("await catalog.listLocal()") <
+      refreshSource.indexOf("await catalog.list()"),
+  );
   assert.match(
     refreshSource,
     /await Promise\.all\(\[\s*dashboardBackend\.sessions\.list\(\),\s*dashboardBackend\.terminals\.listTmux\(\),\s*\]\)/s,

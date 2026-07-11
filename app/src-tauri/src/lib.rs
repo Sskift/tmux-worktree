@@ -466,6 +466,26 @@ async fn list_dashboard_catalog() -> Result<DashboardCatalogSnapshot, String> {
         .map_err(|e| format!("list dashboard catalog task failed: {e}"))?
 }
 
+#[tauri::command]
+async fn list_local_dashboard_catalog() -> Result<DashboardCatalogSnapshot, String> {
+    tauri::async_runtime::spawn_blocking(list_local_dashboard_catalog_blocking)
+        .await
+        .map_err(|e| format!("list local dashboard catalog task failed: {e}"))?
+}
+
+fn list_local_dashboard_catalog_blocking() -> Result<DashboardCatalogSnapshot, String> {
+    let host_ids = load_hosts()?
+        .into_iter()
+        .map(|host| host.id)
+        .collect::<Vec<_>>();
+    Ok(DashboardCatalogSnapshot {
+        sessions: list_local_sessions()?,
+        terminals: list_local_tmux_terminals()?,
+        failed_session_host_ids: host_ids.clone(),
+        failed_terminal_host_ids: host_ids,
+    })
+}
+
 fn list_dashboard_catalog_blocking() -> Result<DashboardCatalogSnapshot, String> {
     let mut sessions = list_local_sessions()?;
     let mut terminals = list_local_tmux_terminals()?;
@@ -584,23 +604,18 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
             if name.starts_with("tw-term-") || name.starts_with("tw-mobile-") {
                 return None;
             }
-            if !local_tmux_session_is_worktree(&name) {
-                return None;
-            }
             let attached = parts.next()? == "1";
             let window_count = parts.next()?.parse().ok()?;
             let created = parts.next()?.parse().ok()?;
             let activity = parts.next()?.parse().ok()?;
             let cwd = parts.next()?.to_string();
-            if !is_managed_worktree_session(&name, &cwd, &worktree_base) {
-                return None;
-            }
+            let worktree_root = managed_worktree_root_for_session(&name, &cwd, &worktree_base)?;
             let output_signature = pane_output_signature(&session_id);
             let agent_running = session_agent_running(&session_id);
             let project = managed_projects
                 .get(&name)
                 .cloned()
-                .or_else(|| project_from_worktree_path(&cwd, &worktree_base));
+                .or_else(|| project_from_worktree_path(&worktree_root, &worktree_base));
             Some(Session {
                 name: name.clone(),
                 attached,
@@ -620,10 +635,27 @@ fn list_local_sessions() -> Result<Vec<Session>, String> {
 }
 
 fn list_remote_sessions(host: &HostConfig) -> Result<Vec<Session>, String> {
-    if let Ok(sessions) = list_remote_sessions_from_tw_rpc(host) {
-        return Ok(sessions);
+    let managed = list_remote_sessions_from_tw_rpc(host);
+    let discovered = list_remote_sessions_via_tmux(host);
+    match (managed, discovered) {
+        (Ok(mut managed), Ok(discovered)) => {
+            let mut seen = managed
+                .iter()
+                .map(|session| session.raw_name.clone())
+                .collect::<HashSet<_>>();
+            managed.extend(
+                discovered
+                    .into_iter()
+                    .filter(|session| seen.insert(session.raw_name.clone())),
+            );
+            Ok(managed)
+        }
+        (Ok(managed), Err(_)) => Ok(managed),
+        (Err(_), Ok(discovered)) => Ok(discovered),
+        (Err(rpc_error), Err(tmux_error)) => Err(format!(
+            "remote session catalog failed via tw rpc ({rpc_error}) and tmux ({tmux_error})"
+        )),
     }
-    list_remote_sessions_via_tmux(host)
 }
 
 fn list_remote_sessions_from_tw_rpc(host: &HostConfig) -> Result<Vec<Session>, String> {
@@ -826,22 +858,8 @@ fn remote_session_active_cwd(host: &HostConfig, raw_name: &str) -> Option<String
     )
 }
 
-fn local_git_root(cwd: &str) -> Option<String> {
-    run_quiet(&["git", "-C", cwd, "rev-parse", "--show-toplevel"])
-}
-
 fn remote_git_root(host: &HostConfig, cwd: &str) -> Option<String> {
     run_remote_cmd_quiet(host, &["git", "-C", cwd, "rev-parse", "--show-toplevel"])
-}
-
-fn local_tmux_session_is_worktree(raw_name: &str) -> bool {
-    let Some(cwd) = local_session_active_cwd(raw_name) else {
-        return false;
-    };
-    let Some(git_root) = local_git_root(&cwd) else {
-        return false;
-    };
-    session_name_matches_git_root(raw_name, &git_root)
 }
 
 fn remote_tmux_session_is_worktree(host: &HostConfig, raw_name: &str) -> bool {
@@ -895,9 +913,6 @@ fn list_local_tmux_terminals() -> Result<Vec<TmuxTerminal>, String> {
             if !raw_name.starts_with("tw-term-") || raw_name.starts_with("tw-mobile-") {
                 return None;
             }
-            if local_tmux_session_is_worktree(&raw_name) {
-                return None;
-            }
             let cwd = local_session_active_cwd(&raw_name).unwrap_or_default();
             Some(TmuxTerminal {
                 id: format!("tmux:{}", raw_name),
@@ -912,10 +927,27 @@ fn list_local_tmux_terminals() -> Result<Vec<TmuxTerminal>, String> {
 }
 
 fn list_remote_tmux_terminals(host: &HostConfig) -> Result<Vec<TmuxTerminal>, String> {
-    if let Ok(terminals) = list_remote_tmux_terminals_from_tw_rpc(host) {
-        return Ok(terminals);
+    let managed = list_remote_tmux_terminals_from_tw_rpc(host);
+    let discovered = list_remote_tmux_terminals_via_tmux(host);
+    match (managed, discovered) {
+        (Ok(mut managed), Ok(discovered)) => {
+            let mut seen = managed
+                .iter()
+                .map(|terminal| terminal.raw_name.clone())
+                .collect::<HashSet<_>>();
+            managed.extend(
+                discovered
+                    .into_iter()
+                    .filter(|terminal| seen.insert(terminal.raw_name.clone())),
+            );
+            Ok(managed)
+        }
+        (Ok(managed), Err(_)) => Ok(managed),
+        (Err(_), Ok(discovered)) => Ok(discovered),
+        (Err(rpc_error), Err(tmux_error)) => Err(format!(
+            "remote terminal catalog failed via tw rpc ({rpc_error}) and tmux ({tmux_error})"
+        )),
     }
-    list_remote_tmux_terminals_via_tmux(host)
 }
 
 fn list_remote_tmux_terminals_from_tw_rpc(host: &HostConfig) -> Result<Vec<TmuxTerminal>, String> {
@@ -969,13 +1001,12 @@ fn is_managed_worktree_session(name: &str, cwd: &str, worktree_base: &str) -> bo
         return false;
     }
     let cwd_path = std::path::Path::new(cwd);
-    if !is_git_worktree_dir(cwd_path) {
-        return false;
-    }
-
     let base = worktree_base.trim_end_matches('/');
     let under_base = cwd == base || cwd.starts_with(&format!("{base}/"));
     if !under_base && !cwd.contains("/.tmux-worktree/worktrees/") {
+        return false;
+    }
+    if !is_git_worktree_dir(cwd_path) {
         return false;
     }
 
@@ -983,6 +1014,14 @@ fn is_managed_worktree_session(name: &str, cwd: &str, worktree_base: &str) -> bo
         return false;
     };
     tw_session_name_from_worktree_dir(dirname).is_some_and(|session_name| session_name == name)
+}
+
+fn managed_worktree_root_for_session(name: &str, cwd: &str, worktree_base: &str) -> Option<String> {
+    std::path::Path::new(cwd)
+        .ancestors()
+        .filter_map(|path| path.to_str())
+        .find(|path| is_managed_worktree_session(name, path, worktree_base))
+        .map(ToString::to_string)
 }
 
 fn pane_output_signature(name: &str) -> Option<String> {
@@ -1055,7 +1094,19 @@ fn tmux_session_exists(name: String) -> Result<bool, String> {
     match host_id {
         Some(hid) => {
             let host = find_host(hid)?;
-            Ok(run_remote_tmux_quiet(&host, &["has-session", "-t", &exact]).is_some())
+            let output = run_remote_tmux_output(&host, &["has-session", "-t", &exact])?;
+            if output.status.success() {
+                return Ok(true);
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let detail = stderr.trim();
+            if tmux_session_is_missing_error(detail) {
+                return Ok(false);
+            }
+            Err(format!(
+                "tmux has-session on {} failed ({}): {}",
+                host.label, output.status, detail
+            ))
         }
         None => Ok(run_quiet(&["tmux", "has-session", "-t", &exact]).is_some()),
     }
@@ -3971,17 +4022,6 @@ struct GitFile {
     path: String,
 }
 
-#[derive(Serialize, Clone)]
-struct GitCommit {
-    hash: String,
-    short: String,
-    parents: Vec<String>,
-    subject: String,
-    author: String,
-    rel_time: String,
-    refs: Vec<String>,
-}
-
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum GitGraphRefKind {
@@ -4453,82 +4493,6 @@ async fn git_graph(
         .map_err(|error| format!("git graph task failed: {error}"))?
 }
 
-#[tauri::command]
-fn git_log(
-    cwd: String,
-    limit: Option<u32>,
-    host_id: Option<String>,
-) -> Result<Vec<GitCommit>, String> {
-    let host = host_id.as_deref();
-    let inside = run_git_quiet(host, &["-C", &cwd, "rev-parse", "--is-inside-work-tree"]);
-    if inside.as_deref() != Some("true") {
-        return Ok(vec![]);
-    }
-
-    let n = limit.unwrap_or(80).min(500);
-    let n_str = n.to_string();
-    let fmt = "%H\x1f%h\x1f%P\x1f%s\x1f%an\x1f%ar\x1f%D";
-    let pretty = format!("--pretty=format:{}", fmt);
-    let output = run_git_output(
-        host,
-        &[
-            "-C",
-            &cwd,
-            "log",
-            "--all",
-            "--topo-order",
-            "--decorate=short",
-            "-n",
-            &n_str,
-            &pretty,
-        ],
-    )?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("does not have any commits yet") {
-            return Ok(vec![]);
-        }
-        return Err(format!("git log failed: {}", stderr.trim()));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let commits = stdout
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|line| {
-            let mut parts = line.splitn(7, '\x1f');
-            let hash = parts.next()?.to_string();
-            let short = parts.next()?.to_string();
-            let parents_raw = parts.next()?;
-            let subject = parts.next()?.to_string();
-            let author = parts.next()?.to_string();
-            let rel_time = parts.next()?.to_string();
-            let refs_raw = parts.next().unwrap_or("");
-            let parents = if parents_raw.is_empty() {
-                Vec::new()
-            } else {
-                parents_raw.split(' ').map(|s| s.to_string()).collect()
-            };
-            let refs = if refs_raw.is_empty() {
-                Vec::new()
-            } else {
-                refs_raw.split(", ").map(|s| s.to_string()).collect()
-            };
-            Some(GitCommit {
-                hash,
-                short,
-                parents,
-                subject,
-                author,
-                rel_time,
-                refs,
-            })
-        })
-        .collect();
-
-    Ok(commits)
-}
-
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4594,8 +4558,7 @@ fn git_fetch_project_root(path: &str) {
         .output();
 }
 
-#[tauri::command]
-fn git_fetch_project_roots(state: State<'_, Arc<GitFetchState>>) -> Result<(), String> {
+fn git_fetch_project_roots_blocking(state: Arc<GitFetchState>) -> Result<(), String> {
     let projects = list_projects()?;
     let paths = fetchable_project_paths(&projects);
     if paths.is_empty() {
@@ -4612,7 +4575,7 @@ fn git_fetch_project_roots(state: State<'_, Arc<GitFetchState>>) -> Result<(), S
     };
 
     for target in targets {
-        let state = state.inner().clone();
+        let state = state.clone();
         thread::spawn(move || {
             git_fetch_project_root(&target);
             let mut tracker = state.tracker.lock().unwrap();
@@ -4624,14 +4587,23 @@ fn git_fetch_project_roots(state: State<'_, Arc<GitFetchState>>) -> Result<(), S
 }
 
 #[tauri::command]
-fn git_status(cwd: String, host_id: Option<String>) -> Result<Option<GitStatus>, String> {
-    let host = host_id.as_deref();
-    let inside = run_git_quiet(host, &["-C", &cwd, "rev-parse", "--is-inside-work-tree"]);
+async fn git_fetch_project_roots(state: State<'_, Arc<GitFetchState>>) -> Result<(), String> {
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || git_fetch_project_roots_blocking(state))
+        .await
+        .map_err(|error| format!("git fetch discovery task failed: {error}"))?
+}
+
+fn git_status_for(cwd: &str, host_id: Option<&str>) -> Result<Option<GitStatus>, String> {
+    let inside = run_git_quiet(host_id, &["-C", cwd, "rev-parse", "--is-inside-work-tree"]);
     if inside.as_deref() != Some("true") {
         return Ok(None);
     }
 
-    let output = run_git_output(host, &["-C", &cwd, "status", "--porcelain=v2", "--branch"])?;
+    let output = run_git_output(
+        host_id,
+        &["-C", cwd, "status", "--porcelain=v2", "--branch"],
+    )?;
     if !output.status.success() {
         return Err(format!(
             "git status failed: {}",
@@ -4727,10 +4699,15 @@ fn git_status(cwd: String, host_id: Option<String>) -> Result<Option<GitStatus>,
 }
 
 #[tauri::command]
-fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String, String> {
-    let host = host_id.as_deref();
+async fn git_status(cwd: String, host_id: Option<String>) -> Result<Option<GitStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || git_status_for(&cwd, host_id.as_deref()))
+        .await
+        .map_err(|error| format!("git status task failed: {error}"))?
+}
+
+fn git_diff_for(cwd: &str, path: &str, host_id: Option<&str>) -> Result<String, String> {
     // Try unstaged diff first
-    let output = run_git_output(host, &["-C", &cwd, "diff", "--", &path])?;
+    let output = run_git_output(host_id, &["-C", cwd, "diff", "--", path])?;
     if !output.status.success() {
         return Err(format!(
             "git diff failed: {}",
@@ -4745,7 +4722,7 @@ fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String
     }
 
     // Try staged diff
-    let output2 = run_git_output(host, &["-C", &cwd, "diff", "--cached", "--", &path])?;
+    let output2 = run_git_output(host_id, &["-C", cwd, "diff", "--cached", "--", path])?;
     if !output2.status.success() {
         return Err(format!(
             "git diff --cached failed: {}",
@@ -4761,8 +4738,8 @@ fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String
 
     // For untracked files, show entire file as addition
     let output3 = run_git_output(
-        host,
-        &["-C", &cwd, "diff", "--no-index", "/dev/null", &path],
+        host_id,
+        &["-C", cwd, "diff", "--no-index", "/dev/null", path],
     );
 
     if let Ok(o) = output3 {
@@ -4779,6 +4756,13 @@ fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String
     }
 
     Ok(String::new())
+}
+
+#[tauri::command]
+async fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || git_diff_for(&cwd, &path, host_id.as_deref()))
+        .await
+        .map_err(|error| format!("git diff task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -4954,14 +4938,6 @@ fn pty_kill(state: State<'_, Arc<PtyState>>, id: String) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn create_plain_terminal(cwd: String) -> Result<String, String> {
-    let name = format!("tw-term-{}", random_id());
-    run_check(&["tmux", "new-session", "-d", "-s", &name, "-c", &cwd])?;
-    setup_clipboard_bindings();
-    Ok(name)
-}
-
 fn unique_terminal_name() -> String {
     loop {
         let name = format!("tw-term-{}", random_id());
@@ -5111,16 +5087,29 @@ fn ensure_terminal_session(args: EnsureTerminalArgs) -> Result<(), String> {
 fn kill_plain_terminal(name: String) -> Result<(), String> {
     let (host_id, raw_name) = parse_session_key(&name);
     let exact = format!("={}", raw_name);
-    match host_id {
+    let result = match host_id {
         Some(host_id) => {
             let host = find_host(host_id)?;
-            let _ = run_remote_tmux_quiet(&host, &["kill-session", "-t", &exact]);
+            run_remote_tmux_check(&host, &["kill-session", "-t", &exact]).map(|_| ())
         }
-        None => {
-            let _ = run_quiet(&["tmux", "kill-session", "-t", &exact]);
-        }
+        None => run_check(&["tmux", "kill-session", "-t", &exact]).map(|_| ()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        // Closing stale persisted metadata is intentionally idempotent. Only a
+        // verified "already gone" response is treated as success; SSH, auth,
+        // executable, and other tmux failures must reach the UI.
+        Err(error) if tmux_session_is_missing_error(&error) => Ok(()),
+        Err(error) => Err(error),
     }
-    Ok(())
+}
+
+fn tmux_session_is_missing_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("can't find session")
+        || lower.contains("no server running")
+        || lower.contains("no current server")
+        || lower.contains("no sessions")
 }
 
 fn terminals_path() -> std::path::PathBuf {
@@ -6563,6 +6552,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_dashboard_catalog,
+            list_local_dashboard_catalog,
             list_sessions,
             tmux_session_exists,
             list_projects,
@@ -6583,11 +6573,9 @@ pub fn run() {
             git_fetch_project_roots,
             git_graph_refs,
             git_graph,
-            git_log,
             git_diff,
             list_tmux_terminals,
             create_terminal,
-            create_plain_terminal,
             ensure_terminal_session,
             kill_plain_terminal,
             load_terminals,
@@ -6657,23 +6645,24 @@ mod tests {
         is_git_worktree_dir, is_managed_worktree_session, kill_plain_terminal, kill_session,
         layout_backup_path, layout_schema_version, list_automation_runs, list_remote_sessions,
         list_remote_tmux_terminals, load_hosts, load_pending_cleanup,
-        mobile_relay_config_from_value, normalize_local_mdns_name, orphaned_worktrees,
-        parse_local_worktree_rpc_response, parse_session_key, probe_local_agents_in_paths,
-        project_from_config, project_from_worktree_path, projects_from_config,
-        projects_from_config_with_home, remote_file_exists_for_host, remote_home_dir_for_host,
-        remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
-        remove_host_with_state, reserve_git_fetch_target, restore_worktree, run_remote_tmux_check,
-        run_remote_tw_check, save_automation, save_hosts_config, save_layout, save_pending_cleanup,
+        managed_worktree_root_for_session, mobile_relay_config_from_value,
+        normalize_local_mdns_name, orphaned_worktrees, parse_local_worktree_rpc_response,
+        parse_session_key, probe_local_agents_in_paths, project_from_config,
+        project_from_worktree_path, projects_from_config, projects_from_config_with_home,
+        remote_file_exists_for_host, remote_home_dir_for_host, remote_read_dirs_for_host,
+        remote_read_file_bytes_for_host, remote_write_file_for_host, remove_host_with_state,
+        reserve_git_fetch_target, restore_worktree, run_remote_tmux_check, run_remote_tw_check,
+        save_automation, save_hosts_config, save_layout, save_pending_cleanup,
         select_local_tw_rpc_runtime, should_skip_automation_overlap,
         ssh_host_candidates_from_config_text, stable_output_signature, test_host,
-        trigger_automation_with_creator, try_cleanup_worktree, update_host_config,
-        upsert_automation_from_input, worktree_has_uncommitted_changes, worktrees_for_session,
-        AddHostArgs, AgentProbeResult, Automation, AutomationOverlap, AutomationRun,
-        AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
-        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
-        GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
-        Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
-        AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+        tmux_session_exists, trigger_automation_with_creator, try_cleanup_worktree,
+        update_host_config, upsert_automation_from_input, worktree_has_uncommitted_changes,
+        worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
+        AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
+        CreateTerminalArgs, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
+        GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
+        LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput,
+        UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -7469,9 +7458,11 @@ exit 12
         let managed = project.join("demo-task-abc12");
         let plain = project.join("demo-task");
         let mismatched = project.join("other-task-abc12");
+        let nested = managed.join("app/src");
         fs::create_dir_all(&managed).expect("managed");
         fs::create_dir_all(&plain).expect("plain");
         fs::create_dir_all(&mismatched).expect("mismatched");
+        fs::create_dir_all(&nested).expect("nested");
         fs::write(
             managed.join(".git"),
             "gitdir: /repo/.git/worktrees/demo-task-abc12",
@@ -7501,6 +7492,15 @@ exit 12
             mismatched.to_str().expect("mismatched path"),
             &base,
         ));
+        assert_eq!(
+            managed_worktree_root_for_session(
+                "demo-task",
+                nested.to_str().expect("nested path"),
+                &base,
+            )
+            .as_deref(),
+            managed.to_str(),
+        );
     }
 
     #[test]
@@ -8707,7 +8707,7 @@ exit 12
     }
 
     #[test]
-    fn list_remote_sessions_prefers_tw_rpc_managed_state() {
+    fn list_remote_sessions_merges_rpc_state_with_legacy_tw_shaped_tmux_sessions() {
         let _guard = test_env_lock().lock().expect("lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
@@ -8736,12 +8736,28 @@ JSON
       exit 0
       ;;
     *"tmux capture-pane"*)
-      printf 'managed-cli\037123:45\037 ⠇ managed-cli\n'
+      printf 'managed-cli\037123:45\037 ⠇ managed-cli\nlegacy-cli\037456:78\037 idle\n'
       exit 0
       ;;
     *"'tmux'"*"'list-sessions'"*)
-      printf 'dashboard should not scan remote tmux when tw rpc list works\n' >&2
-      exit 12
+      printf 'managed-cli\0370\0373\0371760000000\0371760000100\nlegacy-cli\0370\0371\0371760000200\0371760000300\n'
+      exit 0
+      ;;
+    *"'tmux'"*"'display-message'"*"'=managed-cli:'"*)
+      printf '/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c\n'
+      exit 0
+      ;;
+    *"'tmux'"*"'display-message'"*"'=legacy-cli:'"*)
+      printf '/home/dev/.tmux-worktree/worktrees/coco/legacy-cli-d3e4f\n'
+      exit 0
+      ;;
+    *"'git'"*"managed-cli-a1b2c"*"'rev-parse'"*"'--show-toplevel'"*)
+      printf '/home/dev/.tmux-worktree/worktrees/coco/managed-cli-a1b2c\n'
+      exit 0
+      ;;
+    *"'git'"*"legacy-cli-d3e4f"*"'rev-parse'"*"'--show-toplevel'"*)
+      printf '/home/dev/.tmux-worktree/worktrees/coco/legacy-cli-d3e4f\n'
+      exit 0
       ;;
   esac
 fi
@@ -8784,7 +8800,7 @@ exit 12
         let sessions = list_remote_sessions(&host).expect("remote rpc sessions");
         let log = fs::read_to_string(&log_path).expect("ssh log");
 
-        assert_eq!(sessions.len(), 1, "ssh log:\n{log}");
+        assert_eq!(sessions.len(), 2, "ssh log:\n{log}");
         assert_eq!(sessions[0].name, "dev:managed-cli");
         assert_eq!(sessions[0].raw_name, "managed-cli");
         assert_eq!(sessions[0].window_count, 3);
@@ -8795,9 +8811,12 @@ exit 12
             Some("remote:123:45")
         );
         assert_eq!(sessions[0].agent_running, Some(true));
+        assert_eq!(sessions[1].name, "dev:legacy-cli");
+        assert_eq!(sessions[1].raw_name, "legacy-cli");
+        assert_eq!(sessions[1].window_count, 1);
         assert!(log.contains("'tw' 'rpc' 'list'"));
         assert!(log.contains("tmux capture-pane"));
-        assert!(!log.contains("'tmux' 'list-sessions'"));
+        assert!(log.contains("'tmux' 'list-sessions'"));
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);
@@ -8912,7 +8931,7 @@ exit 12
     }
 
     #[test]
-    fn remote_tmux_terminal_listing_prefers_tw_rpc_managed_state() {
+    fn remote_tmux_terminal_listing_merges_rpc_state_with_dashboard_tmux_sessions() {
         let _guard = test_env_lock().lock().expect("lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let bin_dir = temp.path().join("bin");
@@ -8941,8 +8960,20 @@ JSON
       exit 0
       ;;
     *"'tmux'"*"'list-sessions'"*)
-      printf 'dashboard should not scan remote tmux when tw rpc list works\n' >&2
-      exit 12
+      printf 'tw-term-agent\0371\0371\0371760000200\0371760000300\ntw-term-direct\0370\0371\0371760000400\0371760000500\n'
+      exit 0
+      ;;
+    *"'tmux'"*"'display-message'"*"'=tw-term-agent:'"*)
+      printf '/remote/app\n'
+      exit 0
+      ;;
+    *"'tmux'"*"'display-message'"*"'=tw-term-direct:'"*)
+      printf '/remote/direct\n'
+      exit 0
+      ;;
+    *"'git'"*"'rev-parse'"*"'--show-toplevel'"*)
+      printf 'fatal: not a git repository\n' >&2
+      exit 128
       ;;
   esac
 fi
@@ -8985,15 +9016,18 @@ exit 12
         let terminals = list_remote_tmux_terminals(&host).expect("remote rpc terminals");
         let log = fs::read_to_string(&log_path).expect("ssh log");
 
-        assert_eq!(terminals.len(), 1, "ssh log:\n{log}");
+        assert_eq!(terminals.len(), 2, "ssh log:\n{log}");
         assert_eq!(terminals[0].id, "ssh:dev:tw-term-agent");
         assert_eq!(terminals[0].label, "tw-term-agent");
         assert_eq!(terminals[0].tmux_name, "dev:tw-term-agent");
         assert_eq!(terminals[0].cwd, "/remote/app");
         assert_eq!(terminals[0].host_id.as_deref(), Some("dev"));
         assert_eq!(terminals[0].raw_name, "tw-term-agent");
+        assert_eq!(terminals[1].id, "ssh:dev:tw-term-direct");
+        assert_eq!(terminals[1].cwd, "/remote/direct");
+        assert_eq!(terminals[1].host_id.as_deref(), Some("dev"));
         assert!(log.contains("'tw' 'rpc' 'list'"));
-        assert!(!log.contains("'tmux' 'list-sessions'"));
+        assert!(log.contains("'tmux' 'list-sessions'"));
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);
@@ -9375,6 +9409,170 @@ exit 12
 
         restore_env("PATH", original_path);
         restore_env("TW_FAKE_SSH_LOG", original_log);
+        restore_env("HOME", original_home);
+    }
+
+    #[test]
+    fn remote_tmux_session_exists_distinguishes_missing_session_from_ssh_failure() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ssh_path = bin_dir.join("ssh");
+        fs::write(
+            &ssh_path,
+            r#"#!/bin/sh
+case "${TW_FAKE_SSH_MODE:?}" in
+  exists)
+    exit 0
+    ;;
+  missing)
+    printf "can't find session: tw-term-probe\n" >&2
+    exit 1
+    ;;
+  remote_error)
+    printf 'tmux: failed to connect to server\n' >&2
+    exit 1
+    ;;
+  offline)
+    printf 'ssh: connect to host ssh-host port 22: Operation timed out\n' >&2
+    exit 255
+    ;;
+esac
+exit 12
+"#,
+        )
+        .expect("ssh shim");
+        let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ssh_path, perms).expect("ssh executable");
+
+        let original_path = std::env::var("PATH").ok();
+        let original_mode = std::env::var("TW_FAKE_SSH_MODE").ok();
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.to_string_lossy(),
+                    original_path.clone().unwrap_or_default()
+                ),
+            );
+            std::env::set_var("HOME", temp.path());
+        }
+        save_hosts_config(&[HostConfig {
+            id: "dev".to_string(),
+            label: "Dev".to_string(),
+            host: "ssh-host".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
+        }])
+        .expect("save hosts");
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "exists");
+        }
+        assert!(tmux_session_exists("dev:tw-term-probe".to_string()).expect("existing session"));
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "missing");
+        }
+        assert!(!tmux_session_exists("dev:tw-term-probe".to_string()).expect("missing session"));
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "remote_error");
+        }
+        let error = tmux_session_exists("dev:tw-term-probe".to_string())
+            .expect_err("an arbitrary remote exit 1 must not look like a missing session");
+        assert!(error.contains("failed to connect to server"), "{error}");
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "offline");
+        }
+        let error = tmux_session_exists("dev:tw-term-probe".to_string())
+            .expect_err("offline host must not look like a missing session");
+        assert!(error.contains("Operation timed out"), "{error}");
+
+        restore_env("PATH", original_path);
+        restore_env("TW_FAKE_SSH_MODE", original_mode);
+        restore_env("HOME", original_home);
+    }
+
+    #[test]
+    fn kill_remote_plain_terminal_surfaces_transport_failure_but_allows_already_missing() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join("bin");
+        fs::create_dir_all(&bin_dir).expect("bin dir");
+        let ssh_path = bin_dir.join("ssh");
+        fs::write(
+            &ssh_path,
+            r#"#!/bin/sh
+case "${TW_FAKE_SSH_MODE:?}" in
+  missing)
+    printf "can't find session: tw-term-dead\n" >&2
+    exit 1
+    ;;
+  offline)
+    printf 'ssh: connect to host ssh-host port 22: No route to host\n' >&2
+    exit 255
+    ;;
+esac
+exit 12
+"#,
+        )
+        .expect("ssh shim");
+        let mut perms = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&ssh_path, perms).expect("ssh executable");
+
+        let original_path = std::env::var("PATH").ok();
+        let original_mode = std::env::var("TW_FAKE_SSH_MODE").ok();
+        let original_home = std::env::var("HOME").ok();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin_dir.to_string_lossy(),
+                    original_path.clone().unwrap_or_default()
+                ),
+            );
+            std::env::set_var("HOME", temp.path());
+        }
+        save_hosts_config(&[HostConfig {
+            id: "dev".to_string(),
+            label: "Dev".to_string(),
+            host: "ssh-host".to_string(),
+            user: None,
+            port: None,
+            identity_file: None,
+            worktree_base: None,
+            tmux_path: None,
+            tw_path: None,
+        }])
+        .expect("save hosts");
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "offline");
+        }
+        let error = kill_plain_terminal("dev:tw-term-dead".to_string())
+            .expect_err("transport failure must reach the caller");
+        assert!(error.contains("No route to host"), "{error}");
+
+        unsafe {
+            std::env::set_var("TW_FAKE_SSH_MODE", "missing");
+        }
+        kill_plain_terminal("dev:tw-term-dead".to_string())
+            .expect("already missing terminal remains idempotent");
+
+        restore_env("PATH", original_path);
+        restore_env("TW_FAKE_SSH_MODE", original_mode);
         restore_env("HOME", original_home);
     }
 

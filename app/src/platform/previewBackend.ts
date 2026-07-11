@@ -1,7 +1,6 @@
 import type { AutomationRecord, AutomationRunRecord } from "../automationTypes";
 import { createFakeDashboardBackend } from "./fakeBackend";
 import type {
-  GitCommit,
   GitGraphCommit,
   GitGraphRef,
   GitGraphRefs,
@@ -146,27 +145,6 @@ const gitStatus: GitStatus = {
     { code: "??", path: "design-qa.md" },
   ],
 };
-
-const gitLog: GitCommit[] = [
-  {
-    hash: "64bb031f4cb59f4e3c33c28a215f947e8cc15d1a",
-    short: "64bb031",
-    parents: ["682f016"],
-    subject: "refactor(dashboard): add injectable platform backend",
-    author: "Dashboard Preview",
-    rel_time: "4 minutes ago",
-    refs: ["HEAD -> tmux-worktree-app-re-ddf7c"],
-  },
-  {
-    hash: "682f016000000000000000000000000000000000",
-    short: "682f016",
-    parents: ["a9fceb0"],
-    subject: "docs: finalize dashboard v2 redesign plan",
-    author: "Dashboard Preview",
-    rel_time: "20 minutes ago",
-    refs: [],
-  },
-];
 
 const graphRefs: GitGraphRef[] = [
   { name: "refs/heads/tmux-worktree-app-re-ddf7c", shortName: "tmux-worktree-app-re-ddf7c", kind: "local", current: true, upstream: "refs/remotes/origin/tmux-worktree-app-re-ddf7c" },
@@ -319,6 +297,12 @@ transport.handlers.set("list_dashboard_catalog", value({
   failedSessionHostIds: [],
   failedTerminalHostIds: [],
 }));
+transport.handlers.set("list_local_dashboard_catalog", value({
+  sessions: sessions.filter((session) => !session.hostId),
+  terminals: terminals.filter((terminal) => !terminal.hostId),
+  failedSessionHostIds: hosts.map((host) => host.id),
+  failedTerminalHostIds: hosts.map((host) => host.id),
+}));
 transport.handlers.set("list_projects", value(projects));
 transport.handlers.set("list_remote_projects", value(projects.slice(1)));
 transport.handlers.set("list_orphaned_worktrees", value([]));
@@ -382,7 +366,6 @@ transport.handlers.set("mobile_relay_save_config", value(relayStatus));
 transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
 transport.handlers.set("git_fetch_project_roots", nothing);
 transport.handlers.set("git_status", value(gitStatus));
-transport.handlers.set("git_log", value(gitLog));
 transport.handlers.set("git_graph_refs", value(gitGraphRefs));
 transport.handlers.set("git_graph", value(gitGraph));
 transport.handlers.set("git_diff", value([
