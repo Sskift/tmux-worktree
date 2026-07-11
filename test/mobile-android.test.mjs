@@ -12,6 +12,12 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   const relayActor = read(
     "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayV1ConnectionActor.kt",
   );
+  const viewModel = read(
+    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2ViewModel.kt",
+  );
+  const registries = read(
+    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayRegistries.kt",
+  );
 
   assert.match(html, /<script src="xterm\.js"><\/script>/);
   assert.match(html, /<script src="xterm-addon-fit\.js"><\/script>/);
@@ -30,9 +36,38 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   assert.match(webView, /settings\.allowContentAccess = false/);
   assert.match(webView, /settings\.mixedContentMode = WebSettings\.MIXED_CONTENT_NEVER_ALLOW/);
   assert.match(webView, /modifier = modifier\.clipToBounds\(\)/);
+  assert.match(webView, /MAX_PENDING_TERMINAL_CHARS = 1024 \* 1024/);
+  assert.match(webView, /Terminal output truncated: client buffer limit reached/);
+  assert.match(webView, /evaluateJavascript\(script\) \{/);
   assert.match(relayActor, /terminalOutputBuffer\.append\(data\)/);
-  assert.match(relayActor, /delay\(TERMINAL_OUTPUT_BATCH_MILLIS\)/);
+  assert.match(relayActor, /delay\(terminalOutputBatchMillis\.coerceAtLeast\(1\)\)/);
   assert.match(relayActor, /MAX_TERMINAL_OUTPUT_BATCH_CHARS = 64 \* 1024/);
+  assert.match(relayActor, /BoundedActionQueue<Action>\(/);
+  assert.match(relayActor, /normalSlots = Semaphore\(validatedNormalCapacity\)/);
+  assert.match(
+    relayActor,
+    /Channel<QueuedAction<T>>\([\s\S]*validatedNormalCapacity \+ validatedReservedCapacity/,
+  );
+  assert.match(relayActor, /callbackIngressLock = Any\(\)/);
+  assert.match(relayActor, /Channel<RelayClientEvent>\(MAX_PENDING_EVENTS\)/);
+  assert.doesNotMatch(relayActor, /Channel\.UNLIMITED/);
+  assert.doesNotMatch(relayActor, /runBlocking/);
+  assert.doesNotMatch(relayActor, /urgentActions|Action\.DrainThen/);
+  assert.match(relayActor, /actionInput\.trySendReserved\(Action\.Shutdown\)/);
+  assert.match(relayActor, /completion\.completeExceptionally/);
+  assert.match(viewModel, /Channel<V2UiEffect>\(MAX_PENDING_UI_EFFECTS\)/);
+  assert.match(viewModel, /normalEffectSlots = Semaphore\(MAX_PENDING_UI_EFFECTS\)/);
+  assert.match(
+    viewModel,
+    /effectInputChannel = Channel<QueuedUiEffect>\([\s\S]*MAX_PENDING_UI_EFFECTS \+ MAX_PENDING_CRITICAL_UI_EFFECTS/,
+  );
+  assert.doesNotMatch(viewModel, /Channel\.UNLIMITED/);
+  const effectEmitter = viewModel.slice(
+    viewModel.indexOf("private fun emit(effect"),
+    viewModel.indexOf("private suspend fun emitAwait"),
+  );
+  assert.doesNotMatch(effectEmitter, /viewModelScope\.launch/);
+  assert.match(registries, /return !streamId\.isNullOrEmpty\(\) && streamId == active\.streamId/);
   assert.match(
     relayActor,
     /handleTerminalExit[\s\S]*flushTerminalOutput\(active\.streamId\)[\s\S]*RelayClientEvent\.TerminalExit/,
@@ -215,6 +250,10 @@ test("Android V2 connection profile is editable, clearable, and never persists p
     /removeLingeringPlaintext\(legacy\)[\s\S]*preferencesStore\.setLegacyIdentityMigrated\(\)/,
   );
   assert.match(importer, /legacyIdentityMigrated\) \{[\s\S]*removeLingeringPlaintext\(legacy\)/);
+  assert.match(
+    importer,
+    /if \(relayUrl\.isBlank\(\) \|\| relaySecret\.isBlank\(\)\) \{[\s\S]*removeLingeringPlaintext\(legacy\)[\s\S]*setLegacyIdentityMigrated/,
+  );
   assert.match(importer, /Legacy plaintext credential was not removed/);
   assert.match(
     viewModel,

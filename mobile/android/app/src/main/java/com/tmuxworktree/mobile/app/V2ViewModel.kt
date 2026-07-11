@@ -40,6 +40,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -140,7 +141,11 @@ class V2ViewModel(
     private val _uiState = MutableStateFlow(initialState())
     val uiState = _uiState.asStateFlow()
 
-    private val effectChannel = Channel<V2UiEffect>(Channel.UNLIMITED)
+    private val normalEffectSlots = Semaphore(MAX_PENDING_UI_EFFECTS)
+    private val effectInputChannel = Channel<QueuedUiEffect>(
+        MAX_PENDING_UI_EFFECTS + MAX_PENDING_CRITICAL_UI_EFFECTS,
+    )
+    private val effectChannel = Channel<V2UiEffect>(MAX_PENDING_UI_EFFECTS)
     val effects: Flow<V2UiEffect> = effectChannel.receiveAsFlow()
 
     private var rawHealth = if (demoMode) DemoData.health(recovering = demoRecovering) else ConnectionHealth()
@@ -156,6 +161,7 @@ class V2ViewModel(
     private var expectedRelayUrl: String? = null
 
     init {
+        startEffectForwarder()
         if (!demoMode) startRealApp()
     }
 
@@ -247,7 +253,7 @@ class V2ViewModel(
                             selectedScopeId = null,
                         )
                     }
-                    emit(V2UiEffect.ProfileCleared)
+                    emitAwait(V2UiEffect.ProfileCleared)
                 }
             }.onFailure { error ->
                 emit(V2UiEffect.Notice(error.message ?: "Could not forget the pairing"))
@@ -345,7 +351,7 @@ class V2ViewModel(
                                 sessions = emptyList(),
                             )
                         }
-                        emit(V2UiEffect.ProfileCleared)
+                        emitAwait(V2UiEffect.ProfileCleared)
                     }
                     credentials.write(token)
                     preferencesStore.saveProfile(
@@ -380,7 +386,7 @@ class V2ViewModel(
                         preferencesStore.clearProfile()
                         credentials.clear()
                         repository.clearProfileData()
-                        emit(V2UiEffect.ProfileCleared)
+                        emitAwait(V2UiEffect.ProfileCleared)
                     }
                 }
                 _uiState.update {
@@ -660,6 +666,7 @@ class V2ViewModel(
     override fun onCleared() {
         relay.close()
         effectsClosed = true
+        effectInputChannel.close()
         effectChannel.close()
         super.onCleared()
     }
@@ -753,7 +760,7 @@ class V2ViewModel(
                             selectedScopeId = null,
                         )
                     }
-                    emit(V2UiEffect.ProfileCleared)
+                    emitAwait(V2UiEffect.ProfileCleared)
                     emit(V2UiEffect.Notice("The saved pairing credential is no longer readable. Pair again."))
                 } finally {
                     profileMutationInProgress = false
@@ -771,6 +778,16 @@ class V2ViewModel(
                     emit(V2UiEffect.Notice("Local cache could not be fully recovered"))
                 }
             launchCollectors()
+        }
+    }
+
+    private fun startEffectForwarder() {
+        viewModelScope.launch {
+            for (queued in effectInputChannel) {
+                val forwarded = runCatching { effectChannel.send(queued.effect) }.isSuccess
+                if (queued.usesNormalSlot) normalEffectSlots.release()
+                if (!forwarded) break
+            }
         }
     }
 
@@ -931,12 +948,12 @@ class V2ViewModel(
             is RelayClientEvent.WorktreeCreated -> {
                 repository.upsertSession(event.session)
                 _uiState.update { it.copy(creatingWorktree = false, actionError = null) }
-                emit(V2UiEffect.NavigateToSession(event.session.stableId))
+                emitAwait(V2UiEffect.NavigateToSession(event.session.stableId))
             }
             is RelayClientEvent.TerminalCreated -> {
                 repository.upsertSession(event.session)
                 _uiState.update { it.copy(creatingTerminal = false, actionError = null) }
-                emit(V2UiEffect.NavigateToTerminal(event.session.stableId))
+                emitAwait(V2UiEffect.NavigateToTerminal(event.session.stableId))
             }
             is RelayClientEvent.SessionKilled -> {
                 if (event.hostId.isNotBlank() && event.sessionName.isNotBlank()) {
@@ -944,9 +961,9 @@ class V2ViewModel(
                 }
             }
             is RelayClientEvent.TerminalOpening -> if (event.resetDisplay) {
-                emit(V2UiEffect.TerminalReset())
+                emitAwait(V2UiEffect.TerminalReset())
             }
-            is RelayClientEvent.TerminalData -> emit(V2UiEffect.TerminalWrite(event.data))
+            is RelayClientEvent.TerminalData -> emitAwait(V2UiEffect.TerminalWrite(event.data))
             is RelayClientEvent.TerminalExit -> emit(
                 V2UiEffect.Notice("Terminal closed${event.code?.let { " (code $it)" }.orEmpty()}"),
             )
@@ -1272,12 +1289,51 @@ class V2ViewModel(
     private fun ConnectionStatus.label(): String = name.lowercase().replace('_', ' ')
 
     private fun emit(effect: V2UiEffect) {
-        if (!effectsClosed) effectChannel.trySend(effect).getOrThrow()
+        if (effectsClosed) return
+        val usesNormalSlot = !effect.isCritical()
+        if (usesNormalSlot && !normalEffectSlots.tryAcquire()) {
+            reportEffectOverflow()
+            return
+        }
+        if (effectInputChannel.trySend(QueuedUiEffect(effect, usesNormalSlot)).isSuccess) return
+        if (usesNormalSlot) normalEffectSlots.release()
+        reportEffectOverflow()
     }
+
+    private fun reportEffectOverflow() {
+        _uiState.update { state ->
+            state.copy(actionError = state.actionError ?: "UI event buffer is full; retry the action")
+        }
+    }
+
+    private suspend fun emitAwait(effect: V2UiEffect) {
+        if (effectsClosed) return
+        val usesNormalSlot = normalEffectSlots.tryAcquire()
+        val sent = runCatching {
+            effectInputChannel.send(QueuedUiEffect(effect, usesNormalSlot))
+        }.isSuccess
+        if (!sent && usesNormalSlot) normalEffectSlots.release()
+    }
+
+    private fun V2UiEffect.isCritical(): Boolean = when (this) {
+        is V2UiEffect.NavigateToSession,
+        is V2UiEffect.NavigateToTerminal,
+        is V2UiEffect.TerminalReset,
+        V2UiEffect.ProfileCleared,
+        -> true
+        else -> false
+    }
+
+    private data class QueuedUiEffect(
+        val effect: V2UiEffect,
+        val usesNormalSlot: Boolean,
+    )
 
     companion object {
         private const val DEFAULT_SCOPE_ID = "local"
         private const val OUTBOX_EVENT_PREFIX = "outbox-"
+        private const val MAX_PENDING_UI_EFFECTS = 64
+        private const val MAX_PENDING_CRITICAL_UI_EFFECTS = 16
         private const val OUTBOX_EXPIRY_POLL_MILLIS = 30_000L
         private const val PROFILE_DRAIN_TIMEOUT_MILLIS = 5_000L
         private const val MAX_RELAY_URL_LENGTH = 2_048

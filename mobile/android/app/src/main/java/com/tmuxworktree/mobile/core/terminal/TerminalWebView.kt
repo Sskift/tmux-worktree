@@ -30,6 +30,9 @@ class TerminalWebViewController internal constructor() {
     private var webView: WebView? = null
     private val pendingScripts = ArrayDeque<String>()
     private var pendingScriptBytes = 0
+    private val pendingTerminalOutput = StringBuilder()
+    private var terminalWriteInFlight = false
+    private var terminalOutputGeneration = 0L
     @Volatile
     var isReady: Boolean = false
         private set
@@ -39,16 +42,19 @@ class TerminalWebViewController internal constructor() {
     }
 
     internal fun markReady() {
-        val (view, scripts) = synchronized(lock) {
+        val (view, scripts, outputGeneration) = synchronized(lock) {
             isReady = true
             val bound = webView ?: return
             val queued = pendingScripts.toList()
             pendingScripts.clear()
             pendingScriptBytes = 0
-            bound to queued
+            val shouldDrain = pendingTerminalOutput.isNotEmpty() && !terminalWriteInFlight
+            if (shouldDrain) terminalWriteInFlight = true
+            Triple(bound, queued, terminalOutputGeneration.takeIf { shouldDrain })
         }
         view.post {
             scripts.forEach { view.evaluateJavascript(it, null) }
+            outputGeneration?.let { drainTerminalOutput(view, it) }
         }
     }
 
@@ -58,13 +64,37 @@ class TerminalWebViewController internal constructor() {
             isReady = false
             pendingScripts.clear()
             pendingScriptBytes = 0
+            pendingTerminalOutput.clear()
+            terminalWriteInFlight = false
+            terminalOutputGeneration += 1
         }
     }
 
-    fun write(data: String) = evaluate("window.twWrite&&window.twWrite(${JSONObject.quote(data)});")
+    fun write(data: String) {
+        if (data.isEmpty()) return
+        val scheduled: Pair<WebView, Long>? = synchronized(lock) {
+            appendTerminalOutput(data)
+            val readyView = webView?.takeIf { isReady }
+            if (readyView == null || terminalWriteInFlight) {
+                null
+            } else {
+                terminalWriteInFlight = true
+                readyView to terminalOutputGeneration
+            }
+        }
+        scheduled?.let { (view, generation) ->
+            view.post { drainTerminalOutput(view, generation) }
+        }
+    }
 
-    fun reset(message: String = "") =
+    fun reset(message: String = "") {
+        synchronized(lock) {
+            pendingTerminalOutput.clear()
+            terminalWriteInFlight = false
+            terminalOutputGeneration += 1
+        }
         evaluate("window.twReset&&window.twReset(${JSONObject.quote(message)});")
+    }
 
     fun sendKey(data: String) =
         evaluate("window.twSendKey&&window.twSendKey(${JSONObject.quote(data)});")
@@ -85,6 +115,9 @@ class TerminalWebViewController internal constructor() {
         val readyView = synchronized(lock) {
             pendingScripts.clear()
             pendingScriptBytes = 0
+            pendingTerminalOutput.clear()
+            terminalWriteInFlight = false
+            terminalOutputGeneration += 1
             webView?.takeIf { isReady }
         }
         readyView?.post {
@@ -128,8 +161,57 @@ class TerminalWebViewController internal constructor() {
         pendingScriptBytes += marker.length * 2
     }
 
+    private fun appendTerminalOutput(data: String) {
+        if (pendingTerminalOutput.length + data.length > MAX_PENDING_TERMINAL_CHARS) {
+            pendingTerminalOutput.clear()
+            pendingTerminalOutput.append(TERMINAL_TRUNCATION_MARKER)
+        }
+        val available = MAX_PENDING_TERMINAL_CHARS - pendingTerminalOutput.length
+        if (available <= 0) return
+        if (data.length <= available) {
+            pendingTerminalOutput.append(data)
+        } else {
+            pendingTerminalOutput.append(data.takeLast(available))
+        }
+    }
+
+    private fun drainTerminalOutput(view: WebView, generation: Long) {
+        val output = synchronized(lock) {
+            if (webView !== view || !isReady || terminalOutputGeneration != generation) return
+            if (pendingTerminalOutput.isEmpty()) {
+                terminalWriteInFlight = false
+                return
+            }
+            pendingTerminalOutput.toString().also { pendingTerminalOutput.clear() }
+        }
+        val script = "window.twWrite&&window.twWrite(${JSONObject.quote(output)});"
+        val submitted = runCatching {
+            view.evaluateJavascript(script) {
+                val drainAgain = synchronized(lock) {
+                    if (webView !== view || !isReady || terminalOutputGeneration != generation) {
+                        false
+                    } else if (pendingTerminalOutput.isEmpty()) {
+                        terminalWriteInFlight = false
+                        false
+                    } else {
+                        true
+                    }
+                }
+                if (drainAgain) view.post { drainTerminalOutput(view, generation) }
+            }
+        }.isSuccess
+        if (!submitted) {
+            synchronized(lock) {
+                if (terminalOutputGeneration == generation) terminalWriteInFlight = false
+            }
+        }
+    }
+
     private companion object {
         const val MAX_PENDING_SCRIPT_BYTES = 2 * 1024 * 1024
+        const val MAX_PENDING_TERMINAL_CHARS = 1024 * 1024
+        const val TERMINAL_TRUNCATION_MARKER =
+            "\r\n[Terminal output truncated: client buffer limit reached]\r\n"
     }
 }
 

@@ -10,6 +10,7 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -26,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -35,8 +37,8 @@ import okhttp3.WebSocketListener
 /**
  * Serial connection actor for the legacy relay protocol.
  *
- * All mutable protocol state is owned by [actions]. OkHttp callbacks only enqueue actions, and the
- * captured epoch prevents callbacks from a replaced socket from mutating the active connection.
+ * All mutable protocol state is owned by [actionInput]. OkHttp callbacks only enqueue actions, and
+ * the captured epoch prevents callbacks from a replaced socket from mutating the active connection.
  */
 class RelayV1ConnectionActor(
     parentScope: CoroutineScope,
@@ -48,6 +50,9 @@ class RelayV1ConnectionActor(
     private val handshakeTimeoutMillis: Long = DEFAULT_HANDSHAKE_TIMEOUT_MILLIS,
     private val terminalOpenTimeoutMillis: Long = DEFAULT_TERMINAL_OPEN_TIMEOUT_MILLIS,
     private val requestTimeoutPolicy: RelayRequestTimeoutPolicy = RelayRequestTimeoutPolicy(),
+    private val terminalOutputBatchMillis: Long = DEFAULT_TERMINAL_OUTPUT_BATCH_MILLIS,
+    normalActionCapacity: Int = MAX_PENDING_ACTIONS,
+    reservedActionCapacity: Int = MAX_PENDING_RESERVED_ACTIONS,
 ) : Closeable {
     private val actorDispatcher: ExecutorCoroutineDispatcher = Executors
         .newSingleThreadExecutor { runnable ->
@@ -59,14 +64,19 @@ class RelayV1ConnectionActor(
             actorDispatcher +
             SupervisorJob(parentScope.coroutineContext[Job]),
     )
-    private val actions = Channel<Action>(Channel.UNLIMITED)
-    private val eventChannel = Channel<RelayClientEvent>(Channel.UNLIMITED)
+    private val actionInput = BoundedActionQueue<Action>(
+        normalCapacity = normalActionCapacity,
+        reservedCapacity = reservedActionCapacity,
+    )
+    private val eventChannel = Channel<RelayClientEvent>(MAX_PENDING_EVENTS)
     private val reducer = RelayConnectionReducer(reconnectPolicy)
     private val requests = RelayRequestRegistry()
     private val streams = RelayStreamRegistry()
     private val requestSequence = AtomicLong()
     private val isClosed = AtomicBoolean(false)
     private val resourcesClosed = AtomicBoolean(false)
+    private val queueOverloadSignalled = AtomicBoolean(false)
+    private val pendingWireMessages = AtomicInteger(0)
 
     private val _health = MutableStateFlow(RelayTransportState().toConnectionHealth())
     val health: StateFlow<ConnectionHealth> = _health.asStateFlow()
@@ -77,16 +87,14 @@ class RelayV1ConnectionActor(
     private val _terminal = MutableStateFlow(TerminalStreamState())
     val terminal: StateFlow<TerminalStreamState> = _terminal.asStateFlow()
 
-    /**
-     * Lossless, single-consumer event stream. Events remain queued while the UI collector is
-     * briefly absent or slow instead of being silently discarded by a best-effort emission.
-     */
+    /** Bounded, lossless event stream; a slow UI backpressures the dedicated relay actor. */
     val events: Flow<RelayClientEvent> = eventChannel.receiveAsFlow()
 
     private var transport = RelayTransportState()
     private var config: RelayV1ConnectionConfig? = null
     @Volatile
     private var socket: WebSocket? = null
+    @Volatile
     private var socketEpoch: Long = 0
     private var retryJob: Job? = null
     private var handshakeTimeoutJob: Job? = null
@@ -95,13 +103,17 @@ class RelayV1ConnectionActor(
     private var selectedHostId: String = ""
     private var desiredTerminal: DesiredTerminal? = null
     private var pendingReopenGeneration: Long? = null
+    private var rejectedSocketEpoch: Long? = null
     private val terminalOutputBuffer = StringBuilder()
     private var terminalOutputStreamId: String? = null
     private var terminalOutputFlushJob: Job? = null
 
     init {
         scope.launch {
-            for (action in actions) handle(action)
+            while (true) {
+                val action = actionInput.receive() ?: break
+                handle(action)
+            }
         }
         scope.coroutineContext[Job]?.invokeOnCompletion {
             isClosed.set(true)
@@ -124,7 +136,11 @@ class RelayV1ConnectionActor(
             completion.complete(Unit)
         }
         try {
-            enqueueAction(Action.Disconnect(completion = completion, barrierId = barrierId))
+            if (!enqueueAction(Action.Disconnect(completion = completion, barrierId = barrierId))) {
+                completion.completeExceptionally(
+                    IllegalStateException("Relay control queue is unavailable"),
+                )
+            }
             completion.await()
         } finally {
             cancellationHandle?.dispose()
@@ -277,7 +293,7 @@ class RelayV1ConnectionActor(
 
     override fun close() {
         if (!isClosed.compareAndSet(false, true)) return
-        if (actions.trySend(Action.Shutdown).isFailure) {
+        if (!actionInput.trySendReserved(Action.Shutdown)) {
             finishResources()
         }
     }
@@ -286,8 +302,35 @@ class RelayV1ConnectionActor(
         if (!isClosed.get()) enqueueAction(Action.Send(command, context))
     }
 
-    private fun enqueueAction(action: Action) {
-        actions.trySend(action).getOrThrow()
+    private fun enqueueAction(
+        action: Action,
+        overflowEpoch: Long = socketEpoch,
+        overflowSocket: WebSocket? = socket,
+    ): Boolean {
+        val accepted = tryEnqueueAction(action)
+        if (accepted) return true
+        signalQueueOverload(overflowEpoch, overflowSocket)
+        return false
+    }
+
+    private fun tryEnqueueAction(action: Action): Boolean {
+        if (isClosed.get()) return false
+        val accepted = when {
+            action.usesReservedCapacity() -> actionInput.trySendReserved(action)
+            action.isCriticalControl() -> actionInput.trySendNormalOrReserved(action)
+            else -> actionInput.trySendNormal(action)
+        }
+        return accepted
+    }
+
+    private fun signalQueueOverload(epoch: Long, activeSocket: WebSocket?) {
+        if (isClosed.get()) return
+        activeSocket?.cancel()
+        if (epoch != socketEpoch || !queueOverloadSignalled.compareAndSet(false, true)) return
+        if (!actionInput.trySendReserved(Action.QueueOverloaded(epoch))) {
+            isClosed.set(true)
+            finishResources()
+        }
     }
 
     private fun request(
@@ -399,9 +442,16 @@ class RelayV1ConnectionActor(
             }
             Action.CloseTerminal -> closeTerminalNow()
             is Action.SocketOpened -> socketOpened(action)
-            is Action.SocketMessage -> if (action.epoch == transport.epoch) handleWireMessage(action.raw)
+            is Action.SocketMessage -> try {
+                if (action.epoch == transport.epoch && action.epoch != rejectedSocketEpoch) {
+                    handleWireMessage(action.raw)
+                }
+            } finally {
+                pendingWireMessages.decrementAndGet()
+            }
             is Action.SocketClosed -> socketClosed(action)
             is Action.SocketFailure -> socketFailed(action)
+            is Action.QueueOverloaded -> queueOverloaded(action)
             is Action.Retry -> transition(RelayTransportSignal.RetryElapsed(action.epoch, clock()))
             is Action.HandshakeTimeout -> handshakeTimedOut(action)
             is Action.TerminalOpenTimeout -> terminalOpenTimedOut(action)
@@ -436,7 +486,7 @@ class RelayV1ConnectionActor(
                     retryJob?.cancel()
                     retryJob = scope.launch {
                         delay(effect.delayMillis)
-                        actions.send(Action.Retry(effect.epoch))
+                        enqueueAction(Action.Retry(effect.epoch))
                     }
                 }
             }
@@ -460,38 +510,66 @@ class RelayV1ConnectionActor(
             return
         }
 
+        val callbackIngressLock = Any()
         val listener = object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
-                actions.trySend(Action.SocketOpened(epoch, webSocket))
+                val accepted = synchronized(callbackIngressLock) {
+                    tryEnqueueAction(Action.SocketOpened(epoch, webSocket))
+                }
+                if (!accepted) signalQueueOverload(epoch, webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
-                actions.trySend(Action.SocketMessage(epoch, text))
+                val accepted = synchronized(callbackIngressLock) {
+                    if (text.length > MAX_WIRE_MESSAGE_CHARS) {
+                        false
+                    } else if (pendingWireMessages.incrementAndGet() > MAX_PENDING_WIRE_MESSAGES) {
+                        pendingWireMessages.decrementAndGet()
+                        false
+                    } else if (tryEnqueueAction(Action.SocketMessage(epoch, text))) {
+                        true
+                    } else {
+                        pendingWireMessages.decrementAndGet()
+                        false
+                    }
+                }
+                if (!accepted) signalQueueOverload(epoch, webSocket)
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                val accepted = synchronized(callbackIngressLock) {
+                    tryEnqueueAction(Action.SocketClosed(epoch, code, reason))
+                }
                 // OkHttp requires the client to acknowledge the peer close. Do not wait for
                 // onClosed before moving the actor into backoff: a peer that never completes the
                 // close handshake must not leave the UI stuck ONLINE.
                 val acknowledged = runCatching { webSocket.close(code, reason) }.getOrDefault(false)
                 if (!acknowledged) webSocket.cancel()
-                actions.trySend(Action.SocketClosed(epoch, code, reason))
+                if (!accepted) signalQueueOverload(epoch, webSocket)
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                actions.trySend(Action.SocketClosed(epoch, code, reason))
+                val accepted = synchronized(callbackIngressLock) {
+                    tryEnqueueAction(Action.SocketClosed(epoch, code, reason))
+                }
+                if (!accepted) signalQueueOverload(epoch, webSocket)
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                actions.trySend(
-                    Action.SocketFailure(
-                        epoch = epoch,
-                        httpCode = response?.code,
-                        message = t.message ?: t::class.java.simpleName,
-                    ),
-                )
+                val accepted = synchronized(callbackIngressLock) {
+                    tryEnqueueAction(
+                        Action.SocketFailure(
+                            epoch = epoch,
+                            httpCode = response?.code,
+                            message = t.message ?: t::class.java.simpleName,
+                        ),
+                    )
+                }
+                if (!accepted) signalQueueOverload(epoch, webSocket)
             }
         }
+        rejectedSocketEpoch = null
+        queueOverloadSignalled.set(false)
         socketEpoch = epoch
         socket = okHttpClient.newWebSocket(request, listener)
         scheduleHandshakeTimeout(epoch)
@@ -546,6 +624,25 @@ class RelayV1ConnectionActor(
         } else {
             prepareTerminalForConnectionRecovery(action.message)
         }
+    }
+
+    private fun queueOverloaded(action: Action.QueueOverloaded) {
+        if (action.epoch != transport.epoch || rejectedSocketEpoch == action.epoch) return
+        rejectedSocketEpoch = action.epoch
+        cancelHandshakeTimeout()
+        if (socketEpoch == action.epoch) socket = null
+        rejectPendingRequests(
+            "Relay input exceeded the bounded client queue; delivery is ambiguous",
+        )
+        prepareTerminalForConnectionRecovery("Relay output exceeded the client buffer")
+        transition(
+            RelayTransportSignal.SocketFailed(
+                epoch = action.epoch,
+                nowMillis = clock(),
+                message = "Relay output exceeded the bounded client queue",
+            ),
+        )
+        emit(RelayClientEvent.ProtocolWarning("Relay connection reset after bounded queue overflow"))
     }
 
     private fun prepareTerminalForConnectionRecovery(reason: String) {
@@ -852,7 +949,7 @@ class RelayV1ConnectionActor(
             emit(RelayClientEvent.TerminalReconnecting(active.hostId, active.sessionName, event.message))
             scope.launch {
                 delay(180)
-                actions.send(Action.ReopenTerminal(transport.epoch, active.generation))
+                enqueueAction(Action.ReopenTerminal(transport.epoch, active.generation))
             }
             return
         }
@@ -936,7 +1033,7 @@ class RelayV1ConnectionActor(
         val epoch = transport.epoch
         scope.launch {
             delay(delayMillis)
-            actions.send(Action.DelayedRefresh(epoch, hostId))
+            enqueueAction(Action.DelayedRefresh(epoch, hostId))
         }
     }
 
@@ -948,7 +1045,7 @@ class RelayV1ConnectionActor(
         cancelHandshakeTimeout()
         handshakeTimeoutJob = scope.launch {
             delay(handshakeTimeoutMillis.coerceAtLeast(1))
-            actions.send(Action.HandshakeTimeout(epoch))
+            enqueueAction(Action.HandshakeTimeout(epoch))
         }
     }
 
@@ -961,7 +1058,7 @@ class RelayV1ConnectionActor(
         cancelTerminalOpenTimeout()
         terminalOpenTimeoutJob = scope.launch {
             delay(terminalOpenTimeoutMillis.coerceAtLeast(1))
-            actions.send(Action.TerminalOpenTimeout(epoch, stream.streamId, stream.generation))
+            enqueueAction(Action.TerminalOpenTimeout(epoch, stream.streamId, stream.generation))
         }
     }
 
@@ -1024,7 +1121,7 @@ class RelayV1ConnectionActor(
         val timeoutMillis = requestTimeoutPolicy.timeoutMillis(context.kind).coerceAtLeast(1)
         requestTimeoutJobs[context.requestId] = scope.launch {
             delay(timeoutMillis)
-            actions.send(Action.RequestTimeout(context.epoch, context.requestId))
+            enqueueAction(Action.RequestTimeout(context.epoch, context.requestId))
         }
     }
 
@@ -1117,14 +1214,16 @@ class RelayV1ConnectionActor(
         if (!resourcesClosed.compareAndSet(false, true)) return
         socket?.cancel()
         socket = null
-        actions.close()
+        actionInput.close()
         eventChannel.close()
         scope.cancel()
         actorDispatcher.close()
     }
 
     private fun emit(event: RelayClientEvent) {
-        eventChannel.trySend(event).getOrThrow()
+        if (eventChannel.trySend(event).isFailure && !resourcesClosed.get()) {
+            signalQueueOverload(socketEpoch, socket)
+        }
     }
 
     private fun queueTerminalOutput(streamId: String, data: String) {
@@ -1139,8 +1238,8 @@ class RelayV1ConnectionActor(
         }
         if (terminalOutputFlushJob == null) {
             terminalOutputFlushJob = scope.launch {
-                delay(TERMINAL_OUTPUT_BATCH_MILLIS)
-                actions.send(Action.FlushTerminalOutput(streamId))
+                delay(terminalOutputBatchMillis.coerceAtLeast(1))
+                enqueueAction(Action.FlushTerminalOutput(streamId))
             }
         }
     }
@@ -1185,6 +1284,7 @@ class RelayV1ConnectionActor(
         data class SocketMessage(val epoch: Long, val raw: String) : Action
         data class SocketClosed(val epoch: Long, val code: Int, val reason: String) : Action
         data class SocketFailure(val epoch: Long, val httpCode: Int?, val message: String) : Action
+        data class QueueOverloaded(val epoch: Long) : Action
         data class Retry(val epoch: Long) : Action
         data class HandshakeTimeout(val epoch: Long) : Action
         data class TerminalOpenTimeout(
@@ -1199,17 +1299,108 @@ class RelayV1ConnectionActor(
         data class DelayedRefresh(val epoch: Long, val hostId: String) : Action
     }
 
+    private fun Action.usesReservedCapacity(): Boolean = when (this) {
+        is Action.SocketOpened,
+        is Action.SocketClosed,
+        is Action.SocketFailure,
+        is Action.QueueOverloaded,
+        Action.Shutdown,
+        -> true
+        else -> false
+    }
+
+    private fun Action.isCriticalControl(): Boolean = when (this) {
+        is Action.Connect,
+        Action.PauseForNetwork,
+        is Action.Disconnect,
+        is Action.OpenTerminal,
+        Action.CloseTerminal,
+        -> true
+        else -> false
+    }
+
     companion object {
         const val DEFAULT_HANDSHAKE_TIMEOUT_MILLIS = 10_000L
         const val DEFAULT_TERMINAL_OPEN_TIMEOUT_MILLIS = 10_000L
-        private const val TERMINAL_OUTPUT_BATCH_MILLIS = 16L
+        const val DEFAULT_TERMINAL_OUTPUT_BATCH_MILLIS = 16L
         private const val MAX_TERMINAL_OUTPUT_BATCH_CHARS = 64 * 1024
+        internal const val MAX_PENDING_ACTIONS = 512
+        internal const val MAX_PENDING_RESERVED_ACTIONS = 16
+        private const val MAX_PENDING_EVENTS = 32
+        private const val MAX_PENDING_WIRE_MESSAGES = 32
+        private const val MAX_WIRE_MESSAGE_CHARS = 512 * 1024
 
         private fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
             .pingInterval(20, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
     }
+}
+
+internal class BoundedActionQueue<T>(
+    normalCapacity: Int,
+    reservedCapacity: Int,
+) {
+    private val validatedNormalCapacity = normalCapacity.also {
+        require(it > 0) { "normalCapacity must be positive" }
+    }
+    private val validatedReservedCapacity = reservedCapacity.also {
+        require(it > 0) { "reservedCapacity must be positive" }
+    }
+    private val enqueueLock = Any()
+    private val normalSlots = Semaphore(validatedNormalCapacity)
+    private val reservedSlots = Semaphore(validatedReservedCapacity)
+    private val channel = Channel<QueuedAction<T>>(
+        validatedNormalCapacity + validatedReservedCapacity,
+    )
+
+    fun trySendNormal(action: T): Boolean = synchronized(enqueueLock) {
+        if (!normalSlots.tryAcquire()) return@synchronized false
+        if (channel.trySend(QueuedAction(action, SlotKind.NORMAL)).isSuccess) {
+            true
+        } else {
+            normalSlots.release()
+            false
+        }
+    }
+
+    fun trySendNormalOrReserved(action: T): Boolean = synchronized(enqueueLock) {
+        if (normalSlots.tryAcquire()) {
+            if (channel.trySend(QueuedAction(action, SlotKind.NORMAL)).isSuccess) {
+                return@synchronized true
+            }
+            normalSlots.release()
+        }
+        trySendReservedLocked(action)
+    }
+
+    fun trySendReserved(action: T): Boolean = synchronized(enqueueLock) {
+        trySendReservedLocked(action)
+    }
+
+    suspend fun receive(): T? {
+        val queued = channel.receiveCatching().getOrNull() ?: return null
+        when (queued.slotKind) {
+            SlotKind.NORMAL -> normalSlots.release()
+            SlotKind.RESERVED -> reservedSlots.release()
+        }
+        return queued.action
+    }
+
+    fun close() {
+        channel.close()
+    }
+
+    private fun trySendReservedLocked(action: T): Boolean {
+        if (!reservedSlots.tryAcquire()) return false
+        if (channel.trySend(QueuedAction(action, SlotKind.RESERVED)).isSuccess) return true
+        reservedSlots.release()
+        return false
+    }
+
+    private enum class SlotKind { NORMAL, RESERVED }
+
+    private data class QueuedAction<T>(val action: T, val slotKind: SlotKind)
 }
 
 data class RelayRequestTimeoutPolicy(

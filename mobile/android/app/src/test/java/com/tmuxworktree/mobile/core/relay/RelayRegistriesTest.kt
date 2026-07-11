@@ -43,7 +43,8 @@ class RelayRegistriesTest {
         val registry = RelayStreamRegistry()
         val first = registry.open("stream-1", "mac-admin", "local:one")
         assertTrue(registry.accepts("stream-1"))
-        assertTrue(registry.accepts(null))
+        assertFalse(registry.accepts(null))
+        assertFalse(registry.accepts(""))
 
         val second = registry.open("stream-2", "mac-admin", "local:one")
 

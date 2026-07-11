@@ -176,4 +176,34 @@ class PreferencesAndCredentialInstrumentedTest {
             preferences.setLegacyIdentityMigrated(false)
         }
     }
+
+    @Test
+    fun incompleteLegacyProfileScrubsPlaintextBeforeMarkingMigrationComplete() = runTest {
+        val preferences = PreferencesStore(context)
+        val credentials = AndroidKeystoreCredentialStore(context)
+        val legacy = context.getSharedPreferences("identity", Context.MODE_PRIVATE)
+
+        preferences.setLegacyIdentityMigrated(false)
+        credentials.clear()
+        assertTrue(
+            legacy.edit()
+                .clear()
+                .putString("relaySecret", "orphaned-plaintext-token")
+                .commit(),
+        )
+
+        try {
+            val imported = LegacyIdentityImporter(context, preferences, credentials).importIfNeeded()
+
+            assertFalse(imported)
+            assertFalse(legacy.contains("relaySecret"))
+            assertTrue(preferences.values.first().legacyIdentityMigrated)
+            assertNull(credentials.read())
+        } finally {
+            credentials.clear()
+            assertTrue(legacy.edit().clear().commit())
+            preferences.clearProfile()
+            preferences.setLegacyIdentityMigrated(false)
+        }
+    }
 }

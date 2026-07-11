@@ -182,12 +182,12 @@ $ANDROID_HOME/platform-tools/adb install -r \
 Launch with a paired identity:
 
 ```bash
-adb shell am start -n com.tmuxworktree.mobile/.V2Activity \
-  --es relayUrl "'wss://relay.example.com'" \
-  --es hostId "'mac-admin'" \
-  --es relaySecret "'<secret>'"
+adb shell 'am start -n com.tmuxworktree.mobile/.V2Activity \
+  --es relayUrl '"'"'wss://relay.example.com'"'"' \
+  --es hostId '"'"'mac-admin'"'"' \
+  --es relaySecret '"'"'<secret>'"'"''
 ```
 
-The nested quoting is intentional because `adb shell` is parsed once on the desktop and again on Android; Dashboard's copied command escapes arbitrary configured values for both shells. The launch command opens a reviewable pairing screen, while the `tmuxworktree://pair?...` payload is consumed by the app's built-in QR scanner. The custom scheme is intentionally not registered as a browsable Android deep link because another app could claim the same scheme and steal the Relay v1 token. Neither path enables `autoConnect`.
+The nested quoting is intentional because `adb shell` is parsed once on the desktop and again on Android; Dashboard wraps the entire Android command and each value independently, including interactive-shell characters such as `!`, `$`, and backticks. The launch command opens a reviewable pairing screen, while the `tmuxworktree://pair?...` payload is consumed by the app's built-in QR scanner. The custom scheme is intentionally not registered as a browsable Android deep link because another app could claim the same scheme and steal the Relay v1 token. Neither path enables `autoConnect`.
 
 The source currently keeps `versionName=1.0.3` aligned with the repository and uses the higher `versionCode=20000` for Android upgrade ordering. `:app:assembleRelease` produces an **unsigned build-verification artifact** only. This source merge does not start a 2.0 release or produce a production-distributable APK; version bumps and signing happen in the unified release process.

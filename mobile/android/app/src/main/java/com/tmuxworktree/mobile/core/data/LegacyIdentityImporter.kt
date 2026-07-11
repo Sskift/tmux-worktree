@@ -24,6 +24,7 @@ class LegacyIdentityImporter(
         val autoConnect = legacy.getBoolean("autoConnect", false)
 
         if (relayUrl.isBlank() || relaySecret.isBlank()) {
+            removeLingeringPlaintext(legacy)
             preferencesStore.setLegacyIdentityMigrated()
             return false
         }

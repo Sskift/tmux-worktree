@@ -2,6 +2,8 @@ package com.tmuxworktree.mobile.core.relay
 
 import com.tmuxworktree.mobile.core.model.TransportPhase
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -31,6 +33,51 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RelayV1ConnectionActorTest {
+    @Test
+    fun `bounded action queue preserves FIFO and reserved capacity`() = runBlocking {
+        val queue = BoundedActionQueue<String>(normalCapacity = 2, reservedCapacity = 1)
+
+        assertTrue(queue.trySendNormal("message-1"))
+        assertTrue(queue.trySendNormal("message-2"))
+        assertFalse(queue.trySendNormal("normal-overflow"))
+        assertTrue(queue.trySendReserved("socket-closed"))
+        assertFalse(queue.trySendReserved("total-overflow"))
+
+        assertEquals("message-1", queue.receive())
+        assertTrue(queue.trySendNormal("message-3"))
+        assertEquals("message-2", queue.receive())
+        assertEquals("socket-closed", queue.receive())
+        assertEquals("message-3", queue.receive())
+
+        queue.close()
+        assertNull(queue.receive())
+    }
+
+    @Test
+    fun `bounded action queue linearizes causal sends across callback threads`() = runBlocking {
+        val queue = BoundedActionQueue<String>(normalCapacity = 1, reservedCapacity = 1)
+        val messageQueued = CountDownLatch(1)
+        val callbacks = Executors.newFixedThreadPool(2)
+
+        try {
+            val message = callbacks.submit<Boolean> {
+                queue.trySendNormal("message").also { messageQueued.countDown() }
+            }
+            val failure = callbacks.submit<Boolean> {
+                check(messageQueued.await(5, TimeUnit.SECONDS))
+                queue.trySendReserved("failure")
+            }
+
+            assertTrue(message.get(5, TimeUnit.SECONDS))
+            assertTrue(failure.get(5, TimeUnit.SECONDS))
+            assertEquals("message", queue.receive())
+            assertEquals("failure", queue.receive())
+        } finally {
+            queue.close()
+            callbacks.shutdownNow()
+        }
+    }
+
     @Test
     fun `request timeout policy maps every request kind independently`() {
         val policy = RelayRequestTimeoutPolicy(
@@ -149,7 +196,10 @@ class RelayV1ConnectionActorTest {
         )
         server.start()
         val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-        val actor = RelayV1ConnectionActor(actorScope)
+        val actor = RelayV1ConnectionActor(
+            actorScope,
+            terminalOutputBatchMillis = 5_000,
+        )
 
         try {
             actor.connect(configFor(server))
@@ -175,6 +225,81 @@ class RelayV1ConnectionActorTest {
             assertEquals("hello world", output.data)
             assertEquals(streamId, exit.streamId)
             assertEquals(0, exit.code)
+        } finally {
+            actor.close()
+            actorScope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `terminal tail and acknowledgement are processed before immediate socket close`() = runBlocking {
+        val commands = CopyOnWriteArrayList<String>()
+        val activeStreamId = AtomicReference<String>()
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                snapshotListener(commands) { webSocket, payload ->
+                    val streamId = payload.string("streamId")
+                    activeStreamId.set(streamId)
+                    webSocket.send(
+                        "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"opened\"}",
+                    )
+                }.withCommandHandler { webSocket, payload ->
+                    if (payload.string("type") != "send_agent_message") return@withCommandHandler
+                    val padding = "x".repeat(400_000)
+                    webSocket.send("{\"type\":\"ordering_probe\",\"padding\":\"$padding\"}")
+                    webSocket.send(
+                        "{\"type\":\"terminal_data\",\"streamId\":\"${activeStreamId.get()}\",\"data\":\"tail-before-close\"}",
+                    )
+                    webSocket.send(
+                        "{\"type\":\"agent_message_sent\",\"requestId\":\"${payload.string("requestId")}\",\"session\":\"local:demo\"}",
+                    )
+                    webSocket.close(1012, "close-after-tail-and-ack")
+                },
+            ),
+        )
+        server.start()
+        val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(parentScope = actorScope)
+
+        try {
+            actor.connect(configFor(server))
+            withTimeout(5_000) { actor.snapshots.first { it.sessions.isNotEmpty() } }
+            val opened = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events.filterIsInstance<RelayClientEvent.TerminalData>().first {
+                        it.data == "opened"
+                    }
+                }
+            }
+            actor.openTerminal("mac-admin", "local:demo")
+            opened.await()
+
+            val requestId = actor.sendAgentMessage("mac-admin", "local:demo", "status")
+            val deliveredBeforeClose = withTimeout(5_000) {
+                actor.events
+                    .filter { event ->
+                        when (event) {
+                            is RelayClientEvent.TerminalData -> event.data.contains("tail-before-close")
+                            is RelayClientEvent.AgentMessageSent -> event.requestId == requestId
+                            is RelayClientEvent.CommandRejected -> event.request?.requestId == requestId
+                            else -> false
+                        }
+                    }
+                    .take(2)
+                    .toList()
+            }
+
+            assertTrue(deliveredBeforeClose.any {
+                it is RelayClientEvent.TerminalData && it.data.contains("tail-before-close")
+            })
+            assertTrue(deliveredBeforeClose.any {
+                it is RelayClientEvent.AgentMessageSent && it.requestId == requestId
+            })
+            assertFalse(deliveredBeforeClose.any { it is RelayClientEvent.CommandRejected })
+            withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.BACKING_OFF } }
+            Unit
         } finally {
             actor.close()
             actorScope.cancel()
@@ -209,24 +334,46 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
-    fun `request rejections are buffered losslessly and retain request context`() = runBlocking {
+    fun `request rejections within the bounded event window retain request context`() = runBlocking {
         val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         val actor = RelayV1ConnectionActor(actorScope)
         try {
-            val requestIds = (1..300).map { actor.refreshHosts() }.toSet()
-
-            val rejections = withTimeout(5_000) {
-                actor.events
-                    .filterIsInstance<RelayClientEvent.CommandRejected>()
-                    .take(requestIds.size)
-                    .toList()
+            val rejectionsDeferred = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events
+                        .filterIsInstance<RelayClientEvent.CommandRejected>()
+                        .take(24)
+                        .toList()
+                }
             }
+            val requestIds = (1..24).map { actor.refreshHosts() }.toSet()
+            val rejections = rejectionsDeferred.await()
 
             assertEquals(requestIds.size, rejections.size)
             assertEquals(requestIds, rejections.mapNotNull { it.request?.requestId }.toSet())
             assertTrue(rejections.all { it.request?.kind == RelayRequestKind.HOSTS })
             assertTrue(rejections.all { it.reason.contains("not connected", ignoreCase = true) })
             assertTrue(rejections.none { it.reason.contains("ambiguous", ignoreCase = true) })
+        } finally {
+            actor.close()
+            actorScope.cancel()
+        }
+    }
+
+    @Test
+    fun `event saturation cannot block actor shutdown`() = runBlocking {
+        val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(actorScope)
+        try {
+            repeat(100) { actor.refreshHosts() }
+            val completion = async(start = CoroutineStart.UNDISPATCHED) {
+                actor.events.toList()
+            }
+
+            actor.close()
+
+            withTimeout(5_000) { completion.await() }
+            Unit
         } finally {
             actor.close()
             actorScope.cancel()

@@ -130,11 +130,11 @@ class RelayStreamRegistry {
     @Synchronized
     fun current(): RelayStreamContext? = current
 
-    /** Empty stream ids are accepted for compatibility with early relay-host builds. */
+    /** A stream event must name the active generation; blank legacy ids can cross session boundaries. */
     @Synchronized
     fun accepts(streamId: String?): Boolean {
         val active = current ?: return false
-        return streamId.isNullOrEmpty() || streamId == active.streamId
+        return !streamId.isNullOrEmpty() && streamId == active.streamId
     }
 
     @Synchronized

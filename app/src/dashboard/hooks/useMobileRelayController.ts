@@ -222,31 +222,18 @@ export function buildMobileRelayLaunchCommand({
   hostId,
   secret,
 }: Pick<MobileRelayStatus, "relayUrl" | "hostId" | "secret">): string {
-  return [
-    "adb shell am start -n com.tmuxworktree.mobile/.V2Activity",
-    `  --es relayUrl ${quoteAdbShellArgument(relayUrl)}`,
-    `  --es hostId ${quoteAdbShellArgument(hostId)}`,
-    `  --es relaySecret ${quoteAdbShellArgument(secret || "<TW_RELAY_SECRET>")}`,
+  const androidCommand = [
+    "am start -n com.tmuxworktree.mobile/.V2Activity",
+    `  --es relayUrl ${shellSingleQuote(relayUrl)}`,
+    `  --es hostId ${shellSingleQuote(hostId)}`,
+    `  --es relaySecret ${shellSingleQuote(secret || "<TW_RELAY_SECRET>")}`,
   ].join(" \\\n");
+  return `adb shell ${shellSingleQuote(androidCommand)}`;
 }
 
 export function shellSingleQuote(value: string): string {
   const escapedQuote = `'"'"'`;
   return `'${value.replace(/'/g, escapedQuote)}'`;
-}
-
-/**
- * `adb shell COMMAND...` is parsed twice: first by the desktop shell and then
- * again by Android's shell. Preserve the inner single-quoted word through the
- * first parse so credentials can never become remote shell syntax.
- */
-export function quoteAdbShellArgument(value: string): string {
-  const remoteQuotedWord = shellSingleQuote(value);
-  const desktopEscapedWord = remoteQuotedWord.replace(
-    /["\\$`]/g,
-    (character) => `\\${character}`,
-  );
-  return `"${desktopEscapedWord}"`;
 }
 
 export function buildMobileRelayV1PairingPayload({
@@ -280,10 +267,12 @@ export function buildMobileRelayV1PairingPayload({
     parsedUrl.search ||
     parsedUrl.hash
   ) return null;
+  if (/[?#]/.test(normalizedRelayUrl) || normalizedRelayUrl.slice(6).includes("@")) return null;
+  const canonicalRelayUrl = parsedUrl.toString().replace(/\/$/, "");
 
   return [
     "tmuxworktree://pair?relayUrl=",
-    encodeURIComponent(normalizedRelayUrl),
+    encodeURIComponent(canonicalRelayUrl),
     "&token=",
     encodeURIComponent(normalizedSecret),
     "&hostId=",
