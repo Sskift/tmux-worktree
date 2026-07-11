@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,viewport-fit=cover">
+  <link rel="stylesheet" href="xterm.css">
+  <style>
+    html, body, #terminal {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #020509;
+    }
+
+    body {
+      touch-action: none;
+    }
+
+    #terminal .xterm {
+      box-sizing: border-box;
+      height: 100%;
+      padding: 8px 6px;
+    }
+
+    .xterm-viewport {
+      background: #020509 !important;
+    }
+  </style>
+</head>
+<body>
+<div id="terminal" role="application" aria-label="Remote terminal"></div>
+<script src="xterm.js"></script>
+<script src="xterm-addon-fit.js"></script>
+<script>
+  (() => {
+    let terminal;
+    let fitAddon;
+    let ready = false;
+    let readOnly = false;
+    let lastCols = 0;
+    let lastRows = 0;
+    let fontSize = 14;
+    const pending = [];
+
+    function fit() {
+      if (!ready || !terminal || !fitAddon) return;
+      try {
+        fitAddon.fit();
+        if (terminal.cols && terminal.rows &&
+            (terminal.cols !== lastCols || terminal.rows !== lastRows)) {
+          lastCols = terminal.cols;
+          lastRows = terminal.rows;
+          TwBridge.resize(lastCols, lastRows);
+        }
+      } catch (_) {
+      }
+    }
+
+    function fitBurst() {
+      [0, 60, 160, 320, 640].forEach(delay => setTimeout(() => {
+        if (window.requestAnimationFrame) requestAnimationFrame(fit);
+        else fit();
+      }, delay));
+    }
+
+    function lineHeight() {
+      const row = document.querySelector('#terminal .xterm-rows > div');
+      return row ? row.getBoundingClientRect().height : 16;
+    }
+
+    function installTouchScroll() {
+      const element = document.getElementById('terminal');
+      let startX = 0;
+      let startY = 0;
+      let lastY = 0;
+      let accumulated = 0;
+      let scrolling = false;
+
+      element.addEventListener('touchstart', event => {
+        if (event.touches.length !== 1) return;
+        startX = event.touches[0].clientX;
+        startY = event.touches[0].clientY;
+        lastY = startY;
+        accumulated = 0;
+        scrolling = false;
+      }, { passive: true, capture: true });
+
+      element.addEventListener('touchmove', event => {
+        if (!ready || !terminal || event.touches.length !== 1) return;
+        const x = event.touches[0].clientX;
+        const y = event.touches[0].clientY;
+        const dx = Math.abs(x - startX);
+        const totalY = Math.abs(y - startY);
+        if (!scrolling && totalY > 8 && totalY > dx * 1.2) scrolling = true;
+        if (!scrolling) return;
+        event.preventDefault();
+        accumulated += y - lastY;
+        lastY = y;
+        const lines = accumulated / lineHeight();
+        if (Math.abs(lines) >= 1) {
+          const whole = lines > 0 ? Math.floor(lines) : Math.ceil(lines);
+          terminal.scrollLines(-whole);
+          accumulated -= whole * lineHeight();
+        }
+      }, { passive: false, capture: true });
+
+      const stop = () => {
+        scrolling = false;
+        accumulated = 0;
+      };
+      element.addEventListener('touchend', stop, { passive: true, capture: true });
+      element.addEventListener('touchcancel', stop, { passive: true, capture: true });
+    }
+
+    function initialize() {
+      terminal = new Terminal({
+        fontFamily: 'Roboto Mono, Menlo, ui-monospace, monospace',
+        fontSize,
+        lineHeight: 1.18,
+        cursorBlink: true,
+        cursorStyle: 'bar',
+        scrollback: 5000,
+        allowTransparency: false,
+        screenReaderMode: true,
+        theme: {
+          background: '#020509',
+          foreground: '#d5dae2',
+          cursor: '#b794f6',
+          cursorAccent: '#020509',
+          selectionBackground: 'rgba(183,148,246,0.30)',
+          black: '#191e27', red: '#f76060', green: '#67d584', yellow: '#f2b249',
+          blue: '#90cdf4', magenta: '#d6bcfa', cyan: '#81e6d9', white: '#edf1f5',
+          brightBlack: '#67707e', brightRed: '#feb2b2', brightGreen: '#9ae6b4',
+          brightYellow: '#fbd38d', brightBlue: '#90cdf4', brightMagenta: '#b794f6',
+          brightCyan: '#81e6d9', brightWhite: '#ffffff'
+        }
+      });
+      fitAddon = new FitAddon.FitAddon();
+      terminal.loadAddon(fitAddon);
+      terminal.open(document.getElementById('terminal'));
+      installTouchScroll();
+      terminal.onData(data => {
+        if (!readOnly) TwBridge.input(data);
+      });
+      terminal.onResize(size => {
+        lastCols = size.cols;
+        lastRows = size.rows;
+        TwBridge.resize(size.cols, size.rows);
+      });
+      window.addEventListener('resize', fitBurst);
+      if (window.visualViewport) {
+        visualViewport.addEventListener('resize', fitBurst);
+        visualViewport.addEventListener('scroll', fitBurst);
+      }
+      if (window.ResizeObserver) {
+        const observer = new ResizeObserver(fitBurst);
+        observer.observe(document.documentElement);
+        observer.observe(document.body);
+        observer.observe(document.getElementById('terminal'));
+      }
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) fitBurst();
+      });
+      ready = true;
+      fitBurst();
+      pending.splice(0).forEach(data => terminal.write(data));
+      terminal.focus();
+      TwBridge.ready();
+    }
+
+    window.twWrite = data => {
+      if (ready) terminal.write(data);
+      else pending.push(data);
+    };
+    window.twReset = data => {
+      if (!ready) {
+        pending.length = 0;
+        if (data) pending.push(data);
+        return;
+      }
+      terminal.reset();
+      if (data) terminal.write(data);
+      terminal.focus();
+      fitBurst();
+    };
+    window.twSendKey = data => {
+      if (!ready || readOnly) return;
+      terminal.write(data);
+      TwBridge.input(data);
+    };
+    window.twSetReadOnly = value => {
+      readOnly = Boolean(value);
+      if (!readOnly && ready) terminal.focus();
+    };
+    window.twSetFontSize = value => {
+      fontSize = Math.max(10, Math.min(24, Number(value) || 14));
+      if (ready) {
+        terminal.options.fontSize = fontSize;
+        fitBurst();
+      }
+    };
+    window.twFit = fitBurst;
+    window.twFocus = () => {
+      if (ready) terminal.focus();
+    };
+    window.twBlur = () => {
+      if (!ready) return;
+      const textarea = document.querySelector('#terminal textarea');
+      if (textarea) textarea.blur();
+    };
+
+    if (window.Terminal && window.FitAddon) initialize();
+    else TwBridge.failed('Bundled xterm assets failed to initialize');
+  })();
+</script>
+</body>
+</html>
