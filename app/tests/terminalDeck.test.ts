@@ -126,7 +126,7 @@ test("pending remote selections never fall back to local terminal or workspace c
   assert.match(selectionSource, /useState<PendingCatalogSelection \| null>\(null\)/);
   assert.match(
     selectionSource,
-    /pendingCreatedCatalogSelection\(\s*\{ kind: "session", name: sessionName \},\s*catalogRefreshGenerationRef\.current\.started,\s*\)/s,
+    /pendingCreatedCatalogSelection\(\s*\{ kind: "session", name: sessionName \},\s*getLatestStartedRefreshGeneration\(\),\s*\)/s,
   );
   assert.match(
     selectionSource,

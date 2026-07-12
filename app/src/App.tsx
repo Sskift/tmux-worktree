@@ -3,10 +3,13 @@ import { Plus, X } from "lucide-react";
 import {
   type DashboardWindow,
   type PlainTerminal,
-  type Session,
   useDashboardBackend,
 } from "./platform";
-import { useDashboardCatalog } from "./dashboard/hooks/useDashboardCatalog";
+import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
+import {
+  useWorkspaceCatalog,
+  type FullCatalogPublished,
+} from "./dashboard/hooks/useWorkspaceCatalog";
 import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
 import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
@@ -45,7 +48,6 @@ import {
   sameCatalogSelection,
   type PendingCatalogSelection,
 } from "./dashboard/model/selection";
-import { mergeDashboardCatalogSnapshot } from "./dashboard/model/catalogSnapshot";
 import { DEFAULT_COLUMN_ORDER } from "./dashboard/layout/schema";
 import type {
   DiffFile,
@@ -103,11 +105,6 @@ import {
   type AutomationRun,
 } from "./automationTypes";
 import {
-  describeSessionActivity,
-  type PreviousSessionActivity,
-  type SessionActivityInfo,
-} from "./dashboard/model/sessionActivity";
-import {
   basenameFromPath,
   isLocalDiscoveredInternalTerminal,
   normalizePlainTerminal,
@@ -115,9 +112,6 @@ import {
   terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
 import {
-  samePlainTerminals,
-  sameSessionActivity,
-  sameSessions,
   sameStringArray,
   sameStringRecord,
 } from "./dashboard/model/catalogEquality";
@@ -125,7 +119,7 @@ import { projectKey, type WorkspaceStatus } from "./dashboard/model/workspaceSel
 import { buildSshShellArgs } from "./terminal/attach";
 import "./App.css";
 
-const REFRESH_MS = 2000;
+const REFRESH_MS = 2_000;
 const HIDDEN_REFRESH_MS = 10_000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
@@ -145,18 +139,13 @@ let scratchIdCounter = 0;
 function App() {
   const dashboardBackend = useDashboardBackend();
   const { loadLayoutPreferences, saveLayoutPreferences } = useLayoutPreferences();
-  const [sessions, setSessions] = useState<Session[]>([]);
   const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
-  const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
   const [terminalsRestoreReady, setTerminalsRestoreReady] = useState(false);
   const [terminalPersistenceWritable, setTerminalPersistenceWritable] = useState(false);
   const [terminalPersistenceError, setTerminalPersistenceError] = useState<string | null>(null);
   const [terminalPersistenceHydrationGeneration, setTerminalPersistenceHydrationGeneration] =
     useState(0);
   const terminalSaveCoordinatorRef = useRef<TerminalSaveCoordinator | null>(null);
-  const [catalogRefreshGeneration, setCatalogRefreshGeneration] = useState(0);
-  const [failedSessionHostIds, setFailedSessionHostIds] = useState<string[]>([]);
-  const [failedTerminalHostIds, setFailedTerminalHostIds] = useState<string[]>([]);
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -171,9 +160,8 @@ function App() {
     hostStatuses,
     installingHostId,
     installRemoteTw,
-  } = useDashboardCatalog();
+  } = useConnectionCatalog();
   const mobileRelay = useMobileRelayController({ hosts });
-  const [sessionActivity, setSessionActivity] = useState<Record<string, SessionActivityInfo>>({});
   const [selection, setSelection] = useState<Selection>(null);
   const [openedSessions, setOpenedSessions] = useState<string[]>([]);
   const [openedTerminals, setOpenedTerminals] = useState<string[]>([]);
@@ -181,7 +169,6 @@ function App() {
   const [cwdsBySession, setCwdsBySession] = useState<Record<string, string>>({});
   const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
   const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
   const [showNewTerminal, setShowNewTerminal] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -231,13 +218,9 @@ function App() {
   const tmuxPreviewLiveRef = useRef<Set<string>>(new Set());
   const layoutLoadedRef = useRef(false);
   const automationsRef = useRef<Automation[]>([]);
-  const sessionActivityRef = useRef<Map<string, PreviousSessionActivity>>(new Map());
-  const sessionsRef = useRef<Session[]>(sessions);
-  const discoveredTerminalsRef = useRef<PlainTerminal[]>(discoveredTerminals);
   const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   const [pendingCatalogSelection, setPendingCatalogSelection] =
     useState<PendingCatalogSelection | null>(null);
-  const catalogRefreshGenerationRef = useRef({ started: 0, successful: 0 });
   const editingFileRef = useRef<EditingFile | null>(editingFile);
   const editorNavigationGateRef = useRef(createLatestRequestGate());
   const editorDirtySnapshotRef = useRef<EditorDirtySnapshot>({
@@ -271,8 +254,6 @@ function App() {
   }
   panelWidthsRef.current = { sidebarWidth, inspectorWidth };
   automationsRef.current = automations;
-  sessionsRef.current = sessions;
-  discoveredTerminalsRef.current = discoveredTerminals;
 
   const handleEditorDirtyChange = useCallback((dirty: boolean) => {
     const current = editorDirtySnapshotRef.current;
@@ -360,6 +341,23 @@ function App() {
   useEffect(() => {
     dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
   }, [dashboardBackend]);
+
+  const handleFullCatalogPublished = useCallback(({
+    sessionNames,
+  }: FullCatalogPublished) => {
+    const live = new Set(sessionNames);
+    setOpenedSessions((previous) => {
+      const next = previous.filter((name) => live.has(name));
+      return sameStringArray(previous, next) ? previous : next;
+    });
+    setCwdsBySession((previous) => {
+      const next: Record<string, string> = {};
+      for (const [name, cwd] of Object.entries(previous)) {
+        if (live.has(name)) next[name] = cwd;
+      }
+      return sameStringRecord(previous, next) ? previous : next;
+    });
+  }, []);
 
   useEffect(() => {
     const handleResize = () => {
@@ -553,6 +551,25 @@ function App() {
     };
   }, [dashboardBackend]);
 
+  const {
+    sessions,
+    discoveredTerminals,
+    sessionActivity,
+    catalogRefreshGeneration,
+    failedSessionHostIds,
+    failedTerminalHostIds,
+    error,
+    refresh,
+    removeSession,
+    removeDiscoveredTerminal,
+    reportError,
+    getLatestStartedRefreshGeneration,
+    getLatestSuccessfulRefreshGeneration,
+  } = useWorkspaceCatalog({
+    sessionOrder,
+    onFullCatalogPublished: handleFullCatalogPublished,
+  });
+
   // Load layout data on mount.
   useEffect(() => {
     loadLayoutPreferences()
@@ -621,7 +638,7 @@ function App() {
           setPendingCatalogSelection(
             pendingRestoredCatalogSelection(
               lay.selection,
-              catalogRefreshGenerationRef.current.successful,
+              getLatestSuccessfulRefreshGeneration(),
             ),
           );
           setSelection(lay.selection);
@@ -635,7 +652,7 @@ function App() {
       .finally(() => {
         layoutLoadedRef.current = true;
       });
-  }, [dashboardBackend, loadLayoutPreferences]);
+  }, [dashboardBackend, getLatestSuccessfulRefreshGeneration, loadLayoutPreferences]);
 
   // Persist terminal metadata serially. The coordinator keeps the newest
   // snapshot queued and retries failed writes without allowing an older save
@@ -845,9 +862,6 @@ function App() {
         : null;
   const workspaceInteractionBlocked = anyModalOpen || activeDrawer !== null;
 
-  const sessionOrderRef = useRef(sessionOrder);
-  sessionOrderRef.current = sessionOrder;
-
   const allTerminals = useMemo(() => {
     const persistedKeys = new Set(terminals.map(terminalSessionKey));
     return [
@@ -942,116 +956,6 @@ function App() {
       }
     })();
   }, [sessions, allTerminals]);
-
-  const refresh = useCallback(async () => {
-    const refreshGeneration = ++catalogRefreshGenerationRef.current.started;
-    try {
-      const catalog = dashboardBackend.catalog;
-      if (catalog?.listLocal && catalogRefreshGenerationRef.current.successful === 0) {
-        const localSnapshot = await catalog.listLocal().catch(() => null);
-        if (
-          localSnapshot &&
-          refreshGeneration >= catalogRefreshGenerationRef.current.successful
-        ) {
-          const mergedLocalCatalog = mergeDashboardCatalogSnapshot(
-            sessionsRef.current,
-            discoveredTerminalsRef.current,
-            localSnapshot,
-          );
-          const localSessions = mergedLocalCatalog.sessions;
-          const order = sessionOrderRef.current;
-          const orderMap = new Map(order.map((name, index) => [name, index]));
-          localSessions.sort((a, b) =>
-            (orderMap.get(a.name) ?? Infinity) - (orderMap.get(b.name) ?? Infinity),
-          );
-          const localTerminals = mergedLocalCatalog.terminals.map((terminal) => ({
-            ...terminal,
-            discovered: true,
-          }));
-          catalogRefreshGenerationRef.current.successful = refreshGeneration;
-          setFailedSessionHostIds(localSnapshot.failedSessionHostIds);
-          setFailedTerminalHostIds(localSnapshot.failedTerminalHostIds);
-          setSessions((previous) => sameSessions(previous, localSessions) ? previous : localSessions);
-          setDiscoveredTerminals((previous) =>
-            samePlainTerminals(previous, localTerminals) ? previous : localTerminals,
-          );
-          setCatalogRefreshGeneration(refreshGeneration);
-          setError(null);
-        }
-      }
-
-      const snapshot = catalog
-        ? await catalog.list()
-        : await Promise.all([
-          dashboardBackend.sessions.list(),
-          dashboardBackend.terminals.listTmux(),
-        ]).then(([nextSessions, nextTerminals]) => ({
-          sessions: nextSessions,
-          terminals: nextTerminals,
-          failedSessionHostIds: [],
-          failedTerminalHostIds: [],
-        }));
-      if (refreshGeneration < catalogRefreshGenerationRef.current.successful) return;
-      const mergedCatalog = mergeDashboardCatalogSnapshot(
-        sessionsRef.current,
-        discoveredTerminalsRef.current,
-        snapshot,
-      );
-      const list = mergedCatalog.sessions;
-      const discovered = mergedCatalog.terminals;
-      const order = sessionOrderRef.current;
-      const orderMap = new Map(order.map((n, i) => [n, i]));
-      list.sort((a, b) => {
-        const ai = orderMap.get(a.name) ?? Infinity;
-        const bi = orderMap.get(b.name) ?? Infinity;
-        return ai - bi;
-      });
-      const nowSeconds = Date.now() / 1000;
-      const previousActivity = sessionActivityRef.current;
-      const nextActivity = new Map<string, PreviousSessionActivity>();
-      const nextActivityInfo: Record<string, SessionActivityInfo> = {};
-      for (const session of list) {
-        const activity = describeSessionActivity(
-          {
-            name: session.name,
-            outputSignature: session.output_signature ?? null,
-            agentRunning: session.agent_running ?? null,
-          },
-          previousActivity.get(session.name),
-          nowSeconds,
-        );
-        nextActivityInfo[session.name] = activity;
-        nextActivity.set(session.name, {
-          outputSignature: activity.outputSignature,
-          lastChangedAt: activity.lastChangedAt,
-        });
-      }
-      sessionActivityRef.current = nextActivity;
-      const nextDiscoveredTerminals = discovered.map((terminal) => ({ ...terminal, discovered: true }));
-      catalogRefreshGenerationRef.current.successful = refreshGeneration;
-      setFailedSessionHostIds(snapshot.failedSessionHostIds);
-      setFailedTerminalHostIds(snapshot.failedTerminalHostIds);
-      setSessionActivity((prev) => sameSessionActivity(prev, nextActivityInfo) ? prev : nextActivityInfo);
-      setSessions((prev) => sameSessions(prev, list) ? prev : list);
-      setDiscoveredTerminals((prev) => samePlainTerminals(prev, nextDiscoveredTerminals) ? prev : nextDiscoveredTerminals);
-      setCatalogRefreshGeneration(refreshGeneration);
-      setError(mergedCatalog.partialError);
-      const live = new Set(list.map((s) => s.name));
-      setOpenedSessions((prev) => {
-        const next = prev.filter((n) => live.has(n));
-        return sameStringArray(prev, next) ? prev : next;
-      });
-      setCwdsBySession((prev) => {
-        const next: Record<string, string> = {};
-        for (const [k, v] of Object.entries(prev)) {
-          if (live.has(k)) next[k] = v;
-        }
-        return sameStringRecord(prev, next) ? prev : next;
-      });
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [dashboardBackend]);
 
   useVisibilityAwarePolling(refresh, {
     visibleIntervalMs: REFRESH_MS,
@@ -1623,7 +1527,7 @@ function App() {
       });
       if (!confirmed) return;
       await dashboardBackend.sessions.kill(name, session?.managed ?? false);
-      setSessions((current) => current.filter((session) => session.name !== name));
+      removeSession(name);
       setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
       setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
       setPinnedItems((current) => current.filter((item) => item.kind !== "session" || item.name !== name));
@@ -1635,9 +1539,9 @@ function App() {
         return remainingTerminal ? { kind: "terminal", id: remainingTerminal.id } : null;
       });
     } catch (nextError) {
-      setError(String(nextError));
+      reportError(nextError);
     }
-  }, [allTerminals, dashboardBackend, sessions]);
+  }, [allTerminals, dashboardBackend, removeSession, reportError, sessions]);
 
   const closeTerminal = useCallback(async (id: string) => {
     const terminal = allTerminals.find((candidate) => candidate.id === id);
@@ -1651,7 +1555,7 @@ function App() {
       if (!confirmed) return;
       if (terminal.discovered) {
         await dashboardBackend.sessions.kill(sessionKey, terminal.managed ?? false);
-        setDiscoveredTerminals((current) => current.filter((candidate) => candidate.id !== id));
+        removeDiscoveredTerminal(id);
       } else {
         await dashboardBackend.terminals.kill(sessionKey, terminal.managed ?? false);
         setTerminals((current) => current.filter((candidate) => candidate.id !== id));
@@ -1666,9 +1570,9 @@ function App() {
         return remainingSession ? { kind: "session", name: remainingSession.name } : null;
       });
     } catch (nextError) {
-      setError(String(nextError));
+      reportError(nextError);
     }
-  }, [allTerminals, dashboardBackend, sessions]);
+  }, [allTerminals, dashboardBackend, removeDiscoveredTerminal, reportError, sessions]);
 
   const renameTerminal = useCallback((id: string, label: string) => {
     setTerminals((current) => (
@@ -2334,7 +2238,7 @@ function App() {
               setPendingCatalogSelection(
                 pendingCreatedCatalogSelection(
                   { kind: "session", name: sessionName },
-                  catalogRefreshGenerationRef.current.started,
+                  getLatestStartedRefreshGeneration(),
                 ),
               );
               void loadProjectPresets();

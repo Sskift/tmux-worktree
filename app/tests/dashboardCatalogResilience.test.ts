@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const source = readFileSync(
-  new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+  new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
   "utf8",
 );
 

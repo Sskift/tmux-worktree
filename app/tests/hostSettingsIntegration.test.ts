@@ -28,16 +28,16 @@ test("the renderer loads ssh host candidates into Settings and keeps host status
     "utf8",
   );
   const catalog = readFileSync(
-    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
   );
   const composition = rendererImplementationSourceContaining(
-    "useDashboardCatalog()",
+    "useConnectionCatalog()",
     "sshHostCandidates={sshHostCandidates}",
     "hostStatuses={hostStatuses}",
   ).source;
 
-  assert.match(composition, /useDashboardCatalog\(\)/);
+  assert.match(composition, /useConnectionCatalog\(\)/);
   assert.match(catalog, /dashboardBackend\.hosts\.candidates\(\)/);
   assert.match(composition, /sshHostCandidates/);
   assert.match(composition, /sshHostCandidates=\{sshHostCandidates\}/);
@@ -56,7 +56,7 @@ test("the renderer loads ssh host candidates into Settings and keeps host status
 
 test("the renderer polls host status separately from the main session refresh", () => {
   const catalog = readFileSync(
-    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
   );
 
@@ -68,16 +68,17 @@ test("the renderer polls host status separately from the main session refresh", 
   assert.match(catalog, /hiddenIntervalMs: HOST_STATUS_HIDDEN_REFRESH_MS/);
   assert.doesNotMatch(catalog, /setInterval\(/);
 
-  const { source } = rendererImplementationSourceContaining(
-    "const refresh = useCallback",
-    "useVisibilityAwarePolling(refresh",
-    "catalogRefreshGenerationRef.current.started",
+  const workspaceHook = readFileSync(
+    new URL("../src/dashboard/hooks/useWorkspaceCatalog.ts", import.meta.url),
+    "utf8",
   );
-  const refreshStart = source.indexOf("const refresh = useCallback");
-  const refreshEnd = source.indexOf("useVisibilityAwarePolling(refresh", refreshStart);
-  const refreshBlock = source.slice(refreshStart, refreshEnd);
-  assert.ok(refreshStart >= 0 && refreshEnd > refreshStart, "refresh block should be found");
-  assert.doesNotMatch(refreshBlock, /dashboardBackend\.hosts\.statuses/);
+  const refreshCoordinator = readFileSync(
+    new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
+    "utf8",
+  );
+  assert.match(workspaceHook, /const refresh = useCallback\(\(\) => workspaceCatalogRefresh\(/);
+  assert.doesNotMatch(workspaceHook, /dashboardBackend\.hosts\.statuses/);
+  assert.doesNotMatch(refreshCoordinator, /hosts\.statuses/);
 });
 
 test("host status exposes remote tw version and install action from Settings", () => {
@@ -90,7 +91,7 @@ test("host status exposes remote tw version and install action from Settings", (
     "utf8",
   );
   const catalog = readFileSync(
-    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
   );
   const domainTypes = readFileSync(new URL("../src/platform/domainTypes.ts", import.meta.url), "utf8");

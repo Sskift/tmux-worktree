@@ -311,16 +311,12 @@ test("a post-create partial refresh cannot fall back from the new remote session
 });
 
 test("the renderer publishes the local catalog before the slower remote-aware snapshot", () => {
-  const { source } = rendererImplementationSourceContaining(
-    "const refresh = useCallback",
-    "useVisibilityAwarePolling(refresh",
-    "catalogRefreshGenerationRef.current.started",
+  const refreshSource = readFileSync(
+    new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
+    "utf8",
   );
-  const refreshStart = source.indexOf("const refresh = useCallback");
-  const refreshEnd = source.indexOf("useVisibilityAwarePolling(refresh", refreshStart);
-  const refreshSource = source.slice(refreshStart, refreshEnd);
 
-  assert.match(refreshSource, /const refreshGeneration = \+\+catalogRefreshGenerationRef\.current\.started/);
+  assert.match(refreshSource, /const refreshGeneration = \+\+options\.generation\.started/);
   assert.match(refreshSource, /catalog\?\.listLocal/);
   assert.match(refreshSource, /await catalog\.listLocal\(\)\.catch\(\(\) => null\)/);
   assert.ok(
@@ -329,22 +325,21 @@ test("the renderer publishes the local catalog before the slower remote-aware sn
   );
   assert.match(
     refreshSource,
-    /await Promise\.all\(\[\s*dashboardBackend\.sessions\.list\(\),\s*dashboardBackend\.terminals\.listTmux\(\),\s*\]\)/s,
+    /await Promise\.all\(\[\s*options\.backend\.sessions\.list\(\),\s*options\.backend\.terminals\.listTmux\(\),\s*\]\)/s,
   );
   assert.doesNotMatch(refreshSource, /listTmux\(\)\.catch/);
   assert.ok(
-    refreshSource.indexOf("setCatalogRefreshGeneration(refreshGeneration)") <
-      refreshSource.indexOf("} catch (e)"),
+    refreshSource.indexOf("options.generation.successful = refreshGeneration") <
+      refreshSource.indexOf("options.publishFull({"),
   );
-  assert.doesNotMatch(
-    refreshSource.slice(refreshSource.indexOf("} catch (e)")),
-    /setCatalogRefreshGeneration/,
-  );
+  const catchSource = refreshSource.slice(refreshSource.indexOf("} catch (error)"));
+  assert.match(catchSource, /options\.publishError\(String\(error\)\)/);
+  assert.doesNotMatch(catchSource, /generation\.successful|publishLocal|publishFull/);
 });
 
 test("Host readiness distinguishes initial empty state from a successful empty catalog", () => {
   const hookSource = readFileSync(
-    new URL("../src/dashboard/hooks/useDashboardCatalog.ts", import.meta.url),
+    new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
   );
   const loadStart = hookSource.indexOf("const loadHosts = useCallback");

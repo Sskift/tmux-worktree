@@ -18,15 +18,28 @@ const gitStatusSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_status\s*
 const gitDiffSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_diff\s*\(\s*cwd:\s*String,\s*path:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<String,\s*String>\s*\{/m;
 
 test("dashboard refresh preserves state identity when polled data is unchanged", () => {
+  const workspaceCatalog = readFileSync(
+    new URL("../src/dashboard/hooks/useWorkspaceCatalog.ts", import.meta.url),
+    "utf8",
+  );
   assert.match(renderer, /function sameSessions\(/);
   assert.match(renderer, /function samePlainTerminals\(/);
   assert.match(renderer, /function sameSessionActivity\(/);
   assert.match(renderer, /function sameStringRecord\(/);
-  assert.match(renderer, /setSessionActivity\(\(prev\) => sameSessionActivity\(prev, nextActivityInfo\) \? prev : nextActivityInfo\)/);
-  assert.match(renderer, /setSessions\(\(prev\) => sameSessions\(prev, list\) \? prev : list\)/);
-  assert.match(renderer, /setDiscoveredTerminals\(\(prev\) => samePlainTerminals\(prev, nextDiscoveredTerminals\) \? prev : nextDiscoveredTerminals\)/);
-  assert.match(renderer, /return sameStringArray\(prev, next\) \? prev : next;/);
-  assert.match(renderer, /return sameStringRecord\(prev, next\) \? prev : next;/);
+  assert.match(
+    workspaceCatalog,
+    /setSessionActivity\(\(previous\) =>\s*sameSessionActivity\(previous, publication\.sessionActivity\)\s*\? previous\s*: publication\.sessionActivity/s,
+  );
+  assert.match(
+    workspaceCatalog,
+    /setSessions\(\(previous\) =>\s*sameSessions\(previous, publication\.sessions\) \? previous : publication\.sessions/s,
+  );
+  assert.match(
+    workspaceCatalog,
+    /setDiscoveredTerminals\(\(previous\) =>\s*samePlainTerminals\(previous, publication\.discoveredTerminals\)\s*\? previous\s*: publication\.discoveredTerminals/s,
+  );
+  assert.match(renderer, /return sameStringArray\(previous, next\) \? previous : next;/);
+  assert.match(renderer, /return sameStringRecord\(previous, next\) \? previous : next;/);
 });
 
 test("dashboard preloads tmux snapshots without live-mounting every terminal", () => {
