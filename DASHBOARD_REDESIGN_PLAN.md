@@ -1,12 +1,12 @@
 # tw-dashboard v2 最终重构计划
 
-> 状态：Dashboard replacement 与 Android V2 客户端已合入 `master`；Binary / Dashboard headless control-plane Phase 7 已实现、同步最新主分支并通过最终回归，已获授权并准备 fast-forward 交付。Relay v2 Android-first contract 已冻结但尚未实现；下一阶段继续做 SSH 长连接 soak 与恢复状态机，Phase 4/5 保留为后续能力
+> 状态：Dashboard replacement、Android V2 客户端与 Binary / Dashboard headless control-plane Phase 7 均已按授权 fast-forward 合入 `master`。Relay v2 Android-first contract 已冻结但尚未实现；下一阶段继续做 SSH 长连接 soak 与恢复状态机，Phase 4/5 保留为后续能力
 >
 > 日期：2026-07-12
 >
-> 历史已交付分支：`tmux-worktree-app-re-ddf7c` 的 Dashboard replacement 提交与 `tmux-worktree-apk-re-5f44d` 已按用户授权合入 `master`；同名 Dashboard 分支当前继续承载 Phase 7 的待合并提交
+> 已交付分支：`tmux-worktree-app-re-ddf7c`（Dashboard replacement + Phase 7）与 `tmux-worktree-apk-re-5f44d`（Android V2）均已按用户授权合入 `master`
 >
-> 当前实现基线：最新 `master` + `tmux-worktree-app-re-ddf7c` 合并候选（Files 常驻 + CodeMirror 编辑器 + Git Graph + headless CLI/RPC/SSH control plane + Compose Android V2 UI + 安全 Relay v1 pairing/backpressure + 旧 Dashboard/Android UI 清理）
+> 当前实现基线：最新 `master`（Files 常驻 + CodeMirror 编辑器 + Git Graph + headless CLI/RPC/SSH control plane + Compose Android V2 UI + 安全 Relay v1 pairing/backpressure + 旧 Dashboard/Android UI 清理）
 >
 > 当前验收态：历史 Dashboard replacement release bundle 已 ad-hoc 签名并完成真实 worktree/terminal/Host smoke；它不是本轮 Phase 7 的新 packaged build。同步最新 Android `master` 后，Phase 7 最终门禁为 root CLI 73/73、Dashboard 334/334、Rust 81/81、Android JVM 59/59；Android API 36 instrumentation 34/34 沿用已合入主分支的验收结果。新 DMG 与 release APK 尚未构建/生产签名。
 >
@@ -889,8 +889,8 @@ P0/P1/P2 问题修复后才能完成阶段；P3 可记录为后续 polish。
 
 ### 当前阶段
 
-- Dashboard replacement 的历史提交与 Android 分支 `tmux-worktree-apk-re-5f44d` 已完成验收并按用户授权合入 `master`；Phase 7 继续通过同名 Dashboard 分支交付，不直接在主分支开发。
-- Phase 7 已 rebase 到 `master@c356a73` 并通过全量门禁；push 功能分支后再次核对 `origin/master`，只允许 fast-forward，不使用 force push。
+- Dashboard replacement、Android V2 与 Phase 7 均在对应工作分支完成、push、验收，再按用户授权 fast-forward 合入 `master`；没有直接在主分支开发。
+- Phase 7 基于 `master@c356a73` 完成并通过全量门禁；合并前再次核对 `origin/master`，全程只使用 fast-forward，没有 force push。
 - Relay v2 contract 已存在于 `master@c356a73`，本轮不提前实现 v2 broker/host/Android wire changes。
 - Phase 7 合入后，Phase 8 SSH 长连接稳定性从最新 `origin/master` 新建独立任务分支。
 
@@ -922,5 +922,5 @@ Dashboard v2 达到完成状态需要：
 - 自动化测试、真实流程验证和视觉 QA 通过。
 - dogfood 结论记录完成，运行时选择有证据。
 - Dashboard/Android replacement 和冻结协议文档已提交、push 并合入 `master`。
-- Binary / Dashboard headless control-plane Phase 7 已通过完整测试并按授权准备 fast-forward 交付。
+- Binary / Dashboard headless control-plane Phase 7 已通过完整测试并按授权 fast-forward 合入 `master`。
 - 正式 release 与后续 SSH/Relay 实现有独立验收和授权，不因本轮合并自动执行。
