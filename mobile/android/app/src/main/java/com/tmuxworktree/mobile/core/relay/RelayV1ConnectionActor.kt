@@ -27,7 +27,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -1334,92 +1333,6 @@ class RelayV1ConnectionActor(
             .pingInterval(20, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .build()
-    }
-}
-
-internal class BoundedActionQueue<T>(
-    normalCapacity: Int,
-    reservedCapacity: Int,
-) {
-    private val validatedNormalCapacity = normalCapacity.also {
-        require(it > 0) { "normalCapacity must be positive" }
-    }
-    private val validatedReservedCapacity = reservedCapacity.also {
-        require(it > 0) { "reservedCapacity must be positive" }
-    }
-    private val enqueueLock = Any()
-    private val normalSlots = Semaphore(validatedNormalCapacity)
-    private val reservedSlots = Semaphore(validatedReservedCapacity)
-    private val channel = Channel<QueuedAction<T>>(
-        validatedNormalCapacity + validatedReservedCapacity,
-    )
-
-    fun trySendNormal(action: T): Boolean = synchronized(enqueueLock) {
-        if (!normalSlots.tryAcquire()) return@synchronized false
-        if (channel.trySend(QueuedAction(action, SlotKind.NORMAL)).isSuccess) {
-            true
-        } else {
-            normalSlots.release()
-            false
-        }
-    }
-
-    fun trySendNormalOrReserved(action: T): Boolean = synchronized(enqueueLock) {
-        if (normalSlots.tryAcquire()) {
-            if (channel.trySend(QueuedAction(action, SlotKind.NORMAL)).isSuccess) {
-                return@synchronized true
-            }
-            normalSlots.release()
-        }
-        trySendReservedLocked(action)
-    }
-
-    fun trySendReserved(action: T): Boolean = synchronized(enqueueLock) {
-        trySendReservedLocked(action)
-    }
-
-    suspend fun receive(): T? {
-        val queued = channel.receiveCatching().getOrNull() ?: return null
-        when (queued.slotKind) {
-            SlotKind.NORMAL -> normalSlots.release()
-            SlotKind.RESERVED -> reservedSlots.release()
-        }
-        return queued.action
-    }
-
-    fun close() {
-        channel.close()
-    }
-
-    private fun trySendReservedLocked(action: T): Boolean {
-        if (!reservedSlots.tryAcquire()) return false
-        if (channel.trySend(QueuedAction(action, SlotKind.RESERVED)).isSuccess) return true
-        reservedSlots.release()
-        return false
-    }
-
-    private enum class SlotKind { NORMAL, RESERVED }
-
-    private data class QueuedAction<T>(val action: T, val slotKind: SlotKind)
-}
-
-data class RelayRequestTimeoutPolicy(
-    val hostsMillis: Long = 10_000,
-    val sessionsMillis: Long = 10_000,
-    val scopesMillis: Long = 10_000,
-    val createWorktreeMillis: Long = 60_000,
-    val createTerminalMillis: Long = 30_000,
-    val sendAgentMessageMillis: Long = 20_000,
-    val killSessionMillis: Long = 15_000,
-) {
-    fun timeoutMillis(kind: RelayRequestKind): Long = when (kind) {
-        RelayRequestKind.HOSTS -> hostsMillis
-        RelayRequestKind.SESSIONS -> sessionsMillis
-        RelayRequestKind.SCOPES -> scopesMillis
-        RelayRequestKind.CREATE_WORKTREE -> createWorktreeMillis
-        RelayRequestKind.CREATE_TERMINAL -> createTerminalMillis
-        RelayRequestKind.SEND_AGENT_MESSAGE -> sendAgentMessageMillis
-        RelayRequestKind.KILL_SESSION -> killSessionMillis
     }
 }
 

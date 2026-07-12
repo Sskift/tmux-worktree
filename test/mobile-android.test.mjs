@@ -53,6 +53,7 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   const html = read("mobile/android/app/src/main/assets/xterm/index.html");
   const webView = readAndroidSource("TerminalWebView.kt");
   const relayActor = readAndroidSource("RelayV1ConnectionActor.kt");
+  const actionQueue = readAndroidSource("RelayActionQueue.kt");
   const viewModel = readAndroidSource("V2ViewModel.kt");
   const registries = readAndroidSource("RelayRegistries.kt");
 
@@ -80,9 +81,9 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   assert.match(relayActor, /delay\(terminalOutputBatchMillis\.coerceAtLeast\(1\)\)/);
   assert.match(relayActor, /MAX_TERMINAL_OUTPUT_BATCH_CHARS = 64 \* 1024/);
   assert.match(relayActor, /BoundedActionQueue<Action>\(/);
-  assert.match(relayActor, /normalSlots = Semaphore\(validatedNormalCapacity\)/);
+  assert.match(actionQueue, /normalSlots = Semaphore\(validatedNormalCapacity\)/);
   assert.match(
-    relayActor,
+    actionQueue,
     /Channel<QueuedAction<T>>\([\s\S]*validatedNormalCapacity \+ validatedReservedCapacity/,
   );
   assert.match(relayActor, /callbackIngressLock = Any\(\)/);
