@@ -591,6 +591,28 @@ test("dialog rejection remains a rejection and never navigates", async () => {
   assert.equal(navigated, false);
 });
 
+test("a stale terminal callback consults the latest committed editing-file cut", () => {
+  const committedEditingFileRef: {
+    current: { path: string; hostId: string | null } | null;
+  } = {
+    current: { path: "/repo/a.ts", hostId: null },
+  };
+  const staleTerminalCallback = (next: { path: string; hostId: string | null }) =>
+    editingFileSourceKey(committedEditingFileRef.current) === editingFileSourceKey(next);
+
+  committedEditingFileRef.current = { path: "/repo/c.ts", hostId: null };
+  assert.equal(
+    staleTerminalCallback({ path: "/repo/a.ts", hostId: null }),
+    false,
+    "an async callback captured on A must not bypass the dirty guard after C commits",
+  );
+  assert.equal(
+    staleTerminalCallback({ path: "/repo/c.ts", hostId: null }),
+    true,
+    "same-file line navigation must still use the latest committed file",
+  );
+});
+
 test("layout commit publishes the guard while an aborted render cannot replace its backend or file", async () => {
   const harness = loadEditorNavigationHookHarness();
   const sameContextConfirm = deferred<boolean>();

@@ -574,23 +574,63 @@ test("App only wires the D11 guard and retains all eleven business navigation ha
   assert.match(sources.app, /onDirtyChange=\{handleEditorDirtyChange\}/);
   assert.match(sources.app, /onDirtyChange=\{handleAutomationDirtyChange\}/);
   assert.deepEqual(callbackDependencies(appBody, "handleOpenFile"), [
-    "editingFile",
     "requestEditorNavigation",
   ]);
   assert.deepEqual(callbackDependencies(appBody, "selectAutomation"), [
     "diffFile",
-    "editingFile",
     "requestEditorNavigation",
     "selection",
     "viewportTier",
   ]);
   assert.match(
     compact(directFunctionBodyFromVariable(appBody, "handleOpenFile"), appFile),
-    /editingFileSourceKey\(editingFile\)===editingFileSourceKey\(nextFile\)/,
+    /editingFileSourceKey\(committedEditingFileRef\.current\)===editingFileSourceKey\(nextFile\)/,
   );
   assert.match(
     compact(directFunctionBodyFromVariable(appBody, "selectAutomation"), appFile),
-    /automationSelectionIsCurrent\([^)]*editingFile!==null,diffFile!==null,?\)/,
+    /automationSelectionIsCurrent\([^)]*committedEditingFileRef\.current!==null,diffFile!==null,?\)/,
+  );
+
+  const committedRefs: ts.VariableDeclaration[] = [];
+  visit(appBody, (node) => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === "committedEditingFileRef"
+    ) {
+      committedRefs.push(node);
+    }
+  });
+  assert.equal(committedRefs.length, 1);
+  assert.ok(committedRefs[0].initializer && ts.isCallExpression(committedRefs[0].initializer));
+  assert.equal(expressionPath(committedRefs[0].initializer.expression), "useRef");
+  assert.equal(compact(committedRefs[0].initializer.arguments[0], appFile), "editingFile");
+
+  const committedAssignments: ts.BinaryExpression[] = [];
+  visit(appBody, (node) => {
+    if (
+      ts.isBinaryExpression(node) &&
+      node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+      compact(node.left, appFile) === "committedEditingFileRef.current"
+    ) {
+      committedAssignments.push(node);
+    }
+  });
+  assert.equal(committedAssignments.length, 1, "the committed cut must have one writer");
+  assert.equal(compact(committedAssignments[0].right, appFile), "editingFile");
+  const committedEffects = directTopLevelCallExpressions(appBody, "useLayoutEffect").filter(
+    (call) => callCount(call.arguments[0], "editingFileSourceKey") === 0 &&
+      call.arguments[0].getText(appFile).includes("committedEditingFileRef.current"),
+  );
+  assert.equal(committedEffects.length, 1);
+  assert.equal(compact(committedEffects[0].arguments[1], appFile), "[editingFile]");
+  assert.equal(
+    compact(committedEffects[0].arguments[0], appFile),
+    "()=>{committedEditingFileRef.current=editingFile;}",
+  );
+  assert.ok(
+    lifecycleCalls[0] < directTopLevelCalls(appBody, "useLayoutEffect")[0],
+    "the guard context must commit before the App editing-file cut",
   );
 
   const existingEffectPaths = [

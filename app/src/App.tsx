@@ -1,4 +1,11 @@
-import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Plus, X } from "lucide-react";
 import { useDashboardBackend } from "./platform";
 import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
@@ -202,6 +209,7 @@ function App() {
   });
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
+  const committedEditingFileRef = useRef<EditingFile | null>(editingFile);
   const [editorNavigationRevision, setEditorNavigationRevision] = useState(0);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
@@ -693,7 +701,7 @@ function App() {
         ...(col && col > 0 ? { column: col } : {}),
       };
       if (
-        editingFileSourceKey(editingFile) ===
+        editingFileSourceKey(committedEditingFileRef.current) ===
         editingFileSourceKey(nextFile)
       ) {
         if (nextFile.line !== undefined) {
@@ -710,7 +718,7 @@ function App() {
         setEditingFile(nextFile);
       });
     },
-    [editingFile, requestEditorNavigation],
+    [requestEditorNavigation],
   );
 
   const closeEditingFile = useCallback(
@@ -919,7 +927,7 @@ function App() {
         automationSelectionIsCurrent(
           selection?.kind === "automation" ? selection.id : null,
           id,
-          editingFile !== null,
+          committedEditingFileRef.current !== null,
           diffFile !== null,
         )
       ) {
@@ -938,7 +946,7 @@ function App() {
         if (viewportTier === "compact") setSidebarOpen(false);
       });
     },
-    [diffFile, editingFile, requestEditorNavigation, selection, viewportTier],
+    [diffFile, requestEditorNavigation, selection, viewportTier],
   );
 
   const returnFromAutomationManager = useCallback(() => requestEditorNavigation(() => {
@@ -1056,6 +1064,10 @@ function App() {
     editingFile,
     automationDraftKey,
   });
+
+  useLayoutEffect(() => {
+    committedEditingFileRef.current = editingFile;
+  }, [editingFile]);
 
   const openFiles = useCallback(() => {
     sidebarOpenPreferenceRef.current = true;
