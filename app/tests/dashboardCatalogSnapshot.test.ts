@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import type { DashboardCatalogSnapshot, PlainTerminal, Session } from "../src/platform";
-import { mergeDashboardCatalogSnapshot } from "../src/dashboard/dashboardCatalogSnapshot";
+import { mergeDashboardCatalogSnapshot } from "../src/dashboard/model/catalogSnapshot";
 
 const localSession: Session = {
   name: "local",

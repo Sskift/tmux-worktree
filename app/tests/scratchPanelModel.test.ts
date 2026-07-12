@@ -6,7 +6,7 @@ import {
   clampScratchPanelWidth,
   scratchPanelWidthFromKey,
   scratchPanelWidthFromPointer,
-} from "../src/dashboard/scratchPanelModel.ts";
+} from "../src/dashboard/layout/scratchGeometry.ts";
 
 test("scratch width clamps while preserving a usable main workspace", () => {
   assert.equal(clampScratchPanelWidth(10), SCRATCH_PANEL_LIMITS.min);

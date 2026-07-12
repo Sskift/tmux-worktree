@@ -39,7 +39,7 @@ test("worktree sidebar groups sessions by project with collapsible headers", () 
     "utf8",
   );
   const model = readFileSync(
-    new URL("../src/dashboard/DashboardSidebarModel.ts", import.meta.url),
+    new URL("../src/dashboard/model/workspaceSelectors.ts", import.meta.url),
     "utf8",
   );
   const css = readFileSync(
@@ -56,18 +56,17 @@ test("worktree sidebar groups sessions by project with collapsible headers", () 
 });
 
 test("remote scratch terminals start on the selected host cwd", () => {
-  const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
+  const attach = readFileSync(new URL("../src/terminal/attach.ts", import.meta.url), "utf8");
   const composition = rendererImplementationSourceContaining(
-    "function buildSshShellArgs",
     "buildSshShellArgs(scratchContext.host, scratchContext.cwd)",
     "hostId={scratchContext.host?.id ?? null}",
   ).source;
 
-  assert.match(composition, /function buildSshShellArgs\(host: HostConfig, cwd: string\): string\[\]/);
-  assert.match(deck, /function shellQuoteArg\(value: string\): string/);
+  assert.match(attach, /export function buildSshShellArgs\(host: HostConfig, cwd: string\): string\[\]/);
+  assert.match(attach, /export function shellQuoteArg\(value: string\): string/);
   assert.match(composition, /buildSshShellArgs\(scratchContext\.host, scratchContext\.cwd\)/);
   assert.match(composition, /hostId=\{scratchContext\.host\?\.id \?\? null\}/);
-  assert.match(composition, /`cd \$\{shellQuoteArg\(cwd\)\} && exec "\\\$\{SHELL:-\/bin\/sh\}"`/);
+  assert.match(attach, /`cd \$\{shellQuoteArg\(cwd\)\} && exec "\\\$\{SHELL:-\/bin\/sh\}"`/);
   assert.doesNotMatch(renderer, /"sh",\s*"-c"/);
   assert.doesNotMatch(renderer, /"sh",\s*"-lc"/);
   assert.doesNotMatch(renderer, /exec "\$\{SHELL:-\/bin\/sh\}" -l/);

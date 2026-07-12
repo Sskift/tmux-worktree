@@ -6,7 +6,7 @@ import {
   pendingCreatedCatalogSelection,
   pendingRestoredCatalogSelection,
   reconcileCatalogSelection,
-} from "../src/dashboard/catalogSelectionHydration";
+} from "../src/dashboard/model/selection";
 import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const localSession: Session = {

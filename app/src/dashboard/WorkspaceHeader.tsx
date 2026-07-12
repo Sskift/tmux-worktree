@@ -1,7 +1,7 @@
 import { Files, GitBranch, PanelLeftOpen, TerminalSquare } from "lucide-react";
 import productIcon from "../../src-tauri/icons/128x128.png";
-import type { WorkspaceStatus } from "./workspaceStatus";
-import { workspaceStatusLabel } from "./workspaceStatus";
+import type { WorkspaceStatus } from "./model/workspaceSelectors";
+import { workspaceStatusLabel } from "./model/workspaceSelectors";
 import "./WorkspaceHeader.css";
 
 export type WorkspaceHeaderProps = {

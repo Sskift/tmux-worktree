@@ -4,7 +4,7 @@ import {
   loadDashboardLayoutPreferences,
   saveDashboardLayoutPreferences,
 } from "../layoutPersistence";
-import type { DashboardLayoutPreferences } from "../layoutPreferences";
+import type { DashboardLayoutPreferences } from "../layout/types";
 
 export function useLayoutPreferences() {
   const backend = useDashboardBackend();

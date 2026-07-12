@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Plus, X } from "lucide-react";
 import {
   type DashboardWindow,
-  type HostConfig,
   type PlainTerminal,
   type Session,
   useDashboardBackend,
@@ -24,45 +23,38 @@ import {
   ConnectionsSettings,
   relaySettingsBindingsFromController,
 } from "./dashboard/Settings/ConnectionsSettings";
-import {
-  TerminalDeck,
-  sessionDisplayName,
-  shellQuoteArg,
-  sharedSshConnectionArgs,
-  terminalRawName,
-  terminalSessionKey,
-} from "./dashboard/TerminalDeck";
+import { TerminalDeck } from "./dashboard/TerminalDeck";
 import {
   DashboardShell,
   type DashboardDrawer,
 } from "./dashboard/DashboardShell";
-import {
-  DashboardSidebar,
-  type SidebarView,
-} from "./dashboard/DashboardSidebar";
+import { DashboardSidebar } from "./dashboard/DashboardSidebar";
 import { WorkspaceHeader } from "./dashboard/WorkspaceHeader";
 import { GitPanel } from "./dashboard/GitPanel";
-import type { WorkspaceStatus } from "./dashboard/workspaceStatus";
 import {
   clampDashboardPanelWidthForViewport,
+  DEFAULT_INSPECTOR_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
   normalizeDashboardPanelWidths,
-} from "./dashboard/dashboardShellModel";
+  viewportTierForWidth,
+} from "./dashboard/layout/panelGeometry";
 import {
   pendingCreatedCatalogSelection,
   pendingRestoredCatalogSelection,
   reconcileCatalogSelection,
   sameCatalogSelection,
   type PendingCatalogSelection,
-} from "./dashboard/catalogSelectionHydration";
-import { mergeDashboardCatalogSnapshot } from "./dashboard/dashboardCatalogSnapshot";
-import {
-  DEFAULT_COLUMN_ORDER,
-  type DiffFile,
-  type EditingFile,
-  type PinnedItem,
-  type Selection,
-  type WindowLayout,
-} from "./dashboard/layoutPreferences";
+} from "./dashboard/model/selection";
+import { mergeDashboardCatalogSnapshot } from "./dashboard/model/catalogSnapshot";
+import { DEFAULT_COLUMN_ORDER } from "./dashboard/layout/schema";
+import type {
+  DiffFile,
+  EditingFile,
+  SidebarView,
+  ViewportTier,
+  WindowLayout,
+} from "./dashboard/layout/types";
+import type { PinnedItem, Selection } from "./dashboard/model/selection";
 import {
   DEFAULT_SCRATCH_PANEL_WIDTH,
   SCRATCH_PANEL_LIMITS,
@@ -70,7 +62,7 @@ import {
   scratchPanelMaximumWidth,
   scratchPanelWidthFromKey,
   scratchPanelWidthFromPointer,
-} from "./dashboard/scratchPanelModel";
+} from "./dashboard/layout/scratchGeometry";
 import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
@@ -114,127 +106,29 @@ import {
   describeSessionActivity,
   type PreviousSessionActivity,
   type SessionActivityInfo,
-} from "./sessionActivity";
+} from "./dashboard/model/sessionActivity";
+import {
+  basenameFromPath,
+  isLocalDiscoveredInternalTerminal,
+  normalizePlainTerminal,
+  sessionDisplayName,
+  terminalSessionKey,
+} from "./dashboard/model/terminalIdentity";
+import {
+  samePlainTerminals,
+  sameSessionActivity,
+  sameSessions,
+  sameStringArray,
+  sameStringRecord,
+} from "./dashboard/model/catalogEquality";
+import { projectKey, type WorkspaceStatus } from "./dashboard/model/workspaceSelectors";
+import { buildSshShellArgs } from "./terminal/attach";
 import "./App.css";
 
 const REFRESH_MS = 2000;
 const HIDDEN_REFRESH_MS = 10_000;
 const PRELOAD_HISTORY_LINES = 300;
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
-
-function projectKey(name: string): string {
-  const i = name.indexOf("-");
-  return i > 0 ? name.slice(0, i) : name;
-}
-
-function buildSshShellArgs(host: HostConfig, cwd: string): string[] {
-  const args: string[] = ["-tt", ...sharedSshConnectionArgs()];
-  if (host.port) {
-    args.push("-p", String(host.port));
-  }
-  if (host.identityFile) {
-    args.push("-i", host.identityFile);
-  }
-  if (host.user) {
-    args.push("-l", host.user);
-  }
-  args.push(
-    "--",
-    host.host,
-    `cd ${shellQuoteArg(cwd)} && exec "\${SHELL:-/bin/sh}"`,
-  );
-  return args;
-}
-
-function isInternalTerminalName(value: string | null | undefined): boolean {
-  return !!value && value.startsWith("tw-term-");
-}
-
-function basenameFromPath(value: string | null | undefined): string {
-  const parts = (value ?? "").split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? "";
-}
-
-function normalizePlainTerminal(terminal: PlainTerminal): PlainTerminal {
-  const hostId = terminal.hostId === "local" ? null : terminal.hostId ?? null;
-  const rawName = terminal.rawName || terminalRawName({ ...terminal, hostId });
-  const fallbackLabel = basenameFromPath(terminal.cwd) || "terminal";
-  const label = !terminal.label || isInternalTerminalName(terminal.label)
-    ? fallbackLabel
-    : terminal.label;
-  return { ...terminal, hostId, rawName, label };
-}
-
-function isLocalDiscoveredInternalTerminal(terminal: PlainTerminal): boolean {
-  if (terminal.hostId) return false;
-  if (terminal.managed) return false;
-  return isInternalTerminalName(terminal.rawName) || isInternalTerminalName(terminal.tmuxName);
-}
-
-function sameStringArray(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((value, index) => value === b[index]);
-}
-
-function sameStringRecord(a: Record<string, string>, b: Record<string, string>): boolean {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  return aKeys.length === bKeys.length && aKeys.every((key) => a[key] === b[key]);
-}
-
-function sameSessions(a: Session[], b: Session[]): boolean {
-  return a.length === b.length && a.every((left, index) => {
-    const right = b[index];
-    return (
-      left.name === right.name &&
-      left.attached === right.attached &&
-      left.window_count === right.window_count &&
-      left.created === right.created &&
-      left.activity === right.activity &&
-      (left.output_signature ?? null) === (right.output_signature ?? null) &&
-      (left.agent_running ?? null) === (right.agent_running ?? null) &&
-      (left.hostId ?? null) === (right.hostId ?? null) &&
-      (left.rawName ?? "") === (right.rawName ?? "") &&
-      (left.project ?? "") === (right.project ?? "") &&
-      (left.managed ?? false) === (right.managed ?? false)
-    );
-  });
-}
-
-function samePlainTerminals(a: PlainTerminal[], b: PlainTerminal[]): boolean {
-  return a.length === b.length && a.every((left, index) => {
-    const right = b[index];
-    return (
-      left.id === right.id &&
-      left.label === right.label &&
-      left.cwd === right.cwd &&
-      left.tmuxName === right.tmuxName &&
-      (left.hostId ?? null) === (right.hostId ?? null) &&
-      (left.rawName ?? "") === (right.rawName ?? "") &&
-      (left.aiCmd ?? "") === (right.aiCmd ?? "") &&
-      (left.discovered ?? false) === (right.discovered ?? false) &&
-      (left.managed ?? false) === (right.managed ?? false)
-    );
-  });
-}
-
-function sameSessionActivity(
-  a: Record<string, SessionActivityInfo>,
-  b: Record<string, SessionActivityInfo>,
-): boolean {
-  const aKeys = Object.keys(a);
-  const bKeys = Object.keys(b);
-  return aKeys.length === bKeys.length && aKeys.every((key) => {
-    const left = a[key];
-    const right = b[key];
-    return !!right &&
-      left.state === right.state &&
-      left.label === right.label &&
-      left.changed === right.changed &&
-      left.ageSeconds === right.ageSeconds &&
-      left.lastChangedAt === right.lastChangedAt &&
-      (left.outputSignature ?? null) === (right.outputSignature ?? null);
-  });
-}
 async function getWindowExpandedState(win: DashboardWindow) {
   const [fullscreen, maximized] = await Promise.all([
     win.isFullscreen().catch(() => false),
@@ -245,16 +139,6 @@ async function getWindowExpandedState(win: DashboardWindow) {
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
-const DEFAULT_SIDEBAR_WIDTH = 280;
-const DEFAULT_INSPECTOR_WIDTH = 420;
-
-type ViewportTier = "compact" | "drawer" | "wide";
-
-function viewportTierForWidth(width: number): ViewportTier {
-  if (width >= 1440) return "wide";
-  if (width >= 960) return "drawer";
-  return "compact";
-}
 
 let scratchIdCounter = 0;
 

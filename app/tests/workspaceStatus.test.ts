@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   WORKSPACE_STATUS_LABELS,
   workspaceStatusLabel,
-} from "../src/dashboard/workspaceStatus.ts";
+} from "../src/dashboard/model/workspaceSelectors.ts";
 
 test("workspace states always expose readable labels in addition to color", () => {
   assert.deepEqual(WORKSPACE_STATUS_LABELS, {

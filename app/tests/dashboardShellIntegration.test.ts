@@ -15,6 +15,10 @@ const shellCss = readFileSync(
   new URL("../src/dashboard/DashboardShell.css", import.meta.url),
   "utf8",
 );
+const panelGeometry = readFileSync(
+  new URL("../src/dashboard/layout/panelGeometry.ts", import.meta.url),
+  "utf8",
+);
 
 test("the renderer composes the planned shell without legacy arbitrary columns", () => {
   const composition = rendererImplementationSourceContaining(
@@ -33,12 +37,11 @@ test("the renderer composes the planned shell without legacy arbitrary columns",
 
 test("responsive shell docks the sidebar from 960px and keeps a 640px workspace", () => {
   const composition = rendererImplementationSourceContaining(
-    "if (width >= 1440)",
-    "if (width >= 960)",
+    "viewportTierForWidth(window.innerWidth)",
     "setSidebarOpen(false)",
   ).source;
-  assert.match(composition, /if \(width >= 1440\) return "wide"/);
-  assert.match(composition, /if \(width >= 960\) return "drawer"/);
+  assert.match(panelGeometry, /if \(width >= 1440\) return "wide"/);
+  assert.match(panelGeometry, /if \(width >= 960\) return "drawer"/);
   assert.match(composition, /setSidebarOpen\(false\);\s*setInspectorOpen\(false\)/);
   assert.match(shellCss, /minmax\(640px, 1fr\)/);
   assert.match(shellCss, /@media \(max-width: 1439px\)/);

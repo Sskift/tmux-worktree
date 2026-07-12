@@ -27,28 +27,29 @@ import {
 } from "react";
 import { triggerLabel, type Automation } from "../automationTypes";
 import type { HostConfig, HostStatus, PlainTerminal, Session } from "../platform";
-import type { SessionActivityInfo } from "../sessionActivity";
-import type { PinnedItem, Selection, SidebarView } from "./layoutPreferences";
+import type { SessionActivityInfo } from "./model/sessionActivity";
+import type { PinnedItem, Selection } from "./model/selection";
+import type { SidebarView } from "./layout/types";
 import {
   describeSidebarActivity,
   groupSessionsByHostProject,
   summarizeSidebarConnections,
-} from "./DashboardSidebarModel";
+} from "./model/workspaceSelectors";
 import "./DashboardSidebar.css";
 
 export {
   describeSidebarActivity,
   groupSessionsByHostProject,
   summarizeSidebarConnections,
-} from "./DashboardSidebarModel";
+} from "./model/workspaceSelectors";
 export type {
   SidebarActivityDescription,
   SidebarConnectionSummary,
   SidebarConnectionTone,
   SidebarSessionGroup,
-} from "./DashboardSidebarModel";
+} from "./model/workspaceSelectors";
 
-export type { SidebarView } from "./layoutPreferences";
+export type { SidebarView } from "./layout/types";
 
 export type DashboardSidebarProps = {
   sessions: readonly Session[];
@@ -96,7 +97,7 @@ export type DashboardSidebarProps = {
   onInstallTw: (hostId: string) => void | Promise<void>;
 };
 
-function sessionDisplayName(session: Session): string {
+function sidebarSessionDisplayName(session: Session): string {
   return session.rawName?.trim() || session.name;
 }
 
@@ -389,7 +390,7 @@ export function DashboardSidebar({
             <nav className="tw-sidebar-list" aria-label="Pinned workspaces">
               {pinnedRows.map((row) => {
                 if (row.kind === "session") {
-                  const displayName = sessionDisplayName(row.session);
+                  const displayName = sidebarSessionDisplayName(row.session);
                   const selected = selection?.kind === "session" && selection.name === row.session.name;
                   return (
                     <div className="tw-sidebar-row" data-selected={selected} data-pinned="true" key={`pinned-session:${row.session.name}`}>
@@ -500,7 +501,7 @@ export function DashboardSidebar({
                           sessionActivity[session.name],
                           session.attached,
                         );
-                        const displayName = sessionDisplayName(session);
+                        const displayName = sidebarSessionDisplayName(session);
                         const selected = selection?.kind === "session" && selection.name === session.name;
                         const pinned = pinnedItems.some((item) => item.kind === "session" && item.name === session.name);
                         return (

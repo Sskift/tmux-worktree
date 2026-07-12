@@ -3,7 +3,7 @@ import test from "node:test";
 import {
   describeSessionActivity,
   formatActivityAge,
-} from "../src/sessionActivity.ts";
+} from "../src/dashboard/model/sessionActivity.ts";
 
 test("describeSessionActivity marks sessions running when the agent title is active", () => {
   const activity = describeSessionActivity(

@@ -5,20 +5,20 @@ import { readRendererImplementationTree } from "./helpers/rendererImplementation
 import { readRustSourceTree } from "./rustSource.ts";
 
 test("ssh tmux terminals use native tmux mouse scrolling", () => {
-  const deckSource = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
+  const attachSource = readFileSync(new URL("../src/terminal/attach.ts", import.meta.url), "utf8");
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
 
-  assert.match(deckSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
-  assert.match(deckSource, /ControlMaster=auto/);
-  assert.match(deckSource, /ControlPath=~\/\.tmux-worktree\/ssh\/%C/);
-  assert.match(deckSource, /ServerAliveCountMax=3/);
-  assert.match(deckSource, /export TERM=xterm-256color/);
-  assert.match(deckSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
-  assert.match(deckSource, /\$\{tmux\} has-session -t/);
-  assert.match(deckSource, /copy-selection-and-cancel/);
-  assert.match(deckSource, /MouseDragEnd1Pane/);
-  assert.doesNotMatch(deckSource, /MouseDown1Pane/);
-  assert.match(deckSource, /exec \$\{tmux\} attach-session -t/);
+  assert.match(attachSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
+  assert.match(attachSource, /ControlMaster=auto/);
+  assert.match(attachSource, /ControlPath=~\/\.tmux-worktree\/ssh\/%C/);
+  assert.match(attachSource, /ServerAliveCountMax=3/);
+  assert.match(attachSource, /export TERM=xterm-256color/);
+  assert.match(attachSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
+  assert.match(attachSource, /\$\{tmux\} has-session -t/);
+  assert.match(attachSource, /copy-selection-and-cancel/);
+  assert.match(attachSource, /MouseDragEnd1Pane/);
+  assert.doesNotMatch(attachSource, /MouseDown1Pane/);
+  assert.match(attachSource, /exec \$\{tmux\} attach-session -t/);
   assert.doesNotMatch(terminalSource, /tmux_scroll/);
   assert.doesNotMatch(terminalSource, /onTmuxWheel/);
   assert.match(terminalSource, /attachCustomWheelEventHandler/);

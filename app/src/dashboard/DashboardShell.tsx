@@ -11,8 +11,8 @@ import {
   clampDashboardPanelWidthForViewport,
   dashboardPanelWidthFromKey,
   dashboardPanelWidthFromPointer,
-  type ResizablePanel,
-} from "./dashboardShellModel";
+} from "./layout/panelGeometry";
+import type { ResizablePanel } from "./layout/types";
 import "./DashboardShell.css";
 
 type ShellStyle = CSSProperties & {

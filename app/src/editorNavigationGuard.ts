@@ -1,4 +1,4 @@
-import type { EditingFile } from "./dashboard/layoutPreferences";
+import type { EditingFile } from "./dashboard/layout/types";
 import type { LatestRequestGate } from "./latestRequestGate";
 import { requestSourceKey } from "./latestRequestGate";
 

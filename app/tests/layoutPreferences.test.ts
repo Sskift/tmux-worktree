@@ -6,7 +6,7 @@ import {
   createDashboardLayoutV2,
   isDashboardLayoutV2,
   migrateDashboardLayout,
-} from "../src/dashboard/layoutPreferences.ts";
+} from "../src/dashboard/layout/schema.ts";
 import {
   loadDashboardLayoutPreferences,
   saveDashboardLayoutPreferences,

@@ -79,7 +79,7 @@ test("the renderer creates persisted terminals through the host-aware command", 
     "dashboardBackend.sessions.exists(terminal.tmuxName)",
     "dashboardBackend.terminals.ensure({",
   ).source;
-  const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
+  const identity = readFileSync(new URL("../src/dashboard/model/terminalIdentity.ts", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
   assert.match(
@@ -98,6 +98,6 @@ test("the renderer creates persisted terminals through the host-aware command", 
   assert.match(creation, /cwd:\s*created\.cwd/);
   assert.match(creation, /managed:\s*created\.managed/);
   assert.match(restoration, /aiCmd:\s*terminal\.aiCmd/);
-  assert.match(deck, /function terminalSessionKey/);
+  assert.match(identity, /export function terminalSessionKey/);
   assert.match(restoration, /persistedKeys/);
 });

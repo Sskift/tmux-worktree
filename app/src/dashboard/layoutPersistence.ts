@@ -2,9 +2,9 @@ import type { DashboardBackend } from "../platform/dashboardBackend.ts";
 import {
   createDashboardLayoutV2,
   migrateDashboardLayout,
-  type DashboardLayoutPreferences,
   type DashboardLayoutV2,
-} from "./layoutPreferences.ts";
+} from "./layout/schema.ts";
+import type { DashboardLayoutPreferences } from "./layout/types.ts";
 
 type LayoutBackend = Pick<DashboardBackend, "persistence">;
 

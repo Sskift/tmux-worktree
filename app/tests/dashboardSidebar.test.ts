@@ -5,7 +5,7 @@ import {
   describeSidebarActivity,
   groupSessionsByHostProject,
   summarizeSidebarConnections,
-} from "../src/dashboard/DashboardSidebarModel.ts";
+} from "../src/dashboard/model/workspaceSelectors.ts";
 import type { HostConfig, HostStatus, Session } from "../src/platform/domainTypes.ts";
 import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
@@ -225,7 +225,7 @@ test("sidebar keeps independent Workspaces and Files views mounted around a shar
     "utf8",
   );
 
-  assert.match(source, /export type \{ SidebarView \} from "\.\/layoutPreferences"/);
+  assert.match(source, /export type \{ SidebarView \} from "\.\/layout\/types"/);
   assert.match(source, /activeView: SidebarView/);
   assert.match(source, /filesContent: ReactNode/);
   assert.match(source, /onViewChange: \(view: SidebarView\) => void/);

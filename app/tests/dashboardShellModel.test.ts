@@ -1,12 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_INSPECTOR_WIDTH,
+  DEFAULT_SIDEBAR_WIDTH,
   clampDashboardPanelWidth,
   clampDashboardPanelWidthForViewport,
   dashboardPanelWidthFromKey,
   dashboardPanelWidthFromPointer,
   normalizeDashboardPanelWidths,
-} from "../src/dashboard/dashboardShellModel.ts";
+  viewportTierForWidth,
+} from "../src/dashboard/layout/panelGeometry.ts";
+
+test("dashboard panels preserve the frozen default widths", () => {
+  assert.equal(DEFAULT_SIDEBAR_WIDTH, 280);
+  assert.equal(DEFAULT_INSPECTOR_WIDTH, 420);
+});
+
+test("viewport tiers preserve compact, drawer, and wide breakpoints", () => {
+  assert.equal(viewportTierForWidth(959), "compact");
+  assert.equal(viewportTierForWidth(960), "drawer");
+  assert.equal(viewportTierForWidth(1439), "drawer");
+  assert.equal(viewportTierForWidth(1440), "wide");
+});
 
 test("dashboard panel widths clamp to responsive workspace-safe limits", () => {
   assert.equal(clampDashboardPanelWidth("sidebar", 120), 240);
