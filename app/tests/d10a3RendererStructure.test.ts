@@ -1308,6 +1308,10 @@ function frozenEffectContributions(): Map<string, number> {
     ],
     ["useWorkspaceCatalog", effectContribution(sources.workspace, "useWorkspaceCatalog")],
     [
+      "useWorkspaceCatalogOwnerPhase",
+      effectContribution(sources.workspace, "useWorkspaceCatalogOwnerPhase"),
+    ],
+    [
       "useDashboardLayoutHydrationPhase",
       effectContribution(sources.layout, "useDashboardLayoutHydrationPhase"),
     ],
@@ -1337,6 +1341,7 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardWindowCapturePhase", 1],
     ["useTerminalMetadataHydrationPhase", 1],
     ["useWorkspaceCatalog", 0],
+    ["useWorkspaceCatalogOwnerPhase", 0],
     ["useDashboardLayoutHydrationPhase", 1],
     ["useTerminalMetadataPersistencePhase", 2],
     ["useDashboardLayoutPersistencePhase", 1],
@@ -1365,6 +1370,7 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useDashboardWindowCapturePhase",
     "useTerminalMetadataHydrationPhase",
     "useWorkspaceCatalog",
+    "useWorkspaceCatalogOwnerPhase",
     "useDashboardLayoutHydrationPhase",
     "useTerminalMetadataPersistencePhase",
     "useDashboardLayoutPersistencePhase",
@@ -1383,6 +1389,7 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     if (event.path.startsWith("useDashboard")) phaseOrdinals.set(event.path, ordinal);
   }
   assert.equal(contributions.get("useWorkspaceCatalog"), 0);
+  assert.equal(contributions.get("useWorkspaceCatalogOwnerPhase"), 0);
   assert.equal(phaseOrdinals.get("useDashboardViewportResizePhase"), 9);
   assert.equal(phaseOrdinals.get("useDashboardWindowCapturePhase"), 10);
   assert.equal(phaseOrdinals.get("useDashboardLayoutHydrationPhase"), 12);

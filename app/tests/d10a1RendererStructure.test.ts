@@ -25,6 +25,10 @@ const sources = {
     new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
     "utf8",
   ),
+  owner: readFileSync(
+    new URL("../src/dashboard/ownerEpochLease.ts", import.meta.url),
+    "utf8",
+  ),
   terminalDeck: readFileSync(
     new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
     "utf8",
@@ -35,6 +39,7 @@ const canonicalModules = {
   "dashboard/hooks/useConnectionCatalog.ts": sources.connection,
   "dashboard/hooks/useWorkspaceCatalog.ts": sources.workspace,
   "dashboard/hooks/workspaceCatalogRefresh.ts": sources.refresh,
+  "dashboard/ownerEpochLease.ts": sources.owner,
 } as const;
 
 type CanonicalModulePath = keyof typeof canonicalModules;
@@ -44,6 +49,7 @@ const canonicalExportManifests: Record<CanonicalModulePath, readonly string[]> =
   "dashboard/hooks/useWorkspaceCatalog.ts": [
     "FullCatalogPublished",
     "useWorkspaceCatalog",
+    "useWorkspaceCatalogOwnerPhase",
   ],
   "dashboard/hooks/workspaceCatalogRefresh.ts": [
     "WorkspaceCatalogFullPublication",
@@ -51,6 +57,13 @@ const canonicalExportManifests: Record<CanonicalModulePath, readonly string[]> =
     "WorkspaceCatalogPublication",
     "WorkspaceCatalogRefreshOptions",
     "workspaceCatalogRefresh",
+  ],
+  "dashboard/ownerEpochLease.ts": [
+    "OwnerEpochActivation",
+    "OwnerEpochCommit",
+    "OwnerEpochLease",
+    "OwnerEpochLeaseController",
+    "createOwnerEpochLeaseController",
   ],
 };
 
@@ -305,18 +318,21 @@ function locateWorkspaceRefresh(source: string): WorkspaceRefreshAst {
   const refreshCallback = refreshUseCallback.arguments[0];
   assert.ok(ts.isArrowFunction(refreshCallback), "refresh useCallback must receive an arrow");
   assert.equal(refreshCallback.parameters.length, 0);
-  assert.ok(
-    ts.isCallExpression(refreshCallback.body),
-    "refresh arrow must directly return workspaceCatalogRefresh",
+  assert.ok(ts.isBlock(refreshCallback.body), "refresh must own an explicit lease guard body");
+  const returns = refreshCallback.body.statements.filter(ts.isReturnStatement);
+  const coordinatorReturn = returns.find((statement) =>
+    statement.expression && ts.isCallExpression(statement.expression) &&
+    expressionPath(statement.expression.expression) === "workspaceCatalogRefresh"
   );
-  assert.equal(expressionPath(refreshCallback.body.expression), "workspaceCatalogRefresh");
+  assert.ok(coordinatorReturn?.expression && ts.isCallExpression(coordinatorReturn.expression));
+  const coordinatorCall = coordinatorReturn.expression;
   assert.equal(
     callExpressionsWithPath(refreshCallback, "workspaceCatalogRefresh").length,
     1,
     "refresh arrow must call workspaceCatalogRefresh exactly once",
   );
-  assert.equal(refreshCallback.body.arguments.length, 1);
-  const options = refreshCallback.body.arguments[0];
+  assert.equal(coordinatorCall.arguments.length, 1);
+  const options = coordinatorCall.arguments[0];
   assert.ok(ts.isObjectLiteralExpression(options), "refresh options must be an object literal");
   const { byName } = directObjectProperties(options);
   const publishFull = byName.get("publishFull");
@@ -347,37 +363,45 @@ function assertFullPublicationStatements(analysis: WorkspaceRefreshAst): void {
   assert.ok(ts.isArrowFunction(publishFull.initializer));
   assert.ok(ts.isBlock(publishFull.initializer.body));
   const statements = publishFull.initializer.body.statements;
-  assert.equal(statements.length, 9, "publishFull must contain exactly nine direct actions");
-
-  const activityAssignment = statements[0];
-  assert.ok(ts.isExpressionStatement(activityAssignment));
-  assert.ok(ts.isBinaryExpression(activityAssignment.expression));
-  assert.equal(activityAssignment.expression.operatorToken.kind, ts.SyntaxKind.EqualsToken);
-  assert.equal(expressionPath(activityAssignment.expression.left), "sessionActivityRef.current");
-  assert.equal(expressionPath(activityAssignment.expression.right), "publication.nextActivity");
-
-  const directCalls = [
-    "setFailedSessionHostIds",
-    "setFailedTerminalHostIds",
-    "setSessionActivity",
-    "setSessions",
-    "setDiscoveredTerminals",
-    "setCatalogRefreshGeneration",
-    "setError",
-    "onFullCatalogPublishedRef.current",
-  ];
-  const calls = directCalls.map((path, index) => directCallStatement(statements[index + 1], path));
-  for (const call of calls) assert.equal(call.arguments.length, 1);
-
-  assert.equal(expressionPath(calls[0].arguments[0]), "publication.failedSessionHostIds");
-  assert.equal(expressionPath(calls[1].arguments[0]), "publication.failedTerminalHostIds");
-  assert.ok(ts.isArrowFunction(calls[2].arguments[0]));
-  assert.ok(ts.isArrowFunction(calls[3].arguments[0]));
-  assert.ok(ts.isArrowFunction(calls[4].arguments[0]));
-  assert.equal(expressionPath(calls[5].arguments[0]), "publication.generation");
-  assert.equal(expressionPath(calls[6].arguments[0]), "publication.partialError");
-
-  const callbackPayload = calls[7].arguments[0];
+  assert.equal(statements.length, 12, "publishFull must keep the exact fenced publication sequence");
+  assert.match(statements[0].getText(sourceFile), /if \(!registration\.fence\.isCurrent\(lease\)\) return/);
+  const assignment = (statement: ts.Statement, left: string): ts.Expression => {
+    assert.ok(ts.isExpressionStatement(statement));
+    assert.ok(ts.isBinaryExpression(statement.expression));
+    assert.equal(statement.expression.operatorToken.kind, ts.SyntaxKind.EqualsToken);
+    assert.equal(expressionPath(statement.expression.left), left);
+    return statement.expression.right;
+  };
+  for (const [index, left, right] of [
+    [1, "registration.previousActivity", "publication.nextActivity"],
+    [2, "registration.failedSessionHostIds", "publication.failedSessionHostIds"],
+    [3, "registration.failedTerminalHostIds", "publication.failedTerminalHostIds"],
+    [7, "registration.error", "publication.partialError"],
+    [8, "registration.ownerPublishedGeneration", "publication.generation"],
+  ] as const) {
+    assert.equal(expressionPath(assignment(statements[index], left)), right);
+  }
+  for (const [index, left, comparator, published] of [
+    [4, "registration.sessionActivity", "sameSessionActivity", "publication.sessionActivity"],
+    [5, "registration.sessions", "sameSessions", "publication.sessions"],
+    [6, "registration.discoveredTerminals", "samePlainTerminals", "publication.discoveredTerminals"],
+  ] as const) {
+    const right = assignment(statements[index], left);
+    assert.ok(ts.isConditionalExpression(right));
+    assert.ok(ts.isCallExpression(right.condition));
+    assert.equal(expressionPath(right.condition.expression), comparator);
+    assert.deepEqual(
+      right.condition.arguments.map((argument) => expressionPath(argument)),
+      [left, published],
+    );
+    assert.equal(expressionPath(right.whenTrue), left);
+    assert.equal(expressionPath(right.whenFalse), published);
+  }
+  const publishState = directCallStatement(statements[9], "publishState");
+  assert.equal(expressionPath(publishState.arguments[0]), "lease");
+  assert.match(statements[10].getText(sourceFile), /if \(!registration\.fence\.isCurrent\(lease\)\) return/);
+  const callback = directCallStatement(statements[11], "registration.onFullCatalogPublished");
+  const callbackPayload = callback.arguments[0];
   assert.ok(ts.isObjectLiteralExpression(callbackPayload));
   const callbackProperties = directObjectProperties(callbackPayload);
   assert.deepEqual(
@@ -393,15 +417,15 @@ function assertFullPublicationStatements(analysis: WorkspaceRefreshAst): void {
     "publication.authoritativeSessionNames",
   );
   assert.equal(
-    callExpressionsWithPath(refreshCallback, "onFullCatalogPublishedRef.current").length,
+    callExpressionsWithPath(refreshCallback, "registration.onFullCatalogPublished").length,
     1,
     "the accepted-full callback must occur only in publishFull",
   );
-  assert.strictEqual(calls[7], callExpressionsWithPath(
+  assert.strictEqual(callback, callExpressionsWithPath(
     refreshCallback,
-    "onFullCatalogPublishedRef.current",
+    "registration.onFullCatalogPublished",
   )[0]);
-  assert.strictEqual(statements[statements.length - 1], calls[7].parent);
+  assert.strictEqual(statements[statements.length - 1], callback.parent);
   assert.ok(sourceFile === publishFull.getSourceFile());
 }
 
@@ -518,7 +542,9 @@ test("connection, workspace, and refresh implementations have unique reachable o
   const expectedOwners = new Map<string, CanonicalModulePath>([
     ["useConnectionCatalog", "dashboard/hooks/useConnectionCatalog.ts"],
     ["useWorkspaceCatalog", "dashboard/hooks/useWorkspaceCatalog.ts"],
+    ["useWorkspaceCatalogOwnerPhase", "dashboard/hooks/useWorkspaceCatalog.ts"],
     ["workspaceCatalogRefresh", "dashboard/hooks/workspaceCatalogRefresh.ts"],
+    ["createOwnerEpochLeaseController", "dashboard/ownerEpochLease.ts"],
   ]);
   for (const [path, source] of Object.entries(canonicalModules) as Array<[
     CanonicalModulePath,
@@ -545,7 +571,8 @@ test("connection, workspace, and refresh implementations have unique reachable o
 
   assert.match(sources.app, /import \{ useConnectionCatalog \} from "\.\/dashboard\/hooks\/useConnectionCatalog";/);
   assert.match(sources.app, /\} = useConnectionCatalog\(\);/);
-  assert.match(sources.app, /\} = useWorkspaceCatalog\(\{/);
+  assert.match(sources.app, /\} = useWorkspaceCatalog\(dashboardBackend\);/);
+  assert.match(sources.app, /useWorkspaceCatalogOwnerPhase\(workspaceCatalogOwnerPhase, \{/);
   assert.doesNotMatch(sources.app, /useDashboardCatalog/);
 });
 
@@ -560,6 +587,7 @@ test("the D10a-1 hook dependency graph remains one-way", () => {
       "../../platform",
       "../model/catalogEquality",
       "../model/sessionActivity",
+      "../ownerEpochLease",
       "./workspaceCatalogRefresh",
       "react",
     ],
@@ -567,7 +595,9 @@ test("the D10a-1 hook dependency graph remains one-way", () => {
       "../../platform",
       "../model/catalogSnapshot",
       "../model/sessionActivity",
+      "../ownerEpochLease",
     ],
+    "dashboard/ownerEpochLease.ts": [],
   };
   for (const [path, source] of Object.entries(canonicalModules) as Array<[
     CanonicalModulePath,
@@ -584,9 +614,11 @@ test("the D10a-1 hook dependency graph remains one-way", () => {
     {
       "dashboard/hooks/useConnectionCatalog.ts": [],
       "dashboard/hooks/useWorkspaceCatalog.ts": [
+        "dashboard/ownerEpochLease.ts",
         "dashboard/hooks/workspaceCatalogRefresh.ts",
       ],
-      "dashboard/hooks/workspaceCatalogRefresh.ts": [],
+      "dashboard/hooks/workspaceCatalogRefresh.ts": ["dashboard/ownerEpochLease.ts"],
+      "dashboard/ownerEpochLease.ts": [],
     },
   );
   assertAcyclic(graph);
@@ -667,7 +699,7 @@ test("canonical export and edge guards reject declaration and hidden-edge decoys
   assert.throws(() => assertCanonicalStaticEdges(importEquals), /import equals/);
 });
 
-test("workspace catalog owns state and refresh but registers no effect or polling", () => {
+test("workspace catalog keeps state render-pure and commits ownership only in layout phases", () => {
   const sourceFile = parse("useWorkspaceCatalog.ts", sources.workspace);
   const reactImport = sourceFile.statements.find((statement): statement is ts.ImportDeclaration =>
     ts.isImportDeclaration(statement)
@@ -678,19 +710,27 @@ test("workspace catalog owns state and refresh but registers no effect or pollin
   assert.ok(ts.isNamedImports(reactImport.importClause.namedBindings));
   assert.deepEqual(
     reactImport.importClause.namedBindings.elements.map(({ name }) => name.text).sort(),
-    ["useCallback", "useRef", "useState"],
+    ["useCallback", "useLayoutEffect", "useState"],
   );
-  assert.doesNotMatch(sources.workspace, /\buseEffect\b|\buseLayoutEffect\b|useVisibilityAwarePolling/);
+  assert.doesNotMatch(sources.workspace, /\buseEffect\b|useVisibilityAwarePolling|\.current\s*=/);
+  assert.equal(callExpressionsWithPath(sourceFile, "useLayoutEffect").length, 2);
 
   const refresh = locateWorkspaceRefresh(sources.workspace);
   const dependencies = refresh.refreshUseCallback.arguments[1];
   assert.ok(dependencies && ts.isArrayLiteralExpression(dependencies));
   assert.deepEqual(
     dependencies.elements.map((element) => element.getText(sourceFile)),
-    ["dashboardBackend", "publishCatalog"],
+    ["dashboardBackend", "publishState", "registration"],
   );
   assert.doesNotMatch(dependencies.getText(sourceFile), /onFullCatalogPublished/);
-  assert.match(sources.workspace, /onFullCatalogPublishedRef\.current = onFullCatalogPublished;/);
+  assert.match(
+    sources.workspace,
+    /registration\.backend = dashboardBackend;[\s\S]*?registration\.sessionOrder = sessionOrder;[\s\S]*?registration\.onFullCatalogPublished = onFullCatalogPublished;[\s\S]*?registration\.fence\.commit\(dashboardBackend\)/,
+  );
+  assert.match(
+    sources.workspace,
+    /const activation = registration\.fence\.activate\(\);[\s\S]*?registration\.fence\.deactivate\(activation\)/,
+  );
 });
 
 test("a successful full publication invokes the latest callback exactly once as its last action", () => {
@@ -714,26 +754,30 @@ test("workspace refresh AST guard rejects string, nested, duplicate-key, and spr
   assert.throws(() => locateWorkspaceRefresh(`
     function useWorkspaceCatalog() {
       function nested() {
-        const refresh = useCallback(() => workspaceCatalogRefresh({
-          publishFull: () => {},
-        }), []);
+        const refresh = useCallback(() => {
+          return workspaceCatalogRefresh({ publishFull: () => {} });
+        }, []);
       }
     }
   `));
   assert.throws(() => locateWorkspaceRefresh(`
     function useWorkspaceCatalog() {
-      const refresh = useCallback(() => workspaceCatalogRefresh({
-        publishFull: () => {},
-        publishFull: () => {},
-      }), []);
+      const refresh = useCallback(() => {
+        return workspaceCatalogRefresh({
+          publishFull: () => {},
+          publishFull: () => {},
+        });
+      }, []);
     }
   `), /duplicate option publishFull/);
   assert.throws(() => locateWorkspaceRefresh(`
     function useWorkspaceCatalog() {
-      const refresh = useCallback(() => workspaceCatalogRefresh({
-        ...options,
-        publishFull: () => {},
-      }), []);
+      const refresh = useCallback(() => {
+        return workspaceCatalogRefresh({
+          ...options,
+          publishFull: () => {},
+        });
+      }, []);
     }
   `), /object spreads are forbidden/);
 });
@@ -807,7 +851,7 @@ test("App supplies a stable functional full-catalog prune callback", () => {
   assert.match(callbackSource, /sameStringRecord\(previous, next\) \? previous : next/);
   assert.match(
     sources.app,
-    /useWorkspaceCatalog\(\{\s*sessionOrder,\s*onFullCatalogPublished: handleFullCatalogPublished,\s*\}\)/s,
+    /useWorkspaceCatalogOwnerPhase\(workspaceCatalogOwnerPhase, \{\s*dashboardBackend,\s*sessionOrder,\s*onFullCatalogPublished: handleFullCatalogPublished,\s*\}\)/s,
   );
   assert.doesNotMatch(
     `${sources.app}\n${sources.terminalDeck}`,

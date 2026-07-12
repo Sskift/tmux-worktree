@@ -1,5 +1,5 @@
-import { useCallback, useRef, useState } from "react";
-import { type PlainTerminal, type Session, useDashboardBackend } from "../../platform";
+import { useCallback, useLayoutEffect, useState } from "react";
+import type { DashboardBackend, PlainTerminal, Session } from "../../platform";
 import {
   samePlainTerminals,
   sameSessionActivity,
@@ -10,130 +10,296 @@ import type {
   SessionActivityInfo,
 } from "../model/sessionActivity";
 import {
+  createOwnerEpochLeaseController,
+  type OwnerEpochLease,
+  type OwnerEpochLeaseController,
+} from "../ownerEpochLease";
+import {
   workspaceCatalogRefresh,
   type WorkspaceCatalogGenerationFence,
   type WorkspaceCatalogPublication,
   type WorkspaceCatalogFullPublication,
 } from "./workspaceCatalogRefresh";
 
-type UseWorkspaceCatalogOptions = {
-  sessionOrder: string[];
-  onFullCatalogPublished(publication: FullCatalogPublished): void;
-};
-
 export type FullCatalogPublished = {
   generation: number;
   sessionNames: string[];
 };
 
-export function useWorkspaceCatalog({
-  sessionOrder,
-  onFullCatalogPublished,
-}: UseWorkspaceCatalogOptions) {
-  const dashboardBackend = useDashboardBackend();
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [discoveredTerminals, setDiscoveredTerminals] = useState<PlainTerminal[]>([]);
-  const [sessionActivity, setSessionActivity] = useState<Record<string, SessionActivityInfo>>({});
-  const [catalogRefreshGeneration, setCatalogRefreshGeneration] = useState(0);
-  const [failedSessionHostIds, setFailedSessionHostIds] = useState<string[]>([]);
-  const [failedTerminalHostIds, setFailedTerminalHostIds] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const sessionsRef = useRef(sessions);
-  const discoveredTerminalsRef = useRef(discoveredTerminals);
-  const sessionOrderRef = useRef(sessionOrder);
-  const sessionActivityRef = useRef<Map<string, PreviousSessionActivity>>(new Map());
-  const generationRef = useRef<WorkspaceCatalogGenerationFence>({ started: 0, successful: 0 });
-  const onFullCatalogPublishedRef = useRef(onFullCatalogPublished);
+type CatalogOwnerTag = Readonly<{
+  owner: DashboardBackend;
+  epoch: number;
+}>;
 
-  sessionsRef.current = sessions;
-  discoveredTerminalsRef.current = discoveredTerminals;
-  sessionOrderRef.current = sessionOrder;
-  onFullCatalogPublishedRef.current = onFullCatalogPublished;
+type WorkspaceCatalogState = Readonly<{
+  owner: CatalogOwnerTag | null;
+  sessions: Session[];
+  discoveredTerminals: PlainTerminal[];
+  sessionActivity: Record<string, SessionActivityInfo>;
+  catalogRefreshGeneration: number;
+  failedSessionHostIds: string[];
+  failedTerminalHostIds: string[];
+  error: string | null;
+}>;
 
-  const publishCatalog = useCallback((publication: WorkspaceCatalogPublication) => {
-    setFailedSessionHostIds(publication.failedSessionHostIds);
-    setFailedTerminalHostIds(publication.failedTerminalHostIds);
-    setSessions((previous) =>
-      sameSessions(previous, publication.sessions) ? previous : publication.sessions,
-    );
-    setDiscoveredTerminals((previous) =>
-      samePlainTerminals(previous, publication.discoveredTerminals)
-        ? previous
-        : publication.discoveredTerminals,
-    );
-    setCatalogRefreshGeneration(publication.generation);
-  }, []);
+type WorkspaceCatalogRegistration = {
+  fence: OwnerEpochLeaseController<DashboardBackend>;
+  backend: DashboardBackend | null;
+  sessionOrder: string[];
+  onFullCatalogPublished: (publication: FullCatalogPublished) => void;
+  generation: WorkspaceCatalogGenerationFence;
+  firstGeneration: number;
+  ownerPublishedGeneration: number;
+  sessions: Session[];
+  discoveredTerminals: PlainTerminal[];
+  previousActivity: Map<string, PreviousSessionActivity>;
+  sessionActivity: Record<string, SessionActivityInfo>;
+  failedSessionHostIds: string[];
+  failedTerminalHostIds: string[];
+  error: string | null;
+};
 
-  const refresh = useCallback(() => workspaceCatalogRefresh({
-    backend: dashboardBackend,
-    generation: generationRef.current,
-    getCurrentSessions: () => sessionsRef.current,
-    getCurrentDiscoveredTerminals: () => discoveredTerminalsRef.current,
-    getSessionOrder: () => sessionOrderRef.current,
-    getPreviousActivity: () => sessionActivityRef.current,
-    nowSeconds: () => Date.now() / 1_000,
-    publishLocal: (publication) => {
-      publishCatalog(publication);
-      setError(null);
-    },
-    publishFull: (publication: WorkspaceCatalogFullPublication) => {
-      sessionActivityRef.current = publication.nextActivity;
-      setFailedSessionHostIds(publication.failedSessionHostIds);
-      setFailedTerminalHostIds(publication.failedTerminalHostIds);
-      setSessionActivity((previous) =>
-        sameSessionActivity(previous, publication.sessionActivity)
-          ? previous
-          : publication.sessionActivity,
-      );
-      setSessions((previous) =>
-        sameSessions(previous, publication.sessions) ? previous : publication.sessions,
-      );
-      setDiscoveredTerminals((previous) =>
-        samePlainTerminals(previous, publication.discoveredTerminals)
-          ? previous
-          : publication.discoveredTerminals,
-      );
-      setCatalogRefreshGeneration(publication.generation);
-      setError(publication.partialError);
-      onFullCatalogPublishedRef.current({
-        generation: publication.generation,
-        sessionNames: publication.authoritativeSessionNames,
-      });
-    },
-    publishError: setError,
-  }), [dashboardBackend, publishCatalog]);
+type WorkspaceCatalogOwnerPhaseHandle = Readonly<{
+  registration: WorkspaceCatalogRegistration;
+}>;
+
+const EMPTY_SESSIONS: Session[] = [];
+const EMPTY_TERMINALS: PlainTerminal[] = [];
+const EMPTY_ACTIVITY: Record<string, SessionActivityInfo> = {};
+const EMPTY_HOST_IDS: string[] = [];
+
+const EMPTY_STATE: WorkspaceCatalogState = {
+  owner: null,
+  sessions: EMPTY_SESSIONS,
+  discoveredTerminals: EMPTY_TERMINALS,
+  sessionActivity: EMPTY_ACTIVITY,
+  catalogRefreshGeneration: 0,
+  failedSessionHostIds: EMPTY_HOST_IDS,
+  failedTerminalHostIds: EMPTY_HOST_IDS,
+  error: null,
+};
+
+function ownerTag(lease: OwnerEpochLease<DashboardBackend>): CatalogOwnerTag {
+  return { owner: lease.owner, epoch: lease.epoch };
+}
+
+function stateMatchesLease(
+  state: WorkspaceCatalogState,
+  lease: OwnerEpochLease<DashboardBackend> | null,
+): boolean {
+  return !!lease && state.owner?.owner === lease.owner && state.owner.epoch === lease.epoch;
+}
+
+function stateFromRegistration(
+  registration: WorkspaceCatalogRegistration,
+  lease: OwnerEpochLease<DashboardBackend>,
+): WorkspaceCatalogState {
+  return {
+    owner: ownerTag(lease),
+    sessions: registration.sessions,
+    discoveredTerminals: registration.discoveredTerminals,
+    sessionActivity: registration.sessionActivity,
+    catalogRefreshGeneration: registration.ownerPublishedGeneration,
+    failedSessionHostIds: registration.failedSessionHostIds,
+    failedTerminalHostIds: registration.failedTerminalHostIds,
+    error: registration.error,
+  };
+}
+
+function createWorkspaceCatalogRegistration(): WorkspaceCatalogRegistration {
+  return {
+    fence: createOwnerEpochLeaseController<DashboardBackend>(),
+    backend: null,
+    sessionOrder: [],
+    onFullCatalogPublished: () => {},
+    generation: { started: 0, successful: 0 },
+    firstGeneration: 1,
+    ownerPublishedGeneration: 0,
+    sessions: [],
+    discoveredTerminals: [],
+    previousActivity: new Map(),
+    sessionActivity: {},
+    failedSessionHostIds: [],
+    failedTerminalHostIds: [],
+    error: null,
+  };
+}
+
+export function useWorkspaceCatalog(dashboardBackend: DashboardBackend) {
+  const [registration] = useState(createWorkspaceCatalogRegistration);
+  const [ownerPhase] = useState<WorkspaceCatalogOwnerPhaseHandle>(() => ({ registration }));
+  const [catalogState, setCatalogState] = useState<WorkspaceCatalogState>(EMPTY_STATE);
+  const renderLease = registration.fence.capture(dashboardBackend);
+  const visibleState = stateMatchesLease(catalogState, renderLease) ? catalogState : EMPTY_STATE;
+
+  const publishState = useCallback((
+    lease: OwnerEpochLease<DashboardBackend>,
+  ) => {
+    if (!registration.fence.isCurrent(lease)) return;
+    setCatalogState(stateFromRegistration(registration, lease));
+  }, [registration]);
+
+  const refresh = useCallback(() => {
+    const lease = registration.fence.capture(dashboardBackend);
+    if (!lease || registration.backend !== dashboardBackend) return Promise.resolve();
+    const firstGeneration = registration.firstGeneration;
+    return workspaceCatalogRefresh({
+      backend: dashboardBackend,
+      generation: registration.generation,
+      firstGeneration: firstGeneration,
+      lease: lease,
+      isCurrent: (candidate) => registration.fence.isCurrent(candidate),
+      getCurrentSessions: () =>
+        registration.fence.isCurrent(lease) ? registration.sessions : EMPTY_SESSIONS,
+      getCurrentDiscoveredTerminals: () =>
+        registration.fence.isCurrent(lease)
+          ? registration.discoveredTerminals
+          : EMPTY_TERMINALS,
+      getSessionOrder: () =>
+        registration.fence.isCurrent(lease) ? registration.sessionOrder : [],
+      getPreviousActivity: () =>
+        registration.fence.isCurrent(lease)
+          ? registration.previousActivity
+          : new Map<string, PreviousSessionActivity>(),
+      nowSeconds: () => Date.now() / 1_000,
+      publishLocal: (publication: WorkspaceCatalogPublication) => {
+        if (!registration.fence.isCurrent(lease)) return;
+        registration.failedSessionHostIds = publication.failedSessionHostIds;
+        registration.failedTerminalHostIds = publication.failedTerminalHostIds;
+        registration.sessions = sameSessions(registration.sessions, publication.sessions)
+          ? registration.sessions
+          : publication.sessions;
+        registration.discoveredTerminals = samePlainTerminals(
+          registration.discoveredTerminals,
+          publication.discoveredTerminals,
+        )
+          ? registration.discoveredTerminals
+          : publication.discoveredTerminals;
+        registration.error = null;
+        registration.ownerPublishedGeneration = publication.generation;
+        publishState(lease);
+      },
+      publishFull: (publication: WorkspaceCatalogFullPublication) => {
+        if (!registration.fence.isCurrent(lease)) return;
+        registration.previousActivity = publication.nextActivity;
+        registration.failedSessionHostIds = publication.failedSessionHostIds;
+        registration.failedTerminalHostIds = publication.failedTerminalHostIds;
+        registration.sessionActivity = sameSessionActivity(
+          registration.sessionActivity,
+          publication.sessionActivity,
+        )
+          ? registration.sessionActivity
+          : publication.sessionActivity;
+        registration.sessions = sameSessions(registration.sessions, publication.sessions)
+          ? registration.sessions
+          : publication.sessions;
+        registration.discoveredTerminals = samePlainTerminals(
+          registration.discoveredTerminals,
+          publication.discoveredTerminals,
+        )
+          ? registration.discoveredTerminals
+          : publication.discoveredTerminals;
+        registration.error = publication.partialError;
+        registration.ownerPublishedGeneration = publication.generation;
+        publishState(lease);
+        if (!registration.fence.isCurrent(lease)) return;
+        registration.onFullCatalogPublished({
+          generation: publication.generation,
+          sessionNames: publication.authoritativeSessionNames,
+        });
+      },
+      publishError: (nextError) => {
+        if (!registration.fence.isCurrent(lease)) return;
+        registration.error = nextError;
+        publishState(lease);
+      },
+    });
+  }, [dashboardBackend, publishState, registration]);
 
   const removeSession = useCallback((name: string) => {
-    setSessions((current) => current.filter((session) => session.name !== name));
-  }, []);
+    const lease = registration.fence.capture(dashboardBackend);
+    if (!lease) return;
+    registration.sessions = registration.sessions.filter((session) => session.name !== name);
+    publishState(lease);
+  }, [dashboardBackend, publishState, registration]);
+
   const removeDiscoveredTerminal = useCallback((id: string) => {
-    setDiscoveredTerminals((current) => current.filter((terminal) => terminal.id !== id));
-  }, []);
+    const lease = registration.fence.capture(dashboardBackend);
+    if (!lease) return;
+    registration.discoveredTerminals = registration.discoveredTerminals.filter(
+      (terminal) => terminal.id !== id,
+    );
+    publishState(lease);
+  }, [dashboardBackend, publishState, registration]);
+
   const reportError = useCallback((nextError: unknown) => {
-    setError(String(nextError));
-  }, []);
-  const getLatestStartedRefreshGeneration = useCallback(
-    () => generationRef.current.started,
-    [],
-  );
-  const getLatestSuccessfulRefreshGeneration = useCallback(
-    () => generationRef.current.successful,
-    [],
-  );
+    const lease = registration.fence.capture(dashboardBackend);
+    if (!lease) return;
+    registration.error = String(nextError);
+    publishState(lease);
+  }, [dashboardBackend, publishState, registration]);
+
+  const getLatestStartedRefreshGeneration = useCallback(() => {
+    const lease = registration.fence.capture(dashboardBackend);
+    return lease ? registration.generation.started : 0;
+  }, [dashboardBackend, registration]);
+
+  const getLatestSuccessfulRefreshGeneration = useCallback(() => {
+    const lease = registration.fence.capture(dashboardBackend);
+    if (!lease || registration.generation.successful < registration.firstGeneration) return 0;
+    return registration.generation.successful;
+  }, [dashboardBackend, registration]);
 
   return {
-    sessions,
-    discoveredTerminals,
-    sessionActivity,
-    catalogRefreshGeneration,
-    failedSessionHostIds,
-    failedTerminalHostIds,
-    error,
+    sessions: visibleState.sessions,
+    discoveredTerminals: visibleState.discoveredTerminals,
+    sessionActivity: visibleState.sessionActivity,
+    catalogRefreshGeneration: visibleState.catalogRefreshGeneration,
+    failedSessionHostIds: visibleState.failedSessionHostIds,
+    failedTerminalHostIds: visibleState.failedTerminalHostIds,
+    error: visibleState.error,
     refresh,
     removeSession,
     removeDiscoveredTerminal,
     reportError,
     getLatestStartedRefreshGeneration,
     getLatestSuccessfulRefreshGeneration,
+    ownerPhase,
   };
+}
+
+export function useWorkspaceCatalogOwnerPhase(
+  ownerPhase: WorkspaceCatalogOwnerPhaseHandle,
+  {
+    dashboardBackend,
+    sessionOrder,
+    onFullCatalogPublished,
+  }: {
+    dashboardBackend: DashboardBackend;
+    sessionOrder: string[];
+    onFullCatalogPublished(publication: FullCatalogPublished): void;
+  },
+): void {
+  const { registration } = ownerPhase;
+  useLayoutEffect(() => {
+    registration.backend = dashboardBackend;
+    registration.sessionOrder = sessionOrder;
+    registration.onFullCatalogPublished = onFullCatalogPublished;
+    const ownerCommit = registration.fence.commit(dashboardBackend);
+    if (!ownerCommit.changed) return;
+    registration.firstGeneration = registration.generation.started + 1;
+    registration.ownerPublishedGeneration = 0;
+    registration.sessions = [];
+    registration.discoveredTerminals = [];
+    registration.previousActivity = new Map();
+    registration.sessionActivity = {};
+    registration.failedSessionHostIds = [];
+    registration.failedTerminalHostIds = [];
+    registration.error = null;
+  }, [dashboardBackend, onFullCatalogPublished, ownerPhase, registration, sessionOrder]);
+
+  useLayoutEffect(() => {
+    const activation = registration.fence.activate();
+    return () => registration.fence.deactivate(activation);
+  }, [ownerPhase, registration]);
 }

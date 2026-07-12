@@ -14,6 +14,7 @@ import {
   type WorkspaceCatalogPublication,
 } from "../src/dashboard/hooks/workspaceCatalogRefresh.ts";
 import type { PreviousSessionActivity } from "../src/dashboard/model/sessionActivity.ts";
+import { createOwnerEpochLeaseController } from "../src/dashboard/ownerEpochLease.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -81,12 +82,14 @@ function createHarness({
   initialSessions = [],
   initialTerminals = [],
   sessionOrder = [],
+  firstGeneration = 1,
 }: {
   backend: DashboardBackend;
   generation?: WorkspaceCatalogGenerationFence;
   initialSessions?: Session[];
   initialTerminals?: PlainTerminal[];
   sessionOrder?: string[];
+  firstGeneration?: number;
 }) {
   let currentSessions = initialSessions;
   let currentTerminals = initialTerminals;
@@ -96,10 +99,18 @@ function createHarness({
   const fullPublications: WorkspaceCatalogFullPublication[] = [];
   const errors: string[] = [];
   const fullCatalogCuts: Array<{ generation: number; sessionNames: string[] }> = [];
+  const owner = createOwnerEpochLeaseController<DashboardBackend>();
+  owner.commit(backend);
+  owner.activate();
+  const lease = owner.capture(backend);
+  assert.ok(lease);
 
   const refresh = () => workspaceCatalogRefresh({
     backend,
     generation,
+    firstGeneration,
+    lease,
+    isCurrent: owner.isCurrent,
     getCurrentSessions: () => currentSessions,
     getCurrentDiscoveredTerminals: () => currentTerminals,
     getSessionOrder: () => sessionOrder,
@@ -137,9 +148,123 @@ function createHarness({
     getCurrentSessions: () => currentSessions,
     getCurrentTerminals: () => currentTerminals,
     localPublications,
+    owner,
     refresh,
   };
 }
+
+test("a stale result lease cannot start work or advance the global generation", async () => {
+  let calls = 0;
+  const backend = backendWithCatalog({
+    list: async () => {
+      calls += 1;
+      return snapshot([]);
+    },
+  });
+  const harness = createHarness({ backend });
+  const replacement = backendWithCatalog({ list: async () => snapshot([]) });
+  harness.owner.commit(replacement);
+
+  await harness.refresh();
+
+  assert.equal(calls, 0);
+  assert.deepEqual(harness.generation, { started: 0, successful: 0 });
+  assert.deepEqual(harness.events, []);
+});
+
+test("A local pending through B and back to A cannot publish or start full", async () => {
+  const local = deferred<DashboardCatalogSnapshot>();
+  let fullCalls = 0;
+  const backendA = backendWithCatalog({
+    listLocal: () => local.promise,
+    list: async () => {
+      fullCalls += 1;
+      return snapshot([session("late")]);
+    },
+  });
+  const backendB = backendWithCatalog({ list: async () => snapshot([]) });
+  const harness = createHarness({ backend: backendA });
+  const pending = harness.refresh();
+  harness.owner.commit(backendB);
+  harness.owner.commit(backendA);
+
+  local.resolve(snapshot([session("stale-local")]));
+  await pending;
+
+  assert.equal(fullCalls, 0);
+  assert.deepEqual(harness.generation, { started: 1, successful: 0 });
+  assert.deepEqual(harness.events, []);
+});
+
+test("late full and error results from an old owner are inert", async () => {
+  const full = deferred<DashboardCatalogSnapshot>();
+  const backendA = backendWithCatalog({ list: () => full.promise });
+  const backendB = backendWithCatalog({ list: async () => snapshot([]) });
+  const fullHarness = createHarness({ backend: backendA });
+  const pendingFull = fullHarness.refresh();
+  fullHarness.owner.commit(backendB);
+  full.resolve(snapshot([session("stale-full")]));
+  await pendingFull;
+  assert.deepEqual(fullHarness.generation, { started: 1, successful: 0 });
+  assert.deepEqual(fullHarness.events, []);
+
+  const failure = deferred<DashboardCatalogSnapshot>();
+  const failingA = backendWithCatalog({ list: () => failure.promise });
+  const errorHarness = createHarness({ backend: failingA });
+  const pendingError = errorHarness.refresh();
+  errorHarness.owner.commit(backendB);
+  failure.reject(new Error("stale owner failed"));
+  await pendingError;
+  assert.deepEqual(errorHarness.generation, { started: 1, successful: 0 });
+  assert.deepEqual(errorHarness.errors, []);
+});
+
+test("an older current-owner error cannot overwrite a newer successful generation", async () => {
+  const older = deferred<DashboardCatalogSnapshot>();
+  const newer = deferred<DashboardCatalogSnapshot>();
+  let request = 0;
+  const backend = backendWithCatalog({
+    list: () => (++request === 1 ? older.promise : newer.promise),
+  });
+  const harness = createHarness({ backend });
+  const olderRefresh = harness.refresh();
+  const newerRefresh = harness.refresh();
+  newer.resolve(snapshot([session("newer")]));
+  await newerRefresh;
+  older.reject(new Error("older failed"));
+  await olderRefresh;
+
+  assert.deepEqual(harness.events, ["full:2"]);
+  assert.deepEqual(harness.generation, { started: 2, successful: 2 });
+});
+
+test("a new owner cut may use local data until its first global success", async () => {
+  let localCalls = 0;
+  let fullCalls = 0;
+  const backend = backendWithCatalog({
+    listLocal: async () => {
+      localCalls += 1;
+      return snapshot([session(`local-${localCalls}`)]);
+    },
+    list: async () => {
+      fullCalls += 1;
+      return snapshot([session(`full-${fullCalls}`)]);
+    },
+  });
+  const harness = createHarness({
+    backend,
+    generation: { started: 5, successful: 4 },
+    firstGeneration: 6,
+  });
+
+  await harness.refresh();
+  await harness.refresh();
+
+  assert.equal(localCalls, 1);
+  assert.equal(fullCalls, 2);
+  assert.deepEqual(harness.generation, { started: 7, successful: 7 });
+  assert.deepEqual(harness.events, ["local:6", "full:6", "full:7"]);
+});
 
 test("workspace refresh publishes local before full and cuts the deck only after full", async () => {
   const local = deferred<DashboardCatalogSnapshot>();

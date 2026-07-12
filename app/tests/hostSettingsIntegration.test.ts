@@ -76,7 +76,8 @@ test("the renderer polls host status separately from the main session refresh", 
     new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
     "utf8",
   );
-  assert.match(workspaceHook, /const refresh = useCallback\(\(\) => workspaceCatalogRefresh\(/);
+  assert.match(workspaceHook, /const refresh = useCallback\(\(\) => \{/);
+  assert.match(workspaceHook, /return workspaceCatalogRefresh\(\{/);
   assert.doesNotMatch(workspaceHook, /dashboardBackend\.hosts\.statuses/);
   assert.doesNotMatch(refreshCoordinator, /hosts\.statuses/);
 });

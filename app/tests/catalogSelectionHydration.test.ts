@@ -338,8 +338,10 @@ test("the renderer publishes the local catalog before the slower remote-aware sn
   const catchIndex = refreshSource.indexOf("} catch (error)");
   assert.ok(catchIndex >= 0);
   const catchSource = refreshSource.slice(catchIndex);
+  assert.match(catchSource, /refreshGeneration < options\.generation\.successful/);
+  assert.match(catchSource, /!options\.isCurrent\(options\.lease\)/);
   assert.match(catchSource, /options\.publishError\(String\(error\)\)/);
-  assert.doesNotMatch(catchSource, /generation\.successful|publishLocal|publishFull/);
+  assert.doesNotMatch(catchSource, /publishLocal|publishFull/);
 });
 
 test("Host readiness distinguishes initial empty state from a successful empty catalog", () => {

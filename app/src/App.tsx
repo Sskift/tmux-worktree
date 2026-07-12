@@ -9,7 +9,10 @@ import {
 import { Plus, X } from "lucide-react";
 import { useDashboardBackend } from "./platform";
 import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
-import { useWorkspaceCatalog } from "./dashboard/hooks/useWorkspaceCatalog";
+import {
+  useWorkspaceCatalog,
+  useWorkspaceCatalogOwnerPhase,
+} from "./dashboard/hooks/useWorkspaceCatalog";
 import {
   useDashboardLayoutHydrationPhase,
   useDashboardLayoutPersistencePhase,
@@ -263,7 +266,11 @@ function App() {
     reportError,
     getLatestStartedRefreshGeneration,
     getLatestSuccessfulRefreshGeneration,
-  } = useWorkspaceCatalog({
+    ownerPhase: workspaceCatalogOwnerPhase,
+  } = useWorkspaceCatalog(dashboardBackend);
+
+  useWorkspaceCatalogOwnerPhase(workspaceCatalogOwnerPhase, {
+    dashboardBackend,
     sessionOrder,
     onFullCatalogPublished: handleFullCatalogPublished,
   });

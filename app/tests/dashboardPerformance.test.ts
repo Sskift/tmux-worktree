@@ -28,15 +28,15 @@ test("dashboard refresh preserves state identity when polled data is unchanged",
   assert.match(renderer, /function sameStringRecord\(/);
   assert.match(
     workspaceCatalog,
-    /setSessionActivity\(\(previous\) =>\s*sameSessionActivity\(previous, publication\.sessionActivity\)\s*\? previous\s*: publication\.sessionActivity/s,
+    /registration\.sessionActivity = sameSessionActivity\(\s*registration\.sessionActivity,\s*publication\.sessionActivity,?\s*\)\s*\? registration\.sessionActivity\s*: publication\.sessionActivity/s,
   );
   assert.match(
     workspaceCatalog,
-    /setSessions\(\(previous\) =>\s*sameSessions\(previous, publication\.sessions\) \? previous : publication\.sessions/s,
+    /registration\.sessions = sameSessions\(registration\.sessions, publication\.sessions\)\s*\? registration\.sessions\s*: publication\.sessions/s,
   );
   assert.match(
     workspaceCatalog,
-    /setDiscoveredTerminals\(\(previous\) =>\s*samePlainTerminals\(previous, publication\.discoveredTerminals\)\s*\? previous\s*: publication\.discoveredTerminals/s,
+    /registration\.discoveredTerminals = samePlainTerminals\(\s*registration\.discoveredTerminals,\s*publication\.discoveredTerminals,?\s*\)\s*\? registration\.discoveredTerminals\s*: publication\.discoveredTerminals/s,
   );
   assert.match(renderer, /return sameStringArray\(previous, next\) \? previous : next;/);
   assert.match(renderer, /return sameStringRecord\(previous, next\) \? previous : next;/);

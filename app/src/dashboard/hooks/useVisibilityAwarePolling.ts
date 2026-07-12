@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 import { PollingController } from "./pollingController";
 
 type Options = {
@@ -18,7 +18,9 @@ export function useVisibilityAwarePolling(
   }: Options,
 ): void {
   const taskRef = useRef(task);
-  taskRef.current = task;
+  useLayoutEffect(() => {
+    taskRef.current = task;
+  }, [task]);
 
   useEffect(() => {
     if (!enabled) return;

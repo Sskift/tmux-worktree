@@ -840,12 +840,14 @@ test("App preserves the global deck phase order and direct controller wiring", (
   assert.ok(appBody);
   const stateCalls = directTopLevelCalls(appBody, "useTerminalDeckState");
   const workspaceCalls = directTopLevelCalls(appBody, "useWorkspaceCatalog");
+  const workspaceOwnerPhases = directTopLevelCalls(appBody, "useWorkspaceCatalogOwnerPhase");
   for (const [name, calls] of [
     ["state", stateCalls],
     ["workspace", workspaceCalls],
   ] as const) {
     assert.equal(calls.length, 1, `expected one direct App ${name} registration`);
   }
+  assert.equal(workspaceOwnerPhases.length, 1);
 
   const handleAutomationCreate = directVariable(appBody, "handleAutomationCreate");
   const handleAutomationRun = directVariable(appBody, "handleAutomationRun");
@@ -862,6 +864,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
   const order: Array<[string, number]> = [
     ["terminal deck state", stateCalls[0].index],
     ["workspace catalog", workspaceCalls[0].index],
+    ["workspace owner phase", workspaceOwnerPhases[0].index],
     ["selection effect 19", selectionCall.index],
     ["preview effect 20", previewCall.index],
     ["workspace polling effect 21", pollingCall.index],
@@ -925,7 +928,12 @@ test("App preserves the global deck phase order and direct controller wiring", (
     ],
   );
 
-  const workspaceOptions = workspaceCalls[0].call.arguments[0];
+  assert.equal(compact(workspaceCalls[0].call.arguments[0], appFile), "dashboardBackend");
+  assert.equal(
+    compact(workspaceOwnerPhases[0].call.arguments[0], appFile),
+    "workspaceCatalogOwnerPhase",
+  );
+  const workspaceOptions = workspaceOwnerPhases[0].call.arguments[1];
   assert.ok(ts.isObjectLiteralExpression(workspaceOptions));
   const workspaceProperties = directObjectProperties(workspaceOptions);
   assert.equal(

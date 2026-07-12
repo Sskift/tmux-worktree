@@ -5,6 +5,7 @@ import {
   type PreviousSessionActivity,
   type SessionActivityInfo,
 } from "../model/sessionActivity";
+import type { OwnerEpochLease } from "../ownerEpochLease";
 
 type WorkspaceCatalogBackend = Pick<DashboardBackend, "catalog" | "sessions" | "terminals">;
 
@@ -31,6 +32,9 @@ export type WorkspaceCatalogFullPublication = WorkspaceCatalogPublication & {
 export type WorkspaceCatalogRefreshOptions = {
   backend: WorkspaceCatalogBackend;
   generation: WorkspaceCatalogGenerationFence;
+  firstGeneration: number;
+  lease: OwnerEpochLease<DashboardBackend>;
+  isCurrent(lease: OwnerEpochLease<DashboardBackend>): boolean;
   getCurrentSessions(): Session[];
   getCurrentDiscoveredTerminals(): PlainTerminal[];
   getSessionOrder(): string[];
@@ -56,11 +60,13 @@ function discoveredTerminals(terminals: PlainTerminal[]): PlainTerminal[] {
 export async function workspaceCatalogRefresh(
   options: WorkspaceCatalogRefreshOptions,
 ): Promise<void> {
+  if (!options.isCurrent(options.lease)) return;
   const refreshGeneration = ++options.generation.started;
   try {
     const catalog = options.backend.catalog;
-    if (catalog?.listLocal && options.generation.successful === 0) {
+    if (catalog?.listLocal && options.generation.successful < options.firstGeneration) {
       const localSnapshot = await catalog.listLocal().catch(() => null);
+      if (!options.isCurrent(options.lease)) return;
       if (
         localSnapshot &&
         refreshGeneration >= options.generation.successful
@@ -74,7 +80,9 @@ export async function workspaceCatalogRefresh(
           mergedLocalCatalog.sessions,
           options.getSessionOrder(),
         );
+        if (!options.isCurrent(options.lease)) return;
         options.generation.successful = refreshGeneration;
+        if (!options.isCurrent(options.lease)) return;
         options.publishLocal({
           generation: refreshGeneration,
           sessions: localSessions,
@@ -85,6 +93,7 @@ export async function workspaceCatalogRefresh(
       }
     }
 
+    if (!options.isCurrent(options.lease)) return;
     const snapshot = catalog
       ? await catalog.list()
       : await Promise.all([
@@ -96,6 +105,7 @@ export async function workspaceCatalogRefresh(
         failedSessionHostIds: [],
         failedTerminalHostIds: [],
       }));
+    if (!options.isCurrent(options.lease)) return;
     if (refreshGeneration < options.generation.successful) return;
 
     const mergedCatalog = mergeDashboardCatalogSnapshot(
@@ -125,7 +135,9 @@ export async function workspaceCatalogRefresh(
       });
     }
 
+    if (!options.isCurrent(options.lease)) return;
     options.generation.successful = refreshGeneration;
+    if (!options.isCurrent(options.lease)) return;
     options.publishFull({
       generation: refreshGeneration,
       sessions,
@@ -138,6 +150,12 @@ export async function workspaceCatalogRefresh(
       authoritativeSessionNames: sessions.map((session) => session.name),
     });
   } catch (error) {
+    if (
+      !options.isCurrent(options.lease) ||
+      refreshGeneration < options.generation.successful
+    ) {
+      return;
+    }
     options.publishError(String(error));
   }
 }
