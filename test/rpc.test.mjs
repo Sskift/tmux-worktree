@@ -9,15 +9,29 @@ import { fileURLToPath } from "node:url";
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const {
+  acquireManagedStateLock,
   emptyManagedState,
+  loadManagedState,
+  recordManagedSession,
+  releaseManagedStateLock,
+  removeManagedSession,
   upsertManagedSession,
 } = await import("../dist/state.js");
 const {
   buildRpcCapabilitiesResponse,
+  buildRpcKillSessionResponse,
   buildRpcListResponse,
+  parseRpcCreateTerminalArgs,
   parseRpcCreateWorktreeArgs,
+  parseRpcRestoreWorktreeArgs,
+  parseRpcKillSessionArgs,
 } = await import("../dist/rpc.js");
-const { createManagedWorktreeSession } = await import("../dist/session.js");
+const {
+  createManagedTerminalSession,
+  createManagedWorktreeSession,
+  restoreManagedWorktreeSession,
+} = await import("../dist/session.js");
+const { normalizeConfig, resolveWorktreeBase } = await import("../dist/config.js");
 
 test("managed state records TW-owned worktree sessions", () => {
   const state = upsertManagedSession(emptyManagedState(), {
@@ -46,6 +60,54 @@ test("managed state records TW-owned worktree sessions", () => {
       createdAt: "2026-07-02T00:00:00.000Z",
     },
   ]);
+});
+
+test("managed state mutations preserve invalid JSON instead of replacing it", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-invalid-managed-state-"));
+  const statePath = join(root, ".tmux-worktree", "state.json");
+  mkdirSync(join(root, ".tmux-worktree"), { recursive: true });
+  const invalid = '{"version":1,"sessions":[\n';
+  writeFileSync(statePath, invalid);
+
+  // Read-only consumers retain the historical tolerant behavior.
+  assert.deepEqual(loadManagedState(statePath), emptyManagedState());
+  assert.throws(
+    () => recordManagedSession({
+      name: "tw-term-abc12",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/repo/app",
+      createdAt: "2026-07-12T00:00:00.000Z",
+    }, statePath),
+    /refusing to mutate invalid managed state.*original file preserved/,
+  );
+  assert.equal(readFileSync(statePath, "utf8"), invalid);
+  assert.equal(existsSync(`${statePath}.lock`), false);
+
+  assert.throws(
+    () => removeManagedSession("tw-term-abc12", statePath),
+    /refusing to mutate invalid managed state.*original file preserved/,
+  );
+  assert.equal(readFileSync(statePath, "utf8"), invalid);
+  assert.equal(existsSync(`${statePath}.lock`), false);
+});
+
+test("stale managed-state lock owner cannot remove the replacement lock", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-state-lock-takeover-"));
+  const lockPath = join(root, "state.json.lock");
+  const first = acquireManagedStateLock(lockPath);
+  const ownerPath = join(lockPath, "owner.json");
+  const stale = JSON.parse(readFileSync(ownerPath, "utf8"));
+  writeFileSync(ownerPath, `${JSON.stringify({ ...stale, createdAt: 0 })}\n`, { mode: 0o600 });
+
+  const second = acquireManagedStateLock(lockPath);
+  assert.notEqual(first.owner, second.owner);
+  releaseManagedStateLock(first);
+  assert.equal(existsSync(lockPath), true, "old owner must not remove the replacement state lock");
+  assert.equal(JSON.parse(readFileSync(ownerPath, "utf8")).owner, second.owner);
+
+  releaseManagedStateLock(second);
+  assert.equal(existsSync(lockPath), false, "current owner releases its own state lock");
 });
 
 test("rpc list returns only managed sessions that still exist in tmux", () => {
@@ -106,6 +168,9 @@ test("rpc capabilities advertises remote worktree creation", () => {
     "list",
     "managed-state",
     "create-worktree",
+    "create-terminal",
+    "restore-worktree",
+    "kill-session",
   ]);
 });
 
@@ -117,6 +182,85 @@ test("rpc worktree creation accepts configured project targets", () => {
       aiCommand: "codex",
     },
   );
+});
+
+test("rpc terminal and restore parsers keep the headless lifecycle surface narrow", () => {
+  assert.deepEqual(
+    parseRpcCreateTerminalArgs(["--cwd", " ~/src ", "--ai-command", " codex "]),
+    { cwd: "~/src", aiCommand: "codex" },
+  );
+  assert.deepEqual(
+    parseRpcRestoreWorktreeArgs([
+      "--path", " ~/worktrees/app/fix-abc12 ",
+      "--name", " app-fix ",
+      "--ai-command", " codex ",
+    ]),
+    {
+      path: "~/worktrees/app/fix-abc12",
+      name: "app-fix",
+      aiCommand: "codex",
+    },
+  );
+  assert.throws(() => parseRpcCreateTerminalArgs(["--cwd", "/tmp", "--name", "unsafe"]), /unknown create-terminal option/);
+});
+
+test("rpc kill-session only mutates TW-managed sessions and removes stale records idempotently", () => {
+  assert.deepEqual(parseRpcKillSessionArgs(["--name", "tw-term-abc12"]), { name: "tw-term-abc12" });
+  const killed = [];
+  const removed = [];
+  const response = buildRpcKillSessionResponse(
+    { name: "tw-term-abc12" },
+    {
+      loadState: () => ({
+        version: 1,
+        sessions: [{
+          name: "tw-term-abc12",
+          kind: "terminal",
+          profile: "dashboard",
+          cwd: "/repo/app",
+          createdAt: "2026-07-12T00:00:00.000Z",
+        }],
+      }),
+      exists: () => true,
+      kill: (name) => killed.push(name),
+      removeRecord: (name) => removed.push(name),
+    },
+  );
+  assert.deepEqual(response, {
+    protocolVersion: 1,
+    kind: "session-killed",
+    session: "tw-term-abc12",
+    sessionKind: "terminal",
+    killed: true,
+  });
+  assert.deepEqual(killed, ["tw-term-abc12"]);
+  assert.deepEqual(removed, ["tw-term-abc12"]);
+  assert.throws(
+    () => buildRpcKillSessionResponse(
+      { name: "ordinary" },
+      { loadState: () => ({ version: 1, sessions: [] }) },
+    ),
+    /not TW-managed/,
+  );
+});
+
+test("canonical worktree base expands on the target host and host paths retain remote tilde", () => {
+  assert.equal(resolveWorktreeBase(undefined, "/home/dev"), "/home/dev/.tmux-worktree/worktrees");
+  assert.equal(resolveWorktreeBase("~/worktrees", "/home/dev"), "/home/dev/worktrees");
+  const config = normalizeConfig({
+    hosts: {
+      dev: {
+        host: "devbox",
+        identityFile: "~/.ssh/id_ed25519",
+        worktreeBase: "~/worktrees",
+        twPath: "~/.local/bin/tw",
+      },
+    },
+  });
+  assert.equal(config.hosts[0].id, "dev");
+  assert.equal(config.hosts[0].label, "dev");
+  assert.equal(config.hosts[0].worktreeBase, "~/worktrees");
+  assert.equal(config.hosts[0].twPath, "~/.local/bin/tw");
 });
 
 test("rpc worktree creation records a dashboard-managed remote session", () => {
@@ -193,6 +337,250 @@ test("rpc worktree creation records a dashboard-managed remote session", () => {
   ]);
 });
 
+test("rpc terminal creation uses the shared single-pane contract and records managed state", () => {
+  const calls = [];
+  const records = [];
+  const result = createManagedTerminalSession(
+    {
+      cwd: "/home/dev/src/app",
+      aiCmd: "codex --quiet",
+      profile: "dashboard",
+      quiet: true,
+    },
+    {
+      existsSync: (path) => path === "/home/dev/src/app",
+      exec: (bin, args) => calls.push([bin, args]),
+      tmuxBin: () => "tmux",
+      sessionExists: () => false,
+      randomId: () => "abc12",
+      recordManagedSession: (record) => records.push(record),
+      setupClipboardBindings: () => calls.push(["setupClipboardBindings", []]),
+      now: () => new Date("2026-07-12T00:00:00.000Z"),
+    },
+  );
+
+  assert.deepEqual(result, { session: "tw-term-abc12", cwd: "/home/dev/src/app" });
+  assert.deepEqual(calls, [
+    ["tmux", [
+      "new-session",
+      "-d",
+      "-s",
+      "tw-term-abc12",
+      "-c",
+      "/home/dev/src/app",
+      "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"; codex --quiet; exec \"${SHELL:-/bin/zsh}\" -l",
+    ]],
+    ["setupClipboardBindings", []],
+  ]);
+  assert.deepEqual(records, [{
+    name: "tw-term-abc12",
+    kind: "terminal",
+    profile: "dashboard",
+    cwd: "/home/dev/src/app",
+    createdAt: "2026-07-12T00:00:00.000Z",
+  }]);
+});
+
+test("managed terminal creation fails closed when state persistence fails", () => {
+  const killed = [];
+  assert.throws(
+    () => createManagedTerminalSession(
+      { cwd: "/repo/app", profile: "dashboard", quiet: true },
+      {
+        existsSync: () => true,
+        exec: () => {},
+        tmuxBin: () => "tmux",
+        sessionExists: () => false,
+        randomId: () => "abc12",
+        recordManagedSession: () => { throw new Error("disk full"); },
+        killSession: (name) => killed.push(name),
+        setupClipboardBindings: () => {},
+      },
+    ),
+    /已回滚 terminal session: disk full/,
+  );
+  assert.deepEqual(killed, ["tw-term-abc12"]);
+});
+
+test("managed worktree creation fails closed and rolls back every created resource when state persistence fails", () => {
+  const calls = [];
+  const removedWorktrees = [];
+  const removedBranches = [];
+  assert.throws(
+    () => createManagedWorktreeSession(
+      {
+        aiCmd: "codex",
+        projectDir: "/repo/app",
+        sessionName: "app-fix",
+        useWorktree: true,
+        worktreeBase: "/worktrees",
+        projectKey: "app",
+        branch: "main",
+        profile: "dashboard",
+        quiet: true,
+      },
+      {
+        existsSync: () => true,
+        isGitRepo: () => true,
+        gitQuery: () => "",
+        exec: (bin, args) => calls.push([bin, args]),
+        mkdirSync: () => {},
+        tmuxBin: () => "tmux",
+        sessionExists: () => false,
+        randomId: () => "abc12",
+        recordManagedSession: () => { throw new Error("disk full"); },
+        setupClipboardBindings: () => {},
+        removeWorktree: (repo, path, force) => removedWorktrees.push([repo, path, force]),
+        deleteBranch: (repo, branch, force) => {
+          removedBranches.push([repo, branch, force]);
+          return true;
+        },
+      },
+    ),
+    /写入 TW state 失败，已回滚 tmux\/worktree\/branch: disk full/,
+  );
+  assert.deepEqual(calls.at(-1), ["tmux", ["kill-session", "-t", "=app-fix"]]);
+  assert.deepEqual(removedWorktrees, [["/repo/app", "/worktrees/app/app-fix-abc12", true]]);
+  assert.deepEqual(removedBranches, [["/repo/app", "app-fix-abc12", true]]);
+});
+
+test("managed worktree rollback attempts branch cleanup and reports every incomplete step", () => {
+  const attempted = [];
+  assert.throws(
+    () => createManagedWorktreeSession(
+      {
+        aiCmd: "codex",
+        projectDir: "/repo/app",
+        sessionName: "app-fix",
+        useWorktree: true,
+        worktreeBase: "/worktrees",
+        projectKey: "app",
+        branch: "main",
+        profile: "dashboard",
+        quiet: true,
+      },
+      {
+        existsSync: () => true,
+        isGitRepo: () => true,
+        gitQuery: () => "",
+        exec: () => {},
+        mkdirSync: () => {},
+        tmuxBin: () => "tmux",
+        sessionExists: () => false,
+        randomId: () => "abc12",
+        recordManagedSession: () => { throw new Error("state denied"); },
+        killSession: (session) => attempted.push(["kill", session]),
+        setupClipboardBindings: () => {},
+        removeWorktree: (_repo, path) => {
+          attempted.push(["worktree", path]);
+          throw new Error("worktree busy");
+        },
+        deleteBranch: (_repo, branch) => {
+          attempted.push(["branch", branch]);
+          return false;
+        },
+      },
+    ),
+    (error) => {
+      assert.match(error.message, /写入 TW state 失败: state denied/);
+      assert.match(error.message, /回滚不完整/);
+      assert.match(error.message, /删除 worktree .*worktree busy/);
+      assert.match(error.message, /删除分支 app-fix-abc12 失败/);
+      return true;
+    },
+  );
+  assert.deepEqual(attempted, [
+    ["kill", "app-fix"],
+    ["worktree", "/worktrees/app/app-fix-abc12"],
+    ["branch", "app-fix-abc12"],
+  ]);
+});
+
+test("managed worktree rollback preserves the checkout when tmux could not be stopped", () => {
+  const cleanupAttempts = [];
+  assert.throws(
+    () => createManagedWorktreeSession(
+      {
+        aiCmd: "codex",
+        projectDir: "/repo/app",
+        sessionName: "app-fix",
+        useWorktree: true,
+        worktreeBase: "/worktrees",
+        projectKey: "app",
+        branch: "main",
+        profile: "dashboard",
+        quiet: true,
+      },
+      {
+        existsSync: () => true,
+        isGitRepo: () => true,
+        gitQuery: () => "",
+        exec: () => {},
+        mkdirSync: () => {},
+        tmuxBin: () => "tmux",
+        sessionExists: () => false,
+        randomId: () => "abc12",
+        recordManagedSession: () => { throw new Error("state denied"); },
+        killSession: () => { throw new Error("tmux transport failed"); },
+        setupClipboardBindings: () => {},
+        removeWorktree: () => cleanupAttempts.push("worktree"),
+        deleteBranch: () => cleanupAttempts.push("branch"),
+      },
+    ),
+    (error) => {
+      assert.match(error.message, /停止 tmux session app-fix 失败: tmux transport failed/);
+      assert.match(error.message, /保留 worktree .*避免删除仍可能被 tmux 使用的目录/);
+      return true;
+    },
+  );
+  assert.deepEqual(cleanupAttempts, []);
+});
+
+test("orphan restore validates the git entry and records the actual collision-free session", () => {
+  const calls = [];
+  const records = [];
+  const result = restoreManagedWorktreeSession(
+    {
+      worktreePath: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
+      sessionName: "app-fix",
+      aiCmd: "codex",
+      profile: "dashboard",
+      quiet: true,
+    },
+    {
+      existsSync: (path) => path === "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12"
+        || path === "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12/.git",
+      isGitRepo: () => true,
+      gitQuery: (_path, args) => {
+        if (args[0] === "branch") return "app-fix-abc12";
+        if (args.includes("--git-common-dir")) return "/home/dev/src/app/.git";
+        return "";
+      },
+      exec: (bin, args) => calls.push([bin, args]),
+      tmuxBin: () => "tmux",
+      sessionExists: (name) => name === "app-fix",
+      recordManagedSession: (record) => records.push(record),
+      setupClipboardBindings: () => {},
+      now: () => new Date("2026-07-12T00:00:00.000Z"),
+    },
+  );
+
+  assert.equal(result.session, "app-fix-1");
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1].includes("split-window"), false);
+  assert.deepEqual(records, [{
+    name: "app-fix-1",
+    kind: "worktree",
+    profile: "dashboard",
+    project: "app",
+    repoPath: "/home/dev/src/app",
+    worktreePath: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
+    branch: "app-fix-abc12",
+    cwd: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
+    createdAt: "2026-07-12T00:00:00.000Z",
+  }]);
+});
+
 test("shared worktree creation records managed state for cli and rpc consumers", () => {
   const devSource = readFileSync(new URL("../src/dev.ts", import.meta.url), "utf8");
   const sessionSource = readFileSync(new URL("../src/session.ts", import.meta.url), "utf8");
@@ -200,7 +588,7 @@ test("shared worktree creation records managed state for cli and rpc consumers",
   assert.match(devSource, /createManagedWorktreeSession/);
   assert.match(devSource, /profile:\s*"cli"/);
   assert.match(sessionSource, /upsertManagedSession/);
-  assert.match(sessionSource, /saveManagedState/);
+  assert.match(sessionSource, /recordManagedSession/);
   assert.match(sessionSource, /profile:\s*params\.profile/);
   assert.match(sessionSource, /worktreePath:\s*createdWorktree\.path/);
 });
@@ -272,6 +660,58 @@ exit 0
   assert.doesNotMatch(calls, /split-window| status(?: |$)/);
 });
 
+test("tw rpc create-terminal is headless, machine-readable, and discoverable through managed state", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-rpc-terminal-"));
+  const home = join(root, "home");
+  const cwd = join(root, "workspace");
+  const fakeTmux = join(root, "tmux");
+  const tmuxLog = join(root, "tmux.log");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(cwd, { recursive: true });
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+if [ "$1" = "has-session" ]; then exit 1; fi
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [
+    cli,
+    "rpc",
+    "create-terminal",
+    "--cwd",
+    cwd,
+    "--ai-command",
+    "codex --quiet",
+  ], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+    },
+    timeout: 5_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const response = JSON.parse(result.stdout);
+  assert.equal(response.protocolVersion, 1);
+  assert.equal(response.kind, "terminal");
+  assert.match(response.session, /^tw-term-[0-9a-f]{5}$/);
+  assert.equal(response.cwd, cwd);
+  const state = JSON.parse(readFileSync(join(home, ".tmux-worktree", "state.json"), "utf8"));
+  assert.deepEqual(state.sessions[0], {
+    name: response.session,
+    kind: "terminal",
+    profile: "dashboard",
+    cwd,
+    createdAt: state.sessions[0].createdAt,
+  });
+  const calls = readFileSync(tmuxLog, "utf8");
+  assert.match(calls, new RegExp(`new-session -d -s ${response.session} -c `));
+  assert.doesNotMatch(calls, /split-window/);
+});
+
 test("CLI rejects non-git path targets before creating tmux or managed state", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-cli-non-git-path-"));
   const home = join(root, "home");
@@ -306,6 +746,20 @@ exit 0
   assert.equal(existsSync(join(home, ".tmux-worktree.json")), false);
   assert.equal(existsSync(join(home, ".tmux-worktree", "state.json")), false);
   assert.equal(existsSync(tmuxLog), false);
+});
+
+test("headless tw with no arguments prints help instead of opening the TTY wizard", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-headless-help-"));
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [cli], {
+    encoding: "utf8",
+    env: { ...process.env, HOME: root },
+    timeout: 2_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /tw — tmux \+ git worktree/);
+  assert.doesNotMatch(result.stdout, /开始初始化|项目名称:/);
+  assert.equal(existsSync(join(root, ".tmux-worktree.json")), false);
 });
 
 test("CLI and Dashboard provenance use the same single-pane session contract", () => {

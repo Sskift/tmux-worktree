@@ -33,6 +33,13 @@ git -C /remote/path/to/repo rev-parse --show-toplevel
 
 If controlling the remote host from a local machine, prefix the same checks with `ssh <host> --`.
 
+If the Host is already registered in `~/.tmux-worktree.json`, prefer the structured local control plane:
+
+```bash
+tw host probe <host-id> --json
+tw host rpc <host-id> capabilities
+```
+
 If `tw` is missing or `tw rpc capabilities` does not include `create-worktree`, install or update the remote binary, then recheck:
 
 ```bash
@@ -71,6 +78,17 @@ tw rpc create-worktree \
 REMOTE_TW
 ```
 
+For a configured Host, the equivalent Agent-friendly command avoids manual SSH quoting:
+
+```bash
+tw host rpc <host-id> create-worktree \
+  --path /remote/path/to/repo \
+  --project project-key \
+  --name short-task-name \
+  --branch main \
+  --ai-command 'codex "task instruction"'
+```
+
 Argument guidance:
 
 - `--path`: remote repository path.
@@ -78,6 +96,7 @@ Argument guidance:
 - `--name`: short task/session suffix. Keep it shell-safe and under about 20 characters after project prefix.
 - `--branch`: base branch to create the worktree from. Omit only when remote TW should infer the default branch.
 - `--ai-command`: exact command to start the remote agent inside the Dashboard-owned tmux pane.
+- If `--worktree-base` is omitted, the target host uses `~/.tmux-worktree/worktrees`; a leading `~` is expanded on that host.
 
 ## Verify
 

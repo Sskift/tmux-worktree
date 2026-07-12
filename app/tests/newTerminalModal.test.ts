@@ -82,8 +82,11 @@ test("app creates persisted terminals through the host-aware command", () => {
   );
   assert.match(
     app,
-    /restored\.map\(\(terminal\) =>\s*dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s,
+    /if \(terminal\.managed\) \{\s*try \{\s*return await dashboardBackend\.sessions\.exists\(terminal\.tmuxName\) \? terminal : null/s,
   );
+  assert.match(app, /dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
+  assert.match(app, /cwd:\s*created\.cwd/);
+  assert.match(app, /managed:\s*created\.managed/);
   assert.match(app, /aiCmd:\s*terminal\.aiCmd/);
   assert.match(deck, /function terminalSessionKey/);
   assert.match(app, /persistedKeys/);

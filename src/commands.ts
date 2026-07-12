@@ -20,7 +20,7 @@ import {
   labelFromWorktreePath,
   type WorktreeEntry,
 } from "./tmux";
-import { loadConfigFile, type Config } from "./config";
+import { defaultWorktreeBase, loadConfigFile, type Config } from "./config";
 
 // ============================================
 // commands.ts — tw 的会话 / worktree / 诊断 命令族
@@ -401,7 +401,7 @@ export async function doctorCmd(): Promise<void> {
         }
       }
     }
-    const wtBase = config.worktreeBase ?? "/private/tmp/tmux-worktree/projects";
+    const wtBase = config.worktreeBase ?? defaultWorktreeBase();
     ok(`worktree 根目录: ${homeShort(wtBase)}`);
   }
 

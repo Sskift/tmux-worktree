@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { WebSocketServer, type WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import { CliError } from "./tmux.js";
 import {
   isSafeRelayPath,
@@ -234,8 +234,7 @@ export async function run(): Promise<void> {
         if (!clientId) return;
         const client = clients.get(clientId);
         if (!client || !isOpen(client.socket)) return;
-        const outbound = { ...message };
-        delete (outbound as Partial<RelayHostMessage>).clientId;
+        const { clientId: _clientId, ...outbound } = message;
         sendJson(client.socket, outbound satisfies RelayToClientMessage);
       });
 

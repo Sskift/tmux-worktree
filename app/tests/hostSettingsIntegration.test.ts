@@ -84,6 +84,8 @@ test("host status exposes remote tw version and install action from Settings", (
 
   assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twAvailable:\s*boolean/);
   assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twVersion:\s*string \| null/);
+  assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?tmuxAvailable\?:\s*boolean/);
+  assert.match(domainTypes, /export type HostStatus = \{[\s\S]*?twCompatible\?:\s*boolean/);
   assert.match(catalog, /dashboardBackend\.hosts\.installTw\(hostId\)/);
   assert.match(app, /installingHostId/);
   assert.match(sidebar, /const installHost = connections\.twMissingHosts\[0\]/);
@@ -91,4 +93,6 @@ test("host status exposes remote tw version and install action from Settings", (
   assert.match(connections, /\(testedStatus \?\? selectedStatus\)\?\.twVersion/);
   assert.match(connections, /Installing/);
   assert.match(connections, /Install tw/);
+  assert.match(connections, /tmux is not available/);
+  assert.match(connections, /RPC incompatible/);
 });

@@ -1,6 +1,6 @@
 import { execSync } from "child_process";
 import { createInterface } from "readline";
-import { CONFIG_PATH, loadConfigFile } from "./config";
+import { CONFIG_PATH, defaultWorktreeBase, loadConfigFile } from "./config";
 
 interface Dep {
   name: string;
@@ -97,7 +97,7 @@ export async function run() {
       const count = Object.keys(config.projects).length;
       console.log(`  \x1b[32m✓\x1b[0m config         ${CONFIG_PATH}`);
       console.log(`    projects: ${count}`);
-      console.log(`    worktreeBase: ${config.worktreeBase || "/private/tmp/tmux-worktree/projects"}`);
+      console.log(`    worktreeBase: ${config.worktreeBase || defaultWorktreeBase()}`);
     } else {
       console.log(`  \x1b[33m-\x1b[0m config         未找到 ${CONFIG_PATH}`);
     }

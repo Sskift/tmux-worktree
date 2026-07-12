@@ -29,6 +29,17 @@ export interface HostConfig {
 
 export const CONFIG_PATH = join(homedir(), ".tmux-worktree.json");
 
+/**
+ * Canonical default for newly-created worktrees.
+ *
+ * Keeping this under HOME makes the same contract portable across macOS and
+ * remote Linux hosts. Dashboard discovery still recognises the historical
+ * /private/tmp location, but new CLI and RPC mutations must use this value.
+ */
+export function defaultWorktreeBase(home = homedir()): string {
+  return join(home, ".tmux-worktree", "worktrees");
+}
+
 const PROJECT_KEYS = ["projects", "repositories", "repos"];
 const PROJECT_NAME_FIELDS = ["name", "key", "id", "label"];
 const PROJECT_PATH_FIELDS = [
@@ -70,11 +81,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
 
-export function expandHomePath(value: string): string {
+export function expandHomePath(value: string, home = homedir()): string {
   const trimmed = value.trim();
-  if (trimmed === "~") return homedir();
-  if (trimmed.startsWith("~/")) return join(homedir(), trimmed.slice(2));
+  if (trimmed === "~") return home;
+  if (trimmed.startsWith("~/")) return join(home, trimmed.slice(2));
   return trimmed;
+}
+
+export function resolveWorktreeBase(value?: string, home = homedir()): string {
+  return value?.trim() ? expandHomePath(value, home) : defaultWorktreeBase(home);
 }
 
 function stringField(value: unknown, fields: string[]): string | undefined {
@@ -144,6 +159,42 @@ export function normalizeConfig(raw: unknown): Config {
   };
 }
 
+function hostFromRaw(value: unknown, fallbackId?: string): HostConfig | undefined {
+  if (typeof value === "string" && value.trim()) {
+    const host = value.trim();
+    const id = fallbackId?.trim() || host;
+    return { id, label: id, host };
+  }
+  if (!isRecord(value)) return undefined;
+
+  const host = stringField(value, HOST_HOST_FIELDS) || fallbackId?.trim();
+  const id = stringField(value, HOST_ID_FIELDS) || fallbackId?.trim() || host;
+  if (!host || !id) return undefined;
+  const rawPort = value.port;
+  const port = typeof rawPort === "number"
+    ? rawPort
+    : typeof rawPort === "string" && rawPort.trim()
+      ? Number(rawPort)
+      : undefined;
+  const rawWorktreeBase = stringField(value, WORKTREE_BASE_FIELDS);
+  const rawIdentityFile = stringField(value, HOST_IDENTITY_FIELDS);
+  const rawTmuxPath = stringField(value, TMUX_PATH_FIELDS);
+  const rawTwPath = stringField(value, TW_PATH_FIELDS);
+  return {
+    id,
+    label: stringField(value, HOST_LABEL_FIELDS) || id,
+    host,
+    user: stringField(value, HOST_USER_FIELDS),
+    port: Number.isInteger(port) && port && port > 0 ? port : undefined,
+    // identityFile is local and may be expanded here. The remaining paths are
+    // evaluated on the remote host and must retain a leading `~`.
+    identityFile: rawIdentityFile ? expandHomePath(rawIdentityFile) : undefined,
+    worktreeBase: rawWorktreeBase,
+    tmuxPath: rawTmuxPath,
+    twPath: rawTwPath,
+  };
+}
+
 function hostsFromRaw(raw: unknown): HostConfig[] {
   if (!isRecord(raw)) return [];
   let rawHosts: unknown;
@@ -153,35 +204,19 @@ function hostsFromRaw(raw: unknown): HostConfig[] {
       break;
     }
   }
-  if (!Array.isArray(rawHosts)) return [];
-
-  return rawHosts.flatMap((item): HostConfig[] => {
-    if (!isRecord(item)) return [];
-    const host = stringField(item, HOST_HOST_FIELDS);
-    const id = stringField(item, HOST_ID_FIELDS) || host;
-    if (!host || !id) return [];
-    const rawPort = item.port;
-    const port = typeof rawPort === "number"
-      ? rawPort
-      : typeof rawPort === "string" && rawPort.trim()
-        ? Number(rawPort)
-        : undefined;
-    const rawWorktreeBase = stringField(item, WORKTREE_BASE_FIELDS);
-    const rawIdentityFile = stringField(item, HOST_IDENTITY_FIELDS);
-    const rawTmuxPath = stringField(item, TMUX_PATH_FIELDS);
-    const rawTwPath = stringField(item, TW_PATH_FIELDS);
-    return [{
-      id,
-      label: stringField(item, HOST_LABEL_FIELDS),
-      host,
-      user: stringField(item, HOST_USER_FIELDS),
-      port: Number.isInteger(port) && port && port > 0 ? port : undefined,
-      identityFile: rawIdentityFile ? expandHomePath(rawIdentityFile) : undefined,
-      worktreeBase: rawWorktreeBase ? expandHomePath(rawWorktreeBase) : undefined,
-      tmuxPath: rawTmuxPath,
-      twPath: rawTwPath,
-    }];
-  });
+  if (Array.isArray(rawHosts)) {
+    return rawHosts.flatMap((item): HostConfig[] => {
+      const host = hostFromRaw(item);
+      return host ? [host] : [];
+    });
+  }
+  if (isRecord(rawHosts)) {
+    return Object.entries(rawHosts).flatMap(([id, value]): HostConfig[] => {
+      const host = hostFromRaw(value, id);
+      return host ? [host] : [];
+    });
+  }
+  return [];
 }
 
 export function loadConfigFile(): Config | null {

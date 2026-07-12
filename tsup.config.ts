@@ -3,7 +3,9 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: [
     "src/cli.ts",
+    "src/config.ts",
     "src/automation.ts",
+    "src/hosts.ts",
     "src/rpc.ts",
     "src/session.ts",
     "src/state.ts",

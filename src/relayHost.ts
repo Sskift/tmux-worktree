@@ -5,6 +5,7 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
+import { sshConnectionArgs } from "./hosts.js";
 import { CliError, tmuxBin } from "./tmux.js";
 import {
   isValidHostId,
@@ -57,19 +58,35 @@ type StreamRoute = {
   pane?: string | number;
 };
 
-type PlainTerminal = {
+export type PlainTerminal = {
   id?: string;
   label?: string;
   cwd?: string;
   hostId?: string | null;
   rawName?: string;
   tmuxName?: string;
+  managed?: boolean;
 };
 
 type RpcCreateWorktreeResponse = {
   session?: string;
   worktreePath?: string;
   branch?: string;
+};
+
+type RpcCreateTerminalResponse = {
+  protocolVersion: 1;
+  kind: "terminal";
+  session: string;
+  cwd: string;
+};
+
+type RpcKillSessionResponse = {
+  protocolVersion: 1;
+  kind: "session-killed";
+  session: string;
+  sessionKind: "worktree" | "terminal";
+  killed: boolean;
 };
 
 type TmuxRow = {
@@ -94,16 +111,31 @@ type RpcSession = {
   activity?: number;
 };
 
-type RpcList = {
-  sessions?: RpcSession[];
+type TerminalRegistryWriteOperations = {
+  mkdir: (path: string) => void;
+  write: (path: string, contents: string) => void;
+  rename: (from: string, to: string) => void;
+  unlink: (path: string) => void;
 };
 
 const execFileAsync = promisify(execFile);
 const INTERNAL_SESSION_PREFIXES = ["tw-mobile-"];
 const TERMINAL_SESSION_PREFIXES = ["tw-term-"];
 const DEFAULT_REMOTE_WORKTREE_BASE = "~/.tmux-worktree/worktrees";
+const LEGACY_DEFAULT_WORKTREE_BASE = "/private/tmp/tmux-worktree/projects";
 const TERMINALS_REGISTRY = `${homedir()}/.tw-dashboard-terminals.json`;
 const SESSION_NAME_MAX_LEN = 20;
+const RPC_PROTOCOL_VERSION = 1;
+const MANAGED_TERMINAL_NAME = /^tw-term-[A-Za-z0-9][A-Za-z0-9._-]{0,71}$/;
+const REMOTE_RPC_STATUS_MARKER = "__TW_RPC_STATUS__";
+
+async function localTwOutput(args: string[], timeout: number): Promise<string> {
+  const currentCli = process.argv[1];
+  if (currentCli && basename(currentCli) === "cli.js" && existsSync(currentCli)) {
+    return (await execFileAsync(process.execPath, [currentCli, ...args], { timeout })).stdout;
+  }
+  return (await execFileAsync("tw", args, { timeout })).stdout;
+}
 
 function parseArgs(argv: string[]): RelayHostOptions {
   let relay = process.env.TW_RELAY_URL || "";
@@ -247,22 +279,70 @@ function randomId(length = 5): string {
   return Math.floor(Math.random() * 16 ** length).toString(16).padStart(length, "0");
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function parseTerminalRegistry(contents: string): PlainTerminal[] {
+  const parsed = JSON.parse(contents) as unknown;
+  if (!Array.isArray(parsed)) throw new Error("registry root must be an array");
+  const invalidIndex = parsed.findIndex((item) => !isRecord(item));
+  if (invalidIndex >= 0) throw new Error(`registry item ${invalidIndex} must be an object`);
+  return parsed as PlainTerminal[];
+}
+
 function readTerminalRegistry(): PlainTerminal[] {
   try {
-    const parsed = JSON.parse(readFileSync(TERMINALS_REGISTRY, "utf8")) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((item): item is PlainTerminal => !!item && typeof item === "object") : [];
+    return parseTerminalRegistry(readFileSync(TERMINALS_REGISTRY, "utf8"));
   } catch {
     return [];
   }
 }
 
+function readTerminalRegistryForMutation(): PlainTerminal[] {
+  if (!existsSync(TERMINALS_REGISTRY)) return [];
+  try {
+    return parseTerminalRegistry(readFileSync(TERMINALS_REGISTRY, "utf8"));
+  } catch (error) {
+    throw new Error(
+      `refusing to mutate invalid terminal registry ${TERMINALS_REGISTRY}; original file preserved: ${errorDetail(error)}`,
+    );
+  }
+}
+
+export function writeTerminalRegistryAtomic(
+  terminals: PlainTerminal[],
+  path = TERMINALS_REGISTRY,
+  operations: Partial<TerminalRegistryWriteOperations> = {},
+): void {
+  const mkdir = operations.mkdir ?? ((target) => mkdirSync(target, { recursive: true }));
+  const write = operations.write ?? ((target, contents) => {
+    writeFileSync(target, contents, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  });
+  const rename = operations.rename ?? renameSync;
+  const unlink = operations.unlink ?? unlinkSync;
+  const temporaryPath = `${path}.tmp-${process.pid}-${Date.now()}-${randomId(8)}`;
+  let temporaryCreated = false;
+
+  mkdir(dirname(path));
+  try {
+    write(temporaryPath, `${JSON.stringify(terminals, null, 2)}\n`);
+    temporaryCreated = true;
+    rename(temporaryPath, path);
+    temporaryCreated = false;
+  } finally {
+    if (temporaryCreated) {
+      try { unlink(temporaryPath); } catch {}
+    }
+  }
+}
+
 function saveTerminalRegistry(terminals: PlainTerminal[]): void {
-  mkdirSync(dirname(TERMINALS_REGISTRY), { recursive: true });
-  writeFileSync(TERMINALS_REGISTRY, `${JSON.stringify(terminals, null, 2)}\n`);
+  writeTerminalRegistryAtomic(terminals);
 }
 
 function registerDashboardTerminal(scope: AdminScope, name: string, cwd: string, label: string): void {
-  const terminals = readTerminalRegistry().filter((terminal) => {
+  const terminals = readTerminalRegistryForMutation().filter((terminal) => {
     const hostId = terminal.hostId || "local";
     const rawName = terminal.rawName || terminal.tmuxName;
     return !(hostId === scope.id && rawName === name);
@@ -274,8 +354,62 @@ function registerDashboardTerminal(scope: AdminScope, name: string, cwd: string,
     ...(scope.kind === "ssh" ? { hostId: scope.id } : {}),
     rawName: name,
     tmuxName: name,
+    managed: true,
   });
   saveTerminalRegistry(terminals);
+}
+
+function errorDetail(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export async function persistCreatedTerminalMetadata(
+  persist: () => void,
+  killManagedSession: () => Promise<void>,
+): Promise<void> {
+  try {
+    persist();
+  } catch (registryError) {
+    try {
+      await killManagedSession();
+    } catch (rollbackError) {
+      throw new Error(
+        `failed to persist terminal registry: ${errorDetail(registryError)}; `
+        + `failed to roll back TW-managed session: ${errorDetail(rollbackError)}`,
+      );
+    }
+    throw new Error(
+      `failed to persist terminal registry; TW-managed session was rolled back: ${errorDetail(registryError)}`,
+    );
+  }
+}
+
+export function parseRpcCreateTerminalResponse(stdout: string): RpcCreateTerminalResponse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`tw rpc create-terminal returned invalid JSON: ${errorDetail(error)}`);
+  }
+  if (!isRecord(parsed)) throw new Error("tw rpc create-terminal returned a non-object response");
+  if (parsed.protocolVersion !== RPC_PROTOCOL_VERSION) {
+    throw new Error(`unsupported tw rpc protocol version: ${String(parsed.protocolVersion)}`);
+  }
+  if (parsed.kind !== "terminal") {
+    throw new Error(`tw rpc create-terminal returned unexpected kind: ${String(parsed.kind)}`);
+  }
+  if (typeof parsed.session !== "string" || !MANAGED_TERMINAL_NAME.test(parsed.session)) {
+    throw new Error("tw rpc create-terminal returned an invalid tw-term-* session name");
+  }
+  if (typeof parsed.cwd !== "string" || !parsed.cwd.trim() || parsed.cwd.includes("\0")) {
+    throw new Error("tw rpc create-terminal returned an invalid cwd");
+  }
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "terminal",
+    session: parsed.session,
+    cwd: parsed.cwd,
+  };
 }
 
 function splitSessionKey(key: string): { scopeId: string; rawName: string } {
@@ -334,6 +468,9 @@ export function projectNameFromTwWorktreePath(cwd: string, worktreeBase?: string
   if (markerIndex >= 0) {
     return firstPathSegment(normalized.slice(markerIndex + marker.length));
   }
+  if (normalized.startsWith(`${LEGACY_DEFAULT_WORKTREE_BASE}/`)) {
+    return firstPathSegment(normalized.slice(LEGACY_DEFAULT_WORKTREE_BASE.length + 1));
+  }
   return undefined;
 }
 
@@ -344,7 +481,9 @@ function isWorktreeCwd(cwd: string, scope: AdminScope): boolean {
     if (cwd === base || cwd.startsWith(`${base}/`)) return true;
     if (base.startsWith("~/") && cwd.includes(base.slice(1))) return true;
   }
-  return cwd.includes("/.tmux-worktree/worktrees/");
+  return cwd.includes("/.tmux-worktree/worktrees/")
+    || cwd === LEGACY_DEFAULT_WORKTREE_BASE
+    || cwd.startsWith(`${LEGACY_DEFAULT_WORKTREE_BASE}/`);
 }
 
 export function isManagedWorktreeRow(scope: AdminScope, row: TmuxRow): boolean {
@@ -360,7 +499,14 @@ async function remotePathHasGitEntry(scope: AdminScope, cwd: string): Promise<bo
   return stdout.trim() === "yes";
 }
 
-function relaySession(scope: AdminScope, row: TmuxRow, kind: "worktree" | "terminal", label?: string, project?: string): RelaySession {
+function relaySession(
+  scope: AdminScope,
+  row: TmuxRow,
+  kind: "worktree" | "terminal",
+  label?: string,
+  project?: string,
+  managed?: boolean,
+): RelaySession {
   const inferredProject = kind === "worktree"
     ? project?.trim() || projectNameFromTwWorktreePath(row.cwd, scope.worktreeBase)
     : undefined;
@@ -369,6 +515,7 @@ function relaySession(scope: AdminScope, row: TmuxRow, kind: "worktree" | "termi
     rawName: row.name,
     scopeId: scope.id,
     scopeLabel: scope.label,
+    ...(managed === undefined ? {} : { managed }),
     kind,
     project: inferredProject,
     label: label || row.name,
@@ -423,16 +570,8 @@ async function localTmuxRows(scope: AdminScope): Promise<TmuxRow[]> {
   return parseTmuxRows(stdout);
 }
 
-function sshTarget(host: HostConfig): string {
-  return host.user ? `${host.user}@${host.host}` : host.host;
-}
-
-function sshBaseArgs(host: HostConfig): string[] {
-  const args: string[] = [];
-  if (host.port) args.push("-p", String(host.port));
-  if (host.identityFile) args.push("-i", host.identityFile);
-  args.push("-o", "BatchMode=yes", "-o", "ConnectTimeout=5", sshTarget(host));
-  return args;
+export function relaySshConnectionArgs(host: HostConfig): string[] {
+  return [...sshConnectionArgs(host), "--", host.host];
 }
 
 function shQuote(value: string): string {
@@ -440,7 +579,7 @@ function shQuote(value: string): string {
 }
 
 async function sshOutput(host: HostConfig, remoteCommand: string, timeout = 8000): Promise<string> {
-  const { stdout } = await execFileAsync("ssh", [...sshBaseArgs(host), remoteCommand], { timeout });
+  const { stdout } = await execFileAsync("ssh", [...relaySshConnectionArgs(host), remoteCommand], { timeout });
   return stdout;
 }
 
@@ -451,21 +590,88 @@ async function remoteTmuxRows(scope: AdminScope): Promise<TmuxRow[]> {
   return parseTmuxRows(stdout);
 }
 
-export function isRpcManagedWorktreeSession(session: RpcSession): boolean {
+export function isRpcManagedWorktreeSession(
+  session: RpcSession,
+): session is RpcSession & { kind: "worktree"; name: string } {
   if (session.kind !== "worktree" || !session.name) return false;
   return !session.profile || session.profile === "dashboard" || session.profile === "cli";
 }
 
+export function isRpcManagedTerminalSession(
+  session: RpcSession,
+): session is RpcSession & { kind: "terminal"; name: string } {
+  if (session.kind !== "terminal" || !session.name) return false;
+  return !session.profile || session.profile === "dashboard" || session.profile === "cli";
+}
+
+function commandFailureText(error: unknown): string {
+  if (!isRecord(error)) return errorDetail(error);
+  return [error.stderr, error.stdout, error.message]
+    .flatMap((value): string[] => {
+      if (typeof value === "string") return [value];
+      if (Buffer.isBuffer(value)) return [value.toString("utf8")];
+      return [];
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function commandExitStatus(error: unknown): number | undefined {
+  if (!isRecord(error)) return undefined;
+  return typeof error.code === "number" ? error.code : undefined;
+}
+
+export function isUnsupportedRpcListFailure(status: number | undefined, output: string): boolean {
+  if (status === undefined || status === 0) return false;
+  const normalized = output.toLowerCase();
+  return /\b(?:unknown|unrecognized|unsupported|invalid)\s+(?:tw\s+)?(?:subcommand|command)\b[^\n]*\brpc\b/.test(normalized)
+    || /\b(?:unknown|unrecognized|unsupported)\s+rpc(?:\s+(?:subcommand|command))?\b/.test(normalized)
+    || /\brpc\b\s+(?:command\s+)?(?:is\s+)?(?:unknown|unrecognized|unsupported)\b/.test(normalized)
+    || /未知(?:的)?(?:子)?命令[^\n]*rpc/i.test(output);
+}
+
+async function localRpcListOutput(): Promise<string | null> {
+  try {
+    return await localTwOutput(["rpc", "list"], 5000);
+  } catch (error) {
+    const output = commandFailureText(error);
+    if (isUnsupportedRpcListFailure(commandExitStatus(error), output)) return null;
+    throw error;
+  }
+}
+
+async function remoteRpcListOutput(scope: AdminScope): Promise<string | null> {
+  const command = remoteTw(scope, ["rpc", "list"]);
+  const wrapped = `set +e; output=$(${command} 2>&1); status=$?; `
+    + `printf '${REMOTE_RPC_STATUS_MARKER}%s\\n' "$status"; printf '%s' "$output"`;
+  const response = await sshOutput(scope.host!, wrapped);
+  const markerIndex = response.indexOf(REMOTE_RPC_STATUS_MARKER);
+  if (markerIndex < 0) throw new Error(`remote tw rpc list returned no status marker from ${scope.id}`);
+  const statusStart = markerIndex + REMOTE_RPC_STATUS_MARKER.length;
+  const statusEnd = response.indexOf("\n", statusStart);
+  if (statusEnd < 0) throw new Error(`remote tw rpc list returned an invalid status marker from ${scope.id}`);
+  const rawStatus = response.slice(statusStart, statusEnd);
+  if (!/^\d+$/.test(rawStatus)) throw new Error(`remote tw rpc list returned an invalid status from ${scope.id}`);
+  const status = Number(rawStatus);
+  const output = response.slice(statusEnd + 1);
+  if (status === 0) return output;
+  if (isUnsupportedRpcListFailure(status, output)) return null;
+  throw new Error(`remote tw rpc list failed on ${scope.id}: ${output.trim() || `exit ${status}`}`);
+}
+
 async function rpcSessions(scope: AdminScope): Promise<RelaySession[] | null> {
   const stdout = scope.kind === "local"
-    ? (await execFileAsync("tw", ["rpc", "list"], { timeout: 5000 })).stdout
-    : await sshOutput(scope.host!, `${remoteTw(scope, ["rpc", "list"])} 2>/dev/null || true`);
-  if (!stdout.trim()) return null;
-  const parsed = JSON.parse(stdout) as RpcList;
-  const sessions = parsed.sessions ?? [];
+    ? await localRpcListOutput()
+    : await remoteRpcListOutput(scope);
+  if (stdout === null || !stdout.trim()) return null;
+  const parsed = JSON.parse(stdout) as unknown;
+  if (!isRecord(parsed) || parsed.protocolVersion !== RPC_PROTOCOL_VERSION || !Array.isArray(parsed.sessions)) {
+    throw new Error(`unsupported tw rpc list response from ${scope.id}`);
+  }
+  const sessions = parsed.sessions as RpcSession[];
   if (sessions.length === 0) return null;
   return sessions.flatMap((session): RelaySession[] => {
-    if (!isRpcManagedWorktreeSession(session)) return [];
+    if (!isRpcManagedWorktreeSession(session) && !isRpcManagedTerminalSession(session)) return [];
     const cwd = session.cwd || session.worktreePath || "";
     return [relaySession(scope, {
       name: session.name,
@@ -474,7 +680,7 @@ async function rpcSessions(scope: AdminScope): Promise<RelaySession[] | null> {
       created: Number(session.created) || 0,
       activity: Number(session.activity) || 0,
       cwd,
-    }, "worktree", session.name, session.project)];
+    }, session.kind === "terminal" ? "terminal" : "worktree", session.name, session.project, true)];
   });
 }
 
@@ -502,13 +708,22 @@ async function dashboardTerminals(localBase: string, token: string, scope: Admin
       created: 0,
       activity: 0,
       cwd: terminal.cwd || "",
-    }, "terminal", terminal.label || rawName)];
+    }, "terminal", terminal.label || rawName, undefined, terminal.managed === true ? true : undefined)];
   });
 }
 
 async function listScopeSessions(scope: AdminScope, localBase: string, token: string): Promise<RelaySession[]> {
   const rpc = await rpcSessions(scope).catch(() => null);
-  const rows = rpc ? [] : (scope.kind === "local" ? await localTmuxRows(scope) : await remoteTmuxRows(scope));
+  let rows: TmuxRow[];
+  try {
+    rows = scope.kind === "local" ? await localTmuxRows(scope) : await remoteTmuxRows(scope);
+  } catch (error) {
+    // Managed RPC state is still useful if the compatibility tmux scan fails.
+    // When RPC is unavailable too, preserve the original scope failure instead
+    // of publishing an authoritative-looking empty catalog.
+    if (!rpc) throw error;
+    rows = [];
+  }
   const seen = new Set<string>();
   const sessions = rpc ?? [];
   for (const session of sessions) {
@@ -516,6 +731,7 @@ async function listScopeSessions(scope: AdminScope, localBase: string, token: st
   }
 
   for (const row of rows) {
+    if (seen.has(row.name)) continue;
     if (!isManagedWorktreeRow(scope, row)) continue;
     if (scope.kind === "ssh" && !(await remotePathHasGitEntry(scope, row.cwd).catch(() => false))) continue;
     seen.add(row.name);
@@ -661,7 +877,7 @@ async function createWorktreeSession(message: Extract<RelayClientMessage, { type
   const target = await resolveWorktreeTarget(scope, message.project, message.path);
   const args = rpcCreateWorktreeArgs(scope, target, aiCommand, message.name, message.branch);
   const stdout = scope.kind === "local"
-    ? (await execFileAsync("tw", args, { timeout: 120_000 })).stdout
+    ? await localTwOutput(args, 120_000)
     : await sshOutput(scope.host!, remoteTw(scope, args), 120_000);
   const parsed = JSON.parse(stdout) as RpcCreateWorktreeResponse;
   if (!parsed.session) throw new Error("tw rpc create-worktree returned no session");
@@ -672,29 +888,35 @@ async function createWorktreeSession(message: Extract<RelayClientMessage, { type
     created: Math.floor(Date.now() / 1000),
     activity: Math.floor(Date.now() / 1000),
     cwd: parsed.worktreePath || target.path,
-  }, "worktree", parsed.session, target.projectName);
+  }, "worktree", parsed.session, target.projectName, true);
 }
 
 async function createPlainTerminalSession(message: Extract<RelayClientMessage, { type: "create_terminal" }>): Promise<RelaySession> {
   const scope = scopeById(message.scopeId);
   const cwd = message.cwd.trim();
   if (!cwd) throw new Error("cwd required");
-  const name = `tw-term-${randomId()}`;
-  if (scope.kind === "local") {
-    await execFileAsync(localTmuxBin(scope), ["new-session", "-d", "-s", name, "-c", cwd], { timeout: 5000 });
-  } else {
-    await sshOutput(scope.host!, `${remoteTmux(scope)} new-session -d -s ${shQuote(name)} -c ${shQuote(cwd)}`);
-  }
-  const label = message.label?.trim() || basename(cwd) || name;
-  registerDashboardTerminal(scope, name, cwd, label);
+  const args = ["rpc", "create-terminal", "--cwd", cwd];
+  const aiCommand = (message.aiCommand || message.aiCmd || "").trim();
+  if (aiCommand) args.push("--ai-command", aiCommand);
+  const stdout = scope.kind === "local"
+    ? await localTwOutput(args, 30_000)
+    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000);
+  const parsed = parseRpcCreateTerminalResponse(stdout);
+  const name = parsed.session;
+  const canonicalCwd = parsed.cwd;
+  const label = message.label?.trim() || basename(canonicalCwd) || name;
+  await persistCreatedTerminalMetadata(
+    () => registerDashboardTerminal(scope, name, canonicalCwd, label),
+    () => killManagedSession(scope, name),
+  );
   return relaySession(scope, {
     name,
     attached: false,
     windows: 1,
     created: Math.floor(Date.now() / 1000),
     activity: Math.floor(Date.now() / 1000),
-    cwd,
-  }, "terminal", label);
+    cwd: canonicalCwd,
+  }, "terminal", label, undefined, true);
 }
 
 function streamKey(clientId: string, streamId: string): string {
@@ -798,14 +1020,68 @@ async function sendAgentMessage(session: string, pane: string | number | undefin
   if (submit) await sshOutput(scope.host!, `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`);
 }
 
-async function killSession(session: string): Promise<void> {
-  const { scope, rawName } = scopeForSession(session);
-  if (rawName.startsWith("tw-mobile-")) throw new Error("refusing to kill internal mobile mirror session");
+function parseRpcKillSessionResponse(stdout: string, expectedSession: string): RpcKillSessionResponse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`tw rpc kill-session returned invalid JSON: ${errorDetail(error)}`);
+  }
+  if (!isRecord(parsed)) throw new Error("tw rpc kill-session returned a non-object response");
+  if (parsed.protocolVersion !== RPC_PROTOCOL_VERSION || parsed.kind !== "session-killed") {
+    throw new Error("tw rpc kill-session returned an unsupported response");
+  }
+  if (parsed.session !== expectedSession) {
+    throw new Error(`tw rpc kill-session returned unexpected session: ${String(parsed.session)}`);
+  }
+  if (parsed.sessionKind !== "worktree" && parsed.sessionKind !== "terminal") {
+    throw new Error(`tw rpc kill-session returned unexpected session kind: ${String(parsed.sessionKind)}`);
+  }
+  if (typeof parsed.killed !== "boolean") {
+    throw new Error("tw rpc kill-session returned an invalid killed status");
+  }
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "session-killed",
+    session: expectedSession,
+    sessionKind: parsed.sessionKind,
+    killed: parsed.killed,
+  };
+}
+
+async function killManagedSession(scope: AdminScope, rawName: string): Promise<void> {
+  const args = ["rpc", "kill-session", "--name", rawName];
+  const stdout = scope.kind === "local"
+    ? await localTwOutput(args, 30_000)
+    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000);
+  parseRpcKillSessionResponse(stdout, rawName);
+}
+
+async function rpcOwnsSession(scope: AdminScope, rawName: string): Promise<boolean> {
+  const sessions = await rpcSessions(scope);
+  return Boolean(sessions?.some((candidate) => candidate.rawName === rawName && candidate.managed === true));
+}
+
+async function killLegacyTmuxSession(scope: AdminScope, rawName: string): Promise<void> {
   if (scope.kind === "local") {
     await execFileAsync(localTmuxBin(scope), ["kill-session", "-t", `=${rawName}`], { timeout: 5000 });
     return;
   }
   await sshOutput(scope.host!, `${remoteTmux(scope)} kill-session -t ${shQuote(`=${rawName}`)}`);
+}
+
+async function killSession(session: string, managedHint?: boolean): Promise<void> {
+  const { scope, rawName } = scopeForSession(session);
+  if (rawName.startsWith("tw-mobile-")) throw new Error("refusing to kill internal mobile mirror session");
+
+  // New clients can avoid the lookup with managed=true. Older clients omit
+  // the field, so RPC remains the source of truth before using legacy tmux.
+  const managed = managedHint === true || await rpcOwnsSession(scope, rawName);
+  if (managed) {
+    await killManagedSession(scope, rawName);
+    return;
+  }
+  await killLegacyTmuxSession(scope, rawName);
 }
 
 export function remoteAttachCommand(scope: AdminScope, rawName: string, paneIndex: string): string {
@@ -977,7 +1253,7 @@ async function openRemoteStream(
   const pending = existing?.pending.splice(0) ?? [];
   const pendingResize = existing?.pendingResize;
   const resizeFile = `${tmpdir()}/tw-relay-resize-${clientId.replace(/[^a-zA-Z0-9_-]/g, "")}-${streamId.replace(/[^a-zA-Z0-9_-]/g, "")}-${randomId(6)}`;
-  const sshArgs = ["ssh", "-tt", ...sshBaseArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)];
+  const sshArgs = ["ssh", "-tt", ...relaySshConnectionArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)];
   const child = spawn("python3", ["-u", "-c", remotePtyPythonScript(), resizeFile, ...sshArgs], {
     stdio: ["pipe", "pipe", "pipe"],
     env: { ...process.env, TERM: "xterm-256color" },
@@ -1055,7 +1331,7 @@ async function openLocalStream(
 
   localSocket.on("open", () => {
     if (pendingResize) {
-      localSocket.send(JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows } satisfies RelayClientMessage));
+      localSocket.send(JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows }));
     }
     for (const payload of stream.pending.splice(0)) localSocket.send(payload);
   });
@@ -1222,13 +1498,21 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
       }
 
       if (message.type === "kill_session") {
-        await killSession(message.session);
+        await killSession(message.session, message.managed);
         sendJson(relaySocket, {
           type: "session_killed",
           clientId,
           requestId: message.requestId,
           session: message.session,
         });
+        return;
+      }
+
+      if (
+        message.type !== "terminal_input"
+        && message.type !== "resize"
+        && message.type !== "close_terminal"
+      ) {
         return;
       }
 
@@ -1267,7 +1551,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
           stream.resize(message.cols, message.rows);
           return;
         }
-        const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows } satisfies RelayClientMessage);
+        const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows });
         if (sendToStream(stream, resize) === "closed") {
           const route = streamRoutes.get(key);
           if (route) {

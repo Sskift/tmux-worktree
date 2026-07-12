@@ -149,8 +149,8 @@ const commandCases: CommandCase[] = [
   {
     label: "sessions.kill",
     command: "kill_session",
-    args: { name: "dashboard-feature" },
-    call: (backend) => backend.sessions.kill("dashboard-feature"),
+    args: { name: "dashboard-feature", managed: true },
+    call: (backend) => backend.sessions.kill("dashboard-feature", true),
   },
   {
     label: "sessions.cancelCopyMode",
@@ -251,8 +251,8 @@ const commandCases: CommandCase[] = [
   {
     label: "terminals.kill",
     command: "kill_plain_terminal",
-    args: { name: "tw-term-1" },
-    call: (backend) => backend.terminals.kill("tw-term-1"),
+    args: { name: "tw-term-1", managed: true },
+    call: (backend) => backend.terminals.kill("tw-term-1", true),
   },
   {
     label: "pty.write",

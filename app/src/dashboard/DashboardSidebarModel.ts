@@ -103,7 +103,7 @@ export function summarizeSidebarConnections(
       checkingCount += 1;
     } else if (!status.reachable) {
       offlineCount += 1;
-    } else if (!status.twAvailable) {
+    } else if (status.tmuxAvailable === false || !status.twAvailable || status.twCompatible === false) {
       twMissingHosts.push(host);
     } else {
       readyCount += 1;

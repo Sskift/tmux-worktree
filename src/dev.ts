@@ -7,9 +7,11 @@ import {
   CONFIG_PATH,
   type Config,
   type ProjectConfig,
+  defaultWorktreeBase,
   expandHomePath,
   loadConfigFile,
   normalizeConfig,
+  resolveWorktreeBase,
 } from "./config";
 import {
   CliError,
@@ -60,7 +62,7 @@ async function initConfigInteractive(): Promise<Config> {
     }
 
     console.log();
-    const defaultWorktree = "/private/tmp/tmux-worktree/projects";
+    const defaultWorktree = defaultWorktreeBase();
 
     const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
 
@@ -258,7 +260,7 @@ export async function run() {
     ? loadConfigFile() ?? normalizeConfig({})
     : await loadConfig();
   const PROJECT_DIRS = config.projects;
-  const WORKTREE_BASE = config.worktreeBase ?? "/private/tmp/tmux-worktree/projects";
+  const WORKTREE_BASE = resolveWorktreeBase(config.worktreeBase);
 
   // --- 参数解析 ---
   const params = hasArgs ? parseArgs(PROJECT_DIRS) : await interactiveSelect(PROJECT_DIRS);

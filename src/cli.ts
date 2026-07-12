@@ -38,7 +38,25 @@ RPC:
   tw rpc list                 输出 TW 管理的 session/worktree JSON
   tw rpc create-worktree (--path <path> | --project <name>) --ai-command <cmd> [--name <name>] [--branch <name>]
                               创建 Dashboard-managed worktree session 并登记到 TW state
+  tw rpc create-terminal --cwd <path> [--ai-command <cmd>]
+                              创建 headless managed terminal，不写 Dashboard UI 元数据
+  tw rpc restore-worktree --path <path> --name <session> [--ai-command <cmd>]
+                              恢复已有 git worktree 并重新登记到 TW state
+  tw rpc kill-session --name <session>
+                              停止并移除一个 TW-managed session 记录
   tw rpc capabilities         输出 Dashboard 可消费的协议能力 JSON
+
+SSH Host（本地控制面）:
+  tw host ls [--json]         列出 Dashboard 共用的 Host 配置
+  tw host add --id <id> --host <target> [SSH options] [--json]
+  tw host update <id> [SSH options] [--clear <field>] [--json]
+  tw host rm <id> [--json]    删除 Host 配置
+  tw host probe [id] [--json] 独立检查 SSH、tmux、tw RPC 能力
+  tw host connect|connection-status|disconnect <id> [--json]
+                              管理 TW 自有的 SSH ControlMaster 连接
+  tw host rpc <id> <rpc-command> [args...]
+                              在目标 Host 调用机器可读 tw RPC
+  tw host attach <id> <session> 交互接入远端 tmux session
 
 Automation:
   tw automation ls            列出 Dashboard 可见的 automation（别名: tw auto ls）
@@ -68,6 +86,13 @@ Automation:
 
 async function main() {
   const sub = process.argv[2];
+
+  // A headless agent or SSH command must never block on the interactive
+  // project wizard. Humans in a real terminal keep the existing shortcut.
+  if (!sub && (!process.stdin.isTTY || !process.stdout.isTTY)) {
+    printHelp();
+    return;
+  }
 
   switch (sub) {
     case "-v":
@@ -138,6 +163,12 @@ async function main() {
     case "auto": {
       const { automationCmd } = await import("./automation.js");
       await automationCmd(process.argv.slice(3));
+      return;
+    }
+    case "host":
+    case "hosts": {
+      const { hostCmd } = await import("./hosts.js");
+      await hostCmd(process.argv.slice(3));
       return;
     }
     case "doctor": {

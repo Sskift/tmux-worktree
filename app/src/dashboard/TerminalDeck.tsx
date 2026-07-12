@@ -47,22 +47,36 @@ function remoteShellPathExpr(value: string): string {
   return shellQuoteArg(trimmed);
 }
 
+export function sharedSshConnectionArgs(): string[] {
+  return [
+    "-o", "StrictHostKeyChecking=accept-new",
+    "-o", "ConnectTimeout=10",
+    "-o", "ServerAliveInterval=15",
+    "-o", "ServerAliveCountMax=3",
+    "-o", "ControlMaster=auto",
+    "-o", "ControlPersist=600",
+    "-o", "ControlPath=~/.tmux-worktree/ssh/%C",
+  ];
+}
+
 /** Build SSH attach args for a remote session. */
 export function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
-  const args: string[] = ["-tt", "-o", "StrictHostKeyChecking=accept-new"];
+  const args: string[] = ["-tt", ...sharedSshConnectionArgs()];
   if (host.port) {
     args.push("-p", String(host.port));
   }
   if (host.identityFile) {
     args.push("-i", host.identityFile);
   }
-  const target = host.user ? `${host.user}@${host.host}` : host.host;
+  if (host.user) {
+    args.push("-l", host.user);
+  }
   const exact = `=${rawName}`;
   const exactArg = shellQuoteArg(exact);
   const tmux = remoteShellPathExpr(host.tmuxPath || "tmux");
   args.push(
-    target,
     "--",
+    host.host,
     [
       "set -e",
       "export TERM=xterm-256color",

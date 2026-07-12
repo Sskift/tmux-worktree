@@ -61,7 +61,7 @@ export interface DashboardBackend {
     root(name: string): Promise<string>;
     cwd(name: string): Promise<string>;
     captureHistory(name: string, lines?: number): Promise<string>;
-    kill(name: string): Promise<void>;
+    kill(name: string, managed?: boolean): Promise<void>;
     cancelCopyMode(name: string): Promise<void>;
     cancelCopyModeIfActive(name: string): Promise<boolean>;
     copySelection(name: string): Promise<boolean>;
@@ -84,7 +84,7 @@ export interface DashboardBackend {
     save(terminals: PlainTerminal[]): Promise<void>;
     ensure(args: EnsureTerminalInput): Promise<void>;
     create(args: CreateTerminalInput): Promise<CreatedTerminal>;
-    kill(name: string): Promise<void>;
+    kill(name: string, managed?: boolean): Promise<void>;
   };
   pty: {
     connect(
@@ -279,7 +279,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       cwd: (name) => transport.invoke<string>("session_cwd", { name }),
       captureHistory: (name, lines) =>
         transport.invoke<string>("capture_pane_history", { name, lines }),
-      kill: (name) => transport.invoke<void>("kill_session", { name }),
+      kill: (name, managed) => transport.invoke<void>("kill_session", { name, managed: managed ?? false }),
       cancelCopyMode: (name) => transport.invoke<void>("cancel_copy_mode", { name }),
       cancelCopyModeIfActive: (name) =>
         transport.invoke<boolean>("copy_mode_cancel_if_active", { name }),
@@ -306,7 +306,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       save: (terminals) => transport.invoke<void>("save_terminals", { terminals }),
       ensure: (args) => transport.invoke<void>("ensure_terminal_session", { args }),
       create: (args) => transport.invoke<CreatedTerminal>("create_terminal", { args }),
-      kill: (name) => transport.invoke<void>("kill_plain_terminal", { name }),
+      kill: (name, managed) => transport.invoke<void>("kill_plain_terminal", { name, managed: managed ?? false }),
     },
     pty: {
       connect: connectPty,

@@ -14,6 +14,8 @@ Install it like a normal macOS app, then open it:
 open -a tw-dashboard
 ```
 
+The Dashboard bundle includes its matching CLI JavaScript and currently uses a locally installed Node.js 20+ to execute it. If Node is unavailable, the Dashboard will use a globally installed `tw` only when its version and full lifecycle RPC capability set match; it never silently falls back to a second creator.
+
 If a repository or its linked main checkout is under Desktop, Documents, or Downloads, allow the macOS folder-access prompt on first use. Git worktrees keep their actual Git metadata in the main checkout, so denying that folder prevents Git status and diffs from loading.
 
 Install the CLI from source on any machine that should create `tw`-managed sessions:
@@ -64,6 +66,17 @@ Host remote-dev
 ```
 
 2. In the Dashboard, open `Settings → Connections → Add host`, choose the SSH alias from the list, test it, then add it. The Dashboard saves selected SSH config candidates into `~/.tmux-worktree.json`.
+
+The same Host catalog is controllable by an agent or shell without opening the app:
+
+```bash
+tw host add --id remote-dev --host remote-dev.example.com --user alice --json
+tw host probe remote-dev --json
+tw host connect remote-dev --json
+tw host connection-status remote-dev --json
+```
+
+Host mutations preserve the other keys in `~/.tmux-worktree.json`. Remote `worktreeBase`, `tmuxPath`, and `twPath` retain their leading `~` and are expanded on the remote host, not on the Mac.
 
 3. Install or update `tw` on the remote host. A user-local install is enough:
 
@@ -133,11 +146,11 @@ For Dashboard-created sessions, entering `claude`, `codex`, or another command i
 4. Enter the AI command, for example `claude` or `codex`.
 5. Create the worktree.
 
-The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. For discovery, the Dashboard merges this managed state with strict tmux/git checks so older live worktrees and Dashboard-created remote terminals remain attachable.
+The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. Agents can invoke the same operation from the Mac with `tw host rpc remote-dev create-worktree ...`.
 
 ## Create Remote Terminals From Dashboard
 
-Use `+ terminal`, choose the remote host, choose or type the remote path, and enter the AI command. The session is `tw`-managed and visible under Terminals.
+Use `+ terminal`, choose the remote host, choose or type the remote path, and enter the AI command. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
 
 ## Remote Agent Skill
 

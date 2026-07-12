@@ -3,6 +3,8 @@ export type RelaySession = {
   rawName?: string;
   scopeId?: string;
   scopeLabel?: string;
+  /** True when lifecycle mutations must go through the TW RPC/state contract. */
+  managed?: boolean;
   kind?: "session" | "worktree" | "terminal";
   project?: string;
   label?: string;
@@ -34,10 +36,10 @@ export type RelayClientMessage =
   | { type: "list_sessions"; hostId?: string; requestId?: string }
   | { type: "list_scope_statuses"; hostId?: string; requestId?: string }
   | { type: "create_worktree"; hostId?: string; requestId?: string; scopeId?: string; project?: string; path?: string; name?: string; branch?: string; aiCommand?: string; aiCmd?: string }
-  | { type: "create_terminal"; hostId?: string; requestId?: string; scopeId?: string; cwd: string; label?: string }
+  | { type: "create_terminal"; hostId?: string; requestId?: string; scopeId?: string; cwd: string; label?: string; aiCommand?: string; aiCmd?: string }
   | { type: "open_terminal"; hostId?: string; streamId: string; session: string; pane?: string | number }
   | { type: "send_agent_message"; hostId?: string; requestId?: string; session: string; pane?: string | number; message: string; submit?: boolean }
-  | { type: "kill_session"; hostId?: string; requestId?: string; session: string }
+  | { type: "kill_session"; hostId?: string; requestId?: string; session: string; managed?: boolean }
   | { type: "terminal_input"; streamId: string; data: string }
   | { type: "resize"; streamId: string; cols: number; rows: number }
   | { type: "close_terminal"; streamId: string };

@@ -25,6 +25,9 @@
 | `src/cli.ts` | CLI 路由，分发一次性 `status`/`ls`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
 | `src/config.ts` | 读取并归一化 `~/.tmux-worktree.json`，兼容旧版 CLI 字符串映射、对象映射、数组项目和字段别名 | 打包 |
 | `src/dev.ts` | 创建 git worktree 和 tmux session，并启动 AI 命令 | 打包 |
+| `src/session.ts` / `src/state.ts` | canonical single-pane worktree/terminal/restore 生命周期，以及带跨进程锁的 managed state | 打包 |
+| `src/rpc.ts` | 给 Dashboard、Relay 和 Agent 使用的无交互 JSON contract | 打包 |
+| `src/hosts.ts` | Host CRUD、分层 SSH/tmux/TW probe、ControlMaster 和远端 RPC/attach | 打包 |
 | `src/automation.ts` | 管理 Dashboard 共用的 `~/.tw-dashboard-automations.json`，提供 `tw automation`/`tw auto` 的 list/create/delete | 打包 |
 | `src/serve.ts` | 本地/移动端 Web 终端和 Remote 桥接服务 | 打包 |
 | `src/setup.ts` | 系统依赖检查和可选安装 | 打包 |
@@ -90,10 +93,10 @@ Rust 后端：
 
 主要 Tauri command 分组：
 
-- Session/worktree：`list_sessions`、`create_worktree`、`kill_session`、`list_orphaned_worktrees`、`restore_worktree`、`session_cwd`；本地 `create_worktree` 委托同版本 bundled `tw rpc create-worktree`，不再维护第二套 Rust creator。
+- Session/worktree：`list_sessions`、`create_worktree`、`kill_session`、`list_orphaned_worktrees`、`restore_worktree`、`session_cwd`；本地 create/restore 委托同版本 bundled TW RPC，不再维护第二套 Rust creator。
 - Git：`git_status`、`git_graph_refs`、`git_graph`、`git_diff`。
 - PTY：`pty_open`、`pty_write`、`pty_resize`、`pty_kill`、`capture_pane_history`。
-- 独立终端：`create_terminal`、`ensure_terminal_session`、`kill_plain_terminal`、`load_terminals`、`save_terminals`。
+- 独立终端：初次 `create_terminal` 委托本地/远端 `tw rpc create-terminal`；RPC 返回的 canonical cwd 与 `managed=true` 写入 metadata。新 managed metadata 只检查 live 状态，绝不通过 direct tmux 复活；`ensure_terminal_session` 只保留为缺少 managed 标记的旧 Dashboard metadata 兼容恢复。label/order 继续由 `load_terminals`、`save_terminals` 管理。
 - Automation：`list_automations`、`save_automation`、`delete_automation`、`trigger_automation`、`list_automation_runs`。
 - 布局和文件：`load_layout`、`save_layout`、`read_dir`、`read_file`、`write_file`、`search_files`、`file_exists`。
 - Mobile Relay：`mobile_relay_start`、`mobile_relay_stop`、`mobile_relay_status`。
@@ -101,9 +104,9 @@ Rust 后端：
 Remote TW runtime：
 
 - 远端可以安装 `tw` binary；Dashboard 通过 SSH 调用 `tw rpc list`，优先读取远端 `~/.tmux-worktree/state.json` 中登记的 managed session/worktree。
-- `tw rpc list` 默认输出 JSON，返回协议版本和 live managed sessions；Dashboard 只把 `kind=worktree` 的条目映射成 remote worktree session。
+- `tw rpc list` 默认输出 JSON，返回协议版本和 live managed worktree/terminal sessions。
 - Dashboard 在远端创建 worktree 时只通过 SSH 执行 `tw rpc create-worktree --path <path> --ai-command <cmd> ...`，由远端 `tw` 负责 git worktree、tmux session 和 managed state 写入；旧版或缺失 RPC 的 Host 必须先升级，不再静默回退到另一套 git/tmux creator。host 选择发生在 Dashboard/本地调用层，RPC JSON 只作为机器可读返回协议。
-- Host 状态探测分两层：先通过 `tmux -V` 判断 SSH/tmux 是否可达，再通过 `tw version` 判断远端 TW 是否可用。缺少 TW 时 Dashboard 可通过 SSH 从 GitHub source checkout 构建并 link `tw`。
+- Host 状态探测分三层：独立确认 SSH、tmux 和 `tw rpc capabilities`；tmux 缺失不再伪装成 SSH 离线。Dashboard 安装远端 TW 时优先复制 app 内置的同版本 bundled CLI，资源不可用时才回退到固定当前版本 tag。
 - 远端目录会合并 `tw rpc list` 的 managed state 与严格的 tmux/git 形状探测，并按原始 tmux 名去重；RPC 条目优先，形状探测用于保留旧 live worktree 和 Dashboard 直建 terminal。任一路暂时失败时仍可使用另一路；`create-worktree` 不做 fallback，缺少兼容 RPC 时明确要求升级远端 `tw`。
 
 Automation 设计：
@@ -130,7 +133,11 @@ Update 命令：
 
 ## Managed Session Contract
 
-所有新建 worktree（CLI 配置项目、CLI 直接 git 路径、RPC、Dashboard 本地和 Dashboard 远端）都使用同一套 managed single-pane tmux contract：AI 命令在唯一 pane 中运行，退出后回到 login shell，并写入 `~/.tmux-worktree/state.json`。CLI 的非 git 路径会明确报错，不再退化为未登记的普通 tmux session。managed state 的 `profile=cli|dashboard` 只记录请求来源，不再选择不同布局。
+所有新建 worktree 和 standalone terminal 都使用同一套 managed single-pane tmux contract：AI 命令在唯一 pane 中运行，退出后回到 login shell，并写入 `~/.tmux-worktree/state.json`。orphan restore 也通过 RPC 重新登记实际 session 名。CLI 的非 git 路径会明确报错，不再退化为未登记的普通 tmux session。managed state 的 `profile=cli|dashboard` 只记录请求来源，不再选择不同布局。
+
+Managed session 的关闭同样通过目标主机的 `tw rpc kill-session`，确保 tmux runtime 与 managed state 原子地收敛；Dashboard metadata 明确标记 `managed`，只有缺少该标记的历史记录才允许走 direct tmux compatibility path。state mutation 遇到损坏 JSON 或未知 schema 会 fail closed，保留原文件供诊断。
+
+`tw` 是 headless control plane / remote runtime，不是 Dashboard 的文本版复制品。它负责 runtime mutation、Host/SSH 控制、capability negotiation、automation 和 JSON RPC；Editor、Files、Git graph、theme、layout、Pinned 和其他展示状态只属于 Dashboard。
 
 旧版本已经存在的 multi-pane CLI session 不做原地改造，仍可被发现和 attach；新版本不会再创建 status pane、额外 shell pane，也不会启动 alternate-screen/mouse status TUI。`tw status` 是 `tw ls` 的一次性兼容别名。
 
@@ -170,7 +177,7 @@ Update 命令：
 | 文件 | 所属 | 作用 |
 |---|---|---|
 | `~/.tmux-worktree.json` | CLI 和 Dashboard | 项目映射和 worktree 根目录 |
-| `~/.tmux-worktree/state.json` | CLI 和 Dashboard | TW managed runtime state，记录 TW 创建和管理的 tmux/worktree session |
+| `~/.tmux-worktree/state.json` | CLI 和 Dashboard | TW managed runtime state，记录 TW 创建和管理的 worktree/terminal session |
 | `~/.tw-dashboard-layout.json` | Dashboard | 窗口、栏目顺序和宽度、选择、文件树、编辑器/diff、侧边栏布局 |
 | `~/.tw-dashboard-terminals.json` | Dashboard | 独立终端定义 |
 | `~/.tw-dashboard-automations.json` | Dashboard | 本地 automation 定义 |
@@ -184,6 +191,7 @@ Update 命令：
 - 对象映射：`"name": "/repo/path"` 或 `"name": { "path": "/repo/path", "branch": "develop" }`
 - 数组：`[{ "name": "name", "path": "/repo/path" }]`
 - `hosts`：Dashboard SSH host 列表，支持数组对象、数组字符串简写（如 `["ssh-host"]`）和对象映射。
+- 未配置 `worktreeBase` 时，新默认是 `~/.tmux-worktree/worktrees`；Dashboard discovery 继续识别历史 `/private/tmp/tmux-worktree/projects`。
 - 路径别名：`path`、`dir`、`directory`、`root`、`repoPath`
 - 分支别名：`branch`、`targetBranch`、`defaultBranch`
 - worktree 根目录别名：`worktreeBase`、`worktreeDir`、`worktreeRoot`、`worktreesDir`、`worktreesRoot`

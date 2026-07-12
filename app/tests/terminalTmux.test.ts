@@ -7,6 +7,9 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
 
   assert.match(deckSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
+  assert.match(deckSource, /ControlMaster=auto/);
+  assert.match(deckSource, /ControlPath=~\/\.tmux-worktree\/ssh\/%C/);
+  assert.match(deckSource, /ServerAliveCountMax=3/);
   assert.match(deckSource, /export TERM=xterm-256color/);
   assert.match(deckSource, /remoteShellPathExpr\(host\.tmuxPath \|\| "tmux"\)/);
   assert.match(deckSource, /\$\{tmux\} has-session -t/);

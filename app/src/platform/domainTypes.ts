@@ -9,6 +9,7 @@ export type Session = {
   hostId?: string | null;
   rawName?: string;
   project?: string | null;
+  managed?: boolean;
 };
 
 export type HostConfig = {
@@ -37,9 +38,15 @@ export type HostStatus = {
   reachable: boolean;
   latencyMs: number | null;
   error: string | null;
+  tmuxAvailable?: boolean;
+  tmuxVersion?: string | null;
+  tmuxError?: string | null;
   twAvailable: boolean;
   twVersion: string | null;
   twError: string | null;
+  twProtocolVersion?: number | null;
+  twCapabilities?: string[];
+  twCompatible?: boolean;
 };
 
 export type AgentProbeId =
@@ -71,6 +78,7 @@ export type PlainTerminal = {
   rawName?: string;
   aiCmd?: string;
   discovered?: boolean;
+  managed?: boolean;
 };
 
 export type DashboardCatalogSnapshot = {
@@ -84,6 +92,8 @@ export type CreatedTerminal = {
   tmuxName: string;
   hostId?: string | null;
   rawName: string;
+  cwd: string;
+  managed: boolean;
 };
 
 export type CreateTerminalInput = {

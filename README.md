@@ -42,7 +42,7 @@ AI agents are most useful when every task has its own branch, terminal, files, l
 
 | Surface | What it gives you |
 | --- | --- |
-| `tw` CLI | Creates git worktrees, names branches, starts tmux, records managed session state, and runs an AI command. |
+| `tw` CLI | Headless control plane for managed worktrees/terminals, SSH Hosts, automations, relay, and machine-readable RPC. |
 | `tw-dashboard` | Native macOS control plane for worktrees, terminals, files, Git status, diffs, automations, and remote hosts. |
 | SSH remote runtime | Lets the local Dashboard create and attach to TW-managed sessions on devboxes over SSH. |
 | Android relay | Pairs a phone with the Mac admin connector so mobile can see the same managed sessions. |
@@ -78,6 +78,8 @@ Then install it like a normal macOS app and open it:
 ```bash
 open -a tw-dashboard
 ```
+
+The current DMG bundles the exact Dashboard CLI JavaScript but not a separate Node runtime. Install Node.js 20+ on the Mac so local managed create, restore, and kill operations can use that bundled same-version RPC implementation. A globally installed `tw` is accepted only when both its version and lifecycle capabilities match the Dashboard.
 
 When a repository or its main Git checkout lives in Desktop, Documents, or Downloads, macOS asks for access the first time the Dashboard opens its files or Git metadata. Allow that folder so worktree Git status and diffs can resolve the linked main repository.
 
@@ -130,6 +132,8 @@ tw "claude --model opus" /Users/me/code/myapp
 
 New CLI and Dashboard worktree sessions use the same managed, single-pane tmux contract. A configured project name or a direct git repository path always creates a worktree and records it in `~/.tmux-worktree/state.json`; non-git paths are rejected. The AI command runs in the single pane and returns to a login shell when it exits. Older multi-pane CLI sessions remain attachable until you close them; `tw` does not rewrite live sessions.
 
+`tw` intentionally does not duplicate Dashboard presentation features. Files, the editor, Git graph, themes, layout, Pinned, and selection state remain Dashboard responsibilities. The binary owns the host/runtime mutations that humans and agents need to automate reliably.
+
 Open the Dashboard:
 
 ```bash
@@ -180,6 +184,8 @@ tw relay-server
 tw relay-host
 tw rpc list
 tw rpc capabilities
+tw host ls --json
+tw host probe --json
 tw automation ls
 ```
 
@@ -190,9 +196,25 @@ tw claude myapp
 tw claude myapp fix-auth
 tw codex ~/code/backend
 tw rpc create-worktree --project myapp --ai-command "claude" --name fix-auth
+tw rpc create-terminal --cwd ~/code/backend --ai-command "codex"
+tw rpc restore-worktree --path ~/.tmux-worktree/worktrees/myapp/myapp-fix-abc12 --name myapp-fix
+tw rpc kill-session --name tw-term-abc12
 ```
 
 `tw status` is non-interactive and exits after printing the current session list. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
+
+Manage and operate configured SSH Hosts without opening the Dashboard:
+
+```bash
+tw host add --id remote-dev --host remote-dev.example.com --user alice --json
+tw host probe remote-dev --json
+tw host connect remote-dev --json
+tw host rpc remote-dev create-worktree --path /home/alice/code/demo --project demo --name fix-auth --ai-command codex
+tw host attach remote-dev demo-fix-auth
+tw host disconnect remote-dev --json
+```
+
+`tw host` uses an isolated SSH ControlMaster socket with bounded keepalives. `probe` reports SSH reachability, tmux availability, and TW RPC capabilities separately; a missing tmux binary is no longer reported as an SSH outage.
 
 Manage automations:
 
@@ -245,7 +267,7 @@ JSON'
 
 4. Open `Settings → Connections → Add host`, then create remote worktrees from `New worktree`.
 
-Remote sessions are created only through `tw rpc create-worktree`. Discovery merges managed RPC state with strict tmux/git shape checks so older live sessions and Dashboard-created remote terminals remain visible; creation never falls back to a second SSH + git/tmux implementation. Upgrade remote `tw` when `rpc create-worktree` is unavailable or incompatible.
+Remote worktrees and standalone terminals are created only through `tw rpc create-worktree` and `tw rpc create-terminal`. Discovery merges managed RPC state with strict compatibility checks so older live sessions remain visible; creation never falls back to a second SSH + git/tmux implementation. Upgrade remote `tw` when the required capability is unavailable or incompatible.
 
 ## Android Relay
 
@@ -281,7 +303,7 @@ For a persistent broker setup, see [docs/remote-relay-android.md](docs/remote-re
       "host": "gpu-box"
     }
   ],
-  "worktreeBase": "/private/tmp/tmux-worktree/projects"
+  "worktreeBase": "~/.tmux-worktree/worktrees"
 }
 ```
 

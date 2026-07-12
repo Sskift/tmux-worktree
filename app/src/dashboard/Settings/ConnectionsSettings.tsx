@@ -784,13 +784,17 @@ export function ConnectionsSettings({
                   <strong>{(testedStatus ?? selectedStatus)?.reachable ? "SSH reachable" : "SSH unavailable"}</strong>
                   <span>
                     {(testedStatus ?? selectedStatus)?.reachable
-                      ? (testedStatus ?? selectedStatus)?.twAvailable
-                        ? `tw ${(testedStatus ?? selectedStatus)?.twVersion ?? "installed"}`
-                        : (testedStatus ?? selectedStatus)?.twError || "tw is not installed"
+                      ? (testedStatus ?? selectedStatus)?.tmuxAvailable === false
+                        ? (testedStatus ?? selectedStatus)?.tmuxError || "tmux is not available"
+                        : !(testedStatus ?? selectedStatus)?.twAvailable
+                          ? (testedStatus ?? selectedStatus)?.twError || "tw is not installed"
+                          : (testedStatus ?? selectedStatus)?.twCompatible === false
+                            ? `tw ${(testedStatus ?? selectedStatus)?.twVersion ?? "installed"} · RPC incompatible`
+                            : `${(testedStatus ?? selectedStatus)?.tmuxVersion ?? "tmux ready"} · tw ${(testedStatus ?? selectedStatus)?.twVersion ?? "installed"}`
                       : (testedStatus ?? selectedStatus)?.error || "Run a connection test for details"}
                   </span>
                 </div>
-                {mode !== "add" && selectedStatus?.reachable && !selectedStatus.twAvailable && selectedHost && (
+                {mode !== "add" && selectedStatus?.reachable && (!selectedStatus.twAvailable || selectedStatus.twCompatible === false) && selectedHost && (
                   <button
                     type="button"
                     className="connections-button"
@@ -800,7 +804,11 @@ export function ConnectionsSettings({
                     {installingHostId === selectedHost.id
                       ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
                       : <Download aria-hidden="true" size={14} />}
-                    {installingHostId === selectedHost.id ? "Installing" : "Install tw"}
+                    {installingHostId === selectedHost.id
+                      ? "Installing"
+                      : selectedStatus.twAvailable
+                        ? "Upgrade tw"
+                        : "Install tw"}
                   </button>
                 )}
               </div>

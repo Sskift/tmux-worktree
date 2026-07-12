@@ -1,11 +1,18 @@
-import { basename, join } from "node:path";
-import { loadConfigFile } from "./config";
-import { loadManagedState, twHomeDir, type ManagedSession, type ManagedState } from "./state";
+import { basename } from "node:path";
+import { expandHomePath, loadConfigFile, resolveWorktreeBase } from "./config";
 import {
+  loadManagedState,
+  removeManagedSession,
+  type ManagedSession,
+  type ManagedState,
+} from "./state";
+import {
+  createManagedTerminalSession,
   createManagedWorktreeSession,
+  restoreManagedWorktreeSession,
   SESSION_NAME_MAX_LEN,
 } from "./session";
-import { listSessions, type SessionEntry } from "./tmux";
+import { listSessions, run, sessionExists, tmuxBin, type SessionEntry } from "./tmux";
 
 export const RPC_PROTOCOL_VERSION = 1;
 
@@ -45,6 +52,33 @@ export interface RpcCreateWorktreeResponse {
   branch?: string;
 }
 
+export interface RpcCreateTerminalArgs {
+  cwd: string;
+  aiCommand?: string;
+}
+
+export interface RpcCreateTerminalResponse {
+  protocolVersion: number;
+  kind: "terminal";
+  session: string;
+  cwd: string;
+}
+
+export interface RpcRestoreWorktreeArgs {
+  path: string;
+  name: string;
+  aiCommand?: string;
+  project?: string;
+}
+
+export interface RpcKillSessionResponse {
+  protocolVersion: number;
+  kind: "session-killed";
+  session: string;
+  sessionKind: "worktree" | "terminal";
+  killed: boolean;
+}
+
 export function buildRpcCapabilitiesResponse(): RpcCapabilitiesResponse {
   return {
     protocolVersion: RPC_PROTOCOL_VERSION,
@@ -53,6 +87,9 @@ export function buildRpcCapabilitiesResponse(): RpcCapabilitiesResponse {
       "list",
       "managed-state",
       "create-worktree",
+      "create-terminal",
+      "restore-worktree",
+      "kill-session",
     ],
   };
 }
@@ -131,7 +168,9 @@ export function buildRpcCreateWorktreeResponse(
   if (args.project?.trim() && !configuredProject && !args.path?.trim()) {
     throw new Error(`project '${args.project.trim()}' not in ~/.tmux-worktree.json`);
   }
-  const projectDir = args.path?.trim() || configuredProject?.path;
+  const projectDir = args.path?.trim()
+    ? expandHomePath(args.path.trim())
+    : configuredProject?.path;
   if (!projectDir) {
     throw new Error("create-worktree requires --path or --project");
   }
@@ -139,9 +178,7 @@ export function buildRpcCreateWorktreeResponse(
   const title = args.name?.trim();
   const sessionName = (title ? `${project}-${title}` : project)
     .slice(0, SESSION_NAME_MAX_LEN);
-  const worktreeBase = args.worktreeBase?.trim()
-    || config?.worktreeBase
-    || join(twHomeDir(), "worktrees");
+  const worktreeBase = resolveWorktreeBase(args.worktreeBase?.trim() || config?.worktreeBase);
   const branch = args.branch?.trim() || configuredProject?.branch;
   const created = createManagedWorktreeSession({
     aiCmd: args.aiCommand,
@@ -164,6 +201,136 @@ export function buildRpcCreateWorktreeResponse(
   };
 }
 
+export function parseRpcCreateTerminalArgs(args: string[]): RpcCreateTerminalArgs {
+  const parsed: Partial<RpcCreateTerminalArgs> = {};
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const next = () => {
+      const value = args[++i];
+      if (value === undefined) throw new Error(`missing value for ${arg}`);
+      return value;
+    };
+    if (arg === "--cwd" || arg === "--path") parsed.cwd = next();
+    else if (arg === "--ai-command" || arg === "--cmd") parsed.aiCommand = next();
+    else throw new Error(`unknown create-terminal option: ${arg}`);
+  }
+  if (!parsed.cwd?.trim()) throw new Error("create-terminal requires --cwd");
+  const result: RpcCreateTerminalArgs = { cwd: parsed.cwd.trim() };
+  if (parsed.aiCommand !== undefined) result.aiCommand = parsed.aiCommand.trim();
+  return result;
+}
+
+export function buildRpcCreateTerminalResponse(
+  args: RpcCreateTerminalArgs,
+): RpcCreateTerminalResponse {
+  const created = createManagedTerminalSession({
+    cwd: expandHomePath(args.cwd),
+    aiCmd: args.aiCommand,
+    profile: "dashboard",
+    quiet: true,
+  });
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "terminal",
+    session: created.session,
+    cwd: created.cwd,
+  };
+}
+
+export function parseRpcRestoreWorktreeArgs(args: string[]): RpcRestoreWorktreeArgs {
+  const parsed: Partial<RpcRestoreWorktreeArgs> = {};
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    const next = () => {
+      const value = args[++i];
+      if (value === undefined) throw new Error(`missing value for ${arg}`);
+      return value;
+    };
+    if (arg === "--path") parsed.path = next();
+    else if (arg === "--name") parsed.name = next();
+    else if (arg === "--ai-command" || arg === "--cmd") parsed.aiCommand = next();
+    else if (arg === "--project") parsed.project = next();
+    else throw new Error(`unknown restore-worktree option: ${arg}`);
+  }
+  if (!parsed.path?.trim()) throw new Error("restore-worktree requires --path");
+  if (!parsed.name?.trim()) throw new Error("restore-worktree requires --name");
+  const result: RpcRestoreWorktreeArgs = {
+    path: parsed.path.trim(),
+    name: parsed.name.trim().slice(0, SESSION_NAME_MAX_LEN),
+  };
+  if (parsed.aiCommand !== undefined) result.aiCommand = parsed.aiCommand.trim();
+  if (parsed.project?.trim()) result.project = parsed.project.trim();
+  return result;
+}
+
+export function buildRpcRestoreWorktreeResponse(
+  args: RpcRestoreWorktreeArgs,
+): RpcCreateWorktreeResponse {
+  const restored = restoreManagedWorktreeSession({
+    worktreePath: expandHomePath(args.path),
+    sessionName: args.name,
+    aiCmd: args.aiCommand,
+    projectKey: args.project,
+    profile: "dashboard",
+    quiet: true,
+  });
+  const state = loadManagedState();
+  const record = state.sessions.find((session) => session.name === restored.session);
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "worktree",
+    session: restored.session,
+    worktreePath: restored.workDir,
+    branch: record?.branch,
+  };
+}
+
+export function parseRpcKillSessionArgs(args: string[]): { name: string } {
+  let name: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--name" || arg === "--session") {
+      const value = args[++i];
+      if (value === undefined) throw new Error(`missing value for ${arg}`);
+      name = value;
+    } else {
+      throw new Error(`unknown kill-session option: ${arg}`);
+    }
+  }
+  if (!name?.trim()) throw new Error("kill-session requires --name");
+  return { name: name.trim() };
+}
+
+export function buildRpcKillSessionResponse(
+  args: { name: string },
+  deps: {
+    loadState?: () => ManagedState;
+    exists?: (name: string) => boolean;
+    kill?: (name: string) => void;
+    removeRecord?: (name: string) => void;
+  } = {},
+): RpcKillSessionResponse {
+  const state = (deps.loadState ?? loadManagedState)();
+  const managed = state.sessions.find((session) => session.name === args.name);
+  if (!managed) throw new Error(`session is not TW-managed: ${args.name}`);
+  const live = (deps.exists ?? sessionExists)(args.name);
+  if (live) {
+    (deps.kill ?? ((name) => {
+      run(tmuxBin(), ["kill-session", "-t", `=${name}`]);
+    }))(args.name);
+  }
+  (deps.removeRecord ?? ((name) => {
+    removeManagedSession(name);
+  }))(args.name);
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "session-killed",
+    session: args.name,
+    sessionKind: managed.kind,
+    killed: live,
+  };
+}
+
 export async function rpcCmd(args: string[]): Promise<void> {
   const sub = args[0] ?? "list";
   switch (sub) {
@@ -172,6 +339,15 @@ export async function rpcCmd(args: string[]): Promise<void> {
       return;
     case "create-worktree":
       console.log(JSON.stringify(buildRpcCreateWorktreeResponse(parseRpcCreateWorktreeArgs(args.slice(1)))));
+      return;
+    case "create-terminal":
+      console.log(JSON.stringify(buildRpcCreateTerminalResponse(parseRpcCreateTerminalArgs(args.slice(1)))));
+      return;
+    case "restore-worktree":
+      console.log(JSON.stringify(buildRpcRestoreWorktreeResponse(parseRpcRestoreWorktreeArgs(args.slice(1)))));
+      return;
+    case "kill-session":
+      console.log(JSON.stringify(buildRpcKillSessionResponse(parseRpcKillSessionArgs(args.slice(1)))));
       return;
     case "list":
       console.log(JSON.stringify(buildRpcListResponse(loadManagedState(), listSessions(true))));

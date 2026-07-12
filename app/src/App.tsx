@@ -28,6 +28,7 @@ import {
   TerminalDeck,
   sessionDisplayName,
   shellQuoteArg,
+  sharedSshConnectionArgs,
   terminalRawName,
   terminalSessionKey,
 } from "./dashboard/TerminalDeck";
@@ -127,17 +128,19 @@ function projectKey(name: string): string {
 }
 
 function buildSshShellArgs(host: HostConfig, cwd: string): string[] {
-  const args: string[] = ["-tt", "-o", "StrictHostKeyChecking=accept-new"];
+  const args: string[] = ["-tt", ...sharedSshConnectionArgs()];
   if (host.port) {
     args.push("-p", String(host.port));
   }
   if (host.identityFile) {
     args.push("-i", host.identityFile);
   }
-  const target = host.user ? `${host.user}@${host.host}` : host.host;
+  if (host.user) {
+    args.push("-l", host.user);
+  }
   args.push(
-    target,
     "--",
+    host.host,
     `cd ${shellQuoteArg(cwd)} && exec "\${SHELL:-/bin/sh}"`,
   );
   return args;
@@ -164,6 +167,7 @@ function normalizePlainTerminal(terminal: PlainTerminal): PlainTerminal {
 
 function isLocalDiscoveredInternalTerminal(terminal: PlainTerminal): boolean {
   if (terminal.hostId) return false;
+  if (terminal.managed) return false;
   return isInternalTerminalName(terminal.rawName) || isInternalTerminalName(terminal.tmuxName);
 }
 
@@ -190,7 +194,8 @@ function sameSessions(a: Session[], b: Session[]): boolean {
       (left.agent_running ?? null) === (right.agent_running ?? null) &&
       (left.hostId ?? null) === (right.hostId ?? null) &&
       (left.rawName ?? "") === (right.rawName ?? "") &&
-      (left.project ?? "") === (right.project ?? "")
+      (left.project ?? "") === (right.project ?? "") &&
+      (left.managed ?? false) === (right.managed ?? false)
     );
   });
 }
@@ -206,7 +211,8 @@ function samePlainTerminals(a: PlainTerminal[], b: PlainTerminal[]): boolean {
       (left.hostId ?? null) === (right.hostId ?? null) &&
       (left.rawName ?? "") === (right.rawName ?? "") &&
       (left.aiCmd ?? "") === (right.aiCmd ?? "") &&
-      (left.discovered ?? false) === (right.discovered ?? false)
+      (left.discovered ?? false) === (right.discovered ?? false) &&
+      (left.managed ?? false) === (right.managed ?? false)
     );
   });
 }
@@ -605,19 +611,33 @@ function App() {
     const loadPersistedTerminals = async () => {
       try {
         const saved = await dashboardBackend.terminals.load();
-        const restored = saved
+        const candidates = saved
           .filter((terminal) => terminal.tmuxName)
           .map(normalizePlainTerminal);
 
-        await Promise.all(restored.map((terminal) =>
-          dashboardBackend.terminals.ensure({
+        // New metadata records point at sessions owned by TW state. Never
+        // resurrect one that an agent intentionally removed through the RPC.
+        // Records without `managed` predate the RPC contract and retain the
+        // legacy direct-tmux ensure path for migration compatibility.
+        const restored = (await Promise.all(candidates.map(async (terminal) => {
+          if (terminal.managed) {
+            try {
+              return await dashboardBackend.sessions.exists(terminal.tmuxName) ? terminal : null;
+            } catch {
+              // A transient SSH/runtime failure cannot authorize deleting
+              // remote metadata; the next successful hydration will decide.
+              return terminal;
+            }
+          }
+          await dashboardBackend.terminals.ensure({
             name: terminal.tmuxName,
             cwd: terminal.cwd,
             aiCmd: terminal.aiCmd ?? "",
             hostId: terminal.hostId ?? null,
             rawName: terminal.rawName ?? null,
-          }).catch(() => {}),
-        ));
+          }).catch(() => {});
+          return terminal;
+        }))).filter((terminal): terminal is PlainTerminal => terminal !== null);
         if (disposed) return;
 
         setTerminals((current) => {
@@ -1718,7 +1738,7 @@ function App() {
           "The worktree and its files will not be deleted.",
       });
       if (!confirmed) return;
-      await dashboardBackend.sessions.kill(name);
+      await dashboardBackend.sessions.kill(name, session?.managed ?? false);
       setSessions((current) => current.filter((session) => session.name !== name));
       setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
       setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
@@ -1746,10 +1766,10 @@ function App() {
       });
       if (!confirmed) return;
       if (terminal.discovered) {
-        await dashboardBackend.sessions.kill(sessionKey);
+        await dashboardBackend.sessions.kill(sessionKey, terminal.managed ?? false);
         setDiscoveredTerminals((current) => current.filter((candidate) => candidate.id !== id));
       } else {
-        await dashboardBackend.terminals.kill(sessionKey);
+        await dashboardBackend.terminals.kill(sessionKey, terminal.managed ?? false);
         setTerminals((current) => current.filter((candidate) => candidate.id !== id));
       }
       setOpenedTerminals((current) => current.filter((terminalId) => terminalId !== id));
@@ -2457,11 +2477,12 @@ function App() {
               {
                 id,
                 label: draft.label,
-                cwd: draft.cwd,
+                cwd: created.cwd,
                 tmuxName: created.tmuxName,
                 hostId: created.hostId ?? draft.hostId ?? null,
                 rawName: created.rawName,
                 aiCmd: draft.aiCmd,
+                managed: created.managed,
               },
             ]);
             setShowNewTerminal(false);
