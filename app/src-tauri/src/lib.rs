@@ -1,3 +1,9 @@
+mod ipc;
+mod support;
+
+use ipc::*;
+use support::*;
+
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
@@ -9,51 +15,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{Emitter, Manager, State};
-
-/// macOS .app 包启动时环境变量极少，从用户登录 shell 继承完整环境
-/// （PATH、TMUX_TMPDIR、LANG 等），这样 tmux/git 子进程才能正常工作。
-fn inherit_shell_env() {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
-    let output = std::process::Command::new(&shell)
-        .args(["-l", "-c", "env -0"])
-        .output();
-    let output = match output {
-        Ok(o) if o.status.success() => o,
-        _ => return,
-    };
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for entry in stdout.split('\0') {
-        if let Some((key, val)) = entry.split_once('=') {
-            if matches!(key, "PWD" | "OLDPWD" | "_" | "SHLVL") {
-                continue;
-            }
-            unsafe {
-                std::env::set_var(key, val);
-            }
-        }
-    }
-}
-
-fn app_home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("TW_DASHBOARD_HOME")
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir)
-}
-
-fn app_home_dir_or_tmp() -> std::path::PathBuf {
-    app_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
-}
-
-const LEGACY_DEFAULT_WORKTREE_BASE: &str = "/private/tmp/tmux-worktree/projects";
-
-fn default_worktree_base() -> String {
-    app_home_dir_or_tmp()
-        .join(".tmux-worktree")
-        .join("worktrees")
-        .to_string_lossy()
-        .to_string()
-}
 
 fn dashboard_config_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -220,82 +181,6 @@ fn dashboard_terminal_write_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn atomic_write_file_with<F>(path: &Path, contents: &[u8], before_rename: F) -> Result<(), String>
-where
-    F: FnOnce(&Path) -> Result<(), String>,
-{
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| format!("invalid file path: {}", path.display()))?;
-    let temp_path = parent.join(format!(
-        ".{file_name}.tmp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-
-    let result = (|| -> Result<(), String> {
-        let mut options = std::fs::OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp_path)
-            .map_err(|err| format!("create {}: {err}", temp_path.display()))?;
-        file.write_all(contents)
-            .map_err(|err| format!("write {}: {err}", temp_path.display()))?;
-        file.flush()
-            .map_err(|err| format!("flush {}: {err}", temp_path.display()))?;
-        file.sync_all()
-            .map_err(|err| format!("sync {}: {err}", temp_path.display()))?;
-        drop(file);
-
-        before_rename(&temp_path)?;
-        std::fs::rename(&temp_path, path).map_err(|err| {
-            format!(
-                "rename {} to {}: {err}",
-                temp_path.display(),
-                path.display()
-            )
-        })?;
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
-    })();
-
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp_path);
-    }
-    result
-}
-
-fn atomic_write_file(path: &Path, contents: &[u8]) -> Result<(), String> {
-    atomic_write_file_with(path, contents, |_| Ok(()))
-}
-
-fn expand_home_path_with_home(value: &str, home: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed == "~" {
-        return home.to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        return Path::new(home).join(rest).to_string_lossy().to_string();
-    }
-    trimmed.to_string()
-}
-
-fn expand_home_path(value: &str) -> String {
-    let home = app_home_dir_or_tmp().to_string_lossy().to_string();
-    expand_home_path_with_home(value, &home)
-}
-
 fn ssh_control_path() -> Option<String> {
     let directory = app_home_dir_or_tmp().join(".tmux-worktree").join("ssh");
     std::fs::create_dir_all(&directory).ok()?;
@@ -320,74 +205,6 @@ fn apply_ssh_multiplex_options(command: &mut std::process::Command) {
         .arg("ControlPersist=600")
         .arg("-o")
         .arg(format!("ControlPath={control_path}"));
-}
-
-fn tmux_bin() -> &'static str {
-    static BIN: OnceLock<String> = OnceLock::new();
-    BIN.get_or_init(|| {
-        for p in [
-            "/opt/homebrew/bin/tmux",
-            "/usr/local/bin/tmux",
-            "/usr/bin/tmux",
-        ] {
-            if std::path::Path::new(p).exists() {
-                return p.to_string();
-            }
-        }
-        "tmux".to_string()
-    })
-}
-
-fn git_bin() -> &'static str {
-    static BIN: OnceLock<String> = OnceLock::new();
-    BIN.get_or_init(|| {
-        for p in [
-            "/opt/homebrew/bin/git",
-            "/usr/local/bin/git",
-            "/usr/bin/git",
-        ] {
-            if std::path::Path::new(p).exists() {
-                return p.to_string();
-            }
-        }
-        "git".to_string()
-    })
-}
-
-fn resolve_cmd(name: &str) -> &str {
-    match name {
-        "tmux" => tmux_bin(),
-        "git" => git_bin(),
-        _ => name,
-    }
-}
-
-#[derive(Serialize, Clone)]
-struct DirEntry {
-    name: String,
-    path: String,
-    is_dir: bool,
-    is_symlink: bool,
-    is_hidden: bool,
-    size: u64,
-}
-
-#[derive(Serialize, Clone)]
-struct Session {
-    name: String,
-    attached: bool,
-    window_count: u32,
-    created: u64,
-    activity: u64,
-    output_signature: Option<String>,
-    agent_running: Option<bool>,
-    #[serde(default, rename = "hostId")]
-    host_id: Option<String>,
-    #[serde(default, rename = "rawName")]
-    raw_name: String,
-    #[serde(default)]
-    project: Option<String>,
-    managed: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -476,36 +293,6 @@ fn validate_ssh_host_fields(host: &HostConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct HostStatus {
-    id: String,
-    label: String,
-    reachable: bool,
-    latency_ms: Option<u64>,
-    error: Option<String>,
-    tmux_available: bool,
-    tmux_version: Option<String>,
-    tmux_error: Option<String>,
-    tw_available: bool,
-    tw_version: Option<String>,
-    tw_error: Option<String>,
-    tw_protocol_version: Option<u32>,
-    tw_capabilities: Vec<String>,
-    tw_compatible: bool,
-}
-
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct AgentProbeResult {
-    id: String,
-    label: String,
-    command: String,
-    available: bool,
-    executable_path: Option<String>,
-    error: Option<String>,
-}
-
 #[derive(Clone, Copy)]
 struct AgentProbeSpec {
     id: &'static str,
@@ -541,96 +328,6 @@ const AGENT_PROBE_SPECS: [AgentProbeSpec; 5] = [
     },
 ];
 
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct TmuxTerminal {
-    id: String,
-    label: String,
-    cwd: String,
-    tmux_name: String,
-    host_id: Option<String>,
-    raw_name: String,
-    managed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DashboardCatalogSnapshot {
-    sessions: Vec<Session>,
-    terminals: Vec<TmuxTerminal>,
-    failed_session_host_ids: Vec<String>,
-    failed_terminal_host_ids: Vec<String>,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct CreatedTerminal {
-    tmux_name: String,
-    host_id: Option<String>,
-    raw_name: String,
-    cwd: String,
-    managed: bool,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcListResponse {
-    protocol_version: u32,
-    sessions: Vec<TwRpcSession>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcSession {
-    name: String,
-    kind: String,
-    #[serde(default)]
-    project: Option<String>,
-    attached: bool,
-    windows: u32,
-    created: u64,
-    activity: u64,
-    #[serde(default)]
-    cwd: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcCreateWorktreeResponse {
-    protocol_version: u32,
-    #[serde(default)]
-    kind: Option<String>,
-    session: String,
-    #[serde(default)]
-    worktree_path: Option<String>,
-    #[serde(default)]
-    branch: Option<String>,
-}
-
-#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcCreateTerminalResponse {
-    protocol_version: u32,
-    kind: String,
-    session: String,
-    cwd: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcKillSessionResponse {
-    protocol_version: u32,
-    kind: String,
-    session: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TwRpcCapabilitiesResponse {
-    protocol_version: u32,
-    capabilities: Vec<String>,
-}
-
 #[derive(Clone, Default)]
 struct RemoteSessionActivitySample {
     output_signature: Option<String>,
@@ -645,13 +342,6 @@ struct CachedHostStatus {
 #[derive(Default)]
 struct HostState {
     statuses: Mutex<HashMap<String, CachedHostStatus>>,
-}
-
-#[derive(Serialize, Clone)]
-struct Project {
-    name: String,
-    path: String,
-    branch: Option<String>,
 }
 
 const GIT_FETCH_INTERVAL_SECONDS: u64 = 5 * 60;
@@ -700,50 +390,6 @@ impl Default for MobileRelayState {
             last_error: Mutex::new(None),
         }
     }
-}
-
-#[derive(Serialize, Clone)]
-struct PtyChunk {
-    id: String,
-    data: String,
-}
-
-#[derive(Serialize, Clone)]
-struct PtyExit {
-    id: String,
-    code: i32,
-}
-
-#[derive(Deserialize)]
-struct OpenArgs {
-    id: Option<String>,
-    cmd: String,
-    args: Vec<String>,
-    cwd: Option<String>,
-    cols: u16,
-    rows: u16,
-    env: Option<HashMap<String, String>>,
-}
-
-#[derive(Deserialize)]
-struct CreateTerminalArgs {
-    cwd: String,
-    #[serde(rename = "aiCmd")]
-    ai_cmd: String,
-    #[serde(rename = "hostId", default)]
-    host_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct EnsureTerminalArgs {
-    name: String,
-    cwd: String,
-    #[serde(rename = "aiCmd", default)]
-    ai_cmd: Option<String>,
-    #[serde(rename = "hostId", default)]
-    host_id: Option<String>,
-    #[serde(rename = "rawName", default)]
-    raw_name: Option<String>,
 }
 
 #[tauri::command]
@@ -1621,26 +1267,6 @@ fn now_rfc3339() -> String {
     unix_seconds_to_rfc3339(secs)
 }
 
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    let mut quoted = String::from("'");
-    for ch in value.chars() {
-        if ch == '\'' {
-            quoted.push_str("'\\''");
-        } else {
-            quoted.push(ch);
-        }
-    }
-    quoted.push('\'');
-    quoted
-}
-
-fn user_bin_path_prefix() -> &'static str {
-    "export PATH=\"$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\""
-}
-
 fn automation_command_with_instruction(ai_cmd: &str, instruction: &str) -> String {
     let command = ai_cmd.trim();
     let instruction = instruction.trim();
@@ -2084,29 +1710,6 @@ fn ssh_command(host: &HostConfig, remote_cmd: &[&str]) -> Result<std::process::C
         ));
     }
     Ok(cmd)
-}
-
-fn shell_join(args: &[&str]) -> String {
-    args.iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn remote_path_expr(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed == "~" {
-        return "\"$HOME\"".to_string();
-    }
-    if let Some(rest) = trimmed.strip_prefix("~/") {
-        let escaped = rest
-            .replace('\\', "\\\\")
-            .replace('"', "\\\"")
-            .replace('$', "\\$")
-            .replace('`', "\\`");
-        return format!("\"$HOME/{escaped}\"");
-    }
-    shell_quote(trimmed)
 }
 
 fn remote_tmux_cmd(host: &HostConfig) -> String {
@@ -3328,16 +2931,6 @@ fn copy_bytes_to_clipboard(bytes: &[u8]) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("pbcopy exited {status}"))
-    }
-}
-
-fn command_then_login_shell(command: &str) -> String {
-    let path = user_bin_path_prefix();
-    let shell = "exec \"${SHELL:-/bin/zsh}\" -l";
-    if command.trim().is_empty() {
-        format!("{path}; {shell}")
-    } else {
-        format!("{path}; {command}; {shell}")
     }
 }
 
