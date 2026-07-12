@@ -1,4 +1,8 @@
-import type { PlainTerminal } from "./platform";
+import type { DashboardBackend, PlainTerminal } from "./platform";
+import {
+  normalizePlainTerminal,
+  terminalSessionKey,
+} from "./dashboard/model/terminalIdentity";
 
 export type TerminalSaveScheduler = (
   callback: () => void,
@@ -20,6 +24,58 @@ type TerminalSaveCoordinatorOptions = {
 
 function copyTerminalSnapshot(terminals: readonly PlainTerminal[]): PlainTerminal[] {
   return terminals.map((terminal) => ({ ...terminal }));
+}
+
+type TerminalMetadataRestoreBackend = Pick<DashboardBackend, "sessions" | "terminals">;
+
+/**
+ * Resolves persisted terminal metadata against the currently running tmux
+ * sessions. Managed records are owned by TW state and are never resurrected;
+ * legacy records retain the direct-tmux ensure path for migration.
+ */
+export async function restorePersistedTerminalMetadata(
+  saved: readonly PlainTerminal[],
+  backend: TerminalMetadataRestoreBackend,
+): Promise<PlainTerminal[]> {
+  const candidates = saved
+    .filter((terminal) => terminal.tmuxName)
+    .map(normalizePlainTerminal);
+
+  const restored = await Promise.all(candidates.map(async (terminal) => {
+    if (terminal.managed) {
+      try {
+        return await backend.sessions.exists(terminal.tmuxName) ? terminal : null;
+      } catch {
+        return terminal;
+      }
+    }
+    await backend.terminals.ensure({
+      name: terminal.tmuxName,
+      cwd: terminal.cwd,
+      aiCmd: terminal.aiCmd ?? "",
+      hostId: terminal.hostId ?? null,
+      rawName: terminal.rawName ?? null,
+    }).catch(() => {});
+    return terminal;
+  }));
+
+  return restored.filter((terminal): terminal is PlainTerminal => terminal !== null);
+}
+
+/**
+ * Publishes restored metadata first while retaining terminals created during
+ * the asynchronous load. Runtime identity, rather than the metadata id, owns
+ * de-duplication so a concurrent record cannot remount the same tmux session.
+ */
+export function mergeRestoredTerminalMetadata(
+  current: readonly PlainTerminal[],
+  restored: readonly PlainTerminal[],
+): PlainTerminal[] {
+  const restoredKeys = new Set(restored.map(terminalSessionKey));
+  return [
+    ...restored,
+    ...current.filter((terminal) => !restoredKeys.has(terminalSessionKey(terminal))),
+  ];
 }
 
 /**

@@ -7,7 +7,6 @@ import {
   pendingRestoredCatalogSelection,
   reconcileCatalogSelection,
 } from "../src/dashboard/model/selection";
-import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const localSession: Session = {
   name: "local-worktree",
@@ -319,20 +318,26 @@ test("the renderer publishes the local catalog before the slower remote-aware sn
   assert.match(refreshSource, /const refreshGeneration = \+\+options\.generation\.started/);
   assert.match(refreshSource, /catalog\?\.listLocal/);
   assert.match(refreshSource, /await catalog\.listLocal\(\)\.catch\(\(\) => null\)/);
-  assert.ok(
-    refreshSource.indexOf("await catalog.listLocal()") <
-      refreshSource.indexOf("await catalog.list()"),
-  );
+  const localCatalogIndex = refreshSource.indexOf("await catalog.listLocal()");
+  const fullCatalogIndex = refreshSource.indexOf("await catalog.list()");
+  assert.ok(localCatalogIndex >= 0);
+  assert.ok(fullCatalogIndex >= 0);
+  assert.ok(localCatalogIndex < fullCatalogIndex);
   assert.match(
     refreshSource,
     /await Promise\.all\(\[\s*options\.backend\.sessions\.list\(\),\s*options\.backend\.terminals\.listTmux\(\),\s*\]\)/s,
   );
   assert.doesNotMatch(refreshSource, /listTmux\(\)\.catch/);
-  assert.ok(
-    refreshSource.indexOf("options.generation.successful = refreshGeneration") <
-      refreshSource.indexOf("options.publishFull({"),
+  const successfulIndex = refreshSource.indexOf(
+    "options.generation.successful = refreshGeneration",
   );
-  const catchSource = refreshSource.slice(refreshSource.indexOf("} catch (error)"));
+  const publishFullIndex = refreshSource.indexOf("options.publishFull({");
+  assert.ok(successfulIndex >= 0);
+  assert.ok(publishFullIndex >= 0);
+  assert.ok(successfulIndex < publishFullIndex);
+  const catchIndex = refreshSource.indexOf("} catch (error)");
+  assert.ok(catchIndex >= 0);
+  const catchSource = refreshSource.slice(catchIndex);
   assert.match(catchSource, /options\.publishError\(String\(error\)\)/);
   assert.doesNotMatch(catchSource, /generation\.successful|publishLocal|publishFull/);
 });
@@ -344,38 +349,45 @@ test("Host readiness distinguishes initial empty state from a successful empty c
   );
   const loadStart = hookSource.indexOf("const loadHosts = useCallback");
   const loadEnd = hookSource.indexOf("useVisibilityAwarePolling(loadHosts", loadStart);
+  assert.ok(loadStart >= 0);
+  assert.ok(loadEnd > loadStart);
   const loadSource = hookSource.slice(loadStart, loadEnd);
 
   assert.match(hookSource, /useState\(0\).*hostsHydrationGeneration|hostsHydrationGeneration.*useState\(0\)/s);
   assert.match(loadSource, /setHostsHydrationGeneration\(\(generation\) => generation \+ 1\)/);
-  assert.doesNotMatch(loadSource.slice(loadSource.indexOf("} catch")), /setHostsHydrationGeneration/);
+  const loadCatchIndex = loadSource.indexOf("} catch");
+  assert.ok(loadCatchIndex >= 0);
+  assert.doesNotMatch(loadSource.slice(loadCatchIndex), /setHostsHydrationGeneration/);
   assert.doesNotMatch(loadSource, /Promise\.all/);
   assert.match(hookSource, /enabled: hostsHydrationGeneration === 0/);
   assert.match(hookSource, /visibleIntervalMs: HOST_CATALOG_RETRY_MS/);
+  const hostsListIndex = loadSource.indexOf("dashboardBackend.hosts.list()");
+  const hostCandidatesIndex = loadSource.indexOf("dashboardBackend.hosts.candidates()");
+  assert.ok(hostsListIndex >= 0);
+  assert.ok(hostCandidatesIndex >= 0);
   assert.ok(
-    loadSource.indexOf("dashboardBackend.hosts.list()") <
-      loadSource.indexOf("dashboardBackend.hosts.candidates()"),
+    hostsListIndex < hostCandidatesIndex,
     "SSH candidate failure must not block Host hydration",
   );
 });
 
 test("terminal metadata failure keeps fallback pending without authorizing an empty save", () => {
-  const { source: loadImplementation } = rendererImplementationSourceContaining(
-    "const loadPersistedTerminals = async",
-    "setTerminalPersistenceWritable(true)",
+  const hookSource = readFileSync(
+    new URL("../src/dashboard/hooks/useTerminalMetadata.ts", import.meta.url),
+    "utf8",
   );
-  const loadStart = loadImplementation.indexOf("const loadPersistedTerminals = async");
-  const loadEnd = loadImplementation.indexOf("// Load layout data on mount", loadStart);
-  const loadSource = loadImplementation.slice(loadStart, loadEnd);
+  const loadStart = hookSource.indexOf("export function useTerminalMetadataHydrationPhase");
+  const loadEnd = hookSource.indexOf(
+    "export function useTerminalMetadataPersistencePhase",
+    loadStart,
+  );
+  assert.ok(loadStart >= 0);
+  assert.ok(loadEnd > loadStart);
+  const loadSource = hookSource.slice(loadStart, loadEnd);
   const loadFailureStart = loadSource.indexOf("} catch (nextError)");
+  assert.ok(loadFailureStart >= 0);
   const loadFailureSource = loadSource.slice(loadFailureStart);
-  const { source: saveImplementation } = rendererImplementationSourceContaining(
-    "// Persist terminal metadata",
-    "dashboardBackend.terminals.save(snapshot)",
-  );
-  const saveStart = saveImplementation.indexOf("// Persist terminal metadata");
-  const saveEnd = saveImplementation.indexOf("// Persist layout", saveStart);
-  const saveSource = saveImplementation.slice(saveStart, saveEnd);
+  const saveSource = hookSource.slice(loadEnd);
 
   assert.match(loadSource, /setTerminalPersistenceWritable\(true\)/);
   assert.match(loadSource, /setTerminalPersistenceError\(`Terminal metadata could not be loaded:/);
@@ -383,8 +395,9 @@ test("terminal metadata failure keeps fallback pending without authorizing an em
   assert.doesNotMatch(loadFailureSource, /settleHydration\(\)/);
   assert.match(loadFailureSource, /window\.setTimeout/);
   assert.match(saveSource, /!terminalsRestoreReady \|\| !terminalPersistenceWritable/);
-  assert.ok(
-    saveSource.indexOf("terminalPersistenceWritable") <
-      saveSource.indexOf("dashboardBackend.terminals.save(snapshot)"),
-  );
+  const writableGuardIndex = saveSource.indexOf("terminalPersistenceWritable");
+  const terminalSaveIndex = saveSource.indexOf("backend.terminals.save(snapshot)");
+  assert.ok(writableGuardIndex >= 0);
+  assert.ok(terminalSaveIndex >= 0);
+  assert.ok(writableGuardIndex < terminalSaveIndex);
 });

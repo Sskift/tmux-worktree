@@ -2,7 +2,6 @@ import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Plus, X } from "lucide-react";
 import {
   type DashboardWindow,
-  type PlainTerminal,
   useDashboardBackend,
 } from "./platform";
 import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
@@ -12,6 +11,11 @@ import {
 } from "./dashboard/hooks/useWorkspaceCatalog";
 import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
 import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
+import {
+  useTerminalMetadata,
+  useTerminalMetadataHydrationPhase,
+  useTerminalMetadataPersistencePhase,
+} from "./dashboard/hooks/useTerminalMetadata";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
 import {
   CommandPalette,
@@ -81,9 +85,7 @@ import {
 } from "./editorNavigationGuard";
 import {
   allocateTerminalId,
-  createTerminalSaveCoordinator,
   renamePersistedTerminal,
-  type TerminalSaveCoordinator,
 } from "./terminalPersistence";
 import { createLatestRequestGate } from "./latestRequestGate";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
@@ -139,13 +141,13 @@ let scratchIdCounter = 0;
 function App() {
   const dashboardBackend = useDashboardBackend();
   const { loadLayoutPreferences, saveLayoutPreferences } = useLayoutPreferences();
-  const [terminals, setTerminals] = useState<PlainTerminal[]>([]);
-  const [terminalsRestoreReady, setTerminalsRestoreReady] = useState(false);
-  const [terminalPersistenceWritable, setTerminalPersistenceWritable] = useState(false);
-  const [terminalPersistenceError, setTerminalPersistenceError] = useState<string | null>(null);
-  const [terminalPersistenceHydrationGeneration, setTerminalPersistenceHydrationGeneration] =
-    useState(0);
-  const terminalSaveCoordinatorRef = useRef<TerminalSaveCoordinator | null>(null);
+  const terminalMetadata = useTerminalMetadata();
+  const {
+    terminals,
+    setTerminals,
+    terminalPersistenceError,
+    terminalPersistenceHydrationGeneration,
+  } = terminalMetadata;
   const [automations, setAutomations] = useState<Automation[]>([]);
   const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
   const [automationError, setAutomationError] = useState<string | null>(null);
@@ -478,78 +480,7 @@ function App() {
 
   // Persisted terminal metadata is retried independently from the live tmux
   // catalog. A failed read must never authorize saving an empty replacement.
-  useEffect(() => {
-    let disposed = false;
-    let retryTimer: number | null = null;
-    let hydrationSettled = false;
-
-    const settleHydration = () => {
-      if (hydrationSettled || disposed) return;
-      hydrationSettled = true;
-      setTerminalsRestoreReady(true);
-      setTerminalPersistenceHydrationGeneration((generation) => generation + 1);
-    };
-
-    const loadPersistedTerminals = async () => {
-      try {
-        const saved = await dashboardBackend.terminals.load();
-        const candidates = saved
-          .filter((terminal) => terminal.tmuxName)
-          .map(normalizePlainTerminal);
-
-        // New metadata records point at sessions owned by TW state. Never
-        // resurrect one that an agent intentionally removed through the RPC.
-        // Records without `managed` predate the RPC contract and retain the
-        // legacy direct-tmux ensure path for migration compatibility.
-        const restored = (await Promise.all(candidates.map(async (terminal) => {
-          if (terminal.managed) {
-            try {
-              return await dashboardBackend.sessions.exists(terminal.tmuxName) ? terminal : null;
-            } catch {
-              // A transient SSH/runtime failure cannot authorize deleting
-              // remote metadata; the next successful hydration will decide.
-              return terminal;
-            }
-          }
-          await dashboardBackend.terminals.ensure({
-            name: terminal.tmuxName,
-            cwd: terminal.cwd,
-            aiCmd: terminal.aiCmd ?? "",
-            hostId: terminal.hostId ?? null,
-            rawName: terminal.rawName ?? null,
-          }).catch(() => {});
-          return terminal;
-        }))).filter((terminal): terminal is PlainTerminal => terminal !== null);
-        if (disposed) return;
-
-        setTerminals((current) => {
-          const restoredKeys = new Set(restored.map(terminalSessionKey));
-          return [
-            ...restored,
-            ...current.filter((terminal) => !restoredKeys.has(terminalSessionKey(terminal))),
-          ];
-        });
-        setTerminalPersistenceWritable(true);
-        setTerminalPersistenceError(null);
-        settleHydration();
-      } catch (nextError) {
-        if (disposed) return;
-        setTerminalPersistenceError(`Terminal metadata could not be loaded: ${String(nextError)}`);
-        // Keep metadata hydration pending. Falling back while a retry can still
-        // restore the selected terminal would persist the wrong selection.
-        retryTimer = window.setTimeout(
-          () => void loadPersistedTerminals(),
-          document.hidden ? 15_000 : 3_000,
-        );
-      }
-    };
-
-    void loadPersistedTerminals();
-    return () => {
-      disposed = true;
-      if (retryTimer !== null) window.clearTimeout(retryTimer);
-    };
-  }, [dashboardBackend]);
+  useTerminalMetadataHydrationPhase(terminalMetadata, dashboardBackend);
 
   const {
     sessions,
@@ -657,46 +588,7 @@ function App() {
   // Persist terminal metadata serially. The coordinator keeps the newest
   // snapshot queued and retries failed writes without allowing an older save
   // to land after a newer one.
-  useEffect(() => {
-    if (!terminalsRestoreReady || !terminalPersistenceWritable) {
-      terminalSaveCoordinatorRef.current?.stop();
-      terminalSaveCoordinatorRef.current = null;
-      return;
-    }
-
-    const coordinator = createTerminalSaveCoordinator({
-      save: (snapshot) => dashboardBackend.terminals.save(snapshot),
-      schedule: (callback, delayMs) => {
-        const timer = window.setTimeout(callback, delayMs);
-        return () => window.clearTimeout(timer);
-      },
-      retryDelayMs: () => document.hidden ? 15_000 : 3_000,
-      onError: (nextError) => {
-        setTerminalPersistenceError(
-          `Terminal metadata could not be saved: ${String(nextError)}`,
-        );
-      },
-      onSaved: () => setTerminalPersistenceError(null),
-    });
-    terminalSaveCoordinatorRef.current = coordinator;
-
-    return () => {
-      coordinator.stop();
-      if (terminalSaveCoordinatorRef.current === coordinator) {
-        terminalSaveCoordinatorRef.current = null;
-      }
-    };
-  }, [dashboardBackend, terminalPersistenceWritable, terminalsRestoreReady]);
-
-  useEffect(() => {
-    if (!terminalsRestoreReady || !terminalPersistenceWritable) return;
-    const coordinator = terminalSaveCoordinatorRef.current;
-    if (!coordinator) return;
-    // Defer the enqueue one task so React StrictMode's synthetic mount cleanup
-    // can cancel it before any backend write begins.
-    const timer = window.setTimeout(() => coordinator.enqueue(terminals), 0);
-    return () => window.clearTimeout(timer);
-  }, [terminalPersistenceWritable, terminals, terminalsRestoreReady]);
+  useTerminalMetadataPersistencePhase(terminalMetadata, dashboardBackend);
 
   // Persist layout (debounced)
   useEffect(() => {

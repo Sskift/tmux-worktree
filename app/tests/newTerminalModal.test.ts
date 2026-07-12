@@ -74,11 +74,10 @@ test("the renderer creates persisted terminals through the host-aware command", 
     "cwd: created.cwd",
     "managed: created.managed",
   ).source;
-  const restoration = rendererImplementationSourceContaining(
-    "if (terminal.managed)",
-    "dashboardBackend.sessions.exists(terminal.tmuxName)",
-    "dashboardBackend.terminals.ensure({",
-  ).source;
+  const restoration = readFileSync(
+    new URL("../src/terminalPersistence.ts", import.meta.url),
+    "utf8",
+  );
   const identity = readFileSync(new URL("../src/dashboard/model/terminalIdentity.ts", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
@@ -92,12 +91,19 @@ test("the renderer creates persisted terminals through the host-aware command", 
   );
   assert.match(
     restoration,
-    /if \(terminal\.managed\) \{\s*try \{\s*return await dashboardBackend\.sessions\.exists\(terminal\.tmuxName\) \? terminal : null/s,
+    /if \(terminal\.managed\) \{\s*try \{\s*return await backend\.sessions\.exists\(terminal\.tmuxName\) \? terminal : null/s,
   );
-  assert.match(restoration, /dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
+  assert.match(restoration, /backend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
   assert.match(creation, /cwd:\s*created\.cwd/);
   assert.match(creation, /managed:\s*created\.managed/);
-  assert.match(restoration, /aiCmd:\s*terminal\.aiCmd/);
+  assert.match(restoration, /aiCmd:\s*terminal\.aiCmd \?\? ""/);
   assert.match(identity, /export function terminalSessionKey/);
-  assert.match(restoration, /persistedKeys/);
+  assert.match(
+    restoration,
+    /const restoredKeys = new Set\(restored\.map\(terminalSessionKey\)\)/,
+  );
+  assert.match(
+    restoration,
+    /\.\.\.current\.filter\(\(terminal\) => !restoredKeys\.has\(terminalSessionKey\(terminal\)\)\)/,
+  );
 });
