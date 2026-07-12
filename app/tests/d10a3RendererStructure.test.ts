@@ -10,6 +10,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useDashboardLayout.ts", import.meta.url),
     "utf8",
   ),
+  coordinator: readFileSync(
+    new URL("../src/dashboard/layoutSaveCoordinator.ts", import.meta.url),
+    "utf8",
+  ),
   connection: readFileSync(
     new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
@@ -155,6 +159,15 @@ const layoutExports = [
   "useDashboardLayoutState",
   "useDashboardViewportResizePhase",
   "useDashboardWindowCapturePhase",
+] as const;
+
+const coordinatorExports = [
+  "LayoutSaveAuthorization",
+  "LayoutSaveCoordinator",
+  "LayoutSaveCoordinatorOptions",
+  "LayoutSaveFailureClassification",
+  "LayoutSaveScheduler",
+  "createLayoutSaveCoordinator",
 ] as const;
 
 function assertExactCanonicalExport(sourceFile: ts.SourceFile): void {
@@ -487,6 +500,77 @@ function assertNamedImportFromApp(appFile: ts.SourceFile): void {
   );
 }
 
+test("layout save coordinator has one reachable pure owner and an exact API", () => {
+  const coordinatorFile = parse("layoutSaveCoordinator.ts", sources.coordinator);
+  const exported = exportedNames(coordinatorFile);
+  assert.equal(new Set(exported.map(({ name }) => name)).size, exported.length);
+  assert.deepEqual(
+    exported.map(({ name }) => name).sort(),
+    [...coordinatorExports].sort(),
+  );
+  assert.deepEqual(
+    exported.filter(({ runtime }) => runtime).map(({ name }) => name),
+    ["createLayoutSaveCoordinator"],
+  );
+  assert.deepEqual(importManifest(coordinatorFile), [
+    "./layout/types|DashboardLayoutPreferences|DashboardLayoutPreferences|type",
+  ]);
+  assertNoIndirectModuleEdges(coordinatorFile);
+  assert.equal(
+    coordinatorFile.statements.some(
+      (statement) =>
+        ts.isExportDeclaration(statement) || ts.isExportAssignment(statement),
+    ),
+    false,
+  );
+  assert.doesNotMatch(
+    sources.coordinator,
+    /\b(?:React|useEffect|useState|localStorage|fetch|backend|flushNow)\b/,
+  );
+  assert.doesNotMatch(sources.coordinator, /\b(?:window|document)\s*[.[]/);
+
+  const reachable = readRendererImplementationFiles();
+  assert.equal(
+    reachable.some(({ path }) => path === "dashboard/layoutSaveCoordinator.ts"),
+    true,
+  );
+  const owners = reachable.flatMap(({ path, source }) =>
+    exportedNames(parse(path, source)).some(
+        ({ name, runtime }) => runtime && name === "createLayoutSaveCoordinator",
+      )
+      ? [path]
+      : []
+  );
+  assert.deepEqual(owners, ["dashboard/layoutSaveCoordinator.ts"]);
+
+  const debounceDeclarations: ts.VariableDeclaration[] = [];
+  visit(coordinatorFile, (node) => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === "scheduleDebounce"
+    ) {
+      debounceDeclarations.push(node);
+    }
+  });
+  assert.equal(debounceDeclarations.length, 1);
+  const scheduleDebounce = debounceDeclarations[0].initializer;
+  assert.ok(scheduleDebounce && ts.isArrowFunction(scheduleDebounce));
+  assert.equal(scheduleDebounce.parameters.length, 1);
+  assert.equal(scheduleDebounce.parameters[0].name.getText(coordinatorFile), "attempt");
+  assert.equal(scheduleDebounce.parameters[0].type?.kind, ts.SyntaxKind.NumberKeyword);
+  const retainedPayloadIdentifiers: string[] = [];
+  visit(scheduleDebounce.body, (node) => {
+    if (
+      ts.isIdentifier(node) &&
+      (node.text === "entry" || node.text === "snapshot")
+    ) {
+      retainedPayloadIdentifiers.push(node.text);
+    }
+  });
+  assert.deepEqual(retainedPayloadIdentifiers, []);
+});
+
 test("dashboard layout state has one canonical owner and the frozen state/ref API", () => {
   const layoutFile = parse("useDashboardLayout.ts", sources.layout);
   assertExactCanonicalExport(layoutFile);
@@ -509,6 +593,8 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "../layout/types|SidebarView|SidebarView|type",
     "../layout/types|ViewportTier|ViewportTier|type",
     "../layout/types|WindowLayout|WindowLayout|type",
+    "../layoutSaveCoordinator|LayoutSaveCoordinator|LayoutSaveCoordinator|type",
+    "../layoutSaveCoordinator|createLayoutSaveCoordinator|createLayoutSaveCoordinator|value",
     "../model/selection|PendingCatalogSelection|PendingCatalogSelection|type",
     "../model/selection|PinnedItem|PinnedItem|type",
     "../model/selection|Selection|Selection|type",
@@ -564,6 +650,7 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     ["windowLayout", "null"],
     ["windowRestoreReady", "false"],
     ["layoutPersistenceState", '{phase:"hydrating"}'],
+    ["layoutSaveError", "null"],
   ]);
   const stateSetters = new Map([
     ["sessionOrder", "setSessionOrder"],
@@ -581,6 +668,7 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     ["windowLayout", "setWindowLayout"],
     ["windowRestoreReady", "setWindowRestoreReady"],
     ["layoutPersistenceState", "setLayoutPersistenceState"],
+    ["layoutSaveError", "setLayoutSaveError"],
   ]);
   assert.equal(callsWithPath(state.body, "useState").length, stateInitializers.size);
   for (const [name, expected] of stateInitializers) {
@@ -605,6 +693,7 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
       "layoutPersistenceGateRef",
       "{attempt:0,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,}",
     ],
+    ["layoutSaveCoordinatorRef", "null"],
   ]);
   assert.equal(callsWithPath(state.body, "useRef").length, refInitializers.size);
   for (const [name, expected] of refInitializers) {
@@ -614,6 +703,75 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     assert.equal(declaration.initializer.arguments.length, 1);
     assert.equal(compact(declaration.initializer.arguments[0], layoutFile), expected);
   }
+
+  const coordinatorCreation = callsWithPath(state.body, "createLayoutSaveCoordinator");
+  assert.equal(coordinatorCreation.length, 1);
+  assert.equal(coordinatorCreation[0].arguments.length, 1);
+  assert.ok(ts.isObjectLiteralExpression(coordinatorCreation[0].arguments[0]));
+  const coordinatorOptions = directObjectProperties(coordinatorCreation[0].arguments[0]);
+  assert.deepEqual(coordinatorOptions.names, [
+    "debounceMs",
+    "schedule",
+    "retryDelayMs",
+    "onError",
+    "onRecovered",
+    "onBlocked",
+  ]);
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("debounceMs")), layoutFile),
+    "500",
+  );
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("schedule")), layoutFile),
+    "(callback,delayMs)=>{consttimer=window.setTimeout(callback,delayMs);return()=>window.clearTimeout(timer);}",
+  );
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("retryDelayMs")), layoutFile),
+    '()=>document.visibilityState==="hidden"?15_000:3_000',
+  );
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("onError")), layoutFile),
+    '(error)=>{setLayoutSaveError(`Dashboardlayoutchangescouldnotbesaved.Retryingautomatically:${boundedLayoutSaveErrorDetail(error)}`,);}',
+  );
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("onRecovered")), layoutFile),
+    "()=>setLayoutSaveError(null)",
+  );
+  assert.equal(
+    compact(propertyInitializer(coordinatorOptions.byName.get("onBlocked")), layoutFile),
+    '(error)=>{setLayoutSaveError(`Dashboardlayoutchangescouldnotbesaved:${boundedLayoutSaveErrorDetail(error)}`,);}',
+  );
+  const coordinatorIfs = state.body.statements.filter(
+    (statement): statement is ts.IfStatement =>
+      ts.isIfStatement(statement) &&
+      compact(statement.expression, layoutFile) ===
+        "layoutSaveCoordinatorRef.current===null",
+  );
+  assert.equal(coordinatorIfs.length, 1);
+  assert.equal(callsWithPath(coordinatorIfs[0], "createLayoutSaveCoordinator").length, 1);
+  const coordinatorBinding = directVariable(state.body, "layoutSaveCoordinator");
+  assert.equal(
+    compact(coordinatorBinding.initializer!, layoutFile),
+    "layoutSaveCoordinatorRef.current",
+  );
+
+  const boundedError = directFunction(layoutFile, "boundedLayoutSaveErrorDetail");
+  assert.ok(boundedError.body);
+  assert.equal(callsWithPath(boundedError.body, "JSON.stringify").length, 0);
+  assert.equal(callsWithPath(boundedError.body, "String").length, 0);
+  assert.match(compact(boundedError.body, layoutFile), /\.slice\(0,MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH\+1\)/);
+  const maxErrorConstants = layoutFile.statements.filter(
+    (statement): statement is ts.VariableStatement =>
+      ts.isVariableStatement(statement) &&
+      bindingNames(statement.declarationList.declarations[0].name).includes(
+        "MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH",
+      ),
+  );
+  assert.equal(maxErrorConstants.length, 1);
+  assert.equal(
+    compact(maxErrorConstants[0].declarationList.declarations[0].initializer!, layoutFile),
+    "200",
+  );
 
   const perRenderAssignments = state.body.statements.filter(
     (statement): statement is ts.ExpressionStatement =>
@@ -658,11 +816,14 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "setWindowRestoreReady",
     "layoutPersistenceState",
     "setLayoutPersistenceState",
+    "layoutSaveError",
+    "setLayoutSaveError",
     "panelWidthsRef",
     "sidebarOpenPreferenceRef",
     "inspectorOpenPreferenceRef",
     "dashboardWorkspaceRef",
     "layoutPersistenceGateRef",
+    "layoutSaveCoordinator",
     "loadLayoutPreferences",
     "saveLayoutPreferences",
   ];
@@ -731,6 +892,7 @@ function assertAppLayoutWiring(appFile: ts.SourceFile): {
       "setSidebarView",
       "viewportTier",
       "layoutPersistenceState",
+      "layoutSaveError",
       "panelWidthsRef",
       "sidebarOpenPreferenceRef",
       "inspectorOpenPreferenceRef",
@@ -991,6 +1153,7 @@ test("App registers the four layout phases once at global effects 9, 10, 12, and
     "viewportTier",
     "windowLayout",
     "windowRestoreReady",
+    "layoutSaveError",
   ]);
   for (const statement of app.body.statements) {
     if (!ts.isVariableStatement(statement)) continue;
@@ -1021,7 +1184,7 @@ test("App registers the four layout phases once at global effects 9, 10, 12, and
   assert.equal(resizeListeners.length, 0);
 });
 
-test("Advanced settings expose every blocked layout state and disable reset until writable", () => {
+test("Advanced settings prioritize blocked hydration and reuse one alert for save retries", () => {
   const appFile = parse("App.tsx", sources.app);
   const app = directFunction(appFile, "App");
   assert.ok(app.body);
@@ -1089,8 +1252,9 @@ test("Advanced settings expose every blocked layout state and disable reset unti
   assert.ok(blockedCondition);
   assert.equal(
     compact(blockedCondition.left, appFile),
-    'layoutPersistenceState.phase==="blocked"',
+    '(layoutPersistenceState.phase==="blocked"||layoutSaveError)',
   );
+  assert.equal(unwrapParentheses(blockedCondition.right), alerts[0]);
   const alertExpressions = alerts[0].children.filter(
     (child): child is ts.JsxExpression =>
       ts.isJsxExpression(child) && child.expression !== undefined,
@@ -1098,7 +1262,11 @@ test("Advanced settings expose every blocked layout state and disable reset unti
   assert.equal(alertExpressions.length, 1);
   assert.equal(
     compact(alertExpressions[0].expression!, appFile),
-    'layoutPersistenceState.reason==="read_failed"?"Dashboardlayoutcouldnotberead.Thesavedlayoutwillnotbeoverwritten,andlayoutchangeswillnotbesavedthistime.":layoutPersistenceState.reason==="future_schema"?`Dashboardlayoutschema${layoutPersistenceState.version}wascreatedbyanewerversion.Itwillbepreservedunchanged,andlayoutchangeswillnotbesaved.`:"Thesaveddashboardlayoutisinvalid.Itwillbepreservedunchanged,andlayoutchangeswillnotbesaved."',
+    'layoutPersistenceState.phase==="blocked"?layoutPersistenceState.reason==="read_failed"?"Dashboardlayoutcouldnotberead.Thesavedlayoutwillnotbeoverwritten,andlayoutchangeswillnotbesavedthistime.":layoutPersistenceState.reason==="future_schema"?`Dashboardlayoutschema${layoutPersistenceState.version}wascreatedbyanewerversion.Itwillbepreservedunchanged,andlayoutchangeswillnotbesaved.`:"Thesaveddashboardlayoutisinvalid.Itwillbepreservedunchanged,andlayoutchangeswillnotbesaved.":layoutSaveError',
+  );
+  assert.match(
+    sources.layout,
+    /Dashboard layout changes could not be saved\. Retrying automatically:/,
   );
 
   assert.equal(buttons.length, 1);
@@ -1287,24 +1455,34 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
   assert.deepEqual(effectDependencies(analysis.call, layoutFile), [
     "dashboardBackend",
     "getLatestSuccessfulRefreshGeneration",
+    "layoutSaveCoordinator",
     "loadLayoutPreferences",
+    "saveLayoutPreferences",
   ]);
-  assert.equal(analysis.body.statements.length, 6);
+  assert.equal(analysis.body.statements.length, 8);
   assert.equal(
     compact(analysis.body.statements[0], layoutFile),
     "constattempt=layoutPersistenceGateRef.current.attempt+1;",
   );
   assert.equal(
     compact(analysis.body.statements[1], layoutFile),
-    "layoutPersistenceGateRef.current={attempt,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};",
+    "layoutSaveCoordinator.beginAttempt(attempt);",
   );
   assert.equal(
     compact(analysis.body.statements[2], layoutFile),
+    "setLayoutSaveError(null);",
+  );
+  assert.equal(
+    compact(analysis.body.statements[3], layoutFile),
+    "layoutPersistenceGateRef.current={attempt,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};",
+  );
+  assert.equal(
+    compact(analysis.body.statements[4], layoutFile),
     'setLayoutPersistenceState({phase:"hydrating"});',
   );
-  assert.equal(compact(analysis.body.statements[3], layoutFile), "letdisposed=false;");
-  assert.ok(ts.isExpressionStatement(analysis.body.statements[4]));
-  const loadExpression = analysis.body.statements[4].expression;
+  assert.equal(compact(analysis.body.statements[5], layoutFile), "letdisposed=false;");
+  assert.ok(ts.isExpressionStatement(analysis.body.statements[6]));
+  const loadExpression = analysis.body.statements[6].expression;
   assert.equal(loadExpression.kind, ts.SyntaxKind.VoidExpression);
   const catchCall = (loadExpression as ts.VoidExpression).expression;
   assert.ok(ts.isCallExpression(catchCall));
@@ -1316,18 +1494,18 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
   assert.equal(thenCall.expression.expression.arguments.length, 0);
   const thenBody = arrowBlockArgument(thenCall);
   const catchBody = arrowBlockArgument(catchCall);
-  assert.equal(thenBody.statements.length, 29);
+  assert.equal(thenBody.statements.length, 30);
   assert.equal(
     compact(thenBody.statements[0], layoutFile),
     "if(disposed||layoutPersistenceGateRef.current.attempt!==attempt)return;",
   );
   assert.equal(
     compact(thenBody.statements[1], layoutFile),
-    'if(outcome.kind==="future"){setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"future_schema",version:outcome.version,});return;}',
+    'if(outcome.kind==="future"){layoutSaveCoordinator.block(attempt);setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"future_schema",version:outcome.version,});return;}',
   );
   assert.equal(
     compact(thenBody.statements[2], layoutFile),
-    'if(outcome.kind==="invalid"){setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"invalid_layout",invalidReason:outcome.reason,});return;}',
+    'if(outcome.kind==="invalid"){layoutSaveCoordinator.block(attempt);setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"invalid_layout",invalidReason:outcome.reason,});return;}',
   );
   assert.equal(compact(thenBody.statements[3], layoutFile), "constlay=outcome.layout;");
   for (const index of [1, 2]) {
@@ -1342,7 +1520,11 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
       const path = expressionPath(node.expression);
       if (path) calls.push(path);
     });
-    assert.deepEqual(calls, ["setWindowRestoreReady", "setLayoutPersistenceState"]);
+    assert.deepEqual(calls, [
+      "layoutSaveCoordinator.block",
+      "setWindowRestoreReady",
+      "setLayoutPersistenceState",
+    ]);
   }
 
   const compatibleStatements = thenBody.statements.slice(4, 27);
@@ -1459,22 +1641,49 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
     compact(thenBody.statements[27], layoutFile),
     "layoutPersistenceGateRef.current={attempt,writable:true,extensions:outcome.extensions,};",
   );
+  assert.ok(ts.isExpressionStatement(thenBody.statements[28]));
+  const authorizations = callsWithPath(
+    thenBody.statements[28],
+    "layoutSaveCoordinator.authorize",
+  );
+  assert.equal(authorizations.length, 1);
+  assert.equal(authorizations[0].arguments.length, 1);
+  assert.ok(ts.isObjectLiteralExpression(authorizations[0].arguments[0]));
+  const authorization = directObjectProperties(authorizations[0].arguments[0]);
+  assert.deepEqual(authorization.names, ["attempt", "write", "classifyFailure"]);
+  assert.equal(compact(propertyInitializer(authorization.byName.get("attempt")), layoutFile), "attempt");
+  const write = propertyInitializer(authorization.byName.get("write"));
+  assert.ok(ts.isArrowFunction(write));
+  assert.ok(write.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword));
+  assert.ok(ts.isBlock(write.body));
+  assert.deepEqual(
+    write.body.statements.map((statement) => compact(statement, layoutFile)),
+    [
+      "constcurrentGate=layoutPersistenceGateRef.current;",
+      "if(!currentGate.writable||currentGate.attempt!==attempt)return;",
+      "awaitsaveLayoutPreferences(snapshot,outcome.extensions);",
+    ],
+  );
   assert.equal(
-    compact(thenBody.statements[28], layoutFile),
+    compact(propertyInitializer(authorization.byName.get("classifyFailure")), layoutFile),
+    '()=>"retry"',
+  );
+  assert.equal(
+    compact(thenBody.statements[29], layoutFile),
     'setLayoutPersistenceState({phase:"writable",source:outcome.source,});',
   );
   assert.equal(
     compact(catchBody, layoutFile),
-    '{if(disposed||layoutPersistenceGateRef.current.attempt!==attempt)return;setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"read_failed",});}',
+    '{if(disposed||layoutPersistenceGateRef.current.attempt!==attempt)return;layoutSaveCoordinator.block(attempt);setWindowRestoreReady(true);setLayoutPersistenceState({phase:"blocked",reason:"read_failed",});}',
   );
   assert.equal(
-    compact(analysis.body.statements[5], layoutFile),
-    "return()=>{disposed=true;if(layoutPersistenceGateRef.current.attempt===attempt){layoutPersistenceGateRef.current={attempt:attempt+1,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};}};",
+    compact(analysis.body.statements[7], layoutFile),
+    "return()=>{disposed=true;layoutSaveCoordinator.block(attempt);if(layoutPersistenceGateRef.current.attempt===attempt){layoutPersistenceGateRef.current={attempt:attempt+1,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};}};",
   );
   assert.doesNotMatch(compact(analysis.fn, layoutFile), /\.finally\(/);
 });
 
-test("layout persistence keeps the loaded gate, exact payload, and visible-state deps", () => {
+test("layout persistence enqueues one exact snapshot behind the A gate", () => {
   const layoutFile = parse("useDashboardLayout.ts", sources.layout);
   const analysis = effectAnalysis(layoutFile, "useDashboardLayoutPersistencePhase");
   assert.deepEqual(effectDependencies(analysis.call, layoutFile), [
@@ -1493,10 +1702,10 @@ test("layout persistence keeps the loaded gate, exact payload, and visible-state
     "editingFile",
     "diffFile",
     "windowLayout",
-    "saveLayoutPreferences",
+    "layoutSaveCoordinator",
     "layoutPersistenceState.phase",
   ]);
-  assert.equal(analysis.body.statements.length, 6);
+  assert.equal(analysis.body.statements.length, 5);
   assert.equal(
     compact(analysis.body.statements[0], layoutFile),
     'if(layoutPersistenceState.phase!=="writable")return;',
@@ -1513,28 +1722,16 @@ test("layout persistence keeps the loaded gate, exact payload, and visible-state
     compact(analysis.body.statements[3], layoutFile),
     "constauthorizedAttempt=gate.attempt;",
   );
-  const timer = directVariable(analysis.body, "t");
-  assert.ok(timer.initializer && ts.isCallExpression(timer.initializer));
-  assert.equal(expressionPath(timer.initializer.expression), "setTimeout");
-  assert.equal(timer.initializer.arguments.length, 2);
-  assert.equal(compact(timer.initializer.arguments[1], layoutFile), "500");
-  const timerBody = functionExpressionBody(timer.initializer.arguments[0]);
-  assert.equal(timerBody.statements.length, 3);
-  assert.equal(
-    compact(timerBody.statements[0], layoutFile),
-    "constcurrentGate=layoutPersistenceGateRef.current;",
+  assert.ok(ts.isExpressionStatement(analysis.body.statements[4]));
+  const enqueues = callsWithPath(
+    analysis.body.statements[4],
+    "layoutSaveCoordinator.enqueue",
   );
-  assert.equal(
-    compact(timerBody.statements[1], layoutFile),
-    "if(!currentGate.writable||currentGate.attempt!==authorizedAttempt)return;",
-  );
-  assert.ok(ts.isExpressionStatement(timerBody.statements[2]));
-  const saves = callsWithPath(timerBody, "saveLayoutPreferences");
-  assert.equal(saves.length, 1);
-  assert.equal(saves[0].arguments.length, 2);
-  assert.ok(ts.isObjectLiteralExpression(saves[0].arguments[0]));
-  assert.equal(compact(saves[0].arguments[1], layoutFile), "currentGate.extensions");
-  const payload = saves[0].arguments[0];
+  assert.equal(enqueues.length, 1);
+  assert.equal(enqueues[0].arguments.length, 2);
+  assert.equal(compact(enqueues[0].arguments[0], layoutFile), "authorizedAttempt");
+  assert.ok(ts.isObjectLiteralExpression(enqueues[0].arguments[1]));
+  const payload = enqueues[0].arguments[1];
   assert.equal(payload.properties.length, 18);
   const expected = new Map([
     ["left", "sidebarWidth"],
@@ -1570,18 +1767,9 @@ test("layout persistence keeps the loaded gate, exact payload, and visible-state
     compact(conditionalWindow.expression, layoutFile),
     "(windowLayout?{window:windowLayout}:{})",
   );
-  assert.ok(ts.isPropertyAccessExpression(saves[0].parent));
-  assert.equal(saves[0].parent.name.text, "catch");
-  assert.ok(ts.isCallExpression(saves[0].parent.parent));
-  assert.equal(timerBody.statements[2].expression, saves[0].parent.parent);
-  assert.equal(
-    compact(arrowBlockArgument(saves[0].parent.parent), layoutFile),
-    "{}",
-  );
-  assert.equal(
-    compact(analysis.body.statements[5], layoutFile),
-    "return()=>clearTimeout(t);",
-  );
+  assert.equal(callsWithPath(analysis.fn, "saveLayoutPreferences").length, 0);
+  assert.equal(callsWithPath(analysis.fn, "setTimeout").length, 0);
+  assert.equal(callsWithPath(analysis.fn, "clearTimeout").length, 0);
 });
 
 test("layout structure guards reject namespace, indirect-edge, nested, and interval decoys", () => {

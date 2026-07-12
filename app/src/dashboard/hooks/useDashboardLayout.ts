@@ -29,6 +29,10 @@ import type {
   WindowLayout,
 } from "../layout/types";
 import {
+  createLayoutSaveCoordinator,
+  type LayoutSaveCoordinator,
+} from "../layoutSaveCoordinator";
+import {
   pendingRestoredCatalogSelection,
   type PendingCatalogSelection,
   type PinnedItem,
@@ -37,6 +41,7 @@ import {
 import { useLayoutPreferences } from "./useLayoutPreferences";
 
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
+const MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH = 200;
 
 type DashboardLayoutPersistenceState =
   | { phase: "hydrating" }
@@ -56,6 +61,28 @@ type DashboardLayoutPersistenceGate = {
 };
 
 const EMPTY_DASHBOARD_LAYOUT_EXTENSIONS: DashboardLayoutExtensions = Object.freeze({});
+
+function boundedLayoutSaveErrorDetail(error: unknown): string {
+  let detail = "Unknown error";
+  try {
+    if (typeof error === "string") {
+      detail = error;
+    } else if (error && typeof error === "object") {
+      const descriptor = Object.getOwnPropertyDescriptor(error, "message");
+      if (descriptor && "value" in descriptor && typeof descriptor.value === "string") {
+        detail = descriptor.value;
+      }
+    }
+  } catch {
+    detail = "Unknown error";
+  }
+  const prefix = detail.slice(0, MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH + 1);
+  const normalized = prefix.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  if (!normalized) return "Unknown error";
+  return normalized.length > MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH
+    ? `${normalized.slice(0, MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH - 1)}…`
+    : normalized;
+}
 
 async function getWindowExpandedState(win: DashboardWindow) {
   const [fullscreen, maximized] = await Promise.all([
@@ -91,6 +118,7 @@ export function useDashboardLayoutState() {
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const [layoutPersistenceState, setLayoutPersistenceState] =
     useState<DashboardLayoutPersistenceState>({ phase: "hydrating" });
+  const [layoutSaveError, setLayoutSaveError] = useState<string | null>(null);
   const dashboardWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const layoutPersistenceGateRef = useRef<DashboardLayoutPersistenceGate>(
     {
@@ -99,6 +127,29 @@ export function useDashboardLayoutState() {
       extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
     },
   );
+  const layoutSaveCoordinatorRef = useRef<LayoutSaveCoordinator | null>(null);
+  if (layoutSaveCoordinatorRef.current === null) {
+    layoutSaveCoordinatorRef.current = createLayoutSaveCoordinator({
+      debounceMs: 500,
+      schedule: (callback, delayMs) => {
+        const timer = window.setTimeout(callback, delayMs);
+        return () => window.clearTimeout(timer);
+      },
+      retryDelayMs: () => document.visibilityState === "hidden" ? 15_000 : 3_000,
+      onError: (error) => {
+        setLayoutSaveError(
+          `Dashboard layout changes could not be saved. Retrying automatically: ${boundedLayoutSaveErrorDetail(error)}`,
+        );
+      },
+      onRecovered: () => setLayoutSaveError(null),
+      onBlocked: (error) => {
+        setLayoutSaveError(
+          `Dashboard layout changes could not be saved: ${boundedLayoutSaveErrorDetail(error)}`,
+        );
+      },
+    });
+  }
+  const layoutSaveCoordinator = layoutSaveCoordinatorRef.current;
 
   panelWidthsRef.current = { sidebarWidth, inspectorWidth };
 
@@ -133,11 +184,14 @@ export function useDashboardLayoutState() {
     setWindowRestoreReady,
     layoutPersistenceState,
     setLayoutPersistenceState,
+    layoutSaveError,
+    setLayoutSaveError,
     panelWidthsRef,
     sidebarOpenPreferenceRef,
     inspectorOpenPreferenceRef,
     dashboardWorkspaceRef,
     layoutPersistenceGateRef,
+    layoutSaveCoordinator,
     loadLayoutPreferences,
     saveLayoutPreferences,
   };
@@ -305,6 +359,7 @@ export function useDashboardLayoutHydrationPhase(
 ) {
   const {
     inspectorOpenPreferenceRef,
+    layoutSaveCoordinator,
     layoutPersistenceGateRef,
     loadLayoutPreferences,
     panelWidthsRef,
@@ -322,11 +377,15 @@ export function useDashboardLayoutHydrationPhase(
     setWindowLayout,
     setWindowRestoreReady,
     setLayoutPersistenceState,
+    setLayoutSaveError,
+    saveLayoutPreferences,
     sidebarOpenPreferenceRef,
   } = layout;
 
   useEffect(() => {
     const attempt = layoutPersistenceGateRef.current.attempt + 1;
+    layoutSaveCoordinator.beginAttempt(attempt);
+    setLayoutSaveError(null);
     layoutPersistenceGateRef.current = {
       attempt,
       writable: false,
@@ -339,6 +398,7 @@ export function useDashboardLayoutHydrationPhase(
       .then((outcome) => {
         if (disposed || layoutPersistenceGateRef.current.attempt !== attempt) return;
         if (outcome.kind === "future") {
+          layoutSaveCoordinator.block(attempt);
           setWindowRestoreReady(true);
           setLayoutPersistenceState({
             phase: "blocked",
@@ -348,6 +408,7 @@ export function useDashboardLayoutHydrationPhase(
           return;
         }
         if (outcome.kind === "invalid") {
+          layoutSaveCoordinator.block(attempt);
           setWindowRestoreReady(true);
           setLayoutPersistenceState({
             phase: "blocked",
@@ -434,6 +495,15 @@ export function useDashboardLayoutHydrationPhase(
           writable: true,
           extensions: outcome.extensions,
         };
+        layoutSaveCoordinator.authorize({
+          attempt,
+          write: async (snapshot) => {
+            const currentGate = layoutPersistenceGateRef.current;
+            if (!currentGate.writable || currentGate.attempt !== attempt) return;
+            await saveLayoutPreferences(snapshot, outcome.extensions);
+          },
+          classifyFailure: () => "retry",
+        });
         setLayoutPersistenceState({
           phase: "writable",
           source: outcome.source,
@@ -441,6 +511,7 @@ export function useDashboardLayoutHydrationPhase(
       })
       .catch(() => {
         if (disposed || layoutPersistenceGateRef.current.attempt !== attempt) return;
+        layoutSaveCoordinator.block(attempt);
         setWindowRestoreReady(true);
         setLayoutPersistenceState({
           phase: "blocked",
@@ -450,6 +521,7 @@ export function useDashboardLayoutHydrationPhase(
 
     return () => {
       disposed = true;
+      layoutSaveCoordinator.block(attempt);
       if (layoutPersistenceGateRef.current.attempt === attempt) {
         layoutPersistenceGateRef.current = {
           attempt: attempt + 1,
@@ -458,7 +530,13 @@ export function useDashboardLayoutHydrationPhase(
         };
       }
     };
-  }, [dashboardBackend, getLatestSuccessfulRefreshGeneration, loadLayoutPreferences]);
+  }, [
+    dashboardBackend,
+    getLatestSuccessfulRefreshGeneration,
+    layoutSaveCoordinator,
+    loadLayoutPreferences,
+    saveLayoutPreferences,
+  ]);
 }
 
 type DashboardLayoutPersistenceOptions = {
@@ -477,10 +555,10 @@ export function useDashboardLayoutPersistencePhase(
     inspectorOpen,
     inspectorOpenPreferenceRef,
     inspectorWidth,
+    layoutSaveCoordinator,
     layoutPersistenceGateRef,
     layoutPersistenceState,
     pinnedItems,
-    saveLayoutPreferences,
     scratchCollapsed,
     scratchWidth,
     sessionOrder,
@@ -496,31 +574,26 @@ export function useDashboardLayoutPersistencePhase(
     const gate = layoutPersistenceGateRef.current;
     if (!gate.writable) return;
     const authorizedAttempt = gate.attempt;
-    const t = setTimeout(() => {
-      const currentGate = layoutPersistenceGateRef.current;
-      if (!currentGate.writable || currentGate.attempt !== authorizedAttempt) return;
-      saveLayoutPreferences({
-        left: sidebarWidth,
-        sidebarWidth,
-        inspectorWidth,
-        sidebarOpen: sidebarOpenPreferenceRef.current,
-        inspectorOpen: inspectorOpenPreferenceRef.current,
-        sidebarView,
-        sessionOrder,
-        collapsedProjects,
-        pinnedItems,
-        automationSectionCollapsed,
-        columnOrder: DEFAULT_COLUMN_ORDER,
-        scratchCollapsed,
-        scratchWidth,
-        fileBrowserOpen: sidebarView === "files",
-        selection,
-        editingFile,
-        diffFile,
-        ...(windowLayout ? { window: windowLayout } : {}),
-      }, currentGate.extensions).catch(() => {});
-    }, 500);
-    return () => clearTimeout(t);
+    layoutSaveCoordinator.enqueue(authorizedAttempt, {
+      left: sidebarWidth,
+      sidebarWidth,
+      inspectorWidth,
+      sidebarOpen: sidebarOpenPreferenceRef.current,
+      inspectorOpen: inspectorOpenPreferenceRef.current,
+      sidebarView,
+      sessionOrder,
+      collapsedProjects,
+      pinnedItems,
+      automationSectionCollapsed,
+      columnOrder: DEFAULT_COLUMN_ORDER,
+      scratchCollapsed,
+      scratchWidth,
+      fileBrowserOpen: sidebarView === "files",
+      selection,
+      editingFile,
+      diffFile,
+      ...(windowLayout ? { window: windowLayout } : {}),
+    });
   }, [
     sidebarWidth,
     inspectorWidth,
@@ -537,7 +610,7 @@ export function useDashboardLayoutPersistencePhase(
     editingFile,
     diffFile,
     windowLayout,
-    saveLayoutPreferences,
+    layoutSaveCoordinator,
     layoutPersistenceState.phase,
   ]);
 }

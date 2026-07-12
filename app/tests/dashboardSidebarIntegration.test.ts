@@ -80,11 +80,14 @@ test("worktree project groups persist collapse keys without legacy arbitrary sor
   );
 
   const persistence = rendererImplementationSourceContaining(
-    "saveLayoutPreferences({",
+    "layoutSaveCoordinator.enqueue(authorizedAttempt, {",
     "collapsedProjects",
   ).source;
   assert.match(persistence, /collapsedProjects/);
-  assert.match(persistence, /saveLayoutPreferences\(\{[\s\S]*collapsedProjects/);
+  assert.match(
+    persistence,
+    /layoutSaveCoordinator\.enqueue\(authorizedAttempt, \{[\s\S]*collapsedProjects/,
+  );
   assert.match(sidebar, /onToggleProjectCollapsed\(group\.key\)/);
   assert.doesNotMatch(renderer, /useSortable|data-sort-index|column-drag-handle/);
 });

@@ -148,6 +148,7 @@ function App() {
     setSidebarView,
     viewportTier,
     layoutPersistenceState,
+    layoutSaveError,
     panelWidthsRef,
     sidebarOpenPreferenceRef,
     inspectorOpenPreferenceRef,
@@ -1749,13 +1750,15 @@ function App() {
                 <div>
                   <strong>Reset dashboard layout</strong>
                   <span>Restore panel widths and visibility without changing sessions or connections.</span>
-                  {layoutPersistenceState.phase === "blocked" && (
+                  {(layoutPersistenceState.phase === "blocked" || layoutSaveError) && (
                     <span className="settings-action-status" role="alert">
-                      {layoutPersistenceState.reason === "read_failed"
-                        ? "Dashboard layout could not be read. The saved layout will not be overwritten, and layout changes will not be saved this time."
-                        : layoutPersistenceState.reason === "future_schema"
-                          ? `Dashboard layout schema ${layoutPersistenceState.version} was created by a newer version. It will be preserved unchanged, and layout changes will not be saved.`
-                          : "The saved dashboard layout is invalid. It will be preserved unchanged, and layout changes will not be saved."}
+                      {layoutPersistenceState.phase === "blocked"
+                        ? layoutPersistenceState.reason === "read_failed"
+                          ? "Dashboard layout could not be read. The saved layout will not be overwritten, and layout changes will not be saved this time."
+                          : layoutPersistenceState.reason === "future_schema"
+                            ? `Dashboard layout schema ${layoutPersistenceState.version} was created by a newer version. It will be preserved unchanged, and layout changes will not be saved.`
+                            : "The saved dashboard layout is invalid. It will be preserved unchanged, and layout changes will not be saved."
+                        : layoutSaveError}
                     </span>
                   )}
                   {layoutResetMessage && (

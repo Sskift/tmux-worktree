@@ -18,6 +18,12 @@ type LayoutState =
   | { phase: "writable"; source: "legacy" | "current" }
   | { phase: "blocked"; reason: string; version?: number; invalidReason?: string };
 
+type CapturedAuthorization = {
+  attempt: number;
+  write(snapshot: Record<string, unknown>): Promise<void>;
+  classifyFailure(error: unknown): "retry" | "block";
+};
+
 type DashboardLayoutHookModule = {
   useDashboardLayoutHydrationPhase: (
     layout: Record<string, unknown>,
@@ -90,6 +96,10 @@ function loadDashboardLayoutHook(): {
           selection,
         }),
       },
+    ],
+    [
+      "../layoutSaveCoordinator",
+      { createLayoutSaveCoordinator: () => assert.fail("state hook must not execute") },
     ],
     ["./useLayoutPreferences", { useLayoutPreferences: () => assert.fail("not used") }],
   ]);
@@ -171,6 +181,8 @@ const DOMAIN_SETTERS = [
 
 function layoutFixture(load: () => Promise<DashboardLayoutDecodeOutcome>) {
   const calls: Array<{ gateWritable: boolean; name: string; value: unknown }> = [];
+  const authorizations: CapturedAuthorization[] = [];
+  const enqueues: Array<{ attempt: number; snapshot: Record<string, unknown> }> = [];
   const gateRef: { current: LayoutGate } = {
     current: { attempt: 0, writable: false, extensions: {} },
   };
@@ -185,6 +197,39 @@ function layoutFixture(load: () => Promise<DashboardLayoutDecodeOutcome>) {
     inspectorOpen: true,
     inspectorOpenPreferenceRef: { current: false },
     inspectorWidth: 420,
+    layoutSaveCoordinator: {
+      beginAttempt: (attempt: number) => {
+        calls.push({
+          gateWritable: gateRef.current.writable,
+          name: "coordinator.beginAttempt",
+          value: attempt,
+        });
+      },
+      authorize: (authorization: CapturedAuthorization) => {
+        authorizations.push(authorization);
+        calls.push({
+          gateWritable: gateRef.current.writable,
+          name: "coordinator.authorize",
+          value: authorization,
+        });
+      },
+      enqueue: (attempt: number, snapshot: Record<string, unknown>) => {
+        enqueues.push({ attempt, snapshot });
+        calls.push({
+          gateWritable: gateRef.current.writable,
+          name: "coordinator.enqueue",
+          value: { attempt, snapshot },
+        });
+      },
+      block: (attempt: number) => {
+        calls.push({
+          gateWritable: gateRef.current.writable,
+          name: "coordinator.block",
+          value: attempt,
+        });
+      },
+      stop: () => assert.fail("production phases must not stop the shared coordinator"),
+    },
     layoutPersistenceGateRef: gateRef,
     layoutPersistenceState: state,
     loadLayoutPreferences: load,
@@ -211,12 +256,15 @@ function layoutFixture(load: () => Promise<DashboardLayoutDecodeOutcome>) {
       });
     },
     setWindowRestoreReady: setter("setWindowRestoreReady"),
+    setLayoutSaveError: setter("setLayoutSaveError"),
   };
   for (const name of DOMAIN_SETTERS) {
     if (!(name in layout)) layout[name] = setter(name);
   }
   return {
+    authorizations,
     calls,
+    enqueues,
     gateRef,
     layout,
     saves,
@@ -298,6 +346,17 @@ test("read failures and incompatible layouts never hydrate or schedule a save", 
       assert.equal(fixture.gateRef.current.writable, false);
       assert.deepEqual(domainCalls(fixture.calls), []);
       assert.deepEqual(
+        fixture.calls
+          .filter(({ name }) => name.startsWith("coordinator."))
+          .map(({ name, value }) => [name, value]),
+        [
+          ["coordinator.beginAttempt", 1],
+          ["coordinator.block", 1],
+        ],
+      );
+      assert.equal(fixture.authorizations.length, 0);
+      assert.equal(fixture.enqueues.length, 0);
+      assert.deepEqual(
         fixture.calls.filter(({ name }) => name === "setWindowRestoreReady"),
         [{ gateWritable: false, name: "setWindowRestoreReady", value: true }],
       );
@@ -317,6 +376,7 @@ test("read failures and incompatible layouts never hydrate or schedule a save", 
       ).callback();
       assert.equal(timers.size, 0);
       assert.equal(fixture.saves.length, 0);
+      assert.equal(fixture.enqueues.length, 0);
     }
   });
 });
@@ -349,6 +409,9 @@ test("only compatible hydration authorizes persistence and retains extensions", 
     assert.deepEqual(fixture.state(), { phase: "writable", source: "current" });
     assert.equal(fixture.gateRef.current.writable, true);
     assert.equal(fixture.gateRef.current.extensions, extensions);
+    assert.equal(fixture.authorizations.length, 1);
+    assert.equal(fixture.authorizations[0].attempt, 1);
+    assert.equal(fixture.authorizations[0].classifyFailure(new Error("retry")), "retry");
     const writableCalls = fixture.calls.filter(
       ({ name, value }) =>
         name === "setLayoutPersistenceState" &&
@@ -361,6 +424,14 @@ test("only compatible hydration authorizes persistence and retains extensions", 
       domainCalls(fixture.calls).every(({ gateWritable }) => !gateWritable),
       true,
     );
+    const authorizeIndex = fixture.calls.findIndex(
+      ({ name }) => name === "coordinator.authorize",
+    );
+    const domainIndices = fixture.calls.flatMap(({ name }, index) =>
+      (DOMAIN_SETTERS as readonly string[]).includes(name) ? [index] : []
+    );
+    assert.equal(domainIndices.every((index) => index < authorizeIndex), true);
+    assert.equal(fixture.calls[authorizeIndex].gateWritable, true);
 
     Object.assign(fixture.layout, { layoutPersistenceState: fixture.state() });
     const persistence = registerSingleEffect(effects, () =>
@@ -371,11 +442,10 @@ test("only compatible hydration authorizes persistence and retains extensions", 
       })
     );
     persistence.callback();
-    assert.equal(timers.size, 1);
-    [...timers.values()][0]();
-    assert.equal(fixture.saves.length, 1);
-    assert.equal(fixture.saves[0][1], extensions);
-    assert.deepEqual(fixture.saves[0][0], {
+    assert.equal(timers.size, 0);
+    assert.equal(fixture.enqueues.length, 1);
+    assert.equal(fixture.enqueues[0].attempt, 1);
+    assert.deepEqual(fixture.enqueues[0].snapshot, {
       left: 300,
       sidebarWidth: 300,
       inspectorWidth: 420,
@@ -395,6 +465,18 @@ test("only compatible hydration authorizes persistence and retains extensions", 
       diffFile: null,
       window: { width: 1400, height: 900, x: 10, y: 20, maximized: false },
     });
+    await fixture.authorizations[0].write(fixture.enqueues[0].snapshot);
+    assert.equal(fixture.saves.length, 1);
+    assert.equal(fixture.saves[0][1], extensions);
+    assert.equal(fixture.saves[0][0], fixture.enqueues[0].snapshot);
+
+    fixture.gateRef.current = {
+      attempt: 2,
+      writable: false,
+      extensions: {},
+    };
+    await fixture.authorizations[0].write({ columnOrder: [] });
+    assert.equal(fixture.saves.length, 1, "authorization rechecks the A gate before writing");
   });
 });
 
@@ -427,6 +509,16 @@ test("disposed and superseded hydration attempts cannot authorize", async () => 
       assert.equal(fixture.gateRef.current.writable, false);
       assert.equal(fixture.gateRef.current.attempt, 2);
       assert.deepEqual(domainCalls(fixture.calls), []);
+      assert.equal(fixture.authorizations.length, 0);
+      assert.deepEqual(
+        fixture.calls
+          .filter(({ name }) => name.startsWith("coordinator."))
+          .map(({ name, value }) => [name, value]),
+        [
+          ["coordinator.beginAttempt", 1],
+          ["coordinator.block", 1],
+        ],
+      );
       assert.equal(
         fixture.calls.some(
           ({ value }) => (value as { phase?: string } | null)?.phase === "writable",
@@ -461,17 +553,19 @@ test("disposed and superseded hydration attempts cannot authorize", async () => 
       await flushPromises();
       assert.equal(fixture.gateRef.current.writable, false);
       assert.deepEqual(domainCalls(fixture.calls), []);
+      assert.equal(fixture.authorizations.length, 0);
 
       second.resolve(compatible("current"));
       await flushPromises();
       assert.equal(fixture.gateRef.current.writable, true);
       assert.deepEqual(fixture.state(), { phase: "writable", source: "current" });
       assert.deepEqual(fixture.gateRef.current.extensions, { source: "current" });
+      assert.equal(fixture.authorizations.length, 1);
     }
   });
 });
 
-test("persistence requires matching state and gate before and after its timer", async () => {
+test("persistence requires matching state and gate before enqueuing an exact snapshot", async () => {
   await withRuntimeGlobals(async (timers) => {
     const { effects, hooks } = loadDashboardLayoutHook();
     const fixture = layoutFixture(() => Promise.reject(new Error("unused")));
@@ -485,6 +579,7 @@ test("persistence requires matching state and gate before and after its timer", 
       hooks.useDashboardLayoutPersistencePhase(fixture.layout, options)
     ).callback();
     assert.equal(timers.size, 0);
+    assert.equal(fixture.enqueues.length, 0);
 
     fixture.gateRef.current = { attempt: 6, writable: true, extensions: {} };
     Object.assign(fixture.layout, {
@@ -494,28 +589,25 @@ test("persistence requires matching state and gate before and after its timer", 
       hooks.useDashboardLayoutPersistencePhase(fixture.layout, options)
     ).callback();
     assert.equal(timers.size, 0);
+    assert.equal(fixture.enqueues.length, 0);
 
+    fixture.gateRef.current = { attempt: 7, writable: true, extensions: {} };
     Object.assign(fixture.layout, {
       layoutPersistenceState: { phase: "writable", source: "current" },
     });
     registerSingleEffect(effects, () =>
       hooks.useDashboardLayoutPersistencePhase(fixture.layout, options)
     ).callback();
-    assert.equal(timers.size, 1);
-    const writableTimer = [...timers.values()][0];
-    fixture.gateRef.current = { attempt: 6, writable: false, extensions: {} };
-    writableTimer();
-    assert.equal(fixture.saves.length, 0);
-
-    timers.clear();
-    fixture.gateRef.current = { attempt: 7, writable: true, extensions: {} };
-    registerSingleEffect(effects, () =>
-      hooks.useDashboardLayoutPersistencePhase(fixture.layout, options)
-    ).callback();
-    assert.equal(timers.size, 1);
-    const attemptTimer = [...timers.values()][0];
-    fixture.gateRef.current = { attempt: 8, writable: true, extensions: {} };
-    attemptTimer();
+    assert.equal(timers.size, 0);
+    assert.equal(fixture.enqueues.length, 1);
+    assert.equal(fixture.enqueues[0].attempt, 7);
+    assert.equal(fixture.enqueues[0].snapshot.sidebarWidth, 300);
+    assert.deepEqual(fixture.enqueues[0].snapshot.columnOrder, [
+      "file",
+      "main",
+      "scratch",
+      "editor",
+    ]);
     assert.equal(fixture.saves.length, 0);
   });
 });

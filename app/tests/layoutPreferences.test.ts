@@ -759,11 +759,11 @@ test("the renderer delegates layout IO to the versioned layout boundary", () => 
   const source = rendererImplementationSourceContaining(
     "useLayoutPreferences()",
     "loadLayoutPreferences()",
-    "saveLayoutPreferences({",
+    "saveLayoutPreferences(snapshot, outcome.extensions)",
   ).source;
 
   assert.match(source, /const \{ loadLayoutPreferences, saveLayoutPreferences \} = useLayoutPreferences\(\);/);
   assert.match(source, /loadLayoutPreferences\(\)/);
-  assert.match(source, /saveLayoutPreferences\(\{/);
+  assert.match(source, /saveLayoutPreferences\(snapshot, outcome\.extensions\)/);
   assert.doesNotMatch(source, /dashboardBackend\.persistence\.(?:loadLayout|saveLayout)/);
 });
