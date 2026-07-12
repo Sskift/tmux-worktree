@@ -3,6 +3,7 @@ import test from "node:test";
 import type { DashboardWindow } from "../src/platform/types.ts";
 import {
   createWindowCaptureCoordinator,
+  readWindowCapture,
   windowLayoutFromCapture,
   type WindowCaptureResult,
 } from "../src/dashboard/windowCaptureCoordinator.ts";
@@ -436,6 +437,101 @@ test("later normal requests fence older expanded-mode results", async () => {
       mode: "normal",
     }]);
     coordinator.stop();
+  }
+});
+
+test("direct window reads return every outcome without throwing", async () => {
+  {
+    const target = new ScriptedWindow();
+    const read = readWindowCapture(target, new AbortController().signal);
+    resolveExpanded(target, 0, false, true);
+    assert.deepEqual(await read, {
+      kind: "captured",
+      result: { mode: "maximized" },
+    });
+  }
+  {
+    const target = new ScriptedWindow();
+    const read = readWindowCapture(target, new AbortController().signal);
+    resolveExpanded(target, 0, false, false);
+    await flushPromises();
+    resolveGeometry(target, 0);
+    await flushPromises();
+    resolveExpanded(target, 1, true, false);
+    assert.deepEqual(await read, { kind: "changed" });
+  }
+  {
+    const target = new ScriptedWindow();
+    const read = readWindowCapture(target, new AbortController().signal);
+    resolveExpanded(target, 0, false, false);
+    await flushPromises();
+    resolveGeometry(target, 0, { factor: 0 });
+    assert.deepEqual(await read, { kind: "unavailable" });
+  }
+  {
+    const target = new ScriptedWindow();
+    const controller = new AbortController();
+    controller.abort();
+    assert.deepEqual(await readWindowCapture(target, controller.signal), {
+      kind: "cancelled",
+    });
+    assert.equal(target.fullscreenReads.length, 0);
+  }
+});
+
+test("direct window reads check cancellation after every awaited geometry value", async () => {
+  for (const stage of [
+    "expanded-fullscreen",
+    "expanded-maximized",
+    "size",
+    "position",
+    "factor",
+    "confirmed-fullscreen",
+    "confirmed-maximized",
+  ] as const) {
+    const target = new ScriptedWindow();
+    const controller = new AbortController();
+    const read = readWindowCapture(target, controller.signal);
+    if (stage === "expanded-fullscreen") {
+      target.fullscreenReads[0].resolve(false);
+      controller.abort();
+    } else {
+      target.fullscreenReads[0].resolve(false);
+      await flushPromises();
+      target.maximizedReads[0].resolve(false);
+      if (stage === "expanded-maximized") {
+        controller.abort();
+      } else {
+        await flushPromises();
+        target.sizeReads[0].resolve({ width: 2_000, height: 1_200 });
+        if (stage === "size") {
+          controller.abort();
+        } else {
+          await flushPromises();
+          target.positionReads[0].resolve({ x: 200, y: 100 });
+          if (stage === "position") {
+            controller.abort();
+          } else {
+            await flushPromises();
+            target.factorReads[0].resolve(2);
+            if (stage === "factor") {
+              controller.abort();
+            } else {
+              await flushPromises();
+              target.fullscreenReads[1].resolve(false);
+              if (stage === "confirmed-fullscreen") {
+                controller.abort();
+              } else {
+                await flushPromises();
+                target.maximizedReads[1].resolve(false);
+                controller.abort();
+              }
+            }
+          }
+        }
+      }
+    }
+    assert.deepEqual(await read, { kind: "cancelled" }, stage);
   }
 });
 

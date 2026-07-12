@@ -6,6 +6,12 @@ export type WindowCaptureResult =
   | { mode: "maximized" }
   | { layout: WindowLayout; mode: "normal" };
 
+export type WindowCaptureReadResult =
+  | { kind: "captured"; result: WindowCaptureResult }
+  | { kind: "changed" }
+  | { kind: "unavailable" }
+  | { kind: "cancelled" };
+
 export type WindowCaptureCoordinatorOptions = {
   debounceMs: number;
   publish(result: WindowCaptureResult): void;
@@ -39,6 +45,114 @@ function finitePositive(value: number): boolean {
 
 function finite(value: number): boolean {
   return Number.isFinite(value);
+}
+
+type WindowRead<T> =
+  | { ok: true; value: T }
+  | { ok: false };
+
+function startWindowRead<T>(read: () => Promise<T>): Promise<WindowRead<T>> {
+  try {
+    return Promise.resolve(read()).then(
+      (value) => ({ ok: true as const, value }),
+      () => ({ ok: false as const }),
+    );
+  } catch {
+    return Promise.resolve({ ok: false });
+  }
+}
+
+async function readExpandedMode(
+  target: DashboardWindow,
+  signal: AbortSignal,
+): Promise<
+  | { kind: "available"; fullscreen: boolean; maximized: boolean }
+  | { kind: "unavailable" }
+  | { kind: "cancelled" }
+> {
+  if (signal.aborted) return { kind: "cancelled" };
+  const fullscreenRead = startWindowRead(() => target.isFullscreen());
+  const maximizedRead = startWindowRead(() => target.isMaximized());
+  const fullscreen = await fullscreenRead;
+  if (signal.aborted) return { kind: "cancelled" };
+  if (!fullscreen.ok) return { kind: "unavailable" };
+  const maximized = await maximizedRead;
+  if (signal.aborted) return { kind: "cancelled" };
+  if (!maximized.ok) return { kind: "unavailable" };
+  return {
+    kind: "available",
+    fullscreen: fullscreen.value,
+    maximized: maximized.value,
+  };
+}
+
+export async function readWindowCapture(
+  target: DashboardWindow,
+  signal: AbortSignal,
+): Promise<WindowCaptureReadResult> {
+  if (signal.aborted) return { kind: "cancelled" };
+  const expanded = await readExpandedMode(target, signal);
+  if (signal.aborted || expanded.kind === "cancelled") {
+    return { kind: "cancelled" };
+  }
+  if (expanded.kind === "unavailable") return expanded;
+  if (expanded.fullscreen) {
+    return { kind: "captured", result: { mode: "fullscreen" } };
+  }
+  if (expanded.maximized) {
+    return { kind: "captured", result: { mode: "maximized" } };
+  }
+
+  const geometryRead = startWindowRead(() => target.innerSize());
+  const positionRead = startWindowRead(() => target.outerPosition());
+  const factorRead = startWindowRead(() => target.scaleFactor());
+  const geometry = await geometryRead;
+  if (signal.aborted) return { kind: "cancelled" };
+  if (!geometry.ok) return { kind: "unavailable" };
+  const position = await positionRead;
+  if (signal.aborted) return { kind: "cancelled" };
+  if (!position.ok) return { kind: "unavailable" };
+  const factor = await factorRead;
+  if (signal.aborted) return { kind: "cancelled" };
+  if (!factor.ok) return { kind: "unavailable" };
+  if (
+    !finitePositive(factor.value) ||
+    !finitePositive(geometry.value.width) ||
+    !finitePositive(geometry.value.height) ||
+    !finite(position.value.x) ||
+    !finite(position.value.y)
+  ) {
+    return { kind: "unavailable" };
+  }
+
+  const confirmed = await readExpandedMode(target, signal);
+  if (signal.aborted || confirmed.kind === "cancelled") {
+    return { kind: "cancelled" };
+  }
+  if (confirmed.kind === "unavailable") return confirmed;
+  if (
+    confirmed.fullscreen !== expanded.fullscreen ||
+    confirmed.maximized !== expanded.maximized
+  ) {
+    return { kind: "changed" };
+  }
+
+  const layout: WindowLayout = {
+    width: Math.round(geometry.value.width / factor.value),
+    height: Math.round(geometry.value.height / factor.value),
+    x: Math.round(position.value.x / factor.value),
+    y: Math.round(position.value.y / factor.value),
+    maximized: false,
+  };
+  if (
+    !finitePositive(layout.width) ||
+    !finitePositive(layout.height) ||
+    !finite(layout.x) ||
+    !finite(layout.y)
+  ) {
+    return { kind: "unavailable" };
+  }
+  return { kind: "captured", result: { layout, mode: "normal" } };
 }
 
 export function windowLayoutFromCapture(
@@ -75,6 +189,7 @@ export function createWindowCaptureCoordinator(
   let started = false;
   let generation = 0;
   let cancelDebounce: (() => void) | null = null;
+  let captureController: AbortController | null = null;
   const unlisteners = new Set<() => void>();
 
   const isCurrent = (token: number): boolean => active && token === generation;
@@ -94,103 +209,39 @@ export function createWindowCaptureCoordinator(
     cancel?.();
   };
 
-  const readExpanded = async () => {
-    const [fullscreen, maximized] = await Promise.all([
-      options.target.isFullscreen(),
-      options.target.isMaximized(),
-    ]);
-    return { fullscreen, maximized };
-  };
-
   let requestBaseline = () => {};
 
   const capture = async (token: number) => {
     if (!isCurrent(token)) return;
-    let expanded: { fullscreen: boolean; maximized: boolean };
-    try {
-      expanded = await readExpanded();
-    } catch {
-      return;
-    }
+    const controller = new AbortController();
+    captureController = controller;
+    const outcome = await readWindowCapture(options.target, controller.signal);
+    if (captureController === controller) captureController = null;
     if (!isCurrent(token)) return;
-    if (expanded.fullscreen) {
-      publish(token, { mode: "fullscreen" });
-      return;
-    }
-    if (expanded.maximized) {
-      publish(token, { mode: "maximized" });
-      return;
-    }
-
-    if (!isCurrent(token)) return;
-    let geometry: Awaited<ReturnType<DashboardWindow["innerSize"]>>;
-    let position: Awaited<ReturnType<DashboardWindow["outerPosition"]>>;
-    let factor: number;
-    try {
-      [geometry, position, factor] = await Promise.all([
-        options.target.innerSize(),
-        options.target.outerPosition(),
-        options.target.scaleFactor(),
-      ]);
-    } catch {
-      return;
-    }
-    if (!isCurrent(token)) return;
-    if (
-      !finitePositive(factor) ||
-      !finitePositive(geometry.width) ||
-      !finitePositive(geometry.height) ||
-      !finite(position.x) ||
-      !finite(position.y)
-    ) {
-      return;
-    }
-
-    if (!isCurrent(token)) return;
-    let confirmed: { fullscreen: boolean; maximized: boolean };
-    try {
-      confirmed = await readExpanded();
-    } catch {
-      return;
-    }
-    if (!isCurrent(token)) return;
-    if (
-      confirmed.fullscreen !== expanded.fullscreen ||
-      confirmed.maximized !== expanded.maximized
-    ) {
+    if (outcome.kind === "captured") {
+      publish(token, outcome.result);
+    } else if (outcome.kind === "changed") {
       requestBaseline();
-      return;
     }
+  };
 
-    const layout: WindowLayout = {
-      width: Math.round(geometry.width / factor),
-      height: Math.round(geometry.height / factor),
-      x: Math.round(position.x / factor),
-      y: Math.round(position.y / factor),
-      maximized: false,
-    };
-    if (
-      !finitePositive(layout.width) ||
-      !finitePositive(layout.height) ||
-      !finite(layout.x) ||
-      !finite(layout.y) ||
-      !isCurrent(token)
-    ) {
-      return;
-    }
-    publish(token, { layout, mode: "normal" });
+  const nextGeneration = () => {
+    const token = ++generation;
+    captureController?.abort();
+    captureController = null;
+    return token;
   };
 
   requestBaseline = () => {
     if (!active) return;
-    const token = ++generation;
+    const token = nextGeneration();
     clearDebounce();
     void capture(token);
   };
 
   const scheduleCapture = () => {
     if (!active) return;
-    const token = ++generation;
+    const token = nextGeneration();
     clearDebounce();
     let scheduling = true;
     let firedSynchronously = false;
@@ -265,6 +316,8 @@ export function createWindowCaptureCoordinator(
       if (!active) return;
       active = false;
       generation += 1;
+      captureController?.abort();
+      captureController = null;
       clearDebounce();
       for (const unlisten of unlisteners) unlisten();
       unlisteners.clear();

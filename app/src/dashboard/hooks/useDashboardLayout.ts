@@ -12,7 +12,6 @@ import {
   normalizeDashboardPanelWidths,
   viewportTierForWidth,
 } from "../layout/panelGeometry";
-import { DEFAULT_COLUMN_ORDER } from "../layout/schema";
 import type {
   DashboardLayoutExtensions,
   DashboardLayoutInvalidReason,
@@ -33,6 +32,11 @@ import {
   type LayoutSaveCoordinator,
 } from "../layoutSaveCoordinator";
 import { classifyDashboardLayoutPersistenceFailure } from "../layoutPersistence";
+import { flushDashboardLayoutOnClose } from "../layoutClosePersistence";
+import {
+  buildDashboardLayoutSnapshot,
+  type DashboardLayoutSnapshotCut,
+} from "../layoutSnapshot";
 import {
   pendingRestoredCatalogSelection,
   type PendingCatalogSelection,
@@ -61,6 +65,7 @@ type DashboardLayoutPersistenceState =
 
 type DashboardLayoutPersistenceGate = {
   attempt: number;
+  backend: DashboardBackend | null;
   writable: boolean;
   extensions: DashboardLayoutExtensions;
 };
@@ -120,10 +125,13 @@ export function useDashboardLayoutState() {
   const layoutPersistenceGateRef = useRef<DashboardLayoutPersistenceGate>(
     {
       attempt: 0,
+      backend: null,
       writable: false,
       extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
     },
   );
+  const latestSnapshotCutRef = useRef<DashboardLayoutSnapshotCut | null>(null);
+  const activeCloseBackendRef = useRef<DashboardBackend | null>(null);
   const layoutSaveCoordinatorRef = useRef<LayoutSaveCoordinator | null>(null);
   if (layoutSaveCoordinatorRef.current === null) {
     layoutSaveCoordinatorRef.current = createLayoutSaveCoordinator({
@@ -194,6 +202,8 @@ export function useDashboardLayoutState() {
     inspectorOpenPreferenceRef,
     dashboardWorkspaceRef,
     layoutPersistenceGateRef,
+    latestSnapshotCutRef,
+    activeCloseBackendRef,
     layoutSaveCoordinator,
     loadLayoutPreferences,
     saveLayoutPreferences,
@@ -254,10 +264,20 @@ export function useDashboardWindowCapturePhase(
   layout: DashboardLayoutState,
   dashboardBackend: DashboardBackend,
 ) {
-  const { setWindowLayout, windowRestoreReady } = layout;
+  const {
+    latestSnapshotCutRef,
+    activeCloseBackendRef,
+    layoutPersistenceGateRef,
+    layoutSaveCoordinator,
+    setWindowLayout,
+    windowRestoreReady,
+  } = layout;
+  activeCloseBackendRef.current = dashboardBackend;
 
   useEffect(() => {
     if (!windowRestoreReady) return;
+    const target = dashboardBackend.window.current();
+    let active = true;
     const coordinator = createWindowCaptureCoordinator({
       debounceMs: 150,
       publish: (result) => {
@@ -267,10 +287,27 @@ export function useDashboardWindowCapturePhase(
         const timer = window.setTimeout(callback, delayMs);
         return () => window.clearTimeout(timer);
       },
-      target: dashboardBackend.window.current(),
+      target,
     });
+    const unbindClose = dashboardBackend.window.closeLifecycle?.bind((signal) =>
+      flushDashboardLayoutOnClose({
+        backend: dashboardBackend,
+        coordinator: layoutSaveCoordinator,
+        getGate: () => layoutPersistenceGateRef.current,
+        getLatestSnapshotCut: () =>
+          activeCloseBackendRef.current === dashboardBackend
+            ? latestSnapshotCutRef.current
+            : null,
+        isActive: () => active,
+        target,
+      }, signal)
+    );
     coordinator.start();
-    return () => coordinator.stop();
+    return () => {
+      active = false;
+      unbindClose?.();
+      coordinator.stop();
+    };
   }, [windowRestoreReady, dashboardBackend]);
 }
 
@@ -325,6 +362,7 @@ export function useDashboardLayoutHydrationPhase(
     setLayoutSaveError(null);
     layoutPersistenceGateRef.current = {
       attempt,
+      backend: dashboardBackend,
       writable: false,
       extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
     };
@@ -429,6 +467,7 @@ export function useDashboardLayoutHydrationPhase(
         setWindowRestoreReady(true);
         layoutPersistenceGateRef.current = {
           attempt,
+          backend: dashboardBackend,
           writable: true,
           extensions: outcome.extensions,
         };
@@ -437,7 +476,13 @@ export function useDashboardLayoutHydrationPhase(
           attempt,
           write: async (snapshot) => {
             const currentGate = layoutPersistenceGateRef.current;
-            if (!currentGate.writable || currentGate.attempt !== attempt) return;
+            if (
+              !currentGate.writable ||
+              currentGate.attempt !== attempt ||
+              currentGate.backend !== dashboardBackend
+            ) {
+              return;
+            }
             const result = await saveLayoutPreferences(
               snapshot,
               expectedRevision,
@@ -468,6 +513,7 @@ export function useDashboardLayoutHydrationPhase(
       if (layoutPersistenceGateRef.current.attempt === attempt) {
         layoutPersistenceGateRef.current = {
           attempt: attempt + 1,
+          backend: null,
           writable: false,
           extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
         };
@@ -501,6 +547,7 @@ export function useDashboardLayoutPersistencePhase(
     layoutSaveCoordinator,
     layoutPersistenceGateRef,
     layoutPersistenceState,
+    latestSnapshotCutRef,
     pinnedItems,
     scratchCollapsed,
     scratchWidth,
@@ -512,31 +559,43 @@ export function useDashboardLayoutPersistencePhase(
     windowLayout,
   } = layout;
 
+  const gate = layoutPersistenceGateRef.current;
+  latestSnapshotCutRef.current =
+    layoutPersistenceState.phase === "writable" && gate.writable
+      ? {
+          attempt: gate.attempt,
+          snapshot: buildDashboardLayoutSnapshot({
+            automationSectionCollapsed,
+            collapsedProjects,
+            diffFile,
+            editingFile,
+            inspectorOpen: inspectorOpenPreferenceRef.current,
+            inspectorWidth,
+            pinnedItems,
+            scratchCollapsed,
+            scratchWidth,
+            selection,
+            sessionOrder,
+            sidebarOpen: sidebarOpenPreferenceRef.current,
+            sidebarView,
+            sidebarWidth,
+            windowLayout,
+          }),
+        }
+      : null;
+
   useEffect(() => {
     if (layoutPersistenceState.phase !== "writable") return;
-    const gate = layoutPersistenceGateRef.current;
-    if (!gate.writable) return;
-    const authorizedAttempt = gate.attempt;
-    layoutSaveCoordinator.enqueue(authorizedAttempt, {
-      left: sidebarWidth,
-      sidebarWidth,
-      inspectorWidth,
-      sidebarOpen: sidebarOpenPreferenceRef.current,
-      inspectorOpen: inspectorOpenPreferenceRef.current,
-      sidebarView,
-      sessionOrder,
-      collapsedProjects,
-      pinnedItems,
-      automationSectionCollapsed,
-      columnOrder: DEFAULT_COLUMN_ORDER,
-      scratchCollapsed,
-      scratchWidth,
-      fileBrowserOpen: sidebarView === "files",
-      selection,
-      editingFile,
-      diffFile,
-      ...(windowLayout ? { window: windowLayout } : {}),
-    });
+    const currentGate = layoutPersistenceGateRef.current;
+    const cut = latestSnapshotCutRef.current;
+    if (
+      !currentGate.writable ||
+      cut === null ||
+      cut.attempt !== currentGate.attempt
+    ) {
+      return;
+    }
+    layoutSaveCoordinator.enqueue(cut.attempt, cut.snapshot);
   }, [
     sidebarWidth,
     inspectorWidth,

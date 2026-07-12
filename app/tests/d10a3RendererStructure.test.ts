@@ -177,8 +177,10 @@ const coordinatorExports = [
 const windowCaptureExports = [
   "WindowCaptureCoordinator",
   "WindowCaptureCoordinatorOptions",
+  "WindowCaptureReadResult",
   "WindowCaptureResult",
   "createWindowCaptureCoordinator",
+  "readWindowCapture",
   "windowLayoutFromCapture",
 ] as const;
 
@@ -717,7 +719,11 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
   );
   assert.deepEqual(
     exported.filter(({ runtime }) => runtime).map(({ name }) => name).sort(),
-    ["createWindowCaptureCoordinator", "windowLayoutFromCapture"],
+    [
+      "createWindowCaptureCoordinator",
+      "readWindowCapture",
+      "windowLayoutFromCapture",
+    ],
   );
   assert.deepEqual(importManifest(captureFile), [
     "../platform|DashboardWindow|DashboardWindow|type",
@@ -743,6 +749,7 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
   );
   for (const owner of [
     "createWindowCaptureCoordinator",
+    "readWindowCapture",
     "windowLayoutFromCapture",
   ]) {
     const owners = reachable.flatMap(({ path, source }) =>
@@ -758,7 +765,7 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
   const factory = directFunction(captureFile, "createWindowCaptureCoordinator");
   assert.ok(factory.body);
   assert.deepEqual(
-    ["active", "started", "generation", "cancelDebounce"].map((name) => {
+    ["active", "started", "generation", "cancelDebounce", "captureController"].map((name) => {
       const declaration = directVariable(factory.body!, name);
       return [name, compact(declaration.initializer!, captureFile)];
     }),
@@ -767,6 +774,7 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
       ["started", "false"],
       ["generation", "0"],
       ["cancelDebounce", "null"],
+      ["captureController", "null"],
     ],
   );
   const scheduleCapture = directVariable(factory.body, "scheduleCapture");
@@ -776,7 +784,7 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
     scheduleCapture.initializer.body.statements.slice(0, 3).map(
       (statement) => compact(statement, captureFile),
     ),
-    ["if(!active)return;", "consttoken=++generation;", "clearDebounce();"],
+    ["if(!active)return;", "consttoken=nextGeneration();", "clearDebounce();"],
   );
   const trailingCapture = directVariable(factory.body, "requestTrailingCapture");
   assert.ok(trailingCapture.initializer && ts.isArrowFunction(trailingCapture.initializer));
@@ -798,7 +806,8 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
   assert.equal(callsWithPath(factory.body, "options.target.onMoved").length, 1);
   assert.equal(callsWithPath(factory.body, "options.publish").length, 1);
   assert.equal(callsWithPath(captureFile, "Number.isFinite").length, 2);
-  assert.equal(callsWithPath(factory.body, "Promise.all").length, 2);
+  assert.equal(callsWithPath(captureFile, "Promise.all").length, 0);
+  assert.equal(callsWithPath(factory.body, "readWindowCapture").length, 1);
 
   const factoryReturn = factory.body.statements.find(ts.isReturnStatement);
   assert.ok(factoryReturn?.expression && ts.isObjectLiteralExpression(factoryReturn.expression));
@@ -813,11 +822,13 @@ test("window capture coordinator has one reachable pure owner and a fenced API",
   const stop = methods.get("stop")!;
   assert.ok(stop.body);
   assert.deepEqual(
-    stop.body.statements.slice(0, 4).map((statement) => compact(statement, captureFile)),
+    stop.body.statements.slice(0, 6).map((statement) => compact(statement, captureFile)),
     [
       "if(!active)return;",
       "active=false;",
       "generation+=1;",
+      "captureController?.abort();",
+      "captureController=null;",
       "clearDebounce();",
     ],
   );
@@ -834,7 +845,6 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "../layout/panelGeometry|DEFAULT_SIDEBAR_WIDTH|DEFAULT_SIDEBAR_WIDTH|value",
     "../layout/panelGeometry|normalizeDashboardPanelWidths|normalizeDashboardPanelWidths|value",
     "../layout/panelGeometry|viewportTierForWidth|viewportTierForWidth|value",
-    "../layout/schema|DEFAULT_COLUMN_ORDER|DEFAULT_COLUMN_ORDER|value",
     "../layout/schema|DashboardLayoutExtensions|DashboardLayoutExtensions|type",
     "../layout/schema|DashboardLayoutInvalidReason|DashboardLayoutInvalidReason|type",
     "../layout/scratchGeometry|DEFAULT_SCRATCH_PANEL_WIDTH|DEFAULT_SCRATCH_PANEL_WIDTH|value",
@@ -844,9 +854,12 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "../layout/types|SidebarView|SidebarView|type",
     "../layout/types|ViewportTier|ViewportTier|type",
     "../layout/types|WindowLayout|WindowLayout|type",
+    "../layoutClosePersistence|flushDashboardLayoutOnClose|flushDashboardLayoutOnClose|value",
     "../layoutPersistence|classifyDashboardLayoutPersistenceFailure|classifyDashboardLayoutPersistenceFailure|value",
     "../layoutSaveCoordinator|LayoutSaveCoordinator|LayoutSaveCoordinator|type",
     "../layoutSaveCoordinator|createLayoutSaveCoordinator|createLayoutSaveCoordinator|value",
+    "../layoutSnapshot|DashboardLayoutSnapshotCut|DashboardLayoutSnapshotCut|type",
+    "../layoutSnapshot|buildDashboardLayoutSnapshot|buildDashboardLayoutSnapshot|value",
     "../model/selection|PendingCatalogSelection|PendingCatalogSelection|type",
     "../model/selection|PinnedItem|PinnedItem|type",
     "../model/selection|Selection|Selection|type",
@@ -945,8 +958,10 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     ["dashboardWorkspaceRef", "null"],
     [
       "layoutPersistenceGateRef",
-      "{attempt:0,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,}",
+      "{attempt:0,backend:null,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,}",
     ],
+    ["latestSnapshotCutRef", "null"],
+    ["activeCloseBackendRef", "null"],
     ["layoutSaveCoordinatorRef", "null"],
   ]);
   assert.equal(callsWithPath(state.body, "useRef").length, refInitializers.size);
@@ -1077,6 +1092,8 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "inspectorOpenPreferenceRef",
     "dashboardWorkspaceRef",
     "layoutPersistenceGateRef",
+    "latestSnapshotCutRef",
+    "activeCloseBackendRef",
     "layoutSaveCoordinator",
     "loadLayoutPreferences",
     "saveLayoutPreferences",
@@ -1570,11 +1587,16 @@ test("window capture phase delegates one backend-fenced effect to the coordinato
     "windowRestoreReady",
     "dashboardBackend",
   ]);
-  assert.equal(analysis.body.statements.length, 4);
+  assert.equal(analysis.body.statements.length, 7);
   assert.equal(
     compact(analysis.body.statements[0], layoutFile),
     "if(!windowRestoreReady)return;",
   );
+  assert.equal(
+    compact(analysis.body.statements[1], layoutFile),
+    "consttarget=dashboardBackend.window.current();",
+  );
+  assert.equal(compact(analysis.body.statements[2], layoutFile), "letactive=true;");
   const coordinator = directVariable(analysis.body, "coordinator");
   assert.ok(coordinator.initializer && ts.isCallExpression(coordinator.initializer));
   assert.equal(
@@ -1584,19 +1606,63 @@ test("window capture phase delegates one backend-fenced effect to the coordinato
   assert.equal(coordinator.initializer.arguments.length, 1);
   assert.equal(
     compact(coordinator.initializer.arguments[0], layoutFile),
-    "{debounceMs:150,publish:(result)=>{setWindowLayout((previous)=>windowLayoutFromCapture(previous,result));},schedule:(callback,delayMs)=>{consttimer=window.setTimeout(callback,delayMs);return()=>window.clearTimeout(timer);},target:dashboardBackend.window.current(),}",
+    "{debounceMs:150,publish:(result)=>{setWindowLayout((previous)=>windowLayoutFromCapture(previous,result));},schedule:(callback,delayMs)=>{consttimer=window.setTimeout(callback,delayMs);return()=>window.clearTimeout(timer);},target,}",
+  );
+  const unbindClose = directVariable(analysis.body, "unbindClose");
+  assert.ok(unbindClose.initializer && ts.isCallExpression(unbindClose.initializer));
+  assert.equal(
+    expressionPath(unbindClose.initializer.expression),
+    "dashboardBackend.window.closeLifecycle.bind",
+  );
+  const closeFlushes = callsWithPath(
+    unbindClose.initializer,
+    "flushDashboardLayoutOnClose",
+  );
+  assert.equal(closeFlushes.length, 1);
+  assert.equal(closeFlushes[0].arguments.length, 2);
+  assert.ok(ts.isObjectLiteralExpression(closeFlushes[0].arguments[0]));
+  const closeOptions = directObjectProperties(closeFlushes[0].arguments[0]);
+  assert.deepEqual(closeOptions.names, [
+    "backend",
+    "coordinator",
+    "getGate",
+    "getLatestSnapshotCut",
+    "isActive",
+    "target",
+  ]);
+  assert.equal(
+    compact(
+      propertyInitializer(closeOptions.byName.get("getLatestSnapshotCut")),
+      layoutFile,
+    ),
+    "()=>activeCloseBackendRef.current===dashboardBackend?latestSnapshotCutRef.current:null",
   );
   assert.equal(
-    compact(analysis.body.statements[2], layoutFile),
+    compact(propertyInitializer(closeOptions.byName.get("isActive")), layoutFile),
+    "()=>active",
+  );
+  assert.equal(compact(closeFlushes[0].arguments[1], layoutFile), "signal");
+  assert.equal(
+    compact(analysis.body.statements[5], layoutFile),
     "coordinator.start();",
   );
   assert.equal(
-    compact(analysis.body.statements[3], layoutFile),
-    "return()=>coordinator.stop();",
+    compact(analysis.body.statements[6], layoutFile),
+    "return()=>{active=false;unbindClose?.();coordinator.stop();};",
   );
+  const renderFenceAssignments = analysis.fn.body!.statements.filter(
+    (statement): statement is ts.ExpressionStatement =>
+      ts.isExpressionStatement(statement) &&
+      compact(statement, layoutFile) ===
+        "activeCloseBackendRef.current=dashboardBackend;",
+  );
+  assert.equal(renderFenceAssignments.length, 1);
   assert.equal(callsWithPath(analysis.body, "setWindowLayout").length, 1);
   assert.equal(callsWithPath(analysis.body, "windowLayoutFromCapture").length, 1);
   assert.equal(callsWithPath(analysis.body, "dashboardBackend.window.current").length, 1);
+  assert.equal(callsWithPath(analysis.body, "dashboardBackend.window.closeLifecycle.bind").length, 1);
+  assert.equal(callsWithPath(analysis.body, "layoutSaveCoordinator.flush").length, 0);
+  assert.equal(callsWithPath(analysis.body, "saveLayoutPreferences").length, 0);
   assert.equal(callsWithPath(analysis.body, "coordinator.start").length, 1);
   assert.equal(callsWithPath(analysis.body, "coordinator.stop").length, 1);
   assert.equal(callsWithPath(analysis.body, "useEffect").length, 0);
@@ -1627,7 +1693,7 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
   );
   assert.equal(
     compact(analysis.body.statements[3], layoutFile),
-    "layoutPersistenceGateRef.current={attempt,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};",
+    "layoutPersistenceGateRef.current={attempt,backend:dashboardBackend,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};",
   );
   assert.equal(
     compact(analysis.body.statements[4], layoutFile),
@@ -1792,7 +1858,7 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
   );
   assert.equal(
     compact(thenBody.statements[27], layoutFile),
-    "layoutPersistenceGateRef.current={attempt,writable:true,extensions:outcome.extensions,};",
+    "layoutPersistenceGateRef.current={attempt,backend:dashboardBackend,writable:true,extensions:outcome.extensions,};",
   );
   assert.equal(
     compact(thenBody.statements[28], layoutFile),
@@ -1817,7 +1883,7 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
     write.body.statements.map((statement) => compact(statement, layoutFile)),
     [
       "constcurrentGate=layoutPersistenceGateRef.current;",
-      "if(!currentGate.writable||currentGate.attempt!==attempt)return;",
+      "if(!currentGate.writable||currentGate.attempt!==attempt||currentGate.backend!==dashboardBackend){return;}",
       "constresult=awaitsaveLayoutPreferences(snapshot,expectedRevision,outcome.extensions,);",
       "expectedRevision=result.revision;",
     ],
@@ -1836,7 +1902,7 @@ test("layout hydration fences attempts and authorizes only compatible outcomes",
   );
   assert.equal(
     compact(analysis.body.statements[7], layoutFile),
-    "return()=>{disposed=true;layoutSaveCoordinator.block(attempt);if(layoutPersistenceGateRef.current.attempt===attempt){layoutPersistenceGateRef.current={attempt:attempt+1,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};}};",
+    "return()=>{disposed=true;layoutSaveCoordinator.block(attempt);if(layoutPersistenceGateRef.current.attempt===attempt){layoutPersistenceGateRef.current={attempt:attempt+1,backend:null,writable:false,extensions:EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,};}};",
   );
   assert.doesNotMatch(compact(analysis.fn, layoutFile), /\.finally\(/);
 });
@@ -1863,6 +1929,49 @@ test("layout persistence enqueues one exact snapshot behind the A gate", () => {
     "layoutSaveCoordinator",
     "layoutPersistenceState.phase",
   ]);
+  const builders = callsWithPath(analysis.fn.body!, "buildDashboardLayoutSnapshot");
+  assert.equal(builders.length, 1);
+  assert.equal(builders[0].arguments.length, 1);
+  assert.ok(ts.isObjectLiteralExpression(builders[0].arguments[0]));
+  const builderOptions = directObjectProperties(builders[0].arguments[0]);
+  assert.deepEqual(builderOptions.names, [
+    "automationSectionCollapsed",
+    "collapsedProjects",
+    "diffFile",
+    "editingFile",
+    "inspectorOpen",
+    "inspectorWidth",
+    "pinnedItems",
+    "scratchCollapsed",
+    "scratchWidth",
+    "selection",
+    "sessionOrder",
+    "sidebarOpen",
+    "sidebarView",
+    "sidebarWidth",
+    "windowLayout",
+  ]);
+  assert.equal(
+    compact(propertyInitializer(builderOptions.byName.get("inspectorOpen")), layoutFile),
+    "inspectorOpenPreferenceRef.current",
+  );
+  assert.equal(
+    compact(propertyInitializer(builderOptions.byName.get("sidebarOpen")), layoutFile),
+    "sidebarOpenPreferenceRef.current",
+  );
+  const latestCutAssignments = analysis.fn.body!.statements.filter(
+    (statement): statement is ts.ExpressionStatement =>
+      ts.isExpressionStatement(statement) &&
+      compact(statement.expression, layoutFile).startsWith(
+        "latestSnapshotCutRef.current=",
+      ),
+  );
+  assert.equal(latestCutAssignments.length, 1);
+  assert.equal(
+    compact(latestCutAssignments[0], layoutFile),
+    'latestSnapshotCutRef.current=layoutPersistenceState.phase==="writable"&&gate.writable?{attempt:gate.attempt,snapshot:buildDashboardLayoutSnapshot({automationSectionCollapsed,collapsedProjects,diffFile,editingFile,inspectorOpen:inspectorOpenPreferenceRef.current,inspectorWidth,pinnedItems,scratchCollapsed,scratchWidth,selection,sessionOrder,sidebarOpen:sidebarOpenPreferenceRef.current,sidebarView,sidebarWidth,windowLayout,}),}:null;',
+  );
+
   assert.equal(analysis.body.statements.length, 5);
   assert.equal(
     compact(analysis.body.statements[0], layoutFile),
@@ -1870,15 +1979,15 @@ test("layout persistence enqueues one exact snapshot behind the A gate", () => {
   );
   assert.equal(
     compact(analysis.body.statements[1], layoutFile),
-    "constgate=layoutPersistenceGateRef.current;",
+    "constcurrentGate=layoutPersistenceGateRef.current;",
   );
   assert.equal(
     compact(analysis.body.statements[2], layoutFile),
-    "if(!gate.writable)return;",
+    "constcut=latestSnapshotCutRef.current;",
   );
   assert.equal(
     compact(analysis.body.statements[3], layoutFile),
-    "constauthorizedAttempt=gate.attempt;",
+    "if(!currentGate.writable||cut===null||cut.attempt!==currentGate.attempt){return;}",
   );
   assert.ok(ts.isExpressionStatement(analysis.body.statements[4]));
   const enqueues = callsWithPath(
@@ -1887,44 +1996,8 @@ test("layout persistence enqueues one exact snapshot behind the A gate", () => {
   );
   assert.equal(enqueues.length, 1);
   assert.equal(enqueues[0].arguments.length, 2);
-  assert.equal(compact(enqueues[0].arguments[0], layoutFile), "authorizedAttempt");
-  assert.ok(ts.isObjectLiteralExpression(enqueues[0].arguments[1]));
-  const payload = enqueues[0].arguments[1];
-  assert.equal(payload.properties.length, 18);
-  const expected = new Map([
-    ["left", "sidebarWidth"],
-    ["sidebarWidth", "sidebarWidth"],
-    ["inspectorWidth", "inspectorWidth"],
-    ["sidebarOpen", "sidebarOpenPreferenceRef.current"],
-    ["inspectorOpen", "inspectorOpenPreferenceRef.current"],
-    ["sidebarView", "sidebarView"],
-    ["sessionOrder", "sessionOrder"],
-    ["collapsedProjects", "collapsedProjects"],
-    ["pinnedItems", "pinnedItems"],
-    ["automationSectionCollapsed", "automationSectionCollapsed"],
-    ["columnOrder", "DEFAULT_COLUMN_ORDER"],
-    ["scratchCollapsed", "scratchCollapsed"],
-    ["scratchWidth", "scratchWidth"],
-    ["fileBrowserOpen", 'sidebarView==="files"'],
-    ["selection", "selection"],
-    ["editingFile", "editingFile"],
-    ["diffFile", "diffFile"],
-  ]);
-  const directProperties = payload.properties.slice(0, -1);
-  assert.equal(directProperties.length, expected.size);
-  for (const [index, [name, value]] of [...expected].entries()) {
-    const property = directProperties[index];
-    assert.ok(ts.isPropertyAssignment(property) || ts.isShorthandPropertyAssignment(property));
-    assert.ok(ts.isIdentifier(property.name));
-    assert.equal(property.name.text, name);
-    assert.equal(compact(propertyInitializer(property), layoutFile), value);
-  }
-  const conditionalWindow = payload.properties.at(-1);
-  assert.ok(conditionalWindow && ts.isSpreadAssignment(conditionalWindow));
-  assert.equal(
-    compact(conditionalWindow.expression, layoutFile),
-    "(windowLayout?{window:windowLayout}:{})",
-  );
+  assert.equal(compact(enqueues[0].arguments[0], layoutFile), "cut.attempt");
+  assert.equal(compact(enqueues[0].arguments[1], layoutFile), "cut.snapshot");
   assert.equal(callsWithPath(analysis.fn, "saveLayoutPreferences").length, 0);
   assert.equal(callsWithPath(analysis.fn, "setTimeout").length, 0);
   assert.equal(callsWithPath(analysis.fn, "clearTimeout").length, 0);

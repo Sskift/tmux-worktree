@@ -6,6 +6,7 @@ import {
   classifyDashboardLayoutPersistenceFailure,
   type DashboardLayoutPersistenceOutcome,
 } from "../src/dashboard/layoutPersistence.ts";
+import { buildDashboardLayoutSnapshot } from "../src/dashboard/layoutSnapshot.ts";
 
 const INITIAL_REVISION = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
 const NEXT_REVISION = "twlr1_HfyBm0VsDGpTixmc8n6KpBqTiqpSf26rY03Pph07iM8";
@@ -15,6 +16,7 @@ type CapturedEffect = { callback: EffectCallback; dependencies: unknown };
 
 type LayoutGate = {
   attempt: number;
+  backend: object | null;
   writable: boolean;
   extensions: Readonly<Record<string, unknown>>;
 };
@@ -107,6 +109,11 @@ function loadDashboardLayoutHook(): {
       "../layoutSaveCoordinator",
       { createLayoutSaveCoordinator: () => assert.fail("state hook must not execute") },
     ],
+    [
+      "../layoutClosePersistence",
+      { flushDashboardLayoutOnClose: () => assert.fail("window phase is not executed") },
+    ],
+    ["../layoutSnapshot", { buildDashboardLayoutSnapshot }],
     [
       "../windowCaptureCoordinator",
       {
@@ -204,7 +211,7 @@ function layoutFixture(
   const authorizations: CapturedAuthorization[] = [];
   const enqueues: Array<{ attempt: number; snapshot: Record<string, unknown> }> = [];
   const gateRef: { current: LayoutGate } = {
-    current: { attempt: 0, writable: false, extensions: {} },
+    current: { attempt: 0, backend: null, writable: false, extensions: {} },
   };
   let state: LayoutState = { phase: "hydrating" };
   const saves: unknown[][] = [];
@@ -251,6 +258,7 @@ function layoutFixture(
       stop: () => assert.fail("production phases must not stop the shared coordinator"),
     },
     layoutPersistenceGateRef: gateRef,
+    latestSnapshotCutRef: { current: null },
     layoutPersistenceState: state,
     loadLayoutPreferences: load,
     panelWidthsRef: { current: { sidebarWidth: 280, inspectorWidth: 420 } },
@@ -561,6 +569,7 @@ test("only compatible hydration authorizes persistence and retains extensions", 
 
     fixture.gateRef.current = {
       attempt: 2,
+      backend: null,
       writable: false,
       extensions: {},
     };
@@ -711,7 +720,12 @@ test("persistence requires matching state and gate before enqueuing an exact sna
     const fixture = layoutFixture(() => Promise.reject(new Error("unused")));
     const options = { diffFile: null, editingFile: null, selection: null };
 
-    fixture.gateRef.current = { attempt: 5, writable: false, extensions: {} };
+    fixture.gateRef.current = {
+      attempt: 5,
+      backend: null,
+      writable: false,
+      extensions: {},
+    };
     Object.assign(fixture.layout, {
       layoutPersistenceState: { phase: "writable", source: "current" },
     });
@@ -721,7 +735,12 @@ test("persistence requires matching state and gate before enqueuing an exact sna
     assert.equal(timers.size, 0);
     assert.equal(fixture.enqueues.length, 0);
 
-    fixture.gateRef.current = { attempt: 6, writable: true, extensions: {} };
+    fixture.gateRef.current = {
+      attempt: 6,
+      backend: null,
+      writable: true,
+      extensions: {},
+    };
     Object.assign(fixture.layout, {
       layoutPersistenceState: { phase: "blocked", reason: "read_failed" },
     });
@@ -731,7 +750,12 @@ test("persistence requires matching state and gate before enqueuing an exact sna
     assert.equal(timers.size, 0);
     assert.equal(fixture.enqueues.length, 0);
 
-    fixture.gateRef.current = { attempt: 7, writable: true, extensions: {} };
+    fixture.gateRef.current = {
+      attempt: 7,
+      backend: null,
+      writable: true,
+      extensions: {},
+    };
     Object.assign(fixture.layout, {
       layoutPersistenceState: { phase: "writable", source: "current" },
     });
@@ -749,5 +773,47 @@ test("persistence requires matching state and gate before enqueuing an exact sna
       "editor",
     ]);
     assert.equal(fixture.saves.length, 0);
+  });
+});
+
+test("each render publishes the latest snapshot cut before any persistence effect runs", async () => {
+  await withRuntimeGlobals(async () => {
+    const { effects, hooks } = loadDashboardLayoutHook();
+    const fixture = layoutFixture(() => Promise.reject(new Error("unused")));
+    fixture.gateRef.current = {
+      attempt: 9,
+      backend: null,
+      writable: true,
+      extensions: {},
+    };
+    Object.assign(fixture.layout, {
+      layoutPersistenceState: { phase: "writable", source: "current" },
+    });
+
+    const oldEffect = registerSingleEffect(effects, () =>
+      hooks.useDashboardLayoutPersistencePhase(fixture.layout, {
+        diffFile: null,
+        editingFile: null,
+        selection: { kind: "session", name: "old" },
+      })
+    );
+    registerSingleEffect(effects, () =>
+      hooks.useDashboardLayoutPersistencePhase(fixture.layout, {
+        diffFile: null,
+        editingFile: { path: "/repo/latest.ts" },
+        selection: { kind: "session", name: "latest" },
+      })
+    );
+
+    oldEffect.callback();
+    assert.equal(fixture.enqueues.length, 1);
+    assert.equal(fixture.enqueues[0].attempt, 9);
+    assert.deepEqual(fixture.enqueues[0].snapshot.selection, {
+      kind: "session",
+      name: "latest",
+    });
+    assert.deepEqual(fixture.enqueues[0].snapshot.editingFile, {
+      path: "/repo/latest.ts",
+    });
   });
 });
