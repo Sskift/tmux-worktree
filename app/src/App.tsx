@@ -11,6 +11,7 @@ import {
 } from "./dashboard/hooks/useWorkspaceCatalog";
 import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
 import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
+import { useCatalogSelectionHydration } from "./dashboard/hooks/useCatalogSelectionHydration";
 import {
   useTerminalMetadata,
   useTerminalMetadataHydrationPhase,
@@ -48,8 +49,6 @@ import {
 import {
   pendingCreatedCatalogSelection,
   pendingRestoredCatalogSelection,
-  reconcileCatalogSelection,
-  sameCatalogSelection,
   type PendingCatalogSelection,
 } from "./dashboard/model/selection";
 import { DEFAULT_COLUMN_ORDER } from "./dashboard/layout/schema";
@@ -108,8 +107,6 @@ import {
 } from "./automationTypes";
 import {
   basenameFromPath,
-  isLocalDiscoveredInternalTerminal,
-  normalizePlainTerminal,
   sessionDisplayName,
   terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
@@ -754,64 +751,26 @@ function App() {
         : null;
   const workspaceInteractionBlocked = anyModalOpen || activeDrawer !== null;
 
-  const allTerminals = useMemo(() => {
-    const persistedKeys = new Set(terminals.map(terminalSessionKey));
-    return [
-      ...terminals,
-      ...discoveredTerminals
-        .filter((terminal) => !isLocalDiscoveredInternalTerminal(terminal))
-        .filter((terminal) => !persistedKeys.has(terminalSessionKey(terminal)))
-        .map(normalizePlainTerminal),
-    ];
-  }, [terminals, discoveredTerminals]);
-
-  const catalogSelectionResolution = useMemo(
-    () => reconcileCatalogSelection({
-      selection,
-      pendingSelection: pendingCatalogSelection,
-      hydration: {
-        refreshGeneration: catalogRefreshGeneration,
-        terminalPersistenceGeneration: terminalPersistenceHydrationGeneration,
-        hostGeneration: hostsHydrationGeneration,
-      },
-      sessions,
-      terminals: allTerminals,
-      hostIds: new Set(hosts.map((host) => host.id)),
-      failedSessionHostIds: new Set(failedSessionHostIds),
-      failedTerminalHostIds: new Set(failedTerminalHostIds),
-    }),
-    [
-      allTerminals,
-      catalogRefreshGeneration,
-      hosts,
-      hostsHydrationGeneration,
-      failedSessionHostIds,
-      failedTerminalHostIds,
-      pendingCatalogSelection,
-      selection,
-      sessions,
-      terminalPersistenceHydrationGeneration,
-    ],
-  );
-
-  useEffect(() => {
-    if (pendingCatalogSelection !== catalogSelectionResolution.pendingSelection) {
-      setPendingCatalogSelection(catalogSelectionResolution.pendingSelection);
-    }
-    if (!sameCatalogSelection(selection, catalogSelectionResolution.selection)) {
-      setSelection(catalogSelectionResolution.selection);
-    }
-  }, [catalogSelectionResolution, pendingCatalogSelection, selection]);
-
-  const selectedSession =
-    selection?.kind === "session"
-      ? sessions.find((session) => session.name === selection.name) ?? null
-      : null;
-  const selectedTerminal =
-    selection?.kind === "terminal"
-      ? allTerminals.find((terminal) => terminal.id === selection.id) ?? null
-      : null;
-  const selectionMetadataPending = catalogSelectionResolution.metadataPending;
+  const {
+    allTerminals,
+    selectedSession,
+    selectedTerminal,
+    selectionMetadataPending,
+  } = useCatalogSelectionHydration({
+    terminals,
+    discoveredTerminals,
+    sessions,
+    hosts,
+    selection,
+    pendingCatalogSelection,
+    catalogRefreshGeneration,
+    terminalPersistenceHydrationGeneration,
+    hostsHydrationGeneration,
+    failedSessionHostIds,
+    failedTerminalHostIds,
+    setSelection,
+    setPendingCatalogSelection,
+  });
 
   useEffect(() => {
     const names = [

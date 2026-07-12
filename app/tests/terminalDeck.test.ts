@@ -12,11 +12,14 @@ const workspaceSource = rendererImplementationSourceContaining(
   "<TerminalDeck",
   "const overlays",
 ).source;
-const selectionSource = rendererImplementationSourceContaining(
-  "const selectionMetadataPending =",
-  "pendingCreatedCatalogSelection(",
-  "const catalogSelectionResolution",
-).source;
+const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+const selectionHydrationSource = readFileSync(
+  new URL(
+    "../src/dashboard/hooks/useCatalogSelectionHydration.ts",
+    import.meta.url,
+  ),
+  "utf8",
+);
 const deckSource = readFileSync(
   new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url),
   "utf8",
@@ -108,29 +111,29 @@ test("scratch terminals stay mounted when the panel is collapsed", () => {
 });
 
 test("pending remote selections never fall back to local terminal or workspace commands", () => {
-  assert.match(selectionSource, /const selectionMetadataPending =/);
+  assert.match(selectionHydrationSource, /const selectionMetadataPending =/);
   assert.match(
-    selectionSource,
+    appSource,
     /if \(!selectedSession \|\| selectionMetadataPending\) return;/,
   );
   assert.match(
-    selectionSource,
+    appSource,
     /if \(!selectedTerminal \|\| selectionMetadataPending\) return;/,
   );
-  assert.match(selectionSource, /selectionMetadataPending\s*\? null\s*: selection\?\.kind === "session"/s);
-  assert.match(selectionSource, /<strong>Loading workspace details…<\/strong>/);
-  assert.match(selectionSource, /metadataPending=\{selectionMetadataPending\}/);
-  assert.match(selectionSource, /const terminalViewVisible =\s*selectionMetadataPending \|\|/s);
-  assert.match(selectionSource, /\{selectionMetadataPending \? null : editingFile \? \(/);
-  assert.match(selectionSource, /if \(!session \|\| !cwd\) return null;/);
-  assert.match(selectionSource, /useState<PendingCatalogSelection \| null>\(null\)/);
+  assert.match(appSource, /selectionMetadataPending\s*\? null\s*: selection\?\.kind === "session"/s);
+  assert.match(appSource, /<strong>Loading workspace details…<\/strong>/);
+  assert.match(appSource, /metadataPending=\{selectionMetadataPending\}/);
+  assert.match(appSource, /const terminalViewVisible =\s*selectionMetadataPending \|\|/s);
+  assert.match(appSource, /\{selectionMetadataPending \? null : editingFile \? \(/);
+  assert.match(appSource, /if \(!session \|\| !cwd\) return null;/);
+  assert.match(appSource, /useState<PendingCatalogSelection \| null>\(null\)/);
   assert.match(
-    selectionSource,
+    appSource,
     /pendingCreatedCatalogSelection\(\s*\{ kind: "session", name: sessionName \},\s*getLatestStartedRefreshGeneration\(\),\s*\)/s,
   );
   assert.match(
-    selectionSource,
-    /const catalogSelectionResolution = useMemo\(\s*\(\) => reconcileCatalogSelection/s,
+    selectionHydrationSource,
+    /const catalogSelectionResolution = useMemo\(\s*\(\) =>\s*reconcileCatalogSelection/s,
   );
 
   assert.match(deckSource, /metadataPending: boolean;/);
