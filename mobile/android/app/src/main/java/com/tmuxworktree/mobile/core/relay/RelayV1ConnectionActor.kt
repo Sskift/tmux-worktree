@@ -29,9 +29,7 @@ import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.Response
 import okhttp3.WebSocket
-import okhttp3.WebSocketListener
 
 /**
  * Serial connection actor for the legacy relay protocol.
@@ -509,64 +507,37 @@ class RelayV1ConnectionActor(
             return
         }
 
-        val callbackIngressLock = Any()
-        val listener = object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                val accepted = synchronized(callbackIngressLock) {
-                    tryEnqueueAction(Action.SocketOpened(epoch, webSocket))
+        val listener = RelayV1SocketIngress(
+            acceptOpen = { webSocket ->
+                tryEnqueueAction(Action.SocketOpened(epoch, webSocket))
+            },
+            acceptMessage = { text ->
+                if (text.length > MAX_WIRE_MESSAGE_CHARS) {
+                    false
+                } else if (pendingWireMessages.incrementAndGet() > MAX_PENDING_WIRE_MESSAGES) {
+                    pendingWireMessages.decrementAndGet()
+                    false
+                } else if (tryEnqueueAction(Action.SocketMessage(epoch, text))) {
+                    true
+                } else {
+                    pendingWireMessages.decrementAndGet()
+                    false
                 }
-                if (!accepted) signalQueueOverload(epoch, webSocket)
-            }
-
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                val accepted = synchronized(callbackIngressLock) {
-                    if (text.length > MAX_WIRE_MESSAGE_CHARS) {
-                        false
-                    } else if (pendingWireMessages.incrementAndGet() > MAX_PENDING_WIRE_MESSAGES) {
-                        pendingWireMessages.decrementAndGet()
-                        false
-                    } else if (tryEnqueueAction(Action.SocketMessage(epoch, text))) {
-                        true
-                    } else {
-                        pendingWireMessages.decrementAndGet()
-                        false
-                    }
-                }
-                if (!accepted) signalQueueOverload(epoch, webSocket)
-            }
-
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                val accepted = synchronized(callbackIngressLock) {
-                    tryEnqueueAction(Action.SocketClosed(epoch, code, reason))
-                }
-                // OkHttp requires the client to acknowledge the peer close. Do not wait for
-                // onClosed before moving the actor into backoff: a peer that never completes the
-                // close handshake must not leave the UI stuck ONLINE.
-                val acknowledged = runCatching { webSocket.close(code, reason) }.getOrDefault(false)
-                if (!acknowledged) webSocket.cancel()
-                if (!accepted) signalQueueOverload(epoch, webSocket)
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                val accepted = synchronized(callbackIngressLock) {
-                    tryEnqueueAction(Action.SocketClosed(epoch, code, reason))
-                }
-                if (!accepted) signalQueueOverload(epoch, webSocket)
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                val accepted = synchronized(callbackIngressLock) {
-                    tryEnqueueAction(
-                        Action.SocketFailure(
-                            epoch = epoch,
-                            httpCode = response?.code,
-                            message = t.message ?: t::class.java.simpleName,
-                        ),
-                    )
-                }
-                if (!accepted) signalQueueOverload(epoch, webSocket)
-            }
-        }
+            },
+            acceptClose = { code, reason ->
+                tryEnqueueAction(Action.SocketClosed(epoch, code, reason))
+            },
+            acceptFailure = { error, response ->
+                tryEnqueueAction(
+                    Action.SocketFailure(
+                        epoch = epoch,
+                        httpCode = response?.code,
+                        message = error.message ?: error::class.java.simpleName,
+                    ),
+                )
+            },
+            reject = { webSocket -> signalQueueOverload(epoch, webSocket) },
+        )
         rejectedSocketEpoch = null
         queueOverloadSignalled.set(false)
         socketEpoch = epoch
