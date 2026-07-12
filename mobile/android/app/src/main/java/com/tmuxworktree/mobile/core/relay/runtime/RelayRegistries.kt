@@ -1,7 +1,8 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.TerminalStreamState
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1Pane
 
 enum class RelayRequestKind {
     HOSTS,

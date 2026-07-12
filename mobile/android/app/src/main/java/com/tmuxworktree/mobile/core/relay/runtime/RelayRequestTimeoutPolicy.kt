@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 data class RelayRequestTimeoutPolicy(
     val hostsMillis: Long = 10_000,

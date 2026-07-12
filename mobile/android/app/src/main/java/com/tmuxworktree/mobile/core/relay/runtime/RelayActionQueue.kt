@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Semaphore
