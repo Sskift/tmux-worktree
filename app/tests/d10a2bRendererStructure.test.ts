@@ -39,6 +39,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
     "utf8",
   ),
+  layout: readFileSync(
+    new URL("../src/dashboard/hooks/useDashboardLayout.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -822,15 +826,16 @@ test("App leaves selection state local and preserves reconciliation as global ef
   assert.equal(callsWithPath(app.body, "isLocalDiscoveredInternalTerminal").length, 0);
 
   const appEffects = directCalls(app.body, "useEffect");
-  const layoutLoadEffects = appEffects.filter(({ call: effect }) =>
-    callsWithPath(effectCallbackBlock(effect), "loadLayoutPreferences").length === 1
+  const layoutHydrationPhases = directTopLevelCalls(
+    app.body,
+    "useDashboardLayoutHydrationPhase",
   );
   const relayEffects = appEffects.filter(({ call: effect }) =>
     directCalls(effectCallbackBlock(effect), "mobileRelay.setPopoverOpen").length === 1
   );
   const previewPhases = directTopLevelCalls(app.body, "useTerminalDeckPreviewPhase");
   const polling = directCalls(app.body, "useVisibilityAwarePolling");
-  assert.equal(layoutLoadEffects.length, 1);
+  assert.equal(layoutHydrationPhases.length, 1);
   assert.equal(relayEffects.length, 1);
   assert.equal(previewPhases.length, 1);
   assert.equal(polling.length, 1);
@@ -845,7 +850,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "sessions",
     "allTerminals",
   ]);
-  assert.ok(layoutLoadEffects[0].index < selectionIndex);
+  assert.ok(layoutHydrationPhases[0].index < selectionIndex);
   assert.ok(relayEffects[0].index < selectionIndex);
   assert.ok(selectionIndex < previewPhases[0].index);
   assert.ok(previewPhases[0].index < polling[0].index);
@@ -854,6 +859,11 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "useConnectionCatalog",
     "useMobileRelayController",
     "useTerminalDeckState",
+    "useDashboardLayoutState",
+    "useDashboardViewportResizePhase",
+    "useDashboardWindowCapturePhase",
+    "useDashboardLayoutHydrationPhase",
+    "useDashboardLayoutPersistencePhase",
     "useTerminalMetadataHydrationPhase",
     "useTerminalMetadataPersistencePhase",
   ]) {
@@ -894,9 +904,13 @@ test("App leaves selection state local and preserves reconciliation as global ef
     effectContribution(sources.connection, "useConnectionCatalog") +
     effectContribution(sources.relay, "useMobileRelayController") +
     effectContribution(sources.terminalDeck, "useTerminalDeckState") +
+    effectContribution(sources.layout, "useDashboardViewportResizePhase") +
+    effectContribution(sources.layout, "useDashboardWindowCapturePhase") +
+    effectContribution(sources.layout, "useDashboardLayoutHydrationPhase") +
+    effectContribution(sources.layout, "useDashboardLayoutPersistencePhase") +
     effectContribution(sources.metadata, "useTerminalMetadataHydrationPhase") +
     effectContribution(sources.metadata, "useTerminalMetadataPersistencePhase");
-  assert.equal(directAppEffectsBefore, 8);
+  assert.equal(directAppEffectsBefore, 4);
   assert.equal(effectsBeforeSelection, 18);
   const selectionEffectNumber = effectsBeforeSelection + callsWithPath(
       directFunction(
@@ -912,11 +926,19 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "the preview phase must contribute global effect 20",
   );
 
+  const layoutFile = parse("useDashboardLayout.ts", sources.layout);
+  const layoutHydration = directFunction(
+    layoutFile,
+    "useDashboardLayoutHydrationPhase",
+  );
+  assert.ok(layoutHydration.body);
+  const layoutHydrationEffects = directCalls(layoutHydration.body, "useEffect");
+  assert.equal(layoutHydrationEffects.length, 1);
   const restoredSelectionBranches: ts.IfStatement[] = [];
-  visit(effectCallbackBlock(layoutLoadEffects[0].call), (node) => {
+  visit(effectCallbackBlock(layoutHydrationEffects[0].call), (node) => {
     if (
       ts.isIfStatement(node) &&
-      compact(node.expression, appFile) === "lay.selection!==undefined"
+      compact(node.expression, layoutFile) === "lay.selection!==undefined"
     ) {
       restoredSelectionBranches.push(node);
     }
@@ -948,7 +970,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
     restoredBranch.statements[1],
     "setSelection",
   );
-  assert.equal(compact(restoreSelection.arguments[0], appFile), "lay.selection");
+  assert.equal(compact(restoreSelection.arguments[0], layoutFile), "lay.selection");
 });
 
 test("App call guard rejects nested, duplicate-key, and spread decoys", () => {

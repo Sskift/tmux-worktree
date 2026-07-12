@@ -37,6 +37,7 @@ test("the renderer composes the planned shell without legacy arbitrary columns",
 
 test("responsive shell docks the sidebar from 960px and keeps a 640px workspace", () => {
   const composition = rendererImplementationSourceContaining(
+    "function useDashboardViewportResizePhase",
     "viewportTierForWidth(window.innerWidth)",
     "setSidebarOpen(false)",
   ).source;
@@ -91,12 +92,17 @@ test("Files stay beside the editor while Git routes diffs into the workspace", (
     "const openFiles = useCallback",
     "setDiffFile({ path, cwd, hostId: hostId ?? null })",
   ).source;
+  const layoutHydration = rendererImplementationSourceContaining(
+    "function useDashboardLayoutHydrationPhase",
+    "lay.fileBrowserOpen === true",
+    'lay.inspectorTab === "files"',
+  ).source;
   assert.match(composition, /hostId=\{selectedGitHostId\}/);
   assert.match(composition, /onFileSelect=\{\(path, hostId\) =>/);
   assert.match(composition, /handleOpenFile\(path, undefined, undefined, hostId\)/);
   assert.match(composition, /activeView=\{sidebarView\}/);
   assert.match(composition, /filesContent=\{renderFiles\(\)\}/);
-  assert.match(composition, /lay\.fileBrowserOpen === true \|\|[\s\S]*?lay\.inspectorOpen === true && lay\.inspectorTab === "files"/);
+  assert.match(layoutHydration, /lay\.fileBrowserOpen === true \|\|[\s\S]*?lay\.inspectorOpen === true && lay\.inspectorTab === "files"/);
   assert.match(composition, /const openFiles = useCallback[\s\S]*?viewportTier !== "wide"[\s\S]*?setInspectorOpen\(false\)/);
   assert.match(composition, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
   assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);

@@ -1,12 +1,15 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Plus, X } from "lucide-react";
-import {
-  type DashboardWindow,
-  useDashboardBackend,
-} from "./platform";
+import { useDashboardBackend } from "./platform";
 import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
 import { useWorkspaceCatalog } from "./dashboard/hooks/useWorkspaceCatalog";
-import { useLayoutPreferences } from "./dashboard/hooks/useLayoutPreferences";
+import {
+  useDashboardLayoutHydrationPhase,
+  useDashboardLayoutPersistencePhase,
+  useDashboardLayoutState,
+  useDashboardViewportResizePhase,
+  useDashboardWindowCapturePhase,
+} from "./dashboard/hooks/useDashboardLayout";
 import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayController";
 import { useCatalogSelectionHydration } from "./dashboard/hooks/useCatalogSelectionHydration";
 import {
@@ -45,27 +48,20 @@ import {
   clampDashboardPanelWidthForViewport,
   DEFAULT_INSPECTOR_WIDTH,
   DEFAULT_SIDEBAR_WIDTH,
-  normalizeDashboardPanelWidths,
   viewportTierForWidth,
 } from "./dashboard/layout/panelGeometry";
 import {
   pendingCreatedCatalogSelection,
-  pendingRestoredCatalogSelection,
   type PendingCatalogSelection,
 } from "./dashboard/model/selection";
-import { DEFAULT_COLUMN_ORDER } from "./dashboard/layout/schema";
 import type {
   DiffFile,
   EditingFile,
-  SidebarView,
-  ViewportTier,
-  WindowLayout,
 } from "./dashboard/layout/types";
 import type { PinnedItem, Selection } from "./dashboard/model/selection";
 import {
   DEFAULT_SCRATCH_PANEL_WIDTH,
   SCRATCH_PANEL_LIMITS,
-  clampScratchPanelWidth,
   scratchPanelMaximumWidth,
   scratchPanelWidthFromKey,
   scratchPanelWidthFromPointer,
@@ -118,14 +114,6 @@ import "./App.css";
 
 const REFRESH_MS = 2_000;
 const HIDDEN_REFRESH_MS = 10_000;
-const WINDOW_DEFAULTS = { width: 1440, height: 900 };
-async function getWindowExpandedState(win: DashboardWindow) {
-  const [fullscreen, maximized] = await Promise.all([
-    win.isFullscreen().catch(() => false),
-    win.isMaximized().catch(() => false),
-  ]);
-  return { fullscreen, maximized };
-}
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
@@ -134,7 +122,36 @@ let scratchIdCounter = 0;
 
 function App() {
   const dashboardBackend = useDashboardBackend();
-  const { loadLayoutPreferences, saveLayoutPreferences } = useLayoutPreferences();
+  const dashboardLayout = useDashboardLayoutState();
+  const {
+    sessionOrder,
+    setSessionOrder,
+    collapsedProjects,
+    setCollapsedProjects,
+    pinnedItems,
+    setPinnedItems,
+    automationSectionCollapsed,
+    setAutomationSectionCollapsed,
+    scratchCollapsed,
+    setScratchCollapsed,
+    scratchWidth,
+    setScratchWidth,
+    sidebarWidth,
+    setSidebarWidth,
+    inspectorWidth,
+    setInspectorWidth,
+    sidebarOpen,
+    setSidebarOpen,
+    inspectorOpen,
+    setInspectorOpen,
+    sidebarView,
+    setSidebarView,
+    viewportTier,
+    panelWidthsRef,
+    sidebarOpenPreferenceRef,
+    inspectorOpenPreferenceRef,
+    dashboardWorkspaceRef,
+  } = dashboardLayout;
   const terminalMetadata = useTerminalMetadata();
   const {
     terminals,
@@ -183,39 +200,15 @@ function App() {
     applyTheme(id);
     return id;
   });
-  const [sessionOrder, setSessionOrder] = useState<string[]>([]);
-  const [collapsedProjects, setCollapsedProjects] = useState<string[]>([]);
-  const [pinnedItems, setPinnedItems] = useState<PinnedItem[]>([]);
-  const [automationSectionCollapsed, setAutomationSectionCollapsed] = useState(true);
   const [scratchTerminals, setScratchTerminals] = useState<Map<string, ScratchState>>(new Map());
-  const [scratchCollapsed, setScratchCollapsed] = useState(true);
-  const [scratchWidth, setScratchWidth] = useState(DEFAULT_SCRATCH_PANEL_WIDTH);
   const [editingFile, setEditingFile] = useState<EditingFile | null>(null);
   const [editorNavigationRevision, setEditorNavigationRevision] = useState(0);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
   const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
   const [homeDir, setHomeDir] = useState<string | null>(null);
-  const [sidebarWidth, setSidebarWidth] = useState(DEFAULT_SIDEBAR_WIDTH);
-  const [inspectorWidth, setInspectorWidth] = useState(DEFAULT_INSPECTOR_WIDTH);
-  const panelWidthsRef = useRef({
-    sidebarWidth: DEFAULT_SIDEBAR_WIDTH,
-    inspectorWidth: DEFAULT_INSPECTOR_WIDTH,
-  });
-  const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 960);
-  const [inspectorOpen, setInspectorOpen] = useState(() => window.innerWidth >= 1440);
-  const sidebarOpenPreferenceRef = useRef(window.innerWidth >= 960);
-  const inspectorOpenPreferenceRef = useRef(window.innerWidth >= 1440);
-  const [sidebarView, setSidebarView] = useState<SidebarView>("workspaces");
-  const [viewportTier, setViewportTier] = useState<ViewportTier>(() =>
-    viewportTierForWidth(window.innerWidth),
-  );
-  const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
-  const [windowRestoreReady, setWindowRestoreReady] = useState(false);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
-  const dashboardWorkspaceRef = useRef<HTMLDivElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const automationReturnSelectionRef = useRef<Selection>(null);
-  const layoutLoadedRef = useRef(false);
   const automationsRef = useRef<Automation[]>([]);
   const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   const [pendingCatalogSelection, setPendingCatalogSelection] =
@@ -251,7 +244,6 @@ function App() {
       revision: automationDirtySnapshotRef.current.revision + 1,
     };
   }
-  panelWidthsRef.current = { sidebarWidth, inspectorWidth };
   automationsRef.current = automations;
 
   const handleEditorDirtyChange = useCallback((dirty: boolean) => {
@@ -341,122 +333,9 @@ function App() {
     dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
   }, [dashboardBackend]);
 
-  useEffect(() => {
-    const handleResize = () => {
-      setScratchWidth((current) => clampScratchPanelWidth(
-        current,
-        dashboardWorkspaceRef.current?.getBoundingClientRect().width ?? window.innerWidth,
-      ));
-      const normalizedWidths = normalizeDashboardPanelWidths(
-        window.innerWidth,
-        panelWidthsRef.current.sidebarWidth,
-        panelWidthsRef.current.inspectorWidth,
-      );
-      panelWidthsRef.current = normalizedWidths;
-      setSidebarWidth(normalizedWidths.sidebarWidth);
-      setInspectorWidth(normalizedWidths.inspectorWidth);
-      const nextTier = viewportTierForWidth(window.innerWidth);
-      setViewportTier((currentTier) => {
-        if (currentTier === nextTier) return currentTier;
-        if (nextTier === "compact") {
-          setSidebarOpen(false);
-          setInspectorOpen(false);
-        } else if (nextTier === "drawer") {
-          setSidebarOpen(true);
-          setInspectorOpen(false);
-        } else {
-          setSidebarOpen(true);
-          setInspectorOpen(inspectorOpenPreferenceRef.current);
-        }
-        return nextTier;
-      });
-    };
-    window.addEventListener("resize", handleResize);
-    return () => window.removeEventListener("resize", handleResize);
-  }, []);
+  useDashboardViewportResizePhase(dashboardLayout);
 
-  useEffect(() => {
-    if (!windowRestoreReady) return;
-    const win = dashboardBackend.window.current();
-    let disposed = false;
-    let timer: number | null = null;
-    let unlistenResized: (() => void) | undefined;
-    let unlistenMoved: (() => void) | undefined;
-
-    const capture = async () => {
-      try {
-        const { fullscreen, maximized } = await getWindowExpandedState(win);
-        if (disposed) return;
-        if (fullscreen) {
-          setWindowLayout(
-            (prev) =>
-              prev ?? {
-                width: WINDOW_DEFAULTS.width,
-                height: WINDOW_DEFAULTS.height,
-                x: 0,
-                y: 0,
-                maximized: false,
-              },
-          );
-          return;
-        }
-        if (maximized) {
-          setWindowLayout((prev) =>
-            prev
-              ? { ...prev, maximized: true }
-              : {
-                  width: WINDOW_DEFAULTS.width,
-                  height: WINDOW_DEFAULTS.height,
-                  x: 0,
-                  y: 0,
-                  maximized: true,
-                },
-          );
-          return;
-        }
-
-        const [size, position, factor] = await Promise.all([
-          win.innerSize(),
-          win.outerPosition(),
-          win.scaleFactor(),
-        ]);
-        if (disposed) return;
-        setWindowLayout({
-          width: Math.round(size.width / factor),
-          height: Math.round(size.height / factor),
-          x: Math.round(position.x / factor),
-          y: Math.round(position.y / factor),
-          maximized: false,
-        });
-      } catch {
-        // Ignore platform/window-manager errors; persistence is best-effort.
-      }
-    };
-
-    const scheduleCapture = () => {
-      if (timer) clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void capture();
-      }, 150);
-    };
-
-    void capture();
-    void win.onResized(scheduleCapture).then((fn) => {
-      if (disposed) fn();
-      else unlistenResized = fn;
-    });
-    void win.onMoved(scheduleCapture).then((fn) => {
-      if (disposed) fn();
-      else unlistenMoved = fn;
-    });
-
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-      unlistenResized?.();
-      unlistenMoved?.();
-    };
-  }, [windowRestoreReady]);
+  useDashboardWindowCapturePhase(dashboardLayout, dashboardBackend);
 
   // Persisted terminal metadata is retried independently from the live tmux
   // catalog. A failed read must never authorize saving an empty replacement.
@@ -481,139 +360,25 @@ function App() {
     onFullCatalogPublished: handleFullCatalogPublished,
   });
 
-  // Load layout data on mount.
-  useEffect(() => {
-    loadLayoutPreferences()
-      .then((lay) => {
-        const restoredPanelWidths = normalizeDashboardPanelWidths(
-          window.innerWidth,
-          lay.sidebarWidth ?? lay.left ?? DEFAULT_SIDEBAR_WIDTH,
-          lay.inspectorWidth ?? DEFAULT_INSPECTOR_WIDTH,
-        );
-        panelWidthsRef.current = restoredPanelWidths;
-        setSidebarWidth(restoredPanelWidths.sidebarWidth);
-        setInspectorWidth(restoredPanelWidths.inspectorWidth);
-        if (lay.sessionOrder) {
-          setSessionOrder(lay.sessionOrder.filter((name) => !name.startsWith("tw-term-")));
-        }
-        if (lay.collapsedProjects) {
-          setCollapsedProjects(lay.collapsedProjects);
-        }
-        if (lay.pinnedItems) {
-          setPinnedItems(lay.pinnedItems);
-        }
-        if (lay.automationSectionCollapsed !== undefined) {
-          setAutomationSectionCollapsed(lay.automationSectionCollapsed);
-        }
-        const restoredScratchOpen = lay.scratchCollapsed === false;
-        if (lay.scratchCollapsed !== undefined) setScratchCollapsed(lay.scratchCollapsed);
-        if (lay.scratchWidth !== undefined) {
-          setScratchWidth(clampScratchPanelWidth(lay.scratchWidth, window.innerWidth));
-        }
-        const restoredSidebarView: SidebarView = lay.sidebarView ?? (
-          lay.fileBrowserOpen === true ||
-          (lay.inspectorOpen === true && lay.inspectorTab === "files") ||
-          lay.editingFile
-            ? "files"
-            : "workspaces"
-        );
-        setSidebarView(restoredSidebarView);
-        const currentViewportTier = viewportTierForWidth(window.innerWidth);
-        const restoredSidebarOpen = lay.sidebarOpen ?? true;
-        const restoredInspectorOpen = !restoredScratchOpen && (
-          lay.sidebarView !== undefined
-            ? lay.inspectorOpen ?? false
-            : (lay.inspectorTab === "git" || lay.inspectorTab === "diff") &&
-              (lay.inspectorOpen ?? false)
-        );
-        sidebarOpenPreferenceRef.current = restoredSidebarOpen;
-        inspectorOpenPreferenceRef.current = restoredInspectorOpen;
-        if (currentViewportTier === "compact") {
-          setSidebarOpen(false);
-          setInspectorOpen(false);
-        } else if (currentViewportTier === "drawer") {
-          setSidebarOpen(true);
-          setInspectorOpen(false);
-        } else {
-          setSidebarOpen(true);
-          setInspectorOpen(restoredInspectorOpen);
-        }
-        if (lay.diffFile) {
-          setDiffFile(lay.diffFile);
-          setEditingFile(null);
-        } else if (lay.editingFile) {
-          setEditingFile(lay.editingFile);
-          setDiffFile(null);
-        }
-        if (lay.selection !== undefined) {
-          setPendingCatalogSelection(
-            pendingRestoredCatalogSelection(
-              lay.selection,
-              getLatestSuccessfulRefreshGeneration(),
-            ),
-          );
-          setSelection(lay.selection);
-        }
-        if (lay.window) setWindowLayout(lay.window);
-        setWindowRestoreReady(true);
-      })
-      .catch(() => {
-        setWindowRestoreReady(true);
-      })
-      .finally(() => {
-        layoutLoadedRef.current = true;
-      });
-  }, [dashboardBackend, getLatestSuccessfulRefreshGeneration, loadLayoutPreferences]);
+  useDashboardLayoutHydrationPhase(dashboardLayout, {
+    dashboardBackend,
+    getLatestSuccessfulRefreshGeneration,
+    setSelection,
+    setPendingCatalogSelection,
+    setEditingFile,
+    setDiffFile,
+  });
 
   // Persist terminal metadata serially. The coordinator keeps the newest
   // snapshot queued and retries failed writes without allowing an older save
   // to land after a newer one.
   useTerminalMetadataPersistencePhase(terminalMetadata, dashboardBackend);
 
-  // Persist layout (debounced)
-  useEffect(() => {
-    if (!layoutLoadedRef.current) return;
-    const t = setTimeout(() => {
-      saveLayoutPreferences({
-        left: sidebarWidth,
-        sidebarWidth,
-        inspectorWidth,
-        sidebarOpen: sidebarOpenPreferenceRef.current,
-        inspectorOpen: inspectorOpenPreferenceRef.current,
-        sidebarView,
-        sessionOrder,
-        collapsedProjects,
-        pinnedItems,
-        automationSectionCollapsed,
-        columnOrder: DEFAULT_COLUMN_ORDER,
-        scratchCollapsed,
-        scratchWidth,
-        fileBrowserOpen: sidebarView === "files",
-        selection,
-        editingFile,
-        diffFile,
-        ...(windowLayout ? { window: windowLayout } : {}),
-      }).catch(() => {});
-    }, 500);
-    return () => clearTimeout(t);
-  }, [
-    sidebarWidth,
-    inspectorWidth,
-    sidebarOpen,
-    inspectorOpen,
-    sidebarView,
-    sessionOrder,
-    collapsedProjects,
-    pinnedItems,
-    automationSectionCollapsed,
-    scratchCollapsed,
-    scratchWidth,
+  useDashboardLayoutPersistencePhase(dashboardLayout, {
     selection,
     editingFile,
     diffFile,
-    windowLayout,
-    saveLayoutPreferences,
-  ]);
+  });
 
   const loadAutomations = useCallback(async () => {
     try {

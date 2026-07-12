@@ -9,6 +9,10 @@ const metadataSource = readFileSync(
   new URL("../src/dashboard/hooks/useTerminalMetadata.ts", import.meta.url),
   "utf8",
 );
+const layoutSource = readFileSync(
+  new URL("../src/dashboard/hooks/useDashboardLayout.ts", import.meta.url),
+  "utf8",
+);
 const persistenceSource = readFileSync(
   new URL("../src/terminalPersistence.ts", import.meta.url),
   "utf8",
@@ -224,31 +228,38 @@ test("App preserves hydration, layout load, persistence, and layout save registr
   assert.ok(app.body);
   const hydration = directCalls(app.body, "useTerminalMetadataHydrationPhase");
   const persistence = directCalls(app.body, "useTerminalMetadataPersistencePhase");
+  const viewportResize = directCalls(app.body, "useDashboardViewportResizePhase");
+  const windowCapture = directCalls(app.body, "useDashboardWindowCapturePhase");
+  const layoutHydration = directCalls(app.body, "useDashboardLayoutHydrationPhase");
+  const layoutPersistence = directCalls(app.body, "useDashboardLayoutPersistencePhase");
   assert.equal(hydration.length, 1);
   assert.equal(persistence.length, 1);
+  assert.equal(viewportResize.length, 1);
+  assert.equal(windowCapture.length, 1);
+  assert.equal(layoutHydration.length, 1);
+  assert.equal(layoutPersistence.length, 1);
 
   const appEffects = directCalls(app.body, "useEffect");
-  const layoutLoads = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "loadLayoutPreferences").length === 1
-  );
-  const layoutSaves = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "saveLayoutPreferences").length === 1
-  );
-  const windowCaptures = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "dashboardBackend.window.current").length === 1
-  );
   const automationLoads = appEffects.filter(({ call }) =>
     callsWithPath(call.arguments[0], "loadAutomations").length === 1
   );
-  assert.equal(layoutLoads.length, 1);
-  assert.equal(layoutSaves.length, 1);
-  assert.equal(windowCaptures.length, 1);
   assert.equal(automationLoads.length, 1);
-  assert.ok(windowCaptures[0].index < hydration[0].index);
-  assert.ok(hydration[0].index < layoutLoads[0].index);
-  assert.ok(layoutLoads[0].index < persistence[0].index);
-  assert.ok(persistence[0].index < layoutSaves[0].index);
-  assert.ok(layoutSaves[0].index < automationLoads[0].index);
+  assert.ok(viewportResize[0].index < windowCapture[0].index);
+  assert.ok(windowCapture[0].index < hydration[0].index);
+  assert.ok(hydration[0].index < layoutHydration[0].index);
+  assert.ok(layoutHydration[0].index < persistence[0].index);
+  assert.ok(persistence[0].index < layoutPersistence[0].index);
+  assert.ok(layoutPersistence[0].index < automationLoads[0].index);
+
+  const layoutFile = parse("useDashboardLayout.ts", layoutSource);
+  for (const name of [
+    "useDashboardViewportResizePhase",
+    "useDashboardWindowCapturePhase",
+    "useDashboardLayoutHydrationPhase",
+    "useDashboardLayoutPersistencePhase",
+  ]) {
+    assert.equal(directEffects(layoutFile, name).length, 1);
+  }
 
   const forbiddenAppCalls = [
     "dashboardBackend.terminals.load",
