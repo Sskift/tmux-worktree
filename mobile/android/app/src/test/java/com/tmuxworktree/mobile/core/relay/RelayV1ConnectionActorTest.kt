@@ -233,6 +233,73 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
+    fun `terminal data and exit belong only to the exact active stream id`() = runBlocking {
+        val commands = CopyOnWriteArrayList<String>()
+        val socketRef = AtomicReference<WebSocket>()
+        val activeStreamId = AtomicReference<String>()
+        val delegate = snapshotListener(commands) { _, payload ->
+            activeStreamId.set(payload.string("streamId"))
+        }
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    socketRef.set(webSocket)
+                    delegate.onOpen(webSocket, response)
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) =
+                    delegate.onMessage(webSocket, text)
+
+                override fun onClosing(webSocket: WebSocket, code: Int, reason: String) =
+                    delegate.onClosing(webSocket, code, reason)
+            }),
+        )
+        server.start()
+        val actorScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(
+            parentScope = actorScope,
+            terminalOutputBatchMillis = 5_000,
+        )
+
+        try {
+            actor.connect(configFor(server))
+            withTimeout(5_000) { actor.snapshots.first { it.sessions.isNotEmpty() } }
+            val streamId = actor.openTerminal("mac-admin", "local:demo")
+            waitUntil { activeStreamId.get() == streamId }
+
+            val terminalEvents = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events
+                        .filter {
+                            it is RelayClientEvent.TerminalData ||
+                                it is RelayClientEvent.TerminalExit
+                        }
+                        .take(2)
+                        .toList()
+                }
+            }
+            val socket = socketRef.get()
+            socket.send("{\"type\":\"terminal_data\",\"data\":\"missing-id\"}")
+            socket.send("{\"type\":\"terminal_data\",\"streamId\":\"stale-stream\",\"data\":\"stale\"}")
+            socket.send("{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"owned-one\"}")
+            socket.send("{\"type\":\"terminal_exit\",\"streamId\":\"stale-stream\",\"code\":8}")
+            socket.send("{\"type\":\"terminal_exit\",\"code\":9}")
+            socket.send("{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"owned-two\"}")
+            socket.send("{\"type\":\"terminal_exit\",\"streamId\":\"$streamId\",\"code\":0}")
+
+            val events = terminalEvents.await()
+            assertEquals(RelayClientEvent.TerminalData(streamId, "owned-oneowned-two"), events[0])
+            assertEquals(RelayClientEvent.TerminalExit(streamId, 0), events[1])
+            assertNull(actor.terminal.value.streamId)
+        } finally {
+            actor.close()
+            actorScope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun `terminal tail and acknowledgement are processed before immediate socket close`() = runBlocking {
         val commands = CopyOnWriteArrayList<String>()
         val activeStreamId = AtomicReference<String>()
@@ -928,6 +995,22 @@ class RelayV1ConnectionActorTest {
             }
             socket.send("{\"type\":\"error\",\"message\":\"latest error\"}")
             assertEquals(agentRequestId, latestError.await().request?.requestId)
+
+            actor.sendAgentMessage("mac-admin", "local:compat", "legacy acknowledgement")
+            waitUntil { commands.count { it == "send_agent_message" } == 2 }
+            val legacyAcknowledgement = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events.filterIsInstance<RelayClientEvent.AgentMessageSent>().first()
+                }
+            }
+            socket.send(
+                "{\"type\":\"agent_message_sent\",\"session\":\"local:compat\",\"pane\":\"%1\"}",
+            )
+            val acknowledgement = legacyAcknowledgement.await()
+            assertNull(acknowledgement.requestId)
+            assertEquals("mac-admin", acknowledgement.hostId)
+            assertEquals("local:compat", acknowledgement.sessionName)
+            assertEquals(RelayV1Pane.Text("%1"), acknowledgement.pane)
 
             actor.createTerminal("mac-admin", "local", "/tmp")
             waitUntil { commands.contains("create_terminal") }

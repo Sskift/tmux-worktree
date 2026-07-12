@@ -1,6 +1,8 @@
 package com.tmuxworktree.mobile.core.relay
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -109,6 +111,96 @@ class RelayV1CodecTest {
     }
 
     @Test
+    fun `missing request ids remain omitted on requests and nullable on responses`() {
+        val requests = listOf(
+            RelayV1Command.ListHosts(),
+            RelayV1Command.ListSessions(hostId = "mac-admin"),
+            RelayV1Command.ListScopeStatuses(hostId = "mac-admin"),
+            RelayV1Command.CreateWorktree(hostId = "mac-admin", scopeId = "local"),
+            RelayV1Command.CreateTerminal(hostId = "mac-admin", scopeId = "local", cwd = "/tmp"),
+            RelayV1Command.SendAgentMessage(
+                hostId = "mac-admin",
+                session = "local:demo",
+                message = "status",
+            ),
+            RelayV1Command.KillSession(hostId = "mac-admin", session = "local:demo"),
+        )
+        requests.forEach { command ->
+            assertFalse(command.type, TinyJson.parseObject(codec.encode(command)).containsKey("requestId"))
+        }
+
+        val responses = listOf(
+            "{\"type\":\"hosts\",\"hosts\":[]}",
+            "{\"type\":\"sessions\",\"sessions\":[]}",
+            "{\"type\":\"scope_statuses\",\"scopes\":[]}",
+            "{\"type\":\"worktree_created\",\"session\":{\"name\":\"local:demo\"}}",
+            "{\"type\":\"terminal_created\",\"session\":{\"name\":\"local:demo\"}}",
+            "{\"type\":\"agent_message_sent\",\"session\":\"local:demo\"}",
+            "{\"type\":\"session_killed\",\"session\":\"local:demo\"}",
+            "{\"type\":\"error\",\"message\":\"failed\"}",
+        )
+        responses.forEach { fixture ->
+            val event = (codec.decode(fixture) as RelayV1DecodeResult.Message).event
+            assertNull(event.type, event.requestId())
+        }
+    }
+
+    @Test
+    fun `pane preserves number and string wire representations`() {
+        val numericOpen = RelayV1Command.OpenTerminal(
+            hostId = "mac-admin",
+            streamId = "stream-number",
+            session = "local:demo",
+            pane = RelayV1Pane.Number(2),
+        )
+        val textOpen = numericOpen.copy(
+            streamId = "stream-text",
+            pane = RelayV1Pane.Text("%2"),
+        )
+        assertEquals(
+            "{\"type\":\"open_terminal\",\"hostId\":\"mac-admin\",\"streamId\":\"stream-number\",\"session\":\"local:demo\",\"pane\":2}",
+            codec.encode(numericOpen),
+        )
+        assertEquals(
+            "{\"type\":\"open_terminal\",\"hostId\":\"mac-admin\",\"streamId\":\"stream-text\",\"session\":\"local:demo\",\"pane\":\"%2\"}",
+            codec.encode(textOpen),
+        )
+
+        assertEquals(
+            RelayV1Pane.Number(2),
+            codec.agentMessagePane(
+                "{\"type\":\"agent_message_sent\",\"session\":\"local:demo\",\"pane\":2}",
+            ),
+        )
+        assertEquals(
+            RelayV1Pane.Text("%2"),
+            codec.agentMessagePane(
+                "{\"type\":\"agent_message_sent\",\"session\":\"local:demo\",\"pane\":\"%2\"}",
+            ),
+        )
+    }
+
+    @Test
+    fun `terminal events preserve stream ownership fields without inventing defaults`() {
+        assertEquals(
+            RelayV1Event.TerminalData("stream-1", "tail"),
+            codec.message("{\"type\":\"terminal_data\",\"streamId\":\"stream-1\",\"data\":\"tail\"}"),
+        )
+        assertEquals(
+            RelayV1Event.TerminalExit("stream-1", 0),
+            codec.message("{\"type\":\"terminal_exit\",\"streamId\":\"stream-1\",\"code\":0}"),
+        )
+        assertEquals(
+            RelayV1Event.TerminalData(null, "unowned"),
+            codec.message("{\"type\":\"terminal_data\",\"data\":\"unowned\"}"),
+        )
+        assertEquals(
+            RelayV1Event.TerminalExit(null, 0),
+            codec.message("{\"type\":\"terminal_exit\",\"code\":0}"),
+        )
+    }
+
+    @Test
     fun `unknown and malformed messages remain non fatal`() {
         assertTrue(codec.decode("{\"type\":\"future_event\",\"value\":1}") is RelayV1DecodeResult.Unknown)
         assertTrue(codec.decode("{not-json") is RelayV1DecodeResult.Malformed)
@@ -116,4 +208,25 @@ class RelayV1CodecTest {
 
     private fun sessionJson(): String =
         "{\"name\":\"local:demo\",\"rawName\":\"demo\",\"scopeId\":\"local\",\"scopeLabel\":\"local\",\"kind\":\"worktree\",\"project\":\"demo\",\"label\":\"Demo\",\"cwd\":\"/repo/demo\",\"attached\":true,\"windows\":2,\"created\":10,\"activity\":20}"
+
+    private fun RelayV1Event.requestId(): String? = when (this) {
+        is RelayV1Event.Hosts -> requestId
+        is RelayV1Event.Sessions -> requestId
+        is RelayV1Event.ScopeStatuses -> requestId
+        is RelayV1Event.WorktreeCreated -> requestId
+        is RelayV1Event.TerminalCreated -> requestId
+        is RelayV1Event.AgentMessageSent -> requestId
+        is RelayV1Event.SessionKilled -> requestId
+        is RelayV1Event.Error -> requestId
+        is RelayV1Event.Ready,
+        is RelayV1Event.TerminalData,
+        is RelayV1Event.TerminalExit,
+        -> error("${this::class.java.simpleName} has no requestId")
+    }
+
+    private fun RelayV1Codec.message(raw: String): RelayV1Event =
+        (decode(raw) as RelayV1DecodeResult.Message).event
+
+    private fun RelayV1Codec.agentMessagePane(raw: String): RelayV1Pane? =
+        (message(raw) as RelayV1Event.AgentMessageSent).pane
 }
