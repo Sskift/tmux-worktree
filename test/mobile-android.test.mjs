@@ -54,6 +54,7 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
   const webView = readAndroidSource("TerminalWebView.kt");
   const relayActor = readAndroidSource("RelayV1ConnectionActor.kt");
   const actionQueue = readAndroidSource("RelayActionQueue.kt");
+  const socketIngress = readAndroidSource("RelayV1SocketIngress.kt");
   const viewModel = readAndroidSource("V2ViewModel.kt");
   const registries = readAndroidSource("RelayRegistries.kt");
 
@@ -86,7 +87,7 @@ test("Android V2 terminal is bundled, sandboxed, and refits after viewport chang
     actionQueue,
     /Channel<QueuedAction<T>>\([\s\S]*validatedNormalCapacity \+ validatedReservedCapacity/,
   );
-  assert.match(relayActor, /callbackIngressLock = Any\(\)/);
+  assert.match(socketIngress, /callbackIngressLock = Any\(\)/);
   assert.match(relayActor, /Channel<RelayClientEvent>\(MAX_PENDING_EVENTS\)/);
   assert.doesNotMatch(relayActor, /Channel\.UNLIMITED/);
   assert.doesNotMatch(relayActor, /runBlocking/);
