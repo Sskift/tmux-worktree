@@ -587,6 +587,24 @@ test("layout save coordinator has one reachable pure owner and an exact API", ()
     "createLayoutSaveCoordinator",
   );
   assert.ok(coordinatorFactory.body);
+  const coordinatorAliases = coordinatorFile.statements.filter(
+    (statement): statement is ts.TypeAliasDeclaration =>
+      ts.isTypeAliasDeclaration(statement) &&
+      statement.name.text === "LayoutSaveCoordinator",
+  );
+  assert.equal(coordinatorAliases.length, 1);
+  assert.ok(ts.isTypeLiteralNode(coordinatorAliases[0].type));
+  assert.deepEqual(
+    coordinatorAliases[0].type.members.map((member) => compact(member, coordinatorFile)),
+    [
+      "beginAttempt(attempt:number):void;",
+      "authorize(authorization:LayoutSaveAuthorization):void;",
+      "enqueue(attempt:number,snapshot:DashboardLayoutPreferences):void;",
+      'flush(attempt:number,finalSnapshot:DashboardLayoutPreferences,signal:AbortSignal,):Promise<"flushed"|"blocked"|"stale"|"cancelled">;',
+      "block(attempt:number):void;",
+      "stop():void;",
+    ],
+  );
   assert.deepEqual(
     ["pending", "exactRetry", "inFlight"].map((name) => {
       const declaration = directVariable(coordinatorFactory.body!, name);
@@ -602,6 +620,88 @@ test("layout save coordinator has one reachable pure owner and an exact API", ()
       { initializer: "null", name: "inFlight", type: "InFlightSave | null" },
     ],
   );
+  const finalization = directVariable(coordinatorFactory.body, "finalization");
+  assert.equal(finalization.initializer?.getText(coordinatorFile), "null");
+  assert.equal(finalization.type?.getText(coordinatorFile), "LayoutSaveFinalization | null");
+
+  const settleSuccessDeclaration = directVariable(
+    coordinatorFactory.body,
+    "settleSuccess",
+  );
+  assert.ok(
+    settleSuccessDeclaration.initializer &&
+      ts.isArrowFunction(settleSuccessDeclaration.initializer) &&
+      ts.isBlock(settleSuccessDeclaration.initializer.body),
+  );
+  const settleSuccessStatements = settleSuccessDeclaration.initializer.body.statements;
+  const directPumpIndex = settleSuccessStatements.findIndex(
+    (statement) =>
+      ts.isExpressionStatement(statement) &&
+      ts.isCallExpression(statement.expression) &&
+      expressionPath(statement.expression.expression) === "pump",
+  );
+  const recoveredNotificationIndex = settleSuccessStatements.findIndex(
+    (statement) =>
+      ts.isIfStatement(statement) &&
+      callsWithPath(statement.thenStatement, "notify").some(
+        (call) => call.arguments[0]?.getText(coordinatorFile) === "options.onRecovered",
+      ),
+  );
+  assert.ok(directPumpIndex >= 0);
+  assert.ok(recoveredNotificationIndex > directPumpIndex);
+
+  const factoryReturn = coordinatorFactory.body.statements.find(ts.isReturnStatement);
+  assert.ok(factoryReturn?.expression && ts.isObjectLiteralExpression(factoryReturn.expression));
+  const methods = new Map(
+    factoryReturn.expression.properties.map((property) => {
+      assert.ok(ts.isMethodDeclaration(property));
+      assert.ok(ts.isIdentifier(property.name));
+      return [property.name.text, property];
+    }),
+  );
+  assert.deepEqual([...methods.keys()], [
+    "beginAttempt",
+    "authorize",
+    "enqueue",
+    "flush",
+    "block",
+    "stop",
+  ]);
+  const flushMethod = methods.get("flush")!;
+  assert.equal(
+    (ts.getModifiers(flushMethod) ?? []).some(
+      (modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword,
+    ),
+    false,
+    "flush must preserve Promise identity for repeated calls",
+  );
+  assert.deepEqual(
+    flushMethod.parameters.map((parameter) => compact(parameter, coordinatorFile)),
+    [
+      "attempt",
+      "finalSnapshot",
+      "signal",
+    ],
+  );
+  assert.ok(flushMethod.body);
+  assert.equal(callsWithPath(flushMethod.body, "cloneLayoutSnapshot").length, 1);
+  assert.equal(callsWithPath(flushMethod.body, "pump").length, 1);
+  assert.equal(callsWithPath(flushMethod.body, "startWrite").length, 0);
+  const startWrite = directVariable(coordinatorFactory.body, "startWrite");
+  assert.ok(startWrite.initializer && ts.isArrowFunction(startWrite.initializer));
+  const writeCalls: ts.CallExpression[] = [];
+  visit(coordinatorFile, (node) => {
+    if (
+      ts.isCallExpression(node) &&
+      ts.isPropertyAccessExpression(node.expression) &&
+      node.expression.name.text === "write"
+    ) {
+      writeCalls.push(node);
+    }
+  });
+  assert.equal(writeCalls.length, 1);
+  assert.ok(startWrite.initializer.body.pos <= writeCalls[0].pos);
+  assert.ok(writeCalls[0].end <= startWrite.initializer.body.end);
 });
 
 test("window capture coordinator has one reachable pure owner and a fenced API", () => {

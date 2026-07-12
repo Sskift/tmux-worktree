@@ -26,9 +26,16 @@ export type LayoutSaveCoordinator = {
   beginAttempt(attempt: number): void;
   authorize(authorization: LayoutSaveAuthorization): void;
   enqueue(attempt: number, snapshot: DashboardLayoutPreferences): void;
+  flush(
+    attempt: number,
+    finalSnapshot: DashboardLayoutPreferences,
+    signal: AbortSignal,
+  ): Promise<"flushed" | "blocked" | "stale" | "cancelled">;
   block(attempt: number): void;
   stop(): void;
 };
+
+type LayoutSaveFlushResult = "flushed" | "blocked" | "stale" | "cancelled";
 
 type PendingSave = {
   attempt: number;
@@ -38,6 +45,7 @@ type PendingSave = {
 
 type ExactRetrySave = {
   attempt: number;
+  failure: unknown;
   snapshot: DashboardLayoutPreferences;
 };
 
@@ -45,6 +53,17 @@ type InFlightSave = {
   attempt: number;
   authorization: LayoutSaveAuthorization;
   snapshot: DashboardLayoutPreferences;
+};
+
+type LayoutSaveFinalization = {
+  acceleratingExistingBackoff: boolean;
+  abortListener: () => void;
+  attempt: number;
+  finalSnapshot: DashboardLayoutPreferences;
+  immediateRetries: WeakSet<DashboardLayoutPreferences>;
+  promise: Promise<LayoutSaveFlushResult>;
+  resolve(result: LayoutSaveFlushResult): void;
+  signal: AbortSignal;
 };
 
 const PRIMITIVE_LAYOUT_KEYS = [
@@ -170,7 +189,10 @@ export function createLayoutSaveCoordinator(
   let retryToken: object | null = null;
   let cancelRetry: (() => void) | null = null;
   let retryBlocked = false;
+  let retryMode: "normal" | "finalizing" | null = null;
   let errorOutstanding = false;
+  let finalization: LayoutSaveFinalization | null = null;
+  let pumpDepth = 0;
 
   const notify = (callback: () => void) => {
     try {
@@ -199,6 +221,7 @@ export function createLayoutSaveCoordinator(
   const clearRetry = () => {
     retryToken = null;
     retryBlocked = false;
+    retryMode = null;
     const callback = cancelRetry;
     cancelRetry = null;
     cancel(callback);
@@ -210,13 +233,36 @@ export function createLayoutSaveCoordinator(
     currentAttempt === candidate.attempt &&
     authorization === candidate;
 
-  const blockCurrent = (attempt: number): boolean => {
+  const finishFinalization = (
+    candidate: LayoutSaveFinalization,
+    result: LayoutSaveFlushResult,
+  ) => {
+    if (finalization !== candidate) return;
+    finalization = null;
+    try {
+      candidate.signal.removeEventListener("abort", candidate.abortListener);
+    } catch {
+      // Abort listener cleanup must not keep a flush promise pending.
+    }
+    candidate.resolve(result);
+  };
+
+  const finishCurrentFinalization = (result: LayoutSaveFlushResult) => {
+    const candidate = finalization;
+    if (candidate) finishFinalization(candidate, result);
+  };
+
+  const blockCurrent = (
+    attempt: number,
+    flushResult: LayoutSaveFlushResult = "cancelled",
+  ): boolean => {
     if (stopped || currentAttempt !== attempt) return false;
     currentBlocked = true;
     authorization = null;
     pending = null;
     exactRetry = null;
     errorOutstanding = false;
+    finishCurrentFinalization(flushResult);
     clearDebounce();
     clearRetry();
     return true;
@@ -254,7 +300,7 @@ export function createLayoutSaveCoordinator(
       scheduledCancel = options.schedule(run, options.debounceMs);
     } catch (error) {
       scheduling = false;
-      if (debounceToken === token && blockCurrent(attempt)) {
+      if (debounceToken === token && blockCurrent(attempt, "blocked")) {
         notify(() => options.onBlocked(error));
       }
       return;
@@ -271,12 +317,14 @@ export function createLayoutSaveCoordinator(
   const scheduleRetry = (
     attempt: number,
     failure: unknown,
+    notifyFailure = true,
   ): boolean => {
     clearRetry();
     retryBlocked = true;
+    retryMode = "normal";
     const token = {};
     retryToken = token;
-    notify(() => options.onError(failure));
+    if (notifyFailure) notify(() => options.onError(failure));
     if (
       stopped ||
       currentBlocked ||
@@ -289,7 +337,7 @@ export function createLayoutSaveCoordinator(
     try {
       delayMs = options.retryDelayMs();
     } catch (error) {
-      if (retryToken === token && blockCurrent(attempt)) {
+      if (retryToken === token && blockCurrent(attempt, "blocked")) {
         notify(() => options.onBlocked(error));
       }
       return false;
@@ -314,13 +362,14 @@ export function createLayoutSaveCoordinator(
       retryToken = null;
       cancelRetry = null;
       retryBlocked = false;
+      retryMode = null;
       pump();
     };
     try {
       scheduledCancel = options.schedule(run, delayMs);
     } catch (error) {
       scheduling = false;
-      if (retryToken === token && blockCurrent(attempt)) {
+      if (retryToken === token && blockCurrent(attempt, "blocked")) {
         notify(() => options.onBlocked(error));
       }
       return false;
@@ -335,6 +384,87 @@ export function createLayoutSaveCoordinator(
     return true;
   };
 
+  const scheduleImmediateFinalizationRetry = (
+    candidate: LayoutSaveFinalization,
+    failure: unknown,
+  ): boolean => {
+    clearRetry();
+    if (
+      finalization !== candidate ||
+      stopped ||
+      currentBlocked ||
+      currentAttempt !== candidate.attempt
+    ) {
+      return false;
+    }
+    retryBlocked = true;
+    retryMode = "finalizing";
+    const token = {};
+    retryToken = token;
+    notify(() => options.onError(failure));
+    if (
+      finalization !== candidate ||
+      stopped ||
+      currentBlocked ||
+      currentAttempt !== candidate.attempt ||
+      retryToken !== token
+    ) {
+      return false;
+    }
+    try {
+      queueMicrotask(() => {
+        if (
+          finalization !== candidate ||
+          stopped ||
+          currentBlocked ||
+          currentAttempt !== candidate.attempt ||
+          retryToken !== token ||
+          retryMode !== "finalizing"
+        ) {
+          return;
+        }
+        retryToken = null;
+        retryBlocked = false;
+        retryMode = null;
+        pump();
+      });
+    } catch {
+      if (retryToken === token) {
+        clearRetry();
+        scheduleRetry(candidate.attempt, failure, false);
+      }
+      return false;
+    }
+    return true;
+  };
+
+  const cancelFinalization = (candidate: LayoutSaveFinalization) => {
+    if (finalization !== candidate) return;
+    if (
+      pending?.attempt === candidate.attempt &&
+      pending.snapshot === candidate.finalSnapshot
+    ) {
+      pending = null;
+    }
+    const restoreNormalRetry =
+      (candidate.acceleratingExistingBackoff || retryMode === "finalizing") &&
+      exactRetry?.attempt === candidate.attempt;
+    const retryFailure = restoreNormalRetry ? exactRetry?.failure : undefined;
+    finishFinalization(candidate, "cancelled");
+    if (restoreNormalRetry) {
+      clearRetry();
+      if (
+        !stopped &&
+        !currentBlocked &&
+        currentAttempt === candidate.attempt &&
+        exactRetry !== null
+      ) {
+        scheduleRetry(candidate.attempt, retryFailure, false);
+      }
+    }
+    pump();
+  };
+
   const settleSuccess = (flight: InFlightSave) => {
     if (inFlight !== flight) return;
     inFlight = null;
@@ -342,11 +472,13 @@ export function createLayoutSaveCoordinator(
       pump();
       return;
     }
-    if (pending === null && exactRetry === null && errorOutstanding) {
+    const shouldNotifyRecovered =
+      pending === null && exactRetry === null && errorOutstanding;
+    if (shouldNotifyRecovered) {
       errorOutstanding = false;
-      notify(options.onRecovered);
     }
     pump();
+    if (shouldNotifyRecovered) notify(options.onRecovered);
   };
 
   const settleFailure = (flight: InFlightSave, error: unknown) => {
@@ -368,22 +500,35 @@ export function createLayoutSaveCoordinator(
       return;
     }
     if (classification !== "retry") {
-      if (blockCurrent(flight.attempt)) notify(() => options.onBlocked(error));
+      if (blockCurrent(flight.attempt, "blocked")) {
+        notify(() => options.onBlocked(error));
+      }
       pump();
       return;
     }
 
     exactRetry = {
       attempt: flight.attempt,
+      failure: error,
       snapshot: flight.snapshot,
     };
     errorOutstanding = true;
-    scheduleRetry(flight.attempt, error);
+    const activeFinalization = finalization;
+    if (
+      activeFinalization !== null &&
+      activeFinalization.attempt === flight.attempt &&
+      !activeFinalization.immediateRetries.has(flight.snapshot)
+    ) {
+      activeFinalization.immediateRetries.add(flight.snapshot);
+      scheduleImmediateFinalizationRetry(activeFinalization, error);
+    } else {
+      scheduleRetry(flight.attempt, error);
+    }
   };
 
   const startWrite = (
     candidateAuthorization: LayoutSaveAuthorization,
-    entry: ExactRetrySave,
+    entry: { attempt: number; snapshot: DashboardLayoutPreferences },
   ) => {
     const flight: InFlightSave = {
       attempt: entry.attempt,
@@ -409,42 +554,69 @@ export function createLayoutSaveCoordinator(
     }
   };
 
-  pump = () => {
+  const maybeFinishFinalization = () => {
+    const candidate = finalization;
     if (
+      candidate === null ||
+      pumpDepth !== 0 ||
       stopped ||
-      inFlight !== null ||
-      retryBlocked ||
-      authorization === null ||
       currentBlocked ||
-      currentAttempt !== authorization.attempt
+      currentAttempt !== candidate.attempt ||
+      authorization?.attempt !== candidate.attempt ||
+      inFlight !== null ||
+      exactRetry !== null ||
+      pending !== null ||
+      retryBlocked ||
+      retryToken !== null
     ) {
       return;
     }
-    if (
-      exactRetry !== null &&
-      exactRetry.attempt === currentAttempt
-    ) {
-      const retry = exactRetry;
-      exactRetry = null;
-      startWrite(authorization, retry);
-      return;
+    finishFinalization(candidate, "flushed");
+  };
+
+  pump = () => {
+    pumpDepth += 1;
+    try {
+      if (
+        stopped ||
+        inFlight !== null ||
+        retryBlocked ||
+        authorization === null ||
+        currentBlocked ||
+        currentAttempt !== authorization.attempt
+      ) {
+        return;
+      }
+      if (
+        exactRetry !== null &&
+        exactRetry.attempt === currentAttempt
+      ) {
+        const retry = exactRetry;
+        exactRetry = null;
+        startWrite(authorization, retry);
+        return;
+      }
+      if (
+        pending === null ||
+        !pending.debounceReady ||
+        pending.attempt !== currentAttempt
+      ) {
+        return;
+      }
+      const latest = pending;
+      pending = null;
+      clearDebounce();
+      startWrite(authorization, latest);
+    } finally {
+      pumpDepth -= 1;
+      if (pumpDepth === 0) maybeFinishFinalization();
     }
-    if (
-      pending === null ||
-      !pending.debounceReady ||
-      pending.attempt !== currentAttempt
-    ) {
-      return;
-    }
-    const latest = pending;
-    pending = null;
-    clearDebounce();
-    startWrite(authorization, latest);
   };
 
   return {
     beginAttempt(attempt) {
       if (stopped || (currentAttempt !== null && attempt <= currentAttempt)) return;
+      finishCurrentFinalization("cancelled");
       currentAttempt = attempt;
       currentBlocked = false;
       authorization = null;
@@ -459,7 +631,8 @@ export function createLayoutSaveCoordinator(
       if (
         stopped ||
         currentBlocked ||
-        currentAttempt !== candidateAuthorization.attempt
+        currentAttempt !== candidateAuthorization.attempt ||
+        finalization?.attempt === candidateAuthorization.attempt
       ) {
         return;
       }
@@ -472,7 +645,8 @@ export function createLayoutSaveCoordinator(
         stopped ||
         currentBlocked ||
         currentAttempt !== attempt ||
-        authorization?.attempt !== attempt
+        authorization?.attempt !== attempt ||
+        finalization?.attempt === attempt
       ) {
         return;
       }
@@ -484,6 +658,92 @@ export function createLayoutSaveCoordinator(
         snapshot: cloneLayoutSnapshot(snapshot),
       };
       scheduleDebounce(attempt);
+    },
+
+    flush(attempt, finalSnapshot, signal) {
+      const activeFinalization = finalization;
+      if (activeFinalization?.attempt === attempt) {
+        return activeFinalization.promise;
+      }
+      let signalAborted: boolean;
+      try {
+        signalAborted = signal.aborted;
+      } catch {
+        return Promise.resolve("cancelled");
+      }
+      if (signalAborted) return Promise.resolve("cancelled");
+      if (
+        activeFinalization !== null ||
+        stopped ||
+        currentBlocked ||
+        currentAttempt !== attempt ||
+        authorization?.attempt !== attempt
+      ) {
+        return Promise.resolve("stale");
+      }
+
+      let clonedSnapshot: DashboardLayoutPreferences;
+      try {
+        clonedSnapshot = cloneLayoutSnapshot(finalSnapshot);
+      } catch (error) {
+        if (blockCurrent(attempt, "blocked")) {
+          notify(() => options.onBlocked(error));
+        }
+        return Promise.resolve("blocked");
+      }
+
+      let resolveFlush!: (result: LayoutSaveFlushResult) => void;
+      const promise = new Promise<LayoutSaveFlushResult>((resolve) => {
+        resolveFlush = resolve;
+      });
+      const candidate: LayoutSaveFinalization = {
+        acceleratingExistingBackoff: false,
+        abortListener: () => {},
+        attempt,
+        finalSnapshot: clonedSnapshot,
+        immediateRetries: new WeakSet<DashboardLayoutPreferences>(),
+        promise,
+        resolve: resolveFlush,
+        signal,
+      };
+      candidate.abortListener = () => cancelFinalization(candidate);
+      finalization = candidate;
+      try {
+        signal.addEventListener("abort", candidate.abortListener, { once: true });
+        signalAborted = signal.aborted;
+      } catch {
+        finishFinalization(candidate, "cancelled");
+        return promise;
+      }
+      if (signalAborted) {
+        cancelFinalization(candidate);
+        return promise;
+      }
+      if (finalization !== candidate) return promise;
+
+      pending = {
+        attempt,
+        debounceReady: true,
+        snapshot: clonedSnapshot,
+      };
+      clearDebounce();
+      if (finalization !== candidate) return promise;
+      if (exactRetry?.attempt === attempt) {
+        candidate.immediateRetries.add(exactRetry.snapshot);
+      }
+      if (
+        exactRetry?.attempt === attempt &&
+        retryBlocked &&
+        retryMode === "normal"
+      ) {
+        candidate.acceleratingExistingBackoff = true;
+      }
+      if (retryBlocked) clearRetry();
+      if (finalization === candidate) {
+        candidate.acceleratingExistingBackoff = false;
+      }
+      if (finalization === candidate) pump();
+      return promise;
     },
 
     block(attempt) {
@@ -498,6 +758,7 @@ export function createLayoutSaveCoordinator(
       pending = null;
       exactRetry = null;
       errorOutstanding = false;
+      finishCurrentFinalization("cancelled");
       clearDebounce();
       clearRetry();
     },

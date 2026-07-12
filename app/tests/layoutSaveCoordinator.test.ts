@@ -123,6 +123,34 @@ function coordinatorHarness(retryDelayMs = 3_000) {
   };
 }
 
+function trackedAbortSignal() {
+  let aborted = false;
+  const listeners = new Set<() => void>();
+  const signal = {
+    get aborted() {
+      return aborted;
+    },
+    addEventListener(type: string, listener: () => void) {
+      assert.equal(type, "abort");
+      listeners.add(listener);
+    },
+    removeEventListener(type: string, listener: () => void) {
+      assert.equal(type, "abort");
+      listeners.delete(listener);
+    },
+  } as unknown as AbortSignal;
+  return {
+    abort() {
+      if (aborted) return;
+      aborted = true;
+      for (const listener of [...listeners]) listener();
+      listeners.clear();
+    },
+    listenerCount: () => listeners.size,
+    signal,
+  };
+}
+
 test("debounce keeps only the latest deeply cloned known snapshot", async () => {
   const harness = coordinatorHarness();
   const writes: DashboardLayoutPreferences[] = [];
@@ -753,4 +781,881 @@ test("attempts are monotonic and stale API calls cannot disturb current work", a
   assert.equal(clearedTimer.cancelled, true);
   harness.scheduler.fire(clearedTimer, true);
   assert.deepEqual(writes, ["session-current"]);
+});
+
+test("flush replaces a pending debounce with one deeply cloned ready final snapshot", async () => {
+  const harness = coordinatorHarness();
+  const write = deferred();
+  const writes: DashboardLayoutPreferences[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value);
+      return write.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("debounced"));
+  const debounce = harness.scheduler.tasks[0];
+  const finalSnapshot = snapshot("final");
+  const signal = trackedAbortSignal();
+  let outcome: string | undefined;
+  const flush = harness.coordinator.flush(1, finalSnapshot, signal.signal);
+  void flush.then((value) => { outcome = value; });
+
+  assert.equal(debounce.cancelCount, 1);
+  assert.equal(writes.length, 1);
+  assert.equal(outcome, undefined);
+  assert.equal(signal.listenerCount(), 1);
+  finalSnapshot.sessionOrder?.push("mutated-after-flush");
+  if (finalSnapshot.window) finalSnapshot.window.width = 1;
+  assert.deepEqual(jsonValue(writes[0]), jsonValue(snapshot("final")));
+  harness.scheduler.fire(debounce, true);
+  assert.equal(writes.length, 1);
+
+  write.resolve();
+  assert.equal(await flush, "flushed");
+  assert.equal(outcome, "flushed");
+  assert.equal(signal.listenerCount(), 0);
+});
+
+test("flush waits for in-flight work then writes only its final snapshot", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred();
+  const finalWrite = deferred();
+  const writes: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      const pending = writes.length === 1 ? first : finalWrite;
+      return pending.promise.finally(() => { active -= 1; });
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("A"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  harness.coordinator.enqueue(1, snapshot("discarded"));
+  const discardedDebounce = harness.scheduler.tasks[1];
+  const controller = new AbortController();
+  let outcome: string | undefined;
+  const flush = harness.coordinator.flush(1, snapshot("final"), controller.signal);
+  void flush.then((value) => { outcome = value; });
+  harness.coordinator.enqueue(1, snapshot("reentrant-enqueue"));
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "block",
+    write: async () => { writes.push("replacement-writer"); },
+  });
+
+  assert.equal(discardedDebounce.cancelled, true);
+  assert.deepEqual(writes, ["session-A"]);
+  assert.equal(outcome, undefined);
+  first.resolve();
+  await flushPromises();
+  assert.deepEqual(writes, ["session-A", "session-final"]);
+  assert.equal(maxActive, 1);
+  assert.equal(outcome, undefined);
+  finalWrite.resolve();
+  assert.equal(await flush, "flushed");
+  assert.equal(maxActive, 1);
+  assert.equal(harness.scheduler.tasks.length, 2);
+});
+
+test("flush cancels existing backoff and preserves exact A before revisioned final", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred<string>();
+  const exact = deferred<string>();
+  const finalWrite = deferred<string>();
+  const responses = [first, exact, finalWrite];
+  const writes: Array<{ revision: string; session: string }> = [];
+  let expectedRevision = "revision-0";
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      writes.push({
+        revision: expectedRevision,
+        session: value.sessionOrder?.[0] ?? "missing",
+      });
+      const response = responses.shift();
+      assert.ok(response);
+      expectedRevision = await response.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("A"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  first.reject(new Error("ambiguous A"));
+  await flushPromises();
+  const backoff = harness.scheduler.tasks[1];
+  harness.coordinator.enqueue(1, snapshot("discarded"));
+  const discardedDebounce = harness.scheduler.tasks[2];
+
+  const flush = harness.coordinator.flush(
+    1,
+    snapshot("final"),
+    new AbortController().signal,
+  );
+  assert.equal(backoff.cancelCount, 1);
+  assert.equal(discardedDebounce.cancelCount, 1);
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+  ]);
+  harness.scheduler.fire(backoff, true);
+  harness.scheduler.fire(discardedDebounce, true);
+  assert.equal(writes.length, 2);
+
+  exact.resolve("revision-1");
+  await flushPromises();
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-1", session: "session-final" },
+  ]);
+  finalWrite.resolve("revision-2");
+  assert.equal(await flush, "flushed");
+});
+
+test("flush abort during external backoff cancellation restores a normal exact retry", async () => {
+  const scheduler = manualScheduler();
+  const errors: unknown[] = [];
+  const blocked: unknown[] = [];
+  let recovered = 0;
+  let abortOnBackoffCancel: (() => void) | null = null;
+  let shouldAbortOnBackoffCancel = false;
+  const coordinator = createLayoutSaveCoordinator({
+    debounceMs: 500,
+    schedule(callback, delayMs) {
+      const cancelScheduled = scheduler.schedule(callback, delayMs);
+      return () => {
+        cancelScheduled();
+        if (delayMs === 3_000 && shouldAbortOnBackoffCancel) {
+          shouldAbortOnBackoffCancel = false;
+          abortOnBackoffCancel?.();
+        }
+      };
+    },
+    retryDelayMs: () => 3_000,
+    onError: (error) => errors.push(error),
+    onRecovered: () => { recovered += 1; },
+    onBlocked: (error) => blocked.push(error),
+  });
+  const first = deferred();
+  const exact = deferred();
+  const responses = [first, exact];
+  const writes: string[] = [];
+  let active = 0;
+  let maxActive = 0;
+  coordinator.beginAttempt(1);
+  coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      const response = responses.shift();
+      assert.ok(response);
+      try {
+        await response.promise;
+      } finally {
+        active -= 1;
+      }
+    },
+  });
+  coordinator.enqueue(1, snapshot("A"));
+  scheduler.fire(scheduler.tasks[0]);
+  first.reject(new Error("ambiguous A"));
+  await flushPromises();
+  const originalBackoff = scheduler.tasks[1];
+  assert.equal(originalBackoff.delayMs, 3_000);
+
+  const signal = trackedAbortSignal();
+  abortOnBackoffCancel = signal.abort;
+  shouldAbortOnBackoffCancel = true;
+  const flush = coordinator.flush(1, snapshot("cancelled-final"), signal.signal);
+  assert.equal(await flush, "cancelled");
+  assert.equal(signal.listenerCount(), 0);
+  assert.deepEqual(writes, ["session-A"]);
+  assert.equal(originalBackoff.cancelCount, 1);
+  const restoredBackoff = scheduler.tasks[2];
+  assert.equal(restoredBackoff.delayMs, 3_000);
+  assert.equal(restoredBackoff.cancelled, false);
+
+  scheduler.fire(originalBackoff, true);
+  assert.deepEqual(writes, ["session-A"]);
+  scheduler.fire(restoredBackoff);
+  assert.deepEqual(writes, ["session-A", "session-A"]);
+  assert.equal(maxActive, 1);
+  exact.resolve();
+  await flushPromises();
+  assert.equal(maxActive, 1);
+  assert.equal(errors.length, 1);
+  assert.deepEqual(blocked, []);
+  assert.equal(recovered, 1);
+});
+
+test("flush fences an in-flight ambiguous A through exact A before the final revision", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred<string>();
+  const exact = deferred<string>();
+  const finalWrite = deferred<string>();
+  const responses = [first, exact, finalWrite];
+  const writes: Array<{ revision: string; session: string }> = [];
+  let expectedRevision = "revision-0";
+  let active = 0;
+  let maxActive = 0;
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      writes.push({
+        revision: expectedRevision,
+        session: value.sessionOrder?.[0] ?? "missing",
+      });
+      const response = responses.shift();
+      assert.ok(response);
+      try {
+        expectedRevision = await response.promise;
+      } finally {
+        active -= 1;
+      }
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("A"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  const signal = trackedAbortSignal();
+  const flush = harness.coordinator.flush(1, snapshot("final"), signal.signal);
+
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+  ]);
+  first.reject(new Error("ambiguous A"));
+  await flushPromises();
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+  ]);
+  assert.equal(maxActive, 1);
+
+  exact.resolve("revision-1");
+  await flushPromises();
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-1", session: "session-final" },
+  ]);
+  assert.equal(maxActive, 1);
+  finalWrite.resolve("revision-2");
+  assert.equal(await flush, "flushed");
+  assert.equal(signal.listenerCount(), 0);
+  assert.equal(maxActive, 1);
+});
+
+test("a final ambiguous write gets one immediate exact retry then normal backoff", async () => {
+  const harness = coordinatorHarness();
+  const finalSuccess = deferred();
+  const writes: string[] = [];
+  let writeCount = 0;
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writeCount += 1;
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      if (writeCount <= 2) throw new Error(`ambiguous ${writeCount}`);
+      return finalSuccess.promise;
+    },
+  });
+  let outcome: string | undefined;
+  const flush = harness.coordinator.flush(
+    1,
+    snapshot("final-ambiguous"),
+    new AbortController().signal,
+  );
+  void flush.then((value) => { outcome = value; });
+  assert.equal(writeCount, 1);
+  await flushPromises();
+  assert.equal(writeCount, 2, "the first exact retry is released through one microtask");
+  assert.equal(harness.scheduler.tasks.length, 1);
+  const normalBackoff = harness.scheduler.tasks[0];
+  assert.equal(normalBackoff.delayMs, 3_000);
+  await flushPromises();
+  assert.equal(writeCount, 2, "the exact retry cannot create a microtask spin");
+  assert.equal(outcome, undefined);
+
+  harness.scheduler.fire(normalBackoff);
+  assert.equal(writeCount, 3);
+  assert.deepEqual(writes, [
+    "session-final-ambiguous",
+    "session-final-ambiguous",
+    "session-final-ambiguous",
+  ]);
+  finalSuccess.resolve();
+  assert.equal(await flush, "flushed");
+  assert.equal(harness.recovered(), 1);
+});
+
+test("recovery atomically settles flush before reentrant lifecycle notifications", async () => {
+  for (const action of ["block", "begin", "stop", "abort"] as const) {
+    const scheduler = manualScheduler();
+    const signal = trackedAbortSignal();
+    const exact = deferred();
+    const events: string[] = [];
+    let coordinator: ReturnType<typeof createLayoutSaveCoordinator>;
+    let writeCount = 0;
+    coordinator = createLayoutSaveCoordinator({
+      debounceMs: 500,
+      schedule: scheduler.schedule,
+      retryDelayMs: () => 3_000,
+      onError: () => events.push("error"),
+      onRecovered: () => {
+        assert.equal(signal.listenerCount(), 0);
+        events.push(`recovered:${action}`);
+        if (action === "block") coordinator.block(1);
+        else if (action === "begin") coordinator.beginAttempt(2);
+        else if (action === "stop") coordinator.stop();
+        else signal.abort();
+      },
+      onBlocked: () => assert.fail("retry recovery must not block"),
+    });
+    coordinator.beginAttempt(1);
+    coordinator.authorize({
+      attempt: 1,
+      classifyFailure: () => "retry",
+      write: () => {
+        writeCount += 1;
+        if (writeCount === 1) throw new Error(`ambiguous:${action}`);
+        return exact.promise;
+      },
+    });
+    const flush = coordinator.flush(1, snapshot(action), signal.signal);
+    assert.equal(signal.listenerCount(), 1);
+    await flushPromises();
+    assert.equal(writeCount, 2);
+
+    exact.resolve();
+    assert.equal(await flush, "flushed");
+    assert.equal(signal.listenerCount(), 0);
+    assert.deepEqual(events, ["error", `recovered:${action}`]);
+  }
+});
+
+test("flush resolves blocked after a nonretryable failure and rejects reentrant work", async () => {
+  const scheduler = manualScheduler();
+  const events: string[] = [];
+  let coordinator: ReturnType<typeof createLayoutSaveCoordinator>;
+  coordinator = createLayoutSaveCoordinator({
+    debounceMs: 500,
+    schedule: scheduler.schedule,
+    retryDelayMs: () => 3_000,
+    onError: () => events.push("error"),
+    onRecovered: () => events.push("recovered"),
+    onBlocked: () => {
+      events.push("blocked");
+      coordinator.enqueue(1, snapshot("blocked-reentrant"));
+    },
+  });
+  coordinator.beginAttempt(1);
+  coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "block",
+    write: () => {
+      events.push("write");
+      throw new Error("conflict");
+    },
+  });
+  const signal = trackedAbortSignal();
+  const flush = coordinator.flush(
+    1,
+    snapshot("blocked-final"),
+    signal.signal,
+  );
+  void flush.then((result) => events.push(result));
+  assert.equal(await flush, "blocked");
+  assert.equal(signal.listenerCount(), 0);
+  await flushPromises();
+  assert.deepEqual(events, ["write", "blocked", "blocked"]);
+  assert.equal(scheduler.tasks.length, 0);
+});
+
+test("retry notification reentrancy cannot replace a finalizing transaction", async () => {
+  const scheduler = manualScheduler();
+  const exact = deferred();
+  const writes: string[] = [];
+  let coordinator: ReturnType<typeof createLayoutSaveCoordinator>;
+  let firstFlush: Promise<"flushed" | "blocked" | "stale" | "cancelled">;
+  let reentrantFlush: Promise<"flushed" | "blocked" | "stale" | "cancelled"> | null = null;
+  let writeCount = 0;
+  coordinator = createLayoutSaveCoordinator({
+    debounceMs: 500,
+    schedule: scheduler.schedule,
+    retryDelayMs: () => 3_000,
+    onError: () => {
+      coordinator.enqueue(1, snapshot("ignored-from-error"));
+      coordinator.authorize({
+        attempt: 1,
+        classifyFailure: () => "block",
+        write: async () => { writes.push("replacement-writer"); },
+      });
+      reentrantFlush = coordinator.flush(
+        1,
+        snapshot("ignored-from-error-flush"),
+        new AbortController().signal,
+      );
+    },
+    onRecovered: () => {},
+    onBlocked: () => assert.fail("the immediate exact retry must remain retryable"),
+  });
+  coordinator.beginAttempt(1);
+  coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writeCount += 1;
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      if (writeCount === 1) throw new Error("ambiguous final");
+      return exact.promise;
+    },
+  });
+  firstFlush = coordinator.flush(
+    1,
+    snapshot("owned-final"),
+    new AbortController().signal,
+  );
+  await flushPromises();
+  assert.strictEqual(reentrantFlush, firstFlush);
+  assert.deepEqual(writes, ["session-owned-final", "session-owned-final"]);
+  exact.resolve();
+  assert.equal(await firstFlush, "flushed");
+});
+
+test("flush converts clone and signal protocol failures into settled outcomes", async () => {
+  {
+    const harness = coordinatorHarness();
+    let writes = 0;
+    harness.coordinator.beginAttempt(1);
+    harness.coordinator.authorize({
+      attempt: 1,
+      classifyFailure: () => "retry",
+      write: async () => { writes += 1; },
+    });
+    const cloneFailure = new Error("snapshot getter failed");
+    const malformed = Object.create(null) as DashboardLayoutPreferences;
+    Object.defineProperty(malformed, "columnOrder", {
+      enumerable: true,
+      get() {
+        throw cloneFailure;
+      },
+    });
+    assert.equal(
+      await harness.coordinator.flush(
+        1,
+        malformed,
+        new AbortController().signal,
+      ),
+      "blocked",
+    );
+    assert.equal(writes, 0);
+    assert.deepEqual(harness.blocked, [cloneFailure]);
+  }
+
+  {
+    const harness = coordinatorHarness();
+    const writes: string[] = [];
+    harness.coordinator.beginAttempt(1);
+    harness.coordinator.authorize({
+      attempt: 1,
+      classifyFailure: () => "retry",
+      write: async (value) => {
+        writes.push(value.sessionOrder?.[0] ?? "missing");
+      },
+    });
+    const brokenSignal = {
+      aborted: false,
+      addEventListener() {
+        throw new Error("cannot register abort listener");
+      },
+      removeEventListener() {},
+    } as unknown as AbortSignal;
+    assert.equal(
+      await harness.coordinator.flush(1, snapshot("cancelled"), brokenSignal),
+      "cancelled",
+    );
+    harness.coordinator.enqueue(1, snapshot("after-signal-failure"));
+    harness.scheduler.fire(harness.scheduler.tasks[0]);
+    await flushPromises();
+    assert.deepEqual(writes, ["session-after-signal-failure"]);
+  }
+});
+
+test("stale unauthorized blocked and already-aborted flushes perform no work", async () => {
+  {
+    const harness = coordinatorHarness();
+    assert.equal(
+      await harness.coordinator.flush(
+        1,
+        snapshot("unauthorized"),
+        new AbortController().signal,
+      ),
+      "stale",
+    );
+    assert.equal(harness.scheduler.tasks.length, 0);
+  }
+
+  {
+    const harness = coordinatorHarness();
+    let writes = 0;
+    harness.coordinator.beginAttempt(2);
+    harness.coordinator.authorize({
+      attempt: 2,
+      classifyFailure: () => "retry",
+      write: async () => { writes += 1; },
+    });
+    harness.coordinator.enqueue(2, snapshot("current"));
+    const currentDebounce = harness.scheduler.tasks[0];
+    assert.equal(
+      await harness.coordinator.flush(
+        1,
+        snapshot("stale"),
+        new AbortController().signal,
+      ),
+      "stale",
+    );
+    assert.equal(currentDebounce.cancelled, false);
+    harness.coordinator.block(2);
+    assert.equal(
+      await harness.coordinator.flush(
+        2,
+        snapshot("blocked"),
+        new AbortController().signal,
+      ),
+      "stale",
+    );
+    assert.equal(writes, 0);
+  }
+
+  {
+    const harness = coordinatorHarness();
+    let writes = 0;
+    harness.coordinator.beginAttempt(1);
+    harness.coordinator.authorize({
+      attempt: 1,
+      classifyFailure: () => "retry",
+      write: async () => { writes += 1; },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    assert.equal(
+      await harness.coordinator.flush(1, snapshot("aborted"), controller.signal),
+      "cancelled",
+    );
+    assert.equal(writes, 0);
+  }
+});
+
+test("repeated flush shares the first promise snapshot signal and authorization", async () => {
+  const harness = coordinatorHarness();
+  const write = deferred();
+  const writes: string[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      return write.promise;
+    },
+  });
+  const firstSignal = trackedAbortSignal();
+  const ignoredSignal = trackedAbortSignal();
+  const first = harness.coordinator.flush(1, snapshot("first-final"), firstSignal.signal);
+  const repeated = harness.coordinator.flush(
+    1,
+    snapshot("ignored-final"),
+    ignoredSignal.signal,
+  );
+  assert.strictEqual(repeated, first);
+  assert.deepEqual(writes, ["session-first-final"]);
+  assert.equal(firstSignal.listenerCount(), 1);
+  assert.equal(ignoredSignal.listenerCount(), 0);
+  ignoredSignal.abort();
+  harness.coordinator.enqueue(1, snapshot("ignored-enqueue"));
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "block",
+    write: async () => { writes.push("ignored-authorization"); },
+  });
+  assert.deepEqual(writes, ["session-first-final"]);
+
+  write.resolve();
+  assert.equal(await first, "flushed");
+  assert.equal(firstSignal.listenerCount(), 0);
+});
+
+test("signal abort cancels final pending while in-flight work settles normally", async () => {
+  const harness = coordinatorHarness();
+  const inFlight = deferred();
+  const writes: string[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      return inFlight.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("A"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  const signal = trackedAbortSignal();
+  const flush = harness.coordinator.flush(1, snapshot("cancelled-final"), signal.signal);
+  signal.abort();
+  assert.equal(await flush, "cancelled");
+  assert.equal(signal.listenerCount(), 0);
+  inFlight.resolve();
+  await flushPromises();
+  assert.deepEqual(writes, ["session-A"]);
+
+  const resumed = deferred();
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      return resumed.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("resumed"));
+  harness.scheduler.fire(harness.scheduler.tasks.at(-1)!);
+  assert.deepEqual(writes, ["session-A", "session-resumed"]);
+  resumed.resolve();
+  await flushPromises();
+});
+
+test("aborting an in-flight final only cancels its waiter and late success keeps reuse valid", async () => {
+  const harness = coordinatorHarness();
+  const finalWrite = deferred();
+  const resumed = deferred();
+  const writes: string[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      return finalWrite.promise;
+    },
+  });
+  const signal = trackedAbortSignal();
+  let outcome: string | undefined;
+  const flush = harness.coordinator.flush(
+    1,
+    snapshot("cancelled-success"),
+    signal.signal,
+  );
+  void flush.then((result) => { outcome = result; });
+  signal.abort();
+  assert.equal(await flush, "cancelled");
+  assert.equal(signal.listenerCount(), 0);
+
+  finalWrite.resolve();
+  await flushPromises();
+  assert.equal(outcome, "cancelled");
+  assert.deepEqual(harness.errors, []);
+  assert.deepEqual(harness.blocked, []);
+
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      return resumed.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("resumed-success"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  assert.deepEqual(writes, [
+    "session-cancelled-success",
+    "session-resumed-success",
+  ]);
+  resumed.resolve();
+  await flushPromises();
+});
+
+test("aborting an in-flight final preserves normal exact retry after an ambiguous failure", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred<string>();
+  const exact = deferred<string>();
+  const latest = deferred<string>();
+  const responses = [first, exact, latest];
+  const writes: Array<{ revision: string; session: string }> = [];
+  let expectedRevision = "revision-0";
+  let active = 0;
+  let maxActive = 0;
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      writes.push({
+        revision: expectedRevision,
+        session: value.sessionOrder?.[0] ?? "missing",
+      });
+      const response = responses.shift();
+      assert.ok(response);
+      try {
+        expectedRevision = await response.promise;
+      } finally {
+        active -= 1;
+      }
+    },
+  });
+  const signal = trackedAbortSignal();
+  const flush = harness.coordinator.flush(
+    1,
+    snapshot("cancelled-ambiguous"),
+    signal.signal,
+  );
+  signal.abort();
+  assert.equal(await flush, "cancelled");
+  assert.equal(signal.listenerCount(), 0);
+
+  first.reject(new Error("late ambiguous final"));
+  await flushPromises();
+  assert.equal(harness.errors.length, 1);
+  assert.equal(harness.scheduler.tasks.length, 1);
+  const backoff = harness.scheduler.tasks[0];
+  assert.equal(backoff.delayMs, 3_000);
+
+  harness.coordinator.enqueue(1, snapshot("latest-after-abort"));
+  const debounce = harness.scheduler.tasks[1];
+  harness.scheduler.fire(debounce);
+  assert.equal(writes.length, 1);
+  harness.scheduler.fire(backoff);
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-cancelled-ambiguous" },
+    { revision: "revision-0", session: "session-cancelled-ambiguous" },
+  ]);
+  assert.equal(maxActive, 1);
+
+  exact.resolve("revision-1");
+  await flushPromises();
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-cancelled-ambiguous" },
+    { revision: "revision-0", session: "session-cancelled-ambiguous" },
+    { revision: "revision-1", session: "session-latest-after-abort" },
+  ]);
+  assert.equal(maxActive, 1);
+  latest.resolve("revision-2");
+  await flushPromises();
+  assert.equal(harness.recovered(), 1);
+  assert.deepEqual(harness.blocked, []);
+  assert.equal(maxActive, 1);
+});
+
+test("block stop and newer attempts cancel flush while late settles stay fenced", async () => {
+  for (const cancellation of ["block", "stop", "begin"] as const) {
+    const harness = coordinatorHarness();
+    const oldWrite = deferred();
+    const writes: string[] = [];
+    harness.coordinator.beginAttempt(1);
+    harness.coordinator.authorize({
+      attempt: 1,
+      classifyFailure: () => "retry",
+      write: (value) => {
+        writes.push(value.sessionOrder?.[0] ?? "missing");
+        return oldWrite.promise;
+      },
+    });
+    const signal = trackedAbortSignal();
+    const flush = harness.coordinator.flush(
+      1,
+      snapshot(`${cancellation}-final`),
+      signal.signal,
+    );
+    assert.equal(signal.listenerCount(), 1);
+    if (cancellation === "block") harness.coordinator.block(1);
+    else if (cancellation === "stop") harness.coordinator.stop();
+    else harness.coordinator.beginAttempt(2);
+    assert.equal(await flush, "cancelled");
+    assert.equal(signal.listenerCount(), 0);
+
+    oldWrite.reject(new Error("late old failure"));
+    await flushPromises();
+    assert.deepEqual(harness.errors, []);
+    assert.deepEqual(harness.blocked, []);
+    if (cancellation === "begin") {
+      harness.coordinator.authorize({
+        attempt: 2,
+        classifyFailure: () => "retry",
+        write: async (value) => {
+          writes.push(value.sessionOrder?.[0] ?? "missing");
+        },
+      });
+      harness.coordinator.enqueue(2, snapshot("new-attempt"));
+      harness.scheduler.fire(harness.scheduler.tasks.at(-1)!);
+      await flushPromises();
+      assert.deepEqual(writes, [
+        `session-${cancellation}-final`,
+        "session-new-attempt",
+      ]);
+    }
+  }
+});
+
+test("a completed flush releases finalizing for reauthorization and later enqueue", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred();
+  const second = deferred();
+  const writes: string[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(`first:${value.sessionOrder?.[0] ?? "missing"}`);
+      return first.promise;
+    },
+  });
+  const flush = harness.coordinator.flush(
+    1,
+    snapshot("close-final"),
+    new AbortController().signal,
+  );
+  first.resolve();
+  assert.equal(await flush, "flushed");
+
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(`second:${value.sessionOrder?.[0] ?? "missing"}`);
+      return second.promise;
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("after-flush"));
+  const debounce = harness.scheduler.tasks.at(-1)!;
+  assert.equal(debounce.delayMs, 500);
+  harness.scheduler.fire(debounce);
+  assert.deepEqual(writes, [
+    "first:session-close-final",
+    "second:session-after-flush",
+  ]);
+  second.resolve();
+  await flushPromises();
 });
