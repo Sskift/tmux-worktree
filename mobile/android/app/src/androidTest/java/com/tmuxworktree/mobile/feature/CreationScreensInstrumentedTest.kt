@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled

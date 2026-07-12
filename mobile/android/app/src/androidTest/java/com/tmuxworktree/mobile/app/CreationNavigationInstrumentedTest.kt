@@ -12,6 +12,8 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.navArgument
 import androidx.navigation.testing.TestNavHostController
+import com.tmuxworktree.mobile.app.navigation.V2Routes
+import com.tmuxworktree.mobile.app.navigation.navigateAfterCreation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule

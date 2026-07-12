@@ -148,12 +148,15 @@ test("Android package is on the V2 Compose line and V2Activity owns the launcher
 });
 
 test("Android creation flows cannot escape or resubmit while a request is in flight", () => {
-  const app = readAndroidSource("V2App.kt");
+  const navigation = readUniqueSourceContaining(
+    androidSourceRoot,
+    "internal object V2Routes",
+  );
   const worktree = readAndroidSource("NewWorktreeScreen.kt");
 
-  assert.match(app, /navigateAfterCreation\(/);
-  assert.match(app, /popUpTo\(formRoute\) \{ inclusive = true \}/);
-  assert.match(app, /BackHandler\(enabled = state\.creatingTerminal\)/);
+  assert.match(navigation, /navigateAfterCreation\(/);
+  assert.match(navigation, /popUpTo\(formRoute\) \{ inclusive = true \}/);
+  assert.match(navigation, /BackHandler\(enabled = state\.creatingTerminal\)/);
   assert.match(worktree, /NewWorktreeTopBar\([\s\S]*isCreating = isCreating/);
   assert.match(worktree, /IconButton\([\s\S]*enabled = !isCreating[\s\S]*testTag\("topbar_back"\)/);
 });
