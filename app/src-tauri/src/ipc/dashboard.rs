@@ -140,3 +140,48 @@ pub(crate) struct EnsureTerminalArgs {
     #[serde(rename = "rawName", default)]
     pub(crate) raw_name: Option<String>,
 }
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub(crate) struct OrphanedWorktree {
+    pub(crate) project: String,
+    pub(crate) path: String,
+    pub(crate) name: String,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateArgs {
+    pub(crate) project: Option<String>,
+    pub(crate) path: Option<String>,
+    #[serde(rename = "aiCmd")]
+    pub(crate) ai_cmd: String,
+    pub(crate) name: Option<String>,
+    pub(crate) branch: Option<String>,
+    #[serde(rename = "hostId", default)]
+    pub(crate) host_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RestoreArgs {
+    pub(crate) path: String,
+    pub(crate) name: String,
+    #[serde(rename = "aiCmd", default)]
+    pub(crate) ai_cmd: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DeleteWorktreeArgs {
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) force: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TmuxStatusTheme {
+    pub(crate) status_bg: String,
+    pub(crate) status_fg: String,
+    pub(crate) active_bg: String,
+    pub(crate) active_fg: String,
+    pub(crate) inactive_fg: String,
+    pub(crate) accent: String,
+}

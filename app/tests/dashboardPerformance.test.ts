@@ -6,6 +6,11 @@ import { readRustSourceTree } from "./rustSource.ts";
 
 const renderer = readRendererImplementationTree();
 
+const capturePaneHistorySignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?fn capture_pane_history\s*\(\s*name:\s*String,\s*lines:\s*Option<u16>,?\s*\)\s*->\s*Result<String,\s*String>\s*\{/m;
+const listDashboardCatalogSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn list_dashboard_catalog\s*\(\s*\)\s*->\s*Result<DashboardCatalogSnapshot,\s*String>\s*\{/m;
+const listLocalDashboardCatalogSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn list_local_dashboard_catalog\s*\(\s*\)\s*->\s*Result<DashboardCatalogSnapshot,\s*String>\s*\{/m;
+const listSessionsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn list_sessions\s*\(\s*\)\s*->\s*Result<Vec<Session>,\s*String>\s*\{/m;
+const listTmuxTerminalsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn list_tmux_terminals\s*\(\s*\)\s*->\s*Result<Vec<TmuxTerminal>,\s*String>\s*\{/m;
 const hostStatusesSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn host_statuses\s*\(\s*state:\s*State<'_,\s*Arc<HostState>>,?\s*\)\s*->\s*Result<Vec<HostStatus>,\s*String>\s*\{/m;
 const gitGraphRefsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_graph_refs\s*\(\s*cwd:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<GitGraphRefs,\s*String>\s*\{/m;
 const gitFetchProjectRootsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_fetch_project_roots\s*\(\s*state:\s*State<'_,\s*Arc<GitFetchState>>,?\s*\)\s*->\s*Result<\(\),\s*String>\s*\{/m;
@@ -44,17 +49,19 @@ test("dashboard preloads tmux snapshots without live-mounting every terminal", (
   assert.doesNotMatch(renderer, /mergeOpenedItems/);
   assert.match(terminal, /initialHistory\?: string;/);
   assert.match(terminal, /const cachedHistory = initialHistoryRef\.current;/);
-  assert.match(rust, /fn capture_pane_history\(name: String, lines: Option<u16>\) -> Result<String, String>/);
+  assert.match(rust, capturePaneHistorySignature);
 });
 
 test("tauri polling commands run blocking tmux and ssh work off the main thread", () => {
   const rust = readRustSourceTree();
 
-  assert.match(rust, /async fn list_sessions\(\) -> Result<Vec<Session>, String> \{/);
+  assert.match(rust, listSessionsSignature);
   assert.match(rust, /spawn_blocking\(list_sessions_blocking\)/);
-  assert.match(rust, /async fn list_local_dashboard_catalog\(\) -> Result<DashboardCatalogSnapshot, String> \{/);
+  assert.match(rust, listDashboardCatalogSignature);
+  assert.match(rust, /spawn_blocking\(list_dashboard_catalog_blocking\)/);
+  assert.match(rust, listLocalDashboardCatalogSignature);
   assert.match(rust, /spawn_blocking\(list_local_dashboard_catalog_blocking\)/);
-  assert.match(rust, /async fn list_tmux_terminals\(\) -> Result<Vec<TmuxTerminal>, String> \{/);
+  assert.match(rust, listTmuxTerminalsSignature);
   assert.match(rust, /spawn_blocking\(list_tmux_terminals_blocking\)/);
   assert.match(rust, hostStatusesSignature);
   assert.match(rust, /spawn_blocking\(move \|\| host_statuses_blocking\(state\)\)/);
@@ -72,6 +79,26 @@ test("tauri polling commands run blocking tmux and ssh work off the main thread"
 
 test("polling command characterization rejects broader Rust visibility", () => {
   const signatures = [
+    [
+      capturePaneHistorySignature,
+      "fn capture_pane_history(name: String, lines: Option<u16>) -> Result<String, String> {",
+    ],
+    [
+      listDashboardCatalogSignature,
+      "async fn list_dashboard_catalog() -> Result<DashboardCatalogSnapshot, String> {",
+    ],
+    [
+      listLocalDashboardCatalogSignature,
+      "async fn list_local_dashboard_catalog() -> Result<DashboardCatalogSnapshot, String> {",
+    ],
+    [
+      listSessionsSignature,
+      "async fn list_sessions() -> Result<Vec<Session>, String> {",
+    ],
+    [
+      listTmuxTerminalsSignature,
+      "async fn list_tmux_terminals() -> Result<Vec<TmuxTerminal>, String> {",
+    ],
     [
       hostStatusesSignature,
       "async fn host_statuses(state: State<'_, Arc<HostState>>) -> Result<Vec<HostStatus>, String> {",

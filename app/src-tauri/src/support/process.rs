@@ -39,3 +39,33 @@ pub(crate) fn resolve_cmd(name: &str) -> &str {
         _ => name,
     }
 }
+
+pub(crate) fn run_check(args: &[&str]) -> Result<String, String> {
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
+        .args(&args[1..])
+        .output()
+        .map_err(|e| format!("spawn {}: {e}", args[0]))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} failed ({}): {}",
+            args[0],
+            output.status,
+            stderr.trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(crate) fn run_quiet(args: &[&str]) -> Option<String> {
+    let bin = resolve_cmd(args[0]);
+    let output = std::process::Command::new(bin)
+        .args(&args[1..])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
