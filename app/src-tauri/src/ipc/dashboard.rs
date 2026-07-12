@@ -185,3 +185,34 @@ pub(crate) struct TmuxStatusTheme {
     pub(crate) inactive_fg: String,
     pub(crate) accent: String,
 }
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MobileRelayStatus {
+    pub(crate) active: bool,
+    pub(crate) connected: bool,
+    pub(crate) connection_state: String,
+    pub(crate) relay_url: String,
+    pub(crate) host_id: String,
+    pub(crate) secret: String,
+    pub(crate) token: String,
+    pub(crate) connected_at: Option<u64>,
+    pub(crate) updated_at: Option<u64>,
+    pub(crate) retry_in_ms: Option<u64>,
+    pub(crate) error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MobileRelayConfigInput {
+    pub(crate) relay_url: String,
+    pub(crate) host_id: String,
+    pub(crate) secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MobileRelayBrokerInput {
+    pub(crate) host_id: String,
+    pub(crate) port: Option<u16>,
+}

@@ -365,6 +365,10 @@ test("mobile relay failures stay visible on Android and in the Dashboard", () =>
     "app/src-tauri/src",
     "load_mobile_relay_runtime_status",
   );
+  const commands = read(
+    "app/src-tauri/src/features/mobile_relay/commands.rs",
+  );
+  const ipc = read("app/src-tauri/src/ipc/dashboard.rs");
 
   assert.match(reducer, /TransportPhase\.BACKING_OFF/);
   assert.match(reducer, /ConnectionStatus\.AUTH_REQUIRED/);
@@ -377,8 +381,14 @@ test("mobile relay failures stay visible on Android and in the Dashboard", () =>
   assert.match(dashboard, /MOBILE_RELAY_VISIBLE_REFRESH_MS = 2_000/);
   assert.match(dashboard, /MOBILE_RELAY_HIDDEN_REFRESH_MS = 15_000/);
   assert.match(dashboard, /connected\s*\? "Connected"/);
-  assert.match(backend, /connection_state: String/);
+  assert.equal(backend, commands);
+  assert.match(
+    ipc,
+    /struct MobileRelayStatus \{[\s\S]*connection_state: String/,
+  );
   assert.match(backend, /load_mobile_relay_runtime_status/);
+  assert.match(backend, /fn mobile_relay_status\(/);
+  assert.match(backend, /let connection_state =/);
   assert.match(
     backend,
     /status\.relay_url == resolved_relay_url && status\.host_id == resolved_host_id/,
