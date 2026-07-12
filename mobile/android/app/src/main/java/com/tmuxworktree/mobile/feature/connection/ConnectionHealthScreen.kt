@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature.connection
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
@@ -73,6 +73,7 @@ import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.HealthLayer
+import com.tmuxworktree.mobile.designsystem.*
 import kotlin.math.ceil
 
 @Composable

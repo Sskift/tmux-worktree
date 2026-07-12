@@ -43,13 +43,14 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
-import com.tmuxworktree.mobile.ui.TwAccent
-import com.tmuxworktree.mobile.ui.TwBackground
-import com.tmuxworktree.mobile.ui.TwBorder
-import com.tmuxworktree.mobile.ui.TwError
-import com.tmuxworktree.mobile.ui.TwOnAccent
-import com.tmuxworktree.mobile.ui.TwTextPrimary
-import com.tmuxworktree.mobile.ui.TwTextSecondary
+import com.tmuxworktree.mobile.designsystem.TwAccent
+import com.tmuxworktree.mobile.designsystem.TwBackground
+import com.tmuxworktree.mobile.designsystem.TwBorder
+import com.tmuxworktree.mobile.designsystem.TwError
+import com.tmuxworktree.mobile.designsystem.TwOnAccent
+import com.tmuxworktree.mobile.designsystem.TwSurface
+import com.tmuxworktree.mobile.designsystem.TwTextPrimary
+import com.tmuxworktree.mobile.designsystem.TwTextSecondary
 
 @Composable
 fun PairingScreen(
@@ -206,7 +207,7 @@ fun PairingScreen(
     if (confirmForgetPairing && onForgetPairing != null) {
         AlertDialog(
             onDismissRequest = { confirmForgetPairing = false },
-            containerColor = com.tmuxworktree.mobile.ui.TwSurface,
+            containerColor = TwSurface,
             title = { Text("Forget this pairing?", color = TwTextPrimary) },
             text = {
                 Text(

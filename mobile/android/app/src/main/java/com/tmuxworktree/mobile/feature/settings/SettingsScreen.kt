@@ -40,15 +40,15 @@ import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.data.AppPreferences
 import com.tmuxworktree.mobile.core.data.NotificationKind
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
-import com.tmuxworktree.mobile.ui.RootDestination
-import com.tmuxworktree.mobile.ui.TwAccent
-import com.tmuxworktree.mobile.ui.TwBackground
-import com.tmuxworktree.mobile.ui.TwBorder
-import com.tmuxworktree.mobile.ui.TwRootBottomBar
-import com.tmuxworktree.mobile.ui.TwRootTopBar
-import com.tmuxworktree.mobile.ui.TwSurface
-import com.tmuxworktree.mobile.ui.TwTextPrimary
-import com.tmuxworktree.mobile.ui.TwTextSecondary
+import com.tmuxworktree.mobile.designsystem.TwAccent
+import com.tmuxworktree.mobile.designsystem.TwBackground
+import com.tmuxworktree.mobile.designsystem.TwBorder
+import com.tmuxworktree.mobile.designsystem.TwRootTopBar
+import com.tmuxworktree.mobile.designsystem.TwSurface
+import com.tmuxworktree.mobile.designsystem.TwTextPrimary
+import com.tmuxworktree.mobile.designsystem.TwTextSecondary
+import com.tmuxworktree.mobile.navigation.RootDestination
+import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun SettingsScreen(

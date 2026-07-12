@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature.inbox
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
@@ -50,6 +50,9 @@ import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.designsystem.*
+import com.tmuxworktree.mobile.navigation.RootDestination
+import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun InboxScreen(

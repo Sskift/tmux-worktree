@@ -1,8 +1,11 @@
-package com.tmuxworktree.mobile.ui
+@file:OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
+
+package com.tmuxworktree.mobile.feature.createworktree
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -22,14 +25,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Label
+import androidx.compose.material.icons.outlined.AccountTree
+import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.Computer
 import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material.icons.outlined.ExpandMore
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material.icons.outlined.RocketLaunch
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Workspaces
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -38,6 +44,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -72,74 +79,98 @@ import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelayScope
+import com.tmuxworktree.mobile.designsystem.*
+
+enum class NewWorktreeStep(val number: Int, val heading: String, val description: String) {
+    TARGET(1, "Choose a target", "Select the computer and scope that will run this worktree."),
+    CONFIGURE(2, "Configure worktree", "Choose the repository, branch, and worktree name."),
+    REVIEW(3, "Review and create", "Confirm the target and Git details before creating."),
+}
 
 @Immutable
-data class NewTerminalForm(
+data class NewWorktreeForm(
     val hostId: String = "",
     val scopeId: String = "",
-    val workingDirectory: String = "",
-    val label: String = "",
+    val repositoryPath: String = "",
+    val baseBranch: String = "",
+    val aiCommand: String = "codex",
+    val worktreeName: String = "",
 )
 
 @Immutable
-data class NewTerminalValidationErrors(
+data class NewWorktreeValidationErrors(
     val host: String? = null,
     val scope: String? = null,
-    val workingDirectory: String? = null,
-    val label: String? = null,
-)
+    val repositoryPath: String? = null,
+    val baseBranch: String? = null,
+    val aiCommand: String? = null,
+    val worktreeName: String? = null,
+) {
+    fun hasConfigurationError(): Boolean = listOf(
+        repositoryPath,
+        aiCommand,
+        worktreeName,
+    ).any { it != null }
+}
 
 @Composable
-fun NewTerminalScreen(
-    form: NewTerminalForm,
+fun NewWorktreeScreen(
+    step: NewWorktreeStep,
+    form: NewWorktreeForm,
     hosts: List<RelayHost>,
     scopes: List<RelayScope>,
     isLoadingTargets: Boolean,
     isCreating: Boolean,
-    validationErrors: NewTerminalValidationErrors,
+    validationErrors: NewWorktreeValidationErrors,
     targetLoadError: String?,
     creationError: String?,
     onBack: () -> Unit,
+    onPreviousStep: () -> Unit,
+    onNextStep: () -> Unit,
     onHostSelected: (RelayHost) -> Unit,
     onScopeSelected: (RelayScope) -> Unit,
-    onWorkingDirectoryChange: (String) -> Unit,
-    onLabelChange: (String) -> Unit,
+    onRepositoryPathChange: (String) -> Unit,
+    onBaseBranchChange: (String) -> Unit,
+    onAiCommandChange: (String) -> Unit,
+    onWorktreeNameChange: (String) -> Unit,
     onRetryLoadTargets: () -> Unit,
     onCreate: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val onlineHosts = hosts.filter { it.status == ConnectionStatus.ONLINE }
-    val selectedHost = onlineHosts.firstOrNull { it.hostId == form.hostId }
-    val reachableScopes = scopes.filter {
-        it.hostId == form.hostId && it.reachable
+    val selectedHost = hosts.firstOrNull { it.hostId == form.hostId }
+    val visibleScopes = scopes.filter { it.hostId == form.hostId }
+    val selectedScope = visibleScopes.firstOrNull { it.scopeId == form.scopeId }
+    val canContinue = when (step) {
+        NewWorktreeStep.TARGET -> selectedHost?.status == ConnectionStatus.ONLINE &&
+            selectedScope?.reachable == true &&
+            validationErrors.host == null &&
+            validationErrors.scope == null
+        NewWorktreeStep.CONFIGURE -> form.repositoryPath.isNotBlank() &&
+            form.aiCommand.isNotBlank() &&
+            form.worktreeName.isNotBlank() &&
+            !validationErrors.hasConfigurationError()
+        NewWorktreeStep.REVIEW -> !isCreating
     }
-    val selectedScope = reachableScopes.firstOrNull { it.scopeId == form.scopeId }
-    val canCreate = selectedHost != null &&
-        selectedScope != null &&
-        form.workingDirectory.isNotBlank() &&
-        validationErrors.host == null &&
-        validationErrors.scope == null &&
-        validationErrors.workingDirectory == null &&
-        validationErrors.label == null &&
-        !isLoadingTargets &&
-        !isCreating
 
     Scaffold(
         modifier = modifier
             .fillMaxSize()
-            .testTag("new_terminal_screen"),
+            .testTag("new_worktree_screen"),
         containerColor = TwBackground,
         topBar = {
-            NewTerminalTopBar(
+            NewWorktreeTopBar(
+                step = step,
                 isCreating = isCreating,
-                onBack = onBack,
+                onBack = if (step == NewWorktreeStep.TARGET) onBack else onPreviousStep,
             )
         },
         bottomBar = {
-            NewTerminalBottomBar(
-                canCreate = canCreate,
+            NewWorktreeBottomBar(
+                step = step,
+                canContinue = canContinue,
                 isCreating = isCreating,
-                onBack = onBack,
+                onBack = if (step == NewWorktreeStep.TARGET) onBack else onPreviousStep,
+                onNext = onNextStep,
                 onCreate = onCreate,
             )
         },
@@ -155,16 +186,16 @@ fun NewTerminalScreen(
                 bottom = 24.dp,
             ),
         ) {
-            item(key = "new_terminal_heading") {
+            item(key = "step_heading") {
                 Text(
-                    text = "Create a terminal",
+                    text = step.heading,
                     color = TwTextPrimary,
                     style = MaterialTheme.typography.headlineMedium,
                     modifier = Modifier.semantics { heading() },
                 )
                 Spacer(Modifier.height(8.dp))
                 Text(
-                    text = "Start a plain terminal session in the directory you choose.",
+                    text = step.description,
                     color = TwTextSecondary,
                     style = MaterialTheme.typography.bodyLarge,
                 )
@@ -172,46 +203,53 @@ fun NewTerminalScreen(
             }
 
             if (!creationError.isNullOrBlank()) {
-                item(key = "new_terminal_creation_error") {
-                    NewTerminalErrorBanner(
+                item(key = "creation_error") {
+                    WorktreeErrorBanner(
                         message = creationError,
-                        prefix = "Terminal creation failed",
-                        testTag = "new_terminal_error",
+                        testTag = "create_error",
                     )
                     Spacer(Modifier.height(16.dp))
                 }
             }
 
-            if (!targetLoadError.isNullOrBlank() && onlineHosts.isNotEmpty()) {
-                item(key = "new_terminal_target_warning") {
-                    NewTerminalErrorBanner(
-                        message = targetLoadError,
-                        prefix = "Some targets could not be loaded",
-                        testTag = "new_terminal_target_error",
-                    )
-                    Spacer(Modifier.height(16.dp))
+            when (step) {
+                NewWorktreeStep.TARGET -> item(key = "target_step") {
+                    when {
+                        isLoadingTargets -> LoadingTargetsState()
+                        hosts.isEmpty() -> EmptyTargetsState(
+                            message = targetLoadError ?: "No connected computers are available.",
+                            onRetry = onRetryLoadTargets,
+                        )
+                        else -> TargetStep(
+                            form = form,
+                            hosts = hosts,
+                            scopes = visibleScopes,
+                            selectedHost = selectedHost,
+                            selectedScope = selectedScope,
+                            errors = validationErrors,
+                            onHostSelected = onHostSelected,
+                            onScopeSelected = onScopeSelected,
+                        )
+                    }
                 }
-            }
 
-            item(key = "new_terminal_form") {
-                when {
-                    isLoadingTargets -> NewTerminalLoadingState()
-                    onlineHosts.isEmpty() -> NewTerminalEmptyTargetsState(
-                        message = targetLoadError ?: "No online computers are available.",
-                        onRetry = onRetryLoadTargets,
-                    )
-                    else -> NewTerminalFormContent(
+                NewWorktreeStep.CONFIGURE -> item(key = "configure_step") {
+                    ConfigureStep(
                         form = form,
-                        hosts = onlineHosts,
-                        scopes = reachableScopes,
-                        selectedHost = selectedHost,
-                        selectedScope = selectedScope,
-                        validationErrors = validationErrors,
-                        enabled = !isCreating,
-                        onHostSelected = onHostSelected,
-                        onScopeSelected = onScopeSelected,
-                        onWorkingDirectoryChange = onWorkingDirectoryChange,
-                        onLabelChange = onLabelChange,
+                        errors = validationErrors,
+                        onRepositoryPathChange = onRepositoryPathChange,
+                        onBaseBranchChange = onBaseBranchChange,
+                        onAiCommandChange = onAiCommandChange,
+                        onWorktreeNameChange = onWorktreeNameChange,
+                    )
+                }
+
+                NewWorktreeStep.REVIEW -> item(key = "review_step") {
+                    ReviewStep(
+                        form = form,
+                        hostLabel = selectedHost?.displayName ?: form.hostId,
+                        scopeLabel = selectedScope?.label ?: form.scopeId,
+                        isCreating = isCreating,
                     )
                 }
             }
@@ -220,7 +258,8 @@ fun NewTerminalScreen(
 }
 
 @Composable
-private fun NewTerminalTopBar(
+private fun NewWorktreeTopBar(
+    step: NewWorktreeStep,
     isCreating: Boolean,
     onBack: () -> Unit,
 ) {
@@ -242,14 +281,14 @@ private fun NewTerminalTopBar(
                 enabled = !isCreating,
                 modifier = Modifier
                     .size(48.dp)
-                    .testTag("new_terminal_back"),
+                    .testTag("topbar_back"),
             ) {
                 Icon(
                     imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
-                    contentDescription = if (isCreating) {
-                        "Creating terminal, back unavailable"
-                    } else {
-                        "Cancel new terminal"
+                    contentDescription = when {
+                        isCreating -> "Creating worktree, back unavailable"
+                        step == NewWorktreeStep.TARGET -> "Cancel new worktree"
+                        else -> "Return to step ${step.number - 1}"
                     },
                     tint = if (isCreating) TwTextMuted else TwTextSecondary,
                     modifier = Modifier.size(24.dp),
@@ -257,97 +296,97 @@ private fun NewTerminalTopBar(
             }
             Spacer(Modifier.width(8.dp))
             Text(
-                text = "New terminal",
+                text = "New worktree",
                 color = TwTextPrimary,
                 style = MaterialTheme.typography.titleLarge,
                 modifier = Modifier.weight(1f),
             )
+            Text(
+                text = "Step ${step.number} of 3",
+                color = TwTextSecondary,
+                style = MaterialTheme.typography.labelMedium,
+            )
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 20.dp, end = 20.dp, bottom = 12.dp)
+                .testTag("create_step_indicator")
+                .semantics {
+                    stateDescription = "Step ${step.number} of 3, ${step.heading}"
+                },
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            repeat(3) { index ->
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(4.dp)
+                        .background(
+                            color = if (index < step.number) TwAccent else TwBorder,
+                            shape = RoundedCornerShape(2.dp),
+                        ),
+                )
+            }
         }
         HorizontalDivider(color = TwBorder, thickness = 1.dp)
     }
 }
 
 @Composable
-private fun NewTerminalFormContent(
-    form: NewTerminalForm,
+private fun TargetStep(
+    form: NewWorktreeForm,
     hosts: List<RelayHost>,
     scopes: List<RelayScope>,
     selectedHost: RelayHost?,
     selectedScope: RelayScope?,
-    validationErrors: NewTerminalValidationErrors,
-    enabled: Boolean,
+    errors: NewWorktreeValidationErrors,
     onHostSelected: (RelayHost) -> Unit,
     onScopeSelected: (RelayScope) -> Unit,
-    onWorkingDirectoryChange: (String) -> Unit,
-    onLabelChange: (String) -> Unit,
 ) {
-    NewTerminalSelector(
+    SelectorField(
         label = "Computer",
         selectedValue = selectedHost?.displayName.orEmpty(),
-        placeholder = "Choose an online computer",
+        placeholder = "Choose a computer",
         icon = Icons.Outlined.Computer,
         options = hosts,
-        optionLabel = { it.displayName },
+        optionLabel = { host ->
+            val status = host.status.visual().label
+            "${host.displayName} · $status"
+        },
         optionId = { it.hostId },
-        error = validationErrors.host,
-        enabled = enabled,
-        testTag = "new_terminal_host_selector",
-        optionTagPrefix = "new_terminal_host_option",
+        optionEnabled = { it.status == ConnectionStatus.ONLINE },
+        error = errors.host,
+        testTag = "create_host_selector",
+        optionTagPrefix = "create_host_option",
         onSelected = onHostSelected,
     )
     Spacer(Modifier.height(16.dp))
-    NewTerminalSelector(
+    SelectorField(
         label = "Scope",
         selectedValue = selectedScope?.label.orEmpty(),
-        placeholder = if (form.hostId.isBlank()) {
-            "Choose a computer first"
-        } else {
-            "Choose an available scope"
-        },
+        placeholder = if (form.hostId.isBlank()) "Choose a computer first" else "Choose a scope",
         icon = Icons.Outlined.Dns,
         options = scopes,
-        optionLabel = { "${it.label} · ${it.kind}" },
+        optionLabel = { scope ->
+            "${scope.label} · ${if (scope.reachable) scope.kind else "Unavailable"}"
+        },
         optionId = { it.stableId },
-        error = validationErrors.scope ?: if (form.hostId.isNotBlank() && scopes.isEmpty()) {
-            "This computer has no reachable scopes."
+        optionEnabled = { it.reachable },
+        enabled = form.hostId.isNotBlank() && scopes.isNotEmpty(),
+        error = errors.scope ?: if (form.hostId.isNotBlank() && scopes.isEmpty()) {
+            "This computer has no available scopes."
         } else {
             null
         },
-        enabled = enabled && form.hostId.isNotBlank() && scopes.isNotEmpty(),
-        testTag = "new_terminal_scope_selector",
-        optionTagPrefix = "new_terminal_scope_option",
+        testTag = "create_scope_selector",
+        optionTagPrefix = "create_scope_option",
         onSelected = onScopeSelected,
-    )
-    Spacer(Modifier.height(18.dp))
-    NewTerminalTextField(
-        value = form.workingDirectory,
-        onValueChange = onWorkingDirectoryChange,
-        label = "Working directory",
-        placeholder = "/path/to/project",
-        icon = Icons.Outlined.FolderOpen,
-        error = validationErrors.workingDirectory,
-        helper = "Required · the terminal starts in this directory",
-        enabled = enabled,
-        imeAction = ImeAction.Next,
-        testTag = "new_terminal_working_directory",
-    )
-    Spacer(Modifier.height(14.dp))
-    NewTerminalTextField(
-        value = form.label,
-        onValueChange = onLabelChange,
-        label = "Label",
-        placeholder = "Build shell",
-        icon = Icons.AutoMirrored.Outlined.Label,
-        error = validationErrors.label,
-        helper = "Optional · shown instead of the generated session name",
-        enabled = enabled,
-        imeAction = ImeAction.Done,
-        testTag = "new_terminal_label",
     )
 }
 
 @Composable
-private fun <T> NewTerminalSelector(
+private fun <T> SelectorField(
     label: String,
     selectedValue: String,
     placeholder: String,
@@ -355,11 +394,12 @@ private fun <T> NewTerminalSelector(
     options: List<T>,
     optionLabel: (T) -> String,
     optionId: (T) -> String,
+    optionEnabled: (T) -> Boolean,
     error: String?,
-    enabled: Boolean,
     testTag: String,
     optionTagPrefix: String,
     onSelected: (T) -> Unit,
+    enabled: Boolean = true,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Column(modifier = Modifier.fillMaxWidth()) {
@@ -429,7 +469,7 @@ private fun <T> NewTerminalSelector(
                         text = {
                             Text(
                                 text = optionLabel(option),
-                                color = TwTextPrimary,
+                                color = if (optionEnabled(option)) TwTextPrimary else TwTextMuted,
                                 style = MaterialTheme.typography.bodyLarge,
                             )
                         },
@@ -437,32 +477,84 @@ private fun <T> NewTerminalSelector(
                             expanded = false
                             onSelected(option)
                         },
+                        enabled = optionEnabled(option),
                         modifier = Modifier.testTag("${optionTagPrefix}_${optionId(option)}"),
                     )
                 }
             }
         }
-        NewTerminalFieldError(error)
+        FieldError(error = error)
     }
 }
 
 @Composable
-private fun NewTerminalTextField(
+private fun ConfigureStep(
+    form: NewWorktreeForm,
+    errors: NewWorktreeValidationErrors,
+    onRepositoryPathChange: (String) -> Unit,
+    onBaseBranchChange: (String) -> Unit,
+    onAiCommandChange: (String) -> Unit,
+    onWorktreeNameChange: (String) -> Unit,
+) {
+    WorktreeTextField(
+        value = form.repositoryPath,
+        onValueChange = onRepositoryPathChange,
+        label = "Repository project or path",
+        placeholder = "project-name or /path/to/repository",
+        icon = Icons.Outlined.FolderOpen,
+        error = errors.repositoryPath,
+        testTag = "create_repository_path",
+        imeAction = ImeAction.Next,
+    )
+    Spacer(Modifier.height(14.dp))
+    WorktreeTextField(
+        value = form.baseBranch,
+        onValueChange = onBaseBranchChange,
+        label = "Base branch (optional)",
+        placeholder = "Auto-detect from project config",
+        icon = Icons.Outlined.AccountTree,
+        error = errors.baseBranch,
+        testTag = "create_base_branch",
+        imeAction = ImeAction.Next,
+    )
+    Spacer(Modifier.height(14.dp))
+    WorktreeTextField(
+        value = form.aiCommand,
+        onValueChange = onAiCommandChange,
+        label = "Agent command",
+        placeholder = "codex",
+        icon = Icons.Outlined.Terminal,
+        error = errors.aiCommand,
+        testTag = "create_ai_command",
+        imeAction = ImeAction.Next,
+    )
+    Spacer(Modifier.height(14.dp))
+    WorktreeTextField(
+        value = form.worktreeName,
+        onValueChange = onWorktreeNameChange,
+        label = "Worktree name",
+        placeholder = "mobile-v2",
+        icon = Icons.Outlined.Workspaces,
+        error = errors.worktreeName,
+        testTag = "create_worktree_name",
+        imeAction = ImeAction.Done,
+    )
+}
+
+@Composable
+private fun WorktreeTextField(
     value: String,
     onValueChange: (String) -> Unit,
     label: String,
     placeholder: String,
     icon: ImageVector,
     error: String?,
-    helper: String,
-    enabled: Boolean,
-    imeAction: ImeAction,
     testTag: String,
+    imeAction: ImeAction,
 ) {
     OutlinedTextField(
         value = value,
         onValueChange = onValueChange,
-        enabled = enabled,
         modifier = Modifier
             .fillMaxWidth()
             .heightIn(min = 56.dp)
@@ -476,17 +568,18 @@ private fun NewTerminalTextField(
                 modifier = Modifier.size(22.dp),
             )
         },
-        supportingText = {
-            Text(
-                text = error ?: helper,
-                color = if (error == null) TwTextMuted else TwError,
-                modifier = Modifier.semantics {
-                    if (error != null) {
+        supportingText = if (error == null) {
+            null
+        } else {
+            {
+                Text(
+                    text = error,
+                    modifier = Modifier.semantics {
                         liveRegion = LiveRegionMode.Assertive
                         contentDescription = "$label error: $error"
-                    }
-                },
-            )
+                    },
+                )
+            }
         },
         isError = error != null,
         singleLine = true,
@@ -495,10 +588,8 @@ private fun NewTerminalTextField(
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = TwTextPrimary,
             unfocusedTextColor = TwTextPrimary,
-            disabledTextColor = TwTextMuted,
             focusedBorderColor = TwAccent,
             unfocusedBorderColor = TwBorder,
-            disabledBorderColor = TwBorder,
             errorBorderColor = TwError,
             focusedLabelColor = TwAccent,
             unfocusedLabelColor = TwTextSecondary,
@@ -510,15 +601,110 @@ private fun NewTerminalTextField(
 }
 
 @Composable
-private fun NewTerminalLoadingState() {
+private fun ReviewStep(
+    form: NewWorktreeForm,
+    hostLabel: String,
+    scopeLabel: String,
+    isCreating: Boolean,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("create_review"),
+        shape = RoundedCornerShape(12.dp),
+        color = TwSurface,
+        border = BorderStroke(1.dp, TwBorder),
+    ) {
+        Column {
+            ReviewRow(Icons.Outlined.Computer, "Computer", hostLabel)
+            HorizontalDivider(color = TwBorder, thickness = 1.dp)
+            ReviewRow(Icons.Outlined.Dns, "Scope", scopeLabel)
+            HorizontalDivider(color = TwBorder, thickness = 1.dp)
+            ReviewRow(Icons.Outlined.FolderOpen, "Repository", form.repositoryPath)
+            HorizontalDivider(color = TwBorder, thickness = 1.dp)
+            ReviewRow(
+                Icons.Outlined.AccountTree,
+                "Base branch",
+                form.baseBranch.ifBlank { "Auto-detect" },
+            )
+            HorizontalDivider(color = TwBorder, thickness = 1.dp)
+            ReviewRow(Icons.Outlined.Workspaces, "Worktree", form.worktreeName)
+            HorizontalDivider(color = TwBorder, thickness = 1.dp)
+            ReviewRow(Icons.Outlined.Terminal, "Agent", form.aiCommand)
+        }
+    }
+    if (isCreating) {
+        Spacer(Modifier.height(20.dp))
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("create_progress")
+                .semantics {
+                    liveRegion = LiveRegionMode.Polite
+                    contentDescription = "Creating worktree"
+                },
+        ) {
+            LinearProgressIndicator(
+                modifier = Modifier.fillMaxWidth(),
+                color = TwAccent,
+                trackColor = TwBorder,
+            )
+            Spacer(Modifier.height(10.dp))
+            Text(
+                text = "Creating worktree…",
+                color = TwTextSecondary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReviewRow(icon: ImageVector, label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 58.dp)
+            .padding(horizontal = 16.dp, vertical = 10.dp)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$label: $value"
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = TwAccent,
+            modifier = Modifier.size(22.dp),
+        )
+        Spacer(Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = label,
+                color = TwTextSecondary,
+                style = MaterialTheme.typography.labelSmall,
+            )
+            Text(
+                text = value.ifBlank { "Not selected" },
+                color = TwTextPrimary,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun LoadingTargetsState() {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 260.dp)
-            .testTag("new_terminal_loading")
+            .heightIn(min = 220.dp)
+            .testTag("create_targets_loading")
             .semantics {
                 liveRegion = LiveRegionMode.Polite
-                contentDescription = "Loading online computers and scopes"
+                contentDescription = "Loading computers and scopes"
             },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
@@ -538,15 +724,12 @@ private fun NewTerminalLoadingState() {
 }
 
 @Composable
-private fun NewTerminalEmptyTargetsState(
-    message: String,
-    onRetry: () -> Unit,
-) {
+private fun EmptyTargetsState(message: String, onRetry: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(min = 260.dp)
-            .testTag("new_terminal_empty"),
+            .heightIn(min = 220.dp)
+            .testTag("create_targets_empty"),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
@@ -567,10 +750,10 @@ private fun NewTerminalEmptyTargetsState(
             onClick = onRetry,
             modifier = Modifier
                 .height(48.dp)
-                .testTag("new_terminal_retry_targets"),
-            shape = RoundedCornerShape(12.dp),
+                .testTag("create_retry_targets"),
             border = BorderStroke(1.dp, TwAccent),
             colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
+            shape = RoundedCornerShape(12.dp),
         ) {
             Icon(
                 imageVector = Icons.Outlined.Refresh,
@@ -584,18 +767,14 @@ private fun NewTerminalEmptyTargetsState(
 }
 
 @Composable
-private fun NewTerminalErrorBanner(
-    message: String,
-    prefix: String,
-    testTag: String,
-) {
+private fun WorktreeErrorBanner(message: String, testTag: String) {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .testTag(testTag)
             .semantics {
                 liveRegion = LiveRegionMode.Assertive
-                contentDescription = "$prefix: $message"
+                contentDescription = "Creation error: $message"
             },
         color = TwSurface,
         shape = RoundedCornerShape(12.dp),
@@ -612,25 +791,17 @@ private fun NewTerminalErrorBanner(
                 modifier = Modifier.size(22.dp),
             )
             Spacer(Modifier.width(10.dp))
-            Column {
-                Text(
-                    text = prefix,
-                    color = TwError,
-                    style = MaterialTheme.typography.labelLarge,
-                )
-                Spacer(Modifier.height(2.dp))
-                Text(
-                    text = message,
-                    color = TwTextPrimary,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
+            Text(
+                text = message,
+                color = TwTextPrimary,
+                style = MaterialTheme.typography.bodyMedium,
+            )
         }
     }
 }
 
 @Composable
-private fun NewTerminalFieldError(error: String?) {
+private fun FieldError(error: String?) {
     if (error == null) return
     Text(
         text = error,
@@ -646,10 +817,12 @@ private fun NewTerminalFieldError(error: String?) {
 }
 
 @Composable
-private fun NewTerminalBottomBar(
-    canCreate: Boolean,
+private fun NewWorktreeBottomBar(
+    step: NewWorktreeStep,
+    canContinue: Boolean,
     isCreating: Boolean,
     onBack: () -> Unit,
+    onNext: () -> Unit,
     onCreate: () -> Unit,
 ) {
     Column(
@@ -671,25 +844,26 @@ private fun NewTerminalBottomBar(
                 modifier = Modifier
                     .weight(1f)
                     .height(48.dp)
-                    .testTag("new_terminal_cancel"),
+                    .testTag("create_back"),
                 shape = RoundedCornerShape(12.dp),
                 border = BorderStroke(1.dp, TwBorder),
                 colors = ButtonDefaults.outlinedButtonColors(contentColor = TwTextSecondary),
             ) {
-                Text("Cancel")
+                Text(if (step == NewWorktreeStep.TARGET) "Cancel" else "Back")
             }
+
             Button(
-                onClick = onCreate,
-                enabled = canCreate,
+                onClick = if (step == NewWorktreeStep.REVIEW) onCreate else onNext,
+                enabled = canContinue && !isCreating,
                 modifier = Modifier
-                    .weight(1.5f)
+                    .weight(1.45f)
                     .height(48.dp)
-                    .testTag("new_terminal_create")
+                    .testTag(if (step == NewWorktreeStep.REVIEW) "create_submit" else "create_next")
                     .semantics {
                         stateDescription = when {
-                            isCreating -> "Creating terminal"
-                            canCreate -> "Ready"
-                            else -> "Complete the required fields"
+                            isCreating -> "Creating worktree"
+                            canContinue -> "Ready"
+                            else -> "Complete required fields"
                         }
                     },
                 shape = RoundedCornerShape(12.dp),
@@ -706,16 +880,25 @@ private fun NewTerminalBottomBar(
                         strokeWidth = 2.dp,
                         modifier = Modifier.size(18.dp),
                     )
+                    Spacer(Modifier.width(8.dp))
                 } else {
                     Icon(
-                        imageVector = Icons.Outlined.Terminal,
+                        imageVector = if (step == NewWorktreeStep.REVIEW) {
+                            Icons.Outlined.RocketLaunch
+                        } else {
+                            Icons.Outlined.ChevronRight
+                        },
                         contentDescription = null,
                         modifier = Modifier.size(20.dp),
                     )
+                    Spacer(Modifier.width(6.dp))
                 }
-                Spacer(Modifier.width(8.dp))
                 Text(
-                    text = if (isCreating) "Creating…" else "Create terminal",
+                    text = when {
+                        isCreating -> "Creating…"
+                        step == NewWorktreeStep.REVIEW -> "Create worktree"
+                        else -> "Continue"
+                    },
                     style = MaterialTheme.typography.labelLarge,
                 )
             }
@@ -725,29 +908,67 @@ private fun NewTerminalBottomBar(
 
 @Preview(showBackground = true, backgroundColor = 0xFF070A0E, widthDp = 390, heightDp = 844)
 @Composable
-private fun NewTerminalScreenPreview() {
+private fun NewWorktreeTargetPreview() {
     val hosts = DemoData.hosts()
     val scopes = DemoData.scopes()
     TwTheme {
-        NewTerminalScreen(
-            form = NewTerminalForm(
+        NewWorktreeScreen(
+            step = NewWorktreeStep.TARGET,
+            form = NewWorktreeForm(hostId = hosts.first().hostId, scopeId = scopes.first().scopeId),
+            hosts = hosts,
+            scopes = scopes,
+            isLoadingTargets = false,
+            isCreating = false,
+            validationErrors = NewWorktreeValidationErrors(),
+            targetLoadError = null,
+            creationError = null,
+            onBack = {},
+            onPreviousStep = {},
+            onNextStep = {},
+            onHostSelected = {},
+            onScopeSelected = {},
+            onRepositoryPathChange = {},
+            onBaseBranchChange = {},
+            onAiCommandChange = {},
+            onWorktreeNameChange = {},
+            onRetryLoadTargets = {},
+            onCreate = {},
+        )
+    }
+}
+
+@Preview(showBackground = true, backgroundColor = 0xFF070A0E, widthDp = 390, heightDp = 844)
+@Composable
+private fun NewWorktreeReviewPreview() {
+    val hosts = DemoData.hosts()
+    val scopes = DemoData.scopes()
+    TwTheme {
+        NewWorktreeScreen(
+            step = NewWorktreeStep.REVIEW,
+            form = NewWorktreeForm(
                 hostId = hosts.first().hostId,
                 scopeId = scopes.first().scopeId,
-                workingDirectory = "/Users/bytedance/tmux-worktree",
-                label = "Build shell",
+                repositoryPath = "/Users/bytedance/tmux-worktree",
+                baseBranch = "main",
+                aiCommand = "codex",
+                worktreeName = "mobile-v2",
             ),
             hosts = hosts,
             scopes = scopes,
             isLoadingTargets = false,
             isCreating = false,
-            validationErrors = NewTerminalValidationErrors(),
+            validationErrors = NewWorktreeValidationErrors(),
             targetLoadError = null,
             creationError = null,
             onBack = {},
+            onPreviousStep = {},
+            onNextStep = {},
             onHostSelected = {},
             onScopeSelected = {},
-            onWorkingDirectoryChange = {},
-            onLabelChange = {},
+            onRepositoryPathChange = {},
+            onBaseBranchChange = {},
+            onAiCommandChange = {},
+            onWorktreeNameChange = {},
             onRetryLoadTargets = {},
             onCreate = {},
         )

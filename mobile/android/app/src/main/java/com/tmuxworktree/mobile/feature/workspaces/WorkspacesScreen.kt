@@ -49,19 +49,19 @@ import com.tmuxworktree.mobile.core.model.AgentState
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
-import com.tmuxworktree.mobile.ui.RootDestination
-import com.tmuxworktree.mobile.ui.TwAccent
-import com.tmuxworktree.mobile.ui.TwBackground
-import com.tmuxworktree.mobile.ui.TwBorder
-import com.tmuxworktree.mobile.ui.TwError
-import com.tmuxworktree.mobile.ui.TwRootBottomBar
-import com.tmuxworktree.mobile.ui.TwRootTopBar
-import com.tmuxworktree.mobile.ui.TwSuccess
-import com.tmuxworktree.mobile.ui.TwSurfaceRaised
-import com.tmuxworktree.mobile.ui.TwTextPrimary
-import com.tmuxworktree.mobile.ui.TwTextSecondary
-import com.tmuxworktree.mobile.ui.TwTextMuted
-import com.tmuxworktree.mobile.ui.TwWarning
+import com.tmuxworktree.mobile.designsystem.TwAccent
+import com.tmuxworktree.mobile.designsystem.TwBackground
+import com.tmuxworktree.mobile.designsystem.TwBorder
+import com.tmuxworktree.mobile.designsystem.TwError
+import com.tmuxworktree.mobile.designsystem.TwRootTopBar
+import com.tmuxworktree.mobile.designsystem.TwSuccess
+import com.tmuxworktree.mobile.designsystem.TwSurfaceRaised
+import com.tmuxworktree.mobile.designsystem.TwTextPrimary
+import com.tmuxworktree.mobile.designsystem.TwTextSecondary
+import com.tmuxworktree.mobile.designsystem.TwTextMuted
+import com.tmuxworktree.mobile.designsystem.TwWarning
+import com.tmuxworktree.mobile.navigation.RootDestination
+import com.tmuxworktree.mobile.navigation.TwRootBottomBar
 
 @Composable
 fun WorkspacesScreen(

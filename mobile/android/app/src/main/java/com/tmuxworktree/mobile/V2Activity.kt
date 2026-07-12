@@ -16,7 +16,7 @@ import com.tmuxworktree.mobile.app.PairingPayload
 import com.tmuxworktree.mobile.app.PairingPayloadParser
 import com.tmuxworktree.mobile.app.V2App
 import com.tmuxworktree.mobile.app.V2ViewModel
-import com.tmuxworktree.mobile.ui.TwTheme
+import com.tmuxworktree.mobile.designsystem.TwTheme
 
 class V2Activity : ComponentActivity() {
     private val appContainer by lazy { AppContainer(applicationContext) }

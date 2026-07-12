@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature.session
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -78,6 +78,7 @@ import com.tmuxworktree.mobile.core.model.DemoData
 import com.tmuxworktree.mobile.core.model.RelaySession
 import com.tmuxworktree.mobile.core.model.TimelineActor
 import com.tmuxworktree.mobile.core.model.TimelineEvent
+import com.tmuxworktree.mobile.designsystem.*
 
 @Composable
 fun SessionDetailScreen(
