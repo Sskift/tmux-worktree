@@ -1,0 +1,15 @@
+{
+  "contract": "tmux-worktree-tw-rpc-v1",
+  "version": 1,
+  "status": "frozen",
+  "transport": "utf-8-json-line-on-stdout",
+  "commands": [
+    "capabilities",
+    "list",
+    "create-worktree",
+    "create-terminal",
+    "restore-worktree",
+    "kill-session"
+  ],
+  "fixture": "cases.json"
+}

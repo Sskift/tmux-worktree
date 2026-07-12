@@ -1,0 +1,76 @@
+{
+  "objectMap": {
+    "input": {
+      "rootExtension": { "keep": true },
+      "remoteHosts": {
+        "build": {
+          "display_name": "Build box",
+          "hostname": "build.example.com",
+          "username": "builder",
+          "port": "2222",
+          "key_file": "/keys/build_ed25519",
+          "worktreeRoot": "~/worktrees",
+          "tmux_bin": "~/.local/bin/tmux",
+          "tw_bin": "~/.local/bin/tw",
+          "hostExtension": { "keep": true }
+        }
+      }
+    },
+    "normalizedHosts": [
+      {
+        "id": "build",
+        "label": "Build box",
+        "host": "build.example.com",
+        "user": "builder",
+        "port": 2222,
+        "identityFile": "/keys/build_ed25519",
+        "worktreeBase": "~/worktrees",
+        "tmuxPath": "~/.local/bin/tmux",
+        "twPath": "~/.local/bin/tw"
+      }
+    ]
+  },
+  "arrayAliases": {
+    "input": {
+      "remotes": [
+        {
+          "key": "staging",
+          "label": "Staging",
+          "address": "staging.example.com",
+          "identity_file": "/keys/staging"
+        },
+        "shell.example.com"
+      ]
+    },
+    "normalizedHosts": [
+      {
+        "id": "staging",
+        "label": "Staging",
+        "host": "staging.example.com",
+        "identityFile": "/keys/staging"
+      },
+      {
+        "id": "shell.example.com",
+        "label": "shell.example.com",
+        "host": "shell.example.com"
+      }
+    ]
+  },
+  "crudPreservation": {
+    "input": {
+      "rootExtension": { "keep": true },
+      "hosts": [
+        {
+          "id": "build",
+          "label": "Old label",
+          "host": "build.example.com",
+          "hostExtension": { "keep": true }
+        }
+      ]
+    },
+    "argv": ["host", "update", "build", "--label", "Build box", "--json"],
+    "expectedRootExtension": { "keep": true },
+    "expectedHostExtension": { "keep": true },
+    "expectedLabel": "Build box"
+  }
+}

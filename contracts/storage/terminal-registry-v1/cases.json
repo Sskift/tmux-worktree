@@ -1,0 +1,83 @@
+{
+  "stored": [
+    {
+      "id": "term-local",
+      "label": "Local shell",
+      "cwd": "/repo/demo",
+      "tmuxName": "tw-term-a1b2c",
+      "rawName": "tw-term-a1b2c",
+      "aiCmd": "codex",
+      "discovered": false,
+      "managed": true,
+      "extension": "preserve-on-raw-write"
+    },
+    {
+      "id": "term-remote",
+      "label": "Remote shell",
+      "cwd": "/srv/demo",
+      "tmuxName": "build:tw-term-b2c3d",
+      "rawName": "tw-term-b2c3d",
+      "hostId": "build",
+      "managed": true
+    }
+  ],
+  "catalogInput": [
+    {
+      "id": "term-local",
+      "label": "Local shell",
+      "cwd": "/repo/demo",
+      "tmuxName": "tw-term-a1b2c",
+      "rawName": "tw-term-a1b2c",
+      "managed": true,
+      "extension": "ignored-by-catalog-projection"
+    },
+    null,
+    7,
+    { "label": "missing attach identity" },
+    { "rawName": "tw-term-invalid", "hostId": { "bad": true } },
+    {
+      "id": "term-remote",
+      "label": "Remote shell",
+      "cwd": "/srv/demo",
+      "tmuxName": "build:tw-term-b2c3d",
+      "rawName": "tw-term-b2c3d",
+      "hostId": "build",
+      "managed": true
+    }
+  ],
+  "catalogNormalized": [
+    {
+      "id": "term-local",
+      "label": "Local shell",
+      "cwd": "/repo/demo",
+      "rawName": "tw-term-a1b2c",
+      "tmuxName": "tw-term-a1b2c",
+      "managed": true
+    },
+    {
+      "id": "term-remote",
+      "label": "Remote shell",
+      "cwd": "/srv/demo",
+      "hostId": "build",
+      "rawName": "tw-term-b2c3d",
+      "tmuxName": "build:tw-term-b2c3d",
+      "managed": true
+    }
+  ],
+  "remoteScope": {
+    "scope": { "id": "build", "kind": "ssh" },
+    "name": "tw-term-b2c3d",
+    "cwd": "/srv/demo",
+    "label": "Remote shell",
+    "expected": {
+      "hostId": "build",
+      "rawName": "tw-term-b2c3d",
+      "tmuxName": "build:tw-term-b2c3d",
+      "managed": true
+    }
+  },
+  "invalidMutation": {
+    "contents": "{\"not\":\"an array\"}\n",
+    "errorIncludes": "registry root must be an array"
+  }
+}

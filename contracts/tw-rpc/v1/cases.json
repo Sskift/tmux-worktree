@@ -1,0 +1,205 @@
+{
+  "success": [
+    {
+      "id": "capabilities",
+      "command": "capabilities",
+      "argv": ["rpc", "capabilities"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"app\":\"tmux-worktree\",\"capabilities\":[\"list\",\"managed-state\",\"create-worktree\",\"create-terminal\",\"restore-worktree\",\"kill-session\"]}\n",
+      "stderr": "",
+      "normalized": {
+        "protocolVersion": 1,
+        "app": "tmux-worktree",
+        "capabilities": [
+          "list",
+          "managed-state",
+          "create-worktree",
+          "create-terminal",
+          "restore-worktree",
+          "kill-session"
+        ]
+      }
+    },
+    {
+      "id": "list-live-managed-only",
+      "command": "list",
+      "argv": ["rpc", "list"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"sessions\":[{\"name\":\"demo-fix\",\"kind\":\"worktree\",\"profile\":\"dashboard\",\"project\":\"demo\",\"repoPath\":\"/repo/demo\",\"worktreePath\":\"/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c\",\"branch\":\"demo-fix-a1b2c\",\"baseBranch\":\"main\",\"createdAt\":\"2026-07-12T00:00:00.000Z\",\"attached\":false,\"windows\":1,\"created\":1760000000,\"activity\":1760000100,\"cwd\":\"/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c\"}]}\n",
+      "stderr": "",
+      "input": {
+        "state": {
+          "version": 1,
+          "sessions": [
+            {
+              "name": "demo-fix",
+              "kind": "worktree",
+              "profile": "dashboard",
+              "project": "demo",
+              "repoPath": "/repo/demo",
+              "worktreePath": "/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c",
+              "branch": "demo-fix-a1b2c",
+              "baseBranch": "main",
+              "createdAt": "2026-07-12T00:00:00.000Z"
+            },
+            {
+              "name": "tw-term-dead1",
+              "kind": "terminal",
+              "profile": "cli",
+              "cwd": "/repo/demo",
+              "createdAt": "2026-07-12T00:00:01.000Z"
+            }
+          ]
+        },
+        "liveSessions": [
+          {
+            "name": "demo-fix",
+            "attached": false,
+            "windows": 1,
+            "created": 1760000000,
+            "activity": 1760000100,
+            "cwd": "/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c"
+          },
+          {
+            "name": "ordinary-tmux",
+            "attached": true,
+            "windows": 2,
+            "created": 1760000200,
+            "activity": 1760000300,
+            "cwd": "/repo/ordinary"
+          }
+        ]
+      },
+      "normalized": {
+        "protocolVersion": 1,
+        "sessions": [
+          {
+            "name": "demo-fix",
+            "kind": "worktree",
+            "profile": "dashboard",
+            "project": "demo",
+            "repoPath": "/repo/demo",
+            "worktreePath": "/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c",
+            "branch": "demo-fix-a1b2c",
+            "baseBranch": "main",
+            "createdAt": "2026-07-12T00:00:00.000Z",
+            "attached": false,
+            "windows": 1,
+            "created": 1760000000,
+            "activity": 1760000100,
+            "cwd": "/home/dev/.tmux-worktree/worktrees/demo/demo-fix-a1b2c"
+          }
+        ]
+      }
+    },
+    {
+      "id": "create-worktree-all-fields",
+      "command": "create-worktree",
+      "argv": ["rpc", "create-worktree", "--path", "/repo/demo", "--project", "demo", "--ai-command", "codex", "--name", "fix", "--branch", "main", "--worktree-base", "/worktrees"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"kind\":\"worktree\",\"session\":\"demo-fix\",\"worktreePath\":\"/worktrees/demo/demo-fix-a1b2c\",\"branch\":\"demo-fix-a1b2c\"}\n",
+      "stderr": "",
+      "request": {
+        "path": "/repo/demo",
+        "project": "demo",
+        "aiCommand": "codex",
+        "name": "fix",
+        "branch": "main",
+        "worktreeBase": "/worktrees"
+      },
+      "normalized": {
+        "protocolVersion": 1,
+        "kind": "worktree",
+        "session": "demo-fix",
+        "worktreePath": "/worktrees/demo/demo-fix-a1b2c",
+        "branch": "demo-fix-a1b2c"
+      }
+    },
+    {
+      "id": "create-terminal-without-ai-command",
+      "command": "create-terminal",
+      "argv": ["rpc", "create-terminal", "--cwd", "/repo/demo"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"kind\":\"terminal\",\"session\":\"tw-term-a1b2c\",\"cwd\":\"/repo/demo\"}\n",
+      "stderr": "",
+      "request": {
+        "cwd": "/repo/demo"
+      },
+      "normalized": {
+        "protocolVersion": 1,
+        "kind": "terminal",
+        "session": "tw-term-a1b2c",
+        "cwd": "/repo/demo"
+      }
+    },
+    {
+      "id": "restore-worktree-optional-branch-omitted",
+      "command": "restore-worktree",
+      "argv": ["rpc", "restore-worktree", "--path", "/worktrees/demo/demo-fix-a1b2c", "--name", "demo-fix", "--project", "demo", "--ai-command", "codex"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"kind\":\"worktree\",\"session\":\"demo-fix\",\"worktreePath\":\"/worktrees/demo/demo-fix-a1b2c\"}\n",
+      "stderr": "",
+      "request": {
+        "path": "/worktrees/demo/demo-fix-a1b2c",
+        "name": "demo-fix",
+        "project": "demo",
+        "aiCommand": "codex"
+      },
+      "normalized": {
+        "protocolVersion": 1,
+        "kind": "worktree",
+        "session": "demo-fix",
+        "worktreePath": "/worktrees/demo/demo-fix-a1b2c"
+      }
+    },
+    {
+      "id": "kill-live-managed-session",
+      "command": "kill-session",
+      "argv": ["rpc", "kill-session", "--name", "tw-term-a1b2c"],
+      "exitCode": 0,
+      "stdout": "{\"protocolVersion\":1,\"kind\":\"session-killed\",\"session\":\"tw-term-a1b2c\",\"sessionKind\":\"terminal\",\"killed\":true}\n",
+      "stderr": "",
+      "request": {
+        "name": "tw-term-a1b2c"
+      },
+      "input": {
+        "state": {
+          "version": 1,
+          "sessions": [
+            {
+              "name": "tw-term-a1b2c",
+              "kind": "terminal",
+              "profile": "dashboard",
+              "cwd": "/repo/demo",
+              "createdAt": "2026-07-12T00:00:00.000Z"
+            }
+          ]
+        },
+        "live": true
+      },
+      "normalized": {
+        "protocolVersion": 1,
+        "kind": "session-killed",
+        "session": "tw-term-a1b2c",
+        "sessionKind": "terminal",
+        "killed": true
+      }
+    }
+  ],
+  "errors": [
+    {
+      "id": "create-terminal-missing-cwd",
+      "argv": ["rpc", "create-terminal"],
+      "exitCode": 1,
+      "stdout": "",
+      "stderr": "错误: create-terminal requires --cwd\n"
+    },
+    {
+      "id": "unknown-rpc-command",
+      "argv": ["rpc", "unknown"],
+      "exitCode": 1,
+      "stdout": "",
+      "stderr": "错误: unknown rpc command: unknown\n"
+    }
+  ]
+}
