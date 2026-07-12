@@ -324,9 +324,9 @@ test("remote attach connects directly without creating a grouped mirror session"
 
 test("dashboard remote terminal forwards wheel events as tmux mouse input", () => {
   const terminalSource = readFileSync(new URL("../app/src/Terminal.tsx", import.meta.url), "utf8");
-  const terminalDeckSource = readFileSync(new URL("../app/src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
+  const terminalAttachSource = readFileSync(new URL("../app/src/terminal/attach.ts", import.meta.url), "utf8");
 
-  assert.match(terminalDeckSource, /set-option -g mouse on/);
+  assert.match(terminalAttachSource, /set-option -g mouse on/);
   assert.match(terminalSource, /function sgrMouseWheel/);
   assert.match(terminalSource, /attachCustomWheelEventHandler\(handleRemoteWheel\)/);
   assert.match(terminalSource, /addEventListener\("wheel", onRemoteWheel/);
