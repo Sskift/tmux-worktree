@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
+import { readRustProductionSource } from "./rustSource.ts";
 
 const expectedTauriCommands = [
   "list_dashboard_catalog",
@@ -79,9 +79,7 @@ function leafName(path: string): string {
 }
 
 function readTauriCompositionSource(): string {
-  const source = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
-  const testModuleStart = source.lastIndexOf("\n#[cfg(test)]\nmod tests {");
-  return testModuleStart >= 0 ? source.slice(0, testModuleStart) : source;
+  return readRustProductionSource("lib.rs");
 }
 
 test("tauri exposes exactly the frozen 68 dashboard commands", () => {
