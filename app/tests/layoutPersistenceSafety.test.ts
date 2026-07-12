@@ -107,6 +107,13 @@ function loadDashboardLayoutHook(): {
       "../layoutSaveCoordinator",
       { createLayoutSaveCoordinator: () => assert.fail("state hook must not execute") },
     ],
+    [
+      "../windowCaptureCoordinator",
+      {
+        createWindowCaptureCoordinator: () => assert.fail("window phase is not executed"),
+        windowLayoutFromCapture: () => assert.fail("window phase is not executed"),
+      },
+    ],
     ["../layoutPersistence", { classifyDashboardLayoutPersistenceFailure }],
     ["./useLayoutPreferences", { useLayoutPreferences: () => assert.fail("not used") }],
   ]);

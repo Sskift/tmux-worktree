@@ -14,6 +14,10 @@ const sources = {
     new URL("../src/dashboard/layoutSaveCoordinator.ts", import.meta.url),
     "utf8",
   ),
+  windowCapture: readFileSync(
+    new URL("../src/dashboard/windowCaptureCoordinator.ts", import.meta.url),
+    "utf8",
+  ),
   connection: readFileSync(
     new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
@@ -168,6 +172,14 @@ const coordinatorExports = [
   "LayoutSaveFailureClassification",
   "LayoutSaveScheduler",
   "createLayoutSaveCoordinator",
+] as const;
+
+const windowCaptureExports = [
+  "WindowCaptureCoordinator",
+  "WindowCaptureCoordinatorOptions",
+  "WindowCaptureResult",
+  "createWindowCaptureCoordinator",
+  "windowLayoutFromCapture",
 ] as const;
 
 function assertExactCanonicalExport(sourceFile: ts.SourceFile): void {
@@ -592,6 +604,125 @@ test("layout save coordinator has one reachable pure owner and an exact API", ()
   );
 });
 
+test("window capture coordinator has one reachable pure owner and a fenced API", () => {
+  const captureFile = parse(
+    "windowCaptureCoordinator.ts",
+    sources.windowCapture,
+  );
+  const exported = exportedNames(captureFile);
+  assert.equal(new Set(exported.map(({ name }) => name)).size, exported.length);
+  assert.deepEqual(
+    exported.map(({ name }) => name).sort(),
+    [...windowCaptureExports].sort(),
+  );
+  assert.deepEqual(
+    exported.filter(({ runtime }) => runtime).map(({ name }) => name).sort(),
+    ["createWindowCaptureCoordinator", "windowLayoutFromCapture"],
+  );
+  assert.deepEqual(importManifest(captureFile), [
+    "../platform|DashboardWindow|DashboardWindow|type",
+    "./layout/types|WindowLayout|WindowLayout|type",
+  ]);
+  assertNoIndirectModuleEdges(captureFile);
+  assert.equal(
+    captureFile.statements.some(
+      (statement) =>
+        ts.isExportDeclaration(statement) || ts.isExportAssignment(statement),
+    ),
+    false,
+  );
+  assert.doesNotMatch(
+    sources.windowCapture,
+    /\b(?:React|useEffect|useState|localStorage|fetch|document|onCloseRequested|destroy|flush)\b/,
+  );
+  assert.doesNotMatch(sources.windowCapture, /\bwindow\s*[.[]/);
+
+  const reachable = readRendererImplementationFiles();
+  assert.ok(
+    reachable.some(({ path }) => path === "dashboard/windowCaptureCoordinator.ts"),
+  );
+  for (const owner of [
+    "createWindowCaptureCoordinator",
+    "windowLayoutFromCapture",
+  ]) {
+    const owners = reachable.flatMap(({ path, source }) =>
+      exportedNames(parse(path, source)).some(
+          ({ name, runtime }) => runtime && name === owner,
+        )
+        ? [path]
+        : []
+    );
+    assert.deepEqual(owners, ["dashboard/windowCaptureCoordinator.ts"]);
+  }
+
+  const factory = directFunction(captureFile, "createWindowCaptureCoordinator");
+  assert.ok(factory.body);
+  assert.deepEqual(
+    ["active", "started", "generation", "cancelDebounce"].map((name) => {
+      const declaration = directVariable(factory.body!, name);
+      return [name, compact(declaration.initializer!, captureFile)];
+    }),
+    [
+      ["active", "false"],
+      ["started", "false"],
+      ["generation", "0"],
+      ["cancelDebounce", "null"],
+    ],
+  );
+  const scheduleCapture = directVariable(factory.body, "scheduleCapture");
+  assert.ok(scheduleCapture.initializer && ts.isArrowFunction(scheduleCapture.initializer));
+  assert.ok(ts.isBlock(scheduleCapture.initializer.body));
+  assert.deepEqual(
+    scheduleCapture.initializer.body.statements.slice(0, 3).map(
+      (statement) => compact(statement, captureFile),
+    ),
+    ["if(!active)return;", "consttoken=++generation;", "clearDebounce();"],
+  );
+  const trailingCapture = directVariable(factory.body, "requestTrailingCapture");
+  assert.ok(trailingCapture.initializer && ts.isArrowFunction(trailingCapture.initializer));
+  assert.equal(
+    compact(trailingCapture.initializer.body, captureFile),
+    "{if(!active||cancelDebounce!==null)return;scheduleCapture();}",
+  );
+  const registerListener = directVariable(factory.body, "registerListener");
+  assert.ok(registerListener.initializer && ts.isArrowFunction(registerListener.initializer));
+  assert.equal(
+    callsWithPath(registerListener.initializer.body, "requestTrailingCapture").length,
+    3,
+  );
+  assert.equal(
+    callsWithPath(registerListener.initializer.body, "requestBaseline").length,
+    0,
+  );
+  assert.equal(callsWithPath(factory.body, "options.target.onResized").length, 1);
+  assert.equal(callsWithPath(factory.body, "options.target.onMoved").length, 1);
+  assert.equal(callsWithPath(factory.body, "options.publish").length, 1);
+  assert.equal(callsWithPath(captureFile, "Number.isFinite").length, 2);
+  assert.equal(callsWithPath(factory.body, "Promise.all").length, 2);
+
+  const factoryReturn = factory.body.statements.find(ts.isReturnStatement);
+  assert.ok(factoryReturn?.expression && ts.isObjectLiteralExpression(factoryReturn.expression));
+  const methods = new Map(
+    factoryReturn.expression.properties.map((property) => {
+      assert.ok(ts.isMethodDeclaration(property));
+      assert.ok(ts.isIdentifier(property.name));
+      return [property.name.text, property];
+    }),
+  );
+  assert.deepEqual([...methods.keys()], ["start", "stop"]);
+  const stop = methods.get("stop")!;
+  assert.ok(stop.body);
+  assert.deepEqual(
+    stop.body.statements.slice(0, 4).map((statement) => compact(statement, captureFile)),
+    [
+      "if(!active)return;",
+      "active=false;",
+      "generation+=1;",
+      "clearDebounce();",
+    ],
+  );
+});
+
 test("dashboard layout state has one canonical owner and the frozen state/ref API", () => {
   const layoutFile = parse("useDashboardLayout.ts", sources.layout);
   assertExactCanonicalExport(layoutFile);
@@ -599,7 +730,6 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
   assertNoHookImportAliases(layoutFile);
   assert.deepEqual(importManifest(layoutFile), [
     "../../platform|DashboardBackend|DashboardBackend|type",
-    "../../platform|DashboardWindow|DashboardWindow|type",
     "../layout/panelGeometry|DEFAULT_INSPECTOR_WIDTH|DEFAULT_INSPECTOR_WIDTH|value",
     "../layout/panelGeometry|DEFAULT_SIDEBAR_WIDTH|DEFAULT_SIDEBAR_WIDTH|value",
     "../layout/panelGeometry|normalizeDashboardPanelWidths|normalizeDashboardPanelWidths|value",
@@ -621,6 +751,8 @@ test("dashboard layout state has one canonical owner and the frozen state/ref AP
     "../model/selection|PinnedItem|PinnedItem|type",
     "../model/selection|Selection|Selection|type",
     "../model/selection|pendingRestoredCatalogSelection|pendingRestoredCatalogSelection|value",
+    "../windowCaptureCoordinator|createWindowCaptureCoordinator|createWindowCaptureCoordinator|value",
+    "../windowCaptureCoordinator|windowLayoutFromCapture|windowLayoutFromCapture|value",
     "./useLayoutPreferences|useLayoutPreferences|useLayoutPreferences|value",
     "react|Dispatch|Dispatch|type",
     "react|SetStateAction|SetStateAction|type",
@@ -1331,144 +1463,43 @@ test("viewport resize phase preserves clamp, panel normalization, and tier trans
   );
 });
 
-test("window capture phase preserves ready gating, debounce, conversion, and late cleanup", () => {
+test("window capture phase delegates one backend-fenced effect to the coordinator", () => {
   const layoutFile = parse("useDashboardLayout.ts", sources.layout);
-  const expanded = directFunction(layoutFile, "getWindowExpandedState");
-  assert.ok(expanded.body);
-  const expandedPromise = callsWithPath(expanded.body, "Promise.all");
-  assert.equal(expandedPromise.length, 1);
-  assert.equal(expandedPromise[0].arguments.length, 1);
-  assert.ok(ts.isArrayLiteralExpression(expandedPromise[0].arguments[0]));
-  assert.deepEqual(
-    expandedPromise[0].arguments[0].elements.map((element) => compact(element, layoutFile)),
-    [
-      "win.isFullscreen().catch(()=>false)",
-      "win.isMaximized().catch(()=>false)",
-    ],
-  );
-  const expandedReturns = expanded.body.statements.filter(ts.isReturnStatement);
-  assert.equal(expandedReturns.length, 1);
-  assert.equal(compact(expandedReturns[0], layoutFile), "return{fullscreen,maximized};");
-
   const analysis = effectAnalysis(layoutFile, "useDashboardWindowCapturePhase");
-  assert.deepEqual(effectDependencies(analysis.call, layoutFile), ["windowRestoreReady"]);
-  assert.equal(analysis.body.statements.length, 12);
-  assert.ok(ts.isIfStatement(analysis.body.statements[0]));
-  assert.equal(compact(analysis.body.statements[0], layoutFile), "if(!windowRestoreReady)return;");
+  assert.deepEqual(effectDependencies(analysis.call, layoutFile), [
+    "windowRestoreReady",
+    "dashboardBackend",
+  ]);
+  assert.equal(analysis.body.statements.length, 4);
   assert.equal(
-    compact(analysis.body.statements[1], layoutFile),
-    "constwin=dashboardBackend.window.current();",
+    compact(analysis.body.statements[0], layoutFile),
+    "if(!windowRestoreReady)return;",
   );
-  const expectedDeclarations = [
-    [2, "disposed", "false"],
-    [3, "timer", "null"],
-    [4, "unlistenResized", "<undefined>"],
-    [5, "unlistenMoved", "<undefined>"],
-  ] as const;
-  for (const [index, name, initializer] of expectedDeclarations) {
-    const statement = analysis.body.statements[index];
-    assert.ok(ts.isVariableStatement(statement));
-    assert.ok((statement.declarationList.flags & ts.NodeFlags.Let) !== 0);
-    assert.equal(statement.declarationList.declarations.length, 1);
-    const declaration = statement.declarationList.declarations[0];
-    assert.ok(ts.isIdentifier(declaration.name));
-    assert.equal(declaration.name.text, name);
-    assert.equal(
-      declaration.initializer ? compact(declaration.initializer, layoutFile) : "<undefined>",
-      initializer,
-    );
-  }
-  const capture = directVariable(analysis.body, "capture");
-  assert.equal(analysis.body.statements.indexOf(capture.parent.parent), 6);
-  assert.ok(capture.initializer && ts.isArrowFunction(capture.initializer));
-  assert.ok(ts.isBlock(capture.initializer.body));
-  assert.equal(callsWithPath(capture.initializer.body, "getWindowExpandedState").length, 1);
-  assert.equal(callsWithPath(capture.initializer.body, "Promise.all").length, 1);
-  assert.equal(callsWithPath(capture.initializer.body, "Math.round").length, 4);
-  assert.equal(callsWithPath(capture.initializer.body, "setWindowLayout").length, 3);
-  const captureTry = capture.initializer.body.statements[0];
-  assert.ok(ts.isTryStatement(captureTry));
-  assert.ok(captureTry.catchClause);
-  assert.equal(captureTry.catchClause.block.statements.length, 0);
-  assert.deepEqual(
-    captureTry.tryBlock.statements.map((statement) => {
-      if (ts.isVariableStatement(statement)) {
-        return bindingNames(statement.declarationList.declarations[0].name)[0];
-      }
-      if (ts.isIfStatement(statement)) return `if:${compact(statement.expression, layoutFile)}`;
-      if (ts.isExpressionStatement(statement)) return compact(statement.expression, layoutFile);
-      return ts.SyntaxKind[statement.kind];
-    }),
-    [
-      "fullscreen",
-      "if:disposed",
-      "if:fullscreen",
-      "if:maximized",
-      "size",
-      "if:disposed",
-      "setWindowLayout({width:Math.round(size.width/factor),height:Math.round(size.height/factor),x:Math.round(position.x/factor),y:Math.round(position.y/factor),maximized:false,})",
-    ],
+  const coordinator = directVariable(analysis.body, "coordinator");
+  assert.ok(coordinator.initializer && ts.isCallExpression(coordinator.initializer));
+  assert.equal(
+    expressionPath(coordinator.initializer.expression),
+    "createWindowCaptureCoordinator",
+  );
+  assert.equal(coordinator.initializer.arguments.length, 1);
+  assert.equal(
+    compact(coordinator.initializer.arguments[0], layoutFile),
+    "{debounceMs:150,publish:(result)=>{setWindowLayout((previous)=>windowLayoutFromCapture(previous,result));},schedule:(callback,delayMs)=>{consttimer=window.setTimeout(callback,delayMs);return()=>window.clearTimeout(timer);},target:dashboardBackend.window.current(),}",
   );
   assert.equal(
-    compact(captureTry.tryBlock.statements[2], layoutFile),
-    "if(fullscreen){setWindowLayout((prev)=>prev??{width:WINDOW_DEFAULTS.width,height:WINDOW_DEFAULTS.height,x:0,y:0,maximized:false,},);return;}",
+    compact(analysis.body.statements[2], layoutFile),
+    "coordinator.start();",
   );
   assert.equal(
-    compact(captureTry.tryBlock.statements[3], layoutFile),
-    "if(maximized){setWindowLayout((prev)=>prev?{...prev,maximized:true}:{width:WINDOW_DEFAULTS.width,height:WINDOW_DEFAULTS.height,x:0,y:0,maximized:true,},);return;}",
+    compact(analysis.body.statements[3], layoutFile),
+    "return()=>coordinator.stop();",
   );
-  const windowDefaults = layoutFile.statements.filter(
-    (statement): statement is ts.VariableStatement =>
-      ts.isVariableStatement(statement) &&
-      bindingNames(statement.declarationList.declarations[0].name).includes("WINDOW_DEFAULTS"),
-  );
-  assert.equal(windowDefaults.length, 1);
-  assert.equal(
-    compact(windowDefaults[0].declarationList.declarations[0].initializer!, layoutFile),
-    "{width:1440,height:900}",
-  );
-
-  const schedule = directVariable(analysis.body, "scheduleCapture");
-  assert.equal(analysis.body.statements.indexOf(schedule.parent.parent), 7);
-  assert.ok(schedule.initializer && ts.isArrowFunction(schedule.initializer));
-  assert.equal(
-    compact(schedule.initializer.body, layoutFile),
-    "{if(timer)clearTimeout(timer);timer=window.setTimeout(()=>{voidcapture();},150);}",
-  );
-  const immediateCaptures = analysis.body.statements.filter(
-    (statement) => compact(statement, layoutFile) === "voidcapture();",
-  );
-  assert.equal(immediateCaptures.length, 1);
-  assert.equal(analysis.body.statements.indexOf(immediateCaptures[0]), 8);
-  for (const [listener, slot] of [
-    ["win.onResized", "unlistenResized"],
-    ["win.onMoved", "unlistenMoved"],
-  ] as const) {
-    const inner = callsWithPath(analysis.body, listener);
-    assert.equal(inner.length, 1);
-    assert.equal(inner[0].arguments.length, 1);
-    assert.equal(compact(inner[0].arguments[0], layoutFile), "scheduleCapture");
-    assert.equal(
-      analysis.body.statements.indexOf(
-        inner[0].parent.parent.parent.parent as ts.Statement,
-      ),
-      listener === "win.onResized" ? 9 : 10,
-    );
-    assert.ok(ts.isPropertyAccessExpression(inner[0].parent));
-    assert.equal(inner[0].parent.name.text, "then");
-    assert.ok(ts.isCallExpression(inner[0].parent.parent));
-    const thenCall = inner[0].parent.parent;
-    assert.equal(
-      compact(arrowBlockArgument(thenCall), layoutFile),
-      `{if(disposed)fn();else${slot}=fn;}`,
-    );
-  }
-  const cleanup = analysis.body.statements.at(-1);
-  assert.ok(cleanup && ts.isReturnStatement(cleanup) && cleanup.expression);
-  assert.equal(
-    compact(cleanup.expression, layoutFile),
-    "()=>{disposed=true;if(timer)clearTimeout(timer);unlistenResized?.();unlistenMoved?.();}",
-  );
+  assert.equal(callsWithPath(analysis.body, "setWindowLayout").length, 1);
+  assert.equal(callsWithPath(analysis.body, "windowLayoutFromCapture").length, 1);
+  assert.equal(callsWithPath(analysis.body, "dashboardBackend.window.current").length, 1);
+  assert.equal(callsWithPath(analysis.body, "coordinator.start").length, 1);
+  assert.equal(callsWithPath(analysis.body, "coordinator.stop").length, 1);
+  assert.equal(callsWithPath(analysis.body, "useEffect").length, 0);
 });
 
 test("layout hydration fences attempts and authorizes only compatible outcomes", () => {

@@ -5,7 +5,7 @@ import {
   type Dispatch,
   type SetStateAction,
 } from "react";
-import type { DashboardBackend, DashboardWindow } from "../../platform";
+import type { DashboardBackend } from "../../platform";
 import {
   DEFAULT_INSPECTOR_WIDTH,
   DEFAULT_SIDEBAR_WIDTH,
@@ -40,8 +40,11 @@ import {
   type Selection,
 } from "../model/selection";
 import { useLayoutPreferences } from "./useLayoutPreferences";
+import {
+  createWindowCaptureCoordinator,
+  windowLayoutFromCapture,
+} from "../windowCaptureCoordinator";
 
-const WINDOW_DEFAULTS = { width: 1440, height: 900 };
 const MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH = 200;
 
 type DashboardLayoutPersistenceState =
@@ -84,14 +87,6 @@ function boundedLayoutSaveErrorDetail(error: unknown): string {
   return normalized.length > MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH
     ? `${normalized.slice(0, MAX_LAYOUT_SAVE_ERROR_DETAIL_LENGTH - 1)}…`
     : normalized;
-}
-
-async function getWindowExpandedState(win: DashboardWindow) {
-  const [fullscreen, maximized] = await Promise.all([
-    win.isFullscreen().catch(() => false),
-    win.isMaximized().catch(() => false),
-  ]);
-  return { fullscreen, maximized };
 }
 
 export function useDashboardLayoutState() {
@@ -263,86 +258,20 @@ export function useDashboardWindowCapturePhase(
 
   useEffect(() => {
     if (!windowRestoreReady) return;
-    const win = dashboardBackend.window.current();
-    let disposed = false;
-    let timer: number | null = null;
-    let unlistenResized: (() => void) | undefined;
-    let unlistenMoved: (() => void) | undefined;
-
-    const capture = async () => {
-      try {
-        const { fullscreen, maximized } = await getWindowExpandedState(win);
-        if (disposed) return;
-        if (fullscreen) {
-          setWindowLayout(
-            (prev) =>
-              prev ?? {
-                width: WINDOW_DEFAULTS.width,
-                height: WINDOW_DEFAULTS.height,
-                x: 0,
-                y: 0,
-                maximized: false,
-              },
-          );
-          return;
-        }
-        if (maximized) {
-          setWindowLayout((prev) =>
-            prev
-              ? { ...prev, maximized: true }
-              : {
-                  width: WINDOW_DEFAULTS.width,
-                  height: WINDOW_DEFAULTS.height,
-                  x: 0,
-                  y: 0,
-                  maximized: true,
-                },
-          );
-          return;
-        }
-
-        const [size, position, factor] = await Promise.all([
-          win.innerSize(),
-          win.outerPosition(),
-          win.scaleFactor(),
-        ]);
-        if (disposed) return;
-        setWindowLayout({
-          width: Math.round(size.width / factor),
-          height: Math.round(size.height / factor),
-          x: Math.round(position.x / factor),
-          y: Math.round(position.y / factor),
-          maximized: false,
-        });
-      } catch {
-        // Ignore platform/window-manager errors; persistence is best-effort.
-      }
-    };
-
-    const scheduleCapture = () => {
-      if (timer) clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void capture();
-      }, 150);
-    };
-
-    void capture();
-    void win.onResized(scheduleCapture).then((fn) => {
-      if (disposed) fn();
-      else unlistenResized = fn;
+    const coordinator = createWindowCaptureCoordinator({
+      debounceMs: 150,
+      publish: (result) => {
+        setWindowLayout((previous) => windowLayoutFromCapture(previous, result));
+      },
+      schedule: (callback, delayMs) => {
+        const timer = window.setTimeout(callback, delayMs);
+        return () => window.clearTimeout(timer);
+      },
+      target: dashboardBackend.window.current(),
     });
-    void win.onMoved(scheduleCapture).then((fn) => {
-      if (disposed) fn();
-      else unlistenMoved = fn;
-    });
-
-    return () => {
-      disposed = true;
-      if (timer) clearTimeout(timer);
-      unlistenResized?.();
-      unlistenMoved?.();
-    };
-  }, [windowRestoreReady]);
+    coordinator.start();
+    return () => coordinator.stop();
+  }, [windowRestoreReady, dashboardBackend]);
 }
 
 type DashboardLayoutHydrationOptions = {
