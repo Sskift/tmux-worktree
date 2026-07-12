@@ -93,7 +93,7 @@ export function loadManagedState(path = managedStatePath()): ManagedState {
   }
 }
 
-function loadManagedStateForMutation(path: string): ManagedState {
+export function loadManagedStateForMutation(path = managedStatePath()): ManagedState {
   if (!existsSync(path)) return emptyManagedState();
 
   let parsed: unknown;
@@ -258,6 +258,54 @@ export function removeManagedSession(
     const next: ManagedState = {
       version: MANAGED_STATE_VERSION,
       sessions: current.sessions.filter((session) => session.name !== name),
+    };
+    saveManagedState(next, path);
+    return next;
+  });
+}
+
+function sameManagedSessionRecord(
+  current: ManagedSession,
+  expected: ManagedSession,
+): boolean {
+  return (
+    current.name === expected.name
+    && current.kind === expected.kind
+    && current.profile === expected.profile
+    && current.project === expected.project
+    && current.repoPath === expected.repoPath
+    && current.worktreePath === expected.worktreePath
+    && current.branch === expected.branch
+    && current.baseBranch === expected.baseBranch
+    && current.cwd === expected.cwd
+    && current.createdAt === expected.createdAt
+  );
+}
+
+/**
+ * Remove only the exact record observed before a lifecycle mutation.
+ *
+ * A same-named session can be recreated after the old tmux session is killed
+ * but before state cleanup acquires the lock. In that interleaving, an
+ * unconditional name-based delete would erase the replacement record.
+ */
+export function removeManagedSessionIfCurrent(
+  expected: ManagedSession,
+  path = managedStatePath(),
+): ManagedState {
+  if (!isManagedSession(expected)) {
+    throw new Error("refusing to remove a malformed managed session");
+  }
+  return withManagedStateLock(path, () => {
+    const current = loadManagedStateForMutation(path);
+    if (!current.sessions.some((session) => sameManagedSessionRecord(session, expected))) {
+      return current;
+    }
+    const next: ManagedState = {
+      version: MANAGED_STATE_VERSION,
+      sessions: current.sessions.filter(
+        (session) => !sameManagedSessionRecord(session, expected),
+      ),
     };
     saveManagedState(next, path);
     return next;

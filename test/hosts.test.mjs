@@ -85,6 +85,51 @@ test("tw host CRUD preserves unrelated config, remote tilde paths, and private f
   assert.deepEqual(JSON.parse(removed.stdout).hosts.map((host) => host.id), ["legacy-alias"]);
 });
 
+test("tw host rejects the reserved local ID from commands and config", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-host-reserved-local-"));
+  const home = join(root, "home");
+  const sshLog = join(root, "ssh.log");
+  mkdirSync(home, { recursive: true });
+
+  const added = runCli(home, ["host", "add", "--id", "LoCaL", "--host", "devbox", "--json"]);
+  assert.notEqual(added.status, 0);
+  assert.match(added.stderr, /host id 'local'.*保留字/);
+
+  writeFileSync(join(home, ".tmux-worktree.json"), JSON.stringify({
+    hosts: [{ id: "LOCAL", label: "Unsafe collision", host: "devbox" }],
+  }));
+  const listed = runCli(home, ["host", "ls", "--json"]);
+  assert.notEqual(listed.status, 0);
+  assert.match(listed.stderr, /host id 'local'.*保留字/);
+
+  const rpc = runCli(home, ["host", "rpc", "LOCAL", "list"], {
+    TW_TEST_SSH_LOG: sshLog,
+  });
+  assert.notEqual(rpc.status, 0);
+  assert.match(rpc.stderr, /host id 'local'.*保留字/);
+  assert.equal(existsSync(sshLog), false, "reserved IDs must fail before starting SSH");
+
+});
+
+test("tw host shares Dashboard SSH target and identity validation", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-host-shared-validation-"));
+  const home = join(root, "home");
+  mkdirSync(home, { recursive: true });
+
+  const userAtHost = runCli(home, [
+    "host", "add", "--id", "user-at-host", "--host", "alice@devbox", "--json",
+  ]);
+  assert.notEqual(userAtHost.status, 0);
+  assert.match(userAtHost.stderr, /user@/);
+
+  const leadingDashIdentity = runCli(home, [
+    "host", "add", "--id", "dash-identity", "--host", "devbox",
+    "--identity-file", "-unsafe", "--json",
+  ]);
+  assert.notEqual(leadingDashIdentity.status, 0);
+  assert.match(leadingDashIdentity.stderr, /identity file.*不能以 '-' 开头/);
+});
+
 test("stale config lock owner cannot remove the replacement lock", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-host-lock-takeover-"));
   const lockPath = join(root, "config.lock");
@@ -165,6 +210,10 @@ case "$last" in
     exit 0
     ;;
   *tmux*"'-V'"*)
+    if test "$TW_TEST_TMUX_UNAVAILABLE" = 1; then
+      printf '%s\\n' 'tmux not found' >&2
+      exit 127
+    fi
     printf '%s\\n' 'tmux 3.5a'
     exit 0
     ;;
@@ -173,7 +222,11 @@ case "$last" in
     exit 0
     ;;
   *tw*"'rpc' 'capabilities'"*)
-    printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal"]}'
+    if test "$TW_TEST_NO_KILL_SESSION" = 1; then
+      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal"]}'
+    else
+      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session"]}'
+    fi
     exit 0
     ;;
   *tw*"'rpc' 'list'"*)
@@ -198,7 +251,26 @@ exit 12
   assert.equal(result.tmux.version, "tmux 3.5a");
   assert.equal(result.tw.available, true);
   assert.equal(result.tw.compatible, true);
-  assert.deepEqual(result.tw.capabilities, ["list", "create-worktree", "create-terminal"]);
+  assert.deepEqual(result.tw.capabilities, ["list", "create-worktree", "create-terminal", "kill-session"]);
+
+  const missingKill = runCli(home, ["host", "probe", "dev", "--json"], {
+    ...env,
+    TW_TEST_NO_KILL_SESSION: "1",
+  });
+  assert.equal(missingKill.status, 1, missingKill.stderr);
+  const missingKillResult = JSON.parse(missingKill.stdout).results[0];
+  assert.equal(missingKillResult.tmux.available, true);
+  assert.equal(missingKillResult.tw.compatible, false);
+  assert.match(missingKillResult.tw.error, /missing a required RPC capability/);
+
+  const missingTmux = runCli(home, ["host", "probe", "dev", "--json"], {
+    ...env,
+    TW_TEST_TMUX_UNAVAILABLE: "1",
+  });
+  assert.equal(missingTmux.status, 1, missingTmux.stderr);
+  const missingTmuxResult = JSON.parse(missingTmux.stdout).results[0];
+  assert.equal(missingTmuxResult.tmux.available, false);
+  assert.equal(missingTmuxResult.tw.compatible, true);
 
   const remoteList = runCli(home, ["host", "rpc", "dev", "list"], env);
   assert.equal(remoteList.status, 0, remoteList.stderr);

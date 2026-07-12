@@ -2,7 +2,8 @@ import { basename } from "node:path";
 import { expandHomePath, loadConfigFile, resolveWorktreeBase } from "./config";
 import {
   loadManagedState,
-  removeManagedSession,
+  loadManagedStateForMutation,
+  removeManagedSessionIfCurrent,
   type ManagedSession,
   type ManagedState,
 } from "./state";
@@ -307,10 +308,10 @@ export function buildRpcKillSessionResponse(
     loadState?: () => ManagedState;
     exists?: (name: string) => boolean;
     kill?: (name: string) => void;
-    removeRecord?: (name: string) => void;
+    removeRecord?: (name: string, expected: ManagedSession) => void;
   } = {},
 ): RpcKillSessionResponse {
-  const state = (deps.loadState ?? loadManagedState)();
+  const state = (deps.loadState ?? loadManagedStateForMutation)();
   const managed = state.sessions.find((session) => session.name === args.name);
   if (!managed) throw new Error(`session is not TW-managed: ${args.name}`);
   const live = (deps.exists ?? sessionExists)(args.name);
@@ -319,9 +320,9 @@ export function buildRpcKillSessionResponse(
       run(tmuxBin(), ["kill-session", "-t", `=${name}`]);
     }))(args.name);
   }
-  (deps.removeRecord ?? ((name) => {
-    removeManagedSession(name);
-  }))(args.name);
+  (deps.removeRecord ?? ((_name, expected) => {
+    removeManagedSessionIfCurrent(expected);
+  }))(args.name, managed);
   return {
     protocolVersion: RPC_PROTOCOL_VERSION,
     kind: "session-killed",

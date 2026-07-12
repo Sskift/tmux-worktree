@@ -9,7 +9,6 @@ import {
   tmuxBin,
   insideTmux,
   sessionExists,
-  killSession,
   listSessions,
   listWorktrees,
   worktreeIsDirty,
@@ -21,6 +20,7 @@ import {
   type WorktreeEntry,
 } from "./tmux";
 import { defaultWorktreeBase, loadConfigFile, type Config } from "./config";
+import { buildRpcKillSessionResponse } from "./rpc";
 
 // ============================================
 // commands.ts — tw 的会话 / worktree / 诊断 命令族
@@ -201,7 +201,15 @@ export async function rmSessionCmd(args: string[]): Promise<void> {
     }
   }
 
-  killSession(name);
+  try {
+    buildRpcKillSessionResponse({ name });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (!detail.startsWith("session is not TW-managed:")) throw error;
+    // Explicit legacy compatibility: sessions absent from valid managed state
+    // may still be closed, but mutation failures/corruption never authorize it.
+    exec(tmuxBin(), ["kill-session", "-t", `=${name}`]);
+  }
   console.log(C.green(`✓ 已杀掉 session ${name}`));
 
   if (wtToRemove) {

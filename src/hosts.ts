@@ -228,21 +228,26 @@ function writeRawConfig(config: JsonObject): void {
 }
 
 function configuredHosts(): HostConfig[] {
-  return loadConfigFile()?.hosts ?? [];
+  // Validate at the config boundary so a reserved or otherwise unsafe ID can
+  // never enter a Host command through a hand-edited/legacy config file.
+  return (loadConfigFile()?.hosts ?? []).map(normalizeHostConfig);
 }
 
-function validateId(value: string): string {
+export function validateHostId(value: string): string {
   const id = value.trim();
   if (!/^[A-Za-z0-9._-]{1,80}$/.test(id)) {
     throw new CliError("host id 只能包含字母、数字、点、下划线和短横线（最多 80 字符）");
+  }
+  if (id.toLowerCase() === "local") {
+    throw new CliError("host id 'local' 是保留字，用于本机控制面");
   }
   return id;
 }
 
 function validateTarget(value: string): string {
   const host = value.trim();
-  if (!host || host.startsWith("-") || /[\s\0\r\n]/.test(host)) {
-    throw new CliError("host target 不能为空、不能以 '-' 开头或包含空白/控制字符");
+  if (!host || host.startsWith("-") || host.includes("@") || /[\s\0\r\n]/.test(host)) {
+    throw new CliError("host target 不能为空、不能以 '-' 开头、不能包含 user@ 前缀或空白/控制字符");
   }
   return host;
 }
@@ -266,23 +271,24 @@ function validatePort(value: string | number | undefined): number | undefined {
   return port;
 }
 
-function cleanPath(value: string | undefined, local: boolean): string | undefined {
+function cleanPath(value: string | undefined, local: boolean, rejectLeadingDash = false): string | undefined {
   if (value === undefined) return undefined;
   const path = value.trim();
   if (!path) return undefined;
   if (/[\0\r\n]/.test(path)) throw new CliError("路径不能包含控制字符");
+  if (rejectLeadingDash && path.startsWith("-")) throw new CliError("identity file 不能以 '-' 开头");
   return local ? expandHomePath(path) : path;
 }
 
-function normalizeHost(host: HostConfig): HostConfig {
-  const id = validateId(host.id);
+export function normalizeHostConfig(host: HostConfig): HostConfig {
+  const id = validateHostId(host.id);
   return {
     id,
     label: host.label?.trim() || id,
     host: validateTarget(host.host),
     user: validateUser(host.user),
     port: validatePort(host.port),
-    identityFile: cleanPath(host.identityFile, true),
+    identityFile: cleanPath(host.identityFile, true, true),
     // These three paths are evaluated on the remote and retain `~`.
     worktreeBase: cleanPath(host.worktreeBase, false),
     tmuxPath: cleanPath(host.tmuxPath, false),
@@ -296,7 +302,7 @@ function replaceHosts(mutator: (hosts: HostConfig[]) => HostConfig[]): HostConfi
     // Normalize the exact snapshot protected by this lock. Re-reading through
     // loadConfigFile here could observe a different file and overwrite it
     // with mutations derived from stale raw data.
-    const hosts = mutator(normalizeConfig(raw).hosts).map(normalizeHost);
+    const hosts = mutator(normalizeConfig(raw).hosts).map(normalizeHostConfig);
     const existing = rawHostObjectsById(raw);
     raw.hosts = hosts.map((host) => ({
       ...unknownHostFields(existing.get(host.id)),
@@ -310,10 +316,10 @@ function replaceHosts(mutator: (hosts: HostConfig[]) => HostConfig[]): HostConfi
 }
 
 function findHost(id: string): HostConfig {
-  const normalized = validateId(id);
+  const normalized = validateHostId(id);
   const host = configuredHosts().find((candidate) => candidate.id === normalized);
   if (!host) throw new CliError(`未知 Host: ${normalized}`);
-  return normalizeHost(host);
+  return normalizeHostConfig(host);
 }
 
 function shellQuote(value: string): string {
@@ -444,7 +450,8 @@ export function probeHost(host: HostConfig): HostProbeResult {
   const compatible = protocolVersion === 1
     && capabilities.includes("list")
     && capabilities.includes("create-worktree")
-    && capabilities.includes("create-terminal");
+    && capabilities.includes("create-terminal")
+    && capabilities.includes("kill-session");
   if (!capabilityError && !compatible && twVersion.ok) {
     capabilityError = "remote tw is missing a required RPC capability";
   }
@@ -563,12 +570,12 @@ export async function hostCmd(args: string[]): Promise<void> {
   switch (sub) {
     case "ls":
     case "list":
-      printHosts(configuredHosts().map(normalizeHost), json);
+      printHosts(configuredHosts(), json);
       return;
     case "add": {
       const { values } = parseHostOptions(rest);
-      const id = validateId(values.id || "");
-      const next = normalizeHost({
+      const id = validateHostId(values.id || "");
+      const next = normalizeHostConfig({
         id,
         label: values.label || id,
         host: values.host || "",
@@ -588,7 +595,7 @@ export async function hostCmd(args: string[]): Promise<void> {
     }
     case "update": {
       if (!rest[0] || rest[0].startsWith("--")) throw new CliError("用法: tw host update <id> [options]");
-      const id = validateId(rest[0]);
+      const id = validateHostId(rest[0]);
       const optionArgs = rest.slice(1);
       const { values, clears } = parseHostOptions(optionArgs);
       const allowedClears = new Set(["label", "user", "port", "identityFile", "worktreeBase", "tmuxPath", "twPath"]);
@@ -599,14 +606,14 @@ export async function hostCmd(args: string[]): Promise<void> {
       const hosts = replaceHosts((current) => {
         const index = current.findIndex((host) => host.id === id);
         if (index < 0) throw new CliError(`未知 Host: ${id}`);
-        const previous = normalizeHost(current[index]);
+        const previous = normalizeHostConfig(current[index]);
         const draft: Record<string, unknown> = { ...previous };
         for (const [key, value] of Object.entries(values)) {
           if (key === "id") continue;
           draft[key] = key === "port" ? validatePort(value) : value;
         }
         for (const field of clears) draft[field] = undefined;
-        const next = normalizeHost(draft as unknown as HostConfig);
+        const next = normalizeHostConfig(draft as unknown as HostConfig);
         changed = JSON.stringify(previous) !== JSON.stringify(next);
         const result = [...current];
         result[index] = next;
@@ -618,7 +625,7 @@ export async function hostCmd(args: string[]): Promise<void> {
     case "rm":
     case "remove": {
       if (!rest[0] || rest[0].startsWith("--")) throw new CliError(`用法: tw host ${sub} <id> [--json]`);
-      const id = validateId(rest[0]);
+      const id = validateHostId(rest[0]);
       let changed = false;
       const hosts = replaceHosts((current) => {
         changed = current.some((host) => host.id === id);
@@ -630,11 +637,13 @@ export async function hostCmd(args: string[]): Promise<void> {
     }
     case "probe": {
       const id = rest.find((arg) => !arg.startsWith("--"));
-      const hosts = id ? [findHost(id)] : configuredHosts().map(normalizeHost);
+      const hosts = id ? [findHost(id)] : configuredHosts();
       const results = hosts.map(probeHost);
       if (json || results.length !== 1) console.log(JSON.stringify({ protocolVersion: 1, kind: "host-probes", results }));
       else console.log(JSON.stringify(results[0], null, 2));
-      if (results.some((result) => !result.ssh.reachable || !result.tw.compatible)) process.exitCode = 1;
+      if (results.some((result) => !result.ssh.reachable || !result.tmux.available || !result.tw.compatible)) {
+        process.exitCode = 1;
+      }
       return;
     }
     case "connect":

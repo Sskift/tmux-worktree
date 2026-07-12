@@ -5,7 +5,12 @@ import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child
 import { promisify } from "node:util";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
-import { sshConnectionArgs } from "./hosts.js";
+import {
+  acquireConfigFileLock,
+  normalizeHostConfig,
+  releaseConfigFileLock,
+  sshConnectionArgs,
+} from "./hosts.js";
 import { CliError, tmuxBin } from "./tmux.js";
 import {
   isValidHostId,
@@ -69,8 +74,10 @@ export type PlainTerminal = {
 };
 
 type RpcCreateWorktreeResponse = {
-  session?: string;
-  worktreePath?: string;
+  protocolVersion: 1;
+  kind: "worktree";
+  session: string;
+  worktreePath: string;
   branch?: string;
 };
 
@@ -263,15 +270,18 @@ function adminScopes(): AdminScope[] {
       worktreeBase: config?.worktreeBase,
       tmuxPath: config?.tmuxPath,
     },
-    ...(config?.hosts ?? []).map((host) => ({
-      id: host.id,
-      label: host.label || host.id,
-      kind: "ssh" as const,
-      host,
-      worktreeBase: host.worktreeBase || DEFAULT_REMOTE_WORKTREE_BASE,
-      tmuxPath: host.tmuxPath,
-      twPath: host.twPath,
-    })),
+    ...(config?.hosts ?? []).map((configuredHost) => {
+      const host = normalizeHostConfig(configuredHost);
+      return {
+        id: host.id,
+        label: host.label || host.id,
+        kind: "ssh" as const,
+        host,
+        worktreeBase: host.worktreeBase || DEFAULT_REMOTE_WORKTREE_BASE,
+        tmuxPath: host.tmuxPath,
+        twPath: host.twPath,
+      };
+    }),
   ];
 }
 
@@ -291,21 +301,13 @@ function parseTerminalRegistry(contents: string): PlainTerminal[] {
   return parsed as PlainTerminal[];
 }
 
-function readTerminalRegistry(): PlainTerminal[] {
+function readTerminalRegistryForMutation(path = TERMINALS_REGISTRY): PlainTerminal[] {
+  if (!existsSync(path)) return [];
   try {
-    return parseTerminalRegistry(readFileSync(TERMINALS_REGISTRY, "utf8"));
-  } catch {
-    return [];
-  }
-}
-
-function readTerminalRegistryForMutation(): PlainTerminal[] {
-  if (!existsSync(TERMINALS_REGISTRY)) return [];
-  try {
-    return parseTerminalRegistry(readFileSync(TERMINALS_REGISTRY, "utf8"));
+    return parseTerminalRegistry(readFileSync(path, "utf8"));
   } catch (error) {
     throw new Error(
-      `refusing to mutate invalid terminal registry ${TERMINALS_REGISTRY}; original file preserved: ${errorDetail(error)}`,
+      `refusing to mutate invalid terminal registry ${path}; original file preserved: ${errorDetail(error)}`,
     );
   }
 }
@@ -337,26 +339,67 @@ export function writeTerminalRegistryAtomic(
   }
 }
 
-function saveTerminalRegistry(terminals: PlainTerminal[]): void {
-  writeTerminalRegistryAtomic(terminals);
+function saveTerminalRegistry(terminals: PlainTerminal[], path = TERMINALS_REGISTRY): void {
+  writeTerminalRegistryAtomic(terminals, path);
 }
 
-function registerDashboardTerminal(scope: AdminScope, name: string, cwd: string, label: string): void {
-  const terminals = readTerminalRegistryForMutation().filter((terminal) => {
-    const hostId = terminal.hostId || "local";
-    const rawName = terminal.rawName || terminal.tmuxName;
-    return !(hostId === scope.id && rawName === name);
-  });
-  terminals.push({
+export function mutateTerminalRegistry(
+  mutation: (terminals: PlainTerminal[]) => PlainTerminal[],
+  path = TERMINALS_REGISTRY,
+): void {
+  const lock = acquireConfigFileLock(`${path}.lock`);
+  try {
+    saveTerminalRegistry(mutation(readTerminalRegistryForMutation(path)), path);
+  } finally {
+    releaseConfigFileLock(lock);
+  }
+}
+
+export function dashboardTerminalRecord(
+  scope: Pick<AdminScope, "id" | "kind">,
+  name: string,
+  cwd: string,
+  label: string,
+): PlainTerminal {
+  return {
     id: `term-${Date.now()}-${randomId(4)}`,
     label: label || basename(cwd) || name,
     cwd,
     ...(scope.kind === "ssh" ? { hostId: scope.id } : {}),
     rawName: name,
-    tmuxName: name,
+    // Dashboard uses tmuxName as the attach/existence key. Remote entries
+    // therefore retain their scope instead of being checked against local tmux.
+    tmuxName: scope.kind === "ssh" ? `${scope.id}:${name}` : name,
     managed: true,
-  });
-  saveTerminalRegistry(terminals);
+  };
+}
+
+function terminalMatchesScope(terminal: PlainTerminal, scope: AdminScope, name: string): boolean {
+  const hostId = terminal.hostId || "local";
+  const rawName = terminal.rawName || terminal.tmuxName;
+  const scopedPrefix = `${scope.id}:`;
+  const normalizedRawName = rawName?.startsWith(scopedPrefix) ? rawName.slice(scopedPrefix.length) : rawName;
+  return hostId === scope.id && normalizedRawName === name;
+}
+
+function registerDashboardTerminal(scope: AdminScope, name: string, cwd: string, label: string): void {
+  mutateTerminalRegistry((current) => [
+    ...current.filter((terminal) => !terminalMatchesScope(terminal, scope, name)),
+    dashboardTerminalRecord(scope, name, cwd, label),
+  ]);
+}
+
+function unregisterDashboardTerminal(scope: AdminScope, name: string): void {
+  mutateTerminalRegistry((current) => current.filter((terminal) => !terminalMatchesScope(terminal, scope, name)));
+}
+
+function bestEffortUnregisterDashboardTerminal(scope: AdminScope, name: string): void {
+  try {
+    unregisterDashboardTerminal(scope, name);
+  } catch {
+    // UI metadata is never authoritative. A corrupt/busy registry is preserved,
+    // while the live-tmux gate below prevents stale entries from resurfacing.
+  }
 }
 
 function errorDetail(error: unknown): string {
@@ -410,6 +453,87 @@ export function parseRpcCreateTerminalResponse(stdout: string): RpcCreateTermina
     session: parsed.session,
     cwd: parsed.cwd,
   };
+}
+
+export function parseRpcCreateWorktreeResponse(stdout: string): RpcCreateWorktreeResponse {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`tw rpc create-worktree returned invalid JSON: ${errorDetail(error)}`);
+  }
+  if (!isRecord(parsed)) throw new Error("tw rpc create-worktree returned a non-object response");
+  if (parsed.protocolVersion !== RPC_PROTOCOL_VERSION) {
+    throw new Error(`unsupported tw rpc protocol version: ${String(parsed.protocolVersion)}`);
+  }
+  if (parsed.kind !== "worktree") {
+    throw new Error(`tw rpc create-worktree returned unexpected kind: ${String(parsed.kind)}`);
+  }
+  if (
+    typeof parsed.session !== "string"
+    || !parsed.session.trim()
+    || parsed.session.length > 80
+    || /[:\0-\x1f\x7f]/.test(parsed.session)
+  ) {
+    throw new Error("tw rpc create-worktree returned an invalid session name");
+  }
+  if (
+    typeof parsed.worktreePath !== "string"
+    || !parsed.worktreePath.trim()
+    || parsed.worktreePath.includes("\0")
+  ) {
+    throw new Error("tw rpc create-worktree returned an invalid worktree path");
+  }
+  if (parsed.branch !== undefined && typeof parsed.branch !== "string") {
+    throw new Error("tw rpc create-worktree returned an invalid branch");
+  }
+  return {
+    protocolVersion: RPC_PROTOCOL_VERSION,
+    kind: "worktree",
+    session: parsed.session,
+    worktreePath: parsed.worktreePath,
+    ...(typeof parsed.branch === "string" ? { branch: parsed.branch } : {}),
+  };
+}
+
+export function parseDashboardTerminalPayload(value: unknown): PlainTerminal[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): PlainTerminal[] => {
+    if (!isRecord(item)) return [];
+    const textField = (field: string): string | undefined => {
+      const raw = item[field];
+      return typeof raw === "string" ? raw : undefined;
+    };
+    const rawName = textField("rawName");
+    const tmuxName = textField("tmuxName");
+    if (!rawName?.trim() && !tmuxName?.trim()) return [];
+    const hostIdValue = item.hostId;
+    if (hostIdValue !== undefined && hostIdValue !== null && typeof hostIdValue !== "string") return [];
+    return [{
+      ...(textField("id") !== undefined ? { id: textField("id") } : {}),
+      ...(textField("label") !== undefined ? { label: textField("label") } : {}),
+      ...(textField("cwd") !== undefined ? { cwd: textField("cwd") } : {}),
+      ...(typeof hostIdValue === "string" || hostIdValue === null ? { hostId: hostIdValue } : {}),
+      ...(rawName !== undefined ? { rawName } : {}),
+      ...(tmuxName !== undefined ? { tmuxName } : {}),
+      ...(typeof item.managed === "boolean" ? { managed: item.managed } : {}),
+    }];
+  });
+}
+
+export function liveDashboardTerminalName(
+  terminal: PlainTerminal,
+  scopeId: string,
+  seen: ReadonlySet<string>,
+  liveNames: ReadonlySet<string>,
+): string | null {
+  const terminalHostId = terminal.hostId || "local";
+  if (terminalHostId !== scopeId) return null;
+  const rawName = (terminal.rawName || terminal.tmuxName)?.trim();
+  const scopedPrefix = `${scopeId}:`;
+  const normalizedRawName = rawName?.startsWith(scopedPrefix) ? rawName.slice(scopedPrefix.length) : rawName;
+  if (!normalizedRawName || seen.has(normalizedRawName) || !liveNames.has(normalizedRawName)) return null;
+  return isTerminalSession(normalizedRawName) ? normalizedRawName : null;
 }
 
 function splitSessionKey(key: string): { scopeId: string; rawName: string } {
@@ -630,6 +754,15 @@ export function isUnsupportedRpcListFailure(status: number | undefined, output: 
     || /未知(?:的)?(?:子)?命令[^\n]*rpc/i.test(output);
 }
 
+export function isLegacyKillRpcFailure(status: number | undefined, output: string): boolean {
+  if (status === undefined || status === 0 || status === 255) return false;
+  const normalized = output.toLowerCase();
+  return /session is not tw-managed/.test(normalized)
+    || isUnsupportedRpcListFailure(status, output)
+    || /(?:unknown|unrecognized|unsupported|invalid)[^\n]*kill-session/.test(normalized)
+    || /(?:tw[^\n]*not found|command not found[^\n]*tw)/.test(normalized);
+}
+
 async function localRpcListOutput(): Promise<string | null> {
   try {
     return await localTwOutput(["rpc", "list"], 5000);
@@ -684,22 +817,23 @@ async function rpcSessions(scope: AdminScope): Promise<RelaySession[] | null> {
   });
 }
 
-async function dashboardTerminals(localBase: string, token: string, scope: AdminScope, seen: Set<string>): Promise<RelaySession[]> {
+async function dashboardTerminals(
+  localBase: string,
+  token: string,
+  scope: AdminScope,
+  seen: Set<string>,
+  liveNames: ReadonlySet<string>,
+): Promise<RelaySession[]> {
   let terminals: PlainTerminal[] = [];
   try {
-    terminals = await fetchJson<PlainTerminal[]>(localBase, token, "/api/terminals");
+    terminals = parseDashboardTerminalPayload(await fetchJson<unknown>(localBase, token, "/api/terminals"));
   } catch {
     terminals = [];
   }
   return terminals.flatMap((terminal): RelaySession[] => {
-    const tmuxName = terminal.tmuxName?.trim();
-    const terminalHostId = terminal.hostId || "local";
-    if (terminalHostId !== scope.id) return [];
-    const rawName = (terminal.rawName || terminal.tmuxName)?.trim();
-    const scopedPrefix = `${scope.id}:`;
-    const normalizedRawName = rawName?.startsWith(scopedPrefix) ? rawName.slice(scopedPrefix.length) : rawName;
-    if (!normalizedRawName || seen.has(normalizedRawName)) return [];
-    if (!normalizedRawName || !isTerminalSession(normalizedRawName)) return [];
+    const normalizedRawName = liveDashboardTerminalName(terminal, scope.id, seen, liveNames);
+    if (!normalizedRawName) return [];
+    const rawName = terminal.rawName || terminal.tmuxName || normalizedRawName;
     seen.add(normalizedRawName);
     return [relaySession(scope, {
       name: normalizedRawName,
@@ -738,7 +872,8 @@ async function listScopeSessions(scope: AdminScope, localBase: string, token: st
     sessions.push(relaySession(scope, row, "worktree"));
   }
 
-  sessions.push(...await dashboardTerminals(localBase, token, scope, seen));
+  const liveNames = new Set(rows.map((row) => row.name));
+  sessions.push(...await dashboardTerminals(localBase, token, scope, seen, liveNames));
 
   return sessions.sort((a, b) => {
     if (a.kind !== b.kind) return a.kind === "worktree" ? -1 : 1;
@@ -879,8 +1014,7 @@ async function createWorktreeSession(message: Extract<RelayClientMessage, { type
   const stdout = scope.kind === "local"
     ? await localTwOutput(args, 120_000)
     : await sshOutput(scope.host!, remoteTw(scope, args), 120_000);
-  const parsed = JSON.parse(stdout) as RpcCreateWorktreeResponse;
-  if (!parsed.session) throw new Error("tw rpc create-worktree returned no session");
+  const parsed = parseRpcCreateWorktreeResponse(stdout);
   return relaySession(scope, {
     name: parsed.session,
     attached: false,
@@ -1057,11 +1191,6 @@ async function killManagedSession(scope: AdminScope, rawName: string): Promise<v
   parseRpcKillSessionResponse(stdout, rawName);
 }
 
-async function rpcOwnsSession(scope: AdminScope, rawName: string): Promise<boolean> {
-  const sessions = await rpcSessions(scope);
-  return Boolean(sessions?.some((candidate) => candidate.rawName === rawName && candidate.managed === true));
-}
-
 async function killLegacyTmuxSession(scope: AdminScope, rawName: string): Promise<void> {
   if (scope.kind === "local") {
     await execFileAsync(localTmuxBin(scope), ["kill-session", "-t", `=${rawName}`], { timeout: 5000 });
@@ -1074,14 +1203,24 @@ async function killSession(session: string, managedHint?: boolean): Promise<void
   const { scope, rawName } = scopeForSession(session);
   if (rawName.startsWith("tw-mobile-")) throw new Error("refusing to kill internal mobile mirror session");
 
-  // New clients can avoid the lookup with managed=true. Older clients omit
-  // the field, so RPC remains the source of truth before using legacy tmux.
-  const managed = managedHint === true || await rpcOwnsSession(scope, rawName);
-  if (managed) {
+  // New clients assert managed ownership and therefore fail closed on every
+  // RPC/state error. Older clients omit the hint: try the canonical mutation
+  // first and fall back only when the target explicitly proves it is a legacy
+  // session or does not implement this RPC command.
+  if (managedHint === true) {
     await killManagedSession(scope, rawName);
+    bestEffortUnregisterDashboardTerminal(scope, rawName);
     return;
   }
-  await killLegacyTmuxSession(scope, rawName);
+  try {
+    await killManagedSession(scope, rawName);
+    bestEffortUnregisterDashboardTerminal(scope, rawName);
+  } catch (error) {
+    const output = commandFailureText(error);
+    if (!isLegacyKillRpcFailure(commandExitStatus(error), output)) throw error;
+    await killLegacyTmuxSession(scope, rawName);
+    bestEffortUnregisterDashboardTerminal(scope, rawName);
+  }
 }
 
 export function remoteAttachCommand(scope: AdminScope, rawName: string, paneIndex: string): string {

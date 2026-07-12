@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, linkSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename } from "node:path";
 import { createInterface } from "node:readline";
@@ -13,6 +14,7 @@ import {
   normalizeConfig,
   resolveWorktreeBase,
 } from "./config";
+import { acquireConfigFileLock, releaseConfigFileLock } from "./hosts";
 import {
   CliError,
   exec,
@@ -38,6 +40,55 @@ import {
 
 function prompt(rl: ReturnType<typeof createInterface>, question: string): Promise<string> {
   return new Promise((resolve) => rl.question(question, resolve));
+}
+
+interface InitialRawConfig {
+  projects: Record<string, string>;
+  worktreeBase?: string;
+}
+
+function configCreatedDuringInitialization(configPath: string): CliError {
+  return new CliError(`${configPath} 已由其他进程创建，已取消初始化且未覆盖现有配置`);
+}
+
+/**
+ * Publish a brand-new config without ever replacing an existing file.
+ *
+ * The shared lock coordinates with Host/Dashboard read-modify-write paths.
+ * The final hard-link is also an atomic create-if-absent operation, so even a
+ * non-participating writer cannot be overwritten between the locked recheck
+ * and publication.
+ */
+export function persistInitialConfig(
+  rawConfig: InitialRawConfig,
+  configPath = CONFIG_PATH,
+): Config {
+  const lock = acquireConfigFileLock(`${configPath}.lock`);
+  try {
+    if (existsSync(configPath)) throw configCreatedDuringInitialization(configPath);
+
+    const tempPath = `${configPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(tempPath, `${JSON.stringify(rawConfig, null, 2)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      try {
+        linkSync(tempPath, configPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+          throw configCreatedDuringInitialization(configPath);
+        }
+        throw error;
+      }
+    } finally {
+      rmSync(tempPath, { force: true });
+    }
+    return normalizeConfig(rawConfig);
+  } finally {
+    releaseConfigFileLock(lock);
+  }
 }
 
 async function initConfigInteractive(): Promise<Config> {
@@ -67,12 +118,12 @@ async function initConfigInteractive(): Promise<Config> {
     const worktreeInput = (await prompt(rl, `worktree 目录 (${defaultWorktree}): `)).trim();
 
     // 写入磁盘的是原始格式 {projects:{name:"path"}}，由 normalizeConfig 解析为 Config
-    const rawConfig: { projects: Record<string, string>; worktreeBase?: string } = { projects };
+    const rawConfig: InitialRawConfig = { projects };
     if (worktreeInput) rawConfig.worktreeBase = expandHomePath(worktreeInput);
 
-    writeFileSync(CONFIG_PATH, JSON.stringify(rawConfig, null, 2) + "\n");
+    const config = persistInitialConfig(rawConfig);
     console.log(`\n✅ 已保存到 ${CONFIG_PATH}\n`);
-    return normalizeConfig(rawConfig);
+    return config;
   } finally {
     rl.close();
   }

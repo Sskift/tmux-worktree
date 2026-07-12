@@ -15,6 +15,7 @@ const {
   recordManagedSession,
   releaseManagedStateLock,
   removeManagedSession,
+  removeManagedSessionIfCurrent,
   upsertManagedSession,
 } = await import("../dist/state.js");
 const {
@@ -223,7 +224,7 @@ test("rpc kill-session only mutates TW-managed sessions and removes stale record
       }),
       exists: () => true,
       kill: (name) => killed.push(name),
-      removeRecord: (name) => removed.push(name),
+      removeRecord: (name, expected) => removed.push({ name, expected }),
     },
   );
   assert.deepEqual(response, {
@@ -234,7 +235,16 @@ test("rpc kill-session only mutates TW-managed sessions and removes stale record
     killed: true,
   });
   assert.deepEqual(killed, ["tw-term-abc12"]);
-  assert.deepEqual(removed, ["tw-term-abc12"]);
+  assert.deepEqual(removed, [{
+    name: "tw-term-abc12",
+    expected: {
+      name: "tw-term-abc12",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/repo/app",
+      createdAt: "2026-07-12T00:00:00.000Z",
+    },
+  }]);
   assert.throws(
     () => buildRpcKillSessionResponse(
       { name: "ordinary" },
@@ -242,6 +252,150 @@ test("rpc kill-session only mutates TW-managed sessions and removes stale record
     ),
     /not TW-managed/,
   );
+});
+
+test("rpc kill does not delete a same-named session recreated during cleanup", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-rpc-kill-recreate-race-"));
+  const statePath = join(root, ".tmux-worktree", "state.json");
+  const oldRecord = {
+    name: "app-fix",
+    kind: "worktree",
+    profile: "dashboard",
+    project: "app",
+    repoPath: "/repo/app",
+    worktreePath: "/worktrees/app/app-fix-old12",
+    branch: "app-fix-old12",
+    baseBranch: "main",
+    createdAt: "2026-07-12T00:00:00.000Z",
+  };
+  const replacement = {
+    ...oldRecord,
+    worktreePath: "/worktrees/app/app-fix-new34",
+    branch: "app-fix-new34",
+    createdAt: "2026-07-12T00:00:01.000Z",
+  };
+  recordManagedSession(oldRecord, statePath);
+
+  const response = buildRpcKillSessionResponse(
+    { name: oldRecord.name },
+    {
+      loadState: () => loadManagedState(statePath),
+      exists: () => true,
+      // Model the exact interleaving: the old tmux session is gone, then a
+      // creator records a replacement with the same deterministic name before
+      // the killer reaches state cleanup.
+      kill: () => recordManagedSession(replacement, statePath),
+      removeRecord: (_name, expected) => {
+        removeManagedSessionIfCurrent(expected, statePath);
+      },
+    },
+  );
+
+  assert.equal(response.killed, true);
+  assert.deepEqual(loadManagedState(statePath).sessions, [replacement]);
+});
+
+test("tw rpc kill-session fails closed when managed state is corrupt", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-rpc-kill-corrupt-state-"));
+  const home = join(root, "home");
+  const stateDir = join(home, ".tmux-worktree");
+  const statePath = join(stateDir, "state.json");
+  const fakeTmux = join(root, "tmux");
+  const tmuxLog = join(root, "tmux.log");
+  mkdirSync(stateDir, { recursive: true });
+  const invalid = '{"version":1,"sessions":[\n';
+  writeFileSync(statePath, invalid);
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+case "$1" in
+  list-sessions)
+    printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n'
+    ;;
+  has-session)
+    exit 0
+    ;;
+esac
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [cli, "rpc", "kill-session", "--name", "tw-term-abc12"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+    },
+    timeout: 5_000,
+  });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /refusing to mutate invalid managed state.*original file preserved/);
+  assert.equal(readFileSync(statePath, "utf8"), invalid);
+  assert.equal(existsSync(tmuxLog), false, "corrupt state must not authorize a direct tmux kill");
+
+  const humanResult = spawnSync(process.execPath, [cli, "rm", "tw-term-abc12"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+    },
+    timeout: 5_000,
+  });
+  assert.equal(humanResult.status, 1);
+  assert.match(humanResult.stderr, /refusing to mutate invalid managed state.*original file preserved/);
+  assert.doesNotMatch(readFileSync(tmuxLog, "utf8"), /kill-session/);
+});
+
+test("tw rm closes managed sessions through the state-aware lifecycle", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-rm-managed-state-"));
+  const home = join(root, "home");
+  const stateDir = join(home, ".tmux-worktree");
+  const statePath = join(stateDir, "state.json");
+  const fakeTmux = join(root, "tmux");
+  const tmuxLog = join(root, "tmux.log");
+  mkdirSync(stateDir, { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify({
+    version: 1,
+    sessions: [{
+      name: "tw-term-abc12",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/repo/app",
+      createdAt: "2026-07-12T00:00:00.000Z",
+    }],
+  })}\n`);
+  writeFileSync(fakeTmux, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
+case "$1" in
+  list-sessions)
+    printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n'
+    ;;
+  has-session)
+    exit 0
+    ;;
+esac
+exit 0
+`);
+  chmodSync(fakeTmux, 0o755);
+
+  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const result = spawnSync(process.execPath, [cli, "rm", "tw-term-abc12"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      HOME: home,
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+    },
+    timeout: 5_000,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(statePath, "utf8")).sessions, []);
+  assert.match(readFileSync(tmuxLog, "utf8"), /kill-session -t =tw-term-abc12/);
 });
 
 test("canonical worktree base expands on the target host and host paths retain remote tilde", () => {

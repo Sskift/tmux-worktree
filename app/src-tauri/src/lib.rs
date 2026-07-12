@@ -137,10 +137,10 @@ fn write_dashboard_config_lock_owner(
     Ok(())
 }
 
-/// Coordinate ~/.tmux-worktree.json writes with the `tw host` process.
-/// The in-process mutex alone cannot prevent CLI/Dashboard lost updates.
-fn acquire_dashboard_config_file_lock() -> Result<DashboardConfigFileLock, String> {
-    let path = app_home_dir_or_tmp().join(".tmux-worktree.json.lock");
+fn acquire_dashboard_file_lock(
+    path: PathBuf,
+    description: &str,
+) -> Result<DashboardConfigFileLock, String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let owner = format!("{}-{}", std::process::id(), uuid::Uuid::new_v4().simple());
     loop {
@@ -175,7 +175,7 @@ fn acquire_dashboard_config_file_lock() -> Result<DashboardConfigFileLock, Strin
                 }
                 if Instant::now() >= deadline {
                     return Err(format!(
-                        "timed out waiting for dashboard config lock: {}",
+                        "timed out waiting for {description} lock: {}",
                         path.display()
                     ));
                 }
@@ -183,7 +183,7 @@ fn acquire_dashboard_config_file_lock() -> Result<DashboardConfigFileLock, Strin
             }
             Err(error) => {
                 return Err(format!(
-                    "create dashboard config lock {}: {error}",
+                    "create {description} lock {}: {error}",
                     path.display()
                 ));
             }
@@ -191,7 +191,31 @@ fn acquire_dashboard_config_file_lock() -> Result<DashboardConfigFileLock, Strin
     }
 }
 
+/// Coordinate ~/.tmux-worktree.json writes with the `tw host` process.
+/// The in-process mutex alone cannot prevent CLI/Dashboard lost updates.
+fn acquire_dashboard_config_file_lock() -> Result<DashboardConfigFileLock, String> {
+    acquire_dashboard_file_lock(
+        app_home_dir_or_tmp().join(".tmux-worktree.json.lock"),
+        "dashboard config",
+    )
+}
+
+/// Coordinate terminal metadata writes with Relay Host. Both processes use
+/// the exact `<registry>.lock/owner.json` owner-token protocol.
+fn acquire_terminal_registry_file_lock() -> Result<DashboardConfigFileLock, String> {
+    let registry = terminals_path();
+    acquire_dashboard_file_lock(
+        PathBuf::from(format!("{}.lock", registry.display())),
+        "terminal registry",
+    )
+}
+
 fn dashboard_layout_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn dashboard_terminal_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
@@ -383,7 +407,26 @@ struct HostConfig {
     tw_path: Option<String>,
 }
 
+fn validate_host_id(id: &str) -> Result<(), String> {
+    if id.is_empty()
+        || id.len() > 80
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(
+            "host id may contain only letters, numbers, '.', '_' and '-' (maximum 80 characters)"
+                .to_string(),
+        );
+    }
+    if id.eq_ignore_ascii_case("local") {
+        return Err("host id 'local' is reserved for the local control plane".to_string());
+    }
+    Ok(())
+}
+
 fn validate_ssh_host_fields(host: &HostConfig) -> Result<(), String> {
+    validate_host_id(&host.id)?;
     let target = host.host.as_str();
     if target.is_empty() {
         return Err("host target required".to_string());
@@ -2256,7 +2299,12 @@ fn load_configured_hosts() -> Result<Vec<HostConfig>, String> {
     let content = std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
     let config: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("parse config: {e}"))?;
-    Ok(hosts_from_config(&config))
+    let hosts = hosts_from_config(&config);
+    for host in &hosts {
+        validate_ssh_host_fields(host)
+            .map_err(|error| format!("invalid SSH host '{}': {error}", host.id))?;
+    }
+    Ok(hosts)
 }
 
 /// Load explicitly connected host configurations from ~/.tmux-worktree.json.
@@ -3858,13 +3906,77 @@ fn kill_managed_session_via_tw_rpc(app: &tauri::AppHandle, name: &str) -> Result
     parse_kill_session_rpc_response(&output, runtime_label, raw_name)
 }
 
+fn kill_rpc_explicitly_allows_legacy_fallback(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("session is not tw-managed") {
+        return true;
+    }
+
+    // Only an explicit old-CLI compatibility signal may authorize bypassing
+    // managed state. Do not broadly match words such as "invalid": state
+    // corruption errors intentionally contain that word and must fail closed.
+    let unsupported = lower.contains("unknown")
+        || lower.contains("unrecognized")
+        || lower.contains("unsupported")
+        || lower.contains("invalid");
+    let unsupported_kill_command = unsupported
+        && lower.contains("kill-session")
+        && (lower.contains("rpc command")
+            || lower.contains("rpc subcommand")
+            || lower.contains("subcommand")
+            || lower.contains("command: kill-session")
+            || lower.contains("command 'kill-session'")
+            || lower.contains("command \"kill-session\"")
+            || lower.contains("command `kill-session`")
+            || lower.contains("kill-session command")
+            || lower.contains("kill-session option"));
+    let unsupported_rpc_command = unsupported
+        && (lower.contains("unknown rpc")
+            || lower.contains("unrecognized rpc")
+            || lower.contains("unsupported rpc")
+            || lower.contains("invalid rpc")
+            || lower.contains("rpc command is unknown")
+            || lower.contains("rpc command is unrecognized")
+            || lower.contains("rpc command is unsupported")
+            || lower.contains("rpc command is invalid")
+            || lower.contains("command: rpc")
+            || lower.contains("command 'rpc'")
+            || lower.contains("command \"rpc\"")
+            || lower.contains("command `rpc`"));
+    let remote_tw_missing = lower.contains("tw: not found")
+        || lower.contains("tw: command not found")
+        || lower.contains("command not found: tw")
+        || lower.contains("tw: no such file or directory");
+
+    unsupported_kill_command || unsupported_rpc_command || remote_tw_missing
+}
+
+fn kill_canonical_first<C, L>(
+    managed_hint: Option<bool>,
+    canonical_kill: C,
+    legacy_kill: L,
+) -> Result<(), String>
+where
+    C: FnOnce() -> Result<(), String>,
+    L: FnOnce() -> Result<(), String>,
+{
+    // `managed` comes from a cached UI catalog and can be stale. It must not
+    // decide which mutation owns the session; canonical TW state does that.
+    let _ = managed_hint;
+    match canonical_kill() {
+        Ok(()) => Ok(()),
+        Err(error) if kill_rpc_explicitly_allows_legacy_fallback(&error) => legacy_kill(),
+        Err(error) => Err(error),
+    }
+}
+
 #[tauri::command]
 fn kill_session(app: tauri::AppHandle, name: String, managed: Option<bool>) -> Result<(), String> {
-    if managed.unwrap_or(false) {
-        kill_managed_session_via_tw_rpc(&app, &name)
-    } else {
-        kill_legacy_session(&name)
-    }
+    kill_canonical_first(
+        managed,
+        || kill_managed_session_via_tw_rpc(&app, &name),
+        || kill_legacy_session(&name),
+    )
 }
 
 /// A worktree directory is a real git worktree if it contains a `.git` entry
@@ -4189,17 +4301,12 @@ fn add_host_config(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
     let id = args.id.trim();
     let label = args.label.trim();
     let host = args.host.trim();
-    if id.is_empty() {
-        return Err("id required".into());
-    }
+    validate_host_id(id)?;
     if label.is_empty() {
         return Err("label required".into());
     }
     if host.is_empty() {
         return Err("host required".into());
-    }
-    if id.contains(':') {
-        return Err("host id cannot contain ':'".into());
     }
 
     let _guard = dashboard_config_write_lock()
@@ -4242,17 +4349,12 @@ fn update_host_config(args: UpdateHostArgs) -> Result<Vec<HostConfig>, String> {
     let id = args.id.trim();
     let label = args.label.trim();
     let host = args.host.trim();
-    if id.is_empty() {
-        return Err("host id required".into());
-    }
+    validate_host_id(id)?;
     if label.is_empty() {
         return Err("host label required".into());
     }
     if host.is_empty() {
         return Err("host target required".into());
-    }
-    if id.contains(':') {
-        return Err("host id cannot contain ':'".into());
     }
 
     let _guard = dashboard_config_write_lock()
@@ -4472,6 +4574,13 @@ fn remote_read_dirs_for_host(host: &HostConfig, path: &str) -> Result<Vec<DirEnt
     Ok(entries)
 }
 
+fn tw_rpc_capabilities_compatible(protocol_version: u32, capabilities: &[String]) -> bool {
+    protocol_version == 1
+        && ["list", "create-worktree", "create-terminal", "kill-session"]
+            .iter()
+            .all(|required| capabilities.iter().any(|capability| capability == required))
+}
+
 fn probe_host_status(host: &HostConfig) -> HostStatus {
     let start = Instant::now();
     let ssh_result = run_remote_cmd_check(host, &["true"]);
@@ -4505,19 +4614,10 @@ fn probe_host_status(host: &HostConfig) -> HostStatus {
         match tw_version {
             Ok(version) => match remote_tw_capabilities(host) {
                 Ok(capabilities) => {
-                    let compatible = capabilities.protocol_version == 1
-                        && capabilities
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability == "list")
-                        && capabilities
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability == "create-worktree")
-                        && capabilities
-                            .capabilities
-                            .iter()
-                            .any(|capability| capability == "create-terminal");
+                    let compatible = tw_rpc_capabilities_compatible(
+                        capabilities.protocol_version,
+                        &capabilities.capabilities,
+                    );
                     (
                         true,
                         Some(version),
@@ -5809,11 +5909,11 @@ fn kill_plain_terminal(
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
-    if managed.unwrap_or(false) {
-        kill_managed_session_via_tw_rpc(&app, &name)
-    } else {
-        kill_legacy_plain_terminal(&name)
-    }
+    kill_canonical_first(
+        managed,
+        || kill_managed_session_via_tw_rpc(&app, &name),
+        || kill_legacy_plain_terminal(&name),
+    )
 }
 
 fn tmux_session_is_missing_error(error: &str) -> bool {
@@ -5923,9 +6023,14 @@ fn load_terminals() -> Result<Vec<serde_json::Value>, String> {
 
 #[tauri::command]
 fn save_terminals(terminals: Vec<serde_json::Value>) -> Result<(), String> {
-    let text = serde_json::to_string_pretty(&terminals).map_err(|e| format!("serialize: {e}"))?;
-    std::fs::write(terminals_path(), text).map_err(|e| format!("write: {e}"))?;
-    Ok(())
+    let mut text = serde_json::to_string_pretty(&terminals)
+        .map_err(|e| format!("serialize terminal registry: {e}"))?;
+    text.push('\n');
+    let _guard = dashboard_terminal_write_lock()
+        .lock()
+        .map_err(|_| "dashboard terminal write lock poisoned".to_string())?;
+    let _file_guard = acquire_terminal_registry_file_lock()?;
+    atomic_write_file(&terminals_path(), text.as_bytes())
 }
 
 #[tauri::command]
@@ -7385,10 +7490,12 @@ mod tests {
         delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
         find_host, finish_git_fetch_target, git_fetch_args, git_graph_for, git_graph_refs_for,
         hosts_from_config, install_host_tw_from_source, invalidate_host_status_cache,
-        is_git_worktree_dir, is_managed_worktree_session, kill_legacy_plain_terminal,
-        kill_legacy_session, layout_backup_path, layout_schema_version, list_automation_runs,
-        list_orphaned_worktrees, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
-        load_pending_cleanup, managed_worktree_root_for_session, mobile_relay_config_from_value,
+        is_git_worktree_dir, is_managed_worktree_session, kill_canonical_first,
+        kill_legacy_plain_terminal, kill_legacy_session,
+        kill_rpc_explicitly_allows_legacy_fallback, layout_backup_path, layout_schema_version,
+        list_automation_runs, list_orphaned_worktrees, list_remote_sessions,
+        list_remote_tmux_terminals, load_hosts, load_pending_cleanup, load_terminals,
+        managed_worktree_root_for_session, mobile_relay_config_from_value,
         mobile_relay_ssh_forward_command, normalize_local_mdns_name, orphaned_worktrees,
         parse_kill_session_rpc_response, parse_local_worktree_rpc_response, parse_session_key,
         probe_local_agents_in_paths, project_from_config, project_from_worktree_path,
@@ -7397,17 +7504,17 @@ mod tests {
         remote_read_file_bytes_for_host, remote_write_file_for_host, remove_host_with_state,
         reserve_git_fetch_target, restore_local_worktree_via_runtime, run_remote_tmux_check,
         run_remote_tw_check, save_automation, save_hosts_config, save_layout, save_pending_cleanup,
-        scp_cli_command, select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
-        ssh_host_candidates_from_config_text, stable_output_signature, test_host,
-        tmux_session_exists, trigger_automation_with_creator, try_cleanup_worktree,
-        update_host_config, upsert_automation_from_input, validate_ssh_host_fields,
-        worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs, AgentProbeResult,
-        Automation, AutomationOverlap, AutomationRun, AutomationStatus, AutomationTriggerType,
-        CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
-        DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
-        GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
-        Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
-        AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+        save_terminals, scp_cli_command, select_local_tw_rpc_runtime,
+        should_skip_automation_overlap, ssh_command, ssh_host_candidates_from_config_text,
+        stable_output_signature, test_host, tmux_session_exists, trigger_automation_with_creator,
+        try_cleanup_worktree, tw_rpc_capabilities_compatible, update_host_config,
+        upsert_automation_from_input, validate_ssh_host_fields, worktree_has_uncommitted_changes,
+        worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
+        AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
+        CreateTerminalArgs, DashboardConfigLockOwner, DeleteWorktreeArgs, EnsureTerminalArgs,
+        GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState,
+        HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput,
+        UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
     };
     use std::collections::HashSet;
     use std::fs;
@@ -8581,6 +8688,86 @@ exit 12
         )
         .expect_err("mismatched managed kill response")
         .contains("unexpected kill-session response"));
+    }
+
+    #[test]
+    fn canonical_kill_fails_closed_on_corrupt_managed_state_for_every_ui_hint() {
+        let corrupt_state_error = "bundled TW RPC kill-session failed (exit status: 1): refusing to mutate invalid managed state: original file preserved";
+
+        for managed_hint in [None, Some(false), Some(true)] {
+            let canonical_called = std::cell::Cell::new(false);
+            let legacy_called = std::cell::Cell::new(false);
+            let error = kill_canonical_first(
+                managed_hint,
+                || {
+                    canonical_called.set(true);
+                    Err(corrupt_state_error.to_string())
+                },
+                || {
+                    legacy_called.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("corrupt managed state must fail closed");
+
+            assert!(canonical_called.get());
+            assert!(!legacy_called.get());
+            assert_eq!(error, corrupt_state_error);
+        }
+        assert!(!kill_rpc_explicitly_allows_legacy_fallback(
+            corrupt_state_error
+        ));
+        assert!(!kill_rpc_explicitly_allows_legacy_fallback(
+            "ssh on Dev failed: Connection reset by peer"
+        ));
+        assert!(!kill_rpc_explicitly_allows_legacy_fallback(
+            "parse bundled TW RPC kill-session response: expected value"
+        ));
+        assert!(!kill_rpc_explicitly_allows_legacy_fallback(
+            "unsupported bundled TW RPC protocol: 2"
+        ));
+    }
+
+    #[test]
+    fn canonical_kill_only_falls_back_for_explicit_legacy_compatibility() {
+        for explicit_legacy_error in [
+            "session is not TW-managed: legacy-session",
+            "remote tw failed: unknown rpc command: kill-session",
+            "remote tw failed: unknown subcommand kill-session",
+            "remote tw failed: invalid kill-session option --name",
+            "remote tw failed: unknown command: rpc",
+            "ssh on Dev failed: sh: tw: command not found",
+        ] {
+            let legacy_called = std::cell::Cell::new(false);
+            kill_canonical_first(
+                Some(false),
+                || Err(explicit_legacy_error.to_string()),
+                || {
+                    legacy_called.set(true);
+                    Ok(())
+                },
+            )
+            .expect("explicit old-runtime signal may use legacy tmux lifecycle");
+            assert!(
+                legacy_called.get(),
+                "did not fall back for {explicit_legacy_error}"
+            );
+            assert!(kill_rpc_explicitly_allows_legacy_fallback(
+                explicit_legacy_error
+            ));
+        }
+
+        let legacy_called = std::cell::Cell::new(false);
+        kill_canonical_first(
+            Some(false),
+            || Ok(()),
+            || {
+                legacy_called.set(true);
+                Ok(())
+            },
+        )
+        .expect("canonical kill");
+        assert!(!legacy_called.get());
     }
 
     #[test]
@@ -10498,7 +10685,7 @@ case "$1" in
     exit 0
     ;;
   *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal"]}'
+    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
     exit 0
     ;;
 esac
@@ -10648,7 +10835,7 @@ case "$1" in
   *"'tmux'"*"'-V'"*) printf 'tmux: command not found\n' >&2; exit 127 ;;
   *"'tw'"*"'version'"*) printf '1.0.3\n'; exit 0 ;;
   *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal"]}'
+    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
     exit 0
     ;;
 esac
@@ -10733,7 +10920,7 @@ case "$1" in
     exit 0
     ;;
   *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal"]}'
+    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
     exit 0
     ;;
 esac
@@ -10831,6 +11018,22 @@ exit 12
             (
                 {
                     let mut host = valid.clone();
+                    host.id = "LOCAL".to_string();
+                    host
+                },
+                "reserved for the local control plane",
+            ),
+            (
+                {
+                    let mut host = valid.clone();
+                    host.id = "bad/id".to_string();
+                    host
+                },
+                "host id may contain only",
+            ),
+            (
+                {
+                    let mut host = valid.clone();
                     host.host = "-oProxyCommand=/usr/bin/false".to_string();
                     host
                 },
@@ -10888,6 +11091,18 @@ exit 12
             let error = validate_ssh_host_fields(&host).expect_err("unsafe SSH endpoint");
             assert!(error.contains(expected), "{error}");
         }
+    }
+
+    #[test]
+    fn host_compatibility_requires_the_canonical_close_capability() {
+        let complete =
+            ["list", "create-worktree", "create-terminal", "kill-session"].map(str::to_string);
+        assert!(tw_rpc_capabilities_compatible(1, &complete));
+        assert!(!tw_rpc_capabilities_compatible(2, &complete));
+        assert!(!tw_rpc_capabilities_compatible(
+            1,
+            &["list", "create-worktree", "create-terminal"].map(str::to_string),
+        ));
     }
 
     #[test]
@@ -11075,6 +11290,53 @@ exit 12
             .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
             .count();
         assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn terminal_registry_save_is_atomic_private_and_releases_shared_lock() {
+        let _guard = test_env_lock().lock().expect("lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+        }
+
+        let terminals = vec![serde_json::json!({
+            "id": "term-v2-test",
+            "label": "shell",
+            "cwd": "/repo/app",
+            "tmuxName": "tw-term-a1b2c",
+            "rawName": "tw-term-a1b2c",
+            "managed": true
+        })];
+        save_terminals(terminals.clone()).expect("save terminal registry");
+        assert_eq!(load_terminals().expect("load terminal registry"), terminals);
+        let registry = temp.path().join(".tw-dashboard-terminals.json");
+        assert_eq!(
+            fs::metadata(&registry)
+                .expect("registry metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!temp
+            .path()
+            .join(".tw-dashboard-terminals.json.lock")
+            .exists());
+        assert_eq!(
+            fs::read_dir(temp.path())
+                .expect("read registry directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains(".tmp-"))
+                .count(),
+            0
+        );
+
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
     }
 
     #[test]

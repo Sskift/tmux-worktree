@@ -22,6 +22,12 @@ const {
   isRpcManagedTerminalSession,
   isRpcManagedWorktreeSession,
   isUnsupportedRpcListFailure,
+  isLegacyKillRpcFailure,
+  dashboardTerminalRecord,
+  liveDashboardTerminalName,
+  mutateTerminalRegistry,
+  parseDashboardTerminalPayload,
+  parseRpcCreateWorktreeResponse,
   parseRpcCreateTerminalResponse,
   persistCreatedTerminalMetadata,
   projectNameFromTwWorktreePath,
@@ -93,6 +99,63 @@ test("relay create-terminal accepts only the v1 managed response and keeps canon
   }
 });
 
+test("relay create-worktree accepts only a complete v1 managed response", () => {
+  const response = {
+    protocolVersion: 1,
+    kind: "worktree",
+    session: "demo-fix",
+    worktreePath: "/srv/worktrees/demo-fix-a1b2c",
+    branch: "demo-fix-a1b2c",
+  };
+  assert.deepEqual(parseRpcCreateWorktreeResponse(JSON.stringify(response)), response);
+  assert.equal(parseRpcCreateWorktreeResponse(JSON.stringify({
+    ...response,
+    session: "修复 登录 flow",
+  })).session, "修复 登录 flow");
+
+  for (const invalid of [
+    "not-json",
+    JSON.stringify([]),
+    JSON.stringify({ ...response, protocolVersion: 2 }),
+    JSON.stringify({ ...response, kind: "terminal" }),
+    JSON.stringify({ ...response, session: "remote:demo" }),
+    JSON.stringify({ ...response, session: "bad\nsession" }),
+    JSON.stringify({ ...response, worktreePath: "" }),
+    JSON.stringify({ ...response, branch: 42 }),
+  ]) {
+    assert.throws(() => parseRpcCreateWorktreeResponse(invalid));
+  }
+});
+
+test("relay treats Dashboard terminal metadata as scoped best-effort decoration", () => {
+  const remote = dashboardTerminalRecord(
+    { id: "build-box", kind: "ssh" },
+    "tw-term-a1b2c",
+    "/srv/project",
+    "build shell",
+  );
+  assert.equal(remote.hostId, "build-box");
+  assert.equal(remote.rawName, "tw-term-a1b2c");
+  assert.equal(remote.tmuxName, "build-box:tw-term-a1b2c");
+
+  const parsed = parseDashboardTerminalPayload([
+    remote,
+    null,
+    7,
+    { tmuxName: 9 },
+    { rawName: "tw-term-b2c3d", hostId: { invalid: true } },
+    { rawName: "tw-term-c3d4e", cwd: "/valid" },
+  ]);
+  assert.deepEqual(parsed.map((terminal) => terminal.rawName), ["tw-term-a1b2c", "tw-term-c3d4e"]);
+  assert.deepEqual(parseDashboardTerminalPayload({ not: "an array" }), []);
+
+  const live = new Set(["tw-term-a1b2c"]);
+  assert.equal(liveDashboardTerminalName(remote, "build-box", new Set(), live), "tw-term-a1b2c");
+  assert.equal(liveDashboardTerminalName(remote, "local", new Set(), live), null);
+  assert.equal(liveDashboardTerminalName(remote, "build-box", new Set(), new Set()), null);
+  assert.equal(liveDashboardTerminalName(remote, "build-box", new Set(["tw-term-a1b2c"]), live), null);
+});
+
 test("relay terminal registry writes atomically and preserves the previous file on rename failure", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-registry-"));
   const registry = join(root, "terminals.json");
@@ -111,6 +174,25 @@ test("relay terminal registry writes atomically and preserves the previous file 
     assert.equal(readFileSync(registry, "utf8"), before);
     assert.deepEqual(readdirSync(root), ["terminals.json"]);
 
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("relay serializes terminal registry mutations with the shared lock", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-relay-registry-lock-"));
+  const registry = join(root, "terminals.json");
+  try {
+    writeTerminalRegistryAtomic([{ rawName: "tw-term-first" }], registry);
+    mutateTerminalRegistry(
+      (current) => [...current, { rawName: "tw-term-second" }],
+      registry,
+    );
+    assert.deepEqual(
+      JSON.parse(readFileSync(registry, "utf8")).map((terminal) => terminal.rawName),
+      ["tw-term-first", "tw-term-second"],
+    );
+    assert.equal(existsSync(`${registry}.lock`), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -136,10 +218,11 @@ test("relay uses RPC lifecycle for managed kills while retaining legacy tmux fal
   assert.match(source, /const canonicalCwd = parsed\.cwd/);
   assert.match(source, /registerDashboardTerminal\(scope, name, canonicalCwd, label\)/);
   assert.match(source, /\["rpc", "kill-session", "--name", rawName\]/);
-  assert.match(source, /managedHint === true \|\| await rpcOwnsSession\(scope, rawName\)/);
-  assert.doesNotMatch(source, /rpcOwnsSession\(scope, rawName\)\.catch/);
+  assert.match(source, /if \(managedHint === true\) \{\s*await killManagedSession\(scope, rawName\)/s);
+  assert.match(source, /if \(!isLegacyKillRpcFailure\(commandExitStatus\(error\), output\)\) throw error/);
   assert.match(source, /await killManagedSession\(scope, rawName\)/);
   assert.match(source, /await killLegacyTmuxSession\(scope, rawName\)/);
+  assert.match(source, /bestEffortUnregisterDashboardTerminal\(scope, rawName\)/);
   assert.match(source, /killSession\(message\.session, message\.managed\)/);
   assert.match(source, /flag: "wx"/);
 });
@@ -155,6 +238,12 @@ test("relay only treats explicit old-host RPC incompatibility as a legacy catalo
   assert.equal(isUnsupportedRpcListFailure(1, "rpc list failed: managed state version is unsupported"), false);
   assert.equal(isUnsupportedRpcListFailure(undefined, "spawn tw ENOENT"), false);
   assert.equal(isUnsupportedRpcListFailure(0, "unknown command: rpc"), false);
+
+  assert.equal(isLegacyKillRpcFailure(1, "session is not TW-managed: old-shell"), true);
+  assert.equal(isLegacyKillRpcFailure(2, "unknown rpc command: kill-session"), true);
+  assert.equal(isLegacyKillRpcFailure(127, "tw: command not found"), true);
+  assert.equal(isLegacyKillRpcFailure(1, "managed state JSON is corrupt"), false);
+  assert.equal(isLegacyKillRpcFailure(255, "ssh: connection reset"), false);
 });
 
 test("relay host fallback only accepts TW-shaped managed worktree sessions", () => {
