@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature
 
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
