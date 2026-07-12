@@ -4,6 +4,7 @@ import {
   loadDashboardLayoutPreferences,
   saveDashboardLayoutPreferences,
 } from "../layoutPersistence";
+import type { DashboardLayoutExtensions } from "../layout/schema";
 import type { DashboardLayoutPreferences } from "../layout/types";
 
 export function useLayoutPreferences() {
@@ -14,8 +15,10 @@ export function useLayoutPreferences() {
     [backend],
   );
   const saveLayoutPreferences = useCallback(
-    (preferences: DashboardLayoutPreferences) =>
-      saveDashboardLayoutPreferences(backend, preferences),
+    (
+      preferences: DashboardLayoutPreferences,
+      extensions?: DashboardLayoutExtensions,
+    ) => saveDashboardLayoutPreferences(backend, preferences, extensions),
     [backend],
   );
 

@@ -13,6 +13,10 @@ import {
   viewportTierForWidth,
 } from "../layout/panelGeometry";
 import { DEFAULT_COLUMN_ORDER } from "../layout/schema";
+import type {
+  DashboardLayoutExtensions,
+  DashboardLayoutInvalidReason,
+} from "../layout/schema";
 import {
   DEFAULT_SCRATCH_PANEL_WIDTH,
   clampScratchPanelWidth,
@@ -33,6 +37,25 @@ import {
 import { useLayoutPreferences } from "./useLayoutPreferences";
 
 const WINDOW_DEFAULTS = { width: 1440, height: 900 };
+
+type DashboardLayoutPersistenceState =
+  | { phase: "hydrating" }
+  | { phase: "writable"; source: "legacy" | "current" }
+  | { phase: "blocked"; reason: "read_failed" }
+  | { phase: "blocked"; reason: "future_schema"; version: number }
+  | {
+      phase: "blocked";
+      reason: "invalid_layout";
+      invalidReason: DashboardLayoutInvalidReason;
+    };
+
+type DashboardLayoutPersistenceGate = {
+  attempt: number;
+  writable: boolean;
+  extensions: DashboardLayoutExtensions;
+};
+
+const EMPTY_DASHBOARD_LAYOUT_EXTENSIONS: DashboardLayoutExtensions = Object.freeze({});
 
 async function getWindowExpandedState(win: DashboardWindow) {
   const [fullscreen, maximized] = await Promise.all([
@@ -66,8 +89,16 @@ export function useDashboardLayoutState() {
   );
   const [windowLayout, setWindowLayout] = useState<WindowLayout | null>(null);
   const [windowRestoreReady, setWindowRestoreReady] = useState(false);
+  const [layoutPersistenceState, setLayoutPersistenceState] =
+    useState<DashboardLayoutPersistenceState>({ phase: "hydrating" });
   const dashboardWorkspaceRef = useRef<HTMLDivElement | null>(null);
-  const layoutLoadedRef = useRef(false);
+  const layoutPersistenceGateRef = useRef<DashboardLayoutPersistenceGate>(
+    {
+      attempt: 0,
+      writable: false,
+      extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
+    },
+  );
 
   panelWidthsRef.current = { sidebarWidth, inspectorWidth };
 
@@ -100,11 +131,13 @@ export function useDashboardLayoutState() {
     setWindowLayout,
     windowRestoreReady,
     setWindowRestoreReady,
+    layoutPersistenceState,
+    setLayoutPersistenceState,
     panelWidthsRef,
     sidebarOpenPreferenceRef,
     inspectorOpenPreferenceRef,
     dashboardWorkspaceRef,
-    layoutLoadedRef,
+    layoutPersistenceGateRef,
     loadLayoutPreferences,
     saveLayoutPreferences,
   };
@@ -272,7 +305,7 @@ export function useDashboardLayoutHydrationPhase(
 ) {
   const {
     inspectorOpenPreferenceRef,
-    layoutLoadedRef,
+    layoutPersistenceGateRef,
     loadLayoutPreferences,
     panelWidthsRef,
     setAutomationSectionCollapsed,
@@ -288,12 +321,43 @@ export function useDashboardLayoutHydrationPhase(
     setSidebarWidth,
     setWindowLayout,
     setWindowRestoreReady,
+    setLayoutPersistenceState,
     sidebarOpenPreferenceRef,
   } = layout;
 
   useEffect(() => {
-    loadLayoutPreferences()
-      .then((lay) => {
+    const attempt = layoutPersistenceGateRef.current.attempt + 1;
+    layoutPersistenceGateRef.current = {
+      attempt,
+      writable: false,
+      extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
+    };
+    setLayoutPersistenceState({ phase: "hydrating" });
+    let disposed = false;
+
+    void loadLayoutPreferences()
+      .then((outcome) => {
+        if (disposed || layoutPersistenceGateRef.current.attempt !== attempt) return;
+        if (outcome.kind === "future") {
+          setWindowRestoreReady(true);
+          setLayoutPersistenceState({
+            phase: "blocked",
+            reason: "future_schema",
+            version: outcome.version,
+          });
+          return;
+        }
+        if (outcome.kind === "invalid") {
+          setWindowRestoreReady(true);
+          setLayoutPersistenceState({
+            phase: "blocked",
+            reason: "invalid_layout",
+            invalidReason: outcome.reason,
+          });
+          return;
+        }
+
+        const lay = outcome.layout;
         const restoredPanelWidths = normalizeDashboardPanelWidths(
           window.innerWidth,
           lay.sidebarWidth ?? lay.left ?? DEFAULT_SIDEBAR_WIDTH,
@@ -365,13 +429,35 @@ export function useDashboardLayoutHydrationPhase(
         }
         if (lay.window) setWindowLayout(lay.window);
         setWindowRestoreReady(true);
+        layoutPersistenceGateRef.current = {
+          attempt,
+          writable: true,
+          extensions: outcome.extensions,
+        };
+        setLayoutPersistenceState({
+          phase: "writable",
+          source: outcome.source,
+        });
       })
       .catch(() => {
+        if (disposed || layoutPersistenceGateRef.current.attempt !== attempt) return;
         setWindowRestoreReady(true);
-      })
-      .finally(() => {
-        layoutLoadedRef.current = true;
+        setLayoutPersistenceState({
+          phase: "blocked",
+          reason: "read_failed",
+        });
       });
+
+    return () => {
+      disposed = true;
+      if (layoutPersistenceGateRef.current.attempt === attempt) {
+        layoutPersistenceGateRef.current = {
+          attempt: attempt + 1,
+          writable: false,
+          extensions: EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
+        };
+      }
+    };
   }, [dashboardBackend, getLatestSuccessfulRefreshGeneration, loadLayoutPreferences]);
 }
 
@@ -391,7 +477,8 @@ export function useDashboardLayoutPersistencePhase(
     inspectorOpen,
     inspectorOpenPreferenceRef,
     inspectorWidth,
-    layoutLoadedRef,
+    layoutPersistenceGateRef,
+    layoutPersistenceState,
     pinnedItems,
     saveLayoutPreferences,
     scratchCollapsed,
@@ -405,8 +492,13 @@ export function useDashboardLayoutPersistencePhase(
   } = layout;
 
   useEffect(() => {
-    if (!layoutLoadedRef.current) return;
+    if (layoutPersistenceState.phase !== "writable") return;
+    const gate = layoutPersistenceGateRef.current;
+    if (!gate.writable) return;
+    const authorizedAttempt = gate.attempt;
     const t = setTimeout(() => {
+      const currentGate = layoutPersistenceGateRef.current;
+      if (!currentGate.writable || currentGate.attempt !== authorizedAttempt) return;
       saveLayoutPreferences({
         left: sidebarWidth,
         sidebarWidth,
@@ -426,7 +518,7 @@ export function useDashboardLayoutPersistencePhase(
         editingFile,
         diffFile,
         ...(windowLayout ? { window: windowLayout } : {}),
-      }).catch(() => {});
+      }, currentGate.extensions).catch(() => {});
     }, 500);
     return () => clearTimeout(t);
   }, [
@@ -446,5 +538,6 @@ export function useDashboardLayoutPersistencePhase(
     diffFile,
     windowLayout,
     saveLayoutPreferences,
+    layoutPersistenceState.phase,
   ]);
 }

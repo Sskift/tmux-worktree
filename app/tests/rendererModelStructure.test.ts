@@ -81,11 +81,14 @@ const canonicalOwners = {
   "dashboard/layout/schema.ts": [
     "DASHBOARD_LAYOUT_SCHEMA_VERSION",
     "DEFAULT_COLUMN_ORDER",
+    "DashboardLayoutDecodeOutcome",
+    "DashboardLayoutExtensions",
+    "DashboardLayoutInvalidReason",
     "DashboardLayoutV2",
     "normalizeColumnOrder",
     "isDashboardLayoutV2",
     "createDashboardLayoutV2",
-    "migrateDashboardLayout",
+    "decodeDashboardLayout",
   ],
   "dashboard/layout/panelGeometry.ts": [
     "DEFAULT_SIDEBAR_WIDTH",
@@ -138,6 +141,9 @@ const canonicalAllowedImports: Record<keyof typeof canonicalOwners, readonly str
 
 const historicalFacadeExports = {
   "dashboard/layoutPreferences.ts": {
+    DashboardLayoutDecodeOutcome: ["type", "./layout/schema", "DashboardLayoutDecodeOutcome"],
+    DashboardLayoutExtensions: ["type", "./layout/schema", "DashboardLayoutExtensions"],
+    DashboardLayoutInvalidReason: ["type", "./layout/schema", "DashboardLayoutInvalidReason"],
     DashboardLayoutPreferences: ["type", "./layout/types", "DashboardLayoutPreferences"],
     DashboardLayoutV2: ["type", "./layout/schema", "DashboardLayoutV2"],
     DiffFile: ["type", "./layout/types", "DiffFile"],
@@ -155,8 +161,8 @@ const historicalFacadeExports = {
     ],
     DEFAULT_COLUMN_ORDER: ["value", "./layout/schema", "DEFAULT_COLUMN_ORDER"],
     createDashboardLayoutV2: ["value", "./layout/schema", "createDashboardLayoutV2"],
+    decodeDashboardLayout: ["value", "./layout/schema", "decodeDashboardLayout"],
     isDashboardLayoutV2: ["value", "./layout/schema", "isDashboardLayoutV2"],
-    migrateDashboardLayout: ["value", "./layout/schema", "migrateDashboardLayout"],
     normalizeColumnOrder: ["value", "./layout/schema", "normalizeColumnOrder"],
   },
   "dashboard/dashboardShellModel.ts": {
@@ -573,6 +579,7 @@ const allowedExternalRuntimeSymbols = new Set([
   "Math",
   "Number",
   "Object",
+  "Reflect",
   "Set",
   "String",
   "undefined",
@@ -904,5 +911,5 @@ test("legacy entrypoints are thin re-export facades and implementation copies st
       assert.equal(declarations.has(name), false, `${path} must not implement ${name}`);
     }
   }
-  assert.doesNotMatch(renderer, /\bdecodeDashboardLayout\b/);
+  assert.doesNotMatch(renderer, /\bmigrateDashboardLayout\b/);
 });

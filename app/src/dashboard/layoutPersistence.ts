@@ -1,22 +1,26 @@
 import type { DashboardBackend } from "../platform/dashboardBackend.ts";
 import {
   createDashboardLayoutV2,
-  migrateDashboardLayout,
-  type DashboardLayoutV2,
+  decodeDashboardLayout,
+  type DashboardLayoutDecodeOutcome,
+  type DashboardLayoutExtensions,
 } from "./layout/schema.ts";
 import type { DashboardLayoutPreferences } from "./layout/types.ts";
 
 type LayoutBackend = Pick<DashboardBackend, "persistence">;
 
+const EMPTY_DASHBOARD_LAYOUT_EXTENSIONS: DashboardLayoutExtensions = Object.freeze({});
+
 export async function loadDashboardLayoutPreferences(
   backend: LayoutBackend,
-): Promise<DashboardLayoutV2> {
-  return migrateDashboardLayout(await backend.persistence.loadLayout());
+): Promise<DashboardLayoutDecodeOutcome> {
+  return decodeDashboardLayout(await backend.persistence.loadLayout());
 }
 
 export async function saveDashboardLayoutPreferences(
   backend: LayoutBackend,
   preferences: DashboardLayoutPreferences,
+  extensions: DashboardLayoutExtensions = EMPTY_DASHBOARD_LAYOUT_EXTENSIONS,
 ): Promise<void> {
-  await backend.persistence.saveLayout(createDashboardLayoutV2(preferences));
+  await backend.persistence.saveLayout(createDashboardLayoutV2(preferences, extensions));
 }

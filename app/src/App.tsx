@@ -147,6 +147,7 @@ function App() {
     sidebarView,
     setSidebarView,
     viewportTier,
+    layoutPersistenceState,
     panelWidthsRef,
     sidebarOpenPreferenceRef,
     inspectorOpenPreferenceRef,
@@ -1748,6 +1749,15 @@ function App() {
                 <div>
                   <strong>Reset dashboard layout</strong>
                   <span>Restore panel widths and visibility without changing sessions or connections.</span>
+                  {layoutPersistenceState.phase === "blocked" && (
+                    <span className="settings-action-status" role="alert">
+                      {layoutPersistenceState.reason === "read_failed"
+                        ? "Dashboard layout could not be read. The saved layout will not be overwritten, and layout changes will not be saved this time."
+                        : layoutPersistenceState.reason === "future_schema"
+                          ? `Dashboard layout schema ${layoutPersistenceState.version} was created by a newer version. It will be preserved unchanged, and layout changes will not be saved.`
+                          : "The saved dashboard layout is invalid. It will be preserved unchanged, and layout changes will not be saved."}
+                    </span>
+                  )}
                   {layoutResetMessage && (
                     <span className="settings-action-status" role="status">{layoutResetMessage}</span>
                   )}
@@ -1755,6 +1765,7 @@ function App() {
                 <button
                   className="settings-action-button"
                   type="button"
+                  disabled={layoutPersistenceState.phase !== "writable"}
                   onClick={() => void resetDashboardLayout()}
                 >
                   Reset layout

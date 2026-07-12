@@ -12,8 +12,13 @@ export {
   DASHBOARD_LAYOUT_SCHEMA_VERSION,
   DEFAULT_COLUMN_ORDER,
   createDashboardLayoutV2,
+  decodeDashboardLayout,
   isDashboardLayoutV2,
-  migrateDashboardLayout,
   normalizeColumnOrder,
 } from "./layout/schema";
-export type { DashboardLayoutV2 } from "./layout/schema";
+export type {
+  DashboardLayoutDecodeOutcome,
+  DashboardLayoutExtensions,
+  DashboardLayoutInvalidReason,
+  DashboardLayoutV2,
+} from "./layout/schema";
