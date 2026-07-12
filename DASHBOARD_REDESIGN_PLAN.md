@@ -1,6 +1,6 @@
 # tw-dashboard v2 最终重构计划
 
-> 状态：Dashboard replacement 与 Android V2 客户端已合入 `master`；Binary / Dashboard headless control-plane 收口已实现并完成首轮回归，正在同步主分支。Relay v2 Android-first contract 已冻结但尚未实现；下一阶段继续做 SSH 长连接 soak 与恢复状态机，Phase 4/5 保留为后续能力
+> 状态：Dashboard replacement 与 Android V2 客户端已合入 `master`；Binary / Dashboard headless control-plane 收口已实现、同步最新主分支并通过最终回归，等待 fast-forward 合入。Relay v2 Android-first contract 已冻结但尚未实现；下一阶段继续做 SSH 长连接 soak 与恢复状态机，Phase 4/5 保留为后续能力
 >
 > 日期：2026-07-12
 >
@@ -8,7 +8,7 @@
 >
 > 当前实现基线：最新 `master` + `tmux-worktree-app-re-ddf7c` 合并候选（Files 常驻 + CodeMirror 编辑器 + Git Graph + headless CLI/RPC/SSH control plane + Compose Android V2 UI + 安全 Relay v1 pairing/backpressure + 旧 Dashboard/Android UI 清理）
 >
-> 当前验收态：release Tauri bundle 已 ad-hoc 签名并完成真实 worktree/terminal/Host smoke；Android debug/release build、lint 和 API 36 instrumentation 通过。Headless control-plane 分支首轮门禁为 root CLI 58/58、Dashboard 332/332、Rust 77/77；同步最新 Android `master` 后将重跑并在合并前更新最终数字。release APK 尚未生产签名。
+> 当前验收态：release Tauri bundle 已 ad-hoc 签名并完成真实 worktree/terminal/Host smoke；同步最新 Android `master` 后最终门禁为 root CLI 63/63、Dashboard 334/334、Rust 77/77、Android JVM 59/59；Android API 36 instrumentation 34/34 沿用已合入主分支的验收结果。release APK 尚未生产签名。
 >
 > 目标：把现有 Dashboard 从“可自由拆分的终端工具集合”重组为“以 worktree / agent session 为中心的 macOS 工作台”，同时保留现有 Tauri 后端、tmux、SSH、Git、文件、Automation 和 Mobile Relay 能力。
 
