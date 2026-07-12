@@ -10,6 +10,7 @@
     "core:window:allow-is-maximized",
     "core:window:allow-inner-size",
     "core:window:allow-set-size",
+    "core:window:allow-destroy",
     "core:window:allow-scale-factor",
     "dialog:default"
   ]

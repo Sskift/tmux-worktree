@@ -124,6 +124,8 @@ test("fake window state is observable and logical size updates in place", async 
   const { backend, transport } = createFakeDashboardBackend();
   const window = backend.window.current();
 
+  assert.equal("closeLifecycle" in transport, false);
+  assert.equal("closeLifecycle" in backend.window, false);
   assert.equal(window, transport.window);
   assert.equal(await window.isFullscreen(), false);
   assert.equal(await window.isMaximized(), false);

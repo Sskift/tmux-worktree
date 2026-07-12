@@ -2,7 +2,6 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { DashboardBackendProvider, type DashboardBackend } from "./platform";
-import { tauriDashboardBackend } from "./platform/tauriBackend";
 
 async function resolveDashboardBackend(): Promise<DashboardBackend> {
   const localWebPreview =
@@ -11,9 +10,12 @@ async function resolveDashboardBackend(): Promise<DashboardBackend> {
   const previewRequested =
     (import.meta.env.DEV || localWebPreview) &&
     new URLSearchParams(window.location.search).get("backend") === "fake";
-  if (!previewRequested) return tauriDashboardBackend;
-  const preview = await import("./platform/previewBackend");
-  return preview.previewDashboardBackend;
+  if (previewRequested) {
+    const preview = await import("./platform/previewBackend");
+    return preview.previewDashboardBackend;
+  }
+  const tauri = await import("./platform/tauriBackend");
+  return tauri.tauriDashboardBackend;
 }
 
 function renderDashboard(dashboardBackend: DashboardBackend) {

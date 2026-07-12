@@ -4,6 +4,17 @@ import type {
   DashboardTransport,
   DashboardWindow,
 } from "./types";
+import {
+  createWindowCloseBridge,
+  type NativeDashboardCloseRequest,
+} from "./windowCloseBridge";
+
+export interface RawDashboardWindowCloseLifecycle {
+  onCloseRequested(
+    handler: (event: NativeDashboardCloseRequest) => void,
+  ): Promise<BackendUnlisten>;
+  destroy(): Promise<void>;
+}
 
 export interface RawDashboardWindow {
   isFullscreen(): Promise<boolean>;
@@ -13,6 +24,7 @@ export interface RawDashboardWindow {
   scaleFactor(): Promise<number>;
   onResized(handler: () => void): Promise<BackendUnlisten>;
   onMoved(handler: () => void): Promise<BackendUnlisten>;
+  closeLifecycle?: RawDashboardWindowCloseLifecycle;
 }
 
 export interface TauriTransportDependencies {
@@ -29,9 +41,9 @@ export interface TauriTransportDependencies {
 }
 
 function createWindowAdapter(
-  dependencies: TauriTransportDependencies,
+  window: RawDashboardWindow,
+  setLogicalSize: TauriTransportDependencies["setLogicalSize"],
 ): DashboardWindow {
-  const window = dependencies.currentWindow();
   return {
     isFullscreen: () => window.isFullscreen(),
     isMaximized: () => window.isMaximized(),
@@ -44,8 +56,7 @@ function createWindowAdapter(
       return { x: value.x, y: value.y };
     },
     scaleFactor: () => window.scaleFactor(),
-    setLogicalSize: (width, height) =>
-      dependencies.setLogicalSize(width, height),
+    setLogicalSize: (width, height) => setLogicalSize(width, height),
     onResized: (handler) => window.onResized(handler),
     onMoved: (handler) => window.onMoved(handler),
   };
@@ -54,6 +65,19 @@ function createWindowAdapter(
 export function createTauriTransport(
   dependencies: TauriTransportDependencies,
 ): DashboardTransport {
+  const rawWindow = dependencies.currentWindow();
+  const windowAdapter = createWindowAdapter(
+    rawWindow,
+    (width, height) => dependencies.setLogicalSize(width, height),
+  );
+  const rawCloseLifecycle = rawWindow.closeLifecycle;
+  const closeLifecycle = rawCloseLifecycle
+    ? createWindowCloseBridge({
+        onCloseRequested: (handler) =>
+          rawCloseLifecycle.onCloseRequested(handler),
+        destroy: () => rawCloseLifecycle.destroy(),
+      })
+    : null;
   return {
     invoke: (command, args) => dependencies.invoke(command, args),
     listen: async <T>(event: string, handler: BackendEventHandler<T>) =>
@@ -70,6 +94,7 @@ export function createTauriTransport(
       return typeof result === "string" ? result : null;
     },
     confirm: ({ message, title }) => dependencies.confirm(message, title),
-    currentWindow: () => createWindowAdapter(dependencies),
+    currentWindow: () => windowAdapter,
+    ...(closeLifecycle ? { closeLifecycle } : {}),
   };
 }

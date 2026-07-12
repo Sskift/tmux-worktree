@@ -1,6 +1,7 @@
 import type {
   DashboardTransport,
   DashboardWindow,
+  DashboardWindowCloseLifecycle,
   ConfirmDialogOptions,
   DirectoryDialogOptions,
   PtyConnection,
@@ -162,6 +163,7 @@ export interface DashboardBackend {
   };
   window: {
     current(): DashboardWindow;
+    closeLifecycle?: DashboardWindowCloseLifecycle;
   };
 }
 
@@ -172,6 +174,7 @@ function abortError(): Error {
 }
 
 export function createDashboardBackend(transport: DashboardTransport): DashboardBackend {
+  const closeLifecycle = transport.closeLifecycle;
   const writePty = (id: string, data: string) =>
     transport.invoke<void>("pty_write", { id, data });
   const resizePty = (id: string, cols: number, rows: number) =>
@@ -403,6 +406,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     },
     window: {
       current: () => transport.currentWindow(),
+      ...(closeLifecycle ? { closeLifecycle } : {}),
     },
   };
 }

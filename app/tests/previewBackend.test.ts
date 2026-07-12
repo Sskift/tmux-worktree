@@ -33,6 +33,8 @@ test("preview backend supplies the dashboard startup state", async () => {
     layout: {},
     revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",
   });
+  assert.equal("closeLifecycle" in previewDashboardTransport, false);
+  assert.equal("closeLifecycle" in previewDashboardBackend.window, false);
 });
 
 test("preview PTY follows the same facade and emits deterministic output", async () => {

@@ -2,6 +2,14 @@ export type BackendUnlisten = () => void;
 
 export type BackendEventHandler<T> = (payload: T) => void | Promise<void>;
 
+export type DashboardCloseHandler = (
+  signal: AbortSignal,
+) => void | Promise<void>;
+
+export interface DashboardWindowCloseLifecycle {
+  bind(handler: DashboardCloseHandler): BackendUnlisten;
+}
+
 export type PhysicalPoint = {
   x: number;
   y: number;
@@ -41,6 +49,7 @@ export interface DashboardTransport {
   selectDirectory(options: DirectoryDialogOptions): Promise<string | null>;
   confirm(options: ConfirmDialogOptions): Promise<boolean>;
   currentWindow(): DashboardWindow;
+  closeLifecycle?: DashboardWindowCloseLifecycle;
 }
 
 export type PtyOpenArgs = {

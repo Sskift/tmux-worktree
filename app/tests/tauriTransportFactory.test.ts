@@ -3,12 +3,16 @@ import test from "node:test";
 import {
   createTauriTransport,
   type RawDashboardWindow,
+  type RawDashboardWindowCloseLifecycle,
   type TauriTransportDependencies,
 } from "../src/platform/tauriTransportFactory.ts";
+import { createDashboardBackend } from "../src/platform/dashboardBackend.ts";
+import type { NativeDashboardCloseRequest } from "../src/platform/windowCloseBridge.ts";
 
 class RawWindowStub implements RawDashboardWindow {
   resized = new Set<() => void>();
   moved = new Set<() => void>();
+  closeLifecycle?: RawDashboardWindowCloseLifecycle;
 
   async isFullscreen() { return false; }
   async isMaximized() { return true; }
@@ -34,6 +38,7 @@ class TauriDependenciesStub implements TauriTransportDependencies {
   confirmCalls: Array<{ message: string; title?: string }> = [];
   logicalSizes: Array<{ width: number; height: number }> = [];
   window = new RawWindowStub();
+  currentWindowCalls = 0;
 
   async invoke<T>(command: string, args?: unknown): Promise<T> {
     this.calls.push({ command, args });
@@ -70,6 +75,7 @@ class TauriDependenciesStub implements TauriTransportDependencies {
   }
 
   currentWindow(): RawDashboardWindow {
+    this.currentWindowCalls += 1;
     return this.window;
   }
 
@@ -124,6 +130,8 @@ test("Tauri transport normalizes dialogs, assets, and physical window values", a
   ]);
 
   const window = transport.currentWindow();
+  assert.strictEqual(transport.currentWindow(), window);
+  assert.equal(dependencies.currentWindowCalls, 1);
   assert.equal(await window.isFullscreen(), false);
   assert.equal(await window.isMaximized(), true);
   assert.deepEqual(await window.innerSize(), { width: 2880, height: 1800 });
@@ -140,4 +148,48 @@ test("Tauri transport normalizes dialogs, assets, and physical window values", a
   stopMove();
   assert.equal(dependencies.window.resized.size, 0);
   assert.equal(dependencies.window.moved.size, 0);
+  assert.equal("closeLifecycle" in transport, false);
+  assert.equal("closeLifecycle" in createDashboardBackend(transport).window, false);
+});
+
+test("Tauri transport eagerly registers one atomic close capability", async () => {
+  const dependencies = new TauriDependenciesStub();
+  const events: string[] = [];
+  let closeHandler: ((event: NativeDashboardCloseRequest) => void) | null = null;
+  let registrationCount = 0;
+  let destroyCount = 0;
+  dependencies.window.closeLifecycle = {
+    onCloseRequested(handler) {
+      registrationCount += 1;
+      closeHandler = handler;
+      return Promise.resolve(() => {});
+    },
+    async destroy() {
+      destroyCount += 1;
+    },
+  };
+
+  const transport = createTauriTransport(dependencies);
+  assert.equal(dependencies.currentWindowCalls, 1);
+  assert.equal(registrationCount, 1);
+  assert.ok(transport.closeLifecycle);
+  const backend = createDashboardBackend(transport);
+  assert.strictEqual(backend.window.closeLifecycle, transport.closeLifecycle);
+  const unbind = transport.closeLifecycle.bind((signal) => {
+    events.push(`handler:${signal.aborted}`);
+  });
+  assert.ok(closeHandler);
+  const emitClose = closeHandler as unknown as (
+    event: NativeDashboardCloseRequest,
+  ) => void;
+  emitClose({
+    preventDefault() {
+      events.push("prevent");
+    },
+  });
+  assert.deepEqual(events, ["prevent", "handler:false"]);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(destroyCount, 1);
+  unbind();
 });
