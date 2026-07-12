@@ -1,8 +1,4 @@
-use crate::ipc::HostStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -88,14 +84,4 @@ pub(crate) fn validate_ssh_host_fields(host: &HostConfig) -> Result<(), String> 
         }
     }
     Ok(())
-}
-
-pub(crate) struct CachedHostStatus {
-    pub(crate) status: HostStatus,
-    pub(crate) checked_at: Instant,
-}
-
-#[derive(Default)]
-pub(crate) struct HostState {
-    pub(crate) statuses: Mutex<HashMap<String, CachedHostStatus>>,
 }

@@ -16,7 +16,7 @@ use std::io::Write;
 use std::net::ToSocketAddrs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tauri::{Manager, State};
 
 /// Coordinate terminal metadata writes with Relay Host. Both processes use
@@ -836,18 +836,6 @@ fn run_quiet(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-// ── SSH remote execution ──────────────────────────────────────────────
-
-/// Parse a composite session key into (host_id, raw_name).
-/// - "hostid:rawname" → (Some("hostid"), "rawname")
-/// - "rawname"        → (None, "rawname")  (local session, backward compat)
-fn parse_session_key(key: &str) -> (Option<&str>, &str) {
-    match key.split_once(':') {
-        Some((host_id, raw_name)) => (Some(host_id), raw_name),
-        None => (None, key),
-    }
-}
-
 fn is_executable_file(path: &Path) -> bool {
     let Ok(metadata) = std::fs::metadata(path) else {
         return false;
@@ -969,8 +957,6 @@ async fn probe_agents(host_id: Option<String>) -> Result<Vec<AgentProbeResult>, 
         .await
         .map_err(|error| format!("agent probe task failed: {error}"))?
 }
-
-const HOST_STATUS_CACHE_MS: u64 = 5000;
 
 fn pending_cleanup_path() -> std::path::PathBuf {
     app_home_dir_or_tmp().join(".tw-dashboard-pending-worktree-cleanup.json")
@@ -1445,21 +1431,6 @@ fn copy_bytes_to_clipboard(bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum LocalTwRpcRuntime {
-    Bundled { node: String, cli: PathBuf },
-    Installed { tw: String },
-}
-
-impl LocalTwRpcRuntime {
-    fn audit_label(&self) -> &'static str {
-        match self {
-            Self::Bundled { .. } => "bundled same-version TW runtime",
-            Self::Installed { .. } => "installed same-version TW fallback",
-        }
-    }
-}
-
 fn local_worktree_base_for_rpc() -> Result<String, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
     let config_path = home.join(".tmux-worktree.json");
@@ -1623,118 +1594,6 @@ fn build_restore_worktree_rpc_args(args: &RestoreArgs) -> Result<Vec<String>, St
     Ok(rpc_args)
 }
 
-fn installed_tw_version(program: &str, home: &Path) -> Result<String, String> {
-    let output = std::process::Command::new(program)
-        .arg("version")
-        .env("HOME", home)
-        .env("TW_DASHBOARD_HOME", home)
-        .output()
-        .map_err(|error| format!("run {program} version: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{program} version exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn validate_installed_tw_rpc(program: &str, home: &Path) -> Result<(), String> {
-    let output = std::process::Command::new(program)
-        .args(["rpc", "capabilities"])
-        .env("HOME", home)
-        .env("TW_DASHBOARD_HOME", home)
-        .output()
-        .map_err(|error| format!("run {program} rpc capabilities: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{program} rpc capabilities exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let response: TwRpcCapabilitiesResponse = serde_json::from_slice(&output.stdout)
-        .map_err(|error| format!("parse {program} rpc capabilities: {error}"))?;
-    let required = [
-        "list",
-        "create-worktree",
-        "create-terminal",
-        "restore-worktree",
-        "kill-session",
-    ];
-    if response.protocol_version != 1
-        || required.iter().any(|required| {
-            !response
-                .capabilities
-                .iter()
-                .any(|capability| capability == required)
-        })
-    {
-        return Err(format!(
-            "{program} does not provide the complete Dashboard TW RPC contract"
-        ));
-    }
-    Ok(())
-}
-
-fn select_local_tw_rpc_runtime(
-    bundled_cli: Option<PathBuf>,
-    node: Option<String>,
-    installed_tw: Option<String>,
-    home: &Path,
-) -> Result<LocalTwRpcRuntime, String> {
-    if let (Some(cli), Some(node)) = (bundled_cli.as_ref(), node.as_ref()) {
-        return Ok(LocalTwRpcRuntime::Bundled {
-            node: node.clone(),
-            cli: cli.clone(),
-        });
-    }
-
-    let mut failures = Vec::new();
-    if bundled_cli.is_none() {
-        failures.push("bundled CLI resource not found".to_string());
-    } else if node.is_none() {
-        failures.push("Node.js 20+ not found for bundled CLI".to_string());
-    }
-
-    if let Some(tw) = installed_tw {
-        match installed_tw_version(&tw, home) {
-            Ok(version) if version == env!("CARGO_PKG_VERSION") => {
-                match validate_installed_tw_rpc(&tw, home) {
-                    Ok(()) => return Ok(LocalTwRpcRuntime::Installed { tw }),
-                    Err(error) => failures.push(error),
-                }
-            }
-            Ok(version) => failures.push(format!(
-                "installed tw version {version:?} does not match Dashboard {}",
-                env!("CARGO_PKG_VERSION")
-            )),
-            Err(error) => failures.push(error),
-        }
-    } else {
-        failures.push("installed tw/tmux-worktree command not found".to_string());
-    }
-
-    Err(format!(
-        "Canonical local TW runtime unavailable: {}. Direct Rust/tmux lifecycle fallbacks are intentionally disabled so Dashboard cannot silently create a different session contract. Install Node.js 20+ or install a compatible tw {}.",
-        failures.join("; "),
-        env!("CARGO_PKG_VERSION")
-    ))
-}
-
-fn resolve_local_tw_rpc_runtime(
-    app: &tauri::AppHandle,
-    home: &Path,
-) -> Result<LocalTwRpcRuntime, String> {
-    select_local_tw_rpc_runtime(
-        bundled_cli_path(app),
-        node_bin(),
-        installed_tw_command(),
-        home,
-    )
-}
-
 fn create_local_worktree_via_runtime(
     runtime: &LocalTwRpcRuntime,
     args: CreateArgs,
@@ -1743,39 +1602,6 @@ fn create_local_worktree_via_runtime(
     let rpc_args = build_local_worktree_rpc_args(&args, &worktree_base)?;
     let output = run_local_tw_rpc_runtime(runtime, &rpc_args, "create-worktree")?;
     parse_local_worktree_rpc_response(&output, runtime.audit_label())
-}
-
-fn run_local_tw_rpc_runtime(
-    runtime: &LocalTwRpcRuntime,
-    rpc_args: &[String],
-    operation: &str,
-) -> Result<String, String> {
-    let home = app_home_dir().ok_or("home dir not found")?;
-    let mut command = match runtime {
-        LocalTwRpcRuntime::Bundled { node, cli } => {
-            let mut command = std::process::Command::new(node);
-            command.arg(cli);
-            command
-        }
-        LocalTwRpcRuntime::Installed { tw } => std::process::Command::new(tw),
-    };
-    let output = command
-        .args(rpc_args)
-        // The bundled Node CLI uses os.homedir(), while isolated Dashboard
-        // tests and dev builds use TW_DASHBOARD_HOME. Keep both views aligned.
-        .env("HOME", &home)
-        .env("TW_DASHBOARD_HOME", &home)
-        .output()
-        .map_err(|error| format!("spawn {}: {error}", runtime.audit_label()))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} {operation} failed ({}): {}. No secondary creator was attempted.",
-            runtime.audit_label(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn create_local_worktree_via_tw_rpc(
@@ -1965,113 +1791,6 @@ fn kill_legacy_session(name: &str) -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-fn parse_kill_session_rpc_response(
-    output: &str,
-    runtime_label: &str,
-    expected_session: &str,
-) -> Result<(), String> {
-    let response: TwRpcKillSessionResponse = serde_json::from_str(output.trim())
-        .map_err(|error| format!("parse {runtime_label} kill-session response: {error}"))?;
-    if response.protocol_version != 1 {
-        return Err(format!(
-            "unsupported {runtime_label} TW RPC protocol: {}",
-            response.protocol_version
-        ));
-    }
-    if response.kind != "session-killed" || response.session != expected_session {
-        return Err(format!(
-            "{runtime_label} returned an unexpected kill-session response"
-        ));
-    }
-    Ok(())
-}
-
-fn kill_managed_session_via_tw_rpc(app: &tauri::AppHandle, name: &str) -> Result<(), String> {
-    let (host_id, raw_name) = parse_session_key(name);
-    let rpc_args = ["rpc", "kill-session", "--name", raw_name];
-    let (output, runtime_label) = match host_id {
-        Some(host_id) => {
-            let host = find_host(host_id)?;
-            (run_remote_tw_check(&host, &rpc_args)?, "remote tw")
-        }
-        None => {
-            let home = app_home_dir().ok_or("home dir not found")?;
-            let runtime = resolve_local_tw_rpc_runtime(app, &home)?;
-            let owned_args = rpc_args
-                .iter()
-                .map(|arg| (*arg).to_string())
-                .collect::<Vec<_>>();
-            let output = run_local_tw_rpc_runtime(&runtime, &owned_args, "kill-session")?;
-            (output, runtime.audit_label())
-        }
-    };
-    parse_kill_session_rpc_response(&output, runtime_label, raw_name)
-}
-
-fn kill_rpc_explicitly_allows_legacy_fallback(error: &str) -> bool {
-    let lower = error.to_ascii_lowercase();
-    if lower.contains("session is not tw-managed") {
-        return true;
-    }
-
-    // Only an explicit old-CLI compatibility signal may authorize bypassing
-    // managed state. Do not broadly match words such as "invalid": state
-    // corruption errors intentionally contain that word and must fail closed.
-    let unsupported = lower.contains("unknown")
-        || lower.contains("unrecognized")
-        || lower.contains("unsupported")
-        || lower.contains("invalid");
-    let unsupported_kill_command = unsupported
-        && lower.contains("kill-session")
-        && (lower.contains("rpc command")
-            || lower.contains("rpc subcommand")
-            || lower.contains("subcommand")
-            || lower.contains("command: kill-session")
-            || lower.contains("command 'kill-session'")
-            || lower.contains("command \"kill-session\"")
-            || lower.contains("command `kill-session`")
-            || lower.contains("kill-session command")
-            || lower.contains("kill-session option"));
-    let unsupported_rpc_command = unsupported
-        && (lower.contains("unknown rpc")
-            || lower.contains("unrecognized rpc")
-            || lower.contains("unsupported rpc")
-            || lower.contains("invalid rpc")
-            || lower.contains("rpc command is unknown")
-            || lower.contains("rpc command is unrecognized")
-            || lower.contains("rpc command is unsupported")
-            || lower.contains("rpc command is invalid")
-            || lower.contains("command: rpc")
-            || lower.contains("command 'rpc'")
-            || lower.contains("command \"rpc\"")
-            || lower.contains("command `rpc`"));
-    let remote_tw_missing = lower.contains("tw: not found")
-        || lower.contains("tw: command not found")
-        || lower.contains("command not found: tw")
-        || lower.contains("tw: no such file or directory");
-
-    unsupported_kill_command || unsupported_rpc_command || remote_tw_missing
-}
-
-fn kill_canonical_first<C, L>(
-    managed_hint: Option<bool>,
-    canonical_kill: C,
-    legacy_kill: L,
-) -> Result<(), String>
-where
-    C: FnOnce() -> Result<(), String>,
-    L: FnOnce() -> Result<(), String>,
-{
-    // `managed` comes from a cached UI catalog and can be stale. It must not
-    // decide which mutation owns the session; canonical TW state does that.
-    let _ = managed_hint;
-    match canonical_kill() {
-        Ok(()) => Ok(()),
-        Err(error) if kill_rpc_explicitly_allows_legacy_fallback(&error) => legacy_kill(),
-        Err(error) => Err(error),
-    }
 }
 
 #[tauri::command]
@@ -2269,229 +1988,6 @@ fn session_root(name: String) -> Result<String, String> {
     }
 
     session_cwd(name)
-}
-
-// ── Host management commands ──────────────────────────────────────────
-
-const TW_GITHUB_REPO: &str = "https://github.com/Sskift/tmux-worktree.git";
-
-fn remote_tw_version(host: &HostConfig) -> Result<String, String> {
-    run_remote_tw_check(host, &["version"])
-        .map(|version| version.lines().next().unwrap_or("").trim().to_string())
-}
-
-fn remote_tw_capabilities(host: &HostConfig) -> Result<TwRpcCapabilitiesResponse, String> {
-    let output = run_remote_tw_check(host, &["rpc", "capabilities"])?;
-    serde_json::from_str(&output).map_err(|error| format!("parse tw rpc capabilities: {error}"))
-}
-
-fn tw_rpc_capabilities_compatible(protocol_version: u32, capabilities: &[String]) -> bool {
-    protocol_version == 1
-        && ["list", "create-worktree", "create-terminal", "kill-session"]
-            .iter()
-            .all(|required| capabilities.iter().any(|capability| capability == required))
-}
-
-fn probe_host_status(host: &HostConfig) -> HostStatus {
-    let start = Instant::now();
-    let ssh_result = run_remote_cmd_check(host, &["true"]);
-    let latency = start.elapsed().as_millis() as u64;
-    if let Err(error) = ssh_result {
-        return HostStatus {
-            id: host.id.clone(),
-            label: host.label.clone(),
-            reachable: false,
-            latency_ms: None,
-            error: Some(error),
-            tmux_available: false,
-            tmux_version: None,
-            tmux_error: None,
-            tw_available: false,
-            tw_version: None,
-            tw_error: None,
-            tw_protocol_version: None,
-            tw_capabilities: vec![],
-            tw_compatible: false,
-        };
-    }
-
-    let tmux = run_remote_tmux_check(host, &["-V"]);
-    let (tmux_available, tmux_version, tmux_error) = match tmux {
-        Ok(version) => (true, Some(version), None),
-        Err(error) => (false, None, Some(error)),
-    };
-    let tw_version = remote_tw_version(host);
-    let (tw_available, tw_version, tw_error, tw_protocol_version, tw_capabilities, tw_compatible) =
-        match tw_version {
-            Ok(version) => match remote_tw_capabilities(host) {
-                Ok(capabilities) => {
-                    let compatible = tw_rpc_capabilities_compatible(
-                        capabilities.protocol_version,
-                        &capabilities.capabilities,
-                    );
-                    (
-                        true,
-                        Some(version),
-                        if compatible {
-                            None
-                        } else {
-                            Some("remote tw RPC capabilities are incompatible".to_string())
-                        },
-                        Some(capabilities.protocol_version),
-                        capabilities.capabilities,
-                        compatible,
-                    )
-                }
-                Err(error) => (true, Some(version), Some(error), None, vec![], false),
-            },
-            Err(error) => (false, None, Some(error), None, vec![], false),
-        };
-    HostStatus {
-        id: host.id.clone(),
-        label: host.label.clone(),
-        reachable: true,
-        latency_ms: Some(latency),
-        error: None,
-        tmux_available,
-        tmux_version,
-        tmux_error,
-        tw_available,
-        tw_version,
-        tw_error,
-        tw_protocol_version,
-        tw_capabilities,
-        tw_compatible,
-    }
-}
-
-#[tauri::command]
-fn test_host(args: AddHostArgs) -> Result<HostStatus, String> {
-    let host = HostConfig {
-        id: args.id.trim().to_string(),
-        label: args.label.trim().to_string(),
-        host: args.host.trim().to_string(),
-        user: args
-            .user
-            .filter(|u| !u.trim().is_empty())
-            .map(|u| u.trim().to_string()),
-        port: args.port,
-        identity_file: args
-            .identity_file
-            .filter(|p| !p.trim().is_empty())
-            .map(|p| expand_home_path(p.trim())),
-        worktree_base: args
-            .worktree_base
-            .as_deref()
-            .and_then(trimmed_non_empty_string),
-        tmux_path: args.tmux_path.as_deref().and_then(trimmed_non_empty_string),
-        tw_path: args.tw_path.as_deref().and_then(trimmed_non_empty_string),
-    };
-    validate_ssh_host_fields(&host)?;
-    Ok(probe_host_status(&host))
-}
-
-fn install_host_tw_from_source(host: &HostConfig) -> Result<HostStatus, String> {
-    let script = format!(
-        r#"set -e
-repo={}
-tag={}
-root="$HOME/.local/src/tmux-worktree"
-mkdir -p "$HOME/.local/src"
-if [ -d "$root/.git" ]; then
-  git -C "$root" fetch origin "refs/tags/$tag:refs/tags/$tag" --force
-  git -C "$root" checkout --detach "$tag"
-else
-  rm -rf "$root"
-  git clone --depth 1 --branch "$tag" "$repo" "$root"
-fi
-cd "$root"
-npm install
-npm run build
-npm link --prefix "$HOME/.local"
-"#,
-        shell_quote(TW_GITHUB_REPO),
-        shell_quote(&format!("v{}", env!("CARGO_PKG_VERSION")))
-    );
-    run_remote_cmd_check(host, &["sh", "-lc", &script])
-        .map_err(|e| format!("install remote tw on {}: {e}", host.label))?;
-    Ok(probe_host_status(host))
-}
-
-fn install_host_tw_from_bundled_cli(host: &HostConfig, cli: &Path) -> Result<HostStatus, String> {
-    run_remote_cmd_check(host, &["sh", "-lc", "mkdir -p \"$HOME/.tmux-worktree\""])?;
-    scp_cli_to_host(host, cli, ".tmux-worktree/tw-cli.js")?;
-    let install_path = remote_path_expr(host.tw_path.as_deref().unwrap_or("~/.local/bin/tw"));
-    let script = format!(
-        r#"set -e
-target={install_path}
-mkdir -p "$(dirname "$target")"
-cat > "$target" <<'EOF'
-#!/bin/sh
-exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.js" "$@"
-EOF
-chmod 700 "$target"
-"#
-    );
-    run_remote_cmd_check(host, &["sh", "-lc", &script])
-        .map_err(|error| format!("install bundled tw on {}: {error}", host.label))?;
-    Ok(probe_host_status(host))
-}
-
-#[tauri::command]
-fn install_host_tw(app: tauri::AppHandle, host_id: String) -> Result<HostStatus, String> {
-    let host = find_host(host_id.trim())?;
-    if let Some(cli) = bundled_cli_path(&app) {
-        install_host_tw_from_bundled_cli(&host, &cli)
-    } else {
-        install_host_tw_from_source(&host)
-    }
-}
-
-#[tauri::command]
-async fn host_statuses(state: State<'_, Arc<HostState>>) -> Result<Vec<HostStatus>, String> {
-    let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || host_statuses_blocking(state))
-        .await
-        .map_err(|e| format!("host statuses task failed: {e}"))?
-}
-
-fn host_statuses_blocking(state: Arc<HostState>) -> Result<Vec<HostStatus>, String> {
-    let hosts = load_hosts()?;
-    let now = Instant::now();
-    let mut statuses = Vec::new();
-
-    for host in &hosts {
-        // Check cache first
-        {
-            let cached = state.statuses.lock().unwrap();
-            if let Some(cached_status) = cached.get(&host.id) {
-                if now.duration_since(cached_status.checked_at).as_millis()
-                    < HOST_STATUS_CACHE_MS as u128
-                {
-                    statuses.push(cached_status.status.clone());
-                    continue;
-                }
-            }
-        }
-
-        let status = probe_host_status(host);
-
-        // Cache the result
-        {
-            let mut cached = state.statuses.lock().unwrap();
-            cached.insert(
-                host.id.clone(),
-                CachedHostStatus {
-                    status: status.clone(),
-                    checked_at: now,
-                },
-            );
-        }
-
-        statuses.push(status);
-    }
-
-    Ok(statuses)
 }
 
 fn start_local_terminal_session(raw_name: &str, cwd: &str, ai_cmd: &str) -> Result<(), String> {
@@ -2837,78 +2333,6 @@ fn tcp_addr_open(host: &str, port: u16) -> bool {
         .any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
 }
 
-fn executable_exists(path: &Path) -> bool {
-    path.is_file()
-}
-
-fn which_cmd(name: &str) -> Option<String> {
-    let output = std::process::Command::new("/usr/bin/which")
-        .arg(name)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
-}
-
-fn first_existing_command(candidates: &[&str], name: &str) -> Option<String> {
-    candidates
-        .iter()
-        .find(|path| executable_exists(Path::new(path)))
-        .map(|path| path.to_string())
-        .or_else(|| which_cmd(name))
-}
-
-fn node_bin() -> Option<String> {
-    first_existing_command(
-        &[
-            "/opt/homebrew/bin/node",
-            "/usr/local/bin/node",
-            "/usr/bin/node",
-        ],
-        "node",
-    )
-}
-
-fn bundled_cli_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(path) = std::env::var_os("TW_DASHBOARD_CLI").filter(|v| !v.is_empty()) {
-        paths.push(PathBuf::from(path));
-    }
-    if let Ok(resources) = app.path().resource_dir() {
-        paths.push(resources.join("tw-cli").join("cli.js"));
-        paths.push(resources.join("dist").join("cli.js"));
-        paths.push(resources.join("cli.js"));
-    }
-    paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/cli.js"));
-    paths
-}
-
-fn bundled_cli_path(app: &tauri::AppHandle) -> Option<PathBuf> {
-    bundled_cli_candidates(app)
-        .into_iter()
-        .find(|path| executable_exists(path))
-}
-
-fn installed_tw_command() -> Option<String> {
-    first_existing_command(
-        &[
-            "/opt/homebrew/bin/tw",
-            "/usr/local/bin/tw",
-            "/opt/homebrew/bin/tmux-worktree",
-            "/usr/local/bin/tmux-worktree",
-        ],
-        "tw",
-    )
-    .or_else(|| which_cmd("tmux-worktree"))
-}
-
 fn wait_for_serve(mut child: std::process::Child) -> Option<std::process::Child> {
     for _ in 0..40 {
         if tcp_port_open(8311) {
@@ -3200,59 +2624,6 @@ fn mobile_relay_status_file() -> PathBuf {
 fn load_mobile_relay_runtime_status() -> Option<RelayHostRuntimeStatus> {
     let content = std::fs::read_to_string(mobile_relay_status_file()).ok()?;
     serde_json::from_str(&content).ok()
-}
-
-fn scp_remote_target(host: &HostConfig, remote_path: &str) -> String {
-    let target = match &host.user {
-        Some(user) => format!("{user}@{}", host.host),
-        None => host.host.clone(),
-    };
-    format!("{target}:{remote_path}")
-}
-
-fn scp_cli_command(
-    host: &HostConfig,
-    cli: &Path,
-    remote_path: &str,
-) -> Result<std::process::Command, String> {
-    validate_ssh_host_fields(host)?;
-    let mut cmd = std::process::Command::new("scp");
-    cmd.arg("-q")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3");
-    apply_ssh_multiplex_options(&mut cmd);
-    if let Some(port) = host.port {
-        cmd.arg("-P").arg(port.to_string());
-    }
-    if let Some(key) = &host.identity_file {
-        cmd.arg("-i").arg(key);
-    }
-    // scp does not use ssh's `-l <user>` spelling (`scp -l` is a bandwidth
-    // limit), so retain the validated user@host destination and terminate
-    // option parsing before both operands.
-    cmd.arg("--")
-        .arg(cli)
-        .arg(scp_remote_target(host, remote_path));
-    Ok(cmd)
-}
-
-fn scp_cli_to_host(host: &HostConfig, cli: &Path, remote_path: &str) -> Result<(), String> {
-    let output = scp_cli_command(host, cli, remote_path)?
-        .output()
-        .map_err(|e| format!("scp spawn: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("scp to {} failed: {}", host.label, stderr.trim()));
-    }
-    Ok(())
 }
 
 fn direct_mobile_relay_url_for_host(host: &HostConfig, port: u16) -> String {

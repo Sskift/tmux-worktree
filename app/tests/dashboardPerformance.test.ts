@@ -6,6 +6,12 @@ import { readRustSourceTree } from "./rustSource.ts";
 
 const renderer = readRendererImplementationTree();
 
+const hostStatusesSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn host_statuses\s*\(\s*state:\s*State<'_,\s*Arc<HostState>>,?\s*\)\s*->\s*Result<Vec<HostStatus>,\s*String>\s*\{/m;
+const gitGraphRefsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_graph_refs\s*\(\s*cwd:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<GitGraphRefs,\s*String>\s*\{/m;
+const gitFetchProjectRootsSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_fetch_project_roots\s*\(\s*state:\s*State<'_,\s*Arc<GitFetchState>>,?\s*\)\s*->\s*Result<\(\),\s*String>\s*\{/m;
+const gitStatusSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_status\s*\(\s*cwd:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<Option<GitStatus>,\s*String>\s*\{/m;
+const gitDiffSignature = /^[ \t]*(?:pub\(crate\)[ \t]+)?async fn git_diff\s*\(\s*cwd:\s*String,\s*path:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<String,\s*String>\s*\{/m;
+
 test("dashboard refresh preserves state identity when polled data is unchanged", () => {
   assert.match(renderer, /function sameSessions\(/);
   assert.match(renderer, /function samePlainTerminals\(/);
@@ -50,28 +56,48 @@ test("tauri polling commands run blocking tmux and ssh work off the main thread"
   assert.match(rust, /spawn_blocking\(list_local_dashboard_catalog_blocking\)/);
   assert.match(rust, /async fn list_tmux_terminals\(\) -> Result<Vec<TmuxTerminal>, String> \{/);
   assert.match(rust, /spawn_blocking\(list_tmux_terminals_blocking\)/);
-  assert.match(rust, /async fn host_statuses\(state: State<'_, Arc<HostState>>\) -> Result<Vec<HostStatus>, String> \{/);
+  assert.match(rust, hostStatusesSignature);
   assert.match(rust, /spawn_blocking\(move \|\| host_statuses_blocking\(state\)\)/);
-  assert.match(
-    rust,
-    /(?:pub\(crate\)\s+)?async fn git_graph_refs\s*\(\s*cwd:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<GitGraphRefs,\s*String>\s*\{/,
-  );
+  assert.match(rust, gitGraphRefsSignature);
   assert.match(rust, /spawn_blocking\(move \|\| git_graph_refs_for\(&cwd, host_id\.as_deref\(\)\)\)/);
   assert.match(rust, /async fn git_graph\([\s\S]*?\) -> Result<GitGraphResult, String> \{/);
   assert.match(rust, /spawn_blocking\(move \|\| git_graph_for\(&cwd, host_id\.as_deref\(\), query\)\)/);
-  assert.match(
-    rust,
-    /(?:pub\(crate\)\s+)?async fn git_fetch_project_roots\s*\(\s*state:\s*State<'_,\s*Arc<GitFetchState>>,?\s*\)\s*->\s*Result<\(\),\s*String>\s*\{/,
-  );
+  assert.match(rust, gitFetchProjectRootsSignature);
   assert.match(rust, /spawn_blocking\(move \|\| git_fetch_project_roots_blocking\(state\)\)/);
-  assert.match(
-    rust,
-    /(?:pub\(crate\)\s+)?async fn git_status\s*\(\s*cwd:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<Option<GitStatus>,\s*String>\s*\{/,
-  );
+  assert.match(rust, gitStatusSignature);
   assert.match(rust, /spawn_blocking\(move \|\| git_status_for\(&cwd, host_id\.as_deref\(\)\)\)/);
-  assert.match(
-    rust,
-    /(?:pub\(crate\)\s+)?async fn git_diff\s*\(\s*cwd:\s*String,\s*path:\s*String,\s*host_id:\s*Option<String>,?\s*\)\s*->\s*Result<String,\s*String>\s*\{/,
-  );
+  assert.match(rust, gitDiffSignature);
   assert.match(rust, /spawn_blocking\(move \|\| git_diff_for\(&cwd, &path, host_id\.as_deref\(\)\)\)/);
+});
+
+test("polling command characterization rejects broader Rust visibility", () => {
+  const signatures = [
+    [
+      hostStatusesSignature,
+      "async fn host_statuses(state: State<'_, Arc<HostState>>) -> Result<Vec<HostStatus>, String> {",
+    ],
+    [
+      gitGraphRefsSignature,
+      "async fn git_graph_refs(cwd: String, host_id: Option<String>) -> Result<GitGraphRefs, String> {",
+    ],
+    [
+      gitFetchProjectRootsSignature,
+      "async fn git_fetch_project_roots(state: State<'_, Arc<GitFetchState>>) -> Result<(), String> {",
+    ],
+    [
+      gitStatusSignature,
+      "async fn git_status(cwd: String, host_id: Option<String>) -> Result<Option<GitStatus>, String> {",
+    ],
+    [
+      gitDiffSignature,
+      "async fn git_diff(cwd: String, path: String, host_id: Option<String>) -> Result<String, String> {",
+    ],
+  ] as const;
+
+  for (const [pattern, privateSignature] of signatures) {
+    assert.match(privateSignature, pattern);
+    assert.match(`\tpub(crate) ${privateSignature}`, pattern);
+    assert.doesNotMatch(`pub ${privateSignature}`, pattern);
+    assert.doesNotMatch(`pub(super) ${privateSignature}`, pattern);
+  }
 });

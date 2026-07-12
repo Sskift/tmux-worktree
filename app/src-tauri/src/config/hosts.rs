@@ -2,12 +2,10 @@ use super::{
     acquire_dashboard_config_file_lock, dashboard_config_write_lock, string_field,
     trimmed_non_empty_string,
 };
-use crate::remote::{validate_host_id, validate_ssh_host_fields, HostConfig, HostState};
+use crate::remote::{validate_host_id, validate_ssh_host_fields, HostConfig};
 use crate::support::{app_home_dir, atomic_write_file, expand_home_path};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use tauri::State;
 
 fn load_configured_hosts() -> Result<Vec<HostConfig>, String> {
     let home = app_home_dir().ok_or("home dir not found")?;
@@ -505,7 +503,7 @@ pub(crate) fn list_ssh_host_candidates() -> Result<Vec<HostConfig>, String> {
     Ok(load_ssh_host_candidates())
 }
 
-fn add_host_config(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
+pub(crate) fn add_host_config(args: AddHostArgs) -> Result<Vec<HostConfig>, String> {
     let id = args.id.trim();
     let label = args.label.trim();
     let host = args.host.trim();
@@ -604,45 +602,7 @@ pub(crate) fn update_host_config(args: UpdateHostArgs) -> Result<Vec<HostConfig>
     load_hosts()
 }
 
-pub(crate) fn invalidate_host_status_cache(state: &HostState, id: &str) -> Result<(), String> {
-    state
-        .statuses
-        .lock()
-        .map_err(|_| "host status cache lock poisoned".to_string())?
-        .remove(id);
-    Ok(())
-}
-
-pub(crate) fn add_host_with_state(
-    args: AddHostArgs,
-    state: &HostState,
-) -> Result<Vec<HostConfig>, String> {
-    let id = args.id.trim().to_string();
-    let hosts = add_host_config(args)?;
-    invalidate_host_status_cache(state, &id)?;
-    Ok(hosts)
-}
-
-#[tauri::command]
-pub(crate) fn add_host(
-    args: AddHostArgs,
-    state: State<'_, Arc<HostState>>,
-) -> Result<Vec<HostConfig>, String> {
-    add_host_with_state(args, state.inner().as_ref())
-}
-
-#[tauri::command]
-pub(crate) fn update_host(
-    args: UpdateHostArgs,
-    state: State<'_, Arc<HostState>>,
-) -> Result<Vec<HostConfig>, String> {
-    let id = args.id.trim().to_string();
-    let hosts = update_host_config(args)?;
-    invalidate_host_status_cache(state.inner().as_ref(), &id)?;
-    Ok(hosts)
-}
-
-fn remove_host_config(id: &str) -> Result<Vec<HostConfig>, String> {
+pub(crate) fn remove_host_config(id: &str) -> Result<Vec<HostConfig>, String> {
     let _guard = dashboard_config_write_lock()
         .lock()
         .map_err(|_| "dashboard config write lock poisoned".to_string())?;
@@ -651,22 +611,4 @@ fn remove_host_config(id: &str) -> Result<Vec<HostConfig>, String> {
     hosts.retain(|host| host.id != id);
     save_hosts_config_unlocked(&hosts)?;
     load_hosts()
-}
-
-pub(crate) fn remove_host_with_state(
-    id: String,
-    state: &HostState,
-) -> Result<Vec<HostConfig>, String> {
-    let id = id.trim().to_string();
-    let hosts = remove_host_config(&id)?;
-    invalidate_host_status_cache(state, &id)?;
-    Ok(hosts)
-}
-
-#[tauri::command]
-pub(crate) fn remove_host(
-    id: String,
-    state: State<'_, Arc<HostState>>,
-) -> Result<Vec<HostConfig>, String> {
-    remove_host_with_state(id, state.inner().as_ref())
 }
