@@ -25,6 +25,10 @@ const sources = {
     new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
     "utf8",
   ),
+  terminalDeck: readFileSync(
+    new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 const canonicalModules = {
@@ -440,24 +444,15 @@ function locateAppPolling(source: string): AppPollingAst {
     "HIDDEN_REFRESH_MS",
   );
 
-  const previewEffects = statements.flatMap((statement, index) => {
+  const previewPhases = statements.flatMap((statement, index) => {
     if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return [];
-    if (expressionPath(statement.expression.expression) !== "useEffect") return [];
-    const callback = statement.expression.arguments[0];
-    if (!callback || (!ts.isArrowFunction(callback) && !ts.isFunctionExpression(callback))) return [];
-    if (!ts.isBlock(callback.body)) return [];
-    const captureCalls = callExpressionsWithPath(
-      callback.body,
-      "dashboardBackend.sessions.captureHistory",
-    ).filter((call) =>
-      call.arguments.length === 2
-      && expressionPath(call.arguments[0]) === "name"
-      && expressionPath(call.arguments[1]) === "PRELOAD_HISTORY_LINES"
-    );
-    return captureCalls.length === 1 ? [{ index }] : [];
+    return expressionPath(statement.expression.expression) === "useTerminalDeckPreviewPhase"
+      ? [{ call: statement.expression, index }]
+      : [];
   });
-  assert.equal(previewEffects.length, 1, "App must directly own the real preview useEffect");
-  const previewIndex = previewEffects[0].index;
+  assert.equal(previewPhases.length, 1, "App must directly register the preview phase");
+  assert.equal(previewPhases[0].call.arguments.length, 3);
+  const previewIndex = previewPhases[0].index;
 
   const automationDeclarations = statements.flatMap((statement, index) => {
     if (!ts.isVariableStatement(statement)) return [];
@@ -702,7 +697,7 @@ test("a successful full publication invokes the latest callback exactly once as 
   assertFullPublicationStatements(locateWorkspaceRefresh(sources.workspace));
 });
 
-test("App registers workspace polling after the existing selection preview effect", () => {
+test("App registers workspace polling after the terminal deck preview phase", () => {
   const analysis = locateAppPolling(sources.app);
   assert.ok(analysis.previewIndex < analysis.pollingIndex);
   assert.ok(analysis.pollingIndex < analysis.automationIndex);
@@ -745,23 +740,22 @@ test("workspace refresh AST guard rejects string, nested, duplicate-key, and spr
 
 test("App polling AST guard rejects string, nested, duplicate-key, and spread decoys", () => {
   const realPreview = `
-    useEffect(() => {
-      dashboardBackend.sessions.captureHistory(name, PRELOAD_HISTORY_LINES);
-    }, []);
+    useTerminalDeckPreviewPhase(terminalDeck, dashboardBackend, {
+      sessions,
+      allTerminals,
+    });
   `;
   const automation = "const handleAutomationCreate = useCallback(() => {}, []);";
   assert.throws(() => locateAppPolling(`
     function App() {
-      useEffect(() => {
-        const decoy = "dashboardBackend.sessions.captureHistory(name, PRELOAD_HISTORY_LINES)";
-      }, []);
+      const decoy = "useTerminalDeckPreviewPhase(terminalDeck, dashboardBackend, inputs)";
       useVisibilityAwarePolling(refresh, {
         visibleIntervalMs: REFRESH_MS,
         hiddenIntervalMs: HIDDEN_REFRESH_MS,
       });
       ${automation}
     }
-  `), /real preview useEffect/);
+  `), /preview phase/);
   assert.throws(() => locateAppPolling(`
     function App() {
       ${realPreview}
@@ -799,7 +793,7 @@ test("App polling AST guard rejects string, nested, duplicate-key, and spread de
 });
 
 test("App supplies a stable functional full-catalog prune callback", () => {
-  const sourceFile = parse("App.tsx", sources.app);
+  const sourceFile = parse("useTerminalDeckState.ts", sources.terminalDeck);
   const callback = variableDeclaration(sourceFile, "handleFullCatalogPublished");
   assert.ok(callback.initializer && ts.isCallExpression(callback.initializer));
   assert.equal(callback.initializer.expression.getText(sourceFile), "useCallback");
@@ -815,5 +809,8 @@ test("App supplies a stable functional full-catalog prune callback", () => {
     sources.app,
     /useWorkspaceCatalog\(\{\s*sessionOrder,\s*onFullCatalogPublished: handleFullCatalogPublished,\s*\}\)/s,
   );
-  assert.doesNotMatch(sources.app, /authoritativeCatalogGeneration|authoritativeSessionNames/);
+  assert.doesNotMatch(
+    `${sources.app}\n${sources.terminalDeck}`,
+    /authoritativeCatalogGeneration|authoritativeSessionNames/,
+  );
 });

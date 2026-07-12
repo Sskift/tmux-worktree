@@ -35,6 +35,10 @@ const sources = {
     ),
     "utf8",
   ),
+  terminalDeck: readFileSync(
+    new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -824,33 +828,32 @@ test("App leaves selection state local and preserves reconciliation as global ef
   const relayEffects = appEffects.filter(({ call: effect }) =>
     directCalls(effectCallbackBlock(effect), "mobileRelay.setPopoverOpen").length === 1
   );
-  const previewEffects = appEffects.filter(({ call: effect }) => {
-    const callback = effectCallbackBlock(effect);
-    return callback.statements.some((statement) =>
-      ts.isExpressionStatement(statement) &&
-      ts.isBinaryExpression(statement.expression) &&
-      statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-      expressionPath(statement.expression.left) === "tmuxPreviewLiveRef.current" &&
-      expressionPath(statement.expression.right) === "live"
-    );
-  });
+  const previewPhases = directTopLevelCalls(app.body, "useTerminalDeckPreviewPhase");
   const polling = directCalls(app.body, "useVisibilityAwarePolling");
   assert.equal(layoutLoadEffects.length, 1);
   assert.equal(relayEffects.length, 1);
-  assert.equal(previewEffects.length, 1);
+  assert.equal(previewPhases.length, 1);
   assert.equal(polling.length, 1);
-  assert.deepEqual(callDependencies(previewEffects[0].call, appFile), [
+  const previewFunction = directFunction(
+    parse("useTerminalDeckState.ts", sources.terminalDeck),
+    "useTerminalDeckPreviewPhase",
+  );
+  assert.ok(previewFunction.body);
+  const previewEffects = directCalls(previewFunction.body, "useEffect");
+  assert.equal(previewEffects.length, 1);
+  assert.deepEqual(callDependencies(previewEffects[0].call, previewFunction.getSourceFile()), [
     "sessions",
     "allTerminals",
   ]);
   assert.ok(layoutLoadEffects[0].index < selectionIndex);
   assert.ok(relayEffects[0].index < selectionIndex);
-  assert.ok(selectionIndex < previewEffects[0].index);
-  assert.ok(previewEffects[0].index < polling[0].index);
+  assert.ok(selectionIndex < previewPhases[0].index);
+  assert.ok(previewPhases[0].index < polling[0].index);
 
   for (const hookName of [
     "useConnectionCatalog",
     "useMobileRelayController",
+    "useTerminalDeckState",
     "useTerminalMetadataHydrationPhase",
     "useTerminalMetadataPersistencePhase",
   ]) {
@@ -890,19 +893,23 @@ test("App leaves selection state local and preserves reconciliation as global ef
   const effectsBeforeSelection = directAppEffectsBefore +
     effectContribution(sources.connection, "useConnectionCatalog") +
     effectContribution(sources.relay, "useMobileRelayController") +
+    effectContribution(sources.terminalDeck, "useTerminalDeckState") +
     effectContribution(sources.metadata, "useTerminalMetadataHydrationPhase") +
     effectContribution(sources.metadata, "useTerminalMetadataPersistencePhase");
   assert.equal(directAppEffectsBefore, 8);
   assert.equal(effectsBeforeSelection, 18);
-  assert.equal(
-    effectsBeforeSelection + callsWithPath(
+  const selectionEffectNumber = effectsBeforeSelection + callsWithPath(
       directFunction(
         parse("useCatalogSelectionHydration.ts", sources.selection),
         "useCatalogSelectionHydration",
       ).body!,
       "useEffect",
-    ).length,
-    19,
+    ).length;
+  assert.equal(selectionEffectNumber, 19);
+  assert.equal(
+    selectionEffectNumber + previewEffects.length,
+    20,
+    "the preview phase must contribute global effect 20",
   );
 
   const restoredSelectionBranches: ts.IfStatement[] = [];

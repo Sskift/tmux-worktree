@@ -20,6 +20,10 @@ const selectionHydrationSource = readFileSync(
   ),
   "utf8",
 );
+const terminalDeckStateSource = readFileSync(
+  new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
+  "utf8",
+);
 const deckSource = readFileSync(
   new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url),
   "utf8",
@@ -113,11 +117,11 @@ test("scratch terminals stay mounted when the panel is collapsed", () => {
 test("pending remote selections never fall back to local terminal or workspace commands", () => {
   assert.match(selectionHydrationSource, /const selectionMetadataPending =/);
   assert.match(
-    appSource,
+    terminalDeckStateSource,
     /if \(!selectedSession \|\| selectionMetadataPending\) return;/,
   );
   assert.match(
-    appSource,
+    terminalDeckStateSource,
     /if \(!selectedTerminal \|\| selectionMetadataPending\) return;/,
   );
   assert.match(appSource, /selectionMetadataPending\s*\? null\s*: selection\?\.kind === "session"/s);
