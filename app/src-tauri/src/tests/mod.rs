@@ -1,36 +1,38 @@
 use super::{
     acquire_dashboard_config_file_lock, add_host_with_state, agent_running_from_pane_title,
     append_automation_run, atomic_write_file_with, automation_command_with_instruction,
-    build_local_worktree_rpc_args, cleanup_pending_worktrees, config_worktree_base,
-    config_worktree_base_with_home, create_local_terminal_via_runtime,
+    build_local_worktree_rpc_args, classify_dashboard_layout, cleanup_pending_worktrees,
+    config_worktree_base, config_worktree_base_with_home, create_local_terminal_via_runtime,
     create_local_worktree_via_runtime, create_remote_terminal_via_tw_rpc, create_remote_worktree,
-    default_worktree_base, delete_automation_from_list, delete_worktree, derive_session_name,
-    ensure_terminal_session, fetchable_project_paths, find_host, finish_git_fetch_target,
-    git_fetch_args, git_graph_for, git_graph_refs_for, hosts_from_config,
-    install_host_tw_from_source, invalidate_host_status_cache, is_git_worktree_dir,
-    is_managed_worktree_session, kill_canonical_first, kill_legacy_plain_terminal,
-    kill_legacy_session, kill_rpc_explicitly_allows_legacy_fallback, layout_backup_path,
-    layout_schema_version, list_automation_runs, list_orphaned_worktrees, list_remote_sessions,
-    list_remote_tmux_terminals, load_hosts, load_pending_cleanup, load_terminals,
-    managed_worktree_root_for_session, orphaned_worktrees, parse_kill_session_rpc_response,
-    parse_local_worktree_rpc_response, parse_session_key, probe_local_agents_in_paths,
-    project_from_config, project_from_worktree_path, projects_from_config,
-    projects_from_config_with_home, read_dashboard_config_lock_owner, remote_file_exists_for_host,
-    remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
-    remote_write_file_for_host, remove_host_with_state, reserve_git_fetch_target,
-    restore_local_worktree_via_runtime, run_remote_tmux_check, run_remote_tw_check,
-    save_automation, save_hosts_config, save_layout, save_pending_cleanup, save_terminals,
-    scp_cli_command, select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
+    dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
+    delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
+    find_host, finish_git_fetch_target, git_fetch_args, git_graph_for, git_graph_refs_for,
+    hosts_from_config, install_host_tw_from_source, invalidate_host_status_cache,
+    is_git_worktree_dir, is_managed_worktree_session,
+    json_number_texts_semantically_equal_for_test, kill_canonical_first,
+    kill_legacy_plain_terminal, kill_legacy_session, kill_rpc_explicitly_allows_legacy_fallback,
+    layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
+    list_orphaned_worktrees, list_remote_sessions, list_remote_tmux_terminals, load_hosts,
+    load_layout_from_path, load_pending_cleanup, load_terminals, managed_worktree_root_for_session,
+    orphaned_worktrees, parse_kill_session_rpc_response, parse_local_worktree_rpc_response,
+    parse_session_key, probe_local_agents_in_paths, project_from_config,
+    project_from_worktree_path, projects_from_config, projects_from_config_with_home,
+    read_dashboard_config_lock_owner, remote_file_exists_for_host, remote_home_dir_for_host,
+    remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
+    remove_host_with_state, reserve_git_fetch_target, restore_local_worktree_via_runtime,
+    run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
+    save_layout_to_path, save_pending_cleanup, save_terminals, scp_cli_command,
+    select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
     ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
     trigger_automation_with_creator, try_cleanup_worktree, tw_rpc_capabilities_compatible,
     update_host_config, upsert_automation_from_input, validate_ssh_host_fields,
     worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs, AgentProbeResult,
     Automation, AutomationOverlap, AutomationRun, AutomationStatus, AutomationTriggerType,
-    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner, DeleteWorktreeArgs,
-    EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind,
-    HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs,
-    SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT,
-    GIT_FETCH_INTERVAL_SECONDS,
+    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
+    DashboardLayoutClassification, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
+    GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
+    LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
+    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -4212,16 +4214,246 @@ fn remove_then_readd_same_host_id_never_reuses_cached_status() {
     restore_env("HOME", original_home);
 }
 
+fn canonical_dashboard_layout(label: &str) -> serde_json::Value {
+    serde_json::json!({
+        "schemaVersion": 2,
+        "columnOrder": ["file", "main", "scratch", "editor"],
+        "sidebarWidth": if label == "first" { 280 } else { 320 },
+        "selection": { "kind": "session", "name": label },
+        "opaqueExtension": { "label": label }
+    })
+}
+
 #[test]
-fn layout_schema_migration_backup_is_created_once_and_save_is_idempotent() {
-    let _guard = test_env_lock().lock().expect("lock");
-    let original_home = std::env::var("HOME").ok();
-    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+fn layout_revision_contract_distinguishes_presence_and_raw_bytes() {
+    assert_eq!(
+        layout_revision_for_raw(false, b"ignored when absent"),
+        "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY"
+    );
+    assert_eq!(
+        layout_revision_for_raw(true, b""),
+        "twlr1_uCszqlYIarkwDHDFcC2d4YipbZ_B3Uc8l5QiZiVL-CA"
+    );
+    assert_eq!(
+        layout_revision_for_raw(true, b"{}"),
+        "twlr1_HfyBm0VsDGpTixmc8n6KpBqTiqpSf26rY03Pph07iM8"
+    );
+}
+
+#[test]
+fn layout_safe_integer_validation_matches_javascript_number_semantics() {
+    let decimal = serde_json::from_str::<serde_json::Value>(
+        r#"{
+          "schemaVersion": 2.0,
+          "columnOrder": ["file", "main", "scratch", "editor"],
+          "editingFile": { "path": "/repo/app.ts", "line": 12.0, "column": 1e0 }
+        }"#,
+    )
+    .expect("parse decimal integer representations");
+    assert_eq!(
+        classify_dashboard_layout(&decimal),
+        DashboardLayoutClassification::Current
+    );
+
     let temp = tempfile::tempdir().expect("tempdir");
-    unsafe {
-        std::env::set_var("HOME", temp.path());
-        std::env::set_var("TW_DASHBOARD_HOME", temp.path());
-    }
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    save_layout_to_path(&path, decimal, &layout_revision_for_raw(false, b""))
+        .expect("safe integer number representations are canonical");
+
+    let max_safe_marker =
+        serde_json::from_str::<serde_json::Value>(r#"{"schemaVersion":9007199254740991}"#)
+            .expect("parse max-safe marker");
+    assert_eq!(
+        classify_dashboard_layout(&max_safe_marker),
+        DashboardLayoutClassification::Future(9_007_199_254_740_991)
+    );
+    let unsafe_marker =
+        serde_json::from_str::<serde_json::Value>(r#"{"schemaVersion":9007199254740992}"#)
+            .expect("parse unsafe marker");
+    assert_eq!(
+        classify_dashboard_layout(&unsafe_marker),
+        DashboardLayoutClassification::Invalid
+    );
+
+    let max_safe_location = serde_json::from_str::<serde_json::Value>(
+        r#"{
+          "schemaVersion": 2,
+          "columnOrder": ["file", "main", "scratch", "editor"],
+          "editingFile": { "path": "/repo/app.ts", "line": 9007199254740991 }
+        }"#,
+    )
+    .expect("parse max-safe location");
+    assert_eq!(
+        classify_dashboard_layout(&max_safe_location),
+        DashboardLayoutClassification::Current
+    );
+    let unsafe_location = serde_json::from_str::<serde_json::Value>(
+        r#"{
+          "schemaVersion": 2,
+          "columnOrder": ["file", "main", "scratch", "editor"],
+          "editingFile": { "path": "/repo/app.ts", "line": 9007199254740992 }
+        }"#,
+    )
+    .expect("parse unsafe location");
+    assert_eq!(
+        classify_dashboard_layout(&unsafe_location),
+        DashboardLayoutClassification::Invalid
+    );
+}
+
+#[test]
+fn layout_load_distinguishes_missing_from_present_empty_file() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    let missing = load_layout_from_path(&path).expect("load missing layout");
+    assert_eq!(missing.layout, serde_json::json!({}));
+    assert_eq!(missing.revision, layout_revision_for_raw(false, b""));
+
+    fs::write(&path, b"").expect("write empty layout");
+    let error = load_layout_from_path(&path).expect_err("present empty layout must be blocked");
+    assert_eq!(error.code, "LAYOUT_STATE_BLOCKED");
+    assert!(!error.retryable);
+    assert_eq!(
+        error.current_revision.as_deref(),
+        Some(layout_revision_for_raw(true, b"").as_str())
+    );
+}
+
+#[test]
+fn layout_cas_supports_winner_conflict_and_stale_semantic_idempotence() {
+    assert!(json_number_texts_semantically_equal_for_test("-0.0", "0"));
+    assert!(json_number_texts_semantically_equal_for_test(
+        "1e2", "100.0"
+    ));
+    assert!(!json_number_texts_semantically_equal_for_test("1e2", "1e3"));
+    assert!(!json_number_texts_semantically_equal_for_test(
+        "invalid",
+        "also-invalid"
+    ));
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    let missing_revision = layout_revision_for_raw(false, b"");
+    let first_layout = canonical_dashboard_layout("first");
+    let first = save_layout_to_path(&path, first_layout.clone(), &missing_revision)
+        .expect("first CAS write");
+    assert!(!first.unchanged);
+
+    let stale_identical = save_layout_to_path(&path, first_layout, &missing_revision)
+        .expect("stale identical write is semantically idempotent");
+    assert!(stale_identical.unchanged);
+    assert_eq!(stale_identical.revision, first.revision);
+
+    let second_layout = canonical_dashboard_layout("second");
+    let conflict = save_layout_to_path(&path, second_layout.clone(), &missing_revision)
+        .expect_err("stale different write must conflict");
+    assert_eq!(conflict.code, "LAYOUT_REVISION_CONFLICT");
+    assert!(!conflict.retryable);
+    assert_eq!(
+        conflict.current_revision.as_deref(),
+        Some(first.revision.as_str())
+    );
+    let serialized = serde_json::to_value(&conflict).expect("serialize conflict");
+    assert_eq!(serialized["code"], "LAYOUT_REVISION_CONFLICT");
+    assert_eq!(serialized["retryable"], false);
+    assert_eq!(serialized["currentRevision"], first.revision);
+
+    let second = save_layout_to_path(&path, second_layout.clone(), &stale_identical.revision)
+        .expect("matching revision advances CAS");
+    assert!(!second.unchanged);
+    assert_ne!(second.revision, stale_identical.revision);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&path).expect("read winner"))
+            .expect("parse winner"),
+        second_layout
+    );
+
+    let numeric_path = temp.path().join("numeric-layout.json");
+    let integer_layout = serde_json::json!({
+        "schemaVersion": 2,
+        "columnOrder": ["file", "main", "scratch", "editor"],
+        "sidebarWidth": 2,
+        "opaqueNumber": 1
+    });
+    let integer_raw = serde_json::to_vec_pretty(&integer_layout).expect("serialize integer layout");
+    fs::write(&numeric_path, &integer_raw).expect("write integer layout");
+    let integer_revision = layout_revision_for_raw(true, &integer_raw);
+    let decimal_layout = serde_json::json!({
+        "schemaVersion": 2.0,
+        "columnOrder": ["file", "main", "scratch", "editor"],
+        "sidebarWidth": 2.0,
+        "opaqueNumber": 1e0
+    });
+    let numeric_idempotent = save_layout_to_path(
+        &numeric_path,
+        decimal_layout,
+        &layout_revision_for_raw(false, b""),
+    )
+    .expect("mathematically equal JSON numbers ignore stale revision");
+    assert!(numeric_idempotent.unchanged);
+    assert_eq!(numeric_idempotent.revision, integer_revision);
+    assert_eq!(
+        fs::read(&numeric_path).expect("numeric layout remains byte-identical"),
+        integer_raw
+    );
+
+    let large_integer_layout = serde_json::json!({
+        "schemaVersion": 2,
+        "columnOrder": ["file", "main", "scratch", "editor"],
+        "opaqueNumber": 9_007_199_254_740_992_u64
+    });
+    let large_integer_raw =
+        serde_json::to_vec_pretty(&large_integer_layout).expect("serialize large integer layout");
+    fs::write(&numeric_path, &large_integer_raw).expect("write large integer layout");
+    let distinct_large_integer = serde_json::json!({
+        "schemaVersion": 2,
+        "columnOrder": ["file", "main", "scratch", "editor"],
+        "opaqueNumber": 9_007_199_254_740_993_u64
+    });
+    let conflict = save_layout_to_path(
+        &numeric_path,
+        distinct_large_integer,
+        &layout_revision_for_raw(false, b""),
+    )
+    .expect_err("distinct large integers must not compare through f64");
+    assert_eq!(conflict.code, "LAYOUT_REVISION_CONFLICT");
+    assert_eq!(
+        fs::read(&numeric_path).expect("large integer layout unchanged"),
+        large_integer_raw
+    );
+}
+
+#[test]
+fn concurrent_layout_cas_has_exactly_one_winner() {
+    use std::sync::{Arc, Barrier};
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    let revision = layout_revision_for_raw(false, b"");
+    let barrier = Arc::new(Barrier::new(3));
+    let handles = ["first", "second"].map(|label| {
+        let path = path.clone();
+        let revision = revision.clone();
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            save_layout_to_path(&path, canonical_dashboard_layout(label), &revision)
+        })
+    });
+    barrier.wait();
+    let outcomes = handles.map(|handle| handle.join().expect("join CAS writer"));
+    assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+    let errors = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, "LAYOUT_REVISION_CONFLICT");
+}
+
+#[test]
+fn layout_migration_backup_requires_authorized_write_and_uses_layout_lock_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join(".tw-dashboard-layout.json");
     let legacy = serde_json::json!({
         "left": 240,
@@ -4230,18 +4462,35 @@ fn layout_schema_migration_backup_is_created_once_and_save_is_idempotent() {
     let legacy_text = serde_json::to_string_pretty(&legacy).expect("serialize legacy");
     fs::write(&path, &legacy_text).expect("write legacy layout");
 
-    let first_v2 = serde_json::json!({
-        "schemaVersion": 2,
-        "sidebar": { "width": 280 },
-        "selection": { "kind": "session", "id": "local:dashboard" }
-    });
-    assert_eq!(layout_schema_version(&first_v2), 2);
-    assert_eq!(
-        layout_schema_version(&serde_json::json!({ "version": 2 })),
-        2
-    );
-    save_layout(first_v2.clone()).expect("save migrated layout");
+    let legacy_revision = layout_revision_for_raw(true, legacy_text.as_bytes());
+    let first_v2 = canonical_dashboard_layout("first");
     let backup_path = layout_backup_path(&path, 1);
+    let lock_path = layout_lock_path(&path);
+    assert_eq!(
+        lock_path.file_name().and_then(|name| name.to_str()),
+        Some(".tw-dashboard-layout.json.lock")
+    );
+    fs::create_dir(&lock_path).expect("create stale layout lock");
+    fs::write(
+        lock_path.join("owner.json"),
+        r#"{"owner":"stale-test-owner","createdAt":0}"#,
+    )
+    .expect("write stale lock owner");
+
+    let conflict = save_layout_to_path(
+        &path,
+        first_v2.clone(),
+        &layout_revision_for_raw(false, b""),
+    )
+    .expect_err("stale migration must conflict");
+    assert_eq!(conflict.code, "LAYOUT_REVISION_CONFLICT");
+    assert!(!backup_path.exists());
+    assert!(
+        !lock_path.exists(),
+        "save must acquire and release <layout>.lock"
+    );
+
+    save_layout_to_path(&path, first_v2.clone(), &legacy_revision).expect("save migrated layout");
     assert_eq!(
         backup_path.file_name().and_then(|name| name.to_str()),
         Some(".tw-dashboard-layout.v1.backup.json")
@@ -4259,13 +4508,12 @@ fn layout_schema_migration_backup_is_created_once_and_save_is_idempotent() {
         first_v2
     );
 
-    let updated_v2 = serde_json::json!({
-        "schemaVersion": 2,
-        "sidebar": { "width": 300 },
-        "selection": { "kind": "session", "id": "local:dashboard" }
-    });
-    save_layout(updated_v2.clone()).expect("repeat v2 save");
-    save_layout(updated_v2.clone()).expect("idempotent v2 save");
+    let current_raw = fs::read(&path).expect("read current layout");
+    let current_revision = layout_revision_for_raw(true, &current_raw);
+    let updated_v2 = canonical_dashboard_layout("second");
+    save_layout_to_path(&path, updated_v2.clone(), &current_revision).expect("repeat v2 save");
+    save_layout_to_path(&path, updated_v2.clone(), &legacy_revision)
+        .expect("stale idempotent v2 save");
     assert_eq!(
         fs::read(&backup_path).expect("backup unchanged"),
         backup_once
@@ -4277,16 +4525,108 @@ fn layout_schema_migration_backup_is_created_once_and_save_is_idempotent() {
         .expect("parse updated v2"),
         updated_v2
     );
+}
 
-    fs::write(&path, "{ invalid layout").expect("write malformed layout");
-    let malformed_before = fs::read(&path).expect("malformed before");
-    let error = save_layout(serde_json::json!({ "schemaVersion": 3 }))
-        .expect_err("malformed source must block migration");
-    assert!(error.contains("parse layout for backup"));
-    assert_eq!(fs::read(&path).expect("malformed after"), malformed_before);
+#[test]
+fn layout_cas_blocks_future_malformed_and_invalid_current_state_even_when_revision_matches() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    let next = canonical_dashboard_layout("first");
+    let cases = [
+        br#"{"schemaVersion":3,"columnOrder":["file","main","scratch","editor"]}"#.as_slice(),
+        br#"{ malformed"#.as_slice(),
+        br#"{"schemaVersion":2,"columnOrder":["file","file","scratch","editor"]}"#.as_slice(),
+    ];
+    for raw in cases {
+        fs::write(&path, raw).expect("write blocked layout");
+        let before = fs::read(&path).expect("read blocked layout");
+        let revision = layout_revision_for_raw(true, &before);
+        let error = save_layout_to_path(&path, next.clone(), &revision)
+            .expect_err("blocked state must not be downgraded");
+        assert_eq!(error.code, "LAYOUT_STATE_BLOCKED");
+        assert!(!error.retryable);
+        assert_eq!(error.current_revision.as_deref(), Some(revision.as_str()));
+        assert_eq!(fs::read(&path).expect("blocked layout unchanged"), before);
+        assert!(!layout_backup_path(&path, 1).exists());
+    }
+}
 
-    restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
-    restore_env("HOME", original_home);
+#[test]
+fn invalid_layout_save_request_fails_before_lock_backup_or_write() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let path = temp.path().join(".tw-dashboard-layout.json");
+    let revision = layout_revision_for_raw(false, b"");
+    for invalid in [
+        serde_json::json!({ "schemaVersion": 3, "columnOrder": ["file", "main", "scratch", "editor"] }),
+        serde_json::json!({ "schemaVersion": 2, "version": 2, "columnOrder": ["file", "main", "scratch", "editor"] }),
+        serde_json::json!({ "schemaVersion": 2, "columnOrder": ["file", "file", "scratch", "editor"] }),
+    ] {
+        let error = save_layout_to_path(&path, invalid, &revision)
+            .expect_err("invalid request must fail closed");
+        assert_eq!(error.code, "LAYOUT_INVALID_REQUEST");
+        assert!(!error.retryable);
+        assert_eq!(error.current_revision, None);
+        let serialized = serde_json::to_value(&error).expect("serialize invalid request");
+        assert_eq!(
+            serialized
+                .as_object()
+                .expect("invalid request object")
+                .len(),
+            3
+        );
+        assert_eq!(serialized["retryable"], false);
+        assert!(serialized.get("currentRevision").is_none());
+        assert!(!path.exists());
+        assert!(!layout_lock_path(&path).exists());
+        assert!(!layout_backup_path(&path, 1).exists());
+    }
+
+    let io_path = temp.path().join("missing-parent").join("layout.json");
+    let io_error = save_layout_to_path(&io_path, canonical_dashboard_layout("first"), &revision)
+        .expect_err("missing lock parent is a retryable IO error");
+    assert_eq!(io_error.code, "LAYOUT_IO_ERROR");
+    assert!(io_error.retryable);
+    assert_eq!(io_error.current_revision, None);
+    let serialized = serde_json::to_value(&io_error).expect("serialize IO error");
+    assert_eq!(serialized.as_object().expect("IO error object").len(), 3);
+    assert!(serialized.get("currentRevision").is_none());
+}
+
+#[test]
+fn startup_window_restore_skips_future_and_invalid_layouts() {
+    let window = serde_json::json!({
+        "width": 1440,
+        "height": 900,
+        "x": 10,
+        "y": 20,
+        "maximized": false
+    });
+    let legacy = serde_json::json!({ "window": window });
+    assert!(dashboard_layout_window_is_restorable(&legacy));
+    for invalid_window in [
+        serde_json::json!({ "width": 0, "height": 900, "x": 10, "y": 20, "maximized": false }),
+        serde_json::json!({ "width": 1440, "height": -1, "x": 10, "y": 20, "maximized": false }),
+        serde_json::json!({ "width": 1440, "height": 900, "x": "10", "y": 20, "maximized": false }),
+    ] {
+        assert!(!dashboard_layout_window_is_restorable(
+            &serde_json::json!({ "window": invalid_window })
+        ));
+    }
+    let mut current = canonical_dashboard_layout("first");
+    current["window"] = window.clone();
+    assert!(dashboard_layout_window_is_restorable(&current));
+    let future = serde_json::json!({ "schemaVersion": 3, "window": window });
+    assert_eq!(
+        classify_dashboard_layout(&future),
+        DashboardLayoutClassification::Future(3)
+    );
+    assert!(!dashboard_layout_window_is_restorable(&future));
+    let invalid = serde_json::json!({ "schemaVersion": 2, "window": window });
+    assert_eq!(
+        classify_dashboard_layout(&invalid),
+        DashboardLayoutClassification::Invalid
+    );
+    assert!(!dashboard_layout_window_is_restorable(&invalid));
 }
 
 #[test]

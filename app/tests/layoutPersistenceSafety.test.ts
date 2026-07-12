@@ -2,7 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import * as ts from "typescript";
-import type { DashboardLayoutDecodeOutcome } from "../src/dashboard/layout/schema.ts";
+import {
+  classifyDashboardLayoutPersistenceFailure,
+  type DashboardLayoutPersistenceOutcome,
+} from "../src/dashboard/layoutPersistence.ts";
+
+const INITIAL_REVISION = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
+const NEXT_REVISION = "twlr1_HfyBm0VsDGpTixmc8n6KpBqTiqpSf26rY03Pph07iM8";
 
 type EffectCallback = () => void | (() => void);
 type CapturedEffect = { callback: EffectCallback; dependencies: unknown };
@@ -101,6 +107,7 @@ function loadDashboardLayoutHook(): {
       "../layoutSaveCoordinator",
       { createLayoutSaveCoordinator: () => assert.fail("state hook must not execute") },
     ],
+    ["../layoutPersistence", { classifyDashboardLayoutPersistenceFailure }],
     ["./useLayoutPreferences", { useLayoutPreferences: () => assert.fail("not used") }],
   ]);
   const module = { exports: {} as Record<string, unknown> };
@@ -179,7 +186,13 @@ const DOMAIN_SETTERS = [
   "setWindowLayout",
 ] as const;
 
-function layoutFixture(load: () => Promise<DashboardLayoutDecodeOutcome>) {
+function layoutFixture(
+  load: () => Promise<DashboardLayoutPersistenceOutcome>,
+  save: (...args: unknown[]) => Promise<unknown> = async () => ({
+    revision: NEXT_REVISION,
+    unchanged: false,
+  }),
+) {
   const calls: Array<{ gateWritable: boolean; name: string; value: unknown }> = [];
   const authorizations: CapturedAuthorization[] = [];
   const enqueues: Array<{ attempt: number; snapshot: Record<string, unknown> }> = [];
@@ -237,7 +250,7 @@ function layoutFixture(load: () => Promise<DashboardLayoutDecodeOutcome>) {
     pinnedItems: [{ kind: "session", name: "local:one" }],
     saveLayoutPreferences: (...args: unknown[]) => {
       saves.push(args);
-      return Promise.resolve();
+      return save(...args);
     },
     scratchCollapsed: false,
     scratchWidth: 380,
@@ -308,7 +321,7 @@ function domainCalls(
 test("read failures and incompatible layouts never hydrate or schedule a save", async () => {
   await withRuntimeGlobals(async (timers) => {
     const blockedCases: Array<{
-      load: () => Promise<DashboardLayoutDecodeOutcome>;
+      load: () => Promise<DashboardLayoutPersistenceOutcome>;
       expected: LayoutState;
     }> = [
       {
@@ -316,11 +329,20 @@ test("read failures and incompatible layouts never hydrate or schedule a save", 
         expected: { phase: "blocked", reason: "read_failed" },
       },
       {
-        load: () => Promise.resolve({ kind: "future", marker: "schemaVersion", version: 3 }),
+        load: () => Promise.resolve({
+          kind: "future",
+          marker: "schemaVersion",
+          version: 3,
+          revision: INITIAL_REVISION,
+        }),
         expected: { phase: "blocked", reason: "future_schema", version: 3 },
       },
       {
-        load: () => Promise.resolve({ kind: "invalid", reason: "invalid_current_layout" }),
+        load: () => Promise.resolve({
+          kind: "invalid",
+          reason: "invalid_current_layout",
+          revision: INITIAL_REVISION,
+        }),
         expected: {
           phase: "blocked",
           reason: "invalid_layout",
@@ -384,10 +406,11 @@ test("read failures and incompatible layouts never hydrate or schedule a save", 
 test("only compatible hydration authorizes persistence and retains extensions", async () => {
   await withRuntimeGlobals(async (timers) => {
     const extensions = { futureNested: { mode: "graph" } };
-    const outcome: DashboardLayoutDecodeOutcome = {
+    const outcome: DashboardLayoutPersistenceOutcome = {
       kind: "compatible",
       source: "current",
       extensions,
+      revision: INITIAL_REVISION,
       layout: {
         schemaVersion: 2,
         columnOrder: ["file", "main", "scratch", "editor"],
@@ -411,7 +434,61 @@ test("only compatible hydration authorizes persistence and retains extensions", 
     assert.equal(fixture.gateRef.current.extensions, extensions);
     assert.equal(fixture.authorizations.length, 1);
     assert.equal(fixture.authorizations[0].attempt, 1);
-    assert.equal(fixture.authorizations[0].classifyFailure(new Error("retry")), "retry");
+    assert.equal(
+      fixture.authorizations[0].classifyFailure({
+        code: "LAYOUT_IO_ERROR",
+        message: "offline",
+        retryable: true,
+      }),
+      "retry",
+    );
+    assert.equal(fixture.authorizations[0].classifyFailure(new Error("unknown")), "block");
+    assert.equal(
+      fixture.authorizations[0].classifyFailure({
+        code: "LAYOUT_REVISION_CONFLICT",
+        message: "conflict",
+        retryable: false,
+        currentRevision: NEXT_REVISION,
+      }),
+      "block",
+    );
+    assert.equal(
+      fixture.authorizations[0].classifyFailure({
+        code: "LAYOUT_NEW_NON_RETRYABLE_CODE",
+        message: "new native failure",
+        retryable: false,
+      }),
+      "block",
+    );
+    let getterReads = 0;
+    const accessorFailure = Object.create(null) as { retryable?: boolean };
+    Object.defineProperty(accessorFailure, "retryable", {
+      enumerable: true,
+      get() {
+        getterReads += 1;
+        return false;
+      },
+    });
+    assert.equal(fixture.authorizations[0].classifyFailure(accessorFailure), "block");
+    assert.equal(getterReads, 0);
+    let proxyReads = 0;
+    const proxyFailure = new Proxy(
+      { retryable: false },
+      {
+        get(target, property, receiver) {
+          proxyReads += 1;
+          return Reflect.get(target, property, receiver);
+        },
+      },
+    );
+    assert.equal(fixture.authorizations[0].classifyFailure(proxyFailure), "block");
+    assert.equal(proxyReads, 0);
+    assert.equal(
+      fixture.authorizations[0].classifyFailure(
+        Object.create({ retryable: false }) as object,
+      ),
+      "block",
+    );
     const writableCalls = fixture.calls.filter(
       ({ name, value }) =>
         name === "setLayoutPersistenceState" &&
@@ -467,8 +544,13 @@ test("only compatible hydration authorizes persistence and retains extensions", 
     });
     await fixture.authorizations[0].write(fixture.enqueues[0].snapshot);
     assert.equal(fixture.saves.length, 1);
-    assert.equal(fixture.saves[0][1], extensions);
     assert.equal(fixture.saves[0][0], fixture.enqueues[0].snapshot);
+    assert.equal(fixture.saves[0][1], INITIAL_REVISION);
+    assert.equal(fixture.saves[0][2], extensions);
+    await fixture.authorizations[0].write(fixture.enqueues[0].snapshot);
+    assert.equal(fixture.saves.length, 2);
+    assert.equal(fixture.saves[1][1], NEXT_REVISION);
+    assert.equal(fixture.saves[1][2], extensions);
 
     fixture.gateRef.current = {
       attempt: 2,
@@ -476,16 +558,67 @@ test("only compatible hydration authorizes persistence and retains extensions", 
       extensions: {},
     };
     await fixture.authorizations[0].write({ columnOrder: [] });
-    assert.equal(fixture.saves.length, 1, "authorization rechecks the A gate before writing");
+    assert.equal(fixture.saves.length, 2, "authorization rechecks the A gate before writing");
+  });
+});
+
+test("authorization keeps the loaded revision across ambiguous failure until a response advances it", async () => {
+  await withRuntimeGlobals(async () => {
+    const saveResults = [
+      () => Promise.reject({
+        code: "LAYOUT_IO_ERROR",
+        message: "response lost after commit",
+        retryable: true,
+      }),
+      () => Promise.resolve({ revision: NEXT_REVISION, unchanged: true }),
+      () => Promise.resolve({ revision: NEXT_REVISION, unchanged: true }),
+    ];
+    const outcome: DashboardLayoutPersistenceOutcome = {
+      kind: "compatible",
+      source: "current",
+      extensions: { retained: true },
+      revision: INITIAL_REVISION,
+      layout: {
+        schemaVersion: 2,
+        columnOrder: ["file", "main", "scratch", "editor"],
+      },
+    };
+    const { effects, hooks } = loadDashboardLayoutHook();
+    const fixture = layoutFixture(
+      () => Promise.resolve(outcome),
+      async () => {
+        const result = saveResults.shift();
+        assert.ok(result);
+        return await result();
+      },
+    );
+    registerSingleEffect(effects, () =>
+      hooks.useDashboardLayoutHydrationPhase(
+        fixture.layout,
+        hydrationOptions(fixture.calls, fixture.gateRef),
+      )
+    ).callback();
+    await flushPromises();
+    assert.equal(fixture.authorizations.length, 1);
+    const writer = fixture.authorizations[0];
+    const snapshot = { columnOrder: ["file", "main", "scratch", "editor"] };
+
+    await assert.rejects(writer.write(snapshot));
+    assert.equal(fixture.saves[0][1], INITIAL_REVISION);
+    await writer.write(snapshot);
+    assert.equal(fixture.saves[1][1], INITIAL_REVISION);
+    await writer.write(snapshot);
+    assert.equal(fixture.saves[2][1], NEXT_REVISION);
   });
 });
 
 test("disposed and superseded hydration attempts cannot authorize", async () => {
   await withRuntimeGlobals(async () => {
-    const compatible = (source: "legacy" | "current"): DashboardLayoutDecodeOutcome => ({
+    const compatible = (source: "legacy" | "current"): DashboardLayoutPersistenceOutcome => ({
       kind: "compatible",
       source,
       extensions: { source },
+      revision: INITIAL_REVISION,
       layout: {
         schemaVersion: 2,
         columnOrder: ["file", "main", "scratch", "editor"],
@@ -493,7 +626,7 @@ test("disposed and superseded hydration attempts cannot authorize", async () => 
     });
 
     {
-      const pending = deferred<DashboardLayoutDecodeOutcome>();
+      const pending = deferred<DashboardLayoutPersistenceOutcome>();
       const { effects, hooks } = loadDashboardLayoutHook();
       const fixture = layoutFixture(() => pending.promise);
       const cleanup = registerSingleEffect(effects, () =>
@@ -528,8 +661,8 @@ test("disposed and superseded hydration attempts cannot authorize", async () => 
     }
 
     {
-      const first = deferred<DashboardLayoutDecodeOutcome>();
-      const second = deferred<DashboardLayoutDecodeOutcome>();
+      const first = deferred<DashboardLayoutPersistenceOutcome>();
+      const second = deferred<DashboardLayoutPersistenceOutcome>();
       const loads = [first.promise, second.promise];
       const { effects, hooks } = loadDashboardLayoutHook();
       const fixture = layoutFixture(() => {

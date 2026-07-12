@@ -36,6 +36,11 @@ type PendingSave = {
   snapshot: DashboardLayoutPreferences;
 };
 
+type ExactRetrySave = {
+  attempt: number;
+  snapshot: DashboardLayoutPreferences;
+};
+
 type InFlightSave = {
   attempt: number;
   authorization: LayoutSaveAuthorization;
@@ -158,6 +163,7 @@ export function createLayoutSaveCoordinator(
   let currentBlocked = true;
   let authorization: LayoutSaveAuthorization | null = null;
   let pending: PendingSave | null = null;
+  let exactRetry: ExactRetrySave | null = null;
   let inFlight: InFlightSave | null = null;
   let debounceToken: object | null = null;
   let cancelDebounce: (() => void) | null = null;
@@ -209,6 +215,7 @@ export function createLayoutSaveCoordinator(
     currentBlocked = true;
     authorization = null;
     pending = null;
+    exactRetry = null;
     errorOutstanding = false;
     clearDebounce();
     clearRetry();
@@ -335,7 +342,7 @@ export function createLayoutSaveCoordinator(
       pump();
       return;
     }
-    if (pending === null && errorOutstanding) {
+    if (pending === null && exactRetry === null && errorOutstanding) {
       errorOutstanding = false;
       notify(options.onRecovered);
     }
@@ -366,23 +373,18 @@ export function createLayoutSaveCoordinator(
       return;
     }
 
-    if (pending === null) {
-      pending = {
-        attempt: flight.attempt,
-        debounceReady: true,
-        snapshot: flight.snapshot,
-      };
-    }
+    exactRetry = {
+      attempt: flight.attempt,
+      snapshot: flight.snapshot,
+    };
     errorOutstanding = true;
     scheduleRetry(flight.attempt, error);
   };
 
   const startWrite = (
     candidateAuthorization: LayoutSaveAuthorization,
-    entry: PendingSave,
+    entry: ExactRetrySave,
   ) => {
-    pending = null;
-    clearDebounce();
     const flight: InFlightSave = {
       attempt: entry.attempt,
       authorization: candidateAuthorization,
@@ -411,17 +413,33 @@ export function createLayoutSaveCoordinator(
     if (
       stopped ||
       inFlight !== null ||
-      pending === null ||
-      !pending.debounceReady ||
       retryBlocked ||
       authorization === null ||
       currentBlocked ||
-      currentAttempt !== pending.attempt ||
-      authorization.attempt !== pending.attempt
+      currentAttempt !== authorization.attempt
     ) {
       return;
     }
-    startWrite(authorization, pending);
+    if (
+      exactRetry !== null &&
+      exactRetry.attempt === currentAttempt
+    ) {
+      const retry = exactRetry;
+      exactRetry = null;
+      startWrite(authorization, retry);
+      return;
+    }
+    if (
+      pending === null ||
+      !pending.debounceReady ||
+      pending.attempt !== currentAttempt
+    ) {
+      return;
+    }
+    const latest = pending;
+    pending = null;
+    clearDebounce();
+    startWrite(authorization, latest);
   };
 
   return {
@@ -431,6 +449,7 @@ export function createLayoutSaveCoordinator(
       currentBlocked = false;
       authorization = null;
       pending = null;
+      exactRetry = null;
       errorOutstanding = false;
       clearDebounce();
       clearRetry();
@@ -477,6 +496,7 @@ export function createLayoutSaveCoordinator(
       currentBlocked = true;
       authorization = null;
       pending = null;
+      exactRetry = null;
       errorOutstanding = false;
       clearDebounce();
       clearRetry();

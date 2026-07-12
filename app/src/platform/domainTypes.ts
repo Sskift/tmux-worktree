@@ -254,3 +254,28 @@ export type MobileRelayBrokerInput = {
 // Layout is intentionally tolerant while Phase 2 migrates the legacy persisted
 // shape. Callers validate individual fields before restoring them.
 export type DashboardLayout = Record<string, unknown>;
+
+export type DashboardLayoutRevision = string;
+
+export type DashboardLayoutLoadResult = {
+  layout: unknown;
+  revision: DashboardLayoutRevision;
+};
+
+export type DashboardLayoutSaveResult = {
+  revision: DashboardLayoutRevision;
+  unchanged: boolean;
+};
+
+export type DashboardLayoutPersistenceErrorCode =
+  | "LAYOUT_REVISION_CONFLICT"
+  | "LAYOUT_STATE_BLOCKED"
+  | "LAYOUT_INVALID_REQUEST"
+  | "LAYOUT_IO_ERROR";
+
+export type DashboardLayoutPersistenceError = {
+  code: DashboardLayoutPersistenceErrorCode;
+  message: string;
+  retryable: boolean;
+  currentRevision?: DashboardLayoutRevision;
+};

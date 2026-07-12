@@ -344,8 +344,14 @@ transport.handlers.set("cancel_copy_mode", nothing);
 transport.handlers.set("copy_mode_cancel_if_active", value(false));
 transport.handlers.set("copy_tmux_selection", value(false));
 transport.handlers.set("apply_tmux_theme", nothing);
-transport.handlers.set("load_layout", value({}));
-transport.handlers.set("save_layout", nothing);
+transport.handlers.set("load_layout", value({
+  layout: {},
+  revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",
+}));
+transport.handlers.set("save_layout", value({
+  revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",
+  unchanged: true,
+}));
 transport.handlers.set("list_automations", value(automations));
 transport.handlers.set("list_automation_runs", value(automationRuns));
 transport.handlers.set("save_automation", (payload) => {

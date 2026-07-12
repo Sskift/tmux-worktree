@@ -19,6 +19,9 @@ import type {
   DashboardCatalogSnapshot,
   CreateWorktreeInput,
   DashboardLayout,
+  DashboardLayoutLoadResult,
+  DashboardLayoutRevision,
+  DashboardLayoutSaveResult,
   DeleteWorktreeInput,
   DirEntry,
   EnsureTerminalInput,
@@ -147,8 +150,11 @@ export interface DashboardBackend {
   };
   persistence: {
     homeDirectory(): Promise<string>;
-    loadLayout(): Promise<DashboardLayout>;
-    saveLayout(layout: DashboardLayout): Promise<void>;
+    loadLayout(): Promise<DashboardLayoutLoadResult>;
+    saveLayout(
+      layout: DashboardLayout,
+      expectedRevision: DashboardLayoutRevision,
+    ): Promise<DashboardLayoutSaveResult>;
   };
   dialog: {
     selectDirectory(options: DirectoryDialogOptions): Promise<string | null>;
@@ -384,8 +390,12 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     },
     persistence: {
       homeDirectory: () => transport.invoke<string>("home_dir"),
-      loadLayout: () => transport.invoke<DashboardLayout>("load_layout"),
-      saveLayout: (layout) => transport.invoke<void>("save_layout", { layout }),
+      loadLayout: () => transport.invoke<DashboardLayoutLoadResult>("load_layout"),
+      saveLayout: (layout, expectedRevision) =>
+        transport.invoke<DashboardLayoutSaveResult>("save_layout", {
+          layout,
+          expectedRevision,
+        }),
     },
     dialog: {
       selectDirectory: (options) => transport.selectDirectory(options),

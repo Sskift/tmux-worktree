@@ -1757,7 +1757,9 @@ function App() {
                           ? "Dashboard layout could not be read. The saved layout will not be overwritten, and layout changes will not be saved this time."
                           : layoutPersistenceState.reason === "future_schema"
                             ? `Dashboard layout schema ${layoutPersistenceState.version} was created by a newer version. It will be preserved unchanged, and layout changes will not be saved.`
-                            : "The saved dashboard layout is invalid. It will be preserved unchanged, and layout changes will not be saved."
+                            : layoutPersistenceState.reason === "invalid_layout"
+                              ? "The saved dashboard layout is invalid. It will be preserved unchanged, and layout changes will not be saved."
+                              : layoutSaveError ?? "Dashboard layout changes could not be saved. Layout saving is blocked until the next hydration."
                         : layoutSaveError}
                     </span>
                   )}

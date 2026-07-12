@@ -16,6 +16,8 @@ import {
 import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const { createFakeDashboardBackend } = await import("../src/platform/fakeBackend.ts");
+const TEST_LAYOUT_REVISION = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
+const NEXT_LAYOUT_REVISION = "twlr1_HfyBm0VsDGpTixmc8n6KpBqTiqpSf26rY03Pph07iM8";
 
 const legacyLayout = {
   left: 264,
@@ -195,11 +197,33 @@ test("editor cursor locations round-trip only when they are positive integers", 
     column: 7,
   });
 
+  const maxSafe = compatibleLayout({
+    columnOrder: ["main"],
+    editingFile: {
+      path: "/repo/src/App.tsx",
+      line: Number.MAX_SAFE_INTEGER,
+      column: 2.0,
+    },
+  });
+  assert.deepEqual(jsonValue(maxSafe.editingFile), {
+    path: "/repo/src/App.tsx",
+    line: Number.MAX_SAFE_INTEGER,
+    column: 2,
+  });
+
   const invalid = compatibleLayout({
     columnOrder: ["main"],
     editingFile: { path: "/repo/src/App.tsx", line: 0, column: 1.5 },
   });
   assert.equal(invalid.editingFile, undefined);
+  const unsafe = compatibleLayout({
+    columnOrder: ["main"],
+    editingFile: {
+      path: "/repo/src/App.tsx",
+      line: Number.MAX_SAFE_INTEGER + 1,
+    },
+  });
+  assert.equal(unsafe.editingFile, undefined);
 });
 
 test("bad fields fall back safely without throwing or contaminating valid fields", () => {
@@ -728,8 +752,8 @@ test("layout persistence preserves accepted v2 extensions while changing known f
     futureNested: { inspector: { mode: "graph" } },
   };
   const { backend, transport } = createFakeDashboardBackend({
-    load_layout: () => stored,
-    save_layout: () => undefined,
+    load_layout: () => ({ layout: stored, revision: TEST_LAYOUT_REVISION }),
+    save_layout: () => ({ revision: NEXT_LAYOUT_REVISION, unchanged: false }),
   });
 
   const loaded = await loadDashboardLayoutPreferences(backend);
@@ -738,12 +762,17 @@ test("layout persistence preserves accepted v2 extensions while changing known f
   await saveDashboardLayoutPreferences(
     backend,
     { ...loaded.layout, sidebarWidth: 344 },
+    loaded.revision,
     loaded.extensions,
   );
 
   assert.equal(transport.calls.length, 2);
   assert.deepEqual(transport.calls[0], { command: "load_layout", args: undefined });
   assert.equal(transport.calls[1]?.command, "save_layout");
+  assert.equal(
+    (transport.calls[1]?.args as { expectedRevision: string }).expectedRevision,
+    TEST_LAYOUT_REVISION,
+  );
   assert.deepEqual(
     { ...(transport.calls[1]?.args as { layout: DashboardLayoutV2 }).layout },
     {
@@ -759,11 +788,16 @@ test("the renderer delegates layout IO to the versioned layout boundary", () => 
   const source = rendererImplementationSourceContaining(
     "useLayoutPreferences()",
     "loadLayoutPreferences()",
-    "saveLayoutPreferences(snapshot, outcome.extensions)",
+    "saveLayoutPreferences(",
+    "expectedRevision",
+    "outcome.extensions",
   ).source;
 
   assert.match(source, /const \{ loadLayoutPreferences, saveLayoutPreferences \} = useLayoutPreferences\(\);/);
   assert.match(source, /loadLayoutPreferences\(\)/);
-  assert.match(source, /saveLayoutPreferences\(snapshot, outcome\.extensions\)/);
+  assert.match(
+    source,
+    /saveLayoutPreferences\(\s*snapshot,\s*expectedRevision,\s*outcome\.extensions,?\s*\)/,
+  );
   assert.doesNotMatch(source, /dashboardBackend\.persistence\.(?:loadLayout|saveLayout)/);
 });

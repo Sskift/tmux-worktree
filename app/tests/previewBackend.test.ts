@@ -29,7 +29,10 @@ test("preview backend supplies the dashboard startup state", async () => {
     "aider",
   ]);
   assert.equal(agents.find((agent) => agent.id === "codex")?.available, true);
-  assert.deepEqual(layout, {});
+  assert.deepEqual(layout, {
+    layout: {},
+    revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",
+  });
 });
 
 test("preview PTY follows the same facade and emits deterministic output", async () => {

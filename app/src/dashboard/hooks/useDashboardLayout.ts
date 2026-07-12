@@ -32,6 +32,7 @@ import {
   createLayoutSaveCoordinator,
   type LayoutSaveCoordinator,
 } from "../layoutSaveCoordinator";
+import { classifyDashboardLayoutPersistenceFailure } from "../layoutPersistence";
 import {
   pendingRestoredCatalogSelection,
   type PendingCatalogSelection,
@@ -52,7 +53,8 @@ type DashboardLayoutPersistenceState =
       phase: "blocked";
       reason: "invalid_layout";
       invalidReason: DashboardLayoutInvalidReason;
-    };
+    }
+  | { phase: "blocked"; reason: "write_failed" };
 
 type DashboardLayoutPersistenceGate = {
   attempt: number;
@@ -143,6 +145,12 @@ export function useDashboardLayoutState() {
       },
       onRecovered: () => setLayoutSaveError(null),
       onBlocked: (error) => {
+        const gate = layoutPersistenceGateRef.current;
+        layoutPersistenceGateRef.current = {
+          ...gate,
+          writable: false,
+        };
+        setLayoutPersistenceState({ phase: "blocked", reason: "write_failed" });
         setLayoutSaveError(
           `Dashboard layout changes could not be saved: ${boundedLayoutSaveErrorDetail(error)}`,
         );
@@ -495,14 +503,20 @@ export function useDashboardLayoutHydrationPhase(
           writable: true,
           extensions: outcome.extensions,
         };
+        let expectedRevision = outcome.revision;
         layoutSaveCoordinator.authorize({
           attempt,
           write: async (snapshot) => {
             const currentGate = layoutPersistenceGateRef.current;
             if (!currentGate.writable || currentGate.attempt !== attempt) return;
-            await saveLayoutPreferences(snapshot, outcome.extensions);
+            const result = await saveLayoutPreferences(
+              snapshot,
+              expectedRevision,
+              outcome.extensions,
+            );
+            expectedRevision = result.revision;
           },
-          classifyFailure: () => "retry",
+          classifyFailure: classifyDashboardLayoutPersistenceFailure,
         });
         setLayoutPersistenceState({
           phase: "writable",

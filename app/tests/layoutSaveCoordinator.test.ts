@@ -42,10 +42,10 @@ function manualScheduler() {
   };
 }
 
-function deferred() {
-  let resolve!: () => void;
+function deferred<T = void>() {
+  let resolve!: (value: T) => void;
   let reject!: (error: unknown) => void;
-  const promise = new Promise<void>((resolvePromise, rejectPromise) => {
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
     reject = rejectPromise;
   });
@@ -170,7 +170,7 @@ test("one global in-flight write serializes backend attempt switches", async () 
   let maxActive = 0;
   const authorization = (
     attempt: number,
-    pending: ReturnType<typeof deferred>,
+    pending: { promise: Promise<void> },
   ): LayoutSaveAuthorization => ({
     attempt,
     classifyFailure: () => "retry",
@@ -241,9 +241,10 @@ test("stale rejection releases the global lock without callbacks or classificati
   await flushPromises();
 });
 
-test("retry and debounce gates converge on the latest pending intent", async () => {
+test("exact retry runs before the debounced latest intent", async () => {
   const harness = coordinatorHarness(3_000);
   const firstWrite = deferred();
+  const exactWrite = deferred();
   const latestWrite = deferred();
   const writes: DashboardLayoutPreferences[] = [];
   harness.coordinator.beginAttempt(1);
@@ -252,7 +253,9 @@ test("retry and debounce gates converge on the latest pending intent", async () 
     classifyFailure: () => "retry",
     write: (value) => {
       writes.push(value);
-      return writes.length === 1 ? firstWrite.promise : latestWrite.promise;
+      if (writes.length === 1) return firstWrite.promise;
+      if (writes.length === 2) return exactWrite.promise;
+      return latestWrite.promise;
     },
   });
   harness.coordinator.enqueue(1, snapshot("A"));
@@ -270,13 +273,75 @@ test("retry and debounce gates converge on the latest pending intent", async () 
   assert.deepEqual(harness.errors, [failure]);
   harness.scheduler.fire(cancelledB, true);
   harness.scheduler.fire(retry);
-  assert.equal(writes.length, 1, "retry gate alone cannot bypass C's debounce");
+  assert.equal(writes.length, 2, "the exact failed snapshot ignores the latest debounce gate");
+  assert.deepEqual(jsonValue(writes[1]), jsonValue(snapshot("A")));
   harness.scheduler.fire(debounceC);
-  assert.equal(writes.length, 2);
-  assert.deepEqual(jsonValue(writes[1]), jsonValue(snapshot("C")));
+  assert.equal(writes.length, 2, "latest cannot overlap the exact retry");
+  exactWrite.resolve();
+  await flushPromises();
+  assert.equal(writes.length, 3);
+  assert.deepEqual(jsonValue(writes[2]), jsonValue(snapshot("C")));
   harness.scheduler.fire(retry, true);
-  assert.equal(writes.length, 2, "a consumed retry callback is identity-fenced");
+  assert.equal(writes.length, 3, "a consumed retry callback is identity-fenced");
   latestWrite.resolve();
+  await flushPromises();
+  assert.equal(harness.recovered(), 1);
+});
+
+test("ambiguous commit replays exact A before bounded latest C and advances revision", async () => {
+  const harness = coordinatorHarness();
+  const first = deferred<string>();
+  const exact = deferred<string>();
+  const latest = deferred<string>();
+  const responses = [first, exact, latest];
+  const writes: Array<{ revision: string; session: string }> = [];
+  let expectedRevision = "revision-0";
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      writes.push({
+        revision: expectedRevision,
+        session: value.sessionOrder?.[0] ?? "missing",
+      });
+      const response = responses.shift();
+      assert.ok(response);
+      expectedRevision = await response.promise;
+    },
+  });
+
+  harness.coordinator.enqueue(1, snapshot("A"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  harness.coordinator.enqueue(1, snapshot("B"));
+  const discardedB = harness.scheduler.tasks[1];
+  harness.coordinator.enqueue(1, snapshot("C"));
+  const debounceC = harness.scheduler.tasks[2];
+  assert.equal(discardedB.cancelled, true);
+  harness.scheduler.fire(debounceC);
+
+  first.reject(new Error("commit response was lost"));
+  await flushPromises();
+  const retry = harness.scheduler.tasks[3];
+  harness.scheduler.fire(retry);
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+  ]);
+
+  exact.resolve("revision-1");
+  await flushPromises();
+  assert.deepEqual(writes, [
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-0", session: "session-A" },
+    { revision: "revision-1", session: "session-C" },
+  ]);
+  assert.equal(
+    writes.some(({ session }) => session === "session-B"),
+    false,
+    "the coordinator retains only exact A plus latest C",
+  );
+  latest.resolve("revision-2");
   await flushPromises();
   assert.equal(harness.recovered(), 1);
 });
@@ -312,6 +377,7 @@ test("recovery waits until the latest pending snapshot succeeds", async () => {
 test("retry backoff cannot be bypassed by newer intents", async () => {
   const harness = coordinatorHarness();
   const retryWrite = deferred();
+  const latestWrite = deferred();
   const writes: DashboardLayoutPreferences[] = [];
   let first = true;
   harness.coordinator.beginAttempt(1);
@@ -324,7 +390,7 @@ test("retry backoff cannot be bypassed by newer intents", async () => {
         first = false;
         throw new Error("sync retry");
       }
-      return retryWrite.promise;
+      return writes.length === 2 ? retryWrite.promise : latestWrite.promise;
     },
   });
   harness.coordinator.enqueue(1, snapshot("A"));
@@ -339,8 +405,12 @@ test("retry backoff cannot be bypassed by newer intents", async () => {
   assert.equal(writes.length, 1);
   harness.scheduler.fire(retry);
   assert.equal(writes.length, 2);
-  assert.deepEqual(jsonValue(writes[1]), jsonValue(snapshot("D")));
+  assert.deepEqual(jsonValue(writes[1]), jsonValue(snapshot("A")));
   retryWrite.resolve();
+  await flushPromises();
+  assert.equal(writes.length, 3);
+  assert.deepEqual(jsonValue(writes[2]), jsonValue(snapshot("D")));
+  latestWrite.resolve();
   await flushPromises();
   assert.equal(harness.recovered(), 1);
 });
@@ -451,6 +521,42 @@ test("same-attempt reauthorization during retry notification uses the replacemen
   retried.resolve();
   await flushPromises();
   assert.deepEqual(events, ["original", "error", "session-replacement", "recovered"]);
+});
+
+test("a newer attempt clears exact retry and latest slots", async () => {
+  const harness = coordinatorHarness();
+  const writes: string[] = [];
+  harness.coordinator.beginAttempt(1);
+  harness.coordinator.authorize({
+    attempt: 1,
+    classifyFailure: () => "retry",
+    write: (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+      throw new Error("ambiguous old attempt");
+    },
+  });
+  harness.coordinator.enqueue(1, snapshot("old"));
+  harness.scheduler.fire(harness.scheduler.tasks[0]);
+  const staleRetry = harness.scheduler.tasks[1];
+  harness.coordinator.enqueue(1, snapshot("old-latest"));
+  const staleDebounce = harness.scheduler.tasks[2];
+
+  harness.coordinator.beginAttempt(2);
+  assert.equal(staleRetry.cancelled, true);
+  assert.equal(staleDebounce.cancelled, true);
+  harness.coordinator.authorize({
+    attempt: 2,
+    classifyFailure: () => "retry",
+    write: async (value) => {
+      writes.push(value.sessionOrder?.[0] ?? "missing");
+    },
+  });
+  harness.coordinator.enqueue(2, snapshot("new"));
+  harness.scheduler.fire(staleRetry, true);
+  harness.scheduler.fire(staleDebounce, true);
+  harness.scheduler.fire(harness.scheduler.tasks[3]);
+  await flushPromises();
+  assert.deepEqual(writes, ["session-old", "session-new"]);
 });
 
 test("nonretryable failure blocks before notification and rejects reentrant enqueue", async () => {

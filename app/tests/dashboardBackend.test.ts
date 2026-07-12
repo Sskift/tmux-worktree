@@ -96,6 +96,7 @@ const relayArgs = {
   secret: "test-secret",
 };
 const layout = { schemaVersion: 2, sidebar: { width: 280 } };
+const layoutRevision = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
 
 const commandCases: CommandCase[] = [
   {
@@ -537,8 +538,8 @@ const commandCases: CommandCase[] = [
   {
     label: "persistence.saveLayout",
     command: "save_layout",
-    args: { layout },
-    call: (backend) => backend.persistence.saveLayout(layout),
+    args: { layout, expectedRevision: layoutRevision },
+    call: (backend) => backend.persistence.saveLayout(layout, layoutRevision),
   },
 ];
 

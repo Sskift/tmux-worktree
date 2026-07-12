@@ -175,7 +175,7 @@ function normalizedEditingFile(value: unknown): EditingFile | undefined {
   if (typeof record.path !== "string" || !hasValidHostId(record)) return undefined;
   const validLocation = (field: unknown) =>
     field === undefined ||
-    (typeof field === "number" && Number.isInteger(field) && field > 0);
+    (typeof field === "number" && Number.isSafeInteger(field) && field > 0);
   if (!validLocation(record.line) || !validLocation(record.column)) return undefined;
   const editingFile = canonicalOwnDataRecord<EditingFile>({ path: record.path });
   if (hasOwn(record, "hostId")) {
