@@ -24,6 +24,10 @@ import {
 } from "./dashboard/hooks/useTerminalMetadata";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
 import {
+  useEditorNavigationGuard,
+  useEditorNavigationGuardLifecyclePhase,
+} from "./dashboard/hooks/useEditorNavigationGuard";
+import {
   CommandPalette,
   type CommandPaletteItem,
 } from "./dashboard/CommandPalette";
@@ -75,22 +79,16 @@ import { FileTree } from "./FileTree";
 import { FileEditor } from "./FileEditor";
 import { DiffViewer } from "./DiffViewer";
 import { AutomationPanel } from "./AutomationPanel";
-import {
-  editingFileSourceKey,
-  runGuardedWorkspaceNavigation,
-  type EditorDirtySnapshot,
-} from "./editorNavigationGuard";
+import { editingFileSourceKey } from "./editorNavigationGuard";
 import {
   allocateTerminalId,
   renamePersistedTerminal,
 } from "./terminalPersistence";
-import { createLatestRequestGate } from "./latestRequestGate";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import {
   automationSelectionIsCurrent,
   automationSubmitStillOwnsDraft,
-  recordAutomationDirtySignal,
 } from "./automationDraftSync";
 import {
   automationFromRecord,
@@ -215,121 +213,21 @@ function App() {
   const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   const [pendingCatalogSelection, setPendingCatalogSelection] =
     useState<PendingCatalogSelection | null>(null);
-  const editingFileRef = useRef<EditingFile | null>(editingFile);
-  const editorNavigationGateRef = useRef(createLatestRequestGate());
-  const editorDirtySnapshotRef = useRef<EditorDirtySnapshot>({
-    fileKey: editingFileSourceKey(editingFile),
-    dirty: false,
-    revision: 0,
-  });
-  const automationDirtySnapshotRef = useRef<EditorDirtySnapshot>({
-    fileKey: null,
-    dirty: false,
-    revision: 0,
-  });
-  const editingFileKey = editingFileSourceKey(editingFile);
   const automationDraftKey = selection?.kind === "automation"
     ? `automation:${selection.id || "new"}`
     : null;
-  editingFileRef.current = editingFile;
-  if (editorDirtySnapshotRef.current.fileKey !== editingFileKey) {
-    editorDirtySnapshotRef.current = {
-      fileKey: editingFileKey,
-      dirty: false,
-      revision: editorDirtySnapshotRef.current.revision + 1,
-    };
-  }
-  if (automationDirtySnapshotRef.current.fileKey !== automationDraftKey) {
-    automationDirtySnapshotRef.current = {
-      fileKey: automationDraftKey,
-      dirty: false,
-      revision: automationDirtySnapshotRef.current.revision + 1,
-    };
-  }
+  const editorNavigationGuard = useEditorNavigationGuard({
+    dashboardBackend,
+    editingFile,
+    automationDraftKey,
+  });
+  const {
+    requestEditorNavigation,
+    handleEditorDirtyChange,
+    handleAutomationDirtyChange,
+    getAutomationSubmitOwner,
+  } = editorNavigationGuard;
   automationsRef.current = automations;
-
-  const handleEditorDirtyChange = useCallback((dirty: boolean) => {
-    const current = editorDirtySnapshotRef.current;
-    if (current.dirty === dirty) return;
-    editorDirtySnapshotRef.current = {
-      ...current,
-      dirty,
-      revision: current.revision + 1,
-    };
-  }, []);
-
-  const handleAutomationDirtyChange = useCallback((dirty: boolean) => {
-    const current = automationDirtySnapshotRef.current;
-    const next = recordAutomationDirtySignal(current, dirty);
-    if (next === current) return;
-    automationDirtySnapshotRef.current = {
-      ...current,
-      ...next,
-    };
-  }, []);
-
-  const requestEditorNavigation = useCallback(
-    (
-      navigate: () => void,
-      options: { ignoreAutomationDirty?: boolean } = {},
-    ): Promise<boolean> => {
-      const editorSnapshot = editorDirtySnapshotRef.current;
-      const automationSnapshot = automationDirtySnapshotRef.current;
-      const fileName =
-        basenameFromPath(editingFileRef.current?.path) || "the open file";
-      return runGuardedWorkspaceNavigation({
-        gate: editorNavigationGateRef.current,
-        surfaces: [
-          {
-            key: editorSnapshot.fileKey,
-            dirty: editorSnapshot.dirty,
-            revision: editorSnapshot.revision,
-            getCurrent: () => ({
-              key: editorDirtySnapshotRef.current.fileKey,
-              dirty: editorDirtySnapshotRef.current.dirty,
-              revision: editorDirtySnapshotRef.current.revision,
-            }),
-            confirmDiscard: () =>
-              dashboardBackend.dialog.confirm({
-                title: "Discard unsaved changes?",
-                message: `Changes to ${fileName} have not been saved. Continue and discard them?`,
-              }),
-          },
-          {
-            key: automationSnapshot.fileKey,
-            dirty: options.ignoreAutomationDirty ? false : automationSnapshot.dirty,
-            revision: automationSnapshot.revision,
-            getCurrent: () => ({
-              key: automationDirtySnapshotRef.current.fileKey,
-              dirty: automationDirtySnapshotRef.current.dirty,
-              revision: automationDirtySnapshotRef.current.revision,
-            }),
-            confirmDiscard: () =>
-              dashboardBackend.dialog.confirm({
-                title: "Discard unsaved automation changes?",
-                message: "This automation draft has not been saved. Continue and discard it?",
-              }),
-          },
-        ],
-        navigate: () => {
-          const currentEditor = editorDirtySnapshotRef.current;
-          editorDirtySnapshotRef.current = {
-            ...currentEditor,
-            dirty: false,
-            revision: currentEditor.revision + 1,
-          };
-          const currentAutomation = automationDirtySnapshotRef.current;
-          automationDirtySnapshotRef.current = {
-            ...currentAutomation,
-            dirty: false,
-            revision: currentAutomation.revision + 1,
-          };
-          navigate();
-        },
-      });
-    },
-    [dashboardBackend],
-  );
 
   useEffect(() => {
     dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
@@ -410,7 +308,7 @@ function App() {
       setAutomationError(String(err));
       return automationsRef.current;
     }
-  }, []);
+  }, [dashboardBackend]);
 
   useEffect(() => {
     void loadAutomations();
@@ -534,18 +432,15 @@ function App() {
 
   const handleAutomationCreate = useCallback(
     async (draft: AutomationDraft) => {
-      const originatingDraft = {
-        contextKey: automationDirtySnapshotRef.current.fileKey,
-        revision: automationDirtySnapshotRef.current.revision,
-      };
+      const originatingDraft = getAutomationSubmitOwner();
       const record = await dashboardBackend.automations.save(
         automationSaveInputFromDraft(draft),
       );
       const automation = automationFromRecord(record);
-      if (!automationSubmitStillOwnsDraft(originatingDraft, {
-        contextKey: automationDirtySnapshotRef.current.fileKey,
-        revision: automationDirtySnapshotRef.current.revision,
-      })) {
+      if (!automationSubmitStillOwnsDraft(
+        originatingDraft,
+        getAutomationSubmitOwner(),
+      )) {
         await loadAutomations();
         return;
       }
@@ -556,23 +451,25 @@ function App() {
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
     },
-    [loadAutomations, requestEditorNavigation],
+    [
+      dashboardBackend,
+      getAutomationSubmitOwner,
+      loadAutomations,
+      requestEditorNavigation,
+    ],
   );
 
   const handleAutomationSave = useCallback(
     async (id: string, draft: AutomationDraft) => {
-      const originatingDraft = {
-        contextKey: automationDirtySnapshotRef.current.fileKey,
-        revision: automationDirtySnapshotRef.current.revision,
-      };
+      const originatingDraft = getAutomationSubmitOwner();
       const record = await dashboardBackend.automations.save(
         automationSaveInputFromDraft(draft, id),
       );
       const automation = automationFromRecord(record);
-      if (!automationSubmitStillOwnsDraft(originatingDraft, {
-        contextKey: automationDirtySnapshotRef.current.fileKey,
-        revision: automationDirtySnapshotRef.current.revision,
-      })) {
+      if (!automationSubmitStillOwnsDraft(
+        originatingDraft,
+        getAutomationSubmitOwner(),
+      )) {
         await loadAutomations();
         return;
       }
@@ -583,7 +480,12 @@ function App() {
       }, { ignoreAutomationDirty: true });
       await loadAutomations();
     },
-    [loadAutomations, requestEditorNavigation],
+    [
+      dashboardBackend,
+      getAutomationSubmitOwner,
+      loadAutomations,
+      requestEditorNavigation,
+    ],
   );
 
   const handleAutomationToggle = useCallback(
@@ -598,7 +500,7 @@ function App() {
       );
       await loadAutomations();
     },
-    [loadAutomations],
+    [dashboardBackend, loadAutomations],
   );
 
   const handleAutomationDelete = useCallback(
@@ -627,7 +529,7 @@ function App() {
       setAutomationRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
       await Promise.all([loadAutomations(), refresh()]);
     },
-    [loadAutomations, refresh],
+    [dashboardBackend, loadAutomations, refresh],
   );
 
   useEffect(() => {
@@ -791,7 +693,7 @@ function App() {
         ...(col && col > 0 ? { column: col } : {}),
       };
       if (
-        editingFileSourceKey(editingFileRef.current) ===
+        editingFileSourceKey(editingFile) ===
         editingFileSourceKey(nextFile)
       ) {
         if (nextFile.line !== undefined) {
@@ -808,7 +710,7 @@ function App() {
         setEditingFile(nextFile);
       });
     },
-    [requestEditorNavigation],
+    [editingFile, requestEditorNavigation],
   );
 
   const closeEditingFile = useCallback(
@@ -1017,7 +919,7 @@ function App() {
         automationSelectionIsCurrent(
           selection?.kind === "automation" ? selection.id : null,
           id,
-          editingFileRef.current !== null,
+          editingFile !== null,
           diffFile !== null,
         )
       ) {
@@ -1036,7 +938,7 @@ function App() {
         if (viewportTier === "compact") setSidebarOpen(false);
       });
     },
-    [diffFile, requestEditorNavigation, selection, viewportTier],
+    [diffFile, editingFile, requestEditorNavigation, selection, viewportTier],
   );
 
   const returnFromAutomationManager = useCallback(() => requestEditorNavigation(() => {
@@ -1148,6 +1050,12 @@ function App() {
     window.addEventListener("keydown", handleNewWorktreeShortcut);
     return () => window.removeEventListener("keydown", handleNewWorktreeShortcut);
   }, [anyModalOpen]);
+
+  useEditorNavigationGuardLifecyclePhase(editorNavigationGuard, {
+    dashboardBackend,
+    editingFile,
+    automationDraftKey,
+  });
 
   const openFiles = useCallback(() => {
     sidebarOpenPreferenceRef.current = true;

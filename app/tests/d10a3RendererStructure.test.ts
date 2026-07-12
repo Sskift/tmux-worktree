@@ -46,6 +46,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
     "utf8",
   ),
+  editorNavigation: readFileSync(
+    new URL("../src/dashboard/hooks/useEditorNavigationGuard.ts", import.meta.url),
+    "utf8",
+  ),
   backendContext: readFileSync(
     new URL("../src/platform/DashboardBackendContext.tsx", import.meta.url),
     "utf8",
@@ -1285,6 +1289,10 @@ function frozenEffectContributions(): Map<string, number> {
       effectContribution(sources.relay, "useMobileRelayController", pollingEffects),
     ],
     ["useTerminalDeckState", effectContribution(sources.deck, "useTerminalDeckState")],
+    [
+      "useEditorNavigationGuard",
+      effectContribution(sources.editorNavigation, "useEditorNavigationGuard"),
+    ],
     ["useEffect", 1],
     [
       "useDashboardViewportResizePhase",
@@ -1323,6 +1331,7 @@ function frozenEffectContributions(): Map<string, number> {
     ["useConnectionCatalog", 4],
     ["useMobileRelayController", 3],
     ["useTerminalDeckState", 0],
+    ["useEditorNavigationGuard", 0],
     ["useEffect", 1],
     ["useDashboardViewportResizePhase", 1],
     ["useDashboardWindowCapturePhase", 1],
@@ -1350,6 +1359,7 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useConnectionCatalog",
     "useMobileRelayController",
     "useTerminalDeckState",
+    "useEditorNavigationGuard",
     "useEffect",
     "useDashboardViewportResizePhase",
     "useDashboardWindowCapturePhase",
