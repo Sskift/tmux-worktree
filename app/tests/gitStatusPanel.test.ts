@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import {
+  readRendererImplementationTree,
+  rendererImplementationSourceContaining,
+} from "./helpers/rendererImplementationSource.ts";
 
 test("GitStatusPanel periodically triggers project root fetches", () => {
   const source = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
@@ -17,7 +21,12 @@ test("GitStatusPanel periodically triggers project root fetches", () => {
 test("remote git status passes host identity through git commands", () => {
   const panel = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
   const diff = readFileSync(new URL("../src/DiffViewer.tsx", import.meta.url), "utf8");
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const renderer = readRendererImplementationTree();
+  const composition = rendererImplementationSourceContaining(
+    "hostId={selectedGitHostId}",
+    "const openGitDiff = useCallback",
+    "setDiffFile({ path, cwd, hostId: hostId ?? null })",
+  ).source;
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
   assert.match(panel, /hostId\?: string \| null/);
@@ -45,12 +54,12 @@ test("remote git status passes host identity through git commands", () => {
     backend,
     /diff: \(cwd, path, hostId\) =>\s*transport\.invoke<string>\("git_diff", \{ cwd, path, hostId: hostId \?\? null \}\)/s,
   );
-  assert.match(app, /hostId=\{selectedGitHostId\}/);
-  assert.match(app, /active=\{inspectorOpen && \(/);
-  assert.match(app, /const openGitDiff = useCallback/);
-  assert.match(app, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
-  assert.match(app, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
-  assert.doesNotMatch(app, /setInspectorTab\("diff"\)/);
+  assert.match(composition, /hostId=\{selectedGitHostId\}/);
+  assert.match(composition, /active=\{inspectorOpen && \(/);
+  assert.match(composition, /const openGitDiff = useCallback/);
+  assert.match(composition, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
+  assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.doesNotMatch(renderer, /setInspectorTab\("diff"\)/);
 });
 
 test("changed files use native buttons so keyboard activation opens the diff", () => {

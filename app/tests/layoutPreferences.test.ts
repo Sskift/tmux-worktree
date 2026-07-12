@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   DASHBOARD_LAYOUT_SCHEMA_VERSION,
@@ -12,6 +11,7 @@ import {
   loadDashboardLayoutPreferences,
   saveDashboardLayoutPreferences,
 } from "../src/dashboard/layoutPersistence.ts";
+import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const { createFakeDashboardBackend } = await import("../src/platform/fakeBackend.ts");
 
@@ -233,8 +233,12 @@ test("layout persistence loads legacy data and always saves v2", async () => {
   ]);
 });
 
-test("App delegates layout IO to the versioned layout boundary", () => {
-  const source = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+test("the renderer delegates layout IO to the versioned layout boundary", () => {
+  const source = rendererImplementationSourceContaining(
+    "useLayoutPreferences()",
+    "loadLayoutPreferences()",
+    "saveLayoutPreferences({",
+  ).source;
 
   assert.match(source, /const \{ loadLayoutPreferences, saveLayoutPreferences \} = useLayoutPreferences\(\);/);
   assert.match(source, /loadLayoutPreferences\(\)/);

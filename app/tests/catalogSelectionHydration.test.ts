@@ -7,6 +7,7 @@ import {
   pendingRestoredCatalogSelection,
   reconcileCatalogSelection,
 } from "../src/dashboard/catalogSelectionHydration";
+import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const localSession: Session = {
   name: "local-worktree",
@@ -309,11 +310,15 @@ test("a post-create partial refresh cannot fall back from the new remote session
   assert.equal(result.metadataPending, true);
 });
 
-test("App publishes the local catalog before the slower remote-aware snapshot", () => {
-  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const refreshStart = appSource.indexOf("const refresh = useCallback");
-  const refreshEnd = appSource.indexOf("useVisibilityAwarePolling(refresh", refreshStart);
-  const refreshSource = appSource.slice(refreshStart, refreshEnd);
+test("the renderer publishes the local catalog before the slower remote-aware snapshot", () => {
+  const { source } = rendererImplementationSourceContaining(
+    "const refresh = useCallback",
+    "useVisibilityAwarePolling(refresh",
+    "catalogRefreshGenerationRef.current.started",
+  );
+  const refreshStart = source.indexOf("const refresh = useCallback");
+  const refreshEnd = source.indexOf("useVisibilityAwarePolling(refresh", refreshStart);
+  const refreshSource = source.slice(refreshStart, refreshEnd);
 
   assert.match(refreshSource, /const refreshGeneration = \+\+catalogRefreshGenerationRef\.current\.started/);
   assert.match(refreshSource, /catalog\?\.listLocal/);
@@ -360,15 +365,22 @@ test("Host readiness distinguishes initial empty state from a successful empty c
 });
 
 test("terminal metadata failure keeps fallback pending without authorizing an empty save", () => {
-  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const loadStart = appSource.indexOf("const loadPersistedTerminals = async");
-  const loadEnd = appSource.indexOf("// Load layout data on mount", loadStart);
-  const loadSource = appSource.slice(loadStart, loadEnd);
+  const { source: loadImplementation } = rendererImplementationSourceContaining(
+    "const loadPersistedTerminals = async",
+    "setTerminalPersistenceWritable(true)",
+  );
+  const loadStart = loadImplementation.indexOf("const loadPersistedTerminals = async");
+  const loadEnd = loadImplementation.indexOf("// Load layout data on mount", loadStart);
+  const loadSource = loadImplementation.slice(loadStart, loadEnd);
   const loadFailureStart = loadSource.indexOf("} catch (nextError)");
   const loadFailureSource = loadSource.slice(loadFailureStart);
-  const saveStart = appSource.indexOf("// Persist terminal metadata");
-  const saveEnd = appSource.indexOf("// Persist layout", saveStart);
-  const saveSource = appSource.slice(saveStart, saveEnd);
+  const { source: saveImplementation } = rendererImplementationSourceContaining(
+    "// Persist terminal metadata",
+    "dashboardBackend.terminals.save(snapshot)",
+  );
+  const saveStart = saveImplementation.indexOf("// Persist terminal metadata");
+  const saveEnd = saveImplementation.indexOf("// Persist layout", saveStart);
+  const saveSource = saveImplementation.slice(saveStart, saveEnd);
 
   assert.match(loadSource, /setTerminalPersistenceWritable\(true\)/);
   assert.match(loadSource, /setTerminalPersistenceError\(`Terminal metadata could not be loaded:/);

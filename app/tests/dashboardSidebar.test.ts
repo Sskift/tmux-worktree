@@ -7,6 +7,7 @@ import {
   summarizeSidebarConnections,
 } from "../src/dashboard/DashboardSidebarModel.ts";
 import type { HostConfig, HostStatus, Session } from "../src/platform/domainTypes.ts";
+import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const hosts: HostConfig[] = [
   { id: "build", label: "Build host", host: "build.internal" },
@@ -257,7 +258,10 @@ test("persisted terminals expose inline rename without enabling it for discovere
     new URL("../src/dashboard/DashboardSidebar.css", import.meta.url),
     "utf8",
   );
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const composition = rendererImplementationSourceContaining(
+    "renamePersistedTerminal(current, allTerminals, id, label)",
+    "onRenameTerminal={renameTerminal}",
+  ).source;
 
   assert.match(source, /onRenameTerminal: \(terminalId: string, label: string\)/);
   assert.match(source, /onDoubleClick=\{!terminal\.discovered \?/);
@@ -265,6 +269,6 @@ test("persisted terminals expose inline rename without enabling it for discovere
   assert.match(source, /event\.key === "Escape"/);
   assert.match(source, /event\.key === "Enter"[\s\S]*event\.currentTarget\.blur\(\)/);
   assert.match(css, /\.tw-sidebar-row__rename\s*\{/);
-  assert.match(app, /renamePersistedTerminal\(current, allTerminals, id, label\)/);
-  assert.match(app, /onRenameTerminal=\{renameTerminal\}/);
+  assert.match(composition, /renamePersistedTerminal\(current, allTerminals, id, label\)/);
+  assert.match(composition, /onRenameTerminal=\{renameTerminal\}/);
 });

@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { readRendererImplementationTree } from "./helpers/rendererImplementationSource.ts";
+import { readRustSourceTree } from "./rustSource.ts";
 
 test("ssh tmux terminals use native tmux mouse scrolling", () => {
   const deckSource = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
@@ -25,7 +27,7 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
 test("remote tmux clipboard uses local macOS clipboard commands", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-  const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const rustSource = readRustSourceTree();
 
   assert.match(terminalSource, /dashboardBackend\.sessions\.copySelection\(tmuxSession\)/);
   assert.match(
@@ -42,19 +44,19 @@ test("remote tmux clipboard uses local macOS clipboard commands", () => {
 });
 
 test("remote file links keep host identity through the SSH editor", () => {
-  const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const rendererSource = readRendererImplementationTree();
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const editorSource = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
   const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-  const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const rustSource = readRustSourceTree();
 
   assert.match(terminalSource, /linkCwd\?: string/);
   assert.match(terminalSource, /checkFileExists\(dashboardBackend, resolved, hostId\)/);
   assert.match(terminalSource, /openFile\(resolved, link\.line, link\.col, hostId\)/);
   assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
-  assert.match(appSource, /const nextFile: EditingFile = \{\s*path,\s*hostId: hostId \?\? null,/s);
-  assert.match(appSource, /setEditingFile\(nextFile\)/);
-  assert.match(appSource, /hostId=\{editingFile\.hostId \?\? null\}/);
+  assert.match(rendererSource, /const nextFile: EditingFile = \{\s*path,\s*hostId: hostId \?\? null,/s);
+  assert.match(rendererSource, /setEditingFile\(nextFile\)/);
+  assert.match(rendererSource, /hostId=\{editingFile\.hostId \?\? null\}/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, filePath\)/);
   assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, currentContent\)/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemoteBase64\(hostId, filePath\)/);
@@ -72,7 +74,7 @@ test("remote file links keep host identity through the SSH editor", () => {
 test("terminal subscribes to pty output before opening the pty", () => {
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-  const rustSource = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const rustSource = readRustSourceTree();
   const idIndex = terminalSource.indexOf("const id = createPtyId();");
   const connectIndex = terminalSource.indexOf("ptyConnection = await dashboardBackend.pty.connect", idIndex);
   const listenDataIndex = backendSource.indexOf("unlistenData = await transport.listen<PtyDataEvent>");
@@ -102,7 +104,7 @@ test("reactivating a terminal does not steal an overlay focus return", () => {
 test("tmux status bar receives the active dashboard terminal palette", () => {
   const source = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-  const rust = readFileSync(new URL("../src-tauri/src/lib.rs", import.meta.url), "utf8");
+  const rust = readRustSourceTree();
 
   assert.match(source, /function tmuxStatusThemeFromPalette\(palette: TerminalPalette\): TmuxStatusTheme/);
   assert.match(source, /function applyTmuxStatusTheme\(\s*dashboardBackend: DashboardBackend,\s*tmuxSession: string \| undefined,\s*palette: TerminalPalette,/s);

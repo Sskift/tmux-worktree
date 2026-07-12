@@ -5,6 +5,7 @@ import {
   createLatestRequestGate,
   requestSourceKey,
 } from "../src/latestRequestGate.ts";
+import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -67,13 +68,22 @@ test("new terminal invalidates home-default publication from every editable sour
   assert.match(modal, /const browse = async \(\) => \{\s*invalidatePendingHomeDefault\(\)/s);
 });
 
-test("app creates persisted terminals through the host-aware command", () => {
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+test("the renderer creates persisted terminals through the host-aware command", () => {
+  const creation = rendererImplementationSourceContaining(
+    "dashboardBackend.terminals.create({",
+    "cwd: created.cwd",
+    "managed: created.managed",
+  ).source;
+  const restoration = rendererImplementationSourceContaining(
+    "if (terminal.managed)",
+    "dashboardBackend.sessions.exists(terminal.tmuxName)",
+    "dashboardBackend.terminals.ensure({",
+  ).source;
   const deck = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
   assert.match(
-    app,
+    creation,
     /dashboardBackend\.terminals\.create\(\{\s*cwd: draft\.cwd,\s*aiCmd: draft\.aiCmd,\s*hostId: draft\.hostId \?\? null,\s*\}\)/s,
   );
   assert.match(
@@ -81,13 +91,13 @@ test("app creates persisted terminals through the host-aware command", () => {
     /create: \(args\) => transport\.invoke<CreatedTerminal>\("create_terminal", \{ args \}\)/,
   );
   assert.match(
-    app,
+    restoration,
     /if \(terminal\.managed\) \{\s*try \{\s*return await dashboardBackend\.sessions\.exists\(terminal\.tmuxName\) \? terminal : null/s,
   );
-  assert.match(app, /dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
-  assert.match(app, /cwd:\s*created\.cwd/);
-  assert.match(app, /managed:\s*created\.managed/);
-  assert.match(app, /aiCmd:\s*terminal\.aiCmd/);
+  assert.match(restoration, /dashboardBackend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
+  assert.match(creation, /cwd:\s*created\.cwd/);
+  assert.match(creation, /managed:\s*created\.managed/);
+  assert.match(restoration, /aiCmd:\s*terminal\.aiCmd/);
   assert.match(deck, /function terminalSessionKey/);
-  assert.match(app, /persistedKeys/);
+  assert.match(restoration, /persistedKeys/);
 });

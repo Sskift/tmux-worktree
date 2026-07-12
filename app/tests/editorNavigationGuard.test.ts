@@ -15,6 +15,10 @@ import {
   markFileEditorSaved,
 } from "../src/fileEditorDirtyState.ts";
 import { createLatestRequestGate } from "../src/latestRequestGate.ts";
+import {
+  readRendererImplementationTree,
+  rendererImplementationSourceContaining,
+} from "./helpers/rendererImplementationSource.ts";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -171,8 +175,8 @@ test("workspace navigation protects an unsaved automation draft", async () => {
   assert.equal(navigated, true);
 });
 
-test("App guards every editor-destructive routing entry point", () => {
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+test("the renderer guards every editor-destructive routing entry point", () => {
+  const renderer = readRendererImplementationTree();
   const editor = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
 
   assert.match(editor, /onDirtyChange\?: \(dirty: boolean\) => void/);
@@ -180,18 +184,35 @@ test("App guards every editor-destructive routing entry point", () => {
   assert.match(editor, /markFileEditorSaved/);
   assert.match(editor, /beginFileEditorLoad/);
 
-  assert.match(app, /const requestEditorNavigation = useCallback/);
-  assert.match(app, /const closeEditingFile = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const handleOpenFile = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const selectSession = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const selectTerminal = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const selectAutomation = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.match(app, /const openGitDiff = useCallback[\s\S]*?requestEditorNavigation/);
-  assert.doesNotMatch(app, /expandInspectorView|renderExpandedView/);
-  assert.match(app, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
-  assert.match(app, /onDirtyChange=\{handleEditorDirtyChange\}/);
-  assert.match(app, /onDirtyChange=\{handleAutomationDirtyChange\}/);
-  assert.match(app, /onNew=\{handleNewAutomation\}/);
-  assert.match(app, /automationSubmitStillOwnsDraft\(originatingDraft/);
-  assert.match(app, /automationSelectionIsCurrent\([\s\S]*?return Promise\.resolve\(false\)/);
+  for (const handler of [
+    "const closeEditingFile = useCallback",
+    "const handleOpenFile = useCallback",
+    "const selectSession = useCallback",
+    "const selectTerminal = useCallback",
+    "const selectAutomation = useCallback",
+    "const openGitDiff = useCallback",
+  ]) {
+    const source = rendererImplementationSourceContaining(handler, "requestEditorNavigation").source;
+    assert.ok(
+      source.indexOf(handler) < source.indexOf("requestEditorNavigation", source.indexOf(handler)),
+      `${handler} should route through requestEditorNavigation in the same implementation file`,
+    );
+  }
+  assert.doesNotMatch(renderer, /expandInspectorView|renderExpandedView/);
+  const composition = rendererImplementationSourceContaining(
+    'diffFile ? (',
+    "onDirtyChange={handleEditorDirtyChange}",
+    "onDirtyChange={handleAutomationDirtyChange}",
+    "onNew={handleNewAutomation}",
+  ).source;
+  assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.match(composition, /onDirtyChange=\{handleEditorDirtyChange\}/);
+  assert.match(composition, /onDirtyChange=\{handleAutomationDirtyChange\}/);
+  assert.match(composition, /onNew=\{handleNewAutomation\}/);
+  assert.match(composition, /automationSubmitStillOwnsDraft\(originatingDraft/);
+  const automationSelection = rendererImplementationSourceContaining(
+    "automationSelectionIsCurrent(",
+    "return Promise.resolve(false)",
+  ).source;
+  assert.match(automationSelection, /automationSelectionIsCurrent\([\s\S]*?return Promise\.resolve\(false\)/);
 });
