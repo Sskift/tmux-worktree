@@ -1,23 +1,60 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { basename, join, relative } from "node:path";
 import test from "node:test";
 
 const read = (path) => readFileSync(path, "utf8");
+const androidSourceRoot =
+  "mobile/android/app/src/main/java/com/tmuxworktree/mobile";
+
+function descendantFiles(directory) {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(directory, entry.name);
+    return entry.isDirectory() ? descendantFiles(path) : [path];
+  });
+}
+
+const androidSourcesByName = new Map();
+for (const path of descendantFiles(androidSourceRoot)) {
+  const name = basename(path);
+  androidSourcesByName.set(name, [
+    ...(androidSourcesByName.get(name) ?? []),
+    path,
+  ]);
+}
+
+function readAndroidSource(fileName) {
+  const matches = androidSourcesByName.get(fileName) ?? [];
+  assert.equal(
+    matches.length,
+    1,
+    `expected one Android source named ${fileName}, found ${matches
+      .map((path) => relative(androidSourceRoot, path))
+      .join(", ")}`,
+  );
+  return read(matches[0]);
+}
+
+function readUniqueSourceContaining(directory, marker) {
+  const matches = descendantFiles(directory).filter((path) =>
+    read(path).includes(marker),
+  );
+  assert.equal(
+    matches.length,
+    1,
+    `expected one source under ${directory} containing ${marker}, found ${matches
+      .map((path) => relative(directory, path))
+      .join(", ")}`,
+  );
+  return read(matches[0]);
+}
 
 test("Android V2 terminal is bundled, sandboxed, and refits after viewport changes", () => {
   const html = read("mobile/android/app/src/main/assets/xterm/index.html");
-  const webView = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/terminal/TerminalWebView.kt",
-  );
-  const relayActor = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayV1ConnectionActor.kt",
-  );
-  const viewModel = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2ViewModel.kt",
-  );
-  const registries = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayRegistries.kt",
-  );
+  const webView = readAndroidSource("TerminalWebView.kt");
+  const relayActor = readAndroidSource("RelayV1ConnectionActor.kt");
+  const viewModel = readAndroidSource("V2ViewModel.kt");
+  const registries = readAndroidSource("RelayRegistries.kt");
 
   assert.match(html, /<script src="xterm\.js"><\/script>/);
   assert.match(html, /<script src="xterm-addon-fit\.js"><\/script>/);
@@ -109,12 +146,8 @@ test("Android package is on the V2 Compose line and V2Activity owns the launcher
 });
 
 test("Android creation flows cannot escape or resubmit while a request is in flight", () => {
-  const app = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2App.kt",
-  );
-  const worktree = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/ui/NewWorktreeScreen.kt",
-  );
+  const app = readAndroidSource("V2App.kt");
+  const worktree = readAndroidSource("NewWorktreeScreen.kt");
 
   assert.match(app, /navigateAfterCreation\(/);
   assert.match(app, /popUpTo\(formRoute\) \{ inclusive = true \}/);
@@ -125,9 +158,7 @@ test("Android creation flows cannot escape or resubmit while a request is in fli
 
 test("exported Android V2 demo launch modes are debug-only", () => {
   const manifest = read("mobile/android/app/src/main/AndroidManifest.xml");
-  const activity = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/V2Activity.kt",
-  );
+  const activity = readAndroidSource("V2Activity.kt");
   const exportedV2 = manifest.match(
     /<activity\b[^>]*android:name="\.V2Activity"[^>]*android:exported="true"[^>]*>/,
   );
@@ -190,15 +221,9 @@ test("Android app data cannot enter backup or device transfer", () => {
 });
 
 test("Android V2 workspace list groups cached sessions by project and scope", () => {
-  const screen = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/feature/workspaces/WorkspacesScreen.kt",
-  );
-  const models = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/model/Models.kt",
-  );
-  const repository = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/TwRepository.kt",
-  );
+  const screen = readAndroidSource("WorkspacesScreen.kt");
+  const models = readAndroidSource("Models.kt");
+  const repository = readAndroidSource("TwRepository.kt");
 
   assert.match(
     screen,
@@ -214,21 +239,11 @@ test("Android V2 workspace list groups cached sessions by project and scope", ()
 });
 
 test("Android V2 connection profile is editable, clearable, and never persists plaintext credentials", () => {
-  const pairing = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/feature/pairing/PairingScreen.kt",
-  );
-  const preferences = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/PreferencesStore.kt",
-  );
-  const credentials = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/CredentialStore.kt",
-  );
-  const importer = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/LegacyIdentityImporter.kt",
-  );
-  const viewModel = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2ViewModel.kt",
-  );
+  const pairing = readAndroidSource("PairingScreen.kt");
+  const preferences = readAndroidSource("PreferencesStore.kt");
+  const credentials = readAndroidSource("CredentialStore.kt");
+  const importer = readAndroidSource("LegacyIdentityImporter.kt");
+  const viewModel = readAndroidSource("V2ViewModel.kt");
 
   assert.match(pairing, /onRelayUrlChange: \(String\) -> Unit/);
   assert.match(pairing, /onTokenChange: \(String\) -> Unit/);
@@ -262,12 +277,8 @@ test("Android V2 connection profile is editable, clearable, and never persists p
 });
 
 test("Android V2 requires confirmation and clears credential-bound data before profile changes", () => {
-  const activity = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/V2Activity.kt",
-  );
-  const viewModel = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/app/V2ViewModel.kt",
-  );
+  const activity = readAndroidSource("V2Activity.kt");
+  const viewModel = readAndroidSource("V2ViewModel.kt");
   const intentStart = activity.indexOf("private fun consumePairingIntent");
   const qrStart = activity.indexOf("private fun scanPairingQr", intentStart);
   const companionStart = activity.indexOf("companion object", qrStart);
@@ -326,12 +337,8 @@ test("Android V2 requires confirmation and clears credential-bound data before p
 });
 
 test("Android V2 terminal stream recovery reopens only the desired active session", () => {
-  const actor = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayV1ConnectionActor.kt",
-  );
-  const registries = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayRegistries.kt",
-  );
+  const actor = readAndroidSource("RelayV1ConnectionActor.kt");
+  const registries = readAndroidSource("RelayRegistries.kt");
 
   assert.match(actor, /private var desiredTerminal: DesiredTerminal\?/);
   assert.match(actor, /private var pendingReopenGeneration: Long\?/);
@@ -345,17 +352,19 @@ test("Android V2 terminal stream recovery reopens only the desired active sessio
 });
 
 test("mobile relay failures stay visible on Android and in the Dashboard", () => {
-  const reducer = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/relay/RelayConnectionReducer.kt",
+  const reducer = readAndroidSource("RelayConnectionReducer.kt");
+  const healthScreen = readAndroidSource("ConnectionHealthScreen.kt");
+  const app = readUniqueSourceContaining(
+    "app/src",
+    "useMobileRelayController({ hosts })",
   );
-  const healthScreen = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/ui/ConnectionHealthScreen.kt",
-  );
-  const app = read("app/src/App.tsx");
   const dashboard = read(
     "app/src/dashboard/hooks/useMobileRelayController.ts",
   );
-  const backend = read("app/src-tauri/src/lib.rs");
+  const backend = readUniqueSourceContaining(
+    "app/src-tauri/src",
+    "load_mobile_relay_runtime_status",
+  );
 
   assert.match(reducer, /TransportPhase\.BACKING_OFF/);
   assert.match(reducer, /ConnectionStatus\.AUTH_REQUIRED/);
@@ -390,12 +399,8 @@ test("Android V2 terminal supports touch scrolling through bundled xterm scrollb
 });
 
 test("Android V2 outbox makes queued delivery durable and state transitions explicit", () => {
-  const repository = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/TwRepository.kt",
-  );
-  const entities = read(
-    "mobile/android/app/src/main/java/com/tmuxworktree/mobile/core/data/Entities.kt",
-  );
+  const repository = readAndroidSource("TwRepository.kt");
+  const entities = readAndroidSource("Entities.kt");
 
   assert.match(repository, /database\.withTransaction/);
   assert.match(repository, /dao\.insertOutbox\(message\.toEntity\(\)\)/);

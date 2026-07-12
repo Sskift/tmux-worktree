@@ -1,0 +1,84 @@
+[
+  {
+    "name": "host-registered",
+    "type": "host_registered",
+    "wire": "{\"type\":\"host_registered\",\"hostId\":\"mac-admin\"}",
+    "normalized": { "type": "host_registered", "hostId": "mac-admin" }
+  },
+  {
+    "name": "route-list-sessions",
+    "type": "list_sessions",
+    "source": "list-sessions",
+    "wire": "{\"type\":\"list_sessions\",\"hostId\":\"mac-admin\",\"requestId\":\"sessions-1\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "list_sessions", "hostId": "mac-admin", "requestId": "sessions-1", "clientId": "client-1" }
+  },
+  {
+    "name": "route-list-scope-statuses",
+    "type": "list_scope_statuses",
+    "source": "list-scope-statuses",
+    "wire": "{\"type\":\"list_scope_statuses\",\"hostId\":\"mac-admin\",\"requestId\":\"scopes-1\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "list_scope_statuses", "hostId": "mac-admin", "requestId": "scopes-1", "clientId": "client-1" }
+  },
+  {
+    "name": "route-create-worktree",
+    "type": "create_worktree",
+    "source": "create-worktree-all-fields",
+    "wire": "{\"type\":\"create_worktree\",\"hostId\":\"mac-admin\",\"requestId\":\"create-wt-1\",\"scopeId\":\"local\",\"project\":\"demo\",\"path\":\"/repo/demo\",\"name\":\"fix\",\"branch\":\"main\",\"aiCommand\":\"codex\",\"aiCmd\":\"codex --resume\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "create_worktree", "hostId": "mac-admin", "requestId": "create-wt-1", "scopeId": "local", "project": "demo", "path": "/repo/demo", "name": "fix", "branch": "main", "aiCommand": "codex", "aiCmd": "codex --resume", "clientId": "client-1" }
+  },
+  {
+    "name": "route-create-terminal",
+    "type": "create_terminal",
+    "source": "create-terminal-android-v1",
+    "wire": "{\"type\":\"create_terminal\",\"hostId\":\"mac-admin\",\"requestId\":\"create-term-1\",\"scopeId\":\"remote-a\",\"cwd\":\"/repo/demo\",\"label\":\"Demo\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "create_terminal", "hostId": "mac-admin", "requestId": "create-term-1", "scopeId": "remote-a", "cwd": "/repo/demo", "label": "Demo", "clientId": "client-1" }
+  },
+  {
+    "name": "route-open-terminal",
+    "type": "open_terminal",
+    "source": "open-terminal-number-pane",
+    "wire": "{\"type\":\"open_terminal\",\"hostId\":\"mac-admin\",\"streamId\":\"stream-number\",\"session\":\"local:demo\",\"pane\":2,\"clientId\":\"client-1\"}",
+    "normalized": { "type": "open_terminal", "hostId": "mac-admin", "streamId": "stream-number", "session": "local:demo", "pane": { "kind": "number", "value": 2 }, "clientId": "client-1" }
+  },
+  {
+    "name": "route-send-agent-message",
+    "type": "send_agent_message",
+    "source": "send-agent-message-text-pane",
+    "wire": "{\"type\":\"send_agent_message\",\"hostId\":\"mac-admin\",\"requestId\":\"agent-1\",\"session\":\"local:demo\",\"pane\":\"1\",\"message\":\"run\\nnow\",\"submit\":true,\"clientId\":\"client-1\"}",
+    "normalized": { "type": "send_agent_message", "hostId": "mac-admin", "requestId": "agent-1", "session": "local:demo", "pane": { "kind": "text", "value": "1" }, "message": "run\nnow", "submit": true, "clientId": "client-1" }
+  },
+  {
+    "name": "route-kill-session",
+    "type": "kill_session",
+    "source": "kill-session-android-v1",
+    "wire": "{\"type\":\"kill_session\",\"hostId\":\"mac-admin\",\"requestId\":\"kill-1\",\"session\":\"local:demo\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "kill_session", "hostId": "mac-admin", "requestId": "kill-1", "session": "local:demo", "managed": null, "clientId": "client-1" }
+  },
+  {
+    "name": "route-terminal-input",
+    "type": "terminal_input",
+    "source": "terminal-input",
+    "wire": "{\"type\":\"terminal_input\",\"streamId\":\"stream-1\",\"data\":\"\\u001b[A\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "terminal_input", "streamId": "stream-1", "data": "\u001b[A", "clientId": "client-1" }
+  },
+  {
+    "name": "route-resize",
+    "type": "resize",
+    "source": "resize",
+    "wire": "{\"type\":\"resize\",\"streamId\":\"stream-1\",\"cols\":120,\"rows\":40,\"clientId\":\"client-1\"}",
+    "normalized": { "type": "resize", "streamId": "stream-1", "cols": 120, "rows": 40, "clientId": "client-1" }
+  },
+  {
+    "name": "route-close-terminal",
+    "type": "close_terminal",
+    "source": "close-terminal",
+    "wire": "{\"type\":\"close_terminal\",\"streamId\":\"stream-1\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "close_terminal", "streamId": "stream-1", "clientId": "client-1" }
+  },
+  {
+    "name": "client-closed",
+    "type": "client_closed",
+    "wire": "{\"type\":\"client_closed\",\"clientId\":\"client-1\"}",
+    "normalized": { "type": "client_closed", "clientId": "client-1" }
+  }
+]

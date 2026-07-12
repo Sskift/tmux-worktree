@@ -36,6 +36,12 @@ android {
     room {
         schemaDirectory("$projectDir/schemas")
     }
+
+    sourceSets {
+        getByName("test").resources.directories.add(
+            rootProject.file("../../contracts/relay/v1").absolutePath,
+        )
+    }
 }
 
 kapt {

@@ -1,0 +1,71 @@
+[
+  {
+    "name": "host-ready",
+    "type": "host_ready",
+    "wire": "{\"type\":\"host_ready\",\"hostId\":\"mac-admin\",\"displayName\":\"Mac\",\"version\":\"admin-v1\"}",
+    "normalized": { "type": "host_ready", "hostId": "mac-admin", "displayName": "Mac", "version": "admin-v1" }
+  },
+  {
+    "name": "deliver-sessions",
+    "type": "sessions",
+    "deliversAs": "sessions-with-request",
+    "wire": "{\"type\":\"sessions\",\"clientId\":\"client-1\",\"requestId\":\"sessions-1\",\"sessions\":[{\"name\":\"local:demo\",\"rawName\":\"demo\",\"scopeId\":\"local\",\"scopeLabel\":\"local\",\"kind\":\"worktree\",\"project\":\"demo\",\"label\":\"Demo\",\"cwd\":\"/repo/demo\",\"attached\":true,\"windows\":2,\"created\":10,\"activity\":20}]}",
+    "normalized": { "type": "sessions", "clientId": "client-1", "requestId": "sessions-1", "sessions": [{ "name": "local:demo", "rawName": "demo", "scopeId": "local", "scopeLabel": "local", "kind": "worktree", "project": "demo", "label": "Demo", "cwd": "/repo/demo", "attached": true, "windows": 2, "created": 10, "activity": 20 }] }
+  },
+  {
+    "name": "deliver-scope-statuses",
+    "type": "scope_statuses",
+    "deliversAs": "scope-statuses-with-request",
+    "wire": "{\"type\":\"scope_statuses\",\"clientId\":\"client-1\",\"requestId\":\"scopes-1\",\"scopes\":[{\"scopeId\":\"remote-a\",\"scopeLabel\":\"Remote A\",\"kind\":\"ssh\",\"reachable\":false,\"sessionCount\":0,\"error\":\"offline\"}]}",
+    "normalized": { "type": "scope_statuses", "clientId": "client-1", "requestId": "scopes-1", "scopes": [{ "scopeId": "remote-a", "scopeLabel": "Remote A", "kind": "ssh", "reachable": false, "sessionCount": 0, "error": "offline" }] }
+  },
+  {
+    "name": "deliver-worktree-created",
+    "type": "worktree_created",
+    "deliversAs": "worktree-created",
+    "wire": "{\"type\":\"worktree_created\",\"clientId\":\"client-1\",\"requestId\":\"create-wt-1\",\"session\":{\"name\":\"local:demo\",\"rawName\":\"demo\",\"scopeId\":\"local\",\"scopeLabel\":\"local\",\"managed\":true,\"kind\":\"worktree\",\"project\":\"demo\",\"label\":\"Demo\",\"cwd\":\"/repo/demo\",\"attached\":false,\"windows\":1,\"created\":10,\"activity\":10}}",
+    "normalized": { "type": "worktree_created", "clientId": "client-1", "requestId": "create-wt-1", "session": { "name": "local:demo", "rawName": "demo", "scopeId": "local", "scopeLabel": "local", "managed": true, "kind": "worktree", "project": "demo", "label": "Demo", "cwd": "/repo/demo", "attached": false, "windows": 1, "created": 10, "activity": 10 } }
+  },
+  {
+    "name": "deliver-terminal-created",
+    "type": "terminal_created",
+    "deliversAs": "terminal-created-without-request",
+    "wire": "{\"type\":\"terminal_created\",\"clientId\":\"client-1\",\"session\":{\"name\":\"local:tw-term-a1b2c\",\"rawName\":\"tw-term-a1b2c\",\"scopeId\":\"local\",\"scopeLabel\":\"local\",\"managed\":true,\"kind\":\"terminal\",\"label\":\"Shell\",\"cwd\":\"/repo/demo\",\"attached\":false,\"windows\":1,\"created\":10,\"activity\":10}}",
+    "normalized": { "type": "terminal_created", "clientId": "client-1", "requestId": null, "session": { "name": "local:tw-term-a1b2c", "rawName": "tw-term-a1b2c", "scopeId": "local", "scopeLabel": "local", "managed": true, "kind": "terminal", "project": "", "label": "Shell", "cwd": "/repo/demo", "attached": false, "windows": 1, "created": 10, "activity": 10 } }
+  },
+  {
+    "name": "deliver-agent-message-sent",
+    "type": "agent_message_sent",
+    "deliversAs": "agent-message-sent-number-pane",
+    "wire": "{\"type\":\"agent_message_sent\",\"clientId\":\"client-1\",\"requestId\":\"agent-1\",\"session\":\"local:demo\",\"pane\":2}",
+    "normalized": { "type": "agent_message_sent", "clientId": "client-1", "requestId": "agent-1", "session": "local:demo", "pane": { "kind": "number", "value": 2 } }
+  },
+  {
+    "name": "deliver-session-killed",
+    "type": "session_killed",
+    "deliversAs": "session-killed-without-request",
+    "wire": "{\"type\":\"session_killed\",\"clientId\":\"client-1\",\"session\":\"local:demo\"}",
+    "normalized": { "type": "session_killed", "clientId": "client-1", "requestId": null, "session": "local:demo" }
+  },
+  {
+    "name": "deliver-terminal-data",
+    "type": "terminal_data",
+    "deliversAs": "terminal-data",
+    "wire": "{\"type\":\"terminal_data\",\"clientId\":\"client-1\",\"streamId\":\"stream-1\",\"data\":\"tail\"}",
+    "normalized": { "type": "terminal_data", "clientId": "client-1", "streamId": "stream-1", "data": "tail" }
+  },
+  {
+    "name": "deliver-terminal-exit",
+    "type": "terminal_exit",
+    "deliversAs": "terminal-exit-with-code",
+    "wire": "{\"type\":\"terminal_exit\",\"clientId\":\"client-1\",\"streamId\":\"stream-1\",\"code\":0}",
+    "normalized": { "type": "terminal_exit", "clientId": "client-1", "streamId": "stream-1", "code": 0 }
+  },
+  {
+    "name": "deliver-error-without-correlation",
+    "type": "error",
+    "deliversAs": "error-without-correlation",
+    "wire": "{\"type\":\"error\",\"clientId\":\"client-1\",\"message\":\"failed\"}",
+    "normalized": { "type": "error", "clientId": "client-1", "requestId": null, "streamId": null, "message": "failed" }
+  }
+]
