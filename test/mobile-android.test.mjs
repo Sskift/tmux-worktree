@@ -222,7 +222,7 @@ test("Android app data cannot enter backup or device transfer", () => {
 
 test("Android V2 workspace list groups cached sessions by project and scope", () => {
   const screen = readAndroidSource("WorkspacesScreen.kt");
-  const models = readAndroidSource("Models.kt");
+  const models = readAndroidSource("SessionModels.kt");
   const repository = readAndroidSource("TwRepository.kt");
 
   assert.match(
