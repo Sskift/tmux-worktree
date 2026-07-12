@@ -1,6 +1,7 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1Pane
 
 sealed interface RelayClientEvent {
     data class Ready(val clientId: String, val hostId: String?) : RelayClientEvent

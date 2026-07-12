@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.model.ConnectionHealth
 import com.tmuxworktree.mobile.core.model.ConnectionStatus

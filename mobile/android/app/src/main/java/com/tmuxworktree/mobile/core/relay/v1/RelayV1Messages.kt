@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.v1
 
 /** Wire models for the unversioned relay protocol used by the legacy Android client. */
 data class RelayV1Host(

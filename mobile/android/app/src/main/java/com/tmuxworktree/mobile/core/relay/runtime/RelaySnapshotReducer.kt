@@ -1,9 +1,12 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1Host
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1ScopeStatus
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1Session
 
 data class RelaySnapshotState(
     val hostsById: Map<String, RelayHost> = emptyMap(),

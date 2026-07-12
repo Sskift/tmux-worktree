@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.v1
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

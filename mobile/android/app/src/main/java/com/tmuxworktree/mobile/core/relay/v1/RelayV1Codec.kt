@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.v1
 
 class RelayV1Codec {
     fun encode(command: RelayV1Command): String {

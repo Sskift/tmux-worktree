@@ -1,5 +1,6 @@
-package com.tmuxworktree.mobile.core.relay
+package com.tmuxworktree.mobile.core.relay.runtime
 
+import com.tmuxworktree.mobile.core.relay.v1.RelayV1Pane
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
