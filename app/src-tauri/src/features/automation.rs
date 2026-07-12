@@ -1,3 +1,5 @@
+use crate::features::sessions::tmux_session_exists;
+use crate::ipc::CreateArgs;
 use crate::support::{app_home_dir_or_tmp, shell_quote};
 use serde::{Deserialize, Serialize};
 
@@ -167,6 +169,89 @@ pub(crate) fn should_skip_automation_overlap(
         )
         && automation.last_session.is_some()
         && session_exists
+}
+
+pub(crate) fn trigger_automation_with_creator<F>(
+    id: String,
+    create: F,
+) -> Result<AutomationRun, String>
+where
+    F: FnOnce(CreateArgs) -> Result<String, String>,
+{
+    let mut automations = load_automations_from_disk()?;
+    let index = automations
+        .iter()
+        .position(|automation| automation.id == id)
+        .ok_or_else(|| format!("automation not found: {id}"))?;
+    let automation = automations[index].clone();
+    let now = now_rfc3339();
+    let session_exists = automation
+        .last_session
+        .as_ref()
+        .map(|session| tmux_session_exists(session.clone()).unwrap_or(false))
+        .unwrap_or(false);
+
+    if should_skip_automation_overlap(&automation, session_exists) {
+        let run = AutomationRun {
+            id: new_prefixed_id("run"),
+            automation_id: automation.id.clone(),
+            started_at: now.clone(),
+            finished_at: Some(now),
+            status: AutomationStatus::Skipped,
+            session_name: automation.last_session.clone(),
+            error: Some("automation already has a live running session".to_string()),
+        };
+        let mut runs = load_automation_runs_from_disk()?;
+        append_automation_run(&mut runs, run.clone());
+        save_automation_runs_to_disk(&runs)?;
+        return Ok(run);
+    }
+
+    let ai_cmd = automation_command_with_instruction(&automation.ai_cmd, &automation.instruction);
+    let start_result = create(CreateArgs {
+        project: automation.project.clone().and_then(trimmed_non_empty),
+        path: automation.path.clone().and_then(trimmed_non_empty),
+        ai_cmd,
+        name: Some(automation.name.clone()),
+        branch: None,
+        host_id: None,
+    });
+
+    let mut runs = load_automation_runs_from_disk()?;
+    let run = match start_result {
+        Ok(session) => {
+            automations[index].last_run_at = Some(now.clone());
+            automations[index].last_status = AutomationStatus::Running;
+            automations[index].last_session = Some(session.clone());
+            AutomationRun {
+                id: new_prefixed_id("run"),
+                automation_id: automation.id,
+                started_at: now,
+                finished_at: None,
+                status: AutomationStatus::Running,
+                session_name: Some(session),
+                error: None,
+            }
+        }
+        Err(error) => {
+            automations[index].last_run_at = Some(now.clone());
+            automations[index].last_status = AutomationStatus::Failed;
+            AutomationRun {
+                id: new_prefixed_id("run"),
+                automation_id: automation.id,
+                started_at: now.clone(),
+                finished_at: Some(now),
+                status: AutomationStatus::Failed,
+                session_name: None,
+                error: Some(error),
+            }
+        }
+    };
+
+    append_automation_run(&mut runs, run.clone());
+    save_automations_to_disk(&automations)?;
+    save_automation_runs_to_disk(&runs)?;
+    Ok(run)
 }
 
 pub(crate) fn upsert_automation_from_input(
