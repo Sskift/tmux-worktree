@@ -6,6 +6,12 @@
     "normalized": { "type": "host_registered", "hostId": "mac-admin" }
   },
   {
+    "name": "invalid-host-error",
+    "type": "error",
+    "wire": "{\"type\":\"error\",\"message\":\"invalid hostId\"}",
+    "normalized": { "type": "error", "message": "invalid hostId" }
+  },
+  {
     "name": "route-list-sessions",
     "type": "list_sessions",
     "source": "list-sessions",

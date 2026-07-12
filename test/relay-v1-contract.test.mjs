@@ -136,6 +136,7 @@ test("relay v1 fixtures freeze the complete message type surface", () => {
     "close_terminal",
     "create_terminal",
     "create_worktree",
+    "error",
     "host_registered",
     "kill_session",
     "list_scope_statuses",
