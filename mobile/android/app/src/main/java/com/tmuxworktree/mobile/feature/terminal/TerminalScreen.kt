@@ -1,4 +1,4 @@
-package com.tmuxworktree.mobile.ui
+package com.tmuxworktree.mobile.feature.terminal
 
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -57,6 +57,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.tmuxworktree.mobile.core.model.ConnectionStatus
+import com.tmuxworktree.mobile.designsystem.*
 
 @Composable
 fun TerminalScreen(
