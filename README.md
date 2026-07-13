@@ -98,11 +98,15 @@ tw setup
 
 ### Android APK
 
-The Android binary is published as a separate GitHub release asset:
+The current Compose Android client is built and released separately from the macOS Dashboard. This repository revision has not completed a signed Android production release; do not use an older GitHub debug APK to evaluate the current source.
 
-[Download `tw-dashboard-mobile_1.0.3_release-debug-signed.apk`](https://github.com/Sskift/tmux-worktree/releases/download/v1.0.3/tw-dashboard-mobile_1.0.3_release-debug-signed.apk)
+Build the device-test APK from the current checkout:
 
-The APK is installable and debug-signed. Use it for direct device testing, not app-store distribution.
+```bash
+npm run verify:android
+```
+
+This builds `mobile/android/app/build/outputs/apk/debug/app-debug.apk` after the Android JVM and Lint gates. The Debug APK is for direct device testing. `:app:assembleRelease` currently produces an unsigned verification artifact, not an app-store or production-distributable build. See the [Android relay guide](docs/remote-relay-android.md) for installation and pairing.
 
 ## Quick Start
 
@@ -178,7 +182,6 @@ Common commands:
 ```bash
 tw setup
 tw ls
-tw status  # compatibility alias for the same one-shot list
 tw serve
 tw relay-server
 tw relay-host
@@ -201,7 +204,7 @@ tw rpc restore-worktree --path ~/.tmux-worktree/worktrees/myapp/myapp-fix-abc12 
 tw rpc kill-session --name tw-term-abc12
 ```
 
-`tw status` is non-interactive and exits after printing the current session list. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
+`tw ls` is non-interactive and exits after printing the current session list; `tw status` remains a compatibility alias. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
 
 Manage and operate configured SSH Hosts without opening the Dashboard:
 
@@ -327,6 +330,7 @@ Requirements:
 - Xcode Command Line Tools
 - tmux
 - git
+- Android Studio or an Android SDK with Java 17 for Android checks
 
 Build the CLI:
 
@@ -344,11 +348,20 @@ npm install
 npm run tauri dev
 ```
 
-Useful checks:
+Run the repository verification entry points from the repository root:
+
+```bash
+npm run verify          # CLI, Dashboard, Rust, and documentation
+npm run verify:android  # Android JVM tests, Debug/Release lint, and APK builds
+npm run verify:all      # core plus Android checks
+npm run verify:device   # all checks plus connected Android device tests
+```
+
+The device gate requires a running emulator or connected device. The other Android gates do not. To run one layer while iterating:
 
 ```bash
 npm run build
-node --test test/*.test.mjs
+npm run test:cli
 
 cd app
 npm run build
@@ -381,7 +394,7 @@ The release script:
 
 1. Builds the Tauri Dashboard DMG.
 2. Builds the standalone root CLI into `dist/cli.cjs` while retaining `dist/*.js` only as repository-local ESM module builds.
-3. Bundles `dist/cli.cjs` into the Dashboard app as `tw-cli/cli.cjs` for canonical local worktree creation and remote serve fallback.
+3. Bundles `dist/cli.cjs` into the Dashboard app as `tw-cli/cli.cjs` for canonical local lifecycle RPC and the Mobile Relay `tw serve` / `tw relay-host` runtimes.
 4. Copies the DMG to `app/installer/dmg/tw-dashboard-arm64.dmg`.
 5. Leaves upload and channel-specific publishing outside the repository.
 
@@ -397,9 +410,12 @@ Generated asset inputs:
 
 ## Documentation
 
-- [Manual](MANUAL.md): setup, local sessions, SSH remote hosts, mobile relay, and troubleshooting.
+- [Agent guide](AGENTS.md): reading order, code ownership, architectural constraints, and change-to-test matrix for contributors and coding agents.
+- [Manual](MANUAL.md): setup, local sessions, SSH remote hosts, remote AI commands, and troubleshooting.
 - [Architecture](ARCHITECTURE.md): code map, runtime state, release boundaries, and maintenance rules.
-- [Android relay guide](docs/remote-relay-android.md): persistent broker and phone pairing details.
+- [Android architecture](docs/android-v2-architecture.md): Compose UI V2, state management, Relay v1 limits, and Android acceptance gates.
+- [Android relay guide](docs/remote-relay-android.md): persistent broker, Mac connector, phone pairing, and APK development.
+- [Relay v2 contract](docs/relay-v2-contract.md): frozen future protocol contract; no Relay v2 implementation exists yet.
 
 ## License
 

@@ -153,7 +153,7 @@ The **Relay v1 profile** QR contains the current shared Relay v1 token, not a ro
 tmuxworktree://pair?relayUrl=<percent-encoded-relay-url>&token=<percent-encoded-token>&hostId=<percent-encoded-host-id>
 ```
 
-Scanning or launching only prefills the V2 review screen; Android does not save or connect until the user confirms. Relay v2 pairing will be added separately after the broker/host capability issuer exists and must not reuse this shared secret as though it were a v2 token.
+Scanning or launching only prefills the Compose app's pairing review screen; Android does not save or connect until the user confirms. The `V2Activity` entry point names the second-generation Android UI, not the Relay protocol: this flow still uses Relay v1. Relay v2 pairing will be added separately after the broker/host capability issuer exists and must not reuse this shared secret as though it were a v2 token.
 
 When the broker is only reachable over SSH, Dashboard may initially suggest the Mac's mDNS address:
 
@@ -161,7 +161,7 @@ When the broker is only reachable over SSH, Dashboard may initially suggest the 
 ws://<mac-local-name>.local:8787
 ```
 
-That cleartext URL is for local setup only. Before pairing a production Android build, put TLS in front of the broker and edit `Relay URL` to a trusted `wss://` address such as `wss://devbox.example.net`. An upgraded 1.x profile that still contains `ws://` is returned to the V2 pairing review instead of entering an endless reconnect loop.
+That cleartext URL is for local setup only. Before pairing a production Android build, put TLS in front of the broker and edit `Relay URL` to a trusted `wss://` address such as `wss://devbox.example.net`. An imported legacy profile that still contains `ws://` is returned to the pairing review instead of entering an endless reconnect loop.
 
 ## Android
 
@@ -190,4 +190,4 @@ adb shell 'am start -n com.tmuxworktree.mobile/.V2Activity \
 
 The nested quoting is intentional because `adb shell` is parsed once on the desktop and again on Android; Dashboard wraps the entire Android command and each value independently, including interactive-shell characters such as `!`, `$`, and backticks. The launch command opens a reviewable pairing screen, while the `tmuxworktree://pair?...` payload is consumed by the app's built-in QR scanner. The custom scheme is intentionally not registered as a browsable Android deep link because another app could claim the same scheme and steal the Relay v1 token. Neither path enables `autoConnect`.
 
-The source currently keeps `versionName=1.0.3` aligned with the repository and uses the higher `versionCode=20000` for Android upgrade ordering. `:app:assembleRelease` produces an **unsigned build-verification artifact** only. This source merge does not start a 2.0 release or produce a production-distributable APK; version bumps and signing happen in the unified release process.
+The authoritative Android `versionName` and `versionCode` live in `mobile/android/app/build.gradle.kts`. With the repository's current Gradle configuration, `:app:assembleRelease` produces an **unsigned build-verification artifact** only; versioning and signing are explicit release steps. The `V2Activity` class name does not imply an app 2.0 release or Relay v2 support.

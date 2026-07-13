@@ -1,6 +1,6 @@
 # tmux-worktree Manual
 
-This manual covers local macOS Dashboard setup and SSH remote host usage.
+This manual covers macOS Dashboard and CLI setup, local sessions, SSH remote hosts, remote AI commands, and troubleshooting. Android pairing and broker operation are documented separately in [the Android relay guide](docs/remote-relay-android.md).
 
 ## Install On macOS
 

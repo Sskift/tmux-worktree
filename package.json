@@ -20,7 +20,12 @@
   },
   "scripts": {
     "build": "tsup && tsup --config tsup.standalone.config.ts",
-    "test:cli": "node --test --test-concurrency=1 test/*.test.mjs"
+    "test:cli": "node --test --test-concurrency=1 test/*.test.mjs",
+    "test:docs": "node scripts/check-docs.mjs",
+    "verify": "sh scripts/verify.sh core",
+    "verify:android": "sh scripts/verify.sh android",
+    "verify:all": "sh scripts/verify.sh all",
+    "verify:device": "sh scripts/verify.sh device"
   },
   "dependencies": {
     "ws": "^8.18.0"
