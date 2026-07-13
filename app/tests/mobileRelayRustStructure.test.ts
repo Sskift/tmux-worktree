@@ -132,6 +132,7 @@ test("mobile relay production modules and symbols have one frozen owner", () => 
       "config_string_field",
       "mobile_relay_config_from_value",
       "load_mobile_relay_config_file",
+      "preflight_mobile_relay_config_write",
       "env_non_empty",
       "config_or_default",
       "mobile_relay_config",
@@ -140,15 +141,13 @@ test("mobile relay production modules and symbols have one frozen owner", () => 
     ]],
     ["features/mobile_relay/network.rs", [
       "tcp_port_open",
-      "tcp_addr_open",
-      "direct_mobile_relay_url_for_host",
-      "local_lan_ip",
-      "normalize_local_mdns_name",
-      "local_mdns_name",
-      "start_mobile_relay_ssh_forward",
-      "mobile_relay_ssh_forward_command",
-      "mobile_relay_forward_url_for_host",
-      "should_preserve_mobile_relay_url",
+      "is_loopback_host",
+      "validate_mobile_relay_connector_url",
+      "is_cloudflare_quick_tunnel_url",
+      "wait_for_mobile_relay_url_resolution_with",
+      "mobile_relay_public_dns_ready",
+      "wait_for_mobile_relay_url_resolution",
+      "preserved_mobile_relay_url_after_broker_start",
     ]],
     ["features/mobile_relay/runtime.rs", [
       "read_serve_token",
@@ -162,6 +161,9 @@ test("mobile relay production modules and symbols have one frozen owner", () => 
     ["features/mobile_relay/broker.rs", [
       "mobile_relay_secret",
       "start_mobile_relay_broker_on_host",
+      "start_mobile_relay_quick_tunnel_on_host",
+      "stop_mobile_relay_quick_tunnel_on_host",
+      "stop_mobile_relay_broker_on_host",
     ]],
   ]);
   for (const [path, names] of expectedFunctions) {
@@ -207,6 +209,7 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   const commands = source("features/mobile_relay/commands.rs");
   const runtime = source("features/mobile_relay/runtime.rs");
   const broker = source("features/mobile_relay/broker.rs");
+  const network = source("features/mobile_relay/network.rs");
   const ipc = source("ipc/dashboard.rs");
 
   assert.match(commands, /fn load_mobile_relay_runtime_status\(/);
@@ -221,7 +224,19 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.match(runtime, /\.tw-serve-token/);
   assertRelayHostCredentialsPerBranch(runtime);
   assert.match(runtime, /http:\/\/127\.0\.0\.1:8311/);
+  assert.equal(runtime.match(/"serve", "--host", "127\.0\.0\.1"/g)?.length, 2);
   assert.match(commands, /args\.port\.unwrap_or\(8787\)/);
+  assert.match(commands, /pub\(crate\) async fn mobile_relay_start_broker\(/);
+  assert.match(
+    commands,
+    /spawn_blocking\(move \|\| \{\s*mobile_relay_start_broker_blocking\(app, args, state\)\s*\}\)/,
+  );
+  assert.match(commands, /preflight_mobile_relay_config_write\(\)\?/);
+  assert.match(commands, /broker_host_id: host\.id\.clone\(\)/);
+  assert.match(commands, /args\.quick_tunnel\.unwrap_or\(false\)/);
+  assert.match(commands, /start_mobile_relay_quick_tunnel_on_host/);
+  assert.match(commands, /wait_for_mobile_relay_url_resolution\(&relay_url\)/);
+  assert.doesNotMatch(commands, /mobile_relay_forward_url_for_host|should_preserve_mobile_relay_url/);
   assert.match(broker, /TW_RELAY_SECRET/);
   assert.match(broker, /chmod 600/);
   assert.match(broker, /tw-cli\.cjs/);
@@ -230,6 +245,16 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.match(broker, /kill-session -t tw-relay-server/);
   assert.match(broker, /new-session -d -s tw-relay-server/);
   assert.match(broker, /has-session -t tw-relay-server/);
+  assert.match(broker, /relay-server --host 127\.0\.0\.1 --port/);
+  assert.doesNotMatch(broker, /relay-server --host 0\.0\.0\.0/);
+  assert.match(broker, /tw-relay-tunnel/);
+  assert.match(broker, /cloudflared.*tunnel --no-autoupdate --protocol http2 --url http:\/\/127\.0\.0\.1:/s);
+  assert.match(broker, /\.trycloudflare\\\.com/);
+  assert.doesNotMatch(broker, /require\("dns"\)\.lookup/);
+  assert.doesNotMatch(broker, /TW_RELAY_SECRET[^\n]*(?:trycloudflare|relay-tunnel)/);
+
+  assert.match(network, /Command::new\("\/usr\/bin\/dig"\)/);
+  assert.match(network, /line\.parse::<IpAddr>\(\)\.is_ok\(\)/);
 
   const mobileRelayTree = mobileRelayPaths.map(source).join("\n");
   assert.doesNotMatch(
@@ -304,12 +329,13 @@ test("mobile relay persistence keeps locking, aliases, and private atomic writes
   assert.match(persistence, /acquire_dashboard_config_file_lock\(\)/);
   assert.match(persistence, /atomic_write_file\(&config_path, format!\("\{pretty\}\\n"\)\.as_bytes\(\)\)/);
   assert.match(persistence, /mobile-relay-status\.json/);
+  assert.match(persistence, /"brokerHostId"/);
+  assert.match(persistence, /preflight_mobile_relay_config_write/);
 
-  assert.match(network, /target\.contains\(':\'\) && !target\.starts_with\('\['\)/);
-  assert.match(network, /Duration::from_millis\(500\)/);
-  assert.match(network, /start_mobile_relay_ssh_forward\(host, "0\.0\.0\.0", "127\.0\.0\.1", port\)/);
-  assert.match(network, /cmd\.arg\("--"\)\.arg\(&host\.host\)/);
-  assert.match(network, /!trimmed\.contains\("example\.com"\)/);
+  assert.match(network, /validate_mobile_relay_connector_url/);
+  assert.match(network, /"ws" if is_loopback_host\(host\)/);
+  assert.match(network, /LEGACY_PLACEHOLDER_RELAY_URL/);
+  assert.doesNotMatch(network, /ssh|-L|0\.0\.0\.0|\.local|scutil|local_lan_ip/);
 
   assert.ok(productionTree.includes("tauri::RunEvent::ExitRequested"));
 });

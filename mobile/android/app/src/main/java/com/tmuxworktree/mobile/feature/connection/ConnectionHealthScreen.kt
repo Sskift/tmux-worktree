@@ -238,6 +238,8 @@ private fun HealthLayerRow(
     hasNext: Boolean,
 ) {
     val visual = layer.status.visual()
+    val onlineConnectorColor = TwSuccess
+    val offlineConnectorColor = TwTextMuted
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -263,6 +265,8 @@ private fun HealthLayerRow(
                         start = Offset(centerX, 0f),
                         end = Offset(centerX, circleCenterY),
                         status = previousStatus,
+                        onlineColor = onlineConnectorColor,
+                        offlineColor = offlineConnectorColor,
                     )
                 }
                 if (hasNext) {
@@ -270,6 +274,8 @@ private fun HealthLayerRow(
                         start = Offset(centerX, circleCenterY),
                         end = Offset(centerX, size.height),
                         status = layer.status,
+                        onlineColor = onlineConnectorColor,
+                        offlineColor = offlineConnectorColor,
                     )
                 }
             }
@@ -325,10 +331,12 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawConnector(
     start: Offset,
     end: Offset,
     status: ConnectionStatus,
+    onlineColor: androidx.compose.ui.graphics.Color,
+    offlineColor: androidx.compose.ui.graphics.Color,
 ) {
     val online = status == ConnectionStatus.ONLINE
     drawLine(
-        color = if (online) TwSuccess else TwTextMuted,
+        color = if (online) onlineColor else offlineColor,
         start = start,
         end = end,
         strokeWidth = 2.dp.toPx(),

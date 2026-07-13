@@ -462,6 +462,16 @@
   background: var(--shell-surface-1);
 }
 
+.connections-relay-stages {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.connections-relay-stages .connections-relay-summary {
+  align-items: flex-start;
+}
+
 .connections-relay-summary--success {
   color: var(--shell-success);
   border-color: #315f39;
@@ -574,6 +584,10 @@
 }
 
 @media (max-width: 720px) {
+  .connections-relay-stages {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .connections-fields {
     grid-template-columns: minmax(0, 1fr);
   }

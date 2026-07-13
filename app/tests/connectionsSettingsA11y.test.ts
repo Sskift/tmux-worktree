@@ -25,10 +25,15 @@ test("Relay field errors are programmatically associated with their controls", (
   assert.match(source, /<small id=\{errorId\}/);
 });
 
-test("Relay Settings preserves the Android launch handoff", () => {
-  assert.match(source, /launchCopied: controller\.copied/);
-  assert.match(source, /copyLaunch: controller\.copyLaunch/);
-  assert.match(source, /onClick=\{\(\) => void relayActions\.copyLaunch\(\)\}/);
-  assert.match(source, /Copy Android v1 launch/);
-  assert.match(source, /disabled=\{relayBusy \|\| !relay\.statusKnown \|\| !relay\.tokenConfigured\}/);
+test("Relay Settings exposes one-click setup plus connector and Android status", () => {
+  assert.match(source, /aria-label="Relay connection stages"/);
+  assert.match(source, /Relay center ·/);
+  assert.match(source, /Mac connector/);
+  assert.match(source, /Android pairing ·/);
+  assert.match(source, /Stop connector/);
+  assert.doesNotMatch(source, /Reconfigure Relay & rotate token/);
+  assert.match(source, /\? "Setting up Relay"\s*: "Set up Relay"/);
+  assert.match(source, /broker, trusted WSS, and this Mac in one step/);
+  assert.match(source, /temporary Cloudflare Quick Tunnel/);
+  assert.doesNotMatch(source, /Copy Android v1 launch|copyLaunch/);
 });

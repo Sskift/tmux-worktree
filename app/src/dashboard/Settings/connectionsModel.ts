@@ -202,47 +202,47 @@ export function calculateHostRemovalImpact(
 export function summarizeRelayStatus(snapshot: RelayStatusSnapshot): RelayStatusSummary {
   if (snapshot.error || snapshot.connectionState === "error") {
     return {
-      label: "Error",
-      detail: snapshot.error?.trim() || "Relay stopped after an unexpected error.",
+      label: "Mac connector error",
+      detail: snapshot.error?.trim() || "The Mac connector stopped after an unexpected error.",
       tone: "danger",
     };
   }
 
   if (snapshot.statusKnown === false) {
     return {
-      label: "Checking Relay",
-      detail: "Reading the saved configuration and current Relay process state.",
+      label: "Checking Mac connector",
+      detail: "Reading the saved connector configuration and local process state.",
       tone: "progress",
     };
   }
 
   if (snapshot.connected || snapshot.connectionState === "connected") {
     return {
-      label: "Connected",
-      detail: "The mobile client can reach this dashboard through Relay.",
+      label: "Mac connector connected",
+      detail: "The Mac connector reached the selected Relay center. Android connectivity is not independently verified.",
       tone: "success",
     };
   }
 
   if (snapshot.connectionState === "retrying") {
     return {
-      label: "Retrying",
-      detail: "Relay is reconnecting automatically. Your configuration is preserved.",
+      label: "Mac connector retrying",
+      detail: "The Mac connector is reconnecting to the selected Relay center. Your configuration is preserved.",
       tone: "warning",
     };
   }
 
   if (snapshot.active || snapshot.connectionState === "starting") {
     return {
-      label: "Starting",
-      detail: "Relay is establishing a secure connection.",
+      label: "Starting Mac connector",
+      detail: "The Mac connector is opening its connection to the selected Relay center.",
       tone: "progress",
     };
   }
 
   return {
-    label: "Stopped",
-    detail: "Relay is configured locally and is not accepting connections.",
+    label: "Mac connector stopped",
+    detail: "The Mac connector is stopped. A previously deployed Relay center keeps running independently.",
     tone: "neutral",
   };
 }
@@ -252,6 +252,15 @@ export function validateRelayDraft(
   intent: RelayActionIntent,
 ): RelayDraftValidation {
   const errors: RelayDraftErrors = {};
+  if (!draft.brokerHostId.trim()) {
+    errors.brokerHostId = "Select a Relay center.";
+  }
+  if (intent === "startBroker") {
+    return Object.keys(errors).length === 0
+      ? { valid: true, errors }
+      : { valid: false, errors };
+  }
+
   const relayUrl = draft.relayUrl.trim();
 
   if (!relayUrl) {
@@ -259,19 +268,38 @@ export function validateRelayDraft(
   } else {
     try {
       const parsed = new URL(relayUrl);
-      if (parsed.protocol !== "ws:" && parsed.protocol !== "wss:") {
-        errors.relayUrl = "Relay URL must use ws:// or wss://.";
+      const loopback = parsed.hostname === "localhost"
+        || parsed.hostname === "127.0.0.1"
+        || parsed.hostname === "[::1]";
+      if (parsed.hostname.toLowerCase() === "relay.example.com") {
+        errors.relayUrl = "Replace the example with the trusted WSS URL for this Relay center.";
+      } else if (parsed.port === "0") {
+        errors.relayUrl = "Relay URL includes an invalid port.";
+      } else if (parsed.protocol !== "wss:" && !(parsed.protocol === "ws:" && loopback)) {
+        errors.relayUrl = "Use trusted wss://; ws:// is allowed only for localhost diagnostics.";
+      } else if (
+        !parsed.hostname
+        || parsed.username
+        || parsed.password
+        || parsed.pathname !== "/"
+        || parsed.search
+        || parsed.hash
+        || /[?#]/.test(relayUrl)
+        || relayUrl.slice(relayUrl.indexOf("://") + 3).includes("@")
+      ) {
+        errors.relayUrl = "Use a root Relay URL without credentials, path, query, or fragment.";
       }
     } catch {
       errors.relayUrl = "Enter a valid Relay URL.";
     }
   }
 
-  if (!draft.hostId.trim()) errors.hostId = "Host ID is required.";
-  if (intent === "start" && !draft.token.trim()) errors.token = "Token is required to start Relay.";
-  if (intent === "startBroker" && !draft.brokerHostId.trim()) {
-    errors.brokerHostId = "Select a broker host.";
+  if (!draft.hostId.trim()) {
+    errors.hostId = "Host ID is required.";
+  } else if (!/^[A-Za-z0-9._-]{1,80}$/.test(draft.hostId.trim())) {
+    errors.hostId = "Host ID may contain only letters, numbers, dots, underscores, and hyphens.";
   }
+  if (intent === "start" && !draft.token.trim()) errors.token = "Token is required to start Relay.";
 
   return Object.keys(errors).length === 0
     ? { valid: true, errors }

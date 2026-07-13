@@ -79,7 +79,7 @@ const target = targetIndex >= 0 ? String(args[targetIndex + 1] || "") : "";
 const session = target.replace(/^=/, "").split(":.")[0];
 const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
-appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session }) + "\\n");
+appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session, startedAt: Date.now() }) + "\\n");
 if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
   let managed = [];
   try {
@@ -121,6 +121,14 @@ if (args[0] === "show-options") {
 if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}") {
   process.stdout.write("0\\n");
   process.exit(0);
+}
+if (args[0] === "load-buffer" && existsSync(join(gateDir, "fail-load-buffer"))) {
+  process.stderr.write("simulated paste failure\\n");
+  process.exit(41);
+}
+if (args[0] === "send-keys" && existsSync(join(gateDir, "fail-send-keys"))) {
+  process.stderr.write("simulated submit failure\\n");
+  process.exit(42);
 }
 if (args[0] === "load-buffer" && existsSync(join(gateDir, "close-load-buffer-stdin"))) {
   process.exit(0);
@@ -236,11 +244,13 @@ function writeFakeSshOnlyPath(root) {
   mkdirSync(bin);
   const ssh = join(bin, "ssh");
   writeFileSync(ssh, `#!${process.execPath}
-const command = process.argv.slice(2).join(" ");
+const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+const args = process.argv.slice(2);
+const command = args.join(" ");
+const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
+appendFileSync(join(gateDir, "ssh-calls.ndjson"), JSON.stringify({ args, command, startedAt: Date.now() }) + "\\n");
 if (command.includes("terminal-control") && command.includes("request")) {
-  const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
-  const { join } = require("node:path");
-  const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
   const statePath = join(gateDir, "remote-terminal-control.json");
   let input = "";
   process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
@@ -273,6 +283,19 @@ if (command.includes("terminal-control") && command.includes("request")) {
       writeFileSync(statePath, JSON.stringify(state));
       result = { state: "FREE" };
     } else if (request.type.startsWith("input.")) {
+      if (existsSync(join(gateDir, "fail-remote-control-input"))) {
+        process.stdout.write(JSON.stringify({
+          protocolVersion: 1,
+          requestId: request.requestId,
+          ok: false,
+          error: {
+            code: "OPERATION_IN_DOUBT",
+            message: "remote canonical input disposition is uncertain",
+            retryable: false,
+          },
+        }) + "\\n");
+        process.exit(0);
+      }
       appendFileSync(join(gateDir, "remote-control-inputs.ndjson"), JSON.stringify(request) + "\\n");
       result = { operationId: request.operationId, accepted: true, deduplicated: false };
     } else {
@@ -293,8 +316,28 @@ if (command.includes("list-panes")) {
   process.stdout.write("0\\x1f1\\n");
   process.exit(0);
 }
-const { writeFileSync } = require("node:fs");
-const { join } = require("node:path");
+if (command.includes("load-buffer")) {
+  if (existsSync(join(gateDir, "fail-remote-load-buffer"))) {
+    process.stderr.write("simulated remote paste failure\\n");
+    process.exit(43);
+  }
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
+  process.stdin.on("end", () => {
+    appendFileSync(join(gateDir, "ssh-inputs.ndjson"), JSON.stringify({ command, input }) + "\\n");
+    process.exit(0);
+  });
+  process.stdin.resume();
+  return;
+}
+if (command.includes("send-keys")) {
+  if (existsSync(join(gateDir, "fail-remote-send-keys"))) {
+    process.stderr.write("simulated remote submit failure\\n");
+    process.exit(44);
+  }
+  process.exit(0);
+}
+if (command.includes("delete-buffer")) process.exit(0);
 writeFileSync(join(process.env.TW_TEST_TMUX_GATE_DIR, "remote-ssh-pid"), String(process.pid));
 process.on("SIGWINCH", () => {});
 process.on("SIGTERM", () => {});
@@ -319,6 +362,7 @@ async function startHarness(t, {
   waitUntilReady = true,
   remoteChildSpawnFailure = false,
   remotePtySuccess = false,
+  remoteAgentMessages = false,
   environmentToken = "serve-token",
   tokenFileContents,
   localBaseSuffix = "",
@@ -329,12 +373,12 @@ async function startHarness(t, {
   mkdirSync(gateDir);
   const fakeTmux = writeFakeTmux(root);
   const fakeTw = writeFakeTw(root);
-  const hasRemoteScope = remoteChildSpawnFailure || remotePtySuccess;
+  const hasRemoteScope = remoteChildSpawnFailure || remotePtySuccess || remoteAgentMessages;
   const fakeRemoteBin = hasRemoteScope
     ? writeFakeSshOnlyPath(root)
     : undefined;
   const isolatedPath = fakeRemoteBin
-    ? (remotePtySuccess ? `${fakeRemoteBin}:${process.env.PATH}` : fakeRemoteBin)
+    ? ((remotePtySuccess || remoteAgentMessages) ? `${fakeRemoteBin}:${process.env.PATH}` : fakeRemoteBin)
     : process.env.PATH;
   if (tokenFileContents !== undefined) {
     writeFileSync(join(root, ".tw-serve-token"), `${tokenFileContents}\n`, { mode: 0o600 });
@@ -622,7 +666,7 @@ test("local bridge discards inherited query and fragment credentials", async (t)
   assert.equal(connection.requestUrl.includes("stale-fragment"), false);
 });
 
-test("local agent submit preserves raw text and handles empty messages without a buffer", async (t) => {
+test("local agent submit paces paste and submit while preserving exact normalized text", async (t) => {
   const harness = await startHarness(t);
   sendToHost(harness, {
     type: "send_agent_message",
@@ -677,12 +721,17 @@ test("local agent submit preserves raw text and handles empty messages without a
   assert.deepEqual(sendCalls[0].args, [
     "load-buffer", "-b", buffer, "-",
     ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", "$0:.0",
-    ";", "send-keys", "-t", "$0:.0", "C-m",
   ]);
-  const emptySubmitCalls = calls.filter(({ args }) => args[0] === "send-keys");
-  assert.deepEqual(emptySubmitCalls.map(({ args }) => args), [[
+  const submitCalls = calls.filter(({ args }) => args[0] === "send-keys");
+  assert.deepEqual(submitCalls.map(({ args }) => args), [[
+    "send-keys", "-t", "$0:.0", "C-m",
+  ], [
     "send-keys", "-t", "$0:.0", "C-m",
   ]]);
+  assert.ok(
+    submitCalls[0].startedAt - sendCalls[0].startedAt >= 80,
+    `submit followed paste without pacing: ${submitCalls[0].startedAt - sendCalls[0].startedAt}ms`,
+  );
   const inputs = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
     .trim()
     .split("\n")
@@ -792,6 +841,169 @@ test("Relay v1 stays read-only while Feishu owns input and never replays rejecte
   );
   const written = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8");
   assert.equal(written.includes("must-not-write"), false);
+});
+
+test("concurrent agent messages to one pane cannot interleave paste and submit stages", async (t) => {
+  const harness = await startHarness(t);
+  for (const [requestId, message] of [["agent-serialized-a", "first"], ["agent-serialized-b", "second"]]) {
+    sendToHost(harness, {
+      type: "send_agent_message",
+      requestId,
+      session: "local:agent-serialized",
+      pane: 0,
+      message,
+      submit: true,
+    });
+  }
+  await waitFor(
+    () => ["agent-serialized-a", "agent-serialized-b"].every((requestId) => (
+      harness.brokerMessages.some(({ message }) => (
+        message.type === "agent_message_sent" && message.requestId === requestId
+      ))
+    )),
+    "relay-host did not acknowledge both serialized messages",
+  );
+
+  const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const mutationCalls = calls.filter(({ args }) => (
+    (args[0] === "load-buffer" || args[0] === "send-keys")
+    && args.includes("$0:.0")
+  ));
+  assert.deepEqual(
+    mutationCalls.map(({ args }) => args[0]),
+    ["load-buffer", "send-keys", "load-buffer", "send-keys"],
+  );
+  const inputs = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(inputs.map(({ input }) => input), ["first", "second"]);
+});
+
+test("local agent submit failure after paste is diagnostic and never acknowledged", async (t) => {
+  const harness = await startHarness(t);
+  writeFileSync(join(harness.gateDir, "fail-send-keys"), "");
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-submit-failure",
+    session: "local:agent-submit-failure",
+    pane: 0,
+    message: "send exactly this body",
+    submit: true,
+  });
+  const failure = await waitFor(
+    () => harness.brokerMessages.find(({ message }) => (
+      message.type === "error" && message.requestId === "agent-submit-failure"
+    ))?.message,
+    "relay-host did not report the failed submit stage",
+  );
+  assert.match(failure.message, /agent message submit failed after paste; input may remain in the target pane/);
+  assert.equal(harness.brokerMessages.some(({ message }) => (
+    message.type === "agent_message_sent" && message.requestId === "agent-submit-failure"
+  )), false);
+
+  const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const mutationCalls = calls.filter(({ args }) => args[0] === "load-buffer" || args[0] === "send-keys");
+  assert.deepEqual(mutationCalls.map(({ args }) => args[0]), ["load-buffer", "send-keys"]);
+  const inputs = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(inputs.map(({ input }) => input), ["send exactly this body"]);
+});
+
+test("local agent paste failure never attempts submit or sends an acknowledgement", async (t) => {
+  const harness = await startHarness(t);
+  writeFileSync(join(harness.gateDir, "fail-load-buffer"), "");
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-paste-failure",
+    session: "local:agent-paste-failure",
+    pane: 0,
+    message: "body that must not be submitted",
+    submit: true,
+  });
+  const failure = await waitFor(
+    () => harness.brokerMessages.find(({ message }) => (
+      message.type === "error" && message.requestId === "agent-paste-failure"
+    ))?.message,
+    "relay-host did not report the failed paste stage",
+  );
+  assert.match(failure.message, /agent message paste failed/);
+  assert.equal(harness.brokerMessages.some(({ message }) => (
+    message.type === "agent_message_sent" && message.requestId === "agent-paste-failure"
+  )), false);
+
+  const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(calls.some(({ args }) => args[0] === "load-buffer"), true);
+  assert.equal(calls.some(({ args }) => args[0] === "send-keys"), false);
+  assert.equal(calls.some(({ args }) => args[0] === "delete-buffer"), true);
+});
+
+test("remote agent messages use the canonical controller and acknowledge only accepted input", async (t) => {
+  const harness = await startHarness(t, { remoteAgentMessages: true });
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "remote-agent-submit",
+    session: "remote:remote-agent-submit",
+    pane: 0,
+    message: "remote;\r\nbody",
+    submit: true,
+  });
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "agent_message_sent" && message.requestId === "remote-agent-submit"
+    )),
+    `relay-host did not acknowledge the remote agent message; output:\n${harness.output()}`,
+  );
+
+  const successfulCalls = readFileSync(join(harness.gateDir, "ssh-calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(successfulCalls.some(({ command }) => command.includes("load-buffer")), false);
+  assert.equal(successfulCalls.some(({ command }) => command.includes("send-keys")), false);
+  assert.ok(successfulCalls.some(({ command }) => (
+    command.includes("terminal-control") && command.includes("request")
+  )));
+  const inputs = readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(inputs.length, 1);
+  assert.equal(inputs[0].type, "input.agent-message");
+  assert.equal(inputs[0].message, "remote;\r\nbody");
+  assert.equal(inputs[0].submit, true);
+  assert.equal(inputs[0].lease.owner.kind, "relay-v1");
+
+  writeFileSync(join(harness.gateDir, "fail-remote-control-input"), "");
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "remote-agent-submit-failure",
+    session: "remote:remote-agent-submit-failure",
+    pane: 0,
+    message: "remote body left for inspection",
+    submit: true,
+  });
+  const failure = await waitFor(
+    () => harness.brokerMessages.find(({ message }) => (
+      message.type === "error" && message.requestId === "remote-agent-submit-failure"
+    ))?.message,
+    "relay-host did not report the rejected remote canonical input",
+  );
+  assert.match(failure.message, /remote canonical input disposition is uncertain/);
+  assert.equal(harness.brokerMessages.some(({ message }) => (
+    message.type === "agent_message_sent" && message.requestId === "remote-agent-submit-failure"
+  )), false);
 });
 
 test("pending input overflow finalizes a blocked opening without resurrection", async (t) => {

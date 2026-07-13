@@ -13,8 +13,8 @@ android {
         applicationId = "com.tmuxworktree.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20001
-        versionName = "1.0.4"
+        versionCode = 20002
+        versionName = "1.0.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -52,11 +52,15 @@ kapt {
 
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
+    val cameraXVersion = "1.6.1"
 
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
     implementation("androidx.activity:activity-compose:1.13.0")
+    implementation("androidx.camera:camera-camera2:$cameraXVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraXVersion")
+    implementation("androidx.camera:camera-view:$cameraXVersion")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
@@ -73,7 +77,10 @@ dependencies {
     implementation("androidx.webkit:webkit:1.16.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.google.android.gms:play-services-code-scanner:16.1.0")
+    // The bundled ML Kit artifact keeps QR recognition available immediately
+    // after APK install. Do not replace this with a Play services scanner/model,
+    // which would reintroduce an optional runtime module download.
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     kapt("androidx.room:room-compiler:2.8.4")
 

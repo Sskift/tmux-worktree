@@ -25,6 +25,9 @@ fn mobile_relay_config_from_value(config: &serde_json::Value) -> MobileRelayConf
         relay_url: config_string_field(relay, &["relayUrl", "url", "broker", "brokerUrl"])
             .or_else(|| config_string_field(config, &["mobileRelayUrl", "relayUrl"]))
             .unwrap_or_default(),
+        broker_host_id: config_string_field(relay, &["brokerHostId", "relayCenterHostId"])
+            .or_else(|| config_string_field(config, &["mobileRelayBrokerHostId"]))
+            .unwrap_or_default(),
         host_id: config_string_field(relay, &["hostId", "host", "adminHostId"])
             .or_else(|| config_string_field(config, &["mobileRelayHostId", "relayHostId"]))
             .unwrap_or_default(),
@@ -53,6 +56,27 @@ fn load_mobile_relay_config_file() -> MobileRelayConfig {
     mobile_relay_config_from_value(&config)
 }
 
+pub(super) fn preflight_mobile_relay_config_write() -> Result<(), String> {
+    if env_non_empty("TW_RELAY_SECRET").is_some() {
+        return Err(
+            "Start broker cannot rotate the Relay v1 token while TW_RELAY_SECRET overrides the saved configuration"
+                .to_string(),
+        );
+    }
+    let home = app_home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let text = std::fs::read_to_string(&config_path).map_err(|e| format!("read config: {e}"))?;
+    let config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("parse config: {e}"))?;
+    if !config.is_object() {
+        return Err("config root is not an object".to_string());
+    }
+    Ok(())
+}
+
 fn env_non_empty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
@@ -73,7 +97,8 @@ pub(super) fn mobile_relay_config() -> MobileRelayConfig {
     let file = load_mobile_relay_config_file();
     MobileRelayConfig {
         relay_url: env_non_empty("TW_RELAY_URL")
-            .unwrap_or_else(|| config_or_default(&file.relay_url, "wss://relay.example.com")),
+            .unwrap_or_else(|| file.relay_url.trim().to_string()),
+        broker_host_id: file.broker_host_id.trim().to_string(),
         host_id: env_non_empty("TW_RELAY_HOST_ID")
             .unwrap_or_else(|| config_or_default(&file.host_id, "mac-admin")),
         display_name: env_non_empty("TW_RELAY_DISPLAY_NAME")
@@ -105,14 +130,48 @@ pub(super) fn save_mobile_relay_config_file(
         .get("mobileRelay")
         .and_then(|value| config_string_field(value, &["displayName", "name", "label"]))
         .unwrap_or_else(|| "Mac Admin".to_string());
-    root.insert(
-        "mobileRelay".to_string(),
-        serde_json::json!({
-            "relayUrl": args.relay_url.trim(),
-            "hostId": args.host_id.trim(),
-            "displayName": existing_display_name,
-            "secret": args.secret.trim(),
-        }),
+    let relay = root
+        .entry("mobileRelay".to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !relay.is_object() {
+        *relay = serde_json::json!({});
+    }
+    let relay = relay
+        .as_object_mut()
+        .ok_or("mobileRelay config is not an object")?;
+    for alias in [
+        "url",
+        "broker",
+        "brokerUrl",
+        "relayCenterHostId",
+        "host",
+        "adminHostId",
+        "name",
+        "label",
+        "token",
+        "relaySecret",
+    ] {
+        relay.remove(alias);
+    }
+    relay.insert(
+        "relayUrl".to_string(),
+        serde_json::Value::String(args.relay_url.trim().to_string()),
+    );
+    relay.insert(
+        "brokerHostId".to_string(),
+        serde_json::Value::String(args.broker_host_id.trim().to_string()),
+    );
+    relay.insert(
+        "hostId".to_string(),
+        serde_json::Value::String(args.host_id.trim().to_string()),
+    );
+    relay.insert(
+        "displayName".to_string(),
+        serde_json::Value::String(existing_display_name.clone()),
+    );
+    relay.insert(
+        "secret".to_string(),
+        serde_json::Value::String(args.secret.trim().to_string()),
     );
     let pretty =
         serde_json::to_string_pretty(&config).map_err(|e| format!("serialize config: {e}"))?;
@@ -120,6 +179,7 @@ pub(super) fn save_mobile_relay_config_file(
         .map_err(|e| format!("write config: {e}"))?;
     Ok(MobileRelayConfig {
         relay_url: args.relay_url.trim().to_string(),
+        broker_host_id: args.broker_host_id.trim().to_string(),
         host_id: args.host_id.trim().to_string(),
         display_name: existing_display_name,
         secret: args.secret.trim().to_string(),
@@ -135,7 +195,8 @@ pub(super) fn mobile_relay_status_file() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{
-        mobile_relay_config, mobile_relay_config_from_value, save_mobile_relay_config_file,
+        mobile_relay_config, mobile_relay_config_from_value, preflight_mobile_relay_config_write,
+        save_mobile_relay_config_file,
     };
     use crate::ipc::MobileRelayConfigInput;
     use std::fs;
@@ -158,12 +219,14 @@ mod tests {
         let nested = mobile_relay_config_from_value(&serde_json::json!({
             "mobileRelay": {
                 "relayUrl": "wss://relay.example.net",
+                "brokerHostId": "devbox",
                 "hostId": "macbook",
                 "displayName": "Desk Mac",
                 "secret": "token-1"
             }
         }));
         assert_eq!(nested.relay_url, "wss://relay.example.net");
+        assert_eq!(nested.broker_host_id, "devbox");
         assert_eq!(nested.host_id, "macbook");
         assert_eq!(nested.display_name, "Desk Mac");
         assert_eq!(nested.secret, "token-1");
@@ -207,11 +270,13 @@ mod tests {
 
         let saved = save_mobile_relay_config_file(&MobileRelayConfigInput {
             relay_url: " ws://relay.example.net:8787 ".to_string(),
+            broker_host_id: " devbox ".to_string(),
             host_id: " mac-admin ".to_string(),
             secret: " shared-v1-secret ".to_string(),
         })
         .expect("save relay config");
         assert_eq!(saved.relay_url, "ws://relay.example.net:8787");
+        assert_eq!(saved.broker_host_id, "devbox");
         assert_eq!(saved.host_id, "mac-admin");
         assert_eq!(saved.display_name, "Desk Mac");
         assert_eq!(saved.secret, "shared-v1-secret");
@@ -226,8 +291,9 @@ mod tests {
             "ws://relay.example.net:8787"
         );
         assert_eq!(value["mobileRelay"]["hostId"], "mac-admin");
+        assert_eq!(value["mobileRelay"]["brokerHostId"], "devbox");
         assert_eq!(value["mobileRelay"]["secret"], "shared-v1-secret");
-        assert!(value["mobileRelay"].get("legacyNested").is_none());
+        assert_eq!(value["mobileRelay"]["legacyNested"], true);
         assert_eq!(
             fs::metadata(&config_path)
                 .expect("config metadata")
@@ -252,5 +318,36 @@ mod tests {
         for (name, value) in originals {
             restore_env(name, value);
         }
+    }
+
+    #[test]
+    fn mobile_relay_broker_preflight_rejects_corrupt_config_and_secret_override() {
+        let _guard = crate::tests::test_env_lock().lock().expect("test env lock");
+        let original_home = std::env::var("HOME").ok();
+        let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+        let original_secret = std::env::var("TW_RELAY_SECRET").ok();
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+            std::env::remove_var("TW_RELAY_SECRET");
+        }
+        let config_path = temp.path().join(".tmux-worktree.json");
+        fs::write(&config_path, "{broken").expect("write corrupt config");
+        assert!(preflight_mobile_relay_config_write()
+            .expect_err("corrupt config must fail")
+            .contains("parse config"));
+
+        fs::write(&config_path, "{}\n").expect("write valid config");
+        unsafe {
+            std::env::set_var("TW_RELAY_SECRET", "environment-secret");
+        }
+        assert!(preflight_mobile_relay_config_write()
+            .expect_err("secret override must fail")
+            .contains("TW_RELAY_SECRET"));
+
+        restore_env("TW_RELAY_SECRET", original_secret);
+        restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+        restore_env("HOME", original_home);
     }
 }

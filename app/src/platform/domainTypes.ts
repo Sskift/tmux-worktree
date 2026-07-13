@@ -238,6 +238,7 @@ export type MobileRelayStatus = {
   connected: boolean;
   connectionState: string;
   relayUrl: string;
+  brokerHostId: string;
   hostId: string;
   secret: string;
   token: string;
@@ -249,6 +250,7 @@ export type MobileRelayStatus = {
 
 export type MobileRelayConfigInput = {
   relayUrl: string;
+  brokerHostId: string;
   hostId: string;
   secret: string;
 };
@@ -256,6 +258,7 @@ export type MobileRelayConfigInput = {
 export type MobileRelayBrokerInput = {
   hostId: string;
   port?: number;
+  quickTunnel?: boolean;
 };
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";

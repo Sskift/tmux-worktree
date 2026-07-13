@@ -21,6 +21,7 @@ const OUTPUT_GENERATION_OPTION = "@tw_terminal_control_output_generation_v1";
 const COMMAND_TIMEOUT_MS = 5_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
+const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 
 export interface TerminalControlOutputPosition {
   generation: string;
@@ -409,20 +410,31 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     const normalized = message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (!normalized && !submit) return;
     if (!normalized) {
-      await runTmux(["send-keys", "-t", `${sessionId}:.${pane}`, "C-m"]);
+      try {
+        await runTmux(["send-keys", "-t", `${sessionId}:.${pane}`, "C-m"]);
+      } catch (error) {
+        throw new Error(`agent message submit failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
       return;
     }
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
-    const args = [
-      "load-buffer", "-b", bufferName, "-",
-      ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", `${sessionId}:.${pane}`,
-    ];
-    if (submit) args.push(";", "send-keys", "-t", `${sessionId}:.${pane}`, "C-m");
     try {
-      await runTmux(args, { input: normalized });
+      await runTmux([
+        "load-buffer", "-b", bufferName, "-",
+        ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", `${sessionId}:.${pane}`,
+      ], { input: normalized });
     } catch (error) {
       await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
-      throw error;
+      throw new Error(`agent message paste failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!submit) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
+    try {
+      await runTmux(["send-keys", "-t", `${sessionId}:.${pane}`, "C-m"]);
+    } catch (error) {
+      throw new Error(
+        `agent message submit failed after paste; input may remain in the target pane: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
   }
 

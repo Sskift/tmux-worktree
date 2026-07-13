@@ -8,7 +8,13 @@ data class PairingPayload(
     val relayUrl: String,
     val token: String,
     val hostId: String = "",
-)
+) {
+    // Pairing payloads commonly originate in exported Activity inputs. Keep
+    // credentials and unvalidated URLs out of crash breadcrumbs and logs that
+    // stringify local values.
+    override fun toString(): String =
+        "PairingPayload(relayUrl=<redacted>, token=<redacted>, hostId=$hostId)"
+}
 
 object PairingPayloadParser {
     fun parse(raw: String?): PairingPayload? {

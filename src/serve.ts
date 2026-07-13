@@ -1007,6 +1007,16 @@ export async function run() {
     : portIdx >= 0
       ? parseInt(process.argv[portIdx + 1])
       : DEFAULT_PORT;
+  const hostArg = process.argv.find((argument) => argument.startsWith("--host="));
+  const hostIdx = process.argv.indexOf("--host");
+  const bindHost = (hostArg
+    ? hostArg.slice("--host=".length)
+    : hostIdx >= 0
+      ? process.argv[hostIdx + 1]
+      : "0.0.0.0")?.trim();
+  if (!bindHost || /[\0\r\n]/.test(bindHost) || bindHost.startsWith("--")) {
+    throw new Error("tw serve --host requires a valid host name or IP address");
+  }
 
   const token = serveToken();
   const controlInstanceId = randomUUID();
@@ -1487,7 +1497,7 @@ export async function run() {
     server.once("error", onError);
     server.once("listening", onListening);
     try {
-      server.listen(port, "0.0.0.0");
+      server.listen(port, bindHost);
     } catch (error) {
       server.off("error", onError);
       server.off("listening", onListening);
@@ -1496,10 +1506,11 @@ export async function run() {
   });
 
   {
-    const ip = getLanIp();
     console.log(`\ntw-dashboard web server running at:\n`);
-    console.log(`  Local:   http://localhost:${port}`);
-    console.log(`  Network: http://${ip}:${port}`);
+    console.log(`  Listen:  http://${bindHost}:${port}`);
+    if (bindHost === "0.0.0.0" || bindHost === "::") {
+      console.log(`  Network: http://${getLanIp()}:${port}`);
+    }
     console.log(`  Token:   ${token}\n`);
 
     console.log(`Open the Network URL on your phone and enter the token to connect.\n`);

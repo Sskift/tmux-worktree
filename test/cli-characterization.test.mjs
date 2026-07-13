@@ -50,7 +50,7 @@ test("CLI help and version keep the public command surface stable", () => {
     "tw automation ls",
     "tw automation create",
     "tw automation rm <id|name>",
-    "tw serve [--port N]",
+    "tw serve [--host HOST] [--port N]",
     "tw relay-server",
     "tw relay-host",
     "tw setup",

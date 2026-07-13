@@ -49,16 +49,21 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -93,6 +98,7 @@ fun SessionDetailScreen(
     onOpenTerminal: () -> Unit,
     onOverflowClick: () -> Unit,
     onSend: (String) -> Unit,
+    autoFocusReply: Boolean = false,
     agentStateAvailable: Boolean = true,
     onCancelMessage: (TimelineEvent) -> Unit = {},
     modifier: Modifier = Modifier,
@@ -119,6 +125,7 @@ fun SessionDetailScreen(
                 onDraftChange = onDraftChange,
                 onSend = { onSend(draft.trim()) },
                 onAttachmentClick = { showAttachmentNotice = true },
+                autoFocus = autoFocusReply,
             )
         },
     ) { innerPadding ->
@@ -544,8 +551,17 @@ private fun ReplyComposer(
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onAttachmentClick: () -> Unit,
+    autoFocus: Boolean,
 ) {
     val sendEnabled = draft.isNotBlank()
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    LaunchedEffect(autoFocus) {
+        if (autoFocus) {
+            focusRequester.requestFocus()
+            keyboardController?.show()
+        }
+    }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -569,6 +585,7 @@ private fun ReplyComposer(
                     onValueChange = onDraftChange,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .focusRequester(focusRequester)
                         .heightIn(min = 48.dp, max = 104.dp)
                         .padding(end = 4.dp, bottom = 48.dp)
                         .testTag("reply_input")
@@ -675,12 +692,14 @@ private data class TimelineActorVisual(
     val avatarColor: androidx.compose.ui.graphics.Color,
 )
 
+@Composable
 private fun timelineActorVisual(actor: TimelineActor): TimelineActorVisual = when (actor) {
     TimelineActor.AGENT -> TimelineActorVisual("Agent", Icons.Outlined.SmartToy, TwAccent)
     TimelineActor.USER -> TimelineActorVisual("You", Icons.Outlined.Person, TwAccentPressed)
     TimelineActor.SYSTEM -> TimelineActorVisual("System", Icons.Outlined.Info, TwTextMuted)
 }
 
+@Composable
 private fun deliveryVisual(state: DeliveryState): StatusVisual = when (state) {
     DeliveryState.QUEUED -> StatusVisual("Queued safely", TwSuccess, "message queued safely")
     DeliveryState.SENDING -> StatusVisual("Sending…", TwAccent, "message sending")

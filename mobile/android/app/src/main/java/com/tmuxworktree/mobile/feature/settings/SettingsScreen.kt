@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.DarkMode
 import androidx.compose.material.icons.outlined.Devices
 import androidx.compose.material.icons.outlined.HealthAndSafety
 import androidx.compose.material3.HorizontalDivider
@@ -57,10 +58,10 @@ fun SettingsScreen(
     pairedDeviceName: String,
     attentionCount: Int,
     versionName: String,
-    onConnectionStatusClick: () -> Unit,
     onHealthClick: () -> Unit,
     onPairedDeviceClick: () -> Unit,
     onNotificationChanged: (NotificationKind, Boolean) -> Unit,
+    onDarkThemeChanged: (Boolean) -> Unit,
     onCopyDiagnostics: () -> Unit,
     onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
@@ -73,7 +74,8 @@ fun SettingsScreen(
             TwRootTopBar(
                 title = "Settings",
                 connectionStatus = connectionStatus,
-                onConnectionStatusClick = onConnectionStatusClick,
+                onConnectionStatusClick = {},
+                showConnectionStatus = false,
             )
         },
         bottomBar = {
@@ -88,6 +90,24 @@ fun SettingsScreen(
             modifier = Modifier.fillMaxSize().padding(innerPadding),
             contentPadding = PaddingValues(horizontal = 20.dp, vertical = 20.dp),
         ) {
+            item("appearance_heading") { SectionHeading("Appearance") }
+            item("appearance_group") {
+                SettingsGroup {
+                    PreferenceSwitchRow(
+                        title = "Dark mode",
+                        subtitle = if (preferences.darkThemeEnabled) {
+                            "Use the dark color theme"
+                        } else {
+                            "Use the light color theme"
+                        },
+                        checked = preferences.darkThemeEnabled,
+                        icon = { Icon(Icons.Outlined.DarkMode, null, tint = TwAccent) },
+                        testTag = "settings_dark_theme_switch",
+                        onCheckedChange = onDarkThemeChanged,
+                    )
+                }
+            }
+
             item("connection_heading") { SectionHeading("Connection & devices") }
             item("connection_group") {
                 SettingsGroup {
@@ -240,6 +260,38 @@ private fun NotificationRow(
         Switch(
             checked = checked,
             enabled = enabled,
+            onCheckedChange = onCheckedChange,
+            colors = SwitchDefaults.colors(checkedTrackColor = TwAccent),
+            modifier = Modifier.testTag(testTag),
+        )
+    }
+}
+
+@Composable
+private fun PreferenceSwitchRow(
+    title: String,
+    subtitle: String,
+    checked: Boolean,
+    icon: @Composable () -> Unit,
+    testTag: String,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 64.dp)
+            .padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        icon()
+        Spacer(Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, color = TwTextPrimary, style = MaterialTheme.typography.bodyLarge)
+            Text(subtitle, color = TwTextSecondary, style = MaterialTheme.typography.bodyMedium)
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(
+            checked = checked,
             onCheckedChange = onCheckedChange,
             colors = SwitchDefaults.colors(checkedTrackColor = TwAccent),
             modifier = Modifier.testTag(testTag),

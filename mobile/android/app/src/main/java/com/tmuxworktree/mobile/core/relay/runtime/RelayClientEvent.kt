@@ -75,4 +75,8 @@ data class RelayV1ConnectionConfig(
     val relayUrl: String,
     val bearerToken: String,
     val preferredHostId: String = "",
-)
+) {
+    override fun toString(): String =
+        "RelayV1ConnectionConfig(relayUrl=$relayUrl, bearerToken=<redacted>, " +
+            "preferredHostId=$preferredHostId)"
+}

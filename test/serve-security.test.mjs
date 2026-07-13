@@ -123,7 +123,7 @@ function serveTokenTemporaryFiles(home) {
   );
 }
 
-function spawnServe(port, home, token, extraEnv = {}) {
+function spawnServe(port, home, token, extraEnv = {}, extraArgs = []) {
   const env = {
     ...process.env,
     TW_TERMINAL_CONTROL_AUTOSTART: "0",
@@ -133,11 +133,15 @@ function spawnServe(port, home, token, extraEnv = {}) {
   };
   if (token === undefined) delete env.TW_TOKEN;
   else env.TW_TOKEN = token;
-  return spawn(process.execPath, ["dist/cli.cjs", "serve", "--port", String(port)], {
-    cwd: root,
-    env,
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  return spawn(
+    process.execPath,
+    ["dist/cli.cjs", "serve", "--port", String(port), ...extraArgs],
+    {
+      cwd: root,
+      env,
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  );
 }
 
 function sessionCookie(response) {
@@ -154,6 +158,38 @@ function lanIpv4Address() {
   }
   return null;
 }
+
+test("serve can bind only to loopback for the Dashboard Relay backend", async () => {
+  const testRoot = mkdtempSync(join(tmpdir(), "tw-serve-loopback-"));
+  const home = join(testRoot, "home");
+  mkdirSync(home);
+  const port = await unusedPort();
+  const token = "loopback-dashboard-token";
+  const child = spawnServe(port, home, token, {}, ["--host", "127.0.0.1"]);
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  try {
+    await waitFor(
+      () => existsSync(join(home, ".tw-serve-token")),
+      `loopback serve did not start: ${stderr}`,
+    );
+    assert.equal((await httpRequest(port, "/api/sessions", {
+      headers: { Authorization: `Bearer ${token}` },
+    })).status, 200);
+
+    const lanAddress = lanIpv4Address();
+    assert.ok(lanAddress, "loopback bind test requires a non-loopback IPv4 address");
+    await assert.rejects(
+      httpRequest(port, "/api/sessions", {
+        host: lanAddress,
+        headers: { Authorization: `Bearer ${token}` },
+      }),
+    );
+  } finally {
+    await stopChild(child);
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
 
 test("serve publishes a high-entropy token atomically only after listen succeeds", async () => {
   const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");

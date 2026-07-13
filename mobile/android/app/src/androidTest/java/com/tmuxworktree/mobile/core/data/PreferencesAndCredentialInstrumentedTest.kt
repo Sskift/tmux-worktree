@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.core.data
 import android.content.Context
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import java.io.File
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -23,12 +24,13 @@ class PreferencesAndCredentialInstrumentedTest {
         store.clearProfile()
 
         store.saveProfile(
-            relayUrl = "wss://relay.example.com///",
+            relayUrl = "wss://relay.example.com/",
             hostId = "mac-admin",
             autoConnect = true,
         )
         store.setPreferredScope("mew-dev")
         store.setNotificationPreference(NotificationKind.COMPLETED, true)
+        store.setDarkThemeEnabled(false)
 
         val saved = store.values.first()
         assertEquals("wss://relay.example.com", saved.relayUrl)
@@ -36,6 +38,7 @@ class PreferencesAndCredentialInstrumentedTest {
         assertEquals("mew-dev", saved.preferredScopeId)
         assertTrue(saved.autoConnect)
         assertTrue(saved.completedNotifications)
+        assertFalse(saved.darkThemeEnabled)
 
         store.clearProfile()
         val cleared = store.values.first()
@@ -43,6 +46,8 @@ class PreferencesAndCredentialInstrumentedTest {
         assertEquals("", cleared.preferredHostId)
         assertEquals("local", cleared.preferredScopeId)
         assertFalse(cleared.autoConnect)
+        assertFalse(cleared.darkThemeEnabled)
+        store.setDarkThemeEnabled(true)
     }
 
     @Test
@@ -66,6 +71,11 @@ class PreferencesAndCredentialInstrumentedTest {
         assertTrue(securePreferences.contains("iv"))
         assertFalse(securePreferences.all.values.any { it == secret })
         assertFalse(securePreferences.contains("relaySecret"))
+        val securePreferencesFile = File(
+            context.applicationInfo.dataDir,
+            "shared_prefs/tw_mobile_v2_secure.xml",
+        )
+        assertFalse(securePreferencesFile.readText().contains(secret))
 
         store.clear()
         assertFalse(store.hasCredential())

@@ -57,6 +57,7 @@ fun PairingScreen(
     relayUrl: String,
     token: String,
     isConnecting: Boolean,
+    relayUrlError: String?,
     error: String?,
     onRelayUrlChange: (String) -> Unit,
     onTokenChange: (String) -> Unit,
@@ -100,7 +101,7 @@ fun PairingScreen(
         )
         Spacer(Modifier.height(12.dp))
         Text(
-            text = "Open Mobile pairing in tw-dashboard on your Mac, then scan the code or enter the connection details.",
+            text = "Open Mobile pairing in tw-dashboard on your Mac, then scan the Relay v1 profile or enter the connection details.",
             color = TwTextSecondary,
             style = MaterialTheme.typography.bodyLarge,
         )
@@ -134,10 +135,14 @@ fun PairingScreen(
             value = relayUrl,
             onValueChange = onRelayUrlChange,
             label = { Text("Relay URL") },
-            placeholder = { Text("wss://relay.example.com") },
+            placeholder = { Text("wss://devbox.example.net") },
             singleLine = true,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
             colors = pairingFieldColors(),
+            supportingText = relayUrlError?.let { message ->
+                { Text(message, color = MaterialTheme.colorScheme.error) }
+            },
+            isError = relayUrlError != null,
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("pairing_relay_url"),
@@ -162,7 +167,8 @@ fun PairingScreen(
         Spacer(Modifier.height(20.dp))
         OutlinedButton(
             onClick = onConnect,
-            enabled = relayUrl.isNotBlank() && token.isNotBlank() && !isConnecting,
+            enabled = relayUrl.isNotBlank() && token.isNotBlank() &&
+                relayUrlError == null && !isConnecting,
             colors = ButtonDefaults.outlinedButtonColors(contentColor = TwAccent),
             modifier = Modifier
                 .fillMaxWidth()

@@ -9,12 +9,14 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.tmuxworktree.mobile.core.model.RelayHost
 import com.tmuxworktree.mobile.core.model.RelayScope
 import com.tmuxworktree.mobile.core.model.RelaySession
+import java.io.File
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -98,13 +100,65 @@ class V2ViewModelProfileInstrumentedTest {
         val viewModel = createViewModel()
 
         val review = awaitState(viewModel) {
-            it.initialized && it.pairingRequired && !it.pairingError.isNullOrBlank()
+            it.initialized && it.pairingRequired && !it.pairingRelayUrlError.isNullOrBlank()
         }
 
         assertEquals("ws://private-relay.example.com", review.pairingRelayUrl)
         assertEquals("old-host", review.pairingHostId)
-        assertTrue(review.pairingError.orEmpty().contains("Use wss://"))
+        assertTrue(review.pairingRelayUrlError.orEmpty().contains("Use wss://"))
         assertFalse(review.isConnecting)
+    }
+
+    @Test
+    fun importedLanCleartextUrlIsRejectedOnReviewBeforeConnect() = runBlocking {
+        val viewModel = createViewModel()
+        awaitState(viewModel) { it.initialized }
+        val secret = "imported-secret-that-must-stay-in-memory"
+
+        viewModel.applyPairingPayload(
+            PairingPayload("ws://mac.local:8787", secret, "mac-admin"),
+        )
+        val review = awaitState(viewModel) {
+            it.pairingRequired && it.pairingRelayUrl == "ws://mac.local:8787"
+        }
+
+        assertTrue(review.pairingRelayUrlError.orEmpty().contains("limited to emulator or loopback"))
+        assertFalse(review.isConnecting)
+        assertFalse(review.paired)
+        assertEquals("", container.preferences.values.first().relayUrl)
+        assertNull(container.credentials.read())
+        assertTrue(container.repository.hosts.first().isEmpty())
+        assertTrue(container.repository.scopes.first().isEmpty())
+        assertTrue(container.repository.sessions.first().isEmpty())
+        assertTrue(container.repository.outbox.first().isEmpty())
+        assertSecretAbsentFromProfilePersistence(secret)
+
+        viewModel.connectPairing()
+        assertTrue(viewModel.uiState.value.pairingRelayUrlError.orEmpty().contains("Use wss://"))
+        assertEquals("", container.preferences.values.first().relayUrl)
+        assertNull(container.credentials.read())
+        assertSecretAbsentFromProfilePersistence(secret)
+    }
+
+    @Test
+    fun importedValidProfileNeverAutoConnectsOrOverwritesStoredProfile() = runBlocking {
+        seedOldProfile(withReadableCredential = true)
+        val viewModel = createViewModel()
+        awaitState(viewModel) { it.initialized && it.paired }
+
+        viewModel.applyPairingPayload(
+            PairingPayload("wss://new-relay.example.com", "new-secret", "new-host"),
+        )
+        val review = awaitState(viewModel) {
+            it.pairingRequired && it.pairingRelayUrl == "wss://new-relay.example.com"
+        }
+
+        assertNull(review.pairingRelayUrlError)
+        assertFalse(review.confirmProfileSwitch)
+        assertEquals("wss://old-relay.example.com", container.preferences.values.first().relayUrl)
+        assertEquals("old-secret", container.credentials.read())
+        assertTrue(container.repository.sessions.first().any { it.hostId == "old-host" })
+        assertSecretAbsentFromProfilePersistence("new-secret")
     }
 
     private fun createViewModel(): V2ViewModel = ViewModelProvider(
@@ -141,6 +195,20 @@ class V2ViewModelProfileInstrumentedTest {
         container.repository.clearProfileData()
         container.preferences.clearProfile()
         container.credentials.clear()
+    }
+
+    private fun assertSecretAbsentFromProfilePersistence(secret: String) {
+        val database = context.getDatabasePath("tw_mobile_v2.db")
+        listOf(
+            database,
+            File(database.path + "-wal"),
+            File(database.path + "-shm"),
+            File(context.filesDir, "datastore/tw_mobile_v2_preferences.preferences_pb"),
+            File(context.applicationInfo.dataDir, "shared_prefs/tw_mobile_v2_secure.xml"),
+        ).filter(File::isFile).forEach { file ->
+            val persisted = file.readBytes().toString(Charsets.ISO_8859_1)
+            assertFalse("Secret was persisted in ${file.name}", persisted.contains(secret))
+        }
     }
 
     private suspend fun awaitState(

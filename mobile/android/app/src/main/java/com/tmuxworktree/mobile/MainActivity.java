@@ -13,9 +13,15 @@ public final class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        Intent replacement = new Intent(getIntent());
+        Intent source = getIntent();
+        Intent replacement = new Intent(source);
+        PairingIntentConsumer.INSTANCE.scrub(source);
         replacement.setClass(this, V2Activity.class);
-        startActivity(replacement);
+        try {
+            startActivity(replacement);
+        } finally {
+            PairingIntentConsumer.INSTANCE.scrub(replacement);
+        }
         finish();
     }
 }

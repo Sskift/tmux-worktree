@@ -18,6 +18,7 @@ data class V2UiState(
     val pairingRelayUrl: String = "",
     val pairingToken: String = "",
     val pairingHostId: String = "",
+    val pairingRelayUrlError: String? = null,
     val pairingError: String? = null,
     val confirmProfileSwitch: Boolean = false,
     val isConnecting: Boolean = false,
@@ -60,6 +61,15 @@ data class V2UiState(
             scopes.isNotEmpty() || sessions.isNotEmpty()
 
     fun session(stableId: String): RelaySession? = sessions.firstOrNull { it.stableId == stableId }
+
+    // State may be captured by a crash reporter or debugger through toString().
+    // Never include the in-memory review token or the unvalidated imported URL.
+    override fun toString(): String =
+        "V2UiState(" +
+            "initialized=$initialized, demoMode=$demoMode, networkAvailable=$networkAvailable, " +
+            "paired=$paired, pairingRequired=$pairingRequired, pairingInput=<redacted>, " +
+            "isConnecting=$isConnecting, hosts=${hosts.size}, scopes=${scopes.size}, " +
+            "sessions=${sessions.size}, health=$health)"
 }
 
 data class NewWorktreeRequest(

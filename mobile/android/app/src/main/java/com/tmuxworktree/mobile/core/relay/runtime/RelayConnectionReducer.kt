@@ -216,6 +216,6 @@ fun RelayTransportState.toConnectionHealth(): ConnectionHealth {
         lastSyncedAtMillis = lastSyncedAtMillis,
         errorCode = errorCode,
         errorMessage = errorMessage,
-        protocolLabel = "v1 compatibility mode",
+        protocolLabel = "Relay v1",
     )
 }

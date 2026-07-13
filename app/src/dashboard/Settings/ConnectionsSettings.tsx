@@ -82,7 +82,6 @@ export interface RelaySettingsModel extends RelayDraft {
   connected: boolean;
   tokenConfigured: boolean;
   v1PairingPayload: string | null;
-  launchCopied: boolean;
   error?: string | null;
   busy: RelaySettingsBusyState;
 }
@@ -96,7 +95,6 @@ export interface RelaySettingsActions {
   start: () => RelayActionResult | Promise<RelayActionResult>;
   startBroker: () => RelayActionResult | Promise<RelayActionResult>;
   stop: () => RelayActionResult | Promise<RelayActionResult>;
-  copyLaunch: () => void | Promise<void>;
   copy: (field: RelayCopyField, value: string) => void | Promise<void>;
 }
 
@@ -144,7 +142,6 @@ export function relaySettingsBindingsFromController(
       token: controller.draftSecret,
       tokenConfigured: controller.tokenState === "Configured",
       v1PairingPayload: controller.v1PairingPayload,
-      launchCopied: controller.copied,
       connectionState,
       active: controller.active,
       connected: controller.connected,
@@ -165,7 +162,6 @@ export function relaySettingsBindingsFromController(
       start: controller.start,
       startBroker: controller.startBroker,
       stop: controller.stop,
-      copyLaunch: controller.copyLaunch,
       copy: (_field, value) => controller.copyValue(value),
     },
   };
@@ -266,7 +262,7 @@ export function ConnectionsSettings({
   ], [sshHostCandidates]);
   const brokerOptions = useMemo<MenuOption[]>(() => hosts.length
     ? [
-        { value: "", label: "Choose a broker…" },
+        { value: "", label: "Choose a Relay center…" },
         ...hosts.map((host) => ({
           value: host.id,
           label: host.label || host.id,
@@ -279,6 +275,7 @@ export function ConnectionsSettings({
     [selectedHostId, sessions, terminals],
   );
   const relaySummary = summarizeRelayStatus(relay);
+  const selectedRelayCenter = hosts.find((host) => host.id === relay.brokerHostId) ?? null;
   const relayBusy = Object.values(relay.busy).some(Boolean);
   const relayDraftLocked = relayBusy || relay.active || !relay.statusKnown;
   const relayActionLocked = relayBusy || !relay.statusKnown;
@@ -562,15 +559,15 @@ export function ConnectionsSettings({
 
     const pendingLabel: Record<typeof intent, string> = {
       save: "Saving Relay configuration…",
-      start: "Starting Relay…",
-      startBroker: "Starting the broker…",
-      stop: "Stopping Relay…",
+      start: "Starting the Mac connector…",
+      startBroker: "Setting up broker, trusted WSS, and the Mac connector…",
+      stop: "Stopping the Mac connector…",
     };
     const successLabel: Record<typeof intent, string> = {
       save: "Relay configuration saved.",
-      start: "Relay start requested.",
-      startBroker: "Broker start requested.",
-      stop: "Relay stopped.",
+      start: "Mac connector start requested.",
+      startBroker: "Relay setup started. The QR appears when the Mac connector reaches the generated WSS endpoint. Existing Android pairing must be updated after token rotation.",
+      stop: "Mac connector stopped. The selected Relay center keeps running.",
     };
 
     setRelayNotice({ tone: "pending", message: pendingLabel[intent] });
@@ -905,21 +902,47 @@ export function ConnectionsSettings({
           <div className="connections-heading-row">
             <div>
               <h3>Mobile Relay</h3>
-              <p>Connect the mobile client without exposing the local dashboard.</p>
+              <p>Choose a Relay center and set up the broker, trusted WSS, and this Mac in one step.</p>
             </div>
           </div>
 
-          <div className={`connections-relay-summary connections-relay-summary--${relaySummary.tone}`}>
-            {relaySummary.tone === "success"
-              ? <Wifi aria-hidden="true" size={18} />
-              : relaySummary.tone === "danger"
-                ? <AlertCircle aria-hidden="true" size={18} />
-                : relaySummary.tone === "progress"
-                  ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
-                  : <Radio aria-hidden="true" size={18} />}
-            <div>
-              <strong>{relaySummary.label}</strong>
-              <span>{relaySummary.detail}</span>
+          <div className="connections-relay-stages" aria-label="Relay connection stages">
+            <div className={`connections-relay-summary${relay.busy.startBroker ? " connections-relay-summary--progress" : ""}`}>
+              {relay.busy.startBroker
+                ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
+                : <Server aria-hidden="true" size={18} />}
+              <div>
+                <strong>Relay center · {selectedRelayCenter?.label || "Not selected"}</strong>
+                <span>
+                  {relay.busy.startBroker
+                    ? "Deploying Relay v1, publishing trusted WSS, and starting this Mac connector."
+                    : "Set up Relay reuses its fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel when none is configured."}
+                </span>
+              </div>
+            </div>
+            <div className={`connections-relay-summary connections-relay-summary--${relaySummary.tone}`}>
+              {relaySummary.tone === "success"
+                ? <Wifi aria-hidden="true" size={18} />
+                : relaySummary.tone === "danger"
+                  ? <AlertCircle aria-hidden="true" size={18} />
+                  : relaySummary.tone === "progress"
+                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={18} />
+                    : <Radio aria-hidden="true" size={18} />}
+              <div>
+                <strong>{relaySummary.label}</strong>
+                <span>{relaySummary.detail}</span>
+              </div>
+            </div>
+            <div className={`connections-relay-summary${relay.v1PairingPayload ? " connections-relay-summary--success" : ""}`}>
+              <QrCode aria-hidden="true" size={18} />
+              <div>
+                <strong>Android pairing · {relay.v1PairingPayload ? "Ready" : "Not ready"}</strong>
+                <span>
+                  {relay.v1PairingPayload
+                    ? "A trusted root wss:// profile is available. The phone still connects independently after review."
+                    : "Requires a connected Mac connector, a trusted root wss:// URL, Host ID, and Relay v1 token."}
+                </span>
+              </div>
             </div>
           </div>
 
@@ -927,16 +950,16 @@ export function ConnectionsSettings({
             <div className="connections-card__header">
               <div>
                 <h4>Relay configuration</h4>
-                <p>Credentials stay masked. Copying always requires a button press.</p>
+                <p>One-click setup is the normal path. The fields and manual controls remain available for fixed WSS and recovery.</p>
               </div>
             </div>
 
             <div className="connections-fields connections-fields--relay">
               <div className={`connections-field connections-field--wide${relayErrors.brokerHostId ? " connections-field--error" : ""}`}>
-                <span>Broker</span>
+                <span>Relay center</span>
                 <MenuSelect
                   id={RELAY_BROKER_ID}
-                  ariaLabel="Relay broker"
+                  ariaLabel="Relay center"
                   ariaInvalid={Boolean(relayErrors.brokerHostId)}
                   ariaDescribedBy={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
                   ariaErrorMessage={relayErrors.brokerHostId ? RELAY_BROKER_ERROR_ID : undefined}
@@ -954,13 +977,16 @@ export function ConnectionsSettings({
                     {relayErrors.brokerHostId}
                   </small>
                 )}
+                {!relayErrors.brokerHostId && (
+                  <small>Saved with this connection. Set up Relay deploys only to this SSH host and rotates the v1 token.</small>
+                )}
               </div>
 
               <RelayField
                 id="connection-relay-url"
                 label="Relay URL"
                 value={relay.relayUrl}
-                placeholder="wss://relay.example.com"
+                placeholder="Enter the trusted wss:// endpoint for this Relay center"
                 error={relayErrors.relayUrl}
                 disabled={relayDraftLocked}
                 copyDisabled={!relay.statusKnown}
@@ -1015,8 +1041,8 @@ export function ConnectionsSettings({
                     {relay.v1PairingPayload
                       ? "Contains the current shared Relay v1 token. Scan only on a trusted Android device and review before saving. This is not a Relay v2 capability."
                       : relay.active && relay.tokenConfigured
-                        ? "The Relay v1 QR requires an Android-compatible wss:// URL and Host ID. Use Copy Android launch for local ws:// debugging."
-                        : "Start Relay with a configured v1 token to create an Android profile."}
+                        ? "Android pairing is unavailable until the connector reaches a trusted root wss:// URL with a valid Host ID. Cleartext and local URLs are never exported."
+                        : "Start the Mac connector with a trusted WSS configuration to create an Android profile."}
                   </span>
                 </div>
               </div>
@@ -1039,17 +1065,6 @@ export function ConnectionsSettings({
             <div className="connections-actions connections-actions--relay">
               {relay.active ? (
                 <>
-                  <button
-                    type="button"
-                    className="connections-button"
-                    disabled={relayBusy || !relay.statusKnown || !relay.tokenConfigured}
-                    onClick={() => void relayActions.copyLaunch()}
-                  >
-                    {relay.launchCopied
-                      ? <Check aria-hidden="true" size={14} />
-                      : <Clipboard aria-hidden="true" size={14} />}
-                    {relay.launchCopied ? "v1 launch copied" : "Copy Android v1 launch"}
-                  </button>
                   <span className="connections-actions__spacer" />
                   <button
                     type="button"
@@ -1060,21 +1075,23 @@ export function ConnectionsSettings({
                     {relay.busy.stop
                       ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
                       : <Square aria-hidden="true" size={14} />}
-                    {relay.busy.stop ? "Stopping" : "Stop"}
+                    {relay.busy.stop ? "Stopping connector" : "Stop connector"}
                   </button>
                 </>
               ) : (
                 <>
                   <button
                     type="button"
-                    className="connections-button"
+                    className="connections-button connections-button--primary"
                     disabled={relayActionLocked || !hosts.length}
                     onClick={() => runRelayAction("startBroker", relayActions.startBroker)}
                   >
                     {relay.busy.startBroker
                       ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
                       : <Server aria-hidden="true" size={14} />}
-                    {relay.busy.startBroker ? "Starting broker" : "Start broker"}
+                    {relay.busy.startBroker
+                      ? "Setting up Relay"
+                      : "Set up Relay"}
                   </button>
                   <span className="connections-actions__spacer" />
                   <button
@@ -1090,14 +1107,14 @@ export function ConnectionsSettings({
                   </button>
                   <button
                     type="button"
-                    className="connections-button connections-button--primary"
+                    className="connections-button"
                     disabled={relayActionLocked}
                     onClick={() => runRelayAction("start", relayActions.start)}
                   >
                     {relay.busy.start
                       ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
                       : <Play aria-hidden="true" size={14} />}
-                    {relay.busy.start ? "Starting" : "Start"}
+                    {relay.busy.start ? "Starting connector" : "Start connector"}
                   </button>
                 </>
               )}

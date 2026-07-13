@@ -1,245 +1,362 @@
-use crate::remote::{apply_ssh_multiplex_options, validate_ssh_host_fields, HostConfig};
-use std::net::ToSocketAddrs;
-use std::time::Duration;
+use std::net::{IpAddr, ToSocketAddrs};
+
+const LEGACY_PLACEHOLDER_RELAY_URL: &str = "wss://relay.example.com";
 
 pub(super) fn tcp_port_open(port: u16) -> bool {
     std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
 }
 
-fn tcp_addr_open(host: &str, port: u16) -> bool {
-    let Ok(addrs) = (host, port).to_socket_addrs() else {
+fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host == "[::1]"
+}
+
+pub(super) fn validate_mobile_relay_connector_url(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Relay URL is required before starting the connector".to_string());
+    }
+    let parsed = tauri::Url::parse(trimmed).map_err(|_| "Enter a valid Relay URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Relay URL must include a host".to_string())?;
+    let authority = trimmed
+        .split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or(trimmed)
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if trimmed.eq_ignore_ascii_case(LEGACY_PLACEHOLDER_RELAY_URL)
+        || host.eq_ignore_ascii_case("relay.example.com")
+    {
+        return Err(
+            "Replace the example Relay URL with this broker's trusted wss:// endpoint".to_string(),
+        );
+    }
+    if parsed.port() == Some(0) {
+        return Err("Relay URL includes an invalid port".to_string());
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || authority.contains('@')
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(
+            "Relay URL must be a root URL without credentials, path, query, or fragment"
+                .to_string(),
+        );
+    }
+
+    match parsed.scheme() {
+        "wss" => {}
+        "ws" if is_loopback_host(host) => {}
+        "ws" => {
+            return Err(
+                "Cleartext ws:// is allowed only for localhost diagnostics; configure trusted wss:// for remote Relay"
+                    .to_string(),
+            )
+        }
+        _ => return Err("Relay URL must use wss://".to_string()),
+    }
+
+    Ok(trimmed.trim_end_matches('/').to_string())
+}
+
+pub(super) fn is_cloudflare_quick_tunnel_url(value: &str) -> bool {
+    let Ok(normalized) = validate_mobile_relay_connector_url(value) else {
         return false;
     };
-    addrs
-        .into_iter()
-        .any(|addr| std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok())
-}
-
-pub(super) fn direct_mobile_relay_url_for_host(host: &HostConfig, port: u16) -> String {
-    let target = host.host.trim();
-    let host_part = if target.contains(':') && !target.starts_with('[') {
-        format!("[{target}]")
-    } else {
-        target.to_string()
+    let Ok(parsed) = tauri::Url::parse(&normalized) else {
+        return false;
     };
-    format!("ws://{host_part}:{port}")
-}
-
-fn local_lan_ip() -> Option<String> {
-    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let addr = socket.local_addr().ok()?;
-    let ip = addr.ip();
-    if ip.is_loopback() {
-        None
-    } else {
-        Some(ip.to_string())
-    }
-}
-
-fn normalize_local_mdns_name(value: &str) -> Option<String> {
-    let normalized = value.trim().to_ascii_lowercase();
-    let name = normalized.trim_end_matches(".local");
-    if name.is_empty()
-        || name.len() > 63
-        || !name
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let Some(label) = host
+        .to_ascii_lowercase()
+        .strip_suffix(".trycloudflare.com")
+        .map(str::to_string)
+    else {
+        return false;
+    };
+    let bytes = label.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && !label.contains('.')
+        && label
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return None;
-    }
-    Some(format!("{name}.local"))
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn local_mdns_name() -> Option<String> {
-    let output = std::process::Command::new("/usr/sbin/scutil")
-        .args(["--get", "LocalHostName"])
+fn wait_for_mobile_relay_url_resolution_with<Published, Resolve, Pause>(
+    value: &str,
+    publication_attempts: usize,
+    resolution_attempts: usize,
+    mut published: Published,
+    mut resolve: Resolve,
+    mut pause: Pause,
+) -> Result<(), String>
+where
+    Published: FnMut(&str) -> bool,
+    Resolve: FnMut(&str, u16) -> bool,
+    Pause: FnMut(),
+{
+    let normalized = validate_mobile_relay_connector_url(value)?;
+    let parsed = tauri::Url::parse(&normalized)
+        .map_err(|_| "Automatic WSS setup returned an invalid Relay URL".to_string())?;
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "Automatic WSS setup returned a Relay URL without a host".to_string())?;
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let publication_attempts = publication_attempts.max(1);
+    let resolution_attempts = resolution_attempts.max(1);
+
+    let mut publication_ready = false;
+    for attempt in 0..publication_attempts {
+        if published(host) {
+            publication_ready = true;
+            break;
+        }
+        if attempt + 1 < publication_attempts {
+            pause();
+        }
+    }
+    if !publication_ready {
+        return Err(
+            "Automatic WSS setup published a URL, but its public DNS record did not appear within 60 seconds"
+                .to_string(),
+        );
+    }
+
+    for attempt in 0..resolution_attempts {
+        if resolve(host, port) {
+            return Ok(());
+        }
+        if attempt + 1 < resolution_attempts {
+            pause();
+        }
+    }
+
+    Err(
+        "Automatic WSS setup published a URL, but this Mac could not resolve it within 15 seconds"
+            .to_string(),
+    )
+}
+
+fn mobile_relay_public_dns_ready(host: &str) -> bool {
+    let Ok(output) = std::process::Command::new("/usr/bin/dig")
+        .args(["+time=1", "+tries=1", "+short", host])
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    normalize_local_mdns_name(&String::from_utf8_lossy(&output.stdout))
+    else {
+        return false;
+    };
+    output.status.success()
+        && String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .any(|line| line.parse::<IpAddr>().is_ok())
 }
 
-fn start_mobile_relay_ssh_forward(
-    host: &HostConfig,
-    bind_host: &str,
-    probe_host: &str,
-    port: u16,
-) -> Result<(), String> {
-    validate_ssh_host_fields(host)?;
-    if tcp_addr_open(probe_host, port) {
-        return Ok(());
-    }
-
-    let mut cmd = mobile_relay_ssh_forward_command(host, bind_host, port)?;
-    let output = cmd
-        .output()
-        .map_err(|err| format!("ssh forward spawn: {err}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!(
-            "start relay forward through {} failed: {}",
-            host.label,
-            stderr.trim()
-        ));
-    }
-
-    std::thread::sleep(Duration::from_millis(250));
-    if tcp_addr_open(probe_host, port) {
-        Ok(())
-    } else {
-        Err(format!(
-            "relay forward through {} did not open {}:{}",
-            host.label, bind_host, port
-        ))
-    }
+pub(super) fn wait_for_mobile_relay_url_resolution(value: &str) -> Result<(), String> {
+    wait_for_mobile_relay_url_resolution_with(
+        value,
+        30,
+        15,
+        mobile_relay_public_dns_ready,
+        |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .is_ok_and(|mut addresses| addresses.next().is_some())
+        },
+        || std::thread::sleep(std::time::Duration::from_secs(1)),
+    )
 }
 
-fn mobile_relay_ssh_forward_command(
-    host: &HostConfig,
-    bind_host: &str,
-    port: u16,
-) -> Result<std::process::Command, String> {
-    validate_ssh_host_fields(host)?;
-    let mut cmd = std::process::Command::new("ssh");
-    cmd.arg("-fN")
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ExitOnForwardFailure=yes")
-        .arg("-o")
-        .arg("StrictHostKeyChecking=accept-new")
-        .arg("-o")
-        .arg("ConnectTimeout=5")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
-        .arg("-L")
-        .arg(format!("{bind_host}:{port}:127.0.0.1:{port}"));
-    apply_ssh_multiplex_options(&mut cmd);
-    if let Some(remote_port) = host.port {
-        cmd.arg("-p").arg(remote_port.to_string());
+pub(super) fn preserved_mobile_relay_url_after_broker_start(
+    current_url: &str,
+    current_broker_host_id: &str,
+    selected_broker_host_id: &str,
+) -> String {
+    if current_broker_host_id.trim() != selected_broker_host_id.trim() {
+        return String::new();
     }
-    if let Some(key) = &host.identity_file {
-        cmd.arg("-i").arg(key);
-    }
-    if let Some(user) = &host.user {
-        cmd.arg("-l").arg(user);
-    }
-    cmd.arg("--").arg(&host.host);
-    Ok(cmd)
-}
-
-pub(super) fn mobile_relay_forward_url_for_host(
-    host: &HostConfig,
-    port: u16,
-) -> Result<String, String> {
-    let advertised_host = local_mdns_name().or_else(local_lan_ip).ok_or_else(|| {
-        "could not determine this Mac's local hostname or LAN IP for Android relay URL".to_string()
-    })?;
-    start_mobile_relay_ssh_forward(host, "0.0.0.0", "127.0.0.1", port)?;
-    Ok(format!("ws://{advertised_host}:{port}"))
-}
-
-pub(super) fn should_preserve_mobile_relay_url(
-    current: &str,
-    host: &HostConfig,
-    port: u16,
-) -> bool {
-    let trimmed = current.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains("example.com")
-        && trimmed != direct_mobile_relay_url_for_host(host, port)
+    validate_mobile_relay_connector_url(current_url).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        direct_mobile_relay_url_for_host, mobile_relay_ssh_forward_command,
-        normalize_local_mdns_name, should_preserve_mobile_relay_url,
+        is_cloudflare_quick_tunnel_url, preserved_mobile_relay_url_after_broker_start,
+        validate_mobile_relay_connector_url, wait_for_mobile_relay_url_resolution_with,
     };
-    use crate::remote::HostConfig;
 
-    fn host(address: &str) -> HostConfig {
-        HostConfig {
-            id: "dev".to_string(),
-            label: "Dev".to_string(),
-            host: address.to_string(),
-            user: Some("alice".to_string()),
-            port: Some(2222),
-            identity_file: Some("/tmp/dev key".to_string()),
-            worktree_base: None,
-            tmux_path: None,
-            tw_path: None,
-        }
+    #[test]
+    fn mobile_relay_connector_requires_wss_except_for_loopback_diagnostics() {
+        assert_eq!(
+            validate_mobile_relay_connector_url(" wss://relay.example.net/ "),
+            Ok("wss://relay.example.net".to_string())
+        );
+        assert_eq!(
+            validate_mobile_relay_connector_url("ws://127.0.0.1:8787/"),
+            Ok("ws://127.0.0.1:8787".to_string())
+        );
+        assert_eq!(
+            validate_mobile_relay_connector_url("ws://[::1]:8787"),
+            Ok("ws://[::1]:8787".to_string())
+        );
+        assert!(validate_mobile_relay_connector_url("ws://desk-mac.local:8787").is_err());
+        assert!(validate_mobile_relay_connector_url("ws://10.0.0.8:8787").is_err());
+        assert!(validate_mobile_relay_connector_url("https://relay.example.net").is_err());
+        assert!(validate_mobile_relay_connector_url("wss://user@relay.example.net").is_err());
+        assert!(validate_mobile_relay_connector_url("wss://@relay.example.net").is_err());
+        assert!(validate_mobile_relay_connector_url("wss://relay.example.net/client").is_err());
+        assert!(validate_mobile_relay_connector_url("wss://relay.example.net:0").is_err());
+        assert!(validate_mobile_relay_connector_url("wss://relay.example.com/").is_err());
     }
 
     #[test]
-    fn mobile_relay_uses_a_stable_local_mdns_name() {
+    fn broker_start_only_preserves_an_explicit_safe_connector_url() {
         assert_eq!(
-            normalize_local_mdns_name("Desk-Mac\n"),
-            Some("desk-mac.local".to_string())
+            preserved_mobile_relay_url_after_broker_start(
+                "wss://relay.example.net",
+                "devbox",
+                "devbox",
+            ),
+            "wss://relay.example.net"
         );
         assert_eq!(
-            normalize_local_mdns_name("desk-mac.local"),
-            Some("desk-mac.local".to_string())
+            preserved_mobile_relay_url_after_broker_start(
+                "wss://relay.example.com",
+                "devbox",
+                "devbox",
+            ),
+            ""
         );
-        assert_eq!(normalize_local_mdns_name("bad host"), None);
+        assert_eq!(
+            preserved_mobile_relay_url_after_broker_start(
+                "ws://desk-mac.local:8787",
+                "devbox",
+                "devbox",
+            ),
+            ""
+        );
+        assert_eq!(
+            preserved_mobile_relay_url_after_broker_start(
+                "wss://old-relay.example.net",
+                "old-center",
+                "new-center",
+            ),
+            ""
+        );
+        assert_eq!(
+            preserved_mobile_relay_url_after_broker_start(
+                "wss://legacy-relay.example.net",
+                "",
+                "devbox",
+            ),
+            ""
+        );
     }
 
     #[test]
-    fn mobile_relay_direct_url_brackets_ipv6_hosts() {
-        assert_eq!(
-            direct_mobile_relay_url_for_host(&host("2605:340::1"), 8787),
-            "ws://[2605:340::1]:8787"
-        );
-        assert_eq!(
-            direct_mobile_relay_url_for_host(&host("[2605:340::1]"), 8787),
-            "ws://[2605:340::1]:8787"
-        );
-    }
-
-    #[test]
-    fn mobile_relay_preserves_only_non_default_non_direct_urls() {
-        let host = host("relay.example.net");
-        assert!(should_preserve_mobile_relay_url(
-            "ws://desk-mac.local:8787",
-            &host,
-            8787
+    fn quick_tunnel_url_requires_a_single_trycloudflare_subdomain() {
+        assert!(is_cloudflare_quick_tunnel_url(
+            "wss://evaluation-songs-bodies-skins.trycloudflare.com"
         ));
-        assert!(!should_preserve_mobile_relay_url("", &host, 8787));
-        assert!(!should_preserve_mobile_relay_url(
-            "wss://relay.example.com",
-            &host,
-            8787
+        assert!(is_cloudflare_quick_tunnel_url(
+            "wss://ABC-123.trycloudflare.com/"
         ));
-        assert!(!should_preserve_mobile_relay_url(
-            "ws://relay.example.net:8787",
-            &host,
-            8787
+        assert!(!is_cloudflare_quick_tunnel_url("wss://trycloudflare.com"));
+        assert!(!is_cloudflare_quick_tunnel_url(
+            "wss://nested.name.trycloudflare.com"
         ));
+        assert!(!is_cloudflare_quick_tunnel_url(
+            "wss://-invalid.trycloudflare.com"
+        ));
+        assert!(!is_cloudflare_quick_tunnel_url("wss://relay.example.net"));
     }
 
     #[test]
-    fn mobile_relay_ssh_forward_ends_options_before_destination() {
-        let command = mobile_relay_ssh_forward_command(&host("ssh-host"), "127.0.0.1", 8787)
-            .expect("relay forward command");
-        let args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        let separator = args.iter().position(|arg| arg == "--").expect("relay --");
+    fn relay_url_resolution_waits_for_the_system_resolver_before_connector_start() {
+        let mut resolutions = Vec::new();
+        let mut pauses = 0;
         assert_eq!(
-            args.get(separator + 1).map(String::as_str),
-            Some("ssh-host")
+            wait_for_mobile_relay_url_resolution_with(
+                "wss://new-tunnel.trycloudflare.com",
+                1,
+                3,
+                |_| true,
+                |host, port| {
+                    resolutions.push((host.to_string(), port));
+                    resolutions.len() == 3
+                },
+                || pauses += 1,
+            ),
+            Ok(())
         );
-        assert!(args.windows(2).any(|pair| pair == ["-l", "alice"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-L", "127.0.0.1:8787:127.0.0.1:8787"]));
-        assert!(!args.iter().any(|arg| arg == "alice@ssh-host"));
+        assert_eq!(
+            resolutions,
+            vec![
+                ("new-tunnel.trycloudflare.com".to_string(), 443),
+                ("new-tunnel.trycloudflare.com".to_string(), 443),
+                ("new-tunnel.trycloudflare.com".to_string(), 443),
+            ]
+        );
+        assert_eq!(pauses, 2);
+    }
+
+    #[test]
+    fn relay_url_resolution_fails_before_connector_start_when_dns_never_arrives() {
+        let mut resolutions = 0;
+        let mut pauses = 0;
+        let error = wait_for_mobile_relay_url_resolution_with(
+            "wss://unresolved-tunnel.trycloudflare.com",
+            1,
+            2,
+            |_| true,
+            |_, _| {
+                resolutions += 1;
+                false
+            },
+            || pauses += 1,
+        )
+        .unwrap_err();
+        assert_eq!(resolutions, 2);
+        assert_eq!(pauses, 1);
+        assert!(error.contains("could not resolve"));
+    }
+
+    #[test]
+    fn relay_url_resolution_does_not_touch_the_system_resolver_before_public_dns_exists() {
+        let mut publications = 0;
+        let mut resolutions = 0;
+        let mut pauses = 0;
+        assert_eq!(
+            wait_for_mobile_relay_url_resolution_with(
+                "wss://fresh-tunnel.trycloudflare.com",
+                3,
+                1,
+                |_| {
+                    publications += 1;
+                    publications == 3
+                },
+                |_, _| {
+                    resolutions += 1;
+                    true
+                },
+                || pauses += 1,
+            ),
+            Ok(())
+        );
+        assert_eq!(publications, 3);
+        assert_eq!(resolutions, 1);
+        assert_eq!(pauses, 2);
     }
 }

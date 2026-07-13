@@ -286,7 +286,9 @@ The mobile path has three pieces:
 | `tw relay-host` | Mac admin machine | Aggregates local and configured remote TW-managed sessions. |
 | Android APK | Phone | Lists and attaches to sessions exposed through the broker. |
 
-The Dashboard can start or inspect the Mac admin connector. It saves relay settings such as `mobileRelay.relayUrl`, `mobileRelay.hostId`, and `mobileRelay.secret` into `~/.tmux-worktree.json`.
+The Dashboard persists the selected Relay center as `mobileRelay.brokerHostId`. **Set up Relay** performs the normal flow in one action: it deploys the same-version bundled `tw` broker, reuses a saved fixed WSS endpoint or asks an installed `cloudflared` on that center for a temporary Quick Tunnel, waits for the generated public DNS record without poisoning the Mac system resolver's negative cache, confirms the Mac can resolve it, saves the generated URL and Relay v1 token, and starts the Mac connector. A reconfiguration rotates the shared token. Android pairing is offered only after the connector reaches the trusted root `wss://` URL. The editable fields and individual Save/Start controls remain available for fixed production WSS and recovery.
+
+Relay v1 is one trusted administration domain backed by one shared token; it is not a multi-tenant credential model. Hosting unrelated users on one shared Relay service requires the future Relay v2 role-scoped enrollment implementation.
 
 For a persistent broker setup, see [docs/remote-relay-android.md](docs/remote-relay-android.md).
 
