@@ -39,6 +39,28 @@ const idleViewState = {
   stopping: false,
 };
 
+function activateOwner(
+  coordinator: ReturnType<typeof createMobileRelayAsyncCoordinator>,
+  owner: object,
+) {
+  coordinator.commit(owner);
+  const activation = coordinator.activate();
+  const lease = coordinator.capture(owner);
+  assert.ok(lease);
+  return { activation, lease };
+}
+
+function commitOwner(
+  coordinator: ReturnType<typeof createMobileRelayAsyncCoordinator>,
+  owner: object,
+) {
+  const ownerCommit = coordinator.commit(owner);
+  const lease = coordinator.capture(owner);
+  assert.ok(lease);
+  assert.strictEqual(ownerCommit.lease, lease);
+  return lease;
+}
+
 test("mobile relay launch command preserves configured and placeholder token forms", () => {
   assert.deepEqual(
     decodeAdbShellArguments(buildMobileRelayLaunchCommand({
@@ -185,11 +207,13 @@ test("mobile relay keeps its visibility-aware polling cadence", () => {
 
 test("an initial Relay response preserves every draft field edited while it was pending", () => {
   const coordinator = createMobileRelayAsyncCoordinator();
-  const initialStatus = coordinator.issueStatusRequest("untouched");
+  const { lease: owner } = activateOwner(coordinator, {});
+  const initialStatus = coordinator.issueStatusRequest(owner, "untouched");
+  assert.ok(initialStatus);
 
-  coordinator.markDraftEdited("relayUrl");
-  coordinator.markDraftEdited("hostId");
-  coordinator.markDraftEdited("secret");
+  coordinator.markDraftEdited(owner, "relayUrl");
+  coordinator.markDraftEdited(owner, "hostId");
+  coordinator.markDraftEdited(owner, "secret");
 
   assert.equal(coordinator.isCurrentStatusRequest(initialStatus), true);
   assert.equal(coordinator.acceptDraftSync(initialStatus, "relayUrl"), false);
@@ -199,18 +223,21 @@ test("an initial Relay response preserves every draft field edited while it was 
 
 test("a submitted Relay response only normalizes fields unchanged since submission", () => {
   const coordinator = createMobileRelayAsyncCoordinator();
-  coordinator.markDraftEdited("relayUrl");
-  coordinator.markDraftEdited("hostId");
-  coordinator.markDraftEdited("secret");
-  const submitted = coordinator.issueStatusRequest("submitted");
+  const { lease: owner } = activateOwner(coordinator, {});
+  coordinator.markDraftEdited(owner, "relayUrl");
+  coordinator.markDraftEdited(owner, "hostId");
+  coordinator.markDraftEdited(owner, "secret");
+  const submitted = coordinator.issueStatusRequest(owner, "submitted");
+  assert.ok(submitted);
 
-  coordinator.markDraftEdited("secret");
+  coordinator.markDraftEdited(owner, "secret");
 
   assert.equal(coordinator.acceptDraftSync(submitted, "relayUrl"), true);
   assert.equal(coordinator.acceptDraftSync(submitted, "hostId"), true);
   assert.equal(coordinator.acceptDraftSync(submitted, "secret"), false);
 
-  const laterPoll = coordinator.issueStatusRequest("untouched");
+  const laterPoll = coordinator.issueStatusRequest(owner, "untouched");
+  assert.ok(laterPoll);
   assert.equal(coordinator.acceptDraftSync(laterPoll, "relayUrl"), true);
   assert.equal(coordinator.acceptDraftSync(laterPoll, "hostId"), true);
   assert.equal(coordinator.acceptDraftSync(laterPoll, "secret"), false);
@@ -218,20 +245,181 @@ test("a submitted Relay response only normalizes fields unchanged since submissi
 
 test("newer Relay reads and mutations reject stale live-status publications", () => {
   const coordinator = createMobileRelayAsyncCoordinator();
-  const initialRead = coordinator.issueStatusRequest();
-  const newerRead = coordinator.issueStatusRequest();
+  const { lease: owner } = activateOwner(coordinator, {});
+  const initialRead = coordinator.issueStatusRequest(owner);
+  const newerRead = coordinator.issueStatusRequest(owner);
+  assert.ok(initialRead);
+  assert.ok(newerRead);
 
   assert.equal(coordinator.isCurrentStatusRequest(initialRead), false);
   assert.equal(coordinator.isCurrentStatusRequest(newerRead), true);
   assert.equal(coordinator.acceptDraftSync(initialRead, "relayUrl"), false);
 
-  const operation = coordinator.beginOperation();
+  const operation = coordinator.beginOperation(owner);
+  assert.ok(operation);
   assert.equal(coordinator.isCurrentStatusRequest(newerRead), false);
   assert.equal(coordinator.isCurrentOperation(operation), true);
-  assert.equal(coordinator.hasActiveOperation(), true);
+  assert.equal(coordinator.hasActiveOperation(owner), true);
 
-  coordinator.finishOperation(operation);
-  assert.equal(coordinator.hasActiveOperation(), false);
+  assert.equal(coordinator.finishOperation(operation), true);
+  assert.equal(coordinator.hasActiveOperation(owner), false);
+});
+
+test("a speculative owner B render cannot invalidate committed owner A", async () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backendA = {};
+  const backendB = {};
+  const { lease: ownerA } = activateOwner(coordinator, backendA);
+  const requestA = coordinator.issueStatusRequest(ownerA);
+  assert.ok(requestA);
+
+  let resolveA = (_value: string) => {};
+  const responseA = new Promise<string>((resolve) => { resolveA = resolve; });
+  const publications: string[] = [];
+  const pendingA = responseA.then((value) => {
+    if (
+      coordinator.isCurrent(ownerA)
+      && coordinator.isCurrentStatusRequest(requestA)
+    ) publications.push(value);
+  });
+
+  assert.equal(coordinator.capture(backendB), null);
+  assert.equal(coordinator.isCurrent(ownerA), true);
+  assert.equal(coordinator.isCurrentStatusRequest(requestA), true);
+
+  resolveA("A-current");
+  await pendingA;
+  assert.deepEqual(publications, ["A-current"]);
+});
+
+test("committing owner B fences late owner A status before B publishes", async () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backendA = {};
+  const backendB = {};
+  const { lease: ownerA } = activateOwner(coordinator, backendA);
+  const requestA = coordinator.issueStatusRequest(ownerA);
+  assert.ok(requestA);
+
+  let resolveA = (_value: string) => {};
+  const responseA = new Promise<string>((resolve) => { resolveA = resolve; });
+  const publications: string[] = [];
+  const pendingA = responseA.then((value) => {
+    if (
+      coordinator.isCurrent(ownerA)
+      && coordinator.isCurrentStatusRequest(requestA)
+    ) publications.push(value);
+  });
+
+  const ownerB = commitOwner(coordinator, backendB);
+  const requestB = coordinator.issueStatusRequest(ownerB);
+  assert.ok(requestB);
+  assert.equal(coordinator.isCurrent(ownerA), false);
+  assert.equal(coordinator.isCurrentStatusRequest(requestA), false);
+  assert.equal(coordinator.markDraftEdited(ownerA, "secret"), false);
+  assert.equal(coordinator.issueStatusRequest(ownerA), null);
+
+  resolveA("A-late");
+  await pendingA;
+  assert.deepEqual(publications, []);
+  assert.equal(coordinator.isCurrent(ownerB), true);
+  assert.equal(coordinator.isCurrentStatusRequest(requestB), true);
+
+  const ownerA2 = commitOwner(coordinator, backendA);
+  assert.notEqual(ownerA2.epoch, ownerA.epoch);
+  assert.equal(coordinator.isCurrent(ownerA), false);
+});
+
+test("owner A operation finally cannot clear owner B operation", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backendA = {};
+  const backendB = {};
+  const { lease: ownerA } = activateOwner(coordinator, backendA);
+  const operationA = coordinator.beginOperation(ownerA);
+  assert.ok(operationA);
+  assert.equal(coordinator.hasActiveOperation(ownerA), true);
+
+  assert.equal(coordinator.capture(backendB), null);
+  assert.equal(coordinator.hasActiveOperation(ownerA), true);
+
+  const ownerB = commitOwner(coordinator, backendB);
+  const operationB = coordinator.beginOperation(ownerB);
+  assert.ok(operationB);
+  assert.equal(coordinator.isCurrentOperation(operationA), false);
+  assert.equal(coordinator.finishOperation(operationA), false);
+  assert.equal(coordinator.hasActiveOperation(ownerB), true);
+  assert.equal(coordinator.isCurrentOperation(operationB), true);
+
+  assert.equal(coordinator.finishOperation(operationB), true);
+  assert.equal(coordinator.hasActiveOperation(ownerB), false);
+});
+
+test("owner switch after save continuation prevents the old backend start mutation", async () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backendA = {};
+  const backendB = {};
+  const { lease: ownerA } = activateOwner(coordinator, backendA);
+  const operationA = coordinator.beginOperation(ownerA);
+  assert.ok(operationA);
+
+  let resolveSave = () => {};
+  const deferredSave = new Promise<void>((resolve) => { resolveSave = resolve; });
+  let oldBackendStartCalls = 0;
+  const startAfterSave = (async () => {
+    await deferredSave;
+    if (!coordinator.isCurrentOperation(operationA)) return false;
+    oldBackendStartCalls += 1;
+    return true;
+  })();
+
+  resolveSave();
+  const ownerB = commitOwner(coordinator, backendB);
+  assert.equal(await startAfterSave, false);
+  assert.equal(oldBackendStartCalls, 0);
+  assert.equal(coordinator.isCurrent(ownerB), true);
+});
+
+test("exact lifecycle cleanup invalidates old work without deactivating a replay", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backend = {};
+  const first = activateOwner(coordinator, backend);
+  const firstRequest = coordinator.issueStatusRequest(first.lease);
+  assert.ok(firstRequest);
+
+  const secondActivation = coordinator.activate();
+  const secondLease = coordinator.capture(backend);
+  assert.ok(secondLease);
+  assert.equal(coordinator.deactivate(first.activation), false);
+  assert.equal(coordinator.isCurrent(secondLease), true);
+  assert.equal(coordinator.deactivate(secondActivation), true);
+  assert.equal(coordinator.capture(backend), null);
+  assert.equal(coordinator.isCurrentStatusRequest(firstRequest), false);
+});
+
+test("activation replay clears an old busy operation without resetting drafts", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const backend = {};
+  const first = activateOwner(coordinator, backend);
+  assert.equal(coordinator.markDraftEdited(first.lease, "secret"), true);
+  const oldOperation = coordinator.beginOperation(first.lease);
+  assert.ok(oldOperation);
+  assert.equal(coordinator.hasActiveOperation(first.lease), true);
+
+  const secondActivation = coordinator.activate();
+  const secondLease = coordinator.capture(backend);
+  assert.ok(secondLease);
+  assert.equal(coordinator.isCurrentOperation(oldOperation), false);
+  assert.equal(coordinator.hasActiveOperation(secondLease), false);
+  assert.equal(coordinator.deactivate(first.activation), false);
+
+  const replayStatus = coordinator.issueStatusRequest(secondLease, "untouched");
+  assert.ok(replayStatus);
+  assert.equal(coordinator.acceptDraftSync(replayStatus, "secret"), false);
+
+  const replayOperation = coordinator.beginOperation(secondLease);
+  assert.ok(replayOperation);
+  assert.equal(coordinator.hasActiveOperation(secondLease), true);
+  assert.equal(coordinator.finishOperation(replayOperation), true);
+  assert.equal(coordinator.deactivate(secondActivation), true);
 });
 
 test("mobile relay exposes unknown and failed status instead of pretending to be stopped", () => {
@@ -240,12 +428,28 @@ test("mobile relay exposes unknown and failed status instead of pretending to be
     "utf8",
   );
 
-  assert.match(source, /const \[statusKnown, setStatusKnown\] = useState\(false\)/);
-  assert.match(source, /setStatusKnown\(true\)/);
-  assert.match(source, /setStatusKnown\(false\)/);
+  assert.match(source, /ownerLease = asyncCoordinator\.capture\(dashboardBackend\)/);
+  assert.doesNotMatch(source, /renderOwner/);
+  assert.equal(source.match(/useLayoutEffect\(\(\) => \{/g)?.length, 2);
+  assert.match(
+    source,
+    /useLayoutEffect\(\(\) => \{\s*committedBackendRef\.current = dashboardBackend;\s*const ownerCommit = asyncCoordinator\.commit\(dashboardBackend\);/,
+  );
+  assert.match(
+    source,
+    /const activation = asyncCoordinator\.activate\(\);[\s\S]*return \(\) => \{\s*asyncCoordinator\.deactivate\(activation\);\s*\};/,
+  );
+  assert.match(source, /statusKnown: true/);
+  assert.match(source, /statusKnown: false/);
   assert.match(source, /Unable to read Relay status/);
   assert.match(source, /const requireKnownStatus = useCallback/);
   assert.match(source, /if \(!requireKnownStatus\(\)\) return false;/);
   assert.match(source, /Wait for Relay status before changing its configuration/);
+  assert.match(
+    source,
+    /const saved = await saveConfig\(operation\);[\s\S]*?if \(!saved\.secret\.trim\(\)\)[\s\S]*?if \(!asyncCoordinator\.isCurrentOperation\(operation\)\) return false;\s*await dashboardBackend\.relay\.start\(\);/,
+  );
+  assert.match(source, /if \(!asyncCoordinator\.finishOperation\(operation\)\) return;/);
+  assert.doesNotMatch(source, /finally\s*\{[\s\S]{0,120}set(?:Loading|Saving|BrokerStarting|Stopping)\(false\)/);
   assert.doesNotMatch(source, /function fallbackMobileRelayStatus/);
 });
