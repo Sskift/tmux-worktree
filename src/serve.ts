@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync, spawn as cpSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { networkInterfaces, homedir, tmpdir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   accessSync,
   chmodSync,
@@ -34,6 +34,57 @@ const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
 const MAX_PENDING_STDIN_BYTES = 256 * 1024;
 const MAX_SOCKET_BUFFERED_BYTES = 1024 * 1024;
 const MIN_RECOMMENDED_TOKEN_BYTES = 16;
+const SESSION_COOKIE_NAME = "tw_session";
+const SESSION_COOKIE_MAX_AGE_SECONDS = 28_800;
+const SESSION_MAX_AGE_MS = SESSION_COOKIE_MAX_AGE_SECONDS * 1000;
+const MAX_BROWSER_SESSIONS = 64;
+
+function secretDigest(domain: string, value: string): Buffer {
+  return createHash("sha256")
+    .update(`tmux-worktree/serve/${domain}/v1\0`, "utf8")
+    .update(value, "utf8")
+    .digest();
+}
+
+function secretMatches(domain: string, candidate: string, expectedDigest: Buffer): boolean {
+  return timingSafeEqual(secretDigest(domain, candidate), expectedDigest);
+}
+
+function cookieValue(req: IncomingMessage, name: string): string | null {
+  const header = req.headers.cookie;
+  if (typeof header !== "string") return null;
+  let found: string | null = null;
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0 || part.slice(0, separator).trim() !== name) continue;
+    if (found !== null) return null;
+    found = part.slice(separator + 1).trim();
+  }
+  return found;
+}
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  if (!address) return false;
+  const normalized = address.toLowerCase().split("%")[0];
+  return normalized === "::1"
+    || normalized.startsWith("127.")
+    || normalized.startsWith("::ffff:127.");
+}
+
+function hasStrictWebSocketOrigin(req: IncomingMessage): boolean {
+  const origin = req.headers.origin;
+  const host = req.headers.host;
+  if (typeof origin !== "string" || typeof host !== "string") return false;
+  if (/[\0-\x20\x7f]/.test(host)) return false;
+  try {
+    const parsed = new URL(origin);
+    return (parsed.protocol === "http:" || parsed.protocol === "https:")
+      && parsed.origin === origin
+      && parsed.host === host;
+  } catch {
+    return false;
+  }
+}
 
 function serveToken(): string {
   const configured = process.env.TW_TOKEN;
@@ -244,10 +295,16 @@ function getLanIp(): string {
   return "localhost";
 }
 
-function json(res: ServerResponse, data: unknown, status = 200) {
+function json(
+  res: ServerResponse,
+  data: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
+    ...headers,
   });
   res.end(JSON.stringify(data));
 }
@@ -426,20 +483,15 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 
   var term = null, fitAddon = null, ws = null, ro = null, xtermLoaded = null;
   var currentSession = null;
-  var authToken = localStorage.getItem("tw-token") || "";
 
   function showView(name) {
     for (var k in views) views[k].classList.toggle("active", k === name);
   }
   window.showView = showView;
 
-  function authHeaders() {
-    return { "Authorization": "Bearer " + authToken };
-  }
-
   function authFetch(url, opts) {
     opts = opts || {};
-    opts.headers = Object.assign({}, opts.headers || {}, authHeaders());
+    opts.credentials = "same-origin";
     return fetch(url, opts);
   }
 
@@ -457,8 +509,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     if (!val) { err.textContent = "Please enter token"; err.style.display = "block"; return; }
     tryAuth(val).then(function(ok) {
       if (ok) {
-        authToken = val;
-        localStorage.setItem("tw-token", val);
+        input.value = "";
         err.style.display = "none";
         showView("list");
         loadSessions();
@@ -474,13 +525,10 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     if (e.key === "Enter") document.getElementById("auth-btn").click();
   });
 
-  // Auto-login if token in localStorage
-  if (authToken) {
-    tryAuth(authToken).then(function(ok) {
-      if (ok) { showView("list"); loadSessions(); }
-      else { localStorage.removeItem("tw-token"); authToken = ""; }
-    });
-  }
+  // Reuse an unexpired same-origin HttpOnly session without exposing the token to JavaScript.
+  authFetch("/api/sessions").then(function(response) {
+    if (response.ok) { showView("list"); loadSessions(); }
+  }).catch(function() {});
 
   function ago(ts) {
     var s = Math.floor(Date.now() / 1000 - ts);
@@ -646,7 +694,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
       term.focus();
 
       var proto = location.protocol === "https:" ? "wss:" : "ws:";
-      ws = new WebSocket(proto + "//" + location.host + "/ws?session=" + encodeURIComponent(name) + "&pane=" + paneIndex + "&token=" + encodeURIComponent(authToken));
+      ws = new WebSocket(proto + "//" + location.host + "/ws?session=" + encodeURIComponent(name) + "&pane=" + paneIndex);
 
       ws.onopen = function() {
         ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
@@ -846,7 +894,6 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     loadSessions();
   };
 
-  loadSessions();
   // Preload xterm.js in background so terminal opens instantly
   setTimeout(function() { loadXterm(); }, 500);
 })();
@@ -946,16 +993,78 @@ export async function run() {
       : DEFAULT_PORT;
 
   const token = serveToken();
+  const tokenDigest = secretDigest("token", token);
   const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
   if (process.argv.includes("--remote")) {
     throw new Error("tw serve --remote has been removed. Use tw relay-server on a broker and tw relay-host on the Mac admin machine.");
   }
 
-  function checkAuth(req: IncomingMessage, url: URL): boolean {
-    const qToken = url.searchParams.get("token");
-    if (qToken === token) return true;
-    const auth = req.headers.authorization;
-    if (auth === `Bearer ${token}`) return true;
+  const browserSessions = new Map<string, { expiresAt: number }>();
+  let legacyQueryWarningEmitted = false;
+
+  function purgeExpiredBrowserSessions(now: number): void {
+    for (const [digest, session] of browserSessions) {
+      if (session.expiresAt <= now) browserSessions.delete(digest);
+    }
+  }
+
+  function issueBrowserSession(): string {
+    const now = Date.now();
+    purgeExpiredBrowserSessions(now);
+    while (browserSessions.size >= MAX_BROWSER_SESSIONS) {
+      const oldest = browserSessions.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      browserSessions.delete(oldest);
+    }
+    let sessionId: string;
+    let digest: string;
+    do {
+      sessionId = randomBytes(32).toString("base64url");
+      digest = secretDigest("browser-session", sessionId).toString("base64url");
+    } while (browserSessions.has(digest));
+    browserSessions.set(digest, { expiresAt: now + SESSION_MAX_AGE_MS });
+    return sessionId;
+  }
+
+  function hasBrowserSession(req: IncomingMessage): boolean {
+    const sessionId = cookieValue(req, SESSION_COOKIE_NAME);
+    if (!sessionId || !/^[A-Za-z0-9_-]{43}$/.test(sessionId)) return false;
+    const now = Date.now();
+    purgeExpiredBrowserSessions(now);
+    const digest = secretDigest("browser-session", sessionId).toString("base64url");
+    const session = browserSessions.get(digest);
+    if (!session || session.expiresAt <= now) {
+      browserSessions.delete(digest);
+      return false;
+    }
+    browserSessions.delete(digest);
+    browserSessions.set(digest, session);
+    return true;
+  }
+
+  function checkAuth(req: IncomingMessage, url: URL, webSocket = false): boolean {
+    const authorization = req.headers.authorization;
+    if (
+      typeof authorization === "string"
+      && authorization.startsWith("Bearer ")
+      && secretMatches("token", authorization.slice("Bearer ".length), tokenDigest)
+    ) return true;
+
+    if ((!webSocket || hasStrictWebSocketOrigin(req)) && hasBrowserSession(req)) return true;
+
+    const queryToken = url.searchParams.get("token");
+    if (
+      queryToken !== null
+      && secretMatches("token", queryToken, tokenDigest)
+      && req.headers.origin === undefined
+      && isLoopbackAddress(req.socket.remoteAddress)
+    ) {
+      if (!legacyQueryWarningEmitted) {
+        legacyQueryWarningEmitted = true;
+        console.warn("[tw serve] warning: loopback query-token authentication is deprecated");
+      }
+      return true;
+    }
     return false;
   }
 
@@ -1000,8 +1109,15 @@ export async function run() {
             json(res, { ok: false, error: "bad request" }, 400);
             return;
           }
-          if ((data as Record<string, unknown>).token === token) {
-            json(res, { ok: true });
+          const submittedToken = (data as Record<string, unknown>).token;
+          if (
+            typeof submittedToken === "string"
+            && secretMatches("token", submittedToken, tokenDigest)
+          ) {
+            const sessionId = issueBrowserSession();
+            json(res, { ok: true }, 200, {
+              "Set-Cookie": `${SESSION_COOKIE_NAME}=${sessionId}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${SESSION_COOKIE_MAX_AGE_SECONDS}`,
+            });
           } else {
             json(res, { ok: false, error: "invalid token" }, 401);
           }
@@ -1041,7 +1157,7 @@ export async function run() {
       return;
     }
     // Check token for WebSocket
-    if (!checkAuth(req, url)) {
+    if (!checkAuth(req, url, true)) {
       socket.close(4001, "unauthorized");
       return;
     }
