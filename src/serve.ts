@@ -1,26 +1,121 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { execSync, spawn as cpSpawn } from "node:child_process";
-import { networkInterfaces, homedir } from "node:os";
+import { execFileSync, spawn as cpSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { networkInterfaces, homedir, tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
-import { writeFileSync, readFileSync, unlinkSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  closeSync,
+  constants as fsConstants,
+  ftruncateSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+  writeSync,
+} from "node:fs";
 import { join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
 const DEFAULT_PORT = 8311;
+const AUTH_BODY_LIMIT_BYTES = 4096;
+const SESSION_NAME_MAX_LENGTH = 128;
+const PANE_INDEX_MAX = 65_535;
+const MIN_TERMINAL_COLS = 20;
+const MAX_TERMINAL_COLS = 300;
+const MIN_TERMINAL_ROWS = 5;
+const MAX_TERMINAL_ROWS = 200;
+const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
 
-function sh(cmd: string): string {
+function tmuxOutput(tmux: string, args: string[]): string {
+  return execFileSync(tmux, args, {
+    encoding: "utf-8",
+    timeout: 5000,
+    stdio: ["ignore", "pipe", "ignore"],
+  }).trim();
+}
+
+function runTmux(args: string[]): string {
   try {
-    return execSync(cmd, { encoding: "utf-8", timeout: 5000 }).trim();
+    return tmuxOutput(tmuxBin(), args);
   } catch {
     return "";
   }
 }
 
 function tmuxBin(): string {
+  const configured = process.env.TW_TMUX?.trim();
+  if (configured) return configured;
   for (const p of ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"]) {
-    try { execSync(`test -x ${p}`, { timeout: 1000 }); return p; } catch {}
+    try {
+      accessSync(p, fsConstants.X_OK);
+      return p;
+    } catch {}
   }
   return "tmux";
+}
+
+function requestUrl(req: IncomingMessage): URL | null {
+  try {
+    return new URL(req.url || "/", "http://localhost");
+  } catch {
+    return null;
+  }
+}
+
+function validatedSessionName(value: string | null): string | null {
+  if (value === null || !value.trim() || value.length > SESSION_NAME_MAX_LENGTH) return null;
+  if (/[\0-\x1f\x7f]/.test(value)) return null;
+  return value;
+}
+
+function decodedSessionName(value: string): string | null {
+  try {
+    return validatedSessionName(decodeURIComponent(value));
+  } catch {
+    return null;
+  }
+}
+
+function validatedPaneIndex(value: string | null): string | null {
+  const candidate = value ?? "0";
+  if (!/^(?:0|[1-9]\d*)$/.test(candidate)) return null;
+  const paneIndex = Number(candidate);
+  if (!Number.isSafeInteger(paneIndex) || paneIndex > PANE_INDEX_MAX) return null;
+  return String(paneIndex);
+}
+
+function attachTargetExists(tmux: string, sessionName: string, paneIndex: string): boolean {
+  try {
+    const panes = tmuxOutput(tmux, ["list-panes", "-t", `=${sessionName}`, "-F", "#{pane_index}"])
+      .split("\n")
+      .filter(Boolean);
+    if (panes.length === 0) return false;
+    return paneIndex === "0" || panes.includes(paneIndex);
+  } catch {
+    return false;
+  }
+}
+
+type TerminalSize = { cols: number; rows: number };
+
+function parsedResizeMessage(value: unknown): TerminalSize | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (!Object.hasOwn(record, "cols") || !Object.hasOwn(record, "rows")) return null;
+  if (!Number.isSafeInteger(record.cols) || !Number.isSafeInteger(record.rows)) return null;
+  const cols = record.cols as number;
+  const rows = record.rows as number;
+  if (cols < MIN_TERMINAL_COLS || cols > MAX_TERMINAL_COLS) return null;
+  if (rows < MIN_TERMINAL_ROWS || rows > MAX_TERMINAL_ROWS) return null;
+  return { cols, rows };
+}
+
+function writeTerminalSize(fd: number, size: TerminalSize): void {
+  const contents = Buffer.from(`${size.cols},${size.rows}`, "utf8");
+  ftruncateSync(fd, 0);
+  writeSync(fd, contents, 0, contents.length, 0);
 }
 
 type Session = {
@@ -41,9 +136,8 @@ type Pane = {
 };
 
 function listSessions(): Session[] {
-  const tmux = tmuxBin();
   const fmt = "#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}";
-  const raw = sh(`${tmux} list-sessions -F '${fmt}'`);
+  const raw = runTmux(["list-sessions", "-F", fmt]);
   if (!raw) return [];
   return raw.split("\n").filter(Boolean).map((line) => {
     const [name, att, win, cre, act] = line.split("\x1f");
@@ -69,9 +163,8 @@ function listTerminals(): PlainTerminal[] {
 }
 
 function listPanes(sessionName: string): Pane[] {
-  const tmux = tmuxBin();
   const fmt = "#{pane_index}\x1f#{pane_width}\x1f#{pane_height}\x1f#{pane_current_command}\x1f#{pane_title}\x1f#{pane_active}";
-  const raw = sh(`${tmux} list-panes -t '=${sessionName}' -F '${fmt}'`);
+  const raw = runTmux(["list-panes", "-t", `=${sessionName}`, "-F", fmt]);
   if (!raw) return [];
   return raw.split("\n").filter(Boolean).map((line) => {
     const [idx, w, h, cmd, title, active] = line.split("\x1f");
@@ -87,8 +180,7 @@ function listPanes(sessionName: string): Pane[] {
 }
 
 function sessionCwd(name: string): string {
-  const tmux = tmuxBin();
-  return sh(`${tmux} display-message -t '=${name}' -p '#{pane_current_path}'`);
+  return runTmux(["display-message", "-t", `=${name}`, "-p", "#{pane_current_path}"]);
 }
 
 function getLanIp(): string {
@@ -110,8 +202,7 @@ function json(res: ServerResponse, data: unknown, status = 200) {
   res.end(JSON.stringify(data));
 }
 
-function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
-  const url = new URL(req.url || "/", `http://${req.headers.host}`);
+function handleApi(req: IncomingMessage, res: ServerResponse, url: URL): boolean {
   const path = url.pathname;
 
   if (path === "/api/sessions") {
@@ -126,14 +217,22 @@ function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
 
   const panesMatch = path.match(/^\/api\/sessions\/([^/]+)\/panes$/);
   if (panesMatch) {
-    const name = decodeURIComponent(panesMatch[1]);
+    const name = decodedSessionName(panesMatch[1]);
+    if (!name) {
+      json(res, { error: "invalid session" }, 400);
+      return true;
+    }
     json(res, listPanes(name));
     return true;
   }
 
   const cwdMatch = path.match(/^\/api\/sessions\/([^/]+)\/cwd$/);
   if (cwdMatch) {
-    const name = decodeURIComponent(cwdMatch[1]);
+    const name = decodedSessionName(cwdMatch[1]);
+    if (!name) {
+      json(res, { error: "invalid session" }, 400);
+      return true;
+    }
     const cwd = sessionCwd(name);
     json(res, { cwd });
     return true;
@@ -141,9 +240,12 @@ function handleApi(req: IncomingMessage, res: ServerResponse): boolean {
 
   const cancelMatch = path.match(/^\/api\/sessions\/([^/]+)\/cancel-copy-mode$/);
   if (cancelMatch && req.method === "POST") {
-    const name = decodeURIComponent(cancelMatch[1]);
-    const tmux = tmuxBin();
-    sh(`${tmux} send-keys -t '=${name}' -X cancel`);
+    const name = decodedSessionName(cancelMatch[1]);
+    if (!name) {
+      json(res, { error: "invalid session" }, 400);
+      return true;
+    }
+    runTmux(["send-keys", "-t", `=${name}`, "-X", "cancel"]);
     json(res, { ok: true });
     return true;
   }
@@ -702,105 +804,15 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 </body>
 </html>`;
 
-export async function run() {
-  const portArg = process.argv.find((a) => a.startsWith("--port="));
-  const portIdx = process.argv.indexOf("--port");
-  const port = portArg
-    ? parseInt(portArg.split("=")[1])
-    : portIdx >= 0
-      ? parseInt(process.argv[portIdx + 1])
-      : DEFAULT_PORT;
-
-  const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
-  // Write token to file so Tauri app can read it
-  const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
-  writeFileSync(tokenFile, token, { mode: 0o600 });
-  if (process.argv.includes("--remote")) {
-    throw new Error("tw serve --remote has been removed. Use tw relay-server on a broker and tw relay-host on the Mac admin machine.");
-  }
-
-  function checkAuth(req: IncomingMessage): boolean {
-    const url = new URL(req.url || "/", `http://${req.headers.host}`);
-    const qToken = url.searchParams.get("token");
-    if (qToken === token) return true;
-    const auth = req.headers.authorization;
-    if (auth === `Bearer ${token}`) return true;
-    return false;
-  }
-
-  const server = createServer((req, res) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host}`);
-    const path = url.pathname;
-
-    // Auth endpoint - no token required
-    if (path === "/api/auth" && req.method === "POST") {
-      let body = "";
-      req.on("data", (c: Buffer) => { body += c.toString(); });
-      req.on("end", () => {
-        try {
-          const data = JSON.parse(body);
-          if (data.token === token) {
-            json(res, { ok: true });
-          } else {
-            json(res, { ok: false, error: "invalid token" }, 401);
-          }
-        } catch {
-          json(res, { ok: false, error: "bad request" }, 400);
-        }
-      });
-      return;
-    }
-
-    // All other API routes require auth
-    if (path.startsWith("/api/")) {
-      if (!checkAuth(req)) {
-        json(res, { error: "unauthorized" }, 401);
-        return;
-      }
-      if (handleApi(req, res)) return;
-      json(res, { error: "not found" }, 404);
-      return;
-    }
-
-    // HTML page - always served (contains auth UI)
-    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(HTML);
-  });
-
-  const wss = new WebSocketServer({ server, path: "/ws" });
-
-  wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
-    // Check token for WebSocket
-    if (!checkAuth(req)) {
-      socket.close(4001, "unauthorized");
-      return;
-    }
-
-    const url = new URL(req.url || "/", `http://${req.headers.host}`);
-    const sessionName = url.searchParams.get("session");
-    if (!sessionName) {
-      socket.close(4000, "missing session param");
-      return;
-    }
-    const paneIndex = url.searchParams.get("pane") || "0";
-
-    const tmux = tmuxBin();
-    const mobileId = "tw-mobile-" + randomBytes(4).toString("hex");
-    const resizeFile = `/tmp/tw-resize-${mobileId}`;
-
-    const pyScript = `
+const PTY_BRIDGE_SCRIPT = String.raw`
 import pty, os, sys, select, struct, fcntl, termios, signal, subprocess
 
-tmux = '${tmux}'
-session = '${sessionName.replace(/'/g, "\\'")}'
-mobile = '${mobileId}'
-pane_idx = '${paneIndex}'
-resize_file = '${resizeFile}'
+tmux, session, mobile, pane_idx, resize_file = sys.argv[1:6]
 
 subprocess.run([tmux, 'new-session', '-d', '-t', session, '-s', mobile], check=True)
 subprocess.run([tmux, 'set', '-t', mobile, 'status', 'off'])
 if pane_idx != '0':
-    subprocess.run([tmux, 'select-pane', '-t', mobile + ':.' + pane_idx])
+    subprocess.run([tmux, 'select-pane', '-t', mobile + ':.' + pane_idx], check=True)
 
 master, slave = pty.openpty()
 pid = os.fork()
@@ -812,7 +824,7 @@ if pid == 0:
     os.close(master)
     os.close(slave)
     os.environ['TERM'] = 'xterm-256color'
-    os.execvp(tmux, ['tmux', 'attach', '-f', 'ignore-size', '-t', mobile])
+    os.execv(tmux, [tmux, 'attach', '-f', 'ignore-size', '-t', mobile])
 os.close(slave)
 fl = fcntl.fcntl(master, fcntl.F_GETFL)
 fcntl.fcntl(master, fcntl.F_SETFL, fl | os.O_NONBLOCK)
@@ -828,7 +840,7 @@ def on_winch(signum, frame):
         winsize = struct.pack('HHHH', rows, cols, 0, 0)
         fcntl.ioctl(master, termios.TIOCSWINSZ, winsize)
         os.kill(pid, signal.SIGWINCH)
-    except:
+    except Exception:
         pass
 signal.signal(signal.SIGWINCH, on_winch)
 
@@ -854,38 +866,204 @@ try:
         rr = os.waitpid(pid, os.WNOHANG)
         if rr[0] != 0:
             break
-except:
+except Exception:
     pass
 finally:
     try:
         os.kill(pid, signal.SIGTERM)
-    except:
+    except Exception:
         pass
     os.close(master)
     try:
         os.waitpid(pid, 0)
-    except:
+    except Exception:
         pass
     try:
         os.unlink(resize_file)
-    except:
+    except Exception:
         pass
     subprocess.run([tmux, 'kill-session', '-t', mobile], capture_output=True)
     sys.exit(0)
 `;
 
-    const child = cpSpawn("python3", ["-u", "-c", pyScript], {
-      stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, TERM: "xterm-256color" },
-    });
+export async function run() {
+  const portArg = process.argv.find((a) => a.startsWith("--port="));
+  const portIdx = process.argv.indexOf("--port");
+  const port = portArg
+    ? parseInt(portArg.split("=")[1])
+    : portIdx >= 0
+      ? parseInt(process.argv[portIdx + 1])
+      : DEFAULT_PORT;
+
+  const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
+  // Write token to file so Tauri app can read it
+  const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
+  writeFileSync(tokenFile, token, { mode: 0o600 });
+  if (process.argv.includes("--remote")) {
+    throw new Error("tw serve --remote has been removed. Use tw relay-server on a broker and tw relay-host on the Mac admin machine.");
+  }
+
+  function checkAuth(req: IncomingMessage, url: URL): boolean {
+    const qToken = url.searchParams.get("token");
+    if (qToken === token) return true;
+    const auth = req.headers.authorization;
+    if (auth === `Bearer ${token}`) return true;
+    return false;
+  }
+
+  const server = createServer((req, res) => {
+    const url = requestUrl(req);
+    if (!url) {
+      json(res, { error: "bad request" }, 400);
+      return;
+    }
+    const path = url.pathname;
+
+    // Auth endpoint - no token required
+    if (path === "/api/auth" && req.method === "POST") {
+      const chunks: Buffer[] = [];
+      let bodyBytes = 0;
+      let tooLarge = false;
+      const contentLength = req.headers["content-length"];
+      if (
+        typeof contentLength === "string"
+        && /^\d+$/.test(contentLength)
+        && Number(contentLength) > AUTH_BODY_LIMIT_BYTES
+      ) {
+        tooLarge = true;
+        json(res, { ok: false, error: "request body too large" }, 413);
+      }
+      req.on("data", (chunk: Buffer) => {
+        if (tooLarge) return;
+        bodyBytes += chunk.length;
+        if (bodyBytes > AUTH_BODY_LIMIT_BYTES) {
+          tooLarge = true;
+          chunks.length = 0;
+          json(res, { ok: false, error: "request body too large" }, 413);
+          return;
+        }
+        chunks.push(chunk);
+      });
+      req.on("end", () => {
+        if (tooLarge) return;
+        try {
+          const data = JSON.parse(Buffer.concat(chunks).toString("utf8")) as unknown;
+          if (!data || typeof data !== "object" || Array.isArray(data)) {
+            json(res, { ok: false, error: "bad request" }, 400);
+            return;
+          }
+          if ((data as Record<string, unknown>).token === token) {
+            json(res, { ok: true });
+          } else {
+            json(res, { ok: false, error: "invalid token" }, 401);
+          }
+        } catch {
+          json(res, { ok: false, error: "bad request" }, 400);
+        }
+      });
+      req.on("error", () => {
+        if (!tooLarge && !res.writableEnded) json(res, { ok: false, error: "bad request" }, 400);
+      });
+      return;
+    }
+
+    // All other API routes require auth
+    if (path.startsWith("/api/")) {
+      if (!checkAuth(req, url)) {
+        json(res, { error: "unauthorized" }, 401);
+        return;
+      }
+      if (handleApi(req, res, url)) return;
+      json(res, { error: "not found" }, 404);
+      return;
+    }
+
+    // HTML page - always served (contains auth UI)
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+    res.end(HTML);
+  });
+
+  const wss = new WebSocketServer({ server, path: "/ws", maxPayload: MAX_WS_PAYLOAD_BYTES });
+
+  wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
+    const url = requestUrl(req);
+    if (!url) {
+      socket.close(4000, "bad request");
+      return;
+    }
+    // Check token for WebSocket
+    if (!checkAuth(req, url)) {
+      socket.close(4001, "unauthorized");
+      return;
+    }
+
+    const sessionName = validatedSessionName(url.searchParams.get("session"));
+    if (!sessionName) {
+      socket.close(4000, "invalid session param");
+      return;
+    }
+    const paneIndex = validatedPaneIndex(url.searchParams.get("pane"));
+    if (paneIndex === null) {
+      socket.close(4000, "invalid pane param");
+      return;
+    }
+
+    const tmux = tmuxBin();
+    if (!attachTargetExists(tmux, sessionName, paneIndex)) {
+      socket.close(4004, "terminal target not found");
+      return;
+    }
+    const mobileId = "tw-mobile-" + randomBytes(4).toString("hex");
+    let resizeDirectory = "";
+    let resizeFile = "";
+    let resizeFd = -1;
+    try {
+      resizeDirectory = mkdtempSync(join(tmpdir(), "tw-serve-resize-"));
+      chmodSync(resizeDirectory, 0o700);
+      resizeFile = join(resizeDirectory, "size");
+      resizeFd = openSync(resizeFile, "wx+", 0o600);
+      writeTerminalSize(resizeFd, { cols: 80, rows: 24 });
+    } catch {
+      if (resizeFd >= 0) {
+        try { closeSync(resizeFd); } catch {}
+      }
+      if (resizeDirectory) {
+        try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
+      }
+      socket.close(1011, "failed to initialize terminal bridge");
+      return;
+    }
+
+    let child: ChildProcessWithoutNullStreams;
+    try {
+      child = cpSpawn("python3", [
+        "-u",
+        "-c",
+        PTY_BRIDGE_SCRIPT,
+        tmux,
+        sessionName,
+        mobileId,
+        paneIndex,
+        resizeFile,
+      ], {
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, TERM: "xterm-256color" },
+      });
+    } catch {
+      try { closeSync(resizeFd); } catch {}
+      try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
+      socket.close(1011, "failed to start terminal bridge");
+      return;
+    }
 
     let cleaned = false;
     function cleanup() {
       if (cleaned) return;
       cleaned = true;
       try { child.kill(); } catch {}
-      sh(`${tmux} kill-session -t '${mobileId}'`);
-      try { unlinkSync(resizeFile); } catch {}
+      runTmux(["kill-session", "-t", `=${mobileId}`]);
+      try { closeSync(resizeFd); } catch {}
+      try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
     }
 
     child.stdout!.on("data", (data: Buffer) => {
@@ -895,6 +1073,11 @@ finally:
     });
 
     child.stderr!.on("data", (_data: Buffer) => {});
+    child.stdin!.on("error", cleanup);
+    child.on("error", () => {
+      cleanup();
+      if (socket.readyState === socket.OPEN) socket.close(1011, "terminal bridge failed");
+    });
 
     child.on("close", (code: number | null) => {
       cleanup();
@@ -907,20 +1090,28 @@ finally:
     socket.on("message", (raw: Buffer | string) => {
       const msg = raw.toString();
       try {
-        const parsed = JSON.parse(msg);
-        if (parsed.type === "resize") {
-          // Write size to temp file and signal python to ioctl resize the PTY
-          writeFileSync(resizeFile, `${parsed.cols},${parsed.rows}`);
-          try { child.kill("SIGWINCH"); } catch {}
+        const parsed = JSON.parse(msg) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { type?: unknown }).type === "resize") {
+          const size = parsedResizeMessage(parsed);
+          if (size && !cleaned) {
+            try {
+              writeTerminalSize(resizeFd, size);
+              child.kill("SIGWINCH");
+            } catch {
+              cleanup();
+              if (socket.readyState === socket.OPEN) socket.close(1011, "terminal resize failed");
+            }
+          }
           return;
         }
       } catch {}
-      child.stdin!.write(msg);
+      if (!cleaned && child.stdin!.writable) child.stdin!.write(msg);
     });
 
     socket.on("close", () => {
       cleanup();
     });
+    socket.on("error", cleanup);
   });
 
   server.listen(port, "0.0.0.0", () => {
