@@ -10,7 +10,7 @@ const MESSAGE_TIMEOUT_MS = 2_000;
 
 function runRelayServerCli(args, { secret } = {}) {
   const { TW_RELAY_SECRET: _discardedSecret, ...cleanEnv } = process.env;
-  return spawnSync(process.execPath, ["dist/cli.js", "relay-server", ...args], {
+  return spawnSync(process.execPath, ["dist/cli.cjs", "relay-server", ...args], {
     encoding: "utf8",
     env: secret === undefined
       ? cleanEnv
@@ -37,7 +37,7 @@ async function startRelayServer(secret) {
   const port = await unusedLoopbackPort();
   const output = [];
   const child = spawn(process.execPath, [
-    "dist/cli.js",
+    "dist/cli.cjs",
     "relay-server",
     "--host",
     "127.0.0.1",
