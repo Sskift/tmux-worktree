@@ -370,6 +370,38 @@ transport.handlers.set("mobile_relay_start", nothing);
 transport.handlers.set("mobile_relay_stop", nothing);
 transport.handlers.set("mobile_relay_save_config", value(relayStatus));
 transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
+transport.handlers.set("feishu_bridge_status", value({
+  instanceId: "preview-feishu",
+  bindings: [],
+  activeTurns: [],
+  uncertainReplies: [],
+}));
+transport.handlers.set("feishu_groups_list", value([
+  { chatId: "oc_preview", name: "TW Preview Group" },
+]));
+transport.handlers.set("feishu_binding_create", (payload) => {
+  const { args } = payload as { args: { chatId: string; chatName: string; sessionName: string; createdBy: string } };
+  return {
+    version: 1,
+    id: "bind-preview",
+    chatId: args.chatId,
+    chatName: args.chatName,
+    controlTargetId: "ct-preview",
+    backendBirthId: "birth-preview",
+    sessionName: args.sessionName,
+    status: "active",
+    options: { mentionOnly: true, replyAsCard: false, includeQuotedContext: false },
+    allowedSenderIds: [args.createdBy],
+    createdAt: new Date().toISOString(),
+    createdBy: args.createdBy,
+  };
+});
+transport.handlers.set("feishu_binding_pause", nothing);
+transport.handlers.set("feishu_binding_resume", nothing);
+transport.handlers.set("feishu_binding_repair", nothing);
+transport.handlers.set("feishu_binding_remove", nothing);
+transport.handlers.set("feishu_binding_takeover", nothing);
+transport.handlers.set("feishu_binding_return", nothing);
 transport.handlers.set("git_fetch_project_roots", nothing);
 transport.handlers.set("git_status", value(gitStatus));
 transport.handlers.set("git_graph_refs", value(gitGraphRefs));

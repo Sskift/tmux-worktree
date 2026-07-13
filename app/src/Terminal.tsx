@@ -33,6 +33,7 @@ type Props = {
   hostId?: string | null;
   controlSession?: string;
   controlHostId?: string | null;
+  onAttachmentIdChange?: (id: string | null) => void;
   initialHistory?: string;
   onOpenFile?: (path: string, line?: number, col?: number, hostId?: string | null) => void;
 };
@@ -289,6 +290,7 @@ export function Terminal({
   hostId,
   controlSession,
   controlHostId,
+  onAttachmentIdChange,
   initialHistory,
   onOpenFile,
 }: Props) {
@@ -301,11 +303,13 @@ export function Terminal({
   const activeRef = useRef(active);
   const linkCwdRef = useRef(linkCwd ?? cwd);
   const onOpenFileRef = useRef(onOpenFile);
+  const onAttachmentIdChangeRef = useRef(onAttachmentIdChange);
   const remoteReconnectAttemptRef = useRef(0);
   const [reconnectSeq, setReconnectSeq] = useState(0);
   const [controlStatus, setControlStatus] = useState<PtyControlStatus | null>(null);
   linkCwdRef.current = linkCwd ?? cwd;
   onOpenFileRef.current = onOpenFile;
+  onAttachmentIdChangeRef.current = onAttachmentIdChange;
 
   useEffect(() => {
     if (initialHistory !== undefined) {
@@ -587,6 +591,7 @@ export function Terminal({
             onExit: async (event) => {
               if (event.id !== id) return;
               ptyId = null;
+              onAttachmentIdChangeRef.current?.(null);
               if (reconnectStabilityTimer !== null) {
                 window.clearTimeout(reconnectStabilityTimer);
                 reconnectStabilityTimer = null;
@@ -650,6 +655,7 @@ export function Terminal({
         }
         ptyConnectionRef.current = ptyConnection;
         ptyId = ptyConnection.active ? id : null;
+        onAttachmentIdChangeRef.current?.(ptyId);
         if (ptyId && controlSession) {
           const pollControlStatus = async () => {
             if (cancelled || !ptyConnection?.active) return;
@@ -703,6 +709,7 @@ export function Terminal({
       void ptyConnection?.close();
       if (ptyConnectionRef.current === ptyConnection) ptyConnectionRef.current = null;
       ptyId = null;
+      onAttachmentIdChangeRef.current?.(null);
       setControlStatus(null);
       term.dispose();
       termRef.current = null;

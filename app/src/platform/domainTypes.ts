@@ -258,6 +258,51 @@ export type MobileRelayBrokerInput = {
   port?: number;
 };
 
+export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
+
+export type FeishuBinding = {
+  version: 1;
+  id: string;
+  chatId: string;
+  chatName: string;
+  controlTargetId: string;
+  backendBirthId?: string;
+  sessionName: string;
+  status: FeishuBindingStatus;
+  options: {
+    mentionOnly: boolean;
+    replyAsCard: boolean;
+    includeQuotedContext: boolean;
+  };
+  allowedSenderIds: string[];
+  createdAt: string;
+  createdBy: string;
+  lastActivityAt?: string;
+  staleReason?: string;
+};
+
+export type FeishuBridgeSnapshot = {
+  instanceId: string;
+  bindings: FeishuBinding[];
+  activeTurns: Array<{ id: string; bindingId: string; status: string; deadlineAt: string }>;
+  uncertainReplies: Array<{ id: string; turnId: string; status: "uncertain"; error?: string }>;
+};
+
+export type FeishuChat = {
+  chatId: string;
+  name: string;
+};
+
+export type FeishuBindingInput = {
+  chatId: string;
+  chatName: string;
+  sessionName: string;
+  createdBy: string;
+  allowedSenderIds?: string[];
+  mentionOnly?: boolean;
+  attachmentId?: string;
+};
+
 // Layout is intentionally tolerant while Phase 2 migrates the legacy persisted
 // shape. Callers validate individual fields before restoring them.
 export type DashboardLayout = Record<string, unknown>;

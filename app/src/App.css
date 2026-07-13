@@ -805,6 +805,112 @@ button:disabled {
   min-height: 0;
   min-width: 0;
   display: flex;
+  position: relative;
+}
+
+.terminal-feishu-bar {
+  position: absolute;
+  z-index: 5;
+  top: 50px;
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(760px, calc(100% - 32px));
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  box-shadow: 0 8px 24px rgb(0 0 0 / 22%);
+}
+
+.terminal-feishu-bar[data-state="active"],
+.terminal-feishu-bar[data-state="pausing"],
+.terminal-feishu-bar[data-state="stale"] {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  color: var(--text);
+}
+
+.terminal-feishu-bar > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-feishu-bar button,
+.terminal-feishu-dialog button {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 7px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font: inherit;
+}
+
+.terminal-feishu-bar button.danger {
+  color: var(--danger, #ff6b6b);
+}
+
+.terminal-feishu-dialog {
+  position: absolute;
+  z-index: 20;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(0 0 0 / 48%);
+}
+
+.terminal-feishu-dialog__card {
+  width: min(520px, 100%);
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  color: var(--text);
+  box-shadow: 0 18px 60px rgb(0 0 0 / 42%);
+}
+
+.terminal-feishu-dialog__card p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.terminal-feishu-dialog__card label {
+  display: grid;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.terminal-feishu-dialog__card input,
+.terminal-feishu-dialog__card select {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 8px;
+  background: var(--bg-input, var(--bg));
+  color: var(--text);
+}
+
+.terminal-feishu-dialog__card .terminal-feishu-dialog__error {
+  color: var(--danger, #ff6b6b);
+}
+
+.terminal-feishu-dialog__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .term-shell {

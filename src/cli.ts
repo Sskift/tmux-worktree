@@ -46,6 +46,12 @@ RPC:
                               停止并移除一个 TW-managed session 记录
   tw rpc capabilities         输出 Dashboard 可消费的协议能力 JSON
 
+飞书终端桥:
+  tw feishu-bridge serve      启动本机飞书事件、单轮回复与 ownership 服务
+  tw feishu-bridge status     查看 binding、活跃 turn 与不确定回复
+  tw feishu-bridge bind --chat-id <id> --chat-name <name> --session <name> --created-by <open_id>
+  tw feishu-bridge pause|resume|unbind --binding <id> [--force]
+
 SSH Host（本地控制面）:
   tw host ls [--json]         列出 Dashboard 共用的 Host 配置
   tw host add --id <id> --host <target> [SSH options] [--json]
@@ -131,6 +137,11 @@ async function main() {
     case "terminal-control": {
       const { terminalControlCmd } = await import("./terminalControl/cli.js");
       await terminalControlCmd(process.argv.slice(3));
+      return;
+    }
+    case "feishu-bridge": {
+      const { feishuBridgeCmd } = await import("./feishuBridgeServer.js");
+      await feishuBridgeCmd(process.argv.slice(3));
       return;
     }
     case "setup": {

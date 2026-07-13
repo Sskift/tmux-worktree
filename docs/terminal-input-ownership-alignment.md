@@ -1,12 +1,12 @@
 # Terminal Input Ownership Alignment
 
-状态：**跨 Feishu Bridge、Dashboard、TW 本地运行时和 Relay 的架构对齐说明；本地 terminal-control v1 及 Relay v1、Dashboard、`tw serve`、受控 CLI adapter 已实现；不修改 Relay v1/v2 wire contract。**
+状态：**跨 Feishu Bridge、Dashboard、TW 本地运行时和 Relay 的架构对齐说明；本地 terminal-control v1、Feishu Bridge、Relay v1、Dashboard、`tw serve` 和受控 CLI adapter 已实现；不修改 Relay v1/v2 wire contract。**
 
 本文记录不同产品共同操作一个 TW-managed terminal 时的输入所有权边界。它是 [`relay-v2-contract.md`](relay-v2-contract.md) 的非规范性 companion，也是未来本地 terminal-control contract、Feishu Bridge 计划和各输入 adapter 的共同设计基线。
 
 本文不把 Feishu Bridge 合并进 Relay。二者不共享传输、鉴权、credential、配对、broker、消息 envelope 或业务协议；它们只共享同一个 canonical terminal target 和同一个本地输入所有权裁决结果。
 
-当前实现位于 `contracts/terminal-control/v1/`、`src/terminalControl/`、Relay v1 relay-host adapter、Dashboard Tauri PTY adapter、`tw serve` 和受控 `tw attach`。Dashboard 的本机和 SSH managed terminal 都使用目标主机的 controller；SSH attachment 本身保持只读，目标主机缺少兼容 controller 时写入和 destructive lifecycle fail closed。Android Relay v1 在现有 `error.message` 中识别 relay-host 的 ownership 拒绝标记，停止发送 input/resize 并进入只读。Feishu Bridge 和 Relay v2 runtime 不在本工作树中；后者尚未交付，因此本文中的 v2 行为仍是其未来 backend adapter 的实现要求，不能被描述为当前 capability。
+当前实现位于 `contracts/terminal-control/v1/`、`src/terminalControl/`、`contracts/feishu-bridge/v1/`、Feishu Bridge daemon、Relay v1 relay-host adapter、Dashboard Tauri PTY adapter、`tw serve` 和受控 `tw attach`。Dashboard 的本机和 SSH managed terminal 都使用目标主机的 controller；SSH attachment 本身保持只读，目标主机缺少兼容 controller 时写入和 destructive lifecycle fail closed。Android Relay v1 在现有 `error.message` 中识别 relay-host 的 ownership 拒绝标记，停止发送 input/resize 并进入只读。Relay v2 runtime 尚未交付，因此本文中的 v2 行为仍是其未来 backend adapter 的实现要求，不能被描述为当前 capability。
 
 ## 1. 对齐结论
 
@@ -45,6 +45,8 @@ terminal-control plane 负责：
 ### 2.3 Feishu Bridge
 
 Feishu Bridge 拥有 Lark event 消费、群 binding、sender policy、event dedup、单个 awaiting turn、`[[notify-group]]` 提取、群回复和相关审计。它必须通过 terminal-control plane 取得 lease 和发送输入，不能保存或裁决全局 lease，也不能调用 Relay transport。
+
+Feishu Bridge 是共享的本地 daemon。Dashboard 可以在首次管理 binding 时按需启动它，但 Dashboard 退出不得停止 daemon、释放 Feishu lease 或把 active binding 隐式改成 paused；daemon 的显式停止、崩溃和重启分别按 shutdown/recovery 规则处理，不能伪装成用户 handoff。
 
 ### 2.4 Relay v1/v2
 
@@ -320,9 +322,10 @@ Relay v1 wire不变：
 | target同名重建 | 新controlTargetId；旧binding stale且不自动重定向 |
 | target closure/kill竞态 | lease撤销、turn停止tail/post、observer不能用kill绕过handoff |
 | resize/close | observer不能改变backend resize；允许只关闭自己的observation attachment |
+| Dashboard退出 | 不停止共享controller/Bridge，不释放Feishu lease，不暂停active binding；群事件继续由daemon处理 |
 | Feishu remote target未实现 | binding/admission明确拒绝；Dashboard/Relay只调用目标机controller，不以本地名称lease伪装支持 |
 | raw tmux privileged bypass | 产品文档/UI明确不保证，自动化验收不把它当受控路径 |
 | extension未协商 | frozen v2正常运行并强制拒绝，不发送未知ownership frame |
 | extension以后协商 | 只观察最小owner状态，不扩大takeover权限或泄露Feishu身份 |
 
-当前自动化已覆盖local contract closed schema/严格存储、handoff commit/fencing/withdraw、同名target重建、backend不确定性与显式force recovery、Relay v1 Feishu-owner拒绝和不重放、Dashboard/Tauri本机与SSH controller映射及Android v1只读收敛。Feishu turn/reply、Relay v2 ledger/inputSeq和跨分支端到端场景仍须在各自实现分支补齐；在那些测试覆盖前，不得声称Feishu完整独占流程、Relay v2 ownership adapter、ownership observation或手机takeover已经实现。
+当前自动化已覆盖local contract closed schema/严格存储、handoff commit/fencing/withdraw、同名target重建、backend不确定性与显式force recovery、Feishu turn/marker/reply和持久化故障、Relay v1 Feishu-owner拒绝和不重放、Dashboard/Tauri本机与SSH controller映射、Android v1只读收敛，以及真实terminal-control authority与Feishu Bridge之间的无群黑盒写入/接管/fencing路径。Relay v2 ledger/inputSeq和真实群出站仍须在后续实现或发布验证中补齐；在那些验证完成前，不得声称Relay v2 ownership adapter、ownership observation、手机takeover或Feishu生产发布已经实现。

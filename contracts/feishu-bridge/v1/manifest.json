@@ -1,0 +1,86 @@
+{
+  "protocol": "tw-feishu-bridge",
+  "version": 1,
+  "status": "active-local",
+  "transport": {
+    "kind": "unix-domain-socket",
+    "path": "~/.tmux-worktree/feishu-bridge-v1.sock; SHA-256 HOME fallback under tmp when the UTF-8 path exceeds 100 bytes",
+    "mode": "0600",
+    "framing": "ndjson",
+    "maxFrameBytes": 1048576,
+    "closedSchemas": true
+  },
+  "operations": [
+    "bridge.snapshot",
+    "groups.list",
+    "binding.create",
+    "binding.pause",
+    "binding.resume",
+    "binding.repair",
+    "binding.remove",
+    "binding.takeover",
+    "binding.return"
+  ],
+  "eventSource": {
+    "command": "lark-cli event consume im.message.receive_v1 --as bot --quiet",
+    "framing": "ndjson",
+    "requiredRoutingFields": [
+      "event_id",
+      "message_id",
+      "chat_id",
+      "chat_type",
+      "message_type",
+      "sender_id",
+      "content"
+    ],
+    "messageVerification": "lark-cli im +messages-mget --as bot",
+    "botIdentity": "GET /open-apis/bot/v3/info/ as bot"
+  },
+  "reply": {
+    "command": "lark-cli im +messages-reply --as bot",
+    "startMarkerTemplate": "[[notify-group:<persisted-turn-nonce>]]",
+    "endMarkerTemplate": "[[/notify-group:<persisted-turn-nonce>]]",
+    "promptEchoSafe": true,
+    "userMarkerInjectionEscaped": true,
+    "idempotencyRequired": true,
+    "unknownAcknowledgement": "recovery-required",
+    "unterminatedMarker": "never-send"
+  },
+  "storage": {
+    "mode": "0600",
+    "directoryMode": "0700",
+    "atomicReplace": true,
+    "failClosed": true,
+    "handoffDrainPersistedBeforeCommit": true,
+    "utf8TailRemainderPersisted": true,
+    "files": [
+      "feishu-bindings.json",
+      "feishu-event-dedup.json",
+      "feishu-turns.json",
+      "feishu-outbound-replies.json"
+    ]
+  },
+  "limits": {
+    "oneBindingPerChat": true,
+    "oneActiveBindingPerTarget": true,
+    "oneInflightTurnPerTarget": true,
+    "eventDedupEntries": 4096,
+    "turnHistoryEntries": 256,
+    "replyHistoryEntries": 256,
+    "turnTimeoutMs": 600000,
+    "maxPromptBytes": 16384,
+    "maxReplyBytes": 16384,
+    "maxTurnOutputBytes": 131072
+  },
+  "boundaries": {
+    "localManagedTargetsOnly": true,
+    "terminalControlProtocol": 1,
+    "twRpcV1Unchanged": true,
+    "relayV1WireUnchanged": true,
+    "relayV2WireUnchanged": true,
+    "remoteTargets": false,
+    "attachmentsExecuted": false,
+    "auditHistoryDefault": false,
+    "dashboardBindingCreation": "atomic-handoff-without-free-window"
+  }
+}

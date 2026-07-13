@@ -28,6 +28,7 @@ pub fn run() {
         .setup(|app| {
             app.manage(Arc::new(PtyState::default()));
             app.manage(Arc::new(TerminalControlState::new()));
+            app.manage(Arc::new(FeishuBridgeRuntimeState::default()));
             app.manage(Arc::new(MobileRelayState::default()));
             app.manage(Arc::new(GitFetchState::default()));
             app.manage(Arc::new(HostState::default()));
@@ -80,6 +81,15 @@ pub fn run() {
             pty_kill,
             pty_control_status,
             pty_control_takeover,
+            feishu_bridge_status,
+            feishu_groups_list,
+            feishu_binding_create,
+            feishu_binding_pause,
+            feishu_binding_resume,
+            feishu_binding_repair,
+            feishu_binding_remove,
+            feishu_binding_takeover,
+            feishu_binding_return,
             read_dir,
             read_file,
             write_file,
@@ -115,9 +125,10 @@ pub fn run() {
                 cleanup_pending_worktrees();
                 let relay_state = app.state::<Arc<MobileRelayState>>();
                 stop_mobile_relay_processes(relay_state.inner().as_ref());
-                // The terminal-control authority is shared by Dashboard, Feishu,
-                // Relay and CLI adapters.  Dashboard must not fence every other
-                // producer by killing a daemon it happened to auto-start.
+                // The terminal-control authority and Feishu bridge are shared by
+                // Dashboard, Relay and CLI adapters. Dashboard must not fence
+                // every other producer or pause an active group binding by
+                // killing daemons it happened to auto-start.
             }
             _ => {}
         });

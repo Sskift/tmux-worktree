@@ -111,6 +111,8 @@ test("terminal subscribes to pty output before opening the pty", () => {
   );
   assert.match(backendSource, /transport\.invoke<string>\("pty_open", \{ args \}\)/);
   assert.match(rustSource, /id: Option<String>/);
+  assert.match(terminalSource, /onAttachmentIdChangeRef\.current\?\.\(ptyId\)/);
+  assert.doesNotMatch(terminalSource, /attachmentId \?\? createPtyId/);
 });
 
 test("reactivating a terminal does not steal an overlay focus return", () => {

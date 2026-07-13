@@ -29,6 +29,10 @@ import type {
   EnsureTerminalInput,
   FileSearchMode,
   FileSearchResult,
+  FeishuBinding,
+  FeishuBindingInput,
+  FeishuBridgeSnapshot,
+  FeishuChat,
   GitGraphQuery,
   GitGraphRefs,
   GitGraphResponse,
@@ -56,6 +60,18 @@ import type {
 } from "../automationTypes";
 
 type HostId = string | null | undefined;
+
+export interface FeishuProductAdapter {
+  status(): Promise<FeishuBridgeSnapshot>;
+  groups(): Promise<FeishuChat[]>;
+  create(args: FeishuBindingInput): Promise<FeishuBinding>;
+  pause(bindingId: string, force?: boolean): Promise<FeishuBinding>;
+  resume(bindingId: string): Promise<FeishuBinding>;
+  repair(bindingId: string): Promise<FeishuBinding>;
+  remove(bindingId: string, force?: boolean): Promise<void>;
+  takeover(bindingId: string, ptyId: string, force?: boolean): Promise<void>;
+  returnToFeishu(bindingId: string, ptyId: string): Promise<FeishuBinding>;
+}
 
 export interface DashboardBackend {
   catalog?: {
@@ -155,6 +171,7 @@ export interface DashboardBackend {
     startBroker(args: MobileRelayBrokerInput): Promise<MobileRelayStatus>;
     stop(): Promise<void>;
   };
+  feishu: FeishuProductAdapter;
   persistence: {
     homeDirectory(): Promise<string>;
     loadLayout(): Promise<DashboardLayoutLoadResult>;
@@ -421,6 +438,29 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       startBroker: (args) =>
         transport.invoke<MobileRelayStatus>("mobile_relay_start_broker", { args }),
       stop: () => transport.invoke<void>("mobile_relay_stop"),
+    },
+    feishu: {
+      status: () => transport.invoke<FeishuBridgeSnapshot>("feishu_bridge_status"),
+      groups: () => transport.invoke<FeishuChat[]>("feishu_groups_list"),
+      create: (args) => transport.invoke<FeishuBinding>("feishu_binding_create", { args }),
+      pause: (bindingId, force) => transport.invoke<FeishuBinding>("feishu_binding_pause", {
+        bindingId,
+        force: force ?? false,
+      }),
+      resume: (bindingId) => transport.invoke<FeishuBinding>("feishu_binding_resume", { bindingId }),
+      repair: (bindingId) => transport.invoke<FeishuBinding>("feishu_binding_repair", { bindingId }),
+      remove: async (bindingId, force) => {
+        await transport.invoke("feishu_binding_remove", { bindingId, force: force ?? false });
+      },
+      takeover: async (bindingId, ptyId, force) => {
+        await transport.invoke("feishu_binding_takeover", {
+          bindingId,
+          ptyId,
+          force: force ?? false,
+        });
+      },
+      returnToFeishu: (bindingId, ptyId) =>
+        transport.invoke<FeishuBinding>("feishu_binding_return", { bindingId, ptyId }),
     },
     persistence: {
       homeDirectory: () => transport.invoke<string>("home_dir"),
