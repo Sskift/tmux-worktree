@@ -888,14 +888,11 @@ test("App preserves the global deck phase order and direct controller wiring", (
   assert.equal(workspaceOwnerPhases.length, 1);
   assert.equal(ownerPhases.length, 1);
   assert.equal(automationStateCalls.length, 1);
-  const selectedAutomation = directVariable(appBody, "selectedAutomation");
-  const appEffects = directEffectRegistrations(appBody);
+  const workspacePresentation = directVariable(appBody, "workspacePresentation");
   const schedulers = directTopLevelCalls(appBody, "useAutomationWorkspaceSchedulerPhase");
-  const gitEffects = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "dashboardBackend.git.status").length === 1
-  );
+  const branchPhases = directTopLevelCalls(appBody, "useWorkspaceBranchPhase");
   assert.equal(schedulers.length, 1);
-  assert.equal(gitEffects.length, 1);
+  assert.equal(branchPhases.length, 1);
   const order: Array<[string, number]> = [
     ["automation workspace state", automationStateCalls[0].index],
     ["terminal deck state", stateCalls[0].index],
@@ -907,8 +904,8 @@ test("App preserves the global deck phase order and direct controller wiring", (
     ["workspace polling effect 21", pollingCall.index],
     ["automation scheduler effect 22", schedulers[0].index],
     ["attach effects 23-25", attachCall.index],
-    ["selected automation", selectedAutomation.index],
-    ["Git effect", gitEffects[0].index],
+    ["workspace presentation", workspacePresentation.index],
+    ["branch effect 26", branchPhases[0].index],
   ];
   for (let index = 1; index < order.length; index += 1) {
     assert.ok(
@@ -923,7 +920,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
     polling: pollingCall.index,
     scheduler: schedulers[0].index,
     attach: attachCall.index,
-    git: gitEffects[0].index,
+    git: branchPhases[0].index,
   });
 
   assert.ok(stateCalls[0].declaration);

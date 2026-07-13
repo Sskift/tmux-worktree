@@ -33,6 +33,12 @@ import {
   useTerminalMetadataHydrationPhase,
   useTerminalMetadataPersistencePhase,
 } from "./dashboard/hooks/useTerminalMetadata";
+import {
+  useWorkspaceBranchPhase,
+  useWorkspaceHomePhase,
+  useWorkspacePresentation,
+  useWorkspacePresentationOwnerPhase,
+} from "./dashboard/hooks/useWorkspacePresentation";
 import { useVisibilityAwarePolling } from "./dashboard/hooks/useVisibilityAwarePolling";
 import {
   useEditorNavigationGuard,
@@ -57,12 +63,16 @@ import {
   ConnectionsSettings,
   relaySettingsBindingsFromController,
 } from "./dashboard/Settings/ConnectionsSettings";
-import { TerminalDeck } from "./dashboard/TerminalDeck";
 import {
   DashboardShell,
   type DashboardDrawer,
 } from "./dashboard/DashboardShell";
 import { DashboardSidebar } from "./dashboard/DashboardSidebar";
+import { WorkspacePrimaryView } from "./dashboard/WorkspacePrimaryView";
+import {
+  WorkspaceFilesView,
+  WorkspaceGitView,
+} from "./dashboard/WorkspaceContextViews";
 import { WorkspaceHeader } from "./dashboard/WorkspaceHeader";
 import { GitPanel } from "./dashboard/GitPanel";
 import {
@@ -91,10 +101,6 @@ import { Terminal } from "./Terminal";
 import { NewWorktreeModal } from "./NewWorktreeModal";
 import { NewTerminalModal, type TerminalDraft } from "./NewTerminalModal";
 import { ThemePicker } from "./ThemePicker";
-import { GitStatusPanel } from "./GitStatusPanel";
-import { FileTree } from "./FileTree";
-import { FileEditor } from "./FileEditor";
-import { DiffViewer } from "./DiffViewer";
 import { AutomationPanel } from "./AutomationPanel";
 import { editingFileSourceKey } from "./editorNavigationGuard";
 import {
@@ -110,11 +116,11 @@ import {
   triggerLabel,
 } from "./automationTypes";
 import {
-  basenameFromPath,
   sessionDisplayName,
   terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
-import { projectKey, type WorkspaceStatus } from "./dashboard/model/workspaceSelectors";
+import { deriveWorkspacePresentation } from "./dashboard/model/workspacePresentation";
+import { projectKey } from "./dashboard/model/workspaceSelectors";
 import { buildSshShellArgs } from "./terminal/attach";
 import "./App.css";
 
@@ -209,6 +215,11 @@ function App() {
     handleFullCatalogPublished,
   } = terminalDeck;
   useTerminalDeckOwnerPhase(terminalDeckOwnerPhase, dashboardBackend);
+  const workspacePresentationController = useWorkspacePresentation(dashboardBackend);
+  useWorkspacePresentationOwnerPhase(
+    workspacePresentationController.ownerPhase,
+    dashboardBackend,
+  );
   const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
   const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
@@ -228,8 +239,6 @@ function App() {
   const committedEditingFileRef = useRef<EditingFile | null>(editingFile);
   const [editorNavigationRevision, setEditorNavigationRevision] = useState(0);
   const [diffFile, setDiffFile] = useState<DiffFile | null>(null);
-  const [workspaceBranch, setWorkspaceBranch] = useState<string | null>(null);
-  const [homeDir, setHomeDir] = useState<string | null>(null);
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const automationReturnSelectionRef = useRef<Selection>(null);
@@ -249,9 +258,7 @@ function App() {
     handleAutomationDirtyChange,
     getAutomationSubmitOwner,
   } = editorNavigationGuard;
-  useEffect(() => {
-    dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
-  }, [dashboardBackend]);
+  useWorkspaceHomePhase(workspacePresentationController, dashboardBackend);
 
   useDashboardViewportResizePhase(dashboardLayout);
 
@@ -466,74 +473,34 @@ function App() {
     allTerminals,
   });
 
-  // Resolve current cwd for selected item
-  const selectedAutomation =
-    selection?.kind === "automation"
-      ? automations.find((automation) => automation.id === selection.id) ?? null
-      : null;
-  const selectedAutomationProjectPath =
-    selectedAutomation?.project.trim()
-      ? projectPresets.find((project) => project.name === selectedAutomation.project)?.path.trim() || null
-      : null;
-  const selectedSessionIsRemote = !!selectedSession?.hostId;
-  const selectedGitHostId =
-    selectionMetadataPending
-      ? null
-      : selection?.kind === "session"
-      ? selectedSession?.hostId ?? null
-      : selection?.kind === "terminal"
-        ? selectedTerminal?.hostId ?? null
-        : null;
-  const selectedCwd: string | null =
-    selectionMetadataPending
-      ? null
-      : selection?.kind === "session"
-      ? cwdsBySession[selection.name] ?? null
-      : selection?.kind === "terminal"
-        ? selectedTerminal?.cwd ?? null
-        : selection?.kind === "automation"
-          ? selectedAutomation?.path || selectedAutomationProjectPath
-          : null;
-
-  const desktopRoot = homeDir ? `${homeDir.replace(/\/+$/, "")}/Desktop` : null;
-  const fileBrowserRoot =
-    !selection
-      ? null
-      : selection.kind === "automation"
-      ? selectedCwd ?? desktopRoot
-      : selectedGitHostId
-        ? selectedCwd
-        : selectedCwd ?? homeDir ?? "/";
-
-  useEffect(() => {
-    let current = true;
-    setWorkspaceBranch(null);
-    if (
-      selectionMetadataPending ||
-      !selectedCwd ||
-      (selection?.kind !== "session" && selection?.kind !== "terminal")
-    ) {
-      return () => {
-        current = false;
-      };
-    }
-    void dashboardBackend.git.status(selectedCwd, selectedGitHostId)
-      .then((status) => {
-        if (current) setWorkspaceBranch(status?.branch || null);
-      })
-      .catch(() => {
-        if (current) setWorkspaceBranch(null);
-      });
-    return () => {
-      current = false;
-    };
-  }, [
-    dashboardBackend.git,
-    selectedCwd,
-    selectedGitHostId,
+  const workspacePresentation = deriveWorkspacePresentation({
+    ownerReady: workspacePresentationController.ownerReady,
     selection,
     selectionMetadataPending,
-  ]);
+    selectedSession,
+    selectedTerminal,
+    automations,
+    projectPresets,
+    hosts,
+    hostStatuses,
+    sessionActivity,
+    cwdsBySession,
+    homeDirectory: workspacePresentationController.homeDirectory,
+    workspaceBranch: workspacePresentationController.workspaceBranch,
+    editingFile,
+    diffFile,
+  });
+  const publishWorkspaceBranch = useWorkspaceBranchPhase(
+    workspacePresentationController,
+    dashboardBackend,
+    workspacePresentation.branchSource,
+  );
+  const {
+    selectedSessionIsRemote,
+    selectedCwd,
+    selectedGitHostId,
+    fileBrowserRoot,
+  } = workspacePresentation;
 
   const projectPresetForSession = useCallback(
     (sessionName: string): string | null => {
@@ -1184,51 +1151,6 @@ function App() {
   ]);
   const relaySettingsBindings = relaySettingsBindingsFromController(mobileRelay);
 
-  const selectedHostId =
-    selectedSession?.hostId ?? selectedTerminal?.hostId ?? null;
-  const selectedHost = selectedHostId
-    ? hosts.find((host) => host.id === selectedHostId) ?? null
-    : null;
-  const selectedActivity =
-    selection?.kind === "session" ? sessionActivity[selection.name] : null;
-  const selectedHostStatus = selectedHostId ? hostStatuses[selectedHostId] : null;
-
-  const workspaceStatus: WorkspaceStatus = (() => {
-    if (selectionMetadataPending) return "reconnecting";
-    if (selectedHostId && selectedHostStatus && !selectedHostStatus.reachable) return "offline";
-    if (selectedHostId && !selectedHostStatus) return "reconnecting";
-    if (selection?.kind === "automation") {
-      if (selectedAutomation?.status === "running") return "running";
-      if (selectedAutomation?.status === "queued") return "waiting";
-      if (selectedAutomation?.status === "failed" || !selectedAutomation?.active) return "stopped";
-      return selectedAutomation ? "waiting" : "unknown";
-    }
-    if (selection?.kind === "terminal") return selectedTerminal ? "running" : "unknown";
-    if (selectedActivity?.state === "running") return "running";
-    if (selectedActivity?.state === "stopped") return "stopped";
-    if (selectedSession && !selectedCwd) return "waiting";
-    return selectedSession ? "unknown" : "stopped";
-  })();
-
-  const workspaceTitle =
-    selectionMetadataPending && selection?.kind === "session"
-      ? selection.name
-      : selectionMetadataPending && selection?.kind === "terminal"
-        ? "Loading terminal…"
-        : editingFile
-          ? basenameFromPath(editingFile.path) || editingFile.path
-          : diffFile
-            ? basenameFromPath(diffFile.path) || diffFile.path
-            : selectedSession
-              ? sessionDisplayName(selectedSession)
-              : selectedTerminal?.label
-                ? selectedTerminal.label
-                : selectedAutomation?.name || "No workspace selected";
-  const workspaceProject =
-    selectedSession?.project?.trim() ||
-    selectedAutomation?.project?.trim() ||
-    null;
-
   const openGitDiff = useCallback(
     (path: string, cwd: string, hostId?: string | null) =>
       requestEditorNavigation(() => {
@@ -1240,81 +1162,11 @@ function App() {
       }),
     [requestEditorNavigation],
   );
-
-  const renderFiles = () =>
-    selectionMetadataPending ? (
-      <div className="dashboard-context-empty" role="status">
-        <strong>Loading workspace details…</strong>
-        <span>Files will appear after the session and host are resolved.</span>
-      </div>
-    ) : fileBrowserRoot ? (
-      <div className="dashboard-inspector-view dashboard-inspector-view--files">
-        <FileTree
-          root={fileBrowserRoot}
-          hostId={selectedGitHostId}
-          selectedFile={
-            (editingFile?.hostId ?? null) === selectedGitHostId
-              ? editingFile?.path ?? null
-              : null
-          }
-          onFileSelect={(path, hostId) => {
-            void handleOpenFile(path, undefined, undefined, hostId).then((opened) => {
-              if (opened && viewportTier === "compact") setSidebarOpen(false);
-            });
-          }}
-        />
-      </div>
-    ) : (
-      <div className="dashboard-context-empty">
-        <strong>No files context</strong>
-        <span>Select a worktree, terminal, or automation to browse its files.</span>
-      </div>
-    );
-
-  const renderGit = () =>
-    selectionMetadataPending ? (
-      <div className="dashboard-context-empty" role="status">
-        <strong>Loading workspace details…</strong>
-        <span>Git will connect after the session and host are resolved.</span>
-      </div>
-    ) : (
-      <div className="dashboard-inspector-view dashboard-inspector-view--git">
-        <GitStatusPanel
-          cwd={selectedCwd}
-          sessionName={selection?.kind === "session" ? selection.name : undefined}
-          hostId={selectedGitHostId}
-          active={inspectorOpen && (
-            selection?.kind === "session" || selection?.kind === "terminal"
-          )}
-          onFileClick={openGitDiff}
-          onBranchChange={setWorkspaceBranch}
-        />
-      </div>
-    );
-
-  const renderDiff = () =>
-    selectionMetadataPending ? (
-      <div className="dashboard-context-empty" role="status">
-        <strong>Loading workspace details…</strong>
-        <span>Diff will appear after the session and host are resolved.</span>
-      </div>
-    ) : diffFile ? (
-      <div className="dashboard-inspector-view dashboard-inspector-view--diff">
-        <DiffViewer
-          cwd={diffFile.cwd}
-          filePath={diffFile.path}
-          hostId={diffFile.hostId ?? null}
-          onClose={() => {
-            setDiffFile(null);
-          }}
-        />
-      </div>
-    ) : (
-      <div className="dashboard-context-empty">
-        <strong>No diff selected</strong>
-        <span>Select a changed file from the Git panel.</span>
-      </div>
-    );
+  const handleWorkspaceFileSelect = useCallback((path: string, hostId: string | null) => {
+    void handleOpenFile(path, undefined, undefined, hostId).then((opened) => {
+      if (opened && viewportTier === "compact") setSidebarOpen(false);
+    });
+  }, [handleOpenFile, viewportTier]);
 
   const automationPanel = (
     <AutomationPanel
@@ -1337,78 +1189,39 @@ function App() {
     />
   );
 
-  const terminalViewVisible =
-    selectionMetadataPending ||
-    (!editingFile &&
-      !diffFile &&
-      (selection?.kind === "session" || selection?.kind === "terminal"));
-
   const centralWorkspace = (
     <div
       ref={dashboardWorkspaceRef}
       className="dashboard-workspace"
-      data-scratch-open={!selectionMetadataPending && !scratchCollapsed && Boolean(selectionKey)}
+      data-scratch-open={!workspacePresentation.metadataPending && !scratchCollapsed && Boolean(selectionKey)}
       style={{ "--dashboard-scratch-width": `${scratchWidth}px` } as React.CSSProperties}
     >
-      <section className="dashboard-workspace__primary" aria-label="Active workspace">
-        <TerminalDeck
-          key={terminalDeckOwnerEpochKey}
-          selection={selection}
-          sessions={sessions}
-          terminals={allTerminals}
-          hosts={hosts}
-          openedSessions={openedSessions}
-          openedTerminals={openedTerminals}
-          cwdsBySession={cwdsBySession}
-          tmuxPreviews={tmuxPreviews}
-          metadataPending={selectionMetadataPending}
-          visible={terminalViewVisible}
-          blocked={workspaceInteractionBlocked}
-          onOpenFile={handleOpenFile}
-        />
-
-        {selectionMetadataPending ? null : editingFile ? (
-          <div className="dashboard-workspace__editor">
-            <FileEditor
-              filePath={editingFile.path}
-              hostId={editingFile.hostId ?? null}
-              initialLine={editingFile.line}
-              initialColumn={editingFile.column}
-              navigationRevision={editorNavigationRevision}
-              onClose={() => void closeEditingFile()}
-              onOpenFile={handleOpenFile}
-              onDirtyChange={handleEditorDirtyChange}
-            />
-          </div>
-        ) : diffFile ? (
-          <div className="dashboard-workspace__editor">
-            {renderDiff()}
-          </div>
-        ) : selection?.kind === "automation" ? (
-          <div className="dashboard-workspace__expanded">
-            <div className="dashboard-expanded-toolbar">
-              <strong>Automations</strong>
-              <button
-                type="button"
-                onClick={() => void returnFromAutomationManager()}
-                aria-label="Back to workspace"
-              >
-                <X aria-hidden="true" size={14} strokeWidth={1.8} />
-                <span>Back to workspace</span>
-              </button>
-            </div>
-            <div className="dashboard-expanded-content dashboard-workspace__automation">
-              {automationPanel}
-            </div>
-          </div>
-        ) : !selection ? (
-          <div className="pane pane--empty">
-            <div className="pane__hint">
-              Select a worktree, terminal, or automation.
-            </div>
-          </div>
-        ) : null}
-      </section>
+      <WorkspacePrimaryView
+        context={workspacePresentation.primary}
+        diffContext={workspacePresentation.diff}
+        terminalDeckKey={terminalDeckOwnerEpochKey}
+        terminalDeckProps={{
+          selection,
+          sessions,
+          terminals: allTerminals,
+          hosts,
+          openedSessions,
+          openedTerminals,
+          cwdsBySession,
+          tmuxPreviews,
+          metadataPending: workspacePresentation.metadataPending,
+          visible: workspacePresentation.terminalVisible,
+          blocked: workspaceInteractionBlocked,
+          onOpenFile: handleOpenFile,
+        }}
+        editorNavigationRevision={editorNavigationRevision}
+        automationContent={automationPanel}
+        onCloseEditor={() => void closeEditingFile()}
+        onOpenFile={handleOpenFile}
+        onEditorDirtyChange={handleEditorDirtyChange}
+        onCloseDiff={() => setDiffFile(null)}
+        onReturnFromAutomation={() => void returnFromAutomationManager()}
+      />
 
       <button
         className="dashboard-scratch__resize-handle"
@@ -1420,7 +1233,7 @@ function App() {
         aria-valuemin={Math.min(SCRATCH_PANEL_LIMITS.min, scratchPanelMaximumWidth(dashboardWorkspaceRef.current?.clientWidth))}
         aria-valuemax={scratchPanelMaximumWidth(dashboardWorkspaceRef.current?.clientWidth)}
         aria-valuenow={scratchWidth}
-        hidden={selectionMetadataPending || scratchCollapsed || !selectionKey}
+        hidden={workspacePresentation.metadataPending || scratchCollapsed || !selectionKey}
         onPointerDown={startScratchResize}
         onKeyDown={resizeScratchFromKeyboard}
       />
@@ -1429,7 +1242,7 @@ function App() {
         id="dashboard-scratch-panel"
         className="dashboard-scratch"
         aria-label="Scratch terminals"
-        hidden={selectionMetadataPending || scratchCollapsed || !selectionKey}
+        hidden={workspacePresentation.metadataPending || scratchCollapsed || !selectionKey}
       >
           <div className="dashboard-scratch__header">
             <strong>Scratch</strong>
@@ -1676,19 +1489,19 @@ function App() {
     <DashboardShell
       titlebar={
         <WorkspaceHeader
-          title={workspaceTitle}
-          project={workspaceProject}
-          branch={workspaceBranch}
-          cwd={selectedCwd}
-          hostLabel={selectedHost?.label ?? selectedHostId}
-          status={workspaceStatus}
+          title={workspacePresentation.header.title}
+          project={workspacePresentation.header.project}
+          branch={workspacePresentation.header.branch}
+          cwd={workspacePresentation.header.cwd}
+          hostLabel={workspacePresentation.header.hostLabel}
+          status={workspacePresentation.header.status}
           windowTitlebar
           sidebarDrawer={viewportTier === "compact"}
           scratchOpen={!scratchCollapsed}
           filesActive={sidebarOpen && sidebarView === "files"}
-          filesAvailable={Boolean(fileBrowserRoot)}
+          filesAvailable={workspacePresentation.header.filesAvailable}
           gitActive={inspectorOpen}
-          gitAvailable={selection?.kind === "session" || selection?.kind === "terminal"}
+          gitAvailable={workspacePresentation.header.gitAvailable}
           onOpenSidebar={() => {
             sidebarOpenPreferenceRef.current = true;
             setSidebarView("workspaces");
@@ -1730,7 +1543,12 @@ function App() {
           automationsError={automationError}
           settingsButtonRef={settingsTriggerRef}
           activeView={sidebarView}
-          filesContent={renderFiles()}
+          filesContent={(
+            <WorkspaceFilesView
+              context={workspacePresentation.files}
+              onFileSelect={handleWorkspaceFileSelect}
+            />
+          )}
           onViewChange={(view) => {
             sidebarOpenPreferenceRef.current = true;
             setSidebarView(view);
@@ -1763,7 +1581,14 @@ function App() {
       workspace={centralWorkspace}
       inspector={
         <GitPanel
-          content={renderGit()}
+          content={(
+            <WorkspaceGitView
+              context={workspacePresentation.git}
+              active={inspectorOpen}
+              onFileClick={openGitDiff}
+              onBranchChange={publishWorkspaceBranch}
+            />
+          )}
           onClose={() => {
             inspectorOpenPreferenceRef.current = false;
             setInspectorOpen(false);

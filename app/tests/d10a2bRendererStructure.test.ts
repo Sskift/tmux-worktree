@@ -47,6 +47,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useAutomationWorkspace.ts", import.meta.url),
     "utf8",
   ),
+  presentation: readFileSync(
+    new URL("../src/dashboard/hooks/useWorkspacePresentation.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -865,6 +869,9 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "useMobileRelayController",
     "useTerminalDeckState",
     "useTerminalDeckOwnerPhase",
+    "useWorkspacePresentation",
+    "useWorkspacePresentationOwnerPhase",
+    "useWorkspaceHomePhase",
     "useDashboardLayoutState",
     "useDashboardViewportResizePhase",
     "useDashboardWindowCapturePhase",
@@ -914,6 +921,9 @@ test("App leaves selection state local and preserves reconciliation as global ef
     effectContribution(sources.relay, "useMobileRelayController") +
     effectContribution(sources.terminalDeck, "useTerminalDeckState") +
     effectContribution(sources.terminalDeck, "useTerminalDeckOwnerPhase") +
+    effectContribution(sources.presentation, "useWorkspacePresentation") +
+    effectContribution(sources.presentation, "useWorkspacePresentationOwnerPhase") +
+    effectContribution(sources.presentation, "useWorkspaceHomePhase") +
     effectContribution(sources.layout, "useDashboardViewportResizePhase") +
     effectContribution(sources.layout, "useDashboardWindowCapturePhase") +
     effectContribution(sources.layout, "useDashboardLayoutHydrationPhase") +
@@ -923,7 +933,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
     effectContribution(sources.automation, "useAutomationWorkspace") +
     effectContribution(sources.automation, "useAutomationWorkspaceOwnerPhase") +
     effectContribution(sources.automation, "useAutomationWorkspaceHydrationPhase");
-  assert.equal(directAppEffectsBefore, 3);
+  assert.equal(directAppEffectsBefore, 2);
   assert.equal(effectsBeforeSelection, 18);
   const selectionEffectNumber = effectsBeforeSelection + callsWithPath(
       directFunction(

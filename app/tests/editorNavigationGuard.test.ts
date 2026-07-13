@@ -753,13 +753,18 @@ test("the renderer guards every editor-destructive routing entry point", () => {
   }
   assert.doesNotMatch(renderer, /expandInspectorView|renderExpandedView/);
   const composition = rendererImplementationSourceContaining(
-    'diffFile ? (',
-    "onDirtyChange={handleEditorDirtyChange}",
+    "onEditorDirtyChange={handleEditorDirtyChange}",
     "onDirtyChange={handleAutomationDirtyChange}",
     "onNew={handleNewAutomation}",
   ).source;
-  assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
-  assert.match(composition, /onDirtyChange=\{handleEditorDirtyChange\}/);
+  const primary = rendererImplementationSourceContaining(
+    'context.kind === "diff"',
+    "onDirtyChange={onEditorDirtyChange}",
+    "<WorkspaceDiffView",
+  ).source;
+  assert.match(primary, /context\.kind === "diff" \? \(/);
+  assert.match(primary, /onDirtyChange=\{onEditorDirtyChange\}/);
+  assert.match(composition, /onEditorDirtyChange=\{handleEditorDirtyChange\}/);
   assert.match(composition, /onDirtyChange=\{handleAutomationDirtyChange\}/);
   assert.match(composition, /onNew=\{handleNewAutomation\}/);
   const automationCoordinator = rendererImplementationSourceContaining(

@@ -21,9 +21,20 @@ test("GitStatusPanel periodically triggers project root fetches", () => {
 test("remote git status passes host identity through git commands", () => {
   const panel = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
   const diff = readFileSync(new URL("../src/DiffViewer.tsx", import.meta.url), "utf8");
+  const contextViews = readFileSync(
+    new URL("../src/dashboard/WorkspaceContextViews.tsx", import.meta.url),
+    "utf8",
+  );
+  const primary = readFileSync(
+    new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+    "utf8",
+  );
+  const presentation = readFileSync(
+    new URL("../src/dashboard/model/workspacePresentation.ts", import.meta.url),
+    "utf8",
+  );
   const renderer = readRendererImplementationTree();
   const composition = rendererImplementationSourceContaining(
-    "hostId={selectedGitHostId}",
     "const openGitDiff = useCallback",
     "setDiffFile({ path, cwd, hostId: hostId ?? null })",
   ).source;
@@ -54,11 +65,13 @@ test("remote git status passes host identity through git commands", () => {
     backend,
     /diff: \(cwd, path, hostId\) =>\s*transport\.invoke<string>\("git_diff", \{ cwd, path, hostId: hostId \?\? null \}\)/s,
   );
-  assert.match(composition, /hostId=\{selectedGitHostId\}/);
-  assert.match(composition, /active=\{inspectorOpen && \(/);
+  assert.match(contextViews, /hostId=\{context\.hostId\}/);
+  assert.match(contextViews, /active=\{active && context\.available\}/);
+  assert.match(presentation, /hostId: selectedGitHostId,/);
   assert.match(composition, /const openGitDiff = useCallback/);
   assert.match(composition, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
-  assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.match(primary, /context\.kind === "diff" \? \(/);
+  assert.match(primary, /<WorkspaceDiffView context=\{diffContext\}/);
   assert.doesNotMatch(renderer, /setInspectorTab\("diff"\)/);
 });
 

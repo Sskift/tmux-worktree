@@ -47,6 +47,10 @@ test("remote file links keep host identity through the SSH editor", () => {
   const rendererSource = readRendererImplementationTree();
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
   const editorSource = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
+  const primarySource = readFileSync(
+    new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+    "utf8",
+  );
   const backendSource = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
   const rustSource = readRustSourceTree();
 
@@ -56,7 +60,7 @@ test("remote file links keep host identity through the SSH editor", () => {
   assert.doesNotMatch(terminalSource, /cwd, linkCwd, tmuxSession/);
   assert.match(rendererSource, /const nextFile: EditingFile = \{\s*path,\s*hostId: hostId \?\? null,/s);
   assert.match(rendererSource, /setEditingFile\(nextFile\)/);
-  assert.match(rendererSource, /hostId=\{editingFile\.hostId \?\? null\}/);
+  assert.match(primarySource, /hostId=\{context\.file\.hostId \?\? null\}/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemote\(hostId, filePath\)/);
   assert.match(editorSource, /dashboardBackend\.files\.writeRemote\(hostId, pathRef\.current, currentContent\)/);
   assert.match(editorSource, /dashboardBackend\.files\.readRemoteBase64\(hostId, filePath\)/);

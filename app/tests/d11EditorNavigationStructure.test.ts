@@ -17,6 +17,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useEditorNavigationGuard.ts", import.meta.url),
     "utf8",
   ),
+  primary: readFileSync(
+    new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -572,7 +576,8 @@ test("App only wires the D11 guard and retains ten guarded business navigation o
   ]) {
     assert.match(sources.app, new RegExp(`\\b${retained}\\b`));
   }
-  assert.match(sources.app, /onDirtyChange=\{handleEditorDirtyChange\}/);
+  assert.match(sources.app, /onEditorDirtyChange=\{handleEditorDirtyChange\}/);
+  assert.match(sources.primary, /onDirtyChange=\{onEditorDirtyChange\}/);
   assert.match(sources.app, /onDirtyChange=\{handleAutomationDirtyChange\}/);
   assert.deepEqual(callbackDependencies(appBody, "handleOpenFile"), [
     "requestEditorNavigation",

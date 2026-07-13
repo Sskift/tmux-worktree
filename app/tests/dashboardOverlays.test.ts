@@ -12,10 +12,15 @@ test("Settings and Command Palette are reachable without unmounting TerminalDeck
   const composition = rendererImplementationSourceContaining(
     "<CommandPalette",
     "<SettingsDialog",
-    "<TerminalDeck",
+    "<WorkspacePrimaryView",
+  ).source;
+  const primary = rendererImplementationSourceContaining(
+    "<TerminalDeck key={terminalDeckKey}",
   ).source;
   assert.match(composition, /<CommandPalette\s+open=\{commandPaletteOpen\}/);
   assert.match(composition, /<SettingsDialog\s+open=\{settingsOpen\}/);
+  assert.match(composition, /<WorkspacePrimaryView/);
+  assert.match(primary, /<TerminalDeck key=\{terminalDeckKey\} \{\.\.\.terminalDeckProps\} \/>/);
   assert.match(composition, /event\.metaKey/);
   assert.match(composition, /event\.key !== ","/);
   assert.match(composition, /settingsOpen \|\|\s*commandPaletteOpen/);

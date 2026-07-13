@@ -3,16 +3,19 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   readRendererImplementationTree,
-  rendererImplementationSourceContaining,
 } from "./helpers/rendererImplementationSource.ts";
 
 const rendererSource = readRendererImplementationTree();
-const workspaceSource = rendererImplementationSourceContaining(
-  "const centralWorkspace",
-  "<TerminalDeck",
-  "const overlays",
-).source;
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+const workspaceSource = appSource;
+const primarySource = readFileSync(
+  new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+  "utf8",
+);
+const presentationSource = readFileSync(
+  new URL("../src/dashboard/model/workspacePresentation.ts", import.meta.url),
+  "utf8",
+);
 const selectionHydrationSource = readFileSync(
   new URL(
     "../src/dashboard/hooks/useCatalogSelectionHydration.ts",
@@ -35,25 +38,27 @@ const headerSource = readFileSync(
 
 test("main workspace keeps TerminalDeck mounted while automation owns the visible pane", () => {
   const workspaceStart = workspaceSource.indexOf("const centralWorkspace");
-  const deckIndex = workspaceSource.indexOf("<TerminalDeck", workspaceStart);
-  const automationIndex = workspaceSource.indexOf('selection?.kind === "automation"', deckIndex);
-  const workspaceEnd = workspaceSource.indexOf("const overlays", automationIndex);
+  const primaryIndex = workspaceSource.indexOf("<WorkspacePrimaryView", workspaceStart);
+  const workspaceEnd = workspaceSource.indexOf("const overlays", primaryIndex);
+  const deckIndex = primarySource.indexOf("<TerminalDeck");
+  const automationIndex = primarySource.indexOf('context.kind === "automation"', deckIndex);
 
   assert.ok(workspaceStart >= 0, "central workspace should exist");
-  assert.ok(deckIndex > workspaceStart, "TerminalDeck should be a direct workspace child");
+  assert.ok(primaryIndex > workspaceStart, "primary view should be a direct workspace child");
+  assert.ok(deckIndex >= 0, "TerminalDeck should be a direct primary-view child");
   assert.ok(
     automationIndex > deckIndex,
     "TerminalDeck should render before the conditional automation pane",
   );
-  assert.ok(workspaceEnd > automationIndex, "both panes should remain inside the central workspace");
+  assert.ok(workspaceEnd > primaryIndex, "the primary view should remain inside the central workspace");
   assert.equal(
     rendererSource.match(/<TerminalDeck\b/g)?.length,
     1,
     "App should have one unconditional terminal deck instance",
   );
-  assert.match(workspaceSource, /const terminalViewVisible =/);
-  assert.match(workspaceSource.slice(deckIndex, automationIndex), /visible=\{terminalViewVisible\}/);
-  assert.match(workspaceSource, /blocked=\{anyModalOpen\}/);
+  assert.match(presentationSource, /const terminalVisible = metadataPending \|\|/);
+  assert.match(workspaceSource, /visible: workspacePresentation\.terminalVisible/);
+  assert.match(workspaceSource, /blocked: workspaceInteractionBlocked/);
 });
 
 test("display none hides the deck without removing terminal components from the React tree", () => {
@@ -109,7 +114,7 @@ test("hidden or blocked decks preserve PTY identity while disabling input", () =
 });
 
 test("scratch terminals stay mounted when the panel is collapsed", () => {
-  assert.match(workspaceSource, /<aside[\s\S]*?className="dashboard-scratch"[\s\S]*?hidden=\{selectionMetadataPending \|\| scratchCollapsed \|\| !selectionKey\}/);
+  assert.match(workspaceSource, /<aside[\s\S]*?className="dashboard-scratch"[\s\S]*?hidden=\{workspacePresentation\.metadataPending \|\| scratchCollapsed \|\| !selectionKey\}/);
   assert.match(workspaceSource, /active=\{isActive && !scratchCollapsed && !workspaceInteractionBlocked\}/);
   assert.doesNotMatch(workspaceSource, /\{!scratchCollapsed && selectionKey && \(\s*<aside className="dashboard-scratch"/);
 });
@@ -124,11 +129,11 @@ test("pending remote selections never fall back to local terminal or workspace c
     terminalDeckStateSource,
     /if \(!selectedTerminal \|\| selectionMetadataPending\) return;/,
   );
-  assert.match(appSource, /selectionMetadataPending\s*\? null\s*: selection\?\.kind === "session"/s);
-  assert.match(appSource, /<strong>Loading workspace details…<\/strong>/);
-  assert.match(appSource, /metadataPending=\{selectionMetadataPending\}/);
-  assert.match(appSource, /const terminalViewVisible =\s*selectionMetadataPending \|\|/s);
-  assert.match(appSource, /\{selectionMetadataPending \? null : editingFile \? \(/);
+  assert.match(presentationSource, /const metadataPending = !ownerReady \|\| selectionMetadataPending/);
+  assert.match(primarySource, /<TerminalDeck key=\{terminalDeckKey\} \{\.\.\.terminalDeckProps\} \/>/);
+  assert.match(appSource, /metadataPending: workspacePresentation\.metadataPending/);
+  assert.match(presentationSource, /const terminalVisible = metadataPending \|\|/);
+  assert.match(presentationSource, /const primary: WorkspacePrimaryContext = metadataPending/);
   assert.match(appSource, /if \(!session \|\| !cwd\) return null;/);
   assert.match(appSource, /useState<PendingCatalogSelection \| null>\(null\)/);
   assert.match(

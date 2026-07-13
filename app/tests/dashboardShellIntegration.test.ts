@@ -19,6 +19,15 @@ const panelGeometry = readFileSync(
   new URL("../src/dashboard/layout/panelGeometry.ts", import.meta.url),
   "utf8",
 );
+const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+const primaryView = readFileSync(
+  new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+  "utf8",
+);
+const contextViews = readFileSync(
+  new URL("../src/dashboard/WorkspaceContextViews.tsx", import.meta.url),
+  "utf8",
+);
 
 test("the renderer composes the planned shell without legacy arbitrary columns", () => {
   const composition = rendererImplementationSourceContaining(
@@ -55,16 +64,12 @@ test("responsive shell docks the sidebar from 960px and keeps a 640px workspace"
 });
 
 test("responsive drawers isolate terminal input and manage keyboard focus", () => {
-  const composition = rendererImplementationSourceContaining(
-    "const activeDrawer: DashboardDrawer",
-    "workspaceInteractionBlocked = anyModalOpen || activeDrawer !== null",
-    "<TerminalDeck",
-  ).source;
-  assert.match(composition, /const activeDrawer: DashboardDrawer/);
-  assert.match(composition, /workspaceInteractionBlocked = anyModalOpen \|\| activeDrawer !== null/);
-  assert.match(composition, /<TerminalDeck[\s\S]*?blocked=\{workspaceInteractionBlocked\}/);
-  assert.match(composition, /active=\{isActive && !scratchCollapsed && !workspaceInteractionBlocked\}/);
-  assert.match(composition, /activeDrawer=\{activeDrawer\}/);
+  assert.match(app, /const activeDrawer: DashboardDrawer/);
+  assert.match(app, /workspaceInteractionBlocked = anyModalOpen \|\| activeDrawer !== null/);
+  assert.match(app, /terminalDeckProps=\{\{[\s\S]*?blocked: workspaceInteractionBlocked,/);
+  assert.match(primaryView, /<TerminalDeck key=\{terminalDeckKey\} \{\.\.\.terminalDeckProps\} \/>/);
+  assert.match(app, /active=\{isActive && !scratchCollapsed && !workspaceInteractionBlocked\}/);
+  assert.match(app, /activeDrawer=\{activeDrawer\}/);
   assert.match(shell, /inert=\{activeDrawer !== null\}/);
   assert.match(shell, /aria-modal=\{activeDrawer === "sidebar"/);
   assert.match(shell, /aria-modal=\{activeDrawer === "inspector"/);
@@ -87,25 +92,20 @@ test("panel resize feedback stays smooth without escaping modal drawer layering"
 });
 
 test("Files stay beside the editor while Git routes diffs into the workspace", () => {
-  const composition = rendererImplementationSourceContaining(
-    "hostId={selectedGitHostId}",
-    "const openFiles = useCallback",
-    "setDiffFile({ path, cwd, hostId: hostId ?? null })",
-  ).source;
   const layoutHydration = rendererImplementationSourceContaining(
     "function useDashboardLayoutHydrationPhase",
     "lay.fileBrowserOpen === true",
     'lay.inspectorTab === "files"',
   ).source;
-  assert.match(composition, /hostId=\{selectedGitHostId\}/);
-  assert.match(composition, /onFileSelect=\{\(path, hostId\) =>/);
-  assert.match(composition, /handleOpenFile\(path, undefined, undefined, hostId\)/);
-  assert.match(composition, /activeView=\{sidebarView\}/);
-  assert.match(composition, /filesContent=\{renderFiles\(\)\}/);
+  assert.match(contextViews, /hostId=\{context\.hostId\}/);
+  assert.match(contextViews, /onFileSelect=\{onFileSelect\}/);
+  assert.match(app, /handleOpenFile\(path, undefined, undefined, hostId\)/);
+  assert.match(app, /activeView=\{sidebarView\}/);
+  assert.match(app, /filesContent=\{\([\s\S]*?<WorkspaceFilesView/);
   assert.match(layoutHydration, /lay\.fileBrowserOpen === true \|\|[\s\S]*?lay\.inspectorOpen === true && lay\.inspectorTab === "files"/);
-  assert.match(composition, /const openFiles = useCallback[\s\S]*?viewportTier !== "wide"[\s\S]*?setInspectorOpen\(false\)/);
-  assert.match(composition, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
-  assert.match(composition, /diffFile \? \(\s*<div className="dashboard-workspace__editor">/);
+  assert.match(app, /const openFiles = useCallback[\s\S]*?viewportTier !== "wide"[\s\S]*?setInspectorOpen\(false\)/);
+  assert.match(app, /setDiffFile\(\{ path, cwd, hostId: hostId \?\? null \}\)/);
+  assert.match(primaryView, /context\.kind === "diff"[\s\S]*?<WorkspaceDiffView/);
   assert.doesNotMatch(renderer, /setInspectorTab\("diff"\)/);
 });
 
@@ -116,14 +116,9 @@ test("unfinished integrations stay out of Git while overlays keep terminals moun
   );
   assert.doesNotMatch(renderer, /Feishu is not configured/);
   assert.match(settings, /label: "Integrations"/);
-  const composition = rendererImplementationSourceContaining(
-    "<TerminalDeck",
-    "blocked={anyModalOpen}",
-    "event.key.toLowerCase() !== \"n\"",
-  ).source;
-  assert.match(composition, /blocked=\{anyModalOpen\}/);
+  assert.match(app, /blocked: workspaceInteractionBlocked/);
   assert.equal(renderer.match(/<TerminalDeck\b/g)?.length, 1);
-  assert.match(composition, /event\.key\.toLowerCase\(\) !== "n"/);
+  assert.match(app, /event\.key\.toLowerCase\(\) !== "n"/);
 });
 
 test("destructive sidebar and automation actions require confirmation", () => {
@@ -148,13 +143,8 @@ test("destructive sidebar and automation actions require confirmation", () => {
 });
 
 test("Git is a focused side panel and Automation keeps a workspace return path", () => {
-  const composition = rendererImplementationSourceContaining(
-    'selection?.kind === "automation"',
-    "Back to workspace",
-    "<GitPanel",
-  ).source;
-  assert.match(composition, /selection\?\.kind === "automation"[\s\S]*?>Back to workspace</);
-  assert.match(composition, /returnFromAutomationManager/);
-  assert.match(composition, /<GitPanel\s+content=\{renderGit\(\)\}/);
+  assert.match(primaryView, /context\.kind === "automation"[\s\S]*?>Back to workspace</);
+  assert.match(app, /onReturnFromAutomation=\{\(\) => void returnFromAutomationManager\(\)\}/);
+  assert.match(app, /<GitPanel[\s\S]*?<WorkspaceGitView/);
   assert.doesNotMatch(renderer, /inspectorContent|expandedInspectorTab|renderExpandedView/);
 });

@@ -2,12 +2,21 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
+import { readRendererImplementationTree } from "./helpers/rendererImplementationSource.ts";
 
 const deckSource = readFileSync(
   new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
   "utf8",
 );
 const appSource = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+const primarySource = readFileSync(
+  new URL("../src/dashboard/WorkspacePrimaryView.tsx", import.meta.url),
+  "utf8",
+);
+const contextViewsSource = readFileSync(
+  new URL("../src/dashboard/WorkspaceContextViews.tsx", import.meta.url),
+  "utf8",
+);
 
 function parse(path: string, source: string): ts.SourceFile {
   return ts.createSourceFile(
@@ -101,6 +110,134 @@ function directVariableCall(body: ts.Block, name: string): ts.CallExpression {
   }
   assert.equal(matches.length, 1, `expected one direct variable call ${name}`);
   return matches[0];
+}
+
+function directVariable(
+  body: ts.Block,
+  name: string,
+): ts.VariableDeclaration {
+  const matches: ts.VariableDeclaration[] = [];
+  for (const statement of body.statements) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations) {
+      if (ts.isIdentifier(declaration.name) && declaration.name.text === name) {
+        matches.push(declaration);
+      }
+    }
+  }
+  assert.equal(matches.length, 1, `expected one direct variable ${name}`);
+  return matches[0];
+}
+
+function unwrapParentheses(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+function isFunctionLikeNode(node: ts.Node): boolean {
+  return ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isConstructorDeclaration(node);
+}
+
+function assertAncestorChain(
+  node: ts.Node,
+  root: ts.Node,
+  description: string,
+): void {
+  let current: ts.Node | undefined = node;
+  while (current && current !== root) {
+    assert.equal(
+      isFunctionLikeNode(current),
+      false,
+      `${description} cannot be hidden in a nested function`,
+    );
+    assert.equal(
+      ts.isConditionalExpression(current),
+      false,
+      `${description} cannot be conditional`,
+    );
+    assert.equal(
+      ts.isBinaryExpression(current) &&
+        current.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken,
+      false,
+      `${description} cannot be behind a logical condition`,
+    );
+    current = current.parent;
+  }
+  assert.equal(current, root, `${description} must belong to the canonical JSX tree`);
+}
+
+function assertCanonicalPrimaryDeck(source: string): void {
+  const sourceFile = parse("WorkspacePrimaryView.tsx", source);
+  const primary = directFunction(sourceFile, "WorkspacePrimaryView");
+  assert.ok(primary.body);
+  const returns = primary.body.statements.filter(ts.isReturnStatement);
+  assert.equal(returns.length, 1, "primary must have one top-level return");
+  assert.ok(returns[0].expression, "primary return must contain JSX");
+  const root = unwrapParentheses(returns[0].expression);
+  assert.ok(ts.isJsxElement(root), "primary must return one canonical JSX element");
+  assert.equal(root.openingElement.tagName.getText(sourceFile), "section");
+
+  const terminalDecks: ts.JsxSelfClosingElement[] = [];
+  visit(primary.body, (node) => {
+    if (
+      ts.isJsxSelfClosingElement(node) &&
+      node.tagName.getText(sourceFile) === "TerminalDeck"
+    ) {
+      terminalDecks.push(node);
+    }
+  });
+  assert.equal(terminalDecks.length, 1);
+  assertAncestorChain(terminalDecks[0], root, "TerminalDeck");
+
+  const attributes = terminalDecks[0].attributes.properties;
+  const keys = attributes.filter(
+    (property): property is ts.JsxAttribute =>
+      ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "key",
+  );
+  const spreads = attributes.filter(ts.isJsxSpreadAttribute);
+  assert.equal(keys.length, 1);
+  assert.equal(compact(keys[0].initializer!, sourceFile), "{terminalDeckKey}");
+  assert.equal(spreads.length, 1);
+  assert.equal(compact(spreads[0].expression, sourceFile), "terminalDeckProps");
+}
+
+function assertAppPrimaryInCentralWorkspace(source: string): void {
+  const sourceFile = parse("App.tsx", source);
+  const app = directFunction(sourceFile, "App");
+  assert.ok(app.body);
+  const centralWorkspace = directVariable(app.body, "centralWorkspace");
+  assert.ok(centralWorkspace.initializer);
+  const root = unwrapParentheses(centralWorkspace.initializer);
+  assert.ok(ts.isJsxElement(root), "centralWorkspace must be a JSX root");
+
+  const primaryElements: ts.JsxSelfClosingElement[] = [];
+  visit(app.body, (node) => {
+    if (
+      ts.isJsxSelfClosingElement(node) &&
+      node.tagName.getText(sourceFile) === "WorkspacePrimaryView"
+    ) {
+      primaryElements.push(node);
+    }
+  });
+  assert.equal(primaryElements.length, 1);
+  assertAncestorChain(primaryElements[0], root, "WorkspacePrimaryView");
+  const terminalDeckKeys = primaryElements[0].attributes.properties.filter(
+    (property): property is ts.JsxAttribute =>
+      ts.isJsxAttribute(property) &&
+      property.name.getText(sourceFile) === "terminalDeckKey",
+  );
+  assert.equal(terminalDeckKeys.length, 1);
+  assert.equal(
+    compact(terminalDeckKeys[0].initializer!, sourceFile),
+    "{terminalDeckOwnerEpochKey}",
+  );
 }
 
 test("terminal deck has an exact owner phase and no workspace-catalog backedge", () => {
@@ -252,8 +389,11 @@ test("preview and attach retain one plus three passive effects with exact owner 
 
 test("App commits terminal ownership and remounts main and scratch PTYs by owner epoch", () => {
   const sourceFile = parse("App.tsx", appSource);
+  const primaryFile = parse("WorkspacePrimaryView.tsx", primarySource);
   const app = directFunction(sourceFile, "App");
+  const primary = directFunction(primaryFile, "WorkspacePrimaryView");
   assert.ok(app.body);
+  assert.ok(primary.body);
   const stateCalls = allCalls(app.body, "useTerminalDeckState");
   const ownerCalls = allCalls(app.body, "useTerminalDeckOwnerPhase");
   assert.equal(stateCalls.length, 1);
@@ -279,12 +419,8 @@ test("App commits terminal ownership and remounts main and scratch PTYs by owner
     );
   }
 
-  const terminalDeckElements: ts.JsxSelfClosingElement[] = [];
   const scratchKeys: ts.JsxAttribute[] = [];
   visit(app.body, (node) => {
-    if (ts.isJsxSelfClosingElement(node) && node.tagName.getText(sourceFile) === "TerminalDeck") {
-      terminalDeckElements.push(node);
-    }
     if (
       ts.isJsxAttribute(node) &&
       node.name.getText(sourceFile) === "key" &&
@@ -296,13 +432,41 @@ test("App commits terminal ownership and remounts main and scratch PTYs by owner
       scratchKeys.push(node);
     }
   });
-  assert.equal(terminalDeckElements.length, 1);
-  const mainKey = terminalDeckElements[0].attributes.properties.filter(
-    (property): property is ts.JsxAttribute =>
-      ts.isJsxAttribute(property) && property.name.getText(sourceFile) === "key",
-  );
-  assert.equal(mainKey.length, 1);
-  assert.equal(compact(mainKey[0].initializer!, sourceFile), "{terminalDeckOwnerEpochKey}");
-  assert.equal(scratchKeys.length, 2, "main and scratch keys must both include the epoch");
+  assertAppPrimaryInCentralWorkspace(appSource);
+  assert.equal(scratchKeys.length, 1, "App scratch key must include the epoch exactly once");
   assert.match(appSource, /key=\{`\$\{terminalDeckOwnerEpochKey\}:\$\{key\}`\}/);
+  assertCanonicalPrimaryDeck(primarySource);
+  assert.equal(appSource.match(/<TerminalDeck\b/g)?.length ?? 0, 0);
+  assert.equal(readRendererImplementationTree().match(/<TerminalDeck\b/g)?.length, 1);
+  assert.doesNotMatch(`${primarySource}\n${contextViewsSource}`, /useTerminalDeck[A-Z]/);
+});
+
+test("canonical deck and App primary locators reject nested or conditional decoys", () => {
+  const primaryPreamble = `
+    declare const terminalDeckKey: string;
+    declare const terminalDeckProps: Record<string, unknown>;
+    declare function TerminalDeck(props: unknown): JSX.Element;
+  `;
+  assert.throws(() => assertCanonicalPrimaryDeck(`${primaryPreamble}
+    export function WorkspacePrimaryView() {
+      function hidden() {
+        return <TerminalDeck key={terminalDeckKey} {...terminalDeckProps} />;
+      }
+      return <section>{null}</section>;
+    }
+  `));
+  assert.throws(() => assertCanonicalPrimaryDeck(`${primaryPreamble}
+    export function WorkspacePrimaryView() {
+      return <section>{true ? <TerminalDeck key={terminalDeckKey} {...terminalDeckProps} /> : null}</section>;
+    }
+  `));
+  assert.throws(() => assertAppPrimaryInCentralWorkspace(`
+    declare const terminalDeckOwnerEpochKey: string;
+    declare function WorkspacePrimaryView(props: unknown): JSX.Element;
+    export function App() {
+      const centralWorkspace = <div />;
+      const hidden = () => <WorkspacePrimaryView terminalDeckKey={terminalDeckOwnerEpochKey} />;
+      return <main>{hidden()}</main>;
+    }
+  `));
 });

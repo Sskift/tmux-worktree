@@ -54,6 +54,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useEditorNavigationGuard.ts", import.meta.url),
     "utf8",
   ),
+  presentation: readFileSync(
+    new URL("../src/dashboard/hooks/useWorkspacePresentation.ts", import.meta.url),
+    "utf8",
+  ),
   backendContext: readFileSync(
     new URL("../src/platform/DashboardBackendContext.tsx", import.meta.url),
     "utf8",
@@ -1302,8 +1306,20 @@ function frozenEffectContributions(): Map<string, number> {
       effectContribution(sources.deck, "useTerminalDeckOwnerPhase"),
     ],
     [
+      "useWorkspacePresentation",
+      effectContribution(sources.presentation, "useWorkspacePresentation"),
+    ],
+    [
+      "useWorkspacePresentationOwnerPhase",
+      effectContribution(sources.presentation, "useWorkspacePresentationOwnerPhase"),
+    ],
+    [
       "useEditorNavigationGuard",
       effectContribution(sources.editorNavigation, "useEditorNavigationGuard"),
+    ],
+    [
+      "useWorkspaceHomePhase",
+      effectContribution(sources.presentation, "useWorkspaceHomePhase"),
     ],
     ["useEffect", 1],
     [
@@ -1357,7 +1373,10 @@ function frozenEffectContributions(): Map<string, number> {
     ["useMobileRelayController", 3],
     ["useTerminalDeckState", 0],
     ["useTerminalDeckOwnerPhase", 0],
+    ["useWorkspacePresentation", 0],
+    ["useWorkspacePresentationOwnerPhase", 0],
     ["useEditorNavigationGuard", 0],
+    ["useWorkspaceHomePhase", 1],
     ["useEffect", 1],
     ["useDashboardViewportResizePhase", 1],
     ["useDashboardWindowCapturePhase", 1],
@@ -1390,8 +1409,10 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useMobileRelayController",
     "useTerminalDeckState",
     "useTerminalDeckOwnerPhase",
+    "useWorkspacePresentation",
+    "useWorkspacePresentationOwnerPhase",
     "useEditorNavigationGuard",
-    "useEffect",
+    "useWorkspaceHomePhase",
     "useDashboardViewportResizePhase",
     "useDashboardWindowCapturePhase",
     "useTerminalMetadataHydrationPhase",

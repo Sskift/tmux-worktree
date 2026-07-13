@@ -67,6 +67,17 @@ const canonicalOwners = {
     "workspaceStatusLabel",
     "projectKey",
   ],
+  "dashboard/model/workspacePresentation.ts": [
+    "WorkspaceBranchSource",
+    "WorkspaceBranchValue",
+    "WorkspacePrimaryContext",
+    "WorkspaceFilesContext",
+    "WorkspaceGitContext",
+    "WorkspaceDiffContext",
+    "WorkspacePresentation",
+    "WorkspacePresentationInput",
+    "deriveWorkspacePresentation",
+  ],
   "dashboard/layout/types.ts": [
     "WindowLayout",
     "EditingFile",
@@ -132,11 +143,35 @@ const canonicalAllowedImports: Record<keyof typeof canonicalOwners, readonly str
   "dashboard/model/catalogEquality.ts": ["../../platform", "./sessionActivity"],
   "dashboard/model/catalogSnapshot.ts": ["../../platform"],
   "dashboard/model/workspaceSelectors.ts": ["../../platform", "./sessionActivity"],
+  "dashboard/model/workspacePresentation.ts": [
+    "../../automationTypes",
+    "../../platform",
+    "../layout/types",
+    "./sessionActivity",
+    "./selection",
+    "./terminalIdentity",
+    "./workspaceSelectors",
+  ],
   "dashboard/layout/types.ts": ["../model/selection"],
   "dashboard/layout/schema.ts": ["../model/selection", "./types"],
   "dashboard/layout/panelGeometry.ts": ["./types"],
   "dashboard/layout/scratchGeometry.ts": [],
   "terminal/attach.ts": ["../platform"],
+};
+
+const canonicalAllowedValueImports: Partial<
+  Record<keyof typeof canonicalOwners, readonly string[]>
+> = {
+  "dashboard/model/workspacePresentation.ts": ["./terminalIdentity"],
+};
+
+const canonicalAllowedRuntimeImports: Partial<
+  Record<keyof typeof canonicalOwners, Readonly<Record<string, string>>>
+> = {
+  "dashboard/model/workspacePresentation.ts": {
+    basenameFromPath: "dashboard/model/terminalIdentity.ts",
+    sessionDisplayName: "dashboard/model/terminalIdentity.ts",
+  },
 };
 
 const historicalFacadeExports = {
@@ -465,11 +500,31 @@ function canonicalImportSpecifiers(path: string, source: string): string[] {
       ts.isStringLiteral(statement.moduleSpecifier),
       `${path} imports must use static string module specifiers`,
     );
+    const specifier = ts.isStringLiteral(statement.moduleSpecifier)
+      ? statement.moduleSpecifier.text
+      : "";
+    const valueEdgeAllowed = (
+      canonicalAllowedValueImports[path as keyof typeof canonicalOwners] ?? []
+    ).includes(specifier);
     assert.equal(
       statement.importClause?.isTypeOnly,
-      true,
-      `${path} imports must use declaration-level import type`,
+      !valueEdgeAllowed,
+      `${path} imports must match the frozen type/value edge kind for ${specifier}`,
     );
+    if (valueEdgeAllowed) {
+      assert.ok(
+        statement.importClause?.namedBindings &&
+          ts.isNamedImports(statement.importClause.namedBindings),
+        `${path} pure value edges must use named imports`,
+      );
+      assert.equal(
+        statement.importClause.namedBindings.elements.some(
+          (element) => element.isTypeOnly || element.propertyName !== undefined,
+        ),
+        false,
+        `${path} pure value imports cannot hide type-only or aliased edges`,
+      );
+    }
     if (ts.isStringLiteral(statement.moduleSpecifier)) {
       specifiers.push(statement.moduleSpecifier.text);
     }
@@ -575,6 +630,7 @@ const allowedExternalRuntimeSymbols = new Set([
   "Array",
   "Boolean",
   "Date",
+  "JSON",
   "Map",
   "Math",
   "Number",
@@ -695,11 +751,35 @@ function assertRuntimeIdentifiersUseAllowlistedGlobals(
           `${path} has unresolved or forbidden runtime global ${node.text}`,
         );
       } else {
-        assert.equal(
-          (rawSymbol.flags & ts.SymbolFlags.Alias) !== 0,
-          false,
-          `${path} must not use an imported symbol as a runtime value: ${node.text}`,
-        );
+        const isAlias = (rawSymbol.flags & ts.SymbolFlags.Alias) !== 0;
+        if (isAlias) {
+          const allowedTarget = canonicalAllowedRuntimeImports[
+            path as keyof typeof canonicalOwners
+          ]?.[node.text];
+          assert.ok(
+            allowedTarget,
+            `${path} must not use an imported symbol as a runtime value: ${node.text}`,
+          );
+          const targetPaths = new Set(
+            (checker.getAliasedSymbol(rawSymbol).getDeclarations() ?? []).flatMap(
+              (declaration) => {
+                if (declarationIsAmbient(declaration)) return [];
+                const declarationPath = relative(
+                  rendererSourceRoot,
+                  resolve(declaration.getSourceFile().fileName),
+                ).split(sep).join("/");
+                return [declarationPath];
+              },
+            ),
+          );
+          assert.deepEqual(
+            [...targetPaths],
+            [allowedTarget],
+            `${path} runtime import ${node.text} must resolve to its frozen pure owner`,
+          );
+          ts.forEachChild(node, visit);
+          return;
+        }
         const declarations = rawSymbol.getDeclarations() ?? [];
         const projectOwned = declarations.some((declaration) => {
           if (declarationIsAmbient(declaration)) return false;
@@ -777,7 +857,7 @@ test("D9 AST guards fail closed on export, dependency, runtime, and cycle decoys
   );
   assert.throws(
     () => canonicalImportSpecifiers("decoy.ts", 'import { value } from "./value";'),
-    /declaration-level import type/,
+    /frozen type\/value edge kind/,
   );
   assert.throws(
     () => canonicalImportSpecifiers("decoy.ts", 'type Value = import("./value").Value;'),
