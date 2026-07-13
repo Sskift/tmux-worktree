@@ -259,7 +259,9 @@ const COMMAND_TERMINATION_GRACE_MS = 1_000;
 const RELAY_SOCKET_CLOSE_GRACE_MS = 1_000;
 const RELAY_SHUTDOWN_FORCE_CLOSE_MS = 5 * 60_000;
 const MAX_COMMAND_OUTPUT_BYTES = 1 * 1024 * 1024;
+const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 const commandAbortContext = new AsyncLocalStorage<CommandExecutionContext>();
+const agentMessageSessionTails = new Map<string, Promise<void>>();
 let nextAgentBufferId = 1;
 
 function commandExecOptions(timeout: number): CommandExecOptions {
@@ -1953,6 +1955,24 @@ function normalizeAgentMessage(message: string): string {
   return message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
+async function serializeAgentMessageForSession<T>(session: string, action: () => Promise<T>): Promise<T> {
+  const previous = agentMessageSessionTails.get(session) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => { release = resolve; });
+  agentMessageSessionTails.set(session, current);
+  await previous.catch(() => undefined);
+  try {
+    return await action();
+  } finally {
+    release();
+    if (agentMessageSessionTails.get(session) === current) agentMessageSessionTails.delete(session);
+  }
+}
+
+async function paceAgentMessageSubmit(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
+}
+
 function scopeForSession(key: string): { scope: AdminScope; rawName: string } {
   const { scopeId, rawName } = splitSessionKey(key);
   const scope = adminScopes().find((candidate) => candidate.id === scopeId);
@@ -1980,61 +2000,87 @@ async function resolvePaneIndex(scope: AdminScope, rawName: string, pane: string
 
 async function sendAgentMessage(session: string, pane: string | number | undefined, message: string, submit: boolean): Promise<void> {
   const { scope, rawName } = scopeForSession(session);
-  const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-  const target = `=${rawName}:.${paneIndex}`;
   const normalized = normalizeAgentMessage(message);
-  if (normalized.length === 0) {
-    if (!submit) return;
-    if (scope.kind === "local") {
-      await execFileTracked(
-        localTmuxBin(scope),
-        ["send-keys", "-t", target, "C-m"],
-        boundedCommandExecOptions(5000),
-      );
-      return;
+  const sessionKey = `${scope.id}\0${rawName}`;
+  await serializeAgentMessageForSession(sessionKey, async () => {
+    const paneIndex = await resolvePaneIndex(scope, rawName, pane);
+    const target = `=${rawName}:.${paneIndex}`;
+    if (normalized.length === 0) {
+      if (!submit) return;
+      try {
+        if (scope.kind === "local") {
+          await execFileTracked(
+            localTmuxBin(scope),
+            ["send-keys", "-t", target, "C-m"],
+            boundedCommandExecOptions(5000),
+          );
+          return;
+        }
+        await sshOutput(
+          scope.host!,
+          `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`,
+        );
+        return;
+      } catch (error) {
+        throw new Error(`agent message submit failed: ${errorDetail(error)}`);
+      }
     }
-    await sshOutput(
-      scope.host!,
-      `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`,
-    );
-    return;
-  }
-  const buffer = `tw-relay-${process.pid}-${nextAgentBufferId++}`;
-  if (scope.kind === "local") {
-    const args = [
-      "load-buffer", "-b", buffer, "-",
-      ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", target,
-    ];
-    if (submit) args.push(";", "send-keys", "-t", target, "C-m");
-    try {
-      await execFileTracked(
-        localTmuxBin(scope),
-        args,
-        { ...boundedCommandExecOptions(5000), input: normalized },
-      );
-    } catch (error) {
-      await execFileTracked(
-        localTmuxBin(scope),
-        ["delete-buffer", "-b", buffer],
-        boundedCommandExecOptions(5000),
-      ).catch(() => undefined);
-      throw error;
-    }
-    return;
-  }
 
-  const command = `${remoteTmux(scope)} load-buffer -b ${shQuote(buffer)} -`
-    + ` \\; paste-buffer -b ${shQuote(buffer)} -d -r -t ${shQuote(target)}`
-    + (submit ? ` \\; send-keys -t ${shQuote(target)} C-m` : "");
-  try {
-    await sshOutput(scope.host!, command, 8_000, { input: normalized });
-  } catch (error) {
-    await sshOutput(
-      scope.host!,
-      `${remoteTmux(scope)} delete-buffer -b ${shQuote(buffer)}`,
-    ).catch(() => undefined);
-    throw error;
-  }
+    const buffer = `tw-relay-${process.pid}-${nextAgentBufferId++}`;
+    if (scope.kind === "local") {
+      const pasteArgs = [
+        "load-buffer", "-b", buffer, "-",
+        ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", target,
+      ];
+      try {
+        await execFileTracked(
+          localTmuxBin(scope),
+          pasteArgs,
+          { ...boundedCommandExecOptions(5000), input: normalized },
+        );
+      } catch (error) {
+        await execFileTracked(
+          localTmuxBin(scope),
+          ["delete-buffer", "-b", buffer],
+          boundedCommandExecOptions(5000),
+        ).catch(() => undefined);
+        throw new Error(`agent message paste failed: ${errorDetail(error)}`);
+      }
+    } else {
+      const pasteCommand = `${remoteTmux(scope)} load-buffer -b ${shQuote(buffer)} -`
+        + ` \\; paste-buffer -b ${shQuote(buffer)} -d -r -t ${shQuote(target)}`;
+      try {
+        await sshOutput(scope.host!, pasteCommand, 8_000, { input: normalized });
+      } catch (error) {
+        await sshOutput(
+          scope.host!,
+          `${remoteTmux(scope)} delete-buffer -b ${shQuote(buffer)}`,
+        ).catch(() => undefined);
+        throw new Error(`agent message paste failed: ${errorDetail(error)}`);
+      }
+    }
+
+    if (!submit) return;
+    await paceAgentMessageSubmit();
+    try {
+      if (scope.kind === "local") {
+        await execFileTracked(
+          localTmuxBin(scope),
+          ["send-keys", "-t", target, "C-m"],
+          boundedCommandExecOptions(5000),
+        );
+      } else {
+        await sshOutput(
+          scope.host!,
+          `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`,
+        );
+      }
+    } catch (error) {
+      throw new Error(
+        `agent message submit failed after paste; input may remain in the target pane: ${errorDetail(error)}`,
+      );
+    }
+  });
 }
 
 function parseRpcKillSessionResponse(stdout: string, expectedSession: string): RpcKillSessionResponse {

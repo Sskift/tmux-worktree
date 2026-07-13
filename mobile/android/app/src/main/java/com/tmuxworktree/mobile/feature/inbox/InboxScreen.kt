@@ -1,6 +1,5 @@
 package com.tmuxworktree.mobile.feature.inbox
 
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -20,7 +19,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Circle
-import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.ChevronRight
 import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material3.Button
@@ -28,13 +26,11 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -63,7 +59,6 @@ fun InboxScreen(
     onConnectionStatusClick: () -> Unit,
     onSessionClick: (RelaySession) -> Unit,
     onReplyClick: (RelaySession) -> Unit,
-    onNewWorktreeClick: () -> Unit,
     onBottomDestinationSelected: (RootDestination) -> Unit,
     modifier: Modifier = Modifier,
     agentStateAvailable: Boolean = true,
@@ -96,39 +91,11 @@ fun InboxScreen(
             )
         },
         bottomBar = {
-            Column {
-                OutlinedButton(
-                    onClick = onNewWorktreeClick,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 20.dp)
-                        .height(48.dp)
-                        .testTag("new_worktree_button"),
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(1.dp, TwAccent),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = TwAccent,
-                        containerColor = Color.Transparent,
-                    ),
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.Add,
-                        contentDescription = null,
-                        modifier = Modifier.size(24.dp),
-                    )
-                    Spacer(Modifier.width(10.dp))
-                    Text(
-                        text = "New worktree",
-                        style = MaterialTheme.typography.labelLarge,
-                    )
-                }
-                Spacer(Modifier.height(24.dp))
-                TwRootBottomBar(
-                    selectedDestination = RootDestination.INBOX,
-                    attentionCount = attentionSessions.size,
-                    onDestinationSelected = onBottomDestinationSelected,
-                )
-            }
+            TwRootBottomBar(
+                selectedDestination = RootDestination.INBOX,
+                attentionCount = attentionSessions.size,
+                onDestinationSelected = onBottomDestinationSelected,
+            )
         },
     ) { innerPadding ->
         LazyColumn(
@@ -423,7 +390,6 @@ private fun InboxScreenPreview() {
             onConnectionStatusClick = {},
             onSessionClick = {},
             onReplyClick = {},
-            onNewWorktreeClick = {},
             onBottomDestinationSelected = {},
         )
     }

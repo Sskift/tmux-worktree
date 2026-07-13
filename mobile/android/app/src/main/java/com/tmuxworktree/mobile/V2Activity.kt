@@ -8,15 +8,15 @@ import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
-import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import com.tmuxworktree.mobile.app.AppContainer
 import com.tmuxworktree.mobile.app.PairingPayload
 import com.tmuxworktree.mobile.app.PairingPayloadParser
 import com.tmuxworktree.mobile.app.V2App
 import com.tmuxworktree.mobile.app.V2ViewModel
-import com.tmuxworktree.mobile.designsystem.TwTheme
+import com.tmuxworktree.mobile.feature.pairing.PairingQrScanner
 
 class V2Activity : ComponentActivity() {
     private val appContainer by lazy { AppContainer(applicationContext) }
@@ -29,6 +29,7 @@ class V2Activity : ComponentActivity() {
     private val viewModel: V2ViewModel by viewModels {
         V2ViewModel.factory(appContainer, demoMode, demoRecovering)
     }
+    private var scannerVisible by mutableStateOf(false)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -36,15 +37,23 @@ class V2Activity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
-        if (savedInstanceState == null) {
-            consumePairingIntent(intent)
-        }
+        if (savedInstanceState == null) consumePairingIntent(intent)
+        else PairingIntentConsumer.scrub(intent)
         setContent {
-            TwTheme {
-                V2App(
-                    viewModel = viewModel,
-                    onScanQr = ::scanPairingQr,
-                )
+            V2App(
+                viewModel = viewModel,
+                onScanQr = ::scanPairingQr,
+            ) {
+                if (scannerVisible) {
+                    PairingQrScanner(
+                        onQrCode = ::consumeScannedQr,
+                        onDismiss = { scannerVisible = false },
+                        onError = { message ->
+                            scannerVisible = false
+                            viewModel.reportPairingError(message)
+                        },
+                    )
+                }
             }
         }
     }
@@ -59,29 +68,25 @@ class V2Activity : ComponentActivity() {
         val payload = PairingIntentConsumer.consume(intent) ?: return
         // Exported launcher/deep-link inputs are untrusted. They may prefill
         // the review screen, but never replace a pairing without a tap.
-        viewModel.applyPairingPayload(payload, connectImmediately = false)
+        viewModel.applyPairingPayload(payload)
     }
 
     private fun scanPairingQr() {
-        val options = GmsBarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .enableAutoZoom()
-            .build()
-        GmsBarcodeScanning.getClient(this, options)
-            .startScan()
-            .addOnSuccessListener { barcode ->
-                val payload = PairingPayloadParser.parse(barcode.rawValue)
-                if (payload == null || payload.relayUrl.isBlank() || payload.token.isBlank()) {
-                    viewModel.reportPairingError("This QR code does not contain a valid tw-dashboard connection")
-                } else {
-                    // Scanning fills the reviewable fields; the user still
-                    // confirms the relay URL with the Connect button.
-                    viewModel.applyPairingPayload(payload, connectImmediately = false)
-                }
-            }
-            .addOnFailureListener { error ->
-                viewModel.reportPairingError(error.message ?: "QR scanner is unavailable")
-            }
+        scannerVisible = true
+    }
+
+    private fun consumeScannedQr(rawValue: String) {
+        scannerVisible = false
+        val payload = PairingPayloadParser.parse(rawValue)
+        if (payload == null) {
+            viewModel.reportPairingError(
+                "This QR code does not contain a valid Relay v1 pairing profile",
+            )
+            return
+        }
+        // Scanning only fills the reviewable fields. The user must still tap
+        // Connect after reviewing the Relay URL.
+        viewModel.applyPairingPayload(payload)
     }
 
     companion object {
@@ -109,9 +114,13 @@ internal object PairingIntentConsumer {
             ).takeIf { it.relayUrl.isNotBlank() || it.token.isNotBlank() }
             extraPayload ?: PairingPayloadParser.parse(intent.dataString)
         } finally {
-            intent.data = null
-            SENSITIVE_PAIRING_EXTRAS.forEach(intent::removeExtra)
+            scrub(intent)
         }
+    }
+
+    fun scrub(intent: Intent) {
+        intent.data = null
+        SENSITIVE_PAIRING_EXTRAS.forEach(intent::removeExtra)
     }
 
     private val SENSITIVE_PAIRING_EXTRAS = setOf(

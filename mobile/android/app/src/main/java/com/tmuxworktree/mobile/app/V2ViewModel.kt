@@ -100,7 +100,13 @@ class V2ViewModel(
     }
 
     fun setPairingRelayUrl(value: String) {
-        _uiState.update { it.copy(pairingRelayUrl = value, pairingError = null) }
+        _uiState.update {
+            it.copy(
+                pairingRelayUrl = value,
+                pairingRelayUrlError = validateRelayUrl(value),
+                pairingError = null,
+            )
+        }
     }
 
     fun setPairingToken(value: String) {
@@ -115,18 +121,17 @@ class V2ViewModel(
         emit(V2UiEffect.Notice(message))
     }
 
-    fun applyPairingPayload(payload: PairingPayload, connectImmediately: Boolean = false) {
-        _uiState.update {
-            it.copy(
-                pairingRelayUrl = payload.relayUrl.ifBlank { it.pairingRelayUrl },
-                pairingToken = payload.token.ifBlank { it.pairingToken },
-                pairingHostId = payload.hostId.ifBlank { it.pairingHostId },
+    fun applyPairingPayload(payload: PairingPayload) {
+        _uiState.update { state ->
+            val importedRelayUrl = payload.relayUrl.ifBlank { state.pairingRelayUrl }
+            state.copy(
+                pairingRelayUrl = importedRelayUrl,
+                pairingToken = payload.token.ifBlank { state.pairingToken },
+                pairingHostId = payload.hostId.ifBlank { state.pairingHostId },
                 pairingRequired = true,
+                pairingRelayUrlError = validateRelayUrl(importedRelayUrl),
                 pairingError = null,
             )
-        }
-        if (connectImmediately && payload.relayUrl.isNotBlank() && payload.token.isNotBlank()) {
-            connectPairing()
         }
     }
 
@@ -135,6 +140,9 @@ class V2ViewModel(
             it.copy(
                 pairingRequired = true,
                 pairingToken = "",
+                pairingRelayUrlError = it.pairingRelayUrl
+                    .takeIf(String::isNotBlank)
+                    ?.let(::validateRelayUrl),
                 pairingError = null,
             )
         }
@@ -142,7 +150,13 @@ class V2ViewModel(
 
     fun dismissPairing(): Boolean {
         if (!_uiState.value.paired) return false
-        _uiState.update { it.copy(pairingRequired = false, pairingError = null) }
+        _uiState.update {
+            it.copy(
+                pairingRequired = false,
+                pairingRelayUrlError = null,
+                pairingError = null,
+            )
+        }
         return true
     }
 
@@ -170,6 +184,7 @@ class V2ViewModel(
                             pairingRelayUrl = "",
                             pairingToken = "",
                             pairingHostId = "",
+                            pairingRelayUrlError = null,
                             pairingError = null,
                             confirmProfileSwitch = false,
                             preferences = clearedPreferences,
@@ -195,23 +210,50 @@ class V2ViewModel(
             return
         }
         val current = _uiState.value
-        val relayUrl = normalizeRelayUrl(current.pairingRelayUrl)
+        val relayUrlInput = current.pairingRelayUrl.trim()
         val token = current.pairingToken.trim()
-        val validationError = validatePairing(relayUrl, token)
-        if (validationError != null) {
-            _uiState.update { it.copy(pairingError = validationError, isConnecting = false) }
+        val relayUrlError = validateRelayUrl(relayUrlInput)
+        if (relayUrlError != null) {
+            _uiState.update {
+                it.copy(
+                    pairingRelayUrlError = relayUrlError,
+                    pairingError = null,
+                    isConnecting = false,
+                )
+            }
+            return
+        }
+        val relayUrl = PairingInputValidator.normalizeRelayUrl(relayUrlInput)
+        val credentialError = PairingInputValidator.credentialError(
+            token,
+            current.pairingHostId,
+        )
+        if (credentialError != null) {
+            _uiState.update {
+                it.copy(
+                    pairingRelayUrlError = null,
+                    pairingError = credentialError,
+                    isConnecting = false,
+                )
+            }
             return
         }
 
         val hostId = current.pairingHostId.trim()
         val existingProfile = current.hasStoredProfile || credentials.hasCredential()
         val changesExistingProfile = existingProfile && (
-            current.preferences.relayUrl.trimEnd('/') != relayUrl ||
+            PairingInputValidator.normalizeRelayUrl(current.preferences.relayUrl) != relayUrl ||
                 current.preferences.preferredHostId != hostId ||
                 credentials.read() != token
             )
         if (changesExistingProfile) {
-            _uiState.update { it.copy(confirmProfileSwitch = true, pairingError = null) }
+            _uiState.update {
+                it.copy(
+                    confirmProfileSwitch = true,
+                    pairingRelayUrlError = null,
+                    pairingError = null,
+                )
+            }
             return
         }
 
@@ -228,13 +270,29 @@ class V2ViewModel(
 
     fun confirmProfileSwitch() {
         val current = _uiState.value
-        val relayUrl = normalizeRelayUrl(current.pairingRelayUrl)
+        val relayUrlInput = current.pairingRelayUrl.trim()
         val token = current.pairingToken.trim()
         val hostId = current.pairingHostId.trim()
-        val validationError = validatePairing(relayUrl, token)
-        if (validationError != null) {
+        val relayUrlError = validateRelayUrl(relayUrlInput)
+        if (relayUrlError != null) {
             _uiState.update {
-                it.copy(confirmProfileSwitch = false, pairingError = validationError)
+                it.copy(
+                    confirmProfileSwitch = false,
+                    pairingRelayUrlError = relayUrlError,
+                    pairingError = null,
+                )
+            }
+            return
+        }
+        val relayUrl = PairingInputValidator.normalizeRelayUrl(relayUrlInput)
+        val credentialError = PairingInputValidator.credentialError(token, hostId)
+        if (credentialError != null) {
+            _uiState.update {
+                it.copy(
+                    confirmProfileSwitch = false,
+                    pairingRelayUrlError = null,
+                    pairingError = credentialError,
+                )
             }
             return
         }
@@ -254,7 +312,13 @@ class V2ViewModel(
     ) {
 
         viewModelScope.launch {
-            _uiState.update { it.copy(isConnecting = true, pairingError = null) }
+            _uiState.update {
+                it.copy(
+                    isConnecting = true,
+                    pairingRelayUrlError = null,
+                    pairingError = null,
+                )
+            }
             try {
                 mutateProfile(expectedUrl = relayUrl) {
                     if (clearExistingProfile) {
@@ -288,7 +352,8 @@ class V2ViewModel(
                         autoConnect = true,
                     )
                     val savedPreferences = preferencesStore.values.first {
-                        normalizeRelayUrl(it.relayUrl) == relayUrl && it.preferredHostId == hostId
+                        PairingInputValidator.normalizeRelayUrl(it.relayUrl) == relayUrl &&
+                            it.preferredHostId == hostId
                     }
                     _uiState.update {
                         it.copy(
@@ -297,6 +362,7 @@ class V2ViewModel(
                             pairingRelayUrl = relayUrl,
                             pairingToken = "",
                             pairingHostId = hostId,
+                            pairingRelayUrlError = null,
                             pairingError = null,
                             isConnecting = true,
                             preferences = savedPreferences,
@@ -305,7 +371,7 @@ class V2ViewModel(
                 }
                 connectedConfigKey = null
                 connectActiveProfile(force = true)
-            } catch (error: Throwable) {
+            } catch (_: Throwable) {
                 runCatching {
                     mutateProfile(expectedUrl = null) {
                         disconnectRelayAndDrain()
@@ -322,8 +388,14 @@ class V2ViewModel(
                         paired = false,
                         pairingRequired = true,
                         isConnecting = false,
-                        pairingError = error.message ?: "Could not save the connection",
-                        preferences = AppPreferences(),
+                        pairingRelayUrlError = validateRelayUrl(relayUrl),
+                        pairingError = "Could not save the connection",
+                        preferences = it.preferences.copy(
+                            relayUrl = "",
+                            preferredHostId = "",
+                            preferredScopeId = "local",
+                            autoConnect = false,
+                        ),
                         hosts = emptyList(),
                         scopes = emptyList(),
                         sessions = emptyList(),
@@ -573,6 +645,16 @@ class V2ViewModel(
         }
     }
 
+    fun setDarkThemeEnabled(enabled: Boolean) {
+        if (demoMode) {
+            _uiState.update { state ->
+                state.copy(preferences = state.preferences.copy(darkThemeEnabled = enabled))
+            }
+        } else {
+            viewModelScope.launch { preferencesStore.setDarkThemeEnabled(enabled) }
+        }
+    }
+
     fun diagnostics(): String {
         val state = _uiState.value
         return buildString {
@@ -626,7 +708,7 @@ class V2ViewModel(
     ): T = profileMutationMutex.withLock {
         profileMutationInProgress = true
         profileExpectationInitialized = true
-        expectedRelayUrl = expectedUrl?.let(::normalizeRelayUrl)
+        expectedRelayUrl = expectedUrl?.let(PairingInputValidator::normalizeRelayUrl)
         try {
             block()
         } finally {
@@ -646,7 +728,8 @@ class V2ViewModel(
 
     private fun preferenceMatchesExpectedProfile(preferences: AppPreferences): Boolean {
         if (!profileExpectationInitialized) return true
-        return normalizeRelayUrl(preferences.relayUrl) == expectedRelayUrl.orEmpty()
+        return PairingInputValidator.normalizeRelayUrl(preferences.relayUrl) ==
+            expectedRelayUrl.orEmpty()
     }
 
     private fun clearUnreadableProfile(observedRelayUrl: String) {
@@ -655,7 +738,8 @@ class V2ViewModel(
         viewModelScope.launch {
             profileMutationMutex.withLock {
                 val latest = preferencesStore.values.first()
-                if (normalizeRelayUrl(latest.relayUrl) != normalizeRelayUrl(observedRelayUrl) ||
+                if (PairingInputValidator.normalizeRelayUrl(latest.relayUrl) !=
+                    PairingInputValidator.normalizeRelayUrl(observedRelayUrl) ||
                     (latest.relayUrl.isNotBlank() && !credentials.read().isNullOrBlank())
                 ) {
                     credentialRecoveryNotified = false
@@ -679,7 +763,13 @@ class V2ViewModel(
                             pairingRelayUrl = "",
                             pairingToken = "",
                             pairingHostId = "",
-                            preferences = AppPreferences(),
+                            pairingRelayUrlError = null,
+                            preferences = it.preferences.copy(
+                                relayUrl = "",
+                                preferredHostId = "",
+                                preferredScopeId = "local",
+                                autoConnect = false,
+                            ),
                             hosts = emptyList(),
                             scopes = emptyList(),
                             sessions = emptyList(),
@@ -724,7 +814,9 @@ class V2ViewModel(
             preferencesStore.values.collect { preferences ->
                 if (!profileExpectationInitialized) {
                     profileExpectationInitialized = true
-                    expectedRelayUrl = normalizeRelayUrl(preferences.relayUrl).ifBlank { null }
+                    expectedRelayUrl = PairingInputValidator
+                        .normalizeRelayUrl(preferences.relayUrl)
+                        .ifBlank { null }
                 }
                 if (profileMutationInProgress || !preferenceMatchesExpectedProfile(preferences)) {
                     return@collect
@@ -743,6 +835,10 @@ class V2ViewModel(
                         pairingRequired = state.pairingRequired || !paired,
                         pairingRelayUrl = state.pairingRelayUrl.ifBlank { preferences.relayUrl },
                         pairingHostId = state.pairingHostId.ifBlank { preferences.preferredHostId },
+                        pairingRelayUrlError = state.pairingRelayUrlError
+                            ?: preferences.relayUrl
+                                .takeIf { !paired && it.isNotBlank() }
+                                ?.let(::validateRelayUrl),
                         preferences = preferences,
                         selectedScopeId = state.selectedScopeId ?: preferences.preferredScopeId.takeUnless { it == "local" },
                     )
@@ -789,7 +885,14 @@ class V2ViewModel(
                 if (health.overall == ConnectionStatus.ONLINE) {
                     outboxRetryJob?.cancel()
                     outboxRetryAttempt = 0
-                    _uiState.update { it.copy(pairingRequired = false, pairingError = null, isConnecting = false) }
+                    _uiState.update {
+                        it.copy(
+                            pairingRequired = false,
+                            pairingRelayUrlError = null,
+                            pairingError = null,
+                            isConnecting = false,
+                        )
+                    }
                     flushOutbox()
                 }
             }
@@ -837,8 +940,9 @@ class V2ViewModel(
         val token = credentials.read().orEmpty()
         if (relayUrl.isBlank() || token.isBlank()) return
         val hostId = state.activeHostId.ifBlank { state.pairingHostId }
-        val validationError = validatePairing(relayUrl, token, hostId)
-        if (validationError != null) {
+        val relayUrlError = validateRelayUrl(relayUrl)
+        val credentialError = PairingInputValidator.credentialError(token, hostId)
+        if (relayUrlError != null || credentialError != null) {
             connectedConfigKey = null
             relay.disconnect()
             _uiState.update {
@@ -846,7 +950,12 @@ class V2ViewModel(
                     pairingRequired = true,
                     pairingRelayUrl = relayUrl,
                     pairingHostId = hostId,
-                    pairingError = "Saved connection needs review: $validationError",
+                    pairingRelayUrlError = relayUrlError?.let {
+                        "Saved connection needs review: $it"
+                    },
+                    pairingError = credentialError?.let {
+                        "Saved connection needs review: $it"
+                    },
                     isConnecting = false,
                 )
             }
@@ -927,6 +1036,7 @@ class V2ViewModel(
                     it.copy(
                         pairingRequired = true,
                         pairingToken = "",
+                        pairingRelayUrlError = null,
                         pairingError = event.message,
                         isConnecting = false,
                     )
@@ -1174,45 +1284,11 @@ class V2ViewModel(
         )
     }
 
-    private fun validatePairing(
-        relayUrl: String,
-        token: String,
-        hostId: String = _uiState.value.pairingHostId.trim(),
-    ): String? {
-        if (relayUrl.isBlank()) return "Relay URL is required"
-        if (relayUrl.length > MAX_RELAY_URL_LENGTH) return "Relay URL is too long"
-        if (relayUrl.any { it.isISOControl() || it.isWhitespace() }) return "Relay URL contains invalid characters"
-        val uri = runCatching { java.net.URI(relayUrl) }.getOrNull()
-            ?: return "Relay URL is invalid"
-        val scheme = uri.scheme?.lowercase()
-        val host = uri.host?.lowercase().orEmpty()
-        if (host.isBlank()) return "Relay URL must include a host"
-        if (uri.rawUserInfo != null || uri.rawQuery != null || uri.rawFragment != null) {
-            return "Relay URL must not include credentials, a query, or a fragment"
-        }
-        if (uri.rawPath.orEmpty() !in setOf("", "/")) {
-            return "Relay URL must not include a path"
-        }
-        if (scheme != "wss") {
-            val localDebugHost = com.tmuxworktree.mobile.BuildConfig.DEBUG &&
-                scheme == "ws" &&
-                host in setOf("10.0.2.2", "127.0.0.1", "localhost", "::1", "[::1]")
-            if (!localDebugHost) {
-                return "Use wss:// to protect the pairing token and terminal content"
-            }
-        }
-        if (token.isBlank()) return "Pairing token is required"
-        if (token.length > MAX_TOKEN_LENGTH) return "Pairing token is too long"
-        if (token.any { it == '\u0000' || it == '\r' || it == '\n' }) {
-            return "Pairing token contains invalid characters"
-        }
-        if (hostId.trim().isNotEmpty() && !HOST_ID_PATTERN.matches(hostId.trim())) {
-            return "Computer identifier is invalid"
-        }
-        return null
-    }
-
-    private fun normalizeRelayUrl(value: String): String = value.trim().trimEnd('/')
+    private fun validateRelayUrl(value: String): String? =
+        PairingInputValidator.relayUrlError(
+            relayUrl = value.trim(),
+            allowDebugLoopbackCleartext = com.tmuxworktree.mobile.BuildConfig.DEBUG,
+        )
 
     private fun ConnectionStatus.label(): String = name.lowercase().replace('_', ' ')
 
@@ -1264,9 +1340,6 @@ class V2ViewModel(
         private const val MAX_PENDING_CRITICAL_UI_EFFECTS = 16
         private const val OUTBOX_EXPIRY_POLL_MILLIS = 30_000L
         private const val PROFILE_DRAIN_TIMEOUT_MILLIS = 5_000L
-        private const val MAX_RELAY_URL_LENGTH = 2_048
-        private const val MAX_TOKEN_LENGTH = 4_096
-        private val HOST_ID_PATTERN = Regex("[A-Za-z0-9._-]{1,80}")
         private val CANCELLABLE_DELIVERY_STATES = setOf(
             DeliveryState.QUEUED,
             DeliveryState.FAILED_RETRYABLE,

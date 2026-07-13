@@ -34,7 +34,7 @@ pub(super) fn spawn_serve(app: &tauri::AppHandle) -> Result<std::process::Child,
         if let Some(node) = node_bin() {
             let cli_arg = cli.to_string_lossy().to_string();
             match std::process::Command::new(&node)
-                .args([cli_arg.as_str(), "serve"])
+                .args([cli_arg.as_str(), "serve", "--host", "127.0.0.1"])
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -60,7 +60,7 @@ pub(super) fn spawn_serve(app: &tauri::AppHandle) -> Result<std::process::Child,
 
     if let Some(tw) = installed_tw_command() {
         match std::process::Command::new(&tw)
-            .arg("serve")
+            .args(["serve", "--host", "127.0.0.1"])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

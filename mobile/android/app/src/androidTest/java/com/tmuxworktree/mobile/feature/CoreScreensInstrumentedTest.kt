@@ -5,6 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
+import androidx.compose.ui.test.assertIsFocused
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -66,7 +67,6 @@ class CoreScreensInstrumentedTest {
         var replied: RelaySession? = null
         var menuClicks = 0
         var healthClicks = 0
-        var newWorktreeClicks = 0
         var destination: RootDestination? = null
         composeRule.setContent {
             TwTheme {
@@ -78,7 +78,6 @@ class CoreScreensInstrumentedTest {
                     onConnectionStatusClick = { healthClicks++ },
                     onSessionClick = { opened = it },
                     onReplyClick = { replied = it },
-                    onNewWorktreeClick = { newWorktreeClicks++ },
                     onBottomDestinationSelected = { destination = it },
                 )
             }
@@ -88,7 +87,6 @@ class CoreScreensInstrumentedTest {
         composeRule.onNodeWithTag("connection_status_chip").performClick()
         composeRule.onNodeWithTag("attention_session_${waiting.stableId}").performClick()
         composeRule.onNodeWithTag("reply_session_${waiting.stableId}").performClick()
-        composeRule.onNodeWithTag("new_worktree_button").performClick()
         composeRule.onNodeWithTag("nav_workspaces").performClick()
         composeRule.onNodeWithTag("running_session_${terminal.stableId}")
             .assertDoesNotExist()
@@ -96,11 +94,40 @@ class CoreScreensInstrumentedTest {
         composeRule.runOnIdle {
             assertEquals(1, menuClicks)
             assertEquals(1, healthClicks)
-            assertEquals(1, newWorktreeClicks)
             assertSame(waiting, opened)
             assertSame(waiting, replied)
             assertEquals(RootDestination.WORKSPACES, destination)
         }
+    }
+
+    @Test
+    fun sessionReplyShortcutFocusesTheComposer() {
+        val session = RelaySession(
+            hostId = "host",
+            name = "local:demo",
+            rawName = "demo",
+            agentState = AgentState.WAITING_FOR_USER,
+        )
+        composeRule.setContent {
+            TwTheme {
+                SessionDetailScreen(
+                    session = session,
+                    connectionStatus = ConnectionStatus.ONLINE,
+                    timeline = emptyList(),
+                    draft = "",
+                    nowMillis = 1_000,
+                    onDraftChange = {},
+                    onBack = {},
+                    onConnectionStatusClick = {},
+                    onOpenTerminal = {},
+                    onOverflowClick = {},
+                    onSend = {},
+                    autoFocusReply = true,
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("reply_input").assertIsFocused()
     }
 
     @Test
@@ -327,6 +354,7 @@ class CoreScreensInstrumentedTest {
                     relayUrl = "wss://relay.example.com",
                     token = "paired-token",
                     isConnecting = false,
+                    relayUrlError = null,
                     error = null,
                     onRelayUrlChange = {},
                     onTokenChange = {},
@@ -350,5 +378,31 @@ class CoreScreensInstrumentedTest {
             .performClick()
 
         composeRule.runOnIdle { assertEquals(1, forgetCount) }
+    }
+
+    @Test
+    fun pairingReviewShowsImportedUrlErrorAndKeepsConnectActionDisabled() {
+        val error = "Debug ws:// is limited to emulator or loopback hosts. " +
+            "Use wss:// for .local and other network hosts"
+        composeRule.setContent {
+            TwTheme {
+                PairingScreen(
+                    relayUrl = "ws://mac.local:8787",
+                    token = "review-only-token",
+                    isConnecting = false,
+                    relayUrlError = error,
+                    error = null,
+                    onRelayUrlChange = {},
+                    onTokenChange = {},
+                    onScanQr = {},
+                    onConnect = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithText(error)
+            .assertIsDisplayed()
+        composeRule.onNodeWithTag("pairing_connect")
+            .assertIsNotEnabled()
     }
 }

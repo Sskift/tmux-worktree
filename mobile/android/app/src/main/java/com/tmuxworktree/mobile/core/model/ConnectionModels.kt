@@ -66,7 +66,7 @@ data class ConnectionHealth(
     val lastSyncedAtMillis: Long = 0,
     val errorCode: String = "",
     val errorMessage: String = "",
-    val protocolLabel: String = "v1 compatibility mode",
+    val protocolLabel: String = "Relay v1",
 )
 
 data class TerminalStreamState(

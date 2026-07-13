@@ -92,4 +92,9 @@ class V2UiStateTest {
             ),
         )
     }
+
+    @Test
+    fun protocolLabelNamesTheImplementedRelayVersionExplicitly() {
+        assertEquals("Relay v1", ConnectionHealth().protocolLabel)
+    }
 }

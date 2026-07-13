@@ -118,32 +118,36 @@ test("Relay summary distinguishes stopped, starting, connected, retrying, and er
       connected: false,
     }),
     {
-      label: "Checking Relay",
-      detail: "Reading the saved configuration and current Relay process state.",
+      label: "Checking Mac connector",
+      detail: "Reading the saved connector configuration and local process state.",
       tone: "progress",
     },
   );
   assert.deepEqual(
     summarizeRelayStatus({ connectionState: "stopped", active: false, connected: false }),
     {
-      label: "Stopped",
-      detail: "Relay is configured locally and is not accepting connections.",
+      label: "Mac connector stopped",
+      detail: "The Mac connector is stopped. A previously deployed Relay center keeps running independently.",
       tone: "neutral",
     },
   );
-  assert.equal(summarizeRelayStatus({ connectionState: "starting", active: true, connected: false }).label, "Starting");
-  assert.equal(summarizeRelayStatus({ connectionState: "connected", active: true, connected: true }).label, "Connected");
-  assert.equal(summarizeRelayStatus({ connectionState: "retrying", active: true, connected: false }).label, "Retrying");
+  assert.equal(summarizeRelayStatus({ connectionState: "starting", active: true, connected: false }).label, "Starting Mac connector");
+  assert.equal(summarizeRelayStatus({ connectionState: "connected", active: true, connected: true }).label, "Mac connector connected");
+  assert.equal(summarizeRelayStatus({ connectionState: "retrying", active: true, connected: false }).label, "Mac connector retrying");
+  assert.doesNotMatch(
+    summarizeRelayStatus({ connectionState: "connected", active: true, connected: true }).detail,
+    /mobile client can reach/i,
+  );
   assert.deepEqual(
     summarizeRelayStatus({ connectionState: "error", active: false, connected: false, error: "TLS rejected" }),
-    { label: "Error", detail: "TLS rejected", tone: "danger" },
+    { label: "Mac connector error", detail: "TLS rejected", tone: "danger" },
   );
 });
 
 test("Relay validation applies action-specific token and broker requirements", () => {
   const draft = {
-    relayUrl: "wss://relay.example.com",
-    brokerHostId: "",
+    relayUrl: "wss://relay.company.test",
+    brokerHostId: "devbox",
     hostId: "mac-admin",
     token: "",
   };
@@ -152,19 +156,57 @@ test("Relay validation applies action-specific token and broker requirements", (
   const start = validateRelayDraft(draft, "start");
   assert.equal(start.valid, false);
   assert.match(start.errors.token ?? "", /required/);
-  const broker = validateRelayDraft(draft, "startBroker");
+  assert.equal(validateRelayDraft(draft, "startBroker").valid, true);
+  const broker = validateRelayDraft({
+    relayUrl: "",
+    brokerHostId: "",
+    hostId: "",
+    token: "",
+  }, "startBroker");
   assert.equal(broker.valid, false);
-  assert.match(broker.errors.brokerHostId ?? "", /broker host/);
+  assert.match(broker.errors.brokerHostId ?? "", /Relay center/);
+
+  assert.equal(validateRelayDraft({
+    relayUrl: "",
+    brokerHostId: "devbox",
+    hostId: "",
+    token: "",
+  }, "startBroker").valid, true);
 });
 
-test("Relay validation rejects non-websocket URLs", () => {
+test("Relay validation requires trusted WSS or an explicit loopback diagnostic URL", () => {
   const result = validateRelayDraft({
-    relayUrl: "https://relay.example.com",
+    relayUrl: "https://relay.company.test",
     brokerHostId: "remote",
     hostId: "mac-admin",
     token: "secret",
   }, "start");
 
   assert.equal(result.valid, false);
-  assert.match(result.errors.relayUrl ?? "", /ws:\/\/ or wss:\/\//);
+  assert.match(result.errors.relayUrl ?? "", /trusted wss/);
+
+  for (const relayUrl of [
+    "wss://relay.example.com",
+    "wss://relay.example.com/",
+    "ws://desk-mac.local:8787",
+    "ws://10.0.0.8:8787",
+    "wss://user@relay.company.test",
+    "wss://@relay.company.test",
+    "wss://relay.company.test:0",
+    "wss://relay.company.test/client",
+  ]) {
+    assert.equal(validateRelayDraft({
+      relayUrl,
+      brokerHostId: "remote",
+      hostId: "mac-admin",
+      token: "secret",
+    }, "start").valid, false, relayUrl);
+  }
+
+  assert.equal(validateRelayDraft({
+    relayUrl: "ws://127.0.0.1:8787",
+    brokerHostId: "remote",
+    hostId: "mac-admin",
+    token: "secret",
+  }, "start").valid, true);
 });

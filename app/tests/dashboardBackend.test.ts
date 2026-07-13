@@ -93,6 +93,7 @@ const updateHostArgs = {
 };
 const relayArgs = {
   relayUrl: "wss://relay.example.test",
+  brokerHostId: "host-1",
   hostId: "dashboard-host",
   secret: "test-secret",
 };
@@ -521,8 +522,8 @@ const commandCases: CommandCase[] = [
   {
     label: "relay.startBroker",
     command: "mobile_relay_start_broker",
-    args: { args: { hostId: "host-1", port: 8787 } },
-    call: (backend) => backend.relay.startBroker({ hostId: "host-1", port: 8787 }),
+    args: { args: { hostId: "host-1", port: 8787, quickTunnel: true } },
+    call: (backend) => backend.relay.startBroker({ hostId: "host-1", port: 8787, quickTunnel: true }),
   },
   {
     label: "relay.stop",

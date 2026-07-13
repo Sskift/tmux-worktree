@@ -24,13 +24,17 @@ import { useVisibilityAwarePolling } from "./useVisibilityAwarePolling";
 export const MOBILE_RELAY_VISIBLE_REFRESH_MS = 2_000;
 export const MOBILE_RELAY_HIDDEN_REFRESH_MS = 15_000;
 
-const DEFAULT_RELAY_URL = "wss://relay.example.com";
+// QR Code byte-mode capacity at error-correction level M is 2,331 bytes for
+// version 40. Keep a safety margin so every payload accepted here can be
+// rendered by the Dashboard's QR encoder instead of failing only in the UI.
+export const MOBILE_RELAY_V1_QR_MAX_BYTES = 2_200;
+
 const DEFAULT_HOST_ID = "mac-admin";
 
 type MobileRelayIndicatorStatus = "running" | "starting" | "stopped";
 
-export type MobileRelayDraftField = "relayUrl" | "hostId" | "secret";
-export type MobileRelayDraftSyncPolicy = "untouched" | "submitted";
+export type MobileRelayDraftField = "relayUrl" | "brokerHostId" | "hostId" | "secret";
+export type MobileRelayDraftSyncPolicy = "untouched" | "submitted" | "brokerStarted";
 
 export type MobileRelayOwnerLease = OwnerEpochLease<object>;
 
@@ -81,17 +85,19 @@ export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator
   let activeOperationGeneration = 0;
   const draftRevisions: Record<MobileRelayDraftField, number> = {
     relayUrl: 0,
+    brokerHostId: 0,
     hostId: 0,
     secret: 0,
   };
   const dirtyDrafts: Record<MobileRelayDraftField, boolean> = {
     relayUrl: false,
+    brokerHostId: false,
     hostId: false,
     secret: false,
   };
 
   const resetDraftOwnership = () => {
-    for (const field of ["relayUrl", "hostId", "secret"] as const) {
+    for (const field of ["relayUrl", "brokerHostId", "hostId", "secret"] as const) {
       draftRevisions[field] = 0;
       dirtyDrafts[field] = false;
     }
@@ -159,7 +165,13 @@ export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator
       if (!fence.isCurrent(request.lease)) return false;
       if (request.generation !== statusGeneration) return false;
       if (request.draftRevisions[field] !== draftRevisions[field]) return false;
-      if (request.draftSyncPolicy === "untouched" && dirtyDrafts[field]) return false;
+      const brokerGeneratedField = request.draftSyncPolicy === "brokerStarted"
+        && (field === "relayUrl" || field === "brokerHostId" || field === "secret");
+      if (
+        request.draftSyncPolicy !== "submitted"
+        && !brokerGeneratedField
+        && dirtyDrafts[field]
+      ) return false;
       dirtyDrafts[field] = false;
       return true;
     },
@@ -225,7 +237,6 @@ export type MobileRelayController = MobileRelayViewState & {
   saving: boolean;
   brokerStarting: boolean;
   stopping: boolean;
-  copied: boolean;
   v1PairingPayload: string | null;
   error: string | null;
   toggle: () => Promise<void>;
@@ -233,7 +244,6 @@ export type MobileRelayController = MobileRelayViewState & {
   start: () => Promise<boolean>;
   startBroker: () => Promise<boolean>;
   stop: () => Promise<boolean>;
-  copyLaunch: () => void;
   copyValue: (value: string) => void;
 };
 
@@ -262,7 +272,6 @@ type MobileRelayOwnedState = MobileRelayViewStateInput & {
   draftHostId: string;
   draftSecret: string;
   brokerHostId: string;
-  copied: boolean;
   error: string | null;
 };
 
@@ -275,10 +284,10 @@ function initialMobileRelayOwnedState(
     active: false,
     connected: false,
     connectionState: "stopped",
-    relayUrl: DEFAULT_RELAY_URL,
+    relayUrl: "",
     hostId: DEFAULT_HOST_ID,
     secret: "",
-    draftUrl: DEFAULT_RELAY_URL,
+    draftUrl: "",
     draftHostId: DEFAULT_HOST_ID,
     draftSecret: "",
     brokerHostId: "",
@@ -287,7 +296,6 @@ function initialMobileRelayOwnedState(
     saving: false,
     brokerStarting: false,
     stopping: false,
-    copied: false,
     error: null,
   };
 }
@@ -318,7 +326,7 @@ export function deriveMobileRelayViewState({
         ? "starting"
         : "stopped";
   const statusText = brokerStarting
-    ? "Starting broker"
+    ? "Deploying broker"
     : loading
       ? "Starting"
       : saving
@@ -326,10 +334,10 @@ export function deriveMobileRelayViewState({
         : stopping
           ? "Stopping"
           : connected
-            ? "Connected"
+            ? "Connector connected"
             : active
-              ? connectionState === "retrying" ? "Reconnecting" : "Connecting"
-              : "Stopped";
+              ? connectionState === "retrying" ? "Connector retrying" : "Connector connecting"
+              : "Connector stopped";
 
   return {
     busy,
@@ -338,25 +346,6 @@ export function deriveMobileRelayViewState({
     tokenState: secret ? "Configured" : "Missing",
     buttonActive: active || popoverOpen || busy,
   };
-}
-
-export function buildMobileRelayLaunchCommand({
-  relayUrl,
-  hostId,
-  secret,
-}: Pick<MobileRelayStatus, "relayUrl" | "hostId" | "secret">): string {
-  const androidCommand = [
-    "am start -n com.tmuxworktree.mobile/.V2Activity",
-    `  --es relayUrl ${shellSingleQuote(relayUrl)}`,
-    `  --es hostId ${shellSingleQuote(hostId)}`,
-    `  --es relaySecret ${shellSingleQuote(secret || "<TW_RELAY_SECRET>")}`,
-  ].join(" \\\n");
-  return `adb shell ${shellSingleQuote(androidCommand)}`;
-}
-
-export function shellSingleQuote(value: string): string {
-  const escapedQuote = `'"'"'`;
-  return `'${value.replace(/'/g, escapedQuote)}'`;
 }
 
 export function buildMobileRelayV1PairingPayload({
@@ -384,6 +373,7 @@ export function buildMobileRelayV1PairingPayload({
   if (
     parsedUrl.protocol !== "wss:" ||
     !parsedUrl.hostname ||
+    parsedUrl.port === "0" ||
     parsedUrl.username ||
     parsedUrl.password ||
     parsedUrl.pathname !== "/" ||
@@ -393,7 +383,7 @@ export function buildMobileRelayV1PairingPayload({
   if (/[?#]/.test(normalizedRelayUrl) || normalizedRelayUrl.slice(6).includes("@")) return null;
   const canonicalRelayUrl = parsedUrl.toString().replace(/\/$/, "");
 
-  return [
+  const payload = [
     "tmuxworktree://pair?relayUrl=",
     encodeURIComponent(canonicalRelayUrl),
     "&token=",
@@ -401,6 +391,9 @@ export function buildMobileRelayV1PairingPayload({
     "&hostId=",
     encodeURIComponent(normalizedHostId),
   ].join("");
+  return new TextEncoder().encode(payload).byteLength <= MOBILE_RELAY_V1_QR_MAX_BYTES
+    ? payload
+    : null;
 }
 
 export function useMobileRelayController({
@@ -456,7 +449,6 @@ export function useMobileRelayController({
     brokerStarting,
     connected,
     connectionState,
-    copied,
     draftHostId,
     draftSecret,
     draftUrl,
@@ -508,11 +500,12 @@ export function useMobileRelayController({
     }));
   }, [asyncCoordinator, ownerLease, updateOwnedState]);
   const setBrokerHostId = useCallback<Dispatch<SetStateAction<string>>>((value) => {
+    if (!asyncCoordinator.markDraftEdited(ownerLease, "brokerHostId")) return;
     updateOwnedState(ownerLease, (current) => ({
       ...current,
       brokerHostId: resolveStateAction(value, current.brokerHostId),
     }));
-  }, [ownerLease, updateOwnedState]);
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
   const setPopoverOpen = useCallback<Dispatch<SetStateAction<boolean>>>((value) => {
     updateOwnedState(ownerLease, (current) => ({
       ...current,
@@ -539,6 +532,7 @@ export function useMobileRelayController({
     if (!asyncCoordinator.isCurrent(lease)) return false;
     if (!asyncCoordinator.isCurrentStatusRequest(request)) return false;
     const syncRelayUrl = asyncCoordinator.acceptDraftSync(request, "relayUrl");
+    const syncBrokerHostId = asyncCoordinator.acceptDraftSync(request, "brokerHostId");
     const syncHostId = asyncCoordinator.acceptDraftSync(request, "hostId");
     const syncSecret = asyncCoordinator.acceptDraftSync(request, "secret");
     return updateOwnedState(lease, (current) => ({
@@ -551,6 +545,7 @@ export function useMobileRelayController({
       hostId: status.hostId,
       secret: status.secret,
       draftUrl: syncRelayUrl ? status.relayUrl : current.draftUrl,
+      brokerHostId: syncBrokerHostId ? status.brokerHostId : current.brokerHostId,
       draftHostId: syncHostId ? status.hostId : current.draftHostId,
       draftSecret: syncSecret ? status.secret : current.draftSecret,
       error: status.error ?? null,
@@ -670,6 +665,7 @@ export function useMobileRelayController({
   ): Promise<MobileRelayStatus | null> => {
     const args = {
       relayUrl: draftUrl.trim(),
+      brokerHostId: brokerHostId.trim(),
       hostId: draftHostId.trim(),
       secret: draftSecret.trim(),
     };
@@ -688,6 +684,7 @@ export function useMobileRelayController({
     applyStatus,
     asyncCoordinator,
     dashboardBackend,
+    brokerHostId,
     draftHostId,
     draftSecret,
     draftUrl,
@@ -729,7 +726,7 @@ export function useMobileRelayController({
       const saved = await saveConfig(operation);
       if (!saved) return false;
       if (!saved.secret.trim()) {
-        throw new Error("Relay token is required before Android can connect");
+        throw new Error("Relay token is required before starting the connector");
       }
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
       await dashboardBackend.relay.start();
@@ -764,11 +761,12 @@ export function useMobileRelayController({
     const operation = beginOwnedOperation("brokerStarting");
     if (!operation) return false;
     try {
-      const request = asyncCoordinator.issueStatusRequest(ownerLease, "untouched");
+      const request = asyncCoordinator.issueStatusRequest(ownerLease, "brokerStarted");
       if (!request) return false;
       const status = await dashboardBackend.relay.startBroker({
         hostId: brokerHostId,
         port: 8787,
+        quickTunnel: true,
       });
       if (!asyncCoordinator.isCurrent(ownerLease)) return false;
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
@@ -831,22 +829,6 @@ export function useMobileRelayController({
     updateOwnedState,
   ]);
 
-  const copyLaunch = useCallback(() => {
-    if (!asyncCoordinator.isCurrent(ownerLease)) return;
-    void navigator.clipboard.writeText(buildMobileRelayLaunchCommand({ relayUrl, hostId, secret }));
-    updateOwnedState(ownerLease, (current) => ({ ...current, copied: true }));
-    window.setTimeout(() => {
-      updateOwnedState(ownerLease, (current) => ({ ...current, copied: false }));
-    }, 1200);
-  }, [
-    asyncCoordinator,
-    hostId,
-    ownerLease,
-    relayUrl,
-    secret,
-    updateOwnedState,
-  ]);
-
   const copyValue = useCallback((value: string) => {
     if (!asyncCoordinator.isCurrent(ownerLease)) return;
     if (value) void navigator.clipboard.writeText(value);
@@ -868,10 +850,10 @@ export function useMobileRelayController({
   });
 
   useEffect(() => {
-    if (brokerHostId || hosts.length === 0) return;
+    if (!statusKnown || brokerHostId || hosts.length === 0) return;
     const preferred = hosts.find((host) => host.id === "devbox") ?? hosts[0];
     setBrokerHostId(preferred.id);
-  }, [brokerHostId, hosts, setBrokerHostId]);
+  }, [brokerHostId, hosts, setBrokerHostId, statusKnown]);
 
   const viewState = deriveMobileRelayViewState({
     active,
@@ -884,7 +866,7 @@ export function useMobileRelayController({
     brokerStarting,
     stopping,
   });
-  const v1PairingPayload = statusKnown && active
+  const v1PairingPayload = statusKnown && connected
     ? buildMobileRelayV1PairingPayload({ relayUrl, hostId, secret })
     : null;
 
@@ -910,7 +892,6 @@ export function useMobileRelayController({
     saving,
     brokerStarting,
     stopping,
-    copied,
     v1PairingPayload,
     error,
     toggle,
@@ -918,7 +899,6 @@ export function useMobileRelayController({
     start,
     startBroker,
     stop,
-    copyLaunch,
     copyValue,
     ...viewState,
   };

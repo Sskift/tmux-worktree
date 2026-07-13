@@ -168,7 +168,9 @@ relay-host on the Mac admin machine
 
 Mac connector 是业务桥接点：它读取和 Dashboard 相同的项目、Host、terminal metadata 与 managed state，并用 Mac 的 SSH 权限聚合 local 和 remote scope。broker 只鉴权、维护 Host/Client/stream 路由和转发 frame；它不拥有 session、worktree 或 Android Outbox 状态。
 
-Dashboard 的 Rust mobile-relay feature 负责保存 connector 配置、启动或停止 `tw serve` / `tw relay-host`，也可把 bundled CLI 安装到稳定 SSH 主机上启动 broker。connector 的 Node.js 实现仍位于根 `src/`。
+Dashboard 的 Rust mobile-relay feature 负责保存 Relay center 与 connector 配置、启动或停止 `tw serve` / `tw relay-host`，也可把 bundled CLI 安装到用户明确选择的稳定 SSH 主机上启动 broker。选择写入 `mobileRelay.brokerHostId`，与开发 session 运行在哪个 Host 无关。Dashboard 托管的 broker 只监听远端 loopback；一键设置优先复用该 center 已保存的固定 WSS，否则通过远端已有的 `cloudflared` 建立临时 Quick Tunnel，读取并校验生成的根 `wss://` URL。启动 connector 前，Mac 先通过不进入系统负缓存的 DNS 查询等待公网记录出现，再确认本机系统解析器可用；Relay center 不需要解析自己的公网 URL。阻塞的 SSH 与 DNS 编排运行在 Tauri 后台任务中，不占用 UI 线程。它不会创建 Mac LAN forward、公开明文 broker 或合成 `.local` URL。connector 的 Node.js 实现仍位于根 `src/`。
+
+broker、WSS ingress 与 connector 在后端仍是可诊断的独立生命周期，但 Dashboard 的 **Set up Relay** 会按顺序编排它们：取得可信 WSS、部署/重启远端 broker 并轮换 Relay v1 shared secret、原子保存配置，再启动 Mac connector。固定 WSS 和单独 Save/Start 仍作为高级运维与恢复入口；`Stop connector` 只管理 Mac connector 与其本地 loopback `tw serve`。Dashboard 的 `connected` 只证明 Mac connector 已连接 broker，不证明 Android 在线；broker 部署成功也只是一轮命令结果，不伪装成持续健康状态。
 
 Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent message 以及 terminal input/output，但没有：
 
@@ -178,7 +180,7 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 - 带 offset 的 terminal replay/resume；
 - Relay v2 的 role-scoped credential 和 enrollment。
 
-因此 Android Session detail 的 Timeline 只把本机发起的消息及投递状态作为持久事实，不能伪造 Agent 回复或从终端输出推断 Agent lifecycle。Relay v1 shared secret 和终端内容只受 TLS 保护，生产 Android 配对必须使用可信 `wss://`。
+因此 Android Session detail 的 Timeline 只把本机发起的消息及投递状态作为持久事实，不能伪造 Agent 回复或从终端输出推断 Agent lifecycle。Relay v1 shared secret 和终端内容只受 TLS 保护，生产 Android 配对必须使用可信 `wss://`。同一把 v1 secret 也不能为无关用户提供租户隔离；面向多用户的统一 Relay center 必须等待独立的 Relay v2 role-scoped credential 与 enrollment 实现。
 
 ## 状态所有权
 

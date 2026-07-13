@@ -44,6 +44,7 @@ internal data class StatusVisual(
     val accessibleLabel: String,
 )
 
+@Composable
 internal fun ConnectionStatus.visual(): StatusVisual = when (this) {
     ConnectionStatus.ONLINE -> StatusVisual("Online", TwSuccess, "online")
     ConnectionStatus.RECOVERING -> StatusVisual("Recovering", TwWarning, "recovering")
@@ -55,6 +56,7 @@ internal fun ConnectionStatus.visual(): StatusVisual = when (this) {
     ConnectionStatus.UNKNOWN -> StatusVisual("Unknown", TwTextMuted, "unknown")
 }
 
+@Composable
 internal fun AgentState.visual(): StatusVisual = when (this) {
     AgentState.WAITING_FOR_USER -> StatusVisual("Waiting for reply", TwWarning, "waiting for reply")
     AgentState.RUNNING -> StatusVisual("Running", TwSuccess, "running")
@@ -70,6 +72,7 @@ fun TwRootTopBar(
     onConnectionStatusClick: () -> Unit,
     modifier: Modifier = Modifier,
     onMenuClick: (() -> Unit)? = null,
+    showConnectionStatus: Boolean = true,
 ) {
     Row(
         modifier = modifier
@@ -105,11 +108,13 @@ fun TwRootTopBar(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        Spacer(Modifier.width(12.dp))
-        TwConnectionStatusChip(
-            status = connectionStatus,
-            onClick = onConnectionStatusClick,
-        )
+        if (showConnectionStatus) {
+            Spacer(Modifier.width(12.dp))
+            TwConnectionStatusChip(
+                status = connectionStatus,
+                onClick = onConnectionStatusClick,
+            )
+        }
     }
 }
 

@@ -5,6 +5,7 @@ pub(crate) struct MobileRelayState {
     pub(super) process: Mutex<Option<std::process::Child>>,
     pub(super) serve_process: Mutex<Option<std::process::Child>>,
     pub(super) relay_url: Mutex<String>,
+    pub(super) broker_host_id: Mutex<String>,
     pub(super) host_id: Mutex<String>,
     pub(super) secret: Mutex<String>,
     pub(super) token: Mutex<String>,
@@ -16,7 +17,8 @@ impl Default for MobileRelayState {
         Self {
             process: Mutex::new(None),
             serve_process: Mutex::new(None),
-            relay_url: Mutex::new("wss://relay.example.com".to_string()),
+            relay_url: Mutex::new(String::new()),
+            broker_host_id: Mutex::new(String::new()),
             host_id: Mutex::new("mac-admin".to_string()),
             secret: Mutex::new(String::new()),
             token: Mutex::new(String::new()),
@@ -40,6 +42,7 @@ pub(super) struct RelayHostRuntimeStatus {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct MobileRelayConfig {
     pub(super) relay_url: String,
+    pub(super) broker_host_id: String,
     pub(super) host_id: String,
     pub(super) display_name: String,
     pub(super) secret: String,

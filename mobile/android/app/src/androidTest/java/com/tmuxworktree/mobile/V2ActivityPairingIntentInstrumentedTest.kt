@@ -46,7 +46,7 @@ class V2ActivityPairingIntentInstrumentedTest {
     }
 
     @Test
-    fun recreatedActivityDoesNotConsumePairingStateWhenSavedStateExists() {
+    fun recreatedActivityScrubsPairingStateWithoutApplyingItAgain() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         val launchIntent = Intent(context, V2Activity::class.java).apply {
             putExtra(V2Activity.EXTRA_DEMO_MODE, true)
@@ -60,9 +60,9 @@ class V2ActivityPairingIntentInstrumentedTest {
                 assertPairingStateScrubbed(activity.intent)
                 assertTrue(activity.intent.getBooleanExtra(V2Activity.EXTRA_DEMO_MODE, false))
 
-                // ActivityScenario recreates with this current Intent. Adding a
-                // sentinel pairing capability here verifies that the non-null
-                // savedInstanceState path does not consume launch input again.
+                // ActivityScenario recreates with this current Intent. A
+                // restored Activity must scrub any accidentally retained launch
+                // capability without applying it to the ViewModel a second time.
                 activity.intent.putExtra(
                     V2Activity.EXTRA_RELAY_URL,
                     "wss://restore-sentinel.example.com",
@@ -74,17 +74,9 @@ class V2ActivityPairingIntentInstrumentedTest {
             scenario.recreate()
 
             scenario.onActivity { activity ->
-                assertNull(activity.intent.data)
-                assertEquals(
-                    "wss://restore-sentinel.example.com",
-                    activity.intent.getStringExtra(V2Activity.EXTRA_RELAY_URL),
-                )
-                assertEquals(
-                    "restore-sentinel",
-                    activity.intent.getStringExtra(V2Activity.EXTRA_RELAY_SECRET),
-                )
+                assertPairingStateScrubbed(activity.intent)
                 assertTrue(activity.intent.getBooleanExtra(V2Activity.EXTRA_DEMO_MODE, false))
-                PairingIntentConsumer.consume(activity.intent)
+                assertNull(PairingIntentConsumer.consume(activity.intent))
             }
         }
     }

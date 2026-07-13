@@ -8,7 +8,9 @@ import android.content.Context
 import android.net.Uri
 import android.util.Base64
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -24,12 +26,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Devices
-import androidx.compose.material.icons.outlined.HealthAndSafety
-import androidx.compose.material.icons.outlined.Inbox
 import androidx.compose.material.icons.outlined.Link
-import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Terminal
-import androidx.compose.material.icons.outlined.Workspaces
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.AlertDialog
@@ -122,10 +121,11 @@ internal object V2Routes {
     const val HEALTH = "health"
     const val NEW_WORKTREE = "new-worktree"
     const val NEW_TERMINAL = "new-terminal"
-    const val SESSION = "session/{sessionKey}"
+    const val SESSION = "session/{sessionKey}?focusReply={focusReply}"
     const val TERMINAL = "terminal/{sessionKey}"
 
-    fun session(sessionId: String): String = "session/${encodeRouteValue(sessionId)}"
+    fun session(sessionId: String, focusReply: Boolean = false): String =
+        "session/${encodeRouteValue(sessionId)}?focusReply=$focusReply"
     fun terminal(sessionId: String): String = "terminal/${encodeRouteValue(sessionId)}"
 }
 
@@ -173,7 +173,12 @@ internal fun V2Navigation(
         }
     }
 
-    Box(modifier = Modifier.fillMaxSize().testTag("v2_app")) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(TwBackground)
+            .testTag("v2_app"),
+    ) {
         when {
             !state.initialized -> LoadingApp()
             state.pairingRequired || !state.paired -> PairingGate(
@@ -218,6 +223,7 @@ private fun PairingGate(
         relayUrl = state.pairingRelayUrl,
         token = state.pairingToken,
         isConnecting = state.isConnecting,
+        relayUrlError = state.pairingRelayUrlError,
         error = state.pairingError,
         onRelayUrlChange = viewModel::setPairingRelayUrl,
         onTokenChange = viewModel::setPairingToken,
@@ -271,22 +277,15 @@ private fun MainNavigation(
             restoreState = true
         }
     }
-    val closeAndNavigate: (String) -> Unit = { route ->
-        scope.launch { drawerState.close() }
-        navController.navigate(route) { launchSingleTop = true }
-    }
-
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
             DeviceDrawer(
                 state = state,
-                onDestination = { destination ->
+                onRefresh = {
                     scope.launch { drawerState.close() }
-                    navigateRoot(destination)
+                    viewModel.refresh()
                 },
-                onHealth = { closeAndNavigate(V2Routes.HEALTH) },
-                onNewTerminal = { closeAndNavigate(V2Routes.NEW_TERMINAL) },
                 onHostSelected = { hostId ->
                     scope.launch { drawerState.close() }
                     viewModel.selectHost(hostId)
@@ -311,8 +310,7 @@ private fun MainNavigation(
                     onMenuClick = { scope.launch { drawerState.open() } },
                     onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
                     onSessionClick = { navController.navigate(V2Routes.session(it.stableId)) },
-                    onReplyClick = { navController.navigate(V2Routes.session(it.stableId)) },
-                    onNewWorktreeClick = { navController.navigate(V2Routes.NEW_WORKTREE) },
+                    onReplyClick = { navController.navigate(V2Routes.session(it.stableId, focusReply = true)) },
                     onBottomDestinationSelected = navigateRoot,
                     agentStateAvailable = state.demoMode,
                 )
@@ -343,10 +341,10 @@ private fun MainNavigation(
                     }?.displayName.orEmpty(),
                     attentionCount = state.attentionCount,
                     versionName = BuildConfig.VERSION_NAME,
-                    onConnectionStatusClick = { navController.navigate(V2Routes.HEALTH) },
                     onHealthClick = { navController.navigate(V2Routes.HEALTH) },
                     onPairedDeviceClick = viewModel::showPairing,
                     onNotificationChanged = viewModel::setNotificationPreference,
+                    onDarkThemeChanged = viewModel::setDarkThemeEnabled,
                     onCopyDiagnostics = {
                         copyText(context, "tmux-worktree diagnostics", viewModel.diagnostics())
                     },
@@ -381,9 +379,16 @@ private fun MainNavigation(
             }
             composable(
                 route = V2Routes.SESSION,
-                arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
+                arguments = listOf(
+                    navArgument("sessionKey") { type = NavType.StringType },
+                    navArgument("focusReply") {
+                        type = NavType.BoolType
+                        defaultValue = false
+                    },
+                ),
             ) { entry ->
                 val sessionId = decodeRouteValue(entry.arguments?.getString("sessionKey").orEmpty())
+                val focusReply = entry.arguments?.getBoolean("focusReply") ?: false
                 val session = state.session(sessionId)
                 if (session == null) {
                     MissingSession(onBack = { navController.popBackStack() })
@@ -395,6 +400,7 @@ private fun MainNavigation(
                         onBack = { navController.popBackStack() },
                         onHealth = { navController.navigate(V2Routes.HEALTH) },
                         onTerminal = { navController.navigate(V2Routes.terminal(session.stableId)) },
+                        autoFocusReply = focusReply,
                     )
                 }
             }
@@ -424,9 +430,7 @@ private fun MainNavigation(
 @Composable
 private fun DeviceDrawer(
     state: V2UiState,
-    onDestination: (RootDestination) -> Unit,
-    onHealth: () -> Unit,
-    onNewTerminal: () -> Unit,
+    onRefresh: () -> Unit,
     onHostSelected: (String) -> Unit,
     onPairing: () -> Unit,
 ) {
@@ -472,38 +476,12 @@ private fun DeviceDrawer(
             }
             HorizontalDivider(color = TwBorder, modifier = Modifier.padding(vertical = 10.dp))
         }
-        RootDestination.entries.forEach { destination ->
-            NavigationDrawerItem(
-                label = { Text(destination.label) },
-                selected = false,
-                onClick = { onDestination(destination) },
-                icon = {
-                    Icon(
-                        when (destination) {
-                            RootDestination.INBOX -> Icons.Outlined.Inbox
-                            RootDestination.WORKSPACES -> Icons.Outlined.Workspaces
-                            RootDestination.SETTINGS -> Icons.Outlined.Settings
-                        },
-                        contentDescription = null,
-                    )
-                },
-                modifier = Modifier.padding(horizontal = 12.dp),
-            )
-        }
-        HorizontalDivider(color = TwBorder, modifier = Modifier.padding(vertical = 10.dp))
         NavigationDrawerItem(
-            label = { Text("Connection health") },
+            label = { Text("Refresh sessions") },
             selected = false,
-            onClick = onHealth,
-            icon = { Icon(Icons.Outlined.HealthAndSafety, null) },
-            modifier = Modifier.padding(horizontal = 12.dp).testTag("drawer_connection_health"),
-        )
-        NavigationDrawerItem(
-            label = { Text("New terminal") },
-            selected = false,
-            onClick = onNewTerminal,
-            icon = { Icon(Icons.Outlined.Terminal, null) },
-            modifier = Modifier.padding(horizontal = 12.dp).testTag("drawer_new_terminal"),
+            onClick = onRefresh,
+            icon = { Icon(Icons.Outlined.Refresh, null) },
+            modifier = Modifier.padding(horizontal = 12.dp).testTag("drawer_refresh"),
         )
         NavigationDrawerItem(
             label = { Text("Pair another computer") },
@@ -524,6 +502,7 @@ private fun SessionRoute(
     onBack: () -> Unit,
     onHealth: () -> Unit,
     onTerminal: () -> Unit,
+    autoFocusReply: Boolean,
 ) {
     val timelineFlow = remember(session.stableId) { viewModel.timeline(session.stableId) }
     val timeline by timelineFlow.collectAsStateWithLifecycle(initialValue = emptyList())
@@ -543,6 +522,7 @@ private fun SessionRoute(
         onOpenTerminal = onTerminal,
         onOverflowClick = { showActions = true },
         onSend = { viewModel.sendMessage(session, it) },
+        autoFocusReply = autoFocusReply,
         agentStateAvailable = state.demoMode,
         onCancelMessage = viewModel::cancelMessage,
     )
@@ -562,15 +542,14 @@ private fun SessionRoute(
                 headlineContent = { Text("Copy session identifier") },
                 leadingContent = { Icon(Icons.Outlined.Link, null) },
                 colors = ListItemDefaults.colors(containerColor = TwSurface),
-                modifier = Modifier.testTag("session_copy_id"),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        copyText(context, "Session identifier", session.stableId)
+                        showActions = false
+                    }
+                    .testTag("session_copy_id"),
             )
-            TextButton(
-                onClick = {
-                    copyText(context, "Session identifier", session.stableId)
-                    showActions = false
-                },
-                modifier = Modifier.fillMaxWidth(),
-            ) { Text("Copy", color = TwAccent) }
             HorizontalDivider(color = TwBorder)
             TextButton(
                 onClick = {

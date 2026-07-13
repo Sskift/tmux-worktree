@@ -1,31 +1,13 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   MOBILE_RELAY_HIDDEN_REFRESH_MS,
   MOBILE_RELAY_VISIBLE_REFRESH_MS,
-  buildMobileRelayLaunchCommand,
   buildMobileRelayV1PairingPayload,
   createMobileRelayAsyncCoordinator,
   deriveMobileRelayViewState,
-  shellSingleQuote,
 } from "../src/dashboard/hooks/useMobileRelayController.ts";
-
-function decodeAdbShellArguments(command: string): string[] {
-  const prefix = "adb shell ";
-  assert.ok(command.startsWith(prefix));
-  const androidCommand = execFileSync(
-    "/bin/sh",
-    ["-c", `printf %s ${command.slice(prefix.length)}`],
-    { encoding: "utf8" },
-  );
-  const encodedArguments = execFileSync(
-    "/bin/sh",
-    ["-c", `am() { printf '%s\\000' "$@"; }\n${androidCommand}`],
-  );
-  return encodedArguments.toString("utf8").split("\0").slice(0, -1);
-}
 
 const idleViewState = {
   active: false,
@@ -61,52 +43,12 @@ function commitOwner(
   return lease;
 }
 
-test("mobile relay launch command preserves configured and placeholder token forms", () => {
-  assert.deepEqual(
-    decodeAdbShellArguments(buildMobileRelayLaunchCommand({
-      relayUrl: "wss://relay.example.test",
-      hostId: "mac-admin",
-      secret: "relay-token",
-    })),
-    [
-      "start",
-      "-n",
-      "com.tmuxworktree.mobile/.V2Activity",
-      "--es",
-      "relayUrl",
-      "wss://relay.example.test",
-      "--es",
-      "hostId",
-      "mac-admin",
-      "--es",
-      "relaySecret",
-      "relay-token",
-    ],
+test("mobile relay keeps the shared secret out of generated adb commands", () => {
+  const source = readFileSync(
+    new URL("../src/dashboard/hooks/useMobileRelayController.ts", import.meta.url),
+    "utf8",
   );
-
-  assert.equal(
-    decodeAdbShellArguments(buildMobileRelayLaunchCommand({
-      relayUrl: "wss://relay.example.test/client",
-      hostId: "mac-admin",
-      secret: "",
-    })).at(-1),
-    "<TW_RELAY_SECRET>",
-  );
-  assert.equal(shellSingleQuote("value'with'quotes"), "'value'\"'\"'with'\"'\"'quotes'");
-  const hostileValue = "token!'; printf PWNED; '$HOME`id`\\end";
-  const hostileCommand = buildMobileRelayLaunchCommand({
-    relayUrl: "wss://relay.example.test",
-    hostId: "mac-admin",
-    secret: hostileValue,
-  });
-  assert.equal(
-    decodeAdbShellArguments(hostileCommand).at(-1),
-    hostileValue,
-  );
-  assert.doesNotMatch(
-    hostileCommand,
-    /--ez autoConnect|\.MainActivity/,
-  );
+  assert.doesNotMatch(source, /buildMobileRelayLaunchCommand|adb shell|copyLaunch/);
 });
 
 test("mobile relay builds an explicit WSS-only Relay v1 profile payload", () => {
@@ -132,6 +74,16 @@ test("mobile relay builds an explicit WSS-only Relay v1 profile payload", () => 
     relayUrl: "wss://relay.example.test/client",
     hostId: "mac-admin",
     secret: "token",
+  }), null);
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "wss://relay.example.test:0",
+    hostId: "mac-admin",
+    secret: "token",
+  }), null);
+  assert.equal(buildMobileRelayV1PairingPayload({
+    relayUrl: "wss://relay.example.test",
+    hostId: "mac-admin",
+    secret: "a".repeat(4_096),
   }), null);
   assert.equal(buildMobileRelayV1PairingPayload({
     relayUrl: "wss://relay.example.test",
@@ -163,7 +115,7 @@ test("mobile relay derived status follows operation and connection priority", ()
   assert.deepEqual(deriveMobileRelayViewState(idleViewState), {
     busy: false,
     indicatorStatus: "stopped",
-    statusText: "Stopped",
+    statusText: "Connector stopped",
     tokenState: "Missing",
     buttonActive: false,
   });
@@ -176,7 +128,7 @@ test("mobile relay derived status follows operation and connection priority", ()
   }), {
     busy: false,
     indicatorStatus: "starting",
-    statusText: "Reconnecting",
+    statusText: "Connector retrying",
     tokenState: "Configured",
     buttonActive: true,
   });
@@ -185,7 +137,7 @@ test("mobile relay derived status follows operation and connection priority", ()
     ...idleViewState,
     active: true,
     connected: true,
-  }).statusText, "Connected");
+  }).statusText, "Connector connected");
   assert.equal(deriveMobileRelayViewState({
     ...idleViewState,
     active: true,
@@ -197,7 +149,7 @@ test("mobile relay derived status follows operation and connection priority", ()
     loading: true,
     brokerStarting: true,
     stopping: true,
-  }).statusText, "Starting broker");
+  }).statusText, "Deploying broker");
 });
 
 test("mobile relay keeps its visibility-aware polling cadence", () => {
@@ -212,11 +164,13 @@ test("an initial Relay response preserves every draft field edited while it was 
   assert.ok(initialStatus);
 
   coordinator.markDraftEdited(owner, "relayUrl");
+  coordinator.markDraftEdited(owner, "brokerHostId");
   coordinator.markDraftEdited(owner, "hostId");
   coordinator.markDraftEdited(owner, "secret");
 
   assert.equal(coordinator.isCurrentStatusRequest(initialStatus), true);
   assert.equal(coordinator.acceptDraftSync(initialStatus, "relayUrl"), false);
+  assert.equal(coordinator.acceptDraftSync(initialStatus, "brokerHostId"), false);
   assert.equal(coordinator.acceptDraftSync(initialStatus, "hostId"), false);
   assert.equal(coordinator.acceptDraftSync(initialStatus, "secret"), false);
 });
@@ -225,6 +179,7 @@ test("a submitted Relay response only normalizes fields unchanged since submissi
   const coordinator = createMobileRelayAsyncCoordinator();
   const { lease: owner } = activateOwner(coordinator, {});
   coordinator.markDraftEdited(owner, "relayUrl");
+  coordinator.markDraftEdited(owner, "brokerHostId");
   coordinator.markDraftEdited(owner, "hostId");
   coordinator.markDraftEdited(owner, "secret");
   const submitted = coordinator.issueStatusRequest(owner, "submitted");
@@ -233,6 +188,7 @@ test("a submitted Relay response only normalizes fields unchanged since submissi
   coordinator.markDraftEdited(owner, "secret");
 
   assert.equal(coordinator.acceptDraftSync(submitted, "relayUrl"), true);
+  assert.equal(coordinator.acceptDraftSync(submitted, "brokerHostId"), true);
   assert.equal(coordinator.acceptDraftSync(submitted, "hostId"), true);
   assert.equal(coordinator.acceptDraftSync(submitted, "secret"), false);
 
@@ -241,6 +197,21 @@ test("a submitted Relay response only normalizes fields unchanged since submissi
   assert.equal(coordinator.acceptDraftSync(laterPoll, "relayUrl"), true);
   assert.equal(coordinator.acceptDraftSync(laterPoll, "hostId"), true);
   assert.equal(coordinator.acceptDraftSync(laterPoll, "secret"), false);
+});
+
+test("one-click broker setup force-syncs generated URL, token, and selected Relay center", () => {
+  const coordinator = createMobileRelayAsyncCoordinator();
+  const { lease: owner } = activateOwner(coordinator, {});
+  for (const field of ["relayUrl", "brokerHostId", "hostId", "secret"] as const) {
+    coordinator.markDraftEdited(owner, field);
+  }
+  const brokerStarted = coordinator.issueStatusRequest(owner, "brokerStarted");
+  assert.ok(brokerStarted);
+
+  assert.equal(coordinator.acceptDraftSync(brokerStarted, "relayUrl"), true);
+  assert.equal(coordinator.acceptDraftSync(brokerStarted, "brokerHostId"), true);
+  assert.equal(coordinator.acceptDraftSync(brokerStarted, "hostId"), false);
+  assert.equal(coordinator.acceptDraftSync(brokerStarted, "secret"), true);
 });
 
 test("newer Relay reads and mutations reject stale live-status publications", () => {
@@ -449,6 +420,14 @@ test("mobile relay exposes unknown and failed status instead of pretending to be
     source,
     /const saved = await saveConfig\(operation\);[\s\S]*?if \(!saved\.secret\.trim\(\)\)[\s\S]*?if \(!asyncCoordinator\.isCurrentOperation\(operation\)\) return false;\s*await dashboardBackend\.relay\.start\(\);/,
   );
+  const startBrokerStart = source.indexOf("const startBroker = useCallback");
+  const startBrokerEnd = source.indexOf("const stop = useCallback", startBrokerStart);
+  const startBrokerBlock = source.slice(startBrokerStart, startBrokerEnd);
+  assert.match(startBrokerBlock, /relay\.startBroker\(/);
+  assert.match(startBrokerBlock, /quickTunnel: true/);
+  assert.match(startBrokerBlock, /issueStatusRequest\(ownerLease, "brokerStarted"\)/);
+  assert.match(startBrokerBlock, /relay\.start\(\)/);
+  assert.match(startBrokerBlock, /checkStatus\(operation\)/);
   assert.match(source, /if \(!asyncCoordinator\.finishOperation\(operation\)\) return;/);
   assert.doesNotMatch(source, /finally\s*\{[\s\S]{0,120}set(?:Loading|Saving|BrokerStarting|Stopping)\(false\)/);
   assert.doesNotMatch(source, /function fallbackMobileRelayStatus/);

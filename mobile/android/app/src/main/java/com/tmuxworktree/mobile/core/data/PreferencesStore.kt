@@ -26,6 +26,7 @@ data class AppPreferences(
     val waitingNotifications: Boolean = true,
     val failedNotifications: Boolean = true,
     val completedNotifications: Boolean = false,
+    val darkThemeEnabled: Boolean = true,
 )
 
 class PreferencesStore(context: Context) {
@@ -48,7 +49,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun saveProfile(relayUrl: String, hostId: String, autoConnect: Boolean) {
         store.edit { preferences ->
-            preferences[Keys.relayUrl] = relayUrl.trimEnd('/')
+            preferences[Keys.relayUrl] = relayUrl.trim().removeSuffix("/")
             preferences[Keys.hostId] = hostId
             preferences[Keys.autoConnect] = autoConnect
         }
@@ -86,6 +87,10 @@ class PreferencesStore(context: Context) {
         store.edit { it[key] = enabled }
     }
 
+    suspend fun setDarkThemeEnabled(enabled: Boolean) {
+        store.edit { it[Keys.darkThemeEnabled] = enabled }
+    }
+
     suspend fun clearProfile() {
         store.edit { preferences ->
             preferences.remove(Keys.relayUrl)
@@ -104,6 +109,7 @@ class PreferencesStore(context: Context) {
         waitingNotifications = preferences[Keys.waitingNotifications] ?: true,
         failedNotifications = preferences[Keys.failedNotifications] ?: true,
         completedNotifications = preferences[Keys.completedNotifications] ?: false,
+        darkThemeEnabled = preferences[Keys.darkThemeEnabled] ?: true,
     )
 
     private object Keys {
@@ -115,6 +121,7 @@ class PreferencesStore(context: Context) {
         val waitingNotifications = booleanPreferencesKey("notify_waiting")
         val failedNotifications = booleanPreferencesKey("notify_failed")
         val completedNotifications = booleanPreferencesKey("notify_completed")
+        val darkThemeEnabled = booleanPreferencesKey("dark_theme_enabled")
     }
 }
 

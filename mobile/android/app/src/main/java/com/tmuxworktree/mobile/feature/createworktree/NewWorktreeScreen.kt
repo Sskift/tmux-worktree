@@ -392,7 +392,7 @@ private fun <T> SelectorField(
     placeholder: String,
     icon: ImageVector,
     options: List<T>,
-    optionLabel: (T) -> String,
+    optionLabel: @Composable (T) -> String,
     optionId: (T) -> String,
     optionEnabled: (T) -> Boolean,
     error: String?,

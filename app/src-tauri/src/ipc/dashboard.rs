@@ -193,6 +193,7 @@ pub(crate) struct MobileRelayStatus {
     pub(crate) connected: bool,
     pub(crate) connection_state: String,
     pub(crate) relay_url: String,
+    pub(crate) broker_host_id: String,
     pub(crate) host_id: String,
     pub(crate) secret: String,
     pub(crate) token: String,
@@ -206,6 +207,7 @@ pub(crate) struct MobileRelayStatus {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MobileRelayConfigInput {
     pub(crate) relay_url: String,
+    pub(crate) broker_host_id: String,
     pub(crate) host_id: String,
     pub(crate) secret: String,
 }
@@ -215,4 +217,5 @@ pub(crate) struct MobileRelayConfigInput {
 pub(crate) struct MobileRelayBrokerInput {
     pub(crate) host_id: String,
     pub(crate) port: Option<u16>,
+    pub(crate) quick_tunnel: Option<bool>,
 }

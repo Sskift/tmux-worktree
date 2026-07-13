@@ -277,7 +277,7 @@ test("Android V2 connection profile is editable, clearable, and never persists p
   assert.match(importer, /Legacy plaintext credential was not removed/);
   assert.match(
     viewModel,
-    /private fun connectActiveProfile[\s\S]*validatePairing\(relayUrl, token, hostId\)[\s\S]*pairingRequired = true/,
+    /private fun connectActiveProfile[\s\S]*val relayUrlError = validateRelayUrl\(relayUrl\)[\s\S]*val credentialError = PairingInputValidator\.credentialError\(token, hostId\)[\s\S]*if \(relayUrlError != null \|\| credentialError != null\)[\s\S]*pairingRequired = true/,
   );
 });
 
@@ -305,10 +305,11 @@ test("Android V2 requires confirmation and clears credential-bound data before p
   assert.ok(persistStart > cancelStart && retryStart > persistStart);
 
   // Both exported Intent/deep-link input and scanned QR data only prefill reviewable fields.
-  assert.match(intentHandler, /applyPairingPayload\(payload, connectImmediately = false\)/);
-  assert.doesNotMatch(intentHandler, /connectImmediately = true/);
-  assert.match(qrHandler, /applyPairingPayload\(payload, connectImmediately = false\)/);
-  assert.doesNotMatch(qrHandler, /connectImmediately = true/);
+  assert.match(intentHandler, /viewModel\.applyPairingPayload\(payload\)/);
+  assert.doesNotMatch(intentHandler, /connectPairing|connectImmediately|relay\.connect/);
+  assert.match(qrHandler, /viewModel\.applyPairingPayload\(payload\)/);
+  assert.doesNotMatch(qrHandler, /connectPairing|connectImmediately|relay\.connect/);
+  assert.doesNotMatch(activity, /connectImmediately/);
 
   // Any URL, host, or token change on an existing pairing stops at confirmation.
   assert.match(
@@ -316,7 +317,10 @@ test("Android V2 requires confirmation and clears credential-bound data before p
     /val existingProfile = current\.hasStoredProfile \|\| credentials\.hasCredential\(\)/,
   );
   assert.match(connectPairing, /changesExistingProfile = existingProfile && \(/);
-  assert.match(connectPairing, /current\.preferences\.relayUrl\.trimEnd\('\/'\) != relayUrl/);
+  assert.match(
+    connectPairing,
+    /PairingInputValidator\.normalizeRelayUrl\(current\.preferences\.relayUrl\) != relayUrl/,
+  );
   assert.match(connectPairing, /current\.preferences\.preferredHostId != hostId/);
   assert.match(connectPairing, /credentials\.read\(\) != token/);
   assert.match(
@@ -385,7 +389,7 @@ test("mobile relay failures stay visible on Android and in the Dashboard", () =>
   assert.match(dashboard, /useVisibilityAwarePolling\(refreshStatus/);
   assert.match(dashboard, /MOBILE_RELAY_VISIBLE_REFRESH_MS = 2_000/);
   assert.match(dashboard, /MOBILE_RELAY_HIDDEN_REFRESH_MS = 15_000/);
-  assert.match(dashboard, /connected\s*\? "Connected"/);
+  assert.match(dashboard, /connected\s*\? "Connector connected"/);
   assert.equal(backend, commands);
   assert.match(
     ipc,

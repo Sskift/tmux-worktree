@@ -66,7 +66,7 @@ Automation:
   tw automation rm <id|name>  删除 automation（别名: delete；create 别名: add/new）
 
 其它:
-  tw serve [--port N]         启动网页终端（手机可访问）
+  tw serve [--host HOST] [--port N]  启动网页终端（默认监听所有网卡）
   tw relay-server             启动实验性远程 relay 服务
   tw relay-host               连接 relay 并转发本机 tw serve
   tw setup                    安装 / 配置向导

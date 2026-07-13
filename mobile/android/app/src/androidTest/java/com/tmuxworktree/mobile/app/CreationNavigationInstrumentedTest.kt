@@ -74,7 +74,13 @@ class CreationNavigationInstrumentedTest {
                 composable(V2Routes.NEW_TERMINAL) { Box(Modifier) }
                 composable(
                     route = V2Routes.SESSION,
-                    arguments = listOf(navArgument("sessionKey") { type = NavType.StringType }),
+                    arguments = listOf(
+                        navArgument("sessionKey") { type = NavType.StringType },
+                        navArgument("focusReply") {
+                            type = NavType.BoolType
+                            defaultValue = false
+                        },
+                    ),
                 ) { Box(Modifier) }
                 composable(
                     route = V2Routes.TERMINAL,
