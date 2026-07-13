@@ -1,0 +1,196 @@
+[
+  {
+    "name": "resolve-managed-target",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-resolve-1",
+      "type": "target.resolve",
+      "sessionName": "repo-feature"
+    }
+  },
+  {
+    "name": "acquire-feishu-owner",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-acquire-1",
+      "type": "lease.acquire",
+      "controlTargetId": "target-example-1",
+      "owner": {
+        "kind": "feishu",
+        "instanceId": "feishu-binding:binding-1:daemon-1"
+      },
+      "ttlMs": 60000
+    }
+  },
+  {
+    "name": "renew-feishu-owner",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-renew-1",
+      "type": "lease.renew",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "feishu",
+          "instanceId": "feishu-binding:binding-1:daemon-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "ttlMs": 60000
+    }
+  },
+  {
+    "name": "raw-input-with-fence",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-input-1",
+      "type": "input.raw",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "relay-v1",
+          "instanceId": "relay-v1:connector-1:client-1:target-example-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "operationId": "relay-v1:stream-1:input-42",
+      "pane": "0",
+      "dataBase64": "YWJj"
+    }
+  },
+  {
+    "name": "atomic-agent-message",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-message-1",
+      "type": "input.agent-message",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "relay-v2",
+          "instanceId": "relay-v2:principal-1:client-instance-1:target-example-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "operationId": "command-id-example-1",
+      "pane": "0",
+      "message": "review the failing test",
+      "submit": true
+    }
+  },
+  {
+    "name": "graceful-local-handoff",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-handoff-1",
+      "type": "handoff.begin",
+      "controlTargetId": "target-example-1",
+      "nextOwner": {
+        "kind": "dashboard",
+        "instanceId": "dashboard:instance-1:pty-1"
+      }
+    }
+  },
+  {
+    "name": "commit-drained-handoff",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-handoff-commit-1",
+      "type": "handoff.commit",
+      "handoffId": "handoff-example-1",
+      "currentLease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "feishu",
+          "instanceId": "feishu-binding:binding-1:daemon-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "drain": {
+        "disposition": "drained",
+        "recordId": "feishu-turn-settled-1",
+        "recordedAt": "2026-07-13T00:00:30.000Z"
+      }
+    }
+  },
+  {
+    "name": "withdraw-pending-local-handoff",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-handoff-withdraw-1",
+      "type": "handoff.withdraw",
+      "controlTargetId": "target-example-1",
+      "handoffId": "handoff-example-1",
+      "nextOwner": {
+        "kind": "local-cli",
+        "instanceId": "local-cli:process-1:attach-1"
+      }
+    }
+  },
+  {
+    "name": "explicit-local-recovery",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-force-1",
+      "type": "handoff.force",
+      "controlTargetId": "target-example-1",
+      "expectedControlEpoch": "epoch-example-2",
+      "nextOwner": {
+        "kind": "local-cli",
+        "instanceId": "local-cli:recovery-process-1:attach-1"
+      },
+      "proof": {
+        "kind": "operator-acknowledged-in-doubt",
+        "recordId": "operator-recovery-record-1",
+        "recordedAt": "2026-07-13T00:00:45.000Z"
+      },
+      "acknowledgeUncertainOperation": true,
+      "ttlMs": 60000
+    }
+  },
+  {
+    "name": "managed-lifecycle-kill",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-kill-1",
+      "type": "lifecycle.kill",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+        "kind": "dashboard",
+        "instanceId": "dashboard:instance-1:pty-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "operationId": "dashboard:kill:1"
+    }
+  },
+  {
+    "name": "tail-generation-fenced-output",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-output-1",
+      "type": "output.tail",
+      "controlTargetId": "target-example-1",
+      "controlEpoch": "epoch-example-1",
+      "outputGeneration": "output-example-1",
+      "cursor": 42,
+      "maxBytes": 65536
+    }
+  }
+]

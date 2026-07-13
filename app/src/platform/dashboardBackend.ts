@@ -9,6 +9,7 @@ import type {
   PtyExitEvent,
   PtyHandlers,
   PtyOpenArgs,
+  PtyControlStatus,
 } from "./types";
 import type {
   AddHostInput,
@@ -102,6 +103,8 @@ export interface DashboardBackend {
     write(id: string, data: string): Promise<void>;
     resize(id: string, cols: number, rows: number): Promise<void>;
     kill(id: string): Promise<void>;
+    controlStatus(id: string): Promise<PtyControlStatus>;
+    requestTakeover(id: string): Promise<PtyControlStatus>;
   };
   git: {
     status(cwd: string, hostId?: HostId): Promise<GitStatus | null>;
@@ -183,6 +186,10 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
   const resizePty = (id: string, cols: number, rows: number) =>
     transport.invoke<void>("pty_resize", { id, cols, rows });
   const killPty = (id: string) => transport.invoke<void>("pty_kill", { id });
+  const ptyControlStatus = (id: string) =>
+    transport.invoke<PtyControlStatus>("pty_control_status", { id });
+  const requestPtyTakeover = (id: string) =>
+    transport.invoke<PtyControlStatus>("pty_control_takeover", { id });
 
   const connectPty = async (
     args: PtyOpenArgs,
@@ -193,6 +200,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     let opened = false;
     let exited = false;
     let abortRequested = false;
+    let mutationQueue: Promise<void> = Promise.resolve();
     let unlistenData: (() => void) | null = null;
     let unlistenExit: (() => void) | null = null;
 
@@ -203,10 +211,21 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       unlistenExit = null;
     };
 
+    const enqueueMutation = <T,>(operation: () => Promise<T>): Promise<T> => {
+      if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
+      const result = mutationQueue.then(() => {
+        if (closed || exited) throw new Error("PTY connection is closed");
+        return operation();
+      });
+      mutationQueue = result.then(() => undefined, () => undefined);
+      return result;
+    };
+
     const close = async () => {
       if (closed) return;
       closed = true;
       unsubscribe();
+      await mutationQueue;
       if (opened && !exited) await killPty(args.id).catch(() => {});
     };
 
@@ -215,7 +234,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       unsubscribe();
       if (opened) {
         closed = true;
-        if (!exited) void killPty(args.id).catch(() => {});
+        if (!exited) void mutationQueue.finally(() => killPty(args.id).catch(() => {}));
       }
     };
 
@@ -258,12 +277,17 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
           return !closed && !exited;
         },
         write: (data) => {
-          if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
-          return writePty(args.id, data);
+          return enqueueMutation(() => writePty(args.id, data));
         },
         resize: (cols, rows) => {
+          return enqueueMutation(() => resizePty(args.id, cols, rows));
+        },
+        controlStatus: () => {
           if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
-          return resizePty(args.id, cols, rows);
+          return ptyControlStatus(args.id);
+        },
+        requestTakeover: () => {
+          return enqueueMutation(() => requestPtyTakeover(args.id));
         },
         close: async () => {
           signal?.removeEventListener("abort", onAbort);
@@ -327,6 +351,8 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       write: writePty,
       resize: resizePty,
       kill: killPty,
+      controlStatus: ptyControlStatus,
+      requestTakeover: requestPtyTakeover,
     },
     git: {
       status: (cwd, hostId) =>

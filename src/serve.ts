@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { execFileSync, spawn as cpSpawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { networkInterfaces, homedir, tmpdir } from "node:os";
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   accessSync,
   chmodSync,
@@ -18,6 +18,12 @@ import {
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
+import {
+  requestTerminalControl,
+  TERMINAL_CONTROL_RENEW_INTERVAL_MS,
+  TerminalControlProtocolError,
+  type TerminalControlLease,
+} from "./terminalControl/index.js";
 
 const DEFAULT_PORT = 8311;
 const AUTH_BODY_LIMIT_BYTES = 4096;
@@ -482,6 +488,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
   var actionBar = document.getElementById("action-bar");
 
   var term = null, fitAddon = null, ws = null, ro = null, xtermLoaded = null;
+  var inputWritable = false;
   var currentSession = null;
 
   function showView(name) {
@@ -695,6 +702,7 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
 
       var proto = location.protocol === "https:" ? "wss:" : "ws:";
       ws = new WebSocket(proto + "//" + location.host + "/ws?session=" + encodeURIComponent(name) + "&pane=" + paneIndex);
+      inputWritable = true;
 
       ws.onopen = function() {
         ws.send(JSON.stringify({ type: "resize", cols: term.cols, rows: term.rows }));
@@ -707,10 +715,17 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
             term.write("\\r\\n\\x1b[2m[session exited: " + msg.code + "]\\x1b[0m\\r\\n");
             return;
           }
+          if (msg.type === "control_error") {
+            inputWritable = false;
+            inputBuffer = "";
+            term.write("\\r\\n\\x1b[33m[input read-only: " + String(msg.message || "ownership denied") + "]\\x1b[0m\\r\\n");
+            return;
+          }
         } catch(e) {}
         term.write(data);
       };
       ws.onclose = function() {
+        inputWritable = false;
         if (term) term.write("\\r\\n\\x1b[2m[disconnected]\\x1b[0m\\r\\n");
       };
 
@@ -722,14 +737,14 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
       function flushInput() {
         inputFlushTimer = null;
         if (composing) return;
-        if (inputBuffer && ws && ws.readyState === 1) {
+        if (inputWritable && inputBuffer && ws && ws.readyState === 1) {
           ws.send(inputBuffer);
           inputBuffer = "";
         }
       }
 
       term.onData(function(data) {
-        if (!ws || ws.readyState !== 1) return;
+        if (!inputWritable || !ws || ws.readyState !== 1) return;
         inputBuffer += data;
         if (!inputFlushTimer) {
           inputFlushTimer = setTimeout(flushInput, 16);
@@ -879,12 +894,13 @@ body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-are
     if (!btn) return;
     e.preventDefault();
     var seq = shortcuts[btn.id];
-    if (seq && ws && ws.readyState === 1) ws.send(seq);
+    if (seq && inputWritable && ws && ws.readyState === 1) ws.send(seq);
     focusTerminal();
   });
 
   // --- Disconnect ---
   window.disconnect = function() {
+    inputWritable = false;
     if (ws) { ws.close(); ws = null; }
     if (term) { term.dispose(); term = null; fitAddon = null; }
     if (ro) { ro.disconnect(); ro = null; }
@@ -921,7 +937,7 @@ if pid == 0:
     os.close(master)
     os.close(slave)
     os.environ['TERM'] = 'xterm-256color'
-    os.execv(tmux, [tmux, 'attach', '-f', 'ignore-size', '-t', mobile])
+    os.execv(tmux, [tmux, 'attach', '-r', '-f', 'ignore-size', '-t', mobile])
 os.close(slave)
 fl = fcntl.fcntl(master, fcntl.F_GETFL)
 fcntl.fcntl(master, fcntl.F_SETFL, fl | os.O_NONBLOCK)
@@ -993,6 +1009,8 @@ export async function run() {
       : DEFAULT_PORT;
 
   const token = serveToken();
+  const controlInstanceId = randomUUID();
+  const controlAutoStart = process.env.TW_TERMINAL_CONTROL_AUTOSTART !== "0";
   const tokenDigest = secretDigest("token", token);
   const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
   if (process.argv.includes("--remote")) {
@@ -1172,6 +1190,8 @@ export async function run() {
       socket.close(4000, "invalid pane param");
       return;
     }
+    const controlSessionName = sessionName;
+    const controlPaneIndex = paneIndex;
 
     if (activeTerminalBridges >= MAX_ACTIVE_TERMINAL_BRIDGES) {
       socket.close(4008, "terminal bridge limit reached");
@@ -1190,6 +1210,15 @@ export async function run() {
       activeTerminalBridges -= 1;
     };
     const mobileId = "tw-mobile-" + randomBytes(4).toString("hex");
+    const controlOwner = {
+      kind: "tw-serve" as const,
+      instanceId: `tw-serve:${controlInstanceId}:${mobileId}`,
+    };
+    let controlTargetId: string | undefined;
+    let inputLease: TerminalControlLease | undefined;
+    let nextControlOperation = 0;
+    let inputQueue: Promise<void> = Promise.resolve();
+    let queuedInputBytes = 0;
     let resizeDirectory = "";
     let resizeFile = "";
     let resizeFd = -1;
@@ -1235,14 +1264,38 @@ export async function run() {
     }
 
     let cleaned = false;
+    let leaseReleaseScheduled = false;
+    const leaseRenewalTimer = setInterval(() => {
+      const lease = inputLease;
+      if (cleaned || !lease) return;
+      void requestTerminalControl<{ lease: TerminalControlLease }>(
+        { type: "lease.renew", lease },
+        { autoStart: controlAutoStart },
+      ).then(
+        (renewed) => {
+          if (inputLease?.leaseId === lease.leaseId && inputLease.fence === lease.fence) {
+            inputLease = renewed.lease;
+          }
+        },
+        (error) => {
+          if (inputLease?.leaseId === lease.leaseId && inputLease.fence === lease.fence) {
+            inputLease = undefined;
+            sendControlError(error);
+          }
+        },
+      );
+    }, TERMINAL_CONTROL_RENEW_INTERVAL_MS);
+    leaseRenewalTimer.unref();
     function cleanup() {
       if (cleaned) return;
       cleaned = true;
+      clearInterval(leaseRenewalTimer);
       try { child.kill(); } catch {}
       runTmux(["kill-session", "-t", `=${mobileId}`]);
       try { closeSync(resizeFd); } catch {}
       try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
       releaseBridgeReservation();
+      scheduleInputLeaseRelease();
     }
 
     function closeForResourceLimit(reason: string) {
@@ -1268,6 +1321,107 @@ export async function run() {
       }
     }
 
+    function sendControlError(error: unknown): void {
+      const code = error instanceof TerminalControlProtocolError ? error.code : "INTERNAL";
+      sendTerminalData(JSON.stringify({
+        type: "control_error",
+        code,
+        message: error instanceof Error ? error.message : String(error),
+      }));
+    }
+
+    async function ensureInputLease(): Promise<TerminalControlLease> {
+      if (inputLease) return inputLease;
+      if (!controlTargetId) {
+        const resolved = await requestTerminalControl<{ controlTargetId: string }>(
+          { type: "target.resolve", sessionName: controlSessionName },
+          { autoStart: controlAutoStart },
+        );
+        controlTargetId = resolved.controlTargetId;
+      }
+      const acquired = await requestTerminalControl<{ lease: TerminalControlLease }>(
+        { type: "lease.acquire", controlTargetId, owner: controlOwner },
+        { autoStart: controlAutoStart },
+      );
+      inputLease = acquired.lease;
+      return inputLease;
+    }
+
+    async function releaseInputLease(): Promise<void> {
+      const lease = inputLease;
+      inputLease = undefined;
+      if (!lease) return;
+      await requestTerminalControl(
+        { type: "lease.release", lease },
+        { autoStart: controlAutoStart },
+      ).catch(() => undefined);
+    }
+
+    function scheduleInputLeaseRelease(): void {
+      if (leaseReleaseScheduled) return;
+      leaseReleaseScheduled = true;
+      void inputQueue.finally(() => releaseInputLease());
+    }
+
+    function controlLeaseMustBeRevalidated(error: unknown): boolean {
+      if (!(error instanceof TerminalControlProtocolError)) return true;
+      return error.code !== "INVALID_REQUEST" && error.code !== "RESOURCE_EXHAUSTED";
+    }
+
+    function operationId(kind: string): string {
+      nextControlOperation += 1;
+      return `tw-serve:${controlInstanceId}:${mobileId}:${kind}:${nextControlOperation}`;
+    }
+
+    function applyAttachmentResize(size: TerminalSize): void {
+      writeTerminalSize(resizeFd, size);
+      child.kill("SIGWINCH");
+    }
+
+    async function handleControlledMessage(msg: string): Promise<void> {
+      let parsed: unknown;
+      try { parsed = JSON.parse(msg) as unknown; } catch {}
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        const type = (parsed as { type?: unknown }).type;
+        if (type === "resize" || type === "attachment_resize") {
+          const size = parsedResizeMessage(parsed);
+          if (!size || cleaned) return;
+          try {
+            if (type === "resize" && inputLease) {
+              await requestTerminalControl({
+                type: "input.resize",
+                lease: inputLease,
+                operationId: operationId("resize"),
+                pane: controlPaneIndex,
+                cols: size.cols,
+                rows: size.rows,
+              }, { autoStart: controlAutoStart });
+            }
+            applyAttachmentResize(size);
+          } catch (error) {
+            if (controlLeaseMustBeRevalidated(error)) inputLease = undefined;
+            sendControlError(error);
+          }
+          return;
+        }
+      }
+      if (cleaned) return;
+      try {
+        const lease = await ensureInputLease();
+        if (cleaned) return;
+        await requestTerminalControl({
+          type: "input.raw",
+          lease,
+          operationId: operationId("input"),
+          pane: controlPaneIndex,
+          dataBase64: Buffer.from(msg, "utf8").toString("base64"),
+        }, { autoStart: controlAutoStart });
+      } catch (error) {
+        if (controlLeaseMustBeRevalidated(error)) inputLease = undefined;
+        sendControlError(error);
+      }
+    }
+
     child.stdout!.on("data", (data: Buffer) => {
       sendTerminalData(data.toString("utf-8"));
     });
@@ -1285,10 +1439,6 @@ export async function run() {
       if (exitSent && socket.readyState === socket.OPEN) socket.close();
     });
 
-    let stdinBackpressured = false;
-    child.stdin!.on("drain", () => {
-      if (!cleaned) stdinBackpressured = false;
-    });
     socket.on("message", (raw: Buffer | string) => {
       const msg = raw.toString();
       const messageBytes = Buffer.byteLength(msg, "utf8");
@@ -1296,35 +1446,20 @@ export async function run() {
         closeForResourceLimit("terminal input message limit reached");
         return;
       }
-      try {
-        const parsed = JSON.parse(msg) as unknown;
-        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { type?: unknown }).type === "resize") {
-          const size = parsedResizeMessage(parsed);
-          if (size && !cleaned) {
-            try {
-              writeTerminalSize(resizeFd, size);
-              child.kill("SIGWINCH");
-            } catch {
-              cleanup();
-              if (socket.readyState === socket.OPEN) socket.close(1011, "terminal resize failed");
-            }
-          }
-          return;
-        }
-      } catch {}
-      if (cleaned || !child.stdin!.writable) return;
-      if (
-        stdinBackpressured
-        || child.stdin!.writableLength > MAX_PENDING_STDIN_BYTES - messageBytes
-      ) {
+      if (queuedInputBytes > MAX_PENDING_STDIN_BYTES - messageBytes) {
         closeForResourceLimit("terminal input buffer limit reached");
         return;
       }
-      try {
-        stdinBackpressured = !child.stdin!.write(msg);
-      } catch {
-        cleanup();
-      }
+      queuedInputBytes += messageBytes;
+      inputQueue = inputQueue
+        .then(() => handleControlledMessage(msg))
+        .catch((error) => sendControlError(error))
+        .finally(() => {
+          // Keep a short admission window after completion so a burst of
+          // independently delivered WebSocket frames cannot evade the bounded
+          // queue merely because an immediate rejection resolves between them.
+          setTimeout(() => { queuedInputBytes -= messageBytes; }, 25);
+        });
     });
 
     socket.on("close", () => {

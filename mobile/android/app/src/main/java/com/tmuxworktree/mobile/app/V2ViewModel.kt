@@ -903,7 +903,8 @@ class V2ViewModel(
                     val inFlight = inFlightMessages.remove(event.request.requestId)
                     if (inFlight != null) {
                         val final = event.message.contains("auth", ignoreCase = true) ||
-                            event.message.contains("not found", ignoreCase = true)
+                            event.message.contains("not found", ignoreCase = true) ||
+                            event.message.startsWith("[input-ownership:", ignoreCase = true)
                         transitionOutboxSafely(
                             inFlight.commandId,
                             if (final) DeliveryState.FAILED_FINAL else DeliveryState.AMBIGUOUS,

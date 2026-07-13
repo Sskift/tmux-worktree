@@ -252,7 +252,8 @@ test("relay uses RPC lifecycle for managed kills while retaining legacy tmux fal
   assert.match(source, /await killManagedSession\(scope, rawName\)/);
   assert.match(source, /await killLegacyTmuxSession\(scope, rawName\)/);
   assert.match(source, /bestEffortUnregisterDashboardTerminal\(scope, rawName\)/);
-  assert.match(source, /killSession\(message\.session, message\.managed\)/);
+  assert.match(source, /type: "lifecycle\.kill", lease, operationId/);
+  assert.match(source, /killControlledSession\(terminalControl, clientId, message\.session, message\.managed\)/);
   assert.match(source, /flag: "wx"/);
 });
 
@@ -346,7 +347,7 @@ test("remote attach connects directly without creating a grouped mirror session"
   assert.match(command, /export TERM=xterm-256color/);
   assert.match(command, /has-session -t '=x-cloud'/);
   assert.match(command, /set-option -g mouse on/);
-  assert.match(command, /attach-session -t '=x-cloud'/);
+  assert.match(command, /attach-session -r -f ignore-size -t '=x-cloud'/);
   assert.doesNotMatch(command, /new-session/);
   assert.doesNotMatch(command, /kill-session/);
   assert.doesNotMatch(command, /tw-mobile-/);
@@ -385,13 +386,12 @@ test("relay host reopens routed streams only within the current connection and r
   assert.match(source, /streamRoutes\.set\(key, route\)/);
   assert.match(source, /isCurrentStream\(streams, key, stream\)/);
   assert.match(source, /isCurrentRoute\(streamRoutes, key, route, lease\)/);
-  assert.match(source, /reopenRoutedStream\(admissionLedger, lease, streams, streamRoutes, opts, route, message\.data\)/);
+  assert.match(source, /reopenRoutedStream\(terminalControl, admissionLedger, lease, streams, streamRoutes, opts, route, message\.data\)/);
   assert.match(source, /deactivateConnection\(lease, streams, streamRoutes\)/);
   assert.match(source, /child\.stdin\.on\("error", \(\) => \{\}\)/);
   assert.match(source, /child\.stdin\.on\("drain", \(\) => \{/);
   assert.match(source, /function finalizeStream\([\s\S]+?sendIfActive\(stream\.lease,\s*\{\s*type: "terminal_exit"/);
-  assert.match(source, /stream\.inputBackpressured = !stream\.process\.stdin\.write\(payload\)/);
-  assert.match(source, /stream\.process\.stdin\.writableLength \+ payloadBytes > MAX_REMOTE_STDIN_BUFFERED_BYTES/);
+  assert.match(source, /await writeControlledRawInput\(control, stream\.route, payload\)/);
   assert.match(source, /stream\.process\.exitCode === null/);
   assert.match(source, /stream\.process\.signalCode === null/);
   assert.doesNotMatch(source, /!stream\.process\.killed/);

@@ -4,6 +4,7 @@ use crate::features::control_plane::{
     resolve_local_tw_rpc_runtime, run_local_tw_rpc_runtime, LocalTwRpcRuntime,
 };
 use crate::features::sessions::{setup_clipboard_bindings, tmux_session_is_missing_error};
+use crate::features::{kill_managed_session_with_control, PtyState, TerminalControlState};
 use crate::ipc::{
     CreateTerminalArgs, CreatedTerminal, EnsureTerminalArgs, TwRpcCreateTerminalResponse,
 };
@@ -217,9 +218,21 @@ pub(crate) fn kill_legacy_plain_terminal(name: &str) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn kill_plain_terminal(
     app: tauri::AppHandle,
+    pty_state: tauri::State<'_, std::sync::Arc<PtyState>>,
+    control_state: tauri::State<'_, std::sync::Arc<TerminalControlState>>,
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
+    let (host_id, raw_name) = parse_session_key(&name);
+    if managed == Some(true) {
+        return kill_managed_session_with_control(
+            &app,
+            pty_state.inner().as_ref(),
+            control_state.inner().as_ref(),
+            raw_name,
+            host_id,
+        );
+    }
     kill_canonical_first(
         managed,
         || kill_managed_session_via_tw_rpc(&app, &name),

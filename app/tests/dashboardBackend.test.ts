@@ -281,6 +281,18 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.pty.kill("pty-1"),
   },
   {
+    label: "pty.controlStatus",
+    command: "pty_control_status",
+    args: { id: "pty-1" },
+    call: (backend) => backend.pty.controlStatus("pty-1"),
+  },
+  {
+    label: "pty.requestTakeover",
+    command: "pty_control_takeover",
+    args: { id: "pty-1" },
+    call: (backend) => backend.pty.requestTakeover("pty-1"),
+  },
+  {
     label: "git.status normalizes an absent host to null",
     command: "git_status",
     args: { cwd: "/repo/dashboard", hostId: null },

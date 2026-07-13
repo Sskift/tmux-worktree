@@ -8,7 +8,7 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
   const attachSource = readFileSync(new URL("../src/terminal/attach.ts", import.meta.url), "utf8");
   const terminalSource = readFileSync(new URL("../src/Terminal.tsx", import.meta.url), "utf8");
 
-  assert.match(attachSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string\): string\[\]/);
+  assert.match(attachSource, /function buildSshAttachArgs\(host: HostConfig, rawName: string, readOnly = false\): string\[\]/);
   assert.match(attachSource, /ControlMaster=auto/);
   assert.match(attachSource, /ControlPath=~\/\.tmux-worktree\/ssh\/%C/);
   assert.match(attachSource, /ServerAliveCountMax=3/);
@@ -18,10 +18,25 @@ test("ssh tmux terminals use native tmux mouse scrolling", () => {
   assert.match(attachSource, /copy-selection-and-cancel/);
   assert.match(attachSource, /MouseDragEnd1Pane/);
   assert.doesNotMatch(attachSource, /MouseDown1Pane/);
-  assert.match(attachSource, /exec \$\{tmux\} attach-session -t/);
+  assert.match(attachSource, /attach-session\$\{readOnly \? " -r -f ignore-size" : ""\} -t/);
   assert.doesNotMatch(terminalSource, /tmux_scroll/);
   assert.doesNotMatch(terminalSource, /onTmuxWheel/);
   assert.match(terminalSource, /attachCustomWheelEventHandler/);
+});
+
+test("remote managed terminals keep attachment read-only and write through the remote controller", () => {
+  const deckSource = readFileSync(new URL("../src/dashboard/TerminalDeck.tsx", import.meta.url), "utf8");
+  const attachSource = readFileSync(new URL("../src/terminal/attach.ts", import.meta.url), "utf8");
+  const rustSource = readRustSourceTree();
+
+  assert.match(attachSource, /readOnly = false/);
+  assert.match(deckSource, /controlSession=\{session\.managed \? rawName : undefined\}/);
+  assert.match(deckSource, /controlHostId=\{session\.managed \? session\.hostId : undefined\}/);
+  assert.match(deckSource, /controlSession=\{terminal\.managed \? rawName : undefined\}/);
+  assert.match(deckSource, /controlHostId=\{terminal\.managed \? terminal\.hostId : undefined\}/);
+  assert.match(rustSource, /fn send_remote\(host_id: &str, body: &Value\)/);
+  assert.match(rustSource, /run_remote_cmd_with_input\(&host, &\["sh", "-c", &command\], &frame\)/);
+  assert.match(rustSource, /command\.push_str\(" terminal-control request"\)/);
 });
 
 test("remote tmux clipboard uses local macOS clipboard commands", () => {
@@ -90,7 +105,10 @@ test("terminal subscribes to pty output before opening the pty", () => {
   assert.ok(listenDataIndex >= 0, "the PTY facade should register its output listener");
   assert.ok(listenExitIndex > listenDataIndex, "the PTY facade should register its exit listener after output");
   assert.ok(openIndex > listenExitIndex, "the PTY facade should open the pty after registering listeners");
-  assert.match(terminalSource, /dashboardBackend\.pty\.connect\(\s*\{ id, cmd, args, cwd, cols, rows \}/s);
+  assert.match(
+    terminalSource,
+    /dashboardBackend\.pty\.connect\(\s*\{[\s\S]*?id,[\s\S]*?cmd,[\s\S]*?args,[\s\S]*?cwd,[\s\S]*?cols,[\s\S]*?rows,[\s\S]*?controlSession,[\s\S]*?controlHostId:/,
+  );
   assert.match(backendSource, /transport\.invoke<string>\("pty_open", \{ args \}\)/);
   assert.match(rustSource, /id: Option<String>/);
 });

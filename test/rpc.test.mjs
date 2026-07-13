@@ -518,7 +518,7 @@ exit 0
   assert.doesNotMatch(readFileSync(tmuxLog, "utf8"), /kill-session/);
 });
 
-test("tw rm closes managed sessions through the state-aware lifecycle", () => {
+test("tw rm closes managed sessions through the state-aware lifecycle", async (t) => {
   const root = mkdtempSync(join(tmpdir(), "tw-rm-managed-state-"));
   const home = join(root, "home");
   const stateDir = join(home, ".tmux-worktree");
@@ -540,10 +540,41 @@ test("tw rm closes managed sessions through the state-aware lifecycle", () => {
 printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
 case "$1" in
   list-sessions)
-    printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n'
+    case "$3" in
+      *session_id*) printf 'tw-term-abc12\\037$0\\n' ;;
+      *) printf 'tw-term-abc12\\0370\\0371\\0371760000000\\0371760000100\\037/repo/app\\n' ;;
+    esac
     ;;
   has-session)
     exit 0
+    ;;
+  list-panes)
+    printf '0\n'
+    ;;
+  show-options)
+    if [ "$5" = '@tw_terminal_control_output_generation_v1' ]; then
+      [ -f "$TW_TEST_TMUX_LOG.output-generation" ] || exit 1
+      cat "$TW_TEST_TMUX_LOG.output-generation"
+    else
+      printf 'tmux-instance-managed-rm\n'
+    fi
+    ;;
+  set-option)
+    if [ "$4" = '@tw_terminal_control_output_generation_v1' ]; then
+      printf '%s\n' "$5" > "$TW_TEST_TMUX_LOG.output-generation"
+    fi
+    ;;
+  display-message)
+    if [ "$5" = '#{session_id}' ]; then
+      printf '$0\n'
+    elif [ -f "$TW_TEST_TMUX_LOG.output-pipe" ]; then printf '1\n'; else printf '0\n'; fi
+    ;;
+  pipe-pane)
+    if [ "$2" = '-O' ]; then
+      : > "$TW_TEST_TMUX_LOG.output-pipe"
+    else
+      rm -f "$TW_TEST_TMUX_LOG.output-pipe"
+    fi
     ;;
 esac
 exit 0
@@ -551,6 +582,25 @@ exit 0
   chmodSync(fakeTmux, 0o755);
 
   const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
+  const controlSocket = join(root, "terminal-control.sock");
+  const control = spawn(process.execPath, [cli, "terminal-control", "serve"], {
+    env: {
+      ...process.env,
+      HOME: home,
+      TW_TMUX: fakeTmux,
+      TW_TEST_TMUX_LOG: tmuxLog,
+      TW_TERMINAL_CONTROL_SOCKET: controlSocket,
+    },
+    stdio: "ignore",
+  });
+  t.after(() => {
+    if (control.exitCode === null && control.signalCode === null) control.kill("SIGTERM");
+  });
+  const deadline = Date.now() + 2_000;
+  while (!existsSync(controlSocket) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.equal(existsSync(controlSocket), true, "terminal-control test server did not start");
   const result = spawnSync(process.execPath, [cli, "rm", "tw-term-abc12"], {
     encoding: "utf8",
     env: {
@@ -558,6 +608,7 @@ exit 0
       HOME: home,
       TW_TMUX: fakeTmux,
       TW_TEST_TMUX_LOG: tmuxLog,
+      TW_TERMINAL_CONTROL_SOCKET: controlSocket,
     },
     timeout: 5_000,
   });

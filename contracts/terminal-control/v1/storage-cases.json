@@ -1,0 +1,110 @@
+{
+  "valid": [
+    {
+      "name": "free-target",
+      "value": {
+        "version": 1,
+        "controlEpoch": "epoch-example-1",
+        "targets": [
+          {
+            "controlTargetId": "target-example-1",
+            "lifecycle": "ACTIVE",
+            "managedSession": {
+              "name": "repo-feature",
+              "kind": "worktree",
+              "createdAt": "2026-07-13T00:00:00.000Z"
+            },
+            "backend": {
+              "kind": "tmux",
+              "tmuxInstanceId": "tmux-instance-example-1"
+            },
+            "outputGeneration": "output-example-1",
+            "ownership": {
+              "state": "FREE",
+              "fence": "0"
+            },
+            "revision": "1",
+            "completedOperations": [],
+            "updatedAt": "2026-07-13T00:00:00.000Z"
+          }
+        ]
+      }
+    },
+    {
+      "name": "restart-recovery-target",
+      "value": {
+        "version": 1,
+        "controlEpoch": "epoch-example-2",
+        "targets": [
+          {
+            "controlTargetId": "target-example-1",
+            "lifecycle": "RECOVERY_REQUIRED",
+            "managedSession": {
+              "name": "repo-feature",
+              "kind": "worktree",
+              "createdAt": "2026-07-13T00:00:00.000Z"
+            },
+            "backend": {
+              "kind": "tmux",
+              "tmuxInstanceId": "tmux-instance-example-1"
+            },
+            "outputGeneration": "output-example-1",
+            "ownership": {
+              "state": "FREE",
+              "fence": "8"
+            },
+            "revision": "2",
+            "recovery": {
+              "reason": "CONTROLLER_RESTARTED",
+              "since": "2026-07-13T00:01:00.000Z",
+              "previousControlEpoch": "epoch-example-1",
+              "previousOwnerKind": "feishu"
+            },
+            "completedOperations": [],
+            "updatedAt": "2026-07-13T00:01:00.000Z"
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "unknown-version",
+      "value": {
+        "version": 2,
+        "controlEpoch": "epoch-example-1",
+        "targets": []
+      }
+    },
+    {
+      "name": "numeric-fence",
+      "value": {
+        "version": 1,
+        "controlEpoch": "epoch-example-1",
+        "targets": [
+          {
+            "controlTargetId": "target-example-1",
+            "lifecycle": "ACTIVE",
+            "managedSession": {
+              "name": "repo-feature",
+              "kind": "worktree",
+              "createdAt": "2026-07-13T00:00:00.000Z"
+            },
+            "backend": {
+              "kind": "tmux",
+              "tmuxInstanceId": "tmux-instance-example-1"
+            },
+            "outputGeneration": "output-example-1",
+            "ownership": {
+              "state": "FREE",
+              "fence": 0
+            },
+            "revision": "1",
+            "completedOperations": [],
+            "updatedAt": "2026-07-13T00:00:00.000Z"
+          }
+        ]
+      }
+    }
+  ]
+}

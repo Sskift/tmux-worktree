@@ -429,6 +429,18 @@ transport.handlers.set("pty_write", (payload) => {
   }
 });
 transport.handlers.set("pty_resize", nothing);
+transport.handlers.set("pty_control_status", value({
+  controlled: false,
+  readOnly: false,
+  state: "UNCONTROLLED",
+  canTakeOver: false,
+}));
+transport.handlers.set("pty_control_takeover", value({
+  controlled: false,
+  readOnly: false,
+  state: "UNCONTROLLED",
+  canTakeOver: false,
+}));
 transport.handlers.set("pty_kill", (payload) => {
   const { id } = payload as { id: string };
   openPtys.delete(id);

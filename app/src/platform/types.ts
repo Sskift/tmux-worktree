@@ -60,6 +60,17 @@ export type PtyOpenArgs = {
   cols: number;
   rows: number;
   env?: Record<string, string>;
+  controlSession?: string;
+  controlHostId?: string;
+};
+
+export type PtyControlStatus = {
+  controlled: boolean;
+  readOnly: boolean;
+  state: "UNCONTROLLED" | "FREE" | "HELD" | "DRAINING" | "RECOVERY_REQUIRED" | "TARGET_GONE";
+  ownerKind?: "feishu" | "dashboard" | "local-cli" | "relay-v1" | "relay-v2" | "tw-serve";
+  canTakeOver: boolean;
+  message?: string;
 };
 
 export type PtyDataEvent = {
@@ -82,5 +93,7 @@ export interface PtyConnection {
   readonly active: boolean;
   write(data: string): Promise<void>;
   resize(cols: number, rows: number): Promise<void>;
+  controlStatus(): Promise<PtyControlStatus>;
+  requestTakeover(): Promise<PtyControlStatus>;
   close(): Promise<void>;
 }

@@ -124,7 +124,13 @@ function serveTokenTemporaryFiles(home) {
 }
 
 function spawnServe(port, home, token, extraEnv = {}) {
-  const env = { ...process.env, ...extraEnv, HOME: home, NODE_PATH: "" };
+  const env = {
+    ...process.env,
+    TW_TERMINAL_CONTROL_AUTOSTART: "0",
+    ...extraEnv,
+    HOME: home,
+    NODE_PATH: "",
+  };
   if (token === undefined) delete env.TW_TOKEN;
   else env.TW_TOKEN = token;
   return spawn(process.execPath, ["dist/cli.cjs", "serve", "--port", String(port)], {
@@ -401,7 +407,7 @@ if [ "$1" = "list-panes" ]; then
     printf '0\\03780\\03724\\037zsh\\037shell\\0371\\n'
   fi
 elif [ "$1" = "display-message" ]; then
-  printf '/safe/cwd\\n'
+  if [ "$5" = "#{session_id}" ]; then printf '$0\\n'; else printf '/safe/cwd\\n'; fi
 elif [ "$1" = "attach" ]; then
   sleep 30
 fi
@@ -424,6 +430,7 @@ fi
       TW_TOKEN: token,
       TW_TMUX: fakeTmux,
       TW_TMUX_LOG: tmuxLog,
+      TW_TERMINAL_CONTROL_AUTOSTART: "0",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });

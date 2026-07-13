@@ -10,6 +10,7 @@ export default defineConfig({
     "src/state.ts",
     "src/relayHost.ts",
     "src/relayServer.ts",
+    "src/terminalControl/index.ts",
   ],
   format: ["esm"],
   target: "node20",

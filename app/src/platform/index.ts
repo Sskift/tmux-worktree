@@ -6,6 +6,7 @@ export type {
   ConfirmDialogOptions,
   DirectoryDialogOptions,
   PtyConnection,
+  PtyControlStatus,
   PtyDataEvent,
   PtyExitEvent,
   PtyOpenArgs,

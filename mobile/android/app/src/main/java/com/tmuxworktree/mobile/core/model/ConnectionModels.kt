@@ -76,4 +76,5 @@ data class TerminalStreamState(
     val generation: Long = 0,
     val lastOutputSequence: Long = 0,
     val resetReason: String = "",
+    val inputReadOnly: Boolean = false,
 )

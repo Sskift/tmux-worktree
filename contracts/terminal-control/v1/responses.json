@@ -1,0 +1,76 @@
+[
+  {
+    "name": "target-resolved-free",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-resolve-1",
+      "ok": true,
+      "result": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "managedSession": {
+          "name": "repo-feature",
+          "kind": "worktree",
+          "createdAt": "2026-07-13T00:00:00.000Z"
+        },
+        "ownership": {
+          "controlTargetId": "target-example-1",
+          "controlEpoch": "epoch-example-1",
+          "state": "FREE",
+          "fence": "0",
+          "outputGeneration": "output-example-1",
+          "outputCursor": 0,
+          "revision": "1"
+        }
+      }
+    }
+  },
+  {
+    "name": "ownership-rejected",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-input-1",
+      "ok": false,
+      "error": {
+        "code": "PERMISSION_DENIED",
+        "message": "terminal input is owned by feishu",
+        "retryable": false
+      }
+    }
+  },
+  {
+    "name": "raw-input-accepted",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-input-1",
+      "ok": true,
+      "result": {
+        "operationId": "relay-v1:stream-1:input-42",
+        "accepted": true,
+        "deduplicated": false,
+        "controlEpoch": "epoch-example-1",
+        "fence": "7",
+        "outputGeneration": "output-example-1",
+        "outputCursor": 42
+      }
+    }
+  },
+  {
+    "name": "bounded-output-tail",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-output-1",
+      "ok": true,
+      "result": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "fence": "7",
+        "ownerKind": "feishu",
+        "outputGeneration": "output-example-1",
+        "cursor": 42,
+        "dataBase64": "ZG9uZVxu",
+        "nextCursor": 47
+      }
+    }
+  }
+]

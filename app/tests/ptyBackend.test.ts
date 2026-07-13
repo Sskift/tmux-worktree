@@ -330,6 +330,87 @@ test("PTY close is idempotent and closed connections reject write and resize", a
 
   await assert.rejects(connection.write("ignored"), /PTY connection is closed/);
   await assert.rejects(connection.resize(80, 24), /PTY connection is closed/);
+  await assert.rejects(connection.controlStatus(), /PTY connection is closed/);
+  await assert.rejects(connection.requestTakeover(), /PTY connection is closed/);
   assert.equal(transport.calls.some((call) => call.command === "pty_write"), false);
   assert.equal(transport.calls.some((call) => call.command === "pty_resize"), false);
+});
+
+test("PTY ownership status and takeover stay inside the typed backend", async () => {
+  const transport = new InstrumentedPtyTransport();
+  const status = {
+    controlled: true,
+    readOnly: true,
+    state: "HELD",
+    ownerKind: "feishu",
+    canTakeOver: true,
+  } as const;
+  const draining = {
+    controlled: true,
+    readOnly: true,
+    state: "DRAINING",
+    ownerKind: "feishu",
+    canTakeOver: true,
+  } as const;
+  transport.handlers.set("pty_open", () => ptyArgs.id);
+  transport.handlers.set("pty_control_status", () => status);
+  transport.handlers.set("pty_control_takeover", () => draining);
+  const backend = createDashboardBackend(transport);
+  const connection = await backend.pty.connect(ptyArgs, {
+    onData: () => {},
+    onExit: () => {},
+  });
+
+  assert.deepEqual(await connection.controlStatus(), status);
+  assert.deepEqual(await connection.requestTakeover(), draining);
+  assert.deepEqual(
+    transport.calls.filter(({ command }) => command.startsWith("pty_control_")),
+    [
+      { command: "pty_control_status", args: { id: ptyArgs.id } },
+      { command: "pty_control_takeover", args: { id: ptyArgs.id } },
+    ],
+  );
+  await connection.close();
+});
+
+test("PTY input, resize, and takeover share one FIFO mutation lane", async () => {
+  const transport = new InstrumentedPtyTransport();
+  const firstWrite = deferred<void>();
+  transport.handlers.set("pty_open", () => ptyArgs.id);
+  transport.handlers.set("pty_write", async (payload) => {
+    if ((payload as { data: string }).data === "first") await firstWrite.promise;
+  });
+  transport.handlers.set("pty_resize", () => undefined);
+  transport.handlers.set("pty_control_takeover", () => ({
+    controlled: true,
+    readOnly: true,
+    state: "DRAINING",
+    ownerKind: "feishu",
+    canTakeOver: false,
+  }));
+  const backend = createDashboardBackend(transport);
+  const connection = await backend.pty.connect(ptyArgs, {
+    onData: () => {},
+    onExit: () => {},
+  });
+
+  const first = connection.write("first");
+  const second = connection.write("second");
+  const resize = connection.resize(100, 35);
+  const takeover = connection.requestTakeover();
+  await waitUntil(() => transport.calls.some(({ command }) => command === "pty_write"));
+  assert.deepEqual(
+    transport.calls.filter(({ command }) => command !== "pty_open"),
+    [{ command: "pty_write", args: { id: ptyArgs.id, data: "first" } }],
+  );
+
+  firstWrite.resolve();
+  await Promise.all([first, second, resize, takeover]);
+  assert.deepEqual(
+    transport.calls
+      .filter(({ command }) => command !== "pty_open")
+      .map(({ command }) => command),
+    ["pty_write", "pty_write", "pty_resize", "pty_control_takeover"],
+  );
+  await connection.close();
 });

@@ -376,6 +376,7 @@ class RelayV1ConnectionActor(
                         status = ConnectionStatus.RECOVERING,
                         generation = active?.generation ?: _terminal.value.generation,
                         resetReason = "connection restarting",
+                        inputReadOnly = active?.inputReadOnly ?: _terminal.value.inputReadOnly,
                     )
                 } else {
                     desiredTerminal = null
@@ -406,6 +407,7 @@ class RelayV1ConnectionActor(
                         status = ConnectionStatus.PAUSED,
                         generation = active?.generation ?: _terminal.value.generation,
                         resetReason = "waiting for network",
+                        inputReadOnly = active?.inputReadOnly ?: _terminal.value.inputReadOnly,
                     )
                 } else {
                     streams.state(ConnectionStatus.OFFLINE)
@@ -440,8 +442,10 @@ class RelayV1ConnectionActor(
                 resetDisplay = action.resetDisplay,
             )
             is Action.TerminalInput -> terminalInputNow(action.data)
-            is Action.ResizeTerminal -> streams.current()?.let {
-                sendNow(RelayV1Command.Resize(it.streamId, action.cols, action.rows))
+            is Action.ResizeTerminal -> if (!_terminal.value.inputReadOnly) {
+                streams.current()?.let {
+                    sendNow(RelayV1Command.Resize(it.streamId, action.cols, action.rows))
+                }
             }
             Action.CloseTerminal -> closeTerminalNow()
             is Action.SocketOpened -> socketOpened(action)
@@ -634,6 +638,7 @@ class RelayV1ConnectionActor(
                 status = ConnectionStatus.RECOVERING,
                 generation = active?.generation ?: _terminal.value.generation,
                 resetReason = reason,
+                inputReadOnly = active?.inputReadOnly ?: _terminal.value.inputReadOnly,
             )
         }
     }
@@ -886,6 +891,7 @@ class RelayV1ConnectionActor(
             status = ConnectionStatus.OFFLINE,
             generation = active.generation,
             resetReason = "stream closed",
+            inputReadOnly = active.inputReadOnly,
         )
         emit(RelayClientEvent.TerminalExit(active.streamId, event.code))
     }
@@ -906,6 +912,15 @@ class RelayV1ConnectionActor(
         }
         if (!event.streamId.isNullOrEmpty() && !streams.accepts(event.streamId)) return
         val normalized = event.message.lowercase()
+        val ownershipRejected = normalized.startsWith("[input-ownership:")
+        if (ownershipRejected && streams.accepts(event.streamId)) {
+            streams.markInputReadOnly(event.streamId!!)
+            _terminal.value = streams.state(_terminal.value.status).copy(
+                resetReason = event.message,
+            )
+            emit(RelayClientEvent.Error(event.message, resolution?.context, event.streamId))
+            return
+        }
         val recoverable = normalized.contains("terminal stream is not open") ||
             normalized.contains("terminal stream closed") ||
             normalized.contains("host reconnected")
@@ -921,6 +936,7 @@ class RelayV1ConnectionActor(
                 status = ConnectionStatus.RECOVERING,
                 generation = active.generation,
                 resetReason = event.message,
+                inputReadOnly = active.inputReadOnly,
             )
             emit(RelayClientEvent.TerminalReconnecting(active.hostId, active.sessionName, event.message))
             scope.launch {
@@ -947,7 +963,17 @@ class RelayV1ConnectionActor(
         }
         desiredTerminal = DesiredTerminal(hostId, sessionName, pane)
         pendingReopenGeneration = null
-        val stream = streams.open(streamId, hostId, sessionName, pane)
+        val targetSessionId = "$hostId:$sessionName"
+        val preserveOwnershipReadOnly = !resetDisplay &&
+            _terminal.value.sessionId == targetSessionId &&
+            _terminal.value.inputReadOnly
+        val stream = streams.open(
+            streamId,
+            hostId,
+            sessionName,
+            pane,
+            inputReadOnly = preserveOwnershipReadOnly,
+        )
         _terminal.value = streams.state(ConnectionStatus.RECOVERING).copy(
             resetReason = if (resetDisplay) "opening" else "reopening",
         )
@@ -961,6 +987,7 @@ class RelayV1ConnectionActor(
                 status = ConnectionStatus.RECOVERING,
                 generation = stream.generation,
                 resetReason = "relay offline",
+                inputReadOnly = stream.inputReadOnly,
             )
         } else {
             scheduleTerminalOpenTimeout(transport.epoch, stream)
@@ -980,6 +1007,7 @@ class RelayV1ConnectionActor(
     }
 
     private fun terminalInputNow(data: String) {
+        if (_terminal.value.inputReadOnly) return
         var active = streams.current()
         if (active == null) {
             val desired = desiredTerminal ?: return
@@ -1064,6 +1092,7 @@ class RelayV1ConnectionActor(
             status = ConnectionStatus.UNKNOWN,
             generation = active.generation,
             resetReason = message,
+            inputReadOnly = active.inputReadOnly,
         )
         emit(RelayClientEvent.Error(message = message, streamId = active.streamId))
     }

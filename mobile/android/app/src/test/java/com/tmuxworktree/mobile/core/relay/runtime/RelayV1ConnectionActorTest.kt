@@ -179,6 +179,66 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
+    fun `ownership rejection makes terminal read only and never replays later input`() = runBlocking {
+        val terminalInputs = CopyOnWriteArrayList<String>()
+        val resizeCount = AtomicInteger(0)
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    webSocket.send("{\"type\":\"ready\",\"clientId\":\"client-1\"}")
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val payload = TinyJson.parseObject(text)
+                    when (payload.string("type")) {
+                        "open_terminal" -> webSocket.send(
+                            "{\"type\":\"terminal_data\",\"streamId\":\"${payload.string("streamId")}\",\"data\":\"ready\"}",
+                        )
+                        "terminal_input" -> {
+                            terminalInputs += payload.string("data")
+                            webSocket.send(
+                                "{\"type\":\"error\",\"streamId\":\"${payload.string("streamId")}\",\"message\":\"[input-ownership:PERMISSION_DENIED] terminal input is owned by feishu\"}",
+                            )
+                            webSocket.send(
+                                "{\"type\":\"terminal_data\",\"streamId\":\"${payload.string("streamId")}\",\"data\":\"still observing\"}",
+                            )
+                        }
+                        "resize" -> resizeCount.incrementAndGet()
+                    }
+                }
+            }),
+        )
+        server.start()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(scope)
+        try {
+            actor.connect(
+                RelayV1ConnectionConfig(
+                    server.url("/relay").toString().replaceFirst("http://", "ws://"),
+                    "token",
+                ),
+            )
+            withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.ONLINE } }
+            actor.openTerminal("mac-admin", "local:owned")
+            withTimeout(5_000) { actor.terminal.first { it.status.name == "ONLINE" } }
+            actor.sendTerminalInput("first")
+            withTimeout(5_000) { actor.terminal.first { it.inputReadOnly } }
+            delay(100)
+            assertTrue(actor.terminal.value.inputReadOnly)
+            actor.sendTerminalInput("must-not-replay")
+            actor.resizeTerminal(100, 40)
+            delay(150)
+            assertEquals(listOf("first"), terminalInputs.toList())
+            assertEquals(0, resizeCount.get())
+        } finally {
+            actor.close()
+            scope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
     fun `terminal output is batched in order and flushed before exit`() = runBlocking {
         val commands = CopyOnWriteArrayList<String>()
         val server = MockWebServer()

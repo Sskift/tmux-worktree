@@ -1,0 +1,30 @@
+{
+  "contract": "tmux-worktree-local-terminal-control",
+  "version": 1,
+  "status": "active",
+  "transport": "permission-protected-local-unix-domain-socket",
+  "encoding": "utf-8-json-lines",
+  "schema": "closed",
+  "files": [
+    {
+      "kind": "request-fixtures",
+      "path": "requests.json"
+    },
+    {
+      "kind": "response-fixtures",
+      "path": "responses.json"
+    },
+    {
+      "kind": "storage-fixtures",
+      "path": "storage-cases.json"
+    }
+  ],
+  "notes": [
+    "This local contract is independent from tw-rpc v1 and Relay v1/v2.",
+    "controlTargetId, controlEpoch, leaseId and fence are terminal-control namespace values.",
+    "Input adapters MUST NOT query status and then write a backend themselves; input operations execute inside the authority critical section.",
+    "Leases are liveness-bounded and must be renewed; expiry and controller restart enter RECOVERY_REQUIRED rather than FREE.",
+    "output.tail is a read-only observation capability. Its controlEpoch and outputGeneration fence late Feishu markers without granting input ownership.",
+    "handoff.commit is the durable transfer point and requires a persisted drain disposition."
+  ]
+}

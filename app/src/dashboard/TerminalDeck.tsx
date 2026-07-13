@@ -79,9 +79,12 @@ export function TerminalDeck({
           if (isRemote && !host) return null;
           const rawName = session.rawName ?? name;
           const command = isRemote && host ? "ssh" : "tmux";
+          const controlled = session?.managed === true;
           const args = isRemote && host
-            ? buildSshAttachArgs(host, rawName)
-            : ["attach-session", "-t", rawName];
+            ? buildSshAttachArgs(host, rawName, controlled)
+            : controlled
+              ? ["attach-session", "-r", "-f", "ignore-size", "-t", rawName]
+              : ["attach-session", "-t", rawName];
           return (
             <div
               key={`s:${name}`}
@@ -107,6 +110,8 @@ export function TerminalDeck({
                 }
                 tmuxSession={name}
                 hostId={session?.hostId ?? null}
+                controlSession={session.managed ? rawName : undefined}
+                controlHostId={session.managed ? session.hostId : undefined}
                 initialHistory={tmuxPreviews[name]}
                 onOpenFile={onOpenFile}
               />
@@ -138,8 +143,10 @@ export function TerminalDeck({
                 cmd={terminal.hostId ? "ssh" : "tmux"}
                 args={
                   terminal.hostId && remoteHost
-                    ? buildSshAttachArgs(remoteHost, rawName)
-                    : ["attach-session", "-t", terminal.tmuxName]
+                    ? buildSshAttachArgs(remoteHost, rawName, terminal.managed === true)
+                    : terminal.managed === true
+                      ? ["attach-session", "-r", "-f", "ignore-size", "-t", terminal.tmuxName]
+                      : ["attach-session", "-t", terminal.tmuxName]
                 }
                 cwd={terminal.hostId ? undefined : terminal.cwd}
                 linkCwd={terminal.cwd}
@@ -151,6 +158,8 @@ export function TerminalDeck({
                 }
                 tmuxSession={sessionKey}
                 hostId={terminal.hostId ?? null}
+                controlSession={terminal.managed ? rawName : undefined}
+                controlHostId={terminal.managed ? terminal.hostId : undefined}
                 initialHistory={tmuxPreviews[sessionKey]}
                 onOpenFile={onOpenFile}
               />

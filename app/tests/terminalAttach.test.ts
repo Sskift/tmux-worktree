@@ -63,6 +63,10 @@ test("SSH attach argv preserves options, separator, target, and remote command o
       'exec "$HOME/.local/bin/tmux" attach-session -t \'=repo\'\\\'\'s\'',
     ].join("; "),
   ]);
+  assert.match(
+    buildSshAttachArgs(host, "repo's", true).at(-1) ?? "",
+    /attach-session -r -f ignore-size -t/,
+  );
 });
 
 test("SSH shell argv uses the same connection facade and an exact login-shell command", () => {

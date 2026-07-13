@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Terminal as XTerm, type ILinkProvider, type ILink } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { useDashboardBackend } from "./platform";
-import type { DashboardBackend, PtyConnection, TmuxStatusTheme } from "./platform";
+import type { DashboardBackend, PtyConnection, PtyControlStatus, TmuxStatusTheme } from "./platform";
 import {
   THEME_CHANGED_EVENT,
   getCurrentPalette,
@@ -31,6 +31,8 @@ type Props = {
   active?: boolean;
   tmuxSession?: string;
   hostId?: string | null;
+  controlSession?: string;
+  controlHostId?: string | null;
   initialHistory?: string;
   onOpenFile?: (path: string, line?: number, col?: number, hostId?: string | null) => void;
 };
@@ -277,17 +279,31 @@ function canTerminalClaimFocus(host: HTMLElement | null): boolean {
   );
 }
 
-export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, hostId, initialHistory, onOpenFile }: Props) {
+export function Terminal({
+  cmd,
+  args,
+  cwd,
+  linkCwd,
+  active = true,
+  tmuxSession,
+  hostId,
+  controlSession,
+  controlHostId,
+  initialHistory,
+  onOpenFile,
+}: Props) {
   const dashboardBackend = useDashboardBackend();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const termRef = useRef<XTerm | null>(null);
+  const ptyConnectionRef = useRef<PtyConnection | null>(null);
   const initialHistoryRef = useRef<string | undefined>(initialHistory);
   const activeRef = useRef(active);
   const linkCwdRef = useRef(linkCwd ?? cwd);
   const onOpenFileRef = useRef(onOpenFile);
   const remoteReconnectAttemptRef = useRef(0);
   const [reconnectSeq, setReconnectSeq] = useState(0);
+  const [controlStatus, setControlStatus] = useState<PtyControlStatus | null>(null);
   linkCwdRef.current = linkCwd ?? cwd;
   onOpenFileRef.current = onOpenFile;
 
@@ -306,6 +322,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     const ptyAbort = new AbortController();
     let reconnectTimer: number | null = null;
     let reconnectStabilityTimer: number | null = null;
+    let controlStatusTimer: number | null = null;
     let remoteRetryAvailable = false;
     let cancelled = false;
 
@@ -538,7 +555,16 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
         const id = createPtyId();
 
         ptyConnection = await dashboardBackend.pty.connect(
-          { id, cmd, args, cwd, cols, rows },
+          {
+            id,
+            cmd,
+            args,
+            cwd,
+            cols,
+            rows,
+            controlSession,
+            controlHostId: controlHostId ?? undefined,
+          },
           {
             onData: (event) => {
               if (cancelled) return;
@@ -622,10 +648,27 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
           await ptyConnection.close().catch(() => {});
           return;
         }
+        ptyConnectionRef.current = ptyConnection;
         ptyId = ptyConnection.active ? id : null;
+        if (ptyId && controlSession) {
+          const pollControlStatus = async () => {
+            if (cancelled || !ptyConnection?.active) return;
+            try {
+              setControlStatus(await ptyConnection.controlStatus());
+            } catch {}
+            if (!cancelled && ptyConnection?.active) {
+              controlStatusTimer = window.setTimeout(pollControlStatus, 1_000);
+            }
+          };
+          void pollControlStatus();
+        }
 
         term.onData((data) => {
-          if (ptyId) ptyConnection?.write(data).catch(() => {});
+          if (ptyId) {
+            ptyConnection?.write(data).catch(() => {
+              ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
+            });
+          }
         });
         term.onResize(({ cols, rows }) => {
           if (ptyId) ptyConnection?.resize(cols, rows).catch(() => {});
@@ -650,6 +693,7 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       ptyAbort.abort();
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (reconnectStabilityTimer !== null) window.clearTimeout(reconnectStabilityTimer);
+      if (controlStatusTimer !== null) window.clearTimeout(controlStatusTimer);
       ro.disconnect();
       host.removeEventListener("mousedown", onLinkMouseDown, true);
       host.removeEventListener("mouseup", onLinkMouseUp, true);
@@ -657,12 +701,14 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       void ptyConnection?.close();
+      if (ptyConnectionRef.current === ptyConnection) ptyConnectionRef.current = null;
       ptyId = null;
+      setControlStatus(null);
       term.dispose();
       termRef.current = null;
       fitRef.current = null;
     };
-  }, [cmd, args.join("\x1f"), cwd, tmuxSession, hostId, reconnectSeq]);
+  }, [cmd, args.join("\x1f"), cwd, tmuxSession, hostId, controlSession, controlHostId, reconnectSeq]);
 
   useEffect(() => {
     activeRef.current = active;
@@ -691,5 +737,27 @@ export function Terminal({ cmd, args, cwd, linkCwd, active = true, tmuxSession, 
     return () => cancelAnimationFrame(animationFrame);
   }, [active, tmuxSession]);
 
-  return <div ref={hostRef} className="term" />;
+  const requestTakeover = () => {
+    const connection = ptyConnectionRef.current;
+    if (!connection) return;
+    connection.requestTakeover().then(setControlStatus).catch(() => {});
+  };
+
+  return (
+    <div className="term-shell">
+      <div ref={hostRef} className="term" />
+      {controlStatus?.controlled && controlStatus.readOnly && (
+        <div className="term-control-banner" role="status" data-terminal-control-state={controlStatus.state}>
+          <span>
+            {controlStatus.state === "DRAINING"
+              ? `Waiting for ${controlStatus.ownerKind ?? "the current owner"} to finish local handoff…`
+              : `Read-only · input owned by ${controlStatus.ownerKind ?? "another controller"}`}
+          </span>
+          {controlStatus.canTakeOver && (
+            <button type="button" onClick={requestTakeover}>Take over locally</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
 }

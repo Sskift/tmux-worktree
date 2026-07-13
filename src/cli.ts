@@ -69,6 +69,7 @@ Automation:
   tw serve [--port N]         启动网页终端（手机可访问）
   tw relay-server             启动实验性远程 relay 服务
   tw relay-host               连接 relay 并转发本机 tw serve
+  tw terminal-control ...     运行 / 查询本机 terminal input ownership authority
   tw setup                    安装 / 配置向导
   tw doctor                   检查 tmux/git/node 与配置是否就绪
   tw update                   更新 tw CLI 和 tw-dashboard
@@ -125,6 +126,11 @@ async function main() {
     case "relay-host": {
       const { run } = await import("./relayHost.js");
       await run();
+      return;
+    }
+    case "terminal-control": {
+      const { terminalControlCmd } = await import("./terminalControl/cli.js");
+      await terminalControlCmd(process.argv.slice(3));
       return;
     }
     case "setup": {

@@ -31,7 +31,7 @@ export function sharedSshConnectionArgs(): string[] {
 }
 
 /** Build SSH attach args for a remote session. */
-export function buildSshAttachArgs(host: HostConfig, rawName: string): string[] {
+export function buildSshAttachArgs(host: HostConfig, rawName: string, readOnly = false): string[] {
   const args: string[] = ["-tt", ...sharedSshConnectionArgs()];
   if (host.port) {
     args.push("-p", String(host.port));
@@ -55,7 +55,7 @@ export function buildSshAttachArgs(host: HostConfig, rawName: string): string[] 
       `${tmux} set-option -g mouse on >/dev/null 2>&1 || true`,
       `${tmux} bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
       `${tmux} bind-key -T copy-mode MouseDragEnd1Pane send-keys -X copy-selection-and-cancel >/dev/null 2>&1 || true`,
-      `exec ${tmux} attach-session -t ${exactArg}`,
+      `exec ${tmux} attach-session${readOnly ? " -r -f ignore-size" : ""} -t ${exactArg}`,
     ].join("; "),
   );
   return args;

@@ -46,6 +46,8 @@ const expectedTauriCommands = [
   "pty_write",
   "pty_resize",
   "pty_kill",
+  "pty_control_status",
+  "pty_control_takeover",
   "read_dir",
   "read_file",
   "write_file",
@@ -343,7 +345,7 @@ function rustReferencesFeature(source: string, feature: string): boolean {
   return new RegExp(`\\b${escaped}\\b`).test(masked);
 }
 
-test("tauri exposes exactly the frozen 69 dashboard commands", () => {
+test("tauri exposes exactly the frozen 70 dashboard commands", () => {
   const rust = readTauriCompositionSource();
   const handlerBlocks = [...rust.matchAll(/tauri::generate_handler!\[([\s\S]*?)\]/g)];
 
@@ -354,12 +356,12 @@ test("tauri exposes exactly the frozen 69 dashboard commands", () => {
     .filter(Boolean)
     .map(leafName);
 
-  assert.equal(commands.length, 69);
+  assert.equal(commands.length, 70);
   assert.deepEqual(commands, expectedTauriCommands);
   assert.equal(new Set(commands).size, commands.length, "Tauri commands must not be registered twice");
 });
 
-test("tauri composition owns the four long-lived states and exit cleanup", () => {
+test("tauri composition owns the five long-lived states and exit cleanup", () => {
   const rust = readTauriCompositionSource();
   const managedStates = [...rust.matchAll(
     /app\.manage\(\s*Arc::new\(\s*([A-Za-z_][A-Za-z0-9_:]*)::default\(\)\s*\)\s*\)/g,
@@ -369,14 +371,17 @@ test("tauri composition owns the four long-lived states and exit cleanup", () =>
     [...managedStates].sort(),
     ["PtyState", "MobileRelayState", "GitFetchState", "HostState"].sort(),
   );
-  assert.equal(new Set(managedStates).size, 4, "each long-lived state must have one owner");
+  assert.match(rust, /app\.manage\(Arc::new\(TerminalControlState::new\(\)\)\);/);
+  assert.equal(new Set(managedStates).size, 4, "each Default long-lived state must have one owner");
   assert.match(rust, /setup_clipboard_bindings\(\);/);
   assert.match(rust, /restore_window_layout\(&app\.handle\(\)\);/);
   assert.match(rust, /\.build\(tauri::generate_context!\(\)\)/);
   assert.match(
     rust,
-    /tauri::RunEvent::ExitRequested \{ \.\. \} \| tauri::RunEvent::Exit => \{\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*cleanup_pending_worktrees\(\);\s*let relay_state = app\.state::<Arc<(?:[A-Za-z_][A-Za-z0-9_]*::)*MobileRelayState>>\(\);\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*stop_mobile_relay_processes\(relay_state\.inner\(\)\.as_ref\(\)\);\s*\}/s,
+    /tauri::RunEvent::ExitRequested \{ \.\. \} \| tauri::RunEvent::Exit => \{\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*cleanup_pending_worktrees\(\);\s*let relay_state = app\.state::<Arc<(?:[A-Za-z_][A-Za-z0-9_]*::)*MobileRelayState>>\(\);\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*stop_mobile_relay_processes\(relay_state\.inner\(\)\.as_ref\(\)\);/s,
   );
+  assert.doesNotMatch(rust, /stop_terminal_control_process/);
+  assert.match(rust, /Dashboard must not fence every other/);
 });
 
 test("tauri production composition stays thin and initializes the environment first", () => {

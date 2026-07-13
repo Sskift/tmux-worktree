@@ -6,6 +6,8 @@
 
 当前仓库的 Dashboard、relay-server、relay-host 和 Android 客户端仍只实现 Relay v1。本文定义后续 v2 实现边界；任何一端都不得仅凭本文存在而发布 v2 capability、生成 v2 配对二维码或把 v1 credential 当作 v2 credential。
 
+非规范性 companion：[`terminal-input-ownership-alignment.md`](terminal-input-ownership-alignment.md) 记录 Feishu Bridge、Dashboard、本地 CLI 与 Relay 共同操作同一 managed terminal 时的本地输入所有权对齐。该说明不修改本首版 frozen wire、六项 requiredCapabilities、任何 closed schema 或本契约错误表；本首版 adapter 在独立 local terminal-control authority 拒绝写入时使用错误表中既有的 `PERMISSION_DENIED`。未来的 `input.ownership.observe.v1` 是独立、可协商的 capability extension，不属于本首版契约。
+
 不在本版：Agent 入站时间线、通知、附件、跨 relay-host 进程的终端续传、host event replay log。
 
 本文中的 MUST、MUST NOT、SHOULD 按规范性词语理解。所有 UUID/ULID 示例均为不透明值，不允许客户端解析其结构。

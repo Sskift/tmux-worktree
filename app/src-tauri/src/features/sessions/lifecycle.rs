@@ -3,6 +3,7 @@ use crate::config::find_host;
 use crate::features::control_plane::{
     kill_canonical_first, kill_managed_session_via_tw_rpc, parse_session_key,
 };
+use crate::features::{kill_managed_session_with_control, PtyState, TerminalControlState};
 use crate::remote::{run_remote_tmux_check, run_remote_tmux_output};
 use crate::support::{run_check, run_quiet, tmux_bin};
 
@@ -49,9 +50,21 @@ pub(crate) fn kill_legacy_session(name: &str) -> Result<(), String> {
 #[tauri::command]
 pub(crate) fn kill_session(
     app: tauri::AppHandle,
+    pty_state: tauri::State<'_, std::sync::Arc<PtyState>>,
+    control_state: tauri::State<'_, std::sync::Arc<TerminalControlState>>,
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
+    let (host_id, raw_name) = parse_session_key(&name);
+    if managed == Some(true) {
+        return kill_managed_session_with_control(
+            &app,
+            pty_state.inner().as_ref(),
+            control_state.inner().as_ref(),
+            raw_name,
+            host_id,
+        );
+    }
     kill_canonical_first(
         managed,
         || kill_managed_session_via_tw_rpc(&app, &name),

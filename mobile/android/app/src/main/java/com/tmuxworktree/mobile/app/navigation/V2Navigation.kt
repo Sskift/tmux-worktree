@@ -834,10 +834,12 @@ private fun TerminalRoute(
     onBack: () -> Unit,
     onHealth: () -> Unit,
 ) {
-    var readOnly by rememberSaveable(session.stableId) { mutableStateOf(false) }
+    var userReadOnly by rememberSaveable(session.stableId) { mutableStateOf(false) }
     var keyboardVisible by rememberSaveable(session.stableId) { mutableStateOf(true) }
     var fontSize by rememberSaveable(session.stableId) { mutableIntStateOf(14) }
     val connectionStatus = state.terminal.status
+    val ownershipReadOnly = state.terminal.inputReadOnly
+    val readOnly = userReadOnly || ownershipReadOnly
 
     LaunchedEffect(session.stableId) { viewModel.openTerminal(session) }
     LaunchedEffect(readOnly) { controller.setReadOnly(readOnly) }
@@ -862,7 +864,7 @@ private fun TerminalRoute(
         },
         onDecreaseFont = { fontSize = (fontSize - 1).coerceAtLeast(10) },
         onIncreaseFont = { fontSize = (fontSize + 1).coerceAtMost(24) },
-        onToggleReadOnly = { readOnly = !readOnly },
+        onToggleReadOnly = { if (!ownershipReadOnly) userReadOnly = !userReadOnly },
         terminalContent = {
             TerminalWebView(
                 controller = controller,

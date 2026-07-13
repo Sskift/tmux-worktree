@@ -1,4 +1,5 @@
 import { existsSync, realpathSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 import {
@@ -21,6 +22,10 @@ import {
 } from "./tmux";
 import { defaultWorktreeBase, loadConfigFile, type Config } from "./config";
 import { buildRpcKillSessionResponse } from "./rpc";
+import { runControlledAttach } from "./terminalControl/attach";
+import { requestTerminalControl } from "./terminalControl/client";
+import type { TerminalControlLease } from "./terminalControl/protocol";
+import { loadManagedStateForMutation } from "./state";
 
 // ============================================
 // commands.ts — tw 的会话 / worktree / 诊断 命令族
@@ -142,6 +147,8 @@ export async function listCmd(): Promise<void> {
 // ============================================
 export async function attachCmd(args: string[]): Promise<void> {
   const [name] = positional(args);
+  const privilegedBypass = hasFlag(args, "--privileged-bypass");
+  const takeover = hasFlag(args, "--take-over");
   if (!name) {
     throw new CliError("用法: tw attach <session>\n可用: " + sessionNamesHint());
   }
@@ -149,13 +156,28 @@ export async function attachCmd(args: string[]): Promise<void> {
     throw new CliError(`session 不存在: ${name}\n可用: ${sessionNamesHint()}`);
   }
   const tmux = tmuxBin();
-  if (insideTmux()) {
-    exec(tmux, ["switch-client", "-t", name]);
-  } else {
-    // attach 是交互式、可能持续很久：用无超时的 spawnSync，把 TTY 交给 tmux
-    const code = execInteractive(tmux, ["attach", "-t", name]);
-    process.exitCode = code;
+  const managed = loadManagedStateForMutation().sessions.filter((session) => session.name === name);
+  if (managed.length === 0) {
+    console.error(C.yellow("警告: legacy/unmanaged session 不受 TW input ownership lease 保护。"));
+    if (insideTmux()) exec(tmux, ["switch-client", "-t", name]);
+    else process.exitCode = execInteractive(tmux, ["attach", "-t", name]);
+    return;
   }
+  if (managed.length !== 1) {
+    throw new CliError(`managed state 中存在重名 session，拒绝 attach: ${name}`);
+  }
+  if (privilegedBypass) {
+    console.error(C.yellow("警告: --privileged-bypass 不受 TW input ownership lease 保护。"));
+    if (insideTmux()) exec(tmux, ["switch-client", "-t", name]);
+    else process.exitCode = execInteractive(tmux, ["attach", "-t", name]);
+    return;
+  }
+  if (insideTmux()) {
+    throw new CliError(
+      "受控 attach 不能从现有 tmux client 执行；请在 tmux 外运行，或明确使用 --privileged-bypass。",
+    );
+  }
+  process.exitCode = await runControlledAttach({ sessionName: name, tmuxBin: tmux, takeover });
 }
 
 function sessionNamesHint(): string {
@@ -201,14 +223,46 @@ export async function rmSessionCmd(args: string[]): Promise<void> {
     }
   }
 
-  try {
-    buildRpcKillSessionResponse({ name });
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    if (!detail.startsWith("session is not TW-managed:")) throw error;
-    // Explicit legacy compatibility: sessions absent from valid managed state
-    // may still be closed, but mutation failures/corruption never authorize it.
-    exec(tmuxBin(), ["kill-session", "-t", `=${name}`]);
+  const managedMatches = loadManagedStateForMutation().sessions.filter((session) => session.name === name);
+  if (managedMatches.length === 1) {
+    const owner = {
+      kind: "local-cli" as const,
+      instanceId: `local-cli:${process.pid}:lifecycle:${randomUUID()}`,
+    };
+    const resolved = await requestTerminalControl<{ controlTargetId: string }>({
+      type: "target.resolve",
+      sessionName: name,
+    });
+    const acquired = await requestTerminalControl<{ lease: TerminalControlLease }>({
+      type: "lease.acquire",
+      controlTargetId: resolved.controlTargetId,
+      owner,
+    });
+    let killed = false;
+    try {
+      await requestTerminalControl({
+        type: "lifecycle.kill",
+        lease: acquired.lease,
+        operationId: `local-cli:lifecycle-kill:${randomUUID()}`,
+      });
+      killed = true;
+    } finally {
+      if (!killed) {
+        await requestTerminalControl({ type: "lease.release", lease: acquired.lease }).catch(() => undefined);
+      }
+    }
+  } else if (managedMatches.length > 1) {
+    throw new CliError(`managed state 中存在重名 session，拒绝删除: ${name}`);
+  } else {
+    try {
+      buildRpcKillSessionResponse({ name });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (!detail.startsWith("session is not TW-managed:")) throw error;
+      // Explicit legacy compatibility: sessions absent from valid managed state
+      // may still be closed, but mutation failures/corruption never authorize it.
+      exec(tmuxBin(), ["kill-session", "-t", `=${name}`]);
+    }
   }
   console.log(C.green(`✓ 已杀掉 session ${name}`));
 

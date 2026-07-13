@@ -18,6 +18,8 @@ import { WebSocket, WebSocketServer } from "ws";
 
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
+const terminalControlApi = await import("../dist/terminalControl/index.js");
+
 const CLIENT_ID = "lifecycle-client";
 const STREAM_ID = "lifecycle-stream";
 
@@ -67,17 +69,59 @@ function safeGateName(session) {
 function writeFakeTmux(root) {
   const path = join(root, "fake-tmux.cjs");
   writeFileSync(path, `#!${process.execPath}
-const { appendFileSync, existsSync, writeFileSync } = require("node:fs");
+const { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 const { spawn } = require("node:child_process");
 
 const args = process.argv.slice(2);
 const targetIndex = args.indexOf("-t");
 const target = targetIndex >= 0 ? String(args[targetIndex + 1] || "") : "";
-const session = target.replace(/^=/, "");
+const session = target.replace(/^=/, "").split(":.")[0];
 const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
 appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session }) + "\\n");
+if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
+  let managed = [];
+  try {
+    managed = JSON.parse(readFileSync(join(process.env.HOME, ".tmux-worktree", "state.json"), "utf8")).sessions || [];
+  } catch {}
+  managed.forEach((entry, index) => {
+    process.stdout.write(String(entry.name) + "\\u001f$" + String(index) + "\\n");
+  });
+  process.exit(0);
+}
+if (args[0] === "show-options" && args.at(-1) === "@tw_terminal_control_output_generation_v1") {
+  const option = join(gateDir, key + ".output-generation");
+  if (!existsSync(option)) process.exit(1);
+  process.stdout.write(readFileSync(option, "utf8"));
+  process.exit(0);
+}
+if (args[0] === "set-option" && args.includes("@tw_terminal_control_output_generation_v1")) {
+  writeFileSync(join(gateDir, key + ".output-generation"), String(args.at(-1)) + "\\n");
+  process.exit(0);
+}
+if (args[0] === "display-message" && args.at(-1) === "#{session_id}") {
+  process.stdout.write("$0\\n");
+  process.exit(0);
+}
+if (args[0] === "display-message" && args.at(-1) === "#{pane_pipe}") {
+  process.stdout.write(existsSync(join(gateDir, key + ".output-pipe")) ? "1\\n" : "0\\n");
+  process.exit(0);
+}
+if (args[0] === "pipe-pane") {
+  const active = join(gateDir, key + ".output-pipe");
+  if (args.includes("-O")) writeFileSync(active, "1\\n");
+  else rmSync(active, { force: true });
+  process.exit(0);
+}
+if (args[0] === "show-options") {
+  process.stdout.write("tmux-instance-" + key + "\\n");
+  process.exit(0);
+}
+if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}") {
+  process.stdout.write("0\\n");
+  process.exit(0);
+}
 if (args[0] === "load-buffer" && existsSync(join(gateDir, "close-load-buffer-stdin"))) {
   process.exit(0);
 }
@@ -193,6 +237,58 @@ function writeFakeSshOnlyPath(root) {
   const ssh = join(bin, "ssh");
   writeFileSync(ssh, `#!${process.execPath}
 const command = process.argv.slice(2).join(" ");
+if (command.includes("terminal-control") && command.includes("request")) {
+  const { appendFileSync, existsSync, readFileSync, writeFileSync } = require("node:fs");
+  const { join } = require("node:path");
+  const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
+  const statePath = join(gateDir, "remote-terminal-control.json");
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
+  process.stdin.on("end", () => {
+    const request = JSON.parse(input.trim());
+    let state = existsSync(statePath)
+      ? JSON.parse(readFileSync(statePath, "utf8"))
+      : { epoch: "remote-epoch", leases: {} };
+    let result;
+    if (request.type === "target.resolve") {
+      result = { controlTargetId: "remote-target-" + request.sessionName, controlEpoch: state.epoch };
+    } else if (request.type === "lease.acquire") {
+      const lease = state.leases[request.controlTargetId] || {
+        controlTargetId: request.controlTargetId,
+        controlEpoch: state.epoch,
+        leaseId: "remote-lease-" + request.controlTargetId,
+        fence: "1",
+        owner: request.owner,
+        expiresAt: "2099-01-01T00:00:00.000Z",
+      };
+      state.leases[request.controlTargetId] = lease;
+      writeFileSync(statePath, JSON.stringify(state));
+      result = { lease };
+    } else if (request.type === "lease.renew") {
+      const lease = state.leases[request.lease.controlTargetId];
+      if (!lease) throw new Error("remote lease missing");
+      result = { lease };
+    } else if (request.type === "lease.release") {
+      delete state.leases[request.lease.controlTargetId];
+      writeFileSync(statePath, JSON.stringify(state));
+      result = { state: "FREE" };
+    } else if (request.type.startsWith("input.")) {
+      appendFileSync(join(gateDir, "remote-control-inputs.ndjson"), JSON.stringify(request) + "\\n");
+      result = { operationId: request.operationId, accepted: true, deduplicated: false };
+    } else {
+      process.stdout.write(JSON.stringify({
+        protocolVersion: 1,
+        requestId: request.requestId,
+        ok: false,
+        error: { code: "INVALID_REQUEST", message: "unsupported fake request", retryable: false },
+      }) + "\\n");
+      process.exit(0);
+    }
+    process.stdout.write(JSON.stringify({ protocolVersion: 1, requestId: request.requestId, ok: true, result }) + "\\n");
+  });
+  process.stdin.resume();
+  return;
+}
 if (command.includes("list-panes")) {
   process.stdout.write("0\\x1f1\\n");
   process.exit(0);
@@ -250,6 +346,51 @@ async function startHarness(t, {
       ? [{ id: "remote", label: "remote", host: "remote.invalid" }]
       : [],
   }));
+  const twHome = join(root, ".tmux-worktree");
+  mkdirSync(twHome);
+  const managedSessions = new Map();
+  const writeManagedState = () => {
+    writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
+      version: 1,
+      sessions: [...managedSessions.values()],
+    }, null, 2)}\n`, { mode: 0o600 });
+  };
+  writeManagedState();
+  const registerManagedSession = (name) => {
+    if (!name || managedSessions.has(name)) return;
+    managedSessions.set(name, {
+      name,
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: root,
+      createdAt: "2026-07-13T00:00:00.000Z",
+    });
+    writeManagedState();
+  };
+  const terminalControlSocket = join(tmpdir(), `tw-control-${root.split("/").at(-1)}.sock`);
+  const terminalControl = spawn(process.execPath, [
+    "dist/cli.cjs",
+    "terminal-control",
+    "serve",
+  ], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      HOME: root,
+      TW_TMUX: fakeTmux,
+      TW_DASHBOARD_CLI: fakeTw,
+      TW_TEST_TMUX_GATE_DIR: gateDir,
+      TW_TERMINAL_CONTROL_SOCKET: terminalControlSocket,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let terminalControlOutput = "";
+  terminalControl.stdout.on("data", (chunk) => { terminalControlOutput += chunk.toString("utf8"); });
+  terminalControl.stderr.on("data", (chunk) => { terminalControlOutput += chunk.toString("utf8"); });
+  await waitFor(
+    () => existsSync(terminalControlSocket),
+    `terminal-control did not become ready; output:\n${terminalControlOutput}`,
+  );
   const statusFile = withStatusFile ? join(root, "relay-status.json") : undefined;
   const brokerConnections = [];
   const brokerMessages = [];
@@ -301,6 +442,8 @@ async function startHarness(t, {
       TW_TMUX: fakeTmux,
       TW_DASHBOARD_CLI: fakeTw,
       TW_TEST_TMUX_GATE_DIR: gateDir,
+      TW_TERMINAL_CONTROL_SOCKET: terminalControlSocket,
+      TW_TERMINAL_CONTROL_CLI: join(process.cwd(), "dist/cli.cjs"),
       PATH: isolatedPath,
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -316,6 +459,9 @@ async function startHarness(t, {
     local,
     child,
     statusFile,
+    registerManagedSession,
+    terminalControl,
+    terminalControlSocket,
     brokerConnections,
     brokerMessages,
     localConnections,
@@ -324,6 +470,8 @@ async function startHarness(t, {
 
   t.after(async () => {
     await stopChild(child);
+    await stopChild(terminalControl);
+    rmSync(terminalControlSocket, { force: true });
     await closeWebSocketServer(local.server);
     await closeWebSocketServer(broker.server);
     rmSync(root, { recursive: true, force: true });
@@ -350,6 +498,9 @@ function sendToHost(harness, message) {
 }
 
 function sendToHostAs(harness, clientId, message) {
+  if (typeof message.session === "string" && message.session.startsWith("local:")) {
+    harness.registerManagedSession(message.session.slice("local:".length));
+  }
   currentBrokerSocket(harness).send(JSON.stringify({ clientId, ...message }));
 }
 
@@ -522,15 +673,15 @@ test("local agent submit preserves raw text and handles empty messages without a
   const sendCalls = calls.filter(({ args }) => args[0] === "load-buffer");
   assert.equal(sendCalls.length, 1);
   const buffer = sendCalls[0].args[2];
-  assert.match(buffer, /^tw-relay-\d+-\d+$/);
+  assert.match(buffer, /^tw-control-\d+-[0-9a-f-]+$/);
   assert.deepEqual(sendCalls[0].args, [
     "load-buffer", "-b", buffer, "-",
-    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", "=agent-submit:.0",
-    ";", "send-keys", "-t", "=agent-submit:.0", "C-m",
+    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", "$0:.0",
+    ";", "send-keys", "-t", "$0:.0", "C-m",
   ]);
   const emptySubmitCalls = calls.filter(({ args }) => args[0] === "send-keys");
   assert.deepEqual(emptySubmitCalls.map(({ args }) => args), [[
-    "send-keys", "-t", "=agent-submit:.0", "C-m",
+    "send-keys", "-t", "$0:.0", "C-m",
   ]]);
   const inputs = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
     .trim()
@@ -556,6 +707,91 @@ test("local agent submit preserves raw text and handles empty messages without a
   assert.equal(harness.brokerMessages.some(({ message }) => (
     message.type === "agent_message_sent" && message.requestId === "agent-stdin-epipe"
   )), false);
+});
+
+test("Relay v1 stays read-only while Feishu owns input and never replays rejected writes", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "feishu-owned");
+  const observer = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "feishu-owned"),
+    "observer stream did not open",
+  );
+  const requestControl = (input) => terminalControlApi.requestTerminalControl(input, {
+    socketPath: harness.terminalControlSocket,
+    autoStart: false,
+  });
+  const target = await requestControl({ type: "target.resolve", sessionName: "feishu-owned" });
+  const held = await requestControl({
+    type: "lease.acquire",
+    controlTargetId: target.controlTargetId,
+    owner: { kind: "feishu", instanceId: "feishu-binding:test-binding:test-daemon" },
+  });
+  const before = harness.brokerMessages.length;
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "owned-agent-message",
+    session: "local:feishu-owned",
+    pane: 0,
+    message: "must-not-write",
+    submit: true,
+  });
+  sendToHost(harness, {
+    type: "terminal_input",
+    streamId: STREAM_ID,
+    data: "must-not-write-raw",
+  });
+  sendToHost(harness, {
+    type: "resize",
+    streamId: STREAM_ID,
+    cols: 120,
+    rows: 40,
+  });
+  await waitFor(
+    () => {
+      const errors = harness.brokerMessages.slice(before)
+        .map(({ message }) => message)
+        .filter(({ type }) => type === "error");
+      return errors.some(({ requestId }) => requestId === "owned-agent-message")
+        && errors.filter(({ streamId }) => streamId === STREAM_ID).length >= 2;
+    },
+    `ownership errors were not correlated on the frozen v1 wire; output:\n${harness.output()}`,
+  );
+  assert.equal(
+    harness.brokerMessages.slice(before).some(({ message }) => (
+      message.type === "agent_message_sent" && message.requestId === "owned-agent-message"
+    )),
+    false,
+  );
+  const callsBeforeRelease = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(callsBeforeRelease.some(({ args }) => args[0] === "load-buffer"), false);
+  assert.equal(callsBeforeRelease.some(({ args }) => args[0] === "resize-window"), false);
+
+  observer.socket.send("output-still-readable");
+  await waitFor(
+    () => harness.brokerMessages.slice(before).some(({ message }) => (
+      message.type === "terminal_data"
+      && message.streamId === STREAM_ID
+      && message.data.includes("output-still-readable")
+    )),
+    "ownership denial incorrectly closed the observer stream",
+  );
+
+  await requestControl({ type: "lease.release", lease: held.lease });
+  await delay(100);
+  assert.equal(existsSync(join(harness.gateDir, "tmux-inputs.ndjson")), false);
+  sendToHost(harness, {
+    type: "terminal_input",
+    streamId: STREAM_ID,
+    data: "new-explicit-input",
+  });
+  await waitFor(
+    () => existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("new-explicit-input"),
+    "new explicit v1 input did not acquire ownership after Feishu released it",
+  );
+  const written = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8");
+  assert.equal(written.includes("must-not-write"), false);
 });
 
 test("pending input overflow finalizes a blocked opening without resurrection", async (t) => {
@@ -928,44 +1164,49 @@ test("rejecting a same-key replacement retires its previous generation once", as
   await assertNoAdditionalLocalConnection(harness, 1);
 });
 
-test("slow local backend input overflow finalizes once and cannot reopen", async (t) => {
+test("local input bypasses the observer socket and remains on the controlled backend path", async (t) => {
   const harness = await startHarness(t);
   openTerminal(harness, "slow-local-input");
   const transport = await waitFor(
     () => harness.localConnections.find(({ session }) => session === "slow-local-input"),
     "slow local backend did not open",
   );
-  transport.socket._socket.pause();
   const beforeBurst = harness.brokerMessages.length;
-  const chunk = "s".repeat(128 * 1024);
-
-  for (let index = 0; index < 96; index += 1) {
-    sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: chunk });
-    if (index % 4 === 3) {
-      await delay(0);
-      if (harness.brokerMessages.slice(beforeBurst).some(({ message }) => (
-        message.type === "terminal_exit" && message.streamId === STREAM_ID
-      ))) break;
-    }
-  }
+  const chunk = "controlled-input";
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: chunk });
   await waitFor(
-    () => {
-      const messages = harness.brokerMessages.slice(beforeBurst).map(({ message }) => message);
-      return messages.some(({ type, streamId }) => type === "error" && streamId === STREAM_ID)
-        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
-    },
-    "slow local backend did not trip input backpressure",
+    () => existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes(chunk),
+    "controller did not write input to the tmux backend",
   );
-  const exits = harness.brokerMessages
+  assert.equal(transport.received.includes(chunk), false);
+  const lifecycleFailures = harness.brokerMessages
     .slice(beforeBurst)
     .map(({ message }) => message)
-    .filter(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
-  assert.equal(exits.length, 1);
+    .filter(({ type, streamId }) => streamId === STREAM_ID && (type === "error" || type === "terminal_exit"));
+  assert.deepEqual(lifecycleFailures, []);
+});
 
-  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "must-not-reopen" });
-  await assertNoAdditionalLocalConnection(harness, 1);
-  transport.socket._socket.resume();
-  transport.socket.terminate();
+test("closing one observer route does not release another route's shared client ownership", async (t) => {
+  const harness = await startHarness(t);
+  openTerminalAs(harness, CLIENT_ID, "shared-target", "shared-stream-a");
+  openTerminalAs(harness, CLIENT_ID, "shared-target", "shared-stream-b");
+  await waitFor(
+    () => harness.localConnections.filter(({ session }) => session === "shared-target").length === 2,
+    "both observer routes did not open",
+  );
+  sendToHost(harness, { type: "terminal_input", streamId: "shared-stream-a", data: "first-route" });
+  await waitFor(
+    () => existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("first-route"),
+    "the first route did not acquire controlled input",
+  );
+  sendToHost(harness, { type: "close_terminal", streamId: "shared-stream-a" });
+  sendToHost(harness, { type: "terminal_input", streamId: "shared-stream-b", data: "second-route" });
+  await waitFor(
+    () => readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("second-route"),
+    "closing the first observer fenced the still-live route",
+  );
 });
 
 test("remote resize signals do not make the following terminal input look closed", async (t) => {
@@ -983,13 +1224,17 @@ test("remote resize signals do not make the following terminal input look closed
   sendToHost(harness, { type: "resize", streamId: STREAM_ID, cols: 120, rows: 40 });
   sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "after-resize" });
   await waitFor(
-    () => harness.brokerMessages.slice(beforeInput).some(({ message }) => (
-      message.type === "terminal_data"
-      && message.streamId === STREAM_ID
-      && message.data.includes("after-resize")
-    )),
-    "remote input was not delivered after SIGWINCH",
+    () => existsSync(join(harness.gateDir, "remote-control-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
+        .trim().split("\n").filter(Boolean).length >= 2,
+    "remote input and resize did not pass through terminal-control",
   );
+  const controlled = readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
+    .trim().split("\n").map((line) => JSON.parse(line));
+  assert.ok(controlled.some(({ type, cols, rows }) => type === "input.resize" && cols === 120 && rows === 40));
+  assert.ok(controlled.some(({ type, dataBase64 }) => (
+    type === "input.raw" && Buffer.from(dataBase64, "base64").toString("utf8") === "after-resize"
+  )));
   const lifecycleFailures = harness.brokerMessages
     .slice(beforeInput)
     .map(({ message }) => message)
@@ -1168,9 +1413,11 @@ test("late data and finalization from an old transport cannot affect its replace
   oldTransport.socket.terminate();
   sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "input-for-b" });
   await waitFor(
-    () => replacement.received.includes("input-for-b"),
+    () => existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("input-for-b"),
     "old transport finalization removed or replaced the current stream",
   );
+  assert.equal(replacement.received.includes("input-for-b"), false);
 });
 
 test("route-only close prevents later input and resize from reopening a terminal", async (t) => {
@@ -1224,9 +1471,11 @@ test("a failed managed kill preserves the live route and transport", async (t) =
 
   sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "after-failed-kill" });
   await waitFor(
-    () => transport.received.includes("after-failed-kill"),
+    () => existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("after-failed-kill"),
     "failed kill removed the route or transport",
   );
+  assert.equal(transport.received.includes("after-failed-kill"), false);
 });
 
 test("a successful kill finalizes every client stream exactly once and retires all routes", async (t) => {

@@ -23,6 +23,15 @@ import {
   type RelaySession,
   type RelayToHostMessage,
 } from "./relayProtocol.js";
+import {
+  requestTerminalControl,
+  TERMINAL_CONTROL_RENEW_INTERVAL_MS,
+  TERMINAL_CONTROL_PROTOCOL_VERSION,
+  TerminalControlProtocolError,
+  type TerminalControlLease,
+  type TerminalControlRequest,
+  type TerminalControlRequestInput,
+} from "./terminalControl/index.js";
 
 type RelayHostOptions = {
   relay: string;
@@ -138,6 +147,24 @@ type StreamRoute = {
   scope: AdminScope;
   rawName: string;
   pane?: string | number;
+};
+
+type RelayControlLeaseRecord = {
+  key: string;
+  scope: AdminScope;
+  rawName: string;
+  clientId: string;
+  lease: TerminalControlLease;
+  renewing?: Promise<void>;
+};
+
+type RelayTerminalControl = {
+  connectorId: string;
+  accepting: boolean;
+  closedClients: Set<string>;
+  leases: Map<string, RelayControlLeaseRecord>;
+  lanes: Map<string, Promise<void>>;
+  nextOperation: number;
 };
 
 export type PlainTerminal = {
@@ -260,7 +287,6 @@ const RELAY_SOCKET_CLOSE_GRACE_MS = 1_000;
 const RELAY_SHUTDOWN_FORCE_CLOSE_MS = 5 * 60_000;
 const MAX_COMMAND_OUTPUT_BYTES = 1 * 1024 * 1024;
 const commandAbortContext = new AsyncLocalStorage<CommandExecutionContext>();
-let nextAgentBufferId = 1;
 
 function commandExecOptions(timeout: number): CommandExecOptions {
   const context = commandAbortContext.getStore();
@@ -1920,37 +1946,89 @@ function failCurrentStream(
   });
 }
 
-function flushPendingInputs(
+async function writeControlledRawInput(
+  control: RelayTerminalControl,
+  route: StreamRoute,
+  data: string,
+): Promise<void> {
+  await controlledRelayInput(
+    control,
+    route.clientId,
+    route.scope,
+    route.rawName,
+    async (lease, operationId) => {
+      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
+      return {
+        type: "input.raw",
+        lease,
+        operationId,
+        pane: paneIndex,
+        dataBase64: Buffer.from(data, "utf8").toString("base64"),
+      };
+    },
+    `stream:${route.streamId}:input`,
+  );
+}
+
+async function writeControlledResize(
+  control: RelayTerminalControl,
+  route: StreamRoute,
+  cols: number,
+  rows: number,
+): Promise<void> {
+  await controlledRelayInput(
+    control,
+    route.clientId,
+    route.scope,
+    route.rawName,
+    async (lease, operationId) => {
+      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
+      return {
+        type: "input.resize",
+        lease,
+        operationId,
+        pane: paneIndex,
+        cols,
+        rows,
+      };
+    },
+    `stream:${route.streamId}:resize`,
+  );
+}
+
+function sendRelayControlError(stream: LocalStream, error: unknown): void {
+  sendIfActive(stream.lease, {
+    type: "error",
+    clientId: stream.clientId,
+    streamId: stream.streamId,
+    message: relayV1ErrorMessage(error),
+  });
+}
+
+async function flushPendingInputs(
+  control: RelayTerminalControl,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
   key: string,
   stream: LocalStream,
-): boolean {
+): Promise<boolean> {
   const pending = stream.pending.splice(0);
   stream.pendingBytes = 0;
   for (const payload of pending) {
-    const result = sendToStream(stream, payload);
-    if (result === "sent" || result === "queued") continue;
-    failCurrentStream(
-      streams,
-      routes,
-      key,
-      stream,
-      result === "overloaded"
-        ? "terminal input buffer limit reached"
-        : "terminal stream closed while flushing input",
-    );
-    return false;
+    if (!isCurrentStream(streams, key, stream) || !isCurrentRoute(routes, key, stream.route, stream.lease)) {
+      return false;
+    }
+    try {
+      await writeControlledRawInput(control, stream.route, payload);
+    } catch (error) {
+      sendRelayControlError(stream, error);
+    }
   }
   return true;
 }
 
 function isBenignSshCloseNotice(data: string): boolean {
   return /^Connection to .+ closed\.\s*$/.test(data.trim());
-}
-
-function normalizeAgentMessage(message: string): string {
-  return message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
 }
 
 function scopeForSession(key: string): { scope: AdminScope; rawName: string } {
@@ -1978,62 +2056,248 @@ async function resolvePaneIndex(scope: AdminScope, rawName: string, pane: string
   return panes.find((item) => item.active)?.index || panes[0]?.index || requested || "0";
 }
 
-async function sendAgentMessage(session: string, pane: string | number | undefined, message: string, submit: boolean): Promise<void> {
-  const { scope, rawName } = scopeForSession(session);
-  const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-  const target = `=${rawName}:.${paneIndex}`;
-  const normalized = normalizeAgentMessage(message);
-  if (normalized.length === 0) {
-    if (!submit) return;
-    if (scope.kind === "local") {
-      await execFileTracked(
-        localTmuxBin(scope),
-        ["send-keys", "-t", target, "C-m"],
-        boundedCommandExecOptions(5000),
-      );
-      return;
-    }
-    await sshOutput(
-      scope.host!,
-      `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`,
-    );
-    return;
-  }
-  const buffer = `tw-relay-${process.pid}-${nextAgentBufferId++}`;
+function relayControlLeaseKey(clientId: string, scope: AdminScope, rawName: string): string {
+  return `${clientId}\x1f${scope.id}\x1f${rawName}`;
+}
+
+function runRelayControlLane<T>(
+  control: RelayTerminalControl,
+  key: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = control.lanes.get(key) ?? Promise.resolve();
+  const running = previous.catch(() => undefined).then(operation);
+  const settled = running.then(() => undefined, () => undefined);
+  control.lanes.set(key, settled);
+  void settled.then(() => {
+    if (control.lanes.get(key) === settled) control.lanes.delete(key);
+  });
+  return running;
+}
+
+function requestWithEnvelope(input: TerminalControlRequestInput): TerminalControlRequest {
+  return {
+    ...input,
+    protocolVersion: TERMINAL_CONTROL_PROTOCOL_VERSION,
+    requestId: randomUUID(),
+  } as TerminalControlRequest;
+}
+
+async function requestScopedTerminalControl<T>(
+  scope: AdminScope,
+  input: TerminalControlRequestInput,
+): Promise<T> {
   if (scope.kind === "local") {
-    const args = [
-      "load-buffer", "-b", buffer, "-",
-      ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", target,
-    ];
-    if (submit) args.push(";", "send-keys", "-t", target, "C-m");
+    return requestTerminalControl<T>(input);
+  }
+  const request = requestWithEnvelope(input);
+  const command = `TW_TMUX=${shQuote(scope.tmuxPath || "tmux")} ${remoteTw(scope, ["terminal-control", "request"])}`;
+  const stdout = await sshOutput(scope.host!, command, 15_000, {
+    input: `${JSON.stringify(request)}\n`,
+  });
+  let response: unknown;
+  try {
+    response = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`remote terminal-control returned invalid JSON: ${errorDetail(error)}`);
+  }
+  if (!isRecord(response) || response.protocolVersion !== TERMINAL_CONTROL_PROTOCOL_VERSION || response.requestId !== request.requestId) {
+    throw new Error("remote terminal-control returned an invalid response envelope");
+  }
+  if (response.ok === false && isRecord(response.error)) {
+    throw new TerminalControlProtocolError(
+      typeof response.error.code === "string" ? response.error.code as never : "INTERNAL",
+      typeof response.error.message === "string" ? response.error.message : "remote terminal-control rejected the operation",
+      response.error.retryable === true,
+    );
+  }
+  if (response.ok !== true || !Object.hasOwn(response, "result")) {
+    throw new Error("remote terminal-control returned an invalid result envelope");
+  }
+  return response.result as T;
+}
+
+async function relayControlLease(
+  control: RelayTerminalControl,
+  clientId: string,
+  scope: AdminScope,
+  rawName: string,
+): Promise<TerminalControlLease> {
+  const key = relayControlLeaseKey(clientId, scope, rawName);
+  const cached = control.leases.get(key);
+  if (cached) return cached.lease;
+  const target = await requestScopedTerminalControl<{
+    controlTargetId: string;
+    controlEpoch: string;
+  }>(scope, { type: "target.resolve", sessionName: rawName });
+  const acquired = await requestScopedTerminalControl<{ lease: TerminalControlLease }>(scope, {
+    type: "lease.acquire",
+    controlTargetId: target.controlTargetId,
+    owner: {
+      kind: "relay-v1",
+      instanceId: `relay-v1:${control.connectorId}:${clientId}:${target.controlTargetId}`,
+    },
+  });
+  const record = { key, scope, rawName, clientId, lease: acquired.lease };
+  control.leases.set(key, record);
+  return record.lease;
+}
+
+function nextRelayControlOperation(
+  control: RelayTerminalControl,
+  clientId: string,
+  lane: string,
+): string {
+  control.nextOperation += 1;
+  return `relay-v1:${control.connectorId}:${clientId}:${lane}:${control.nextOperation}`;
+}
+
+function forgetRelayControlLease(
+  control: RelayTerminalControl,
+  clientId: string,
+  scope: AdminScope,
+  rawName: string,
+): void {
+  control.leases.delete(relayControlLeaseKey(clientId, scope, rawName));
+}
+
+function shouldForgetControlLease(error: unknown): boolean {
+  if (!(error instanceof TerminalControlProtocolError)) return true;
+  return error.code !== "INVALID_REQUEST" && error.code !== "RESOURCE_EXHAUSTED";
+}
+
+function relayV1ErrorMessage(error: unknown): string {
+  if (
+    error instanceof TerminalControlProtocolError
+    && ["PERMISSION_DENIED", "HANDOFF_PENDING", "TARGET_GONE", "RECOVERY_REQUIRED"].includes(error.code)
+  ) {
+    return `[input-ownership:${error.code}] ${error.message}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function controlledRelayInput<T>(
+  control: RelayTerminalControl,
+  clientId: string,
+  scope: AdminScope,
+  rawName: string,
+  input: (
+    lease: TerminalControlLease,
+    operationId: string,
+  ) => TerminalControlRequestInput | Promise<TerminalControlRequestInput>,
+  lane: string,
+): Promise<T> {
+  const key = relayControlLeaseKey(clientId, scope, rawName);
+  return runRelayControlLane(control, key, async () => {
+    if (!control.accepting || control.closedClients.has(clientId)) {
+      throw new Error("relay client closed before terminal input was accepted");
+    }
+    const lease = await relayControlLease(control, clientId, scope, rawName);
+    const operationId = nextRelayControlOperation(control, clientId, lane);
+    const request = await input(lease, operationId);
+    if (!control.accepting || control.closedClients.has(clientId)) {
+      throw new Error("relay client closed before terminal input was accepted");
+    }
     try {
-      await execFileTracked(
-        localTmuxBin(scope),
-        args,
-        { ...boundedCommandExecOptions(5000), input: normalized },
-      );
+      return await requestScopedTerminalControl<T>(scope, request);
     } catch (error) {
-      await execFileTracked(
-        localTmuxBin(scope),
-        ["delete-buffer", "-b", buffer],
-        boundedCommandExecOptions(5000),
-      ).catch(() => undefined);
+      if (shouldForgetControlLease(error)) {
+        forgetRelayControlLease(control, clientId, scope, rawName);
+      }
       throw error;
     }
-    return;
-  }
+  });
+}
 
-  const command = `${remoteTmux(scope)} load-buffer -b ${shQuote(buffer)} -`
-    + ` \\; paste-buffer -b ${shQuote(buffer)} -d -r -t ${shQuote(target)}`
-    + (submit ? ` \\; send-keys -t ${shQuote(target)} C-m` : "");
-  try {
-    await sshOutput(scope.host!, command, 8_000, { input: normalized });
-  } catch (error) {
-    await sshOutput(
-      scope.host!,
-      `${remoteTmux(scope)} delete-buffer -b ${shQuote(buffer)}`,
-    ).catch(() => undefined);
-    throw error;
+async function sendControlledAgentMessage(
+  control: RelayTerminalControl,
+  clientId: string,
+  session: string,
+  pane: string | number | undefined,
+  message: string,
+  submit: boolean,
+): Promise<void> {
+  const { scope, rawName } = scopeForSession(session);
+  await controlledRelayInput(
+    control,
+    clientId,
+    scope,
+    rawName,
+    async (lease, operationId) => {
+      const paneIndex = await resolvePaneIndex(scope, rawName, pane);
+      return {
+        type: "input.agent-message",
+        lease,
+        operationId,
+        pane: paneIndex,
+        message,
+        submit,
+      };
+    },
+    "agent-message",
+  );
+}
+
+async function releaseRelayControlRecord(
+  control: RelayTerminalControl,
+  record: RelayControlLeaseRecord,
+): Promise<void> {
+  await runRelayControlLane(control, record.key, async () => {
+    if (control.leases.get(record.key) !== record) return;
+    control.leases.delete(record.key);
+    await requestScopedTerminalControl(record.scope, {
+      type: "lease.release",
+      lease: record.lease,
+    }).catch(() => undefined);
+  });
+}
+
+async function releaseRelayControlForClient(
+  control: RelayTerminalControl,
+  clientId: string,
+): Promise<void> {
+  await Promise.all(
+    [...control.leases.values()]
+      .filter((record) => record.clientId === clientId)
+      .map((record) => releaseRelayControlRecord(control, record)),
+  );
+}
+
+async function releaseAllRelayControl(control: RelayTerminalControl): Promise<void> {
+  await Promise.all(
+    [...control.leases.values()].map((record) => releaseRelayControlRecord(control, record)),
+  );
+}
+
+function renewRelayControlLeases(control: RelayTerminalControl): void {
+  if (!control.accepting) return;
+  for (const record of control.leases.values()) {
+    if (record.renewing) continue;
+    const lease = record.lease;
+    const renewal = requestScopedTerminalControl<{ lease: TerminalControlLease }>(record.scope, {
+      type: "lease.renew",
+      lease,
+    }).then(
+      (result) => {
+        if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
+          record.lease = result.lease;
+        }
+      },
+      () => {
+        if (control.leases.get(record.key) === record && record.lease.leaseId === lease.leaseId) {
+          control.leases.delete(record.key);
+        }
+      },
+    ).finally(() => {
+      if (record.renewing === renewal) record.renewing = undefined;
+    });
+    record.renewing = renewal;
+  }
+}
+
+async function drainRelayControlLanes(control: RelayTerminalControl): Promise<void> {
+  while (control.lanes.size > 0) {
+    await Promise.all([...control.lanes.values()]);
   }
 }
 
@@ -2107,6 +2371,36 @@ async function killSession(session: string, managedHint?: boolean): Promise<void
   }
 }
 
+async function killControlledSession(
+  control: RelayTerminalControl,
+  clientId: string,
+  session: string,
+  managedHint?: boolean,
+): Promise<void> {
+  const { scope, rawName } = scopeForSession(session);
+  try {
+    await controlledRelayInput(
+      control,
+      clientId,
+      scope,
+      rawName,
+      (lease, operationId) => ({ type: "lifecycle.kill", lease, operationId }),
+      "lifecycle-kill",
+    );
+    bestEffortUnregisterDashboardTerminal(scope, rawName);
+  } catch (error) {
+    if (
+      managedHint !== true
+      && error instanceof TerminalControlProtocolError
+      && error.code === "TARGET_NOT_FOUND"
+    ) {
+      await killSession(session, managedHint);
+      return;
+    }
+    throw error;
+  }
+}
+
 export function remoteAttachCommand(scope: AdminScope, rawName: string, paneIndex: string): string {
   const tmux = remoteTmux(scope);
   const target = `=${rawName}`;
@@ -2119,7 +2413,7 @@ export function remoteAttachCommand(scope: AdminScope, rawName: string, paneInde
   if (paneIndex !== "0") parts.push(`${tmux} select-pane -t ${shQuote(`${target}:.${paneIndex}`)} 2>/dev/null || true`);
   parts.push(
     "set +e",
-    `${tmux} attach-session -t ${shQuote(target)}`,
+    `${tmux} attach-session -r -f ignore-size -t ${shQuote(target)}`,
     "status=$?",
     "exit $status",
   );
@@ -2302,6 +2596,7 @@ finally:
 }
 
 async function openRemoteStream(
+  control: RelayTerminalControl,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
   stream: LocalStream,
@@ -2380,11 +2675,19 @@ async function openRemoteStream(
   });
   const pendingResize = stream.pendingResize;
   stream.pendingResize = undefined;
-  if (pendingResize) stream.resize(pendingResize.cols, pendingResize.rows);
-  flushPendingInputs(streams, routes, key, stream);
+  if (pendingResize) {
+    try {
+      await writeControlledResize(control, route, pendingResize.cols, pendingResize.rows);
+      stream.resize(pendingResize.cols, pendingResize.rows);
+    } catch (error) {
+      sendRelayControlError(stream, error);
+    }
+  }
+  await flushPendingInputs(control, streams, routes, key, stream);
 }
 
 async function openLocalStream(
+  control: RelayTerminalControl,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
   localBase: string,
@@ -2404,34 +2707,41 @@ async function openLocalStream(
   });
   stream.resourceActive = true;
   stream.socket = localSocket;
-  stream.opening = false;
 
   localSocket.on("open", () => {
     if (!isCurrentStream(streams, key, stream)) {
       try { localSocket.close(); } catch {}
       return;
     }
+    stream.opening = false;
     const pendingResize = stream.pendingResize;
     stream.pendingResize = undefined;
-    if (pendingResize) {
-      const result = sendToStream(
-        stream,
-        JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows }),
-      );
-      if (result !== "sent") {
-        failCurrentStream(
-          streams,
-          routes,
-          key,
-          stream,
-          result === "overloaded"
-            ? "terminal input buffer limit reached"
-            : "terminal stream closed while applying resize",
-        );
-        return;
+    void (async () => {
+      if (pendingResize) {
+        try {
+          await writeControlledResize(control, route, pendingResize.cols, pendingResize.rows);
+          const result = sendToStream(
+            stream,
+            JSON.stringify({ type: "attachment_resize", cols: pendingResize.cols, rows: pendingResize.rows }),
+          );
+          if (result !== "sent") {
+            failCurrentStream(
+              streams,
+              routes,
+              key,
+              stream,
+              result === "overloaded"
+                ? "terminal input buffer limit reached"
+                : "terminal stream closed while applying attachment resize",
+            );
+            return;
+          }
+        } catch (error) {
+          sendRelayControlError(stream, error);
+        }
       }
-    }
-    flushPendingInputs(streams, routes, key, stream);
+      await flushPendingInputs(control, streams, routes, key, stream);
+    })();
   });
   localSocket.on("message", (chunk) => {
     if (!isCurrentStream(streams, key, stream)) return;
@@ -2448,6 +2758,7 @@ async function openLocalStream(
 }
 
 async function openRouteStream(
+  control: RelayTerminalControl,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
   opts: RelayHostOptions,
@@ -2458,6 +2769,7 @@ async function openRouteStream(
     const { route } = stream;
     if (route.scope.kind === "local") {
       await openLocalStream(
+        control,
         streams,
         routes,
         opts.local,
@@ -2466,7 +2778,7 @@ async function openRouteStream(
       );
       return;
     }
-    await openRemoteStream(streams, routes, stream);
+    await openRemoteStream(control, streams, routes, stream);
   } finally {
     stream.openTaskActive = false;
     releaseStreamAdmissionIfQuiescent(stream);
@@ -2474,6 +2786,7 @@ async function openRouteStream(
 }
 
 async function reopenRoutedStream(
+  control: RelayTerminalControl,
   admissionLedger: StreamAdmissionLedger,
   lease: RelayConnectionLease,
   streams: Map<string, LocalStream>,
@@ -2525,7 +2838,7 @@ async function reopenRoutedStream(
     return;
   }
   try {
-    await openRouteStream(streams, routes, opts, stream);
+    await openRouteStream(control, streams, routes, opts, stream);
   } catch (error) {
     if (
       !isCurrentStream(streams, key, stream)
@@ -2587,6 +2900,19 @@ async function runConnection(
   onSocket(relaySocket);
   const streams = new Map<string, LocalStream>();
   const streamRoutes = new Map<string, StreamRoute>();
+  const terminalControl: RelayTerminalControl = {
+    connectorId: statusOwnership.instanceId,
+    accepting: true,
+    closedClients: new Set(),
+    leases: new Map(),
+    lanes: new Map(),
+    nextOperation: 0,
+  };
+  const terminalControlRenewal = setInterval(
+    () => renewRelayControlLeases(terminalControl),
+    TERMINAL_CONTROL_RENEW_INTERVAL_MS,
+  );
+  terminalControlRenewal.unref();
   const lease: RelayConnectionLease = { socket: relaySocket, active: true };
   const retireController = new AbortController();
   const connectionSignal = AbortSignal.any([shutdownSignal, retireController.signal]);
@@ -2599,6 +2925,7 @@ async function runConnection(
   let shutdownForceTimer: ReturnType<typeof setTimeout> | undefined;
 
   const drainConnection = (): Promise<void> => {
+    terminalControl.accepting = false;
     closeConnectionStreams(streams, streamRoutes);
     retireController.abort();
     drainPromise ||= drainRelayWork(taskLedger, admissionLedger, commandAdmissionLedger);
@@ -2654,6 +2981,7 @@ async function runConnection(
       forceCloseTimer = undefined;
       shutdownForceTimer = undefined;
       shutdownSignal.removeEventListener("abort", onShutdown);
+      terminalControl.accepting = false;
       deactivateConnection(lease, streams, streamRoutes);
       resolve({ code, reason: reason.toString("utf8") });
     });
@@ -2705,8 +3033,10 @@ async function runConnection(
       if (!lease.active || connectionSignal.aborted) return;
 
       if (message.type === "client_closed") {
+        terminalControl.closedClients.add(message.clientId);
         closeClientRoutes(streamRoutes, message.clientId);
         closeClientStreams(streams, message.clientId);
+        await releaseRelayControlForClient(terminalControl, message.clientId);
         return;
       }
       if (!("clientId" in message) || !message.clientId) return;
@@ -2806,7 +3136,7 @@ async function runConnection(
           const stream = openingStream(lease, route, reservation);
           streams.set(key, stream);
           try {
-            await openRouteStream(streams, streamRoutes, opts, stream);
+            await openRouteStream(terminalControl, streams, streamRoutes, opts, stream);
           } catch (error) {
             if (
               !isCurrentStream(streams, key, stream)
@@ -2824,7 +3154,14 @@ async function runConnection(
         }
 
         if (message.type === "send_agent_message") {
-          await sendAgentMessage(message.session, message.pane, message.message, message.submit !== false);
+          await sendControlledAgentMessage(
+            terminalControl,
+            clientId,
+            message.session,
+            message.pane,
+            message.message,
+            message.submit !== false,
+          );
           sendIfActive(lease, {
             type: "agent_message_sent",
             clientId,
@@ -2836,8 +3173,10 @@ async function runConnection(
         }
 
         if (message.type === "kill_session") {
-          await killSession(message.session, message.managed);
+          const target = scopeForSession(message.session);
+          await killControlledSession(terminalControl, clientId, message.session, message.managed);
           finalizeSessionStreams(streams, streamRoutes, message.session);
+          forgetRelayControlLease(terminalControl, clientId, target.scope, target.rawName);
           sendIfActive(lease, {
             type: "session_killed",
             clientId,
@@ -2857,11 +3196,24 @@ async function runConnection(
 
         const key = streamKey(clientId, message.streamId);
         if (message.type === "close_terminal") {
+          const route = streamRoutes.get(key);
           streamRoutes.delete(key);
           const stream = streams.get(key);
           if (stream) {
             streams.delete(key);
             closeStream(stream);
+          }
+          if (route) {
+            const leaseKey = relayControlLeaseKey(clientId, route.scope, route.rawName);
+            const record = terminalControl.leases.get(leaseKey);
+            const routeStillUsesTarget = [...streamRoutes.values()].some((candidate) => (
+              candidate.clientId === clientId
+              && candidate.scope.id === route.scope.id
+              && candidate.rawName === route.rawName
+            ));
+            if (record && !routeStillUsesTarget) {
+              await releaseRelayControlRecord(terminalControl, record);
+            }
           }
           return;
         }
@@ -2875,11 +3227,11 @@ async function runConnection(
         if (!stream) {
           const route = streamRoutes.get(key);
           if (route && message.type === "terminal_input") {
-            await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, message.data);
+            await reopenRoutedStream(terminalControl, admissionLedger, lease, streams, streamRoutes, opts, route, message.data);
             return;
           }
           if (route && message.type === "resize") {
-            await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
+            await reopenRoutedStream(terminalControl, admissionLedger, lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
             return;
           }
           if (message.type === "resize") return;
@@ -2888,53 +3240,46 @@ async function runConnection(
         }
 
         if (message.type === "terminal_input") {
-          const result = sendToStream(stream, message.data);
-          if (result === "overloaded") {
-            failCurrentStream(
-              streams,
-              streamRoutes,
-              key,
-              stream,
-              "terminal input buffer limit reached",
-            );
+          if (stream.opening) {
+            if (!queuePendingInput(stream, message.data)) {
+              failCurrentStream(
+                streams,
+                streamRoutes,
+                key,
+                stream,
+                "terminal input buffer limit reached",
+              );
+            }
             return;
           }
-          if (result === "closed") {
-            const route = streamRoutes.get(key);
-            if (route) {
-              await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, message.data);
-              return;
-            }
-            sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
-          }
+          await writeControlledRawInput(terminalControl, stream.route, message.data);
         } else if (message.type === "resize") {
           if (stream.opening) {
             stream.pendingResize = { cols: message.cols, rows: message.rows };
             return;
           }
+          await writeControlledResize(
+            terminalControl,
+            stream.route,
+            message.cols,
+            message.rows,
+          );
           if (stream.resize) {
             stream.resize(message.cols, message.rows);
-            return;
-          }
-          const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows });
-          const result = sendToStream(stream, resize);
-          if (result === "overloaded") {
-            failCurrentStream(
-              streams,
-              streamRoutes,
-              key,
-              stream,
-              "terminal input buffer limit reached",
-            );
-            return;
-          }
-          if (result === "closed") {
-            const route = streamRoutes.get(key);
-            if (route) {
-              await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
-              return;
+          } else {
+            const resize = JSON.stringify({ type: "attachment_resize", cols: message.cols, rows: message.rows });
+            const result = sendToStream(stream, resize);
+            if (result !== "sent") {
+              failCurrentStream(
+                streams,
+                streamRoutes,
+                key,
+                stream,
+                result === "overloaded"
+                  ? "terminal input buffer limit reached"
+                  : "terminal stream closed while applying attachment resize",
+              );
             }
-            sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
           }
         }
       } catch (err) {
@@ -2943,7 +3288,7 @@ async function runConnection(
           clientId,
           requestId: "requestId" in message ? message.requestId : undefined,
           streamId: "streamId" in message ? message.streamId : undefined,
-          message: err instanceof Error ? err.message : String(err),
+          message: relayV1ErrorMessage(err),
         });
       } finally {
         if (commandReservation) releaseCommandAdmission(commandReservation);
@@ -2953,6 +3298,9 @@ async function runConnection(
   });
 
   const closeOutcome = await closed;
+  clearInterval(terminalControlRenewal);
+  await drainRelayControlLanes(terminalControl);
+  await releaseAllRelayControl(terminalControl);
   console.log("[relay-host] disconnected");
   return {
     opened,

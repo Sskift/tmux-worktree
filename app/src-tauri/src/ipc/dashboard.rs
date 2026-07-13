@@ -118,6 +118,10 @@ pub(crate) struct OpenArgs {
     pub(crate) cols: u16,
     pub(crate) rows: u16,
     pub(crate) env: Option<HashMap<String, String>>,
+    #[serde(rename = "controlSession", default)]
+    pub(crate) control_session: Option<String>,
+    #[serde(rename = "controlHostId", default)]
+    pub(crate) control_host_id: Option<String>,
 }
 
 #[derive(Deserialize)]

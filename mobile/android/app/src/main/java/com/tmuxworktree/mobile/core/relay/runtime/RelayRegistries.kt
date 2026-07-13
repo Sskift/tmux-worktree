@@ -105,6 +105,7 @@ data class RelayStreamContext(
     val pane: RelayV1Pane? = null,
     val generation: Long,
     val phase: RelayStreamPhase = RelayStreamPhase.OPENING,
+    val inputReadOnly: Boolean = false,
 )
 
 class RelayStreamRegistry {
@@ -117,6 +118,7 @@ class RelayStreamRegistry {
         hostId: String,
         sessionName: String,
         pane: RelayV1Pane? = null,
+        inputReadOnly: Boolean = false,
     ): RelayStreamContext {
         generation += 1
         return RelayStreamContext(
@@ -125,6 +127,7 @@ class RelayStreamRegistry {
             sessionName = sessionName,
             pane = pane,
             generation = generation,
+            inputReadOnly = inputReadOnly,
         ).also { current = it }
     }
 
@@ -145,6 +148,13 @@ class RelayStreamRegistry {
     fun markRecovering(streamId: String): RelayStreamContext? = update(streamId, RelayStreamPhase.RECOVERING)
 
     @Synchronized
+    fun markInputReadOnly(streamId: String): RelayStreamContext? {
+        val active = current ?: return null
+        if (active.streamId != streamId) return null
+        return active.copy(inputReadOnly = true).also { current = it }
+    }
+
+    @Synchronized
     fun close(streamId: String? = current?.streamId): RelayStreamContext? {
         val active = current ?: return null
         if (!streamId.isNullOrEmpty() && streamId != active.streamId) return null
@@ -163,6 +173,7 @@ class RelayStreamRegistry {
             sessionId = active?.let { "${it.hostId}:${it.sessionName}" }.orEmpty(),
             status = status,
             generation = active?.generation ?: generation,
+            inputReadOnly = active?.inputReadOnly ?: false,
         )
     }
 
