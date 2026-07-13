@@ -1,16 +1,24 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useRef,
   useState,
   type Dispatch,
   type SetStateAction,
 } from "react";
 import {
+  type DashboardBackend,
   type HostConfig,
   type MobileRelayStatus,
   useDashboardBackend,
 } from "../../platform";
+import {
+  createOwnerEpochLeaseController,
+  type OwnerEpochActivation,
+  type OwnerEpochCommit,
+  type OwnerEpochLease,
+} from "../ownerEpochLease";
 import { useVisibilityAwarePolling } from "./useVisibilityAwarePolling";
 
 export const MOBILE_RELAY_VISIBLE_REFRESH_MS = 2_000;
@@ -24,25 +32,40 @@ type MobileRelayIndicatorStatus = "running" | "starting" | "stopped";
 export type MobileRelayDraftField = "relayUrl" | "hostId" | "secret";
 export type MobileRelayDraftSyncPolicy = "untouched" | "submitted";
 
+export type MobileRelayOwnerLease = OwnerEpochLease<object>;
+
 export type MobileRelayStatusRequest = Readonly<{
+  lease: MobileRelayOwnerLease;
   generation: number;
   draftSyncPolicy: MobileRelayDraftSyncPolicy;
   draftRevisions: Readonly<Record<MobileRelayDraftField, number>>;
 }>;
 
 export type MobileRelayOperation = Readonly<{
+  lease: MobileRelayOwnerLease;
   generation: number;
 }>;
 
 export type MobileRelayAsyncCoordinator = {
-  markDraftEdited(field: MobileRelayDraftField): void;
-  issueStatusRequest(policy?: MobileRelayDraftSyncPolicy): MobileRelayStatusRequest;
+  commit(owner: object): OwnerEpochCommit<object>;
+  activate(): OwnerEpochActivation;
+  deactivate(activation: OwnerEpochActivation): boolean;
+  capture(owner: object): MobileRelayOwnerLease | null;
+  isCurrent(lease: MobileRelayOwnerLease | null): boolean;
+  markDraftEdited(
+    lease: MobileRelayOwnerLease | null,
+    field: MobileRelayDraftField,
+  ): boolean;
+  issueStatusRequest(
+    lease: MobileRelayOwnerLease | null,
+    policy?: MobileRelayDraftSyncPolicy,
+  ): MobileRelayStatusRequest | null;
   isCurrentStatusRequest(request: MobileRelayStatusRequest): boolean;
   acceptDraftSync(request: MobileRelayStatusRequest, field: MobileRelayDraftField): boolean;
-  beginOperation(): MobileRelayOperation;
+  beginOperation(lease: MobileRelayOwnerLease | null): MobileRelayOperation | null;
   isCurrentOperation(operation: MobileRelayOperation): boolean;
-  finishOperation(operation: MobileRelayOperation): void;
-  hasActiveOperation(): boolean;
+  finishOperation(operation: MobileRelayOperation): boolean;
+  hasActiveOperation(lease: MobileRelayOwnerLease | null): boolean;
 };
 
 /**
@@ -52,6 +75,7 @@ export type MobileRelayAsyncCoordinator = {
  * changed it. A submitted save may normalize the exact values it sent.
  */
 export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator {
+  const fence = createOwnerEpochLeaseController<object>();
   let statusGeneration = 0;
   let operationGeneration = 0;
   let activeOperationGeneration = 0;
@@ -66,15 +90,61 @@ export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator
     secret: false,
   };
 
+  const resetDraftOwnership = () => {
+    for (const field of ["relayUrl", "hostId", "secret"] as const) {
+      draftRevisions[field] = 0;
+      dirtyDrafts[field] = false;
+    }
+  };
+
   return {
-    markDraftEdited(field) {
-      draftRevisions[field] += 1;
-      dirtyDrafts[field] = true;
+    commit(owner) {
+      const ownerCommit = fence.commit(owner);
+      if (ownerCommit.changed) {
+        statusGeneration += 1;
+        operationGeneration += 1;
+        activeOperationGeneration = 0;
+        resetDraftOwnership();
+      }
+      return ownerCommit;
     },
 
-    issueStatusRequest(draftSyncPolicy = "untouched") {
+    activate() {
+      const activation = fence.activate();
+      statusGeneration += 1;
+      operationGeneration += 1;
+      activeOperationGeneration = 0;
+      return activation;
+    },
+
+    deactivate(activation) {
+      if (!fence.deactivate(activation)) return false;
+      statusGeneration += 1;
+      operationGeneration += 1;
+      activeOperationGeneration = 0;
+      return true;
+    },
+
+    capture(owner) {
+      return fence.capture(owner);
+    },
+
+    isCurrent(lease) {
+      return lease !== null && fence.isCurrent(lease);
+    },
+
+    markDraftEdited(lease, field) {
+      if (!lease || !fence.isCurrent(lease)) return false;
+      draftRevisions[field] += 1;
+      dirtyDrafts[field] = true;
+      return true;
+    },
+
+    issueStatusRequest(lease, draftSyncPolicy = "untouched") {
+      if (!lease || !fence.isCurrent(lease)) return null;
       statusGeneration += 1;
       return {
+        lease,
         generation: statusGeneration,
         draftSyncPolicy,
         draftRevisions: { ...draftRevisions },
@@ -82,10 +152,11 @@ export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator
     },
 
     isCurrentStatusRequest(request) {
-      return request.generation === statusGeneration;
+      return fence.isCurrent(request.lease) && request.generation === statusGeneration;
     },
 
     acceptDraftSync(request, field) {
+      if (!fence.isCurrent(request.lease)) return false;
       if (request.generation !== statusGeneration) return false;
       if (request.draftRevisions[field] !== draftRevisions[field]) return false;
       if (request.draftSyncPolicy === "untouched" && dirtyDrafts[field]) return false;
@@ -93,26 +164,33 @@ export function createMobileRelayAsyncCoordinator(): MobileRelayAsyncCoordinator
       return true;
     },
 
-    beginOperation() {
+    beginOperation(lease) {
+      if (!lease || !fence.isCurrent(lease)) return null;
       operationGeneration += 1;
       activeOperationGeneration = operationGeneration;
       // A mutation supersedes any status read that began before it.
       statusGeneration += 1;
-      return { generation: operationGeneration };
+      return { lease, generation: operationGeneration };
     },
 
     isCurrentOperation(operation) {
-      return operation.generation === activeOperationGeneration;
+      return fence.isCurrent(operation.lease)
+        && operation.generation === activeOperationGeneration;
     },
 
     finishOperation(operation) {
-      if (operation.generation === activeOperationGeneration) {
+      if (
+        fence.isCurrent(operation.lease)
+        && operation.generation === activeOperationGeneration
+      ) {
         activeOperationGeneration = 0;
+        return true;
       }
+      return false;
     },
 
-    hasActiveOperation() {
-      return activeOperationGeneration !== 0;
+    hasActiveOperation(lease) {
+      return !!lease && fence.isCurrent(lease) && activeOperationGeneration !== 0;
     },
   };
 }
@@ -174,6 +252,51 @@ type MobileRelayViewStateInput = {
   brokerStarting: boolean;
   stopping: boolean;
 };
+
+type MobileRelayOwnedState = MobileRelayViewStateInput & {
+  ownerLease: MobileRelayOwnerLease | null;
+  statusKnown: boolean;
+  relayUrl: string;
+  hostId: string;
+  draftUrl: string;
+  draftHostId: string;
+  draftSecret: string;
+  brokerHostId: string;
+  copied: boolean;
+  error: string | null;
+};
+
+function initialMobileRelayOwnedState(
+  ownerLease: MobileRelayOwnerLease | null,
+): MobileRelayOwnedState {
+  return {
+    ownerLease,
+    statusKnown: false,
+    active: false,
+    connected: false,
+    connectionState: "stopped",
+    relayUrl: DEFAULT_RELAY_URL,
+    hostId: DEFAULT_HOST_ID,
+    secret: "",
+    draftUrl: DEFAULT_RELAY_URL,
+    draftHostId: DEFAULT_HOST_ID,
+    draftSecret: "",
+    brokerHostId: "",
+    popoverOpen: false,
+    loading: false,
+    saving: false,
+    brokerStarting: false,
+    stopping: false,
+    copied: false,
+    error: null,
+  };
+}
+
+function resolveStateAction<T>(value: SetStateAction<T>, current: T): T {
+  return typeof value === "function"
+    ? (value as (previous: T) => T)(current)
+    : value;
+}
 
 export function deriveMobileRelayViewState({
   active,
@@ -284,97 +407,219 @@ export function useMobileRelayController({
   hosts,
 }: UseMobileRelayControllerOptions): MobileRelayController {
   const dashboardBackend = useDashboardBackend();
-  const asyncCoordinatorRef = useRef<MobileRelayAsyncCoordinator | null>(null);
-  if (asyncCoordinatorRef.current === null) {
-    asyncCoordinatorRef.current = createMobileRelayAsyncCoordinator();
-  }
-  const asyncCoordinator = asyncCoordinatorRef.current;
-  const [brokerHostId, setBrokerHostId] = useState("");
-  const [active, setActive] = useState(false);
-  const [connected, setConnected] = useState(false);
-  const [connectionState, setConnectionState] = useState("stopped");
-  const [relayUrl, setRelayUrl] = useState(DEFAULT_RELAY_URL);
-  const [hostId, setHostId] = useState(DEFAULT_HOST_ID);
-  const [secret, setSecret] = useState("");
-  const [draftUrl, setDraftUrlState] = useState(DEFAULT_RELAY_URL);
-  const [draftHostId, setDraftHostIdState] = useState(DEFAULT_HOST_ID);
-  const [draftSecret, setDraftSecretState] = useState("");
-  const [popoverOpen, setPopoverOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [brokerStarting, setBrokerStarting] = useState(false);
-  const [stopping, setStopping] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [statusKnown, setStatusKnown] = useState(false);
+  const [asyncCoordinator] = useState(createMobileRelayAsyncCoordinator);
+  const committedBackendRef = useRef<DashboardBackend | null>(null);
+  const ownerLease = asyncCoordinator.capture(dashboardBackend);
+  const [ownedState, setOwnedState] = useState<MobileRelayOwnedState>(
+    () => initialMobileRelayOwnedState(null),
+  );
+
+  useLayoutEffect(() => {
+    committedBackendRef.current = dashboardBackend;
+    const ownerCommit = asyncCoordinator.commit(dashboardBackend);
+    if (!ownerCommit.changed) return;
+    setOwnedState(initialMobileRelayOwnedState(ownerCommit.lease));
+  }, [asyncCoordinator, dashboardBackend]);
+
+  useLayoutEffect(() => {
+    const activation = asyncCoordinator.activate();
+    const lease = committedBackendRef.current
+      ? asyncCoordinator.capture(committedBackendRef.current)
+      : null;
+    setOwnedState((current) => {
+      if (!lease) return initialMobileRelayOwnedState(null);
+      const sameCommittedOwner = current.ownerLease?.owner === lease.owner
+        && current.ownerLease.epoch === lease.epoch;
+      const ownerState = sameCommittedOwner
+        ? current
+        : initialMobileRelayOwnedState(lease);
+      return {
+        ...ownerState,
+        ownerLease: lease,
+        loading: false,
+        saving: false,
+        brokerStarting: false,
+        stopping: false,
+      };
+    });
+    return () => {
+      asyncCoordinator.deactivate(activation);
+    };
+  }, [asyncCoordinator]);
+
+  const visibleState = ownerLease !== null && ownedState.ownerLease === ownerLease
+    ? ownedState
+    : initialMobileRelayOwnedState(null);
+  const {
+    active,
+    brokerHostId,
+    brokerStarting,
+    connected,
+    connectionState,
+    copied,
+    draftHostId,
+    draftSecret,
+    draftUrl,
+    error,
+    hostId,
+    loading,
+    popoverOpen,
+    relayUrl,
+    saving,
+    secret,
+    statusKnown,
+    stopping,
+  } = visibleState;
+
+  const updateOwnedState = useCallback((
+    lease: MobileRelayOwnerLease | null,
+    update: (current: MobileRelayOwnedState) => MobileRelayOwnedState,
+  ): boolean => {
+    if (!asyncCoordinator.isCurrent(lease)) return false;
+    setOwnedState((current) => {
+      if (!asyncCoordinator.isCurrent(lease)) return current;
+      const ownerState = current.ownerLease === lease
+        ? current
+        : initialMobileRelayOwnedState(lease);
+      return update(ownerState);
+    });
+    return true;
+  }, [asyncCoordinator]);
 
   const setDraftUrl = useCallback<Dispatch<SetStateAction<string>>>((value) => {
-    asyncCoordinator.markDraftEdited("relayUrl");
-    setDraftUrlState(value);
-  }, [asyncCoordinator]);
+    if (!asyncCoordinator.markDraftEdited(ownerLease, "relayUrl")) return;
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      draftUrl: resolveStateAction(value, current.draftUrl),
+    }));
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
   const setDraftHostId = useCallback<Dispatch<SetStateAction<string>>>((value) => {
-    asyncCoordinator.markDraftEdited("hostId");
-    setDraftHostIdState(value);
-  }, [asyncCoordinator]);
+    if (!asyncCoordinator.markDraftEdited(ownerLease, "hostId")) return;
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      draftHostId: resolveStateAction(value, current.draftHostId),
+    }));
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
   const setDraftSecret = useCallback<Dispatch<SetStateAction<string>>>((value) => {
-    asyncCoordinator.markDraftEdited("secret");
-    setDraftSecretState(value);
-  }, [asyncCoordinator]);
+    if (!asyncCoordinator.markDraftEdited(ownerLease, "secret")) return;
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      draftSecret: resolveStateAction(value, current.draftSecret),
+    }));
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
+  const setBrokerHostId = useCallback<Dispatch<SetStateAction<string>>>((value) => {
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      brokerHostId: resolveStateAction(value, current.brokerHostId),
+    }));
+  }, [ownerLease, updateOwnedState]);
+  const setPopoverOpen = useCallback<Dispatch<SetStateAction<boolean>>>((value) => {
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      popoverOpen: resolveStateAction(value, current.popoverOpen),
+    }));
+  }, [ownerLease, updateOwnedState]);
 
   const requireKnownStatus = useCallback((): boolean => {
+    if (!asyncCoordinator.isCurrent(ownerLease)) return false;
     if (statusKnown) return true;
-    setPopoverOpen(true);
-    setError((current) => current ?? "Wait for Relay status before changing its configuration.");
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      popoverOpen: true,
+      error: current.error ?? "Wait for Relay status before changing its configuration.",
+    }));
     return false;
-  }, [statusKnown]);
+  }, [asyncCoordinator, ownerLease, statusKnown, updateOwnedState]);
 
   const applyStatus = useCallback((
     status: MobileRelayStatus,
     request: MobileRelayStatusRequest,
+    lease: MobileRelayOwnerLease,
   ): boolean => {
+    if (!asyncCoordinator.isCurrent(lease)) return false;
     if (!asyncCoordinator.isCurrentStatusRequest(request)) return false;
-    setStatusKnown(true);
-    setActive(status.active);
-    setConnected(status.connected);
-    setConnectionState(status.connectionState);
-    setRelayUrl(status.relayUrl);
-    setHostId(status.hostId);
-    setSecret(status.secret);
-    if (asyncCoordinator.acceptDraftSync(request, "relayUrl")) {
-      setDraftUrlState(status.relayUrl);
-    }
-    if (asyncCoordinator.acceptDraftSync(request, "hostId")) {
-      setDraftHostIdState(status.hostId);
-    }
-    if (asyncCoordinator.acceptDraftSync(request, "secret")) {
-      setDraftSecretState(status.secret);
-    }
-    setError(status.error ?? null);
-    return true;
-  }, [asyncCoordinator]);
+    const syncRelayUrl = asyncCoordinator.acceptDraftSync(request, "relayUrl");
+    const syncHostId = asyncCoordinator.acceptDraftSync(request, "hostId");
+    const syncSecret = asyncCoordinator.acceptDraftSync(request, "secret");
+    return updateOwnedState(lease, (current) => ({
+      ...current,
+      statusKnown: true,
+      active: status.active,
+      connected: status.connected,
+      connectionState: status.connectionState,
+      relayUrl: status.relayUrl,
+      hostId: status.hostId,
+      secret: status.secret,
+      draftUrl: syncRelayUrl ? status.relayUrl : current.draftUrl,
+      draftHostId: syncHostId ? status.hostId : current.draftHostId,
+      draftSecret: syncSecret ? status.secret : current.draftSecret,
+      error: status.error ?? null,
+    }));
+  }, [asyncCoordinator, updateOwnedState]);
 
   const checkStatus = useCallback(async (
     operation?: MobileRelayOperation,
   ): Promise<MobileRelayStatus | null> => {
+    if (!asyncCoordinator.isCurrent(ownerLease)) return null;
     if (operation && !asyncCoordinator.isCurrentOperation(operation)) return null;
-    const request = asyncCoordinator.issueStatusRequest("untouched");
+    const request = asyncCoordinator.issueStatusRequest(ownerLease, "untouched");
+    if (!request) return null;
     try {
       const status = await dashboardBackend.relay.status();
+      if (!asyncCoordinator.isCurrent(ownerLease)) return null;
       if (operation && !asyncCoordinator.isCurrentOperation(operation)) return null;
-      return applyStatus(status, request) ? status : null;
+      return applyStatus(status, request, request.lease) ? status : null;
     } catch (nextError) {
       if (
+        asyncCoordinator.isCurrent(ownerLease) &&
         (!operation || asyncCoordinator.isCurrentOperation(operation)) &&
         asyncCoordinator.isCurrentStatusRequest(request)
       ) {
-        setStatusKnown(false);
-        setError(`Unable to read Relay status: ${String(nextError)}`);
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          statusKnown: false,
+          error: `Unable to read Relay status: ${String(nextError)}`,
+        }));
       }
       return null;
     }
-  }, [applyStatus, asyncCoordinator, dashboardBackend]);
+  }, [
+    applyStatus,
+    asyncCoordinator,
+    dashboardBackend,
+    ownerLease,
+    updateOwnedState,
+  ]);
+
+  const beginOwnedOperation = useCallback((
+    kind: "loading" | "saving" | "brokerStarting" | "stopping",
+  ): MobileRelayOperation | null => {
+    const operation = asyncCoordinator.beginOperation(ownerLease);
+    if (!operation) return null;
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      loading: kind === "loading",
+      saving: kind === "saving",
+      brokerStarting: kind === "brokerStarting",
+      stopping: kind === "stopping",
+      error: null,
+    }));
+    return operation;
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
+
+  const finishOwnedOperation = useCallback((operation: MobileRelayOperation): void => {
+    if (!asyncCoordinator.finishOperation(operation)) return;
+    updateOwnedState(ownerLease, (current) => ({
+      ...current,
+      loading: false,
+      saving: false,
+      brokerStarting: false,
+      stopping: false,
+    }));
+  }, [asyncCoordinator, ownerLease, updateOwnedState]);
 
   const toggle = useCallback(async () => {
+    if (!asyncCoordinator.isCurrent(ownerLease)) return;
     if (active) {
       setPopoverOpen(true);
       return;
@@ -387,27 +632,38 @@ export function useMobileRelayController({
     }
     if (!status.secret.trim()) {
       setPopoverOpen(true);
-      setError(null);
+      updateOwnedState(ownerLease, (current) => ({ ...current, error: null }));
       return;
     }
 
-    const operation = asyncCoordinator.beginOperation();
-    setLoading(true);
+    const operation = beginOwnedOperation("loading");
+    if (!operation) return;
     setPopoverOpen(true);
-    setError(null);
     try {
       await dashboardBackend.relay.start();
       if (!asyncCoordinator.isCurrentOperation(operation)) return;
       await checkStatus(operation);
     } catch (nextError) {
       if (asyncCoordinator.isCurrentOperation(operation)) {
-        setError(String(nextError));
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          error: String(nextError),
+        }));
       }
     } finally {
-      asyncCoordinator.finishOperation(operation);
-      setLoading(false);
+      finishOwnedOperation(operation);
     }
-  }, [active, asyncCoordinator, checkStatus, dashboardBackend]);
+  }, [
+    active,
+    asyncCoordinator,
+    beginOwnedOperation,
+    checkStatus,
+    dashboardBackend,
+    finishOwnedOperation,
+    ownerLease,
+    setPopoverOpen,
+    updateOwnedState,
+  ]);
 
   const saveConfig = useCallback(async (
     operation: MobileRelayOperation,
@@ -420,95 +676,133 @@ export function useMobileRelayController({
     if (!args.relayUrl || !args.hostId) {
       throw new Error("Relay URL and host are required");
     }
+    if (!asyncCoordinator.isCurrent(ownerLease)) return null;
     if (!asyncCoordinator.isCurrentOperation(operation)) return null;
-    const request = asyncCoordinator.issueStatusRequest("submitted");
+    const request = asyncCoordinator.issueStatusRequest(ownerLease, "submitted");
+    if (!request) return null;
     const status = await dashboardBackend.relay.saveConfig(args);
+    if (!asyncCoordinator.isCurrent(ownerLease)) return null;
     if (!asyncCoordinator.isCurrentOperation(operation)) return null;
-    return applyStatus(status, request) ? status : null;
-  }, [applyStatus, asyncCoordinator, dashboardBackend, draftHostId, draftSecret, draftUrl]);
+    return applyStatus(status, request, request.lease) ? status : null;
+  }, [
+    applyStatus,
+    asyncCoordinator,
+    dashboardBackend,
+    draftHostId,
+    draftSecret,
+    draftUrl,
+    ownerLease,
+  ]);
 
   const save = useCallback(async () => {
     if (!requireKnownStatus()) return false;
-    const operation = asyncCoordinator.beginOperation();
-    setSaving(true);
-    setError(null);
+    const operation = beginOwnedOperation("saving");
+    if (!operation) return false;
     try {
       return (await saveConfig(operation)) !== null;
     } catch (nextError) {
       if (asyncCoordinator.isCurrentOperation(operation)) {
-        setError(String(nextError));
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          error: String(nextError),
+        }));
       }
       return false;
     } finally {
-      asyncCoordinator.finishOperation(operation);
-      setSaving(false);
+      finishOwnedOperation(operation);
     }
-  }, [asyncCoordinator, requireKnownStatus, saveConfig]);
+  }, [
+    asyncCoordinator,
+    beginOwnedOperation,
+    finishOwnedOperation,
+    ownerLease,
+    requireKnownStatus,
+    saveConfig,
+    updateOwnedState,
+  ]);
 
   const start = useCallback(async () => {
     if (!requireKnownStatus()) return false;
-    const operation = asyncCoordinator.beginOperation();
-    setLoading(true);
-    setError(null);
+    const operation = beginOwnedOperation("loading");
+    if (!operation) return false;
     try {
       const saved = await saveConfig(operation);
       if (!saved) return false;
       if (!saved.secret.trim()) {
         throw new Error("Relay token is required before Android can connect");
       }
+      if (!asyncCoordinator.isCurrentOperation(operation)) return false;
       await dashboardBackend.relay.start();
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
       return (await checkStatus(operation)) !== null;
     } catch (nextError) {
       if (asyncCoordinator.isCurrentOperation(operation)) {
-        setError(String(nextError));
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          error: String(nextError),
+        }));
       }
       return false;
     } finally {
-      asyncCoordinator.finishOperation(operation);
-      setLoading(false);
+      finishOwnedOperation(operation);
     }
-  }, [asyncCoordinator, checkStatus, dashboardBackend, requireKnownStatus, saveConfig]);
+  }, [
+    asyncCoordinator,
+    beginOwnedOperation,
+    checkStatus,
+    dashboardBackend,
+    finishOwnedOperation,
+    ownerLease,
+    requireKnownStatus,
+    saveConfig,
+    updateOwnedState,
+  ]);
 
   const startBroker = useCallback(async () => {
     if (!brokerHostId) return false;
     if (!requireKnownStatus()) return false;
-    const operation = asyncCoordinator.beginOperation();
-    setBrokerStarting(true);
-    setError(null);
+    const operation = beginOwnedOperation("brokerStarting");
+    if (!operation) return false;
     try {
-      const request = asyncCoordinator.issueStatusRequest("untouched");
+      const request = asyncCoordinator.issueStatusRequest(ownerLease, "untouched");
+      if (!request) return false;
       const status = await dashboardBackend.relay.startBroker({
         hostId: brokerHostId,
         port: 8787,
       });
+      if (!asyncCoordinator.isCurrent(ownerLease)) return false;
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
-      if (!applyStatus(status, request)) return false;
+      if (!applyStatus(status, request, request.lease)) return false;
       await dashboardBackend.relay.start();
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
       return (await checkStatus(operation)) !== null;
     } catch (nextError) {
       if (asyncCoordinator.isCurrentOperation(operation)) {
-        setError(String(nextError));
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          error: String(nextError),
+        }));
       }
       return false;
     } finally {
-      asyncCoordinator.finishOperation(operation);
-      setBrokerStarting(false);
+      finishOwnedOperation(operation);
     }
   }, [
     applyStatus,
     asyncCoordinator,
+    beginOwnedOperation,
     brokerHostId,
     checkStatus,
     dashboardBackend,
+    finishOwnedOperation,
+    ownerLease,
     requireKnownStatus,
+    updateOwnedState,
   ]);
 
   const stop = useCallback(async () => {
-    const operation = asyncCoordinator.beginOperation();
-    setStopping(true);
-    setError(null);
+    const operation = beginOwnedOperation("stopping");
+    if (!operation) return false;
     try {
       await dashboardBackend.relay.stop();
       if (!asyncCoordinator.isCurrentOperation(operation)) return false;
@@ -517,33 +811,55 @@ export function useMobileRelayController({
       return true;
     } catch (nextError) {
       if (asyncCoordinator.isCurrentOperation(operation)) {
-        setError(String(nextError));
+        updateOwnedState(ownerLease, (current) => ({
+          ...current,
+          error: String(nextError),
+        }));
       }
       return false;
     } finally {
-      asyncCoordinator.finishOperation(operation);
-      setStopping(false);
+      finishOwnedOperation(operation);
     }
-  }, [asyncCoordinator, checkStatus, dashboardBackend]);
+  }, [
+    asyncCoordinator,
+    beginOwnedOperation,
+    checkStatus,
+    dashboardBackend,
+    finishOwnedOperation,
+    ownerLease,
+    setPopoverOpen,
+    updateOwnedState,
+  ]);
 
   const copyLaunch = useCallback(() => {
+    if (!asyncCoordinator.isCurrent(ownerLease)) return;
     void navigator.clipboard.writeText(buildMobileRelayLaunchCommand({ relayUrl, hostId, secret }));
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1200);
-  }, [hostId, relayUrl, secret]);
+    updateOwnedState(ownerLease, (current) => ({ ...current, copied: true }));
+    window.setTimeout(() => {
+      updateOwnedState(ownerLease, (current) => ({ ...current, copied: false }));
+    }, 1200);
+  }, [
+    asyncCoordinator,
+    hostId,
+    ownerLease,
+    relayUrl,
+    secret,
+    updateOwnedState,
+  ]);
 
   const copyValue = useCallback((value: string) => {
+    if (!asyncCoordinator.isCurrent(ownerLease)) return;
     if (value) void navigator.clipboard.writeText(value);
-  }, []);
+  }, [asyncCoordinator, ownerLease]);
 
   useEffect(() => {
     void checkStatus();
   }, [checkStatus]);
 
   const refreshStatus = useCallback(async () => {
-    if (asyncCoordinator.hasActiveOperation()) return;
+    if (asyncCoordinator.hasActiveOperation(ownerLease)) return;
     await checkStatus();
-  }, [asyncCoordinator, checkStatus]);
+  }, [asyncCoordinator, checkStatus, ownerLease]);
   useVisibilityAwarePolling(refreshStatus, {
     enabled: active || popoverOpen,
     visibleIntervalMs: MOBILE_RELAY_VISIBLE_REFRESH_MS,
@@ -555,7 +871,7 @@ export function useMobileRelayController({
     if (brokerHostId || hosts.length === 0) return;
     const preferred = hosts.find((host) => host.id === "devbox") ?? hosts[0];
     setBrokerHostId(preferred.id);
-  }, [brokerHostId, hosts]);
+  }, [brokerHostId, hosts, setBrokerHostId]);
 
   const viewState = deriveMobileRelayViewState({
     active,
