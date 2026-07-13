@@ -3200,7 +3200,7 @@ case "$1" in
     exit 0
     ;;
   *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
+    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
     exit 0
     ;;
 esac
@@ -3350,7 +3350,7 @@ case "$1" in
   *"'tmux'"*"'-V'"*) printf 'tmux: command not found\n' >&2; exit 127 ;;
   *"'tw'"*"'version'"*) printf '1.0.3\n'; exit 0 ;;
   *"'tw'"*"'rpc'"*"'capabilities'"*)
-    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session"]}'
+    printf '%s\n' '{"protocolVersion":1,"capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
     exit 0
     ;;
 esac
