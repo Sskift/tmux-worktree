@@ -7,6 +7,7 @@ import { WebSocket } from "ws";
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const MESSAGE_TIMEOUT_MS = 2_000;
+let barrierSequence = 0;
 
 function runRelayServerCli(args, { secret } = {}) {
   const { TW_RELAY_SECRET: _discardedSecret, ...cleanEnv } = process.env;
@@ -121,6 +122,7 @@ class SocketInbox {
       if (waiter) waiter.resolve(text);
       else this.messages.push(text);
     });
+    this.socket.on("error", () => {});
   }
 
   async open() {
@@ -153,6 +155,52 @@ class SocketInbox {
 
   sendJson(message) {
     this.socket.send(JSON.stringify(message));
+  }
+
+  async barrier(timeoutMs = MESSAGE_TIMEOUT_MS) {
+    const marker = `relay-test-barrier-${++barrierSequence}`;
+    await new Promise((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer);
+        this.socket.off("pong", onPong);
+        this.socket.off("close", onClose);
+        this.socket.off("error", onError);
+      };
+      const onPong = (payload) => {
+        if (payload.toString("utf8") !== marker) return;
+        cleanup();
+        resolve();
+      };
+      const onClose = (code, reason) => {
+        cleanup();
+        reject(new Error(`WebSocket closed before barrier pong (${code}: ${reason.toString("utf8")})`));
+      };
+      const onError = (error) => {
+        cleanup();
+        reject(error);
+      };
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(new Error(`timed out waiting for WebSocket barrier after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.socket.on("pong", onPong);
+      this.socket.once("close", onClose);
+      this.socket.once("error", onError);
+      try {
+        this.socket.ping(marker);
+      } catch (error) {
+        cleanup();
+        reject(error);
+      }
+    });
+  }
+
+  pauseIncoming() {
+    this.socket.pause();
+  }
+
+  resumeIncoming() {
+    this.socket.resume();
   }
 
   nextRaw(timeoutMs = MESSAGE_TIMEOUT_MS) {
@@ -208,6 +256,18 @@ class SocketInbox {
 
   waitClosed() {
     return this.closed;
+  }
+
+  expectClosed(timeoutMs = MESSAGE_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for WebSocket close after ${timeoutMs}ms`));
+      }, timeoutMs);
+      this.closed.then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      });
+    });
   }
 
   terminate() {
@@ -399,7 +459,7 @@ test("relay v1 broker preserves authentication, routing, and stream teardown sem
   }
 });
 
-test("relay v1 duplicate host replacement fences the old socket without deleting the new host", async () => {
+test("relay v1 host replacement fences every old-host frame and retires its routes", async () => {
   const secret = "relay-replacement-test-secret";
   const hostId = "replacement-host";
   const { child, port, output } = await startRelayServer(secret);
@@ -432,10 +492,16 @@ test("relay v1 duplicate host replacement fences the old socket without deleting
       JSON.stringify({ ...openTerminal, clientId: ready.clientId }),
     );
 
+    // Keep H1's client side OPEN after the broker starts its replacement close.
+    // This lets the test deterministically put stale application frames ahead of
+    // H1's close reply instead of depending on scheduling between two sockets.
+    oldHost.pauseIncoming();
     const newHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
     sockets.push(newHost);
     await newHost.open();
     assert.deepEqual(await newHost.nextJson(), { type: "host_registered", hostId });
+    newHost.sendJson({ type: "host_ready", hostId, displayName: "Winning H2" });
+    await newHost.barrier();
 
     assert.deepEqual(await client.nextJson(), {
       type: "error",
@@ -447,13 +513,45 @@ test("relay v1 duplicate host replacement fences the old socket without deleting
       streamId: "stream-before-replacement",
       code: 0,
     });
+
+    oldHost.sendJson({ type: "host_ready", hostId, displayName: "Stale H1" });
+    oldHost.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: "stale-h1-sessions",
+      sessions: [],
+    });
+    oldHost.sendJson({
+      type: "terminal_data",
+      clientId: ready.clientId,
+      streamId: "stream-before-replacement",
+      data: "stale H1 tail",
+    });
+    oldHost.sendJson({
+      type: "terminal_exit",
+      clientId: ready.clientId,
+      streamId: "stream-before-replacement",
+      code: 91,
+    });
+    oldHost.resumeIncoming();
     assert.deepEqual(await oldHost.waitClosed(), { code: 4002, reason: "host replaced" });
+    await client.expectNoMessage();
+
+    client.sendJson({
+      type: "close_terminal",
+      streamId: "stream-before-replacement",
+    });
+    const retiredClose = await client.nextJson();
+    assert.equal(retiredClose.type, "error");
+    assert.equal(retiredClose.streamId, "stream-before-replacement");
+    await newHost.expectNoMessage();
 
     const authenticatedHosts = await fetch(`${baseHttp}/api/hosts`, auth);
     assert.equal(authenticatedHosts.status, 200);
     const hostCatalog = await authenticatedHosts.json();
     assert.equal(hostCatalog.hosts.length, 1);
     assert.equal(hostCatalog.hosts[0].hostId, hostId);
+    assert.equal(hostCatalog.hosts[0].displayName, "Winning H2");
 
     const afterReplacement = {
       type: "list_sessions",
@@ -465,6 +563,473 @@ test("relay v1 duplicate host replacement fences the old socket without deleting
       JSON.stringify({ ...afterReplacement, clientId: ready.clientId }),
       "the old host close callback must not remove the replacement host",
     );
+    newHost.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: "after-replacement",
+      sessions: [],
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "sessions",
+      requestId: "after-replacement",
+      sessions: [],
+    });
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 stream ids are one-shot after a client closes them", async () => {
+  const secret = "relay-client-close-tombstone-secret";
+  const hostId = "client-close-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const firstOpen = {
+      type: "open_terminal",
+      streamId: "client-closed-stream",
+      session: "tw-term-first-generation",
+    };
+    client.sendJson(firstOpen);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...firstOpen, clientId: ready.clientId }),
+    );
+
+    client.sendJson({ type: "close_terminal", streamId: firstOpen.streamId });
+    assert.deepEqual(await host.nextJson(), {
+      type: "close_terminal",
+      streamId: firstOpen.streamId,
+      clientId: ready.clientId,
+    });
+
+    client.sendJson({
+      type: "open_terminal",
+      streamId: firstOpen.streamId,
+      session: "tw-term-forbidden-reuse",
+    });
+    const reuseError = await client.nextJson();
+    assert.equal(reuseError.type, "error");
+    assert.equal(reuseError.streamId, firstOpen.streamId);
+    await host.expectNoMessage();
+
+    const freshOpen = {
+      type: "open_terminal",
+      streamId: "fresh-stream-after-close",
+      session: "tw-term-fresh-generation",
+    };
+    client.sendJson(freshOpen);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...freshOpen, clientId: ready.clientId }),
+      "rejecting streamId reuse must not disable fresh routes for the client",
+    );
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 active routes deliver one data tail and one terminal exit before retirement", async () => {
+  const secret = "relay-host-exit-tombstone-secret";
+  const hostId = "host-exit-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const openTerminal = {
+      type: "open_terminal",
+      streamId: "host-exited-stream",
+      session: "tw-term-host-exit",
+    };
+    client.sendJson(openTerminal);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...openTerminal, clientId: ready.clientId }),
+    );
+
+    host.sendJson({
+      type: "terminal_data",
+      clientId: ready.clientId,
+      streamId: openTerminal.streamId,
+      data: "active route data",
+    });
+    host.sendJson({
+      type: "terminal_exit",
+      clientId: ready.clientId,
+      streamId: openTerminal.streamId,
+      code: 23,
+    });
+    host.sendJson({
+      type: "terminal_data",
+      clientId: ready.clientId,
+      streamId: openTerminal.streamId,
+      data: "late data after exit",
+    });
+    host.sendJson({
+      type: "terminal_exit",
+      clientId: ready.clientId,
+      streamId: openTerminal.streamId,
+      code: 24,
+    });
+    await host.barrier();
+
+    assert.deepEqual(await client.nextJson(), {
+      type: "terminal_data",
+      streamId: openTerminal.streamId,
+      data: "active route data",
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "terminal_exit",
+      streamId: openTerminal.streamId,
+      code: 23,
+    });
+    await client.expectNoMessage();
+
+    client.sendJson({
+      type: "open_terminal",
+      streamId: openTerminal.streamId,
+      session: "tw-term-forbidden-after-exit",
+    });
+    const reuseError = await client.nextJson();
+    assert.equal(reuseError.type, "error");
+    assert.equal(reuseError.streamId, openTerminal.streamId);
+    await host.expectNoMessage();
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 rejects primitive and null frames without crashing or poisoning later routing", async () => {
+  const secret = "relay-malformed-frame-secret";
+  const hostId = "malformed-frame-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseHttp = `http://127.0.0.1:${port}`;
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const malformedValues = [null, 0, false, "primitive", []];
+    for (const value of malformedValues) host.sendJson(value);
+    await host.barrier();
+
+    for (const value of malformedValues) client.sendJson(value);
+    await client.barrier();
+    for (const _value of malformedValues) {
+      const error = await client.nextJson();
+      assert.equal(error.type, "error");
+      assert.equal(typeof error.message, "string");
+    }
+    await host.expectNoMessage();
+
+    const health = await fetch(`${baseHttp}/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true });
+
+    const validRequest = { type: "list_sessions", requestId: "after-malformed" };
+    client.sendJson(validRequest);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...validRequest, clientId: ready.clientId }),
+    );
+    host.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "sessions",
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 enforces a lifetime budget of 1024 accepted stream ids per client", async () => {
+  const secret = "relay-stream-budget-secret";
+  const hostId = "stream-budget-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const streamIds = Array.from(
+      { length: 1_024 },
+      (_unused, index) => `lifetime-stream-${index}`,
+    );
+    for (const streamId of streamIds) {
+      client.sendJson({
+        type: "open_terminal",
+        streamId,
+        session: `tw-term-${streamId}`,
+      });
+      client.sendJson({ type: "close_terminal", streamId });
+    }
+    await client.barrier(10_000);
+    await host.barrier(10_000);
+
+    for (const streamId of streamIds) {
+      assert.deepEqual(await host.nextJson(), {
+        type: "open_terminal",
+        streamId,
+        session: `tw-term-${streamId}`,
+        clientId: ready.clientId,
+      });
+      assert.deepEqual(await host.nextJson(), {
+        type: "close_terminal",
+        streamId,
+        clientId: ready.clientId,
+      });
+    }
+
+    client.sendJson({
+      type: "open_terminal",
+      streamId: streamIds[0],
+      session: "tw-term-oldest-reuse",
+    });
+    await client.barrier();
+    const oldestReuse = await client.nextJson();
+    assert.equal(oldestReuse.type, "error");
+    assert.equal(oldestReuse.streamId, streamIds[0]);
+    await host.expectNoMessage();
+
+    client.sendJson({
+      type: "open_terminal",
+      streamId: "lifetime-stream-over-budget",
+      session: "tw-term-over-lifetime-budget",
+    });
+    await client.barrier();
+    const budgetError = await client.nextJson(500);
+    assert.equal(budgetError.type, "error");
+    assert.equal(budgetError.streamId, "lifetime-stream-over-budget");
+    await host.expectNoMessage();
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 closes oversized host and client frames while keeping the broker usable", async () => {
+  const secret = "relay-oversized-frame-secret";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseHttp = `http://127.0.0.1:${port}`;
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const oversizedHost = new SocketInbox(`${baseWs}/host?hostId=oversized-frame-host`, auth);
+    sockets.push(oversizedHost);
+    await oversizedHost.open();
+    assert.deepEqual(await oversizedHost.nextJson(), {
+      type: "host_registered",
+      hostId: "oversized-frame-host",
+    });
+
+    const oversizedClient = new SocketInbox(`${baseWs}/client?hostId=oversized-frame-host`, auth);
+    sockets.push(oversizedClient);
+    await oversizedClient.open();
+    assert.equal((await oversizedClient.nextJson()).type, "ready");
+
+    const oversizedValue = "x".repeat(1024 * 1024);
+    oversizedHost.sendJson(oversizedValue);
+    oversizedClient.sendJson(oversizedValue);
+    await Promise.all([
+      oversizedHost.expectClosed(5_000),
+      oversizedClient.expectClosed(5_000),
+    ]);
+
+    const health = await fetch(`${baseHttp}/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true });
+
+    const recoveryHostId = "oversized-frame-recovery-host";
+    const recoveryHost = new SocketInbox(`${baseWs}/host?hostId=${recoveryHostId}`, auth);
+    sockets.push(recoveryHost);
+    await recoveryHost.open();
+    assert.deepEqual(await recoveryHost.nextJson(), {
+      type: "host_registered",
+      hostId: recoveryHostId,
+    });
+    const recoveryClient = new SocketInbox(`${baseWs}/client?hostId=${recoveryHostId}`, auth);
+    sockets.push(recoveryClient);
+    await recoveryClient.open();
+    const ready = await recoveryClient.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const validRequest = { type: "list_sessions", requestId: "after-oversized-frames" };
+    recoveryClient.sendJson(validRequest);
+    assert.equal(
+      await recoveryHost.nextRaw(),
+      JSON.stringify({ ...validRequest, clientId: ready.clientId }),
+    );
+    recoveryHost.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await recoveryClient.nextJson(), {
+      type: "sessions",
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 disconnects a paused slow client without poisoning its host or replacements", async () => {
+  const secret = "relay-slow-client-secret";
+  const hostId = "slow-client-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseHttp = `http://127.0.0.1:${port}`;
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const slowClient = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(slowClient);
+    await slowClient.open();
+    const slowReady = await slowClient.nextJson();
+    assert.equal(slowReady.type, "ready");
+    const openTerminal = {
+      type: "open_terminal",
+      streamId: "slow-client-stream",
+      session: "tw-term-slow-client",
+    };
+    slowClient.sendJson(openTerminal);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...openTerminal, clientId: slowReady.clientId }),
+    );
+
+    slowClient.pauseIncoming();
+    const chunk = "z".repeat(256 * 1024);
+    for (let index = 0; index < 96; index += 1) {
+      host.sendJson({
+        type: "terminal_data",
+        clientId: slowReady.clientId,
+        streamId: openTerminal.streamId,
+        data: chunk,
+      });
+    }
+    await host.barrier(15_000);
+    slowClient.resumeIncoming();
+    await slowClient.expectClosed(5_000);
+
+    assert.deepEqual(await host.nextJson(), {
+      type: "client_closed",
+      clientId: slowReady.clientId,
+    });
+    const health = await fetch(`${baseHttp}/health`);
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { ok: true });
+
+    const replacement = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(replacement);
+    await replacement.open();
+    const replacementReady = await replacement.nextJson();
+    assert.equal(replacementReady.type, "ready");
+    const validRequest = { type: "list_sessions", requestId: "after-slow-client" };
+    replacement.sendJson(validRequest);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...validRequest, clientId: replacementReady.clientId }),
+    );
+    host.sendJson({
+      type: "sessions",
+      clientId: replacementReady.clientId,
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await replacement.nextJson(), {
+      type: "sessions",
+      requestId: validRequest.requestId,
+      sessions: [],
+    });
   } catch (error) {
     error.message += `\nrelay-server output:\n${output.join("")}`;
     throw error;

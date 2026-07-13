@@ -11,15 +11,22 @@ import {
   isSafeRelayPath,
   isValidHostId,
   parseJsonMessage,
-  sendJson,
 } from "../v1/wire.js";
 import type { RelayServerOptions } from "./options.js";
 
 type HostConnection = {
   hostId: string;
+  connectorId: string;
+  active: boolean;
   displayName?: string;
   socket: WebSocket;
   connectedAt: number;
+};
+
+type StreamBinding = {
+  hostId: string;
+  connectorId: string;
+  routeId: string;
 };
 
 type ClientConnection = {
@@ -27,18 +34,32 @@ type ClientConnection = {
   defaultHostId?: string;
   socket: WebSocket;
   connectedAt: number;
-  streams: Map<string, string>;
+  streams: Map<string, StreamBinding>;
+  retiredStreams: Set<string>;
 };
 
 type RelaySocket = WebSocket & {
   isAlive?: boolean;
 };
 
+const MAX_ACTIVE_STREAMS_PER_CLIENT = 128;
+const MAX_ACCEPTED_STREAM_IDS_PER_CLIENT = 1_024;
+const MAX_RELAY_FRAME_BYTES = 1 * 1024 * 1024;
+const MAX_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+
 function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+function requestUrl(req: IncomingMessage): URL | undefined {
+  try {
+    return new URL(req.url || "/", "http://localhost");
+  } catch {
+    return undefined;
+  }
 }
 
 function requestSecret(req: IncomingMessage, url: URL): string {
@@ -59,13 +80,42 @@ function isOpen(socket: WebSocket): boolean {
   return socket.readyState === WebSocket.OPEN;
 }
 
+function sendJson(socket: WebSocket, message: unknown): boolean {
+  if (!isOpen(socket)) return false;
+  try {
+    const payload = JSON.stringify(message);
+    const payloadBytes = Buffer.byteLength(payload);
+    if (
+      payloadBytes > MAX_RELAY_FRAME_BYTES
+      || socket.bufferedAmount + payloadBytes > MAX_SOCKET_BUFFERED_BYTES
+    ) {
+      socket.terminate();
+      return false;
+    }
+    socket.send(payload);
+    return true;
+  } catch {
+    try { socket.terminate(); } catch {}
+    return false;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isCurrentHost(hosts: Map<string, HostConnection>, host: HostConnection): boolean {
+  return host.active && hosts.get(host.hostId) === host && isOpen(host.socket);
+}
+
 function hostInfos(hosts: Map<string, HostConnection>, clients: Map<string, ClientConnection>): RelayHostInfo[] {
   return [...hosts.values()].map((host) => ({
     hostId: host.hostId,
     displayName: host.displayName,
     connectedAt: host.connectedAt,
     clients: [...clients.values()].filter((client) =>
-      client.defaultHostId === host.hostId || [...client.streams.values()].includes(host.hostId)
+      client.defaultHostId === host.hostId
+      || [...client.streams.values()].some((binding) => binding.hostId === host.hostId)
     ).length,
   }));
 }
@@ -75,7 +125,7 @@ function getMessageHostId(message: RelayToHostMessage, client: ClientConnection)
     return message.hostId;
   }
   if ("streamId" in message && typeof message.streamId === "string") {
-    return client.streams.get(message.streamId) || client.defaultHostId;
+    return client.streams.get(message.streamId)?.hostId || client.defaultHostId;
   }
   return client.defaultHostId;
 }
@@ -92,11 +142,19 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
   const hosts = new Map<string, HostConnection>();
   const clients = new Map<string, ClientConnection>();
 
-  function dropHostStreams(hostId: string, reason: string): void {
+  function retireClientStream(client: ClientConnection, streamId: string): StreamBinding | undefined {
+    const binding = client.streams.get(streamId);
+    if (!binding) return undefined;
+    client.streams.delete(streamId);
+    client.retiredStreams.add(streamId);
+    return binding;
+  }
+
+  function dropHostStreams(host: HostConnection, reason: string): void {
     for (const client of clients.values()) {
-      for (const [streamId, streamHostId] of [...client.streams]) {
-        if (streamHostId !== hostId) continue;
-        client.streams.delete(streamId);
+      for (const [streamId, binding] of [...client.streams]) {
+        if (binding.hostId !== host.hostId || binding.connectorId !== host.connectorId) continue;
+        retireClientStream(client, streamId);
         if (isOpen(client.socket)) {
           sendJson(client.socket, { type: "error", streamId, message: reason });
           sendJson(client.socket, { type: "terminal_exit", streamId, code: 0 });
@@ -106,7 +164,11 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
   }
 
   const server = createServer((req, res) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const url = requestUrl(req);
+    if (!url) {
+      writeJson(res, { ok: false, error: "invalid request target" }, 400);
+      return;
+    }
     if (url.pathname === "/health") {
       writeJson(res, { ok: true });
       return;
@@ -128,10 +190,17 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
     writeJson(res, { ok: false, error: "not found" }, 404);
   });
 
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: MAX_RELAY_FRAME_BYTES,
+  });
 
   server.on("upgrade", (req, socket, head) => {
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const url = requestUrl(req);
+    if (!url) {
+      socket.destroy();
+      return;
+    }
     if (!isSafeRelayPath(url.pathname)) {
       socket.destroy();
       return;
@@ -152,8 +221,15 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
     liveSocket.on("pong", () => {
       liveSocket.isAlive = true;
     });
+    liveSocket.on("error", () => {
+      try { liveSocket.terminate(); } catch {}
+    });
 
-    const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+    const url = requestUrl(req);
+    if (!url) {
+      liveSocket.terminate();
+      return;
+    }
     if (url.pathname === "/host") {
       const hostId = url.searchParams.get("hostId") || "";
       if (!isValidHostId(hostId)) {
@@ -162,41 +238,83 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         return;
       }
       const previous = hosts.get(hostId);
-      if (previous && isOpen(previous.socket)) {
-        dropHostStreams(hostId, "host reconnected; terminal stream closed");
-        previous.socket.close(4002, "host replaced");
-      }
-      const host: HostConnection = { hostId, socket, connectedAt: Date.now() };
+      if (previous) previous.active = false;
+      const host: HostConnection = {
+        hostId,
+        connectorId: randomUUID(),
+        active: true,
+        socket,
+        connectedAt: Date.now(),
+      };
       hosts.set(hostId, host);
+      if (previous) {
+        dropHostStreams(previous, "host reconnected; terminal stream closed");
+        if (isOpen(previous.socket)) previous.socket.close(4002, "host replaced");
+      }
       console.log(`[relay] host connected: ${hostId}`);
       sendJson(socket, { type: "host_registered", hostId });
 
       socket.on("message", (raw) => {
+        if (!isCurrentHost(hosts, host)) return;
         let message: RelayHostMessage;
         try {
-          message = parseJsonMessage(raw) as RelayHostMessage;
+          const parsed = parseJsonMessage(raw);
+          if (!isRecord(parsed) || typeof parsed.type !== "string") return;
+          message = parsed as RelayHostMessage;
         } catch {
           return;
         }
         if (message.type === "host_ready") {
-          const current = hosts.get(hostId);
-          if (current) current.displayName = message.displayName;
+          if (
+            message.hostId !== hostId
+            || (message.displayName !== undefined && typeof message.displayName !== "string")
+          ) {
+            host.active = false;
+            if (hosts.get(hostId) === host) hosts.delete(hostId);
+            dropHostStreams(host, "host identity changed; terminal stream closed");
+            socket.close(4000, "hostId mismatch");
+            return;
+          }
+          host.displayName = message.displayName;
           return;
         }
-        const clientId = "clientId" in message ? message.clientId : undefined;
-        if (!clientId) return;
+        const clientId = "clientId" in message && typeof message.clientId === "string"
+          ? message.clientId
+          : undefined;
+        if (!clientId || !isCurrentHost(hosts, host)) return;
         const client = clients.get(clientId);
         if (!client || !isOpen(client.socket)) return;
+        const streamId = "streamId" in message && typeof message.streamId === "string"
+          ? message.streamId
+          : undefined;
+        if (
+          (message.type === "terminal_data" || message.type === "terminal_exit")
+          && !streamId
+        ) {
+          return;
+        }
+        if (streamId) {
+          const binding = client.streams.get(streamId);
+          if (
+            !binding
+            || binding.hostId !== hostId
+            || binding.connectorId !== host.connectorId
+          ) {
+            return;
+          }
+        }
         const { clientId: _clientId, ...outbound } = message;
         sendJson(client.socket, outbound satisfies RelayToClientMessage);
+        if (message.type === "terminal_exit") retireClientStream(client, message.streamId);
       });
 
       socket.on("close", () => {
-        if (hosts.get(hostId)?.socket === socket) {
+        if (hosts.get(hostId) === host) {
+          host.active = false;
           hosts.delete(hostId);
-          dropHostStreams(hostId, "host disconnected");
+          dropHostStreams(host, "host disconnected");
+          console.log(`[relay] host disconnected: ${hostId}`);
         }
-        console.log(`[relay] host disconnected: ${hostId}`);
       });
       return;
     }
@@ -215,6 +333,7 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         socket,
         connectedAt: Date.now(),
         streams: new Map(),
+        retiredStreams: new Set(),
       };
       clients.set(clientId, client);
       sendJson(socket, { type: "ready", clientId, hostId: client.defaultHostId });
@@ -226,7 +345,12 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
       socket.on("message", (raw) => {
         let message: RelayToHostMessage;
         try {
-          message = { ...(parseJsonMessage(raw) as object), clientId } as RelayToHostMessage;
+          const parsed = parseJsonMessage(raw);
+          if (!isRecord(parsed) || typeof parsed.type !== "string") {
+            sendJson(socket, { type: "error", message: "invalid message" });
+            return;
+          }
+          message = { ...parsed, clientId } as RelayToHostMessage;
         } catch {
           sendJson(socket, { type: "error", message: "invalid json" });
           return;
@@ -235,19 +359,67 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
           sendJson(socket, { type: "hosts", requestId: message.requestId, hosts: hostInfos(hosts, clients) });
           return;
         }
+
+        const streamIdValue: unknown = "streamId" in message ? message.streamId : undefined;
+        const requiresStreamId = message.type === "open_terminal"
+          || message.type === "terminal_input"
+          || message.type === "resize"
+          || message.type === "close_terminal";
+        if (
+          (requiresStreamId || streamIdValue !== undefined)
+          && (
+            typeof streamIdValue !== "string"
+            || !streamIdValue
+            || streamIdValue.length > 256
+            || /[\0\r\n]/.test(streamIdValue)
+          )
+        ) {
+          sendJson(socket, {
+            type: "error",
+            requestId: messageRequestId(message),
+            streamId: typeof streamIdValue === "string" ? streamIdValue : undefined,
+            message: "invalid streamId",
+          });
+          return;
+        }
+
+        if (
+          message.type === "terminal_input"
+          || message.type === "resize"
+          || message.type === "close_terminal"
+        ) {
+          const binding = client.streams.get(message.streamId);
+          if (!binding) {
+            sendJson(socket, {
+              type: "error",
+              streamId: message.streamId,
+              message: "terminal stream is not open",
+            });
+            return;
+          }
+          const currentHost = hosts.get(binding.hostId);
+          if (
+            !currentHost
+            || !isCurrentHost(hosts, currentHost)
+            || currentHost.connectorId !== binding.connectorId
+          ) {
+            retireClientStream(client, message.streamId);
+            sendJson(socket, { type: "error", streamId: message.streamId, message: "host is not connected" });
+            sendJson(socket, { type: "terminal_exit", streamId: message.streamId, code: 0 });
+            return;
+          }
+          sendJson(currentHost.socket, message);
+          if (message.type === "close_terminal") retireClientStream(client, message.streamId);
+          return;
+        }
+
         const targetHostId = getMessageHostId(message, client);
         if (!targetHostId || !isValidHostId(targetHostId)) {
           sendJson(socket, { type: "error", requestId: "requestId" in message ? message.requestId : undefined, message: "missing or invalid hostId" });
           return;
         }
-        if (message.type === "open_terminal") {
-          client.streams.set(message.streamId, targetHostId);
-        }
         const currentHost = hosts.get(targetHostId);
-        if (!currentHost || !isOpen(currentHost.socket)) {
-          if (message.type === "open_terminal") {
-            client.streams.delete(message.streamId);
-          }
+        if (!currentHost || !isCurrentHost(hosts, currentHost)) {
           sendJson(socket, {
             type: "error",
             requestId: messageRequestId(message),
@@ -256,23 +428,61 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
           });
           return;
         }
-        sendJson(currentHost.socket, message);
-        if (message.type === "close_terminal") {
-          client.streams.delete(message.streamId);
+        if (message.type === "open_terminal") {
+          if (client.streams.has(message.streamId) || client.retiredStreams.has(message.streamId)) {
+            sendJson(socket, {
+              type: "error",
+              streamId: message.streamId,
+              message: "streamId has already been used",
+            });
+            return;
+          }
+          if (client.streams.size >= MAX_ACTIVE_STREAMS_PER_CLIENT) {
+            sendJson(socket, {
+              type: "error",
+              streamId: message.streamId,
+              message: "too many active terminal streams",
+            });
+            return;
+          }
+          if (
+            client.streams.size + client.retiredStreams.size
+            >= MAX_ACCEPTED_STREAM_IDS_PER_CLIENT
+          ) {
+            sendJson(socket, {
+              type: "error",
+              streamId: message.streamId,
+              message: "terminal stream id budget exhausted; reconnect client",
+            });
+            return;
+          }
+          client.streams.set(message.streamId, {
+            hostId: targetHostId,
+            connectorId: currentHost.connectorId,
+            routeId: randomUUID(),
+          });
         }
+        sendJson(currentHost.socket, message);
       });
 
       socket.on("close", () => {
         clients.delete(clientId);
-        for (const hostId of new Set(client.streams.values())) {
-          const currentHost = hosts.get(hostId);
-          if (currentHost && isOpen(currentHost.socket)) {
+        const notifiedConnectors = new Set<string>();
+        for (const binding of client.streams.values()) {
+          if (notifiedConnectors.has(binding.connectorId)) continue;
+          const currentHost = hosts.get(binding.hostId);
+          if (
+            currentHost
+            && currentHost.connectorId === binding.connectorId
+            && isCurrentHost(hosts, currentHost)
+          ) {
             sendJson(currentHost.socket, { type: "client_closed", clientId });
+            notifiedConnectors.add(binding.connectorId);
           }
         }
         if (client.defaultHostId && !client.streams.size) {
           const currentHost = hosts.get(client.defaultHostId);
-          if (currentHost && isOpen(currentHost.socket)) {
+          if (currentHost && isCurrentHost(hosts, currentHost)) {
             sendJson(currentHost.socket, { type: "client_closed", clientId });
           }
         }
