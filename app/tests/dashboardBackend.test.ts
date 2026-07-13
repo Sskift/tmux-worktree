@@ -28,6 +28,7 @@ const theme: TmuxStatusTheme = {
   accent: "#4c8dff",
 };
 const projectArgs = { name: "dashboard", path: "/repo/dashboard" };
+const missingProjectArgs = { name: "legacy", path: "/repo/missing" };
 const createWorktreeArgs: CreateWorktreeInput = {
   project: "dashboard",
   branch: "feature/platform",
@@ -194,6 +195,12 @@ const commandCases: CommandCase[] = [
     command: "add_project",
     args: { args: projectArgs },
     call: (backend) => backend.projects.add(projectArgs),
+  },
+  {
+    label: "projects.removeMissing",
+    command: "remove_missing_project",
+    args: { args: missingProjectArgs },
+    call: (backend) => backend.projects.removeMissing(missingProjectArgs),
   },
   {
     label: "worktrees.listOrphaned",

@@ -198,7 +198,7 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 | `~/.tw-serve-token` | `tw serve` | `tw serve` | 本地 Web terminal bearer token |
 | `~/.tmux-worktree/mobile-relay-status.json` | connector runtime | 当前 relay-host instance | 可丢弃的连接状态，不是配置或 session 权威 |
 
-`profile=cli|dashboard` 只是 managed record 的来源标记，不选择不同的 tmux 布局。新 managed worktree 和 terminal 都是 single-pane contract：AI command 在唯一 pane 中运行，退出后回到 login shell。
+`profile=cli|dashboard` 只是 managed record 的来源标记，不选择不同的 tmux 布局。新 managed worktree 和 terminal 都是 single-pane contract：可选的 AI command 在唯一 pane 中运行，退出后回到 login shell；terminal 省略命令时直接进入 login shell。
 
 ### Android
 

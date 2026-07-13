@@ -84,7 +84,7 @@
   min-width: 0;
   overflow-y: auto;
   padding: 14px 12px;
-  background: #161617;
+  background: var(--shell-sidebar);
   border-right: 1px solid var(--shell-border);
 }
 
@@ -128,7 +128,7 @@
 .settings-dialog__nav-item[aria-selected="true"] {
   color: var(--shell-text);
   background: var(--shell-accent-soft);
-  border-color: rgb(58 139 255 / 22%);
+  border-color: color-mix(in srgb, var(--shell-accent) 28%, transparent);
 }
 
 .settings-dialog__panel {
@@ -187,9 +187,9 @@
 }
 
 .settings-notice--warning {
-  color: #f5c46b;
-  background: #2b2113;
-  border-color: #59411c;
+  color: var(--shell-warning);
+  background: var(--shell-warning-soft);
+  border-color: color-mix(in srgb, var(--shell-warning) 36%, transparent);
 }
 
 .settings-notice p {

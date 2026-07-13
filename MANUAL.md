@@ -53,6 +53,8 @@ Both forms always create a managed git worktree and write `~/.tmux-worktree/stat
 
 Create one from the Dashboard with `New worktree`: choose `Local`, choose a configured project or browse a path, then enter an AI command such as `claude` or `codex`.
 
+When a selected local project preset points to a path that no longer exists, the Dashboard removes only that exact name/path entry from `~/.tmux-worktree.json`; unrelated fields and a concurrently replaced entry are preserved.
+
 ## SSH Remote Hosts
 
 Remote Dashboard support assumes the host is reachable by SSH and has `tmux`, `git`, Node.js 20+, npm, and `tw`.
@@ -146,11 +148,13 @@ For Dashboard-created sessions, entering `claude`, `codex`, or another command i
 4. Enter the AI command, for example `claude` or `codex`.
 5. Create the worktree.
 
+For a selected SSH host, the project picker reads `projects`/`repositories`/`repos` from that host's own `~/.tmux-worktree.json`, expanding `~` against the remote physical home. The picker reports loading and an explicit empty-config state instead of hiding the project row.
+
 The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. Agents can invoke the same operation from the Mac with `tw host rpc remote-dev create-worktree ...`.
 
 ## Create Remote Terminals From Dashboard
 
-Use `+ terminal`, choose the remote host, choose or type the remote path, and enter the AI command. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
+Use `+ terminal`, choose the remote host, and choose or type the remote path. The AI command is optional; leaving it empty opens the TW-managed terminal in a login shell. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
 
 ## Remote Agent Skill
 

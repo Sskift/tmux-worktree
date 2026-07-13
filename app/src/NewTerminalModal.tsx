@@ -132,10 +132,6 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
       setError(isRemote ? "remote path required" : "directory required");
       return;
     }
-    if (!ai) {
-      setError("ai command required");
-      return;
-    }
     const l = label.trim() || p.split("/").filter(Boolean).pop() || "terminal";
     if (existingLabels.includes(l)) {
       setError(`A terminal named "${l}" already exists`);
@@ -154,7 +150,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
         setBusy(false);
         return;
       }
-      saveLastAiCmd(ai);
+      if (ai) saveLastAiCmd(ai);
     } catch (err) {
       setError(String(err));
       setBusy(false);
@@ -191,7 +187,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
       >
         <div className="modal__title" id={titleId}>new terminal</div>
         <p className="modal__hint" id={descriptionId}>
-          Create a TW-managed tmux session and start the AI command in it.
+          Create a TW-managed tmux session. An AI command is optional.
         </p>
 
         {hosts.length > 0 && (
@@ -242,13 +238,13 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
         </label>
 
         <label className="field">
-          <span className="field__label">ai command</span>
+          <span className="field__label">ai command (optional)</span>
           <input
             className="field__input"
             type="text"
             value={aiCmd}
             onChange={(e) => setAiCmd(e.target.value)}
-            placeholder="claude"
+            placeholder="leave empty for a login shell"
             disabled={busy}
             autoComplete="off"
             autoCorrect="off"
@@ -290,7 +286,7 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
           <button
             type="submit"
             className="btn btn--accent"
-            disabled={busy || !path.trim() || !aiCmd.trim()}
+            disabled={busy || !path.trim()}
           >
             {busy ? "creating..." : isRemote ? "create on host" : "create"}
           </button>

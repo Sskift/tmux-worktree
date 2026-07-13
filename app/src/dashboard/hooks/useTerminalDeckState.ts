@@ -424,7 +424,16 @@ export function useTerminalDeckAttachPhase(
       if (!registration.fence.isCurrent(lease)) return prev;
       return prev.includes(name) ? prev : [...prev, name];
     });
-    if (cwdIncarnations.current.get(name) === incarnation) return;
+    const existing = cwdRequested.current.get(name);
+    const existingIsCurrent = !!existing &&
+      existing.incarnation === incarnation &&
+      registration.fence.isCurrent(existing.lease);
+    if (
+      cwdIncarnations.current.get(name) === incarnation &&
+      existingIsCurrent
+    ) {
+      return;
+    }
     setCwdsBySession((prev) => {
       if (!registration.fence.isCurrent(lease) || !(name in prev)) return prev;
       const next = { ...prev };
@@ -432,14 +441,7 @@ export function useTerminalDeckAttachPhase(
       return next;
     });
     cwdIncarnations.current.delete(name);
-    const existing = cwdRequested.current.get(name);
-    if (
-      existing &&
-      existing.incarnation === incarnation &&
-      registration.fence.isCurrent(existing.lease)
-    ) {
-      return;
-    }
+    if (existingIsCurrent) return;
     const request: TerminalDeckRequest = {
       lease,
       incarnation,
@@ -449,10 +451,13 @@ export function useTerminalDeckAttachPhase(
     dashboardBackend.sessions.root(name)
       .then((cwd) => {
         if (
-          !cwd ||
           !registration.fence.isCurrent(lease) ||
           cwdRequested.current.get(name) !== request
         ) {
+          return;
+        }
+        if (!cwd) {
+          cwdRequested.current.delete(name);
           return;
         }
         cwdIncarnations.current.set(name, incarnation);
@@ -463,8 +468,7 @@ export function useTerminalDeckAttachPhase(
             : prev
         ));
       })
-      .catch(() => {})
-      .finally(() => {
+      .catch(() => {
         if (cwdRequested.current.get(name) === request) {
           cwdRequested.current.delete(name);
         }

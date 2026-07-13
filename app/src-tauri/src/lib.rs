@@ -41,6 +41,7 @@ pub fn run() {
             tmux_session_exists,
             list_projects,
             add_project,
+            remove_missing_project,
             create_worktree,
             kill_session,
             list_orphaned_worktrees,

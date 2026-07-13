@@ -199,10 +199,14 @@ tw claude myapp
 tw claude myapp fix-auth
 tw codex ~/code/backend
 tw rpc create-worktree --project myapp --ai-command "claude" --name fix-auth
+tw rpc create-terminal --cwd ~/code/backend
 tw rpc create-terminal --cwd ~/code/backend --ai-command "codex"
 tw rpc restore-worktree --path ~/.tmux-worktree/worktrees/myapp/myapp-fix-abc12 --name myapp-fix
 tw rpc kill-session --name tw-term-abc12
 ```
+
+The Dashboard's `New terminal` AI command is optional. Leaving it empty creates the same
+TW-managed single-pane terminal directly in a login shell.
 
 `tw ls` is non-interactive and exits after printing the current session list; `tw status` remains a compatibility alias. Session switching remains available through `tw attach <session>` and native tmux; the CLI no longer opens an alternate-screen status UI or creates status/extra-shell panes.
 

@@ -203,10 +203,10 @@
 .tw-sidebar-section__heading h2 {
   min-inline-size: 0;
   margin: 0;
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 650;
-  letter-spacing: 0.075em;
-  line-height: 1;
+  letter-spacing: 0.065em;
+  line-height: 1.2;
   text-transform: uppercase;
 }
 
@@ -309,7 +309,7 @@
 }
 
 .tw-sidebar-section__error {
-  color: #ffb4ae;
+  color: var(--shell-danger);
   background: var(--shell-danger-soft);
 }
 
@@ -328,8 +328,8 @@
   grid-template-columns: auto auto auto auto minmax(0, 1fr) auto;
   align-items: center;
   inline-size: 100%;
-  min-block-size: 30px;
-  gap: 5px;
+  min-block-size: 34px;
+  gap: 6px;
   padding: 0 8px;
   border: 0;
   border-radius: var(--shell-radius-sm);
@@ -356,8 +356,9 @@
   max-inline-size: 68px;
   overflow: hidden;
   color: var(--shell-text-muted);
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 550;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -371,8 +372,10 @@
   min-inline-size: 0;
   overflow: hidden;
   color: var(--shell-text-secondary);
-  font-size: 11px;
-  font-weight: 550;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.005em;
+  line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -387,7 +390,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   min-inline-size: 0;
-  min-block-size: 40px;
+  min-block-size: 42px;
   border-radius: var(--shell-radius-md);
   color: var(--shell-text-muted);
 }
@@ -406,7 +409,7 @@
   grid-template-columns: 10px minmax(0, 1fr);
   align-items: center;
   min-inline-size: 0;
-  min-block-size: 40px;
+  min-block-size: 42px;
   gap: 8px;
   padding: 4px 4px 4px 16px;
   border: 0;
@@ -440,7 +443,7 @@
 .tw-sidebar-row__copy {
   display: grid;
   min-inline-size: 0;
-  gap: 1px;
+  gap: 2px;
 }
 
 .tw-sidebar-row__title,
@@ -454,18 +457,20 @@
 .tw-sidebar-row__title {
   color: var(--shell-text-secondary);
   font-size: 13px;
-  font-weight: 500;
-  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  line-height: 1.35;
 }
 
 .tw-sidebar-row[data-selected="true"] .tw-sidebar-row__title {
   color: var(--shell-text);
+  font-weight: 650;
 }
 
 .tw-sidebar-row__meta {
   color: var(--shell-text-faint);
-  font-size: 11px;
-  line-height: 1.25;
+  font-size: 11.5px;
+  line-height: 1.3;
 }
 
 .tw-sidebar-row__status,

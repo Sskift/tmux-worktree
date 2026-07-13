@@ -1,9 +1,10 @@
 use super::{
     acquire_dashboard_config_file_lock, add_host_with_state, agent_running_from_pane_title,
     append_automation_run, atomic_write_file_with, automation_command_with_instruction,
-    build_local_worktree_rpc_args, classify_dashboard_layout, cleanup_pending_worktrees,
-    config_worktree_base, config_worktree_base_with_home, create_local_terminal_via_runtime,
-    create_local_worktree_via_runtime, create_remote_terminal_via_tw_rpc, create_remote_worktree,
+    build_local_worktree_rpc_args, build_terminal_rpc_args, classify_dashboard_layout,
+    cleanup_pending_worktrees, config_worktree_base, config_worktree_base_with_home,
+    create_local_terminal_via_runtime, create_local_worktree_via_runtime,
+    create_remote_terminal_via_tw_rpc, create_remote_worktree,
     dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
     delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
     find_host, finish_git_fetch_target, git_fetch_args, git_graph_for, git_graph_refs_for,
@@ -17,21 +18,22 @@ use super::{
     orphaned_worktrees, parse_kill_session_rpc_response, parse_local_worktree_rpc_response,
     parse_session_key, probe_local_agents_in_paths, project_from_config,
     project_from_worktree_path, projects_from_config, projects_from_config_with_home,
-    read_dashboard_config_lock_owner, remote_file_exists_for_host, remote_home_dir_for_host,
-    remote_read_dirs_for_host, remote_read_file_bytes_for_host, remote_write_file_for_host,
-    remove_host_with_state, reserve_git_fetch_target, restore_local_worktree_via_runtime,
-    run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
-    save_layout_to_path, save_pending_cleanup, save_terminals, scp_cli_command,
-    select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
-    ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
-    trigger_automation_with_creator, try_cleanup_worktree, tw_rpc_capabilities_compatible,
-    update_host_config, upsert_automation_from_input, validate_ssh_host_fields,
-    worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs, AgentProbeResult,
-    Automation, AutomationOverlap, AutomationRun, AutomationStatus, AutomationTriggerType,
-    CachedHostStatus, CreateArgs, CreateTerminalArgs, DashboardConfigLockOwner,
-    DashboardLayoutClassification, DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker,
-    GitGraphPreset, GitGraphQuery, GitGraphRefKind, HostConfig, HostState, HostStatus,
-    LocalTwRpcRuntime, OrphanedWorktree, Project, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
+    read_dashboard_config_lock_owner, remote_config_for_host, remote_file_exists_for_host,
+    remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
+    remote_write_file_for_host, remove_host_with_state, remove_missing_project,
+    reserve_git_fetch_target, restore_local_worktree_via_runtime, run_remote_tmux_check,
+    run_remote_tw_check, save_automation, save_hosts_config, save_layout_to_path,
+    save_pending_cleanup, save_terminals, scp_cli_command, select_local_tw_rpc_runtime,
+    should_skip_automation_overlap, ssh_command, ssh_host_candidates_from_config_text,
+    stable_output_signature, test_host, tmux_session_exists, trigger_automation_with_creator,
+    try_cleanup_worktree, tw_rpc_capabilities_compatible, update_host_config,
+    upsert_automation_from_input, validate_ssh_host_fields, worktree_has_uncommitted_changes,
+    worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
+    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
+    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
+    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
+    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
+    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
     AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
 };
 use std::collections::HashSet;
@@ -981,6 +983,127 @@ fn config_parses_remote_home_relative_paths() {
 }
 
 #[test]
+fn missing_selected_project_is_removed_atomically_without_touching_other_config() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let existing_path = temp.path().join("existing");
+    let missing_path = temp.path().join("missing");
+    fs::create_dir_all(&existing_path).expect("existing project");
+    unsafe {
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+    }
+
+    let config_path = temp.path().join(".tmux-worktree.json");
+    fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "rootExtension": { "keep": true },
+            "repositories": {
+                "stale": {
+                    "directory": missing_path,
+                    "defaultBranch": "develop",
+                    "projectExtension": { "keep": true }
+                },
+                "keep": {
+                    "path": existing_path,
+                    "projectExtension": { "keep": true }
+                }
+            },
+            "hosts": [{
+                "id": "builder",
+                "host": "builder.example.test",
+                "hostExtension": { "keep": true }
+            }]
+        }))
+        .expect("serialize config"),
+    )
+    .expect("seed config");
+
+    let result = remove_missing_project(RemoveMissingProjectArgs {
+        name: "stale".to_string(),
+        path: missing_path.to_string_lossy().to_string(),
+    })
+    .expect("remove stale project");
+    assert!(result.removed);
+    assert_eq!(
+        result
+            .projects
+            .iter()
+            .map(|project| project.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["keep"]
+    );
+
+    let bytes = fs::read(&config_path).expect("updated config");
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse updated config");
+    assert!(
+        saved.get("projects").is_none(),
+        "preserve the repositories alias"
+    );
+    assert!(saved["repositories"].get("stale").is_none());
+    assert_eq!(
+        saved["repositories"]["keep"]["projectExtension"]["keep"],
+        true
+    );
+    assert_eq!(saved["rootExtension"]["keep"], true);
+    assert_eq!(saved["hosts"][0]["hostExtension"]["keep"], true);
+    assert_eq!(
+        fs::metadata(&config_path)
+            .expect("config metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(!temp.path().join(".tmux-worktree.json.lock").exists());
+
+    restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+    restore_env("HOME", original_home);
+}
+
+#[test]
+fn missing_project_cleanup_does_not_delete_a_concurrently_replaced_entry() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_dashboard_home = std::env::var("TW_DASHBOARD_HOME").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    unsafe {
+        std::env::set_var("HOME", temp.path());
+        std::env::set_var("TW_DASHBOARD_HOME", temp.path());
+    }
+
+    let old_path = temp.path().join("old-missing");
+    let replacement_path = temp.path().join("replacement-missing");
+    let config_path = temp.path().join(".tmux-worktree.json");
+    fs::write(
+        &config_path,
+        format!(
+            "{{\"projects\":{{\"demo\":{{\"path\":\"{}\",\"future\":true}}}},\"rootFuture\":true}}\n",
+            replacement_path.to_string_lossy()
+        ),
+    )
+    .expect("seed replacement config");
+    let before = fs::read(&config_path).expect("config before");
+
+    let result = remove_missing_project(RemoveMissingProjectArgs {
+        name: "demo".to_string(),
+        path: old_path.to_string_lossy().to_string(),
+    })
+    .expect("ignore stale cleanup request");
+    assert!(!result.removed);
+    assert_eq!(fs::read(&config_path).expect("config after"), before);
+    assert_eq!(result.projects[0].path, replacement_path.to_string_lossy());
+    assert!(!temp.path().join(".tmux-worktree.json.lock").exists());
+
+    restore_env("TW_DASHBOARD_HOME", original_dashboard_home);
+    restore_env("HOME", original_home);
+}
+
+#[test]
 fn orphaned_worktrees_excludes_live_sessions() {
     let temp = tempfile::tempdir().expect("tempdir");
     let project_dir = temp.path().join("proj");
@@ -1488,6 +1611,19 @@ printf '%s\n' '{"protocolVersion":1,"kind":"terminal","session":"tw-term-abc12",
     );
     restore_env("TW_DASHBOARD_HOME", original_tw_home);
     restore_env("HOME", original_home);
+}
+
+#[test]
+fn dashboard_terminal_without_ai_command_uses_the_frozen_optional_rpc_shape() {
+    assert_eq!(
+        build_terminal_rpc_args(&CreateTerminalArgs {
+            cwd: "  /repo/app  ".to_string(),
+            ai_cmd: "   ".to_string(),
+            host_id: None,
+        })
+        .expect("terminal RPC args"),
+        vec!["rpc", "create-terminal", "--cwd", "/repo/app"]
+    );
 }
 
 #[test]
@@ -2618,6 +2754,94 @@ exit 12
 }
 
 #[test]
+fn remote_project_catalog_reads_physical_home_config_over_ssh() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let bin_dir = temp.path().join("bin");
+    let log_path = temp.path().join("ssh.log");
+    fs::create_dir_all(&bin_dir).expect("bin dir");
+    let ssh_path = bin_dir.join("ssh");
+    fs::write(
+        &ssh_path,
+        r#"#!/bin/sh
+log="${TW_FAKE_SSH_LOG:?}"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    if [ "$#" -gt 0 ]; then shift; fi
+    break
+  fi
+  shift
+done
+printf '%s\n' "$*" >> "$log"
+
+if [ "$#" -eq 1 ]; then
+  case "$1" in
+    *'pwd -P'*)
+      printf '/data/home/dev'
+      exit 0
+      ;;
+    *'.tmux-worktree.json'*)
+      printf '%s' '{"projects":{"x":{"path":"~/workspace/x","defaultBranch":"develop"}}}'
+      exit 0
+      ;;
+  esac
+fi
+
+printf 'unexpected remote command: %s\n' "$*" >&2
+exit 12
+"#,
+    )
+    .expect("ssh shim");
+    let mut permissions = fs::metadata(&ssh_path).expect("ssh metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&ssh_path, permissions).expect("ssh executable");
+
+    let original_path = std::env::var("PATH").ok();
+    let original_log = std::env::var("TW_FAKE_SSH_LOG").ok();
+    unsafe {
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin_dir.to_string_lossy(),
+                original_path.clone().unwrap_or_default()
+            ),
+        );
+        std::env::set_var("TW_FAKE_SSH_LOG", &log_path);
+    }
+
+    let host = HostConfig {
+        id: "dev".to_string(),
+        label: "Dev".to_string(),
+        host: "ssh-host".to_string(),
+        user: None,
+        port: None,
+        identity_file: None,
+        worktree_base: None,
+        tmux_path: None,
+        tw_path: None,
+    };
+
+    let (config, home) = remote_config_for_host(&host)
+        .expect("remote config")
+        .expect("remote config exists");
+    let projects = projects_from_config_with_home(&config, Some(&home));
+    let log = fs::read_to_string(&log_path).expect("ssh log");
+
+    assert_eq!(home, "/data/home/dev");
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0].name, "x");
+    assert_eq!(projects[0].path, "/data/home/dev/workspace/x");
+    assert_eq!(projects[0].branch.as_deref(), Some("develop"));
+    assert!(log.contains("pwd -P"));
+    assert!(log.contains(".tmux-worktree.json"));
+
+    restore_env("PATH", original_path);
+    restore_env("TW_FAKE_SSH_LOG", original_log);
+}
+
+#[test]
 fn remote_directory_picker_reads_home_and_directories_over_ssh() {
     let _guard = test_env_lock().lock().expect("lock");
     let temp = tempfile::tempdir().expect("tempdir");
@@ -3487,7 +3711,7 @@ exit 12
     let log = fs::read_to_string(&log_path).expect("ssh log");
     assert!(log.contains("git clone --depth 1"));
     assert!(log.contains("--branch \"$tag\""));
-    assert!(log.contains("v1.0.3"));
+    assert!(log.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
     assert!(log.contains("https://github.com/Sskift/tmux-worktree.git"));
     assert!(log.contains("npm link --prefix"));
 

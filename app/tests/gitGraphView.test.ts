@@ -51,7 +51,17 @@ test("selected commit details reserve comparison and diff actions", () => {
 
 test("graph styling is self-contained and sized for the Git side panel", () => {
   assert.match(styles, /\.git-graph\s*\{[\s\S]*?max-width:\s*440px;/);
-  assert.match(styles, /--git-graph-row-height:\s*58px/);
+  assert.match(styles, /--git-graph-row-height:\s*54px/);
+  assert.match(styles, /--git-graph-subject-size:\s*12px/);
+  assert.match(styles, /--git-graph-meta-size:\s*10px/);
+  assert.match(source, /const ROW_HEIGHT = 54;/);
+  assert.match(source, /const LANE_STEP = 16;/);
+  assert.match(source, /const MIN_GRAPH_WIDTH = 40;/);
+  assert.match(source, /const NODE_RADIUS = 4;/);
+  assert.match(source, /const MERGE_NODE_RADIUS = 5;/);
+  assert.match(source, /const SELECTED_NODE_RADIUS = 7;/);
+  assert.match(styles, /\.git-graph__subject\s*\{[\s\S]*?font-size:\s*var\(--git-graph-subject-size\);[\s\S]*?font-weight:\s*500;/);
+  assert.match(styles, /\.git-graph__commit-meta\s*\{[\s\S]*?font-size:\s*var\(--git-graph-meta-size\);/);
   assert.match(styles, /\.git-graph__lane-0/);
   assert.match(styles, /\.git-graph__lane-5/);
   assert.doesNotMatch(source, /gitgraph\.js|@gitgraph|gitgraph-js/iu);

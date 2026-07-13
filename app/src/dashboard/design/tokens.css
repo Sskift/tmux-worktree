@@ -1,5 +1,5 @@
 :root {
-  color-scheme: dark;
+  color-scheme: var(--theme-color-scheme, dark);
 
   --shell-font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, sans-serif;
   --shell-font-mono: ui-monospace, "SFMono-Regular", Menlo, Monaco, Consolas, monospace;

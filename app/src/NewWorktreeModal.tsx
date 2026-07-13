@@ -63,6 +63,7 @@ export function NewWorktreeModal({
   const remoteBrowseButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const catalogRequestGateRef = useRef(createLatestRequestGate());
+  const projectValidationGateRef = useRef(createLatestRequestGate());
   const catalogDraftStateRef = useRef<WorktreeCatalogDraftState>({
     source: LOCAL_HOST,
     dirty: false,
@@ -79,6 +80,8 @@ export function NewWorktreeModal({
   const [name, setName] = useState<string>("");
   const [branch, setBranch] = useState<string>("");
   const [showRemotePicker, setShowRemotePicker] = useState(false);
+  const [validatingProject, setValidatingProject] = useState(false);
+  const [projectCatalogLoading, setProjectCatalogLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -92,18 +95,26 @@ export function NewWorktreeModal({
       detail: host.host,
     })),
   ];
-  const projectMenuOptions: MenuOption[] = [
-    ...projects.map((p) => ({
-      value: p.name,
-      label: p.name,
-      detail: `${p.path}${p.branch ? ` @ ${p.branch}` : ""}`,
-    })),
-    {
-      value: CUSTOM,
-      label: "+ custom path...",
-      detail: "choose another repository",
-    },
-  ];
+  const selectedHostLabel = hosts.find((host) => host.id === selectedHost)?.label
+    ?? selectedHost;
+  const projectMenuOptions: MenuOption[] = isRemote && projectCatalogLoading
+    ? [{
+        value: CUSTOM,
+        label: "Loading remote projects…",
+        detail: `${selectedHostLabel} · ~/.tmux-worktree.json`,
+      }]
+    : [
+        ...projects.map((p) => ({
+          value: p.name,
+          label: p.name,
+          detail: `${p.path}${p.branch ? ` @ ${p.branch}` : ""}`,
+        })),
+        {
+          value: CUSTOM,
+          label: "+ custom path...",
+          detail: "choose another repository",
+        },
+      ];
 
   useEffect(() => {
     previousFocusRef.current = document.activeElement instanceof HTMLElement
@@ -113,6 +124,7 @@ export function NewWorktreeModal({
 
     return () => {
       window.cancelAnimationFrame(animationFrame);
+      projectValidationGateRef.current.invalidate();
       const focusTarget = previousFocusRef.current;
       if (focusTarget?.isConnected) focusTarget.focus();
     };
@@ -135,6 +147,7 @@ export function NewWorktreeModal({
       setProjects([]);
       setProject(CUSTOM);
     }
+    setProjectCatalogLoading(true);
     setOrphans([]);
     setError(null);
 
@@ -142,6 +155,7 @@ export function NewWorktreeModal({
       void dashboardBackend.projects.list()
         .then((list) => {
           if (!requestGate.isCurrent(token)) return;
+          setProjectCatalogLoading(false);
           setProjects(list);
           if (
             shouldApplyWorktreeCatalogDefault(catalogDraftStateRef.current, selectedHost)
@@ -150,7 +164,9 @@ export function NewWorktreeModal({
           }
         })
         .catch((e) => {
-          if (requestGate.isCurrent(token)) setError(String(e));
+          if (!requestGate.isCurrent(token)) return;
+          setProjectCatalogLoading(false);
+          setError(String(e));
         });
       void dashboardBackend.worktrees.listOrphaned()
         .then((list) => {
@@ -161,6 +177,7 @@ export function NewWorktreeModal({
       void dashboardBackend.projects.listRemote(selectedHost)
         .then((list) => {
           if (!requestGate.isCurrent(token)) return;
+          setProjectCatalogLoading(false);
           setProjects(list);
           if (
             shouldApplyWorktreeCatalogDefault(catalogDraftStateRef.current, selectedHost)
@@ -170,6 +187,7 @@ export function NewWorktreeModal({
         })
         .catch((e) => {
           if (!requestGate.isCurrent(token)) return;
+          setProjectCatalogLoading(false);
           setProjects([]);
           setProject(CUSTOM);
           setError(String(e));
@@ -181,10 +199,13 @@ export function NewWorktreeModal({
 
   const changeHost = (hostId: string) => {
     catalogRequestGateRef.current.invalidate();
+    projectValidationGateRef.current.invalidate();
     catalogDraftStateRef.current = { source: hostId, dirty: false };
     setSelectedHost(hostId);
     setProjects([]);
     setProject(CUSTOM);
+    setValidatingProject(false);
+    setProjectCatalogLoading(true);
     setOrphans([]);
     setError(null);
   };
@@ -195,7 +216,35 @@ export function NewWorktreeModal({
 
   const changeProject = (nextProject: string) => {
     markCatalogDraftDirty();
+    projectValidationGateRef.current.invalidate();
     setProject(nextProject);
+    setValidatingProject(false);
+    setError(null);
+
+    if (isRemote || nextProject === CUSTOM) return;
+    const selected = projects.find((candidate) => candidate.name === nextProject);
+    if (!selected) return;
+
+    const requestGate = projectValidationGateRef.current;
+    const token = requestGate.issue(
+      requestSourceKey("new-worktree-local-project", selected.name, selected.path),
+    );
+    setValidatingProject(true);
+    void dashboardBackend.projects.removeMissing({
+      name: selected.name,
+      path: selected.path,
+    }).then((result) => {
+      if (!requestGate.isCurrent(token)) return;
+      setValidatingProject(false);
+      if (!result.removed) return;
+      setProjects(result.projects);
+      setProject(CUSTOM);
+      setError(`Removed "${selected.name}" because its directory no longer exists: ${selected.path}`);
+    }).catch((reason) => {
+      if (!requestGate.isCurrent(token)) return;
+      setValidatingProject(false);
+      setError(String(reason));
+    });
   };
 
   const browse = async () => {
@@ -284,6 +333,19 @@ export function NewWorktreeModal({
           createArgs.path = path;
         }
       } else {
+        const selected = projects.find((candidate) => candidate.name === project);
+        if (!selected) throw new Error("project required");
+        const result = await dashboardBackend.projects.removeMissing({
+          name: selected.name,
+          path: selected.path,
+        });
+        if (result.removed) {
+          setProjects(result.projects);
+          setProject(CUSTOM);
+          setError(`Removed "${selected.name}" because its directory no longer exists: ${selected.path}`);
+          setBusy(false);
+          return;
+        }
         createArgs.project = project;
       }
       if (branch.trim()) {
@@ -383,18 +445,21 @@ export function NewWorktreeModal({
           </label>
         )}
 
-        {(!isRemote || projects.length > 0) && (
-          <label className="field">
-            <span className="field__label">project</span>
-            <MenuSelect
-              ariaLabel="Project"
-              value={project}
-              options={projectMenuOptions}
-              onChange={changeProject}
-              disabled={busy}
-            />
-          </label>
-        )}
+        <label className="field">
+          <span className="field__label">project</span>
+          <MenuSelect
+            ariaLabel="Project"
+            value={project}
+            options={projectMenuOptions}
+            onChange={changeProject}
+            disabled={busy || validatingProject || (isRemote && projectCatalogLoading)}
+          />
+          {isRemote && !projectCatalogLoading && projects.length === 0 && !error && (
+            <span className="field__hint" role="status">
+              No projects found in ~/.tmux-worktree.json on {selectedHostLabel}. Use a custom path or add a projects entry on that host.
+            </span>
+          )}
+        </label>
 
         {isCustom && (
           <>
@@ -542,6 +607,7 @@ export function NewWorktreeModal({
             className="btn btn--accent"
             disabled={
               busy ||
+              validatingProject ||
               !aiCmd.trim() ||
               (isCustom &&
                 (!customPath.trim() ||

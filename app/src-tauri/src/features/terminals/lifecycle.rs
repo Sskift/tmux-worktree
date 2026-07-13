@@ -18,17 +18,16 @@ pub(crate) fn build_terminal_rpc_args(args: &CreateTerminalArgs) -> Result<Vec<S
         return Err("cwd required".to_string());
     }
     let ai_command = args.ai_cmd.trim();
-    if ai_command.is_empty() {
-        return Err("ai command required".to_string());
-    }
-    Ok(vec![
+    let mut rpc_args = vec![
         "rpc".to_string(),
         "create-terminal".to_string(),
         "--cwd".to_string(),
         cwd.to_string(),
-        "--ai-command".to_string(),
-        ai_command.to_string(),
-    ])
+    ];
+    if !ai_command.is_empty() {
+        rpc_args.extend(["--ai-command".to_string(), ai_command.to_string()]);
+    }
+    Ok(rpc_args)
 }
 
 fn parse_terminal_rpc_response(

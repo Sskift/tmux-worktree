@@ -33,7 +33,7 @@
   font-family:
     "JetBrains Mono", "SF Mono", Menlo, ui-monospace, monospace;
   font-size: 13px;
-  color-scheme: dark;
+  color-scheme: var(--theme-color-scheme, dark);
 }
 
 * {
@@ -1129,6 +1129,12 @@ button:disabled {
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-dim);
+}
+
+.field__hint {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .field__input {

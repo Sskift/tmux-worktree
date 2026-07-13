@@ -15,15 +15,15 @@
   --bg-elevated: var(--shell-surface-2);
   --line: var(--shell-border);
   --line-2: var(--shell-border-strong);
-  --divider-subtle: rgb(138 138 144 / 14%);
-  --divider: rgb(138 138 144 / 24%);
+  --divider-subtle: color-mix(in srgb, var(--shell-text-muted) 14%, transparent);
+  --divider: color-mix(in srgb, var(--shell-text-muted) 24%, transparent);
   --divider-strong: var(--shell-border-strong);
   --border: var(--shell-border);
-  --surface-muted: rgb(138 138 144 / 8%);
+  --surface-muted: color-mix(in srgb, var(--shell-text-muted) 8%, transparent);
   --surface-hover: var(--shell-surface-hover);
   --surface-hover-strong: var(--shell-accent-soft);
   --surface-selected: var(--shell-accent-soft);
-  --surface-selected-hover: rgb(58 139 255 / 24%);
+  --surface-selected-hover: color-mix(in srgb, var(--shell-accent) 24%, transparent);
   --surface-accent-soft: var(--shell-info-soft);
   --scrollbar: var(--shell-border-strong);
   --scrollbar-hover: var(--shell-text-disabled);
@@ -34,7 +34,7 @@
   --accent-a: var(--shell-accent);
   --accent-b: var(--shell-focus);
   --accent-c: var(--shell-warning);
-  --accent-a-glow: rgb(58 139 255 / 38%);
+  --accent-a-glow: color-mix(in srgb, var(--shell-accent) 38%, transparent);
   --accent-a-ink: var(--shell-focus);
   --ok: var(--shell-success);
   --ok-soft: var(--shell-success-soft);

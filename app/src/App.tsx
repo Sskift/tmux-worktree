@@ -1413,8 +1413,8 @@ function App() {
             <div className="settings-info-list">
               <div className="settings-info-row">
                 <div>
-                  <strong>Terminal theme</strong>
-                  <span>Controls xterm colors and the synchronized tmux palette.</span>
+                  <strong>Dashboard theme</strong>
+                  <span>Controls the app chrome, editor, terminal, and synchronized tmux palette.</span>
                 </div>
                 <ThemePicker current={theme} onChange={setTheme} />
               </div>

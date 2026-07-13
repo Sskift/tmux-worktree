@@ -66,9 +66,13 @@ export type GitGraphViewProps = {
   onCompareRefs?: (refs: readonly string[]) => void;
 };
 
-const ROW_HEIGHT = 58;
-const LANE_STEP = 18;
-const GRAPH_PADDING = 14;
+const ROW_HEIGHT = 54;
+const LANE_STEP = 16;
+const GRAPH_PADDING = 12;
+const MIN_GRAPH_WIDTH = 40;
+const NODE_RADIUS = 4;
+const MERGE_NODE_RADIUS = 5;
+const SELECTED_NODE_RADIUS = 7;
 const LANE_COLORS = 6;
 
 const PRESETS: ReadonlyArray<{ value: GitGraphPreset; label: string }> = [
@@ -104,7 +108,7 @@ function edgePath(edge: GitGraphEdgeLayout, rowCount: number): string {
   const toY = edge.truncated ? rowCount * ROW_HEIGHT : rowY(edge.toRow);
   if (fromX === toX) return `M ${fromX} ${fromY} L ${toX} ${toY}`;
 
-  const bend = Math.min(ROW_HEIGHT * 0.46, Math.max(14, (toY - fromY) * 0.35));
+  const bend = Math.min(ROW_HEIGHT * 0.46, Math.max(12, (toY - fromY) * 0.35));
   return `M ${fromX} ${fromY} C ${fromX} ${fromY + bend}, ${toX} ${toY - bend}, ${toX} ${toY}`;
 }
 
@@ -181,7 +185,10 @@ export function GitGraphView({
     id: commit.hash,
     parentIds: commit.parents,
   }))), [commits]);
-  const graphWidth = Math.max(48, GRAPH_PADDING * 2 + Math.max(0, layout.laneCount - 1) * LANE_STEP);
+  const graphWidth = Math.max(
+    MIN_GRAPH_WIDTH,
+    GRAPH_PADDING * 2 + Math.max(0, layout.laneCount - 1) * LANE_STEP,
+  );
   const graphHeight = commits.length * ROW_HEIGHT;
   const graphStyle = { "--git-graph-width": `${graphWidth}px` } as CSSProperties;
   const selectedCommit = commits.find((commit) => commit.hash === selectedCommitHash) ?? null;
@@ -433,18 +440,18 @@ export function GitGraphView({
                 const selected = node.commitId === selectedCommitHash;
                 return (
                   <g key={node.commitId} className={`${laneClass(node.lane)}${selected ? " git-graph__node--selected" : ""}`}>
-                    {selected && <circle className="git-graph__node-halo" cx={x} cy={y} r="8" />}
+                    {selected && <circle className="git-graph__node-halo" cx={x} cy={y} r={SELECTED_NODE_RADIUS} />}
                     {node.isMerge ? (
                       <path
                         className="git-graph__node git-graph__node--merge"
-                        d={`M ${x} ${y - 6} L ${x + 6} ${y} L ${x} ${y + 6} L ${x - 6} ${y} Z`}
+                        d={`M ${x} ${y - MERGE_NODE_RADIUS} L ${x + MERGE_NODE_RADIUS} ${y} L ${x} ${y + MERGE_NODE_RADIUS} L ${x - MERGE_NODE_RADIUS} ${y} Z`}
                       />
                     ) : (
                       <circle
                         className={`git-graph__node${node.isRoot ? " git-graph__node--root" : ""}`}
                         cx={x}
                         cy={y}
-                        r="5"
+                        r={NODE_RADIUS}
                       />
                     )}
                   </g>

@@ -62,6 +62,8 @@ function loadTerminalDeckHarness() {
   let pendingLayout = new Map<number, Effect>();
   let pendingPassive = new Map<number, Effect>();
   let cursor = 0;
+  let deferFunctionalStateUpdates = false;
+  const pendingFunctionalStateUpdates: Array<() => void> = [];
   const source = readFileSync(
     new URL("../src/dashboard/hooks/useTerminalDeckState.ts", import.meta.url),
     "utf8",
@@ -81,9 +83,18 @@ function loadTerminalDeckHarness() {
         states[index] = typeof initial === "function" ? (initial as () => unknown)() : initial;
       }
       return [states[index], (next: unknown) => {
-        states[index] = typeof next === "function"
-          ? (next as (current: unknown) => unknown)(states[index])
-          : next;
+        if (typeof next !== "function") {
+          states[index] = next;
+          return;
+        }
+        const apply = () => {
+          states[index] = (next as (current: unknown) => unknown)(states[index]);
+        };
+        if (deferFunctionalStateUpdates) {
+          pendingFunctionalStateUpdates.push(apply);
+        } else {
+          apply();
+        }
       }];
     },
     useRef(initial: unknown) {
@@ -217,6 +228,13 @@ function loadTerminalDeckHarness() {
         });
       }
     },
+    deferFunctionalStateUpdates() {
+      deferFunctionalStateUpdates = true;
+    },
+    flushFunctionalStateUpdates() {
+      deferFunctionalStateUpdates = false;
+      for (const apply of pendingFunctionalStateUpdates.splice(0)) apply();
+    },
   };
 }
 
@@ -258,6 +276,31 @@ async function settle(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
 }
+
+test("session root survives React-delayed state publication after the promise settles", async () => {
+  const harness = loadTerminalDeckHarness();
+  const backend = createFakeDashboardBackend().backend;
+  const root = deferred<string>();
+  backend.sessions.root = async () => root.promise;
+  const selectedSession = session(1);
+
+  harness.render(backend).commitLayout();
+  harness.render(backend, {
+    sessions: [selectedSession],
+    terminals: [],
+    selection: { kind: "session", name: "same" },
+    selectedSession,
+    selectedTerminal: null,
+  }).commitPassive();
+
+  harness.deferFunctionalStateUpdates();
+  root.resolve("/repo/same");
+  await settle();
+  assert.equal(harness.render(backend).controller.cwdsBySession.same, undefined);
+
+  harness.flushFunctionalStateUpdates();
+  assert.equal(harness.render(backend).controller.cwdsBySession.same, "/repo/same");
+});
 
 test("owner cuts hide speculative renders and fence stale setters, full cuts, and A to B to A", async () => {
   const harness = loadTerminalDeckHarness();
@@ -324,7 +367,7 @@ test("owner cuts hide speculative renders and fence stale setters, full cuts, an
   assert.equal(nextA.controller.cwdsBySession.same, "/A2");
 });
 
-test("same-name session reincarnation fences old preview and root completion and finally", async () => {
+test("same-name session reincarnation fences old preview and root completion", async () => {
   const harness = loadTerminalDeckHarness();
   const backend = createFakeDashboardBackend().backend;
   const oldHistory = deferred<string>();

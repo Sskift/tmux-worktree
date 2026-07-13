@@ -57,7 +57,7 @@
 
 .command-palette__search:focus-within {
   border-color: var(--shell-accent);
-  box-shadow: 0 0 0 2px rgb(58 139 255 / 18%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--shell-accent) 18%, transparent);
 }
 
 .command-palette__search:focus-within > svg {
@@ -254,8 +254,8 @@
   color: var(--shell-text-secondary);
   font-size: 11px;
   line-height: 1.35;
-  background: rgb(127 29 29 / 38%);
-  border: 1px solid rgb(255 95 87 / 32%);
+  background: var(--shell-danger-soft);
+  border: 1px solid var(--shell-danger-line);
   border-radius: var(--shell-radius-md);
 }
 

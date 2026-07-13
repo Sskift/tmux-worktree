@@ -1168,8 +1168,16 @@ function ink(color: string, bg: RGB, target = 4.5): string {
 export function deriveThemeVars(theme: Theme): Record<string, string> {
   const ui = theme.ui;
   const bg = parseRgb(ui["--bg"]);
+  // The raised surface is the closest background to foreground text in both
+  // dark and light palettes, so meeting contrast there also covers the flatter
+  // sidebar, header, and workspace surfaces.
+  const chromeSurface = parseRgb(ui["--bg-3"]);
   const light = isLightBg(bg);
+  const text = parseRgb(ui["--text"]);
+  const textDim = parseRgb(ui["--text-dim"]);
+  const accent = parseRgb(ui["--accent-a"]);
   const vars: Record<string, string> = {
+    "--theme-color-scheme": light ? "light" : "dark",
     "--divider-subtle": toRgba(ui["--text-dim"], 0.14),
     "--divider": toRgba(ui["--text-dim"], 0.24),
     "--divider-strong": toRgba(ui["--text-dim"], 0.34),
@@ -1188,6 +1196,30 @@ export function deriveThemeVars(theme: Theme): Record<string, string> {
     // vivid accent for fills/gradients, but ink a readable version for text.
     "--accent-a-ink": ink(ui["--accent-a"], bg, 4.0),
     "--accent-c-ink": ink(ui["--accent-c"], bg, 4.0),
+
+    // The product shell has its own semantic token vocabulary because it also
+    // needs secondary text, focus, chrome, and interaction states. Populate it
+    // from the selected theme instead of leaving the shell on a fixed dark
+    // palette while only the terminal and legacy panes change color.
+    "--shell-bg": ui["--bg"],
+    "--shell-sidebar": ui["--bg-1"],
+    "--shell-workspace": ui["--bg"],
+    "--shell-header": ui["--bg-1"],
+    "--shell-surface-1": ui["--bg-2"],
+    "--shell-surface-2": toHex(mix(parseRgb(ui["--bg-2"]), parseRgb(ui["--bg-3"]), 0.45)),
+    "--shell-surface-3": ui["--bg-3"],
+    "--shell-surface-hover": toRgba(ui["--accent-a"], light ? 0.08 : 0.12),
+    "--shell-border": ui["--line"],
+    "--shell-border-strong": ui["--line-2"],
+    "--shell-text": ink(ui["--text"], chromeSurface, 7.0),
+    "--shell-text-secondary": ink(toHex(mix(text, textDim, 0.24)), chromeSurface, 4.5),
+    "--shell-text-muted": ink(ui["--text-dim"], chromeSurface, 4.5),
+    "--shell-text-faint": ink(ui["--text-faint"], chromeSurface, 4.5),
+    "--shell-text-disabled": ink(ui["--text-faint"], chromeSurface, 3.0),
+    "--shell-accent": ui["--accent-a"],
+    "--shell-accent-hover": toHex(mix(accent, light ? [0, 0, 0] : [255, 255, 255], 0.16)),
+    "--shell-accent-soft": toRgba(ui["--accent-a"], light ? 0.13 : 0.18),
+    "--shell-focus": ink(ui["--accent-a"], chromeSurface, 3.2),
   };
   // Theme-adaptive semantic status colors, inked against the real --bg so they
   // stay legible on both light and dark themes.
@@ -1202,6 +1234,17 @@ export function deriveThemeVars(theme: Theme): Record<string, string> {
     vars[`${key}-soft`] = toRgba(val, light ? 0.16 : 0.12);
     vars[`${key}-line`] = toRgba(val, 0.3);
   }
+  vars["--shell-success"] = ink(vars["--ok"], chromeSurface, 3.6);
+  vars["--shell-success-soft"] = toRgba(vars["--shell-success"], light ? 0.16 : 0.12);
+  vars["--shell-warning"] = ink(vars["--warn"], chromeSurface, 3.6);
+  vars["--shell-warning-soft"] = toRgba(vars["--shell-warning"], light ? 0.16 : 0.12);
+  vars["--shell-danger"] = ink(vars["--danger"], chromeSurface, 4.0);
+  vars["--shell-danger-soft"] = toRgba(vars["--shell-danger"], light ? 0.16 : 0.12);
+  vars["--shell-danger-line"] = toRgba(vars["--shell-danger"], 0.3);
+  vars["--shell-info-soft"] = toRgba(
+    ink(vars["--info"], chromeSurface, 3.6),
+    light ? 0.16 : 0.12,
+  );
   return vars;
 }
 

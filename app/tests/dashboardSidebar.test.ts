@@ -210,6 +210,18 @@ test("sidebar source uses the icon library and responsive accessible styling", (
   assert.match(css, /max-inline-size:\s*100%/);
   assert.match(css, /font-size:\s*13px/);
   assert.match(css, /font-size:\s*11px/);
+  assert.match(
+    css,
+    /\.tw-sidebar-group__project\s*\{[\s\S]*?font-size:\s*13px;[\s\S]*?font-weight:\s*650;[\s\S]*?line-height:\s*1\.25;/,
+  );
+  assert.match(
+    css,
+    /\.tw-sidebar-row__title\s*\{[\s\S]*?font-size:\s*13px;[\s\S]*?font-weight:\s*600;[\s\S]*?line-height:\s*1\.35;/,
+  );
+  assert.match(
+    css,
+    /\.tw-sidebar-row__meta\s*\{[\s\S]*?color:\s*var\(--shell-text-faint\);[\s\S]*?font-size:\s*11\.5px;[\s\S]*?line-height:\s*1\.3;/,
+  );
   assert.match(css, /button:focus-visible/);
   assert.match(css, /@media \(max-width:\s*959px\)/);
   assert.match(css, /@media \(prefers-reduced-motion:\s*reduce\)/);

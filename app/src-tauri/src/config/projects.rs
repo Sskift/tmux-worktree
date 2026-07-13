@@ -6,7 +6,7 @@ use crate::remote::{remote_home_dir_for_host, run_remote_cmd_check, HostConfig};
 use crate::support::{
     app_home_dir, atomic_write_file, expand_home_path, expand_home_path_with_home,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 fn expand_config_path(value: &str, home: Option<&str>) -> String {
@@ -64,6 +64,32 @@ fn project_from_value_with_home(
     })
 }
 
+fn project_from_array_item_with_home(
+    value: &serde_json::Value,
+    home: Option<&str>,
+) -> Option<Project> {
+    if let Some(path) = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let expanded = expand_config_path(path, home);
+        let name = Path::new(&expanded)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(&expanded)
+            .to_string();
+        return Some(Project {
+            name,
+            path: expanded,
+            branch: None,
+        });
+    }
+
+    let name = string_field(value, &["name", "key", "id", "label"])?.to_string();
+    project_from_value_with_home(name, value, home)
+}
+
 fn projects_value(config: &serde_json::Value) -> Option<&serde_json::Value> {
     if config.is_array() {
         return Some(config);
@@ -88,27 +114,7 @@ pub(crate) fn projects_from_config_with_home(
             .collect(),
         Some(serde_json::Value::Array(items)) => items
             .iter()
-            .filter_map(|value| {
-                if let Some(path) = value
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    let expanded = expand_config_path(path, home);
-                    let name = Path::new(&expanded)
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or(&expanded)
-                        .to_string();
-                    return Some(Project {
-                        name,
-                        path: expanded,
-                        branch: None,
-                    });
-                }
-                let name = string_field(value, &["name", "key", "id", "label"])?.to_string();
-                project_from_value_with_home(name, value, home)
-            })
+            .filter_map(|value| project_from_array_item_with_home(value, home))
             .collect(),
         _ => vec![],
     }
@@ -129,12 +135,8 @@ pub(crate) fn project_from_config_with_home(
             .get(name)
             .and_then(|value| project_from_value_with_home(name.to_string(), value, home)),
         serde_json::Value::Array(items) => items.iter().find_map(|value| {
-            let project_name = string_field(value, &["name", "key", "id", "label"])?;
-            if project_name == name {
-                project_from_value_with_home(name.to_string(), value, home)
-            } else {
-                None
-            }
+            let project = project_from_array_item_with_home(value, home)?;
+            (project.name == name).then_some(project)
         }),
         _ => None,
     })
@@ -183,6 +185,133 @@ pub(crate) fn list_projects() -> Result<Vec<Project>, String> {
 pub(crate) struct AddProjectArgs {
     name: String,
     path: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RemoveMissingProjectArgs {
+    pub(crate) name: String,
+    pub(crate) path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RemoveMissingProjectResult {
+    pub(crate) removed: bool,
+    pub(crate) projects: Vec<Project>,
+}
+
+fn project_entry_matches(
+    value: &serde_json::Value,
+    mapped_name: Option<&str>,
+    name: &str,
+    path: &str,
+) -> bool {
+    let project = match mapped_name {
+        Some(mapped_name) => project_from_value_with_home(mapped_name.to_string(), value, None),
+        None => project_from_array_item_with_home(value, None),
+    };
+    project.is_some_and(|project| project.name == name && project.path == path)
+}
+
+fn remove_exact_project_entry(config: &mut serde_json::Value, name: &str, path: &str) -> bool {
+    if let serde_json::Value::Array(items) = config {
+        let original_len = items.len();
+        items.retain(|value| !project_entry_matches(value, None, name, path));
+        return items.len() != original_len;
+    }
+
+    let Some(root) = config.as_object_mut() else {
+        return false;
+    };
+    let Some(projects_key) = ["projects", "repositories", "repos"]
+        .iter()
+        .find(|key| root.contains_key(**key))
+        .copied()
+    else {
+        return false;
+    };
+    let Some(projects) = root.get_mut(projects_key) else {
+        return false;
+    };
+
+    match projects {
+        serde_json::Value::Object(entries) => {
+            let matches = entries
+                .get(name)
+                .is_some_and(|value| project_entry_matches(value, Some(name), name, path));
+            if matches {
+                entries.remove(name);
+            }
+            matches
+        }
+        serde_json::Value::Array(items) => {
+            let original_len = items.len();
+            items.retain(|value| !project_entry_matches(value, None, name, path));
+            items.len() != original_len
+        }
+        _ => false,
+    }
+}
+
+/// Remove only the locally configured project entry the caller selected, and
+/// only after reloading the locked config and confirming that the exact path
+/// is still configured and no longer exists. This prevents a stale UI request
+/// from deleting a concurrently replaced preset.
+#[tauri::command]
+pub(crate) fn remove_missing_project(
+    args: RemoveMissingProjectArgs,
+) -> Result<RemoveMissingProjectResult, String> {
+    let name = args.name.trim();
+    let selected_path = expand_config_path(args.path.trim(), None);
+    if name.is_empty() {
+        return Err("name required".into());
+    }
+    if selected_path.is_empty() {
+        return Err("path required".into());
+    }
+
+    let home = app_home_dir().ok_or("home dir not found")?;
+    let config_path = home.join(".tmux-worktree.json");
+    let _guard = dashboard_config_write_lock()
+        .lock()
+        .map_err(|_| "dashboard config write lock poisoned".to_string())?;
+    let _file_guard = acquire_dashboard_config_file_lock()?;
+
+    if !config_path.exists() {
+        return Ok(RemoveMissingProjectResult {
+            removed: false,
+            projects: vec![],
+        });
+    }
+
+    let text =
+        std::fs::read_to_string(&config_path).map_err(|error| format!("read config: {error}"))?;
+    let mut config: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("parse config: {error}"))?;
+    let selected_is_current = projects_from_config(&config)
+        .iter()
+        .any(|project| project.name == name && project.path == selected_path);
+
+    if !selected_is_current || Path::new(&selected_path).exists() {
+        return Ok(RemoveMissingProjectResult {
+            removed: false,
+            projects: projects_from_config(&config),
+        });
+    }
+
+    let removed = remove_exact_project_entry(&mut config, name, &selected_path);
+    if removed {
+        let mut pretty = serde_json::to_string_pretty(&config)
+            .map_err(|error| format!("serialize config: {error}"))?;
+        pretty.push('\n');
+        atomic_write_file(&config_path, pretty.as_bytes())
+            .map_err(|error| format!("write config: {error}"))?;
+    }
+
+    Ok(RemoveMissingProjectResult {
+        removed,
+        projects: projects_from_config(&config),
+    })
 }
 
 #[tauri::command]

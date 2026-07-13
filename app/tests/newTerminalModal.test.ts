@@ -14,7 +14,7 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-test("new terminal modal supports host selection and ai command", () => {
+test("new terminal modal supports host selection and an optional ai command", () => {
   const modal = readFileSync(new URL("../src/NewTerminalModal.tsx", import.meta.url), "utf8");
 
   assert.match(modal, /hosts:\s*HostConfig\[\]/);
@@ -23,6 +23,10 @@ test("new terminal modal supports host selection and ai command", () => {
   assert.match(modal, /loadLastAiCmd/);
   assert.match(modal, /saveLastAiCmd/);
   assert.match(modal, /hostId/);
+  assert.match(modal, /ai command \(optional\)/i);
+  assert.doesNotMatch(modal, /ai command required/i);
+  assert.match(modal, /disabled=\{busy \|\| !path\.trim\(\)\}/);
+  assert.match(modal, /if \(ai\) saveLastAiCmd\(ai\)/);
 });
 
 test("new terminal rejects a delayed home default after a source change or user edit", async () => {

@@ -10,6 +10,7 @@ const expectedTauriCommands = [
   "tmux_session_exists",
   "list_projects",
   "add_project",
+  "remove_missing_project",
   "create_worktree",
   "kill_session",
   "list_orphaned_worktrees",
@@ -102,6 +103,8 @@ const expectedRootRustTests = [
   "config_parses_object_projects_with_aliases",
   "config_parses_array_projects",
   "config_parses_remote_home_relative_paths",
+  "missing_selected_project_is_removed_atomically_without_touching_other_config",
+  "missing_project_cleanup_does_not_delete_a_concurrently_replaced_entry",
   "orphaned_worktrees_excludes_live_sessions",
   "worktrees_for_session_returns_only_matching_session",
   "is_git_worktree_dir_requires_git_entry",
@@ -113,6 +116,7 @@ const expectedRootRustTests = [
   "local_tw_rpc_runtime_requires_bundled_node_or_exact_installed_version",
   "local_dashboard_create_delegates_every_field_to_bundled_tw_rpc",
   "local_dashboard_terminal_delegates_to_bundled_tw_rpc",
+  "dashboard_terminal_without_ai_command_uses_the_frozen_optional_rpc_shape",
   "restore_worktree_delegates_to_canonical_tw_rpc",
   "kill_session_does_not_register_worktree_for_cleanup",
   "delete_worktree_requires_force_for_dirty_worktree",
@@ -125,6 +129,7 @@ const expectedRootRustTests = [
   "list_remote_sessions_merges_rpc_state_with_legacy_tw_shaped_tmux_sessions",
   "remote_tmux_terminal_listing_only_includes_tw_managed_sessions",
   "remote_tmux_terminal_listing_merges_rpc_state_with_dashboard_tmux_sessions",
+  "remote_project_catalog_reads_physical_home_config_over_ssh",
   "remote_directory_picker_reads_home_and_directories_over_ssh",
   "remote_file_editor_checks_reads_and_writes_over_ssh",
   "create_remote_terminal_delegates_to_tw_rpc_without_tmux_fallback",
@@ -338,7 +343,7 @@ function rustReferencesFeature(source: string, feature: string): boolean {
   return new RegExp(`\\b${escaped}\\b`).test(masked);
 }
 
-test("tauri exposes exactly the frozen 68 dashboard commands", () => {
+test("tauri exposes exactly the frozen 69 dashboard commands", () => {
   const rust = readTauriCompositionSource();
   const handlerBlocks = [...rust.matchAll(/tauri::generate_handler!\[([\s\S]*?)\]/g)];
 
@@ -349,7 +354,7 @@ test("tauri exposes exactly the frozen 68 dashboard commands", () => {
     .filter(Boolean)
     .map(leafName);
 
-  assert.equal(commands.length, 68);
+  assert.equal(commands.length, 69);
   assert.deepEqual(commands, expectedTauriCommands);
   assert.equal(new Set(commands).size, commands.length, "Tauri commands must not be registered twice");
 });

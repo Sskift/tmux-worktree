@@ -118,6 +118,13 @@ export type ProjectPreset = {
 
 export type AddProjectInput = Pick<ProjectPreset, "name" | "path">;
 
+export type RemoveMissingProjectInput = Pick<ProjectPreset, "name" | "path">;
+
+export type RemoveMissingProjectResult = {
+  removed: boolean;
+  projects: ProjectPreset[];
+};
+
 export type OrphanedWorktree = {
   project: string;
   path: string;

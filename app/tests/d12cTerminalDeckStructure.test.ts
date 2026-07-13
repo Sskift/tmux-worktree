@@ -382,8 +382,9 @@ test("preview and attach retain one plus three passive effects with exact owner 
   assert.match(rootText, /cwdRequested\.current\.get\(name\)!==request/);
   assert.match(
     rootText,
-    /if\(cwdRequested\.current\.get\(name\)===request\)\{cwdRequested\.current\.delete\(name\);\}/,
+    /\.catch\(\(\)=>\{if\(cwdRequested\.current\.get\(name\)===request\)\{cwdRequested\.current\.delete\(name\);\}\}\)/,
   );
+  assert.doesNotMatch(rootText, /\.finally\(/);
   assert.match(deckSource, /const PRELOAD_HISTORY_LINES = 300;/);
 });
 

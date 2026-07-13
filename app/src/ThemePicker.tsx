@@ -181,7 +181,7 @@ export function ThemePicker({ current, onChange }: Props) {
           id={menuId}
           className="theme__menu"
           role="menu"
-          aria-label="Terminal themes"
+          aria-label="Dashboard themes"
           data-side={position?.side}
           onKeyDown={handleMenuKeyDown}
           style={position
@@ -234,8 +234,8 @@ export function ThemePicker({ current, onChange }: Props) {
           if (open) closeMenu();
           else setOpen(true);
         }}
-        aria-label="Terminal theme"
-        title="Terminal theme"
+        aria-label="Dashboard theme"
+        title="Dashboard theme"
         aria-haspopup="menu"
         aria-controls={open ? menuId : undefined}
         aria-expanded={open}

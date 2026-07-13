@@ -41,6 +41,8 @@ import type {
   OrphanedWorktree,
   PlainTerminal,
   ProjectPreset,
+  RemoveMissingProjectInput,
+  RemoveMissingProjectResult,
   RestoreWorktreeInput,
   Session,
   TmuxStatusTheme,
@@ -75,6 +77,7 @@ export interface DashboardBackend {
     list(): Promise<ProjectPreset[]>;
     listRemote(hostId: string): Promise<ProjectPreset[]>;
     add(args: AddProjectInput): Promise<ProjectPreset[]>;
+    removeMissing(args: RemoveMissingProjectInput): Promise<RemoveMissingProjectResult>;
   };
   worktrees: {
     listOrphaned(): Promise<OrphanedWorktree[]>;
@@ -302,6 +305,8 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       listRemote: (hostId) =>
         transport.invoke<ProjectPreset[]>("list_remote_projects", { hostId }),
       add: (args) => transport.invoke<ProjectPreset[]>("add_project", { args }),
+      removeMissing: (args) =>
+        transport.invoke<RemoveMissingProjectResult>("remove_missing_project", { args }),
     },
     worktrees: {
       listOrphaned: () => transport.invoke<OrphanedWorktree[]>("list_orphaned_worktrees"),

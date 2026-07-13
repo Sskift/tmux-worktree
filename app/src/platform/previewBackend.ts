@@ -402,6 +402,7 @@ transport.handlers.set("file_exists", value(true));
 transport.handlers.set("remote_file_exists", value(true));
 transport.handlers.set("open_url", nothing);
 transport.handlers.set("add_project", value(projects));
+transport.handlers.set("remove_missing_project", value({ removed: false, projects }));
 transport.handlers.set("create_worktree", value("dashboard-preview"));
 transport.handlers.set("restore_worktree", value("dashboard-preview-restored"));
 transport.handlers.set("delete_worktree", nothing);

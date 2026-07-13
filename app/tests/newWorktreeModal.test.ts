@@ -37,6 +37,30 @@ test("new worktree remote hosts can use remote project presets", () => {
   );
   assert.match(modal, /createArgs\.project = project;/);
   assert.doesNotMatch(modal, /const isCustom = project === CUSTOM \|\| isRemote;/);
+  assert.match(modal, /label: "Loading remote projects…"/);
+  assert.match(modal, /No projects found in ~\/\.tmux-worktree\.json on \{selectedHostLabel\}/);
+  assert.match(
+    modal,
+    /disabled=\{busy \|\| validatingProject \|\| \(isRemote && projectCatalogLoading\)\}/,
+  );
+  assert.doesNotMatch(modal, /\{\(!isRemote \|\| projects\.length > 0\) && \(/);
+});
+
+test("new worktree removes only a selected missing local project preset", () => {
+  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
+  const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
+
+  assert.match(
+    backend,
+    /removeMissing: \(args\) =>\s*transport\.invoke<RemoveMissingProjectResult>\("remove_missing_project", \{ args \}\)/s,
+  );
+  assert.match(
+    modal,
+    /if \(isRemote \|\| nextProject === CUSTOM\) return;[\s\S]*dashboardBackend\.projects\.removeMissing\(\{[\s\S]*name: selected\.name,[\s\S]*path: selected\.path/s,
+  );
+  assert.match(modal, /if \(!result\.removed\) return;[\s\S]*setProjects\(result\.projects\);[\s\S]*setProject\(CUSTOM\)/s);
+  assert.match(modal, /because its directory no longer exists/);
+  assert.match(modal, /return \(\) => \{[\s\S]*projectValidationGateRef\.current\.invalidate\(\)/s);
 });
 
 test("new worktree publishes catalogs only for the current Local/Host A/Host B source", async () => {
