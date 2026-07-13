@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { copyFileSync, mkdtempSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 
 test("release-facing package versions stay aligned", () => {
   const rootVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
@@ -31,21 +31,55 @@ test("release-facing package versions stay aligned", () => {
   );
 });
 
-test("bundled CLI reports the package version without a runtime package.json", () => {
+test("bundled CLI runs version and RPC without a runtime package or node_modules", () => {
   execFileSync("npm", ["run", "build"], { stdio: "ignore" });
   const isolatedDir = mkdtempSync(join(tmpdir(), "tw-bundled-cli-version-"));
-  const isolatedCli = join(isolatedDir, "cli.mjs");
+  const isolatedCli = join(isolatedDir, "cli.cjs");
   copyFileSync(cli, isolatedCli);
   const expectedVersion = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
   ).version;
+  const isolatedEnv = { ...process.env, HOME: isolatedDir, NODE_PATH: "" };
+  assert.equal(existsSync(join(isolatedDir, "package.json")), false);
+  assert.equal(existsSync(join(isolatedDir, "node_modules")), false);
 
   const result = spawnSync(process.execPath, [isolatedCli, "version"], {
+    cwd: isolatedDir,
     encoding: "utf8",
+    env: isolatedEnv,
   });
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), expectedVersion);
+  const capabilities = spawnSync(process.execPath, [isolatedCli, "rpc", "capabilities"], {
+    cwd: isolatedDir,
+    encoding: "utf8",
+    env: isolatedEnv,
+  });
+  assert.equal(capabilities.status, 0, capabilities.stderr);
+  assert.equal(capabilities.stderr, "");
+  assert.deepEqual(JSON.parse(capabilities.stdout), {
+    protocolVersion: 1,
+    app: "tmux-worktree",
+    capabilities: [
+      "list",
+      "managed-state",
+      "create-worktree",
+      "create-terminal",
+      "restore-worktree",
+      "kill-session",
+    ],
+  });
+  for (const command of ["relay-server", "relay-host"]) {
+    const help = spawnSync(process.execPath, [isolatedCli, command, "--help"], {
+      cwd: isolatedDir,
+      encoding: "utf8",
+      env: isolatedEnv,
+    });
+    assert.equal(help.status, 0, help.stderr);
+    assert.equal(help.stderr, "");
+    assert.match(help.stdout, new RegExp(`tw ${command}`));
+  }
 });
 
 describe("tw update", () => {

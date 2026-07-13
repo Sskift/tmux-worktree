@@ -15,14 +15,14 @@
 
 1. `src/*.ts`
 2. `npm run build`
-3. `dist/cli.js`
+3. `dist/cli.cjs`
 4. `package.json` 的 `bin` 映射用于本地 link/source install
 
 源码边界：
 
 | 文件 | 作用 | 发布状态 |
 |---|---|---|
-| `src/cli.ts` | CLI 路由，分发一次性 `status`/`ls`、`serve`、`setup` 和默认 session 创建流程 | 打包进 `dist/cli.js` |
+| `src/cli.ts` | CLI 路由，分发一次性 `status`/`ls`、`serve`、`setup` 和默认 session 创建流程 | 单文件打包进 `dist/cli.cjs` |
 | `src/config.ts` | 读取并归一化 `~/.tmux-worktree.json`，兼容旧版 CLI 字符串映射、对象映射、数组项目和字段别名 | 打包 |
 | `src/dev.ts` | 创建 git worktree 和 tmux session，并启动 AI 命令 | 打包 |
 | `src/session.ts` / `src/state.ts` | canonical single-pane worktree/terminal/restore 生命周期，以及带跨进程锁的 managed state | 打包 |
@@ -42,8 +42,8 @@
 发布路径：
 
 1. `app/src` 和 `app/src-tauri`
-2. `npm run tauri build`，Tauri `beforeBuildCommand` 同时构建根目录 `dist/cli.js`
-3. 根目录 `dist/cli.js` 作为 `tw-cli/` resource 打进 `.app`，既作为本地 worktree 的 canonical RPC creator，也供 Dashboard Mobile Relay 启动 `tw serve` / `tw relay-host`
+2. `npm run tauri build`，Tauri `beforeBuildCommand` 同时构建根目录 standalone `dist/cli.cjs`
+3. 根目录 `dist/cli.cjs` 作为 `tw-cli/cli.cjs` resource 打进 `.app`，既作为本地 worktree 的 canonical RPC creator，也供 Dashboard Mobile Relay 启动 `tw serve` / `tw relay-host`
 4. DMG 复制到 `app/installer/dmg/tw-dashboard-arm64.dmg`
 5. `app/installer/installer.mjs` 挂载 DMG 并安装 `tw-dashboard.app`
 
@@ -53,6 +53,8 @@
 |---|---|---|
 | `app/installer/installer.mjs` | macOS DMG 安装器 | 发布 |
 | `app/installer/dmg/` | release 脚本填充的 DMG 目录 | 发布时包含 |
+
+根目录 `dist/config.js`、`dist/rpc.js` 等 `.js` 文件是仓库内测试和动态 import 使用的 ESM 模块产物；它们不是可复制执行的 CLI。唯一 standalone Node 入口是 `dist/cli.cjs`。
 
 ## Dashboard 源码
 
@@ -121,7 +123,7 @@ Automation 设计：
 Mobile Relay 启动顺序：
 
 1. 如果 `127.0.0.1:8311` 已经有 `tw serve`，直接复用。
-2. 否则优先使用 `.app` resources 内置的 `tw-cli/cli.js` 启动 `serve`。
+2. 否则优先使用 `.app` resources 内置的 `tw-cli/cli.cjs` 启动 `serve`。
 3. 启动 `tw relay-host`，连接外部 broker 上的 `relay-server`，默认 host id 为 `mac-admin`；host 只暴露 `tw rpc list` 中的 TW-managed worktree，或严格匹配 `<worktreeBase>/<project>/<session>-<5 hex>` 且带 `.git` 的 legacy worktree，普通 tmux session 不暴露。
 4. 如果内置资源不可用，回退到用户全局安装的 `tw` / `tmux-worktree` 命令，兼容已安装 CLI 后端的用户。
 

@@ -87,6 +87,12 @@ function assertRelayHostCredentialsPerBranch(rust: string): void {
       );
     }
   }
+  assert.equal(
+    bundledBranch.split('.env("TW_DASHBOARD_CLI", &cli_arg)').length - 1,
+    1,
+    "bundled relay-host must identify its exact CLI artifact",
+  );
+  assert.doesNotMatch(installedBranch, /TW_DASHBOARD_CLI/);
 }
 
 test("mobile relay production modules and symbols have one frozen owner", () => {
@@ -218,6 +224,8 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.match(commands, /args\.port\.unwrap_or\(8787\)/);
   assert.match(broker, /TW_RELAY_SECRET/);
   assert.match(broker, /chmod 600/);
+  assert.match(broker, /tw-cli\.cjs/);
+  assert.doesNotMatch(broker, /tw-cli\.js/);
   assert.match(broker, /chmod 700/);
   assert.match(broker, /kill-session -t tw-relay-server/);
   assert.match(broker, /new-session -d -s tw-relay-server/);

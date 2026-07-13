@@ -157,7 +157,7 @@ npm link --prefix "$HOME/.local"
 
 fn install_host_tw_from_bundled_cli(host: &HostConfig, cli: &Path) -> Result<HostStatus, String> {
     run_remote_cmd_check(host, &["sh", "-lc", "mkdir -p \"$HOME/.tmux-worktree\""])?;
-    scp_cli_to_host(host, cli, ".tmux-worktree/tw-cli.js")?;
+    scp_cli_to_host(host, cli, ".tmux-worktree/tw-cli.cjs")?;
     let install_path = remote_path_expr(host.tw_path.as_deref().unwrap_or("~/.local/bin/tw"));
     let script = format!(
         r#"set -e
@@ -165,7 +165,7 @@ target={install_path}
 mkdir -p "$(dirname "$target")"
 cat > "$target" <<'EOF'
 #!/bin/sh
-exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.js" "$@"
+exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.cjs" "$@"
 EOF
 chmod 700 "$target"
 "#

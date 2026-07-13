@@ -137,8 +137,16 @@ const MANAGED_TERMINAL_NAME = /^tw-term-[A-Za-z0-9][A-Za-z0-9._-]{0,71}$/;
 const REMOTE_RPC_STATUS_MARKER = "__TW_RPC_STATUS__";
 
 async function localTwOutput(args: string[], timeout: number): Promise<string> {
+  const configuredCli = process.env.TW_DASHBOARD_CLI?.trim();
+  if (configuredCli && existsSync(configuredCli)) {
+    return (await execFileAsync(process.execPath, [configuredCli, ...args], { timeout })).stdout;
+  }
   const currentCli = process.argv[1];
-  if (currentCli && basename(currentCli) === "cli.js" && existsSync(currentCli)) {
+  if (
+    currentCli &&
+    ["cli.cjs", "tw-cli.cjs"].includes(basename(currentCli)) &&
+    existsSync(currentCli)
+  ) {
     return (await execFileAsync(process.execPath, [currentCli, ...args], { timeout })).stdout;
   }
   return (await execFileAsync("tw", args, { timeout })).stdout;

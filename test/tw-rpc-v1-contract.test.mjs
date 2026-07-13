@@ -9,7 +9,7 @@ execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 const contractRoot = new URL("../contracts/tw-rpc/v1/", import.meta.url);
 const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot), "utf8"));
 const cases = JSON.parse(readFileSync(new URL("cases.json", contractRoot), "utf8"));
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const rpc = await import("../dist/rpc.js");
 
 function runCli(argv) {

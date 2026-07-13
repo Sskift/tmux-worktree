@@ -319,7 +319,7 @@ exit 0
 `);
   chmodSync(fakeTmux, 0o755);
 
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(process.execPath, [cli, "rpc", "kill-session", "--name", "tw-term-abc12"], {
     encoding: "utf8",
     env: {
@@ -382,7 +382,7 @@ exit 0
 `);
   chmodSync(fakeTmux, 0o755);
 
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(process.execPath, [cli, "rm", "tw-term-abc12"], {
     encoding: "utf8",
     env: {
@@ -779,7 +779,7 @@ exit 0
 `);
   chmodSync(fakeTmux, 0o755);
 
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(
     process.execPath,
     [cli, "codex", repo, "fix", "--branch", "main"],
@@ -828,7 +828,7 @@ if [ "$1" = "has-session" ]; then exit 1; fi
 exit 0
 `);
   chmodSync(fakeTmux, 0o755);
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(process.execPath, [
     cli,
     "rpc",
@@ -880,7 +880,7 @@ exit 0
 `);
   chmodSync(fakeTmux, 0o755);
 
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(process.execPath, [cli, "codex", plainDir], {
     encoding: "utf8",
     env: {
@@ -904,7 +904,7 @@ exit 0
 
 test("headless tw with no arguments prints help instead of opening the TTY wizard", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-headless-help-"));
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
   const result = spawnSync(process.execPath, [cli], {
     encoding: "utf8",
     env: { ...process.env, HOME: root },
@@ -983,7 +983,7 @@ exit 0
     TW_TMUX: fakeTmux,
     TW_TEST_TMUX_LOG: callLog,
   };
-  const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+  const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 
   const status = spawnSync(process.execPath, [cli, "status", "--once"], {
     encoding: "utf8",

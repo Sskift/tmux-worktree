@@ -38,7 +38,7 @@
     "active": true,
     "targets": "all",
     "resources": {
-      "../../dist/*": "tw-cli/"
+      "../../dist/cli.cjs": "tw-cli/cli.cjs"
     },
     "icon": [
       "icons/32x32.png",

@@ -14,12 +14,12 @@
     "app/installer/dmg/"
   ],
   "bin": {
-    "tmux-worktree": "dist/cli.js",
-    "tw": "dist/cli.js",
+    "tmux-worktree": "dist/cli.cjs",
+    "tw": "dist/cli.cjs",
     "tw-dashboard-install": "app/installer/installer.mjs"
   },
   "scripts": {
-    "build": "tsup",
+    "build": "tsup && tsup --config tsup.standalone.config.ts",
     "test:cli": "node --test --test-concurrency=1 test/*.test.mjs"
   },
   "dependencies": {

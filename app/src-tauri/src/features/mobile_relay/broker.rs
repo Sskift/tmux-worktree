@@ -28,7 +28,7 @@ pub(super) fn start_mobile_relay_broker_on_host(
             "mkdir -p \"$HOME/.tmux-worktree\"".into(),
         ],
     )?;
-    scp_cli_to_host(host, &cli, ".tmux-worktree/tw-cli.js")?;
+    scp_cli_to_host(host, &cli, ".tmux-worktree/tw-cli.cjs")?;
     let script = format!(
         r#"set -e
 mkdir -p "$HOME/.tmux-worktree"
@@ -37,7 +37,7 @@ chmod 600 "$HOME/.tmux-worktree/relay-secret"
 cat > "$HOME/.tmux-worktree/relay-server.sh" <<'EOF'
 #!/bin/sh
 export TW_RELAY_SECRET="$(cat "$HOME/.tmux-worktree/relay-secret")"
-exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.js" relay-server --host 0.0.0.0 --port {}
+exec /usr/bin/env node "$HOME/.tmux-worktree/tw-cli.cjs" relay-server --host 0.0.0.0 --port {}
 EOF
 chmod 700 "$HOME/.tmux-worktree/relay-server.sh"
 {} kill-session -t tw-relay-server 2>/dev/null || true

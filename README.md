@@ -333,7 +333,7 @@ Build the CLI:
 ```bash
 npm install
 npm run build
-node dist/cli.js status
+node dist/cli.cjs status
 ```
 
 Run the Dashboard:
@@ -380,8 +380,8 @@ Build the CLI plus bundled Dashboard installer assets:
 The release script:
 
 1. Builds the Tauri Dashboard DMG.
-2. Builds the root CLI into `dist/cli.js`.
-3. Bundles the built CLI modules into the Dashboard app resources for canonical local worktree creation and remote serve fallback.
+2. Builds the standalone root CLI into `dist/cli.cjs` while retaining `dist/*.js` only as repository-local ESM module builds.
+3. Bundles `dist/cli.cjs` into the Dashboard app as `tw-cli/cli.cjs` for canonical local worktree creation and remote serve fallback.
 4. Copies the DMG to `app/installer/dmg/tw-dashboard-arm64.dmg`.
 5. Leaves upload and channel-specific publishing outside the repository.
 

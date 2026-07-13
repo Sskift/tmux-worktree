@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const version = JSON.parse(
   readFileSync(new URL("../package.json", import.meta.url), "utf8"),
 ).version;
@@ -82,7 +82,7 @@ test("unknown options preserve the concise error boundary and print help", () =>
   assert.equal(result.status, 1);
   assert.equal(result.stderr, "未知选项: --definitely-unknown\n\n");
   assert.match(result.stdout, /tw — tmux \+ git worktree/);
-  assert.doesNotMatch(result.stderr, /\bat\b.*cli\.js|Error:/);
+  assert.doesNotMatch(result.stderr, /\bat\b.*cli\.cjs|Error:/);
 });
 
 test("rpc capabilities is one machine-readable JSON line with no stderr", () => {

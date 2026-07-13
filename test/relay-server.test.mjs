@@ -15,7 +15,7 @@ test("relay server keeps detailed host state behind authentication", async () =>
 
   const secret = "relay-health-test-secret";
   const child = spawn(process.execPath, [
-    "dist/cli.js",
+    "dist/cli.cjs",
     "relay-server",
     "--host",
     "127.0.0.1",

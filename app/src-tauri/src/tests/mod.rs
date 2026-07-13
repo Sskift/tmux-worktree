@@ -3652,19 +3652,19 @@ fn ssh_and_scp_end_options_before_the_destination() {
 
     let scp = scp_cli_command(
         &host,
-        Path::new("/tmp/tw-cli.js"),
-        ".tmux-worktree/tw-cli.js",
+        Path::new("/tmp/tw-cli.cjs"),
+        ".tmux-worktree/tw-cli.cjs",
     )
     .expect("scp command");
     let scp_args = args(&scp);
     let scp_separator = scp_args.iter().position(|arg| arg == "--").expect("scp --");
     assert_eq!(
         scp_args.get(scp_separator + 1).map(String::as_str),
-        Some("/tmp/tw-cli.js")
+        Some("/tmp/tw-cli.cjs")
     );
     assert_eq!(
         scp_args.get(scp_separator + 2).map(String::as_str),
-        Some("alice@ssh-host:.tmux-worktree/tw-cli.js")
+        Some("alice@ssh-host:.tmux-worktree/tw-cli.cjs")
     );
 }
 

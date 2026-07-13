@@ -364,7 +364,7 @@ test("relay host publishes connection failures without exposing credentials", as
   const statusFile = join(root, "relay-status.json");
   const secret = "test-secret-must-not-leak";
   const child = spawn(process.execPath, [
-    "dist/cli.js",
+    "dist/cli.cjs",
     "relay-host",
     "--relay",
     "ws://127.0.0.1:9",

@@ -17,7 +17,7 @@ import { fileURLToPath } from "node:url";
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const contractsRoot = new URL("../contracts/storage/", import.meta.url);
-const cli = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
+const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const state = await import("../dist/state.js");
 const config = await import("../dist/config.js");
 const relayHost = await import("../dist/relayHost.js");

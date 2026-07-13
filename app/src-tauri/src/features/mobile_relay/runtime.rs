@@ -137,8 +137,9 @@ pub(super) fn spawn_relay_host(
             let cli_arg = cli.to_string_lossy().to_string();
             let mut command = std::process::Command::new(&node);
             command
-                .arg(cli_arg)
+                .arg(&cli_arg)
                 .args(&args)
+                .env("TW_DASHBOARD_CLI", &cli_arg)
                 .env("TW_RELAY_SECRET", secret)
                 .env("TW_TOKEN", token)
                 .stdin(std::process::Stdio::null())

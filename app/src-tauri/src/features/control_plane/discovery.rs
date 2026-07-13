@@ -46,11 +46,9 @@ fn bundled_cli_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
         paths.push(PathBuf::from(path));
     }
     if let Ok(resources) = app.path().resource_dir() {
-        paths.push(resources.join("tw-cli").join("cli.js"));
-        paths.push(resources.join("dist").join("cli.js"));
-        paths.push(resources.join("cli.js"));
+        paths.push(resources.join("tw-cli").join("cli.cjs"));
     }
-    paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/cli.js"));
+    paths.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/cli.cjs"));
     paths
 }
 
