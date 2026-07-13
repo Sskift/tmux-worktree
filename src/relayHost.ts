@@ -144,6 +144,7 @@ const SESSION_NAME_MAX_LEN = 20;
 const RPC_PROTOCOL_VERSION = 1;
 const MANAGED_TERMINAL_NAME = /^tw-term-[A-Za-z0-9][A-Za-z0-9._-]{0,71}$/;
 const REMOTE_RPC_STATUS_MARKER = "__TW_RPC_STATUS__";
+const LOCAL_WS_MAX_PAYLOAD_BYTES = 1 * 1024 * 1024;
 
 async function localTwOutput(args: string[], timeout: number): Promise<string> {
   const configuredCli = process.env.TW_DASHBOARD_CLI?.trim();
@@ -211,12 +212,14 @@ function printHelp(): void {
 }
 
 function readServeToken(): string {
+  const configured = process.env.TW_TOKEN;
+  if (configured) return configured;
   try {
     const token = readFileSync(`${homedir()}/.tw-serve-token`, "utf8").trim();
     if (token) return token;
   } catch {
   }
-  return process.env.TW_TOKEN || "";
+  return "";
 }
 
 function requireServeToken(): string {
@@ -257,13 +260,14 @@ function writeRelayStatus(
   }
 }
 
-function localWsUrl(localBase: string, session: string, paneIndex: string, token: string): string {
+function localWsUrl(localBase: string, session: string, paneIndex: string): string {
   const url = new URL(localBase);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   url.pathname = "/ws";
+  url.search = "";
+  url.hash = "";
   url.searchParams.set("session", session);
   url.searchParams.set("pane", paneIndex);
-  url.searchParams.set("token", token);
   return url.toString();
 }
 
@@ -1586,7 +1590,11 @@ async function openLocalStream(
   const paneIndex = await resolvePaneIndex({ id: "local", label: "local", kind: "local" }, rawName, pane);
   if (!isCurrentStream(streams, key, stream)) return;
 
-  const localSocket = new WebSocket(localWsUrl(localBase, rawName, paneIndex, token));
+  const localSocket = new WebSocket(localWsUrl(localBase, rawName, paneIndex), {
+    headers: { Authorization: `Bearer ${token}` },
+    perMessageDeflate: false,
+    maxPayload: LOCAL_WS_MAX_PAYLOAD_BYTES,
+  });
   stream.socket = localSocket;
   stream.opening = false;
 

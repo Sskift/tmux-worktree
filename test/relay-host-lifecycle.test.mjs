@@ -151,6 +151,9 @@ async function stopChild(child) {
 async function startHarness(t, {
   waitUntilReady = true,
   remoteChildSpawnFailure = false,
+  environmentToken = "serve-token",
+  tokenFileContents,
+  localBaseSuffix = "",
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-host-lifecycle-"));
   const gateDir = join(root, "gates");
@@ -158,6 +161,9 @@ async function startHarness(t, {
   const fakeTmux = writeFakeTmux(root);
   const fakeTw = writeFakeTw(root);
   const isolatedPath = remoteChildSpawnFailure ? writeFakeSshOnlyPath(root) : process.env.PATH;
+  if (tokenFileContents !== undefined) {
+    writeFileSync(join(root, ".tw-serve-token"), `${tokenFileContents}\n`, { mode: 0o600 });
+  }
   writeFileSync(join(root, ".tmux-worktree.json"), JSON.stringify({
     projects: {},
     tmuxPath: fakeTmux,
@@ -182,6 +188,8 @@ async function startHarness(t, {
     const url = new URL(request.url || "/", local.httpUrl);
     localConnections.push({
       socket,
+      requestUrl: request.url || "",
+      authorization: request.headers.authorization,
       session: url.searchParams.get("session"),
       pane: url.searchParams.get("pane"),
       received: [],
@@ -198,13 +206,13 @@ async function startHarness(t, {
     "--relay", broker.wsUrl,
     "--host-id", "lifecycle-host",
     "--secret", "lifecycle-secret",
-    "--local", local.httpUrl,
+    "--local", `${local.httpUrl}${localBaseSuffix}`,
   ], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       HOME: root,
-      TW_TOKEN: "serve-token",
+      TW_TOKEN: environmentToken,
       TW_TMUX: fakeTmux,
       TW_DASHBOARD_CLI: fakeTw,
       TW_TEST_TMUX_GATE_DIR: gateDir,
@@ -304,6 +312,60 @@ async function assertNoAdditionalLocalConnection(harness, count, durationMs = 30
     `unexpected local terminal connections: ${harness.localConnections.map(({ session }) => session).join(", ")}`,
   );
 }
+
+function assertLocalBridgeRequest(connection, expectedToken) {
+  const url = new URL(connection.requestUrl, "ws://local.invalid");
+  assert.equal(url.pathname, "/ws");
+  assert.deepEqual([...url.searchParams.keys()].sort(), ["pane", "session"]);
+  assert.equal(url.searchParams.get("session"), connection.session);
+  assert.equal(url.searchParams.get("pane"), connection.pane);
+  assert.equal(url.searchParams.has("token"), false);
+  assert.equal(connection.authorization, `Bearer ${expectedToken}`);
+}
+
+test("local tw serve bridge keeps credentials in the Authorization header", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "bridge-header");
+  const connection = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "bridge-header"),
+    "local bridge did not open",
+  );
+
+  assertLocalBridgeRequest(connection, "serve-token");
+});
+
+test("explicit TW_TOKEN overrides a stale token file for the local bridge", async (t) => {
+  const harness = await startHarness(t, {
+    environmentToken: "env-token",
+    tokenFileContents: "stale-file-token",
+  });
+  openTerminal(harness, "bridge-explicit");
+  const connection = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "bridge-explicit"),
+    "local bridge did not open with an explicit environment token",
+  );
+
+  assertLocalBridgeRequest(connection, "env-token");
+  assert.equal(connection.requestUrl.includes("stale-file-token"), false);
+  assert.notEqual(connection.authorization, "Bearer stale-file-token");
+});
+
+test("local bridge discards inherited query and fragment credentials", async (t) => {
+  const harness = await startHarness(t, {
+    environmentToken: "env-token",
+    localBaseSuffix: "?token=stale-url-token&other=stale-other#stale-fragment",
+  });
+  openTerminal(harness, "bridge-sanitized-base");
+  const connection = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "bridge-sanitized-base"),
+    "local bridge did not open from a base URL containing stale parameters",
+  );
+
+  assertLocalBridgeRequest(connection, "env-token");
+  assert.equal(connection.requestUrl.includes("stale-url-token"), false);
+  assert.equal(connection.requestUrl.includes("stale-other"), false);
+  assert.equal(connection.requestUrl.includes("stale-fragment"), false);
+});
 
 test("close invalidates an open attempt waiting on pane resolution", async (t) => {
   const harness = await startHarness(t);
