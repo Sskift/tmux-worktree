@@ -345,17 +345,20 @@ test("remote pty wrapper survives resize signal interruptions", () => {
   assert.match(source, /if \(safeCols === lastResizeCols && safeRows === lastResizeRows\) return/);
 });
 
-test("relay host can reopen routed terminal streams after transient remote close", () => {
+test("relay host reopens routed streams only within the current connection and route generation", () => {
   const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
 
+  assert.match(source, /type RelayConnectionLease/);
   assert.match(source, /type StreamRoute/);
+  assert.match(source, /generation: number/);
   assert.match(source, /const streamRoutes = new Map<string, StreamRoute>\(\)/);
-  assert.match(source, /streamRoutes\.set\(key, \{ clientId, streamId: message\.streamId, scope, rawName, pane: message\.pane \}\)/);
-  assert.match(source, /reopenRoutedStream\(relaySocket, streams, opts, route, message\.data\)/);
-  assert.match(source, /reopenRoutedStream\(relaySocket, streams, opts, route, undefined, \{ cols: message\.cols, rows: message\.rows \}\)/);
+  assert.match(source, /streamRoutes\.set\(key, route\)/);
+  assert.match(source, /isCurrentStream\(streams, key, stream\)/);
+  assert.match(source, /isCurrentRoute\(streamRoutes, key, route, lease\)/);
+  assert.match(source, /reopenRoutedStream\(lease, streams, streamRoutes, opts, route, message\.data\)/);
+  assert.match(source, /deactivateConnection\(lease, streams, streamRoutes\)/);
   assert.match(source, /child\.stdin\.on\("error", \(\) => \{\}\)/);
-  assert.match(source, /const isCurrent = streams\.get\(key\) === stream/);
-  assert.match(source, /if \(isCurrent\) sendJson\(relaySocket, \{ type: "terminal_exit"/);
+  assert.match(source, /function finalizeStream\([\s\S]+?sendIfActive\(stream\.lease,\s*\{\s*type: "terminal_exit"/);
   assert.match(source, /try \{\n\s+stream\.process\.stdin\.write\(payload\);/);
 });
 

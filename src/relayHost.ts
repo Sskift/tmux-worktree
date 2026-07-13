@@ -33,6 +33,11 @@ type RelayHostOptions = {
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopped";
 
+type RelayConnectionLease = {
+  socket: WebSocket;
+  active: boolean;
+};
+
 type AdminScope = {
   id: string;
   label: string;
@@ -46,10 +51,13 @@ type AdminScope = {
 type LocalStream = {
   clientId: string;
   streamId: string;
+  lease: RelayConnectionLease;
+  route: StreamRoute;
   socket?: WebSocket;
   process?: ChildProcessWithoutNullStreams;
   pending: string[];
-  opening?: boolean;
+  opening: boolean;
+  closed: boolean;
   pendingResize?: { cols: number; rows: number };
   resize?: (cols: number, rows: number) => void;
   cleanup?: () => void;
@@ -58,6 +66,7 @@ type LocalStream = {
 type StreamRoute = {
   clientId: string;
   streamId: string;
+  generation: number;
   scope: AdminScope;
   rawName: string;
   pane?: string | number;
@@ -1065,17 +1074,76 @@ function streamKey(clientId: string, streamId: string): string {
   return `${clientId}\x1f${streamId}`;
 }
 
+function isCurrentStream(
+  streams: Map<string, LocalStream>,
+  key: string,
+  stream: LocalStream,
+): boolean {
+  return stream.lease.active && !stream.closed && streams.get(key) === stream;
+}
+
+function isCurrentRoute(
+  routes: Map<string, StreamRoute>,
+  key: string,
+  route: StreamRoute,
+  lease: RelayConnectionLease,
+): boolean {
+  return lease.active && routes.get(key) === route;
+}
+
 function closeStream(stream: LocalStream): void {
+  if (stream.closed) return;
+  stream.closed = true;
+  stream.opening = false;
+  stream.pending.length = 0;
+  stream.pendingResize = undefined;
   try { stream.socket?.close(); } catch {}
   try { stream.process?.kill(); } catch {}
+  try { stream.cleanup?.(); } catch {}
+}
+
+function finalizeStream(
+  streams: Map<string, LocalStream>,
+  key: string,
+  stream: LocalStream,
+  code: number,
+  options: { error?: string; closeResource?: boolean } = {},
+): void {
+  const isCurrent = isCurrentStream(streams, key, stream);
+  if (isCurrent) {
+    streams.delete(key);
+    if (options.error) {
+      sendIfActive(stream.lease, {
+        type: "error",
+        clientId: stream.clientId,
+        streamId: stream.streamId,
+        message: options.error,
+      });
+    }
+    sendIfActive(stream.lease, {
+      type: "terminal_exit",
+      clientId: stream.clientId,
+      streamId: stream.streamId,
+      code,
+    });
+  }
+
+  if (options.closeResource) {
+    closeStream(stream);
+    return;
+  }
+  stream.closed = true;
+  stream.opening = false;
+  stream.pending.length = 0;
+  stream.pendingResize = undefined;
   try { stream.cleanup?.(); } catch {}
 }
 
 function closeClientStreams(streams: Map<string, LocalStream>, clientId: string): void {
   for (const [key, stream] of streams) {
     if (stream.clientId === clientId) {
-      closeStream(stream);
       streams.delete(key);
+      closeStream(stream);
     }
   }
 }
@@ -1086,7 +1154,67 @@ function closeClientRoutes(routes: Map<string, StreamRoute>, clientId: string): 
   }
 }
 
+function openingStream(
+  lease: RelayConnectionLease,
+  route: StreamRoute,
+  pending: string[] = [],
+  pendingResize?: { cols: number; rows: number },
+): LocalStream {
+  return {
+    clientId: route.clientId,
+    streamId: route.streamId,
+    lease,
+    route,
+    pending,
+    pendingResize,
+    opening: true,
+    closed: false,
+  };
+}
+
+function finalizeSessionStreams(
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+  session: string,
+): void {
+  const { scopeId, rawName } = splitSessionKey(session);
+  for (const [key, route] of routes) {
+    if (route.scope.id !== scopeId || route.rawName !== rawName) continue;
+    routes.delete(key);
+    const stream = streams.get(key);
+    if (!stream) continue;
+    streams.delete(key);
+    sendIfActive(stream.lease, {
+      type: "terminal_exit",
+      clientId: stream.clientId,
+      streamId: stream.streamId,
+      code: 0,
+    });
+    closeStream(stream);
+  }
+}
+
+function deactivateConnection(
+  lease: RelayConnectionLease,
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+): void {
+  if (!lease.active) return;
+  lease.active = false;
+  routes.clear();
+  for (const [key, stream] of streams) {
+    streams.delete(key);
+    closeStream(stream);
+  }
+}
+
+function sendIfActive(lease: RelayConnectionLease, message: unknown): void {
+  if (!lease.active || lease.socket.readyState !== WebSocket.OPEN) return;
+  sendJson(lease.socket, message);
+}
+
 function sendToStream(stream: LocalStream, payload: string): "sent" | "queued" | "closed" {
+  if (stream.closed || !stream.lease.active) return "closed";
   if (stream.opening) {
     stream.pending.push(payload);
     return "queued";
@@ -1386,19 +1514,15 @@ finally:
 }
 
 async function openRemoteStream(
-  relaySocket: WebSocket,
   streams: Map<string, LocalStream>,
-  clientId: string,
-  streamId: string,
-  scope: AdminScope,
-  rawName: string,
-  pane: string | number | undefined,
+  stream: LocalStream,
 ): Promise<void> {
-  const paneIndex = await resolvePaneIndex(scope, rawName, pane);
+  const { route } = stream;
+  const { clientId, streamId, scope, rawName, pane } = route;
   const key = streamKey(clientId, streamId);
-  const existing = streams.get(key);
-  const pending = existing?.pending.splice(0) ?? [];
-  const pendingResize = existing?.pendingResize;
+  const paneIndex = await resolvePaneIndex(scope, rawName, pane);
+  if (!isCurrentStream(streams, key, stream)) return;
+
   const resizeFile = `${tmpdir()}/tw-relay-resize-${clientId.replace(/[^a-zA-Z0-9_-]/g, "")}-${streamId.replace(/[^a-zA-Z0-9_-]/g, "")}-${randomId(6)}`;
   const sshArgs = ["ssh", "-tt", ...relaySshConnectionArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)];
   const child = spawn("python3", ["-u", "-c", remotePtyPythonScript(), resizeFile, ...sshArgs], {
@@ -1413,143 +1537,142 @@ async function openRemoteStream(
     cleaned = true;
     try { unlinkSync(resizeFile); } catch {}
   };
-  const stream: LocalStream = {
-    clientId,
-    streamId,
-    process: child,
-    pending: [],
-    cleanup,
-    resize: (cols, rows) => {
-      const safeCols = Math.max(20, Math.min(300, Math.floor(cols)));
-      const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
-      if (safeCols === lastResizeCols && safeRows === lastResizeRows) return;
-      lastResizeCols = safeCols;
-      lastResizeRows = safeRows;
-      writeFileSync(resizeFile, `${safeCols},${safeRows}`);
-      try { child.kill("SIGWINCH"); } catch {}
-    },
+  stream.process = child;
+  stream.cleanup = cleanup;
+  stream.resize = (cols, rows) => {
+    const safeCols = Math.max(20, Math.min(300, Math.floor(cols)));
+    const safeRows = Math.max(5, Math.min(200, Math.floor(rows)));
+    if (safeCols === lastResizeCols && safeRows === lastResizeRows) return;
+    lastResizeCols = safeCols;
+    lastResizeRows = safeRows;
+    writeFileSync(resizeFile, `${safeCols},${safeRows}`);
+    try { child.kill("SIGWINCH"); } catch {}
   };
-  streams.set(key, stream);
+  stream.opening = false;
   child.stdin.on("error", () => {});
   child.stdout.on("error", () => {});
   child.stderr.on("error", () => {});
   child.stdout.on("data", (data) => {
-    sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: data.toString("utf8") });
+    if (!isCurrentStream(streams, key, stream)) return;
+    sendIfActive(stream.lease, { type: "terminal_data", clientId, streamId, data: data.toString("utf8") });
   });
   child.stderr.on("data", (data) => {
+    if (!isCurrentStream(streams, key, stream)) return;
     const text = data.toString("utf8");
     if (isBenignSshCloseNotice(text)) return;
-    sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data: text });
+    sendIfActive(stream.lease, { type: "terminal_data", clientId, streamId, data: text });
   });
   child.on("close", (code) => {
-    const isCurrent = streams.get(key) === stream;
-    if (isCurrent) streams.delete(key);
-    cleanup();
-    if (isCurrent) sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: code ?? 0 });
+    finalizeStream(streams, key, stream, code ?? 0);
   });
   child.on("error", (err) => {
-    const isCurrent = streams.get(key) === stream;
-    if (isCurrent) streams.delete(key);
-    cleanup();
-    if (isCurrent) sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
+    finalizeStream(streams, key, stream, 1, { error: err.message, closeResource: true });
   });
-  if (pendingResize) stream.resize?.(pendingResize.cols, pendingResize.rows);
-  for (const payload of pending) sendToStream(stream, payload);
+  const pendingResize = stream.pendingResize;
+  stream.pendingResize = undefined;
+  if (pendingResize) stream.resize(pendingResize.cols, pendingResize.rows);
+  for (const payload of stream.pending.splice(0)) sendToStream(stream, payload);
 }
 
 async function openLocalStream(
-  relaySocket: WebSocket,
   streams: Map<string, LocalStream>,
   localBase: string,
   token: string,
-  clientId: string,
-  streamId: string,
-  rawName: string,
-  pane: string | number | undefined,
+  stream: LocalStream,
 ): Promise<void> {
-  const paneIndex = await resolvePaneIndex({ id: "local", label: "local", kind: "local" }, rawName, pane);
+  const { route } = stream;
+  const { clientId, streamId, rawName, pane } = route;
   const key = streamKey(clientId, streamId);
-  const existing = streams.get(key);
-  const pending = existing?.pending.splice(0) ?? [];
-  const pendingResize = existing?.pendingResize;
+  const paneIndex = await resolvePaneIndex({ id: "local", label: "local", kind: "local" }, rawName, pane);
+  if (!isCurrentStream(streams, key, stream)) return;
+
   const localSocket = new WebSocket(localWsUrl(localBase, rawName, paneIndex, token));
-  const stream: LocalStream = { clientId, streamId, socket: localSocket, pending };
-  streams.set(key, stream);
+  stream.socket = localSocket;
+  stream.opening = false;
 
   localSocket.on("open", () => {
+    if (!isCurrentStream(streams, key, stream)) {
+      try { localSocket.close(); } catch {}
+      return;
+    }
+    const pendingResize = stream.pendingResize;
+    stream.pendingResize = undefined;
     if (pendingResize) {
       localSocket.send(JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows }));
     }
     for (const payload of stream.pending.splice(0)) localSocket.send(payload);
   });
   localSocket.on("message", (chunk) => {
+    if (!isCurrentStream(streams, key, stream)) return;
     const data = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
-    sendJson(relaySocket, { type: "terminal_data", clientId, streamId, data });
+    sendIfActive(stream.lease, { type: "terminal_data", clientId, streamId, data });
   });
   localSocket.on("close", () => {
-    const isCurrent = streams.get(key) === stream;
-    if (isCurrent) streams.delete(key);
-    if (isCurrent) sendJson(relaySocket, { type: "terminal_exit", clientId, streamId, code: 0 });
+    finalizeStream(streams, key, stream, 0);
   });
   localSocket.on("error", (err) => {
-    const isCurrent = streams.get(key) === stream;
-    if (isCurrent) streams.delete(key);
-    if (isCurrent) sendJson(relaySocket, { type: "error", clientId, streamId, message: err.message });
+    finalizeStream(streams, key, stream, 1, { error: err.message, closeResource: true });
   });
 }
 
 async function openRouteStream(
-  relaySocket: WebSocket,
   streams: Map<string, LocalStream>,
   opts: RelayHostOptions,
-  route: StreamRoute,
+  stream: LocalStream,
 ): Promise<void> {
+  const { route } = stream;
   if (route.scope.kind === "local") {
     await openLocalStream(
-      relaySocket,
       streams,
       opts.local,
       requireServeToken(),
-      route.clientId,
-      route.streamId,
-      route.rawName,
-      route.pane,
+      stream,
     );
     return;
   }
-  await openRemoteStream(relaySocket, streams, route.clientId, route.streamId, route.scope, route.rawName, route.pane);
+  await openRemoteStream(streams, stream);
 }
 
 async function reopenRoutedStream(
-  relaySocket: WebSocket,
+  lease: RelayConnectionLease,
   streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
   opts: RelayHostOptions,
   route: StreamRoute,
   pendingInput?: string,
   pendingResize?: { cols: number; rows: number },
 ): Promise<void> {
   const key = streamKey(route.clientId, route.streamId);
+  if (!isCurrentRoute(routes, key, route, lease)) return;
+
   const existing = streams.get(key);
-  if (existing?.opening) {
+  if (existing?.opening && existing.route === route && isCurrentStream(streams, key, existing)) {
     if (pendingInput) existing.pending.push(pendingInput);
     if (pendingResize) existing.pendingResize = pendingResize;
     return;
   }
   if (existing) {
-    closeStream(existing);
     streams.delete(key);
+    closeStream(existing);
   }
-  streams.set(key, {
-    clientId: route.clientId,
-    streamId: route.streamId,
-    pending: pendingInput ? [pendingInput] : [],
-    pendingResize,
-    opening: true,
-  });
-  await openRouteStream(relaySocket, streams, opts, route);
+  const stream = openingStream(lease, route, pendingInput ? [pendingInput] : [], pendingResize);
+  streams.set(key, stream);
+  try {
+    await openRouteStream(streams, opts, stream);
+  } catch (error) {
+    if (!isCurrentStream(streams, key, stream)) return;
+    streams.delete(key);
+    closeStream(stream);
+    if (isCurrentRoute(routes, key, route, lease)) throw error;
+  }
 }
 
-async function runConnection(opts: RelayHostOptions): Promise<boolean> {
+async function runConnection(opts: RelayHostOptions): Promise<{
+  opened: boolean;
+  closeCode: number;
+  closeReason: string;
+  superseded: boolean;
+}> {
   requireServeToken();
   writeRelayStatus(opts, "connecting");
 
@@ -1558,7 +1681,15 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
   });
   const streams = new Map<string, LocalStream>();
   const streamRoutes = new Map<string, StreamRoute>();
+  const lease: RelayConnectionLease = { socket: relaySocket, active: true };
+  let nextStreamGeneration = 1;
   let opened = false;
+  const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+    relaySocket.once("close", (code, reason) => {
+      deactivateConnection(lease, streams, streamRoutes);
+      resolve({ code, reason: reason.toString("utf8") });
+    });
+  });
 
   await new Promise<void>((resolve, reject) => {
     relaySocket.once("open", () => {
@@ -1569,19 +1700,21 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
   });
   console.log(`[relay-host] connected to ${opts.relay} as ${opts.hostId}`);
   writeRelayStatus(opts, "connected", { connectedAt: Date.now() });
-  sendJson(relaySocket, { type: "host_ready", hostId: opts.hostId, displayName: opts.displayName, version: "admin-v1" });
+  sendIfActive(lease, { type: "host_ready", hostId: opts.hostId, displayName: opts.displayName, version: "admin-v1" });
 
   relaySocket.on("message", async (raw) => {
+    if (!lease.active) return;
     let message: RelayToHostMessage | ({ type: "client_closed"; clientId: string });
     try {
       message = parseJsonMessage(raw) as RelayToHostMessage | ({ type: "client_closed"; clientId: string });
     } catch {
       return;
     }
+    if (!message || typeof message !== "object") return;
 
     if (message.type === "client_closed") {
-      closeClientStreams(streams, message.clientId);
       closeClientRoutes(streamRoutes, message.clientId);
+      closeClientStreams(streams, message.clientId);
       return;
     }
     if (!("clientId" in message) || !message.clientId) return;
@@ -1590,43 +1723,54 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
     try {
       if (message.type === "list_sessions") {
         const sessions = await listAdminSessions(opts.local, requireServeToken());
-        sendJson(relaySocket, { type: "sessions", clientId, requestId: message.requestId, sessions });
+        sendIfActive(lease, { type: "sessions", clientId, requestId: message.requestId, sessions });
         return;
       }
 
       if (message.type === "list_scope_statuses") {
         const scopes = await listScopeStatuses(opts.local, requireServeToken());
-        sendJson(relaySocket, { type: "scope_statuses", clientId, requestId: message.requestId, scopes });
+        sendIfActive(lease, { type: "scope_statuses", clientId, requestId: message.requestId, scopes });
         return;
       }
 
       if (message.type === "create_worktree") {
         const session = await createWorktreeSession(message);
-        sendJson(relaySocket, { type: "worktree_created", clientId, requestId: message.requestId, session });
+        sendIfActive(lease, { type: "worktree_created", clientId, requestId: message.requestId, session });
         return;
       }
 
       if (message.type === "create_terminal") {
         const session = await createPlainTerminalSession(message);
-        sendJson(relaySocket, { type: "terminal_created", clientId, requestId: message.requestId, session });
+        sendIfActive(lease, { type: "terminal_created", clientId, requestId: message.requestId, session });
         return;
       }
 
       if (message.type === "open_terminal") {
         const key = streamKey(clientId, message.streamId);
+        const { scope, rawName } = scopeForSession(message.session);
+        const route: StreamRoute = {
+          clientId,
+          streamId: message.streamId,
+          generation: nextStreamGeneration++,
+          scope,
+          rawName,
+          pane: message.pane,
+        };
+        streamRoutes.set(key, route);
         const previous = streams.get(key);
         if (previous) {
+          streams.delete(key);
           closeStream(previous);
-          streams.delete(key);
         }
-        streams.set(key, { clientId, streamId: message.streamId, pending: [], opening: true });
-
-        const { scope, rawName } = scopeForSession(message.session);
-        streamRoutes.set(key, { clientId, streamId: message.streamId, scope, rawName, pane: message.pane });
+        const stream = openingStream(lease, route);
+        streams.set(key, stream);
         try {
-          await openRouteStream(relaySocket, streams, opts, { clientId, streamId: message.streamId, scope, rawName, pane: message.pane });
+          await openRouteStream(streams, opts, stream);
         } catch (err) {
+          if (!isCurrentStream(streams, key, stream)) return;
           streams.delete(key);
+          closeStream(stream);
+          if (!isCurrentRoute(streamRoutes, key, route, lease)) return;
           throw err;
         }
         return;
@@ -1634,7 +1778,7 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 
       if (message.type === "send_agent_message") {
         await sendAgentMessage(message.session, message.pane, message.message, message.submit !== false);
-        sendJson(relaySocket, {
+        sendIfActive(lease, {
           type: "agent_message_sent",
           clientId,
           requestId: message.requestId,
@@ -1646,7 +1790,8 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
 
       if (message.type === "kill_session") {
         await killSession(message.session, message.managed);
-        sendJson(relaySocket, {
+        finalizeSessionStreams(streams, streamRoutes, message.session);
+        sendIfActive(lease, {
           type: "session_killed",
           clientId,
           requestId: message.requestId,
@@ -1664,19 +1809,34 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
       }
 
       const key = streamKey(clientId, message.streamId);
-      const stream = streams.get(key);
+      if (message.type === "close_terminal") {
+        streamRoutes.delete(key);
+        const stream = streams.get(key);
+        if (stream) {
+          streams.delete(key);
+          closeStream(stream);
+        }
+        return;
+      }
+
+      let stream = streams.get(key);
+      if (stream && stream.route !== streamRoutes.get(key)) {
+        streams.delete(key);
+        closeStream(stream);
+        stream = undefined;
+      }
       if (!stream) {
         const route = streamRoutes.get(key);
         if (route && message.type === "terminal_input") {
-          await reopenRoutedStream(relaySocket, streams, opts, route, message.data);
+          await reopenRoutedStream(lease, streams, streamRoutes, opts, route, message.data);
           return;
         }
         if (route && message.type === "resize") {
-          await reopenRoutedStream(relaySocket, streams, opts, route, undefined, { cols: message.cols, rows: message.rows });
+          await reopenRoutedStream(lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
           return;
         }
-        if (message.type === "resize" || message.type === "close_terminal") return;
-        sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+        if (message.type === "resize") return;
+        sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         return;
       }
 
@@ -1684,10 +1844,10 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
         if (sendToStream(stream, message.data) === "closed") {
           const route = streamRoutes.get(key);
           if (route) {
-            await reopenRoutedStream(relaySocket, streams, opts, route, message.data);
+            await reopenRoutedStream(lease, streams, streamRoutes, opts, route, message.data);
             return;
           }
-          sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+          sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         }
       } else if (message.type === "resize") {
         if (stream.opening) {
@@ -1702,18 +1862,14 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
         if (sendToStream(stream, resize) === "closed") {
           const route = streamRoutes.get(key);
           if (route) {
-            await reopenRoutedStream(relaySocket, streams, opts, route, undefined, { cols: message.cols, rows: message.rows });
+            await reopenRoutedStream(lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
             return;
           }
-          sendJson(relaySocket, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+          sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
         }
-      } else if (message.type === "close_terminal") {
-        streams.delete(key);
-        streamRoutes.delete(key);
-        closeStream(stream);
       }
     } catch (err) {
-      sendJson(relaySocket, {
+      sendIfActive(lease, {
         type: "error",
         clientId,
         requestId: "requestId" in message ? message.requestId : undefined,
@@ -1723,10 +1879,14 @@ async function runConnection(opts: RelayHostOptions): Promise<boolean> {
     }
   });
 
-  await new Promise<void>((resolve) => relaySocket.once("close", resolve));
-  for (const stream of streams.values()) closeStream(stream);
+  const closeOutcome = await closed;
   console.log("[relay-host] disconnected");
-  return opened;
+  return {
+    opened,
+    closeCode: closeOutcome.code,
+    closeReason: closeOutcome.reason,
+    superseded: closeOutcome.code === 4002,
+  };
 }
 
 export async function run(): Promise<void> {
@@ -1742,8 +1902,15 @@ export async function run(): Promise<void> {
   while (true) {
     let retryError = "Relay connection closed";
     try {
-      const opened = await runConnection(opts);
-      delay = opened ? 1000 : Math.min(delay * 2, 15_000);
+      const result = await runConnection(opts);
+      if (result.superseded) {
+        const error = result.closeReason || "host replaced";
+        console.error(`[relay-host] stopped: ${error}`);
+        writeRelayStatus(opts, "stopped", { error });
+        return;
+      }
+      retryError = result.closeReason || retryError;
+      delay = result.opened ? 1000 : Math.min(delay * 2, 15_000);
     } catch (err) {
       retryError = err instanceof Error ? err.message : String(err);
       console.error(`[relay-host] ${retryError}`);
