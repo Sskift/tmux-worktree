@@ -13,7 +13,7 @@ import {
 } from "node:fs";
 import { request } from "node:http";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WebSocket } from "ws";
@@ -41,12 +41,21 @@ async function waitFor(check, message, timeoutMs = 5000) {
   assert.fail(message);
 }
 
-function httpRequest(port, path, { method = "GET", headers = {}, chunks = [] } = {}) {
+function httpRequest(port, path, {
+  host = "127.0.0.1",
+  method = "GET",
+  headers = {},
+  chunks = [],
+} = {}) {
   return new Promise((resolve, reject) => {
-    const req = request({ host: "127.0.0.1", port, path, method, headers }, (res) => {
+    const req = request({ host, port, path, method, headers }, (res) => {
       const body = [];
       res.on("data", (chunk) => body.push(chunk));
-      res.on("end", () => resolve({ status: res.statusCode, body: Buffer.concat(body).toString("utf8") }));
+      res.on("end", () => resolve({
+        status: res.statusCode,
+        headers: res.headers,
+        body: Buffer.concat(body).toString("utf8"),
+      }));
     });
     req.on("error", reject);
     for (const chunk of chunks) req.write(chunk);
@@ -61,17 +70,17 @@ function authBodyOfSize(size) {
   return prefix + "x".repeat(size - Buffer.byteLength(prefix + suffix)) + suffix;
 }
 
-function websocketClose(url) {
+function websocketClose(url, options) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, options);
     socket.once("close", (code, reason) => resolve({ code, reason: reason.toString("utf8") }));
     socket.once("error", reject);
   });
 }
 
-function openWebSocket(url) {
+function openWebSocket(url, options) {
   return new Promise((resolve, reject) => {
-    const socket = new WebSocket(url);
+    const socket = new WebSocket(url, options);
     socket.once("open", () => resolve(socket));
     socket.once("error", reject);
   });
@@ -114,8 +123,8 @@ function serveTokenTemporaryFiles(home) {
   );
 }
 
-function spawnServe(port, home, token) {
-  const env = { ...process.env, HOME: home, NODE_PATH: "" };
+function spawnServe(port, home, token, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv, HOME: home, NODE_PATH: "" };
   if (token === undefined) delete env.TW_TOKEN;
   else env.TW_TOKEN = token;
   return spawn(process.execPath, ["dist/cli.cjs", "serve", "--port", String(port)], {
@@ -123,6 +132,21 @@ function spawnServe(port, home, token) {
     env,
     stdio: ["ignore", "ignore", "pipe"],
   });
+}
+
+function sessionCookie(response) {
+  const setCookie = response.headers["set-cookie"];
+  assert.ok(Array.isArray(setCookie) && setCookie.length === 1);
+  return { header: setCookie[0], cookie: setCookie[0].split(";", 1)[0] };
+}
+
+function lanIpv4Address() {
+  for (const addresses of Object.values(networkInterfaces())) {
+    for (const address of addresses || []) {
+      if (address.family === "IPv4" && !address.internal) return address.address;
+    }
+  }
+  return null;
 }
 
 test("serve publishes a high-entropy token atomically only after listen succeeds", async () => {
@@ -226,6 +250,90 @@ test("serve publishes a high-entropy token atomically only after listen succeeds
     assert.equal(statSync(join(cleanupHome, ".tw-serve-token")).isDirectory(), true);
     assert.deepEqual(serveTokenTemporaryFiles(cleanupHome), []);
   } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
+test("serve browser sessions expire and retain only the 64 most recently used entries", async () => {
+  const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
+  const htmlStart = source.indexOf("const HTML =");
+  const htmlEnd = source.indexOf("const PTY_BRIDGE_SCRIPT", htmlStart);
+  assert.ok(htmlStart >= 0 && htmlEnd > htmlStart);
+  const html = source.slice(htmlStart, htmlEnd);
+  assert.doesNotMatch(html, /localStorage|authToken|[?&]token=/);
+  assert.match(html, /opts\.credentials = "same-origin"/);
+  assert.match(
+    html.replace(/\s+/g, ""),
+    /newWebSocket\(proto\+"\/\/"\+location\.host\+"\/ws\?session="\+encodeURIComponent\(name\)\+"&pane="\+paneIndex\)/,
+  );
+  assert.match(source, /const MAX_BROWSER_SESSIONS = 64/);
+  assert.match(source, /const SESSION_COOKIE_MAX_AGE_SECONDS = 28_800/);
+  assert.match(source, /timingSafeEqual\(secretDigest\(domain, candidate\), expectedDigest\)/);
+
+  const testRoot = mkdtempSync(join(tmpdir(), "tw-serve-sessions-"));
+  const home = join(testRoot, "home");
+  const clockFile = join(testRoot, "clock");
+  const clockPreload = join(testRoot, "clock.cjs");
+  const token = "session-test-token";
+  const initialNow = 1_800_000_000_000;
+  mkdirSync(home);
+  writeFileSync(clockFile, String(initialNow));
+  writeFileSync(clockPreload, `const fs = require("node:fs");
+Date.now = () => Number(fs.readFileSync(process.env.TW_TEST_CLOCK_FILE, "utf8"));
+`);
+  const port = await unusedPort();
+  const child = spawnServe(port, home, token, {
+    NODE_OPTIONS: `--require=${clockPreload}`,
+    TW_TEST_CLOCK_FILE: clockFile,
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  try {
+    await waitFor(
+      () => existsSync(join(home, ".tw-serve-token")),
+      `session test serve did not become ready: ${stderr}`,
+    );
+
+    const issueSession = async () => {
+      const response = await httpRequest(port, "/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        chunks: [JSON.stringify({ token })],
+      });
+      assert.equal(response.status, 200);
+      return sessionCookie(response);
+    };
+
+    const sessions = [];
+    for (let index = 0; index < 64; index += 1) sessions.push(await issueSession());
+    assert.match(sessions[0].cookie, /^tw_session=[A-Za-z0-9_-]{43}$/);
+    assert.match(
+      sessions[0].header,
+      /^tw_session=[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=28800$/,
+    );
+
+    const touched = await httpRequest(port, "/api/terminals", {
+      headers: { Cookie: sessions[0].cookie },
+    });
+    assert.equal(touched.status, 200);
+
+    const newest = await issueSession();
+    assert.equal((await httpRequest(port, "/api/terminals", {
+      headers: { Cookie: sessions[0].cookie },
+    })).status, 200);
+    assert.equal((await httpRequest(port, "/api/terminals", {
+      headers: { Cookie: sessions[1].cookie },
+    })).status, 401);
+    assert.equal((await httpRequest(port, "/api/terminals", {
+      headers: { Cookie: newest.cookie },
+    })).status, 200);
+
+    writeFileSync(clockFile, String(initialNow + 28_800_000 + 1));
+    assert.equal((await httpRequest(port, "/api/terminals", {
+      headers: { Cookie: newest.cookie },
+    })).status, 401);
+  } finally {
+    await stopChild(child);
     rmSync(testRoot, { recursive: true, force: true });
   }
 });
@@ -336,6 +444,71 @@ fi
         return false;
       }
     }, "serve did not become ready");
+
+    const cookieAuthResponse = await httpRequest(port, "/api/auth", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      chunks: [JSON.stringify({ token })],
+    });
+    assert.equal(cookieAuthResponse.status, 200);
+    const browserSession = sessionCookie(cookieAuthResponse);
+    assert.match(
+      browserSession.header,
+      /^tw_session=[A-Za-z0-9_-]{43}; HttpOnly; SameSite=Strict; Path=\/; Max-Age=28800$/,
+    );
+    assert.equal((await httpRequest(port, "/api/sessions", {
+      headers: { Cookie: browserSession.cookie },
+    })).status, 200);
+
+    const websocketUrl = `ws://127.0.0.1:${port}/ws?session=safe&pane=0`;
+    const missingOriginCookie = await websocketClose(websocketUrl, {
+      headers: { Cookie: browserSession.cookie },
+    });
+    assert.equal(missingOriginCookie.code, 4001);
+    const wrongOriginCookie = await websocketClose(websocketUrl, {
+      headers: { Cookie: browserSession.cookie, Origin: "https://attacker.invalid" },
+    });
+    assert.equal(wrongOriginCookie.code, 4001);
+    const cookieSocket = await openWebSocket(websocketUrl, {
+      headers: {
+        Cookie: browserSession.cookie,
+        Origin: `http://127.0.0.1:${port}`,
+      },
+    });
+    openedSockets.add(cookieSocket);
+    const cookieSocketClosed = openedWebSocketClose(cookieSocket);
+    cookieSocket.close();
+    await cookieSocketClosed;
+    openedSockets.delete(cookieSocket);
+
+    const bearerSocket = await openWebSocket(websocketUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    openedSockets.add(bearerSocket);
+    const bearerSocketClosed = openedWebSocketClose(bearerSocket);
+    bearerSocket.close();
+    await bearerSocketClosed;
+    openedSockets.delete(bearerSocket);
+
+    const loopbackQuery = await httpRequest(
+      port,
+      `/api/sessions?token=${encodeURIComponent(token)}`,
+    );
+    assert.equal(loopbackQuery.status, 200);
+    const browserOriginQuery = await httpRequest(
+      port,
+      `/api/sessions?token=${encodeURIComponent(token)}`,
+      { headers: { Origin: `http://127.0.0.1:${port}` } },
+    );
+    assert.equal(browserOriginQuery.status, 401);
+    const lanAddress = lanIpv4Address();
+    assert.ok(lanAddress, "serve security test requires a non-loopback IPv4 address");
+    const lanQuery = await httpRequest(
+      port,
+      `/api/sessions?token=${encodeURIComponent(token)}`,
+      { host: lanAddress },
+    );
+    assert.equal(lanQuery.status, 401);
 
     const exactLimitBody = authBodyOfSize(4096);
     const exactLimit = await httpRequest(port, "/api/auth", {
@@ -538,6 +711,10 @@ fi
     assert.equal(existsSync(httpSentinel), false);
     assert.equal(existsSync(paneSentinel), false);
     assert.equal(existsSync(sessionSentinel), false);
+    assert.equal(
+      stderr.split("loopback query-token authentication is deprecated").length - 1,
+      1,
+    );
   } finally {
     for (const socket of openedSockets) socket.terminate();
     await stopChild(child);
