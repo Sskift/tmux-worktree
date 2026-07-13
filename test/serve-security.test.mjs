@@ -77,6 +77,12 @@ function openWebSocket(url) {
   });
 }
 
+function openedWebSocketClose(socket) {
+  return new Promise((resolve) => {
+    socket.once("close", (code, reason) => resolve({ code, reason: reason.toString("utf8") }));
+  });
+}
+
 async function stopChild(child) {
   if (child.exitCode !== null) return;
   const exited = new Promise((resolve) => child.once("exit", resolve));
@@ -149,7 +155,7 @@ if [ "$1" = "list-panes" ]; then
 elif [ "$1" = "display-message" ]; then
   printf '/safe/cwd\\n'
 elif [ "$1" = "attach" ]; then
-  cat
+  sleep 30
 fi
 `, { mode: 0o700 });
   chmodSync(fakeTmux, 0o700);
@@ -173,6 +179,7 @@ fi
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  const openedSockets = new Set();
   child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
 
   try {
@@ -190,12 +197,13 @@ fi
       }
     }, "serve did not become ready");
 
+    const exactLimitBody = authBodyOfSize(4096);
     const exactLimit = await httpRequest(port, "/api/auth", {
       method: "POST",
       headers: { "Content-Type": "application/json", "Transfer-Encoding": "chunked" },
-      chunks: [authBodyOfSize(2048), authBodyOfSize(2048)],
+      chunks: [exactLimitBody.slice(0, 2048), exactLimitBody.slice(2048)],
     });
-    assert.notEqual(exactLimit.status, 413);
+    assert.equal(exactLimit.status, 401);
 
     const overLimitBody = authBodyOfSize(4097);
     const overLimit = await httpRequest(port, "/api/auth", {
@@ -253,6 +261,7 @@ fi
     const ws = await openWebSocket(
       `ws://127.0.0.1:${port}/ws?session=${encodeURIComponent(hostileSession)}&pane=2&token=${encodeURIComponent(token)}`,
     );
+    openedSockets.add(ws);
     await waitFor(
       () => readFileSync(tmuxLog, "utf8").includes(`\u001f${hostileSession}\u001f`),
       "real Python bridge did not pass the hostile session as one tmux argv",
@@ -290,7 +299,98 @@ fi
     const closed = new Promise((resolve) => ws.once("close", resolve));
     ws.close();
     await closed;
+    openedSockets.delete(ws);
     await waitFor(() => !existsSync(resizeDirectory), "private resize directory was not cleaned");
+
+    const longUrl = await httpRequest(port, `/${"x".repeat(8193)}`, { headers: authHeaders });
+    assert.equal(longUrl.status, 400);
+
+    const oversizedInputSocket = await openWebSocket(
+      `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+    );
+    openedSockets.add(oversizedInputSocket);
+    const oversizedInputClosed = openedWebSocketClose(oversizedInputSocket);
+    oversizedInputSocket.send("x".repeat(256 * 1024 + 1));
+    assert.equal((await oversizedInputClosed).code, 4009);
+    openedSockets.delete(oversizedInputSocket);
+
+    const backpressureSocket = await openWebSocket(
+      `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+    );
+    openedSockets.add(backpressureSocket);
+    const backpressureClosed = openedWebSocketClose(backpressureSocket);
+    backpressureSocket.send("a".repeat(200 * 1024));
+    backpressureSocket.send("b".repeat(200 * 1024));
+    assert.equal((await backpressureClosed).code, 4009);
+    openedSockets.delete(backpressureSocket);
+
+    const maxPayloadSocket = await openWebSocket(
+      `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+    );
+    openedSockets.add(maxPayloadSocket);
+    const maxPayloadClosed = openedWebSocketClose(maxPayloadSocket);
+    maxPayloadSocket.send(Buffer.alloc(1024 * 1024 + 1, 120));
+    assert.equal((await maxPayloadClosed).code, 1009);
+    openedSockets.delete(maxPayloadSocket);
+
+    await waitFor(
+      () => readdirSync(runtimeTmp).filter((name) => name.startsWith("tw-serve-resize-")).length === 0,
+      "limited bridge resources were not cleaned",
+    );
+
+    const bridgeSockets = [];
+    for (let index = 0; index < 8; index += 1) {
+      const bridgeSocket = await openWebSocket(
+        `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+      );
+      bridgeSockets.push(bridgeSocket);
+      openedSockets.add(bridgeSocket);
+    }
+    await waitFor(
+      () => readdirSync(runtimeTmp).filter((name) => name.startsWith("tw-serve-resize-")).length === 8,
+      "eight terminal bridges were not reserved",
+    );
+    const listPaneCallsBeforeLimit = readFileSync(tmuxLog, "utf8").split("\n")
+      .filter((line) => line.startsWith("CALL\u001flist-panes\u001f")).length;
+    const limitedSocket = await websocketClose(
+      `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+    );
+    assert.equal(limitedSocket.code, 4008);
+    const listPaneCallsAfterLimit = readFileSync(tmuxLog, "utf8").split("\n")
+      .filter((line) => line.startsWith("CALL\u001flist-panes\u001f")).length;
+    assert.equal(listPaneCallsAfterLimit, listPaneCallsBeforeLimit);
+
+    const releasedSocket = bridgeSockets.shift();
+    const releasedClosed = openedWebSocketClose(releasedSocket);
+    releasedSocket.close();
+    await releasedClosed;
+    openedSockets.delete(releasedSocket);
+    await waitFor(
+      () => readdirSync(runtimeTmp).filter((name) => name.startsWith("tw-serve-resize-")).length === 7,
+      "closing a bridge did not release its reservation",
+    );
+    const replacementSocket = await openWebSocket(
+      `ws://127.0.0.1:${port}/ws?session=safe&pane=0&token=${encodeURIComponent(token)}`,
+    );
+    bridgeSockets.push(replacementSocket);
+    openedSockets.add(replacementSocket);
+    await waitFor(
+      () => readdirSync(runtimeTmp).filter((name) => name.startsWith("tw-serve-resize-")).length === 8,
+      "released bridge capacity was not reusable",
+    );
+    for (const bridgeSocket of bridgeSockets) {
+      const bridgeClosed = openedWebSocketClose(bridgeSocket);
+      bridgeSocket.close();
+      await bridgeClosed;
+      openedSockets.delete(bridgeSocket);
+    }
+    await waitFor(
+      () => readdirSync(runtimeTmp).filter((name) => name.startsWith("tw-serve-resize-")).length === 0,
+      "bridge reservation cleanup was not exact",
+    );
+
+    const aliveAfterLimits = await httpRequest(port, "/api/sessions", { headers: authHeaders });
+    assert.equal(aliveAfterLimits.status, 200);
 
     const log = readFileSync(tmuxLog, "utf8");
     assert.ok(log.split("\n").filter((line) => line.includes(`\u001f=${hostileHttpSession}\u001f`)).length >= 3);
@@ -299,6 +399,7 @@ fi
     assert.equal(existsSync(paneSentinel), false);
     assert.equal(existsSync(sessionSentinel), false);
   } finally {
+    for (const socket of openedSockets) socket.terminate();
     await stopChild(child);
     for (const path of [httpSentinel, paneSentinel, sessionSentinel]) rmSync(path, { force: true });
     rmSync(testRoot, { recursive: true, force: true });
