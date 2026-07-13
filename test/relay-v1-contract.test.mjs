@@ -138,6 +138,7 @@ test("relay v1 fixtures freeze the complete message type surface", () => {
     "create_worktree",
     "error",
     "host_registered",
+    "host_retire",
     "kill_session",
     "list_scope_statuses",
     "list_sessions",
@@ -149,6 +150,7 @@ test("relay v1 fixtures freeze the complete message type surface", () => {
   assert.deepEqual(sortedTypes(fixtures("host-to-broker.json")), [
     "agent_message_sent",
     "error",
+    "host_drained",
     "host_ready",
     "scope_statuses",
     "session_killed",

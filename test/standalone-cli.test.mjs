@@ -79,6 +79,6 @@ test("standalone CLI build and every automatic consumer use the canonical CJS ar
   assert.ok(localTwStart >= 0 && localTwEnd > localTwStart);
   const localTw = relayHost.slice(localTwStart, localTwEnd);
   assert.ok(localTw.indexOf("TW_DASHBOARD_CLI") < localTw.indexOf("process.argv[1]"));
-  assert.ok(localTw.indexOf("process.argv[1]") < localTw.lastIndexOf('execFileAsync("tw"'));
+  assert.ok(localTw.indexOf("process.argv[1]") < localTw.lastIndexOf('execFileTracked("tw"'));
   assert.match(localTw, /\["cli\.cjs", "tw-cli\.cjs"\]/);
 });

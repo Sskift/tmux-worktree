@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildSync } from "esbuild";
 
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
@@ -33,6 +34,72 @@ const {
   restoreManagedWorktreeSession,
 } = await import("../dist/session.js");
 const { normalizeConfig, resolveWorktreeBase } = await import("../dist/config.js");
+const tmuxTestRoot = mkdtempSync(join(tmpdir(), "tw-tmux-hard-timeout-module-"));
+const tmuxTestModule = join(tmuxTestRoot, "tmux.mjs");
+buildSync({
+  entryPoints: [fileURLToPath(new URL("../src/tmux.ts", import.meta.url))],
+  bundle: true,
+  platform: "node",
+  format: "esm",
+  target: "node20",
+  outfile: tmuxTestModule,
+  logLevel: "silent",
+});
+const {
+  exec: hardBoundExec,
+  query: hardBoundQuery,
+  run: hardBoundRun,
+} = await import(pathToFileURL(tmuxTestModule).href);
+process.once("exit", () => rmSync(tmuxTestRoot, { recursive: true, force: true }));
+
+function writeHardBoundFixture(root) {
+  const fixture = join(root, "hard-bound-fixture.cjs");
+  writeFileSync(fixture, `
+const { spawn } = require("node:child_process");
+const { writeFileSync } = require("node:fs");
+
+const mode = process.argv[2];
+const pidFile = process.argv[3];
+const descendant = spawn(process.execPath, [
+  "-e",
+  "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+], { stdio: "inherit" });
+descendant.unref();
+writeFileSync(pidFile, JSON.stringify({ parent: process.pid, descendant: descendant.pid }));
+process.on("SIGTERM", () => {});
+if (mode === "exit") process.exit(0);
+setInterval(() => {}, 1_000);
+`);
+  return fixture;
+}
+
+function readFixturePids(path) {
+  const parsed = JSON.parse(readFileSync(path, "utf8"));
+  assert.ok(Number.isSafeInteger(parsed.parent) && parsed.parent > 1);
+  assert.ok(Number.isSafeInteger(parsed.descendant) && parsed.descendant > 1);
+  return parsed;
+}
+
+function assertProcessGone(pid, label) {
+  assert.throws(
+    () => process.kill(pid, 0),
+    { code: "ESRCH" },
+    `${label} process ${pid} survived the synchronous command wrapper`,
+  );
+}
+
+async function waitForProcessToDisappear(pid, timeout = 1_500) {
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`process ${pid} did not disappear within ${timeout}ms`);
+}
 
 test("managed state records TW-owned worktree sessions", () => {
   const state = upsertManagedSession(emptyManagedState(), {
@@ -164,15 +231,116 @@ test("rpc list returns only managed sessions that still exist in tmux", () => {
   assert.equal(response.sessions[0].worktreePath, "/home/dev/.tmux-worktree/worktrees/web/managed-live-bbbbb");
 });
 
-test("rpc capabilities advertises remote worktree creation", () => {
+test("rpc capabilities advertise hard-bounded remote mutations", () => {
   assert.deepEqual(buildRpcCapabilitiesResponse().capabilities, [
     "list",
     "managed-state",
+    "hard-timeout",
     "create-worktree",
     "create-terminal",
     "restore-worktree",
     "kill-session",
   ]);
+});
+
+test("query, exec, and run hard-kill TERM-ignoring command groups at timeout", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "tw-hard-timeout-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const fixture = writeHardBoundFixture(root);
+  const invocations = [
+    {
+      name: "query",
+      invoke: (pidFile) => assert.equal(
+        hardBoundQuery(process.execPath, [fixture, "hang", pidFile], 80),
+        "",
+      ),
+    },
+    {
+      name: "exec",
+      invoke: (pidFile) => assert.throws(
+        () => hardBoundExec(process.execPath, [fixture, "hang", pidFile], 80),
+        /command timed out after 80ms/,
+      ),
+    },
+    {
+      name: "run",
+      invoke: (pidFile) => assert.throws(
+        () => hardBoundRun(process.execPath, [fixture, "hang", pidFile], 80),
+        /command timed out after 80ms/,
+      ),
+    },
+  ];
+
+  for (const invocation of invocations) {
+    const pidFile = join(root, `${invocation.name}.json`);
+    const startedAt = Date.now();
+    invocation.invoke(pidFile);
+    assert.ok(
+      Date.now() - startedAt < 1_500,
+      `${invocation.name} exceeded its timeout plus termination grace`,
+    );
+    const pids = readFixturePids(pidFile);
+    assertProcessGone(pids.parent, `${invocation.name} parent`);
+    assertProcessGone(pids.descendant, `${invocation.name} descendant`);
+  }
+});
+
+test("a normally exiting command cannot leave descendants behind", (t) => {
+  const root = mkdtempSync(join(tmpdir(), "tw-descendant-cleanup-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const fixture = writeHardBoundFixture(root);
+  const pidFile = join(root, "pids.json");
+  const startedAt = Date.now();
+  assert.throws(
+    () => hardBoundRun(process.execPath, [fixture, "exit", pidFile], 1_000),
+    /command left descendant processes after exit/,
+  );
+  assert.ok(Date.now() - startedAt < 1_500, "descendant cleanup waited for the outer timeout");
+  const pids = readFixturePids(pidFile);
+  assertProcessGone(pids.parent, "normally exited parent");
+  assertProcessGone(pids.descendant, "orphaned descendant");
+});
+
+test("an outer process-group shutdown is forwarded to the supervised command group", async (t) => {
+  const root = mkdtempSync(join(tmpdir(), "tw-supervisor-signal-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const fixture = writeHardBoundFixture(root);
+  const pidFile = join(root, "pids.json");
+  const moduleUrl = pathToFileURL(tmuxTestModule).href;
+  const source = `import(${JSON.stringify(moduleUrl)}).then(({ run }) => {
+    run(process.execPath, ${JSON.stringify([fixture, "hang", pidFile])}, 10_000);
+  });`;
+  const wrapper = spawn(process.execPath, ["-e", source], {
+    detached: true,
+    stdio: "ignore",
+  });
+  t.after(() => {
+    try { process.kill(-wrapper.pid, "SIGKILL"); } catch {}
+  });
+
+  const enteredDeadline = Date.now() + 1_500;
+  while (!existsSync(pidFile) && Date.now() < enteredDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(existsSync(pidFile), true, "supervised command did not start");
+  const pids = readFixturePids(pidFile);
+  process.kill(-wrapper.pid, "SIGTERM");
+
+  await Promise.all([
+    waitForProcessToDisappear(pids.parent),
+    waitForProcessToDisappear(pids.descendant),
+    waitForProcessToDisappear(-wrapper.pid),
+  ]);
+});
+
+test("hard-bound wrappers preserve normal stdout and stdio behavior", () => {
+  const command = [
+    "-e",
+    "process.stdout.write('  hard-bound ok  ');process.stderr.write('hidden stderr')",
+  ];
+  assert.equal(hardBoundQuery(process.execPath, command, 1_000), "hard-bound ok");
+  assert.equal(hardBoundRun(process.execPath, command, 1_000), "hard-bound ok");
+  assert.equal(hardBoundExec(process.execPath, ["-e", "process.exit(0)"], 1_000), undefined);
 });
 
 test("rpc worktree creation accepts configured project targets", () => {

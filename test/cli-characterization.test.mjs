@@ -96,6 +96,7 @@ test("rpc capabilities is one machine-readable JSON line with no stderr", () => 
     capabilities: [
       "list",
       "managed-state",
+      "hard-timeout",
       "create-worktree",
       "create-terminal",
       "restore-worktree",

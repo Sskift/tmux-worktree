@@ -64,6 +64,7 @@ test("bundled CLI runs version and RPC without a runtime package or node_modules
     capabilities: [
       "list",
       "managed-state",
+      "hard-timeout",
       "create-worktree",
       "create-terminal",
       "restore-worktree",

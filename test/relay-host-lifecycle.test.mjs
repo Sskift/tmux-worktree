@@ -3,8 +3,10 @@ import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -67,6 +69,7 @@ function writeFakeTmux(root) {
   writeFileSync(path, `#!${process.execPath}
 const { appendFileSync, existsSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
+const { spawn } = require("node:child_process");
 
 const args = process.argv.slice(2);
 const targetIndex = args.indexOf("-t");
@@ -75,20 +78,50 @@ const session = target.replace(/^=/, "");
 const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
 appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session }) + "\\n");
+if (args[0] === "load-buffer" && existsSync(join(gateDir, "close-load-buffer-stdin"))) {
+  process.exit(0);
+}
+if (existsSync(join(gateDir, key + ".ignore-term"))) {
+  process.on("SIGTERM", () => {});
+}
+if (existsSync(join(gateDir, key + ".spawn-grandchild"))) {
+  const descendant = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)",
+  ], { stdio: "ignore" });
+  writeFileSync(join(gateDir, key + ".descendant-pid"), String(descendant.pid));
+}
 
 const finish = () => {
   process.stdout.write("0\\x1f1\\n");
   process.exit(0);
 };
 
+const run = () => {
+  if (args[0] !== "load-buffer") {
+    finish();
+    return;
+  }
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
+  process.stdin.on("end", () => {
+    appendFileSync(
+      join(gateDir, "tmux-inputs.ndjson"),
+      JSON.stringify({ args, input }) + "\\n",
+    );
+    finish();
+  });
+  process.stdin.resume();
+};
+
 if (!existsSync(join(gateDir, key + ".block"))) {
-  finish();
+  run();
 } else {
   writeFileSync(join(gateDir, key + "." + process.pid + ".entered"), "");
   const timer = setInterval(() => {
     if (!existsSync(join(gateDir, key + ".release"))) return;
     clearInterval(timer);
-    finish();
+    run();
   }, 5);
 }
 `, { mode: 0o700 });
@@ -99,7 +132,7 @@ if (!existsSync(join(gateDir, key + ".block"))) {
 function writeFakeTw(root) {
   const path = join(root, "fake-tw.cjs");
   writeFileSync(path, `
-const { appendFileSync, existsSync } = require("node:fs");
+const { appendFileSync, existsSync, writeFileSync } = require("node:fs");
 const { join } = require("node:path");
 
 const args = process.argv.slice(2);
@@ -109,21 +142,46 @@ const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
 appendFileSync(join(gateDir, "tw-calls.ndjson"), JSON.stringify({ args, session }) + "\\n");
 
-if (args[0] !== "rpc" || args[1] !== "kill-session") {
-  process.stderr.write("unsupported fake tw command\\n");
-  process.exit(2);
-}
-if (existsSync(join(gateDir, key + ".rpc-kill-fail"))) {
+if (args[0] === "rpc" && args[1] === "kill-session" && existsSync(join(gateDir, key + ".rpc-kill-fail"))) {
   process.stderr.write("simulated managed RPC failure\\n");
   process.exit(1);
 }
-process.stdout.write(JSON.stringify({
-  protocolVersion: 1,
-  kind: "session-killed",
-  session,
-  sessionKind: "terminal",
-  killed: true,
-}) + "\\n");
+const finish = () => {
+  if (args[0] === "rpc" && args[1] === "kill-session") {
+    process.stdout.write(JSON.stringify({
+      protocolVersion: 1,
+      kind: "session-killed",
+      session,
+      sessionKind: "terminal",
+      killed: true,
+    }) + "\\n");
+    process.exit(0);
+  }
+  if (args[0] === "rpc" && args[1] === "create-terminal") {
+    const cwdIndex = args.indexOf("--cwd");
+    const cwd = cwdIndex >= 0 ? String(args[cwdIndex + 1] || "") : "";
+    process.stdout.write(JSON.stringify({
+      protocolVersion: 1,
+      kind: "terminal",
+      session: "tw-term-drained",
+      cwd,
+    }) + "\\n");
+    process.exit(0);
+  }
+  process.stderr.write("unsupported fake tw command\\n");
+  process.exit(2);
+};
+const commandGate = "tw-" + key;
+if (!existsSync(join(gateDir, commandGate + ".block"))) {
+  finish();
+} else {
+  writeFileSync(join(gateDir, commandGate + "." + process.pid + ".entered"), "");
+  const timer = setInterval(() => {
+    if (!existsSync(join(gateDir, commandGate + ".release"))) return;
+    clearInterval(timer);
+    finish();
+  }, 5);
+}
 `, { mode: 0o700 });
   chmodSync(path, 0o700);
   return path;
@@ -134,7 +192,20 @@ function writeFakeSshOnlyPath(root) {
   mkdirSync(bin);
   const ssh = join(bin, "ssh");
   writeFileSync(ssh, `#!${process.execPath}
-process.stdout.write("0\\x1f1\\n");
+const command = process.argv.slice(2).join(" ");
+if (command.includes("list-panes")) {
+  process.stdout.write("0\\x1f1\\n");
+  process.exit(0);
+}
+const { writeFileSync } = require("node:fs");
+const { join } = require("node:path");
+writeFileSync(join(process.env.TW_TEST_TMUX_GATE_DIR, "remote-ssh-pid"), String(process.pid));
+process.on("SIGWINCH", () => {});
+process.on("SIGTERM", () => {});
+process.stdout.write("REMOTE_READY");
+process.stdin.on("data", (chunk) => process.stdout.write(chunk));
+process.stdin.resume();
+setInterval(() => {}, 1_000);
 `, { mode: 0o700 });
   chmodSync(ssh, 0o700);
   return bin;
@@ -151,35 +222,48 @@ async function stopChild(child) {
 async function startHarness(t, {
   waitUntilReady = true,
   remoteChildSpawnFailure = false,
+  remotePtySuccess = false,
   environmentToken = "serve-token",
   tokenFileContents,
   localBaseSuffix = "",
+  withStatusFile = false,
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), "tw-relay-host-lifecycle-"));
   const gateDir = join(root, "gates");
   mkdirSync(gateDir);
   const fakeTmux = writeFakeTmux(root);
   const fakeTw = writeFakeTw(root);
-  const isolatedPath = remoteChildSpawnFailure ? writeFakeSshOnlyPath(root) : process.env.PATH;
+  const hasRemoteScope = remoteChildSpawnFailure || remotePtySuccess;
+  const fakeRemoteBin = hasRemoteScope
+    ? writeFakeSshOnlyPath(root)
+    : undefined;
+  const isolatedPath = fakeRemoteBin
+    ? (remotePtySuccess ? `${fakeRemoteBin}:${process.env.PATH}` : fakeRemoteBin)
+    : process.env.PATH;
   if (tokenFileContents !== undefined) {
     writeFileSync(join(root, ".tw-serve-token"), `${tokenFileContents}\n`, { mode: 0o600 });
   }
   writeFileSync(join(root, ".tmux-worktree.json"), JSON.stringify({
     projects: {},
     tmuxPath: fakeTmux,
-    hosts: remoteChildSpawnFailure
+    hosts: hasRemoteScope
       ? [{ id: "remote", label: "remote", host: "remote.invalid" }]
       : [],
   }));
+  const statusFile = withStatusFile ? join(root, "relay-status.json") : undefined;
   const brokerConnections = [];
   const brokerMessages = [];
   const broker = await openWebSocketServer((socket, request) => {
-    const connection = { socket, request, messages: [] };
+    const connection = { socket, request, messages: [], closeCode: undefined, closeReason: undefined };
     brokerConnections.push(connection);
     socket.on("message", (raw) => {
       const message = JSON.parse(Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw));
       connection.messages.push(message);
       brokerMessages.push({ connection, message });
+    });
+    socket.on("close", (code, reason) => {
+      connection.closeCode = code;
+      connection.closeReason = reason.toString("utf8");
     });
   });
 
@@ -207,6 +291,7 @@ async function startHarness(t, {
     "--host-id", "lifecycle-host",
     "--secret", "lifecycle-secret",
     "--local", `${local.httpUrl}${localBaseSuffix}`,
+    ...(statusFile ? ["--status-file", statusFile] : []),
   ], {
     cwd: process.cwd(),
     env: {
@@ -230,6 +315,7 @@ async function startHarness(t, {
     broker,
     local,
     child,
+    statusFile,
     brokerConnections,
     brokerMessages,
     localConnections,
@@ -304,6 +390,24 @@ function releasePaneResolution(harness, session) {
   writeFileSync(join(harness.gateDir, `${safeGateName(session)}.release`), "");
 }
 
+function blockTwCommand(harness, key = "default") {
+  writeFileSync(join(harness.gateDir, `tw-${safeGateName(key)}.block`), "");
+}
+
+async function waitForBlockedTwCommand(harness, key = "default") {
+  const prefix = `tw-${safeGateName(key)}.`;
+  return waitFor(
+    () => readdirSync(harness.gateDir).find((name) => (
+      name.startsWith(prefix) && name.endsWith(".entered")
+    )),
+    `tw command ${key} did not enter its gate`,
+  );
+}
+
+function releaseTwCommand(harness, key = "default") {
+  writeFileSync(join(harness.gateDir, `tw-${safeGateName(key)}.release`), "");
+}
+
 async function assertNoAdditionalLocalConnection(harness, count, durationMs = 300) {
   await delay(durationMs);
   assert.equal(
@@ -365,6 +469,642 @@ test("local bridge discards inherited query and fragment credentials", async (t)
   assert.equal(connection.requestUrl.includes("stale-url-token"), false);
   assert.equal(connection.requestUrl.includes("stale-other"), false);
   assert.equal(connection.requestUrl.includes("stale-fragment"), false);
+});
+
+test("local agent submit preserves raw text and handles empty messages without a buffer", async (t) => {
+  const harness = await startHarness(t);
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-submit",
+    session: "local:agent-submit",
+    pane: 0,
+    message: "a;\r\nb",
+    submit: true,
+  });
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "agent_message_sent" && message.requestId === "agent-submit"
+    )),
+    `relay-host did not acknowledge the agent message; output:\n${harness.output()}`,
+  );
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-empty-submit",
+    session: "local:agent-submit",
+    pane: 0,
+    message: "",
+    submit: true,
+  });
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "agent_message_sent" && message.requestId === "agent-empty-submit"
+    )),
+    "relay-host did not acknowledge the empty submit",
+  );
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-empty-no-submit",
+    session: "local:agent-submit",
+    pane: 0,
+    message: "",
+    submit: false,
+  });
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "agent_message_sent" && message.requestId === "agent-empty-no-submit"
+    )),
+    "relay-host did not acknowledge the empty no-op",
+  );
+  const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  const sendCalls = calls.filter(({ args }) => args[0] === "load-buffer");
+  assert.equal(sendCalls.length, 1);
+  const buffer = sendCalls[0].args[2];
+  assert.match(buffer, /^tw-relay-\d+-\d+$/);
+  assert.deepEqual(sendCalls[0].args, [
+    "load-buffer", "-b", buffer, "-",
+    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", "=agent-submit:.0",
+    ";", "send-keys", "-t", "=agent-submit:.0", "C-m",
+  ]);
+  const emptySubmitCalls = calls.filter(({ args }) => args[0] === "send-keys");
+  assert.deepEqual(emptySubmitCalls.map(({ args }) => args), [[
+    "send-keys", "-t", "=agent-submit:.0", "C-m",
+  ]]);
+  const inputs = readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
+    .trim()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.deepEqual(inputs, [{ args: sendCalls[0].args, input: "a;\nb" }]);
+
+  writeFileSync(join(harness.gateDir, "close-load-buffer-stdin"), "");
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "agent-stdin-epipe",
+    session: "local:agent-epipe",
+    pane: 0,
+    message: "x".repeat(512 * 1024),
+    submit: true,
+  });
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "error" && message.requestId === "agent-stdin-epipe"
+    )),
+    "relay-host acknowledged a message whose tmux stdin closed early",
+  );
+  assert.equal(harness.brokerMessages.some(({ message }) => (
+    message.type === "agent_message_sent" && message.requestId === "agent-stdin-epipe"
+  )), false);
+});
+
+test("pending input overflow finalizes a blocked opening without resurrection", async (t) => {
+  const harness = await startHarness(t);
+  const session = "pending-overflow";
+  blockPaneResolution(harness, session);
+  openTerminal(harness, session);
+  await waitForBlockedResolution(harness, session);
+  const beforeOverflow = harness.brokerMessages.length;
+  const chunk = "p".repeat(64 * 1024);
+
+  for (let index = 0; index < 5; index += 1) {
+    sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: chunk });
+  }
+  await waitFor(
+    () => {
+      const messages = harness.brokerMessages.slice(beforeOverflow).map(({ message }) => message);
+      return messages.some(({ type, streamId }) => type === "error" && streamId === STREAM_ID)
+        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+    },
+    "pending input overflow did not fail and finalize the opening stream",
+  );
+
+  releasePaneResolution(harness, session);
+  await assertNoAdditionalLocalConnection(harness, 0);
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "must-not-reopen" });
+  await assertNoAdditionalLocalConnection(harness, 0);
+  const exits = harness.brokerMessages
+    .slice(beforeOverflow)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+  assert.equal(exits.length, 1);
+});
+
+test("local stream admission reserves eight slots and releases a closed slot", async (t) => {
+  const harness = await startHarness(t);
+  for (let index = 0; index < 8; index += 1) {
+    openTerminal(harness, `local-cap-${index}`, `local-cap-stream-${index}`);
+  }
+  await waitFor(
+    () => harness.localConnections.length === 8,
+    "the first eight local streams did not open",
+  );
+  const beforeNinth = harness.brokerMessages.length;
+  openTerminal(harness, "local-cap-rejected", "local-cap-stream-rejected");
+  await waitFor(
+    () => {
+      const messages = harness.brokerMessages.slice(beforeNinth).map(({ message }) => message);
+      return messages.some(({ type, streamId }) => type === "error" && streamId === "local-cap-stream-rejected")
+        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === "local-cap-stream-rejected");
+    },
+    "the ninth local stream was not rejected with a terminal lifecycle",
+  );
+  await assertNoAdditionalLocalConnection(harness, 8, 100);
+  const rejectedExits = harness.brokerMessages
+    .slice(beforeNinth)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => type === "terminal_exit" && streamId === "local-cap-stream-rejected");
+  assert.equal(rejectedExits.length, 1);
+
+  const first = harness.localConnections.find(({ session }) => session === "local-cap-0");
+  assert.ok(first);
+  sendToHost(harness, { type: "close_terminal", streamId: "local-cap-stream-0" });
+  await waitFor(
+    () => first.socket.readyState === WebSocket.CLOSED,
+    "closing a local stream did not release its backend connection",
+  );
+  openTerminal(harness, "local-cap-after-close", "local-cap-stream-after-close");
+  await waitFor(
+    () => harness.localConnections.some(({ session }) => session === "local-cap-after-close"),
+    "a new local stream could not use the released slot",
+  );
+  assert.equal(harness.localConnections.length, 9);
+});
+
+test("blocked stream reservations remain bounded across carrier reconnects", async (t) => {
+  const harness = await startHarness(t);
+  const heldSessions = Array.from({ length: 8 }, (_, index) => `held-acquisition-${index}`);
+  for (const [index, session] of heldSessions.entries()) {
+    blockPaneResolution(harness, session);
+    openTerminalAs(harness, CLIENT_ID, session, `held-stream-${index}`);
+  }
+  await Promise.all(heldSessions.map((session) => waitForBlockedResolution(harness, session)));
+
+  const firstCarrier = harness.brokerConnections[0];
+  assert.ok(firstCarrier);
+  firstCarrier.socket.terminate();
+  const replacement = await waitFor(
+    () => harness.brokerConnections.find((connection, index) => (
+      index > 0 && connection.messages.some(({ type }) => type === "host_ready")
+    )),
+    `relay-host did not reconnect with blocked acquisitions; output:\n${harness.output()}`,
+  );
+
+  const beforeRejected = replacement.messages.length;
+  openTerminalAs(harness, "replacement-client", "blocked-by-old-acquisitions", "replacement-rejected");
+  await waitFor(
+    () => {
+      const messages = replacement.messages.slice(beforeRejected);
+      return messages.some(({ type, streamId }) => type === "error" && streamId === "replacement-rejected")
+        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === "replacement-rejected");
+    },
+    "a replacement carrier bypassed reservations held by old open tasks",
+  );
+  await assertNoAdditionalLocalConnection(harness, 0, 100);
+
+  releasePaneResolution(harness, heldSessions[0]);
+  await delay(100);
+  openTerminalAs(harness, "replacement-client", "released-acquisition", "replacement-accepted");
+  await waitFor(
+    () => harness.localConnections.some(({ session }) => session === "released-acquisition"),
+    "a physically released acquisition did not return its admission slot",
+  );
+  for (const session of heldSessions.slice(1)) releasePaneResolution(harness, session);
+});
+
+test("command admission remains bounded across clients and carrier reconnects", async (t) => {
+  const harness = await startHarness(t);
+  blockPaneResolution(harness, "default");
+  for (let index = 0; index < 4; index += 1) {
+    sendToHostAs(harness, "command-client-a", {
+      type: "list_sessions",
+      requestId: `command-a-${index}`,
+    });
+  }
+  await waitFor(
+    () => readdirSync(harness.gateDir).filter((name) => (
+      name.startsWith("default.") && name.endsWith(".entered")
+    )).length >= 4,
+    "four commands from the first client did not enter the blocked backend",
+  );
+  const firstCarrier = harness.brokerConnections[0];
+  assert.ok(firstCarrier);
+  const beforePerClientReject = firstCarrier.messages.length;
+  sendToHostAs(harness, "command-client-a", {
+    type: "list_sessions",
+    requestId: "command-a-rejected",
+  });
+  await waitFor(
+    () => firstCarrier.messages.slice(beforePerClientReject).some((message) => (
+      message.type === "error"
+      && message.requestId === "command-a-rejected"
+      && message.message === "too many in-flight relay commands for client"
+    )),
+    "the per-client command limit did not reject the fifth command",
+  );
+
+  for (let index = 0; index < 4; index += 1) {
+    sendToHostAs(harness, "command-client-b", {
+      type: "list_sessions",
+      requestId: `command-b-${index}`,
+    });
+  }
+  await waitFor(
+    () => readdirSync(harness.gateDir).filter((name) => (
+      name.startsWith("default.") && name.endsWith(".entered")
+    )).length >= 8,
+    "eight globally admitted commands did not enter the blocked backend",
+  );
+
+  firstCarrier.socket.terminate();
+  const replacement = await waitFor(
+    () => harness.brokerConnections.find((connection, index) => (
+      index > 0 && connection.messages.some(({ type }) => type === "host_ready")
+    )),
+    `relay-host did not reconnect with blocked commands; output:\n${harness.output()}`,
+  );
+  const beforeGlobalReject = replacement.messages.length;
+  sendToHostAs(harness, "command-client-c", {
+    type: "create_terminal",
+    requestId: "command-global-rejected",
+    scopeId: "local",
+    cwd: "/tmp/rejected-command",
+  });
+  await waitFor(
+    () => replacement.messages.slice(beforeGlobalReject).some((message) => (
+      message.type === "error"
+      && message.requestId === "command-global-rejected"
+      && message.message === "too many in-flight relay commands on host"
+    )),
+    "the replacement carrier bypassed the global command limit",
+  );
+  const twCallsBeforeRelease = readFileSync(join(harness.gateDir, "tw-calls.ndjson"), "utf8");
+  assert.equal(twCallsBeforeRelease.includes("create-terminal"), false);
+
+  releasePaneResolution(harness, "default");
+  await delay(200);
+  const beforeRecovery = replacement.messages.length;
+  sendToHostAs(harness, "command-client-c", {
+    type: "list_sessions",
+    requestId: "command-after-release",
+  });
+  await waitFor(
+    () => replacement.messages.slice(beforeRecovery).some((message) => (
+      message.type === "sessions" && message.requestId === "command-after-release"
+    )),
+    "settled commands did not release their admission slots",
+  );
+});
+
+test("SIGTERM aborts blocked admin commands before relay-host exits", async (t) => {
+  const harness = await startHarness(t);
+  blockPaneResolution(harness, "default");
+  writeFileSync(join(harness.gateDir, "default.ignore-term"), "");
+  writeFileSync(join(harness.gateDir, "default.spawn-grandchild"), "");
+  sendToHost(harness, {
+    type: "list_sessions",
+    requestId: "shutdown-blocked-command",
+  });
+  await waitForBlockedResolution(harness, "default");
+  const entered = readdirSync(harness.gateDir).find((name) => (
+    name.startsWith("default.") && name.endsWith(".entered")
+  ));
+  assert.ok(entered);
+  const backendPid = Number.parseInt(entered.split(".")[1], 10);
+  assert.ok(Number.isSafeInteger(backendPid) && backendPid > 1);
+  const descendantPid = Number.parseInt(
+    await waitFor(
+      () => existsSync(join(harness.gateDir, "default.descendant-pid"))
+        && readFileSync(join(harness.gateDir, "default.descendant-pid"), "utf8"),
+      "the blocked command did not publish its descendant pid",
+    ),
+    10,
+  );
+  assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 1);
+
+  const exited = once(harness.child, "exit");
+  harness.child.kill("SIGTERM");
+  const [code, signal] = await Promise.race([
+    exited,
+    delay(2_500).then(() => assert.fail(
+      `relay-host did not abort a blocked command during shutdown; output:\n${harness.output()}`,
+    )),
+  ]);
+  assert.equal(code, 0);
+  assert.equal(signal, null);
+  await waitFor(
+    () => {
+      try {
+        process.kill(backendPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    "the blocked command child survived relay-host shutdown",
+  );
+  await waitFor(
+    () => {
+      try {
+        process.kill(descendantPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    "the blocked command descendant survived relay-host shutdown",
+  );
+});
+
+test("terminal shutdown drains accepted mutations instead of aborting their RPC parent", async (t) => {
+  for (const trigger of ["SIGTERM", "4002"]) {
+    await t.test(trigger, async (t) => {
+      const harness = await startHarness(t, { withStatusFile: trigger === "4002" });
+      blockTwCommand(harness);
+      sendToHost(harness, {
+        type: "create_terminal",
+        requestId: `drain-mutation-${trigger}`,
+        scopeId: "local",
+        cwd: `/tmp/drain-${trigger.toLowerCase()}`,
+      });
+      const entered = await waitForBlockedTwCommand(harness);
+      const mutationPid = Number.parseInt(entered.split(".")[1], 10);
+      assert.ok(Number.isSafeInteger(mutationPid) && mutationPid > 1);
+
+      const exited = once(harness.child, "exit");
+      if (trigger === "SIGTERM") {
+        harness.child.kill("SIGTERM");
+      } else {
+        currentBrokerSocket(harness).close(4002, "host replaced");
+      }
+      await delay(150);
+      assert.equal(
+        harness.child.exitCode,
+        null,
+        `${trigger} exited relay-host before its accepted mutation settled`,
+      );
+      assert.doesNotThrow(() => process.kill(mutationPid, 0));
+      const replacementStatus = trigger === "4002"
+        ? { state: "connected", owner: "replacement", updatedAt: Date.now() }
+        : undefined;
+      if (replacementStatus) {
+        writeFileSync(harness.statusFile, `${JSON.stringify(replacementStatus)}\n`);
+      }
+
+      releaseTwCommand(harness);
+      if (trigger === "SIGTERM") {
+        await waitFor(
+          () => harness.brokerMessages.some(({ message }) => (
+            message.type === "terminal_created"
+            && message.requestId === `drain-mutation-${trigger}`
+          )),
+          `broker did not receive the accepted mutation ACK before SIGTERM exit; output:\n${harness.output()}`,
+          1_800,
+        );
+      }
+      const [code, signal] = await Promise.race([
+        exited,
+        delay(2_000).then(() => assert.fail(
+          `relay-host did not exit after its ${trigger} mutation drained; output:\n${harness.output()}`,
+        )),
+      ]);
+      assert.equal(code, 0);
+      assert.equal(signal, null);
+      await waitFor(
+        () => {
+          try {
+            process.kill(mutationPid, 0);
+            return false;
+          } catch {
+            return true;
+          }
+        },
+        `${trigger} left the settled mutation parent alive`,
+      );
+      const calls = readFileSync(join(harness.gateDir, "tw-calls.ndjson"), "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line));
+      assert.equal(calls.filter(({ args }) => args[1] === "create-terminal").length, 1);
+      if (replacementStatus) {
+        assert.deepEqual(
+          JSON.parse(readFileSync(harness.statusFile, "utf8")),
+          replacementStatus,
+          "the superseded relay-host overwrote its replacement status",
+        );
+      }
+    });
+  }
+});
+
+test("rejecting a same-key replacement retires its previous generation once", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "same-key-live");
+  const previous = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "same-key-live"),
+    "the original same-key transport did not open",
+  );
+  const beforeRejected = harness.brokerMessages.length;
+  openScopedTerminalAs(harness, CLIENT_ID, "missing-scope:invalid", STREAM_ID);
+  await waitFor(
+    () => {
+      const messages = harness.brokerMessages.slice(beforeRejected).map(({ message }) => message);
+      return messages.some(({ type, streamId }) => type === "error" && streamId === STREAM_ID)
+        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+    },
+    "the invalid replacement did not retire its previous generation",
+  );
+  await waitFor(
+    () => previous.socket.readyState === WebSocket.CLOSED,
+    "the rejected replacement left its previous transport alive",
+  );
+  const exits = harness.brokerMessages
+    .slice(beforeRejected)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+  assert.equal(exits.length, 1);
+
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "must-not-reopen" });
+  await assertNoAdditionalLocalConnection(harness, 1);
+});
+
+test("slow local backend input overflow finalizes once and cannot reopen", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "slow-local-input");
+  const transport = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "slow-local-input"),
+    "slow local backend did not open",
+  );
+  transport.socket._socket.pause();
+  const beforeBurst = harness.brokerMessages.length;
+  const chunk = "s".repeat(128 * 1024);
+
+  for (let index = 0; index < 96; index += 1) {
+    sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: chunk });
+    if (index % 4 === 3) {
+      await delay(0);
+      if (harness.brokerMessages.slice(beforeBurst).some(({ message }) => (
+        message.type === "terminal_exit" && message.streamId === STREAM_ID
+      ))) break;
+    }
+  }
+  await waitFor(
+    () => {
+      const messages = harness.brokerMessages.slice(beforeBurst).map(({ message }) => message);
+      return messages.some(({ type, streamId }) => type === "error" && streamId === STREAM_ID)
+        && messages.some(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+    },
+    "slow local backend did not trip input backpressure",
+  );
+  const exits = harness.brokerMessages
+    .slice(beforeBurst)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => type === "terminal_exit" && streamId === STREAM_ID);
+  assert.equal(exits.length, 1);
+
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "must-not-reopen" });
+  await assertNoAdditionalLocalConnection(harness, 1);
+  transport.socket._socket.resume();
+  transport.socket.terminate();
+});
+
+test("remote resize signals do not make the following terminal input look closed", async (t) => {
+  const harness = await startHarness(t, { remotePtySuccess: true });
+  openScopedTerminalAs(harness, CLIENT_ID, "remote:resize-input", STREAM_ID);
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "terminal_data"
+      && message.streamId === STREAM_ID
+      && message.data.includes("REMOTE_READY")
+    )),
+    "the real remote PTY wrapper did not start its fake ssh child",
+  );
+  const beforeInput = harness.brokerMessages.length;
+  sendToHost(harness, { type: "resize", streamId: STREAM_ID, cols: 120, rows: 40 });
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "after-resize" });
+  await waitFor(
+    () => harness.brokerMessages.slice(beforeInput).some(({ message }) => (
+      message.type === "terminal_data"
+      && message.streamId === STREAM_ID
+      && message.data.includes("after-resize")
+    )),
+    "remote input was not delivered after SIGWINCH",
+  );
+  const lifecycleFailures = harness.brokerMessages
+    .slice(beforeInput)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => (
+      streamId === STREAM_ID && (type === "error" || type === "terminal_exit")
+    ));
+  assert.deepEqual(lifecycleFailures, []);
+
+  const sshPid = Number.parseInt(
+    readFileSync(join(harness.gateDir, "remote-ssh-pid"), "utf8"),
+    10,
+  );
+  assert.ok(Number.isSafeInteger(sshPid) && sshPid > 1);
+  const controlDir = await waitFor(
+    () => readdirSync(tmpdir())
+      .filter((name) => name.startsWith("tw-relay-stream-"))
+      .map((name) => join(tmpdir(), name))
+      .find((path) => (
+        existsSync(join(path, "process-group"))
+        && readFileSync(join(path, "process-group"), "utf8").trim() === String(sshPid)
+      )),
+    "the remote PTY wrapper did not publish its private process-group directory",
+  );
+  sendToHost(harness, { type: "close_terminal", streamId: STREAM_ID });
+  await waitFor(
+    () => {
+      try {
+        process.kill(sshPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    },
+    "the remote process-group escalation left an ssh descendant alive",
+    4_000,
+  );
+  await waitFor(
+    () => !existsSync(controlDir),
+    "the remote process-group control directory survived stream teardown",
+    4_000,
+  );
+});
+
+test("oversized carrier frame closes the connection and relay-host reconnects", async (t) => {
+  const harness = await startHarness(t);
+  const first = harness.brokerConnections[0];
+  assert.ok(first);
+  first.socket.send(JSON.stringify({
+    type: "terminal_input",
+    clientId: CLIENT_ID,
+    streamId: "oversized-carrier-stream",
+    data: "c".repeat(1024 * 1024),
+  }));
+
+  const replacement = await waitFor(
+    () => harness.brokerConnections.find((connection, index) => (
+      index > 0 && connection.messages.some(({ type }) => type === "host_ready")
+    )),
+    `relay-host did not reconnect after an oversized carrier frame; output:\n${harness.output()}`,
+  );
+  assert.notEqual(first.closeCode, 1000);
+  assert.equal(first.socket.readyState, WebSocket.CLOSED);
+  assert.equal(replacement.socket.readyState, WebSocket.OPEN);
+});
+
+test("slow broker output closes the overloaded carrier and relay-host reconnects", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "slow-broker-output");
+  const terminal = await waitFor(
+    () => harness.localConnections.find(({ session }) => session === "slow-broker-output"),
+    "local output source did not open",
+  );
+  const first = harness.brokerConnections[0];
+  assert.ok(first);
+  first.socket._socket.pause();
+  const output = "o".repeat(256 * 1024);
+
+  for (let index = 0; index < 40; index += 1) {
+    terminal.socket.send(output);
+    if (index % 4 === 3) {
+      await delay(0);
+      if (harness.brokerConnections.length > 1) break;
+    }
+  }
+  const replacement = await waitFor(
+    () => harness.brokerConnections.find((connection, index) => (
+      index > 0 && connection.messages.some(({ type }) => type === "host_ready")
+    )),
+    `relay-host did not replace a slow output carrier; output:\n${harness.output()}`,
+    5_000,
+  );
+  first.socket._socket.resume();
+  await waitFor(
+    () => first.socket.readyState === WebSocket.CLOSED,
+    "the overloaded carrier did not close",
+  );
+  assert.equal(replacement.socket.readyState, WebSocket.OPEN);
+  await waitFor(
+    () => terminal.socket.readyState === WebSocket.CLOSED,
+    "the old carrier left its local stream alive",
+  );
+
+  const replacementMessageStart = replacement.messages.length;
+  sendToHost(harness, {
+    type: "terminal_input",
+    streamId: STREAM_ID,
+    data: "must-not-survive-carrier",
+  });
+  await waitFor(
+    () => replacement.messages.slice(replacementMessageStart).some((message) => (
+      message.type === "error" && message.streamId === STREAM_ID
+    )),
+    "the replacement carrier retained the old stream route",
+  );
+  await assertNoAdditionalLocalConnection(harness, 1);
 });
 
 test("close invalidates an open attempt waiting on pane resolution", async (t) => {

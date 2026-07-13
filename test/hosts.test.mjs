@@ -225,7 +225,7 @@ case "$last" in
     if test "$TW_TEST_NO_KILL_SESSION" = 1; then
       printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal"]}'
     else
-      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session"]}'
+      printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
     fi
     exit 0
     ;;
@@ -251,7 +251,7 @@ exit 12
   assert.equal(result.tmux.version, "tmux 3.5a");
   assert.equal(result.tw.available, true);
   assert.equal(result.tw.compatible, true);
-  assert.deepEqual(result.tw.capabilities, ["list", "create-worktree", "create-terminal", "kill-session"]);
+  assert.deepEqual(result.tw.capabilities, ["list", "create-worktree", "create-terminal", "kill-session", "hard-timeout"]);
 
   const missingKill = runCli(home, ["host", "probe", "dev", "--json"], {
     ...env,

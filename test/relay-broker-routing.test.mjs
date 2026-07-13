@@ -275,6 +275,11 @@ class SocketInbox {
   }
 }
 
+async function markHostReady(host, hostId, options = {}) {
+  host.sendJson({ type: "host_ready", hostId, ...options });
+  await host.barrier();
+}
+
 test("relay-server CLI keeps its v1 option and error contract", () => {
   const help = runRelayServerCli(["--help"]);
   assert.equal(help.status, 0);
@@ -314,6 +319,73 @@ test("relay-server CLI keeps its v1 option and error contract", () => {
     assert.equal(result.signal, null, `${scenario.name} signal`);
     assert.equal(result.stdout, "", `${scenario.name} stdout`);
     assert.equal(result.stderr, scenario.stderr, `${scenario.name} stderr`);
+  }
+});
+
+test("relay v1 does not route to the first host before host_ready", async () => {
+  const secret = "relay-first-host-ready-barrier-secret";
+  const hostId = "first-host-ready-barrier";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseHttp = `http://127.0.0.1:${port}`;
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+
+    const beforeReadyCatalog = await fetch(`${baseHttp}/api/hosts`, auth);
+    assert.deepEqual(await beforeReadyCatalog.json(), { ok: true, hosts: [] });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+    assert.deepEqual(await client.nextJson(), {
+      type: "error",
+      message: "host is not connected",
+    });
+
+    const beforeReadyRequest = { type: "list_sessions", requestId: "before-host-ready" };
+    client.sendJson(beforeReadyRequest);
+    assert.deepEqual(await client.nextJson(), {
+      type: "error",
+      requestId: beforeReadyRequest.requestId,
+      message: "host is not connected",
+    });
+    await host.expectNoMessage();
+
+    await markHostReady(host, hostId, {
+      displayName: "Ready Host",
+      capabilities: ["retire-drain-v1"],
+    });
+    const afterReadyRequest = { type: "list_sessions", requestId: "after-host-ready" };
+    client.sendJson(afterReadyRequest);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...afterReadyRequest, clientId: ready.clientId }),
+    );
+    host.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: afterReadyRequest.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "sessions",
+      requestId: afterReadyRequest.requestId,
+      sessions: [],
+    });
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
   }
 });
 
@@ -357,7 +429,7 @@ test("relay v1 broker preserves authentication, routing, and stream teardown sem
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
-    host.sendJson({ type: "host_ready", hostId, displayName: "Routing Host" });
+    await markHostReady(host, hostId, { displayName: "Routing Host" });
 
     const client = new SocketInbox(
       `${baseWs}/client?hostId=${hostId}&secret=${encodeURIComponent(secret)}`,
@@ -384,6 +456,25 @@ test("relay v1 broker preserves authentication, routing, and stream teardown sem
       clients: 1,
     });
     assert.equal(typeof hosts.hosts[0].connectedAt, "number");
+    await host.expectNoMessage();
+
+    for (const type of [
+      "host_retire",
+      "client_closed",
+      "host_registered",
+      "host_drained",
+      "host_ready",
+      "unknown_relay_message",
+    ]) {
+      client.sendJson({ type, clientId: "forged-client", hostId });
+    }
+    await client.barrier();
+    for (let index = 0; index < 6; index += 1) {
+      assert.deepEqual(await client.nextJson(), {
+        type: "error",
+        message: "invalid message",
+      });
+    }
     await host.expectNoMessage();
 
     const clientPayload = {
@@ -459,6 +550,94 @@ test("relay v1 broker preserves authentication, routing, and stream teardown sem
   }
 });
 
+test("relay v1 bounds pending mutations per host before forwarding", async () => {
+  const secret = "relay-pending-mutation-limit-secret";
+  const hostId = "pending-mutation-limit-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const host = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(host);
+    await host.open();
+    assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    for (let index = 0; index < 128; index += 1) {
+      client.sendJson({
+        type: "create_terminal",
+        requestId: `pending-${index}`,
+        scopeId: "local",
+        cwd: `/tmp/pending-${index}`,
+      });
+    }
+    await client.barrier();
+    for (let index = 0; index < 128; index += 1) {
+      assert.deepEqual(await host.nextJson(), {
+        type: "create_terminal",
+        requestId: `pending-${index}`,
+        scopeId: "local",
+        cwd: `/tmp/pending-${index}`,
+        clientId: ready.clientId,
+      });
+    }
+
+    const overflow = {
+      type: "create_terminal",
+      requestId: "pending-overflow",
+      scopeId: "local",
+      cwd: "/tmp/pending-overflow",
+    };
+    client.sendJson(overflow);
+    assert.deepEqual(await client.nextJson(), {
+      type: "error",
+      requestId: overflow.requestId,
+      message: "too many pending relay mutations on host",
+    });
+    await host.expectNoMessage();
+
+    const completedSession = {
+      name: "local:tw-term-pending-0",
+      attached: false,
+      windows: 1,
+      created: 1,
+      activity: 1,
+    };
+    host.sendJson({
+      type: "terminal_created",
+      clientId: ready.clientId,
+      requestId: "pending-0",
+      session: completedSession,
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "terminal_created",
+      requestId: "pending-0",
+      session: completedSession,
+    });
+
+    client.sendJson(overflow);
+    assert.equal(
+      await host.nextRaw(),
+      JSON.stringify({ ...overflow, clientId: ready.clientId }),
+      "a completed mutation must release one pending slot",
+    );
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
 test("relay v1 host replacement fences every old-host frame and retires its routes", async () => {
   const secret = "relay-replacement-test-secret";
   const hostId = "replacement-host";
@@ -474,6 +653,10 @@ test("relay v1 host replacement fences every old-host frame and retires its rout
     sockets.push(oldHost);
     await oldHost.open();
     assert.deepEqual(await oldHost.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(oldHost, hostId, {
+      displayName: "Retiring H1",
+      capabilities: ["retire-drain-v1"],
+    });
 
     const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(client);
@@ -492,16 +675,48 @@ test("relay v1 host replacement fences every old-host frame and retires its rout
       JSON.stringify({ ...openTerminal, clientId: ready.clientId }),
     );
 
-    // Keep H1's client side OPEN after the broker starts its replacement close.
-    // This lets the test deterministically put stale application frames ahead of
-    // H1's close reply instead of depending on scheduling between two sockets.
-    oldHost.pauseIncoming();
+    const pendingMutation = {
+      type: "create_terminal",
+      requestId: "accepted-by-h1",
+      scopeId: "local",
+      cwd: "/tmp/accepted-by-h1",
+    };
+    client.sendJson(pendingMutation);
+    assert.equal(
+      await oldHost.nextRaw(),
+      JSON.stringify({ ...pendingMutation, clientId: ready.clientId }),
+    );
+
     const newHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
     sockets.push(newHost);
     await newHost.open();
     assert.deepEqual(await newHost.nextJson(), { type: "host_registered", hostId });
-    newHost.sendJson({ type: "host_ready", hostId, displayName: "Winning H2" });
-    await newHost.barrier();
+
+    const beforeH2Ready = { type: "list_sessions", requestId: "before-h2-ready" };
+    client.sendJson(beforeH2Ready);
+    assert.equal(
+      await oldHost.nextRaw(),
+      JSON.stringify({ ...beforeH2Ready, clientId: ready.clientId }),
+      "a replacement candidate must not receive traffic before host_ready",
+    );
+    await newHost.expectNoMessage();
+    oldHost.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: beforeH2Ready.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "sessions",
+      requestId: beforeH2Ready.requestId,
+      sessions: [],
+    });
+
+    await markHostReady(newHost, hostId, {
+      displayName: "Winning H2",
+      capabilities: ["retire-drain-v1"],
+    });
+    assert.deepEqual(await oldHost.nextJson(), { type: "host_retire" });
 
     assert.deepEqual(await client.nextJson(), {
       type: "error",
@@ -512,6 +727,27 @@ test("relay v1 host replacement fences every old-host frame and retires its rout
       type: "terminal_exit",
       streamId: "stream-before-replacement",
       code: 0,
+    });
+
+    const afterReplacement = {
+      type: "list_sessions",
+      requestId: "after-replacement",
+    };
+    client.sendJson(afterReplacement);
+    assert.equal(
+      await newHost.nextRaw(),
+      JSON.stringify({ ...afterReplacement, clientId: ready.clientId }),
+    );
+    newHost.sendJson({
+      type: "sessions",
+      clientId: ready.clientId,
+      requestId: afterReplacement.requestId,
+      sessions: [],
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "sessions",
+      requestId: afterReplacement.requestId,
+      sessions: [],
     });
 
     oldHost.sendJson({ type: "host_ready", hostId, displayName: "Stale H1" });
@@ -533,7 +769,25 @@ test("relay v1 host replacement fences every old-host frame and retires its rout
       streamId: "stream-before-replacement",
       code: 91,
     });
-    oldHost.resumeIncoming();
+    const completedSession = {
+      name: "local:tw-term-accepted-by-h1",
+      attached: false,
+      windows: 1,
+      created: 1,
+      activity: 1,
+    };
+    oldHost.sendJson({
+      type: "terminal_created",
+      clientId: ready.clientId,
+      requestId: pendingMutation.requestId,
+      session: completedSession,
+    });
+    oldHost.sendJson({ type: "host_drained" });
+    assert.deepEqual(await client.nextJson(), {
+      type: "terminal_created",
+      requestId: pendingMutation.requestId,
+      session: completedSession,
+    });
     assert.deepEqual(await oldHost.waitClosed(), { code: 4002, reason: "host replaced" });
     await client.expectNoMessage();
 
@@ -552,28 +806,164 @@ test("relay v1 host replacement fences every old-host frame and retires its rout
     assert.equal(hostCatalog.hosts.length, 1);
     assert.equal(hostCatalog.hosts[0].hostId, hostId);
     assert.equal(hostCatalog.hosts[0].displayName, "Winning H2");
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
 
-    const afterReplacement = {
-      type: "list_sessions",
-      requestId: "after-replacement",
-    };
-    client.sendJson(afterReplacement);
+test("relay v1 immediately closes a legacy replaced host with no pending mutations", async () => {
+  const secret = "relay-legacy-retire-timeout-secret";
+  const hostId = "legacy-retire-timeout-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const oldHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(oldHost);
+    await oldHost.open();
+    assert.deepEqual(await oldHost.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(oldHost, hostId, { displayName: "Legacy H1" });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const newHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(newHost);
+    await newHost.open();
+    assert.deepEqual(await newHost.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(newHost, hostId, {
+      displayName: "Ready H2",
+      capabilities: ["retire-drain-v1"],
+    });
+    assert.deepEqual(await oldHost.nextJson(), { type: "host_retire" });
+
+    const request = { type: "list_sessions", requestId: "during-legacy-retirement" };
+    client.sendJson(request);
     assert.equal(
       await newHost.nextRaw(),
-      JSON.stringify({ ...afterReplacement, clientId: ready.clientId }),
-      "the old host close callback must not remove the replacement host",
+      JSON.stringify({ ...request, clientId: ready.clientId }),
+      "new traffic must route to H2 after the legacy H1 is retired",
     );
     newHost.sendJson({
       type: "sessions",
       clientId: ready.clientId,
-      requestId: "after-replacement",
+      requestId: request.requestId,
       sessions: [],
     });
     assert.deepEqual(await client.nextJson(), {
       type: "sessions",
-      requestId: "after-replacement",
+      requestId: request.requestId,
       sessions: [],
     });
+
+    assert.deepEqual(
+      await oldHost.expectClosed(2_500),
+      { code: 4002, reason: "host replaced" },
+    );
+
+    const afterTimeout = { type: "list_sessions", requestId: "after-legacy-timeout" };
+    client.sendJson(afterTimeout);
+    assert.equal(
+      await newHost.nextRaw(),
+      JSON.stringify({ ...afterTimeout, clientId: ready.clientId }),
+      "the old host close callback must not remove H2",
+    );
+  } catch (error) {
+    error.message += `\nrelay-server output:\n${output.join("")}`;
+    throw error;
+  } finally {
+    for (const socket of sockets) socket.terminate();
+    await stopRelayServer(child);
+  }
+});
+
+test("relay v1 lets a legacy replaced host finish its accepted mutation before close", async () => {
+  const secret = "relay-legacy-pending-mutation-secret";
+  const hostId = "legacy-pending-mutation-host";
+  const { child, port, output } = await startRelayServer(secret);
+  const sockets = [];
+
+  try {
+    const baseWs = `ws://127.0.0.1:${port}`;
+    const auth = { headers: { Authorization: `Bearer ${secret}` } };
+    const oldHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(oldHost);
+    await oldHost.open();
+    assert.deepEqual(await oldHost.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(oldHost, hostId, { displayName: "Legacy H1" });
+
+    const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
+    sockets.push(client);
+    await client.open();
+    const ready = await client.nextJson();
+    assert.equal(ready.type, "ready");
+
+    const mutation = {
+      type: "create_terminal",
+      requestId: "legacy-accepted-mutation",
+      scopeId: "local",
+      cwd: "/tmp/legacy-accepted-mutation",
+    };
+    client.sendJson(mutation);
+    assert.equal(
+      await oldHost.nextRaw(),
+      JSON.stringify({ ...mutation, clientId: ready.clientId }),
+    );
+
+    const newHost = new SocketInbox(`${baseWs}/host?hostId=${hostId}`, auth);
+    sockets.push(newHost);
+    await newHost.open();
+    assert.deepEqual(await newHost.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(newHost, hostId, {
+      displayName: "Ready H2",
+      capabilities: ["retire-drain-v1"],
+    });
+    assert.deepEqual(await oldHost.nextJson(), { type: "host_retire" });
+
+    const closedPrematurely = await Promise.race([
+      oldHost.waitClosed().then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 150)),
+    ]);
+    assert.equal(closedPrematurely, false, "legacy H1 closed before its accepted mutation settled");
+
+    const completedSession = {
+      name: "local:tw-term-legacy-accepted",
+      attached: false,
+      windows: 1,
+      created: 1,
+      activity: 1,
+    };
+    oldHost.sendJson({
+      type: "terminal_created",
+      clientId: ready.clientId,
+      requestId: mutation.requestId,
+      session: completedSession,
+    });
+    assert.deepEqual(await client.nextJson(), {
+      type: "terminal_created",
+      requestId: mutation.requestId,
+      session: completedSession,
+    });
+    assert.deepEqual(
+      await oldHost.expectClosed(),
+      { code: 4002, reason: "host replaced" },
+    );
+
+    const afterClose = { type: "list_sessions", requestId: "after-legacy-ack" };
+    client.sendJson(afterClose);
+    assert.equal(
+      await newHost.nextRaw(),
+      JSON.stringify({ ...afterClose, clientId: ready.clientId }),
+    );
   } catch (error) {
     error.message += `\nrelay-server output:\n${output.join("")}`;
     throw error;
@@ -596,6 +986,7 @@ test("relay v1 stream ids are one-shot after a client closes them", async () => 
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
 
     const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(client);
@@ -664,6 +1055,7 @@ test("relay v1 active routes deliver one data tail and one terminal exit before 
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
 
     const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(client);
@@ -752,6 +1144,7 @@ test("relay v1 rejects primitive and null frames without crashing or poisoning l
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
 
     const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(client);
@@ -815,6 +1208,7 @@ test("relay v1 enforces a lifetime budget of 1024 accepted stream ids per client
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
 
     const client = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(client);
@@ -897,6 +1291,7 @@ test("relay v1 closes oversized host and client frames while keeping the broker 
       type: "host_registered",
       hostId: "oversized-frame-host",
     });
+    await markHostReady(oversizedHost, "oversized-frame-host");
 
     const oversizedClient = new SocketInbox(`${baseWs}/client?hostId=oversized-frame-host`, auth);
     sockets.push(oversizedClient);
@@ -923,6 +1318,7 @@ test("relay v1 closes oversized host and client frames while keeping the broker 
       type: "host_registered",
       hostId: recoveryHostId,
     });
+    await markHostReady(recoveryHost, recoveryHostId);
     const recoveryClient = new SocketInbox(`${baseWs}/client?hostId=${recoveryHostId}`, auth);
     sockets.push(recoveryClient);
     await recoveryClient.open();
@@ -969,6 +1365,7 @@ test("relay v1 disconnects a paused slow client without poisoning its host or re
     sockets.push(host);
     await host.open();
     assert.deepEqual(await host.nextJson(), { type: "host_registered", hostId });
+    await markHostReady(host, hostId);
 
     const slowClient = new SocketInbox(`${baseWs}/client?hostId=${hostId}`, auth);
     sockets.push(slowClient);

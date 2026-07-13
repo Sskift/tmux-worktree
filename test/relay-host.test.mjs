@@ -17,6 +17,7 @@ import test from "node:test";
 execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const {
+  assertRpcMutationCapabilities,
   isManagedWorktreeRow,
   isRpcManagedTerminalSession,
   isRpcManagedWorktreeSession,
@@ -36,7 +37,34 @@ const {
   writeTerminalRegistryAtomic,
 } = await import("../dist/relayHost.js");
 
-test("relay SSH argv reuses the host ControlMaster and keepalive contract", () => {
+test("remote mutation requires an explicit hard-timeout RPC capability", () => {
+  const supported = JSON.stringify({
+    protocolVersion: 1,
+    app: "tmux-worktree",
+    capabilities: ["create-worktree", "hard-timeout"],
+  });
+  assert.doesNotThrow(() => {
+    assertRpcMutationCapabilities(supported, "create-worktree", "build-box");
+  });
+  assert.throws(
+    () => assertRpcMutationCapabilities(
+      JSON.stringify({
+        protocolVersion: 1,
+        app: "tmux-worktree",
+        capabilities: ["create-worktree"],
+      }),
+      "create-worktree",
+      "legacy-box",
+    ),
+    /legacy-box.*create-worktree and hard-timeout/,
+  );
+  assert.throws(
+    () => assertRpcMutationCapabilities("not-json", "kill-session", "broken-box"),
+    /invalid JSON from broken-box/,
+  );
+});
+
+test("relay SSH argv keeps every SSH process inside relay admission", () => {
   const args = relaySshConnectionArgs({
     id: "build-box",
     host: "build.example.com",
@@ -51,11 +79,13 @@ test("relay SSH argv reuses the host ControlMaster and keepalive contract", () =
     "ConnectTimeout=5",
     "ServerAliveInterval=15",
     "ServerAliveCountMax=3",
-    "ControlMaster=auto",
-    "ControlPersist=600",
+    "ControlMaster=no",
+    "ControlPersist=no",
   ]) {
     assert.ok(args.includes(option), `missing SSH option ${option}`);
   }
+  assert.equal(args.includes("ControlMaster=auto"), false);
+  assert.equal(args.includes("ControlPersist=600"), false);
   const controlPath = args.find((arg) => arg.startsWith("ControlPath="));
   assert.match(controlPath, /\.tmux-worktree\/ssh\/%C$/);
   const controlDirectory = controlPath.slice("ControlPath=".length).replace(/\/%C$/, "");
@@ -355,11 +385,18 @@ test("relay host reopens routed streams only within the current connection and r
   assert.match(source, /streamRoutes\.set\(key, route\)/);
   assert.match(source, /isCurrentStream\(streams, key, stream\)/);
   assert.match(source, /isCurrentRoute\(streamRoutes, key, route, lease\)/);
-  assert.match(source, /reopenRoutedStream\(lease, streams, streamRoutes, opts, route, message\.data\)/);
+  assert.match(source, /reopenRoutedStream\(admissionLedger, lease, streams, streamRoutes, opts, route, message\.data\)/);
   assert.match(source, /deactivateConnection\(lease, streams, streamRoutes\)/);
   assert.match(source, /child\.stdin\.on\("error", \(\) => \{\}\)/);
+  assert.match(source, /child\.stdin\.on\("drain", \(\) => \{/);
   assert.match(source, /function finalizeStream\([\s\S]+?sendIfActive\(stream\.lease,\s*\{\s*type: "terminal_exit"/);
-  assert.match(source, /try \{\n\s+stream\.process\.stdin\.write\(payload\);/);
+  assert.match(source, /stream\.inputBackpressured = !stream\.process\.stdin\.write\(payload\)/);
+  assert.match(source, /stream\.process\.stdin\.writableLength \+ payloadBytes > MAX_REMOTE_STDIN_BUFFERED_BYTES/);
+  assert.match(source, /stream\.process\.exitCode === null/);
+  assert.match(source, /stream\.process\.signalCode === null/);
+  assert.doesNotMatch(source, /!stream\.process\.killed/);
+  assert.match(source, /signalRemoteProcessGroup\(stream, "SIGKILL"\)/);
+  assert.match(source, /os\.killpg\(pid, signal\.SIGTERM\)/);
 });
 
 test("relay host publishes connection failures without exposing credentials", async () => {
@@ -393,12 +430,23 @@ test("relay host publishes connection failures without exposing credentials", as
     assert.equal(status?.state, "retrying");
     assert.equal(status?.relayUrl, "ws://127.0.0.1:9");
     assert.equal(status?.hostId, "test-host");
+    assert.equal(typeof status?.ownerInstanceId, "string");
     assert.equal(typeof status?.updatedAt, "number");
     assert.equal(typeof status?.retryInMs, "number");
     assert.equal(JSON.stringify(status).includes(secret), false);
   } finally {
+    const exited = new Promise((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("relay-host kept its retry timer alive after SIGTERM")),
+        750,
+      );
+      child.once("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
     child.kill("SIGTERM");
-    await new Promise((resolve) => child.once("exit", resolve));
+    await exited;
     rmSync(root, { recursive: true, force: true });
   }
 });

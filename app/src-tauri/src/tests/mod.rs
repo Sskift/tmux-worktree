@@ -3609,14 +3609,25 @@ fn ssh_host_validation_blocks_option_injection_and_control_characters() {
 }
 
 #[test]
-fn host_compatibility_requires_the_canonical_close_capability() {
-    let complete =
-        ["list", "create-worktree", "create-terminal", "kill-session"].map(str::to_string);
+fn host_compatibility_requires_hard_bounded_mutation_capabilities() {
+    let complete = [
+        "list",
+        "create-worktree",
+        "create-terminal",
+        "kill-session",
+        "hard-timeout",
+    ]
+    .map(str::to_string);
     assert!(tw_rpc_capabilities_compatible(1, &complete));
     assert!(!tw_rpc_capabilities_compatible(2, &complete));
     assert!(!tw_rpc_capabilities_compatible(
         1,
         &["list", "create-worktree", "create-terminal"].map(str::to_string),
+    ));
+    assert!(!tw_rpc_capabilities_compatible(
+        1,
+        &["list", "create-worktree", "create-terminal", "kill-session"]
+            .map(str::to_string),
     ));
 }
 
