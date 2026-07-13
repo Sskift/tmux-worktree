@@ -25,6 +25,6 @@ pub(crate) fn tw_rpc_capabilities_compatible(
             "kill-session",
             "hard-timeout",
         ]
-            .iter()
-            .all(|required| capabilities.iter().any(|capability| capability == required))
+        .iter()
+        .all(|required| capabilities.iter().any(|capability| capability == required))
 }

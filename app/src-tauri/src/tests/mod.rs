@@ -3626,8 +3626,7 @@ fn host_compatibility_requires_hard_bounded_mutation_capabilities() {
     ));
     assert!(!tw_rpc_capabilities_compatible(
         1,
-        &["list", "create-worktree", "create-terminal", "kill-session"]
-            .map(str::to_string),
+        &["list", "create-worktree", "create-terminal", "kill-session"].map(str::to_string),
     ));
 }
 
