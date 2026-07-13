@@ -831,14 +831,17 @@ test("App polling AST guard rejects string, nested, duplicate-key, and spread de
   `), /object spreads are forbidden/);
 });
 
-test("App supplies a stable functional full-catalog prune callback", () => {
+test("App supplies an exact owner-bound functional full-catalog prune callback", () => {
   const sourceFile = parse("useTerminalDeckState.ts", sources.terminalDeck);
   const callback = variableDeclaration(sourceFile, "handleFullCatalogPublished");
   assert.ok(callback.initializer && ts.isCallExpression(callback.initializer));
   assert.equal(callback.initializer.expression.getText(sourceFile), "useCallback");
   const dependencies = callback.initializer.arguments[1];
   assert.ok(dependencies && ts.isArrayLiteralExpression(dependencies));
-  assert.equal(dependencies.elements.length, 0);
+  assert.deepEqual(
+    dependencies.elements.map((element) => element.getText(sourceFile)),
+    ["lease", "registration"],
+  );
   const callbackSource = callback.initializer.arguments[0]?.getText(sourceFile) ?? "";
   assert.match(callbackSource, /setOpenedSessions\(\(previous\) => \{/);
   assert.match(callbackSource, /setCwdsBySession\(\(previous\) => \{/);

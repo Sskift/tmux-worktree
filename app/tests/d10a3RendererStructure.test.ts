@@ -1298,6 +1298,10 @@ function frozenEffectContributions(): Map<string, number> {
     ],
     ["useTerminalDeckState", effectContribution(sources.deck, "useTerminalDeckState")],
     [
+      "useTerminalDeckOwnerPhase",
+      effectContribution(sources.deck, "useTerminalDeckOwnerPhase"),
+    ],
+    [
       "useEditorNavigationGuard",
       effectContribution(sources.editorNavigation, "useEditorNavigationGuard"),
     ],
@@ -1352,6 +1356,7 @@ function frozenEffectContributions(): Map<string, number> {
     ["useConnectionCatalog", 4],
     ["useMobileRelayController", 3],
     ["useTerminalDeckState", 0],
+    ["useTerminalDeckOwnerPhase", 0],
     ["useEditorNavigationGuard", 0],
     ["useEffect", 1],
     ["useDashboardViewportResizePhase", 1],
@@ -1384,6 +1389,7 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useConnectionCatalog",
     "useMobileRelayController",
     "useTerminalDeckState",
+    "useTerminalDeckOwnerPhase",
     "useEditorNavigationGuard",
     "useEffect",
     "useDashboardViewportResizePhase",

@@ -392,6 +392,7 @@ function unwrapParentheses(expression: ts.Expression): ts.Expression {
 
 const deckExports = [
   "useTerminalDeckAttachPhase",
+  "useTerminalDeckOwnerPhase",
   "useTerminalDeckPreviewPhase",
   "useTerminalDeckState",
 ] as const;
@@ -402,8 +403,20 @@ const stateInventory = [
   "tmuxPreviews,setTmuxPreviews",
   "cwdsBySession,setCwdsBySession",
   "cwdRequested",
+  "cwdIncarnations",
   "tmuxPreviewRequested",
   "tmuxPreviewLiveRef",
+  "tmuxPreviewIncarnations",
+  "publishedOwner,setPublishedOwner",
+  "registration",
+  "ownerPhase",
+  "lease",
+  "ownerVisible",
+  "ownerEpochKey",
+  "setOpenedSessionsForOwner",
+  "setOpenedTerminalsForOwner",
+  "setTmuxPreviewsForOwner",
+  "setCwdsBySessionForOwner",
   "handleFullCatalogPublished",
   "return",
 ] as const;
@@ -426,9 +439,9 @@ function assertState(source: string): StateAnalysis {
     return bindingNames(statement.declarationList.declarations[0].name).join(",");
   });
   assert.deepEqual(inventory, stateInventory);
-  assert.equal(callsWithPath(body, "useState").length, 4);
-  assert.equal(callsWithPath(body, "useRef").length, 3);
-  assert.equal(callsWithPath(body, "useCallback").length, 1);
+  assert.equal(callsWithPath(body, "useState").length, 7);
+  assert.equal(callsWithPath(body, "useRef").length, 5);
+  assert.equal(callsWithPath(body, "useCallback").length, 5);
   assert.equal(callsWithPath(body, "useEffect").length, 0);
   assert.equal(callsWithPath(body, "useMemo").length, 0);
 
@@ -460,7 +473,10 @@ function assertState(source: string): StateAnalysis {
   assert.equal(callbackDeclaration.initializer.arguments.length, 2);
   const dependencies = callbackDeclaration.initializer.arguments[1];
   assert.ok(ts.isArrayLiteralExpression(dependencies));
-  assert.equal(dependencies.elements.length, 0);
+  assert.deepEqual(
+    dependencies.elements.map((element) => compact(element, sourceFile)),
+    ["lease", "registration"],
+  );
   const callback = callbackDeclaration.initializer.arguments[0];
   assert.ok(ts.isArrowFunction(callback) && ts.isBlock(callback.body));
   assert.equal(hasModifier(callback, ts.SyntaxKind.AsyncKeyword), false);
@@ -477,7 +493,7 @@ function assertState(source: string): StateAnalysis {
   assert.ok(ts.isIdentifier(sessionNames.name));
   assert.equal(sessionNames.name.text, "sessionNames");
   assert.ok(parameter.type);
-  assert.equal(compact(parameter.type, sourceFile), "FullCatalogPublished");
+  assert.equal(compact(parameter.type, sourceFile), "TerminalDeckCatalogPublication");
   return { sourceFile, body, callback };
 }
 
@@ -580,9 +596,12 @@ test("terminal deck hooks have one reachable canonical owner and an exact API", 
     "react|SetStateAction|SetStateAction|type",
     "react|useCallback|useCallback|value",
     "react|useEffect|useEffect|value",
+    "react|useLayoutEffect|useLayoutEffect|value",
     "react|useRef|useRef|value",
     "react|useState|useState|value",
-    "./useWorkspaceCatalog|FullCatalogPublished|FullCatalogPublished|type",
+    "../ownerEpochLease|OwnerEpochLease|OwnerEpochLease|type",
+    "../ownerEpochLease|OwnerEpochLeaseController|OwnerEpochLeaseController|type",
+    "../ownerEpochLease|createOwnerEpochLeaseController|createOwnerEpochLeaseController|value",
   ].sort());
   assert.deepEqual(sourceFile.referencedFiles, []);
   assert.deepEqual(sourceFile.typeReferenceDirectives, []);
@@ -639,7 +658,7 @@ test("terminal deck hooks have one reachable canonical owner and an exact API", 
   assert.throws(() => assertExactCanonicalExport(decoy, deckExports));
 });
 
-test("terminal deck state owns exactly four states, three refs, and the synchronous full cut", () => {
+test("terminal deck state owns the exact owner-fenced state and synchronous full cut", () => {
   const {
     sourceFile,
     body: stateBody,
@@ -648,19 +667,26 @@ test("terminal deck state owns exactly four states, three refs, and the synchron
 
   for (const name of [
     "cwdRequested",
+    "cwdIncarnations",
     "tmuxPreviewRequested",
     "tmuxPreviewLiveRef",
+    "tmuxPreviewIncarnations",
   ]) {
     const declaration: ts.VariableDeclaration = directVariable(stateBody, name).declaration;
     assert.ok(declaration.initializer && ts.isCallExpression(declaration.initializer));
     assert.equal(expressionPath(declaration.initializer.expression), "useRef");
-    assert.equal(compact(declaration.initializer.arguments[0], sourceFile), "newSet()");
+    assert.equal(compact(declaration.initializer.arguments[0], sourceFile), "newMap()");
   }
 
   const fullCutBody = callbackBody.body;
   assert.ok(ts.isBlock(fullCutBody));
-  assert.equal(fullCutBody.statements.length, 3);
-  const [live, sessionCut, cwdCut] = fullCutBody.statements;
+  assert.equal(fullCutBody.statements.length, 6);
+  const [guard, live, sessionCut, cwdCut, requestCut, incarnationCut] =
+    fullCutBody.statements;
+  assert.equal(
+    compact(guard, sourceFile),
+    "if(!lease||!registration.fence.isCurrent(lease))return;",
+  );
   assert.ok(ts.isVariableStatement(live));
   assert.equal(
     compact(live.declarationList.declarations[0].initializer!, sourceFile),
@@ -668,11 +694,19 @@ test("terminal deck state owns exactly four states, three refs, and the synchron
   );
   assert.equal(
     compact(sessionCut, sourceFile),
-    "setOpenedSessions((previous)=>{constnext=previous.filter((name)=>live.has(name));returnsameStringArray(previous,next)?previous:next;});",
+    "setOpenedSessions((previous)=>{if(!registration.fence.isCurrent(lease))returnprevious;constnext=previous.filter((name)=>live.has(name));returnsameStringArray(previous,next)?previous:next;});",
   );
   assert.equal(
     compact(cwdCut, sourceFile),
-    "setCwdsBySession((previous)=>{constnext:Record<string,string>={};for(const[name,cwd]ofObject.entries(previous)){if(live.has(name))next[name]=cwd;}returnsameStringRecord(previous,next)?previous:next;});",
+    "setCwdsBySession((previous)=>{if(!registration.fence.isCurrent(lease))returnprevious;constnext:Record<string,string>={};for(const[name,cwd]ofObject.entries(previous)){if(live.has(name))next[name]=cwd;}returnsameStringRecord(previous,next)?previous:next;});",
+  );
+  assert.equal(
+    compact(requestCut, sourceFile),
+    "for(constnameofArray.from(cwdRequested.current.keys())){if(!live.has(name))cwdRequested.current.delete(name);}",
+  );
+  assert.equal(
+    compact(incarnationCut, sourceFile),
+    "for(constnameofArray.from(cwdIncarnations.current.keys())){if(!live.has(name))cwdIncarnations.current.delete(name);}",
   );
   assert.equal(callsWithPath(fullCutBody, "setOpenedSessions").length, 1);
   assert.equal(callsWithPath(fullCutBody, "setCwdsBySession").length, 1);
@@ -684,6 +718,8 @@ test("terminal deck state owns exactly four states, three refs, and the synchron
   assert.ok(returns[0].expression && ts.isObjectLiteralExpression(returns[0].expression));
   const returnProperties = directObjectProperties(returns[0].expression);
   assert.deepEqual(returnProperties.names, [
+    "ownerEpochKey",
+    "ownerPhase",
     "openedSessions",
     "setOpenedSessions",
     "openedTerminals",
@@ -697,10 +733,26 @@ test("terminal deck state owns exactly four states, three refs, and the synchron
     "tmuxPreviewLiveRef",
     "handleFullCatalogPublished",
   ]);
+  const expectedInitializers = new Map<string, string>([
+    ["ownerEpochKey", "ownerEpochKey"],
+    ["ownerPhase", "ownerPhase"],
+    ["openedSessions", "ownerVisible?openedSessions:[]"],
+    ["setOpenedSessions", "setOpenedSessionsForOwner"],
+    ["openedTerminals", "ownerVisible?openedTerminals:[]"],
+    ["setOpenedTerminals", "setOpenedTerminalsForOwner"],
+    ["tmuxPreviews", "ownerVisible?tmuxPreviews:{}"],
+    ["setTmuxPreviews", "setTmuxPreviewsForOwner"],
+    ["cwdsBySession", "ownerVisible?cwdsBySession:{}"],
+    ["setCwdsBySession", "setCwdsBySessionForOwner"],
+    ["cwdRequested", "cwdRequested"],
+    ["tmuxPreviewRequested", "tmuxPreviewRequested"],
+    ["tmuxPreviewLiveRef", "tmuxPreviewLiveRef"],
+    ["handleFullCatalogPublished", "handleFullCatalogPublished"],
+  ]);
   for (const name of returnProperties.names) {
     assert.equal(
       compact(propertyInitializer(returnProperties.byName.get(name)), sourceFile),
-      name,
+      expectedInitializers.get(name),
     );
   }
 });
@@ -720,52 +772,35 @@ test("preview phase preserves live gates, serial preload, and exact dependencies
   assert.ok(ts.isVariableStatement(preview.body.statements[0]));
   assert.deepEqual(
     bindingNames(preview.body.statements[0].declarationList.declarations[0].name),
-    ["setTmuxPreviews", "tmuxPreviewLiveRef", "tmuxPreviewRequested"],
+    ["ownerPhase", "tmuxPreviewLiveRef", "tmuxPreviewRequested"],
   );
   const effects = directCalls(preview.body, "useEffect");
   assert.equal(effects.length, 1);
   assert.equal(effects[0].index, 1);
   assert.equal(callsWithPath(preview.body, "useEffect").length, 1);
   assert.deepEqual(effectDependencies(effects[0].call, sourceFile), [
+    "dashboardBackend",
     "sessions",
     "allTerminals",
   ]);
   const body = effectBody(effects[0].call);
-  assert.equal(body.statements.length, 6);
-  const [names, live, publishLive, clearRequests, prune, preload] = body.statements;
-  assert.ok(ts.isVariableStatement(names));
-  assert.equal(
-    compact(names.declarationList.declarations[0].initializer!, sourceFile),
-    "[...sessions.map((session)=>session.name),...allTerminals.map(terminalSessionKey),]",
-  );
-  assert.ok(ts.isVariableStatement(live));
-  assert.equal(
-    compact(live.declarationList.declarations[0].initializer!, sourceFile),
-    "newSet(names)",
-  );
-  assert.equal(
-    compact(publishLive, sourceFile),
-    "tmuxPreviewLiveRef.current=live;",
-  );
-  assert.equal(
-    compact(clearRequests, sourceFile),
-    "for(constnameofArray.from(tmuxPreviewRequested.current)){if(!live.has(name))tmuxPreviewRequested.current.delete(name);}",
-  );
-  assert.equal(
-    compact(prune, sourceFile),
-    "setTmuxPreviews((prev)=>{constnext:Record<string,string>={};for(const[name,history]ofObject.entries(prev)){if(live.has(name))next[name]=history;}returnsameStringRecord(prev,next)?prev:next;});",
-  );
-  assert.ok(ts.isExpressionStatement(preload));
-  assert.ok(ts.isCallExpression(preload.expression));
+  assert.equal(body.statements.length, 11);
+  const preload = body.statements[10];
+  assert.ok(ts.isExpressionStatement(preload) && ts.isCallExpression(preload.expression));
   const preloadFunction = unwrapParentheses(preload.expression.expression);
   assert.ok(ts.isArrowFunction(preloadFunction) && ts.isBlock(preloadFunction.body));
   assert.equal(hasModifier(preloadFunction, ts.SyntaxKind.AsyncKeyword), true);
   assert.equal(preloadFunction.body.statements.length, 1);
-  assert.equal(
-    compact(preloadFunction.body.statements[0], sourceFile),
-    "for(constnameofnames){if(tmuxPreviewRequested.current.has(name))continue;tmuxPreviewRequested.current.add(name);consthistory=awaitdashboardBackend.sessions.captureHistory(name,PRELOAD_HISTORY_LINES).catch(()=>\"\");if(!tmuxPreviewLiveRef.current.has(name)){tmuxPreviewRequested.current.delete(name);continue;}setTmuxPreviews((prev)=>(prev[name]===history?prev:{...prev,[name]:history}));}",
-  );
+  assert.ok(ts.isForOfStatement(preloadFunction.body.statements[0]));
   assert.equal(callsWithPath(preloadFunction.body, "dashboardBackend.sessions.captureHistory").length, 1);
+  assert.equal(callsWithPath(preloadFunction.body, "Promise.all").length, 0);
+  assert.equal(callsWithPath(body, "registration.fence.capture").length, 1);
+  assert.ok(callsWithPath(body, "registration.fence.isCurrent").length >= 5);
+  assert.equal(callsWithPath(body, "terminalIncarnation").length, 1);
+  assert.match(compact(body, sourceFile), /terminalIncarnation\(registration,terminal\)/);
+  assert.match(compact(body, sourceFile), /tmuxPreviewRequested\.current\.get\(name\)!==request/);
+  assert.match(compact(body, sourceFile), /tmuxPreviewLiveRef\.current\.get\(name\)!==incarnation/);
+  assert.match(compact(body, sourceFile), /\.catch\(\(\)=>\"\"\)/);
   assert.match(sources.deck, /const PRELOAD_HISTORY_LINES = 300;/);
 });
 
@@ -790,13 +825,7 @@ test("attach phase preserves three ordered barriers, dependencies, and cleanup s
   assert.ok(ts.isVariableStatement(attach.body.statements[0]));
   assert.deepEqual(
     bindingNames(attach.body.statements[0].declarationList.declarations[0].name),
-    [
-      "cwdRequested",
-      "cwdsBySession",
-      "setCwdsBySession",
-      "setOpenedSessions",
-      "setOpenedTerminals",
-    ],
+    ["cwdRequested", "ownerPhase"],
   );
   const effects = directCalls(attach.body, "useEffect");
   assert.equal(effects.length, 3);
@@ -807,28 +836,31 @@ test("attach phase preserves three ordered barriers, dependencies, and cleanup s
     "selection",
     "selectedSession",
     "selectionMetadataPending",
-    "cwdsBySession",
   ]);
   assert.deepEqual(effectDependencies(effects[1].call, sourceFile), [
+    "dashboardBackend",
     "selection",
     "selectedTerminal",
     "selectionMetadataPending",
   ]);
   assert.deepEqual(effectDependencies(effects[2].call, sourceFile), [
+    "dashboardBackend",
     "allTerminals",
   ]);
-  assert.equal(
-    compact(effectBody(effects[0].call), sourceFile),
-    "{if(selection?.kind!==\"session\")return;if(!selectedSession||selectionMetadataPending)return;constname=selection.name;setOpenedSessions((prev)=>prev.includes(name)?prev:[...prev,name],);if(cwdsBySession[name]||cwdRequested.current.has(name))return;cwdRequested.current.add(name);dashboardBackend.sessions.root(name).then((cwd)=>{if(cwd)setCwdsBySession((prev)=>({...prev,[name]:cwd}));}).catch(()=>{}).finally(()=>{cwdRequested.current.delete(name);});}",
+  const rootBody = effectBody(effects[0].call);
+  assert.equal(callsWithPath(rootBody, "dashboardBackend.sessions.root").length, 1);
+  assert.equal(callsWithPath(rootBody, "registration.fence.capture").length, 1);
+  assert.ok(callsWithPath(rootBody, "registration.fence.isCurrent").length >= 4);
+  assert.match(compact(rootBody, sourceFile), /incarnation=sessionIncarnation\(selectedSession\)/);
+  assert.match(compact(rootBody, sourceFile), /cwdRequested\.current\.get\(name\)!==request/);
+  assert.match(
+    compact(rootBody, sourceFile),
+    /if\(cwdRequested\.current\.get\(name\)===request\)\{cwdRequested\.current\.delete\(name\);\}/,
   );
-  assert.equal(
-    compact(effectBody(effects[1].call), sourceFile),
-    "{if(selection?.kind!==\"terminal\")return;if(!selectedTerminal||selectionMetadataPending)return;constid=selection.id;setOpenedTerminals((prev)=>prev.includes(id)?prev:[...prev,id],);}",
-  );
-  assert.equal(
-    compact(effectBody(effects[2].call), sourceFile),
-    "{constliveTerminalIds=newSet(allTerminals.map((terminal)=>terminal.id));setOpenedTerminals((prev)=>{constnext=prev.filter((id)=>liveTerminalIds.has(id));returnsameStringArray(prev,next)?prev:next;});}",
-  );
+  for (const effect of effects.slice(1)) {
+    assert.equal(callsWithPath(effectBody(effect.call), "registration.fence.capture").length, 1);
+    assert.ok(callsWithPath(effectBody(effect.call), "registration.fence.isCurrent").length >= 1);
+  }
 });
 
 test("App preserves the global deck phase order and direct controller wiring", () => {
@@ -843,6 +875,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
   const appBody = app.body;
   assert.ok(appBody);
   const stateCalls = directTopLevelCalls(appBody, "useTerminalDeckState");
+  const ownerPhases = directTopLevelCalls(appBody, "useTerminalDeckOwnerPhase");
   const automationStateCalls = directTopLevelCalls(appBody, "useAutomationWorkspace");
   const workspaceCalls = directTopLevelCalls(appBody, "useWorkspaceCatalog");
   const workspaceOwnerPhases = directTopLevelCalls(appBody, "useWorkspaceCatalogOwnerPhase");
@@ -853,6 +886,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
     assert.equal(calls.length, 1, `expected one direct App ${name} registration`);
   }
   assert.equal(workspaceOwnerPhases.length, 1);
+  assert.equal(ownerPhases.length, 1);
   assert.equal(automationStateCalls.length, 1);
   const selectedAutomation = directVariable(appBody, "selectedAutomation");
   const appEffects = directEffectRegistrations(appBody);
@@ -865,6 +899,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
   const order: Array<[string, number]> = [
     ["automation workspace state", automationStateCalls[0].index],
     ["terminal deck state", stateCalls[0].index],
+    ["terminal deck owner phase", ownerPhases[0].index],
     ["workspace catalog", workspaceCalls[0].index],
     ["workspace owner phase", workspaceOwnerPhases[0].index],
     ["selection effect 19", selectionCall.index],
@@ -892,6 +927,14 @@ test("App preserves the global deck phase order and direct controller wiring", (
   });
 
   assert.ok(stateCalls[0].declaration);
+  assert.deepEqual(
+    stateCalls[0].call.arguments.map((argument) => compact(argument, appFile)),
+    ["dashboardBackend"],
+  );
+  assert.deepEqual(
+    ownerPhases[0].call.arguments.map((argument) => compact(argument, appFile)),
+    ["terminalDeckOwnerPhase", "dashboardBackend"],
+  );
   assert.ok(ts.isIdentifier(stateCalls[0].declaration.name));
   assert.equal(stateCalls[0].declaration.name.text, "terminalDeck");
   const deckBindings = appBody.statements.flatMap((statement) => {
@@ -909,12 +952,17 @@ test("App preserves the global deck phase order and direct controller wiring", (
   assert.deepEqual(
     deckBindings[0].elements.map((element) => {
       assert.equal(element.dotDotDotToken, undefined);
-      assert.equal(element.propertyName, undefined);
       assert.equal(element.initializer, undefined);
       assert.ok(ts.isIdentifier(element.name));
-      return { property: element.name.text, local: element.name.text };
+      assert.ok(!element.propertyName || ts.isIdentifier(element.propertyName));
+      return {
+        property: element.propertyName?.text ?? element.name.text,
+        local: element.name.text,
+      };
     }),
     [
+      { property: "ownerEpochKey", local: "terminalDeckOwnerEpochKey" },
+      { property: "ownerPhase", local: "terminalDeckOwnerPhase" },
       { property: "openedSessions", local: "openedSessions" },
       { property: "setOpenedSessions", local: "setOpenedSessions" },
       { property: "openedTerminals", local: "openedTerminals" },
@@ -1002,12 +1050,12 @@ test("App preserves the global deck phase order and direct controller wiring", (
 
 test("deck structure guards reject extra state work and hidden App phase calls", () => {
   const hiddenStateEffect = sources.deck.replace(
-    "  return {\n    openedSessions,",
+    "  return {\n    ownerEpochKey,",
     `  const hiddenEffect = useEffect;
   hiddenEffect(() => {}, []);
 
   return {
-    openedSessions,`,
+    ownerEpochKey,`,
   );
   assert.notEqual(hiddenStateEffect, sources.deck);
   assert.throws(() => assertState(hiddenStateEffect));

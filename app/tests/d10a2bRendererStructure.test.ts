@@ -851,6 +851,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
   const previewEffects = directCalls(previewFunction.body, "useEffect");
   assert.equal(previewEffects.length, 1);
   assert.deepEqual(callDependencies(previewEffects[0].call, previewFunction.getSourceFile()), [
+    "dashboardBackend",
     "sessions",
     "allTerminals",
   ]);
@@ -863,6 +864,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "useConnectionCatalog",
     "useMobileRelayController",
     "useTerminalDeckState",
+    "useTerminalDeckOwnerPhase",
     "useDashboardLayoutState",
     "useDashboardViewportResizePhase",
     "useDashboardWindowCapturePhase",
@@ -911,6 +913,7 @@ test("App leaves selection state local and preserves reconciliation as global ef
     effectContribution(sources.connection, "useConnectionCatalog") +
     effectContribution(sources.relay, "useMobileRelayController") +
     effectContribution(sources.terminalDeck, "useTerminalDeckState") +
+    effectContribution(sources.terminalDeck, "useTerminalDeckOwnerPhase") +
     effectContribution(sources.layout, "useDashboardViewportResizePhase") +
     effectContribution(sources.layout, "useDashboardWindowCapturePhase") +
     effectContribution(sources.layout, "useDashboardLayoutHydrationPhase") +

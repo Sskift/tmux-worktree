@@ -24,6 +24,7 @@ import { useMobileRelayController } from "./dashboard/hooks/useMobileRelayContro
 import { useCatalogSelectionHydration } from "./dashboard/hooks/useCatalogSelectionHydration";
 import {
   useTerminalDeckAttachPhase,
+  useTerminalDeckOwnerPhase,
   useTerminalDeckPreviewPhase,
   useTerminalDeckState,
 } from "./dashboard/hooks/useTerminalDeckState";
@@ -195,8 +196,10 @@ function App() {
   } = useConnectionCatalog();
   const mobileRelay = useMobileRelayController({ hosts });
   const [selection, setSelection] = useState<Selection>(null);
-  const terminalDeck = useTerminalDeckState();
+  const terminalDeck = useTerminalDeckState(dashboardBackend);
   const {
+    ownerEpochKey: terminalDeckOwnerEpochKey,
+    ownerPhase: terminalDeckOwnerPhase,
     openedSessions,
     setOpenedSessions,
     openedTerminals,
@@ -205,6 +208,7 @@ function App() {
     cwdsBySession,
     handleFullCatalogPublished,
   } = terminalDeck;
+  useTerminalDeckOwnerPhase(terminalDeckOwnerPhase, dashboardBackend);
   const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
   const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
@@ -886,7 +890,14 @@ function App() {
     } catch (nextError) {
       reportError(nextError);
     }
-  }, [allTerminals, dashboardBackend, removeSession, reportError, sessions]);
+  }, [
+    allTerminals,
+    dashboardBackend,
+    removeSession,
+    reportError,
+    sessions,
+    setOpenedSessions,
+  ]);
 
   const closeTerminal = useCallback(async (id: string) => {
     const terminal = allTerminals.find((candidate) => candidate.id === id);
@@ -917,7 +928,14 @@ function App() {
     } catch (nextError) {
       reportError(nextError);
     }
-  }, [allTerminals, dashboardBackend, removeDiscoveredTerminal, reportError, sessions]);
+  }, [
+    allTerminals,
+    dashboardBackend,
+    removeDiscoveredTerminal,
+    reportError,
+    sessions,
+    setOpenedTerminals,
+  ]);
 
   const renameTerminal = useCallback((id: string, label: string) => {
     setTerminals((current) => (
@@ -1334,6 +1352,7 @@ function App() {
     >
       <section className="dashboard-workspace__primary" aria-label="Active workspace">
         <TerminalDeck
+          key={terminalDeckOwnerEpochKey}
           selection={selection}
           sessions={sessions}
           terminals={allTerminals}
@@ -1458,7 +1477,7 @@ function App() {
             if (!scratchContext) return null;
             return (
               <div
-                key={key}
+                key={`${terminalDeckOwnerEpochKey}:${key}`}
                 className="scratch__sections"
                 ref={isActive ? scratchSectionsRef : undefined}
                 style={{ display: isActive ? "flex" : "none" }}
