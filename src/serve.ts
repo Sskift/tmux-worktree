@@ -7,15 +7,16 @@ import {
   chmodSync,
   closeSync,
   constants as fsConstants,
+  fsyncSync,
   ftruncateSync,
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
-  writeFileSync,
   writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 
 const DEFAULT_PORT = 8311;
@@ -32,6 +33,48 @@ const MAX_ACTIVE_TERMINAL_BRIDGES = 8;
 const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
 const MAX_PENDING_STDIN_BYTES = 256 * 1024;
 const MAX_SOCKET_BUFFERED_BYTES = 1024 * 1024;
+const MIN_RECOMMENDED_TOKEN_BYTES = 16;
+
+function serveToken(): string {
+  const configured = process.env.TW_TOKEN;
+  if (configured !== undefined && /[\0\r\n]/.test(configured)) {
+    throw new Error("TW_TOKEN must not contain NUL, carriage return, or line feed characters");
+  }
+  if (configured) {
+    if (Buffer.byteLength(configured, "utf8") < MIN_RECOMMENDED_TOKEN_BYTES) {
+      console.warn(
+        `[tw serve] warning: TW_TOKEN is shorter than ${MIN_RECOMMENDED_TOKEN_BYTES} bytes; accepted for compatibility`,
+      );
+    }
+    return configured;
+  }
+  return randomBytes(32).toString("base64url");
+}
+
+function publishServeToken(tokenFile: string, token: string): void {
+  const directory = dirname(tokenFile);
+  const temporaryFile = join(
+    directory,
+    `.${basename(tokenFile)}.${process.pid}.${randomBytes(12).toString("hex")}.tmp`,
+  );
+  let fd = -1;
+  try {
+    fd = openSync(temporaryFile, "wx", 0o600);
+    chmodSync(temporaryFile, 0o600);
+    const contents = Buffer.from(token, "utf8");
+    writeSync(fd, contents, 0, contents.length, 0);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = -1;
+    renameSync(temporaryFile, tokenFile);
+    chmodSync(tokenFile, 0o600);
+  } finally {
+    if (fd >= 0) {
+      try { closeSync(fd); } catch {}
+    }
+    try { rmSync(temporaryFile, { force: true }); } catch {}
+  }
+}
 
 function tmuxOutput(tmux: string, args: string[]): string {
   return execFileSync(tmux, args, {
@@ -902,10 +945,8 @@ export async function run() {
       ? parseInt(process.argv[portIdx + 1])
       : DEFAULT_PORT;
 
-  const token = process.env.TW_TOKEN || randomBytes(4).toString("hex");
-  // Write token to file so Tauri app can read it
+  const token = serveToken();
   const tokenFile = (process.env.HOME || "/tmp") + "/.tw-serve-token";
-  writeFileSync(tokenFile, token, { mode: 0o600 });
   if (process.argv.includes("--remote")) {
     throw new Error("tw serve --remote has been removed. Use tw relay-server on a broker and tw relay-host on the Mac admin machine.");
   }
@@ -1176,7 +1217,34 @@ export async function run() {
     socket.on("error", cleanup);
   });
 
-  server.listen(port, "0.0.0.0", () => {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => {
+      server.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      server.off("error", onError);
+      try {
+        publishServeToken(tokenFile, token);
+      } catch (error) {
+        server.close(() => reject(error));
+        return;
+      }
+
+      resolve();
+    };
+    server.once("error", onError);
+    server.once("listening", onListening);
+    try {
+      server.listen(port, "0.0.0.0");
+    } catch (error) {
+      server.off("error", onError);
+      server.off("listening", onListening);
+      reject(error);
+    }
+  });
+
+  {
     const ip = getLanIp();
     console.log(`\ntw-dashboard web server running at:\n`);
     console.log(`  Local:   http://localhost:${port}`);
@@ -1184,5 +1252,5 @@ export async function run() {
     console.log(`  Token:   ${token}\n`);
 
     console.log(`Open the Network URL on your phone and enter the token to connect.\n`);
-  });
+  }
 }
