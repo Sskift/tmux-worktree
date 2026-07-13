@@ -137,7 +137,7 @@ const expectedRootRustTests = [
   "install_host_tw_uses_github_source_install",
   "test_parse_session_key",
   "ssh_host_validation_blocks_option_injection_and_control_characters",
-  "host_compatibility_requires_the_canonical_close_capability",
+  "host_compatibility_requires_hard_bounded_mutation_capabilities",
   "ssh_and_scp_end_options_before_the_destination",
   "unsafe_ssh_host_is_rejected_before_config_replacement_or_probe",
   "hosts_from_config_accepts_string_and_object_shorthand",
