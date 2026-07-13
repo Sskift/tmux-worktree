@@ -27,6 +27,11 @@ const MAX_TERMINAL_COLS = 300;
 const MIN_TERMINAL_ROWS = 5;
 const MAX_TERMINAL_ROWS = 200;
 const MAX_WS_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_REQUEST_URL_BYTES = 8192;
+const MAX_ACTIVE_TERMINAL_BRIDGES = 8;
+const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
+const MAX_PENDING_STDIN_BYTES = 256 * 1024;
+const MAX_SOCKET_BUFFERED_BYTES = 1024 * 1024;
 
 function tmuxOutput(tmux: string, args: string[]): string {
   return execFileSync(tmux, args, {
@@ -58,7 +63,9 @@ function tmuxBin(): string {
 
 function requestUrl(req: IncomingMessage): URL | null {
   try {
-    return new URL(req.url || "/", "http://localhost");
+    const rawUrl = req.url || "/";
+    if (Buffer.byteLength(rawUrl, "utf8") > MAX_REQUEST_URL_BYTES) return null;
+    return new URL(rawUrl, "http://localhost");
   } catch {
     return null;
   }
@@ -984,6 +991,7 @@ export async function run() {
   });
 
   const wss = new WebSocketServer({ server, path: "/ws", maxPayload: MAX_WS_PAYLOAD_BYTES });
+  let activeTerminalBridges = 0;
 
   wss.on("connection", (socket: WebSocket, req: IncomingMessage) => {
     const url = requestUrl(req);
@@ -1008,11 +1016,22 @@ export async function run() {
       return;
     }
 
+    if (activeTerminalBridges >= MAX_ACTIVE_TERMINAL_BRIDGES) {
+      socket.close(4008, "terminal bridge limit reached");
+      return;
+    }
     const tmux = tmuxBin();
     if (!attachTargetExists(tmux, sessionName, paneIndex)) {
       socket.close(4004, "terminal target not found");
       return;
     }
+    activeTerminalBridges += 1;
+    let bridgeReservationActive = true;
+    const releaseBridgeReservation = () => {
+      if (!bridgeReservationActive) return;
+      bridgeReservationActive = false;
+      activeTerminalBridges -= 1;
+    };
     const mobileId = "tw-mobile-" + randomBytes(4).toString("hex");
     let resizeDirectory = "";
     let resizeFile = "";
@@ -1030,6 +1049,7 @@ export async function run() {
       if (resizeDirectory) {
         try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
       }
+      releaseBridgeReservation();
       socket.close(1011, "failed to initialize terminal bridge");
       return;
     }
@@ -1052,6 +1072,7 @@ export async function run() {
     } catch {
       try { closeSync(resizeFd); } catch {}
       try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
+      releaseBridgeReservation();
       socket.close(1011, "failed to start terminal bridge");
       return;
     }
@@ -1064,12 +1085,34 @@ export async function run() {
       runTmux(["kill-session", "-t", `=${mobileId}`]);
       try { closeSync(resizeFd); } catch {}
       try { rmSync(resizeDirectory, { recursive: true, force: true }); } catch {}
+      releaseBridgeReservation();
+    }
+
+    function closeForResourceLimit(reason: string) {
+      if (socket.readyState === socket.OPEN) socket.close(4009, reason);
+      cleanup();
+    }
+
+    function sendTerminalData(data: string): boolean {
+      if (cleaned || socket.readyState !== socket.OPEN) return false;
+      const bytes = Buffer.byteLength(data, "utf8");
+      if (bytes > MAX_SOCKET_BUFFERED_BYTES - socket.bufferedAmount) {
+        closeForResourceLimit("terminal output buffer limit reached");
+        return false;
+      }
+      try {
+        socket.send(data, (error) => {
+          if (error) cleanup();
+        });
+        return true;
+      } catch {
+        cleanup();
+        return false;
+      }
     }
 
     child.stdout!.on("data", (data: Buffer) => {
-      if (socket.readyState === socket.OPEN) {
-        socket.send(data.toString("utf-8"));
-      }
+      sendTerminalData(data.toString("utf-8"));
     });
 
     child.stderr!.on("data", (_data: Buffer) => {});
@@ -1080,15 +1123,22 @@ export async function run() {
     });
 
     child.on("close", (code: number | null) => {
+      const exitSent = sendTerminalData(JSON.stringify({ type: "exit", code: code ?? 0 }));
       cleanup();
-      if (socket.readyState === socket.OPEN) {
-        socket.send(JSON.stringify({ type: "exit", code: code ?? 0 }));
-        socket.close();
-      }
+      if (exitSent && socket.readyState === socket.OPEN) socket.close();
     });
 
+    let stdinBackpressured = false;
+    child.stdin!.on("drain", () => {
+      if (!cleaned) stdinBackpressured = false;
+    });
     socket.on("message", (raw: Buffer | string) => {
       const msg = raw.toString();
+      const messageBytes = Buffer.byteLength(msg, "utf8");
+      if (messageBytes > MAX_TERMINAL_INPUT_BYTES) {
+        closeForResourceLimit("terminal input message limit reached");
+        return;
+      }
       try {
         const parsed = JSON.parse(msg) as unknown;
         if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && (parsed as { type?: unknown }).type === "resize") {
@@ -1105,7 +1155,19 @@ export async function run() {
           return;
         }
       } catch {}
-      if (!cleaned && child.stdin!.writable) child.stdin!.write(msg);
+      if (cleaned || !child.stdin!.writable) return;
+      if (
+        stdinBackpressured
+        || child.stdin!.writableLength > MAX_PENDING_STDIN_BYTES - messageBytes
+      ) {
+        closeForResourceLimit("terminal input buffer limit reached");
+        return;
+      }
+      try {
+        stdinBackpressured = !child.stdin!.write(msg);
+      } catch {
+        cleanup();
+      }
     });
 
     socket.on("close", () => {
