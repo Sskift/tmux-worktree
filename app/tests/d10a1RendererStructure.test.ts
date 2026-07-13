@@ -45,7 +45,11 @@ const canonicalModules = {
 type CanonicalModulePath = keyof typeof canonicalModules;
 
 const canonicalExportManifests: Record<CanonicalModulePath, readonly string[]> = {
-  "dashboard/hooks/useConnectionCatalog.ts": ["useConnectionCatalog"],
+  "dashboard/hooks/useConnectionCatalog.ts": [
+    "useConnectionCatalog",
+    "useConnectionCatalogOwnerPhase",
+    "useConnectionCatalogSyncPhase",
+  ],
   "dashboard/hooks/useWorkspaceCatalog.ts": [
     "FullCatalogPublished",
     "useWorkspaceCatalog",
@@ -536,6 +540,8 @@ test("connection, workspace, and refresh implementations have unique reachable o
   const reachablePaths = new Set(reachable.map(({ path }) => path));
   const expectedOwners = new Map<string, CanonicalModulePath>([
     ["useConnectionCatalog", "dashboard/hooks/useConnectionCatalog.ts"],
+    ["useConnectionCatalogOwnerPhase", "dashboard/hooks/useConnectionCatalog.ts"],
+    ["useConnectionCatalogSyncPhase", "dashboard/hooks/useConnectionCatalog.ts"],
     ["useWorkspaceCatalog", "dashboard/hooks/useWorkspaceCatalog.ts"],
     ["useWorkspaceCatalogOwnerPhase", "dashboard/hooks/useWorkspaceCatalog.ts"],
     ["workspaceCatalogRefresh", "dashboard/hooks/workspaceCatalogRefresh.ts"],
@@ -564,8 +570,39 @@ test("connection, workspace, and refresh implementations have unique reachable o
     assert.deepEqual(owners.get(name), [path]);
   }
 
-  assert.match(sources.app, /import \{ useConnectionCatalog \} from "\.\/dashboard\/hooks\/useConnectionCatalog";/);
-  assert.match(sources.app, /\} = useConnectionCatalog\(\);/);
+  const appFile = parse("App.tsx", sources.app);
+  const connectionImports = appFile.statements.filter(
+    (statement): statement is ts.ImportDeclaration =>
+      ts.isImportDeclaration(statement) &&
+      ts.isStringLiteral(statement.moduleSpecifier) &&
+      statement.moduleSpecifier.text === "./dashboard/hooks/useConnectionCatalog",
+  );
+  assert.equal(connectionImports.length, 1);
+  const connectionBindings = connectionImports[0].importClause?.namedBindings;
+  assert.ok(connectionBindings && ts.isNamedImports(connectionBindings));
+  assert.deepEqual(
+    connectionBindings.elements.map((element) => ({
+      imported: element.propertyName?.text ?? element.name.text,
+      local: element.name.text,
+      typeOnly: element.isTypeOnly,
+    })),
+    [
+      { imported: "useConnectionCatalog", local: "useConnectionCatalog", typeOnly: false },
+      {
+        imported: "useConnectionCatalogOwnerPhase",
+        local: "useConnectionCatalogOwnerPhase",
+        typeOnly: false,
+      },
+      {
+        imported: "useConnectionCatalogSyncPhase",
+        local: "useConnectionCatalogSyncPhase",
+        typeOnly: false,
+      },
+    ],
+  );
+  assert.match(sources.app, /const connectionCatalog = useConnectionCatalog\(dashboardBackend\);/);
+  assert.match(sources.app, /useConnectionCatalogOwnerPhase\(connectionCatalog\.ownerPhase, dashboardBackend\);/);
+  assert.match(sources.app, /useConnectionCatalogSyncPhase\(connectionCatalog, dashboardBackend\);/);
   assert.match(sources.app, /\} = useWorkspaceCatalog\(dashboardBackend\);/);
   assert.match(sources.app, /useWorkspaceCatalogOwnerPhase\(workspaceCatalogOwnerPhase, \{/);
   assert.doesNotMatch(sources.app, /useDashboardCatalog/);
@@ -575,6 +612,7 @@ test("the D10a-1 hook dependency graph remains one-way", () => {
   const expectedImports: Record<CanonicalModulePath, readonly string[]> = {
     "dashboard/hooks/useConnectionCatalog.ts": [
       "../../platform",
+      "../ownerEpochLease",
       "./useVisibilityAwarePolling",
       "react",
     ],
@@ -607,7 +645,7 @@ test("the D10a-1 hook dependency graph remains one-way", () => {
   assert.deepEqual(
     Object.fromEntries([...graph].map(([path, dependencies]) => [path, dependencies])),
     {
-      "dashboard/hooks/useConnectionCatalog.ts": [],
+      "dashboard/hooks/useConnectionCatalog.ts": ["dashboard/ownerEpochLease.ts"],
       "dashboard/hooks/useWorkspaceCatalog.ts": [
         "dashboard/ownerEpochLease.ts",
         "dashboard/hooks/workspaceCatalogRefresh.ts",

@@ -107,7 +107,10 @@ export interface ConnectionsSettingsProps {
   sshHostCandidates: readonly HostConfig[];
   sessions: readonly Session[];
   terminals: readonly PlainTerminal[];
-  onHostsChange: (hosts: HostConfig[]) => void;
+  onHostsMutationSettled: (
+    hosts: HostConfig[],
+    acceptPayload: boolean,
+  ) => boolean;
   installingHostId: string | null;
   onInstallTw: (hostId: string) => void | Promise<void>;
   relay: RelaySettingsModel;
@@ -219,7 +222,7 @@ export function ConnectionsSettings({
   sshHostCandidates,
   sessions,
   terminals,
-  onHostsChange,
+  onHostsMutationSettled,
   installingHostId,
   onInstallTw,
   relay,
@@ -461,9 +464,12 @@ export function ConnectionsSettings({
       const updatedHosts = operationMode === "add"
         ? await dashboardBackend.hosts.add(validation.value)
         : await dashboardBackend.hosts.update(validation.value);
-      if (asyncCoordinatorRef.current.isCurrent(catalogRequest)) {
+      const payloadAccepted = onHostsMutationSettled(
+        updatedHosts,
+        asyncCoordinatorRef.current.isCurrent(catalogRequest),
+      );
+      if (payloadAccepted) {
         acceptedHostCatalogFingerprintRef.current = hostCatalogFingerprint(updatedHosts);
-        onHostsChange(updatedHosts);
       }
       if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       setSelectedHostId(validation.value.id);
@@ -488,9 +494,12 @@ export function ConnectionsSettings({
     setHostNotice({ tone: "pending", message: `Removing ${hostToDelete.label}…` });
     try {
       const updatedHosts = await dashboardBackend.hosts.remove(hostToDelete.id);
-      if (asyncCoordinatorRef.current.isCurrent(catalogRequest)) {
+      const payloadAccepted = onHostsMutationSettled(
+        updatedHosts,
+        asyncCoordinatorRef.current.isCurrent(catalogRequest),
+      );
+      if (payloadAccepted) {
         acceptedHostCatalogFingerprintRef.current = hostCatalogFingerprint(updatedHosts);
-        onHostsChange(updatedHosts);
       }
       if (!asyncCoordinatorRef.current.isCurrent(feedbackRequest)) return;
       const nextHost = updatedHosts[0] ?? null;

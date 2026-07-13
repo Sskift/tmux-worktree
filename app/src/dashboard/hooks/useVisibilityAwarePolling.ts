@@ -6,6 +6,7 @@ type Options = {
   visibleIntervalMs: number;
   hiddenIntervalMs: number;
   refreshKey?: string;
+  restartKey?: unknown;
 };
 
 export function useVisibilityAwarePolling(
@@ -15,6 +16,7 @@ export function useVisibilityAwarePolling(
     visibleIntervalMs,
     hiddenIntervalMs,
     refreshKey = "",
+    restartKey,
   }: Options,
 ): void {
   const taskRef = useRef(task);
@@ -42,5 +44,5 @@ export function useVisibilityAwarePolling(
     });
     controller.start();
     return () => controller.stop();
-  }, [enabled, hiddenIntervalMs, refreshKey, visibleIntervalMs]);
+  }, [enabled, hiddenIntervalMs, refreshKey, restartKey, visibleIntervalMs]);
 }

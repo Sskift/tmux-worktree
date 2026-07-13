@@ -32,12 +32,14 @@ test("the renderer loads ssh host candidates into Settings and keeps host status
     "utf8",
   );
   const composition = rendererImplementationSourceContaining(
-    "useConnectionCatalog()",
+    "useConnectionCatalog(dashboardBackend)",
+    "useConnectionCatalogOwnerPhase(connectionCatalog.ownerPhase, dashboardBackend)",
+    "useConnectionCatalogSyncPhase(connectionCatalog, dashboardBackend)",
     "sshHostCandidates={sshHostCandidates}",
     "hostStatuses={hostStatuses}",
   ).source;
 
-  assert.match(composition, /useConnectionCatalog\(\)/);
+  assert.match(composition, /useConnectionCatalog\(dashboardBackend\)/);
   assert.match(catalog, /dashboardBackend\.hosts\.candidates\(\)/);
   assert.match(composition, /sshHostCandidates/);
   assert.match(composition, /sshHostCandidates=\{sshHostCandidates\}/);

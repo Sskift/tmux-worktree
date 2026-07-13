@@ -141,6 +141,47 @@ test("a later save or delete owns the authoritative Host list", async () => {
   assert.deepEqual(publishedLists, [["host-a"]]);
 });
 
+test("unmounted add update and remove settlements request an A2 reload without publishing A1 payloads", async () => {
+  for (const intent of ["add", "update", "remove"] as const) {
+    const coordinator = createConnectionsAsyncCoordinator();
+    const mutation = deferred<HostConfig[]>();
+    const acceptedPayloads: HostConfig[][] = [];
+    const authoritativeCatalogs: HostConfig[][] = [];
+    const staleCallbacks: string[] = [];
+    const backendA = {};
+    const backendB = {};
+    let currentBackend = backendA;
+    const originatingBackend = backendA;
+    const catalogRequest = coordinator.issue("hostCatalog", intent, "host-a");
+    const acceptPayload = () => currentBackend === originatingBackend && false;
+    const settleMutation = mutation.promise.then((payload) => {
+      if (coordinator.isCurrent(catalogRequest) && acceptPayload()) {
+        acceptedPayloads.push(payload);
+        return;
+      }
+      staleCallbacks.push(intent);
+      if (currentBackend !== originatingBackend) return;
+      authoritativeCatalogs.push([
+        { id: "host-a", label: "A2", host: "authoritative-a2.example" },
+      ]);
+    });
+
+    coordinator.invalidateAll(); // owner-key unmount of A1
+    currentBackend = backendB;
+    currentBackend = backendA; // A2 already hydrated before A1 settles
+    mutation.resolve([
+      { id: "host-a", label: "A1 payload", host: "untrusted-a1.example" },
+    ]);
+    await settleMutation;
+
+    assert.deepEqual(acceptedPayloads, [], intent);
+    assert.deepEqual(staleCallbacks, [intent]);
+    assert.deepEqual(authoritativeCatalogs, [[
+      { id: "host-a", label: "A2", host: "authoritative-a2.example" },
+    ]]);
+  }
+});
+
 test("Relay actions reject stale completion without cancelling current Host feedback", async () => {
   const coordinator = createConnectionsAsyncCoordinator();
   const relayStart = coordinator.issue("relay", "start");
@@ -190,19 +231,21 @@ test("Connections Settings guards every Host async publication site", () => {
     assert.match(block, /issueHostCatalogMutation\(/);
     assert.match(block, /isCurrent\(catalogRequest\)/);
     assert.match(block, /isCurrent\(feedbackRequest\)/);
+    assert.match(block, /onHostsMutationSettled\(/);
+    assert.match(block, /asyncCoordinatorRef\.current\.isCurrent\(catalogRequest\)/);
   }
 
   assert.ok(
-    saveBlock.indexOf("isCurrent(catalogRequest)") < saveBlock.indexOf("onHostsChange(updatedHosts)"),
-    "a stale catalog mutation must be rejected before publishing its Host list",
+    saveBlock.indexOf("onHostsMutationSettled") < saveBlock.indexOf("isCurrent(feedbackRequest)"),
+    "an owner settlement must happen before selection-specific feedback",
   );
   assert.ok(
-    saveBlock.indexOf("onHostsChange(updatedHosts)") < saveBlock.indexOf("isCurrent(feedbackRequest)"),
-    "selection-specific feedback must not prevent publishing a committed Host list",
+    saveBlock.indexOf("isCurrent(catalogRequest)") < saveBlock.indexOf("isCurrent(feedbackRequest)"),
+    "catalog trust must be classified before selection-specific feedback",
   );
   assert.ok(
-    deleteBlock.indexOf("onHostsChange(updatedHosts)") < deleteBlock.indexOf("isCurrent(feedbackRequest)"),
-    "a committed delete must publish before selection-specific feedback is checked",
+    deleteBlock.indexOf("onHostsMutationSettled") < deleteBlock.indexOf("isCurrent(feedbackRequest)"),
+    "a delete settlement must reconcile before selection-specific feedback is checked",
   );
   assert.match(source, /currentHostCatalogFingerprint = hostCatalogFingerprint\(hosts\)/);
   assert.match(source, /hostCatalogFingerprintRef\.current === currentHostCatalogFingerprint/);

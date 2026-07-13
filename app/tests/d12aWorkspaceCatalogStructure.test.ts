@@ -135,7 +135,7 @@ test("polling publishes task identity only in layout commit and keeps one passiv
   assert.equal(compact(layout[0].arguments[1], sourceFile), "[task]");
   assert.equal(
     compact(passive[0].arguments[1], sourceFile),
-    "[enabled,hiddenIntervalMs,refreshKey,visibleIntervalMs]",
+    "[enabled,hiddenIntervalMs,refreshKey,restartKey,visibleIntervalMs]",
   );
   const hookStatements = hook.body!.statements.map((statement) => compact(statement, sourceFile));
   assert.equal(hookStatements.filter((statement) => statement.includes("taskRef.current=task")).length, 1);

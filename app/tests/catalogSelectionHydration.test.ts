@@ -349,19 +349,20 @@ test("Host readiness distinguishes initial empty state from a successful empty c
     new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
     "utf8",
   );
-  const loadStart = hookSource.indexOf("const loadHosts = useCallback");
-  const loadEnd = hookSource.indexOf("useVisibilityAwarePolling(loadHosts", loadStart);
+  const loadStart = hookSource.indexOf("async function loadHostsForOwner");
+  const loadEnd = hookSource.indexOf("function publishHostsForOwner", loadStart);
   assert.ok(loadStart >= 0);
   assert.ok(loadEnd > loadStart);
   const loadSource = hookSource.slice(loadStart, loadEnd);
 
-  assert.match(hookSource, /useState\(0\).*hostsHydrationGeneration|hostsHydrationGeneration.*useState\(0\)/s);
-  assert.match(loadSource, /setHostsHydrationGeneration\(\(generation\) => generation \+ 1\)/);
-  const loadCatchIndex = loadSource.indexOf("} catch");
+  assert.match(hookSource, /hostsHydrationGeneration: 0/);
+  assert.match(loadSource, /registration\.hostsHydrationGeneration \+= 1/);
+  const loadCatchIndex = loadSource.lastIndexOf("} catch (nextError)");
   assert.ok(loadCatchIndex >= 0);
-  assert.doesNotMatch(loadSource.slice(loadCatchIndex), /setHostsHydrationGeneration/);
+  assert.doesNotMatch(loadSource.slice(loadCatchIndex), /hostsHydrationGeneration \+=/);
   assert.doesNotMatch(loadSource, /Promise\.all/);
-  assert.match(hookSource, /enabled: hostsHydrationGeneration === 0/);
+  assert.match(hookSource, /enabled: connectionCatalog\.hostsHydrationGeneration === 0 \|\|/);
+  assert.match(hookSource, /connectionCatalog\.catalogReloadRequired/);
   assert.match(hookSource, /visibleIntervalMs: HOST_CATALOG_RETRY_MS/);
   const hostsListIndex = loadSource.indexOf("dashboardBackend.hosts.list()");
   const hostCandidatesIndex = loadSource.indexOf("dashboardBackend.hosts.candidates()");

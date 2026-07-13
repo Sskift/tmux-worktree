@@ -8,7 +8,7 @@ import {
 } from "react";
 import { Plus, X } from "lucide-react";
 import { useDashboardBackend } from "./platform";
-import { useConnectionCatalog } from "./dashboard/hooks/useConnectionCatalog";
+import { useConnectionCatalog, useConnectionCatalogOwnerPhase, useConnectionCatalogSyncPhase } from "./dashboard/hooks/useConnectionCatalog";
 import {
   useWorkspaceCatalog,
   useWorkspaceCatalogOwnerPhase,
@@ -188,18 +188,22 @@ function App() {
     tick: tickScheduledAutomations,
     ownerPhase: automationWorkspaceOwnerPhase,
   } = automationWorkspace;
+  const connectionCatalog = useConnectionCatalog(dashboardBackend);
+  useConnectionCatalogOwnerPhase(connectionCatalog.ownerPhase, dashboardBackend);
+  useConnectionCatalogSyncPhase(connectionCatalog, dashboardBackend);
   const {
     projectPresets,
     loadProjectPresets,
     hosts,
     hostsHydrationGeneration,
     hostsLoadError,
-    setHosts,
+    onHostsMutationSettled,
     sshHostCandidates,
     hostStatuses,
     installingHostId,
     installRemoteTw,
-  } = useConnectionCatalog();
+    ownerEpochKey: connectionCatalogOwnerEpochKey,
+  } = connectionCatalog;
   const mobileRelay = useMobileRelayController({ hosts });
   const [selection, setSelection] = useState<Selection>(null);
   const terminalDeck = useTerminalDeckState(dashboardBackend);
@@ -1361,6 +1365,7 @@ function App() {
         content={{
           agents: (
             <AgentsSettings
+              key={`agents:${connectionCatalogOwnerEpochKey}`}
               hosts={hosts}
               defaultAgentCommand={defaultAgentCommand}
               onDefaultAgentCommandChange={(command) => {
@@ -1371,13 +1376,14 @@ function App() {
           ),
           connections: (
             <ConnectionsSettings
+              key={`connections:${connectionCatalogOwnerEpochKey}`}
               hosts={hosts}
               hostStatuses={hostStatuses}
               hostCatalogError={hostsLoadError}
               sshHostCandidates={sshHostCandidates}
               sessions={sessions}
               terminals={allTerminals}
-              onHostsChange={setHosts}
+              onHostsMutationSettled={onHostsMutationSettled}
               installingHostId={installingHostId}
               onInstallTw={installRemoteTw}
               {...relaySettingsBindings}
@@ -1433,6 +1439,7 @@ function App() {
 
       {showNewWorktree && (
         <NewWorktreeModal
+          key={`worktree:${connectionCatalogOwnerEpochKey}`}
           hosts={hosts}
           onClose={() => setShowNewWorktree(false)}
           onCreated={(sessionName) => {
@@ -1454,6 +1461,7 @@ function App() {
 
       {showNewTerminal && (
         <NewTerminalModal
+          key={`terminal:${connectionCatalogOwnerEpochKey}`}
           hosts={hosts}
           existingLabels={allTerminals.map((terminal) => terminal.label)}
           onClose={() => setShowNewTerminal(false)}

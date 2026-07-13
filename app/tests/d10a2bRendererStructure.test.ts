@@ -866,6 +866,8 @@ test("App leaves selection state local and preserves reconciliation as global ef
 
   for (const hookName of [
     "useConnectionCatalog",
+    "useConnectionCatalogOwnerPhase",
+    "useConnectionCatalogSyncPhase",
     "useMobileRelayController",
     "useTerminalDeckState",
     "useTerminalDeckOwnerPhase",
@@ -918,6 +920,8 @@ test("App leaves selection state local and preserves reconciliation as global ef
   ).length;
   const effectsBeforeSelection = directAppEffectsBefore +
     effectContribution(sources.connection, "useConnectionCatalog") +
+    effectContribution(sources.connection, "useConnectionCatalogOwnerPhase") +
+    effectContribution(sources.connection, "useConnectionCatalogSyncPhase") +
     effectContribution(sources.relay, "useMobileRelayController") +
     effectContribution(sources.terminalDeck, "useTerminalDeckState") +
     effectContribution(sources.terminalDeck, "useTerminalDeckOwnerPhase") +

@@ -23,11 +23,12 @@ test("an aborted polling render cannot publish its task before layout commit", a
   let starts = 0;
   let stops = 0;
   class FakePollingController {
-    constructor(options: { task(): void | Promise<void> }) {
+    constructor(private readonly options: { task(): void | Promise<void> }) {
       controllerTask = options.task;
     }
     start() {
       starts += 1;
+      void this.options.task();
     }
     stop() {
       stops += 1;
@@ -66,13 +67,28 @@ test("an aborted polling render cannot publish its task before layout commit", a
   );
   const useVisibilityAwarePolling = module.exports.useVisibilityAwarePolling as (
     task: () => void | Promise<void>,
-    options: { visibleIntervalMs: number; hiddenIntervalMs: number },
+    options: {
+      visibleIntervalMs: number;
+      hiddenIntervalMs: number;
+      refreshKey?: string;
+      restartKey?: unknown;
+    },
   ) => void;
 
-  const render = (task: () => void | Promise<void>) => {
+  const backendA = {};
+  const backendB = {};
+  const render = (
+    task: () => void | Promise<void>,
+    restartKey: unknown = backendA,
+  ) => {
     cursor = 0;
     pending = new Map();
-    useVisibilityAwarePolling(task, { visibleIntervalMs: 2_000, hiddenIntervalMs: 10_000 });
+    useVisibilityAwarePolling(task, {
+      visibleIntervalMs: 2_000,
+      hiddenIntervalMs: 10_000,
+      refreshKey: "connection:pending",
+      restartKey,
+    });
     const rendered = pending;
     const commitKind = (kind: Effect["kind"]) => {
       for (const [index, next] of rendered) {
@@ -106,19 +122,38 @@ test("an aborted polling render cannot publish its task before layout commit", a
   initial.commitLayout();
   initial.commitPassive();
   assert.equal(starts, 1);
-  await runControllerTask();
   assert.deepEqual(calls, ["A"]);
+  await runControllerTask();
+  assert.deepEqual(calls, ["A", "A"]);
 
   const aborted = render(() => { calls.push("B-aborted"); });
   aborted.abort();
   await runControllerTask();
-  assert.deepEqual(calls, ["A", "A"]);
+  assert.deepEqual(calls, ["A", "A", "A"]);
 
   const committedB = render(() => { calls.push("B"); });
   committedB.commitLayout();
   committedB.commitPassive();
   await runControllerTask();
-  assert.deepEqual(calls, ["A", "A", "B"]);
+  assert.deepEqual(calls, ["A", "A", "A", "B"]);
   assert.equal(starts, 1, "task commits must not restart the passive polling controller");
   assert.equal(stops, 0);
+
+  const never = new Promise<void>(() => {});
+  const switchB = render(() => {
+    calls.push("B-owner");
+    return never;
+  }, backendB);
+  switchB.commitLayout();
+  switchB.commitPassive();
+  assert.equal(starts, 2);
+  assert.equal(stops, 1);
+  assert.deepEqual(calls.at(-1), "B-owner");
+
+  const switchA2 = render(() => { calls.push("A2-owner"); }, backendA);
+  switchA2.commitLayout();
+  switchA2.commitPassive();
+  assert.equal(starts, 3, "one backend change must start exactly one new controller");
+  assert.equal(stops, 2);
+  assert.deepEqual(calls.at(-1), "A2-owner");
 });
