@@ -762,7 +762,15 @@ test("the renderer guards every editor-destructive routing entry point", () => {
   assert.match(composition, /onDirtyChange=\{handleEditorDirtyChange\}/);
   assert.match(composition, /onDirtyChange=\{handleAutomationDirtyChange\}/);
   assert.match(composition, /onNew=\{handleNewAutomation\}/);
-  assert.match(composition, /automationSubmitStillOwnsDraft\(\s*originatingDraft/);
+  const automationCoordinator = rendererImplementationSourceContaining(
+    "automationSubmitStillOwnsDraft(",
+    "originatingDraft",
+    "navigateToSavedAutomation",
+  ).source;
+  assert.match(
+    automationCoordinator,
+    /automationSubmitStillOwnsDraft\(\s*originatingDraft/,
+  );
   const automationSelection = rendererImplementationSourceContaining(
     "automationSelectionIsCurrent(",
     "return Promise.resolve(false)",

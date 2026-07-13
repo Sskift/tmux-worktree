@@ -119,7 +119,7 @@ test("workspace ownership has no render publication and uses exact ordered layou
     lifecycleCallback.body.statements.map((statement) => compact(statement, sourceFile)),
     [
       "constactivation=registration.fence.activate();",
-      "return()=>registration.fence.deactivate(activation);",
+      "return()=>{registration.fence.deactivate(activation);};",
     ],
   );
 });

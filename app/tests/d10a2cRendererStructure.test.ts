@@ -24,6 +24,10 @@ const sources = {
     ),
     "utf8",
   ),
+  automation: readFileSync(
+    new URL("../src/dashboard/hooks/useAutomationWorkspace.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -308,7 +312,7 @@ function assertCriticalPhaseIntervals(
   assert.deepEqual(directHookRegistrationsBetween(body, indices.preview, indices.polling), []);
   assert.deepEqual(
     directHookRegistrationsBetween(body, indices.polling, indices.scheduler),
-    ["useCallback", "useCallback", "useCallback", "useCallback", "useCallback"],
+    [],
   );
   assert.deepEqual(directHookRegistrationsBetween(body, indices.scheduler, indices.attach), []);
   assert.deepEqual(directHookRegistrationsBetween(body, indices.attach, indices.git), []);
@@ -839,6 +843,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
   const appBody = app.body;
   assert.ok(appBody);
   const stateCalls = directTopLevelCalls(appBody, "useTerminalDeckState");
+  const automationStateCalls = directTopLevelCalls(appBody, "useAutomationWorkspace");
   const workspaceCalls = directTopLevelCalls(appBody, "useWorkspaceCatalog");
   const workspaceOwnerPhases = directTopLevelCalls(appBody, "useWorkspaceCatalogOwnerPhase");
   for (const [name, calls] of [
@@ -848,28 +853,23 @@ test("App preserves the global deck phase order and direct controller wiring", (
     assert.equal(calls.length, 1, `expected one direct App ${name} registration`);
   }
   assert.equal(workspaceOwnerPhases.length, 1);
-
-  const handleAutomationCreate = directVariable(appBody, "handleAutomationCreate");
-  const handleAutomationRun = directVariable(appBody, "handleAutomationRun");
+  assert.equal(automationStateCalls.length, 1);
   const selectedAutomation = directVariable(appBody, "selectedAutomation");
   const appEffects = directEffectRegistrations(appBody);
-  const schedulers = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "shouldRunAutomationSchedule").length === 1
-  );
+  const schedulers = directTopLevelCalls(appBody, "useAutomationWorkspaceSchedulerPhase");
   const gitEffects = appEffects.filter(({ call }) =>
     callsWithPath(call.arguments[0], "dashboardBackend.git.status").length === 1
   );
   assert.equal(schedulers.length, 1);
   assert.equal(gitEffects.length, 1);
   const order: Array<[string, number]> = [
+    ["automation workspace state", automationStateCalls[0].index],
     ["terminal deck state", stateCalls[0].index],
     ["workspace catalog", workspaceCalls[0].index],
     ["workspace owner phase", workspaceOwnerPhases[0].index],
     ["selection effect 19", selectionCall.index],
     ["preview effect 20", previewCall.index],
     ["workspace polling effect 21", pollingCall.index],
-    ["automation create", handleAutomationCreate.index],
-    ["automation run", handleAutomationRun.index],
     ["automation scheduler effect 22", schedulers[0].index],
     ["attach effects 23-25", attachCall.index],
     ["selected automation", selectedAutomation.index],
@@ -964,11 +964,17 @@ test("App preserves the global deck phase order and direct controller wiring", (
     parse("useTerminalDeckState.ts", sources.deck),
     "useTerminalDeckAttachPhase",
   );
-  assert.ok(selection.body && preview.body && polling.body && attach.body);
+  const automationScheduler = directFunction(
+    parse("useAutomationWorkspace.ts", sources.automation),
+    "useAutomationWorkspaceSchedulerPhase",
+  );
+  assert.ok(selection.body && preview.body && polling.body && attach.body && automationScheduler.body);
   const selectionContribution = directCalls(selection.body, "useEffect").length;
   const previewContribution = directCalls(preview.body, "useEffect").length;
   const pollingContribution = directCalls(polling.body, "useEffect").length;
   const attachContribution = directCalls(attach.body, "useEffect").length;
+  const schedulerContribution = directCalls(automationScheduler.body, "useEffect").length;
+  assert.equal(schedulerContribution, 1);
   assert.deepEqual(
     [
       selectionContribution,
@@ -985,7 +991,7 @@ test("App preserves the global deck phase order and direct controller wiring", (
   assert.equal(effectOrdinal, 20);
   effectOrdinal += pollingContribution;
   assert.equal(effectOrdinal, 21);
-  effectOrdinal += schedulers.length;
+  effectOrdinal += schedulerContribution;
   assert.equal(effectOrdinal, 22);
   const attachOrdinals = Array.from({ length: attachContribution }, () => {
     effectOrdinal += 1;
@@ -1069,11 +1075,6 @@ test("deck structure guards reject extra state work and hidden App phase calls",
       );
       ${afterPreview}
       useVisibilityAwarePolling(refresh, {});
-      const one = useCallback(() => {}, []);
-      const two = useCallback(() => {}, []);
-      const three = useCallback(() => {}, []);
-      const four = useCallback(() => {}, []);
-      const five = useCallback(() => {}, []);
       useEffect(() => {
         shouldRunAutomationSchedule(automation, now);
       }, []);

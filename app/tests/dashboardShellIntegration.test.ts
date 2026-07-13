@@ -141,7 +141,10 @@ test("destructive sidebar and automation actions require confirmation", () => {
   ).source;
   assert.match(sessionClose, /title: "Close worktree session\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?sessions\.kill/);
   assert.match(terminalClose, /title: "Close terminal\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?terminals\.kill/);
-  assert.match(automationDelete, /title: "Delete automation\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?automations\.delete/);
+  assert.match(
+    automationDelete,
+    /title: "Delete automation\?"[\s\S]*?if \(!currentContext\(mutation\.lease\) \|\| !confirmed\) return false;[\s\S]*?automations\.delete/,
+  );
 });
 
 test("Git is a focused side panel and Automation keeps a workspace return path", () => {

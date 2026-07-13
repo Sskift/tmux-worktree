@@ -15,7 +15,7 @@ export type OwnerEpochCommit<Owner extends object> = Readonly<{
 export type OwnerEpochLeaseController<Owner extends object> = Readonly<{
   commit(owner: Owner): OwnerEpochCommit<Owner>;
   activate(): OwnerEpochActivation;
-  deactivate(activation: OwnerEpochActivation): void;
+  deactivate(activation: OwnerEpochActivation): boolean;
   capture(owner: Owner): OwnerEpochLease<Owner> | null;
   isCurrent(lease: OwnerEpochLease<Owner>): boolean;
 }>;
@@ -52,9 +52,10 @@ export function createOwnerEpochLeaseController<Owner extends object>():
     },
 
     deactivate(expectedActivation) {
-      if (activation !== expectedActivation) return;
+      if (activation !== expectedActivation) return false;
       activation = null;
       activeLease = null;
+      return true;
     },
 
     capture(owner) {

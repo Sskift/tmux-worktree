@@ -38,6 +38,12 @@ import {
   useEditorNavigationGuardLifecyclePhase,
 } from "./dashboard/hooks/useEditorNavigationGuard";
 import {
+  useAutomationWorkspace,
+  useAutomationWorkspaceHydrationPhase,
+  useAutomationWorkspaceOwnerPhase,
+  useAutomationWorkspaceSchedulerPhase,
+} from "./dashboard/hooks/useAutomationWorkspace";
+import {
   CommandPalette,
   type CommandPaletteItem,
 } from "./dashboard/CommandPalette";
@@ -98,18 +104,9 @@ import { applyTheme, loadTheme, type ThemeId } from "./themes";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import {
   automationSelectionIsCurrent,
-  automationSubmitStillOwnsDraft,
 } from "./automationDraftSync";
 import {
-  automationFromRecord,
-  automationRunFromRecord,
-  automationSaveInputFromDraft,
-  createAutomationDraft,
-  shouldRunAutomationSchedule,
   triggerLabel,
-  type Automation,
-  type AutomationDraft,
-  type AutomationRun,
 } from "./automationTypes";
 import {
   basenameFromPath,
@@ -169,9 +166,21 @@ function App() {
     terminalPersistenceError,
     terminalPersistenceHydrationGeneration,
   } = terminalMetadata;
-  const [automations, setAutomations] = useState<Automation[]>([]);
-  const [automationRuns, setAutomationRuns] = useState<AutomationRun[]>([]);
-  const [automationError, setAutomationError] = useState<string | null>(null);
+  const automationWorkspace = useAutomationWorkspace(dashboardBackend);
+  const {
+    automations,
+    runs: automationRuns,
+    error: automationError,
+    ownerEpochKey: automationOwnerEpochKey,
+    load: loadAutomations,
+    create: handleAutomationCreate,
+    save: handleAutomationSave,
+    toggle: handleAutomationToggle,
+    remove: handleAutomationDelete,
+    run: handleAutomationRun,
+    tick: tickScheduledAutomations,
+    ownerPhase: automationWorkspaceOwnerPhase,
+  } = automationWorkspace;
   const {
     projectPresets,
     loadProjectPresets,
@@ -220,12 +229,10 @@ function App() {
   const settingsTriggerRef = useRef<HTMLButtonElement | null>(null);
   const scratchSectionsRef = useRef<HTMLDivElement | null>(null);
   const automationReturnSelectionRef = useRef<Selection>(null);
-  const automationsRef = useRef<Automation[]>([]);
-  const scheduledAutomationMinuteRef = useRef<Set<string>>(new Set());
   const [pendingCatalogSelection, setPendingCatalogSelection] =
     useState<PendingCatalogSelection | null>(null);
   const automationDraftKey = selection?.kind === "automation"
-    ? `automation:${selection.id || "new"}`
+    ? `${automationOwnerEpochKey}:automation:${selection.id || "new"}`
     : null;
   const editorNavigationGuard = useEditorNavigationGuard({
     dashboardBackend,
@@ -238,8 +245,6 @@ function App() {
     handleAutomationDirtyChange,
     getAutomationSubmitOwner,
   } = editorNavigationGuard;
-  automationsRef.current = automations;
-
   useEffect(() => {
     dashboardBackend.persistence.homeDirectory().then(setHomeDir).catch(() => {});
   }, [dashboardBackend]);
@@ -295,39 +300,41 @@ function App() {
     diffFile,
   });
 
-  const loadAutomations = useCallback(async () => {
-    try {
-      const [records, runRecords] = await Promise.all([
-        dashboardBackend.automations.list(),
-        dashboardBackend.automations.listRuns(null),
-      ]);
-      const nextAutomations = records.map(automationFromRecord);
-      const automationsById = new Map(
-        nextAutomations.map((automation) => [automation.id, automation]),
-      );
-      const nextRuns = runRecords.map((run) =>
-        automationRunFromRecord(run, automationsById.get(run.automationId)),
-      );
+  const navigateToSavedAutomation = useCallback((id: string) =>
+    requestEditorNavigation(() => {
+      setEditingFile(null);
+      setDiffFile(null);
+      setSelection({ kind: "automation", id });
+    }, { ignoreAutomationDirty: true }), [requestEditorNavigation]);
 
-      setAutomations(nextAutomations);
-      setAutomationRuns(nextRuns);
-      setAutomationError(null);
-      setSelection((current) => {
-        if (current?.kind !== "automation" || !current.id || automationsById.has(current.id)) {
-          return current;
-        }
-        return nextAutomations[0] ? { kind: "automation", id: nextAutomations[0].id } : null;
-      });
-      return nextAutomations;
-    } catch (err) {
-      setAutomationError(String(err));
-      return automationsRef.current;
-    }
-  }, [dashboardBackend]);
+  const reconcileAutomationSelection = useCallback((items: typeof automations) => {
+    const automationsById = new Set(items.map(({ id }) => id));
+    setSelection((current) => {
+      if (current?.kind !== "automation" || !current.id || automationsById.has(current.id)) {
+        return current;
+      }
+      return items[0] ? { kind: "automation", id: items[0].id } : null;
+    });
+  }, []);
 
-  useEffect(() => {
-    void loadAutomations();
-  }, [loadAutomations]);
+  const clearDeletedAutomationSelection = useCallback((id: string) => {
+    setSelection((current) =>
+      current?.kind === "automation" && current.id === id
+        ? { kind: "automation", id: "" }
+        : current,
+    );
+  }, []);
+
+  useAutomationWorkspaceOwnerPhase(automationWorkspaceOwnerPhase, {
+    backend: dashboardBackend,
+    getAutomationSubmitOwner,
+    navigateToSavedAutomation,
+    reconcileAutomationSelection,
+    clearDeletedAutomationSelection,
+    refreshWorkspace: refresh,
+  });
+
+  useAutomationWorkspaceHydrationPhase(loadAutomations);
 
   const openSettings = useCallback((section: SettingsSectionId = "general") => {
     setCommandPaletteOpen(false);
@@ -445,126 +452,7 @@ function App() {
     hiddenIntervalMs: HIDDEN_REFRESH_MS,
   });
 
-  const handleAutomationCreate = useCallback(
-    async (draft: AutomationDraft) => {
-      const originatingDraft = getAutomationSubmitOwner();
-      const record = await dashboardBackend.automations.save(
-        automationSaveInputFromDraft(draft),
-      );
-      const automation = automationFromRecord(record);
-      if (!automationSubmitStillOwnsDraft(
-        originatingDraft,
-        getAutomationSubmitOwner(),
-      )) {
-        await loadAutomations();
-        return;
-      }
-      await requestEditorNavigation(() => {
-        setEditingFile(null);
-        setDiffFile(null);
-        setSelection({ kind: "automation", id: automation.id });
-      }, { ignoreAutomationDirty: true });
-      await loadAutomations();
-    },
-    [
-      dashboardBackend,
-      getAutomationSubmitOwner,
-      loadAutomations,
-      requestEditorNavigation,
-    ],
-  );
-
-  const handleAutomationSave = useCallback(
-    async (id: string, draft: AutomationDraft) => {
-      const originatingDraft = getAutomationSubmitOwner();
-      const record = await dashboardBackend.automations.save(
-        automationSaveInputFromDraft(draft, id),
-      );
-      const automation = automationFromRecord(record);
-      if (!automationSubmitStillOwnsDraft(
-        originatingDraft,
-        getAutomationSubmitOwner(),
-      )) {
-        await loadAutomations();
-        return;
-      }
-      await requestEditorNavigation(() => {
-        setEditingFile(null);
-        setDiffFile(null);
-        setSelection({ kind: "automation", id: automation.id });
-      }, { ignoreAutomationDirty: true });
-      await loadAutomations();
-    },
-    [
-      dashboardBackend,
-      getAutomationSubmitOwner,
-      loadAutomations,
-      requestEditorNavigation,
-    ],
-  );
-
-  const handleAutomationToggle = useCallback(
-    async (id: string, active: boolean) => {
-      const automation = automationsRef.current.find((item) => item.id === id);
-      if (!automation) return;
-      await dashboardBackend.automations.save(
-        automationSaveInputFromDraft(
-          { ...createAutomationDraft(automation), active },
-          id,
-        ),
-      );
-      await loadAutomations();
-    },
-    [dashboardBackend, loadAutomations],
-  );
-
-  const handleAutomationDelete = useCallback(
-    async (id: string) => {
-      const automation = automationsRef.current.find((item) => item.id === id);
-      const confirmed = await dashboardBackend.dialog.confirm({
-        title: "Delete automation?",
-        message: `This will remove ${automation?.name || "this automation"} and stop its future scheduled runs.`,
-      });
-      if (!confirmed) return;
-      await dashboardBackend.automations.delete(id);
-      setAutomationRuns((prev) => prev.filter((run) => run.automationId !== id));
-      setSelection((current) =>
-        current?.kind === "automation" && current.id === id ? { kind: "automation", id: "" } : current,
-      );
-      await loadAutomations();
-    },
-    [dashboardBackend, loadAutomations],
-  );
-
-  const handleAutomationRun = useCallback(
-    async (id: string) => {
-      const automation = automationsRef.current.find((item) => item.id === id);
-      const runRecord = await dashboardBackend.automations.trigger(id);
-      const run = automationRunFromRecord(runRecord, automation);
-      setAutomationRuns((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-      await Promise.all([loadAutomations(), refresh()]);
-    },
-    [dashboardBackend, loadAutomations, refresh],
-  );
-
-  useEffect(() => {
-    const tick = () => {
-      const now = new Date();
-      const minute = now.toISOString().slice(0, 16);
-      for (const automation of automationsRef.current) {
-        if (!shouldRunAutomationSchedule(automation, now)) continue;
-        const key = `${automation.id}:${minute}`;
-        if (scheduledAutomationMinuteRef.current.has(key)) continue;
-        scheduledAutomationMinuteRef.current.add(key);
-        void handleAutomationRun(automation.id).catch((err) => {
-          setAutomationError(String(err));
-        });
-      }
-    };
-
-    const id = setInterval(tick, 30_000);
-    return () => clearInterval(id);
-  }, [handleAutomationRun]);
+  useAutomationWorkspaceSchedulerPhase(tickScheduledAutomations);
 
   useTerminalDeckAttachPhase(terminalDeck, dashboardBackend, {
     selection,
@@ -1191,7 +1079,9 @@ function App() {
       detail: triggerLabel(automation),
       keywords: ["run", "schedule", automation.name],
       disabledReason: automation.active ? undefined : "Automation is paused",
-      execute: () => handleAutomationRun(automation.id),
+      execute: async () => {
+        await handleAutomationRun(automation.id);
+      },
     }));
 
     const recentSessionNames = openedSessions.slice(-4).reverse();
@@ -1410,6 +1300,7 @@ function App() {
 
   const automationPanel = (
     <AutomationPanel
+      key={automationOwnerEpochKey}
       automations={automations}
       selectedId={selection?.kind === "automation" ? selection.id || null : null}
       runs={automationRuns}

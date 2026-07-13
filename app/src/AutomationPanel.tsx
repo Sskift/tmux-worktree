@@ -25,6 +25,7 @@ import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
 
 type MaybePromise = unknown | Promise<unknown>;
+type BooleanMaybePromise = boolean | Promise<boolean>;
 
 export type AutomationProjectOption = {
   name: string;
@@ -41,11 +42,11 @@ export type AutomationPanelProps = {
   recentProject?: string | null;
   onSelect: (id: string) => MaybePromise;
   onNew: () => MaybePromise;
-  onCreate: (draft: AutomationDraft) => MaybePromise;
+  onCreate: (draft: AutomationDraft) => BooleanMaybePromise;
   onToggle: (id: string, active: boolean) => MaybePromise;
   onRun: (id: string) => MaybePromise;
   onDelete: (id: string) => MaybePromise;
-  onSave: (id: string, draft: AutomationDraft) => MaybePromise;
+  onSave: (id: string, draft: AutomationDraft) => BooleanMaybePromise;
   onDirtyChange?: (dirty: boolean) => void;
   showList?: boolean;
 };
@@ -456,11 +457,12 @@ export function AutomationPanel({
     const submittedRevision = draftRevisionRef.current;
     setSaving(true);
     try {
-      if (isCreating) {
-        await onCreate(normalizedDraft);
-      } else if (selected) {
-        await onSave(selected.id, normalizedDraft);
-      }
+      const accepted = isCreating
+        ? await onCreate(normalizedDraft)
+        : selected
+          ? await onSave(selected.id, normalizedDraft)
+          : false;
+      if (accepted === false) return;
       saveLastAiCmd(normalizedDraft.aiCmd);
       if (draftRevisionRef.current === submittedRevision) {
         if (!isCreating && selected) {

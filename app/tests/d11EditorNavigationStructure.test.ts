@@ -460,7 +460,7 @@ test("each navigation request snapshots its backend and file label before confir
   assert.equal(callCount(requestProperty.body, "requestBackend.dialog.confirm"), 2);
 });
 
-test("App only wires the D11 guard and retains all eleven business navigation handlers", () => {
+test("App only wires the D11 guard and retains ten guarded business navigation owners", () => {
   const appFile = parse("App.tsx", sources.app);
   const app = directFunction(appFile, "App");
   const appBody = app.body!;
@@ -486,8 +486,7 @@ test("App only wires the D11 guard and retains all eleven business navigation ha
 
   for (const handler of [
     "resetDashboardLayout",
-    "handleAutomationCreate",
-    "handleAutomationSave",
+    "navigateToSavedAutomation",
     "handleNewAutomation",
     "handleOpenFile",
     "closeEditingFile",
@@ -516,34 +515,36 @@ test("App only wires the D11 guard and retains all eleven business navigation ha
       );
     }
   }
-  assert.equal(callCount(appBody, "requestEditorNavigation"), 11);
-  assert.equal(callCount(appBody, "getAutomationSubmitOwner"), 4);
-  assert.equal(callCount(appBody, "automationSubmitStillOwnsDraft"), 2);
+  assert.equal(callCount(appBody, "requestEditorNavigation"), 10);
+  assert.equal(callCount(appBody, "getAutomationSubmitOwner"), 0);
+  assert.equal(callCount(appBody, "automationSubmitStillOwnsDraft"), 0);
   assert.equal(callCount(appBody, "automationSelectionIsCurrent"), 1);
-  assert.deepEqual(callbackDependencies(appBody, "handleAutomationCreate"), [
-    "dashboardBackend",
-    "getAutomationSubmitOwner",
-    "loadAutomations",
+  const savedNavigation = directFunctionBodyFromVariable(
+    appBody,
+    "navigateToSavedAutomation",
+  );
+  const savedNavigationRequests: ts.CallExpression[] = [];
+  visit(savedNavigation, (node) => {
+    if (
+      ts.isCallExpression(node) &&
+      expressionPath(node.expression) === "requestEditorNavigation"
+    ) {
+      savedNavigationRequests.push(node);
+    }
+  });
+  assert.equal(savedNavigationRequests.length, 1);
+  assert.equal(savedNavigationRequests[0].arguments.length, 2);
+  assert.equal(
+    compact(savedNavigationRequests[0].arguments[1], appFile),
+    "{ignoreAutomationDirty:true}",
+  );
+  assert.deepEqual(callbackDependencies(appBody, "navigateToSavedAutomation"), [
     "requestEditorNavigation",
   ]);
-  assert.deepEqual(callbackDependencies(appBody, "handleAutomationSave"), [
-    "dashboardBackend",
-    "getAutomationSubmitOwner",
-    "loadAutomations",
-    "requestEditorNavigation",
-  ]);
-  assert.deepEqual(callbackDependencies(appBody, "loadAutomations"), [
-    "dashboardBackend",
-  ]);
-  assert.deepEqual(callbackDependencies(appBody, "handleAutomationToggle"), [
-    "dashboardBackend",
-    "loadAutomations",
-  ]);
-  assert.deepEqual(callbackDependencies(appBody, "handleAutomationRun"), [
-    "dashboardBackend",
-    "loadAutomations",
-    "refresh",
-  ]);
+  assert.match(
+    sources.app,
+    /const automationDraftKey = selection\?\.kind === "automation"[\s\S]*?`\$\{automationOwnerEpochKey\}:automation:\$\{selection\.id \|\| "new"\}`/,
+  );
   assert.ok(
     callbackDependencies(appBody, "resetDashboardLayout").includes("dashboardBackend"),
   );

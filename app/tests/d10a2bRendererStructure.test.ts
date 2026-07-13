@@ -43,6 +43,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useDashboardLayout.ts", import.meta.url),
     "utf8",
   ),
+  automation: readFileSync(
+    new URL("../src/dashboard/hooks/useAutomationWorkspace.ts", import.meta.url),
+    "utf8",
+  ),
 };
 
 function parse(path: string, source: string): ts.SourceFile {
@@ -866,6 +870,9 @@ test("App leaves selection state local and preserves reconciliation as global ef
     "useDashboardLayoutPersistencePhase",
     "useTerminalMetadataHydrationPhase",
     "useTerminalMetadataPersistencePhase",
+    "useAutomationWorkspace",
+    "useAutomationWorkspaceOwnerPhase",
+    "useAutomationWorkspaceHydrationPhase",
   ]) {
     const directRegistrations = directTopLevelCalls(app.body, hookName);
     assert.equal(
@@ -909,8 +916,11 @@ test("App leaves selection state local and preserves reconciliation as global ef
     effectContribution(sources.layout, "useDashboardLayoutHydrationPhase") +
     effectContribution(sources.layout, "useDashboardLayoutPersistencePhase") +
     effectContribution(sources.metadata, "useTerminalMetadataHydrationPhase") +
-    effectContribution(sources.metadata, "useTerminalMetadataPersistencePhase");
-  assert.equal(directAppEffectsBefore, 4);
+    effectContribution(sources.metadata, "useTerminalMetadataPersistencePhase") +
+    effectContribution(sources.automation, "useAutomationWorkspace") +
+    effectContribution(sources.automation, "useAutomationWorkspaceOwnerPhase") +
+    effectContribution(sources.automation, "useAutomationWorkspaceHydrationPhase");
+  assert.equal(directAppEffectsBefore, 3);
   assert.equal(effectsBeforeSelection, 18);
   const selectionEffectNumber = effectsBeforeSelection + callsWithPath(
       directFunction(

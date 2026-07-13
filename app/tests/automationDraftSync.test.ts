@@ -132,3 +132,17 @@ test("AutomationPanel gates snapshot effects by editable content and exposes can
   assert.match(source, /const setDraftClean[\s\S]*?onDirtyChange\?\.\(false\)/);
   assert.match(source, />\s*cancel\s*<\/button>/);
 });
+
+test("AutomationPanel keeps a stale save dirty when the workspace action returns false", () => {
+  const source = readFileSync(new URL("../src/AutomationPanel.tsx", import.meta.url), "utf8");
+  assert.match(source, /onCreate: \(draft: AutomationDraft\) => BooleanMaybePromise/);
+  assert.match(source, /onSave: \(id: string, draft: AutomationDraft\) => BooleanMaybePromise/);
+  const accepted = source.indexOf("if (accepted === false) return;");
+  const rememberCommand = source.indexOf("saveLastAiCmd(normalizedDraft.aiCmd)", accepted);
+  const cleanDraft = source.indexOf("setDraftClean();", rememberCommand);
+  const stopCreating = source.indexOf("setCreatingMode(false);", rememberCommand);
+  assert.ok(accepted >= 0);
+  assert.ok(rememberCommand > accepted);
+  assert.ok(cleanDraft > accepted);
+  assert.ok(stopCreating > accepted);
+});

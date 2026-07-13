@@ -300,6 +300,8 @@ export function useWorkspaceCatalogOwnerPhase(
 
   useLayoutEffect(() => {
     const activation = registration.fence.activate();
-    return () => registration.fence.deactivate(activation);
+    return () => {
+      registration.fence.deactivate(activation);
+    };
   }, [ownerPhase, registration]);
 }

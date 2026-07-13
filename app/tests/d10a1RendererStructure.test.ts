@@ -478,23 +478,18 @@ function locateAppPolling(source: string): AppPollingAst {
   assert.equal(previewPhases[0].call.arguments.length, 3);
   const previewIndex = previewPhases[0].index;
 
-  const automationDeclarations = statements.flatMap((statement, index) => {
-    if (!ts.isVariableStatement(statement)) return [];
-    return statement.declarationList.declarations.flatMap((declaration) => {
-      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== "handleAutomationCreate") {
-        return [];
-      }
-      assert.ok(declaration.initializer && ts.isCallExpression(declaration.initializer));
-      assert.equal(expressionPath(declaration.initializer.expression), "useCallback");
-      return [{ index }];
-    });
+  const automationPhases = statements.flatMap((statement, index) => {
+    if (!ts.isExpressionStatement(statement) || !ts.isCallExpression(statement.expression)) return [];
+    return expressionPath(statement.expression.expression) === "useAutomationWorkspaceSchedulerPhase"
+      ? [{ index }]
+      : [];
   });
   assert.equal(
-    automationDeclarations.length,
+    automationPhases.length,
     1,
-    "handleAutomationCreate must be a direct App variable statement",
+    "automation scheduler must be a direct App phase",
   );
-  const automationIndex = automationDeclarations[0].index;
+  const automationIndex = automationPhases[0].index;
   assert.ok(previewIndex < pollingIndex && pollingIndex < automationIndex);
   return { sourceFile, previewIndex, pollingIndex, automationIndex };
 }
@@ -789,7 +784,7 @@ test("App polling AST guard rejects string, nested, duplicate-key, and spread de
       allTerminals,
     });
   `;
-  const automation = "const handleAutomationCreate = useCallback(() => {}, []);";
+  const automation = "useAutomationWorkspaceSchedulerPhase(tickScheduledAutomations);";
   assert.throws(() => locateAppPolling(`
     function App() {
       const decoy = "useTerminalDeckPreviewPhase(terminalDeck, dashboardBackend, inputs)";

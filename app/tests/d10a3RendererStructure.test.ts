@@ -30,6 +30,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useTerminalMetadata.ts", import.meta.url),
     "utf8",
   ),
+  automation: readFileSync(
+    new URL("../src/dashboard/hooks/useAutomationWorkspace.ts", import.meta.url),
+    "utf8",
+  ),
   selection: readFileSync(
     new URL("../src/dashboard/hooks/useCatalogSelectionHydration.ts", import.meta.url),
     "utf8",
@@ -1281,6 +1285,10 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardLayoutState", effectContribution(sources.layout, "useDashboardLayoutState")],
     ["useTerminalMetadata", effectContribution(sources.metadata, "useTerminalMetadata")],
     [
+      "useAutomationWorkspace",
+      effectContribution(sources.automation, "useAutomationWorkspace"),
+    ],
+    [
       "useConnectionCatalog",
       effectContribution(sources.connection, "useConnectionCatalog", pollingEffects),
     ],
@@ -1324,6 +1332,14 @@ function frozenEffectContributions(): Map<string, number> {
       effectContribution(sources.layout, "useDashboardLayoutPersistencePhase"),
     ],
     [
+      "useAutomationWorkspaceOwnerPhase",
+      effectContribution(sources.automation, "useAutomationWorkspaceOwnerPhase"),
+    ],
+    [
+      "useAutomationWorkspaceHydrationPhase",
+      effectContribution(sources.automation, "useAutomationWorkspaceHydrationPhase"),
+    ],
+    [
       "useCatalogSelectionHydration",
       effectContribution(sources.selection, "useCatalogSelectionHydration"),
     ],
@@ -1332,6 +1348,7 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardBackend", 0],
     ["useDashboardLayoutState", 0],
     ["useTerminalMetadata", 0],
+    ["useAutomationWorkspace", 0],
     ["useConnectionCatalog", 4],
     ["useMobileRelayController", 3],
     ["useTerminalDeckState", 0],
@@ -1345,6 +1362,8 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardLayoutHydrationPhase", 1],
     ["useTerminalMetadataPersistencePhase", 2],
     ["useDashboardLayoutPersistencePhase", 1],
+    ["useAutomationWorkspaceOwnerPhase", 0],
+    ["useAutomationWorkspaceHydrationPhase", 1],
     ["useCatalogSelectionHydration", 1],
   ]);
   return contributions;
@@ -1361,6 +1380,7 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useDashboardBackend",
     "useDashboardLayoutState",
     "useTerminalMetadata",
+    "useAutomationWorkspace",
     "useConnectionCatalog",
     "useMobileRelayController",
     "useTerminalDeckState",
@@ -1374,7 +1394,8 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useDashboardLayoutHydrationPhase",
     "useTerminalMetadataPersistencePhase",
     "useDashboardLayoutPersistencePhase",
-    "useEffect",
+    "useAutomationWorkspaceOwnerPhase",
+    "useAutomationWorkspaceHydrationPhase",
     "useEffect",
     "useEffect",
     "useCatalogSelectionHydration",
@@ -1390,6 +1411,9 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
   }
   assert.equal(contributions.get("useWorkspaceCatalog"), 0);
   assert.equal(contributions.get("useWorkspaceCatalogOwnerPhase"), 0);
+  assert.equal(contributions.get("useAutomationWorkspace"), 0);
+  assert.equal(contributions.get("useAutomationWorkspaceOwnerPhase"), 0);
+  assert.equal(contributions.get("useAutomationWorkspaceHydrationPhase"), 1);
   assert.equal(phaseOrdinals.get("useDashboardViewportResizePhase"), 9);
   assert.equal(phaseOrdinals.get("useDashboardWindowCapturePhase"), 10);
   assert.equal(phaseOrdinals.get("useDashboardLayoutHydrationPhase"), 12);

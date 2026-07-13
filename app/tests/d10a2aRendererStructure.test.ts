@@ -239,11 +239,11 @@ test("App preserves hydration, layout load, persistence, and layout save registr
   assert.equal(layoutHydration.length, 1);
   assert.equal(layoutPersistence.length, 1);
 
-  const appEffects = directCalls(app.body, "useEffect");
-  const automationLoads = appEffects.filter(({ call }) =>
-    callsWithPath(call.arguments[0], "loadAutomations").length === 1
-  );
+  const automationLoads = directCalls(app.body, "useAutomationWorkspaceHydrationPhase");
   assert.equal(automationLoads.length, 1);
+  assert.equal(automationLoads[0].call.arguments.length, 1);
+  assert.ok(ts.isIdentifier(automationLoads[0].call.arguments[0]));
+  assert.equal(automationLoads[0].call.arguments[0].text, "loadAutomations");
   assert.ok(viewportResize[0].index < windowCapture[0].index);
   assert.ok(windowCapture[0].index < hydration[0].index);
   assert.ok(hydration[0].index < layoutHydration[0].index);

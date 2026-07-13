@@ -26,11 +26,11 @@ test("automation selection and deletion are sibling native buttons", () => {
       runs: [],
       onSelect: () => {},
       onNew: () => {},
-      onCreate: () => {},
+      onCreate: () => true,
       onToggle: () => {},
       onRun: () => {},
       onDelete: () => {},
-      onSave: () => {},
+      onSave: () => true,
     }),
   );
 
@@ -67,11 +67,11 @@ test("automation run history owns its styles instead of depending on legacy Git 
       runs: [run],
       onSelect: () => {},
       onNew: () => {},
-      onCreate: () => {},
+      onCreate: () => true,
       onToggle: () => {},
       onRun: () => {},
       onDelete: () => {},
-      onSave: () => {},
+      onSave: () => true,
     }),
   );
 

@@ -30,7 +30,7 @@ test("owner epochs advance only when the committed owner changes", () => {
   assert.equal(nextLeaseA.epoch, 3);
   assert.equal(controller.isCurrent(leaseB), false);
   assert.equal(controller.isCurrent(nextLeaseA), true);
-  controller.deactivate(activation);
+  assert.equal(controller.deactivate(activation), true);
 });
 
 test("activation cleanup is exact and Strict replay invalidates the old result lease", () => {
@@ -41,7 +41,7 @@ test("activation cleanup is exact and Strict replay invalidates the old result l
   const firstActivation = controller.activate();
   const firstLease = controller.capture(owner);
   assert.ok(firstLease);
-  controller.deactivate(firstActivation);
+  assert.equal(controller.deactivate(firstActivation), true);
   assert.equal(controller.capture(owner), null);
   assert.equal(controller.isCurrent(firstLease), false);
 
@@ -52,8 +52,8 @@ test("activation cleanup is exact and Strict replay invalidates the old result l
   assert.notEqual(secondLease, firstLease);
   assert.equal(controller.isCurrent(secondLease), true);
 
-  controller.deactivate(firstActivation);
+  assert.equal(controller.deactivate(firstActivation), false);
   assert.equal(controller.capture(owner), secondLease, "stale cleanup must not deactivate replay");
-  controller.deactivate(secondActivation);
+  assert.equal(controller.deactivate(secondActivation), true);
   assert.equal(controller.capture(owner), null);
 });
