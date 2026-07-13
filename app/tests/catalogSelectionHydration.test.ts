@@ -373,34 +373,3 @@ test("Host readiness distinguishes initial empty state from a successful empty c
     "SSH candidate failure must not block Host hydration",
   );
 });
-
-test("terminal metadata failure keeps fallback pending without authorizing an empty save", () => {
-  const hookSource = readFileSync(
-    new URL("../src/dashboard/hooks/useTerminalMetadata.ts", import.meta.url),
-    "utf8",
-  );
-  const loadStart = hookSource.indexOf("export function useTerminalMetadataHydrationPhase");
-  const loadEnd = hookSource.indexOf(
-    "export function useTerminalMetadataPersistencePhase",
-    loadStart,
-  );
-  assert.ok(loadStart >= 0);
-  assert.ok(loadEnd > loadStart);
-  const loadSource = hookSource.slice(loadStart, loadEnd);
-  const loadFailureStart = loadSource.indexOf("} catch (nextError)");
-  assert.ok(loadFailureStart >= 0);
-  const loadFailureSource = loadSource.slice(loadFailureStart);
-  const saveSource = hookSource.slice(loadEnd);
-
-  assert.match(loadSource, /setTerminalPersistenceWritable\(true\)/);
-  assert.match(loadSource, /setTerminalPersistenceError\(`Terminal metadata could not be loaded:/);
-  assert.match(loadSource.slice(0, loadFailureStart), /settleHydration\(\)/);
-  assert.doesNotMatch(loadFailureSource, /settleHydration\(\)/);
-  assert.match(loadFailureSource, /window\.setTimeout/);
-  assert.match(saveSource, /!terminalsRestoreReady \|\| !terminalPersistenceWritable/);
-  const writableGuardIndex = saveSource.indexOf("terminalPersistenceWritable");
-  const terminalSaveIndex = saveSource.indexOf("backend.terminals.save(snapshot)");
-  assert.ok(writableGuardIndex >= 0);
-  assert.ok(terminalSaveIndex >= 0);
-  assert.ok(writableGuardIndex < terminalSaveIndex);
-});

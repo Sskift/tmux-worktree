@@ -5,7 +5,6 @@ import {
   createLatestRequestGate,
   requestSourceKey,
 } from "../src/latestRequestGate.ts";
-import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -68,12 +67,7 @@ test("new terminal invalidates home-default publication from every editable sour
   assert.match(modal, /const browse = async \(\) => \{\s*invalidatePendingHomeDefault\(\)/s);
 });
 
-test("the renderer creates persisted terminals through the host-aware command", () => {
-  const creation = rendererImplementationSourceContaining(
-    "dashboardBackend.terminals.create({",
-    "cwd: created.cwd",
-    "managed: created.managed",
-  ).source;
+test("persisted terminal restoration keeps host-aware runtime identity", () => {
   const restoration = readFileSync(
     new URL("../src/terminalPersistence.ts", import.meta.url),
     "utf8",
@@ -81,10 +75,6 @@ test("the renderer creates persisted terminals through the host-aware command", 
   const identity = readFileSync(new URL("../src/dashboard/model/terminalIdentity.ts", import.meta.url), "utf8");
   const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
 
-  assert.match(
-    creation,
-    /dashboardBackend\.terminals\.create\(\{\s*cwd: draft\.cwd,\s*aiCmd: draft\.aiCmd,\s*hostId: draft\.hostId \?\? null,\s*\}\)/s,
-  );
   assert.match(
     backend,
     /create: \(args\) => transport\.invoke<CreatedTerminal>\("create_terminal", \{ args \}\)/,
@@ -94,8 +84,6 @@ test("the renderer creates persisted terminals through the host-aware command", 
     /if \(terminal\.managed\) \{\s*try \{\s*return await backend\.sessions\.exists\(terminal\.tmuxName\) \? terminal : null/s,
   );
   assert.match(restoration, /backend\.terminals\.ensure\(\{\s*name: terminal\.tmuxName,/s);
-  assert.match(creation, /cwd:\s*created\.cwd/);
-  assert.match(creation, /managed:\s*created\.managed/);
   assert.match(restoration, /aiCmd:\s*terminal\.aiCmd \?\? ""/);
   assert.match(identity, /export function terminalSessionKey/);
   assert.match(

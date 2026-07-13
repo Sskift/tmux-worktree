@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import { Plus, X } from "lucide-react";
-import { useDashboardBackend } from "./platform";
+import { type CreatedTerminal, useDashboardBackend } from "./platform";
 import { useConnectionCatalog, useConnectionCatalogOwnerPhase, useConnectionCatalogSyncPhase } from "./dashboard/hooks/useConnectionCatalog";
 import {
   useWorkspaceCatalog,
@@ -31,8 +31,13 @@ import {
 import {
   useTerminalMetadata,
   useTerminalMetadataHydrationPhase,
+  useTerminalMetadataOwnerPhase,
   useTerminalMetadataPersistencePhase,
 } from "./dashboard/hooks/useTerminalMetadata";
+import {
+  useWorkspaceActions,
+  useWorkspaceActionsOwnerPhase,
+} from "./dashboard/hooks/useWorkspaceActions";
 import {
   useWorkspaceBranchPhase,
   useWorkspaceHomePhase,
@@ -104,7 +109,6 @@ import { ThemePicker } from "./ThemePicker";
 import { AutomationPanel } from "./AutomationPanel";
 import { editingFileSourceKey } from "./editorNavigationGuard";
 import {
-  allocateTerminalId,
   renamePersistedTerminal,
 } from "./terminalPersistence";
 import { applyTheme, loadTheme, type ThemeId } from "./themes";
@@ -117,7 +121,6 @@ import {
 } from "./automationTypes";
 import {
   sessionDisplayName,
-  terminalSessionKey,
 } from "./dashboard/model/terminalIdentity";
 import { deriveWorkspacePresentation } from "./dashboard/model/workspacePresentation";
 import { projectKey } from "./dashboard/model/workspaceSelectors";
@@ -129,7 +132,6 @@ const HIDDEN_REFRESH_MS = 10_000;
 
 type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
-
 let scratchIdCounter = 0;
 
 function App() {
@@ -166,13 +168,30 @@ function App() {
     inspectorOpenPreferenceRef,
     dashboardWorkspaceRef,
   } = dashboardLayout;
-  const terminalMetadata = useTerminalMetadata();
+  const terminalMetadata = useTerminalMetadata(dashboardBackend);
   const {
     terminals,
     setTerminals,
     terminalPersistenceError,
     terminalPersistenceHydrationGeneration,
+    ownerPhase: terminalMetadataOwnerPhase,
   } = terminalMetadata;
+  useTerminalMetadataOwnerPhase(terminalMetadataOwnerPhase, dashboardBackend);
+  const workspaceActions = useWorkspaceActions(dashboardBackend);
+  const {
+    ownerEpochKey: workspaceActionOwnerEpochKey,
+    recentPath: lastAutomationContextPath,
+    recentProject: lastAutomationContextProject,
+    rememberAutomationContext,
+    resolveAutomationRoot,
+    createWorktree,
+    restoreWorktree,
+    deleteWorktree,
+    createTerminal,
+    closeSession,
+    closeTerminal,
+    ownerPhase: workspaceActionOwnerPhase,
+  } = workspaceActions;
   const automationWorkspace = useAutomationWorkspace(dashboardBackend);
   const {
     automations,
@@ -224,8 +243,6 @@ function App() {
     workspacePresentationController.ownerPhase,
     dashboardBackend,
   );
-  const [lastAutomationContextPath, setLastAutomationContextPath] = useState<string | null>(null);
-  const [lastAutomationContextProject, setLastAutomationContextProject] = useState<string | null>(null);
   const [showNewWorktree, setShowNewWorktree] = useState(false);
   const [showNewTerminal, setShowNewTerminal] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -516,48 +533,52 @@ function App() {
 
   useEffect(() => {
     if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd && !selectedGitHostId) {
-      setLastAutomationContextPath(selectedCwd);
-      setLastAutomationContextProject(
+      rememberAutomationContext(
+        selectedCwd,
         selection.kind === "session" ? projectPresetForSession(selection.name) : null,
       );
     }
-  }, [projectPresetForSession, selection, selectedCwd, selectedGitHostId]);
+  }, [
+    projectPresetForSession,
+    rememberAutomationContext,
+    selection,
+    selectedCwd,
+    selectedGitHostId,
+  ]);
 
   const handleNewAutomation = useCallback(() => requestEditorNavigation(() => {
     if (selection?.kind === "session" || selection?.kind === "terminal") {
       automationReturnSelectionRef.current = selection;
     }
     if ((selection?.kind === "session" || selection?.kind === "terminal") && selectedCwd && !selectedGitHostId) {
-      setLastAutomationContextPath(selectedCwd);
-      setLastAutomationContextProject(
+      rememberAutomationContext(
+        selectedCwd,
         selection.kind === "session" ? projectPresetForSession(selection.name) : null,
       );
     } else if (
       selection?.kind === "session" &&
       !selectionMetadataPending &&
-      !selectedSessionIsRemote
+      !selectedSessionIsRemote &&
+      selectedSession
     ) {
-      const name = selection.name;
-      void dashboardBackend.sessions.root(name)
-        .then((cwd) => {
-          if (cwd) {
-            setLastAutomationContextPath(cwd);
-            setLastAutomationContextProject(projectPresetForSession(name));
-          }
-        })
-        .catch(() => {});
+      void resolveAutomationRoot(
+        selectedSession,
+        projectPresetForSession(selection.name),
+      );
     }
     setEditingFile(null);
     setDiffFile(null);
     setInspectorOpen(false);
     setSelection({ kind: "automation", id: "" });
   }), [
-    dashboardBackend,
     projectPresetForSession,
+    rememberAutomationContext,
     requestEditorNavigation,
+    resolveAutomationRoot,
     selection,
     selectedCwd,
     selectedGitHostId,
+    selectedSession,
     selectedSessionIsRemote,
     selectionMetadataPending,
   ]);
@@ -835,79 +856,78 @@ function App() {
     setEditingFile(null);
     setDiffFile(null);
   }), [allTerminals, requestEditorNavigation, sessions]);
-
-  const closeSession = useCallback(async (name: string) => {
-    try {
-      const session = sessions.find((candidate) => candidate.name === name);
-      const confirmed = await dashboardBackend.dialog.confirm({
-        title: "Close worktree session?",
-        message:
-          `This will stop the tmux session for ${session ? sessionDisplayName(session) : name}. ` +
-          "The worktree and its files will not be deleted.",
-      });
-      if (!confirmed) return;
-      await dashboardBackend.sessions.kill(name, session?.managed ?? false);
-      removeSession(name);
-      setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
-      setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
-      setPinnedItems((current) => current.filter((item) => item.kind !== "session" || item.name !== name));
-      setSelection((current) => {
-        if (current?.kind !== "session" || current.name !== name) return current;
-        const remainingSession = sessions.find((session) => session.name !== name);
-        if (remainingSession) return { kind: "session", name: remainingSession.name };
-        const remainingTerminal = allTerminals[0];
-        return remainingTerminal ? { kind: "terminal", id: remainingTerminal.id } : null;
-      });
-    } catch (nextError) {
-      reportError(nextError);
-    }
-  }, [
-    allTerminals,
-    dashboardBackend,
-    removeSession,
-    reportError,
-    sessions,
-    setOpenedSessions,
-  ]);
-
-  const closeTerminal = useCallback(async (id: string) => {
+  const closeNewWorktree = useCallback(() => setShowNewWorktree(false), []);
+  const closeNewTerminal = useCallback(() => setShowNewTerminal(false), []);
+  const publishPendingSession = useCallback((name: string) => {
+    setPendingCatalogSelection(pendingCreatedCatalogSelection(
+      { kind: "session", name },
+      getLatestStartedRefreshGeneration(),
+    ));
+  }, [getLatestStartedRefreshGeneration]);
+  const publishCreatedTerminal = useCallback((
+    draft: TerminalDraft,
+    created: CreatedTerminal,
+  ): string => {
+    return terminalMetadata.upsertCreatedTerminal(draft, created, allTerminals);
+  }, [allTerminals, terminalMetadata.upsertCreatedTerminal]);
+  const publishClosedSession = useCallback((name: string) => {
+    removeSession(name);
+    setOpenedSessions((current) => current.filter((sessionName) => sessionName !== name));
+    setSessionOrder((current) => current.filter((sessionName) => sessionName !== name));
+    setPinnedItems((current) => current.filter(
+      (item) => item.kind !== "session" || item.name !== name,
+    ));
+    setSelection((current) => {
+      if (current?.kind !== "session" || current.name !== name) return current;
+      const remainingSession = sessions.find((session) => session.name !== name);
+      if (remainingSession) return { kind: "session", name: remainingSession.name };
+      const remainingTerminal = allTerminals[0];
+      return remainingTerminal ? { kind: "terminal", id: remainingTerminal.id } : null;
+    });
+  }, [allTerminals, removeSession, sessions, setOpenedSessions]);
+  const publishClosedTerminal = useCallback((id: string) => {
     const terminal = allTerminals.find((candidate) => candidate.id === id);
     if (!terminal) return;
-    const sessionKey = terminalSessionKey(terminal);
-    try {
-      const confirmed = await dashboardBackend.dialog.confirm({
-        title: "Close terminal?",
-        message: `This will stop the tmux session for ${terminal.label}.`,
-      });
-      if (!confirmed) return;
-      if (terminal.discovered) {
-        await dashboardBackend.sessions.kill(sessionKey, terminal.managed ?? false);
-        removeDiscoveredTerminal(id);
-      } else {
-        await dashboardBackend.terminals.kill(sessionKey, terminal.managed ?? false);
-        setTerminals((current) => current.filter((candidate) => candidate.id !== id));
-      }
-      setOpenedTerminals((current) => current.filter((terminalId) => terminalId !== id));
-      setPinnedItems((current) => current.filter((item) => item.kind !== "terminal" || item.id !== id));
-      setSelection((current) => {
-        if (current?.kind !== "terminal" || current.id !== id) return current;
-        const remainingTerminal = allTerminals.find((candidate) => candidate.id !== id);
-        if (remainingTerminal) return { kind: "terminal", id: remainingTerminal.id };
-        const remainingSession = sessions[0];
-        return remainingSession ? { kind: "session", name: remainingSession.name } : null;
-      });
-    } catch (nextError) {
-      reportError(nextError);
+    if (terminal.discovered) {
+      removeDiscoveredTerminal(id);
+    } else {
+      setTerminals((current) => current.filter((candidate) => candidate.id !== id));
     }
+    setOpenedTerminals((current) => current.filter((terminalId) => terminalId !== id));
+    setPinnedItems((current) => current.filter(
+      (item) => item.kind !== "terminal" || item.id !== id,
+    ));
+    setSelection((current) => {
+      if (current?.kind !== "terminal" || current.id !== id) return current;
+      const remainingTerminal = allTerminals.find((candidate) => candidate.id !== id);
+      if (remainingTerminal) return { kind: "terminal", id: remainingTerminal.id };
+      const remainingSession = sessions[0];
+      return remainingSession ? { kind: "session", name: remainingSession.name } : null;
+    });
   }, [
     allTerminals,
-    dashboardBackend,
     removeDiscoveredTerminal,
-    reportError,
     sessions,
     setOpenedTerminals,
+    setTerminals,
   ]);
-
+  useWorkspaceActionsOwnerPhase(workspaceActionOwnerPhase, {
+    backend: dashboardBackend,
+    sessions,
+    terminals: allTerminals,
+    closeNewWorktree,
+    closeNewTerminal,
+    selectSession,
+    selectTerminal,
+    publishPendingSession,
+    publishCreatedTerminal,
+    publishClosedSession,
+    publishClosedTerminal,
+    reconcilePersistedTerminal: terminalMetadata.reconcilePersistedTerminal,
+    refreshWorkspace: refresh,
+    refreshProjects: loadProjectPresets,
+    reportError,
+  });
   const renameTerminal = useCallback((id: string, label: string) => {
     setTerminals((current) => (
       renamePersistedTerminal(current, allTerminals, id, label)
@@ -1439,55 +1459,22 @@ function App() {
 
       {showNewWorktree && (
         <NewWorktreeModal
-          key={`worktree:${connectionCatalogOwnerEpochKey}`}
+          key={`worktree:${workspaceActionOwnerEpochKey}:${workspaceActions.orphanRevision}`}
           hosts={hosts}
-          onClose={() => setShowNewWorktree(false)}
-          onCreated={(sessionName) => {
-            setShowNewWorktree(false);
-            void selectSession(sessionName).then((navigated) => {
-              if (!navigated) return;
-              setPendingCatalogSelection(
-                pendingCreatedCatalogSelection(
-                  { kind: "session", name: sessionName },
-                  getLatestStartedRefreshGeneration(),
-                ),
-              );
-              void loadProjectPresets();
-              void refresh();
-            });
-          }}
+          onClose={closeNewWorktree}
+          onCreateWorktree={createWorktree}
+          onRestoreWorktree={restoreWorktree}
+          onDeleteWorktree={deleteWorktree}
         />
       )}
 
       {showNewTerminal && (
         <NewTerminalModal
-          key={`terminal:${connectionCatalogOwnerEpochKey}`}
+          key={`terminal:${workspaceActionOwnerEpochKey}`}
           hosts={hosts}
           existingLabels={allTerminals.map((terminal) => terminal.label)}
-          onClose={() => setShowNewTerminal(false)}
-          onCreated={async (draft: TerminalDraft) => {
-            const created = await dashboardBackend.terminals.create({
-              cwd: draft.cwd,
-              aiCmd: draft.aiCmd,
-              hostId: draft.hostId ?? null,
-            });
-            const id = allocateTerminalId(allTerminals);
-            setTerminals((current) => [
-              ...current,
-              {
-                id,
-                label: draft.label,
-                cwd: created.cwd,
-                tmuxName: created.tmuxName,
-                hostId: created.hostId ?? draft.hostId ?? null,
-                rawName: created.rawName,
-                aiCmd: draft.aiCmd,
-                managed: created.managed,
-              },
-            ]);
-            setShowNewTerminal(false);
-            await selectTerminal(id);
-          }}
+          onClose={closeNewTerminal}
+          onCreated={createTerminal}
         />
       )}
     </>

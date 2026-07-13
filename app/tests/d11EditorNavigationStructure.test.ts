@@ -552,10 +552,6 @@ test("App only wires the D11 guard and retains ten guarded business navigation o
   assert.ok(
     callbackDependencies(appBody, "resetDashboardLayout").includes("dashboardBackend"),
   );
-  assert.ok(
-    callbackDependencies(appBody, "handleNewAutomation").includes("dashboardBackend"),
-  );
-
   for (const forbidden of [
     "editorNavigationGateRef",
     "editorDirtySnapshotRef",

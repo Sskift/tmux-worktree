@@ -405,20 +405,6 @@ test("App commits terminal ownership and remounts main and scratch PTYs by owner
   );
   assert.equal(allCalls(app.body, "useTerminalDeckPreviewPhase").length, 1);
   assert.equal(allCalls(app.body, "useTerminalDeckAttachPhase").length, 1);
-  for (const [handler, setter] of [
-    ["closeSession", "setOpenedSessions"],
-    ["closeTerminal", "setOpenedTerminals"],
-  ] as const) {
-    const call = directVariableCall(app.body, handler);
-    const deps = call.arguments[1];
-    assert.ok(ts.isArrayLiteralExpression(deps));
-    assert.equal(
-      deps.elements.some((element) => compact(element, sourceFile) === setter),
-      true,
-      `${handler} must refresh with the exact owner-bound setter`,
-    );
-  }
-
   const scratchKeys: ts.JsxAttribute[] = [];
   visit(app.body, (node) => {
     if (

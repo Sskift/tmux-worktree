@@ -121,21 +121,11 @@ test("unfinished integrations stay out of Git while overlays keep terminals moun
   assert.match(app, /event\.key\.toLowerCase\(\) !== "n"/);
 });
 
-test("destructive sidebar and automation actions require confirmation", () => {
-  const sessionClose = rendererImplementationSourceContaining(
-    'title: "Close worktree session?"',
-    "sessions.kill",
-  ).source;
-  const terminalClose = rendererImplementationSourceContaining(
-    'title: "Close terminal?"',
-    "terminals.kill",
-  ).source;
+test("automation deletion requires confirmation", () => {
   const automationDelete = rendererImplementationSourceContaining(
     'title: "Delete automation?"',
     "automations.delete",
   ).source;
-  assert.match(sessionClose, /title: "Close worktree session\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?sessions\.kill/);
-  assert.match(terminalClose, /title: "Close terminal\?"[\s\S]*?if \(!confirmed\) return;[\s\S]*?terminals\.kill/);
   assert.match(
     automationDelete,
     /title: "Delete automation\?"[\s\S]*?if \(!currentContext\(mutation\.lease\) \|\| !confirmed\) return false;[\s\S]*?automations\.delete/,

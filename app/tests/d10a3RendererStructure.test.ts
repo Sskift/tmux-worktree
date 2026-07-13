@@ -30,6 +30,10 @@ const sources = {
     new URL("../src/dashboard/hooks/useTerminalMetadata.ts", import.meta.url),
     "utf8",
   ),
+  actions: readFileSync(
+    new URL("../src/dashboard/hooks/useWorkspaceActions.ts", import.meta.url),
+    "utf8",
+  ),
   automation: readFileSync(
     new URL("../src/dashboard/hooks/useAutomationWorkspace.ts", import.meta.url),
     "utf8",
@@ -1289,6 +1293,11 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardLayoutState", effectContribution(sources.layout, "useDashboardLayoutState")],
     ["useTerminalMetadata", effectContribution(sources.metadata, "useTerminalMetadata")],
     [
+      "useTerminalMetadataOwnerPhase",
+      effectContribution(sources.metadata, "useTerminalMetadataOwnerPhase"),
+    ],
+    ["useWorkspaceActions", effectContribution(sources.actions, "useWorkspaceActions")],
+    [
       "useAutomationWorkspace",
       effectContribution(sources.automation, "useAutomationWorkspace"),
     ],
@@ -1376,6 +1385,8 @@ function frozenEffectContributions(): Map<string, number> {
     ["useDashboardBackend", 0],
     ["useDashboardLayoutState", 0],
     ["useTerminalMetadata", 0],
+    ["useTerminalMetadataOwnerPhase", 0],
+    ["useWorkspaceActions", 0],
     ["useAutomationWorkspace", 0],
     ["useConnectionCatalog", 0],
     ["useConnectionCatalogOwnerPhase", 0],
@@ -1414,6 +1425,8 @@ function assertAppEffectTimeline(appFile: ts.SourceFile): void {
     "useDashboardBackend",
     "useDashboardLayoutState",
     "useTerminalMetadata",
+    "useTerminalMetadataOwnerPhase",
+    "useWorkspaceActions",
     "useAutomationWorkspace",
     "useConnectionCatalog",
     "useConnectionCatalogOwnerPhase",

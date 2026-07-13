@@ -6,24 +6,20 @@ import {
   useState,
 } from "react";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
+import type { WorkspaceTerminalDraft } from "./dashboard/actions/workspaceActionCoordinator";
 import { keepFocusInside } from "./dashboard/Settings/focusTrap";
 import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
 import { type HostConfig, useDashboardBackend } from "./platform";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
 
-export type TerminalDraft = {
-  label: string;
-  cwd: string;
-  aiCmd: string;
-  hostId?: string | null;
-};
+export type TerminalDraft = WorkspaceTerminalDraft;
 
 type Props = {
   hosts: HostConfig[];
   existingLabels?: string[];
   onClose: () => void;
-  onCreated: (draft: TerminalDraft) => Promise<void> | void;
+  onCreated: (draft: TerminalDraft) => Promise<boolean> | boolean;
 };
 
 const LOCAL_HOST = "__local__";
@@ -148,12 +144,16 @@ export function NewTerminalModal({ hosts, existingLabels = [], onClose, onCreate
     setBusy(true);
     setError(null);
     try {
-      await onCreated({
+      const accepted = await onCreated({
         label: l,
         cwd: p,
         aiCmd: ai,
         hostId: isRemote ? selectedHost : null,
       });
+      if (!accepted) {
+        setBusy(false);
+        return;
+      }
       saveLastAiCmd(ai);
     } catch (err) {
       setError(String(err));

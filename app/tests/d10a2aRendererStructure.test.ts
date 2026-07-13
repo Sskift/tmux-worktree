@@ -177,15 +177,19 @@ test("terminal metadata state and phases own exactly the frozen effects and depe
   const state = directFunction(sourceFile, "useTerminalMetadata");
   assert.ok(state.body);
   assert.equal(directCalls(state.body, "useEffect").length, 0);
-  assert.equal(callsWithPath(state.body, "useState").length, 5);
-  assert.equal(callsWithPath(state.body, "useRef").length, 1);
+  assert.equal(callsWithPath(state.body, "useState").length, 3);
+  assert.equal(callsWithPath(state.body, "useRef").length, 0);
 
   const hydrationEffects = directEffects(
     sourceFile,
     "useTerminalMetadataHydrationPhase",
   );
   assert.equal(hydrationEffects.length, 1);
-  assert.deepEqual(effectDependencies(hydrationEffects[0], sourceFile), ["backend"]);
+  assert.deepEqual(effectDependencies(hydrationEffects[0], sourceFile), [
+    "backend",
+    "registration",
+    "setState",
+  ]);
   assert.equal(callsWithPath(hydrationEffects[0], "backend.terminals.load").length, 1);
   assert.equal(callsWithPath(
     hydrationEffects[0],
@@ -203,10 +207,14 @@ test("terminal metadata state and phases own exactly the frozen effects and depe
   assert.equal(persistenceEffects.length, 2);
   assert.deepEqual(effectDependencies(persistenceEffects[0], sourceFile), [
     "backend",
+    "registration",
+    "setState",
     "terminalPersistenceWritable",
     "terminalsRestoreReady",
   ]);
   assert.deepEqual(effectDependencies(persistenceEffects[1], sourceFile), [
+    "backend",
+    "registration",
     "terminalPersistenceWritable",
     "terminals",
     "terminalsRestoreReady",
@@ -283,6 +291,7 @@ test("terminal metadata implementation has one production owner and React-free r
   assertExactExportManifest(metadataFile, [
     "useTerminalMetadata",
     "useTerminalMetadataHydrationPhase",
+    "useTerminalMetadataOwnerPhase",
     "useTerminalMetadataPersistencePhase",
   ]);
   assertExactExportManifest(persistenceFile, [
@@ -297,6 +306,7 @@ test("terminal metadata implementation has one production owner and React-free r
   const expectedOwners = new Map([
     ["useTerminalMetadata", "dashboard/hooks/useTerminalMetadata.ts"],
     ["useTerminalMetadataHydrationPhase", "dashboard/hooks/useTerminalMetadata.ts"],
+    ["useTerminalMetadataOwnerPhase", "dashboard/hooks/useTerminalMetadata.ts"],
     ["useTerminalMetadataPersistencePhase", "dashboard/hooks/useTerminalMetadata.ts"],
     ["restorePersistedTerminalMetadata", "terminalPersistence.ts"],
     ["mergeRestoredTerminalMetadata", "terminalPersistence.ts"],

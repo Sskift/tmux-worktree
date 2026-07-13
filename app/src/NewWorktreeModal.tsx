@@ -8,6 +8,9 @@ import {
 } from "react";
 import { X } from "lucide-react";
 import { loadLastAiCmd, saveLastAiCmd } from "./appPrefs";
+import type {
+  WorkspaceCreateWorktreeRequest,
+} from "./dashboard/actions/workspaceActionCoordinator";
 import { keepFocusInside } from "./dashboard/Settings/focusTrap";
 import { createLatestRequestGate, requestSourceKey } from "./latestRequestGate";
 import { MenuSelect, type MenuOption } from "./MenuSelect";
@@ -23,7 +26,13 @@ import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
 type Props = {
   hosts: HostConfig[];
   onClose: () => void;
-  onCreated: (sessionName: string) => void;
+  onCreateWorktree(request: WorkspaceCreateWorktreeRequest): Promise<boolean>;
+  onRestoreWorktree(args: {
+    path: string;
+    name: string;
+    aiCmd: string;
+  }): Promise<boolean>;
+  onDeleteWorktree(orphan: Orphan): Promise<boolean>;
 };
 
 const CUSTOM = "__custom__";
@@ -41,7 +50,13 @@ export function shouldApplyWorktreeCatalogDefault(
   return draftState.source === source && !draftState.dirty;
 }
 
-export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
+export function NewWorktreeModal({
+  hosts,
+  onClose,
+  onCreateWorktree,
+  onRestoreWorktree,
+  onDeleteWorktree,
+}: Props) {
   const dashboardBackend = useDashboardBackend();
   const dialogRef = useRef<HTMLFormElement>(null);
   const initialFocusRef = useRef<HTMLInputElement>(null);
@@ -205,13 +220,16 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const sessionName = await dashboardBackend.worktrees.restore({
+      const accepted = await onRestoreWorktree({
         path: orphan.path,
         name: orphan.name,
         aiCmd: aiCmd.trim() || "",
       });
+      if (!accepted) {
+        setBusy(false);
+        return;
+      }
       saveLastAiCmd(aiCmd);
-      onCreated(sessionName);
     } catch (err) {
       setError(String(err));
       setBusy(false);
@@ -219,17 +237,13 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
   };
 
   const deleteOrphan = async (orphan: Orphan) => {
-    const confirmed = await dashboardBackend.dialog.confirm({
-      title: "Delete worktree",
-      message: `Delete worktree "${orphan.name}"? This will discard any uncommitted changes.`,
-    });
-    if (!confirmed) return;
-
     setBusy(true);
     setError(null);
     try {
-      await dashboardBackend.worktrees.delete({ path: orphan.path, force: true });
-      setOrphans((prev) => prev.filter((item) => item.path !== orphan.path));
+      const accepted = await onDeleteWorktree(orphan);
+      if (accepted) {
+        setOrphans((prev) => prev.filter((item) => item.path !== orphan.path));
+      }
     } catch (err) {
       setError(String(err));
     } finally {
@@ -247,6 +261,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         aiCmd: aiCmd.trim(),
         name: name.trim() || null,
       };
+      let preset: WorkspaceCreateWorktreeRequest["preset"];
 
       if (isRemote) {
         createArgs.hostId = selectedHost;
@@ -263,7 +278,7 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         if (savePreset) {
           const presetName = customName.trim();
           if (!presetName) throw new Error("preset name required");
-          await dashboardBackend.projects.add({ name: presetName, path });
+          preset = { name: presetName, path };
           createArgs.project = presetName;
         } else {
           createArgs.path = path;
@@ -275,9 +290,15 @@ export function NewWorktreeModal({ hosts, onClose, onCreated }: Props) {
         createArgs.branch = branch.trim();
       }
 
-      const sessionName = await dashboardBackend.worktrees.create(createArgs);
+      const accepted = await onCreateWorktree({
+        args: createArgs,
+        ...(preset ? { preset } : {}),
+      });
+      if (!accepted) {
+        setBusy(false);
+        return;
+      }
       saveLastAiCmd(aiCmd);
-      onCreated(sessionName);
     } catch (err) {
       setError(String(err));
       setBusy(false);

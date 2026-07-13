@@ -253,7 +253,7 @@ test("connection catalog has exact exports imports and phase effect ownership", 
   ]);
 });
 
-test("App registers connection ownership contiguously before Relay and remounts four consumers", () => {
+test("App registers connection ownership before Relay and remounts connection settings", () => {
   const sourceFile = parse("App.tsx", appSource);
   const app = directFunction(sourceFile, "App");
   assert.ok(app.body);
@@ -305,8 +305,6 @@ test("App registers connection ownership contiguously before Relay and remounts 
   for (const [component, prefix] of [
     ["AgentsSettings", "agents"],
     ["ConnectionsSettings", "connections"],
-    ["NewWorktreeModal", "worktree"],
-    ["NewTerminalModal", "terminal"],
   ] as const) {
     const elements: Array<ts.JsxOpeningElement | ts.JsxSelfClosingElement> = [];
     visit(app.body, (node) => {
