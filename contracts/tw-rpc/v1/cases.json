@@ -5,7 +5,7 @@
       "command": "capabilities",
       "argv": ["rpc", "capabilities"],
       "exitCode": 0,
-      "stdout": "{\"protocolVersion\":1,\"app\":\"tmux-worktree\",\"capabilities\":[\"list\",\"managed-state\",\"create-worktree\",\"create-terminal\",\"restore-worktree\",\"kill-session\"]}\n",
+      "stdout": "{\"protocolVersion\":1,\"app\":\"tmux-worktree\",\"capabilities\":[\"list\",\"managed-state\",\"hard-timeout\",\"create-worktree\",\"create-terminal\",\"restore-worktree\",\"kill-session\"]}\n",
       "stderr": "",
       "normalized": {
         "protocolVersion": 1,
@@ -13,6 +13,7 @@
         "capabilities": [
           "list",
           "managed-state",
+          "hard-timeout",
           "create-worktree",
           "create-terminal",
           "restore-worktree",

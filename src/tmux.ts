@@ -1,4 +1,4 @@
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync, type StdioOptions } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename } from "node:path";
 import { loadConfigFile } from "./config";
@@ -6,10 +6,316 @@ import { loadConfigFile } from "./config";
 // ============================================
 // tmux.ts — 安全执行 git / tmux 的底层模块
 //
-// 所有外部命令都用 execFileSync(bin, [args]) 直接调用，不经过 shell，
+// 所有外部命令都用 spawn(bin, [args]) 直接调用，不经过 shell，
 // 因此路径 / 分支名 / session 名即便含空格或 shell 元字符也不会被解析或注入。
 // 这里同时集中 session / worktree 的列举与删除原语，供各命令复用。
 // ============================================
+
+const COMMAND_TERMINATION_GRACE_MS = 100;
+const COMMAND_KILL_SETTLE_MS = 250;
+const COMMAND_MAX_OUTPUT_BYTES = 1 * 1024 * 1024;
+const COMMAND_HELPER_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
+
+type CommandMode = "query" | "run" | "exec";
+
+type CommandHelperStatus = {
+  kind: "exit" | "timeout" | "descendants" | "output" | "spawn" | "signal" | "unkillable";
+  code?: number | null;
+  signal?: string | null;
+  message?: string;
+};
+
+type SyncCommandResult = {
+  status?: CommandHelperStatus;
+  stdout: string;
+  stderr: string;
+  helperError?: Error;
+};
+
+/**
+ * `spawnSync`/`execFileSync` timeouts only send one signal and can block forever
+ * when a command ignores it. Run the real command under a tiny asynchronous
+ * supervisor instead: the public API remains synchronous, while the supervisor
+ * can escalate TERM to KILL and wait for the command process group to disappear.
+ *
+ * fd 3 is a private status channel, keeping command stdout/stderr byte-for-byte
+ * compatible with the old wrappers. The supervisor stays in its caller's
+ * process group and forwards shutdown signals to the detached command group, so
+ * an outer relay-host group shutdown cannot orphan the supervised command.
+ */
+const SYNC_COMMAND_HELPER = `
+"use strict";
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+
+const spec = JSON.parse(process.argv[1]);
+const detached = process.platform !== "win32";
+let child;
+let pid;
+let childClosed = false;
+let targetCode = null;
+let targetSignal = null;
+let failure = null;
+let settled = false;
+let timeoutTimer;
+let forceTimer;
+let hardTimer;
+let pollTimer;
+let pendingSignal = null;
+const stdoutChunks = [];
+const stderrChunks = [];
+let stdoutBytes = 0;
+let stderrBytes = 0;
+
+function groupExists() {
+  if (!detached || !pid) return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function signalCommand(signal) {
+  if (detached && pid) {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (_) {}
+  }
+  try {
+    if (child) child.kill(signal);
+  } catch (_) {}
+}
+
+function cleanup() {
+  if (timeoutTimer) clearTimeout(timeoutTimer);
+  if (forceTimer) clearTimeout(forceTimer);
+  if (hardTimer) clearTimeout(hardTimer);
+  if (pollTimer) clearTimeout(pollTimer);
+}
+
+function writeFd(fd, value) {
+  if (!value || value.length === 0) return;
+  try {
+    fs.writeSync(fd, value);
+  } catch (_) {}
+}
+
+function finish(force) {
+  if (settled) return;
+  if (!force && !childClosed) return;
+  if (!force && groupExists()) {
+    if (!pollTimer) {
+      pollTimer = setTimeout(() => {
+        pollTimer = undefined;
+        finish(false);
+      }, 10);
+    }
+    return;
+  }
+  settled = true;
+  cleanup();
+  if (spec.mode !== "exec") {
+    writeFd(1, Buffer.concat(stdoutChunks, stdoutBytes));
+    if (spec.mode === "run") writeFd(2, Buffer.concat(stderrChunks, stderrBytes));
+  }
+  let status = failure || {
+    kind: "exit",
+    code: targetCode,
+    signal: targetSignal,
+  };
+  if (force && groupExists()) {
+    status = {
+      kind: "unkillable",
+      code: targetCode,
+      signal: targetSignal,
+      message: "command process group survived SIGKILL",
+    };
+  }
+  writeFd(3, Buffer.from(JSON.stringify(status), "utf8"));
+  const success = status.kind === "exit" && status.code === 0 && !status.signal;
+  process.exit(success ? 0 : 1);
+}
+
+function beginTermination(status) {
+  if (settled || failure) return;
+  failure = status;
+  signalCommand("SIGTERM");
+  forceTimer = setTimeout(() => {
+    signalCommand("SIGKILL");
+    hardTimer = setTimeout(() => {
+      signalCommand("SIGKILL");
+      try { if (child && child.stdout) child.stdout.destroy(); } catch (_) {}
+      try { if (child && child.stderr) child.stderr.destroy(); } catch (_) {}
+      finish(true);
+    }, spec.killSettleMs);
+    finish(false);
+  }, spec.graceMs);
+}
+
+function onSupervisorSignal(signal) {
+  pendingSignal = signal;
+  if (child) {
+    beginTermination({
+      kind: "signal",
+      signal,
+      message: "command supervisor received " + signal,
+    });
+  }
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(signal, () => onSupervisorSignal(signal));
+}
+
+if (pendingSignal) {
+  failure = { kind: "signal", signal: pendingSignal };
+  childClosed = true;
+  finish(false);
+}
+
+const stdio = spec.mode === "exec"
+  ? "inherit"
+  : spec.mode === "query"
+    ? ["ignore", "pipe", "ignore"]
+    : ["ignore", "pipe", "pipe"];
+
+try {
+  child = spawn(spec.file, spec.args, { detached, stdio });
+  pid = child.pid;
+} catch (error) {
+  failure = {
+    kind: "spawn",
+    message: error instanceof Error ? error.message : String(error),
+  };
+  childClosed = true;
+  finish(false);
+}
+
+function collect(stream, output) {
+  if (!stream) return;
+  stream.on("data", (raw) => {
+    const chunk = Buffer.isBuffer(raw) ? raw : Buffer.from(raw);
+    const current = output === "stdout" ? stdoutBytes : stderrBytes;
+    if (current + chunk.byteLength > spec.maxOutputBytes) {
+      beginTermination({
+        kind: "output",
+        message: "command " + output + " exceeded " + spec.maxOutputBytes + " bytes",
+      });
+      return;
+    }
+    if (output === "stdout") {
+      stdoutBytes += chunk.byteLength;
+      stdoutChunks.push(Buffer.from(chunk));
+    } else {
+      stderrBytes += chunk.byteLength;
+      stderrChunks.push(Buffer.from(chunk));
+    }
+  });
+}
+
+if (child) {
+  collect(child.stdout, "stdout");
+  collect(child.stderr, "stderr");
+  child.once("error", (error) => {
+    if (!failure) {
+      failure = {
+        kind: "spawn",
+        message: error instanceof Error ? error.message : String(error),
+      };
+    }
+  });
+  child.once("exit", (code, signal) => {
+    targetCode = code;
+    targetSignal = signal;
+    if (!failure && groupExists()) {
+      beginTermination({
+        kind: "descendants",
+        code,
+        signal,
+        message: "command left descendant processes after exit",
+      });
+    }
+  });
+  child.once("close", (code, signal) => {
+    childClosed = true;
+    if (targetCode === null && code !== null) targetCode = code;
+    if (targetSignal === null && signal !== null) targetSignal = signal;
+    finish(false);
+  });
+  if (spec.timeout > 0) {
+    timeoutTimer = setTimeout(() => {
+      beginTermination({
+        kind: "timeout",
+        message: "command timed out after " + spec.timeout + "ms",
+      });
+    }, spec.timeout);
+  }
+  if (pendingSignal) onSupervisorSignal(pendingSignal);
+}
+`;
+
+function runSyncCommand(
+  file: string,
+  args: string[],
+  timeout: number,
+  mode: CommandMode,
+): SyncCommandResult {
+  const spec = JSON.stringify({
+    file,
+    args,
+    timeout,
+    mode,
+    graceMs: COMMAND_TERMINATION_GRACE_MS,
+    killSettleMs: COMMAND_KILL_SETTLE_MS,
+    maxOutputBytes: COMMAND_MAX_OUTPUT_BYTES,
+  });
+  const stdio: StdioOptions = mode === "exec"
+    ? ["inherit", "inherit", "inherit", "pipe"]
+    : mode === "query"
+      ? ["ignore", "pipe", "ignore", "pipe"]
+      : ["ignore", "pipe", "pipe", "pipe"];
+  const result = spawnSync(process.execPath, ["-e", SYNC_COMMAND_HELPER, spec], {
+    encoding: "utf-8",
+    maxBuffer: COMMAND_HELPER_MAX_BUFFER_BYTES,
+    stdio,
+  });
+  const rawStatus = result.output?.[3];
+  let status: CommandHelperStatus | undefined;
+  if (typeof rawStatus === "string" && rawStatus) {
+    try {
+      status = JSON.parse(rawStatus) as CommandHelperStatus;
+    } catch {}
+  }
+  return {
+    status,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    ...(result.error ? { helperError: result.error } : {}),
+  };
+}
+
+function commandSucceeded(result: SyncCommandResult): boolean {
+  return !result.helperError
+    && result.status?.kind === "exit"
+    && result.status.code === 0
+    && !result.status.signal;
+}
+
+function commandFailureDetail(result: SyncCommandResult): string {
+  if (result.helperError) return result.helperError.message;
+  const status = result.status;
+  if (!status) return "command supervisor exited without status";
+  const stderr = result.stderr.trim();
+  const detail = status.message || (
+    status.signal
+      ? `command exited on ${status.signal}`
+      : `command exited with status ${String(status.code)}`
+  );
+  return stderr ? `${detail}: ${stderr}` : detail;
+}
 
 // 内部 session 前缀：dashboard 的临时终端与移动端，CLI 命令族应忽略
 const INTERNAL_SESSION_PREFIXES = ["tw-term-", "tw-mobile-"];
@@ -50,11 +356,8 @@ export function tmuxBin(): string {
 /** 运行命令，返回 trim 后的 stdout；失败返回空串（用于查询，不抛错，吞掉 stderr）。 */
 export function query(bin: string, args: string[], timeout = 5000): string {
   try {
-    return execFileSync(bin, args, {
-      encoding: "utf-8",
-      timeout,
-      stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    const result = runSyncCommand(bin, args, timeout, "query");
+    return commandSucceeded(result) ? result.stdout.trim() : "";
   } catch {
     return "";
   }
@@ -63,7 +366,8 @@ export function query(bin: string, args: string[], timeout = 5000): string {
 /** 运行命令，stdio 继承到终端；失败抛 CliError（用于会改状态的操作）。 */
 export function exec(bin: string, args: string[], timeout = 30000): void {
   try {
-    execFileSync(bin, args, { stdio: "inherit", timeout });
+    const result = runSyncCommand(bin, args, timeout, "exec");
+    if (!commandSucceeded(result)) throw new Error(commandFailureDetail(result));
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new CliError(`命令失败: ${bin} ${args.join(" ")}\n  ${detail}`);
@@ -73,7 +377,9 @@ export function exec(bin: string, args: string[], timeout = 30000): void {
 /** 运行命令并捕获 stdout；失败抛 CliError。 */
 export function run(bin: string, args: string[], timeout = 30000): string {
   try {
-    return execFileSync(bin, args, { encoding: "utf-8", timeout }).trim();
+    const result = runSyncCommand(bin, args, timeout, "run");
+    if (!commandSucceeded(result)) throw new Error(commandFailureDetail(result));
+    return result.stdout.trim();
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new CliError(`命令失败: ${bin} ${args.join(" ")}\n  ${detail}`);
@@ -168,11 +474,12 @@ export function removeWorktree(repoDir: string, worktreePath: string, force = fa
 export function deleteBranch(repoDir: string, branch: string, force = false): boolean {
   if (!branch || branch === "(detached)") return false;
   try {
-    execFileSync("git", ["-C", repoDir, "branch", force ? "-D" : "-d", branch], {
-      stdio: ["ignore", "ignore", "ignore"],
-      timeout: 10000,
-    });
-    return true;
+    return commandSucceeded(runSyncCommand(
+      "git",
+      ["-C", repoDir, "branch", force ? "-D" : "-d", branch],
+      10000,
+      "query",
+    ));
   } catch {
     return false;
   }
@@ -216,8 +523,12 @@ export function listSessions(includeInternal = false): SessionEntry[] {
 /** session 是否存在（精确名匹配 `=name`，用 exit code 判定）。 */
 export function sessionExists(name: string): boolean {
   try {
-    execFileSync(tmuxBin(), ["has-session", "-t", `=${name}`], { timeout: 3000, stdio: "ignore" });
-    return true;
+    return commandSucceeded(runSyncCommand(
+      tmuxBin(),
+      ["has-session", "-t", `=${name}`],
+      3000,
+      "query",
+    ));
   } catch {
     return false;
   }

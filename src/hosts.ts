@@ -349,7 +349,11 @@ function sshControlDirectory(): string {
 
 export function sshConnectionArgs(
   host: HostConfig,
-  options: { batch?: boolean; controlMaster?: "auto" | "yes" | "no" } = {},
+  options: {
+    batch?: boolean;
+    controlMaster?: "auto" | "yes" | "no";
+    controlPersist?: number | false;
+  } = {},
 ): string[] {
   const args = [
     "-o", `BatchMode=${options.batch === false ? "no" : "yes"}`,
@@ -358,7 +362,9 @@ export function sshConnectionArgs(
     "-o", "ServerAliveInterval=15",
     "-o", "ServerAliveCountMax=3",
     "-o", `ControlMaster=${options.controlMaster ?? "auto"}`,
-    "-o", `ControlPersist=${SSH_CONTROL_PERSIST_SECONDS}`,
+    "-o", `ControlPersist=${options.controlPersist === false
+      ? "no"
+      : options.controlPersist ?? SSH_CONTROL_PERSIST_SECONDS}`,
     "-o", `ControlPath=${join(sshControlDirectory(), "%C")}`,
   ];
   if (host.port) args.push("-p", String(host.port));
@@ -370,7 +376,12 @@ export function sshConnectionArgs(
 function runSsh(
   host: HostConfig,
   extraArgs: string[],
-  options: { timeout?: number; batch?: boolean; controlMaster?: "auto" | "yes" | "no" } = {},
+  options: {
+    timeout?: number;
+    batch?: boolean;
+    controlMaster?: "auto" | "yes" | "no";
+    controlPersist?: number | false;
+  } = {},
 ): CommandResult {
   const result = spawnSync("ssh", [
     ...sshConnectionArgs(host, options),
@@ -451,7 +462,8 @@ export function probeHost(host: HostConfig): HostProbeResult {
     && capabilities.includes("list")
     && capabilities.includes("create-worktree")
     && capabilities.includes("create-terminal")
-    && capabilities.includes("kill-session");
+    && capabilities.includes("kill-session")
+    && capabilities.includes("hard-timeout");
   if (!capabilityError && !compatible && twVersion.ok) {
     capabilityError = "remote tw is missing a required RPC capability";
   }

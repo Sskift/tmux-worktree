@@ -48,9 +48,12 @@ export type RelayToHostMessage = RelayClientMessage & {
   clientId: string;
 };
 
+export const RELAY_HOST_RETIRE_CAPABILITY = "retire-drain-v1";
+
 /** Broker-originated Relay v1 control messages, kept separate from routed client messages. */
 export type RelayBrokerControlMessage =
   | { type: "host_registered"; hostId: string }
+  | { type: "host_retire" }
   | { type: "client_closed"; clientId: string }
   | { type: "error"; message: string };
 
@@ -58,7 +61,8 @@ export type RelayBrokerControlMessage =
 export type RelayBrokerToHostMessage = RelayToHostMessage | RelayBrokerControlMessage;
 
 export type RelayHostMessage =
-  | { type: "host_ready"; hostId: string; displayName?: string; version?: string }
+  | { type: "host_ready"; hostId: string; displayName?: string; version?: string; capabilities?: string[] }
+  | { type: "host_drained" }
   | { type: "sessions"; clientId: string; requestId?: string; sessions: RelaySession[] }
   | { type: "scope_statuses"; clientId: string; requestId?: string; scopes: RelayScopeStatus[] }
   | { type: "worktree_created"; clientId: string; requestId?: string; session: RelaySession }

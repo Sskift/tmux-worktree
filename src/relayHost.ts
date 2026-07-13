@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, hostname, tmpdir } from "node:os";
-import { basename, dirname } from "node:path";
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { promisify } from "node:util";
+import { basename, dirname, join } from "node:path";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
 import {
@@ -13,9 +14,10 @@ import {
 } from "./hosts.js";
 import { CliError, tmuxBin } from "./tmux.js";
 import {
+  RELAY_HOST_RETIRE_CAPABILITY,
   isValidHostId,
   parseJsonMessage,
-  sendJson,
+  type RelayBrokerToHostMessage,
   type RelayClientMessage,
   type RelayScopeStatus,
   type RelaySession,
@@ -31,7 +33,12 @@ type RelayHostOptions = {
   statusFile: string;
 };
 
-type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopped";
+type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
+
+type RelayStatusOwnership = {
+  instanceId: string;
+  claimed: boolean;
+};
 
 type RelayConnectionLease = {
   socket: WebSocket;
@@ -48,6 +55,60 @@ type AdminScope = {
   twPath?: string;
 };
 
+type StreamAdmissionLedger = {
+  total: number;
+  local: number;
+  remote: number;
+  byClient: Map<string, number>;
+};
+
+type StreamAdmissionReservation = {
+  ledger: StreamAdmissionLedger;
+  clientId: string;
+  kind: AdminScope["kind"];
+  released: boolean;
+};
+
+type CommandAdmissionLedger = {
+  total: number;
+  byClient: Map<string, number>;
+};
+
+type CommandAdmissionReservation = {
+  ledger: CommandAdmissionLedger;
+  clientId: string;
+  released: boolean;
+};
+
+type RelayTaskLedger = {
+  active: Set<Promise<void>>;
+};
+
+type CommandExecutionContext = {
+  mutation?: boolean;
+  signal?: AbortSignal;
+};
+
+type CommandExecOptions = {
+  input?: string;
+  transactionParent?: boolean;
+  timeout?: number;
+  signal?: AbortSignal;
+};
+
+type CommandOutput = {
+  stdout: string;
+  stderr: string;
+};
+
+type CommandProcessError = Error & {
+  code: string | number;
+  killed?: boolean;
+  signal?: NodeJS.Signals | null;
+  stdout?: string;
+  stderr?: string;
+};
+
 type LocalStream = {
   clientId: string;
   streamId: string;
@@ -56,11 +117,18 @@ type LocalStream = {
   socket?: WebSocket;
   process?: ChildProcessWithoutNullStreams;
   pending: string[];
+  pendingBytes: number;
+  inputBackpressured: boolean;
+  reservation: StreamAdmissionReservation;
+  openTaskActive: boolean;
+  resourceActive: boolean;
   opening: boolean;
   closed: boolean;
   pendingResize?: { cols: number; rows: number };
   resize?: (cols: number, rows: number) => void;
   cleanup?: () => void;
+  processGroupFile?: string;
+  forceCloseTimer?: ReturnType<typeof setTimeout>;
 };
 
 type StreamRoute = {
@@ -105,6 +173,34 @@ type RpcKillSessionResponse = {
   killed: boolean;
 };
 
+export function assertRpcMutationCapabilities(
+  stdout: string,
+  requiredCapability: "create-worktree" | "create-terminal" | "kill-session",
+  scopeId: string,
+): void {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new Error(`remote tw rpc capabilities returned invalid JSON from ${scopeId}: ${errorDetail(error)}`);
+  }
+  if (
+    !isRecord(parsed)
+    || parsed.protocolVersion !== RPC_PROTOCOL_VERSION
+    || parsed.app !== "tmux-worktree"
+    || !Array.isArray(parsed.capabilities)
+    || parsed.capabilities.some((value) => typeof value !== "string")
+  ) {
+    throw new Error(`remote tw rpc capabilities returned an unsupported response from ${scopeId}`);
+  }
+  const capabilities = new Set(parsed.capabilities as string[]);
+  if (!capabilities.has(requiredCapability) || !capabilities.has("hard-timeout")) {
+    throw new Error(
+      `remote tw on ${scopeId} must advertise ${requiredCapability} and hard-timeout before mutation`,
+    );
+  }
+}
+
 type TmuxRow = {
   name: string;
   attached: boolean;
@@ -134,7 +230,6 @@ type TerminalRegistryWriteOperations = {
   unlink: (path: string) => void;
 };
 
-const execFileAsync = promisify(execFile);
 const INTERNAL_SESSION_PREFIXES = ["tw-mobile-"];
 const TERMINAL_SESSION_PREFIXES = ["tw-term-"];
 const DEFAULT_REMOTE_WORKTREE_BASE = "~/.tmux-worktree/worktrees";
@@ -145,11 +240,287 @@ const RPC_PROTOCOL_VERSION = 1;
 const MANAGED_TERMINAL_NAME = /^tw-term-[A-Za-z0-9][A-Za-z0-9._-]{0,71}$/;
 const REMOTE_RPC_STATUS_MARKER = "__TW_RPC_STATUS__";
 const LOCAL_WS_MAX_PAYLOAD_BYTES = 1 * 1024 * 1024;
+const MAX_RELAY_FRAME_BYTES = 1 * 1024 * 1024;
+const MAX_RELAY_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+const MAX_TERMINAL_INPUT_BYTES = 256 * 1024;
+const MAX_PENDING_INPUT_BYTES_PER_STREAM = 256 * 1024;
+const MAX_REMOTE_STDIN_BUFFERED_BYTES = 256 * 1024;
+const MAX_LOCAL_SOCKET_BUFFERED_BYTES = 1 * 1024 * 1024;
+const MAX_ACTIVE_STREAMS_PER_CLIENT = 128;
+const MAX_ACTIVE_STREAMS_TOTAL = 128;
+const MAX_LOCAL_STREAMS_TOTAL = 8;
+const MAX_REMOTE_STREAMS_TOTAL = 32;
+const REMOTE_STREAM_KILL_GRACE_MS = 1_000;
+const MAX_IN_FLIGHT_COMMANDS_TOTAL = 8;
+const MAX_IN_FLIGHT_COMMANDS_PER_CLIENT = 4;
+const MAX_SCOPE_QUERY_CONCURRENCY = 4;
+const LOCAL_HTTP_TIMEOUT_MS = 5_000;
+const COMMAND_TERMINATION_GRACE_MS = 1_000;
+const RELAY_SOCKET_CLOSE_GRACE_MS = 1_000;
+const RELAY_SHUTDOWN_FORCE_CLOSE_MS = 5 * 60_000;
+const MAX_COMMAND_OUTPUT_BYTES = 1 * 1024 * 1024;
+const commandAbortContext = new AsyncLocalStorage<CommandExecutionContext>();
+let nextAgentBufferId = 1;
+
+function commandExecOptions(timeout: number): CommandExecOptions {
+  const context = commandAbortContext.getStore();
+  // A mutation RPC parent owns rollback after each internally bounded git/tmux
+  // primitive. Killing that parent at an outer deadline can orphan the current
+  // primitive and skip rollback, so terminal shutdown drains it to normal exit.
+  if (context?.mutation) return { transactionParent: true };
+  return context?.signal
+    ? { timeout, signal: context.signal }
+    : { timeout };
+}
+
+function boundedCommandExecOptions(timeout: number): CommandExecOptions {
+  const context = commandAbortContext.getStore();
+  return context?.signal && !context.mutation
+    ? { timeout, signal: context.signal }
+    : { timeout };
+}
+
+function commandFetchSignal(timeout: number): AbortSignal {
+  const timeoutSignal = AbortSignal.timeout(timeout);
+  const commandSignal = commandAbortContext.getStore()?.signal;
+  return commandSignal
+    ? AbortSignal.any([timeoutSignal, commandSignal])
+    : timeoutSignal;
+}
+
+function isSafeToAbortDuringShutdown(message: RelayToHostMessage): boolean {
+  return message.type !== "create_worktree"
+    && message.type !== "create_terminal"
+    && message.type !== "send_agent_message"
+    && message.type !== "kill_session";
+}
+
+function processGroupExists(pid: number): boolean {
+  if (process.platform === "win32") return false;
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function execTerminationError(
+  name: "AbortError" | "TimeoutError",
+  code: "ABORT_ERR" | "ETIMEDOUT",
+  message: string,
+): Error & { code: string; killed: boolean } {
+  const error = new Error(message) as Error & { code: string; killed: boolean };
+  error.name = name;
+  error.code = code;
+  error.killed = true;
+  return error;
+}
+
+function commandProcessError(
+  message: string,
+  code: string | number,
+  fields: Pick<CommandProcessError, "killed" | "signal"> = {},
+): CommandProcessError {
+  const error = new Error(message) as CommandProcessError;
+  error.code = code;
+  Object.assign(error, fields);
+  return error;
+}
+
+function execFileTracked(
+  file: string,
+  args: string[],
+  options: CommandExecOptions,
+): Promise<CommandOutput> {
+  if (options.signal?.aborted) {
+    return Promise.reject(execTerminationError("AbortError", "ABORT_ERR", `command aborted: ${file}`));
+  }
+  return new Promise<CommandOutput>((resolve, reject) => {
+    const detached = process.platform !== "win32"
+      && Boolean(options.transactionParent || options.signal || options.timeout);
+    let childClosed = false;
+    let callbackError: CommandProcessError | null = null;
+    let terminationError: CommandProcessError | undefined;
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+    let forceTimer: ReturnType<typeof setTimeout> | undefined;
+    let physicalPollTimer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+
+    const child = spawn(file, args, {
+      detached,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const pid = child.pid;
+
+    const signalPhysicalCommand = (signal: NodeJS.Signals) => {
+      if (pid && detached) {
+        try {
+          process.kill(-pid, signal);
+          return;
+        } catch {}
+      }
+      try { child.kill(signal); } catch {}
+    };
+
+    const cleanup = () => {
+      if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (physicalPollTimer) clearTimeout(physicalPollTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+    };
+
+    function finishIfQuiescent(): void {
+      if (settled || !childClosed) return;
+      if (terminationError && pid && detached && processGroupExists(pid)) {
+        if (!physicalPollTimer) {
+          physicalPollTimer = setTimeout(() => {
+            physicalPollTimer = undefined;
+            finishIfQuiescent();
+          }, 10);
+        }
+        return;
+      }
+      settled = true;
+      cleanup();
+      const stdout = Buffer.concat(stdoutChunks, stdoutBytes).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks, stderrBytes).toString("utf8");
+      const error = terminationError || callbackError;
+      if (error) {
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      } else {
+        resolve({ stdout, stderr });
+      }
+    }
+
+    const beginTermination = (error: CommandProcessError) => {
+      if (terminationError || settled) return;
+      terminationError = error;
+      signalPhysicalCommand("SIGTERM");
+      forceTimer = setTimeout(() => {
+        signalPhysicalCommand("SIGKILL");
+        finishIfQuiescent();
+      }, COMMAND_TERMINATION_GRACE_MS);
+    };
+
+    function onAbort(): void {
+      beginTermination(execTerminationError("AbortError", "ABORT_ERR", `command aborted: ${file}`));
+    }
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      if (stdoutBytes + chunk.byteLength > MAX_COMMAND_OUTPUT_BYTES) {
+        const error = commandProcessError(
+          `command stdout exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes: ${file}`,
+          "ENOBUFS",
+          { killed: !options.transactionParent },
+        );
+        if (options.transactionParent) {
+          callbackError ||= error;
+        } else {
+          beginTermination(error);
+        }
+        return;
+      }
+      stdoutBytes += chunk.byteLength;
+      stdoutChunks.push(Buffer.from(chunk));
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderrBytes + chunk.byteLength > MAX_COMMAND_OUTPUT_BYTES) {
+        const error = commandProcessError(
+          `command stderr exceeded ${MAX_COMMAND_OUTPUT_BYTES} bytes: ${file}`,
+          "ENOBUFS",
+          { killed: !options.transactionParent },
+        );
+        if (options.transactionParent) {
+          callbackError ||= error;
+        } else {
+          beginTermination(error);
+        }
+        return;
+      }
+      stderrBytes += chunk.byteLength;
+      stderrChunks.push(Buffer.from(chunk));
+    });
+    child.once("error", (error) => {
+      callbackError ||= error as CommandProcessError;
+    });
+    child.stdin.on("error", (error) => {
+      if ((options.input?.length ?? 0) > 0) {
+        callbackError ||= error as CommandProcessError;
+      }
+    });
+    child.stdin.end(options.input ?? "");
+    child.once("close", (code, signal) => {
+      childClosed = true;
+      if (!terminationError && !callbackError && (code !== 0 || signal)) {
+        callbackError = commandProcessError(
+          `command failed (${signal || code}): ${file}`,
+          code ?? 1,
+          { killed: Boolean(signal), signal },
+        );
+      }
+      if (!terminationError && pid && detached && processGroupExists(pid)) {
+        beginTermination(commandProcessError(
+          `command left descendant processes after exit: ${file}`,
+          "ECHILD",
+          { killed: true },
+        ));
+      }
+      finishIfQuiescent();
+    });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.timeout && options.timeout > 0) {
+      timeoutTimer = setTimeout(() => {
+        beginTermination(execTerminationError(
+          "TimeoutError",
+          "ETIMEDOUT",
+          `command timed out after ${options.timeout}ms: ${file}`,
+        ));
+      }, options.timeout);
+    }
+    if (options.signal?.aborted) onAbort();
+  });
+}
+
+function trackRelayTask(ledger: RelayTaskLedger, task: Promise<void>): void {
+  ledger.active.add(task);
+  const remove = () => ledger.active.delete(task);
+  void task.then(remove, remove);
+}
+
+async function drainRelayWork(
+  taskLedger: RelayTaskLedger,
+  admissionLedger: StreamAdmissionLedger,
+  commandAdmissionLedger: CommandAdmissionLedger,
+): Promise<void> {
+  while (
+    taskLedger.active.size > 0
+    || admissionLedger.total > 0
+    || commandAdmissionLedger.total > 0
+  ) {
+    const tasks = [...taskLedger.active];
+    await new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const finish = () => {
+        if (timer) clearTimeout(timer);
+        resolve();
+      };
+      timer = setTimeout(finish, 25);
+      if (tasks.length > 0) void Promise.allSettled(tasks).then(finish);
+    });
+  }
+}
 
 async function localTwOutput(args: string[], timeout: number): Promise<string> {
   const configuredCli = process.env.TW_DASHBOARD_CLI?.trim();
   if (configuredCli && existsSync(configuredCli)) {
-    return (await execFileAsync(process.execPath, [configuredCli, ...args], { timeout })).stdout;
+    return (await execFileTracked(process.execPath, [configuredCli, ...args], commandExecOptions(timeout))).stdout;
   }
   const currentCli = process.argv[1];
   if (
@@ -157,9 +528,9 @@ async function localTwOutput(args: string[], timeout: number): Promise<string> {
     ["cli.cjs", "tw-cli.cjs"].includes(basename(currentCli)) &&
     existsSync(currentCli)
   ) {
-    return (await execFileAsync(process.execPath, [currentCli, ...args], { timeout })).stdout;
+    return (await execFileTracked(process.execPath, [currentCli, ...args], commandExecOptions(timeout))).stdout;
   }
-  return (await execFileAsync("tw", args, { timeout })).stdout;
+  return (await execFileTracked("tw", args, commandExecOptions(timeout))).stdout;
 }
 
 function parseArgs(argv: string[]): RelayHostOptions {
@@ -237,26 +608,45 @@ function relayUrl(opts: RelayHostOptions): string {
 
 function writeRelayStatus(
   opts: RelayHostOptions,
+  ownership: RelayStatusOwnership,
   state: RelayHostConnectionState,
   details: { error?: string; retryInMs?: number; connectedAt?: number } = {},
-): void {
-  if (!opts.statusFile) return;
+  claim = false,
+): boolean {
+  if (!opts.statusFile) return true;
   const status = {
     state,
     relayUrl: opts.relay,
     hostId: opts.hostId,
+    ownerInstanceId: ownership.instanceId,
     updatedAt: Date.now(),
     ...(details.connectedAt ? { connectedAt: details.connectedAt } : {}),
     ...(details.retryInMs ? { retryInMs: details.retryInMs } : {}),
     ...(details.error ? { error: details.error } : {}),
   };
   const temp = `${opts.statusFile}.${process.pid}.tmp`;
+  let lock: ReturnType<typeof acquireConfigFileLock> | undefined;
   try {
     mkdirSync(dirname(opts.statusFile), { recursive: true });
+    lock = acquireConfigFileLock(`${opts.statusFile}.lock`);
+    if (!claim) {
+      let currentOwner: unknown;
+      try {
+        const current = JSON.parse(readFileSync(opts.statusFile, "utf8")) as unknown;
+        currentOwner = isRecord(current) ? current.ownerInstanceId : undefined;
+      } catch {
+        currentOwner = undefined;
+      }
+      if (currentOwner !== ownership.instanceId) return false;
+    }
     writeFileSync(temp, `${JSON.stringify(status)}\n`, { encoding: "utf8", mode: 0o600 });
     renameSync(temp, opts.statusFile);
+    return true;
   } catch {
     try { unlinkSync(temp); } catch {}
+    return false;
+  } finally {
+    if (lock) releaseConfigFileLock(lock);
   }
 }
 
@@ -274,6 +664,7 @@ function localWsUrl(localBase: string, session: string, paneIndex: string): stri
 async function fetchJson<T>(localBase: string, token: string, path: string): Promise<T> {
   const response = await fetch(`${localBase}${path}`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal: commandFetchSignal(LOCAL_HTTP_TIMEOUT_MS),
   });
   if (!response.ok) {
     throw new Error(`local ${path} returned ${response.status}`);
@@ -711,21 +1102,49 @@ function remoteTw(scope: AdminScope, args: string[]): string {
 
 async function localTmuxRows(scope: AdminScope): Promise<TmuxRow[]> {
   const fmt = "#{session_name}\x1f#{session_attached}\x1f#{session_windows}\x1f#{session_created}\x1f#{session_activity}\x1f#{pane_current_path}";
-  const { stdout } = await execFileAsync(localTmuxBin(scope), ["list-sessions", "-F", fmt], { timeout: 5000 });
+  const { stdout } = await execFileTracked(localTmuxBin(scope), ["list-sessions", "-F", fmt], boundedCommandExecOptions(5000));
   return parseTmuxRows(stdout);
 }
 
 export function relaySshConnectionArgs(host: HostConfig): string[] {
-  return [...sshConnectionArgs(host), "--", host.host];
+  return [
+    ...sshConnectionArgs(host, { controlMaster: "no", controlPersist: false }),
+    "--",
+    host.host,
+  ];
 }
 
 function shQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-async function sshOutput(host: HostConfig, remoteCommand: string, timeout = 8000): Promise<string> {
-  const { stdout } = await execFileAsync("ssh", [...relaySshConnectionArgs(host), remoteCommand], { timeout });
+async function sshOutput(
+  host: HostConfig,
+  remoteCommand: string,
+  timeout = 8000,
+  execution: { transactionParent?: boolean; input?: string } = {},
+): Promise<string> {
+  const baseOptions = execution.transactionParent
+    ? commandExecOptions(timeout)
+    : boundedCommandExecOptions(timeout);
+  const options = execution.input === undefined
+    ? baseOptions
+    : { ...baseOptions, input: execution.input };
+  const { stdout } = await execFileTracked("ssh", [...relaySshConnectionArgs(host), remoteCommand], options);
   return stdout;
+}
+
+async function requireRemoteMutationCapability(
+  scope: AdminScope,
+  capability: "create-worktree" | "create-terminal" | "kill-session",
+): Promise<void> {
+  if (scope.kind !== "ssh" || !scope.host) return;
+  const stdout = await sshOutput(
+    scope.host,
+    remoteTw(scope, ["rpc", "capabilities"]),
+    8_000,
+  );
+  assertRpcMutationCapabilities(stdout, capability, scope.id);
 }
 
 async function remoteTmuxRows(scope: AdminScope): Promise<TmuxRow[]> {
@@ -902,23 +1321,57 @@ async function listScopeSessions(scope: AdminScope, localBase: string, token: st
   });
 }
 
+async function mapSettledWithConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length);
+  let nextIndex = 0;
+  const worker = async () => {
+    while (true) {
+      const index = nextIndex;
+      nextIndex += 1;
+      if (index >= items.length) return;
+      try {
+        results[index] = { status: "fulfilled", value: await mapper(items[index]!, index) };
+      } catch (reason) {
+        results[index] = { status: "rejected", reason };
+      }
+    }
+  };
+  const workerCount = Math.min(Math.max(1, concurrency), items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return results;
+}
+
 async function listAdminSessions(localBase: string, token: string): Promise<RelaySession[]> {
-  const results = await Promise.allSettled(adminScopes().map((scope) => listScopeSessions(scope, localBase, token)));
+  const scopes = adminScopes();
+  const results = await mapSettledWithConcurrency(
+    scopes,
+    MAX_SCOPE_QUERY_CONCURRENCY,
+    (scope) => listScopeSessions(scope, localBase, token),
+  );
   return results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
 }
 
 async function listScopeStatuses(localBase: string, token: string): Promise<RelayScopeStatus[]> {
-  const results = await Promise.allSettled(adminScopes().map(async (scope): Promise<RelayScopeStatus> => {
-    const sessions = await listScopeSessions(scope, localBase, token);
-    return {
-      scopeId: scope.id,
-      scopeLabel: scope.label,
-      kind: scope.kind,
-      reachable: true,
-      sessionCount: sessions.length,
-    };
-  }));
-  return adminScopes().map((scope, index) => {
+  const scopes = adminScopes();
+  const results = await mapSettledWithConcurrency(
+    scopes,
+    MAX_SCOPE_QUERY_CONCURRENCY,
+    async (scope): Promise<RelayScopeStatus> => {
+      const sessions = await listScopeSessions(scope, localBase, token);
+      return {
+        scopeId: scope.id,
+        scopeLabel: scope.label,
+        kind: scope.kind,
+        reachable: true,
+        sessionCount: sessions.length,
+      };
+    },
+  );
+  return scopes.map((scope, index) => {
     const result = results[index];
     if (result?.status === "fulfilled") return result.value;
     const error = result?.status === "rejected" ? (result.reason instanceof Error ? result.reason.message : String(result.reason)) : "unknown";
@@ -1032,9 +1485,10 @@ async function createWorktreeSession(message: Extract<RelayClientMessage, { type
   if (!aiCommand) throw new Error("AI command required");
   const target = await resolveWorktreeTarget(scope, message.project, message.path);
   const args = rpcCreateWorktreeArgs(scope, target, aiCommand, message.name, message.branch);
+  await requireRemoteMutationCapability(scope, "create-worktree");
   const stdout = scope.kind === "local"
     ? await localTwOutput(args, 120_000)
-    : await sshOutput(scope.host!, remoteTw(scope, args), 120_000);
+    : await sshOutput(scope.host!, remoteTw(scope, args), 120_000, { transactionParent: true });
   const parsed = parseRpcCreateWorktreeResponse(stdout);
   return relaySession(scope, {
     name: parsed.session,
@@ -1053,9 +1507,10 @@ async function createPlainTerminalSession(message: Extract<RelayClientMessage, {
   const args = ["rpc", "create-terminal", "--cwd", cwd];
   const aiCommand = (message.aiCommand || message.aiCmd || "").trim();
   if (aiCommand) args.push("--ai-command", aiCommand);
+  await requireRemoteMutationCapability(scope, "create-terminal");
   const stdout = scope.kind === "local"
     ? await localTwOutput(args, 30_000)
-    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000);
+    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000, { transactionParent: true });
   const parsed = parseRpcCreateTerminalResponse(stdout);
   const name = parsed.session;
   const canonicalCwd = parsed.cwd;
@@ -1095,19 +1550,145 @@ function isCurrentRoute(
   return lease.active && routes.get(key) === route;
 }
 
+function createStreamAdmissionLedger(): StreamAdmissionLedger {
+  return {
+    total: 0,
+    local: 0,
+    remote: 0,
+    byClient: new Map(),
+  };
+}
+
+function createCommandAdmissionLedger(): CommandAdmissionLedger {
+  return { total: 0, byClient: new Map() };
+}
+
+function reserveCommandAdmission(
+  ledger: CommandAdmissionLedger,
+  clientId: string,
+): CommandAdmissionReservation | string {
+  const clientTotal = ledger.byClient.get(clientId) ?? 0;
+  if (clientTotal >= MAX_IN_FLIGHT_COMMANDS_PER_CLIENT) {
+    return "too many in-flight relay commands for client";
+  }
+  if (ledger.total >= MAX_IN_FLIGHT_COMMANDS_TOTAL) {
+    return "too many in-flight relay commands on host";
+  }
+  ledger.total += 1;
+  ledger.byClient.set(clientId, clientTotal + 1);
+  return { ledger, clientId, released: false };
+}
+
+function releaseCommandAdmission(reservation: CommandAdmissionReservation): void {
+  if (reservation.released) return;
+  reservation.released = true;
+  const { ledger } = reservation;
+  ledger.total -= 1;
+  const clientTotal = (ledger.byClient.get(reservation.clientId) ?? 1) - 1;
+  if (clientTotal > 0) ledger.byClient.set(reservation.clientId, clientTotal);
+  else ledger.byClient.delete(reservation.clientId);
+}
+
+function requiresCommandAdmission(message: RelayToHostMessage): boolean {
+  return message.type === "list_sessions"
+    || message.type === "list_scope_statuses"
+    || message.type === "create_worktree"
+    || message.type === "create_terminal"
+    || message.type === "send_agent_message"
+    || message.type === "kill_session";
+}
+
+function reserveStreamAdmission(
+  ledger: StreamAdmissionLedger,
+  clientId: string,
+  scope: AdminScope,
+): StreamAdmissionReservation | string {
+  const clientTotal = ledger.byClient.get(clientId) ?? 0;
+  if (clientTotal >= MAX_ACTIVE_STREAMS_PER_CLIENT) {
+    return "too many active terminal streams for client";
+  }
+  if (ledger.total >= MAX_ACTIVE_STREAMS_TOTAL) {
+    return "too many active terminal streams on host";
+  }
+  if (scope.kind === "local" && ledger.local >= MAX_LOCAL_STREAMS_TOTAL) {
+    return "too many active local terminal streams";
+  }
+  if (scope.kind === "ssh" && ledger.remote >= MAX_REMOTE_STREAMS_TOTAL) {
+    return "too many active remote terminal streams";
+  }
+
+  ledger.total += 1;
+  if (scope.kind === "local") ledger.local += 1;
+  else ledger.remote += 1;
+  ledger.byClient.set(clientId, clientTotal + 1);
+  return {
+    ledger,
+    clientId,
+    kind: scope.kind,
+    released: false,
+  };
+}
+
+function releaseStreamAdmission(reservation: StreamAdmissionReservation): void {
+  if (reservation.released) return;
+  reservation.released = true;
+  const { ledger } = reservation;
+  ledger.total -= 1;
+  if (reservation.kind === "local") ledger.local -= 1;
+  else ledger.remote -= 1;
+  const clientTotal = (ledger.byClient.get(reservation.clientId) ?? 1) - 1;
+  if (clientTotal > 0) ledger.byClient.set(reservation.clientId, clientTotal);
+  else ledger.byClient.delete(reservation.clientId);
+}
+
+function releaseStreamAdmissionIfQuiescent(stream: LocalStream): void {
+  if (stream.openTaskActive || stream.resourceActive) return;
+  releaseStreamAdmission(stream.reservation);
+}
+
+function signalRemoteProcessGroup(
+  stream: LocalStream,
+  signal: NodeJS.Signals,
+): void {
+  if (!stream.processGroupFile) return;
+  try {
+    const groupId = Number.parseInt(readFileSync(stream.processGroupFile, "utf8").trim(), 10);
+    if (!Number.isSafeInteger(groupId) || groupId <= 1) return;
+    process.kill(-groupId, signal);
+  } catch {}
+}
+
 function closeStream(stream: LocalStream): void {
   if (stream.closed) return;
   stream.closed = true;
   stream.opening = false;
   stream.pending.length = 0;
+  stream.pendingBytes = 0;
+  stream.inputBackpressured = false;
   stream.pendingResize = undefined;
-  try { stream.socket?.close(); } catch {}
-  try { stream.process?.kill(); } catch {}
-  try { stream.cleanup?.(); } catch {}
+  try { stream.socket?.terminate(); } catch {}
+  const childProcess = stream.process;
+  signalRemoteProcessGroup(stream, "SIGTERM");
+  try { childProcess?.kill("SIGTERM"); } catch {}
+  if (childProcess && stream.resourceActive && !stream.forceCloseTimer) {
+    stream.forceCloseTimer = setTimeout(() => {
+      if (!stream.resourceActive) return;
+      signalRemoteProcessGroup(stream, "SIGKILL");
+      stream.forceCloseTimer = setTimeout(() => {
+        stream.forceCloseTimer = undefined;
+        if (!stream.resourceActive) return;
+        try { childProcess.kill("SIGKILL"); } catch {}
+      }, REMOTE_STREAM_KILL_GRACE_MS);
+      stream.forceCloseTimer.unref();
+    }, REMOTE_STREAM_KILL_GRACE_MS);
+    stream.forceCloseTimer.unref();
+  }
+  releaseStreamAdmissionIfQuiescent(stream);
 }
 
 function finalizeStream(
   streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
   key: string,
   stream: LocalStream,
   code: number,
@@ -1116,6 +1697,7 @@ function finalizeStream(
   const isCurrent = isCurrentStream(streams, key, stream);
   if (isCurrent) {
     streams.delete(key);
+    if (routes.get(key) === stream.route) routes.delete(key);
     if (options.error) {
       sendIfActive(stream.lease, {
         type: "error",
@@ -1139,8 +1721,15 @@ function finalizeStream(
   stream.closed = true;
   stream.opening = false;
   stream.pending.length = 0;
+  stream.pendingBytes = 0;
+  stream.inputBackpressured = false;
   stream.pendingResize = undefined;
+  if (stream.forceCloseTimer) {
+    clearTimeout(stream.forceCloseTimer);
+    stream.forceCloseTimer = undefined;
+  }
   try { stream.cleanup?.(); } catch {}
+  releaseStreamAdmissionIfQuiescent(stream);
 }
 
 function closeClientStreams(streams: Map<string, LocalStream>, clientId: string): void {
@@ -1161,6 +1750,7 @@ function closeClientRoutes(routes: Map<string, StreamRoute>, clientId: string): 
 function openingStream(
   lease: RelayConnectionLease,
   route: StreamRoute,
+  reservation: StreamAdmissionReservation,
   pending: string[] = [],
   pendingResize?: { cols: number; rows: number },
 ): LocalStream {
@@ -1170,6 +1760,11 @@ function openingStream(
     lease,
     route,
     pending,
+    pendingBytes: pending.reduce((total, payload) => total + Buffer.byteLength(payload, "utf8"), 0),
+    inputBackpressured: false,
+    reservation,
+    openTaskActive: false,
+    resourceActive: false,
     pendingResize,
     opening: true,
     closed: false,
@@ -1205,6 +1800,13 @@ function deactivateConnection(
 ): void {
   if (!lease.active) return;
   lease.active = false;
+  closeConnectionStreams(streams, routes);
+}
+
+function closeConnectionStreams(
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+): void {
   routes.clear();
   for (const [key, stream] of streams) {
     streams.delete(key);
@@ -1212,39 +1814,135 @@ function deactivateConnection(
   }
 }
 
-function sendIfActive(lease: RelayConnectionLease, message: unknown): void {
-  if (!lease.active || lease.socket.readyState !== WebSocket.OPEN) return;
-  sendJson(lease.socket, message);
+function sendIfActive(lease: RelayConnectionLease, message: unknown): boolean {
+  if (!lease.active || lease.socket.readyState !== WebSocket.OPEN) return false;
+  try {
+    const payload = JSON.stringify(message);
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (
+      payloadBytes > MAX_RELAY_FRAME_BYTES
+      || lease.socket.bufferedAmount + payloadBytes > MAX_RELAY_SOCKET_BUFFERED_BYTES
+    ) {
+      lease.socket.terminate();
+      return false;
+    }
+    lease.socket.send(payload, (error) => {
+      if (error) {
+        try { lease.socket.terminate(); } catch {}
+      }
+    });
+    return true;
+  } catch {
+    try { lease.socket.terminate(); } catch {}
+    return false;
+  }
 }
 
-function sendToStream(stream: LocalStream, payload: string): "sent" | "queued" | "closed" {
+function queuePendingInput(stream: LocalStream, payload: string): boolean {
+  if (!payload) return true;
+  const payloadBytes = Buffer.byteLength(payload, "utf8");
+  if (
+    payloadBytes > MAX_TERMINAL_INPUT_BYTES
+    || stream.pendingBytes + payloadBytes > MAX_PENDING_INPUT_BYTES_PER_STREAM
+  ) {
+    return false;
+  }
+  stream.pending.push(payload);
+  stream.pendingBytes += payloadBytes;
+  return true;
+}
+
+type StreamSendResult = "sent" | "queued" | "closed" | "overloaded";
+
+function sendToStream(stream: LocalStream, payload: string): StreamSendResult {
   if (stream.closed || !stream.lease.active) return "closed";
   if (stream.opening) {
-    stream.pending.push(payload);
-    return "queued";
+    return queuePendingInput(stream, payload) ? "queued" : "overloaded";
   }
 
   if (stream.socket) {
     if (stream.socket.readyState === WebSocket.OPEN) {
-      stream.socket.send(payload);
-      return "sent";
+      const payloadBytes = Buffer.byteLength(payload, "utf8");
+      if (
+        payloadBytes > MAX_TERMINAL_INPUT_BYTES
+        || stream.socket.bufferedAmount + payloadBytes > MAX_LOCAL_SOCKET_BUFFERED_BYTES
+      ) {
+        try { stream.socket.terminate(); } catch {}
+        return "overloaded";
+      }
+      try {
+        stream.socket.send(payload);
+        return "sent";
+      } catch {
+        return "closed";
+      }
     }
     if (stream.socket.readyState === WebSocket.CONNECTING) {
-      stream.pending.push(payload);
-      return "queued";
+      return queuePendingInput(stream, payload) ? "queued" : "overloaded";
     }
     return "closed";
   }
 
-  if (stream.process && !stream.process.killed && stream.process.stdin.writable) {
+  if (
+    stream.process
+    && stream.process.exitCode === null
+    && stream.process.signalCode === null
+    && stream.process.stdin.writable
+  ) {
+    const payloadBytes = Buffer.byteLength(payload, "utf8");
+    if (
+      payloadBytes > MAX_TERMINAL_INPUT_BYTES
+      || stream.inputBackpressured
+      || stream.process.stdin.writableLength + payloadBytes > MAX_REMOTE_STDIN_BUFFERED_BYTES
+    ) {
+      return "overloaded";
+    }
     try {
-      stream.process.stdin.write(payload);
+      stream.inputBackpressured = !stream.process.stdin.write(payload);
       return "sent";
     } catch {
       return "closed";
     }
   }
   return "closed";
+}
+
+function failCurrentStream(
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+  key: string,
+  stream: LocalStream,
+  message: string,
+): void {
+  finalizeStream(streams, routes, key, stream, 1, {
+    error: message,
+    closeResource: true,
+  });
+}
+
+function flushPendingInputs(
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+  key: string,
+  stream: LocalStream,
+): boolean {
+  const pending = stream.pending.splice(0);
+  stream.pendingBytes = 0;
+  for (const payload of pending) {
+    const result = sendToStream(stream, payload);
+    if (result === "sent" || result === "queued") continue;
+    failCurrentStream(
+      streams,
+      routes,
+      key,
+      stream,
+      result === "overloaded"
+        ? "terminal input buffer limit reached"
+        : "terminal stream closed while flushing input",
+    );
+    return false;
+  }
+  return true;
 }
 
 function isBenignSshCloseNotice(data: string): boolean {
@@ -1267,7 +1965,7 @@ async function resolvePaneIndex(scope: AdminScope, rawName: string, pane: string
   const requested = pane === undefined ? "" : String(pane);
   const fmt = "#{pane_index}\x1f#{pane_active}";
   const stdout = scope.kind === "local"
-    ? (await execFileAsync(localTmuxBin(scope), ["list-panes", "-t", `=${rawName}`, "-F", fmt], { timeout: 5000 })).stdout
+    ? (await execFileTracked(localTmuxBin(scope), ["list-panes", "-t", `=${rawName}`, "-F", fmt], boundedCommandExecOptions(5000))).stdout
     : await sshOutput(scope.host!, `${remoteTmux(scope)} list-panes -t ${shQuote(`=${rawName}`)} -F ${shQuote(fmt)}`);
   const panes = stdout
     .split("\n")
@@ -1284,14 +1982,59 @@ async function sendAgentMessage(session: string, pane: string | number | undefin
   const { scope, rawName } = scopeForSession(session);
   const paneIndex = await resolvePaneIndex(scope, rawName, pane);
   const target = `=${rawName}:.${paneIndex}`;
+  const normalized = normalizeAgentMessage(message);
+  if (normalized.length === 0) {
+    if (!submit) return;
+    if (scope.kind === "local") {
+      await execFileTracked(
+        localTmuxBin(scope),
+        ["send-keys", "-t", target, "C-m"],
+        boundedCommandExecOptions(5000),
+      );
+      return;
+    }
+    await sshOutput(
+      scope.host!,
+      `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`,
+    );
+    return;
+  }
+  const buffer = `tw-relay-${process.pid}-${nextAgentBufferId++}`;
   if (scope.kind === "local") {
-    await execFileAsync(localTmuxBin(scope), ["send-keys", "-t", target, "-l", normalizeAgentMessage(message)], { timeout: 5000 });
-    if (submit) await execFileAsync(localTmuxBin(scope), ["send-keys", "-t", target, "C-m"], { timeout: 5000 });
+    const args = [
+      "load-buffer", "-b", buffer, "-",
+      ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", target,
+    ];
+    if (submit) args.push(";", "send-keys", "-t", target, "C-m");
+    try {
+      await execFileTracked(
+        localTmuxBin(scope),
+        args,
+        { ...boundedCommandExecOptions(5000), input: normalized },
+      );
+    } catch (error) {
+      await execFileTracked(
+        localTmuxBin(scope),
+        ["delete-buffer", "-b", buffer],
+        boundedCommandExecOptions(5000),
+      ).catch(() => undefined);
+      throw error;
+    }
     return;
   }
 
-  await sshOutput(scope.host!, `${remoteTmux(scope)} send-keys -t ${shQuote(target)} -l ${shQuote(normalizeAgentMessage(message))}`);
-  if (submit) await sshOutput(scope.host!, `${remoteTmux(scope)} send-keys -t ${shQuote(target)} C-m`);
+  const command = `${remoteTmux(scope)} load-buffer -b ${shQuote(buffer)} -`
+    + ` \\; paste-buffer -b ${shQuote(buffer)} -d -r -t ${shQuote(target)}`
+    + (submit ? ` \\; send-keys -t ${shQuote(target)} C-m` : "");
+  try {
+    await sshOutput(scope.host!, command, 8_000, { input: normalized });
+  } catch (error) {
+    await sshOutput(
+      scope.host!,
+      `${remoteTmux(scope)} delete-buffer -b ${shQuote(buffer)}`,
+    ).catch(() => undefined);
+    throw error;
+  }
 }
 
 function parseRpcKillSessionResponse(stdout: string, expectedSession: string): RpcKillSessionResponse {
@@ -1325,15 +2068,16 @@ function parseRpcKillSessionResponse(stdout: string, expectedSession: string): R
 
 async function killManagedSession(scope: AdminScope, rawName: string): Promise<void> {
   const args = ["rpc", "kill-session", "--name", rawName];
+  await requireRemoteMutationCapability(scope, "kill-session");
   const stdout = scope.kind === "local"
     ? await localTwOutput(args, 30_000)
-    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000);
+    : await sshOutput(scope.host!, remoteTw(scope, args), 30_000, { transactionParent: true });
   parseRpcKillSessionResponse(stdout, rawName);
 }
 
 async function killLegacyTmuxSession(scope: AdminScope, rawName: string): Promise<void> {
   if (scope.kind === "local") {
-    await execFileAsync(localTmuxBin(scope), ["kill-session", "-t", `=${rawName}`], { timeout: 5000 });
+    await execFileTracked(localTmuxBin(scope), ["kill-session", "-t", `=${rawName}`], boundedCommandExecOptions(5000));
     return;
   }
   await sshOutput(scope.host!, `${remoteTmux(scope)} kill-session -t ${shQuote(`=${rawName}`)}`);
@@ -1387,13 +2131,24 @@ function remotePtyPythonScript(): string {
 import fcntl, os, pty, select, signal, struct, sys, termios
 
 resize_file = sys.argv[1]
-ssh_args = sys.argv[2:]
+pid_file = sys.argv[2]
+ssh_args = sys.argv[3:]
 if not ssh_args:
     sys.exit(2)
+
+blocked_signals = {signal.SIGTERM, signal.SIGINT}
+try:
+    signal.pthread_sigmask(signal.SIG_BLOCK, blocked_signals)
+except AttributeError:
+    pass
 
 master, slave = pty.openpty()
 pid = os.fork()
 if pid == 0:
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
+    except AttributeError:
+        pass
     os.setsid()
     os.dup2(slave, 0)
     os.dup2(slave, 1)
@@ -1404,6 +2159,25 @@ if pid == 0:
     os.execvp(ssh_args[0], ssh_args)
 
 os.close(slave)
+try:
+    pid_fd = os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.write(pid_fd, str(pid).encode('ascii'))
+    os.close(pid_fd)
+except Exception:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        pass
+    try:
+        os.waitpid(pid, 0)
+    except Exception:
+        pass
+    raise
+
 fcntl.fcntl(master, fcntl.F_SETFL, fcntl.fcntl(master, fcntl.F_GETFL) | os.O_NONBLOCK)
 fcntl.fcntl(0, fcntl.F_SETFL, fcntl.fcntl(0, fcntl.F_GETFL) | os.O_NONBLOCK)
 stopping = False
@@ -1431,6 +2205,8 @@ def wait_writable(fd):
 def write_all(fd, data):
     offset = 0
     while offset < len(data):
+        if stopping:
+            return False
         try:
             written = os.write(fd, data[offset:])
             if written <= 0:
@@ -1461,16 +2237,24 @@ def on_winch(signum, frame):
 def on_stop(signum, frame):
     global stopping
     stopping = True
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except Exception:
+        pass
 
 signal.signal(signal.SIGWINCH, on_winch)
 signal.signal(signal.SIGTERM, on_stop)
 signal.signal(signal.SIGINT, on_stop)
+try:
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, blocked_signals)
+except AttributeError:
+    pass
 apply_resize()
 
 try:
     while not stopping:
         try:
-            readable, _, _ = select.select([master, 0], [], [], 1)
+            readable, _, _ = select.select([master, 0], [], [], 0.25)
         except InterruptedError:
             continue
         except OSError:
@@ -1487,23 +2271,19 @@ try:
                 break
             if data and not write_all(1, data):
                 break
-        try:
-            result = os.waitpid(pid, os.WNOHANG)
-        except InterruptedError:
-            continue
-        except ChildProcessError:
-            break
-        if result[0] != 0:
-            break
 except Exception:
     pass
 finally:
     try:
-        os.kill(pid, signal.SIGTERM)
+        os.killpg(pid, signal.SIGTERM)
     except Exception:
         pass
     try:
         os.close(master)
+    except Exception:
+        pass
+    try:
+        os.killpg(pid, signal.SIGKILL)
     except Exception:
         pass
     try:
@@ -1514,11 +2294,16 @@ finally:
         os.unlink(resize_file)
     except Exception:
         pass
+    try:
+        os.unlink(pid_file)
+    except Exception:
+        pass
 `;
 }
 
 async function openRemoteStream(
   streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
   stream: LocalStream,
 ): Promise<void> {
   const { route } = stream;
@@ -1527,21 +2312,31 @@ async function openRemoteStream(
   const paneIndex = await resolvePaneIndex(scope, rawName, pane);
   if (!isCurrentStream(streams, key, stream)) return;
 
-  const resizeFile = `${tmpdir()}/tw-relay-resize-${clientId.replace(/[^a-zA-Z0-9_-]/g, "")}-${streamId.replace(/[^a-zA-Z0-9_-]/g, "")}-${randomId(6)}`;
   const sshArgs = ["ssh", "-tt", ...relaySshConnectionArgs(scope.host!), remoteAttachCommand(scope, rawName, paneIndex)];
-  const child = spawn("python3", ["-u", "-c", remotePtyPythonScript(), resizeFile, ...sshArgs], {
-    stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, TERM: "xterm-256color" },
-  });
+  const controlDir = mkdtempSync(join(tmpdir(), "tw-relay-stream-"));
+  const resizeFile = join(controlDir, "resize");
+  const processGroupFile = join(controlDir, "process-group");
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn("python3", ["-u", "-c", remotePtyPythonScript(), resizeFile, processGroupFile, ...sshArgs], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...process.env, TERM: "xterm-256color" },
+    });
+  } catch (error) {
+    rmSync(controlDir, { recursive: true, force: true });
+    throw error;
+  }
+  stream.resourceActive = true;
   let lastResizeCols = 0;
   let lastResizeRows = 0;
   let cleaned = false;
   const cleanup = () => {
     if (cleaned) return;
     cleaned = true;
-    try { unlinkSync(resizeFile); } catch {}
+    rmSync(controlDir, { recursive: true, force: true });
   };
   stream.process = child;
+  stream.processGroupFile = processGroupFile;
   stream.cleanup = cleanup;
   stream.resize = (cols, rows) => {
     const safeCols = Math.max(20, Math.min(300, Math.floor(cols)));
@@ -1554,6 +2349,9 @@ async function openRemoteStream(
   };
   stream.opening = false;
   child.stdin.on("error", () => {});
+  child.stdin.on("drain", () => {
+    if (isCurrentStream(streams, key, stream)) stream.inputBackpressured = false;
+  });
   child.stdout.on("error", () => {});
   child.stderr.on("error", () => {});
   child.stdout.on("data", (data) => {
@@ -1566,20 +2364,29 @@ async function openRemoteStream(
     if (isBenignSshCloseNotice(text)) return;
     sendIfActive(stream.lease, { type: "terminal_data", clientId, streamId, data: text });
   });
-  child.on("close", (code) => {
-    finalizeStream(streams, key, stream, code ?? 0);
+  child.on("close", (code, signal) => {
+    if (stream.forceCloseTimer) {
+      clearTimeout(stream.forceCloseTimer);
+      stream.forceCloseTimer = undefined;
+    }
+    if (signal !== null || (code ?? 1) !== 0) {
+      signalRemoteProcessGroup(stream, "SIGKILL");
+    }
+    stream.resourceActive = false;
+    finalizeStream(streams, routes, key, stream, code ?? 0);
   });
   child.on("error", (err) => {
-    finalizeStream(streams, key, stream, 1, { error: err.message, closeResource: true });
+    finalizeStream(streams, routes, key, stream, 1, { error: err.message, closeResource: true });
   });
   const pendingResize = stream.pendingResize;
   stream.pendingResize = undefined;
   if (pendingResize) stream.resize(pendingResize.cols, pendingResize.rows);
-  for (const payload of stream.pending.splice(0)) sendToStream(stream, payload);
+  flushPendingInputs(streams, routes, key, stream);
 }
 
 async function openLocalStream(
   streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
   localBase: string,
   token: string,
   stream: LocalStream,
@@ -1595,6 +2402,7 @@ async function openLocalStream(
     perMessageDeflate: false,
     maxPayload: LOCAL_WS_MAX_PAYLOAD_BYTES,
   });
+  stream.resourceActive = true;
   stream.socket = localSocket;
   stream.opening = false;
 
@@ -1606,9 +2414,24 @@ async function openLocalStream(
     const pendingResize = stream.pendingResize;
     stream.pendingResize = undefined;
     if (pendingResize) {
-      localSocket.send(JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows }));
+      const result = sendToStream(
+        stream,
+        JSON.stringify({ type: "resize", cols: pendingResize.cols, rows: pendingResize.rows }),
+      );
+      if (result !== "sent") {
+        failCurrentStream(
+          streams,
+          routes,
+          key,
+          stream,
+          result === "overloaded"
+            ? "terminal input buffer limit reached"
+            : "terminal stream closed while applying resize",
+        );
+        return;
+      }
     }
-    for (const payload of stream.pending.splice(0)) localSocket.send(payload);
+    flushPendingInputs(streams, routes, key, stream);
   });
   localSocket.on("message", (chunk) => {
     if (!isCurrentStream(streams, key, stream)) return;
@@ -1616,32 +2439,42 @@ async function openLocalStream(
     sendIfActive(stream.lease, { type: "terminal_data", clientId, streamId, data });
   });
   localSocket.on("close", () => {
-    finalizeStream(streams, key, stream, 0);
+    stream.resourceActive = false;
+    finalizeStream(streams, routes, key, stream, 0);
   });
   localSocket.on("error", (err) => {
-    finalizeStream(streams, key, stream, 1, { error: err.message, closeResource: true });
+    finalizeStream(streams, routes, key, stream, 1, { error: err.message, closeResource: true });
   });
 }
 
 async function openRouteStream(
   streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
   opts: RelayHostOptions,
   stream: LocalStream,
 ): Promise<void> {
-  const { route } = stream;
-  if (route.scope.kind === "local") {
-    await openLocalStream(
-      streams,
-      opts.local,
-      requireServeToken(),
-      stream,
-    );
-    return;
+  stream.openTaskActive = true;
+  try {
+    const { route } = stream;
+    if (route.scope.kind === "local") {
+      await openLocalStream(
+        streams,
+        routes,
+        opts.local,
+        requireServeToken(),
+        stream,
+      );
+      return;
+    }
+    await openRemoteStream(streams, routes, stream);
+  } finally {
+    stream.openTaskActive = false;
+    releaseStreamAdmissionIfQuiescent(stream);
   }
-  await openRemoteStream(streams, stream);
 }
 
 async function reopenRoutedStream(
+  admissionLedger: StreamAdmissionLedger,
   lease: RelayConnectionLease,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
@@ -1655,49 +2488,179 @@ async function reopenRoutedStream(
 
   const existing = streams.get(key);
   if (existing?.opening && existing.route === route && isCurrentStream(streams, key, existing)) {
-    if (pendingInput) existing.pending.push(pendingInput);
+    if (pendingInput && !queuePendingInput(existing, pendingInput)) {
+      failCurrentStream(
+        streams,
+        routes,
+        key,
+        existing,
+        "terminal input buffer limit reached",
+      );
+      return;
+    }
     if (pendingResize) existing.pendingResize = pendingResize;
+    return;
+  }
+  const reservation = reserveStreamAdmission(admissionLedger, route.clientId, route.scope);
+  if (typeof reservation === "string") {
+    rejectTerminalOpen(
+      lease,
+      streams,
+      routes,
+      key,
+      route.clientId,
+      route.streamId,
+      reservation,
+    );
     return;
   }
   if (existing) {
     streams.delete(key);
     closeStream(existing);
   }
-  const stream = openingStream(lease, route, pendingInput ? [pendingInput] : [], pendingResize);
+  const stream = openingStream(lease, route, reservation, [], pendingResize);
   streams.set(key, stream);
+  if (pendingInput && !queuePendingInput(stream, pendingInput)) {
+    failCurrentStream(streams, routes, key, stream, "terminal input buffer limit reached");
+    return;
+  }
   try {
-    await openRouteStream(streams, opts, stream);
+    await openRouteStream(streams, routes, opts, stream);
   } catch (error) {
-    if (!isCurrentStream(streams, key, stream)) return;
-    streams.delete(key);
-    closeStream(stream);
-    if (isCurrentRoute(routes, key, route, lease)) throw error;
+    if (
+      !isCurrentStream(streams, key, stream)
+      || !isCurrentRoute(routes, key, route, lease)
+    ) return;
+    failCurrentStream(
+      streams,
+      routes,
+      key,
+      stream,
+      error instanceof Error ? error.message : String(error),
+    );
   }
 }
 
-async function runConnection(opts: RelayHostOptions): Promise<{
+function rejectTerminalOpen(
+  lease: RelayConnectionLease,
+  streams: Map<string, LocalStream>,
+  routes: Map<string, StreamRoute>,
+  key: string,
+  clientId: string,
+  streamId: string,
+  message: string,
+): void {
+  const route = routes.get(key);
+  if (route?.clientId === clientId && route.streamId === streamId) {
+    routes.delete(key);
+  }
+  const stream = streams.get(key);
+  if (stream?.clientId === clientId && stream.streamId === streamId) {
+    streams.delete(key);
+    closeStream(stream);
+  }
+  sendIfActive(lease, { type: "error", clientId, streamId, message });
+  sendIfActive(lease, { type: "terminal_exit", clientId, streamId, code: 1 });
+}
+
+async function runConnection(
+  opts: RelayHostOptions,
+  statusOwnership: RelayStatusOwnership,
+  admissionLedger: StreamAdmissionLedger,
+  commandAdmissionLedger: CommandAdmissionLedger,
+  taskLedger: RelayTaskLedger,
+  onSocket: (socket: WebSocket) => void,
+  shutdownSignal: AbortSignal,
+): Promise<{
   opened: boolean;
   closeCode: number;
   closeReason: string;
   superseded: boolean;
 }> {
   requireServeToken();
-  writeRelayStatus(opts, "connecting");
 
   const relaySocket = new WebSocket(relayUrl(opts), {
     headers: { Authorization: `Bearer ${opts.secret}` },
+    perMessageDeflate: false,
+    maxPayload: MAX_RELAY_FRAME_BYTES,
   });
+  onSocket(relaySocket);
   const streams = new Map<string, LocalStream>();
   const streamRoutes = new Map<string, StreamRoute>();
   const lease: RelayConnectionLease = { socket: relaySocket, active: true };
+  const retireController = new AbortController();
+  const connectionSignal = AbortSignal.any([shutdownSignal, retireController.signal]);
   let nextStreamGeneration = 1;
   let opened = false;
+  let retiring = false;
+  let shuttingDown = false;
+  let drainPromise: Promise<void> | undefined;
+  let forceCloseTimer: ReturnType<typeof setTimeout> | undefined;
+  let shutdownForceTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const drainConnection = (): Promise<void> => {
+    closeConnectionStreams(streams, streamRoutes);
+    retireController.abort();
+    drainPromise ||= drainRelayWork(taskLedger, admissionLedger, commandAdmissionLedger);
+    return drainPromise;
+  };
+
+  const closeAfterDrain = () => {
+    if (!lease.active) return;
+    if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
+    shutdownForceTimer = undefined;
+    if (relaySocket.readyState !== WebSocket.OPEN) {
+      try { relaySocket.terminate(); } catch {}
+      return;
+    }
+    try {
+      relaySocket.close(1000, "host stopping");
+    } catch {
+      try { relaySocket.terminate(); } catch {}
+      return;
+    }
+    forceCloseTimer = setTimeout(() => {
+      forceCloseTimer = undefined;
+      if (relaySocket.readyState !== WebSocket.CLOSED) {
+        try { relaySocket.terminate(); } catch {}
+      }
+    }, RELAY_SOCKET_CLOSE_GRACE_MS);
+    forceCloseTimer.unref();
+  };
+
+  const beginShutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (relaySocket.readyState === WebSocket.CONNECTING) {
+      try { relaySocket.terminate(); } catch {}
+      return;
+    }
+    if (!lease.active) return;
+    shutdownForceTimer = setTimeout(() => {
+      shutdownForceTimer = undefined;
+      if (relaySocket.readyState !== WebSocket.CLOSED) {
+        try { relaySocket.terminate(); } catch {}
+      }
+    }, RELAY_SHUTDOWN_FORCE_CLOSE_MS);
+    shutdownForceTimer.unref();
+    void drainConnection().then(closeAfterDrain, closeAfterDrain);
+  };
+
+  const onShutdown = () => beginShutdown();
   const closed = new Promise<{ code: number; reason: string }>((resolve) => {
     relaySocket.once("close", (code, reason) => {
+      if (forceCloseTimer) clearTimeout(forceCloseTimer);
+      if (shutdownForceTimer) clearTimeout(shutdownForceTimer);
+      forceCloseTimer = undefined;
+      shutdownForceTimer = undefined;
+      shutdownSignal.removeEventListener("abort", onShutdown);
       deactivateConnection(lease, streams, streamRoutes);
       resolve({ code, reason: reason.toString("utf8") });
     });
   });
+
+  shutdownSignal.addEventListener("abort", onShutdown, { once: true });
+  if (shutdownSignal.aborted) onShutdown();
 
   await new Promise<void>((resolve, reject) => {
     relaySocket.once("open", () => {
@@ -1707,184 +2670,286 @@ async function runConnection(opts: RelayHostOptions): Promise<{
     relaySocket.once("error", reject);
   });
   console.log(`[relay-host] connected to ${opts.relay} as ${opts.hostId}`);
-  writeRelayStatus(opts, "connected", { connectedAt: Date.now() });
-  sendIfActive(lease, { type: "host_ready", hostId: opts.hostId, displayName: opts.displayName, version: "admin-v1" });
+  writeRelayStatus(opts, statusOwnership, "connected", { connectedAt: Date.now() });
+  sendIfActive(lease, {
+    type: "host_ready",
+    hostId: opts.hostId,
+    displayName: opts.displayName,
+    version: "admin-v1",
+    capabilities: [RELAY_HOST_RETIRE_CAPABILITY],
+  });
 
-  relaySocket.on("message", async (raw) => {
-    if (!lease.active) return;
-    let message: RelayToHostMessage | ({ type: "client_closed"; clientId: string });
+  const beginRetirement = () => {
+    if (retiring || !lease.active) return;
+    retiring = true;
+    void drainConnection()
+      .then(() => {
+        if (!shuttingDown) sendIfActive(lease, { type: "host_drained" });
+      });
+  };
+
+  relaySocket.on("message", (raw) => {
+    if (!lease.active || connectionSignal.aborted) return;
+    let message: RelayBrokerToHostMessage;
     try {
-      message = parseJsonMessage(raw) as RelayToHostMessage | ({ type: "client_closed"; clientId: string });
+      message = parseJsonMessage(raw) as RelayBrokerToHostMessage;
     } catch {
       return;
     }
     if (!message || typeof message !== "object") return;
-
-    if (message.type === "client_closed") {
-      closeClientRoutes(streamRoutes, message.clientId);
-      closeClientStreams(streams, message.clientId);
+    if (message.type === "host_retire") {
+      beginRetirement();
       return;
     }
-    if (!("clientId" in message) || !message.clientId) return;
+    const task = commandAbortContext.run({}, async () => {
+      if (!lease.active || connectionSignal.aborted) return;
 
-    const clientId = message.clientId;
-    try {
-      if (message.type === "list_sessions") {
-        const sessions = await listAdminSessions(opts.local, requireServeToken());
-        sendIfActive(lease, { type: "sessions", clientId, requestId: message.requestId, sessions });
+      if (message.type === "client_closed") {
+        closeClientRoutes(streamRoutes, message.clientId);
+        closeClientStreams(streams, message.clientId);
         return;
       }
-
-      if (message.type === "list_scope_statuses") {
-        const scopes = await listScopeStatuses(opts.local, requireServeToken());
-        sendIfActive(lease, { type: "scope_statuses", clientId, requestId: message.requestId, scopes });
-        return;
+      if (!("clientId" in message) || !message.clientId) return;
+      const context = commandAbortContext.getStore();
+      const safeToAbort = isSafeToAbortDuringShutdown(message);
+      if (context) {
+        context.mutation = !safeToAbort;
+        if (safeToAbort) context.signal = connectionSignal;
       }
 
-      if (message.type === "create_worktree") {
-        const session = await createWorktreeSession(message);
-        sendIfActive(lease, { type: "worktree_created", clientId, requestId: message.requestId, session });
-        return;
-      }
+      const clientId = message.clientId;
+      let commandReservation: CommandAdmissionReservation | undefined;
+      try {
+        if (requiresCommandAdmission(message)) {
+          const reservation = reserveCommandAdmission(commandAdmissionLedger, clientId);
+          if (typeof reservation === "string") {
+            sendIfActive(lease, {
+              type: "error",
+              clientId,
+              requestId: "requestId" in message ? message.requestId : undefined,
+              message: reservation,
+            });
+            return;
+          }
+          commandReservation = reservation;
+        }
 
-      if (message.type === "create_terminal") {
-        const session = await createPlainTerminalSession(message);
-        sendIfActive(lease, { type: "terminal_created", clientId, requestId: message.requestId, session });
-        return;
-      }
+        if (message.type === "list_sessions") {
+          const sessions = await listAdminSessions(opts.local, requireServeToken());
+          sendIfActive(lease, { type: "sessions", clientId, requestId: message.requestId, sessions });
+          return;
+        }
 
-      if (message.type === "open_terminal") {
+        if (message.type === "list_scope_statuses") {
+          const scopes = await listScopeStatuses(opts.local, requireServeToken());
+          sendIfActive(lease, { type: "scope_statuses", clientId, requestId: message.requestId, scopes });
+          return;
+        }
+
+        if (message.type === "create_worktree") {
+          const session = await createWorktreeSession(message);
+          sendIfActive(lease, { type: "worktree_created", clientId, requestId: message.requestId, session });
+          return;
+        }
+
+        if (message.type === "create_terminal") {
+          const session = await createPlainTerminalSession(message);
+          sendIfActive(lease, { type: "terminal_created", clientId, requestId: message.requestId, session });
+          return;
+        }
+
+        if (message.type === "open_terminal") {
+          const key = streamKey(clientId, message.streamId);
+          let scope: AdminScope;
+          let rawName: string;
+          try {
+            ({ scope, rawName } = scopeForSession(message.session));
+          } catch (error) {
+            rejectTerminalOpen(
+              lease,
+              streams,
+              streamRoutes,
+              key,
+              clientId,
+              message.streamId,
+              error instanceof Error ? error.message : String(error),
+            );
+            return;
+          }
+          const reservation = reserveStreamAdmission(admissionLedger, clientId, scope);
+          if (typeof reservation === "string") {
+            rejectTerminalOpen(
+              lease,
+              streams,
+              streamRoutes,
+              key,
+              clientId,
+              message.streamId,
+              reservation,
+            );
+            return;
+          }
+          const route: StreamRoute = {
+            clientId,
+            streamId: message.streamId,
+            generation: nextStreamGeneration++,
+            scope,
+            rawName,
+            pane: message.pane,
+          };
+          streamRoutes.set(key, route);
+          const previous = streams.get(key);
+          if (previous) {
+            streams.delete(key);
+            closeStream(previous);
+          }
+          const stream = openingStream(lease, route, reservation);
+          streams.set(key, stream);
+          try {
+            await openRouteStream(streams, streamRoutes, opts, stream);
+          } catch (error) {
+            if (
+              !isCurrentStream(streams, key, stream)
+              || !isCurrentRoute(streamRoutes, key, route, lease)
+            ) return;
+            failCurrentStream(
+              streams,
+              streamRoutes,
+              key,
+              stream,
+              error instanceof Error ? error.message : String(error),
+            );
+          }
+          return;
+        }
+
+        if (message.type === "send_agent_message") {
+          await sendAgentMessage(message.session, message.pane, message.message, message.submit !== false);
+          sendIfActive(lease, {
+            type: "agent_message_sent",
+            clientId,
+            requestId: message.requestId,
+            session: message.session,
+            pane: message.pane,
+          });
+          return;
+        }
+
+        if (message.type === "kill_session") {
+          await killSession(message.session, message.managed);
+          finalizeSessionStreams(streams, streamRoutes, message.session);
+          sendIfActive(lease, {
+            type: "session_killed",
+            clientId,
+            requestId: message.requestId,
+            session: message.session,
+          });
+          return;
+        }
+
+        if (
+          message.type !== "terminal_input"
+          && message.type !== "resize"
+          && message.type !== "close_terminal"
+        ) {
+          return;
+        }
+
         const key = streamKey(clientId, message.streamId);
-        const { scope, rawName } = scopeForSession(message.session);
-        const route: StreamRoute = {
-          clientId,
-          streamId: message.streamId,
-          generation: nextStreamGeneration++,
-          scope,
-          rawName,
-          pane: message.pane,
-        };
-        streamRoutes.set(key, route);
-        const previous = streams.get(key);
-        if (previous) {
-          streams.delete(key);
-          closeStream(previous);
+        if (message.type === "close_terminal") {
+          streamRoutes.delete(key);
+          const stream = streams.get(key);
+          if (stream) {
+            streams.delete(key);
+            closeStream(stream);
+          }
+          return;
         }
-        const stream = openingStream(lease, route);
-        streams.set(key, stream);
-        try {
-          await openRouteStream(streams, opts, stream);
-        } catch (err) {
-          if (!isCurrentStream(streams, key, stream)) return;
+
+        let stream = streams.get(key);
+        if (stream && stream.route !== streamRoutes.get(key)) {
           streams.delete(key);
           closeStream(stream);
-          if (!isCurrentRoute(streamRoutes, key, route, lease)) return;
-          throw err;
+          stream = undefined;
         }
-        return;
-      }
-
-      if (message.type === "send_agent_message") {
-        await sendAgentMessage(message.session, message.pane, message.message, message.submit !== false);
-        sendIfActive(lease, {
-          type: "agent_message_sent",
-          clientId,
-          requestId: message.requestId,
-          session: message.session,
-          pane: message.pane,
-        });
-        return;
-      }
-
-      if (message.type === "kill_session") {
-        await killSession(message.session, message.managed);
-        finalizeSessionStreams(streams, streamRoutes, message.session);
-        sendIfActive(lease, {
-          type: "session_killed",
-          clientId,
-          requestId: message.requestId,
-          session: message.session,
-        });
-        return;
-      }
-
-      if (
-        message.type !== "terminal_input"
-        && message.type !== "resize"
-        && message.type !== "close_terminal"
-      ) {
-        return;
-      }
-
-      const key = streamKey(clientId, message.streamId);
-      if (message.type === "close_terminal") {
-        streamRoutes.delete(key);
-        const stream = streams.get(key);
-        if (stream) {
-          streams.delete(key);
-          closeStream(stream);
-        }
-        return;
-      }
-
-      let stream = streams.get(key);
-      if (stream && stream.route !== streamRoutes.get(key)) {
-        streams.delete(key);
-        closeStream(stream);
-        stream = undefined;
-      }
-      if (!stream) {
-        const route = streamRoutes.get(key);
-        if (route && message.type === "terminal_input") {
-          await reopenRoutedStream(lease, streams, streamRoutes, opts, route, message.data);
-          return;
-        }
-        if (route && message.type === "resize") {
-          await reopenRoutedStream(lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
-          return;
-        }
-        if (message.type === "resize") return;
-        sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
-        return;
-      }
-
-      if (message.type === "terminal_input") {
-        if (sendToStream(stream, message.data) === "closed") {
+        if (!stream) {
           const route = streamRoutes.get(key);
-          if (route) {
-            await reopenRoutedStream(lease, streams, streamRoutes, opts, route, message.data);
+          if (route && message.type === "terminal_input") {
+            await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, message.data);
             return;
           }
-          sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
-        }
-      } else if (message.type === "resize") {
-        if (stream.opening) {
-          stream.pendingResize = { cols: message.cols, rows: message.rows };
-          return;
-        }
-        if (stream.resize) {
-          stream.resize(message.cols, message.rows);
-          return;
-        }
-        const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows });
-        if (sendToStream(stream, resize) === "closed") {
-          const route = streamRoutes.get(key);
-          if (route) {
-            await reopenRoutedStream(lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
+          if (route && message.type === "resize") {
+            await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
             return;
           }
+          if (message.type === "resize") return;
           sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+          return;
         }
+
+        if (message.type === "terminal_input") {
+          const result = sendToStream(stream, message.data);
+          if (result === "overloaded") {
+            failCurrentStream(
+              streams,
+              streamRoutes,
+              key,
+              stream,
+              "terminal input buffer limit reached",
+            );
+            return;
+          }
+          if (result === "closed") {
+            const route = streamRoutes.get(key);
+            if (route) {
+              await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, message.data);
+              return;
+            }
+            sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+          }
+        } else if (message.type === "resize") {
+          if (stream.opening) {
+            stream.pendingResize = { cols: message.cols, rows: message.rows };
+            return;
+          }
+          if (stream.resize) {
+            stream.resize(message.cols, message.rows);
+            return;
+          }
+          const resize = JSON.stringify({ type: "resize", cols: message.cols, rows: message.rows });
+          const result = sendToStream(stream, resize);
+          if (result === "overloaded") {
+            failCurrentStream(
+              streams,
+              streamRoutes,
+              key,
+              stream,
+              "terminal input buffer limit reached",
+            );
+            return;
+          }
+          if (result === "closed") {
+            const route = streamRoutes.get(key);
+            if (route) {
+              await reopenRoutedStream(admissionLedger, lease, streams, streamRoutes, opts, route, undefined, { cols: message.cols, rows: message.rows });
+              return;
+            }
+            sendIfActive(lease, { type: "error", clientId, streamId: message.streamId, message: "terminal stream is not open" });
+          }
+        }
+      } catch (err) {
+        sendIfActive(lease, {
+          type: "error",
+          clientId,
+          requestId: "requestId" in message ? message.requestId : undefined,
+          streamId: "streamId" in message ? message.streamId : undefined,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      } finally {
+        if (commandReservation) releaseCommandAdmission(commandReservation);
       }
-    } catch (err) {
-      sendIfActive(lease, {
-        type: "error",
-        clientId,
-        requestId: "requestId" in message ? message.requestId : undefined,
-        streamId: "streamId" in message ? message.streamId : undefined,
-        message: err instanceof Error ? err.message : String(err),
-      });
-    }
+    });
+    trackRelayTask(taskLedger, task);
   });
 
   const closeOutcome = await closed;
@@ -1899,32 +2964,89 @@ async function runConnection(opts: RelayHostOptions): Promise<{
 
 export async function run(): Promise<void> {
   const opts = parseArgs(process.argv.slice(3));
+  const statusOwnership: RelayStatusOwnership = {
+    instanceId: randomUUID(),
+    claimed: false,
+  };
+  statusOwnership.claimed = writeRelayStatus(
+    opts,
+    statusOwnership,
+    "connecting",
+    {},
+    true,
+  );
+  const admissionLedger = createStreamAdmissionLedger();
+  const commandAdmissionLedger = createCommandAdmissionLedger();
+  const taskLedger: RelayTaskLedger = { active: new Set() };
   let delay = 1000;
+  let stopping = false;
+  let stopError: string | undefined;
+  let publishTerminalStatus = true;
+  let activeSocket: WebSocket | undefined;
+  const stopController = new AbortController();
   const stop = () => {
-    writeRelayStatus(opts, "stopped");
-    process.exit(0);
+    if (stopping) return;
+    stopping = true;
+    writeRelayStatus(opts, statusOwnership, "stopping");
+    stopController.abort();
+    if (activeSocket?.readyState === WebSocket.CONNECTING) {
+      try { activeSocket.terminate(); } catch {}
+    }
   };
   process.once("SIGINT", stop);
   process.once("SIGTERM", stop);
 
-  while (true) {
+  while (!stopping) {
     let retryError = "Relay connection closed";
+    writeRelayStatus(opts, statusOwnership, "connecting");
     try {
-      const result = await runConnection(opts);
+      const result = await runConnection(
+        opts,
+        statusOwnership,
+        admissionLedger,
+        commandAdmissionLedger,
+        taskLedger,
+        (socket) => {
+          activeSocket = socket;
+        },
+        stopController.signal,
+      );
+      activeSocket = undefined;
       if (result.superseded) {
-        const error = result.closeReason || "host replaced";
-        console.error(`[relay-host] stopped: ${error}`);
-        writeRelayStatus(opts, "stopped", { error });
-        return;
+        stopError = result.closeReason || "host replaced";
+        console.error(`[relay-host] stopping: ${stopError}`);
+        stopping = true;
+        publishTerminalStatus = false;
+        stopController.abort();
+        break;
       }
+      if (stopping) break;
       retryError = result.closeReason || retryError;
       delay = result.opened ? 1000 : Math.min(delay * 2, 15_000);
     } catch (err) {
+      activeSocket = undefined;
+      if (stopping) break;
       retryError = err instanceof Error ? err.message : String(err);
       console.error(`[relay-host] ${retryError}`);
       delay = Math.min(delay * 2, 15_000);
     }
-    writeRelayStatus(opts, "retrying", { error: retryError, retryInMs: delay });
-    await new Promise((resolve) => setTimeout(resolve, delay));
+    writeRelayStatus(opts, statusOwnership, "retrying", { error: retryError, retryInMs: delay });
+    await new Promise<void>((resolve) => {
+      const onStop = () => {
+        clearTimeout(timer);
+        stopController.signal.removeEventListener("abort", onStop);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        stopController.signal.removeEventListener("abort", onStop);
+        resolve();
+      }, delay);
+      stopController.signal.addEventListener("abort", onStop, { once: true });
+      if (stopController.signal.aborted) onStop();
+    });
+  }
+  await drainRelayWork(taskLedger, admissionLedger, commandAdmissionLedger);
+  if (publishTerminalStatus) {
+    writeRelayStatus(opts, statusOwnership, "stopped", stopError ? { error: stopError } : {});
   }
 }

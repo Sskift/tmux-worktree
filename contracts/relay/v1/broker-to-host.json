@@ -6,6 +6,12 @@
     "normalized": { "type": "host_registered", "hostId": "mac-admin" }
   },
   {
+    "name": "host-retire",
+    "type": "host_retire",
+    "wire": "{\"type\":\"host_retire\"}",
+    "normalized": { "type": "host_retire" }
+  },
+  {
     "name": "invalid-host-error",
     "type": "error",
     "wire": "{\"type\":\"error\",\"message\":\"invalid hostId\"}",

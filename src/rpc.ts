@@ -87,6 +87,7 @@ export function buildRpcCapabilitiesResponse(): RpcCapabilitiesResponse {
     capabilities: [
       "list",
       "managed-state",
+      "hard-timeout",
       "create-worktree",
       "create-terminal",
       "restore-worktree",

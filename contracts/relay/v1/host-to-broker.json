@@ -6,6 +6,12 @@
     "normalized": { "type": "host_ready", "hostId": "mac-admin", "displayName": "Mac", "version": "admin-v1" }
   },
   {
+    "name": "host-drained",
+    "type": "host_drained",
+    "wire": "{\"type\":\"host_drained\"}",
+    "normalized": { "type": "host_drained" }
+  },
+  {
     "name": "deliver-sessions",
     "type": "sessions",
     "deliversAs": "sessions-with-request",

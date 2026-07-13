@@ -2,6 +2,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  RELAY_HOST_RETIRE_CAPABILITY,
+  type RelayClientMessage,
   type RelayHostMessage,
   type RelayHostInfo,
   type RelayToClientMessage,
@@ -18,9 +20,26 @@ type HostConnection = {
   hostId: string;
   connectorId: string;
   active: boolean;
+  retiring: boolean;
+  supportsRetireDrain: boolean;
   displayName?: string;
   socket: WebSocket;
   connectedAt: number;
+  pendingMutations: PendingMutation[];
+  retireTimer?: ReturnType<typeof setTimeout>;
+  forceCloseTimer?: ReturnType<typeof setTimeout>;
+};
+
+type MutationResponseType =
+  | "worktree_created"
+  | "terminal_created"
+  | "agent_message_sent"
+  | "session_killed";
+
+type PendingMutation = {
+  clientId: string;
+  requestId?: string;
+  responseType: MutationResponseType;
 };
 
 type StreamBinding = {
@@ -44,8 +63,24 @@ type RelaySocket = WebSocket & {
 
 const MAX_ACTIVE_STREAMS_PER_CLIENT = 128;
 const MAX_ACCEPTED_STREAM_IDS_PER_CLIENT = 1_024;
+const MAX_PENDING_MUTATIONS_PER_HOST = 128;
 const MAX_RELAY_FRAME_BYTES = 1 * 1024 * 1024;
 const MAX_SOCKET_BUFFERED_BYTES = 4 * 1024 * 1024;
+const HOST_RETIRE_TIMEOUT_MS = 5 * 60_000;
+const HOST_CLOSE_GRACE_MS = 1_000;
+const RELAY_CLIENT_MESSAGE_TYPES: ReadonlySet<string> = new Set([
+  "list_hosts",
+  "list_sessions",
+  "list_scope_statuses",
+  "create_worktree",
+  "create_terminal",
+  "open_terminal",
+  "send_agent_message",
+  "kill_session",
+  "terminal_input",
+  "resize",
+  "close_terminal",
+] satisfies RelayClientMessage["type"][]);
 
 function constantTimeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
@@ -104,6 +139,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isRelayClientMessageType(type: string): type is RelayClientMessage["type"] {
+  return RELAY_CLIENT_MESSAGE_TYPES.has(type);
+}
+
 function isCurrentHost(hosts: Map<string, HostConnection>, host: HostConnection): boolean {
   return host.active && hosts.get(host.hostId) === host && isOpen(host.socket);
 }
@@ -138,8 +177,18 @@ function messageStreamId(message: RelayToHostMessage): string | undefined {
   return "streamId" in message ? message.streamId : undefined;
 }
 
+function mutationResponseType(message: RelayToHostMessage): MutationResponseType | undefined {
+  if (message.type === "create_worktree") return "worktree_created";
+  if (message.type === "create_terminal") return "terminal_created";
+  if (message.type === "send_agent_message") return "agent_message_sent";
+  if (message.type === "kill_session") return "session_killed";
+  return undefined;
+}
+
 export async function startRelayBroker(opts: RelayServerOptions): Promise<void> {
   const hosts = new Map<string, HostConnection>();
+  const candidates = new Map<string, HostConnection>();
+  const hostConnections = new Set<HostConnection>();
   const clients = new Map<string, ClientConnection>();
 
   function retireClientStream(client: ClientConnection, streamId: string): StreamBinding | undefined {
@@ -161,6 +210,109 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         }
       }
     }
+  }
+
+  function clearHostTimers(host: HostConnection): void {
+    if (host.retireTimer) clearTimeout(host.retireTimer);
+    if (host.forceCloseTimer) clearTimeout(host.forceCloseTimer);
+    host.retireTimer = undefined;
+    host.forceCloseTimer = undefined;
+  }
+
+  function failPendingMutations(host: HostConnection, reason: string): void {
+    const pending = host.pendingMutations.splice(0);
+    for (const mutation of pending) {
+      const client = clients.get(mutation.clientId);
+      if (!client || !isOpen(client.socket)) continue;
+      sendJson(client.socket, {
+        type: "error",
+        requestId: mutation.requestId,
+        message: reason,
+      });
+    }
+  }
+
+  function finishHostRetirement(host: HostConnection): void {
+    if (!host.retiring) return;
+    host.retiring = false;
+    if (host.retireTimer) clearTimeout(host.retireTimer);
+    host.retireTimer = undefined;
+    failPendingMutations(host, "host replaced before mutation completed");
+    if (isOpen(host.socket)) host.socket.close(4002, "host replaced");
+    if (host.socket.readyState === WebSocket.CLOSED) return;
+    host.forceCloseTimer = setTimeout(() => {
+      host.forceCloseTimer = undefined;
+      if (host.socket.readyState !== WebSocket.CLOSED) {
+        try { host.socket.terminate(); } catch {}
+      }
+    }, HOST_CLOSE_GRACE_MS);
+    host.forceCloseTimer.unref();
+  }
+
+  function finishLegacyRetirementIfDrained(host: HostConnection): void {
+    if (
+      host.retiring
+      && !host.supportsRetireDrain
+      && host.pendingMutations.length === 0
+    ) {
+      finishHostRetirement(host);
+    }
+  }
+
+  function beginHostRetirement(host: HostConnection): void {
+    if (host.retiring || !isOpen(host.socket)) return;
+    host.active = false;
+    host.retiring = true;
+    dropHostStreams(host, "host reconnected; terminal stream closed");
+    if (!sendJson(host.socket, { type: "host_retire" })) {
+      finishHostRetirement(host);
+      return;
+    }
+    host.retireTimer = setTimeout(
+      () => finishHostRetirement(host),
+      HOST_RETIRE_TIMEOUT_MS,
+    );
+    host.retireTimer.unref();
+    finishLegacyRetirementIfDrained(host);
+  }
+
+  function activateHost(host: HostConnection): void {
+    if (!isOpen(host.socket)) return;
+    const previous = hosts.get(host.hostId);
+    if (candidates.get(host.hostId) === host) candidates.delete(host.hostId);
+    host.active = true;
+    hosts.set(host.hostId, host);
+    if (previous && previous !== host) beginHostRetirement(previous);
+  }
+
+  function registerPendingMutation(
+    host: HostConnection,
+    message: RelayToHostMessage,
+  ): PendingMutation | undefined {
+    const responseType = mutationResponseType(message);
+    if (!responseType) return undefined;
+    const pending = {
+      clientId: message.clientId,
+      requestId: messageRequestId(message),
+      responseType,
+    };
+    host.pendingMutations.push(pending);
+    return pending;
+  }
+
+  function consumePendingMutation(
+    host: HostConnection,
+    message: RelayHostMessage & { clientId: string },
+  ): boolean {
+    const requestId = "requestId" in message ? message.requestId : undefined;
+    const index = host.pendingMutations.findIndex((pending) => (
+      pending.clientId === message.clientId
+      && pending.requestId === requestId
+      && (message.type === "error" || message.type === pending.responseType)
+    ));
+    if (index < 0) return false;
+    host.pendingMutations.splice(index, 1);
+    return true;
   }
 
   const server = createServer((req, res) => {
@@ -237,25 +389,26 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         socket.close(4000, "invalid hostId");
         return;
       }
-      const previous = hosts.get(hostId);
-      if (previous) previous.active = false;
       const host: HostConnection = {
         hostId,
         connectorId: randomUUID(),
-        active: true,
+        active: false,
+        retiring: false,
+        supportsRetireDrain: false,
         socket,
         connectedAt: Date.now(),
+        pendingMutations: [],
       };
-      hosts.set(hostId, host);
-      if (previous) {
-        dropHostStreams(previous, "host reconnected; terminal stream closed");
-        if (isOpen(previous.socket)) previous.socket.close(4002, "host replaced");
+      hostConnections.add(host);
+      const previousCandidate = candidates.get(hostId);
+      if (previousCandidate && previousCandidate !== host) {
+        previousCandidate.socket.close(4002, "host candidate replaced");
       }
+      candidates.set(hostId, host);
       console.log(`[relay] host connected: ${hostId}`);
       sendJson(socket, { type: "host_registered", hostId });
 
       socket.on("message", (raw) => {
-        if (!isCurrentHost(hosts, host)) return;
         let message: RelayHostMessage;
         try {
           const parsed = parseJsonMessage(raw);
@@ -264,24 +417,43 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         } catch {
           return;
         }
+        const currentHost = isCurrentHost(hosts, host);
+        const candidateHost = candidates.get(hostId) === host && isOpen(host.socket);
+        const retiringHost = host.retiring && isOpen(host.socket);
+        if (!currentHost && !candidateHost && !retiringHost) return;
         if (message.type === "host_ready") {
+          if (retiringHost) return;
           if (
             message.hostId !== hostId
             || (message.displayName !== undefined && typeof message.displayName !== "string")
+            || (message.capabilities !== undefined && (
+              !Array.isArray(message.capabilities)
+              || message.capabilities.some((capability) => typeof capability !== "string")
+            ))
           ) {
             host.active = false;
             if (hosts.get(hostId) === host) hosts.delete(hostId);
+            if (candidates.get(hostId) === host) candidates.delete(hostId);
             dropHostStreams(host, "host identity changed; terminal stream closed");
             socket.close(4000, "hostId mismatch");
             return;
           }
           host.displayName = message.displayName;
+          host.supportsRetireDrain = message.capabilities?.includes(
+            RELAY_HOST_RETIRE_CAPABILITY,
+          ) ?? false;
+          if (candidateHost) activateHost(host);
           return;
         }
+        if (message.type === "host_drained") {
+          if (retiringHost) finishHostRetirement(host);
+          return;
+        }
+        if (!currentHost && !retiringHost) return;
         const clientId = "clientId" in message && typeof message.clientId === "string"
           ? message.clientId
           : undefined;
-        if (!clientId || !isCurrentHost(hosts, host)) return;
+        if (!clientId) return;
         const client = clients.get(clientId);
         if (!client || !isOpen(client.socket)) return;
         const streamId = "streamId" in message && typeof message.streamId === "string"
@@ -303,12 +475,24 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
             return;
           }
         }
+        const pendingMutation = streamId
+          ? false
+          : consumePendingMutation(host, message as RelayHostMessage & { clientId: string });
+        if (retiringHost && !pendingMutation) return;
         const { clientId: _clientId, ...outbound } = message;
         sendJson(client.socket, outbound satisfies RelayToClientMessage);
+        if (retiringHost && pendingMutation) finishLegacyRetirementIfDrained(host);
         if (message.type === "terminal_exit") retireClientStream(client, message.streamId);
       });
 
       socket.on("close", () => {
+        clearHostTimers(host);
+        hostConnections.delete(host);
+        if (candidates.get(hostId) === host) candidates.delete(hostId);
+        failPendingMutations(host, host.retiring
+          ? "host replaced before mutation completed"
+          : "host disconnected before mutation completed");
+        host.retiring = false;
         if (hosts.get(hostId) === host) {
           host.active = false;
           hosts.delete(hostId);
@@ -346,7 +530,11 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
         let message: RelayToHostMessage;
         try {
           const parsed = parseJsonMessage(raw);
-          if (!isRecord(parsed) || typeof parsed.type !== "string") {
+          if (
+            !isRecord(parsed)
+            || typeof parsed.type !== "string"
+            || !isRelayClientMessageType(parsed.type)
+          ) {
             sendJson(socket, { type: "error", message: "invalid message" });
             return;
           }
@@ -462,11 +650,29 @@ export async function startRelayBroker(opts: RelayServerOptions): Promise<void> 
             routeId: randomUUID(),
           });
         }
+        if (
+          mutationResponseType(message)
+          && currentHost.pendingMutations.length >= MAX_PENDING_MUTATIONS_PER_HOST
+        ) {
+          sendJson(socket, {
+            type: "error",
+            requestId: messageRequestId(message),
+            message: "too many pending relay mutations on host",
+          });
+          return;
+        }
+        registerPendingMutation(currentHost, message);
         sendJson(currentHost.socket, message);
       });
 
       socket.on("close", () => {
         clients.delete(clientId);
+        for (const host of hostConnections) {
+          host.pendingMutations = host.pendingMutations.filter((pending) => (
+            pending.clientId !== clientId
+          ));
+          finishLegacyRetirementIfDrained(host);
+        }
         const notifiedConnectors = new Set<string>();
         for (const binding of client.streams.values()) {
           if (notifiedConnectors.has(binding.connectorId)) continue;

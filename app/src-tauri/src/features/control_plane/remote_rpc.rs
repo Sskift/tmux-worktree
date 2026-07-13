@@ -18,7 +18,13 @@ pub(crate) fn tw_rpc_capabilities_compatible(
     capabilities: &[String],
 ) -> bool {
     protocol_version == 1
-        && ["list", "create-worktree", "create-terminal", "kill-session"]
+        && [
+            "list",
+            "create-worktree",
+            "create-terminal",
+            "kill-session",
+            "hard-timeout",
+        ]
             .iter()
             .all(|required| capabilities.iter().any(|capability| capability == required))
 }
