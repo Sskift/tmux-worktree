@@ -90,6 +90,146 @@ async function stopChild(child) {
   await exited;
 }
 
+function waitForChildExit(child, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    if (child.exitCode !== null) {
+      resolve({ code: child.exitCode, signal: child.signalCode });
+      return;
+    }
+    const timer = setTimeout(() => {
+      child.off("exit", onExit);
+      reject(new Error("serve process did not exit"));
+    }, timeoutMs);
+    const onExit = (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal });
+    };
+    child.once("exit", onExit);
+  });
+}
+
+function serveTokenTemporaryFiles(home) {
+  return readdirSync(home).filter(
+    (name) => name.startsWith(".tw-serve-token.") && name.endsWith(".tmp"),
+  );
+}
+
+function spawnServe(port, home, token) {
+  const env = { ...process.env, HOME: home, NODE_PATH: "" };
+  if (token === undefined) delete env.TW_TOKEN;
+  else env.TW_TOKEN = token;
+  return spawn(process.execPath, ["dist/cli.cjs", "serve", "--port", String(port)], {
+    cwd: root,
+    env,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+test("serve publishes a high-entropy token atomically only after listen succeeds", async () => {
+  const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
+  assert.match(source, /randomBytes\(32\)\.toString\("base64url"\)/);
+  assert.match(source, /\[\\0\\r\\n\]\/\.test\(configured\)/);
+  assert.match(source, /openSync\(temporaryFile, "wx", 0o600\)/);
+  assert.match(source, /fsyncSync\(fd\)[\s\S]*renameSync\(temporaryFile, tokenFile\)[\s\S]*chmodSync\(tokenFile, 0o600\)/);
+  const runSource = source.slice(source.indexOf("export async function run()"));
+  assert.ok(runSource.indexOf("await new Promise<void>") < runSource.indexOf("publishServeToken(tokenFile, token)"));
+
+  const testRoot = mkdtempSync(join(tmpdir(), "tw-serve-token-"));
+  try {
+    const generatedHome = join(testRoot, "generated-home");
+    mkdirSync(generatedHome);
+    const generatedPort = await unusedPort();
+    const generatedChild = spawnServe(generatedPort, generatedHome);
+    let generatedStderr = "";
+    generatedChild.stderr.on("data", (chunk) => { generatedStderr += chunk.toString("utf8"); });
+    try {
+      const tokenFile = join(generatedHome, ".tw-serve-token");
+      const generatedToken = await waitFor(
+        () => existsSync(tokenFile) && readFileSync(tokenFile, "utf8"),
+        `default token was not published: ${generatedStderr}`,
+      );
+      assert.match(generatedToken, /^[A-Za-z0-9_-]{43}$/);
+      assert.equal(Buffer.from(generatedToken, "base64url").length, 32);
+      assert.equal(statSync(tokenFile).mode & 0o777, 0o600);
+      assert.deepEqual(serveTokenTemporaryFiles(generatedHome), []);
+      const authenticated = await httpRequest(generatedPort, "/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        chunks: [JSON.stringify({ token: generatedToken })],
+      });
+      assert.equal(authenticated.status, 200);
+    } finally {
+      await stopChild(generatedChild);
+    }
+
+    const compatibilityHome = join(testRoot, "compatibility-home");
+    mkdirSync(compatibilityHome);
+    const compatibilityTokenFile = join(compatibilityHome, ".tw-serve-token");
+    writeFileSync(compatibilityTokenFile, "old-token", { mode: 0o644 });
+    chmodSync(compatibilityTokenFile, 0o644);
+    const compatibilityPort = await unusedPort();
+    const compatibilityChild = spawnServe(compatibilityPort, compatibilityHome, "short");
+    let compatibilityStderr = "";
+    compatibilityChild.stderr.on("data", (chunk) => { compatibilityStderr += chunk.toString("utf8"); });
+    try {
+      await waitFor(
+        () => existsSync(compatibilityTokenFile) && readFileSync(compatibilityTokenFile, "utf8") === "short",
+        `configured token was not published: ${compatibilityStderr}`,
+      );
+      await waitFor(
+        () => compatibilityStderr.includes("TW_TOKEN is shorter than 16 bytes"),
+        "short configured token warning was not emitted",
+      );
+      assert.equal(statSync(compatibilityTokenFile).mode & 0o777, 0o600);
+      assert.deepEqual(serveTokenTemporaryFiles(compatibilityHome), []);
+    } finally {
+      await stopChild(compatibilityChild);
+    }
+
+    const invalidHome = join(testRoot, "invalid-home");
+    mkdirSync(invalidHome);
+    const invalidChild = spawnServe(await unusedPort(), invalidHome, "bad\nvalue");
+    let invalidStderr = "";
+    invalidChild.stderr.on("data", (chunk) => { invalidStderr += chunk.toString("utf8"); });
+    const invalidExit = await waitForChildExit(invalidChild);
+    assert.notEqual(invalidExit.code, 0);
+    assert.match(invalidStderr, /TW_TOKEN must not contain NUL, carriage return, or line feed/);
+    assert.equal(existsSync(join(invalidHome, ".tw-serve-token")), false);
+
+    const conflictHome = join(testRoot, "conflict-home");
+    mkdirSync(conflictHome);
+    const conflictTokenFile = join(conflictHome, ".tw-serve-token");
+    writeFileSync(conflictTokenFile, "preserve-this-token", { mode: 0o644 });
+    chmodSync(conflictTokenFile, 0o644);
+    const blocker = createServer();
+    await new Promise((resolve) => blocker.listen(0, "0.0.0.0", resolve));
+    const blockerAddress = blocker.address();
+    assert.ok(typeof blockerAddress === "object" && blockerAddress);
+    const conflictChild = spawnServe(blockerAddress.port, conflictHome, "replacement-token");
+    try {
+      const conflictExit = await waitForChildExit(conflictChild);
+      assert.notEqual(conflictExit.code, 0);
+      assert.equal(readFileSync(conflictTokenFile, "utf8"), "preserve-this-token");
+      assert.equal(statSync(conflictTokenFile).mode & 0o777, 0o644);
+      assert.deepEqual(serveTokenTemporaryFiles(conflictHome), []);
+    } finally {
+      await new Promise((resolve) => blocker.close(resolve));
+      await stopChild(conflictChild);
+    }
+
+    const cleanupHome = join(testRoot, "cleanup-home");
+    mkdirSync(cleanupHome);
+    mkdirSync(join(cleanupHome, ".tw-serve-token"));
+    const cleanupChild = spawnServe(await unusedPort(), cleanupHome, "cleanup-token-value");
+    const cleanupExit = await waitForChildExit(cleanupChild);
+    assert.notEqual(cleanupExit.code, 0);
+    assert.equal(statSync(join(cleanupHome, ".tw-serve-token")).isDirectory(), true);
+    assert.deepEqual(serveTokenTemporaryFiles(cleanupHome), []);
+  } finally {
+    rmSync(testRoot, { recursive: true, force: true });
+  }
+});
+
 test("serve keeps tmux and Python identifiers in argv and fences authenticated input", async () => {
   const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
   assert.doesNotMatch(source, /\bexecSync\b|function\s+sh\s*\(/);
