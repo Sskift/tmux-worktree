@@ -100,6 +100,19 @@ function leaseExpired(target: TerminalControlTargetRecord, now: () => Date): boo
   return Date.parse(target.ownership.leaseExpiresAt) <= now().getTime();
 }
 
+function isAbandonableNonFeishuLease(target: TerminalControlTargetRecord): boolean {
+  return target.lifecycle === "ACTIVE"
+    && target.ownership.state === "HELD"
+    && target.ownership.owner.kind !== "feishu"
+    && target.inFlight === undefined;
+}
+
+function isAutoRecoverableNonFeishuState(target: TerminalControlTargetRecord): boolean {
+  if (target.lifecycle !== "RECOVERY_REQUIRED" || target.inFlight || !target.recovery) return false;
+  if (target.recovery.previousOwnerKind === "feishu" || target.recovery.operationId) return false;
+  return !["OPERATION_IN_DOUBT", "DRAIN_UNCERTAIN"].includes(target.recovery.reason);
+}
+
 function appendOperation(
   target: TerminalControlTargetRecord,
   operation: TerminalControlOperationRecord,
@@ -271,9 +284,19 @@ export class TerminalControlAuthority {
       state.controlEpoch = randomUUID();
       for (const target of state.targets) {
         if (target.lifecycle === "TARGET_GONE") continue;
-        const hadAuthority = target.ownership.state !== "FREE";
-        const hadInFlight = target.inFlight !== undefined;
-        if (hadAuthority || hadInFlight || target.lifecycle === "RECOVERY_REQUIRED") {
+        // Never erase a persisted uncertainty record on another restart. In
+        // particular, its operationId is what prevents an in-doubt write from
+        // later being mistaken for an idle, safely abandonable local lease.
+        if (target.lifecycle === "RECOVERY_REQUIRED") continue;
+        if (target.inFlight) {
+          markRecovery(state, target, "OPERATION_IN_DOUBT", this.now, {
+            previousControlEpoch,
+          });
+        } else if (target.ownership.state === "DRAINING") {
+          markRecovery(state, target, "DRAIN_UNCERTAIN", this.now, {
+            previousControlEpoch,
+          });
+        } else if (target.ownership.state === "HELD") {
           markRecovery(state, target, "CONTROLLER_RESTARTED", this.now, {
             previousControlEpoch,
           });
@@ -294,18 +317,70 @@ export class TerminalControlAuthority {
     }
   }
 
+  private async reconcileAbandonedOwnership(
+    state: TerminalControlState,
+    target: TerminalControlTargetRecord,
+  ): Promise<boolean> {
+    if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
+      const abandonable = isAbandonableNonFeishuLease(target);
+      markRecovery(
+        state,
+        target,
+        target.ownership.state === "DRAINING" ? "DRAIN_UNCERTAIN" : "LEASE_EXPIRED",
+        this.now,
+      );
+      saveTerminalControlState(state, this.statePath);
+      if (!abandonable) return false;
+    }
+    if (!isAutoRecoverableNonFeishuState(target)) return false;
+
+    try {
+      await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+    } catch (error) {
+      if (
+        error instanceof TerminalControlProtocolError
+        && (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND")
+      ) {
+        invalidateTarget(target, this.now);
+        saveTerminalControlState(state, this.statePath);
+        throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+      }
+      markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
+      saveTerminalControlState(state, this.statePath);
+      return false;
+    }
+
+    try {
+      const output = await this.backend.resetOutput(
+        target.controlTargetId,
+        target.managedSession.name,
+        "0",
+        target.outputGeneration,
+      );
+      target.outputGeneration = output.generation;
+    } catch {
+      markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
+      saveTerminalControlState(state, this.statePath);
+      return false;
+    }
+    target.lifecycle = "ACTIVE";
+    target.recovery = undefined;
+    target.ownership = {
+      state: "FREE",
+      // markRecovery already advanced this fence before recovery was entered.
+      fence: target.ownership.fence,
+    };
+    revision(target);
+    target.updatedAt = isoNow(this.now);
+    saveTerminalControlState(state, this.statePath);
+    return true;
+  }
+
   private async assertTargetCurrent(
     state: TerminalControlState,
     target: TerminalControlTargetRecord,
   ): Promise<void> {
-    if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
-      markRecovery(state, target, "LEASE_EXPIRED", this.now);
-      saveTerminalControlState(state, this.statePath);
-      throw new TerminalControlProtocolError(
-        "RECOVERY_REQUIRED",
-        "terminal input owner liveness expired; explicit local recovery is required",
-      );
-    }
+    await this.reconcileAbandonedOwnership(state, target);
     ensureOperable(target);
     try {
       await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
@@ -341,6 +416,33 @@ export class TerminalControlAuthority {
       target.outputGeneration = output.generation;
       return output;
     } catch (error) {
+      // Dashboard/Relay/local producers do not own a Feishu output turn. If
+      // their otherwise idle capture disappeared, rotate the observation
+      // generation and rebuild pane_pipe before treating the terminal as
+      // unavailable. Feishu and every draining/in-flight state remain strict.
+      if (
+        target.lifecycle === "ACTIVE"
+        && target.ownership.state === "HELD"
+        && target.ownership.owner.kind !== "feishu"
+        && !target.inFlight
+      ) {
+        try {
+          await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+          const repaired = await this.backend.resetOutput(
+            target.controlTargetId,
+            target.managedSession.name,
+            "0",
+            target.outputGeneration,
+          );
+          target.outputGeneration = repaired.generation;
+          revision(target);
+          target.updatedAt = isoNow(this.now);
+          saveTerminalControlState(state, this.statePath);
+          return repaired;
+        } catch {
+          // The normal recovery path below persists and fences this failure.
+        }
+      }
       markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
       saveTerminalControlState(state, this.statePath);
       throw new TerminalControlProtocolError(
@@ -432,6 +534,15 @@ export class TerminalControlAuthority {
         `${normalized}\0${request.submit ? "1" : "0"}`,
       );
     }
+    if (request.type === "input.scroll") {
+      return this.executeInput(
+        request.lease,
+        request.operationId,
+        request.pane,
+        "scroll",
+        `${request.direction}:${request.lines}`,
+      );
+    }
     if (request.type === "lifecycle.kill") {
       return this.executeLifecycleKill(request.lease, request.operationId);
     }
@@ -501,10 +612,7 @@ export class TerminalControlAuthority {
         markRecovery(state, target, "OPERATION_IN_DOUBT", this.now);
         changed = true;
       }
-      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
-        markRecovery(state, target, "LEASE_EXPIRED", this.now);
-        changed = true;
-      }
+      await this.reconcileAbandonedOwnership(state, target);
       const output = target.lifecycle === "ACTIVE"
         ? await this.prepareOutput(state, target)
         : { generation: target.outputGeneration, cursor: 0 };
@@ -522,15 +630,13 @@ export class TerminalControlAuthority {
     return this.locked(async (state) => {
       const target = targetById(state, controlTargetId);
       let changed = false;
-      if (target.lifecycle === "ACTIVE" && leaseExpired(target, this.now)) {
-        markRecovery(state, target, "LEASE_EXPIRED", this.now);
-        changed = true;
-      }
-      if (target.lifecycle === "ACTIVE" && !target.inFlight) {
-        await this.assertTargetCurrent(state, target);
-      } else if (target.inFlight && target.lifecycle === "ACTIVE") {
+      if (target.inFlight && target.lifecycle === "ACTIVE") {
         markRecovery(state, target, "OPERATION_IN_DOUBT", this.now);
         changed = true;
+      }
+      await this.reconcileAbandonedOwnership(state, target);
+      if (target.lifecycle === "ACTIVE") {
+        await this.assertTargetCurrent(state, target);
       }
       const output = target.lifecycle === "ACTIVE"
         ? await this.prepareOutput(state, target)
@@ -878,7 +984,14 @@ export class TerminalControlAuthority {
   ): Promise<unknown> {
     return this.locked(async (state) => {
       const target = targetById(state, lease.controlTargetId);
-      await this.assertTargetCurrent(state, target);
+      const hasFencedRawPath = kind === "raw"
+        && this.backend.rawInputPosition !== undefined
+        && this.backend.writeRawFenced !== undefined;
+      if (hasFencedRawPath) {
+        await this.reconcileAbandonedOwnership(state, target);
+      } else {
+        await this.assertTargetCurrent(state, target);
+      }
       validateLease(state, target, lease);
       const hash = payloadHash(kind, pane, payload);
       const completed = existingOperation(
@@ -890,9 +1003,50 @@ export class TerminalControlAuthority {
         kind,
       );
       if (completed) {
+        if (hasFencedRawPath) await this.assertTargetCurrent(state, target);
         return operationResult(state, target, completed, true);
       }
-      const output = await this.prepareOutput(state, target);
+      let output: { generation: string; cursor: number };
+      if (hasFencedRawPath) {
+        try {
+          output = await this.backend.rawInputPosition!(
+            target.controlTargetId,
+            target.outputGeneration,
+          );
+        } catch (error) {
+          if (lease.owner.kind !== "feishu" && target.ownership.state === "HELD" && !target.inFlight) {
+            try {
+              await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
+              output = await this.backend.resetOutput(
+                target.controlTargetId,
+                target.managedSession.name,
+                "0",
+                target.outputGeneration,
+              );
+              target.outputGeneration = output.generation;
+              revision(target);
+              target.updatedAt = isoNow(this.now);
+              saveTerminalControlState(state, this.statePath);
+            } catch {
+              markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
+              saveTerminalControlState(state, this.statePath);
+              throw new TerminalControlProtocolError(
+                "RECOVERY_REQUIRED",
+                `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            }
+          } else {
+            markRecovery(state, target, "OUTPUT_CONTINUITY_UNCERTAIN", this.now);
+            saveTerminalControlState(state, this.statePath);
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              `terminal output continuity is uncertain: ${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+      } else {
+        output = await this.prepareOutput(state, target);
+      }
       target.inFlight = {
         operationId,
         ownerInstanceId: lease.owner.instanceId,
@@ -909,7 +1063,17 @@ export class TerminalControlAuthority {
       try {
         const sessionName = target.managedSession.name;
         if (kind === "raw") {
-          await this.backend.writeRaw(sessionName, pane, payload as Buffer);
+          if (hasFencedRawPath) {
+            await this.backend.writeRawFenced!(
+              target.managedSession,
+              target.backend.tmuxInstanceId,
+              output.generation,
+              pane,
+              payload as Buffer,
+            );
+          } else {
+            await this.backend.writeRaw(sessionName, pane, payload as Buffer);
+          }
         } else if (kind === "agent-message") {
           const separator = (payload as string).lastIndexOf("\0");
           await this.backend.sendAgentMessage(
@@ -918,12 +1082,40 @@ export class TerminalControlAuthority {
             (payload as string).slice(0, separator),
             (payload as string).slice(separator + 1) === "1",
           );
+        } else if (kind === "scroll") {
+          const match = /^(up|down):(\d+)$/.exec(payload as string);
+          if (!match) throw new Error("invalid normalized scroll payload");
+          await this.backend.scroll(
+            sessionName,
+            pane,
+            match[1] as "up" | "down",
+            Number(match[2]),
+          );
         } else {
           const match = /^(\d+)x(\d+)$/.exec(payload as string);
           if (!match) throw new Error("invalid normalized resize payload");
           await this.backend.resize(sessionName, pane, Number(match[1]), Number(match[2]));
         }
       } catch (error) {
+        if (
+          hasFencedRawPath
+          && error instanceof TerminalControlProtocolError
+          && ["TARGET_GONE", "TARGET_NOT_FOUND", "RECOVERY_REQUIRED"].includes(error.code)
+        ) {
+          // writeRawFenced only returns these errors from pre-write checks or
+          // the false branch of tmux if-shell, which proves paste-buffer did
+          // not run. Clear the durable in-flight marker without classifying
+          // the raw bytes themselves as ambiguous.
+          target.inFlight = undefined;
+          if (error.code === "TARGET_GONE" || error.code === "TARGET_NOT_FOUND") {
+            invalidateTarget(target, this.now);
+            saveTerminalControlState(state, this.statePath);
+            throw new TerminalControlProtocolError("TARGET_GONE", error.message);
+          }
+          markRecovery(state, target, "BACKEND_IDENTITY_UNCERTAIN", this.now);
+          saveTerminalControlState(state, this.statePath);
+          throw new TerminalControlProtocolError("RECOVERY_REQUIRED", error.message);
+        }
         markRecovery(state, target, "OPERATION_IN_DOUBT", this.now, { operationId });
         try { saveTerminalControlState(state, this.statePath); } catch {}
         throw new TerminalControlProtocolError(

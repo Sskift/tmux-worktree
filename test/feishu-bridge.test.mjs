@@ -1337,6 +1337,49 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
   }
 });
 
+test("Feishu bridge allows a profile restart only while it has no bindings", async () => {
+  const empty = harness();
+  const emptyServer = await FeishuBridgeServer.create({
+    paths: empty.paths,
+    control: empty.control,
+    lark: empty.lark,
+    botOpenId: "ou-bot",
+  });
+  try {
+    await emptyServer.start();
+    const client = new FeishuBridgeClient(empty.paths.socket);
+    assert.deepEqual(await client.request("bridge.shutdown", {}), { stopping: true });
+    await emptyServer.stopped;
+    assert.equal(existsSync(empty.paths.socket), false);
+  } finally {
+    await emptyServer.stop();
+    rmSync(empty.root, { recursive: true, force: true });
+  }
+
+  const bound = harness();
+  const boundServer = await FeishuBridgeServer.create({
+    paths: bound.paths,
+    control: bound.control,
+    lark: bound.lark,
+    botOpenId: "ou-bot",
+  });
+  try {
+    await boundServer.start();
+    const client = new FeishuBridgeClient(bound.paths.socket);
+    await client.request("binding.create", {
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await assert.rejects(
+      client.request("bridge.shutdown", {}),
+      /cannot restart while group bindings exist/,
+    );
+    assert.equal(existsSync(bound.paths.socket), true);
+  } finally {
+    await boundServer.stop();
+    rmSync(bound.root, { recursive: true, force: true });
+  }
+});
+
 test("corrupt Feishu bridge storage is preserved and refused", () => {
   const h = harness();
   try {

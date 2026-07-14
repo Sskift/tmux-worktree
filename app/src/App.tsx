@@ -61,6 +61,7 @@ import {
 } from "./dashboard/CommandPalette";
 import {
   AgentsSettings,
+  FeishuIntegrationSettings,
   SettingsDialog,
   type SettingsSectionId,
 } from "./dashboard/Settings";
@@ -1409,6 +1410,7 @@ function App() {
               {...relaySettingsBindings}
             />
           ),
+          integrations: <FeishuIntegrationSettings />,
           appearance: (
             <div className="settings-info-list">
               <div className="settings-info-row">

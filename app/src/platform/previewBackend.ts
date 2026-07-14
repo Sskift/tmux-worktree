@@ -371,6 +371,44 @@ transport.handlers.set("mobile_relay_start", nothing);
 transport.handlers.set("mobile_relay_stop", nothing);
 transport.handlers.set("mobile_relay_save_config", value(relayStatus));
 transport.handlers.set("mobile_relay_start_broker", value(relayStatus));
+const feishuIntegrationStatus = {
+  selectedProfile: "preview-bot",
+  profileSource: "config",
+  bridgeRunning: true,
+  profiles: [{
+    name: "preview-bot",
+    appId: "cli_preview",
+    brand: "feishu",
+    displayName: "TW Preview",
+    active: true,
+  }],
+};
+transport.handlers.set("feishu_integration_status", value(feishuIntegrationStatus));
+transport.handlers.set("feishu_integration_add_profile", (payload) => {
+  const { appId, brand } = payload as { appId: string; brand: "feishu" | "lark" };
+  const name = `tw-${appId.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")}`;
+  return {
+    status: {
+      ...feishuIntegrationStatus,
+      profiles: [...feishuIntegrationStatus.profiles, {
+        name,
+        appId,
+        brand,
+        displayName: appId,
+        active: false,
+      }],
+    },
+    addedProfile: name,
+    warning: null,
+  };
+});
+transport.handlers.set("feishu_integration_save_profile", value(feishuIntegrationStatus));
+transport.handlers.set("feishu_integration_remove_profile", value({
+  ...feishuIntegrationStatus,
+  selectedProfile: null,
+  bridgeRunning: false,
+  profiles: [],
+}));
 transport.handlers.set("feishu_bridge_status", value({
   instanceId: "preview-feishu",
   bindings: [],
@@ -478,12 +516,28 @@ transport.handlers.set("pty_control_status", value({
   readOnly: false,
   state: "UNCONTROLLED",
   canTakeOver: false,
+  canRecover: false,
+}));
+transport.handlers.set("pty_control_release", value({
+  controlled: true,
+  readOnly: false,
+  state: "FREE",
+  canTakeOver: false,
+  canRecover: false,
 }));
 transport.handlers.set("pty_control_takeover", value({
   controlled: false,
   readOnly: false,
   state: "UNCONTROLLED",
   canTakeOver: false,
+  canRecover: false,
+}));
+transport.handlers.set("pty_control_recover", value({
+  controlled: false,
+  readOnly: false,
+  state: "UNCONTROLLED",
+  canTakeOver: false,
+  canRecover: false,
 }));
 transport.handlers.set("pty_kill", (payload) => {
   const { id } = payload as { id: string };

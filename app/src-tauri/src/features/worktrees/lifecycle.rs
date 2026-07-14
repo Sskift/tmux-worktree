@@ -328,8 +328,7 @@ pub(crate) fn restore_worktree(app: tauri::AppHandle, args: RestoreArgs) -> Resu
     Ok(session)
 }
 
-#[tauri::command]
-pub(crate) fn delete_worktree(args: DeleteWorktreeArgs) -> Result<(), String> {
+pub(crate) fn delete_worktree_blocking(args: DeleteWorktreeArgs) -> Result<(), String> {
     if !args.force && worktree_has_uncommitted_changes(&args.path).unwrap_or(false) {
         return Err(format!("worktree has uncommitted changes: {}", args.path));
     }
@@ -342,4 +341,11 @@ pub(crate) fn delete_worktree(args: DeleteWorktreeArgs) -> Result<(), String> {
     } else {
         Err(format!("worktree has uncommitted changes: {}", args.path))
     }
+}
+
+#[tauri::command]
+pub(crate) async fn delete_worktree(args: DeleteWorktreeArgs) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_worktree_blocking(args))
+        .await
+        .map_err(|error| format!("worktree delete task failed: {error}"))?
 }

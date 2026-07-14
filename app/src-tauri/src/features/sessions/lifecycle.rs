@@ -48,28 +48,34 @@ pub(crate) fn kill_legacy_session(name: &str) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn kill_session(
+pub(crate) async fn kill_session(
     app: tauri::AppHandle,
     pty_state: tauri::State<'_, std::sync::Arc<PtyState>>,
     control_state: tauri::State<'_, std::sync::Arc<TerminalControlState>>,
     name: String,
     managed: Option<bool>,
 ) -> Result<(), String> {
-    let (host_id, raw_name) = parse_session_key(&name);
-    if managed == Some(true) {
-        return kill_managed_session_with_control(
-            &app,
-            pty_state.inner().as_ref(),
-            control_state.inner().as_ref(),
-            raw_name,
-            host_id,
-        );
-    }
-    kill_canonical_first(
-        managed,
-        || kill_managed_session_via_tw_rpc(&app, &name),
-        || kill_legacy_session(&name),
-    )
+    let pty_state = std::sync::Arc::clone(pty_state.inner());
+    let control_state = std::sync::Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let (host_id, raw_name) = parse_session_key(&name);
+        if managed == Some(true) {
+            return kill_managed_session_with_control(
+                &app,
+                pty_state.as_ref(),
+                control_state.as_ref(),
+                raw_name,
+                host_id,
+            );
+        }
+        kill_canonical_first(
+            managed,
+            || kill_managed_session_via_tw_rpc(&app, &name),
+            || kill_legacy_session(&name),
+        )
+    })
+    .await
+    .map_err(|error| format!("session kill task failed: {error}"))?
 }
 
 #[tauri::command]

@@ -51,7 +51,7 @@ export interface TerminalControlOperationRecord {
   ownerInstanceId: string;
   fence: string;
   payloadHash: string;
-  kind: "raw" | "agent-message" | "resize" | "lifecycle-kill";
+  kind: "raw" | "agent-message" | "resize" | "scroll" | "lifecycle-kill";
   disposition: "committed" | "in-doubt";
   outputGeneration?: string;
   outputCursor?: number;
@@ -63,7 +63,7 @@ export interface TerminalControlInFlightOperation {
   ownerInstanceId: string;
   fence: string;
   payloadHash: string;
-  kind: "raw" | "agent-message" | "resize" | "lifecycle-kill";
+  kind: "raw" | "agent-message" | "resize" | "scroll" | "lifecycle-kill";
   outputGeneration?: string;
   outputCursor?: number;
   startedAt: string;
@@ -238,7 +238,7 @@ function isOperation(value: unknown, inFlight: boolean): boolean {
     && isDecimal(value.fence)
     && typeof value.payloadHash === "string"
     && /^[a-f0-9]{64}$/.test(value.payloadHash)
-    && ["raw", "agent-message", "resize", "lifecycle-kill"].includes(String(value.kind))
+    && ["raw", "agent-message", "resize", "scroll", "lifecycle-kill"].includes(String(value.kind))
     && isCanonicalTimestamp(value[timeKey])
     && (inFlight || value.disposition === "committed" || value.disposition === "in-doubt")
     && (value.outputGeneration === undefined || isStoredString(value.outputGeneration, 128))

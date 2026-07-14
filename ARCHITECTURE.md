@@ -215,9 +215,9 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 
 ### 共享 terminal input 与 Feishu Bridge
 
-Dashboard、受控 `tw attach`、`tw serve`、Relay v1 和 Feishu Bridge 的产品级真实写路径都映射到同一个 `controlTargetId`，并由目标主机上的 terminal-control authority 在一次 critical section 内完成 lease/fence 校验和 backend write。Relay terminal stream、Android 重连和 Feishu awaiting turn 都不是 input lease；observer 可以继续读 output，但不能据此取得或恢复写权。
+Dashboard、受控 `tw attach`、`tw serve`、Relay v1 和 Feishu Bridge 的产品级真实写路径都映射到同一个 `controlTargetId`，并由目标主机上的 terminal-control authority 在一次 critical section 内完成 lease/fence 校验和 backend write。Relay terminal stream、Android 重连和 Feishu awaiting turn 都不是 input lease；observer 可以继续读 output，但不能据此取得或恢复写权。Dashboard mount/status 也只是 observer：首个真实 input 才 lazy-acquire，非活动 PTY 主动 release；无 in-flight/handoff 的非 Feishu 陈旧 lease 可在旧 fence 失效、exact target 复核和 output capture 换代后安全回到 `FREE`，Feishu 与不确定副作用仍 fail closed。
 
-Feishu Bridge 是独立本地 daemon，拥有群 binding、sender policy、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
+Feishu Bridge 是独立本地 daemon，拥有群 binding、sender policy、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership；它只释放自己仍持有的 Dashboard PTY lease。Settings 只持久化非敏感的 `lark-cli` profile 名称，bot credential 继续由 `lark-cli` 拥有；更换 profile 只允许在没有任何 binding/turn 的空 Bridge 上执行。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
 
 ## 状态所有权
 
@@ -228,7 +228,7 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、sender policy、event
 | live tmux sessions/panes | 各目标主机的 tmux server | `tw`；明确的 legacy compatibility path | 表示进程是否真实存在，不表示是否 TW-managed |
 | git repositories/worktrees | 各目标主机的 git | `tw` managed create；Dashboard orphan cleanup | 工作区内容和 dirty 状态由 git 决定 |
 | `~/.tmux-worktree/state.json` | 目标主机上的 `tw` | `tw` session/RPC lifecycle | managed worktree/terminal registry；mutation 使用跨进程锁和原子替换，损坏或未知 schema 时 fail closed |
-| `~/.tmux-worktree.json` | 用户配置 | CLI 和 Dashboard | projects、hosts、worktree base、mobile relay；跨进程写入必须持锁并保留未知字段 |
+| `~/.tmux-worktree.json` | 用户配置 | CLI 和 Dashboard | projects、hosts、worktree base、mobile relay，以及非敏感的 `feishuBridge.larkProfile`；跨进程写入必须持锁并保留未知字段，Lark credential 不写入这里 |
 | `~/.tw-dashboard-terminals.json` | Dashboard metadata | Dashboard Rust 与 relay-host | label、order、cwd、host/raw name、managed marker；不是 tmux 或 managed state 的替代品 |
 | `~/.tw-dashboard-layout.json` | Dashboard | Dashboard Rust | canonical schema、revision/CAS、窗口与工作区展示状态 |
 | `~/.tw-dashboard-automations.json` | Dashboard/CLI 共用定义 | Dashboard Rust 与 `tw automation` | 本机 automation 定义；调度器随 Dashboard 进程运行 |

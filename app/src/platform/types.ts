@@ -70,6 +70,7 @@ export type PtyControlStatus = {
   state: "UNCONTROLLED" | "FREE" | "HELD" | "DRAINING" | "RECOVERY_REQUIRED" | "TARGET_GONE";
   ownerKind?: "feishu" | "dashboard" | "local-cli" | "relay-v1" | "relay-v2" | "tw-serve";
   canTakeOver: boolean;
+  canRecover: boolean;
   message?: string;
 };
 
@@ -92,8 +93,11 @@ export interface PtyConnection {
   readonly id: string;
   readonly active: boolean;
   write(data: string): Promise<void>;
+  scroll(direction: "up" | "down", lines: number): Promise<void>;
   resize(cols: number, rows: number): Promise<void>;
   controlStatus(): Promise<PtyControlStatus>;
+  releaseControl(): Promise<PtyControlStatus>;
   requestTakeover(): Promise<PtyControlStatus>;
+  requestRecovery(): Promise<PtyControlStatus>;
   close(): Promise<void>;
 }

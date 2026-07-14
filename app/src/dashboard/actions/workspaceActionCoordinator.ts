@@ -227,8 +227,14 @@ export function createWorkspaceActionCoordinator(
     lease: OwnerEpochLease<DashboardBackend> | null,
     slot: string,
     validate?: (nextContext: WorkspaceActionContext) => boolean,
+    replaceExisting = false,
   ): WorkspaceActionToken | null => {
     if (!lease || !fence.isCurrent(lease) || !currentContext(lease)) return null;
+    // Mutation slots are single-flight. Replacing an in-flight token only
+    // fences its UI publication; it does not cancel the backend mutation and
+    // can therefore create/delete the same resource more than once. Read-only
+    // latest-wins requests opt in to replacement explicitly below.
+    if (!replaceExisting && activeActions.has(slot)) return null;
     const action: WorkspaceActionToken = {
       lease,
       slot,
@@ -393,7 +399,7 @@ export function createWorkspaceActionCoordinator(
       const action = beginAction(lease, "automation-root", (nextContext) => {
         const current = nextContext.sessions.find(({ name }) => name === session.name);
         return !!current && sessionFingerprint(current) === fingerprint;
-      });
+      }, true);
       if (!action) return false;
       try {
         const startContext = actionContext(action);

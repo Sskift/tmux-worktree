@@ -1,7 +1,8 @@
 use super::{
-    kill_pty_controlled_session, open_pty_control, refresh_pty_control_status, release_pty_control,
-    request_pty_control_takeover, resize_pty_control, resolve_pty_control_target,
-    write_pty_control, PtyControl, PtyControlStatus, TerminalControlState,
+    kill_pty_controlled_session, open_pty_control, recover_pty_control, refresh_pty_control_status,
+    release_pty_control, request_pty_control_takeover, resize_pty_control,
+    resolve_pty_control_target, scroll_pty_control, write_pty_control, PtyControl,
+    PtyControlStatus, TerminalControlState,
 };
 use crate::config::{find_host, load_hosts};
 use crate::ipc::{OpenArgs, PtyChunk, PtyExit};
@@ -11,15 +12,18 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 
 struct PtyHandle {
+    instance_id: String,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     control: Option<PtyControl>,
+    control_pending: bool,
 }
 
 #[derive(Default)]
@@ -234,9 +238,13 @@ pub(crate) fn with_pty_control<R>(
     operation: impl FnOnce(&mut PtyControl) -> Result<R, String>,
 ) -> Result<R, String> {
     let mut map = state.ptys.lock().unwrap();
-    let control = map
-        .get_mut(id)
-        .and_then(|handle| handle.control.as_mut())
+    let handle = map.get_mut(id).ok_or("pty not found")?;
+    if handle.control_pending {
+        return Err("managed PTY control is still initializing".to_string());
+    }
+    let control = handle
+        .control
+        .as_mut()
         .ok_or("pty is not a controlled managed terminal")?;
     operation(control)
 }
@@ -279,31 +287,142 @@ pub(crate) fn kill_managed_session_with_control(
 }
 
 #[tauri::command]
-pub(crate) fn pty_open(
+pub(crate) async fn pty_open(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     args: OpenArgs,
 ) -> Result<String, String> {
-    validate_generic_open(&app, control_state.inner(), &args)?;
-    pty_open_impl(app, state.inner(), control_state.inner(), args, None)
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        validate_generic_open(&app, control_state.as_ref(), &args)?;
+        pty_open_impl(app, state.as_ref(), control_state.as_ref(), args, None)
+    })
+    .await
+    .map_err(|error| format!("PTY open task failed: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn pty_open_managed(
+pub(crate) async fn pty_open_managed(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     args: OpenArgs,
 ) -> Result<String, String> {
-    let control_target = validate_managed_open(&args)?;
-    pty_open_impl(
-        app,
-        state.inner(),
-        control_state.inner(),
-        args,
-        Some(control_target),
-    )
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let control_target = validate_managed_open(&args)?;
+        pty_open_impl(
+            app,
+            state.as_ref(),
+            control_state.as_ref(),
+            args,
+            Some(control_target),
+        )
+    })
+    .await
+    .map_err(|error| format!("managed PTY open task failed: {error}"))?
+}
+
+fn start_pty_reader(
+    app: tauri::AppHandle,
+    id: String,
+    instance_id: String,
+    mut reader: Box<dyn Read + Send>,
+) -> Result<(), String> {
+    let (started_tx, started_rx) = mpsc::sync_channel(0);
+    thread::Builder::new()
+        .name("tw-pty-reader".to_string())
+        .spawn(move || {
+            // A zero-capacity channel is a startup barrier: pty_open_impl cannot
+            // begin terminal-control RPCs until this drain thread is scheduled.
+            if started_tx.send(()).is_err() {
+                return;
+            }
+            let mut buffer = [0u8; 8192];
+            let mut pending: Vec<u8> = Vec::new();
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        pending.extend_from_slice(&buffer[..read]);
+                        let valid_up_to = match std::str::from_utf8(&pending) {
+                            Ok(_) => pending.len(),
+                            Err(error) => error.valid_up_to(),
+                        };
+                        if valid_up_to > 0 {
+                            let valid: Vec<u8> = pending.drain(..valid_up_to).collect();
+                            let chunk = String::from_utf8(valid).expect("validated above");
+                            let _ = app.emit(
+                                &format!("pty:{id}"),
+                                PtyChunk {
+                                    id: id.clone(),
+                                    data: chunk,
+                                },
+                            );
+                        }
+                        // Max valid UTF-8 sequence is 4 bytes; anything longer in pending
+                        // is genuine garbage, not a chunk boundary — flush lossy and reset.
+                        if pending.len() > 4 {
+                            let chunk = String::from_utf8_lossy(&pending).to_string();
+                            let _ = app.emit(
+                                &format!("pty:{id}"),
+                                PtyChunk {
+                                    id: id.clone(),
+                                    data: chunk,
+                                },
+                            );
+                            pending.clear();
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let mut handle = {
+                let state = app.state::<Arc<PtyState>>();
+                remove_pty_instance(state.inner(), &id, &instance_id)
+            };
+            if let Some(handle) = handle.as_mut() {
+                if let Some(control) = handle.control.as_mut() {
+                    let control_state = app.state::<Arc<TerminalControlState>>();
+                    release_pty_control(&app, control_state.inner(), control);
+                }
+            }
+            let code = handle
+                .as_mut()
+                .and_then(|handle| handle.child.wait().ok())
+                .map(|status| status.exit_code() as i32)
+                .unwrap_or(0);
+            let _ = app.emit(
+                &format!("pty-exit:{id}"),
+                PtyExit {
+                    id: id.clone(),
+                    code,
+                },
+            );
+        })
+        .map_err(|error| format!("start PTY reader: {error}"))?;
+    started_rx
+        .recv_timeout(Duration::from_secs(1))
+        .map_err(|error| format!("start PTY reader barrier: {error}"))
+}
+
+fn remove_pty_instance(state: &PtyState, id: &str, instance_id: &str) -> Option<PtyHandle> {
+    let mut map = state.ptys.lock().unwrap();
+    if map.get(id).map(|handle| handle.instance_id.as_str()) != Some(instance_id) {
+        return None;
+    }
+    map.remove(id)
+}
+
+fn abort_pty_open(state: &PtyState, id: &str, instance_id: &str) {
+    let handle = remove_pty_instance(state, id, instance_id);
+    if let Some(mut handle) = handle {
+        let _ = handle.child.kill();
+        let _ = handle.child.wait();
+    }
 }
 
 fn pty_open_impl(
@@ -334,6 +453,37 @@ fn pty_open_impl(
         })
         .map_err(|error| format!("openpty: {error}"))?;
 
+    // Resolve and size a managed target before tmux attaches. The attachment
+    // uses `ignore-size`, so resizing its PTY after spawn cannot prevent the
+    // first frame from being rendered at tmux's previous window geometry.
+    // terminal-control has a dedicated SSH lane, and no interactive child has
+    // been spawned yet, so this preflight cannot be blocked by PTY output.
+    let mut prepared_control = if let Some((session, host_id)) = control_target.as_ref() {
+        let mut control = open_pty_control(&app, control_state, &id, session, host_id.as_deref());
+        if control.control_target_id.is_none() {
+            let detail = control
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "managed control target is unresolved".to_string());
+            release_pty_control(&app, control_state, &mut control);
+            return Err(format!("managed PTY fails closed: {detail}"));
+        }
+        if let Err(error) = resize_pty_control(
+            &app,
+            control_state,
+            &mut control,
+            args.cols,
+            args.rows,
+        ) {
+            control.last_error = Some(error.to_string());
+            control.last_state = "RECOVERY_REQUIRED".to_string();
+            control.last_owner_kind = None;
+        }
+        Some(control)
+    } else {
+        None
+    };
+
     let resolved_cmd = resolve_cmd(&args.cmd);
     let mut cmd = CommandBuilder::new(resolved_cmd);
     for argument in &args.args {
@@ -353,13 +503,18 @@ fn pty_open_impl(
         }
     }
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|error| format!("spawn: {error}"))?;
+    let child = match pair.slave.spawn_command(cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            if let Some(control) = prepared_control.as_mut() {
+                release_pty_control(&app, control_state, control);
+            }
+            return Err(format!("spawn: {error}"));
+        }
+    };
     drop(pair.slave);
 
-    let mut reader = pair
+    let reader = pair
         .master
         .try_clone_reader()
         .map_err(|error| format!("clone reader: {error}"))?;
@@ -368,122 +523,96 @@ fn pty_open_impl(
         .take_writer()
         .map_err(|error| format!("take writer: {error}"))?;
 
-    let control = if let Some((session, host_id)) = control_target {
-        let mut control = open_pty_control(&app, control_state, &id, &session, host_id.as_deref());
-        if control.control_target_id.is_none() {
-            let detail = control
-                .last_error
-                .clone()
-                .unwrap_or_else(|| "managed control target is unresolved".to_string());
-            let _ = child.kill();
-            release_pty_control(&app, control_state, &mut control);
-            return Err(format!("managed PTY fails closed: {detail}"));
-        }
-        Some(control)
-    } else {
-        None
-    };
-    let handle = PtyHandle {
+    let instance_id = uuid::Uuid::new_v4().to_string();
+    let mut handle = PtyHandle {
+        instance_id: instance_id.clone(),
         master: pair.master,
         writer,
         child,
-        control,
+        control: prepared_control,
+        control_pending: false,
     };
-    state.ptys.lock().unwrap().insert(id.clone(), handle);
+    {
+        let mut map = state.ptys.lock().unwrap();
+        if map.contains_key(&id) {
+            drop(map);
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
+            return Err(format!("pty id already exists: {id}"));
+        }
+        map.insert(id.clone(), handle);
+    }
 
-    let id_for_thread = id.clone();
-    let app_for_thread = app.clone();
-    thread::spawn(move || {
-        let mut buffer = [0u8; 8192];
-        let mut pending: Vec<u8> = Vec::new();
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => break,
-                Ok(read) => {
-                    pending.extend_from_slice(&buffer[..read]);
-                    let valid_up_to = match std::str::from_utf8(&pending) {
-                        Ok(_) => pending.len(),
-                        Err(error) => error.valid_up_to(),
-                    };
-                    if valid_up_to > 0 {
-                        let valid: Vec<u8> = pending.drain(..valid_up_to).collect();
-                        let chunk = String::from_utf8(valid).expect("validated above");
-                        let _ = app_for_thread.emit(
-                            &format!("pty:{}", id_for_thread),
-                            PtyChunk {
-                                id: id_for_thread.clone(),
-                                data: chunk,
-                            },
-                        );
-                    }
-                    // Max valid UTF-8 sequence is 4 bytes; anything longer in pending
-                    // is genuine garbage, not a chunk boundary — flush lossy and reset.
-                    if pending.len() > 4 {
-                        let chunk = String::from_utf8_lossy(&pending).to_string();
-                        let _ = app_for_thread.emit(
-                            &format!("pty:{}", id_for_thread),
-                            PtyChunk {
-                                id: id_for_thread.clone(),
-                                data: chunk,
-                            },
-                        );
-                        pending.clear();
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        let mut handle = {
-            let state = app_for_thread.state::<Arc<PtyState>>();
-            let mut map = state.ptys.lock().unwrap();
-            map.remove(&id_for_thread)
-        };
-        if let Some(handle) = handle.as_mut() {
-            if let Some(control) = handle.control.as_mut() {
-                let control_state = app_for_thread.state::<Arc<TerminalControlState>>();
-                release_pty_control(&app_for_thread, control_state.inner(), control);
-            }
-        }
-        let code = handle
-            .as_mut()
-            .and_then(|handle| handle.child.wait().ok())
-            .map(|status| status.exit_code() as i32)
-            .unwrap_or(0);
-        let _ = app_for_thread.emit(
-            &format!("pty-exit:{}", id_for_thread),
-            PtyExit {
-                id: id_for_thread.clone(),
-                code,
-            },
-        );
-    });
+    // Start draining immediately after spawn so tmux/SSH can never block on a
+    // full PTY while the frontend establishes its event listeners.
+    if let Err(error) = start_pty_reader(app.clone(), id.clone(), instance_id.clone(), reader) {
+        abort_pty_open(state, &id, &instance_id);
+        return Err(error);
+    }
 
     Ok(id)
 }
 
 #[tauri::command]
-pub(crate) fn pty_write(
+pub(crate) async fn pty_write(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     id: String,
     data: String,
 ) -> Result<(), String> {
-    let mut map = state.ptys.lock().unwrap();
-    let handle = map.get_mut(&id).ok_or("pty not found")?;
-    if let Some(control) = handle.control.as_mut() {
-        return write_pty_control(&app, control_state.inner(), control, data.as_bytes())
-            .map_err(|error| error.to_string());
-    }
-    handle
-        .writer
-        .write_all(data.as_bytes())
-        .map_err(|error| format!("write: {error}"))?;
-    Ok(())
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        if let Some(control) = handle.control.as_mut() {
+            return write_pty_control(&app, control_state.as_ref(), control, data.as_bytes())
+                .map_err(|error| error.to_string());
+        }
+        handle
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|error| format!("write: {error}"))?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("join PTY write: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn pty_resize(
+pub(crate) async fn pty_control_scroll(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<PtyState>>,
+    control_state: State<'_, Arc<TerminalControlState>>,
+    id: String,
+    direction: String,
+    lines: u16,
+) -> Result<(), String> {
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        let control = handle
+            .control
+            .as_mut()
+            .ok_or("pty is not a controlled managed terminal")?;
+        scroll_pty_control(&app, control_state.as_ref(), control, &direction, lines)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("join PTY scroll: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn pty_resize(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
@@ -491,39 +620,68 @@ pub(crate) fn pty_resize(
     cols: u16,
     rows: u16,
 ) -> Result<(), String> {
-    let mut map = state.ptys.lock().unwrap();
-    let handle = map.get_mut(&id).ok_or("pty not found")?;
-    handle
-        .master
-        .resize(PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|error| format!("resize: {error}"))?;
-    if let Some(control) = handle.control.as_mut() {
-        resize_pty_control(&app, control_state.inner(), control, cols, rows)
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        handle
+            .master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| format!("resize: {error}"))?;
+        if let Some(control) = handle.control.as_mut() {
+            resize_pty_control(&app, control_state.as_ref(), control, cols, rows)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("join PTY resize: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn pty_kill(
+pub(crate) async fn pty_kill(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     id: String,
 ) -> Result<(), String> {
-    let mut map = state.ptys.lock().unwrap();
-    if let Some(mut handle) = map.remove(&id) {
-        if let Some(control) = handle.control.as_mut() {
-            release_pty_control(&app, control_state.inner(), control);
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let handle = state.ptys.lock().unwrap().remove(&id);
+        if let Some(mut handle) = handle {
+            if let Some(control) = handle.control.as_mut() {
+                release_pty_control(&app, control_state.as_ref(), control);
+            }
+            let _ = handle.child.kill();
+            let _ = handle.child.wait();
         }
-        let _ = handle.child.kill();
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("PTY kill task failed: {error}"))?
+}
+
+pub(crate) fn release_all_pty_controls(
+    app: &tauri::AppHandle,
+    state: &PtyState,
+    control_state: &TerminalControlState,
+) {
+    let mut map = state.ptys.lock().unwrap();
+    for handle in map.values_mut() {
+        if let Some(control) = handle.control.as_mut() {
+            release_pty_control(app, control_state, control);
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -621,47 +779,117 @@ mod tests {
 }
 
 #[tauri::command]
-pub(crate) fn pty_control_status(
+pub(crate) async fn pty_control_status(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     id: String,
 ) -> Result<PtyControlStatus, String> {
-    let mut map = state.ptys.lock().unwrap();
-    let handle = map.get_mut(&id).ok_or("pty not found")?;
-    let Some(control) = handle.control.as_mut() else {
-        return Ok(PtyControlStatus {
-            controlled: false,
-            read_only: false,
-            state: "UNCONTROLLED".to_string(),
-            owner_kind: None,
-            can_take_over: false,
-            message: None,
-        });
-    };
-    Ok(refresh_pty_control_status(
-        &app,
-        control_state.inner(),
-        control,
-    ))
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        let Some(control) = handle.control.as_mut() else {
+            return Ok(PtyControlStatus {
+                controlled: false,
+                read_only: false,
+                state: "UNCONTROLLED".to_string(),
+                owner_kind: None,
+                can_take_over: false,
+                can_recover: false,
+                message: None,
+            });
+        };
+        Ok(refresh_pty_control_status(
+            &app,
+            control_state.as_ref(),
+            control,
+        ))
+    })
+    .await
+    .map_err(|error| format!("join PTY control status: {error}"))?
 }
 
 #[tauri::command]
-pub(crate) fn pty_control_takeover(
+pub(crate) async fn pty_control_release(
     app: tauri::AppHandle,
     state: State<'_, Arc<PtyState>>,
     control_state: State<'_, Arc<TerminalControlState>>,
     id: String,
 ) -> Result<PtyControlStatus, String> {
-    let mut map = state.ptys.lock().unwrap();
-    let handle = map.get_mut(&id).ok_or("pty not found")?;
-    let control = handle
-        .control
-        .as_mut()
-        .ok_or("pty is not a controlled managed terminal")?;
-    Ok(request_pty_control_takeover(
-        &app,
-        control_state.inner(),
-        control,
-    ))
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        let control = handle
+            .control
+            .as_mut()
+            .ok_or("pty is not a controlled managed terminal")?;
+        release_pty_control(&app, control_state.as_ref(), control);
+        Ok(control.status())
+    })
+    .await
+    .map_err(|error| format!("join PTY control release: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn pty_control_takeover(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<PtyState>>,
+    control_state: State<'_, Arc<TerminalControlState>>,
+    id: String,
+) -> Result<PtyControlStatus, String> {
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        let control = handle
+            .control
+            .as_mut()
+            .ok_or("pty is not a controlled managed terminal")?;
+        Ok(request_pty_control_takeover(
+            &app,
+            control_state.as_ref(),
+            control,
+        ))
+    })
+    .await
+    .map_err(|error| format!("join PTY takeover: {error}"))?
+}
+
+#[tauri::command]
+pub(crate) async fn pty_control_recover(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<PtyState>>,
+    control_state: State<'_, Arc<TerminalControlState>>,
+    id: String,
+) -> Result<PtyControlStatus, String> {
+    let state = Arc::clone(state.inner());
+    let control_state = Arc::clone(control_state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        let control = handle
+            .control
+            .as_mut()
+            .ok_or("pty is not a controlled managed terminal")?;
+        Ok(recover_pty_control(&app, control_state.as_ref(), control))
+    })
+    .await
+    .map_err(|error| format!("join PTY recovery: {error}"))?
 }

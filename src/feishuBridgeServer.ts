@@ -28,6 +28,7 @@ const INSTANCE_LOCK_STALE_MS = 30_000;
 
 type FeishuBridgeOperation =
   | "bridge.snapshot"
+  | "bridge.shutdown"
   | "groups.list"
   | "binding.create"
   | "binding.pause"
@@ -108,7 +109,7 @@ function parseRequest(value: unknown): BridgeRequest {
   }
   text(value.requestId, "requestId");
   const operations: FeishuBridgeOperation[] = [
-    "bridge.snapshot", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
+    "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
     "binding.takeover", "binding.return",
   ];
   if (!operations.includes(value.operation as FeishuBridgeOperation)) throw new Error("unknown Feishu bridge operation");
@@ -125,6 +126,14 @@ async function dispatch(
     case "bridge.snapshot":
       if (!exactKeys(params, [])) throw new Error("invalid snapshot params");
       return bridge.snapshot();
+    case "bridge.shutdown": {
+      if (!exactKeys(params, [])) throw new Error("invalid bridge.shutdown params");
+      const snapshot = bridge.snapshot();
+      if (snapshot.bindings.length > 0 || snapshot.activeTurns.length > 0) {
+        throw new Error("Feishu bridge cannot restart while group bindings exist");
+      }
+      return { stopping: true };
+    }
     case "groups.list":
       if (!exactKeys(params, [])) throw new Error("invalid groups.list params");
       return lark.listGroups();
@@ -206,7 +215,12 @@ function responseError(requestId: string, error: unknown): BridgeResponse {
   };
 }
 
-function attachSocket(bridge: FeishuBridge, lark: FeishuLarkAdapter, socket: Socket): void {
+function attachSocket(
+  bridge: FeishuBridge,
+  lark: FeishuLarkAdapter,
+  socket: Socket,
+  onShutdown: () => void,
+): void {
   socket.setEncoding("utf8");
   let buffer = "";
   let chain = Promise.resolve();
@@ -225,10 +239,12 @@ function attachSocket(bridge: FeishuBridge, lark: FeishuLarkAdapter, socket: Soc
       chain = chain.then(async () => {
         let requestId = "invalid";
         let response: BridgeResponse;
+        let shutdown = false;
         try {
           const parsed = JSON.parse(line) as unknown;
           if (isRecord(parsed) && typeof parsed.requestId === "string") requestId = parsed.requestId;
           const request = parseRequest(parsed);
+          shutdown = request.operation === "bridge.shutdown";
           response = {
             protocolVersion: PROTOCOL_VERSION,
             requestId: request.requestId,
@@ -238,7 +254,12 @@ function attachSocket(bridge: FeishuBridge, lark: FeishuLarkAdapter, socket: Soc
         } catch (error) {
           response = responseError(requestId, error);
         }
-        socket.write(`${JSON.stringify(response)}\n`);
+        const frame = `${JSON.stringify(response)}\n`;
+        if (shutdown && response.ok) {
+          socket.end(frame, onShutdown);
+        } else {
+          socket.write(frame);
+        }
       });
     }
   });
@@ -299,6 +320,8 @@ export class FeishuBridgeServer {
   private renewTimer?: ReturnType<typeof setInterval>;
   private restartTimer?: ReturnType<typeof setTimeout>;
   private stopping = false;
+  readonly stopped: Promise<void>;
+  private resolveStopped!: () => void;
 
   private constructor(options: {
     paths: FeishuBridgePaths;
@@ -308,7 +331,15 @@ export class FeishuBridgeServer {
     this.paths = options.paths;
     this.bridge = options.bridge;
     this.lark = options.lark;
-    this.server = createServer((socket) => attachSocket(this.bridge, this.lark, socket));
+    this.stopped = new Promise<void>((resolve) => {
+      this.resolveStopped = resolve;
+    });
+    this.server = createServer((socket) => attachSocket(
+      this.bridge,
+      this.lark,
+      socket,
+      () => { void this.stop(); },
+    ));
   }
 
   static async create(options: {
@@ -368,17 +399,21 @@ export class FeishuBridgeServer {
   async stop(): Promise<void> {
     if (this.stopping) return;
     this.stopping = true;
-    if (this.pollTimer) clearInterval(this.pollTimer);
-    if (this.renewTimer) clearInterval(this.renewTimer);
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.consumer?.stop();
-    await new Promise<void>((resolve) => {
-      if (!this.server.listening) resolve();
-      else this.server.close(() => resolve());
-    });
-    await this.bridge.close();
-    rmSync(this.paths.socket, { force: true });
-    rmSync(this.paths.instanceLock, { force: true });
+    try {
+      if (this.pollTimer) clearInterval(this.pollTimer);
+      if (this.renewTimer) clearInterval(this.renewTimer);
+      if (this.restartTimer) clearTimeout(this.restartTimer);
+      this.consumer?.stop();
+      await new Promise<void>((resolve) => {
+        if (!this.server.listening) resolve();
+        else this.server.close(() => resolve());
+      });
+      await this.bridge.close();
+    } finally {
+      rmSync(this.paths.socket, { force: true });
+      rmSync(this.paths.instanceLock, { force: true });
+      this.resolveStopped();
+    }
   }
 
   private startConsumer(): void {
@@ -471,16 +506,17 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
     });
     await server.start();
     process.stderr.write(`[feishu-bridge] ready socket=${server.paths.socket}\n`);
-    await new Promise<void>((resolve) => {
-      let stopping = false;
-      const stop = () => {
-        if (stopping) return;
-        stopping = true;
-        void server.stop().finally(resolve);
-      };
-      process.once("SIGTERM", stop);
-      process.once("SIGINT", stop);
-    });
+    let stopping = false;
+    const stop = () => {
+      if (stopping) return;
+      stopping = true;
+      void server.stop();
+    };
+    process.once("SIGTERM", stop);
+    process.once("SIGINT", stop);
+    await server.stopped;
+    process.off("SIGTERM", stop);
+    process.off("SIGINT", stop);
     return;
   }
   const client = new FeishuBridgeClient();

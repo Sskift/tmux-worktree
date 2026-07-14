@@ -78,10 +78,17 @@ pub fn run() {
             pty_open,
             pty_open_managed,
             pty_write,
+            pty_control_scroll,
             pty_resize,
             pty_kill,
             pty_control_status,
+            pty_control_release,
             pty_control_takeover,
+            pty_control_recover,
+            feishu_integration_status,
+            feishu_integration_add_profile,
+            feishu_integration_save_profile,
+            feishu_integration_remove_profile,
             feishu_bridge_status,
             feishu_groups_list,
             feishu_binding_create,
@@ -124,8 +131,16 @@ pub fn run() {
         .run(|app, event| match event {
             tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
                 cleanup_pending_worktrees();
+                let pty_state = app.state::<Arc<PtyState>>();
+                let control_state = app.state::<Arc<TerminalControlState>>();
+                release_all_pty_controls(
+                    app,
+                    pty_state.inner().as_ref(),
+                    control_state.inner().as_ref(),
+                );
                 let relay_state = app.state::<Arc<MobileRelayState>>();
                 stop_mobile_relay_processes(relay_state.inner().as_ref());
+                control_state.inner().stop_remote_proxies();
                 // The terminal-control authority and Feishu bridge are shared by
                 // Dashboard, Relay and CLI adapters. Dashboard must not fence
                 // every other producer or pause an active group binding by

@@ -88,6 +88,29 @@
     }
   },
   {
+    "name": "lease-fenced-tmux-scroll",
+    "message": {
+      "protocolVersion": 1,
+      "requestId": "req-scroll-1",
+      "type": "input.scroll",
+      "lease": {
+        "controlTargetId": "target-example-1",
+        "controlEpoch": "epoch-example-1",
+        "leaseId": "lease-example-1",
+        "fence": "7",
+        "owner": {
+          "kind": "dashboard",
+          "instanceId": "dashboard:instance-1:pty-1"
+        },
+        "expiresAt": "2026-07-13T00:01:00.000Z"
+      },
+      "operationId": "dashboard:scroll:1",
+      "pane": "0",
+      "direction": "up",
+      "lines": 3
+    }
+  },
+  {
     "name": "graceful-local-handoff",
     "message": {
       "protocolVersion": 1,

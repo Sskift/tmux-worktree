@@ -218,6 +218,29 @@ test("speculative backend B cannot invalidate committed owner A", async () => {
   assert.deepEqual(harness.selectedSessions, ["session-a"]);
 });
 
+test("worktree creation is single-flight while the modal mutation is pending", async () => {
+  const backend = createFakeDashboardBackend().backend;
+  const created = deferred<string>();
+  let createCalls = 0;
+  backend.worktrees.create = async () => {
+    createCalls += 1;
+    return created.promise;
+  };
+  const harness = createHarness(backend);
+  const lease = harness.capture(backend);
+  const request = {
+    args: { aiCmd: "codex", name: null, path: "/repo/a" },
+  };
+
+  const first = harness.coordinator.createWorktree(lease, request);
+  assert.equal(await harness.coordinator.createWorktree(lease, request), false);
+  assert.equal(createCalls, 1);
+
+  created.resolve("session-a");
+  assert.equal(await first, true);
+  assert.deepEqual(harness.selectedSessions, ["session-a"]);
+});
+
 test("committing B rejects late A worktree publication and A to B to A2 stays exact", async () => {
   const backendA = createFakeDashboardBackend().backend;
   const backendB = createFakeDashboardBackend().backend;

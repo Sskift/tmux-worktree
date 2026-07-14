@@ -141,7 +141,7 @@ export function TerminalDeck({
     setFeishuError(null);
     void dashboardBackend.feishu.groups().then(setGroups).catch((error) => {
       setGroups([]);
-      setFeishuError(`无法读取机器人群列表，可手动填写：${error instanceof Error ? error.message : String(error)}`);
+      setFeishuError(`Could not load the bot's groups. Enter the details manually: ${error instanceof Error ? error.message : String(error)}`);
     });
   };
 
@@ -158,14 +158,22 @@ export function TerminalDeck({
     if (!binding) {
       return (
         <div className="terminal-feishu-bar" data-state="unbound">
-          <span>{feishuSnapshot ? "Feishu 未绑定" : "正在核对输入所有权…"}</span>
+          <span>
+            {feishuSnapshot
+              ? "Feishu not linked"
+              : feishuError?.includes("FEISHU_PROFILE_NOT_CONFIGURED")
+                ? "Feishu bot not configured · Settings › Integrations"
+                : feishuError
+                  ? "Feishu bridge unavailable"
+                  : "Checking input ownership…"}
+          </span>
           {feishuSnapshot && (
             <button
               type="button"
               disabled={feishuBusy || !ptyId}
               onClick={() => ptyId && openBinding(sessionName, ptyId)}
             >
-              绑定群聊
+              Link group
             </button>
           )}
         </div>
@@ -175,12 +183,12 @@ export function TerminalDeck({
       <div className="terminal-feishu-bar" data-state={binding.status} role="status">
         <span>
           {binding.status === "active"
-            ? `输入已被飞书群「${binding.chatName}」锁定${activeTurn ? "（正在处理一轮）" : ""}`
+            ? `Input locked by Feishu group “${binding.chatName}”${activeTurn ? " (turn in progress)" : ""}`
             : binding.status === "paused"
-              ? `飞书群「${binding.chatName}」已暂停，本地拥有输入`
+              ? `Feishu group “${binding.chatName}” is paused; local input is active`
               : binding.status === "pausing"
-                ? `正在从飞书群「${binding.chatName}」安全交接…`
-                : `飞书绑定需要恢复：${binding.staleReason ?? binding.chatName}`}
+                ? `Safely handing off from Feishu group “${binding.chatName}”…`
+                : `Feishu link needs recovery: ${binding.staleReason ?? binding.chatName}`}
         </span>
         {binding.status === "active" && !activeTurn && (
           <button
@@ -188,7 +196,7 @@ export function TerminalDeck({
             disabled={feishuBusy || !ptyId}
             onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.takeover(binding.id, ptyId))}
           >
-            接管并暂停飞书
+            Take over and pause Feishu
           </button>
         )}
         {binding.status === "active" && activeTurn && (
@@ -198,7 +206,7 @@ export function TerminalDeck({
             disabled={feishuBusy || !ptyId}
             onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.takeover(binding.id, ptyId, true))}
           >
-            强制取消本轮并接管
+            Cancel turn and take over
           </button>
         )}
         {binding.status === "paused" && (
@@ -207,7 +215,7 @@ export function TerminalDeck({
             disabled={feishuBusy || !ptyId}
             onClick={() => ptyId && void runFeishuAction(() => dashboardBackend.feishu.returnToFeishu(binding.id, ptyId))}
           >
-            交还飞书
+            Return input to Feishu
           </button>
         )}
         {(binding.status === "paused" || binding.status === "stale") && (
@@ -216,7 +224,7 @@ export function TerminalDeck({
             disabled={feishuBusy}
             onClick={() => void runFeishuAction(() => dashboardBackend.feishu.remove(binding.id, true))}
           >
-            解除绑定
+            Unlink
           </button>
         )}
         {binding.status === "stale" && (
@@ -225,7 +233,7 @@ export function TerminalDeck({
             disabled={feishuBusy}
             onClick={() => void runFeishuAction(() => dashboardBackend.feishu.repair(binding.id))}
           >
-            检查本地恢复状态
+            Check recovery status
           </button>
         )}
       </div>
@@ -353,18 +361,18 @@ export function TerminalDeck({
           );
         })}
         {bindingTarget && (
-          <div className="terminal-feishu-dialog" role="dialog" aria-modal="true" aria-label="绑定飞书群聊">
+          <div className="terminal-feishu-dialog" role="dialog" aria-modal="true" aria-label="Link a Feishu group">
             <div className="terminal-feishu-dialog__card">
-              <strong>绑定飞书群聊</strong>
-              <p>终端中完整公开标记内的内容会发送给群内所有成员。相同系统账号仍可用原始 tmux 或低层 RPC 命令绕过产品级输入锁。</p>
+              <strong>Link a Feishu group</strong>
+              <p>Content inside a complete public marker in this terminal is sent to every group member. A process running as the same OS account can still bypass this product-level input lock through raw tmux or low-level RPC commands.</p>
               {groups.length > 0 && (
                 <label>
-                  机器人所在群
+                  Bot groups
                   <MenuSelect
-                    ariaLabel="机器人所在群"
+                    ariaLabel="Bot groups"
                     value={chatId}
                     options={[
-                      { value: "", label: "选择群聊…" },
+                      { value: "", label: "Select a group…" },
                       ...groups.map((group) => ({ value: group.chatId, label: group.name })),
                     ]}
                     onChange={(value) => {
@@ -380,16 +388,16 @@ export function TerminalDeck({
                 <input value={chatId} onChange={(event) => setChatId(event.target.value)} placeholder="oc_…" />
               </label>
               <label>
-                群名称
+                Group name
                 <input value={chatName} onChange={(event) => setChatName(event.target.value)} />
               </label>
               <label>
-                管理员 Open ID
+                Administrator Open ID
                 <input value={createdBy} onChange={(event) => setCreatedBy(event.target.value)} placeholder="ou_…" />
               </label>
               {feishuError && <p className="terminal-feishu-dialog__error">{feishuError}</p>}
               <div className="terminal-feishu-dialog__actions">
-                <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>取消</button>
+                <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>Cancel</button>
                 <button
                   type="button"
                   disabled={feishuBusy || !chatId.trim() || !chatName.trim() || !createdBy.trim()}
@@ -406,7 +414,7 @@ export function TerminalDeck({
                     setBindingTarget(null);
                   })}
                 >
-                  确认独占绑定
+                  Confirm exclusive link
                 </button>
               </div>
             </div>

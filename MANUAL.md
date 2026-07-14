@@ -158,6 +158,16 @@ The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `
 
 Use `+ terminal`, choose the remote host, and choose or type the remote path. The AI command is optional; leaving it empty opens the TW-managed terminal in a login shell. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
 
+## Configure The Feishu Bot
+
+Feishu Bridge uses a `lark-cli` application profile as a bot. Open `Settings → Integrations` to add a bot, delete the selected bot, or choose which bot is active; selecting an entry takes effect immediately and a newly added bot is selected automatically when no binding blocks the change. Dashboard derives the local-only `lark-cli` profile key from the App ID, but presents the application name returned by Feishu/Lark (falling back to App ID) instead of exposing that internal key. The App Secret is sent directly to `lark-cli config init --app-secret-stdin`; Dashboard never writes that secret to its configuration or command arguments.
+
+Dashboard saves only the non-sensitive profile name as `feishuBridge.larkProfile` in `~/.tmux-worktree.json`. App secrets and access tokens remain owned by `lark-cli`; the bridge always invokes that profile with bot identity. `TW_FEISHU_LARK_PROFILE` is an explicit environment override and disables profile changes in Settings.
+
+Changing profiles safely restarts an empty bridge. The Dashboard refuses the change while any Feishu group is linked, so a binding cannot silently move to another bot. Unlink all groups before selecting a different profile.
+
+Merely opening or backgrounding a managed terminal does not lock it: Dashboard acquires ownership on the first real input and releases it when that PTY becomes inactive. Idle stale Dashboard/Relay/CLI leases are fenced and safely returned to `FREE` after the target and output capture are re-established. If a terminal still says `Read-only · terminal input continuity needs local recovery`, an operation, handoff, Feishu lease, or backend continuity is genuinely uncertain. Click `Recover local input` only after checking that another controller is not still writing. When the banner says Feishu owns input, use the Feishu takeover action; recovery is not a shortcut around an active Feishu lease.
+
 ## Remote Agent Skill
 
 The repo includes `.codex/skills/tw-remote-session` for headless remote agents. Install it on the remote agent machine:
@@ -183,3 +193,4 @@ The skill tells the agent to use `tw rpc create-worktree`, not plain `tmux new-s
 - Remote path picker is empty for `/home/<user>`: the host may use a symlinked home. Current Dashboard follows symlinked directories; update the app and remote `tw`.
 - Dashboard cannot see a remote tmux session: confirm it was created by `tw` and appears in `tw rpc list`.
 - Existing failed panes do not inherit newly installed commands. Recreate the session, or run `export PATH="$HOME/.local/bin:$PATH"` inside that pane before starting the command.
+- A Dashboard tmux window remains too small or shows a dotted unused region: update the Dashboard, then reopen that terminal. The selected xterm now waits for the workspace layout to settle, and a FREE managed target uses a short acquire→resize→release terminal-control transaction so the real tmux window matches the viewport without remaining locked. The same path runs against the target host for remote managed terminals.

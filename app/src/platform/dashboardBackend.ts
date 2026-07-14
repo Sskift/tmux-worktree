@@ -33,6 +33,9 @@ import type {
   FeishuBindingInput,
   FeishuBridgeSnapshot,
   FeishuChat,
+  FeishuAddProfileInput,
+  FeishuAddProfileResult,
+  FeishuIntegrationStatus,
   GitGraphQuery,
   GitGraphRefs,
   GitGraphResponse,
@@ -62,6 +65,10 @@ import type {
 type HostId = string | null | undefined;
 
 export interface FeishuProductAdapter {
+  integrationStatus(): Promise<FeishuIntegrationStatus>;
+  addProfile(input: FeishuAddProfileInput): Promise<FeishuAddProfileResult>;
+  selectProfile(profile: string): Promise<FeishuIntegrationStatus>;
+  removeProfile(profile: string): Promise<FeishuIntegrationStatus>;
   status(): Promise<FeishuBridgeSnapshot>;
   groups(): Promise<FeishuChat[]>;
   create(args: FeishuBindingInput): Promise<FeishuBinding>;
@@ -117,10 +124,13 @@ export interface DashboardBackend {
       signal?: AbortSignal,
     ): Promise<PtyConnection>;
     write(id: string, data: string): Promise<void>;
+    scroll(id: string, direction: "up" | "down", lines: number): Promise<void>;
     resize(id: string, cols: number, rows: number): Promise<void>;
     kill(id: string): Promise<void>;
     controlStatus(id: string): Promise<PtyControlStatus>;
+    releaseControl(id: string): Promise<PtyControlStatus>;
     requestTakeover(id: string): Promise<PtyControlStatus>;
+    requestRecovery(id: string): Promise<PtyControlStatus>;
   };
   git: {
     status(cwd: string, hostId?: HostId): Promise<GitStatus | null>;
@@ -196,17 +206,26 @@ function abortError(): Error {
   return error;
 }
 
+const MAX_COALESCED_PTY_WRITE_BYTES = 64 * 1024;
+const ptyTextEncoder = new TextEncoder();
+
 export function createDashboardBackend(transport: DashboardTransport): DashboardBackend {
   const closeLifecycle = transport.closeLifecycle;
   const writePty = (id: string, data: string) =>
     transport.invoke<void>("pty_write", { id, data });
+  const scrollPty = (id: string, direction: "up" | "down", lines: number) =>
+    transport.invoke<void>("pty_control_scroll", { id, direction, lines });
   const resizePty = (id: string, cols: number, rows: number) =>
     transport.invoke<void>("pty_resize", { id, cols, rows });
   const killPty = (id: string) => transport.invoke<void>("pty_kill", { id });
   const ptyControlStatus = (id: string) =>
     transport.invoke<PtyControlStatus>("pty_control_status", { id });
+  const releasePtyControl = (id: string) =>
+    transport.invoke<PtyControlStatus>("pty_control_release", { id });
   const requestPtyTakeover = (id: string) =>
     transport.invoke<PtyControlStatus>("pty_control_takeover", { id });
+  const requestPtyRecovery = (id: string) =>
+    transport.invoke<PtyControlStatus>("pty_control_recover", { id });
 
   const connectPty = async (
     args: PtyOpenArgs,
@@ -218,6 +237,24 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     let exited = false;
     let abortRequested = false;
     let mutationQueue: Promise<void> = Promise.resolve();
+    let pendingWrite: {
+      data: string;
+      byteLength: number;
+      started: boolean;
+      result?: Promise<void>;
+    } | null = null;
+    let pendingResize: {
+      cols: number;
+      rows: number;
+      started: boolean;
+      result?: Promise<void>;
+    } | null = null;
+    let pendingScroll: {
+      direction: "up" | "down";
+      lines: number;
+      started: boolean;
+      result?: Promise<void>;
+    } | null = null;
     let unlistenData: (() => void) | null = null;
     let unlistenExit: (() => void) | null = null;
 
@@ -235,6 +272,64 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
         return operation();
       });
       mutationQueue = result.then(() => undefined, () => undefined);
+      return result;
+    };
+
+    const enqueueWrite = (data: string): Promise<void> => {
+      if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
+      const byteLength = ptyTextEncoder.encode(data).byteLength;
+      if (
+        pendingWrite &&
+        !pendingWrite.started &&
+        pendingWrite.byteLength + byteLength <= MAX_COALESCED_PTY_WRITE_BYTES
+      ) {
+        pendingWrite.data += data;
+        pendingWrite.byteLength += byteLength;
+        return pendingWrite.result!;
+      }
+      const batch = { data, byteLength, started: false } as NonNullable<typeof pendingWrite>;
+      pendingWrite = batch;
+      const result = enqueueMutation(() => {
+        batch.started = true;
+        if (pendingWrite === batch) pendingWrite = null;
+        return writePty(args.id, batch.data);
+      });
+      batch.result = result;
+      return result;
+    };
+
+    const enqueueResize = (cols: number, rows: number): Promise<void> => {
+      if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
+      if (pendingResize && !pendingResize.started) {
+        pendingResize.cols = cols;
+        pendingResize.rows = rows;
+        return pendingResize.result!;
+      }
+      const batch = { cols, rows, started: false } as NonNullable<typeof pendingResize>;
+      pendingResize = batch;
+      const result = enqueueMutation(() => {
+        batch.started = true;
+        if (pendingResize === batch) pendingResize = null;
+        return resizePty(args.id, batch.cols, batch.rows);
+      });
+      batch.result = result;
+      return result;
+    };
+
+    const enqueueScroll = (direction: "up" | "down", lines: number): Promise<void> => {
+      if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
+      if (pendingScroll && !pendingScroll.started && pendingScroll.direction === direction) {
+        pendingScroll.lines = Math.min(100, pendingScroll.lines + lines);
+        return pendingScroll.result!;
+      }
+      const batch = { direction, lines, started: false } as NonNullable<typeof pendingScroll>;
+      pendingScroll = batch;
+      const result = enqueueMutation(() => {
+        batch.started = true;
+        if (pendingScroll === batch) pendingScroll = null;
+        return scrollPty(args.id, batch.direction, batch.lines);
+      });
+      batch.result = result;
       return result;
     };
 
@@ -294,18 +389,21 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
         get active() {
           return !closed && !exited;
         },
-        write: (data) => {
-          return enqueueMutation(() => writePty(args.id, data));
-        },
-        resize: (cols, rows) => {
-          return enqueueMutation(() => resizePty(args.id, cols, rows));
-        },
+        write: enqueueWrite,
+        scroll: enqueueScroll,
+        resize: enqueueResize,
         controlStatus: () => {
           if (closed || exited) return Promise.reject(new Error("PTY connection is closed"));
           return ptyControlStatus(args.id);
         },
+        releaseControl: () => {
+          return enqueueMutation(() => releasePtyControl(args.id));
+        },
         requestTakeover: () => {
           return enqueueMutation(() => requestPtyTakeover(args.id));
+        },
+        requestRecovery: () => {
+          return enqueueMutation(() => requestPtyRecovery(args.id));
         },
         close: async () => {
           signal?.removeEventListener("abort", onAbort);
@@ -367,10 +465,13 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
     pty: {
       connect: connectPty,
       write: writePty,
+      scroll: scrollPty,
       resize: resizePty,
       kill: killPty,
       controlStatus: ptyControlStatus,
+      releaseControl: releasePtyControl,
       requestTakeover: requestPtyTakeover,
+      requestRecovery: requestPtyRecovery,
     },
     git: {
       status: (cwd, hostId) =>
@@ -441,6 +542,18 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       stop: () => transport.invoke<void>("mobile_relay_stop"),
     },
     feishu: {
+      integrationStatus: () =>
+        transport.invoke<FeishuIntegrationStatus>("feishu_integration_status"),
+      addProfile: (input) =>
+        transport.invoke<FeishuAddProfileResult>("feishu_integration_add_profile", {
+          appId: input.appId,
+          appSecret: input.appSecret,
+          brand: input.brand,
+        }),
+      selectProfile: (profile) =>
+        transport.invoke<FeishuIntegrationStatus>("feishu_integration_save_profile", { profile }),
+      removeProfile: (profile) =>
+        transport.invoke<FeishuIntegrationStatus>("feishu_integration_remove_profile", { profile }),
       status: () => transport.invoke<FeishuBridgeSnapshot>("feishu_bridge_status"),
       groups: () => transport.invoke<FeishuChat[]>("feishu_groups_list"),
       create: (args) => transport.invoke<FeishuBinding>("feishu_binding_create", { args }),

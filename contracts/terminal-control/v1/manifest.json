@@ -23,7 +23,8 @@
     "This local contract is independent from tw-rpc v1 and Relay v1/v2.",
     "controlTargetId, controlEpoch, leaseId and fence are terminal-control namespace values.",
     "Input adapters MUST NOT query status and then write a backend themselves; input operations execute inside the authority critical section.",
-    "Leases are liveness-bounded and must be renewed; expiry and controller restart enter RECOVERY_REQUIRED rather than FREE.",
+    "input.scroll is the lease-fenced semantic tmux history path; controlled adapters MUST NOT send terminal mouse escape bytes directly to a pane.",
+    "Leases are liveness-bounded and must be renewed. An idle expired/restarted non-Feishu HELD lease is fenced, exact-target checked, output-capture reset, and safely abandoned to FREE; Feishu, DRAINING, and accepted/in-doubt operations remain RECOVERY_REQUIRED.",
     "output.tail is a read-only observation capability. Its controlEpoch and outputGeneration fence late Feishu markers without granting input ownership.",
     "handoff.commit is the durable transfer point and requires a persisted drain disposition."
   ]

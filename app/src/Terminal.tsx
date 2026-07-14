@@ -327,6 +327,10 @@ export function Terminal({
     let reconnectTimer: number | null = null;
     let reconnectStabilityTimer: number | null = null;
     let controlStatusTimer: number | null = null;
+    let fitAnimationFrame: number | null = null;
+    let fitFollowupFrame: number | null = null;
+    let lastControlReadOnly: boolean | null = null;
+    let lastControlState: PtyControlStatus["state"] | null = null;
     let remoteRetryAvailable = false;
     let cancelled = false;
 
@@ -436,18 +440,23 @@ export function Terminal({
     host.addEventListener("mousedown", onLinkMouseDown, true);
     host.addEventListener("mouseup", onLinkMouseUp, true);
 
+    const routesWheelThroughPty = Boolean(hostId || controlSession);
     let wheelAccum = 0;
-    const handleRemoteWheel = (event: WheelEvent): boolean => {
-      if (!hostId || !ptyId || event.deltaY === 0) return true;
-      const pos = getViewportPositionFromMouse(term, event);
-      if (!pos) return true;
+    const handlePtyWheel = (event: WheelEvent): boolean => {
+      if (!routesWheelThroughPty || !ptyId || event.deltaY === 0) return true;
+      const pos = controlSession ? null : getViewportPositionFromMouse(term, event);
+      if (!controlSession && !pos) return true;
 
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
 
+      const cellHeight = Math.max(
+        1,
+        (term.options.fontSize ?? 13) * (term.options.lineHeight ?? 1.2),
+      );
       const deltaLines = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL
-        ? event.deltaY / 35
+        ? event.deltaY / cellHeight
         : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
           ? event.deltaY * Math.max(1, term.rows)
           : event.deltaY;
@@ -455,26 +464,35 @@ export function Terminal({
 
       const steps = Math.min(12, Math.floor(Math.abs(wheelAccum)));
       if (steps <= 0) return false;
-      const button: 64 | 65 = wheelAccum > 0 ? 65 : 64;
+      const direction = wheelAccum > 0 ? "down" : "up";
       wheelAccum -= Math.sign(wheelAccum) * steps;
 
-      let data = "";
-      for (let i = 0; i < steps; i++) {
-        data += sgrMouseWheel(button, pos);
+      if (controlSession) {
+        ptyConnection?.scroll(direction, steps).catch(() => {
+          ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
+        });
+      } else {
+        const button: 64 | 65 = direction === "down" ? 65 : 64;
+        let data = "";
+        for (let i = 0; i < steps; i++) {
+          data += sgrMouseWheel(button, pos!);
+        }
+        ptyConnection?.write(data).catch(() => {});
       }
-      ptyConnection?.write(data).catch(() => {});
       return false;
     };
-    const onRemoteWheel = (event: WheelEvent) => {
-      handleRemoteWheel(event);
-    };
-    if (hostId) {
-      term.attachCustomWheelEventHandler(handleRemoteWheel);
-      host.addEventListener("wheel", onRemoteWheel, { capture: true, passive: false });
+    if (routesWheelThroughPty) {
+      term.attachCustomWheelEventHandler(handlePtyWheel);
     }
 
     termRef.current = term;
     fitRef.current = fit;
+
+    let latestSize = { cols: term.cols, rows: term.rows };
+    const resizeSubscription = term.onResize(({ cols, rows }) => {
+      latestSize = { cols, rows };
+      if (ptyId) ptyConnection?.resize(cols, rows).catch(() => {});
+    });
 
     const writePty = (data: string) => {
       if (ptyId) ptyConnection?.write(data).catch(() => {});
@@ -524,14 +542,51 @@ export function Terminal({
     }
 
     const safeFit = () => {
+      const bounds = host.getBoundingClientRect();
+      if (bounds.width <= 0 || bounds.height <= 0) return false;
       try {
         fit.fit();
+        return true;
       } catch {
         // ignore — host not yet sized
+        return false;
       }
     };
 
-    safeFit();
+    const scheduleStableFit = () => {
+      if (fitAnimationFrame !== null) cancelAnimationFrame(fitAnimationFrame);
+      if (fitFollowupFrame !== null) cancelAnimationFrame(fitFollowupFrame);
+      fitAnimationFrame = requestAnimationFrame(() => {
+        fitAnimationFrame = null;
+        safeFit();
+        // React can reveal the selected slot and settle the workspace grid in
+        // separate layout passes. Refit on the following frame so a managed
+        // tmux attachment never opens permanently at xterm's 10x4 fallback.
+        fitFollowupFrame = requestAnimationFrame(() => {
+          fitFollowupFrame = null;
+          safeFit();
+        });
+      });
+    };
+
+    const fitBeforeOpen = async () => {
+      if (!activeRef.current) return;
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          safeFit();
+          resolve();
+        });
+      });
+      if (cancelled || !activeRef.current) return;
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => {
+          safeFit();
+          resolve();
+        });
+      });
+    };
+
+    scheduleStableFit();
     if (activeRef.current && canTerminalClaimFocus(host)) term.focus();
 
     const onThemeChange = (e: Event) => {
@@ -545,6 +600,12 @@ export function Terminal({
 
     const start = async () => {
       try {
+        // Fit before replaying captured output as well as before opening the
+        // managed PTY. Otherwise xterm can hard-wrap the snapshot at its
+        // fallback geometry and tmux briefly attaches at that stale size.
+        await fitBeforeOpen();
+        if (cancelled) return;
+
         if (tmuxSession) {
           const cachedHistory = initialHistoryRef.current;
           const history = cachedHistory !== undefined
@@ -656,14 +717,53 @@ export function Terminal({
         ptyConnectionRef.current = ptyConnection;
         ptyId = ptyConnection.active ? id : null;
         onAttachmentIdChangeRef.current?.(ptyId);
+        if (ptyId && controlSession && !activeRef.current) {
+          // TerminalDeck intentionally keeps inactive PTYs mounted for output
+          // continuity. Mounted observation must not retain input ownership.
+          const released = await ptyConnection.releaseControl().catch(() => null);
+          if (released) {
+            setControlStatus(released);
+            lastControlReadOnly = released.readOnly;
+            lastControlState = released.state;
+          }
+        }
+        if (ptyId && controlSession) {
+          // Controlled tmux attachments use ignore-size and therefore do not
+          // resize the shared window from their read-only PTY. Seed the
+          // canonical writer with the latest fitted dimensions so a layout
+          // change during open cannot leave tmux at a stale size.
+          void ptyConnection.resize(latestSize.cols, latestSize.rows).catch(() => {});
+        }
         if (ptyId && controlSession) {
           const pollControlStatus = async () => {
             if (cancelled || !ptyConnection?.active) return;
+            if (!activeRef.current) {
+              const released = await ptyConnection.releaseControl().catch(() => null);
+              if (released) {
+                setControlStatus(released);
+                lastControlReadOnly = released.readOnly;
+                lastControlState = released.state;
+              }
+              controlStatusTimer = window.setTimeout(pollControlStatus, 1_000);
+              return;
+            }
             try {
-              setControlStatus(await ptyConnection.controlStatus());
+              const nextStatus = await ptyConnection.controlStatus();
+              setControlStatus(nextStatus);
+              if (lastControlReadOnly === true && !nextStatus.readOnly) {
+                void ptyConnection.resize(term.cols, term.rows).catch(() => {});
+              }
+              lastControlReadOnly = nextStatus.readOnly;
+              lastControlState = nextStatus.state;
             } catch {}
             if (!cancelled && ptyConnection?.active) {
-              controlStatusTimer = window.setTimeout(pollControlStatus, 1_000);
+              // Only a HELD lease owned by this PTY uses the 20s renewal
+              // cadence. FREE is writable-on-demand but still polls quickly so
+              // a new Feishu binding becomes visible before the next input.
+              const nextPollMs = lastControlState === "HELD" && lastControlReadOnly === false
+                ? 20_000
+                : 1_000;
+              controlStatusTimer = window.setTimeout(pollControlStatus, nextPollMs);
             }
           };
           void pollControlStatus();
@@ -675,9 +775,6 @@ export function Terminal({
               ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
             });
           }
-        });
-        term.onResize(({ cols, rows }) => {
-          if (ptyId) ptyConnection?.resize(cols, rows).catch(() => {});
         });
       } catch (e) {
         if (cancelled || (e instanceof Error && e.name === "AbortError")) return;
@@ -691,8 +788,11 @@ export function Terminal({
 
     start();
 
-    const ro = new ResizeObserver(() => safeFit());
+    const ro = new ResizeObserver(() => scheduleStableFit());
     ro.observe(host);
+    void document.fonts?.ready.then(() => {
+      if (!cancelled) scheduleStableFit();
+    });
 
     return () => {
       cancelled = true;
@@ -700,12 +800,14 @@ export function Terminal({
       if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
       if (reconnectStabilityTimer !== null) window.clearTimeout(reconnectStabilityTimer);
       if (controlStatusTimer !== null) window.clearTimeout(controlStatusTimer);
+      if (fitAnimationFrame !== null) cancelAnimationFrame(fitAnimationFrame);
+      if (fitFollowupFrame !== null) cancelAnimationFrame(fitFollowupFrame);
       ro.disconnect();
       host.removeEventListener("mousedown", onLinkMouseDown, true);
       host.removeEventListener("mouseup", onLinkMouseUp, true);
-      if (hostId) host.removeEventListener("wheel", onRemoteWheel, true);
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
+      resizeSubscription.dispose();
       void ptyConnection?.close();
       if (ptyConnectionRef.current === ptyConnection) ptyConnectionRef.current = null;
       ptyId = null;
@@ -720,6 +822,10 @@ export function Terminal({
   useEffect(() => {
     activeRef.current = active;
     if (!active) {
+      const connection = ptyConnectionRef.current;
+      if (controlSession && connection?.active) {
+        void connection.releaseControl().then(setControlStatus).catch(() => {});
+      }
       const ta = termRef.current?.textarea;
       if (ta) {
         ta.blur();
@@ -730,24 +836,60 @@ export function Terminal({
     const term = termRef.current;
     const fit = fitRef.current;
     if (!term || !fit) return;
+    const connection = ptyConnectionRef.current;
+    if (controlSession && connection?.active) {
+      void connection.controlStatus().then(setControlStatus).catch(() => {});
+    }
     if (term.textarea) term.textarea.disabled = false;
     const palette = getCurrentPalette();
     term.options.theme = palette;
     applyTmuxStatusTheme(dashboardBackend, tmuxSession, palette);
+    let followupFrame: number | null = null;
     const animationFrame = requestAnimationFrame(() => {
-      if (!activeRef.current || termRef.current !== term || fitRef.current !== fit) return;
-      try {
-        fit.fit();
-      } catch {}
-      if (canTerminalClaimFocus(hostRef.current)) term.focus();
+      followupFrame = requestAnimationFrame(() => {
+        if (!activeRef.current || termRef.current !== term || fitRef.current !== fit) return;
+        try {
+          fit.fit();
+        } catch {}
+        if (canTerminalClaimFocus(hostRef.current)) term.focus();
+      });
     });
-    return () => cancelAnimationFrame(animationFrame);
-  }, [active, tmuxSession]);
+    return () => {
+      cancelAnimationFrame(animationFrame);
+      if (followupFrame !== null) cancelAnimationFrame(followupFrame);
+    };
+  }, [active, tmuxSession, controlSession]);
 
   const requestTakeover = () => {
     const connection = ptyConnectionRef.current;
     if (!connection) return;
-    connection.requestTakeover().then(setControlStatus).catch(() => {});
+    connection.requestTakeover().then((nextStatus) => {
+      setControlStatus(nextStatus);
+      const term = termRef.current;
+      if (term && !nextStatus.readOnly) {
+        void connection.resize(term.cols, term.rows).catch(() => {});
+      }
+    }).catch(() => {});
+  };
+
+  const requestRecovery = async () => {
+    const connection = ptyConnectionRef.current;
+    if (!connection) return;
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Recover local terminal input?",
+      message:
+        "The previous input lease expired or its controller restarted. Recovery advances the input fence and treats any uncertain in-flight operation as already attempted. Continue only if no other controller is still writing to this terminal.",
+    });
+    if (!confirmed || !connection.active) return;
+    connection.requestRecovery().then((nextStatus) => {
+      setControlStatus(nextStatus);
+      const term = termRef.current;
+      if (term && !nextStatus.readOnly) {
+        void connection.resize(term.cols, term.rows).catch(() => {});
+      }
+    }).catch(() => {
+      connection.controlStatus().then(setControlStatus).catch(() => {});
+    });
   };
 
   return (
@@ -758,10 +900,15 @@ export function Terminal({
           <span>
             {controlStatus.state === "DRAINING"
               ? `Waiting for ${controlStatus.ownerKind ?? "the current owner"} to finish local handoff…`
-              : `Read-only · input owned by ${controlStatus.ownerKind ?? "another controller"}`}
+              : controlStatus.state === "RECOVERY_REQUIRED"
+                ? "Read-only · terminal input continuity needs local recovery"
+                : `Read-only · input owned by ${controlStatus.ownerKind ?? "another controller"}`}
           </span>
           {controlStatus.canTakeOver && (
             <button type="button" onClick={requestTakeover}>Take over locally</button>
+          )}
+          {controlStatus.canRecover && (
+            <button type="button" onClick={() => void requestRecovery()}>Recover local input</button>
           )}
         </div>
       )}

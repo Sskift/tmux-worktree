@@ -131,6 +131,14 @@ export type TerminalControlRequest =
       rows: number;
     })
   | (TerminalControlRequestBase & {
+      type: "input.scroll";
+      lease: TerminalControlLease;
+      operationId: string;
+      pane: string;
+      direction: "up" | "down";
+      lines: number;
+    })
+  | (TerminalControlRequestBase & {
       type: "lifecycle.kill";
       lease: TerminalControlLease;
       operationId: string;
@@ -476,6 +484,23 @@ export function parseTerminalControlRequest(value: unknown): TerminalControlRequ
         pane: pane(record.pane),
         cols: record.cols as number,
         rows: record.rows as number,
+      };
+    case "input.scroll":
+      if (!exactKeys(record, ["protocolVersion", "requestId", "type", "lease", "operationId", "pane", "direction", "lines"])) break;
+      if (record.direction !== "up" && record.direction !== "down") {
+        throw new TerminalControlProtocolError("INVALID_REQUEST", "scroll direction must be up or down");
+      }
+      if (!Number.isSafeInteger(record.lines) || (record.lines as number) < 1 || (record.lines as number) > 100) {
+        throw new TerminalControlProtocolError("INVALID_REQUEST", "scroll lines must be an integer from 1 to 100");
+      }
+      return {
+        ...base,
+        type,
+        lease: lease(record.lease),
+        operationId: boundedString(record.operationId, "operationId", 192),
+        pane: pane(record.pane),
+        direction: record.direction,
+        lines: record.lines as number,
       };
     case "lifecycle.kill":
       if (!exactKeys(record, ["protocolVersion", "requestId", "type", "lease", "operationId"])) break;

@@ -6,8 +6,9 @@ use super::{
     create_local_terminal_via_runtime, create_local_worktree_via_runtime,
     create_remote_terminal_via_tw_rpc, create_remote_worktree,
     dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
-    delete_worktree, derive_session_name, ensure_terminal_session, fetchable_project_paths,
-    find_host, finish_git_fetch_target, git_fetch_args, git_graph_for, git_graph_refs_for,
+    delete_worktree_blocking, derive_session_name, ensure_terminal_session,
+    fetchable_project_paths, find_host, finish_git_fetch_target, git_fetch_args, git_graph_for,
+    git_graph_refs_for,
     hosts_from_config, install_host_tw_from_source, invalidate_host_status_cache,
     is_git_worktree_dir, is_managed_worktree_session,
     json_number_texts_semantically_equal_for_test, kill_canonical_first,
@@ -1812,7 +1813,7 @@ fn delete_worktree_requires_force_for_dirty_worktree() {
         name: "delete-dirty".to_string(),
     }]);
 
-    let err = delete_worktree(DeleteWorktreeArgs {
+    let err = delete_worktree_blocking(DeleteWorktreeArgs {
         path: path.clone(),
         force: false,
     })
@@ -1821,7 +1822,7 @@ fn delete_worktree_requires_force_for_dirty_worktree() {
     assert!(Path::new(&worktree).exists());
     assert_eq!(load_pending_cleanup().len(), 1);
 
-    delete_worktree(DeleteWorktreeArgs {
+    delete_worktree_blocking(DeleteWorktreeArgs {
         path: path.clone(),
         force: true,
     })

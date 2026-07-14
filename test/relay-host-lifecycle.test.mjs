@@ -80,8 +80,17 @@ let session = rawSession;
 if (/^%\\d+$/.test(rawSession)) {
   const mapped = join(gateDir, "pane-" + rawSession.slice(1) + ".session");
   if (existsSync(mapped)) session = readFileSync(mapped, "utf8").trim();
+} else if (/^\\$\\d+$/.test(rawSession)) {
+  const mapped = join(gateDir, "session-" + rawSession.slice(1) + ".name");
+  if (existsSync(mapped)) session = readFileSync(mapped, "utf8").trim();
 }
 const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
+const paneNumber = Array.from(session).reduce(
+  (hash, character) => (hash * 31 + character.codePointAt(0)) % 2147483646,
+  1,
+);
+const paneId = "%" + paneNumber;
+const instanceId = "tmux-instance-" + paneNumber;
 appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session, startedAt: Date.now() }) + "\\n");
 if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
   let managed = [];
@@ -89,6 +98,7 @@ if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
     managed = JSON.parse(readFileSync(join(process.env.HOME, ".tmux-worktree", "state.json"), "utf8")).sessions || [];
   } catch {}
   managed.forEach((entry, index) => {
+    writeFileSync(join(gateDir, "session-" + index + ".name"), String(entry.name) + "\\n");
     process.stdout.write(String(entry.name) + "\\u001f$" + String(index) + "\\n");
   });
   process.exit(0);
@@ -111,6 +121,20 @@ if (args[0] === "display-message" && args.at(-1) === "#{pane_pipe}") {
   process.stdout.write(existsSync(join(gateDir, key + ".output-pipe")) ? "1\\n" : "0\\n");
   process.exit(0);
 }
+if (args[0] === "display-message" && String(args.at(-1)).startsWith("#{pane_id}\\u001f")) {
+  const generationPath = join(gateDir, key + ".output-generation");
+  const generation = existsSync(generationPath) ? readFileSync(generationPath, "utf8").trim() : "";
+  writeFileSync(join(gateDir, "pane-" + paneNumber + ".session"), session + "\\n");
+  process.stdout.write([
+    paneId,
+    instanceId,
+    generation,
+    existsSync(join(gateDir, key + ".output-pipe")) ? "1" : "0",
+    "1",
+    "1",
+  ].join("\\u001f") + "\\n");
+  process.exit(0);
+}
 if (args[0] === "pipe-pane") {
   const active = join(gateDir, key + ".output-pipe");
   if (args.includes("-O")) writeFileSync(active, "1\\n");
@@ -118,17 +142,76 @@ if (args[0] === "pipe-pane") {
   process.exit(0);
 }
 if (args[0] === "show-options") {
-  process.stdout.write("tmux-instance-" + key + "\\n");
+  process.stdout.write(instanceId + "\\n");
   process.exit(0);
 }
 if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}\\u001f#{pane_id}") {
-  const paneNumber = Array.from(session).reduce(
-    (hash, character) => (hash * 31 + character.codePointAt(0)) % 2147483646,
-    1,
-  );
   writeFileSync(join(gateDir, "pane-" + paneNumber + ".session"), session + "\\n");
-  process.stdout.write("0\\u001f%" + paneNumber + "\\n");
+  process.stdout.write("0\\u001f" + paneId + "\\n");
   process.exit(0);
+}
+if (args[0] === "if-shell") {
+  const condition = String(args.at(-3) || "");
+  const committedCommand = String(args.at(-2) || "");
+  const rejectedCommand = String(args.at(-1) || "");
+  const committedMarker = /display-message -p (__TW_CONTROL_RAW_COMMITTED_[A-Za-z0-9-]+__)/.exec(committedCommand)?.[1];
+  const rejectedMarker = /display-message -p (__TW_CONTROL_RAW_REJECTED_[A-Za-z0-9-]+__)/.exec(rejectedCommand)?.[1];
+  const generationPath = join(gateDir, key + ".output-generation");
+  const generation = existsSync(generationPath) ? readFileSync(generationPath, "utf8").trim() : "";
+  const ready = Boolean(
+    committedMarker
+    && rejectedMarker
+    && condition.includes(instanceId)
+    && condition.includes(generation)
+    && existsSync(join(gateDir, key + ".output-pipe"))
+  );
+  if (!ready) {
+    process.stdout.write(String(rejectedMarker || "rejected") + "\\n");
+    process.exit(0);
+  }
+  const translatedKey = /(?:^| ; )send-keys -t (%\\d+) ([A-Za-z0-9-]+)(?: ; |$)/.exec(committedCommand);
+  if (translatedKey) {
+    if (existsSync(join(gateDir, "fail-send-keys"))) {
+      process.stderr.write("simulated key input failure\\n");
+      process.exit(42);
+    }
+    appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({
+      pid: process.pid,
+      args: ["send-keys", "-t", translatedKey[1], translatedKey[2]],
+      session,
+      startedAt: Date.now(),
+    }) + "\\n");
+    process.stdout.write(committedMarker + "\\n");
+    process.exit(0);
+  }
+  if (existsSync(join(gateDir, "fail-load-buffer"))) {
+    process.stderr.write("simulated paste failure\\n");
+    process.exit(41);
+  }
+  const buffer = /load-buffer -b ([A-Za-z0-9-]+) -/.exec(committedCommand)?.[1] || "missing";
+  const pane = /paste-buffer [^;]+ -t (%\\d+)/.exec(committedCommand)?.[1] || paneId;
+  const mutationArgs = [
+    "load-buffer", "-b", buffer, "-",
+    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", pane,
+  ];
+  let input = "";
+  process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
+  process.stdin.on("end", () => {
+    appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({
+      pid: process.pid,
+      args: mutationArgs,
+      session,
+      startedAt: Date.now(),
+    }) + "\\n");
+    appendFileSync(
+      join(gateDir, "tmux-inputs.ndjson"),
+      JSON.stringify({ args: mutationArgs, input }) + "\\n",
+    );
+    process.stdout.write(committedMarker + "\\n");
+    process.exit(0);
+  });
+  process.stdin.resume();
+  return;
 }
 if (args[0] === "load-buffer" && existsSync(join(gateDir, "fail-load-buffer"))) {
   process.stderr.write("simulated paste failure\\n");
@@ -1406,6 +1489,28 @@ test("local input bypasses the observer socket and remains on the controlled bac
     .map(({ message }) => message)
     .filter(({ type, streamId }) => streamId === STREAM_ID && (type === "error" || type === "terminal_exit"));
   assert.deepEqual(lifecycleFailures, []);
+});
+
+test("application cursor input is translated by tmux inside the fenced controller write", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "application-cursor-input");
+  await waitFor(
+    () => harness.localConnections.some(({ session }) => session === "application-cursor-input"),
+    "application cursor backend did not open",
+  );
+
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "\x1bOD" });
+  const translated = await waitFor(() => {
+    const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
+    return calls.find(({ args }) => args[0] === "send-keys" && args[3] === "Left");
+  }, "application cursor Left was not translated through tmux");
+
+  assert.match(translated.args[2], /^%\d+$/);
+  assert.deepEqual(translated.args, ["send-keys", "-t", translated.args[2], "Left"]);
+  assert.equal(existsSync(join(harness.gateDir, "tmux-inputs.ndjson")), false);
 });
 
 test("closing one observer route does not release another route's shared client ownership", async (t) => {

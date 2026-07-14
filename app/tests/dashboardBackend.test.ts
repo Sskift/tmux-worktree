@@ -270,6 +270,12 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.pty.write("pty-1", "hello"),
   },
   {
+    label: "pty.scroll",
+    command: "pty_control_scroll",
+    args: { id: "pty-1", direction: "up", lines: 3 },
+    call: (backend) => backend.pty.scroll("pty-1", "up", 3),
+  },
+  {
     label: "pty.resize",
     command: "pty_resize",
     args: { id: "pty-1", cols: 120, rows: 40 },
@@ -288,10 +294,22 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.pty.controlStatus("pty-1"),
   },
   {
+    label: "pty.releaseControl",
+    command: "pty_control_release",
+    args: { id: "pty-1" },
+    call: (backend) => backend.pty.releaseControl("pty-1"),
+  },
+  {
     label: "pty.requestTakeover",
     command: "pty_control_takeover",
     args: { id: "pty-1" },
     call: (backend) => backend.pty.requestTakeover("pty-1"),
+  },
+  {
+    label: "pty.requestRecovery",
+    command: "pty_control_recover",
+    args: { id: "pty-1" },
+    call: (backend) => backend.pty.requestRecovery("pty-1"),
   },
   {
     label: "git.status normalizes an absent host to null",
@@ -542,6 +560,38 @@ const commandCases: CommandCase[] = [
     command: "mobile_relay_stop",
     args: undefined,
     call: (backend) => backend.relay.stop(),
+  },
+  {
+    label: "feishu.integrationStatus",
+    command: "feishu_integration_status",
+    args: undefined,
+    call: (backend) => backend.feishu.integrationStatus(),
+  },
+  {
+    label: "feishu.addProfile",
+    command: "feishu_integration_add_profile",
+    args: {
+      appId: "cli_new_bot",
+      appSecret: "transient-secret",
+      brand: "feishu",
+    },
+    call: (backend) => backend.feishu.addProfile({
+      appId: "cli_new_bot",
+      appSecret: "transient-secret",
+      brand: "feishu",
+    }),
+  },
+  {
+    label: "feishu.selectProfile",
+    command: "feishu_integration_save_profile",
+    args: { profile: "bot-profile" },
+    call: (backend) => backend.feishu.selectProfile("bot-profile"),
+  },
+  {
+    label: "feishu.removeProfile",
+    command: "feishu_integration_remove_profile",
+    args: { profile: "bot-profile" },
+    call: (backend) => backend.feishu.removeProfile("bot-profile"),
   },
   {
     label: "persistence.homeDirectory",

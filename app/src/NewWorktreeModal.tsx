@@ -64,6 +64,7 @@ export function NewWorktreeModal({
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const catalogRequestGateRef = useRef(createLatestRequestGate());
   const projectValidationGateRef = useRef(createLatestRequestGate());
+  const busyRef = useRef(false);
   const catalogDraftStateRef = useRef<WorktreeCatalogDraftState>({
     source: LOCAL_HOST,
     dirty: false,
@@ -265,9 +266,21 @@ export function NewWorktreeModal({
     }
   };
 
-  const restoreOrphan = async (orphan: Orphan) => {
+  const beginBusy = (): boolean => {
+    if (busyRef.current) return false;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
+    return true;
+  };
+
+  const endBusy = () => {
+    busyRef.current = false;
+    setBusy(false);
+  };
+
+  const restoreOrphan = async (orphan: Orphan) => {
+    if (!beginBusy()) return;
     try {
       const accepted = await onRestoreWorktree({
         path: orphan.path,
@@ -275,19 +288,18 @@ export function NewWorktreeModal({
         aiCmd: aiCmd.trim() || "",
       });
       if (!accepted) {
-        setBusy(false);
+        endBusy();
         return;
       }
       saveLastAiCmd(aiCmd);
     } catch (err) {
       setError(String(err));
-      setBusy(false);
+      endBusy();
     }
   };
 
   const deleteOrphan = async (orphan: Orphan) => {
-    setBusy(true);
-    setError(null);
+    if (!beginBusy()) return;
     try {
       const accepted = await onDeleteWorktree(orphan);
       if (accepted) {
@@ -296,15 +308,13 @@ export function NewWorktreeModal({
     } catch (err) {
       setError(String(err));
     } finally {
-      setBusy(false);
+      endBusy();
     }
   };
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!aiCmd.trim()) return;
-    setBusy(true);
-    setError(null);
+    if (!aiCmd.trim() || !beginBusy()) return;
     try {
       const createArgs: CreateWorktreeInput = {
         aiCmd: aiCmd.trim(),
@@ -343,7 +353,7 @@ export function NewWorktreeModal({
           setProjects(result.projects);
           setProject(CUSTOM);
           setError(`Removed "${selected.name}" because its directory no longer exists: ${selected.path}`);
-          setBusy(false);
+          endBusy();
           return;
         }
         createArgs.project = project;
@@ -357,13 +367,13 @@ export function NewWorktreeModal({
         ...(preset ? { preset } : {}),
       });
       if (!accepted) {
-        setBusy(false);
+        endBusy();
         return;
       }
       saveLastAiCmd(aiCmd);
     } catch (err) {
       setError(String(err));
-      setBusy(false);
+      endBusy();
     }
   };
 

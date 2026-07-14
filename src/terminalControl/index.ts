@@ -5,3 +5,4 @@ export * from "./backend";
 export * from "./store";
 export * from "./attach";
 export * from "./server";
+export * from "./proxy";

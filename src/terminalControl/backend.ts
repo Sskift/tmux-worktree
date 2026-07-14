@@ -23,6 +23,55 @@ const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
 const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 
+// xterm emits client-terminal escape sequences for special keys. Pasting
+// those bytes directly into a pane bypasses tmux's key translation, so TUIs
+// can receive the trailing characters as text (for example "[D" for Left).
+// Route exact single-key frames through `send-keys`; arbitrary text and paste
+// payloads still use the binary-safe load-buffer path below.
+const TMUX_KEY_BY_RAW_HEX = new Map<string, string>([
+  ["1b5b41", "Up"],
+  ["1b4f41", "Up"],
+  ["1b5b42", "Down"],
+  ["1b4f42", "Down"],
+  ["1b5b43", "Right"],
+  ["1b4f43", "Right"],
+  ["1b5b44", "Left"],
+  ["1b4f44", "Left"],
+  ["1b5b48", "Home"],
+  ["1b4f48", "Home"],
+  ["1b5b317e", "Home"],
+  ["1b5b377e", "Home"],
+  ["1b5b46", "End"],
+  ["1b4f46", "End"],
+  ["1b5b347e", "End"],
+  ["1b5b387e", "End"],
+  ["1b5b327e", "IC"],
+  ["1b5b337e", "DC"],
+  ["1b5b357e", "PPage"],
+  ["1b5b367e", "NPage"],
+  ["1b5b5a", "BTab"],
+  ["7f", "BSpace"],
+  ["0d", "Enter"],
+  ["09", "Tab"],
+  ["1b", "Escape"],
+  ["1b4f50", "F1"],
+  ["1b4f51", "F2"],
+  ["1b4f52", "F3"],
+  ["1b4f53", "F4"],
+  ["1b5b31357e", "F5"],
+  ["1b5b31377e", "F6"],
+  ["1b5b31387e", "F7"],
+  ["1b5b31397e", "F8"],
+  ["1b5b32307e", "F9"],
+  ["1b5b32317e", "F10"],
+  ["1b5b32337e", "F11"],
+  ["1b5b32347e", "F12"],
+]);
+
+function tmuxKeyForRawInput(data: Buffer): string | undefined {
+  return TMUX_KEY_BY_RAW_HEX.get(data.toString("hex"));
+}
+
 export interface TerminalControlOutputPosition {
   generation: string;
   cursor: number;
@@ -45,8 +94,20 @@ export interface TerminalControlBackend {
     tmuxInstanceId: string,
   ): Promise<void>;
   writeRaw(sessionName: string, pane: string, data: Buffer): Promise<void>;
+  rawInputPosition?(
+    controlTargetId: string,
+    generation: string,
+  ): Promise<TerminalControlOutputPosition>;
+  writeRawFenced?(
+    session: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    data: Buffer,
+  ): Promise<void>;
   sendAgentMessage(sessionName: string, pane: string, message: string, submit: boolean): Promise<void>;
   resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void>;
+  scroll(sessionName: string, pane: string, direction: "up" | "down", lines: number): Promise<void>;
   killManaged(sessionName: string): Promise<void>;
   prepareOutput(
     controlTargetId: string,
@@ -415,6 +476,11 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
   async writeRaw(sessionName: string, pane: string, data: Buffer): Promise<void> {
     const { paneTarget } = await requirePane(sessionName, pane);
     if (data.byteLength === 0) return;
+    const key = tmuxKeyForRawInput(data);
+    if (key) {
+      await runTmux(["send-keys", "-t", paneTarget, key]);
+      return;
+    }
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
     try {
       await runTmux(
@@ -427,6 +493,131 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     } catch (error) {
       await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
       throw error;
+    }
+  }
+
+  async rawInputPosition(
+    controlTargetId: string,
+    generation: string,
+  ): Promise<TerminalControlOutputPosition> {
+    const path = outputPath(controlTargetId, generation);
+    if (!existsSync(path)) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output capture file is missing",
+      );
+    }
+    ensureOutputFile(path);
+    return { generation, cursor: statSync(path).size };
+  }
+
+  async writeRawFenced(
+    expected: Pick<ManagedSession, "name" | "kind" | "createdAt">,
+    tmuxInstanceId: string,
+    outputGeneration: string,
+    pane: string,
+    data: Buffer,
+  ): Promise<void> {
+    if (pane !== "0") {
+      throw new TerminalControlProtocolError(
+        "TARGET_NOT_FOUND",
+        `managed single-pane target has no logical pane: ${pane}`,
+      );
+    }
+    const current = exactManagedSession(expected.name);
+    if (current.kind !== expected.kind || current.createdAt !== expected.createdAt) {
+      throw new TerminalControlProtocolError(
+        "TARGET_GONE",
+        "managed session lifecycle no longer matches the control target",
+      );
+    }
+    if (
+      !/^[A-Za-z0-9-]{1,128}$/.test(tmuxInstanceId)
+      || !/^[A-Za-z0-9-]{1,128}$/.test(outputGeneration)
+    ) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal backend fencing identity is malformed",
+      );
+    }
+
+    const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
+    const committedMarker = `__TW_CONTROL_RAW_COMMITTED_${randomUUID()}__`;
+    const rejectedMarker = `__TW_CONTROL_RAW_REJECTED_${randomUUID()}__`;
+    let paneId: string;
+    try {
+      const probe = await runTmux([
+        "display-message",
+        "-p",
+        "-t",
+        expected.name,
+        [
+          "#{pane_id}",
+          `#{@${TMUX_INSTANCE_OPTION.slice(1)}}`,
+          `#{@${OUTPUT_GENERATION_OPTION.slice(1)}}`,
+          "#{pane_pipe}",
+          "#{session_windows}",
+          "#{window_panes}",
+        ].join("\u001f"),
+      ]);
+      const fields = probe.stdout.trim().split("\u001f");
+      if (
+        fields.length !== 6
+        || !/^%\d+$/.test(fields[0])
+        || fields[1] !== tmuxInstanceId
+        || fields[2] !== outputGeneration
+        || fields[3] !== "1"
+        || fields[4] !== "1"
+        || fields[5] !== "1"
+      ) {
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          "terminal backend identity, output capture, or single-pane shape changed before input",
+        );
+      }
+      paneId = fields[0];
+    } catch (error) {
+      if (error instanceof TerminalControlProtocolError) throw error;
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        `could not resolve the fenced terminal pane before input: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    const condition = [
+      `#{==:#{@${TMUX_INSTANCE_OPTION.slice(1)}},${tmuxInstanceId}}`,
+      `#{==:#{@${OUTPUT_GENERATION_OPTION.slice(1)}},${outputGeneration}}`,
+      "#{==:#{pane_pipe},1}",
+      "#{==:#{session_windows},1}",
+      "#{==:#{window_panes},1}",
+    ].reduceRight((right, left) => `#{&&:${left},${right}}`);
+    const key = tmuxKeyForRawInput(data);
+    const committed = [
+      key
+        ? `send-keys -t ${paneId} ${key}`
+        : `load-buffer -b ${bufferName} - ; paste-buffer -b ${bufferName} -d -r -t ${paneId}`,
+      `display-message -p ${committedMarker}`,
+    ].join(" ; ");
+    const result = await runTmux(
+      [
+        "if-shell",
+        "-F",
+        "-t",
+        paneId,
+        condition,
+        committed,
+        `display-message -p ${rejectedMarker}`,
+      ],
+      key ? {} : { input: data },
+    );
+    const response = result.stdout.trim();
+    if (response === rejectedMarker) {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal backend identity, output capture, or single-pane shape changed before input",
+      );
+    }
+    if (response !== committedMarker) {
+      throw new Error("tmux did not confirm the fenced raw input boundary");
     }
   }
 
@@ -475,6 +666,29 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       "-t", sessionId,
       "-x", String(cols),
       "-y", String(rows),
+    ]);
+  }
+
+  async scroll(
+    sessionName: string,
+    pane: string,
+    direction: "up" | "down",
+    lines: number,
+  ): Promise<void> {
+    if ((direction !== "up" && direction !== "down") || !Number.isSafeInteger(lines) || lines < 1 || lines > 100) {
+      throw new TerminalControlProtocolError("INVALID_REQUEST", "tmux scroll input is invalid");
+    }
+    const { paneTarget } = await requirePane(sessionName, pane);
+    const inMode = (await runTmux([
+      "display-message", "-p", "-t", paneTarget, "#{pane_in_mode}",
+    ])).stdout.trim() === "1";
+    if (direction === "down" && !inMode) return;
+    if (direction === "up" && !inMode) {
+      await runTmux(["copy-mode", "-e", "-t", paneTarget]);
+    }
+    await runTmux([
+      "send-keys", "-X", "-N", String(lines), "-t", paneTarget,
+      direction === "up" ? "scroll-up" : "scroll-down",
     ]);
   }
 

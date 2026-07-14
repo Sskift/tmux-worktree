@@ -13,3 +13,4 @@ export {
   type SettingsSectionId,
 } from "./settingsModel";
 export { AgentsSettings, type AgentsSettingsProps } from "./AgentsSettings";
+export { FeishuIntegrationSettings } from "./FeishuIntegrationSettings";

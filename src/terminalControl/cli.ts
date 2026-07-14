@@ -8,6 +8,7 @@ import {
   terminalControlErrorResponse,
 } from "./protocol";
 import { runTerminalControlServer } from "./server";
+import { runTerminalControlProxy } from "./proxy";
 
 async function readOneFrame(): Promise<string> {
   stdin.setEncoding("utf8");
@@ -55,6 +56,10 @@ export async function terminalControlCmd(args: string[]): Promise<void> {
     }
     return;
   }
+  if (command === "proxy") {
+    await runTerminalControlProxy();
+    return;
+  }
   if (command === "resolve") {
     const sessionName = args[1];
     if (!sessionName) throw new Error("usage: tw terminal-control resolve <managed-session>");
@@ -81,6 +86,6 @@ export async function terminalControlCmd(args: string[]): Promise<void> {
     return;
   }
   throw new Error(
-    "usage: tw terminal-control serve|request|resolve <session>|status <target>|acquire-local <target>",
+    "usage: tw terminal-control serve|request|proxy|resolve <session>|status <target>|acquire-local <target>",
   );
 }

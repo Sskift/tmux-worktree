@@ -1,23 +1,61 @@
 use crate::config::find_host;
 use crate::features::control_plane::{bundled_cli_path, installed_tw_command, node_bin};
-use crate::remote::{remote_tmux_cmd, remote_tw_cmd, run_remote_cmd_with_input};
+use crate::features::now_rfc3339;
+use crate::remote::{
+    remote_tmux_cmd, remote_tw_cmd, spawn_remote_terminal_control_proxy, HostConfig,
+    RemoteTerminalControlProxy,
+};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_RESPONSE_BYTES: usize = 384 * 1024;
+const REMOTE_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteTerminalControlFingerprint {
+    host: String,
+    user: Option<String>,
+    port: Option<u16>,
+    identity_file: Option<String>,
+    tw_path: Option<String>,
+    tmux_path: Option<String>,
+}
+
+impl From<&HostConfig> for RemoteTerminalControlFingerprint {
+    fn from(host: &HostConfig) -> Self {
+        Self {
+            host: host.host.clone(),
+            user: host.user.clone(),
+            port: host.port,
+            identity_file: host.identity_file.clone(),
+            tw_path: host.tw_path.clone(),
+            tmux_path: host.tmux_path.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RemoteTerminalControlProxySlot {
+    fingerprint: Option<RemoteTerminalControlFingerprint>,
+    proxy: Option<RemoteTerminalControlProxy>,
+}
+
+type SharedRemoteTerminalControlProxySlot = Arc<Mutex<RemoteTerminalControlProxySlot>>;
 
 pub(crate) struct TerminalControlState {
     process: Mutex<Option<Child>>,
+    remote_proxies: Mutex<HashMap<String, SharedRemoteTerminalControlProxySlot>>,
     dashboard_instance_id: String,
 }
 
@@ -25,7 +63,30 @@ impl TerminalControlState {
     pub(crate) fn new() -> Self {
         Self {
             process: Mutex::new(None),
+            remote_proxies: Mutex::new(HashMap::new()),
             dashboard_instance_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+
+    fn remote_proxy_slot(&self, host_id: &str) -> SharedRemoteTerminalControlProxySlot {
+        let mut proxies = self.remote_proxies.lock().unwrap();
+        Arc::clone(
+            proxies
+                .entry(host_id.to_string())
+                .or_insert_with(|| Arc::new(Mutex::new(RemoteTerminalControlProxySlot::default()))),
+        )
+    }
+
+    pub(crate) fn stop_remote_proxies(&self) {
+        let slots = self
+            .remote_proxies
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, slot)| slot)
+            .collect::<Vec<_>>();
+        for slot in slots {
+            slot.lock().unwrap().proxy.take();
         }
     }
 
@@ -54,8 +115,11 @@ pub(crate) struct PtyControl {
     pub(crate) session_name: String,
     pub(crate) host_id: Option<String>,
     pub(crate) control_target_id: Option<String>,
+    pub(crate) control_epoch: Option<String>,
     pub(crate) owner: Value,
     pub(crate) lease: Option<Value>,
+    pub(crate) desired_size: Option<(u16, u16)>,
+    pub(crate) applied_size: Option<(u16, u16)>,
     pub(crate) next_operation: u64,
     pub(crate) pending_handoff_id: Option<String>,
     pub(crate) last_state: String,
@@ -71,6 +135,7 @@ pub(crate) struct PtyControlStatus {
     pub(crate) state: String,
     pub(crate) owner_kind: Option<String>,
     pub(crate) can_take_over: bool,
+    pub(crate) can_recover: bool,
     pub(crate) message: Option<String>,
 }
 
@@ -160,12 +225,19 @@ impl PtyControl {
         let owned_here = self.lease.is_some();
         PtyControlStatus {
             controlled: true,
-            read_only: !owned_here,
+            // FREE is writable-on-demand: the first real input atomically
+            // acquires a lease. Merely observing or mounting a PTY must not
+            // make the session look locked or claim it pre-emptively.
+            read_only: !owned_here && self.last_state != "FREE",
             state: self.last_state.clone(),
             owner_kind: self.last_owner_kind.clone(),
             can_take_over: !owned_here
                 && self.last_state == "HELD"
                 && matches!(self.last_owner_kind.as_deref(), Some("feishu")),
+            can_recover: !owned_here
+                && self.last_state == "RECOVERY_REQUIRED"
+                && self.control_target_id.is_some()
+                && self.control_epoch.is_some(),
             message: self.last_error.clone(),
         }
     }
@@ -225,6 +297,7 @@ impl PtyControl {
 
     pub(crate) fn clear_dashboard_lease_after_transfer_attempt(&mut self) {
         self.lease = None;
+        self.applied_size = None;
         self.pending_handoff_id = None;
         self.last_state = "RECOVERY_REQUIRED".to_string();
         self.last_owner_kind = None;
@@ -241,7 +314,12 @@ impl PtyControl {
             .ok_or_else(|| "Dashboard terminal has no canonical controlTargetId".to_string())?;
         let lease = validated_dashboard_lease(&lease, target_id, &self.owner)
             .map_err(|error| error.to_string())?;
+        self.control_epoch = lease
+            .get("controlEpoch")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         self.lease = Some(lease);
+        self.applied_size = None;
         self.pending_handoff_id = None;
         self.last_state = "HELD".to_string();
         self.last_owner_kind = Some("dashboard".to_string());
@@ -271,20 +349,47 @@ fn socket_path() -> PathBuf {
         .join("v1.sock")
 }
 
-fn decode_response(body: &Value, response: &[u8]) -> Result<Value, TerminalControlCallError> {
+fn decode_response_envelope(
+    body: &Value,
+    response: &[u8],
+) -> Result<Value, TerminalControlCallError> {
     let decoded: Value =
         serde_json::from_slice(response).map_err(|error| TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
             message: format!("decode terminal-control response: {error}"),
         })?;
+    let object = decoded.as_object();
+    let ok = decoded.get("ok").and_then(Value::as_bool);
+    let payload_matches = match ok {
+        Some(true) => object.is_some_and(|object| {
+            object.len() == 4 && object.contains_key("result") && !object.contains_key("error")
+        }),
+        Some(false) => object.is_some_and(|object| {
+            let error = object.get("error").and_then(Value::as_object);
+            object.len() == 4
+                && !object.contains_key("result")
+                && error.is_some_and(|error| {
+                    error.len() == 3
+                        && error.get("code").and_then(Value::as_str).is_some()
+                        && error.get("message").and_then(Value::as_str).is_some()
+                        && error.get("retryable").and_then(Value::as_bool).is_some()
+                })
+        }),
+        None => false,
+    };
     if decoded.get("protocolVersion").and_then(Value::as_u64) != Some(PROTOCOL_VERSION)
         || decoded.get("requestId") != body.get("requestId")
+        || !payload_matches
     {
         return Err(TerminalControlCallError {
             code: "UNAVAILABLE".to_string(),
             message: "terminal-control response envelope mismatch".to_string(),
         });
     }
+    Ok(decoded)
+}
+
+fn decode_response_result(decoded: &Value) -> Result<Value, TerminalControlCallError> {
     if decoded.get("ok").and_then(Value::as_bool) == Some(false) {
         let error = decoded.get("error").and_then(Value::as_object);
         return Err(TerminalControlCallError {
@@ -307,6 +412,11 @@ fn decode_response(body: &Value, response: &[u8]) -> Result<Value, TerminalContr
             code: "UNAVAILABLE".to_string(),
             message: "terminal-control response has no result".to_string(),
         })
+}
+
+fn decode_response(body: &Value, response: &[u8]) -> Result<Value, TerminalControlCallError> {
+    let decoded = decode_response_envelope(body, response)?;
+    decode_response_result(&decoded)
 }
 
 fn send_once(body: &Value) -> Result<Value, TerminalControlCallError> {
@@ -362,11 +472,7 @@ fn send_once(body: &Value) -> Result<Value, TerminalControlCallError> {
     decode_response(body, &response)
 }
 
-fn send_remote(host_id: &str, body: &Value) -> Result<Value, TerminalControlCallError> {
-    let host = find_host(host_id).map_err(|message| TerminalControlCallError {
-        code: "UNAVAILABLE".to_string(),
-        message,
-    })?;
+fn remote_terminal_control_command(host: &HostConfig, mode: &str) -> String {
     let mut command = String::new();
     if host
         .tmux_path
@@ -377,41 +483,131 @@ fn send_remote(host_id: &str, body: &Value) -> Result<Value, TerminalControlCall
         command.push_str(&remote_tmux_cmd(&host));
         command.push(' ');
     }
-    command.push_str(&remote_tw_cmd(&host));
-    command.push_str(" terminal-control request");
+    command.push_str(&remote_tw_cmd(host));
+    command.push_str(" terminal-control ");
+    command.push_str(mode);
+    command
+}
+
+fn lock_remote_proxy_slot_until<'a>(
+    slot: &'a Mutex<RemoteTerminalControlProxySlot>,
+    deadline: Instant,
+) -> Result<MutexGuard<'a, RemoteTerminalControlProxySlot>, TerminalControlCallError> {
+    loop {
+        match slot.try_lock() {
+            Ok(slot) => return Ok(slot),
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(TerminalControlCallError {
+                    code: "INTERNAL".to_string(),
+                    message: "remote terminal-control proxy lane is poisoned".to_string(),
+                });
+            }
+            Err(TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Err(TerminalControlCallError {
+                        code: "UNAVAILABLE".to_string(),
+                        message: format!(
+                            "remote terminal-control hard timeout after {} ms waiting for the host lane",
+                            REMOTE_PROXY_REQUEST_TIMEOUT.as_millis()
+                        ),
+                    });
+                }
+                std::thread::sleep(remaining.min(Duration::from_millis(2)));
+            }
+        }
+    }
+}
+
+fn send_remote(
+    state: &TerminalControlState,
+    host_id: &str,
+    body: &Value,
+) -> Result<Value, TerminalControlCallError> {
+    let deadline = Instant::now() + REMOTE_PROXY_REQUEST_TIMEOUT;
+    let request_id = body
+        .get("requestId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| TerminalControlCallError {
+            code: "INTERNAL".to_string(),
+            message: "terminal-control request has no requestId".to_string(),
+        })?;
     let mut frame = serde_json::to_vec(body).map_err(|error| TerminalControlCallError {
         code: "INTERNAL".to_string(),
         message: format!("encode terminal-control request: {error}"),
     })?;
     frame.push(b'\n');
-    let output =
-        run_remote_cmd_with_input(&host, &["sh", "-c", &command], &frame).map_err(|message| {
-            TerminalControlCallError {
+    if frame.len() > MAX_RESPONSE_BYTES {
+        return Err(TerminalControlCallError {
+            code: "INTERNAL".to_string(),
+            message: "terminal-control request exceeds the frame limit".to_string(),
+        });
+    }
+
+    let shared_slot = state.remote_proxy_slot(host_id);
+    let mut slot = lock_remote_proxy_slot_until(&shared_slot, deadline)?;
+    // Resolve the Host only after entering its serial lane. A config edit while
+    // another request is in flight must not let this request reuse the old
+    // endpoint snapshot after it finally reaches the head of the queue.
+    let host = find_host(host_id).map_err(|message| TerminalControlCallError {
+        code: "UNAVAILABLE".to_string(),
+        message,
+    })?;
+    let fingerprint = RemoteTerminalControlFingerprint::from(&host);
+    if slot.fingerprint.as_ref() != Some(&fingerprint) {
+        slot.proxy.take();
+        slot.fingerprint = Some(fingerprint);
+    }
+    if slot.proxy.as_mut().is_some_and(|proxy| !proxy.is_usable()) {
+        slot.proxy.take();
+    }
+    if slot.proxy.is_none() {
+        let command = remote_terminal_control_command(&host, "proxy");
+        slot.proxy = Some(
+            spawn_remote_terminal_control_proxy(&host, &["sh", "-c", &command], MAX_RESPONSE_BYTES)
+                .map_err(|message| TerminalControlCallError {
+                    code: "UNAVAILABLE".to_string(),
+                    message: format!(
+                        "start remote terminal-control proxy on {}: {message}",
+                        host.label
+                    ),
+                })?,
+        );
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        slot.proxy.take();
+        return Err(TerminalControlCallError {
+            code: "UNAVAILABLE".to_string(),
+            message: format!(
+                "remote terminal-control hard timeout after {} ms",
+                REMOTE_PROXY_REQUEST_TIMEOUT.as_millis()
+            ),
+        });
+    }
+    let response = match slot
+        .proxy
+        .as_mut()
+        .expect("proxy initialized above")
+        .request(&frame, request_id, remaining)
+    {
+        Ok(response) => response,
+        Err(message) => {
+            slot.proxy.take();
+            return Err(TerminalControlCallError {
                 code: "UNAVAILABLE".to_string(),
                 message: format!("remote terminal-control on {}: {message}", host.label),
-            }
-        })?;
-    if !output.status.success() {
-        return Err(TerminalControlCallError {
-            code: "UNAVAILABLE".to_string(),
-            message: format!(
-                "remote terminal-control on {} exited {}: {}",
-                host.label,
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
-            ),
-        });
-    }
-    if output.stdout.len() > MAX_RESPONSE_BYTES || !output.stdout.ends_with(b"\n") {
-        return Err(TerminalControlCallError {
-            code: "UNAVAILABLE".to_string(),
-            message: format!(
-                "remote terminal-control on {} returned a missing or oversized response",
-                host.label
-            ),
-        });
-    }
-    decode_response(body, &output.stdout)
+            });
+        }
+    };
+    let decoded = match decode_response_envelope(body, &response) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            slot.proxy.take();
+            return Err(error);
+        }
+    };
+    decode_response_result(&decoded)
 }
 
 fn request(kind: &str, fields: Value) -> Value {
@@ -522,7 +718,7 @@ pub(crate) fn call_terminal_control(
 ) -> Result<Value, TerminalControlCallError> {
     let body = request(kind, fields);
     if let Some(host_id) = host_id {
-        return send_remote(host_id, &body);
+        return send_remote(state, host_id, &body);
     }
     ensure_server(app, state)?;
     send_once(&body)
@@ -579,8 +775,11 @@ pub(crate) fn open_pty_control(
         session_name: session_name.to_string(),
         host_id: host_id.map(str::to_string),
         control_target_id: None,
+        control_epoch: None,
         owner,
         lease: None,
+        desired_size: None,
+        applied_size: None,
         next_operation: 0,
         pending_handoff_id: None,
         last_state: "RECOVERY_REQUIRED".to_string(),
@@ -605,38 +804,24 @@ pub(crate) fn open_pty_control(
         .and_then(Value::as_str)
         .filter(|value| valid_wire_token(value, 128))
         .map(str::to_string);
+    control.control_epoch = resolved
+        .get("controlEpoch")
+        .and_then(Value::as_str)
+        .filter(|value| valid_wire_token(value, 128))
+        .map(str::to_string);
     let (resolved_state, resolved_owner) = resolved
         .get("ownership")
         .map(ownership_fields)
         .unwrap_or_else(|| ("FREE".to_string(), None));
     control.last_state = resolved_state;
     control.last_owner_kind = resolved_owner;
-    let Some(target_id) = control.control_target_id.clone() else {
+    if control.control_target_id.is_none() {
         control.last_error = Some("terminal-control resolve returned no target ID".to_string());
         return control;
-    };
-    match call_terminal_control(
-        app,
-        state,
-        host_id,
-        "lease.acquire",
-        json!({ "controlTargetId": target_id, "owner": control.owner }),
-    ) {
-        Ok(value) => match dashboard_lease_from_result(&value, &target_id, &control.owner) {
-            Ok(lease) => {
-                control.lease = Some(lease);
-                let (current_state, current_owner) = ownership_fields(&value);
-                control.last_state = current_state;
-                control.last_owner_kind = current_owner;
-            }
-            Err(error) => control.last_error = Some(error.to_string()),
-        },
-        Err(error) => {
-            control.last_error = Some(error.to_string());
-            if error.code == "PERMISSION_DENIED" {
-                control.last_state = "HELD".to_string();
-            }
-        }
+    }
+    if control.control_epoch.is_none() {
+        control.last_error = Some("terminal-control resolve returned no control epoch".to_string());
+        return control;
     }
     control
 }
@@ -669,6 +854,7 @@ pub(crate) fn acquire_pty_control(
     let lease = dashboard_lease_from_result(&value, &target_id, &control.owner)?;
     let (current_state, current_owner) = ownership_fields(&value);
     control.lease = Some(lease.clone());
+    control.applied_size = None;
     control.pending_handoff_id = None;
     control.last_state = current_state;
     control.last_owner_kind = current_owner;
@@ -682,14 +868,31 @@ pub(crate) fn release_pty_control(
     control: &mut PtyControl,
 ) {
     if let Some(lease) = control.lease.take() {
+        control.applied_size = None;
         control.pending_handoff_id = None;
-        let _ = call_terminal_control(
+        match call_terminal_control(
             app,
             state,
             control.host_id.as_deref(),
             "lease.release",
             json!({ "lease": lease }),
-        );
+        ) {
+            Ok(value) => {
+                let (current_state, current_owner) = ownership_fields(&value);
+                control.last_state = current_state;
+                control.last_owner_kind = current_owner;
+                control.last_error = None;
+            }
+            Err(error) => {
+                control.last_error = Some(error.to_string());
+                control.last_state = if error.code == "TARGET_GONE" {
+                    "TARGET_GONE".to_string()
+                } else {
+                    "RECOVERY_REQUIRED".to_string()
+                };
+                control.last_owner_kind = None;
+            }
+        }
         return;
     }
     let (Some(target_id), Some(handoff_id)) = (
@@ -737,6 +940,7 @@ pub(crate) fn write_pty_control(
     data: &[u8],
 ) -> Result<(), TerminalControlCallError> {
     let lease = acquire_pty_control(app, state, control)?;
+    apply_desired_pty_size(app, state, control)?;
     let operation_id = control.operation_id("input");
     let result = call_terminal_control(
         app,
@@ -762,6 +966,7 @@ pub(crate) fn write_pty_control(
                 | "INTERNAL"
         ) {
             control.lease = None;
+            control.applied_size = None;
         }
         if matches!(
             error.code.as_str(),
@@ -775,13 +980,72 @@ pub(crate) fn write_pty_control(
     result.map(|_| ())
 }
 
-pub(crate) fn resize_pty_control(
+pub(crate) fn scroll_pty_control(
     app: &tauri::AppHandle,
     state: &TerminalControlState,
     control: &mut PtyControl,
-    cols: u16,
-    rows: u16,
+    direction: &str,
+    lines: u16,
 ) -> Result<(), TerminalControlCallError> {
+    if !matches!(direction, "up" | "down") || !(1..=100).contains(&lines) {
+        return Err(TerminalControlCallError {
+            code: "INVALID_REQUEST".to_string(),
+            message: "terminal scroll input is invalid".to_string(),
+        });
+    }
+    let lease = acquire_pty_control(app, state, control)?;
+    apply_desired_pty_size(app, state, control)?;
+    let operation_id = control.operation_id("scroll");
+    let result = call_terminal_control(
+        app,
+        state,
+        control.host_id.as_deref(),
+        "input.scroll",
+        json!({
+            "lease": lease,
+            "operationId": operation_id,
+            "pane": "0",
+            "direction": direction,
+            "lines": lines,
+        }),
+    );
+    if let Err(error) = &result {
+        if matches!(
+            error.code.as_str(),
+            "PERMISSION_DENIED"
+                | "HANDOFF_PENDING"
+                | "TARGET_GONE"
+                | "RECOVERY_REQUIRED"
+                | "OPERATION_IN_DOUBT"
+                | "UNAVAILABLE"
+                | "INTERNAL"
+        ) {
+            control.lease = None;
+            control.applied_size = None;
+        }
+        if matches!(
+            error.code.as_str(),
+            "RECOVERY_REQUIRED" | "OPERATION_IN_DOUBT" | "UNAVAILABLE" | "INTERNAL"
+        ) {
+            control.last_state = "RECOVERY_REQUIRED".to_string();
+            control.last_owner_kind = None;
+        }
+        control.last_error = Some(error.to_string());
+    }
+    result.map(|_| ())
+}
+
+fn apply_desired_pty_size(
+    app: &tauri::AppHandle,
+    state: &TerminalControlState,
+    control: &mut PtyControl,
+) -> Result<(), TerminalControlCallError> {
+    let Some((cols, rows)) = control.desired_size else {
+        return Ok(());
+    };
+    if control.applied_size == Some((cols, rows)) {
+        return Ok(());
+    }
     let Some(lease) = control.lease.clone() else {
         return Ok(());
     };
@@ -799,11 +1063,47 @@ pub(crate) fn resize_pty_control(
             "rows": rows,
         }),
     );
-    if let Err(error) = &result {
-        control.lease = None;
-        control.last_error = Some(error.to_string());
+    match result {
+        Ok(_) => {
+            control.applied_size = Some((cols, rows));
+            Ok(())
+        }
+        Err(error) => {
+            control.lease = None;
+            control.applied_size = None;
+            control.last_error = Some(error.to_string());
+            Err(error)
+        }
     }
-    result.map(|_| ())
+}
+
+pub(crate) fn resize_pty_control(
+    app: &tauri::AppHandle,
+    state: &TerminalControlState,
+    control: &mut PtyControl,
+    cols: u16,
+    rows: u16,
+) -> Result<(), TerminalControlCallError> {
+    control.desired_size = Some((cols, rows));
+    if control.lease.is_some() {
+        return apply_desired_pty_size(app, state, control);
+    }
+    if control.last_state != "FREE" {
+        return Ok(());
+    }
+
+    // A read-only tmux attachment uses ignore-size, so resizing its PTY alone
+    // cannot make the shared window match the visible Dashboard viewport.
+    // When the target is still FREE, fence the real tmux resize with a short
+    // Dashboard lease and release it immediately. A concurrent Feishu/local
+    // owner wins at lease.acquire or input.resize; this path never bypasses
+    // terminal-control and never leaves an observation-only PTY holding input.
+    acquire_pty_control(app, state, control)?;
+    let result = apply_desired_pty_size(app, state, control);
+    if result.is_ok() {
+        release_pty_control(app, state, control);
+    }
+    result
 }
 
 pub(crate) fn kill_pty_controlled_session(
@@ -863,6 +1163,13 @@ pub(crate) fn refresh_pty_control_status(
     };
     match refreshed {
         Ok(value) => {
+            if let Some(control_epoch) = value
+                .get("controlEpoch")
+                .and_then(Value::as_str)
+                .filter(|value| valid_wire_token(value, 128))
+            {
+                control.control_epoch = Some(control_epoch.to_string());
+            }
             if value.get("lease").is_some() {
                 match dashboard_lease_from_result(&value, &target_id, &control.owner) {
                     Ok(lease) => control.lease = Some(lease),
@@ -879,12 +1186,12 @@ pub(crate) fn refresh_pty_control_status(
             control.last_state = current_state;
             control.last_owner_kind = current_owner;
             control.last_error = None;
-            let owns_target = control.last_owner_kind.as_deref() == Some("dashboard")
-                && control.last_state == "HELD";
-            if !owns_target {
+            if value.get("lease").is_none() {
+                // ownership.status is observation only. Another mounted PTY
+                // (including one from this Dashboard) must never be treated as
+                // this connection's lease, and FREE stays lazy-acquire.
                 control.lease = None;
-            } else if control.lease.is_none() {
-                let _ = acquire_pty_control(app, state, control);
+                control.applied_size = None;
             }
             if control.last_state != "DRAINING" {
                 control.pending_handoff_id = None;
@@ -898,6 +1205,62 @@ pub(crate) fn refresh_pty_control_status(
                 "RECOVERY_REQUIRED".to_string()
             };
             control.lease = None;
+            control.applied_size = None;
+        }
+    }
+    control.status()
+}
+
+pub(crate) fn recover_pty_control(
+    app: &tauri::AppHandle,
+    state: &TerminalControlState,
+    control: &mut PtyControl,
+) -> PtyControlStatus {
+    if control.lease.is_some() || control.last_state != "RECOVERY_REQUIRED" {
+        control.last_error = Some(
+            "local recovery is only available while terminal input continuity requires recovery"
+                .to_string(),
+        );
+        return control.status();
+    }
+    let (Some(target_id), Some(control_epoch)) = (
+        control.control_target_id.clone(),
+        control.control_epoch.clone(),
+    ) else {
+        control.last_error = Some("terminal recovery identity is incomplete".to_string());
+        return control.status();
+    };
+    let record_id = format!("dashboard-recovery:{}", uuid::Uuid::new_v4().simple());
+    match call_terminal_control(
+        app,
+        state,
+        control.host_id.as_deref(),
+        "handoff.force",
+        json!({
+            "controlTargetId": target_id.clone(),
+            "expectedControlEpoch": control_epoch,
+            "nextOwner": control.owner,
+            "proof": {
+                "kind": "operator-acknowledged-in-doubt",
+                "recordId": record_id,
+                "recordedAt": now_rfc3339(),
+            },
+            "acknowledgeUncertainOperation": true,
+        }),
+    ) {
+        Ok(value) => match dashboard_lease_from_result(&value, &target_id, &control.owner) {
+            Ok(lease) => {
+                if let Err(error) = control.adopt_dashboard_lease(lease) {
+                    control.last_error = Some(error);
+                }
+            }
+            Err(error) => control.last_error = Some(error.to_string()),
+        },
+        Err(error) => {
+            control.last_error = Some(error.to_string());
+            if error.code != "RECOVERY_REQUIRED" {
+                let _ = refresh_pty_control_status(app, state, control);
+            }
         }
     }
     control.status()
@@ -929,6 +1292,9 @@ pub(crate) fn request_pty_control_takeover(
                 },
                 None => None,
             };
+            if control.lease.is_some() {
+                control.applied_size = None;
+            }
             control.pending_handoff_id = value
                 .get("ownership")
                 .and_then(|ownership| ownership.get("handoffId"))
@@ -954,6 +1320,130 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn remote_host() -> HostConfig {
+        HostConfig {
+            id: "dev".to_string(),
+            label: "Dev".to_string(),
+            host: "devbox".to_string(),
+            user: Some("alice".to_string()),
+            port: Some(22),
+            identity_file: Some("~/.ssh/dev".to_string()),
+            worktree_base: Some("~/worktrees".to_string()),
+            tmux_path: Some("~/.local/bin/tmux".to_string()),
+            tw_path: Some("~/.local/bin/tw".to_string()),
+        }
+    }
+
+    #[test]
+    fn remote_proxy_fingerprint_covers_every_connection_and_command_field() {
+        let host = remote_host();
+        let expected = RemoteTerminalControlFingerprint::from(&host);
+        let variants = [
+            {
+                let mut value = host.clone();
+                value.host = "another-host".to_string();
+                value
+            },
+            {
+                let mut value = host.clone();
+                value.user = Some("bob".to_string());
+                value
+            },
+            {
+                let mut value = host.clone();
+                value.port = Some(2222);
+                value
+            },
+            {
+                let mut value = host.clone();
+                value.identity_file = Some("~/.ssh/another".to_string());
+                value
+            },
+            {
+                let mut value = host.clone();
+                value.tw_path = Some("~/bin/tw-next".to_string());
+                value
+            },
+            {
+                let mut value = host.clone();
+                value.tmux_path = Some("~/bin/tmux-next".to_string());
+                value
+            },
+        ];
+        for variant in variants {
+            assert_ne!(RemoteTerminalControlFingerprint::from(&variant), expected);
+        }
+
+        let mut presentation_only = host;
+        presentation_only.label = "Renamed Dev".to_string();
+        presentation_only.worktree_base = Some("~/other-worktrees".to_string());
+        assert_eq!(
+            RemoteTerminalControlFingerprint::from(&presentation_only),
+            expected
+        );
+    }
+
+    #[test]
+    fn terminal_control_response_envelope_is_closed_and_correlated() {
+        let body = json!({
+            "protocolVersion": 1,
+            "requestId": "outer-request",
+            "type": "ping",
+        });
+        let invalid = [
+            json!({
+                "protocolVersion": 1,
+                "requestId": "wrong-request",
+                "ok": true,
+                "result": {},
+            }),
+            json!({
+                "protocolVersion": 1,
+                "requestId": "outer-request",
+                "ok": true,
+            }),
+            json!({
+                "protocolVersion": 1,
+                "requestId": "outer-request",
+                "ok": true,
+                "result": {},
+                "extra": true,
+            }),
+            json!({
+                "protocolVersion": 1,
+                "requestId": "outer-request",
+                "ok": false,
+                "error": { "code": "INTERNAL", "message": "bad" },
+            }),
+        ];
+        for response in invalid {
+            let encoded = format!("{response}\n");
+            let error = decode_response_envelope(&body, encoded.as_bytes()).unwrap_err();
+            assert_eq!(error.code, "UNAVAILABLE");
+            assert_eq!(error.message, "terminal-control response envelope mismatch");
+        }
+    }
+
+    #[test]
+    fn remote_proxy_host_lane_wait_is_deadline_bounded() {
+        let slot = Arc::new(Mutex::new(RemoteTerminalControlProxySlot::default()));
+        let guard = slot.lock().unwrap();
+        let waiting = Arc::clone(&slot);
+        let started = Instant::now();
+        let task = std::thread::spawn(move || {
+            match lock_remote_proxy_slot_until(&waiting, Instant::now() + Duration::from_millis(30))
+            {
+                Ok(_) => panic!("locked host lane must not be acquired"),
+                Err(error) => error,
+            }
+        });
+        let error = task.join().unwrap();
+        assert_eq!(error.code, "UNAVAILABLE");
+        assert!(error.message.contains("hard timeout"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(guard);
+    }
+
     #[test]
     fn terminal_control_socket_checks_correlation_and_preserves_permission_errors() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -964,7 +1454,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         std::env::set_var("TW_TERMINAL_CONTROL_SOCKET", &path);
         let server = std::thread::spawn(move || {
-            for index in 0..2 {
+            for index in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
                 BufReader::new(stream.try_clone().unwrap())
@@ -978,7 +1468,7 @@ mod tests {
                         "ok": true,
                         "result": { "authority": "test" },
                     })
-                } else {
+                } else if index == 1 {
                     json!({
                         "protocolVersion": 1,
                         "requestId": request["requestId"],
@@ -988,6 +1478,13 @@ mod tests {
                             "message": "owned by feishu",
                             "retryable": false,
                         },
+                    })
+                } else {
+                    json!({
+                        "protocolVersion": 1,
+                        "requestId": "a-different-request",
+                        "ok": true,
+                        "result": { "authority": "must-not-be-accepted" },
                     })
                 };
                 stream
@@ -1002,6 +1499,13 @@ mod tests {
         let error = send_once(&second).unwrap_err();
         assert_eq!(error.code, "PERMISSION_DENIED");
         assert_eq!(error.message, "owned by feishu");
+        let third = request("ping", json!({}));
+        let mismatch = send_once(&third).unwrap_err();
+        assert_eq!(mismatch.code, "UNAVAILABLE");
+        assert_eq!(
+            mismatch.message,
+            "terminal-control response envelope mismatch"
+        );
 
         server.join().unwrap();
         std::env::remove_var("TW_TERMINAL_CONTROL_SOCKET");
@@ -1026,8 +1530,11 @@ mod tests {
             session_name: "tw-term-one".to_string(),
             host_id: None,
             control_target_id: Some("target-one".to_string()),
+            control_epoch: Some("epoch-one".to_string()),
             owner,
             lease: None,
+            desired_size: None,
+            applied_size: None,
             next_operation: 0,
             pending_handoff_id: None,
             last_state: "FREE".to_string(),

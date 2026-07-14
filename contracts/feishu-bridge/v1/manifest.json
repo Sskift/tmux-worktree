@@ -12,6 +12,7 @@
   },
   "operations": [
     "bridge.snapshot",
+    "bridge.shutdown",
     "groups.list",
     "binding.create",
     "binding.pause",
@@ -81,6 +82,7 @@
     "remoteTargets": false,
     "attachmentsExecuted": false,
     "auditHistoryDefault": false,
-    "dashboardBindingCreation": "atomic-handoff-without-free-window"
+    "dashboardBindingCreation": "atomic-handoff-without-free-window",
+    "profileChangeRequiresEmptyBridge": true
   }
 }

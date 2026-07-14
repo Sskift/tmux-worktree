@@ -296,6 +296,36 @@ export type FeishuChat = {
   name: string;
 };
 
+export type FeishuLarkProfile = {
+  name: string;
+  appId: string;
+  brand: string;
+  displayName?: string | null;
+  active: boolean;
+  user?: string | null;
+  tokenStatus?: string | null;
+};
+
+export type FeishuIntegrationStatus = {
+  selectedProfile?: string | null;
+  profileSource: "none" | "config" | "environment";
+  bridgeRunning: boolean;
+  profiles: FeishuLarkProfile[];
+  profilesError?: string | null;
+};
+
+export type FeishuAddProfileInput = {
+  appId: string;
+  appSecret: string;
+  brand: "feishu" | "lark";
+};
+
+export type FeishuAddProfileResult = {
+  status: FeishuIntegrationStatus;
+  addedProfile: string;
+  warning?: string | null;
+};
+
 export type FeishuBindingInput = {
   chatId: string;
   chatName: string;
