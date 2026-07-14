@@ -19,7 +19,6 @@ import test from "node:test";
 import { WebSocket } from "ws";
 
 const root = new URL("../", import.meta.url);
-execFileSync("npm", ["run", "build"], { cwd: root, stdio: "ignore" });
 
 async function unusedPort() {
   const probe = createServer();
@@ -192,14 +191,6 @@ test("serve can bind only to loopback for the Dashboard Relay backend", async ()
 });
 
 test("serve publishes a high-entropy token atomically only after listen succeeds", async () => {
-  const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
-  assert.match(source, /randomBytes\(32\)\.toString\("base64url"\)/);
-  assert.match(source, /\[\\0\\r\\n\]\/\.test\(configured\)/);
-  assert.match(source, /openSync\(temporaryFile, "wx", 0o600\)/);
-  assert.match(source, /fsyncSync\(fd\)[\s\S]*renameSync\(temporaryFile, tokenFile\)[\s\S]*chmodSync\(tokenFile, 0o600\)/);
-  const runSource = source.slice(source.indexOf("export async function run()"));
-  assert.ok(runSource.indexOf("await new Promise<void>") < runSource.indexOf("publishServeToken(tokenFile, token)"));
-
   const testRoot = mkdtempSync(join(tmpdir(), "tw-serve-token-"));
   try {
     const generatedHome = join(testRoot, "generated-home");
@@ -297,21 +288,6 @@ test("serve publishes a high-entropy token atomically only after listen succeeds
 });
 
 test("serve browser sessions expire and retain only the 64 most recently used entries", async () => {
-  const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
-  const htmlStart = source.indexOf("const HTML =");
-  const htmlEnd = source.indexOf("const PTY_BRIDGE_SCRIPT", htmlStart);
-  assert.ok(htmlStart >= 0 && htmlEnd > htmlStart);
-  const html = source.slice(htmlStart, htmlEnd);
-  assert.doesNotMatch(html, /localStorage|authToken|[?&]token=/);
-  assert.match(html, /opts\.credentials = "same-origin"/);
-  assert.match(
-    html.replace(/\s+/g, ""),
-    /newWebSocket\(proto\+"\/\/"\+location\.host\+"\/ws\?session="\+encodeURIComponent\(name\)\+"&pane="\+paneIndex\)/,
-  );
-  assert.match(source, /const MAX_BROWSER_SESSIONS = 64/);
-  assert.match(source, /const SESSION_COOKIE_MAX_AGE_SECONDS = 28_800/);
-  assert.match(source, /timingSafeEqual\(secretDigest\(domain, candidate\), expectedDigest\)/);
-
   const testRoot = mkdtempSync(join(tmpdir(), "tw-serve-sessions-"));
   const home = join(testRoot, "home");
   const clockFile = join(testRoot, "clock");
@@ -381,26 +357,6 @@ Date.now = () => Number(fs.readFileSync(process.env.TW_TEST_CLOCK_FILE, "utf8"))
 });
 
 test("serve keeps tmux and Python identifiers in argv and fences authenticated input", async () => {
-  const source = readFileSync(new URL("../src/serve.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /\bexecSync\b|function\s+sh\s*\(/);
-  assert.match(source, /execFileSync\(tmux, args,/);
-
-  const scriptStart = source.indexOf("const PTY_BRIDGE_SCRIPT = String.raw`");
-  const scriptEnd = source.indexOf("\n`;", scriptStart);
-  assert.ok(scriptStart >= 0 && scriptEnd > scriptStart);
-  const bridgeScript = source.slice(scriptStart, scriptEnd);
-  assert.match(bridgeScript, /tmux, session, mobile, pane_idx, resize_file = sys\.argv\[1:6\]/);
-  assert.doesNotMatch(bridgeScript, /\$\{/);
-
-  const spawnStart = source.indexOf('child = cpSpawn("python3"');
-  const spawnEnd = source.indexOf("], {", spawnStart);
-  const spawnArgs = source.slice(spawnStart, spawnEnd);
-  assert.match(
-    spawnArgs.replace(/\s+/g, ""),
-    /\["-u","-c",PTY_BRIDGE_SCRIPT,tmux,sessionName,mobileId,paneIndex,resizeFile,$/,
-  );
-  assert.doesNotMatch(spawnArgs, /"--"/);
-
   const realPythonArgv = JSON.parse(execFileSync("python3", [
     "-c",
     "import json,sys; print(json.dumps(sys.argv))",

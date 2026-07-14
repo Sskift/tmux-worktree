@@ -1,11 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const {
   buildAutomationRecord,

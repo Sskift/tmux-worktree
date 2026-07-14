@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -13,8 +13,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const {
   assertRpcMutationCapabilities,
@@ -241,22 +239,6 @@ test("relay compensates a terminal registry failure through the managed-session 
   ), /failed to roll back TW-managed session: rpc kill failed/);
 });
 
-test("relay uses RPC lifecycle for managed kills while retaining legacy tmux fallback", () => {
-  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
-
-  assert.match(source, /const canonicalCwd = parsed\.cwd/);
-  assert.match(source, /registerDashboardTerminal\(scope, name, canonicalCwd, label\)/);
-  assert.match(source, /\["rpc", "kill-session", "--name", rawName\]/);
-  assert.match(source, /if \(managedHint === true\) \{\s*await killManagedSession\(scope, rawName\)/s);
-  assert.match(source, /if \(!isLegacyKillRpcFailure\(commandExitStatus\(error\), output\)\) throw error/);
-  assert.match(source, /await killManagedSession\(scope, rawName\)/);
-  assert.match(source, /await killLegacyTmuxSession\(scope, rawName\)/);
-  assert.match(source, /bestEffortUnregisterDashboardTerminal\(scope, rawName\)/);
-  assert.match(source, /type: "lifecycle\.kill", lease, operationId/);
-  assert.match(source, /killControlledSession\(terminalControl, clientId, message\.session, message\.managed\)/);
-  assert.match(source, /flag: "wx"/);
-});
-
 test("relay only treats explicit old-host RPC incompatibility as a legacy catalog", () => {
   assert.equal(isUnsupportedRpcListFailure(1, "unknown command: rpc"), true);
   assert.equal(isUnsupportedRpcListFailure(2, "unrecognized subcommand 'rpc'"), true);
@@ -318,14 +300,6 @@ test("relay host fallback only accepts TW-shaped managed worktree sessions", () 
   }
 });
 
-test("relay host merges managed RPC sessions with unseen legacy tmux rows", () => {
-  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
-
-  assert.doesNotMatch(source, /const rows = rpc \? \[\] :/);
-  assert.match(source, /rows = scope\.kind === "local" \? await localTmuxRows\(scope\) : await remoteTmuxRows\(scope\)/);
-  assert.match(source, /if \(seen\.has\(row\.name\)\) continue;/);
-});
-
 test("relay host accepts TW-managed CLI and Dashboard worktree profiles from rpc", () => {
   assert.equal(isRpcManagedWorktreeSession({ kind: "worktree", profile: "dashboard", name: "dash" }), true);
   assert.equal(isRpcManagedWorktreeSession({ kind: "worktree", profile: "cli", name: "cli" }), true);
@@ -351,52 +325,6 @@ test("remote attach connects directly without creating a grouped mirror session"
   assert.doesNotMatch(command, /new-session/);
   assert.doesNotMatch(command, /kill-session/);
   assert.doesNotMatch(command, /tw-mobile-/);
-});
-
-test("dashboard remote terminal forwards wheel events as tmux mouse input", () => {
-  const terminalSource = readFileSync(new URL("../app/src/Terminal.tsx", import.meta.url), "utf8");
-  const terminalAttachSource = readFileSync(new URL("../app/src/terminal/attach.ts", import.meta.url), "utf8");
-
-  assert.match(terminalAttachSource, /set-option -g mouse on/);
-  assert.match(terminalSource, /function sgrMouseWheel/);
-  assert.match(terminalSource, /attachCustomWheelEventHandler\(handleRemoteWheel\)/);
-  assert.match(terminalSource, /addEventListener\("wheel", onRemoteWheel/);
-  assert.match(terminalSource, /WheelEvent\.DOM_DELTA_PIXEL/);
-});
-
-test("remote stream resize does not reference removed mobile mirror state", () => {
-  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /resize-pane[^`]+\\$\\{mobile\\}/s);
-});
-
-test("remote pty wrapper survives resize signal interruptions", () => {
-  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
-
-  assert.match(source, /except InterruptedError:\n\s+continue/);
-  assert.match(source, /if \(safeCols === lastResizeCols && safeRows === lastResizeRows\) return/);
-});
-
-test("relay host reopens routed streams only within the current connection and route generation", () => {
-  const source = readFileSync(new URL("../src/relayHost.ts", import.meta.url), "utf8");
-
-  assert.match(source, /type RelayConnectionLease/);
-  assert.match(source, /type StreamRoute/);
-  assert.match(source, /generation: number/);
-  assert.match(source, /const streamRoutes = new Map<string, StreamRoute>\(\)/);
-  assert.match(source, /streamRoutes\.set\(key, route\)/);
-  assert.match(source, /isCurrentStream\(streams, key, stream\)/);
-  assert.match(source, /isCurrentRoute\(streamRoutes, key, route, lease\)/);
-  assert.match(source, /reopenRoutedStream\(terminalControl, admissionLedger, lease, streams, streamRoutes, opts, route, message\.data\)/);
-  assert.match(source, /deactivateConnection\(lease, streams, streamRoutes\)/);
-  assert.match(source, /child\.stdin\.on\("error", \(\) => \{\}\)/);
-  assert.match(source, /child\.stdin\.on\("drain", \(\) => \{/);
-  assert.match(source, /function finalizeStream\([\s\S]+?sendIfActive\(stream\.lease,\s*\{\s*type: "terminal_exit"/);
-  assert.match(source, /await writeControlledRawInput\(control, stream\.route, payload\)/);
-  assert.match(source, /stream\.process\.exitCode === null/);
-  assert.match(source, /stream\.process\.signalCode === null/);
-  assert.doesNotMatch(source, /!stream\.process\.killed/);
-  assert.match(source, /signalRemoteProcessGroup\(stream, "SIGKILL"\)/);
-  assert.match(source, /os\.killpg\(pid, signal\.SIGTERM\)/);
 });
 
 test("relay host publishes connection failures without exposing credentials", async () => {

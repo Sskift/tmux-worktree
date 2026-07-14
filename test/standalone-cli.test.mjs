@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 import ts from "typescript";
@@ -8,7 +7,6 @@ const root = new URL("../", import.meta.url);
 const read = (path) => readFileSync(new URL(path, root), "utf8");
 
 test("standalone CLI build and every automatic consumer use the canonical CJS artifact", () => {
-  execFileSync("npm", ["run", "build"], { cwd: root, stdio: "ignore" });
   const packageJson = JSON.parse(read("package.json"));
   assert.deepEqual(packageJson.bin, {
     "tmux-worktree": "dist/cli.cjs",
@@ -59,26 +57,4 @@ test("standalone CLI build and every automatic consumer use the canonical CJS ar
   assert.deepEqual(tauri.bundle.resources, {
     "../../dist/cli.cjs": "tw-cli/cli.cjs",
   });
-  for (const path of [
-    "app/src-tauri/src/features/control_plane/discovery.rs",
-    "app/src-tauri/src/features/control_plane/hosts.rs",
-    "app/src-tauri/src/features/mobile_relay/broker.rs",
-  ]) {
-    const source = read(path);
-    assert.doesNotMatch(source, /(?:tw-)?cli\.js/);
-    assert.match(source, /(?:tw-)?cli\.cjs/);
-  }
-  const discovery = read("app/src-tauri/src/features/control_plane/discovery.rs");
-  assert.ok(
-    discovery.indexOf("TW_DASHBOARD_CLI") <
-      discovery.indexOf('resources.join("tw-cli").join("cli.cjs")'),
-  );
-  const relayHost = read("src/relayHost.ts");
-  const localTwStart = relayHost.indexOf("async function localTwOutput");
-  const localTwEnd = relayHost.indexOf("\nfunction parseArgs", localTwStart);
-  assert.ok(localTwStart >= 0 && localTwEnd > localTwStart);
-  const localTw = relayHost.slice(localTwStart, localTwEnd);
-  assert.ok(localTw.indexOf("TW_DASHBOARD_CLI") < localTw.indexOf("process.argv[1]"));
-  assert.ok(localTw.indexOf("process.argv[1]") < localTw.lastIndexOf('execFileTracked("tw"'));
-  assert.match(localTw, /\["cli\.cjs", "tw-cli\.cjs"\]/);
 });

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   LOCAL_AGENT_TARGET_KEY,
@@ -32,17 +31,4 @@ test("agent scan target options include local and each injected Host", () => {
     { value: "host:build-mac", label: "Build Mac", detail: "dev@build.internal" },
     { value: "host:lab", label: "Lab", detail: "lab.internal" },
   ]);
-});
-
-test("Agents Settings probes only through the typed backend and guards stale results", () => {
-  const source = readFileSync(
-    new URL("../src/dashboard/Settings/AgentsSettings.tsx", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(source, /dashboardBackend\.agents\.probe\(selectedTarget\)/);
-  assert.match(source, /createLatestRequestGate\(\)/);
-  assert.match(source, /isCurrent\(request\)/);
-  assert.match(source, /Detection never runs this full command/);
-  assert.doesNotMatch(source, /exec\(|eval\(|Command::new/);
 });

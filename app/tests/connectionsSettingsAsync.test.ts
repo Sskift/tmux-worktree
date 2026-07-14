@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   createConnectionsAsyncCoordinator,
@@ -191,79 +190,4 @@ test("Relay actions reject stale completion without cancelling current Host feed
   assert.equal(coordinator.isCurrent(relayStart), false);
   assert.equal(coordinator.isCurrent(relayStop), true);
   assert.equal(coordinator.isCurrent(hostTest), true);
-});
-
-test("Connections Settings cannot publish default Relay drafts before status hydration", () => {
-  const source = readFileSync(
-    new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(source, /statusKnown: controller\.statusKnown/);
-  assert.match(source, /const relayDraftLocked = relayBusy \|\| relay\.active \|\| !relay\.statusKnown/);
-  assert.match(source, /const relayActionLocked = relayBusy \|\| !relay\.statusKnown/);
-  assert.match(source, /if \(intent !== "stop" && !relay\.statusKnown\)/);
-  assert.match(source, /disabled=\{relayActionLocked\}/);
-  assert.match(source, /copyDisabled=\{!relay\.statusKnown\}/);
-});
-
-test("Connections Settings guards every Host async publication site", () => {
-  const source = readFileSync(
-    new URL("../src/dashboard/Settings/ConnectionsSettings.tsx", import.meta.url),
-    "utf8",
-  );
-
-  const saveStart = source.indexOf("const saveHost = async");
-  const saveEnd = source.indexOf("const deleteHost = async", saveStart);
-  const saveBlock = source.slice(saveStart, saveEnd);
-  const deleteEnd = source.indexOf("const installTw = async", saveEnd);
-  const deleteBlock = source.slice(saveEnd, deleteEnd);
-  const testBlock = source.slice(source.indexOf("const testConnection = async"), saveStart);
-  const installBlock = source.slice(deleteEnd, source.indexOf("const runRelayAction = async", deleteEnd));
-
-  assert.match(testBlock, /issueHostFeedbackOperation\(/);
-  assert.match(testBlock, /isCurrent\(feedbackRequest\)/);
-  assert.match(installBlock, /issueHostFeedbackOperation\("install"/);
-  assert.match(installBlock, /isCurrent\(feedbackRequest\)/);
-
-  for (const block of [saveBlock, deleteBlock]) {
-    assert.match(block, /issueHostFeedbackOperation\(/);
-    assert.match(block, /issueHostCatalogMutation\(/);
-    assert.match(block, /isCurrent\(catalogRequest\)/);
-    assert.match(block, /isCurrent\(feedbackRequest\)/);
-    assert.match(block, /onHostsMutationSettled\(/);
-    assert.match(block, /asyncCoordinatorRef\.current\.isCurrent\(catalogRequest\)/);
-  }
-
-  assert.ok(
-    saveBlock.indexOf("onHostsMutationSettled") < saveBlock.indexOf("isCurrent(feedbackRequest)"),
-    "an owner settlement must happen before selection-specific feedback",
-  );
-  assert.ok(
-    saveBlock.indexOf("isCurrent(catalogRequest)") < saveBlock.indexOf("isCurrent(feedbackRequest)"),
-    "catalog trust must be classified before selection-specific feedback",
-  );
-  assert.ok(
-    deleteBlock.indexOf("onHostsMutationSettled") < deleteBlock.indexOf("isCurrent(feedbackRequest)"),
-    "a delete settlement must reconcile before selection-specific feedback is checked",
-  );
-  assert.match(source, /currentHostCatalogFingerprint = hostCatalogFingerprint\(hosts\)/);
-  assert.match(source, /hostCatalogFingerprintRef\.current === currentHostCatalogFingerprint/);
-  const fingerprintEffect = source.slice(
-    source.indexOf("if (hostCatalogFingerprintRef.current === currentHostCatalogFingerprint)"),
-    source.indexOf("useEffect(() => {\n    if (mode === \"add\")"),
-  );
-  assert.ok(
-    fingerprintEffect.indexOf("acceptedHostCatalogFingerprintRef.current === currentHostCatalogFingerprint")
-      < fingerprintEffect.indexOf('invalidate("hostCatalog")'),
-    "a catalog published by this component is accepted before external-revision invalidation",
-  );
-  assert.match(fingerprintEffect, /invalidate\("hostFeedback"\)/);
-  assert.match(fingerprintEffect, /invalidate\("hostCatalog"\)/);
-
-  const resetStart = source.indexOf("const resetFeedback = () => {");
-  const resetEnd = source.indexOf("const selectHost", resetStart);
-  const resetBlock = source.slice(resetStart, resetEnd);
-  assert.match(resetBlock, /invalidate\("hostFeedback"\)/);
-  assert.doesNotMatch(resetBlock, /invalidate\("hostCatalog"\)/);
 });

@@ -260,7 +260,7 @@ Relay v1 wire不变：
 - 新增Feishu Bridge进程、binding/event/turn/reply persistence和Lark adapter。
 - 修改DashboardBackend、Tauri/fake/preview backend和UI以管理binding、只读状态和本地handoff。
 - 修改Dashboard PTY write/paste/resize、受控CLI attach和Relay v1 relay-host内部adapter，使其调用controller。
-- 增加storage、安全、竞态和端到端测试。
+- 按 `AGENTS.md` 的测试准入规则补充必要的 storage、安全、竞态或端到端证据；不要求每类都新建测试。
 
 ### Terminal-control / Feishu 侧不可修改
 
@@ -298,6 +298,8 @@ Relay v1 wire不变：
 - extension必须有独立manifest、fixture、Node/Android codec和capability negotiation测试，不能条件分支污染Relay v1 actor/codec。
 
 ## 14. 验收测试矩阵
+
+本矩阵列出必须获得的风险证据，不表示一行对应一个自动化测试，也不要求每次修改运行或复制整个矩阵。相邻状态可由同一 authority 层状态机或端到端场景证明；跨端只在协议边界保留最小互操作证据，具体选择遵循 `AGENTS.md` 的测试准入与风险驱动验证规则。
 
 | 场景 | 必须证明的结果 |
 | --- | --- |

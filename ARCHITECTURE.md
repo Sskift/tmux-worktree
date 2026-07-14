@@ -1,6 +1,6 @@
 # tmux-worktree 架构
 
-本文描述当前源码已经实现的边界。用户安装与开发命令见 `README.md`，Agent 的阅读顺序和变更门禁见 `AGENTS.md`。如果文档与代码冲突，以源码、版本化 contract 和测试为准，并同步修正文档。
+本文描述当前源码已经实现的边界。用户安装与开发命令见 `README.md`，Agent 的阅读顺序和变更门禁见 `AGENTS.md`。如果文档、contract、源码和测试冲突，先以当前可观察生产行为与版本化 contract 确认兼容承诺；源码和测试都是证据，不能仅凭某个内部结构测试反推架构。确认后在同一变更同步修正冲突项。
 
 ## 架构结论
 
@@ -13,6 +13,32 @@
 - 独立的本地 terminal-control v1 是 Dashboard、受控 CLI、Relay v1 和 Feishu Bridge 共同使用的 terminal input authority；Feishu 与 Relay 不共享 transport、鉴权、credential 或业务协议。
 
 最重要的所有权规则是：`tmux` 保存活进程事实，`tw` 保存 managed lifecycle 事实，local terminal-control 保存唯一 input owner/lease/fence，Feishu Bridge 保存 binding/turn/reply 事实，Dashboard 保存桌面展示状态，Android 保存手机侧缓存与待发送状态。展示层缓存不能决定一次写入或破坏性操作应走哪条权威路径。
+
+## 顶层依赖方向与变更落点
+
+仓库以“权威状态与写路径”组织代码，不以页面、需求阶段或发布版本复制垂直功能。稳定依赖方向如下：
+
+```text
+CLI command / RPC / Relay adapter ──> tw domain owner ──> git / tmux / state
+
+React view ──> renderer model/hooks ──> DashboardBackend
+                                      └─> Tauri adapter ──> tw RPC or native OS capability
+
+Compose screen ──> V2ViewModel ──> repository / Relay actor ──> storage / codec / socket
+
+cross-surface implementation ──> versioned RPC / wire / storage contract
+```
+
+维护代码时遵守以下落点规则：
+
+1. 状态、写权限和生命周期判断落在已有 authority owner；UI、transport、IPC DTO 和 composition root 只能传递意图、适配数据或编排调用。
+2. 上层依赖下层公开边界，下层不反向依赖具体页面或 transport。跨发布面不直接共享实现；需要互操作时先定义或沿用版本化 contract。
+3. 新模块只在形成独立职责、状态或生命周期边界时成立。单调用 wrapper、为测试导出的内部函数、按任务阶段拆分的文件，以及与现有 owner 并行的 `new`/`v2`/`legacy` 实现都不是架构分层。
+4. 一次替换应收敛到一条生产路径；除明确支持的兼容入口外，不保留双写、双读或“失败后试另一套实现”。兼容入口必须枚举触发条件并有删除标准。
+5. composition root 可以装配大量能力，但不能成为业务 owner。文件变长不是复制 owner 的理由；应先把逻辑移动到正确的现有 feature/domain，再判断是否需要新边界。
+6. 架构不由精确文件布局、export manifest、函数调用图或组件树定义。只要 authority、依赖方向、contract 和可观察行为不变，内部结构应可自由重构；测试不得冻结这些实现形状。
+
+代码审查首先检查 owner、依赖方向、canonical 写路径和失败语义，再检查局部实现。测试策略与新增准入见 `AGENTS.md`；测试用于保护行为和契约，不作为增加抽象或保留重复实现的理由。
 
 ## 发布物与源码边界
 

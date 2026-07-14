@@ -15,7 +15,6 @@ run_cli() {
   echo "==> root CLI"
   (
     cd "$ROOT"
-    npm run build
     npm run test:cli
   )
 }

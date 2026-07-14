@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import { THEMES, deriveThemeVars } from "../src/themes.ts";
 
@@ -100,41 +99,4 @@ test("every theme supplies the complete Dashboard shell palette", () => {
       );
     }
   }
-});
-
-test("shell CSS consumes theme-derived chrome and interaction tokens", () => {
-  const app = readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
-  const appCss = readFileSync(new URL("../src/App.css", import.meta.url), "utf8");
-  const tokenCss = readFileSync(
-    new URL("../src/dashboard/design/tokens.css", import.meta.url),
-    "utf8",
-  );
-  const shellCss = readFileSync(
-    new URL("../src/dashboard/DashboardShell.css", import.meta.url),
-    "utf8",
-  );
-  const picker = readFileSync(new URL("../src/ThemePicker.tsx", import.meta.url), "utf8");
-  const settingsCss = readFileSync(
-    new URL("../src/dashboard/Settings/SettingsDialog.css", import.meta.url),
-    "utf8",
-  );
-  const commandPaletteCss = readFileSync(
-    new URL("../src/dashboard/CommandPalette.css", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(app, /<strong>Dashboard theme<\/strong>/);
-  assert.match(app, /Controls the app chrome, editor, terminal/);
-  assert.match(appCss, /color-scheme:\s*var\(--theme-color-scheme, dark\)/);
-  assert.match(tokenCss, /color-scheme:\s*var\(--theme-color-scheme, dark\)/);
-  assert.match(shellCss, /--surface-selected-hover:\s*color-mix\(in srgb, var\(--shell-accent\) 24%, transparent\)/);
-  assert.match(shellCss, /--accent-a-glow:\s*color-mix\(in srgb, var\(--shell-accent\) 38%, transparent\)/);
-  assert.doesNotMatch(shellCss, /rgb\(58 139 255/);
-  assert.match(picker, /aria-label="Dashboard themes"/);
-  assert.match(picker, /aria-label="Dashboard theme"/);
-  assert.match(settingsCss, /background:\s*var\(--shell-sidebar\)/);
-  assert.match(settingsCss, /\.settings-notice--warning\s*\{[\s\S]*?var\(--shell-warning-soft\)/);
-  assert.doesNotMatch(settingsCss, /background:\s*#161617/);
-  assert.match(commandPaletteCss, /\.command-palette__error\s*\{[\s\S]*?var\(--shell-danger-soft\)/);
-  assert.doesNotMatch(commandPaletteCss, /rgb\(58 139 255/);
 });

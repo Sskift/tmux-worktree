@@ -354,7 +354,7 @@ npm install
 npm run tauri dev
 ```
 
-Run the repository verification entry points from the repository root:
+Run aggregate repository verification entry points from the repository root when a change crosses layers or is being prepared for release:
 
 ```bash
 npm run verify          # CLI, Dashboard, Rust, and documentation
@@ -363,11 +363,10 @@ npm run verify:all      # core plus Android checks
 npm run verify:device   # all checks plus connected Android device tests
 ```
 
-The device gate requires a running emulator or connected device. The other Android gates do not. To run one layer while iterating:
+These aggregate commands are not the default for every change and do not by themselves measure test quality. Follow the risk-driven selection and evidence rules in [AGENTS.md](AGENTS.md#验证选择与证据质量). The device gate requires a running emulator or connected device; the other Android gates do not. When layer-wide validation is warranted:
 
 ```bash
-npm run build
-npm run test:cli
+npm run test:cli  # builds the CLI once, then runs the root tests serially
 
 cd app
 npm run build
@@ -379,6 +378,9 @@ cargo fmt --check
 cargo check
 cargo test
 ```
+
+For a targeted root test file, run `npm run build` first and then invoke
+`node --test --test-concurrency=1 test/<name>.test.mjs` as described in `AGENTS.md`.
 
 Use the isolated dev app only when state isolation is required:
 

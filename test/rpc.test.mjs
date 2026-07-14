@@ -7,8 +7,6 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { buildSync } from "esbuild";
 
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
-
 const {
   acquireManagedStateLock,
   emptyManagedState,
@@ -952,18 +950,6 @@ test("orphan restore validates the git entry and records the actual collision-fr
     cwd: "/home/dev/.tmux-worktree/worktrees/app/app-fix-abc12",
     createdAt: "2026-07-12T00:00:00.000Z",
   }]);
-});
-
-test("shared worktree creation records managed state for cli and rpc consumers", () => {
-  const devSource = readFileSync(new URL("../src/dev.ts", import.meta.url), "utf8");
-  const sessionSource = readFileSync(new URL("../src/session.ts", import.meta.url), "utf8");
-
-  assert.match(devSource, /createManagedWorktreeSession/);
-  assert.match(devSource, /profile:\s*"cli"/);
-  assert.match(sessionSource, /upsertManagedSession/);
-  assert.match(sessionSource, /recordManagedSession/);
-  assert.match(sessionSource, /profile:\s*params\.profile/);
-  assert.match(sessionSource, /worktreePath:\s*createdWorktree\.path/);
 });
 
 test("CLI git-repository paths create a managed single-pane worktree", () => {

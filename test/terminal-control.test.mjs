@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   existsSync,
@@ -12,8 +12,6 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const terminalControl = await import("../dist/terminalControl/index.js");
 const contractRoot = new URL("../contracts/terminal-control/v1/", import.meta.url);

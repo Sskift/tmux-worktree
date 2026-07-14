@@ -13,7 +13,6 @@ import {
   loadDashboardLayoutPreferences,
   saveDashboardLayoutPreferences,
 } from "../src/dashboard/layoutPersistence.ts";
-import { rendererImplementationSourceContaining } from "./helpers/rendererImplementationSource.ts";
 
 const { createFakeDashboardBackend } = await import("../src/platform/fakeBackend.ts");
 const TEST_LAYOUT_REVISION = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
@@ -782,22 +781,4 @@ test("layout persistence preserves accepted v2 extensions while changing known f
       sidebarWidth: 344,
     },
   );
-});
-
-test("the renderer delegates layout IO to the versioned layout boundary", () => {
-  const source = rendererImplementationSourceContaining(
-    "useLayoutPreferences()",
-    "loadLayoutPreferences()",
-    "saveLayoutPreferences(",
-    "expectedRevision",
-    "outcome.extensions",
-  ).source;
-
-  assert.match(source, /const \{ loadLayoutPreferences, saveLayoutPreferences \} = useLayoutPreferences\(\);/);
-  assert.match(source, /loadLayoutPreferences\(\)/);
-  assert.match(
-    source,
-    /saveLayoutPreferences\(\s*snapshot,\s*expectedRevision,\s*outcome\.extensions,?\s*\)/,
-  );
-  assert.doesNotMatch(source, /dashboardBackend\.persistence\.(?:loadLayout|saveLayout)/);
 });

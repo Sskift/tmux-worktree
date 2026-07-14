@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const version = JSON.parse(

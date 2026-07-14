@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -13,8 +13,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
 const hostsModuleUrl = new URL("../dist/hosts.js", import.meta.url);
 const { acquireConfigFileLock, releaseConfigFileLock } = await import(hostsModuleUrl.href);

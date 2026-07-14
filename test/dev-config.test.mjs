@@ -15,7 +15,6 @@ import test from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const repositoryRoot = fileURLToPath(new URL("..", import.meta.url));
-execFileSync("npm", ["run", "build"], { cwd: repositoryRoot, stdio: "ignore" });
 
 // dev.ts is bundled into the CLI rather than emitted as a standalone module.
 // Build a temporary test-only entry so the persistence boundary can be driven

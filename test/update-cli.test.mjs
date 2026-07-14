@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -32,7 +32,6 @@ test("release-facing package versions stay aligned", () => {
 });
 
 test("bundled CLI runs version and RPC without a runtime package or node_modules", () => {
-  execFileSync("npm", ["run", "build"], { stdio: "ignore" });
   const isolatedDir = mkdtempSync(join(tmpdir(), "tw-bundled-cli-version-"));
   const isolatedCli = join(isolatedDir, "cli.cjs");
   copyFileSync(cli, isolatedCli);
@@ -85,8 +84,6 @@ test("bundled CLI runs version and RPC without a runtime package or node_modules
 
 describe("tw update", () => {
   test("dry-run prints GitHub release update instructions", () => {
-    execFileSync("npm", ["run", "build"], { stdio: "ignore" });
-
     const result = spawnSync(process.execPath, [cli, "update", "--dry-run"], {
       encoding: "utf8",
     });

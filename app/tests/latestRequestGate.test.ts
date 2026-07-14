@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   createLatestRequestGate,
@@ -78,35 +77,4 @@ test("issuing a debounced search identity invalidates the previous query before 
   await nextRun;
 
   assert.deepEqual(published, [["current"]]);
-});
-
-test("async views wire host-aware keys and guard state publication", () => {
-  const git = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
-  const diff = readFileSync(new URL("../src/DiffViewer.tsx", import.meta.url), "utf8");
-  const editor = readFileSync(new URL("../src/FileEditor.tsx", import.meta.url), "utf8");
-  const tree = readFileSync(new URL("../src/FileTree.tsx", import.meta.url), "utf8");
-
-  assert.match(
-    git,
-    /requestSourceKey\(\s*hostId \?\? null,\s*cwd,\s*sessionName,\s*tab,\s*graphPreset,\s*selectedGraphRefsKey,\s*graphLimit,/s,
-  );
-  assert.match(diff, /requestSourceKey\(hostId \?\? null, cwd, filePath\)/);
-  assert.match(editor, /requestSourceKey\(hostId \?\? null, filePath\)/);
-  assert.match(tree, /requestSourceKey\(sourceKey, searchQuery\.trim\(\), searchMode\)/);
-
-  for (const source of [git, diff, editor, tree]) {
-    assert.match(source, /createLatestRequestGate\(\)/);
-    assert.match(source, /isCurrent\(request\)/);
-  }
-});
-
-test("Git branch callback occurs only after the current request check", () => {
-  const git = readFileSync(new URL("../src/GitStatusPanel.tsx", import.meta.url), "utf8");
-  const statusRequest = git.indexOf("await dashboardBackend.git.status");
-  const currentCheck = git.indexOf("if (!requestGate.isCurrent(request)) return;", statusRequest);
-  const branchCallback = git.indexOf("onBranchChange?.(status?.branch ?? null);", currentCheck);
-
-  assert.ok(statusRequest >= 0);
-  assert.ok(currentCheck > statusRequest);
-  assert.ok(branchCallback > currentCheck);
 });

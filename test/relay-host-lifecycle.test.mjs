@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import {
   chmodSync,
@@ -15,8 +15,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const terminalControlApi = await import("../dist/terminalControl/index.js");
 

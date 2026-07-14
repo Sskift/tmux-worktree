@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { PlainTerminal, Session } from "../src/platform";
 import {
@@ -307,69 +306,4 @@ test("a post-create partial refresh cannot fall back from the new remote session
   assert.deepEqual(result.selection, selection);
   assert.deepEqual(result.pendingSelection, pendingSelection);
   assert.equal(result.metadataPending, true);
-});
-
-test("the renderer publishes the local catalog before the slower remote-aware snapshot", () => {
-  const refreshSource = readFileSync(
-    new URL("../src/dashboard/hooks/workspaceCatalogRefresh.ts", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(refreshSource, /const refreshGeneration = \+\+options\.generation\.started/);
-  assert.match(refreshSource, /catalog\?\.listLocal/);
-  assert.match(refreshSource, /await catalog\.listLocal\(\)\.catch\(\(\) => null\)/);
-  const localCatalogIndex = refreshSource.indexOf("await catalog.listLocal()");
-  const fullCatalogIndex = refreshSource.indexOf("await catalog.list()");
-  assert.ok(localCatalogIndex >= 0);
-  assert.ok(fullCatalogIndex >= 0);
-  assert.ok(localCatalogIndex < fullCatalogIndex);
-  assert.match(
-    refreshSource,
-    /await Promise\.all\(\[\s*options\.backend\.sessions\.list\(\),\s*options\.backend\.terminals\.listTmux\(\),\s*\]\)/s,
-  );
-  assert.doesNotMatch(refreshSource, /listTmux\(\)\.catch/);
-  const successfulIndex = refreshSource.indexOf(
-    "options.generation.successful = refreshGeneration",
-  );
-  const publishFullIndex = refreshSource.indexOf("options.publishFull({");
-  assert.ok(successfulIndex >= 0);
-  assert.ok(publishFullIndex >= 0);
-  assert.ok(successfulIndex < publishFullIndex);
-  const catchIndex = refreshSource.indexOf("} catch (error)");
-  assert.ok(catchIndex >= 0);
-  const catchSource = refreshSource.slice(catchIndex);
-  assert.match(catchSource, /refreshGeneration < options\.generation\.successful/);
-  assert.match(catchSource, /!options\.isCurrent\(options\.lease\)/);
-  assert.match(catchSource, /options\.publishError\(String\(error\)\)/);
-  assert.doesNotMatch(catchSource, /publishLocal|publishFull/);
-});
-
-test("Host readiness distinguishes initial empty state from a successful empty catalog", () => {
-  const hookSource = readFileSync(
-    new URL("../src/dashboard/hooks/useConnectionCatalog.ts", import.meta.url),
-    "utf8",
-  );
-  const loadStart = hookSource.indexOf("async function loadHostsForOwner");
-  const loadEnd = hookSource.indexOf("function publishHostsForOwner", loadStart);
-  assert.ok(loadStart >= 0);
-  assert.ok(loadEnd > loadStart);
-  const loadSource = hookSource.slice(loadStart, loadEnd);
-
-  assert.match(hookSource, /hostsHydrationGeneration: 0/);
-  assert.match(loadSource, /registration\.hostsHydrationGeneration \+= 1/);
-  const loadCatchIndex = loadSource.lastIndexOf("} catch (nextError)");
-  assert.ok(loadCatchIndex >= 0);
-  assert.doesNotMatch(loadSource.slice(loadCatchIndex), /hostsHydrationGeneration \+=/);
-  assert.doesNotMatch(loadSource, /Promise\.all/);
-  assert.match(hookSource, /enabled: connectionCatalog\.hostsHydrationGeneration === 0 \|\|/);
-  assert.match(hookSource, /connectionCatalog\.catalogReloadRequired/);
-  assert.match(hookSource, /visibleIntervalMs: HOST_CATALOG_RETRY_MS/);
-  const hostsListIndex = loadSource.indexOf("dashboardBackend.hosts.list()");
-  const hostCandidatesIndex = loadSource.indexOf("dashboardBackend.hosts.candidates()");
-  assert.ok(hostsListIndex >= 0);
-  assert.ok(hostCandidatesIndex >= 0);
-  assert.ok(
-    hostsListIndex < hostCandidatesIndex,
-    "SSH candidate failure must not block Host hydration",
-  );
 });

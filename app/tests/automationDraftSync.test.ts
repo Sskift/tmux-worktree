@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   automationSelectionIsCurrent,
@@ -113,36 +112,4 @@ test("reselecting the visible automation is a no-op that preserves its draft", (
   assert.equal(automationSelectionIsCurrent("a", "b", false, false), false);
   assert.equal(automationSelectionIsCurrent("a", "a", true, false), false);
   assert.equal(automationSelectionIsCurrent("a", "a", false, true), false);
-});
-
-test("AutomationPanel gates snapshot effects by editable content and exposes cancel", () => {
-  const source = readFileSync(new URL("../src/AutomationPanel.tsx", import.meta.url), "utf8");
-
-  assert.match(source, /shouldSyncAutomationDraft\(\{/);
-  assert.match(source, /\[selected\?\.id, selectedDraftKey, selectedId\]/);
-  assert.doesNotMatch(source, /\}, \[selected, selectedId\]\);/);
-  assert.match(source, /const handleCancel = \(\) => \{/);
-  assert.match(source, /if \(draftDirtyRef\.current\) return current;/);
-  assert.match(source, /const accepted = await onSelect\(automation\.id\);/);
-  assert.match(source, /if \(automation\.id === selected\?\.id && !creatingRef\.current\) return;/);
-  assert.match(source, /if \(accepted === false\) return;/);
-  assert.match(source, /const handleNew = async \(\) => \{\s*const accepted = await onNew\(\)/);
-  assert.match(source, /<fieldset\s+disabled=\{saving\}/);
-  assert.match(source, /const markDraftDirty[\s\S]*?onDirtyChange\?\.\(true\)/);
-  assert.match(source, /const setDraftClean[\s\S]*?onDirtyChange\?\.\(false\)/);
-  assert.match(source, />\s*cancel\s*<\/button>/);
-});
-
-test("AutomationPanel keeps a stale save dirty when the workspace action returns false", () => {
-  const source = readFileSync(new URL("../src/AutomationPanel.tsx", import.meta.url), "utf8");
-  assert.match(source, /onCreate: \(draft: AutomationDraft\) => BooleanMaybePromise/);
-  assert.match(source, /onSave: \(id: string, draft: AutomationDraft\) => BooleanMaybePromise/);
-  const accepted = source.indexOf("if (accepted === false) return;");
-  const rememberCommand = source.indexOf("saveLastAiCmd(normalizedDraft.aiCmd)", accepted);
-  const cleanDraft = source.indexOf("setDraftClean();", rememberCommand);
-  const stopCreating = source.indexOf("setCreatingMode(false);", rememberCommand);
-  assert.ok(accepted >= 0);
-  assert.ok(rememberCommand > accepted);
-  assert.ok(cleanDraft > accepted);
-  assert.ok(stopCreating > accepted);
 });

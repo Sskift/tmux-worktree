@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -13,8 +13,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const contractsRoot = new URL("../contracts/storage/", import.meta.url);
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));

@@ -1,9 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createServer } from "node:net";
 import test from "node:test";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 test("relay server keeps detailed host state behind authentication", async () => {
   const probe = createServer();

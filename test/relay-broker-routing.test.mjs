@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:net";
 import test from "node:test";
 import { WebSocket } from "ws";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const MESSAGE_TIMEOUT_MS = 2_000;
 let barrierSequence = 0;

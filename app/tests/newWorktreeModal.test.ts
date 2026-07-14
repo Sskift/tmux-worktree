@@ -1,6 +1,5 @@
-import { readFileSync } from "node:fs";
-import test from "node:test";
 import assert from "node:assert/strict";
+import test from "node:test";
 import {
   createLatestRequestGate,
   requestSourceKey,
@@ -16,52 +15,6 @@ function deferred<T>() {
   });
   return { promise, reject, resolve };
 }
-
-test("new worktree project picker uses the shared menu select", () => {
-  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
-
-  assert.match(modal, /import \{ MenuSelect, type MenuOption \} from "\.\/MenuSelect";/);
-  assert.match(modal, /const projectMenuOptions\s*:\s*MenuOption\[\]/);
-  assert.match(modal, /<MenuSelect\s+ariaLabel="Project"/);
-  assert.doesNotMatch(modal, /<select[^>]*value=\{project\}/);
-});
-
-test("new worktree remote hosts can use remote project presets", () => {
-  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
-  const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-
-  assert.match(modal, /dashboardBackend\.projects\.listRemote\(selectedHost\)/);
-  assert.match(
-    backend,
-    /listRemote: \(hostId\) =>\s*transport\.invoke<ProjectPreset\[\]>\("list_remote_projects", \{ hostId \}\)/s,
-  );
-  assert.match(modal, /createArgs\.project = project;/);
-  assert.doesNotMatch(modal, /const isCustom = project === CUSTOM \|\| isRemote;/);
-  assert.match(modal, /label: "Loading remote projects…"/);
-  assert.match(modal, /No projects found in ~\/\.tmux-worktree\.json on \{selectedHostLabel\}/);
-  assert.match(
-    modal,
-    /disabled=\{busy \|\| validatingProject \|\| \(isRemote && projectCatalogLoading\)\}/,
-  );
-  assert.doesNotMatch(modal, /\{\(!isRemote \|\| projects\.length > 0\) && \(/);
-});
-
-test("new worktree removes only a selected missing local project preset", () => {
-  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
-  const backend = readFileSync(new URL("../src/platform/dashboardBackend.ts", import.meta.url), "utf8");
-
-  assert.match(
-    backend,
-    /removeMissing: \(args\) =>\s*transport\.invoke<RemoveMissingProjectResult>\("remove_missing_project", \{ args \}\)/s,
-  );
-  assert.match(
-    modal,
-    /if \(isRemote \|\| nextProject === CUSTOM\) return;[\s\S]*dashboardBackend\.projects\.removeMissing\(\{[\s\S]*name: selected\.name,[\s\S]*path: selected\.path/s,
-  );
-  assert.match(modal, /if \(!result\.removed\) return;[\s\S]*setProjects\(result\.projects\);[\s\S]*setProject\(CUSTOM\)/s);
-  assert.match(modal, /because its directory no longer exists/);
-  assert.match(modal, /return \(\) => \{[\s\S]*projectValidationGateRef\.current\.invalidate\(\)/s);
-});
 
 test("new worktree publishes catalogs only for the current Local/Host A/Host B source", async () => {
   const gate = createLatestRequestGate();
@@ -119,16 +72,6 @@ test("new worktree publishes catalogs only for the current Local/Host A/Host B s
   assert.equal(error, null);
 });
 
-test("new worktree invalidates a catalog immediately when the host menu changes", () => {
-  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
-
-  assert.match(modal, /catalogRequestGateRef = useRef\(createLatestRequestGate\(\)\)/);
-  assert.match(modal, /requestSourceKey\("new-worktree-catalog", selectedHost\)/);
-  assert.match(modal, /if \(!requestGate\.isCurrent\(token\)\) return;/);
-  assert.match(modal, /const changeHost = \(hostId: string\) => \{\s*catalogRequestGateRef\.current\.invalidate\(\)/s);
-  assert.match(modal, /onChange=\{changeHost\}/);
-});
-
 test("new worktree catalog defaults never replace a Custom draft edited for the current source", async () => {
   assert.equal(
     shouldApplyWorktreeCatalogDefault({ source: "host-a", dirty: false }, "host-a"),
@@ -160,20 +103,4 @@ test("new worktree catalog defaults never replace a Custom draft edited for the 
 
   assert.equal(project, "__custom__");
   assert.equal(customPath, "/srv/repos/custom-dashboard");
-
-  const modal = readFileSync(new URL("../src/NewWorktreeModal.tsx", import.meta.url), "utf8");
-  assert.match(modal, /catalogDraftStateRef = useRef<WorktreeCatalogDraftState>/);
-  assert.match(
-    modal,
-    /if \(\s*shouldApplyWorktreeCatalogDefault\(catalogDraftStateRef\.current, selectedHost\)/s,
-  );
-  assert.match(modal, /onChange=\{changeProject\}/);
-  assert.match(modal, /markCatalogDraftDirty\(\);\s*setCustomPath/s);
-});
-
-test("automation panel reuses the shared menu select component", () => {
-  const panel = readFileSync(new URL("../src/AutomationPanel.tsx", import.meta.url), "utf8");
-
-  assert.match(panel, /import \{ MenuSelect, type MenuOption \} from "\.\/MenuSelect";/);
-  assert.doesNotMatch(panel, /function AutomationMenuSelect/);
 });

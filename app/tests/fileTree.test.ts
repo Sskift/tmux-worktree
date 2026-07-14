@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   createFileTreeRequestGate,
@@ -117,30 +116,4 @@ test("file tree errors always have an honest retry message", () => {
   assert.equal(fileTreeErrorMessage(new Error("permission denied")), "permission denied");
   assert.equal(fileTreeErrorMessage("host offline"), "host offline");
   assert.equal(fileTreeErrorMessage(null), "Unable to load this folder");
-});
-
-test("FileTree disables unsupported remote search and forwards host identity", () => {
-  const source = readFileSync(new URL("../src/FileTree.tsx", import.meta.url), "utf8");
-
-  assert.match(source, /hostId\?: string \| null/);
-  assert.match(source, /readFileTreeDirectory\(dashboardBackend\.files, hostId, dirPath\)/);
-  assert.match(source, /disabled=\{isRemote\}/);
-  assert.match(source, /Search is not available for remote files yet/);
-  assert.match(source, /onFileSelect\(entry\.path, hostId\)/);
-  assert.match(source, /file-tree__retry/);
-  assert.match(source, /empty folder/);
-  assert.doesNotMatch(source, /<svg/);
-});
-
-test("FileTree switches directory sources only after React commits the render", () => {
-  const source = readFileSync(new URL("../src/FileTree.tsx", import.meta.url), "utf8");
-  const gateStart = source.indexOf("const requestGateRef");
-  const layoutEffectStart = source.indexOf("useLayoutEffect(() => {", gateStart);
-  const switchSource = source.indexOf("requestGateRef.current?.switchSource(sourceKey)", gateStart);
-  const layoutEffectEnd = source.indexOf("}, [sourceKey]);", layoutEffectStart);
-
-  assert.ok(gateStart >= 0);
-  assert.ok(layoutEffectStart > gateStart);
-  assert.ok(switchSource > layoutEffectStart && switchSource < layoutEffectEnd);
-  assert.doesNotMatch(source.slice(gateStart, layoutEffectStart), /switchSource\(/);
 });

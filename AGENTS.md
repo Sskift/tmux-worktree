@@ -36,7 +36,7 @@ Android (Compose)
    - Android 产品信息架构、持久层、连接状态机、Outbox 和迁移层：`docs/android-v2-architecture.md`。
    - 未来 Relay v2 实现：完整阅读 `docs/relay-v2-contract.md`；它只规范 v2，不描述当前已交付能力。
 4. 修改 wire/storage/RPC 前，先读对应 `contracts/**/manifest.json`、fixture 和消费它们的测试。
-5. 最后读目标模块源码及相邻测试。测试既是回归保护，也是兼容行为的可执行说明。
+5. 最后读目标模块源码及相邻测试。测试是理解当前行为的证据之一；只有面向稳定外部行为、版本化契约或关键安全不变量的测试才构成长期兼容说明，源码形状断言不能反过来定义架构。
 
 若文档、契约、测试和代码互相矛盾，不要任选一个方便的解释。先确认当前可观察行为与兼容承诺，再在同一变更中收敛代码、测试和文档。不要保留会被误当作当前事实的实施计划、临时截图路径、测试数量或分支/commit 状态。
 
@@ -50,7 +50,7 @@ Android (Compose)
 | `contracts/relay/v1/` | Node 与 Android 共用的 active-but-legacy-frozen Relay v1 wire fixture。 |
 | `contracts/storage/` | host config、managed state、Dashboard terminal registry 的冻结磁盘契约。 |
 | `app/src/` | React renderer、Dashboard 状态/交互模型及 `DashboardBackend` 抽象；不得直接承担 OS、tmux、SSH 或凭证操作。 |
-| `app/tests/` | renderer、平台边界、持久化、安全、无障碍及结构回归测试。 |
+| `app/tests/` | renderer 可观察行为、平台依赖边界、持久化、安全和无障碍测试；不用于冻结组件拆分、函数名、导出列表或调用形状。 |
 | `app/src-tauri/` | Rust 原生适配层：Tauri IPC、PTY、Git/files、SSH、配置、catalog、持久化、Mobile Relay 进程编排，以及 bundled `tw` RPC 调用。 |
 | `app/scripts/`、`app/installer/` | 隔离开发、Dashboard/DMG 构建和安装器；不是业务逻辑来源。 |
 | `mobile/android/` | 独立 Android 生产代码与 Gradle 工程：Compose、Room、DataStore、Keystore、OkHttp Relay v1 actor、内置 xterm WebView 和 Android 测试。 |
@@ -58,6 +58,18 @@ Android (Compose)
 | `.codex/skills/` | Agent 操作规程；不是应用运行时或用户状态。 |
 
 `dist/`、`node_modules/`、Gradle `build/`、Rust `target/` 和生成的 DMG/APK 都不是源码事实。不要手改生成物，也不要为了“让 diff 干净”删除他人的本地构建或工作树内容。
+
+## 顶层架构与变更准入
+
+- **先找 owner，再写代码。** 实现前必须能说明：这项行为的权威状态属于谁、唯一写路径在哪里、调用从哪一层进入、失败时由谁决定语义。无法回答时先读架构和现有入口，不新增平行的 manager/service/coordinator 来绕开问题。
+- **依赖只朝权威边界收敛。** React view/hook 只能依赖 renderer model 与 `DashboardBackend`；Tauri command 只做 IPC 适配和编排；managed mutation 继续进入 `tw rpc`；Android Compose 只进入 `V2ViewModel`，再由 repository/actor 访问 Room、DataStore、Keystore 和 Relay。下层不得反向导入展示层，transport/adapter 不得成为业务事实 owner。
+- **一个概念只有一个生产 owner 和一条 canonical 写路径。** 不能因修改现有 owner 较难就复制状态机、缓存、codec、生命周期或 fallback。跨 CLI、Dashboard、Android 的共享只能通过已定义的 RPC/wire/storage contract，不通过复制实现或跨发布面源码依赖。
+- **composition root 只装配。** `App.tsx`、Tauri `lib.rs`、Android Activity/navigation root 和 CLI command router 可以连接模块，但不沉积可复用业务规则、持久状态机或第二套权限判断；逻辑应落在已经拥有该职责的 domain/feature 模块。
+- **新抽象必须有独立职责。** 仅为减少单文件行数、迎合测试、包一层单次调用或保留旧实现而新增模块/接口，不构成新抽象的理由。新模块应拥有清晰输入输出、状态或生命周期边界；替换旧路径时在同一变更删除旧路径，除非它是有明确入口和删除条件的兼容层。
+- **兼容与 fallback 必须局部、枚举、可删除。** 不建立散落的 `legacy`/`v2` 条件分支，不用 catch-all fallback 掩盖 authority、contract、auth 或 corrupt-state 错误。兼容入口必须写清触发信号、允许行为和删除条件。
+- **架构约束描述稳定关系，不冻结实现形状。** 应优先用类型、接口、可见性、版本化 contract 和少量跨目录依赖检查表达边界。文件名、函数名、精确导出清单、hook 拆分、调用次数和组件嵌套不是架构契约，允许在 owner、依赖方向和可观察行为不变时重构。
+
+修改范围应保持在最小 owner 闭包内。若一个需求同时迫使多个发布面、多个 authority 或无关重构一起变化，先确认是否确有 contract 变化；不要用扩大 diff 的方式制造“完整性”。
 
 ## 不可破坏的架构约束
 
@@ -101,21 +113,73 @@ Android (Compose)
   - `TerminalWebView`、`androidx.webkit` 和 APK 内 xterm assets：Compose 终端的当前生产实现，不是迁移遗留。
 - 只有支持的升级窗口结束、真实升级设备验证完成且产品明确停止 1.x 直升后，才能删除前两个 migration shim；删除必须连同针对升级路径的证据和文档一起评审。
 
+## 测试准入与维护
+
+验证矩阵规定一次变更需要运行哪些既有 gate，**不表示每次变更都要新增测试**。无测试增量可以是正确结果，尤其是纯重构、文档、构建编排或已被现有 contract/behavior 测试覆盖的修改。
+
+新增测试必须同时满足以下条件：
+
+1. 保护一项可观察行为、版本化 contract、关键状态转换，或曾真实发生且可能复发的安全/生命周期缺陷。
+2. 能说明修改前它会因正确原因失败；若旧实现同样通过，该测试不能作为本次回归证据。
+3. 仓库中没有别的测试已经覆盖同一风险；新增 case 提供的是新故障信号，不是换一组 mock、入口或参数重复证明。
+4. 放在最便宜且最接近 authority 的边界，并允许不改变行为的内部重构继续通过。
+
+不满足上述条件时，运行相关既有测试即可，不新增测试。修复缺陷时优先补一个最小回归 case；新增 feature 优先扩展最近的行为或 contract suite。只有出现新的独立公共边界、独立状态机或现有文件无法合理容纳的测试族时才新建测试文件，默认修改现有测试文件。
+
+下列测试默认禁止：
+
+- 读取生产源码文本或 AST，断言精确文件路径、函数/类型名、export 列表、直接调用次数或顺序、hook dependency array、组件嵌套、CSS 字面量；
+- 为一次重构或任务阶段命名的 `*Structure.test.*`、里程碑编号测试，以及只证明“代码被拆到了某文件”的测试；
+- 把生产实现复制到 fake/helper 后只验证副本，或只验证 mock 返回了测试自己配置的值；
+- 用 `transpileModule` + `new Function` 或自制 hook/framework runtime 模拟 React、Compose、Tauri 等框架语义；应把纯状态机从框架中提取后测试，或使用真实框架 renderer 做少量边界集成；
+- 同一语义在 unit、integration、source scan 和多端 fixture 中无差别重复；跨端 codec 各自消费同一 contract fixture不属于重复；
+- 为追求测试数量、覆盖率数字或 diff 的“对称”而枚举没有独立风险的分支、getter、样式和透传 wrapper。
+
+唯一允许的源码扫描是无法由编译器、类型系统、lint 或 contract 表达的**窄依赖禁令**，例如 renderer 中只有 Tauri adapter 可导入 `@tauri-apps/*`。这类检查只能查“禁止的依赖是否出现”，不得枚举允许的内部文件、export、函数或调用图。
+
+测试所有权与生产代码所有权一致：根 `test/` 验证 CLI/Node runtime 和共享 contract，不扫描 Dashboard 或 Android 内部源码；`app/tests/` 不解析 Rust 实现；Android 行为、manifest 和 packaging 检查留在 Gradle source set。跨发布面互操作由各端独立消费 `contracts/**` fixture，不由某一端测试遍历另一端的内部文件。
+
+测试不是只增不减的账本。行为删除、兼容窗口结束、实现被更高层 contract 测试覆盖，或新增 case 使旧 case 重复时，必须在同一变更删除或合并旧测试。现有源码形状测试属于待收敛债务，不得复制或扩写；触及相关区域时优先替换成行为/contract 测试，无法提供独立故障信号的直接删除。测试代码明显大于所保护的实现或状态空间时，先停下来合并 table case、收窄 fixture 和删除重复层，而不是继续追加 helper。
+
+## 验证选择与证据质量
+
+全量 gate 是检查集合，不是质量评分。全量通过只表示这些检查没有发现问题；它不能弥补相关场景没有行为测试，也不能把源码形状测试变成有效回归证据。运行不熟悉的 suite 前，先抽查与改动直接相关的 case，能说明其输入、动作、可观察结果以及会捕获的故障后，才把它列为交付证据。
+
+验证证据按用途区分：
+
+| 证据 | 可支持的结论 | 典型形式 |
+| --- | --- | --- |
+| 主要行为/契约证据 | 对指定风险有直接回归保护 | 共享 contract fixture、authority 层状态转换、失败注入、隔离文件/进程/网络集成、真实 renderer/device 行为 |
+| 辅助静态证据 | 代码可构建且满足工具可检查的边界 | typecheck、compiler、lint、format、manifest/schema、窄依赖禁令、bundle 检查 |
+| 弱证据 | 只能说明遗留检查仍通过，不能单独证明功能正确 | 源码/AST 形状、mock echo、无语义 snapshot、test-of-tests、自制 framework runtime |
+
+Agent 交付时不得只写“全量测试通过”。应说明运行了哪些检查、它们覆盖哪个风险，以及仍缺少的 device、真实网络、签名或发布证据；弱证据即使在全量 gate 中通过，也不计作对应行为已验证。
+
+默认执行风险驱动的最小验证，不自动运行 `npm run verify`、`verify:all` 或 `verify:device`。只有以下情况才扩大到统一 gate：
+
+- 变更跨多个生产 owner 或发布面；
+- 修改共享 RPC/wire/storage contract，或一个 adapter/interface 的多个消费者；
+- 准备 release、签名、发布或用户明确要求全量验证；
+- 最小检查暴露跨层影响，无法在单一 owner 层封闭风险。
+
+同一轮工作先跑相关 case，再跑受影响层；确需统一 gate 时最多在收敛后跑一次。失败后先重跑失败层和直接相关 case，不因“保险”反复跑全仓。仅文档变更只跑 docs gate；没有 device/真实服务行为变化时不运行 device 或真实连接验证。
+
 ## 变更到验证矩阵
 
-先运行最小相关检查，交付前运行覆盖所有受影响层的统一 gate。不要用硬编码测试数量判断完成，也不要绕开根 CLI 的串行测试脚本。
+本矩阵给出默认最小证据和扩大验证的触发条件；“交付”本身不触发全量。测试新增仍必须通过上面的准入条件。不要用硬编码测试数量判断完成，也不要绕开根 CLI 的串行测试脚本。
 
-| 变更范围 | 最小检查 | 交付 gate |
+| 变更范围 | 默认最小证据 | 何时扩大验证 |
 | --- | --- | --- |
 | 仅 Markdown/链接 | `sh scripts/verify.sh docs` | 同左，并人工核对描述是否为当前事实 |
-| 根 CLI、config、state、RPC、Hosts、automations | `npm run build && npm run test:cli` | `npm run verify` |
-| Relay v1 Node/broker/host/serve | `npm run build && npm run test:cli` | `npm run verify:all`；涉及真实连接再做隔离的端到端验证 |
-| Dashboard React/model/platform interface | `(cd app && npm run build && npm run test:typecheck && npm test)` | `npm run verify` |
-| Tauri/Rust/IPC/PTY/SSH/storage | `(cd app/src-tauri && cargo fmt --check && cargo check && cargo test)` | `npm run verify`；IPC shape 变化还要跑 Dashboard 全测试 |
-| Android Kotlin/Room/Relay/UI | `npm run verify:android` | `npm run verify:all`；需要设备行为时运行 `npm run verify:device` |
-| `contracts/relay/v1` 或跨 Node/Android wire 行为 | 两端相关 contract/codec 测试 | `npm run verify:all`，必要时 `npm run verify:device` |
-| `contracts/tw-rpc`、storage contract 或跨 CLI/Rust 行为 | 根 contract 测试 + Rust 测试 | `npm run verify:all` |
-| 版本、bundle、签名或发布路径 | 所有受影响构建与 contract 检查 | `npm run verify:device`，再执行下面的发布检查清单 |
+| 根 CLI、config、state、RPC、Hosts、automations | `npm run build` + 直接相关的 `node --test --test-concurrency=1 test/<name>.test.mjs` | shared command/state/RPC 影响多个 suite 时跑 `npm run test:cli`；同时影响 Dashboard/Rust consumer 才跑 `npm run verify` |
+| Relay v1 Node/broker/host/serve | `npm run build` + 直接相关的 broker/host/serve test | 跨 Node 模块跑 `npm run test:cli`；修改 Relay wire 或 Android consumer 才跑 `npm run verify:all`；真实连接变化再做隔离端到端 |
+| Dashboard React/model | `npm run build`、`npm run test:typecheck` + `npm exec -- tsx --test tests/<name>.test.ts` | shared renderer model/hook 或 test infrastructure 变化时跑 `npm test`；跨 Tauri interface 才跑 `npm run verify` |
+| Dashboard platform interface | 相关 platform test + build/typecheck，并同步 fake/preview/Tauri shape | interface 多消费者或 IPC shape 变化时跑 Dashboard 全 suite 与 Rust test；不因单一 adapter 修改自动跑 Android |
+| Tauri/Rust/IPC/PTY/SSH/storage | `cargo fmt --check`、`cargo check` + 相关 `cargo test <filter>` | shared support/IPC/storage 影响多个 feature 时跑 `cargo test`；跨 Dashboard/CLI contract 才跑 `npm run verify` |
+| Android Kotlin/Room/Relay/UI | 相关 `:app:testDebugUnitTest --tests <class>`；按改动补相应 lint/build | Room migration、manifest/packaging、共享 actor/repository 或广泛 UI 变化时跑 `npm run verify:android`；跨 Node contract 才跑 `verify:all` |
+| `contracts/relay/v1` 或跨 Node/Android wire 行为 | 两端最小 contract/codec consumer test | wire fixture/manifest 变化跑 `npm run verify:all`；真实 device 行为变化才跑 `verify:device` |
+| `contracts/tw-rpc`、storage contract 或跨 CLI/Rust 行为 | 根 contract test + 对应 Rust consumer test | fixture/schema/双端解析变化跑 `npm run verify` 或 `verify:all`，按实际消费者决定 |
+| 版本、bundle、签名或发布路径 | 所有受影响构建、artifact 和 contract 检查 | release candidate 才执行适用统一 gate；只有 Android device/release 行为在范围内时才要求 `verify:device` |
 
 统一入口：
 
@@ -148,4 +212,4 @@ Android (Compose)
 
 ## 完成定义
 
-一次变更只有在以下条件同时满足时才算完成：实现位于正确的所有权层；兼容和安全红线未被绕开；相关 contract、测试和文档同步；适用 gate 通过；diff 不包含无关或生成内容；交付说明明确区分已验证事实、未运行的设备/发布步骤以及任何剩余风险。
+一次变更只有在以下条件同时满足时才算完成：实现位于正确的所有权层；兼容和安全红线未被绕开；受影响的 contract 和当前事实文档同步；测试增删符合准入与去重规则；适用 gate 通过；diff 不包含无关或生成内容；交付说明明确区分已验证事实、未运行的设备/发布步骤以及任何剩余风险。完成定义不要求测试数量增加。

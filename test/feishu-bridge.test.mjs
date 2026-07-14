@@ -1,12 +1,9 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-
-execFileSync("npm", ["run", "build"], { stdio: "ignore" });
 
 const { FeishuBridge, extractFeishuMarkedReply, feishuTurnMarkers } = await import("../dist/feishuBridge.js");
 const {

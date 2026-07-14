@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   MOBILE_RELAY_HIDDEN_REFRESH_MS,
@@ -42,14 +41,6 @@ function commitOwner(
   assert.strictEqual(ownerCommit.lease, lease);
   return lease;
 }
-
-test("mobile relay keeps the shared secret out of generated adb commands", () => {
-  const source = readFileSync(
-    new URL("../src/dashboard/hooks/useMobileRelayController.ts", import.meta.url),
-    "utf8",
-  );
-  assert.doesNotMatch(source, /buildMobileRelayLaunchCommand|adb shell|copyLaunch/);
-});
 
 test("mobile relay builds an explicit WSS-only Relay v1 profile payload", () => {
   assert.equal(
@@ -391,44 +382,4 @@ test("activation replay clears an old busy operation without resetting drafts", 
   assert.equal(coordinator.hasActiveOperation(secondLease), true);
   assert.equal(coordinator.finishOperation(replayOperation), true);
   assert.equal(coordinator.deactivate(secondActivation), true);
-});
-
-test("mobile relay exposes unknown and failed status instead of pretending to be stopped", () => {
-  const source = readFileSync(
-    new URL("../src/dashboard/hooks/useMobileRelayController.ts", import.meta.url),
-    "utf8",
-  );
-
-  assert.match(source, /ownerLease = asyncCoordinator\.capture\(dashboardBackend\)/);
-  assert.doesNotMatch(source, /renderOwner/);
-  assert.equal(source.match(/useLayoutEffect\(\(\) => \{/g)?.length, 2);
-  assert.match(
-    source,
-    /useLayoutEffect\(\(\) => \{\s*committedBackendRef\.current = dashboardBackend;\s*const ownerCommit = asyncCoordinator\.commit\(dashboardBackend\);/,
-  );
-  assert.match(
-    source,
-    /const activation = asyncCoordinator\.activate\(\);[\s\S]*return \(\) => \{\s*asyncCoordinator\.deactivate\(activation\);\s*\};/,
-  );
-  assert.match(source, /statusKnown: true/);
-  assert.match(source, /statusKnown: false/);
-  assert.match(source, /Unable to read Relay status/);
-  assert.match(source, /const requireKnownStatus = useCallback/);
-  assert.match(source, /if \(!requireKnownStatus\(\)\) return false;/);
-  assert.match(source, /Wait for Relay status before changing its configuration/);
-  assert.match(
-    source,
-    /const saved = await saveConfig\(operation\);[\s\S]*?if \(!saved\.secret\.trim\(\)\)[\s\S]*?if \(!asyncCoordinator\.isCurrentOperation\(operation\)\) return false;\s*await dashboardBackend\.relay\.start\(\);/,
-  );
-  const startBrokerStart = source.indexOf("const startBroker = useCallback");
-  const startBrokerEnd = source.indexOf("const stop = useCallback", startBrokerStart);
-  const startBrokerBlock = source.slice(startBrokerStart, startBrokerEnd);
-  assert.match(startBrokerBlock, /relay\.startBroker\(/);
-  assert.match(startBrokerBlock, /quickTunnel: true/);
-  assert.match(startBrokerBlock, /issueStatusRequest\(ownerLease, "brokerStarted"\)/);
-  assert.match(startBrokerBlock, /relay\.start\(\)/);
-  assert.match(startBrokerBlock, /checkStatus\(operation\)/);
-  assert.match(source, /if \(!asyncCoordinator\.finishOperation\(operation\)\) return;/);
-  assert.doesNotMatch(source, /finally\s*\{[\s\S]{0,120}set(?:Loading|Saving|BrokerStarting|Stopping)\(false\)/);
-  assert.doesNotMatch(source, /function fallbackMobileRelayStatus/);
 });
