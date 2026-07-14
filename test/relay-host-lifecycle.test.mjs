@@ -76,9 +76,14 @@ const { spawn } = require("node:child_process");
 const args = process.argv.slice(2);
 const targetIndex = args.indexOf("-t");
 const target = targetIndex >= 0 ? String(args[targetIndex + 1] || "") : "";
-const session = target.replace(/^=/, "").split(":.")[0];
-const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 const gateDir = process.env.TW_TEST_TMUX_GATE_DIR;
+const rawSession = target.replace(/^=/, "").split(":.")[0];
+let session = rawSession;
+if (/^%\\d+$/.test(rawSession)) {
+  const mapped = join(gateDir, "pane-" + rawSession.slice(1) + ".session");
+  if (existsSync(mapped)) session = readFileSync(mapped, "utf8").trim();
+}
+const key = session.replace(/[^A-Za-z0-9._-]/g, "_") || "default";
 appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session, startedAt: Date.now() }) + "\\n");
 if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
   let managed = [];
@@ -118,8 +123,13 @@ if (args[0] === "show-options") {
   process.stdout.write("tmux-instance-" + key + "\\n");
   process.exit(0);
 }
-if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}") {
-  process.stdout.write("0\\n");
+if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}\\u001f#{pane_id}") {
+  const paneNumber = Array.from(session).reduce(
+    (hash, character) => (hash * 31 + character.codePointAt(0)) % 2147483646,
+    1,
+  );
+  writeFileSync(join(gateDir, "pane-" + paneNumber + ".session"), session + "\\n");
+  process.stdout.write("0\\u001f%" + paneNumber + "\\n");
   process.exit(0);
 }
 if (args[0] === "load-buffer" && existsSync(join(gateDir, "fail-load-buffer"))) {
@@ -313,7 +323,7 @@ if (command.includes("terminal-control") && command.includes("request")) {
   return;
 }
 if (command.includes("list-panes")) {
-  process.stdout.write("0\\x1f1\\n");
+  process.stdout.write("0\\x1f%1\\n");
   process.exit(0);
 }
 if (command.includes("load-buffer")) {
@@ -717,16 +727,18 @@ test("local agent submit paces paste and submit while preserving exact normalize
   const sendCalls = calls.filter(({ args }) => args[0] === "load-buffer");
   assert.equal(sendCalls.length, 1);
   const buffer = sendCalls[0].args[2];
+  const paneTarget = sendCalls[0].args.at(-1);
   assert.match(buffer, /^tw-control-\d+-[0-9a-f-]+$/);
+  assert.match(paneTarget, /^%\d+$/);
   assert.deepEqual(sendCalls[0].args, [
     "load-buffer", "-b", buffer, "-",
-    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", "$0:.0",
+    ";", "paste-buffer", "-b", buffer, "-d", "-r", "-t", paneTarget,
   ]);
   const submitCalls = calls.filter(({ args }) => args[0] === "send-keys");
   assert.deepEqual(submitCalls.map(({ args }) => args), [[
-    "send-keys", "-t", "$0:.0", "C-m",
+    "send-keys", "-t", paneTarget, "C-m",
   ], [
-    "send-keys", "-t", "$0:.0", "C-m",
+    "send-keys", "-t", paneTarget, "C-m",
   ]]);
   assert.ok(
     submitCalls[0].startedAt - sendCalls[0].startedAt >= 80,
@@ -869,8 +881,7 @@ test("concurrent agent messages to one pane cannot interleave paste and submit s
     .split("\n")
     .map((line) => JSON.parse(line));
   const mutationCalls = calls.filter(({ args }) => (
-    (args[0] === "load-buffer" || args[0] === "send-keys")
-    && args.includes("$0:.0")
+    args[0] === "load-buffer" || args[0] === "send-keys"
   ));
   assert.deepEqual(
     mutationCalls.map(({ args }) => args[0]),
