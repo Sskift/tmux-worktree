@@ -282,6 +282,88 @@ exit 12
   assert.match(sshLog, /\$HOME\/\.local\/bin\/tw/);
 });
 
+test("tw host attach uses the remote terminal-control authority and never silently falls back", () => {
+  const root = mkdtempSync(join(tmpdir(), "tw-host-controlled-attach-"));
+  const home = join(root, "home");
+  const bin = join(root, "bin");
+  const log = join(root, "ssh.log");
+  mkdirSync(home, { recursive: true });
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(home, ".tmux-worktree.json"), JSON.stringify({
+    hosts: [{ id: "dev", label: "Dev", host: "devbox" }],
+  }));
+  const fakeSsh = join(bin, "ssh");
+  writeFileSync(fakeSsh, `#!/bin/sh
+printf '%s\\n' "$*" >> "$TW_TEST_SSH_LOG"
+last=""
+for arg in "$@"; do last="$arg"; done
+case "$last" in
+  true)
+    exit 0
+    ;;
+  *tmux*"'-V'"*)
+    printf '%s\\n' 'tmux 3.5a'
+    exit 0
+    ;;
+  *tw*"'version'"*)
+    printf '%s\\n' '1.0.5'
+    exit 0
+    ;;
+  *tw*"'rpc' 'capabilities'"*)
+    printf '%s\\n' '{"protocolVersion":1,"app":"tmux-worktree","capabilities":["list","create-worktree","create-terminal","kill-session","hard-timeout"]}'
+    exit 0
+    ;;
+  *tw*"'terminal-control' 'resolve' 'managed-one'"*)
+    if test "$TW_TEST_NO_TERMINAL_CONTROL" = 1; then
+      printf '%s\\n' 'unknown command: terminal-control' >&2
+      exit 2
+    fi
+    printf '%s\\n' 'target:test'
+    exit 0
+    ;;
+  *tw*"'attach' 'managed-one'"*)
+    exit 0
+    ;;
+  *tmux*"'attach-session' '-t' '=managed-one'"*)
+    exit 0
+    ;;
+esac
+printf 'unexpected ssh command: %s\\n' "$last" >&2
+exit 12
+`);
+  chmodSync(fakeSsh, 0o755);
+  const env = {
+    PATH: `${bin}:${process.env.PATH ?? ""}`,
+    TW_TEST_SSH_LOG: log,
+  };
+
+  const controlled = runCli(home, ["host", "attach", "dev", "managed-one", "--take-over"], env);
+  assert.equal(controlled.status, 0, controlled.stderr);
+  let calls = readFileSync(log, "utf8");
+  assert.match(calls, /'terminal-control' 'resolve' 'managed-one'/);
+  assert.match(calls, /'attach' 'managed-one' '--take-over'/);
+  assert.doesNotMatch(calls, /'attach-session' '-t' '=managed-one'/);
+
+  writeFileSync(log, "");
+  const unavailable = runCli(home, ["host", "attach", "dev", "managed-one"], {
+    ...env,
+    TW_TEST_NO_TERMINAL_CONTROL: "1",
+  });
+  assert.notEqual(unavailable.status, 0);
+  assert.match(unavailable.stderr, /terminal-control authority.*direct tmux/);
+  calls = readFileSync(log, "utf8");
+  assert.match(calls, /'terminal-control' 'resolve' 'managed-one'/);
+  assert.doesNotMatch(calls, /'attach-session'|'attach' 'managed-one'/);
+
+  writeFileSync(log, "");
+  const bypass = runCli(home, ["host", "attach", "dev", "managed-one", "--privileged-bypass"], env);
+  assert.equal(bypass.status, 0, bypass.stderr);
+  assert.match(bypass.stderr, /--privileged-bypass.*input ownership lease/);
+  calls = readFileSync(log, "utf8");
+  assert.match(calls, /'attach-session' '-t' '=managed-one'/);
+  assert.doesNotMatch(calls, /'terminal-control'|'rpc' 'capabilities'/);
+});
+
 test("tw host owns an isolated SSH ControlMaster lifecycle", () => {
   const root = mkdtempSync(join(tmpdir(), "tw-host-control-"));
   const home = join(root, "home");

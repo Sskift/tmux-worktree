@@ -455,6 +455,17 @@ transport.handlers.set("pty_open", (payload) => {
   });
   return args.id;
 });
+transport.handlers.set("pty_open_managed", (payload) => {
+  const args = (payload as { args: PtyOpenArgs }).args;
+  openPtys.add(args.id);
+  queueMicrotask(() => {
+    transport.emit(`pty:${args.id}`, {
+      id: args.id,
+      data: "\r\n\u001b[2m[preview managed backend connected]\u001b[0m\r\n$ ",
+    });
+  });
+  return args.id;
+});
 transport.handlers.set("pty_write", (payload) => {
   const { id, data } = payload as { id: string; data: string };
   if (openPtys.has(id) && data === "\r") {

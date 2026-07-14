@@ -692,10 +692,50 @@ export async function hostCmd(args: string[]): Promise<void> {
       return;
     }
     case "attach": {
-      const [id, session] = rest;
-      if (!id || !session) throw new CliError("用法: tw host attach <id> <session>");
+      const allowedFlags = new Set(["--take-over", "--privileged-bypass"]);
+      const unknownFlag = rest.find((arg) => arg.startsWith("-") && !allowedFlags.has(arg));
+      if (unknownFlag) throw new CliError(`未知 host attach 选项: ${unknownFlag}`);
+      const positional = rest.filter((arg) => !arg.startsWith("-"));
+      const [id, session, extra] = positional;
+      if (!id || !session || extra) {
+        throw new CliError("用法: tw host attach <id> <session> [--take-over|--privileged-bypass]");
+      }
       const host = findHost(id);
-      const command = remoteTmuxCommand(host, ["attach-session", "-t", `=${session}`]);
+      const privilegedBypass = rest.includes("--privileged-bypass");
+      const takeover = rest.includes("--take-over");
+      if (privilegedBypass && takeover) {
+        throw new CliError("--take-over 与 --privileged-bypass 不能同时使用");
+      }
+
+      let command: string;
+      if (privilegedBypass) {
+        console.error("警告: --privileged-bypass 直接连接远程 tmux，不受 TW input ownership lease 保护。");
+        command = remoteTmuxCommand(host, ["attach-session", "-t", `=${session}`]);
+      } else {
+        const probe = probeHost(host);
+        if (!probe.ssh.reachable) {
+          throw new CliError(`远程 Host ${host.id} 不可达: ${probe.ssh.error || "SSH unavailable"}`);
+        }
+        if (!probe.tw.available || !probe.tw.compatible) {
+          throw new CliError(
+            `远程 Host ${host.id} 缺少兼容 tw，拒绝绕过 terminal-control attach: ${probe.tw.error || "upgrade remote tw"}`,
+          );
+        }
+        const control = runRemoteCommand(
+          host,
+          remoteTwCommand(host, ["terminal-control", "resolve", session]),
+        );
+        if (!control.ok) {
+          throw new CliError(
+            `远程 Host ${host.id} 没有可用的 terminal-control authority，拒绝回退到 direct tmux: ${resultError(control)}`,
+          );
+        }
+        command = remoteTwCommand(host, [
+          "attach",
+          session,
+          ...(takeover ? ["--take-over"] : []),
+        ]);
+      }
       const result = spawnSync("ssh", [
         ...sshConnectionArgs(host, { batch: false }),
         "-tt",

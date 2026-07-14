@@ -276,7 +276,8 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       });
       if (signal?.aborted || abortRequested) throw abortError();
 
-      const openedId = await transport.invoke<string>("pty_open", { args });
+      const openCommand = args.controlSession ? "pty_open_managed" : "pty_open";
+      const openedId = await transport.invoke<string>(openCommand, { args });
       if (openedId !== args.id) {
         await transport.invoke<void>("pty_kill", { id: openedId }).catch(() => {});
         throw new Error(`pty id mismatch: expected ${args.id}, got ${openedId}`);

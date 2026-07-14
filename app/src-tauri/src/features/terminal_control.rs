@@ -543,6 +543,30 @@ fn ownership_fields(value: &Value) -> (String, Option<String>) {
     )
 }
 
+pub(crate) fn resolve_pty_control_target(
+    app: &tauri::AppHandle,
+    state: &TerminalControlState,
+    session_name: &str,
+    host_id: Option<&str>,
+) -> Result<String, TerminalControlCallError> {
+    let resolved = call_terminal_control(
+        app,
+        state,
+        host_id,
+        "target.resolve",
+        json!({ "sessionName": session_name }),
+    )?;
+    resolved
+        .get("controlTargetId")
+        .and_then(Value::as_str)
+        .filter(|value| valid_wire_token(value, 128))
+        .map(str::to_string)
+        .ok_or_else(|| TerminalControlCallError {
+            code: "RECOVERY_REQUIRED".to_string(),
+            message: "terminal-control resolve returned no target ID".to_string(),
+        })
+}
+
 pub(crate) fn open_pty_control(
     app: &tauri::AppHandle,
     state: &TerminalControlState,

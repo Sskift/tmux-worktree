@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -17,7 +16,6 @@ import {
 import { acquireConfigFileLock, releaseConfigFileLock } from "./hosts";
 import {
   CliError,
-  exec,
   insideTmux,
   isGitRepo,
   tmuxBin,
@@ -26,6 +24,7 @@ import {
   createManagedWorktreeSession,
   SESSION_NAME_MAX_LEN,
 } from "./session";
+import { runControlledAttach } from "./terminalControl/attach";
 
 // ============================================
 // dev.ts — AI + tmux + git worktree 开发环境
@@ -340,15 +339,25 @@ export async function run() {
   const session = created.session;
   const tmux = tmuxBin();
 
-  // 连接：如果已在 tmux 中则 switch-client，否则 attach
+  // Managed session input must enter through the canonical terminal-control
+  // authority. Creation has already committed at this point, so an attach
+  // failure deliberately leaves the new session running for a later retry.
   console.log(`✅ 环境就绪，正在连接 tmux session "${session}"...`);
   if (insideTmux()) {
-    exec(tmux, ["switch-client", "-t", session]);
-  } else {
-    const child = spawn(tmux, ["attach", "-t", session], { stdio: "inherit" });
-    const exitCode = await new Promise<number>((resolve) => {
-      child.on("exit", (code) => resolve(code ?? 0));
+    throw new CliError(
+      `managed session "${session}" 已创建并保留，但受控 attach 不能从现有 tmux client 执行；请先离开 tmux，再运行 tw attach ${session}。`,
+    );
+  }
+  try {
+    process.exitCode = await runControlledAttach({
+      sessionName: session,
+      tmuxBin: tmux,
+      takeover: false,
     });
-    process.exitCode = exitCode;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new CliError(
+      `managed session "${session}" 已创建并保留，但受控 attach 失败: ${detail}`,
+    );
   }
 }

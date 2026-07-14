@@ -43,6 +43,7 @@ const expectedTauriCommands = [
   "list_automation_runs",
   "home_dir",
   "pty_open",
+  "pty_open_managed",
   "pty_write",
   "pty_resize",
   "pty_kill",
@@ -354,7 +355,7 @@ function rustReferencesFeature(source: string, feature: string): boolean {
   return new RegExp(`\\b${escaped}\\b`).test(masked);
 }
 
-test("tauri exposes exactly the frozen 80 dashboard commands", () => {
+test("tauri exposes exactly the declared 81 dashboard commands", () => {
   const rust = readTauriCompositionSource();
   const handlerBlocks = [...rust.matchAll(/tauri::generate_handler!\[([\s\S]*?)\]/g)];
 
@@ -365,7 +366,7 @@ test("tauri exposes exactly the frozen 80 dashboard commands", () => {
     .filter(Boolean)
     .map(leafName);
 
-  assert.equal(commands.length, 80);
+  assert.equal(commands.length, 81);
   assert.deepEqual(commands, expectedTauriCommands);
   assert.equal(new Set(commands).size, commands.length, "Tauri commands must not be registered twice");
 });

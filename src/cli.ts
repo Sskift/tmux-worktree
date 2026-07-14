@@ -62,7 +62,8 @@ SSH Host（本地控制面）:
                               管理 TW 自有的 SSH ControlMaster 连接
   tw host rpc <id> <rpc-command> [args...]
                               在目标 Host 调用机器可读 tw RPC
-  tw host attach <id> <session> 交互接入远端 tmux session
+  tw host attach <id> <session> [--take-over|--privileged-bypass]
+                              通过远程 input ownership authority 接入 session
 
 Automation:
   tw automation ls            列出 Dashboard 可见的 automation（别名: tw auto ls）

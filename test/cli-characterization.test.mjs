@@ -46,7 +46,7 @@ test("CLI help and version keep the public command surface stable", () => {
     "tw host probe [id] [--json]",
     "tw host connect|connection-status|disconnect <id> [--json]",
     "tw host rpc <id> <rpc-command> [args...]",
-    "tw host attach <id> <session>",
+    "tw host attach <id> <session> [--take-over|--privileged-bypass]",
     "tw automation ls",
     "tw automation create",
     "tw automation rm <id|name>",

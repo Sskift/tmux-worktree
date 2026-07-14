@@ -242,14 +242,44 @@ async function currentTmuxInstanceId(sessionId: string): Promise<string | undefi
   return value || undefined;
 }
 
-async function requirePane(sessionName: string, pane: string): Promise<string> {
-  const sessionId = await requireTmuxSession(sessionName, "TARGET_GONE");
-  const result = await runTmux(["list-panes", "-t", sessionId, "-F", "#{pane_index}"]);
-  const panes = result.stdout.split("\n").map((item) => item.trim()).filter(Boolean);
-  if (!panes.includes(pane)) {
-    throw new TerminalControlProtocolError("TARGET_NOT_FOUND", `terminal pane is not available: ${pane}`);
+async function requirePane(
+  sessionName: string,
+  pane: string,
+): Promise<{ sessionId: string; paneTarget: string }> {
+  if (pane !== "0") {
+    throw new TerminalControlProtocolError(
+      "TARGET_NOT_FOUND",
+      `managed single-pane target has no logical pane: ${pane}`,
+    );
   }
-  return sessionId;
+  const sessionId = await requireTmuxSession(sessionName, "TARGET_GONE");
+  const result = await runTmux([
+    "list-panes",
+    "-s",
+    "-t",
+    sessionId,
+    "-F",
+    "#{pane_index}\u001f#{pane_id}",
+  ]);
+  const panes = result.stdout
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("\u001f"));
+  if (
+    panes.some((row) => row.length !== 2 || !/^\d+$/.test(row[0]) || !/^%\d+$/.test(row[1]))
+  ) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "tmux returned a malformed managed pane identity",
+    );
+  }
+  if (panes.length !== 1) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      `managed single-pane target has ${panes.length} live panes`,
+    );
+  }
+  return { sessionId, paneTarget: panes[0][1] };
 }
 
 function shellQuote(value: string): string {
@@ -383,14 +413,14 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
   }
 
   async writeRaw(sessionName: string, pane: string, data: Buffer): Promise<void> {
-    const sessionId = await requirePane(sessionName, pane);
+    const { paneTarget } = await requirePane(sessionName, pane);
     if (data.byteLength === 0) return;
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
     try {
       await runTmux(
         [
           "load-buffer", "-b", bufferName, "-",
-          ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", `${sessionId}:.${pane}`,
+          ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
         ],
         { input: data },
       );
@@ -406,12 +436,12 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     message: string,
     submit: boolean,
   ): Promise<void> {
-    const sessionId = await requirePane(sessionName, pane);
+    const { paneTarget } = await requirePane(sessionName, pane);
     const normalized = message.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
     if (!normalized && !submit) return;
     if (!normalized) {
       try {
-        await runTmux(["send-keys", "-t", `${sessionId}:.${pane}`, "C-m"]);
+        await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
       } catch (error) {
         throw new Error(`agent message submit failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -421,7 +451,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     try {
       await runTmux([
         "load-buffer", "-b", bufferName, "-",
-        ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", `${sessionId}:.${pane}`,
+        ";", "paste-buffer", "-b", bufferName, "-d", "-r", "-t", paneTarget,
       ], { input: normalized });
     } catch (error) {
       await runTmux(["delete-buffer", "-b", bufferName], { allowFailure: true }).catch(() => undefined);
@@ -430,7 +460,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     if (!submit) return;
     await new Promise<void>((resolve) => setTimeout(resolve, AGENT_MESSAGE_SUBMIT_PACE_MS));
     try {
-      await runTmux(["send-keys", "-t", `${sessionId}:.${pane}`, "C-m"]);
+      await runTmux(["send-keys", "-t", paneTarget, "C-m"]);
     } catch (error) {
       throw new Error(
         `agent message submit failed after paste; input may remain in the target pane: ${error instanceof Error ? error.message : String(error)}`,
@@ -439,7 +469,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
   }
 
   async resize(sessionName: string, pane: string, cols: number, rows: number): Promise<void> {
-    const sessionId = await requirePane(sessionName, pane);
+    const { sessionId } = await requirePane(sessionName, pane);
     await runTmux([
       "resize-window",
       "-t", sessionId,
@@ -508,8 +538,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     pane: string,
     generation?: string,
   ): Promise<TerminalControlOutputPosition> {
-    const sessionId = await requirePane(sessionName, pane);
-    const target = `${sessionId}:.${pane}`;
+    const { sessionId, paneTarget: target } = await requirePane(sessionName, pane);
     const configured = (await runTmux(
       ["show-options", "-v", "-t", sessionId, OUTPUT_GENERATION_OPTION],
       { allowFailure: true },
@@ -551,8 +580,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     pane: string,
     previousGeneration: string,
   ): Promise<TerminalControlOutputPosition> {
-    const sessionId = await requirePane(sessionName, pane);
-    const target = `${sessionId}:.${pane}`;
+    const { sessionId, paneTarget: target } = await requirePane(sessionName, pane);
     const configured = (await runTmux(
       ["show-options", "-v", "-t", sessionId, OUTPUT_GENERATION_OPTION],
       { allowFailure: true },

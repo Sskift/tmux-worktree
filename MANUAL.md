@@ -111,6 +111,8 @@ ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw rpc capabilities'
 ssh remote-dev -- 'PATH="$HOME/.local/bin:$PATH" tw rpc list'
 ```
 
+`tw host attach <id> <session>` first proves that the selected remote `tw` has a working terminal-control authority, then invokes its controlled attach. Old or unavailable controllers fail closed without a direct-tmux fallback. Add `--take-over` for a graceful Feishu-to-local handoff. `--privileged-bypass` is the explicit, warned break-glass path and is never selected automatically.
+
 ## Remote AI Commands
 
 The AI command runs on the remote host inside the `tw`-owned tmux session. Install the command on the remote host and verify `--version`.

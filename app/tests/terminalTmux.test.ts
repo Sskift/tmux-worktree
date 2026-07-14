@@ -98,7 +98,7 @@ test("terminal subscribes to pty output before opening the pty", () => {
   const connectIndex = terminalSource.indexOf("ptyConnection = await dashboardBackend.pty.connect", idIndex);
   const listenDataIndex = backendSource.indexOf("unlistenData = await transport.listen<PtyDataEvent>");
   const listenExitIndex = backendSource.indexOf("unlistenExit = await transport.listen<PtyExitEvent>", listenDataIndex);
-  const openIndex = backendSource.indexOf('const openedId = await transport.invoke<string>("pty_open"', listenExitIndex);
+  const openIndex = backendSource.indexOf("const openedId = await transport.invoke<string>(openCommand", listenExitIndex);
 
   assert.ok(idIndex >= 0, "terminal should create the pty id before opening");
   assert.ok(connectIndex > idIndex, "terminal should connect through the typed PTY facade after creating the id");
@@ -109,7 +109,8 @@ test("terminal subscribes to pty output before opening the pty", () => {
     terminalSource,
     /dashboardBackend\.pty\.connect\(\s*\{[\s\S]*?id,[\s\S]*?cmd,[\s\S]*?args,[\s\S]*?cwd,[\s\S]*?cols,[\s\S]*?rows,[\s\S]*?controlSession,[\s\S]*?controlHostId:/,
   );
-  assert.match(backendSource, /transport\.invoke<string>\("pty_open", \{ args \}\)/);
+  assert.match(backendSource, /args\.controlSession \? "pty_open_managed" : "pty_open"/);
+  assert.match(backendSource, /transport\.invoke<string>\(openCommand, \{ args \}\)/);
   assert.match(rustSource, /id: Option<String>/);
   assert.match(terminalSource, /onAttachmentIdChangeRef\.current\?\.\(ptyId\)/);
   assert.doesNotMatch(terminalSource, /attachmentId \?\? createPtyId/);

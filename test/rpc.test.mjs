@@ -549,7 +549,7 @@ case "$1" in
     exit 0
     ;;
   list-panes)
-    printf '0\n'
+    printf '0\\037%%1\\n'
     ;;
   show-options)
     if [ "$5" = '@tw_terminal_control_output_generation_v1' ]; then
@@ -974,6 +974,10 @@ test("CLI git-repository paths create a managed single-pane worktree", () => {
   const worktreeBase = join(root, "worktrees");
   const fakeTmux = join(root, "tmux");
   const tmuxLog = join(root, "tmux.log");
+  const tmuxSession = join(root, "tmux.session");
+  const tmuxInstance = join(root, "tmux.instance");
+  const tmuxOutput = join(root, "tmux.output");
+  const tmuxPipe = join(root, "tmux.pipe");
   mkdirSync(home, { recursive: true });
 
   execFileSync("git", ["init", "--bare", "--initial-branch=main", origin], { stdio: "ignore" });
@@ -992,7 +996,56 @@ test("CLI git-repository paths create a managed single-pane worktree", () => {
   writeFileSync(fakeTmux, `#!/bin/sh
 printf '%s\\n' "$*" >> "$TW_TEST_TMUX_LOG"
 if [ "$1" = "has-session" ]; then
+  for arg in "$@"; do target="$arg"; done
+  target="$(printf '%s' "$target" | sed 's/^=//')"
+  test -f "$TW_TEST_TMUX_SESSION" && grep -Fqx "$target" "$TW_TEST_TMUX_SESSION"
+  exit $?
+fi
+if [ "$1" = "new-session" ]; then
+  previous=""
+  for arg in "$@"; do
+    if [ "$previous" = "-s" ]; then printf '%s\\n' "$arg" >> "$TW_TEST_TMUX_SESSION"; break; fi
+    previous="$arg"
+  done
+  exit 0
+fi
+if [ "$1" = "list-sessions" ]; then
+  if [ ! -f "$TW_TEST_TMUX_SESSION" ]; then printf '%s\\n' "no server running" >&2; exit 1; fi
+  while IFS= read -r name; do printf '%s\\037%s\\n' "$name" '$1'; done < "$TW_TEST_TMUX_SESSION"
+  exit 0
+fi
+if [ "$1" = "show-options" ]; then
+  for arg in "$@"; do last="$arg"; done
+  case "$last" in
+    *@tw_terminal_control_instance_v1)
+      if [ -f "$TW_TEST_TMUX_INSTANCE" ]; then cat "$TW_TEST_TMUX_INSTANCE"; exit 0; fi
+      ;;
+    *@tw_terminal_control_output_generation_v1)
+      if [ -f "$TW_TEST_TMUX_OUTPUT" ]; then cat "$TW_TEST_TMUX_OUTPUT"; exit 0; fi
+      ;;
+  esac
+  printf '%s\\n' "unknown option" >&2
   exit 1
+fi
+if [ "$1" = "set-option" ]; then
+  for arg in "$@"; do last="$arg"; done
+  case "$*" in
+    *@tw_terminal_control_instance_v1*) printf '%s\\n' "$last" > "$TW_TEST_TMUX_INSTANCE" ;;
+    *@tw_terminal_control_output_generation_v1*) printf '%s\\n' "$last" > "$TW_TEST_TMUX_OUTPUT" ;;
+  esac
+  exit 0
+fi
+if [ "$1" = "list-panes" ]; then
+  printf '0\\037%%1\\n'
+  exit 0
+fi
+if [ "$1" = "display-message" ]; then
+  if [ -f "$TW_TEST_TMUX_PIPE" ]; then printf '1\\n'; else printf '0\\n'; fi
+  exit 0
+fi
+if [ "$1" = "pipe-pane" ]; then
+  if [ "$2" = "-O" ]; then : > "$TW_TEST_TMUX_PIPE"; else rm -f "$TW_TEST_TMUX_PIPE"; fi
+  exit 0
 fi
 exit 0
 `);
@@ -1010,6 +1063,10 @@ exit 0
         TMUX: "",
         TW_TMUX: fakeTmux,
         TW_TEST_TMUX_LOG: tmuxLog,
+        TW_TEST_TMUX_SESSION: tmuxSession,
+        TW_TEST_TMUX_INSTANCE: tmuxInstance,
+        TW_TEST_TMUX_OUTPUT: tmuxOutput,
+        TW_TEST_TMUX_PIPE: tmuxPipe,
       },
       timeout: 10_000,
     },
@@ -1030,7 +1087,33 @@ exit 0
 
   const calls = readFileSync(tmuxLog, "utf8");
   assert.match(calls, /new-session -d -s sample-app-fix -c /);
+  assert.match(calls, /attach-session -r -f ignore-size -t =sample-app-fix/);
   assert.doesNotMatch(calls, /split-window| status(?: |$)/);
+
+  const insideTmux = spawnSync(
+    process.execPath,
+    [cli, "codex", repo, "inside", "--branch", "main"],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        HOME: home,
+        TMUX: "/tmp/existing-tmux,1,0",
+        TW_TMUX: fakeTmux,
+        TW_TEST_TMUX_LOG: tmuxLog,
+        TW_TEST_TMUX_SESSION: tmuxSession,
+        TW_TEST_TMUX_INSTANCE: tmuxInstance,
+        TW_TEST_TMUX_OUTPUT: tmuxOutput,
+        TW_TEST_TMUX_PIPE: tmuxPipe,
+      },
+      timeout: 10_000,
+    },
+  );
+  assert.notEqual(insideTmux.status, 0);
+  assert.match(insideTmux.stderr, /sample-app-inside.*已创建并保留.*受控 attach/);
+  const afterInside = JSON.parse(readFileSync(join(home, ".tmux-worktree", "state.json"), "utf8"));
+  assert.equal(afterInside.sessions.some((session) => session.name === "sample-app-inside"), true);
+  assert.doesNotMatch(readFileSync(tmuxLog, "utf8"), /switch-client -t sample-app-inside/);
 });
 
 test("tw rpc create-terminal is headless, machine-readable, and discoverable through managed state", () => {

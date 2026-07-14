@@ -102,6 +102,14 @@ const ptyArgs: PtyOpenArgs = {
   rows: 40,
 };
 
+const managedPtyArgs: PtyOpenArgs = {
+  ...ptyArgs,
+  id: "pty-managed-test",
+  cmd: "tmux",
+  args: ["attach-session", "-r", "-f", "ignore-size", "-t", "managed-one"],
+  controlSession: "managed-one",
+};
+
 async function waitUntil(condition: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     if (condition()) return;
@@ -139,6 +147,24 @@ test("PTY subscribes to data and exit before opening and receives data emitted d
   });
   assert.deepEqual(received, ["early output"]);
   assert.equal(connection.active, true);
+  await connection.close();
+});
+
+test("managed PTY uses the distinct native command instead of optional generic fields", async () => {
+  const transport = new InstrumentedPtyTransport();
+  transport.handlers.set("pty_open_managed", () => managedPtyArgs.id);
+  const backend = createDashboardBackend(transport);
+
+  const connection = await backend.pty.connect(managedPtyArgs, {
+    onData: () => {},
+    onExit: () => {},
+  });
+
+  assert.deepEqual(transport.calls[0], {
+    command: "pty_open_managed",
+    args: { args: managedPtyArgs },
+  });
+  assert.equal(transport.calls.some(({ command }) => command === "pty_open"), false);
   await connection.close();
 });
 

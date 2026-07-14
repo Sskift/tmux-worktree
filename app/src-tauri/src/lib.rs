@@ -76,6 +76,7 @@ pub fn run() {
             list_automation_runs,
             home_dir,
             pty_open,
+            pty_open_managed,
             pty_write,
             pty_resize,
             pty_kill,

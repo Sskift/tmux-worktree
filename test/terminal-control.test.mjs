@@ -861,10 +861,23 @@ test("production tmux backend captures bounded correlated output on an isolated 
   process.env.TW_TMUX = wrapper;
   process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = join(twHome, "terminal-control-output-v1");
   try {
+    const bootstrap = spawnSync(wrapper, ["new-session", "-d", "-s", "bootstrap"], {
+      encoding: "utf8",
+    });
+    assert.equal(bootstrap.status, 0, bootstrap.stderr);
+    const paneBase = spawnSync(wrapper, ["set-option", "-g", "pane-base-index", "1"], {
+      encoding: "utf8",
+    });
+    assert.equal(paneBase.status, 0, paneBase.stderr);
     const created = spawnSync(wrapper, ["new-session", "-d", "-s", "controlled", "-c", temp.root], {
       encoding: "utf8",
     });
     assert.equal(created.status, 0, created.stderr);
+    spawnSync(wrapper, ["kill-session", "-t", "bootstrap"], { encoding: "utf8" });
+    const physicalPane = spawnSync(wrapper, ["list-panes", "-t", "controlled", "-F", "#{pane_index}"], {
+      encoding: "utf8",
+    });
+    assert.equal(physicalPane.stdout.trim(), "1", "test must cover non-zero physical pane index");
     writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
       version: 1,
       sessions: [{
@@ -875,9 +888,10 @@ test("production tmux backend captures bounded correlated output on an isolated 
         createdAt: "2026-07-13T00:00:00.000Z",
       }],
     })}\n`, { mode: 0o600 });
+    const backend = new terminalControl.TmuxTerminalControlBackend();
     const authority = new terminalControl.TerminalControlAuthority({
       statePath: temp.path,
-      backend: new terminalControl.TmuxTerminalControlBackend(),
+      backend,
     });
     const target = await resolved(authority, "controlled");
     const feishu = await acquired(authority, target.controlTargetId, owner("feishu", "real-tmux:daemon-1"));
@@ -918,6 +932,14 @@ test("production tmux backend captures bounded correlated output on an isolated 
     });
     assert.equal(released.state, "FREE");
     assert.notEqual(released.outputGeneration, sent.outputGeneration);
+    const extraWindow = spawnSync(wrapper, ["new-window", "-d", "-t", "controlled"], {
+      encoding: "utf8",
+    });
+    assert.equal(extraWindow.status, 0, extraWindow.stderr);
+    await assert.rejects(
+      backend.writeRaw("controlled", "0", Buffer.from("must-not-write")),
+      (error) => error.code === "RECOVERY_REQUIRED" && /2 live panes/.test(error.message),
+    );
   } finally {
     spawnSync(wrapper, ["kill-server"], { encoding: "utf8" });
     if (previous.HOME === undefined) delete process.env.HOME;
