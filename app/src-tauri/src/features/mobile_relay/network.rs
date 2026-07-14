@@ -1,5 +1,3 @@
-use std::net::{IpAddr, ToSocketAddrs};
-
 const LEGACY_PLACEHOLDER_RELAY_URL: &str = "wss://relay.example.com";
 
 pub(super) fn tcp_port_open(port: u16) -> bool {
@@ -95,90 +93,6 @@ pub(super) fn is_cloudflare_quick_tunnel_url(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
-fn wait_for_mobile_relay_url_resolution_with<Published, Resolve, Pause>(
-    value: &str,
-    publication_attempts: usize,
-    resolution_attempts: usize,
-    mut published: Published,
-    mut resolve: Resolve,
-    mut pause: Pause,
-) -> Result<(), String>
-where
-    Published: FnMut(&str) -> bool,
-    Resolve: FnMut(&str, u16) -> bool,
-    Pause: FnMut(),
-{
-    let normalized = validate_mobile_relay_connector_url(value)?;
-    let parsed = tauri::Url::parse(&normalized)
-        .map_err(|_| "Automatic WSS setup returned an invalid Relay URL".to_string())?;
-    let host = parsed
-        .host_str()
-        .ok_or_else(|| "Automatic WSS setup returned a Relay URL without a host".to_string())?;
-    let port = parsed.port_or_known_default().unwrap_or(443);
-    let publication_attempts = publication_attempts.max(1);
-    let resolution_attempts = resolution_attempts.max(1);
-
-    let mut publication_ready = false;
-    for attempt in 0..publication_attempts {
-        if published(host) {
-            publication_ready = true;
-            break;
-        }
-        if attempt + 1 < publication_attempts {
-            pause();
-        }
-    }
-    if !publication_ready {
-        return Err(
-            "Automatic WSS setup published a URL, but its public DNS record did not appear within 60 seconds"
-                .to_string(),
-        );
-    }
-
-    for attempt in 0..resolution_attempts {
-        if resolve(host, port) {
-            return Ok(());
-        }
-        if attempt + 1 < resolution_attempts {
-            pause();
-        }
-    }
-
-    Err(
-        "Automatic WSS setup published a URL, but this Mac could not resolve it within 15 seconds"
-            .to_string(),
-    )
-}
-
-fn mobile_relay_public_dns_ready(host: &str) -> bool {
-    let Ok(output) = std::process::Command::new("/usr/bin/dig")
-        .args(["+time=1", "+tries=1", "+short", host])
-        .output()
-    else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .any(|line| line.parse::<IpAddr>().is_ok())
-}
-
-pub(super) fn wait_for_mobile_relay_url_resolution(value: &str) -> Result<(), String> {
-    wait_for_mobile_relay_url_resolution_with(
-        value,
-        30,
-        15,
-        mobile_relay_public_dns_ready,
-        |host, port| {
-            (host, port)
-                .to_socket_addrs()
-                .is_ok_and(|mut addresses| addresses.next().is_some())
-        },
-        || std::thread::sleep(std::time::Duration::from_secs(1)),
-    )
-}
-
 pub(super) fn preserved_mobile_relay_url_after_broker_start(
     current_url: &str,
     current_broker_host_id: &str,
@@ -194,7 +108,7 @@ pub(super) fn preserved_mobile_relay_url_after_broker_start(
 mod tests {
     use super::{
         is_cloudflare_quick_tunnel_url, preserved_mobile_relay_url_after_broker_start,
-        validate_mobile_relay_connector_url, wait_for_mobile_relay_url_resolution_with,
+        validate_mobile_relay_connector_url,
     };
 
     #[test]
@@ -281,82 +195,5 @@ mod tests {
             "wss://-invalid.trycloudflare.com"
         ));
         assert!(!is_cloudflare_quick_tunnel_url("wss://relay.example.net"));
-    }
-
-    #[test]
-    fn relay_url_resolution_waits_for_the_system_resolver_before_connector_start() {
-        let mut resolutions = Vec::new();
-        let mut pauses = 0;
-        assert_eq!(
-            wait_for_mobile_relay_url_resolution_with(
-                "wss://new-tunnel.trycloudflare.com",
-                1,
-                3,
-                |_| true,
-                |host, port| {
-                    resolutions.push((host.to_string(), port));
-                    resolutions.len() == 3
-                },
-                || pauses += 1,
-            ),
-            Ok(())
-        );
-        assert_eq!(
-            resolutions,
-            vec![
-                ("new-tunnel.trycloudflare.com".to_string(), 443),
-                ("new-tunnel.trycloudflare.com".to_string(), 443),
-                ("new-tunnel.trycloudflare.com".to_string(), 443),
-            ]
-        );
-        assert_eq!(pauses, 2);
-    }
-
-    #[test]
-    fn relay_url_resolution_fails_before_connector_start_when_dns_never_arrives() {
-        let mut resolutions = 0;
-        let mut pauses = 0;
-        let error = wait_for_mobile_relay_url_resolution_with(
-            "wss://unresolved-tunnel.trycloudflare.com",
-            1,
-            2,
-            |_| true,
-            |_, _| {
-                resolutions += 1;
-                false
-            },
-            || pauses += 1,
-        )
-        .unwrap_err();
-        assert_eq!(resolutions, 2);
-        assert_eq!(pauses, 1);
-        assert!(error.contains("could not resolve"));
-    }
-
-    #[test]
-    fn relay_url_resolution_does_not_touch_the_system_resolver_before_public_dns_exists() {
-        let mut publications = 0;
-        let mut resolutions = 0;
-        let mut pauses = 0;
-        assert_eq!(
-            wait_for_mobile_relay_url_resolution_with(
-                "wss://fresh-tunnel.trycloudflare.com",
-                3,
-                1,
-                |_| {
-                    publications += 1;
-                    publications == 3
-                },
-                |_, _| {
-                    resolutions += 1;
-                    true
-                },
-                || pauses += 1,
-            ),
-            Ok(())
-        );
-        assert_eq!(publications, 3);
-        assert_eq!(resolutions, 1);
-        assert_eq!(pauses, 2);
     }
 }

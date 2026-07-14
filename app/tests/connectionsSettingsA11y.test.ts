@@ -30,10 +30,13 @@ test("Relay Settings exposes one-click setup plus connector and Android status",
   assert.match(source, /Relay center ·/);
   assert.match(source, /Mac connector/);
   assert.match(source, /Android pairing ·/);
-  assert.match(source, /Stop connector/);
+  assert.match(source, /Disconnect this Mac/);
   assert.doesNotMatch(source, /Reconfigure Relay & rotate token/);
-  assert.match(source, /\? "Setting up Relay"\s*: "Set up Relay"/);
+  assert.match(source, /\? "Setting up Relay"\s*: "Set up \/ repair Relay"/);
   assert.match(source, /broker, trusted WSS, and this Mac in one step/);
   assert.match(source, /temporary Cloudflare Quick Tunnel/);
+  assert.match(source, /<details className="connections-relay-manual">/);
+  assert.match(source, /Save fields only/);
+  assert.match(source, /Connect this Mac/);
   assert.doesNotMatch(source, /Copy Android v1 launch|copyLaunch/);
 });

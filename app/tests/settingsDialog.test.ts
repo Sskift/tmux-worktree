@@ -6,6 +6,7 @@ import {
   isSettingsSectionId,
 } from "../src/dashboard/Settings/settingsModel.ts";
 import { getWrappedFocusIndex } from "../src/dashboard/Settings/focusTrap.ts";
+import { FOCUSABLE_SELECTOR } from "../src/dashboard/Settings/focusTrap.ts";
 
 test("settings exposes the complete planned section model", () => {
   assert.deepEqual(SETTINGS_SECTION_IDS, [
@@ -23,6 +24,7 @@ test("settings exposes the complete planned section model", () => {
 });
 
 test("focus trap only wraps at dialog boundaries", () => {
+  assert.match(FOCUSABLE_SELECTOR, /summary/);
   assert.equal(getWrappedFocusIndex(-1, 3, 1), 0);
   assert.equal(getWrappedFocusIndex(-1, 3, -1), 2);
   assert.equal(getWrappedFocusIndex(0, 3, -1), 2);
@@ -46,6 +48,9 @@ test("settings dialog declares modal, keyboard, and focus-return behavior", () =
   assert.match(source, /focusTarget\?\.isConnected/);
   assert.match(source, /role="tablist"/);
   assert.match(source, /role="tabpanel"/);
+  assert.match(source, /aria-label="Resize settings dialog"/);
+  assert.match(source, /setPointerCapture\(event\.pointerId\)/);
+  assert.match(source, /resizeDialogFromKeyboard/);
 });
 
 test("settings content is injectable without presenting pretend controls", () => {

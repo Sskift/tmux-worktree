@@ -6,7 +6,7 @@ use super::broker::{
 use super::model::{MobileRelayState, RelayHostRuntimeStatus};
 use super::network::{
     is_cloudflare_quick_tunnel_url, preserved_mobile_relay_url_after_broker_start, tcp_port_open,
-    validate_mobile_relay_connector_url, wait_for_mobile_relay_url_resolution,
+    validate_mobile_relay_connector_url,
 };
 use super::persistence::{
     mobile_relay_config, mobile_relay_status_file, preflight_mobile_relay_config_write,
@@ -198,28 +198,11 @@ fn mobile_relay_start_broker_blocking(
         set_mobile_relay_error(state.as_ref(), Some(message.clone()));
         return Err(message);
     }
-    if quick_tunnel_started {
-        if let Err(err) = wait_for_mobile_relay_url_resolution(&relay_url) {
-            let mut cleanup_errors = Vec::new();
-            if let Err(cleanup_err) = stop_mobile_relay_broker_on_host(&host) {
-                cleanup_errors.push(format!("broker: {cleanup_err}"));
-            }
-            if let Err(cleanup_err) = stop_mobile_relay_quick_tunnel_on_host(&host) {
-                cleanup_errors.push(format!("temporary WSS: {cleanup_err}"));
-            }
-            let cleanup_status = if cleanup_errors.is_empty() {
-                "the remote setup was stopped".to_string()
-            } else {
-                format!(
-                    "remote cleanup could not be confirmed ({})",
-                    cleanup_errors.join("; ")
-                )
-            };
-            let message = format!("{err}; {cleanup_status}");
-            set_mobile_relay_error(state.as_ref(), Some(message.clone()));
-            return Err(message);
-        }
-    }
+    // A Quick Tunnel can publish its URL before the corresponding DNS record
+    // reaches the Mac's resolver. The relay-host already owns reconnect/backoff
+    // semantics, so keep the valid remote tunnel and broker alive, save the
+    // generated profile, and let the connector converge instead of treating
+    // DNS propagation as a destructive setup failure.
     let config = MobileRelayConfigInput {
         relay_url,
         broker_host_id: host.id.clone(),
