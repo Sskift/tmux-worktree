@@ -11,7 +11,9 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import {
+  type CSSProperties,
   type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
   type ReactNode,
   type RefObject,
   useEffect,
@@ -26,6 +28,10 @@ import {
   SETTINGS_SECTION_IDS,
   type SettingsSectionId,
 } from "./settingsModel";
+import {
+  clampSettingsDialogSize,
+  type SettingsDialogSize,
+} from "./settingsDialogSize";
 
 export type SettingsContent = Partial<Record<SettingsSectionId, ReactNode>>;
 
@@ -199,10 +205,19 @@ export function SettingsDialog({
   onSectionChange,
 }: SettingsDialogProps) {
   const [activeSection, setActiveSection] = useState<SettingsSectionId>(initialSection);
+  const [dialogSize, setDialogSize] = useState<SettingsDialogSize | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
   const sectionButtonRefs = useRef(new Map<SettingsSectionId, HTMLButtonElement>());
+  const resizeSessionRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startWidth: number;
+    startHeight: number;
+  } | null>(null);
+  const resizeBodyStyleRef = useRef<{ cursor: string; userSelect: string } | null>(null);
   const titleId = useId();
   const descriptionId = useId();
 
@@ -224,6 +239,38 @@ export function SettingsDialog({
     };
   }, [open, returnFocusRef]);
 
+  useEffect(() => {
+    const clampToViewport = () => {
+      setDialogSize((current) => current
+        ? clampSettingsDialogSize(current, {
+            width: window.innerWidth,
+            height: window.innerHeight,
+          })
+        : null);
+    };
+    window.addEventListener("resize", clampToViewport);
+    return () => window.removeEventListener("resize", clampToViewport);
+  }, []);
+
+  useEffect(() => () => {
+    const bodyStyle = resizeBodyStyleRef.current;
+    if (bodyStyle) {
+      document.body.style.cursor = bodyStyle.cursor;
+      document.body.style.userSelect = bodyStyle.userSelect;
+    }
+  }, []);
+
+  useEffect(() => {
+    if (open) return;
+    resizeSessionRef.current = null;
+    const bodyStyle = resizeBodyStyleRef.current;
+    if (bodyStyle) {
+      document.body.style.cursor = bodyStyle.cursor;
+      document.body.style.userSelect = bodyStyle.userSelect;
+      resizeBodyStyleRef.current = null;
+    }
+  }, [open]);
+
   if (!open) return null;
 
   const activeDefinition = SETTINGS_SECTIONS.find((section) => section.id === activeSection) ??
@@ -234,6 +281,79 @@ export function SettingsDialog({
     setActiveSection(section);
     onSectionChange?.(section);
   };
+
+  const resizeDialog = (size: SettingsDialogSize) => {
+    setDialogSize(clampSettingsDialogSize(size, {
+      width: window.innerWidth,
+      height: window.innerHeight,
+    }));
+  };
+
+  const startDialogResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    if (event.button !== 0 || resizeSessionRef.current || !dialogRef.current) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const bounds = dialogRef.current.getBoundingClientRect();
+    resizeSessionRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startWidth: bounds.width,
+      startHeight: bounds.height,
+    };
+    resizeBodyStyleRef.current = {
+      cursor: document.body.style.cursor,
+      userSelect: document.body.style.userSelect,
+    };
+    document.body.style.cursor = "nwse-resize";
+    document.body.style.userSelect = "none";
+    event.currentTarget.setPointerCapture(event.pointerId);
+  };
+
+  const moveDialogResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const session = resizeSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    resizeDialog({
+      // The modal remains centered in the overlay, so each pointer pixel moves
+      // both opposite edges by half a pixel. Double the delta to keep the
+      // bottom-right handle under the captured pointer.
+      width: session.startWidth + 2 * (event.clientX - session.startX),
+      height: session.startHeight + 2 * (event.clientY - session.startY),
+    });
+  };
+
+  const stopDialogResize = (event: ReactPointerEvent<HTMLButtonElement>) => {
+    const session = resizeSessionRef.current;
+    if (!session || session.pointerId !== event.pointerId) return;
+    resizeSessionRef.current = null;
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    const bodyStyle = resizeBodyStyleRef.current;
+    if (bodyStyle) {
+      document.body.style.cursor = bodyStyle.cursor;
+      document.body.style.userSelect = bodyStyle.userSelect;
+    }
+    resizeBodyStyleRef.current = null;
+  };
+
+  const resizeDialogFromKeyboard = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const horizontal = event.key === "ArrowLeft" || event.key === "ArrowRight";
+    const vertical = event.key === "ArrowUp" || event.key === "ArrowDown";
+    if (!horizontal && !vertical) return;
+    event.preventDefault();
+    const current = dialogRef.current?.getBoundingClientRect();
+    if (!current) return;
+    const step = event.shiftKey ? 48 : 16;
+    resizeDialog({
+      width: current.width + (event.key === "ArrowLeft" ? -step : event.key === "ArrowRight" ? step : 0),
+      height: current.height + (event.key === "ArrowUp" ? -step : event.key === "ArrowDown" ? step : 0),
+    });
+  };
+
+  const dialogStyle: CSSProperties | undefined = dialogSize
+    ? { width: dialogSize.width, height: dialogSize.height }
+    : undefined;
 
   const handleDialogKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (event.key === "Escape") {
@@ -280,6 +400,7 @@ export function SettingsDialog({
       <div
         ref={dialogRef}
         className="settings-dialog"
+        style={dialogStyle}
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
@@ -350,6 +471,18 @@ export function SettingsDialog({
             </SettingsSection>
           </main>
         </div>
+        <button
+          type="button"
+          className="settings-dialog__resize-handle"
+          aria-label="Resize settings dialog"
+          title="Drag to resize. Arrow keys resize by 16 px; hold Shift for 48 px."
+          onPointerDown={startDialogResize}
+          onPointerMove={moveDialogResize}
+          onPointerUp={stopDialogResize}
+          onPointerCancel={stopDialogResize}
+          onLostPointerCapture={stopDialogResize}
+          onKeyDown={resizeDialogFromKeyboard}
+        />
       </div>
     </div>
   );

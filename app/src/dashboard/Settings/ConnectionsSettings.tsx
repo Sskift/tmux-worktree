@@ -17,6 +17,7 @@ import {
   Trash2,
   Wifi,
   WifiOff,
+  Wrench,
   X,
 } from "lucide-react";
 import {
@@ -559,15 +560,15 @@ export function ConnectionsSettings({
 
     const pendingLabel: Record<typeof intent, string> = {
       save: "Saving Relay configuration…",
-      start: "Starting the Mac connector…",
+      start: "Connecting this Mac to the saved Relay…",
       startBroker: "Setting up broker, trusted WSS, and the Mac connector…",
-      stop: "Stopping the Mac connector…",
+      stop: "Disconnecting this Mac from the Relay…",
     };
     const successLabel: Record<typeof intent, string> = {
       save: "Relay configuration saved.",
-      start: "Mac connector start requested.",
-      startBroker: "Relay setup started. The QR appears when the Mac connector reaches the generated WSS endpoint. Existing Android pairing must be updated after token rotation.",
-      stop: "Mac connector stopped. The selected Relay center keeps running.",
+      start: "This Mac is connecting to the saved Relay. The connector retries while DNS propagates.",
+      startBroker: "Relay setup started. The broker and tunnel stay available while the Mac connector retries DNS. The QR appears after it reaches the generated WSS endpoint. Existing Android pairing must be updated after token rotation.",
+      stop: "This Mac disconnected. The selected Relay center keeps running.",
     };
 
     setRelayNotice({ tone: "pending", message: pendingLabel[intent] });
@@ -916,7 +917,7 @@ export function ConnectionsSettings({
                 <span>
                   {relay.busy.startBroker
                     ? "Deploying Relay v1, publishing trusted WSS, and starting this Mac connector."
-                    : "Set up Relay reuses its fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel when none is configured."}
+                    : "Set up / repair Relay reuses a fixed WSS URL, or provisions a temporary Cloudflare Quick Tunnel. DNS propagation is handled by connector retries."}
                 </span>
               </div>
             </div>
@@ -950,7 +951,7 @@ export function ConnectionsSettings({
             <div className="connections-card__header">
               <div>
                 <h4>Relay configuration</h4>
-                <p>One-click setup is the normal path. The fields and manual controls remain available for fixed WSS and recovery.</p>
+                <p>Choose a Relay center, then use the one-click setup. Manual fields are only for fixed WSS and recovery.</p>
               </div>
             </div>
 
@@ -982,53 +983,96 @@ export function ConnectionsSettings({
                 )}
               </div>
 
-              <RelayField
-                id="connection-relay-url"
-                label="Relay URL"
-                value={relay.relayUrl}
-                placeholder="Enter the trusted wss:// endpoint for this Relay center"
-                error={relayErrors.relayUrl}
-                disabled={relayDraftLocked}
-                copyDisabled={!relay.statusKnown}
-                copied={copiedField === "relayUrl"}
-                onChange={(value) => {
-                  relayActions.setRelayUrl(value);
-                  setRelayErrors((current) => ({ ...current, relayUrl: undefined }));
-                }}
-                onCopy={() => copyRelayValue("relayUrl", relay.relayUrl)}
-              />
-              <RelayField
-                id="connection-relay-host"
-                label="Host ID"
-                value={relay.hostId}
-                placeholder="mac-admin"
-                error={relayErrors.hostId}
-                disabled={relayDraftLocked}
-                copyDisabled={!relay.statusKnown}
-                copied={copiedField === "hostId"}
-                onChange={(value) => {
-                  relayActions.setHostId(value);
-                  setRelayErrors((current) => ({ ...current, hostId: undefined }));
-                }}
-                onCopy={() => copyRelayValue("hostId", relay.hostId)}
-              />
-              <RelayField
-                id="connection-relay-token"
-                label="Token"
-                value={relay.token}
-                placeholder={relay.tokenConfigured ? "Configured" : "Required to start Relay"}
-                error={relayErrors.token}
-                disabled={relayDraftLocked}
-                copyDisabled={!relay.statusKnown}
-                copied={copiedField === "token"}
-                secret
-                onChange={(value) => {
-                  relayActions.setToken(value);
-                  setRelayErrors((current) => ({ ...current, token: undefined }));
-                }}
-                onCopy={() => copyRelayValue("token", relay.token)}
-              />
             </div>
+
+            <details className="connections-relay-manual">
+              <summary>
+                <span className="connections-relay-manual__icon">
+                  <Wrench aria-hidden="true" size={16} />
+                </span>
+                <span>
+                  <strong>Manual recovery</strong>
+                  <small>Inspect or supply a fixed WSS profile. These controls do not create a Relay center.</small>
+                </span>
+              </summary>
+              <div className="connections-fields connections-fields--relay connections-relay-manual__fields">
+                <RelayField
+                  id="connection-relay-url"
+                  label="Relay URL"
+                  value={relay.relayUrl}
+                  placeholder="Enter the trusted wss:// endpoint for this Relay center"
+                  error={relayErrors.relayUrl}
+                  disabled={relayDraftLocked}
+                  copyDisabled={!relay.statusKnown}
+                  copied={copiedField === "relayUrl"}
+                  onChange={(value) => {
+                    relayActions.setRelayUrl(value);
+                    setRelayErrors((current) => ({ ...current, relayUrl: undefined }));
+                  }}
+                  onCopy={() => copyRelayValue("relayUrl", relay.relayUrl)}
+                />
+                <RelayField
+                  id="connection-relay-host"
+                  label="Host ID"
+                  value={relay.hostId}
+                  placeholder="mac-admin"
+                  error={relayErrors.hostId}
+                  disabled={relayDraftLocked}
+                  copyDisabled={!relay.statusKnown}
+                  copied={copiedField === "hostId"}
+                  onChange={(value) => {
+                    relayActions.setHostId(value);
+                    setRelayErrors((current) => ({ ...current, hostId: undefined }));
+                  }}
+                  onCopy={() => copyRelayValue("hostId", relay.hostId)}
+                />
+                <RelayField
+                  id="connection-relay-token"
+                  label="Token"
+                  value={relay.token}
+                  placeholder={relay.tokenConfigured ? "Configured" : "Required to start Relay"}
+                  error={relayErrors.token}
+                  disabled={relayDraftLocked}
+                  copyDisabled={!relay.statusKnown}
+                  copied={copiedField === "token"}
+                  secret
+                  onChange={(value) => {
+                    relayActions.setToken(value);
+                    setRelayErrors((current) => ({ ...current, token: undefined }));
+                  }}
+                  onCopy={() => copyRelayValue("token", relay.token)}
+                />
+              </div>
+              {!relay.active && (
+                <div className="connections-actions connections-actions--relay-manual">
+                  <span className="connections-actions__spacer" />
+                  <button
+                    type="button"
+                    className="connections-button"
+                    disabled={relayActionLocked}
+                    title="Save these fields without starting any local or remote process"
+                    onClick={() => runRelayAction("save", relayActions.save)}
+                  >
+                    {relay.busy.save
+                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                      : <Save aria-hidden="true" size={14} />}
+                    {relay.busy.save ? "Saving fields" : "Save fields only"}
+                  </button>
+                  <button
+                    type="button"
+                    className="connections-button"
+                    disabled={relayActionLocked}
+                    title="Connect this Mac to an already running Relay using the saved fields"
+                    onClick={() => runRelayAction("start", relayActions.start)}
+                  >
+                    {relay.busy.start
+                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                      : <Play aria-hidden="true" size={14} />}
+                    {relay.busy.start ? "Connecting this Mac" : "Connect this Mac"}
+                  </button>
+                </div>
+              )}
+            </details>
 
             <div className="connections-relay-pairing">
               <div className="connections-relay-pairing__copy">
@@ -1063,60 +1107,35 @@ export function ConnectionsSettings({
             )}
 
             <div className="connections-actions connections-actions--relay">
+              <span className="connections-actions__spacer" />
               {relay.active ? (
-                <>
-                  <span className="connections-actions__spacer" />
-                  <button
-                    type="button"
-                    className="connections-button connections-button--danger"
-                    disabled={relayBusy}
-                    onClick={() => runRelayAction("stop", relayActions.stop)}
-                  >
-                    {relay.busy.stop
-                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-                      : <Square aria-hidden="true" size={14} />}
-                    {relay.busy.stop ? "Stopping connector" : "Stop connector"}
-                  </button>
-                </>
+                <button
+                  type="button"
+                  className="connections-button connections-button--danger"
+                  disabled={relayBusy}
+                  title="Disconnect this Mac only; the selected Relay center keeps running"
+                  onClick={() => runRelayAction("stop", relayActions.stop)}
+                >
+                  {relay.busy.stop
+                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                    : <Square aria-hidden="true" size={14} />}
+                  {relay.busy.stop ? "Disconnecting this Mac" : "Disconnect this Mac"}
+                </button>
               ) : (
-                <>
-                  <button
-                    type="button"
-                    className="connections-button connections-button--primary"
-                    disabled={relayActionLocked || !hosts.length}
-                    onClick={() => runRelayAction("startBroker", relayActions.startBroker)}
-                  >
-                    {relay.busy.startBroker
-                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-                      : <Server aria-hidden="true" size={14} />}
-                    {relay.busy.startBroker
-                      ? "Setting up Relay"
-                      : "Set up Relay"}
-                  </button>
-                  <span className="connections-actions__spacer" />
-                  <button
-                    type="button"
-                    className="connections-button"
-                    disabled={relayActionLocked}
-                    onClick={() => runRelayAction("save", relayActions.save)}
-                  >
-                    {relay.busy.save
-                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-                      : <Save aria-hidden="true" size={14} />}
-                    {relay.busy.save ? "Saving" : "Save"}
-                  </button>
-                  <button
-                    type="button"
-                    className="connections-button"
-                    disabled={relayActionLocked}
-                    onClick={() => runRelayAction("start", relayActions.start)}
-                  >
-                    {relay.busy.start
-                      ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
-                      : <Play aria-hidden="true" size={14} />}
-                    {relay.busy.start ? "Starting connector" : "Start connector"}
-                  </button>
-                </>
+                <button
+                  type="button"
+                  className="connections-button connections-button--primary"
+                  disabled={relayActionLocked || !hosts.length}
+                  title="Create or repair the broker, trusted WSS tunnel, token, and this Mac connector"
+                  onClick={() => runRelayAction("startBroker", relayActions.startBroker)}
+                >
+                  {relay.busy.startBroker
+                    ? <LoaderCircle className="connections-spin" aria-hidden="true" size={14} />
+                    : <Server aria-hidden="true" size={14} />}
+                  {relay.busy.startBroker
+                    ? "Setting up Relay"
+                    : "Set up / repair Relay"}
+                </button>
               )}
             </div>
           </div>

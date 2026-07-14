@@ -144,9 +144,6 @@ test("mobile relay production modules and symbols have one frozen owner", () => 
       "is_loopback_host",
       "validate_mobile_relay_connector_url",
       "is_cloudflare_quick_tunnel_url",
-      "wait_for_mobile_relay_url_resolution_with",
-      "mobile_relay_public_dns_ready",
-      "wait_for_mobile_relay_url_resolution",
       "preserved_mobile_relay_url_after_broker_start",
     ]],
     ["features/mobile_relay/runtime.rs", [
@@ -235,7 +232,8 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.match(commands, /broker_host_id: host\.id\.clone\(\)/);
   assert.match(commands, /args\.quick_tunnel\.unwrap_or\(false\)/);
   assert.match(commands, /start_mobile_relay_quick_tunnel_on_host/);
-  assert.match(commands, /wait_for_mobile_relay_url_resolution\(&relay_url\)/);
+  assert.doesNotMatch(commands, /wait_for_mobile_relay_url_resolution/);
+  assert.match(commands, /relay-host already owns reconnect\/backoff/);
   assert.doesNotMatch(commands, /mobile_relay_forward_url_for_host|should_preserve_mobile_relay_url/);
   assert.match(broker, /TW_RELAY_SECRET/);
   assert.match(broker, /chmod 600/);
@@ -253,8 +251,7 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.doesNotMatch(broker, /require\("dns"\)\.lookup/);
   assert.doesNotMatch(broker, /TW_RELAY_SECRET[^\n]*(?:trycloudflare|relay-tunnel)/);
 
-  assert.match(network, /Command::new\("\/usr\/bin\/dig"\)/);
-  assert.match(network, /line\.parse::<IpAddr>\(\)\.is_ok\(\)/);
+  assert.doesNotMatch(network, /Command::new\("\/usr\/bin\/dig"\)/);
 
   const mobileRelayTree = mobileRelayPaths.map(source).join("\n");
   assert.doesNotMatch(
