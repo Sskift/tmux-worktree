@@ -180,6 +180,14 @@ export function parseFeishuMessageDetail(value: unknown, messageId?: string): Fe
   };
 }
 
+export function larkCliCommandArgs(args: string[], profile?: string): string[] {
+  if (profile === undefined) return [...args];
+  if (profile.length === 0 || profile.length > 256 || profile.includes("\0")) {
+    throw new Error("invalid lark-cli profile");
+  }
+  return ["--profile", profile, ...args];
+}
+
 function runLark(args: string[]): Promise<unknown> {
   return new Promise((resolve, reject) => {
     execFile(
@@ -239,17 +247,33 @@ export function parseFeishuChats(value: unknown): FeishuChat[] {
 export function parseFeishuBotOpenId(value: unknown): string {
   if (!isRecord(value)) throw new Error("invalid bot info response");
   const data = isRecord(value.data) ? value.data : value;
-  const bot = isRecord(data.bot) ? data.bot : data;
+  const identities = isRecord(value.identities) ? value.identities : undefined;
+  const bot = isRecord(identities?.bot)
+    ? identities.bot
+    : isRecord(data.bot)
+      ? data.bot
+      : data;
   const openId = pickString(bot.open_id, bot.openId);
   if (!openId?.startsWith("ou_")) throw new Error("bot info omitted open_id");
   return openId;
 }
 
 export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
+  private readonly profile?: string;
+
+  constructor(options: { profile?: string } = {}) {
+    if (options.profile !== undefined) larkCliCommandArgs([], options.profile);
+    this.profile = options.profile;
+  }
+
+  private commandArgs(args: string[]): string[] {
+    return larkCliCommandArgs(args, this.profile);
+  }
+
   subscribe(onEvent: (event: FeishuInboundEvent) => Promise<void>): FeishuEventSubscription {
     const child = spawn(
       "lark-cli",
-      ["event", "consume", "im.message.receive_v1", "--as", "bot", "--quiet"],
+      this.commandArgs(["event", "consume", "im.message.receive_v1", "--as", "bot", "--quiet"]),
       { stdio: ["ignore", "pipe", "pipe"] },
     );
     let stdout = "";
@@ -300,44 +324,42 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   }
 
   async messageDetail(messageId: string): Promise<FeishuMessageDetail> {
-    const raw = await runLark([
+    const raw = await runLark(this.commandArgs([
       "im", "+messages-mget",
       "--message-ids", messageId,
       "--as", "bot",
       "--no-reactions",
       "--json",
-    ]);
+    ]));
     return parseFeishuMessageDetail(raw, messageId);
   }
 
   async reply(messageId: string, text: string, idempotencyKey: string): Promise<FeishuReplyResult> {
-    const raw = await runLark([
+    const raw = await runLark(this.commandArgs([
       "im", "+messages-reply",
       "--message-id", messageId,
       "--text", text,
       "--idempotency-key", idempotencyKey,
       "--as", "bot",
       "--json",
-    ]);
+    ]));
     return { messageId: findReplyMessageId(raw), raw };
   }
 
   async listGroups(): Promise<FeishuChat[]> {
-    const raw = await runLark([
+    const raw = await runLark(this.commandArgs([
       "im", "+chat-list",
       "--as", "bot",
       "--page-size", "100",
       "--json",
-    ]);
+    ]));
     return parseFeishuChats(raw);
   }
 
   async botOpenId(): Promise<string> {
-    const raw = await runLark([
-      "api", "GET", "/open-apis/bot/v3/info/",
-      "--as", "bot",
-      "--json",
-    ]);
+    const raw = await runLark(this.commandArgs([
+      "auth", "status", "--json", "--verify",
+    ]));
     return parseFeishuBotOpenId(raw);
   }
 }

@@ -19,7 +19,12 @@ const {
   CanonicalTerminalControlSocketClient,
   canonicalTerminalControlSocketPath,
 } = await import("../dist/canonicalTerminalControlClient.js");
-const { parseFeishuInboundEvent, parseFeishuMessageDetail } = await import("../dist/larkCliBridge.js");
+const {
+  larkCliCommandArgs,
+  parseFeishuBotOpenId,
+  parseFeishuInboundEvent,
+  parseFeishuMessageDetail,
+} = await import("../dist/larkCliBridge.js");
 const terminalControl = await import("../dist/terminalControl/index.js");
 
 class JointTerminalBackend {
@@ -104,7 +109,6 @@ class JointTerminalBackend {
     this.outputs.set(key, Buffer.concat([current, Buffer.from(text, "utf8")]));
   }
 }
-
 class FakeControlClient {
   constructor() {
     this.requests = [];
@@ -739,6 +743,19 @@ test("real terminal-control authority and Feishu bridge share one fenced writer"
     await serving.catch(() => {});
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("Lark CLI bridge pins every command to an explicitly selected profile", () => {
+  const command = ["im", "+messages-mget", "--message-ids", "om_one", "--as", "bot"];
+  assert.deepEqual(larkCliCommandArgs(command, "bot"), ["--profile", "bot", ...command]);
+  assert.deepEqual(larkCliCommandArgs(command), command);
+  assert.notEqual(larkCliCommandArgs(command), command, "command arguments must be copied");
+  assert.throws(() => larkCliCommandArgs(command, ""), /invalid lark-cli profile/);
+  assert.throws(() => larkCliCommandArgs(command, "bad\0profile"), /invalid lark-cli profile/);
+  assert.equal(parseFeishuBotOpenId({
+    ok: true,
+    identities: { bot: { status: "ready", openId: "ou_bot_profile" } },
+  }), "ou_bot_profile");
 });
 
 test("Feishu event and message detail parsers keep the verified routing fields", () => {

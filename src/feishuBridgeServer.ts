@@ -315,11 +315,14 @@ export class FeishuBridgeServer {
     paths?: FeishuBridgePaths;
     control?: CanonicalTerminalControlClient;
     lark?: FeishuLarkAdapter;
+    larkProfile?: string;
     botOpenId?: string;
   } = {}): Promise<FeishuBridgeServer> {
     const paths = options.paths ?? feishuBridgePaths();
     const control = options.control ?? new CanonicalTerminalControlSocketClient();
-    const lark = options.lark ?? new LarkCliBridgeAdapter();
+    const lark = options.lark ?? new LarkCliBridgeAdapter({
+      profile: options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE,
+    });
     const bridge = new FeishuBridge({
       control,
       lark,
@@ -463,7 +466,9 @@ function requiredFlag(args: string[], name: string): string {
 export async function feishuBridgeCmd(args: string[]): Promise<void> {
   const [command] = args;
   if (command === "serve") {
-    const server = await FeishuBridgeServer.create();
+    const server = await FeishuBridgeServer.create({
+      larkProfile: flag(args, "--lark-profile"),
+    });
     await server.start();
     process.stderr.write(`[feishu-bridge] ready socket=${server.paths.socket}\n`);
     await new Promise<void>((resolve) => {
@@ -514,6 +519,6 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
       }), null, 2)}\n`);
       return;
     default:
-      throw new Error("usage: tw feishu-bridge serve|status|bind|pause|resume|unbind");
+      throw new Error("usage: tw feishu-bridge serve [--lark-profile NAME]|status|bind|pause|resume|unbind");
   }
 }
