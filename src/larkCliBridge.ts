@@ -274,7 +274,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     const child = spawn(
       "lark-cli",
       this.commandArgs(["event", "consume", "im.message.receive_v1", "--as", "bot", "--quiet"]),
-      { stdio: ["ignore", "pipe", "pipe"] },
+      { stdio: ["pipe", "pipe", "pipe"] },
     );
     let stdout = "";
     let stderr = "";
