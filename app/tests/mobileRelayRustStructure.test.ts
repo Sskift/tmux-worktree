@@ -246,6 +246,16 @@ test("mobile relay status composition and v1 credential roles remain exact", () 
   assert.match(broker, /relay-server --host 127\.0\.0\.1 --port/);
   assert.doesNotMatch(broker, /relay-server --host 0\.0\.0\.0/);
   assert.match(broker, /tw-relay-tunnel/);
+  assert.match(broker, /cloudflare\/cloudflared\/releases\/download/);
+  assert.match(broker, /cloudflared-linux-amd64/);
+  assert.match(broker, /cloudflared-linux-arm64/);
+  assert.match(broker, /Downloaded cloudflared failed SHA-256 verification/);
+  assert.match(broker, /mv \"\$cloudflared_tmp\" \"\$managed_cloudflared\"/);
+  assert.ok(
+    broker.indexOf('mv \"$cloudflared_tmp\" \"$managed_cloudflared\"') <
+      broker.indexOf('kill-session -t {}'),
+    "cloudflared must be provisioned and verified before replacing an existing tunnel",
+  );
   assert.match(broker, /cloudflared.*tunnel --no-autoupdate --protocol http2 --url http:\/\/127\.0\.0\.1:/s);
   assert.match(broker, /\.trycloudflare\\\.com/);
   assert.doesNotMatch(broker, /require\("dns"\)\.lookup/);
