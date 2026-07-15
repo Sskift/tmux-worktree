@@ -1,0 +1,65 @@
+[
+  {
+    "name": "unknown-top-level-field",
+    "category": "unknown-field",
+    "type": "agent.timeline.status.get",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.status.get\",\"requestId\":\"bad-1\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{},\"futureField\":true}"
+  },
+  {
+    "name": "unknown-status-payload-field",
+    "category": "unknown-field",
+    "type": "agent.timeline.status",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.status\",\"requestId\":\"bad-2\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"support\":\"available\",\"reason\":null,\"liveSource\":\"connected\",\"activeSourceEpoch\":\"source-1\",\"timelineEpoch\":\"timeline-1\",\"currentAgentSeq\":\"1\",\"earliestReplaySeq\":\"1\",\"limits\":{\"maxTextUtf8Bytes\":65536,\"maxPageRecords\":256,\"eventReplayRetentionMs\":604800000,\"snapshotLeaseMs\":300000},\"terminalState\":\"idle\"}}"
+  },
+  {
+    "name": "noncanonical-agent-sequence",
+    "category": "noncanonical-counter",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"08\",\"eventId\":\"event-bad-3\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"entry.deleted\",\"entryId\":\"entry-1\",\"reason\":\"retention\"}}}"
+  },
+  {
+    "name": "run-lifecycle-carries-turn-id",
+    "category": "invalid-lifecycle-scope",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"4\",\"eventId\":\"event-bad-4\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"lifecycle.changed\",\"lifecycle\":{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-bad-4\",\"sourceEpoch\":\"source-invalid\",\"scope\":\"run\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"4\"}}}}"
+  },
+  {
+    "name": "terminal-transcript-is-not-entry-authority",
+    "category": "raw-terminal-transcript",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"6\",\"eventId\":\"event-bad-6\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"text_entry.appended\",\"entry\":{\"recordType\":\"text_entry\",\"entryId\":\"entry-bad-6\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"looks done\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"6\",\"lastModifiedAgentSeq\":\"6\",\"terminalTranscript\":\"$ prompt output\"}}}}"
+  },
+  {
+    "name": "tool-call-body-excluded",
+    "category": "tool-call-body",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"7\",\"eventId\":\"event-bad-7\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"lifecycle.changed\",\"lifecycle\":{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-bad-7\",\"sourceEpoch\":\"source-invalid\",\"scope\":\"turn\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"7\"},\"toolCall\":{\"name\":\"shell\",\"arguments\":\"secret\"}}}}"
+  },
+  {
+    "name": "attachment-excluded",
+    "category": "attachment",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"8\",\"eventId\":\"event-bad-8\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"text_entry.appended\",\"entry\":{\"recordType\":\"text_entry\",\"entryId\":\"entry-bad-8\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"role\":\"user\",\"state\":\"visible\",\"text\":\"inspect this\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"8\",\"lastModifiedAgentSeq\":\"8\"},\"attachments\":[{\"name\":\"dump.txt\"}]}}}"
+  },
+  {
+    "name": "snapshot-nonfinal-page-missing-cursor",
+    "category": "snapshot-page-shape",
+    "type": "agent.timeline.snapshot.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-9\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-1\",\"snapshotId\":\"cut-1\",\"pageIndex\":0,\"isLast\":false,\"nextCursor\":null,\"throughAgentSeq\":\"8\",\"earliestRetainedSeq\":\"1\",\"records\":[]}}"
+  },
+  {
+    "name": "agent-entry-cannot-claim-command-status",
+    "category": "agent-command-correlation",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"9\",\"eventId\":\"event-bad-10\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"text_entry.appended\",\"entry\":{\"recordType\":\"text_entry\",\"entryId\":\"entry-bad-10\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"done\",\"redactionReason\":null,\"commandId\":\"command-1\",\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"9\",\"lastModifiedAgentSeq\":\"9\"}}}}"
+  }
+]

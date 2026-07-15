@@ -1,0 +1,164 @@
+{
+  "contract": "tmux-worktree-relay-agent-transcript-lifecycle-extension",
+  "version": 1,
+  "status": "frozen-extension-not-implemented",
+  "normativeDocument": "../../../../../docs/relay-agent-transcript-lifecycle-extension-v1.md",
+  "baseProtocolVersion": 2,
+  "capability": "agent.transcript-lifecycle.v1",
+  "delivery": {
+    "artifactKind": "fixtures-only",
+    "runtimeConsumers": "pending",
+    "nodeCodecConformance": false,
+    "androidCodecConformance": false,
+    "hostAuthorityMachineConformance": false,
+    "androidConsumerMachineConformance": false,
+    "g4Passed": false
+  },
+  "activation": {
+    "kind": "optional-three-party-intersection",
+    "baseRequiredCapability": false,
+    "requiresBaseV2Gate": "G3",
+    "releaseGate": "G4",
+    "unnegotiatedFramesAllowed": false,
+    "failureIsolation": "extension-only"
+  },
+  "authority": {
+    "acceptedSources": ["agent-sdk-hook", "controlled-agent-adapter"],
+    "forbiddenInferenceSources": ["terminal-text", "command-ack", "local-timer", "process-exit"],
+    "hostStoreOwner": "relay-host-agent-extension-store",
+    "brokerBusinessAuthority": false
+  },
+  "identity": {
+    "lineage": ["hostId", "hostEpoch", "scopeId", "sessionId", "timelineEpoch"],
+    "sourceLineage": "sourceEpoch",
+    "resourceIds": ["runId", "turnId", "entryId", "eventId"],
+    "sourceDedupeKey": ["sessionId", "timelineEpoch", "sourceEpoch", "sourceEventId"],
+    "notificationDedupeKey": ["profileId", "hostId", "hostEpoch", "scopeId", "sessionId", "timelineEpoch", "lifecycleEventId", "state"],
+    "counter": "agentEventSeq",
+    "counterScope": ["hostId", "hostEpoch", "sessionId", "timelineEpoch"],
+    "counterEncoding": "canonical-uint64-decimal-string",
+    "baseHostEventSeqUnchanged": true
+  },
+  "lifecycle": {
+    "scopes": ["run", "turn"],
+    "states": ["running", "waiting_for_user", "failed", "completed"],
+    "initial": "running",
+    "transitions": {
+      "running": ["waiting_for_user", "failed", "completed"],
+      "waiting_for_user": ["running", "failed", "completed"],
+      "failed": [],
+      "completed": []
+    },
+    "terminalStates": ["failed", "completed"]
+  },
+  "machineDispositions": {
+    "authorityIngestion": [
+      "applied",
+      "duplicate",
+      "source_gap",
+      "stale_source",
+      "invalid_transition",
+      "redundant_terminal",
+      "terminal_conflict",
+      "entry_id_conflict",
+      "entry_deleted"
+    ],
+    "androidLocal": [
+      "applied",
+      "duplicate",
+      "gap_resync",
+      "continuity_conflict",
+      "command_applied",
+      "config_applied",
+      "snapshot_applied",
+      "status_applied",
+      "extension_not_active",
+      "timeline_reset"
+    ],
+    "areWireErrorCodes": false
+  },
+  "wire": {
+    "encoding": "utf-8-json-text",
+    "schema": "closed",
+    "messageTypes": [
+      "agent.timeline.status.get",
+      "agent.timeline.status",
+      "agent.timeline.snapshot.get",
+      "agent.timeline.snapshot.page",
+      "agent.timeline.replay.get",
+      "agent.timeline.replay.page",
+      "agent.timeline.event",
+      "agent.timeline.reset"
+    ],
+    "mutationTypes": [
+      "text_entry.appended",
+      "entry.redacted",
+      "entry.deleted",
+      "lifecycle.changed",
+      "source.availability"
+    ],
+    "extensionErrorCodes": [
+      "AGENT_TIMELINE_UNAVAILABLE",
+      "AGENT_CURSOR_EXPIRED",
+      "AGENT_CURSOR_AHEAD",
+      "AGENT_SNAPSHOT_EXPIRED",
+      "AGENT_TIMELINE_EPOCH_MISMATCH"
+    ]
+  },
+  "limits": {
+    "maxTextUtf8Bytes": 65536,
+    "maxFailureSummaryUtf8Bytes": 1024,
+    "maxPageRecords": 256,
+    "minimumEventReplayRetentionMs": 86400000,
+    "defaultEventReplayRetentionMs": 604800000,
+    "defaultSnapshotLeaseMs": 300000
+  },
+  "notifications": {
+    "delivery": "android-local-after-durable-lifecycle-event",
+    "offlinePushIncluded": false,
+    "defaultLockScreenPolicy": "private",
+    "candidateTurnStates": ["waiting_for_user", "failed", "completed"],
+    "candidateRunStatesWithoutTurns": ["failed", "completed"],
+    "runningNotifies": false
+  },
+  "boundaries": {
+    "relayV1Unchanged": true,
+    "relayV2BaseContractUnchanged": true,
+    "baseCommandLedgerIndependent": true,
+    "terminalTranscriptExcluded": true,
+    "toolCallBodiesExcluded": true,
+    "attachmentsExcluded": true,
+    "offlinePushExcluded": true,
+    "productionCapabilityDelivered": false
+  },
+  "files": [
+    { "kind": "wire-golden", "path": "golden-frames.json" },
+    { "kind": "wire-invalid", "path": "invalid-frames.json" },
+    { "kind": "authority-machine", "path": "authority-machine-cases.json" },
+    { "kind": "client-machine", "path": "client-machine-cases.json" }
+  ],
+  "requiredInvalidCategories": [
+    "unknown-field",
+    "noncanonical-counter",
+    "invalid-lifecycle-scope",
+    "raw-terminal-transcript",
+    "tool-call-body",
+    "attachment",
+    "snapshot-page-shape",
+    "agent-command-correlation"
+  ],
+  "requiredMachineScenarios": [
+    "golden",
+    "duplicate",
+    "out-of-order",
+    "late-terminal",
+    "invalid-transition",
+    "agent-restart",
+    "entry-identity",
+    "redaction-delete",
+    "replay-gap",
+    "command-lifecycle-independent",
+    "notification-dedupe",
+    "unsupported-agent"
+  ]
+}

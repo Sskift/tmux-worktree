@@ -1,0 +1,174 @@
+[
+  {
+    "name": "live-duplicate-gap-and-replay-notify-once",
+    "scenarios": ["replay-gap", "notification-dedupe"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-1",
+      "lastAgentSeq": "5",
+      "notificationBaselineAgentSeq": "5",
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": { "turn:run-1:turn-1": "running" },
+      "commandStates": {}
+    },
+    "steps": [
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "6", "eventId": "event-6", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "waiting_for_user" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "shown" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "6", "eventId": "event-6", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "waiting_for_user" } },
+        "expect": { "disposition": "duplicate", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "6", "eventId": "event-6-conflict", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
+        "expect": { "disposition": "continuity_conflict", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "8", "eventId": "event-8", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
+        "expect": { "disposition": "gap_resync", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "7", "eventId": "event-7", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "running" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "7", "lifecycleState": "running", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "8", "eventId": "event-8", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "8", "lifecycleState": "completed", "notification": "shown" }
+      }
+    ]
+  },
+  {
+    "name": "command-ledger-and-agent-lifecycle-are-separate-lanes",
+    "scenarios": ["command-lifecycle-independent"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-2",
+      "lastAgentSeq": "0",
+      "notificationBaselineAgentSeq": "0",
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": {},
+      "commandStates": { "command-1": "accepted" }
+    },
+    "steps": [
+      {
+        "input": { "kind": "command_status", "commandId": "command-1", "state": "succeeded" },
+        "expect": { "disposition": "command_applied", "commandState": "succeeded", "lifecycleState": null, "lastAgentSeq": "0" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-2", "agentEventSeq": "1", "eventId": "event-c1", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "run", "runId": "run-c1", "turnId": null, "state": "running" } },
+        "expect": { "disposition": "applied", "commandState": "succeeded", "lifecycleState": "running", "lastAgentSeq": "1", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-2", "agentEventSeq": "2", "eventId": "event-c2", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-c1", "turnId": "turn-c1", "state": "running" } },
+        "expect": { "disposition": "applied", "commandState": "succeeded", "lifecycleState": "running", "lastAgentSeq": "2", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-2", "agentEventSeq": "3", "eventId": "event-c3", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-c1", "turnId": "turn-c1", "state": "failed" } },
+        "expect": { "disposition": "applied", "commandState": "succeeded", "lifecycleState": "failed", "lastAgentSeq": "3", "notification": "shown" }
+      }
+    ]
+  },
+  {
+    "name": "permission-and-profile-suppression-are-durable",
+    "scenarios": ["notification-dedupe"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-3",
+      "lastAgentSeq": "1",
+      "notificationBaselineAgentSeq": "1",
+      "notificationPermission": "denied",
+      "profileActive": true,
+      "lifecycleStates": { "turn:run-3:turn-3": "running" },
+      "commandStates": {}
+    },
+    "steps": [
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-3", "agentEventSeq": "2", "eventId": "event-n2", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "waiting_for_user" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "2", "notification": "suppressed_permission" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-3", "agentEventSeq": "2", "eventId": "event-n2", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "waiting_for_user" } },
+        "expect": { "disposition": "duplicate", "lastAgentSeq": "2", "notification": "none" }
+      },
+      {
+        "input": { "kind": "client_config", "notificationPermission": "granted", "profileActive": false },
+        "expect": { "disposition": "config_applied", "lastAgentSeq": "2" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-3", "agentEventSeq": "3", "eventId": "event-n3", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "running" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "3", "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-3", "agentEventSeq": "4", "eventId": "event-n4", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "completed" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "4", "notification": "suppressed_inactive_profile" }
+      }
+    ]
+  },
+  {
+    "name": "initial-snapshot-establishes-silent-notification-baseline",
+    "scenarios": ["notification-dedupe"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-4",
+      "lastAgentSeq": "0",
+      "notificationBaselineAgentSeq": null,
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": {},
+      "commandStates": {}
+    },
+    "steps": [
+      {
+        "input": { "kind": "snapshot_commit", "timelineEpoch": "timeline-4", "throughAgentSeq": "20", "records": [{ "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-history", "turnId": "turn-history", "state": "completed", "lifecycleEventId": "event-history", "agentEventSeq": "20" }] },
+        "expect": { "disposition": "snapshot_applied", "lastAgentSeq": "20", "notificationBaselineAgentSeq": "20", "notification": "none" }
+      }
+    ]
+  },
+  {
+    "name": "unsupported-agent-never-accepts-simulated-events",
+    "scenarios": ["unsupported-agent"],
+    "initial": {
+      "support": "unknown",
+      "timelineEpoch": null,
+      "lastAgentSeq": "0",
+      "notificationBaselineAgentSeq": null,
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": {},
+      "commandStates": {}
+    },
+    "steps": [
+      {
+        "input": { "kind": "status", "support": "unavailable", "reason": "agent_unsupported", "timelineEpoch": null },
+        "expect": { "disposition": "status_applied", "support": "unavailable", "unavailableReason": "agent_unsupported", "lastAgentSeq": "0" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "made-up", "agentEventSeq": "1", "eventId": "fake-reply", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "run", "runId": "fake-run", "turnId": null, "state": "completed" } },
+        "expect": { "disposition": "extension_not_active", "support": "unavailable", "lastAgentSeq": "0", "notification": "none" }
+      }
+    ]
+  },
+  {
+    "name": "timeline-reset-clears-only-extension-state",
+    "scenarios": ["command-lifecycle-independent"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-old",
+      "lastAgentSeq": "9",
+      "notificationBaselineAgentSeq": "4",
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": { "run:run-old": "running" },
+      "commandStates": { "command-old": "ambiguous" }
+    },
+    "steps": [
+      {
+        "input": { "kind": "timeline_reset", "previousTimelineEpoch": "timeline-old", "newTimelineEpoch": "timeline-new", "reason": "deleted" },
+        "expect": { "disposition": "timeline_reset", "timelineEpoch": "timeline-new", "lastAgentSeq": "0", "lifecycleState": null, "commandState": "ambiguous", "notification": "none" }
+      }
+    ]
+  }
+]

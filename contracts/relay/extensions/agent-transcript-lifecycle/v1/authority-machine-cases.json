@@ -1,0 +1,206 @@
+[
+  {
+    "name": "ordered-run-turn-and-text-golden",
+    "scenarios": ["golden"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "1", "sourceEventId": "source-1-start", "occurredAtMs": 1000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "2", "sourceEventId": "run-1-running", "occurredAtMs": 1010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-1", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2", "runState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "3", "sourceEventId": "turn-1-running", "occurredAtMs": 1020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3", "turnState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "4", "sourceEventId": "entry-user-1", "occurredAtMs": 1030, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-user-1", "runId": "run-1", "turnId": "turn-1", "role": "user", "text": "continue", "commandId": "command-1" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "4", "entryCount": 1 }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "5", "sourceEventId": "entry-agent-1", "occurredAtMs": 1040, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-agent-1", "runId": "run-1", "turnId": "turn-1", "role": "agent", "text": "Working on it", "commandId": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "5", "entryCount": 2 }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "6", "sourceEventId": "turn-1-waiting", "occurredAtMs": 1050, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "waiting_for_user", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "6", "turnState": "waiting_for_user" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "7", "sourceEventId": "run-1-waiting", "occurredAtMs": 1060, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-1", "turnId": null, "state": "waiting_for_user", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "7", "runState": "waiting_for_user" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "8", "sourceEventId": "run-1-running-again", "occurredAtMs": 1070, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-1", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "8", "runState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "9", "sourceEventId": "turn-1-running-again", "occurredAtMs": 1080, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "9", "turnState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "10", "sourceEventId": "turn-1-completed", "occurredAtMs": 1090, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "10", "turnState": "completed" }
+      },
+      {
+        "input": { "sourceEpoch": "source-1", "sourceSeq": "11", "sourceEventId": "run-1-completed", "occurredAtMs": 1100, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-1", "turnId": null, "state": "completed", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "11", "runState": "completed" }
+      }
+    ]
+  },
+  {
+    "name": "source-dedupe-and-entry-id-not-text",
+    "scenarios": ["duplicate", "entry-identity"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "1", "sourceEventId": "source-2-start", "occurredAtMs": 2000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "2", "sourceEventId": "run-2-running", "occurredAtMs": 2010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-2", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2" }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "3", "sourceEventId": "turn-2-running", "occurredAtMs": 2020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-2", "turnId": "turn-2", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3" }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "4", "sourceEventId": "same-text-first", "occurredAtMs": 2030, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-a", "runId": "run-2", "turnId": "turn-2", "role": "agent", "text": "same text", "commandId": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "4", "entryCount": 1 }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "4", "sourceEventId": "same-text-first", "occurredAtMs": 2030, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-a", "runId": "run-2", "turnId": "turn-2", "role": "agent", "text": "same text", "commandId": null } },
+        "expect": { "disposition": "duplicate", "agentEventSeq": "4", "entryCount": 1 }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "5", "sourceEventId": "same-text-second", "occurredAtMs": 2040, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-b", "runId": "run-2", "turnId": "turn-2", "role": "agent", "text": "same text", "commandId": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "5", "entryCount": 2 }
+      },
+      {
+        "input": { "sourceEpoch": "source-2", "sourceSeq": "6", "sourceEventId": "entry-a-conflict", "occurredAtMs": 2050, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-a", "runId": "run-2", "turnId": "turn-2", "role": "agent", "text": "changed text", "commandId": null } },
+        "expect": { "disposition": "entry_id_conflict", "agentEventSeq": "5", "entryCount": 2 }
+      }
+    ]
+  },
+  {
+    "name": "source-gap-requires-ordered-replay",
+    "scenarios": ["out-of-order"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-3", "sourceSeq": "1", "sourceEventId": "source-3-start", "occurredAtMs": 3000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-3", "sourceSeq": "3", "sourceEventId": "turn-too-early", "occurredAtMs": 3020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "running", "failure": null } },
+        "expect": { "disposition": "source_gap", "agentEventSeq": "1", "expectedSourceSeq": "2" }
+      },
+      {
+        "input": { "sourceEpoch": "source-3", "sourceSeq": "2", "sourceEventId": "run-3-running", "occurredAtMs": 3010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-3", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2", "runState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-3", "sourceSeq": "3", "sourceEventId": "turn-too-early", "occurredAtMs": 3020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-3", "turnId": "turn-3", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3", "turnState": "running" }
+      }
+    ]
+  },
+  {
+    "name": "restart-fences-late-old-terminal",
+    "scenarios": ["agent-restart", "late-terminal"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-old", "sourceSeq": "1", "sourceEventId": "source-old-start", "occurredAtMs": 4000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-old", "sourceSeq": "2", "sourceEventId": "run-old-running", "occurredAtMs": 4010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-old", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2" }
+      },
+      {
+        "input": { "sourceEpoch": "source-old", "sourceSeq": "3", "sourceEventId": "turn-old-running", "occurredAtMs": 4020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-old", "turnId": "turn-old", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3" }
+      },
+      {
+        "input": { "sourceEpoch": "source-new", "sourceSeq": "1", "sourceEventId": "source-new-start", "occurredAtMs": 4100, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "4", "activeSourceEpoch": "source-new" }
+      },
+      {
+        "input": { "sourceEpoch": "source-old", "sourceSeq": "4", "sourceEventId": "turn-old-completed-late", "occurredAtMs": 4110, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-old", "turnId": "turn-old", "state": "completed", "failure": null } },
+        "expect": { "disposition": "stale_source", "agentEventSeq": "4", "turnState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-new", "sourceSeq": "2", "sourceEventId": "run-new-running", "occurredAtMs": 4120, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-new", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "5", "runState": "running" }
+      }
+    ]
+  },
+  {
+    "name": "terminal-state-and-illegal-transition-fail-closed",
+    "scenarios": ["invalid-transition", "late-terminal"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "1", "sourceEventId": "source-5-start", "occurredAtMs": 5000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "2", "sourceEventId": "new-run-waiting", "occurredAtMs": 5010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-invalid", "turnId": null, "state": "waiting_for_user", "failure": null } },
+        "expect": { "disposition": "invalid_transition", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "2", "sourceEventId": "run-5-running", "occurredAtMs": 5020, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-5", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2" }
+      },
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "3", "sourceEventId": "run-5-completed", "occurredAtMs": 5030, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-5", "turnId": null, "state": "completed", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3", "runState": "completed" }
+      },
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "4", "sourceEventId": "run-5-completed-again", "occurredAtMs": 5040, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-5", "turnId": null, "state": "completed", "failure": null } },
+        "expect": { "disposition": "redundant_terminal", "agentEventSeq": "3", "runState": "completed" }
+      },
+      {
+        "input": { "sourceEpoch": "source-5", "sourceSeq": "5", "sourceEventId": "run-5-failed-late", "occurredAtMs": 5050, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-5", "turnId": null, "state": "failed", "failure": { "code": "late", "summary": null } } },
+        "expect": { "disposition": "terminal_conflict", "agentEventSeq": "3", "runState": "completed" }
+      }
+    ]
+  },
+  {
+    "name": "redaction-delete-and-old-replay-do-not-resurrect",
+    "scenarios": ["redaction-delete", "duplicate"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "1", "sourceEventId": "source-6-start", "occurredAtMs": 6000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "2", "sourceEventId": "run-6-running", "occurredAtMs": 6010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-6", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "3", "sourceEventId": "turn-6-running", "occurredAtMs": 6020, "mutation": { "mutationType": "lifecycle.changed", "scope": "turn", "runId": "run-6", "turnId": "turn-6", "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "4", "sourceEventId": "entry-sensitive", "occurredAtMs": 6030, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-sensitive", "runId": "run-6", "turnId": "turn-6", "role": "user", "text": "sensitive text", "commandId": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "4", "entryState": "visible" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "5", "sourceEventId": "entry-sensitive-redact", "occurredAtMs": 6040, "mutation": { "mutationType": "entry.redacted", "entryId": "entry-sensitive", "reason": "user_request" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "5", "entryState": "redacted" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "6", "sourceEventId": "entry-sensitive-delete", "occurredAtMs": 6050, "mutation": { "mutationType": "entry.deleted", "entryId": "entry-sensitive", "reason": "policy" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "6", "entryState": "deleted" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "4", "sourceEventId": "entry-sensitive", "occurredAtMs": 6030, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-sensitive", "runId": "run-6", "turnId": "turn-6", "role": "user", "text": "sensitive text", "commandId": null } },
+        "expect": { "disposition": "duplicate", "agentEventSeq": "6", "entryState": "deleted" }
+      },
+      {
+        "input": { "sourceEpoch": "source-6", "sourceSeq": "7", "sourceEventId": "entry-sensitive-recreate", "occurredAtMs": 6060, "mutation": { "mutationType": "text_entry.appended", "entryId": "entry-sensitive", "runId": "run-6", "turnId": "turn-6", "role": "user", "text": "new text", "commandId": null } },
+        "expect": { "disposition": "entry_deleted", "agentEventSeq": "6", "entryState": "deleted" }
+      }
+    ]
+  }
+]

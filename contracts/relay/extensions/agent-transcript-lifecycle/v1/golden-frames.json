@@ -1,0 +1,74 @@
+[
+  {
+    "name": "status-get",
+    "direction": "client-to-host",
+    "type": "agent.timeline.status.get",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.status.get\",\"requestId\":\"agent-status-1\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{}}"
+  },
+  {
+    "name": "status-available",
+    "direction": "host-to-client",
+    "type": "agent.timeline.status",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.status\",\"requestId\":\"agent-status-1\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"support\":\"available\",\"reason\":null,\"liveSource\":\"connected\",\"activeSourceEpoch\":\"source-1\",\"timelineEpoch\":\"timeline-1\",\"currentAgentSeq\":\"8\",\"earliestReplaySeq\":\"1\",\"limits\":{\"maxTextUtf8Bytes\":65536,\"maxPageRecords\":256,\"eventReplayRetentionMs\":604800000,\"snapshotLeaseMs\":300000}}}"
+  },
+  {
+    "name": "status-unsupported-agent",
+    "direction": "host-to-client",
+    "type": "agent.timeline.status",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.status\",\"requestId\":\"agent-status-2\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-shell\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"support\":\"unavailable\",\"reason\":\"agent_unsupported\",\"liveSource\":\"absent\",\"activeSourceEpoch\":null,\"timelineEpoch\":null,\"currentAgentSeq\":null,\"earliestReplaySeq\":null,\"limits\":null}}"
+  },
+  {
+    "name": "snapshot-get-first-page",
+    "direction": "client-to-host",
+    "type": "agent.timeline.snapshot.get",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.snapshot.get\",\"requestId\":\"agent-snapshot-attempt-1\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"snapshotRequestId\":\"agent-snapshot-logical-1\",\"snapshotId\":null,\"cursor\":null,\"nextPageIndex\":0}}"
+  },
+  {
+    "name": "snapshot-page-materialized",
+    "direction": "host-to-client",
+    "type": "agent.timeline.snapshot.page",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"agent-snapshot-attempt-1\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"agent-snapshot-logical-1\",\"snapshotId\":\"agent-snapshot-cut-1\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"8\",\"earliestRetainedSeq\":\"1\",\"records\":[{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-2\",\"sourceEpoch\":\"source-1\",\"scope\":\"run\",\"runId\":\"run-1\",\"turnId\":null,\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700100000,\"agentEventSeq\":\"2\"},{\"recordType\":\"text_entry\",\"entryId\":\"entry-user-1\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"role\":\"user\",\"state\":\"visible\",\"text\":\"Please inspect the failure\",\"redactionReason\":null,\"commandId\":\"command-1\",\"createdAtMs\":1783700200000,\"createdAgentSeq\":\"3\",\"lastModifiedAgentSeq\":\"3\"},{\"recordType\":\"text_entry\",\"entryId\":\"entry-agent-1\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"role\":\"agent\",\"state\":\"redacted\",\"text\":null,\"redactionReason\":\"policy\",\"commandId\":null,\"createdAtMs\":1783700250000,\"createdAgentSeq\":\"5\",\"lastModifiedAgentSeq\":\"6\"},{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-8\",\"sourceEpoch\":\"source-1\",\"scope\":\"turn\",\"runId\":\"run-1\",\"turnId\":\"turn-1\",\"state\":\"completed\",\"failure\":null,\"occurredAtMs\":1783700300000,\"agentEventSeq\":\"8\"}]}}"
+  },
+  {
+    "name": "replay-get",
+    "direction": "client-to-host",
+    "type": "agent.timeline.replay.get",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.replay.get\",\"requestId\":\"agent-replay-1\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"timelineEpoch\":\"timeline-1\",\"afterAgentSeq\":\"8\",\"cursor\":null,\"limit\":256}}"
+  },
+  {
+    "name": "replay-page-lifecycle-and-entry",
+    "direction": "host-to-client",
+    "type": "agent.timeline.replay.page",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.replay.page\",\"requestId\":\"agent-replay-1\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"afterAgentSeq\":\"8\",\"replayThroughAgentSeq\":\"11\",\"isLast\":true,\"nextCursor\":null,\"events\":[{\"agentEventSeq\":\"9\",\"eventId\":\"event-9\",\"occurredAtMs\":1783700400000,\"mutation\":{\"mutationType\":\"lifecycle.changed\",\"lifecycle\":{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-9\",\"sourceEpoch\":\"source-2\",\"scope\":\"turn\",\"runId\":\"run-2\",\"turnId\":\"turn-2\",\"state\":\"waiting_for_user\",\"failure\":null,\"occurredAtMs\":1783700400000,\"agentEventSeq\":\"9\"}}},{\"agentEventSeq\":\"10\",\"eventId\":\"event-10\",\"occurredAtMs\":1783700500000,\"mutation\":{\"mutationType\":\"text_entry.appended\",\"entry\":{\"recordType\":\"text_entry\",\"entryId\":\"entry-agent-2\",\"runId\":\"run-2\",\"turnId\":\"turn-2\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"Which environment should I inspect?\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700500000,\"createdAgentSeq\":\"10\",\"lastModifiedAgentSeq\":\"10\"}}},{\"agentEventSeq\":\"11\",\"eventId\":\"event-11\",\"occurredAtMs\":1783700600000,\"mutation\":{\"mutationType\":\"source.availability\",\"state\":\"interrupted\",\"sourceEpoch\":\"source-2\",\"reason\":\"source_disconnected\"}}]}}"
+  },
+  {
+    "name": "live-entry-redacted",
+    "direction": "host-to-client",
+    "type": "agent.timeline.event",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"12\",\"eventId\":\"event-12\",\"occurredAtMs\":1783700700000,\"mutation\":{\"mutationType\":\"entry.redacted\",\"entryId\":\"entry-user-1\",\"reason\":\"user_request\"}}}"
+  },
+  {
+    "name": "live-entry-deleted",
+    "direction": "host-to-client",
+    "type": "agent.timeline.event",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"13\",\"eventId\":\"event-13\",\"occurredAtMs\":1783700800000,\"mutation\":{\"mutationType\":\"entry.deleted\",\"entryId\":\"entry-agent-1\",\"reason\":\"retention\"}}}"
+  },
+  {
+    "name": "live-run-failed",
+    "direction": "host-to-client",
+    "type": "agent.timeline.event",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"14\",\"eventId\":\"event-14\",\"occurredAtMs\":1783700900000,\"mutation\":{\"mutationType\":\"lifecycle.changed\",\"lifecycle\":{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-14\",\"sourceEpoch\":\"source-startup\",\"scope\":\"run\",\"runId\":\"run-startup\",\"turnId\":null,\"state\":\"failed\",\"failure\":{\"code\":\"agent_start_failed\",\"summary\":null},\"occurredAtMs\":1783700900000,\"agentEventSeq\":\"14\"}}}}"
+  },
+  {
+    "name": "timeline-deleted-reset",
+    "direction": "host-to-client",
+    "type": "agent.timeline.reset",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.reset\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"previousTimelineEpoch\":\"timeline-1\",\"newTimelineEpoch\":\"timeline-2\",\"reason\":\"deleted\"}}"
+  },
+  {
+    "name": "timeline-store-reset-unavailable",
+    "direction": "host-to-client",
+    "type": "agent.timeline.reset",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.reset\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"previousTimelineEpoch\":\"timeline-2\",\"newTimelineEpoch\":null,\"reason\":\"store_reset\"}}"
+  }
+]
