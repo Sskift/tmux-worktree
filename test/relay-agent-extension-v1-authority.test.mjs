@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
@@ -36,6 +37,27 @@ const noCommitDispositions = new Set([
   "entry_deleted",
 ]);
 
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => (
+    `${JSON.stringify(key)}:${canonicalJson(value[key])}`
+  )).join(",")}}`;
+}
+
+function canonicalBytes(value) {
+  return Buffer.byteLength(canonicalJson(value), "utf8");
+}
+
+function eventIdForTest(agentEventSeq) {
+  const digest = createHash("sha256").update(canonicalJson({
+    kind: "relay-agent-authority-event-v1",
+    ...binding,
+    agentEventSeq,
+  })).digest("hex");
+  return `agent-event-${digest}`;
+}
+
 function sourceEvent(sourceSeq, sourceEventId, mutation, sourceEpoch = "source-main", occurredAtMs = 1_000) {
   return { sourceEpoch, sourceSeq, sourceEventId, occurredAtMs, mutation };
 }
@@ -44,6 +66,88 @@ function apply(state, input, disposition = "applied") {
   const reduction = authority.reduceRelayAgentAuthority(state, input, trustedAdapterBinding);
   assert.equal(reduction.disposition, disposition);
   return reduction;
+}
+
+function buildBudgetState(capacityOverride) {
+  let state = authority.createRelayAgentAuthorityState(binding, capacityOverride);
+  let sourceSeq = 1;
+  const ingest = (sourceEventId, mutation) => {
+    state = apply(state, sourceEvent(String(sourceSeq), sourceEventId, mutation)).state;
+    sourceSeq += 1;
+  };
+  ingest("budget-map-start", { mutationType: "source.started" });
+  for (const suffix of ["one", "two"]) {
+    const runId = `budget-map-run-${suffix}`;
+    const turnId = `budget-map-turn-${suffix}`;
+    ingest(`budget-map-run-${suffix}`, {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId,
+      turnId: null,
+      state: "running",
+      failure: null,
+    });
+    ingest(`budget-map-turn-${suffix}`, {
+      mutationType: "lifecycle.changed",
+      scope: "turn",
+      runId,
+      turnId,
+      state: "running",
+      failure: null,
+    });
+    ingest(`budget-map-visible-${suffix}`, {
+      mutationType: "text_entry.appended",
+      entryId: `budget-map-visible-${suffix}`,
+      runId,
+      turnId,
+      role: "agent",
+      text: `visible ${suffix}`,
+      commandId: null,
+    });
+    ingest(`budget-map-doomed-${suffix}`, {
+      mutationType: "text_entry.appended",
+      entryId: `budget-map-doomed-${suffix}`,
+      runId,
+      turnId,
+      role: "agent",
+      text: `doomed ${suffix}`,
+      commandId: null,
+    });
+    ingest(`budget-map-delete-${suffix}`, {
+      mutationType: "entry.deleted",
+      entryId: `budget-map-doomed-${suffix}`,
+      reason: "retention",
+    });
+  }
+  state = apply(state, sourceEvent(
+    "1",
+    "budget-map-second-source",
+    { mutationType: "source.started" },
+    "budget-map-source-two",
+  )).state;
+  return state;
+}
+
+function callWithMutableInputProbe(input, operation) {
+  const inputBefore = structuredClone(input);
+  const serializedBefore = JSON.stringify(input);
+  const rootSentinel = Symbol("root-sentinel");
+  const mutationSentinel = Symbol("mutation-sentinel");
+  Object.defineProperty(input, rootSentinel, { value: "before", writable: true, configurable: true });
+  Object.defineProperty(input.mutation, mutationSentinel, { value: "before", writable: true, configurable: true });
+  try {
+    return { inputBefore, value: operation() };
+  } finally {
+    assert.equal(JSON.stringify(input), serializedBefore, "reducer must not mutate caller source input");
+    assert.equal(Object.getOwnPropertyDescriptor(input, rootSentinel).writable, true);
+    assert.equal(Object.getOwnPropertyDescriptor(input.mutation, mutationSentinel).writable, true);
+    input[rootSentinel] = "after";
+    input.mutation[mutationSentinel] = "after";
+    assert.equal(input[rootSentinel], "after");
+    assert.equal(input.mutation[mutationSentinel], "after");
+    assert.equal(delete input[rootSentinel], true);
+    assert.equal(delete input.mutation[mutationSentinel], true);
+  }
 }
 
 function stateSnapshot(state) {
@@ -70,8 +174,44 @@ function stateSnapshot(state) {
   });
 }
 
+function snapshotHeader(snapshot) {
+  return {
+    schemaVersion: snapshot.schemaVersion,
+    binding: snapshot.binding,
+    limits: snapshot.limits,
+    agentEventSeq: snapshot.agentEventSeq,
+    activeSourceEpoch: snapshot.activeSourceEpoch,
+    activeSourceAvailability: snapshot.activeSourceAvailability,
+    sources: [],
+    dedupe: [],
+    runs: [],
+    turns: [],
+    activeTurns: [],
+    entries: [],
+    deletedEntries: [],
+  };
+}
+
+function snapshotResourceBytes(items, keyOf) {
+  return items.reduce((total, item, index) => (
+    total + canonicalBytes({ key: keyOf(item), value: item.value }) + (index === 0 ? 0 : 1)
+  ), 0);
+}
+
 function restoreState(snapshot) {
   return authority.restoreRelayAgentAuthorityState(snapshot, binding);
+}
+
+function assertRestoreRejectsWithoutMutation(snapshot, label) {
+  const before = JSON.stringify(snapshot);
+  assert.throws(
+    () => restoreState(snapshot),
+    (error) => error instanceof authority.RelayAgentAuthorityRestoreError
+      || error instanceof authority.RelayAgentAuthorityCapacityError,
+    label,
+  );
+  assert.equal(JSON.stringify(snapshot), before, `${label} leaves caller snapshot unchanged`);
+  assert.equal(Object.isFrozen(snapshot), false, `${label} leaves caller snapshot mutable`);
 }
 
 function applyFixtureArrangement(state, arrange, label) {
@@ -201,12 +341,11 @@ test("shared authority machine cases drive the production reducer and consume ev
       state = applyFixtureArrangement(state, step.arrange, `${fixture.name}[${index}]`);
       const before = state;
       const beforeJson = JSON.stringify(stateSnapshot(before));
-      const reduction = authority.reduceRelayAgentAuthority(
-        before,
+      const { inputBefore, value: reduction } = callWithMutableInputProbe(
         step.input,
-        trustedAdapterBinding,
+        () => authority.reduceRelayAgentAuthority(before, step.input, trustedAdapterBinding),
       );
-      const observed = expectedObservation(reduction, step.input);
+      const observed = expectedObservation(reduction, inputBefore);
 
       for (const [key, expected] of Object.entries(step.expect)) {
         assert.ok(Object.hasOwn(observed, key), `${fixture.name}[${index}] consumes expect.${key}`);
@@ -218,24 +357,24 @@ test("shared authority machine cases drive the production reducer and consume ev
         assert.notEqual(reduction.state, before, `${fixture.name}[${index}] must return a new state`);
         assert.ok(reduction.publicEvent, `${fixture.name}[${index}] public event`);
         assert.equal(reduction.publicEvent.agentEventSeq, reduction.state.agentEventSeq);
-        assert.notEqual(reduction.publicEvent.eventId, step.input.sourceEventId);
+        assert.notEqual(reduction.publicEvent.eventId, inputBefore.sourceEventId);
         assertPublicProjection(
           reduction,
           before,
-          step.input,
+          inputBefore,
           knownEntryTexts,
           `${fixture.name}[${index}]`,
         );
-        if (step.input.mutation.mutationType === "lifecycle.changed") {
+        if (inputBefore.mutation.mutationType === "lifecycle.changed") {
           assert.equal(reduction.publicEvent.mutation.lifecycle.lifecycleEventId, reduction.publicEvent.eventId);
-          assert.notEqual(reduction.publicEvent.mutation.lifecycle.lifecycleEventId, step.input.sourceEventId);
+          assert.notEqual(reduction.publicEvent.mutation.lifecycle.lifecycleEventId, inputBefore.sourceEventId);
         }
       } else if (reduction.disposition === "redundant_terminal") {
         assert.notEqual(reduction.state, before, `${fixture.name}[${index}] must consume source cursor`);
         assert.equal(reduction.publicEvent, null);
       } else if (reduction.disposition === "source_event_conflict") {
         assert.equal(reduction.publicEvent, null);
-        assert.equal(reduction.state.sources.get(step.input.sourceEpoch).fenced, true);
+        assert.equal(reduction.state.sources.get(inputBefore.sourceEpoch).fenced, true);
       } else if (noCommitDispositions.has(reduction.disposition)) {
         assert.equal(reduction.state, before, `${fixture.name}[${index}] must not half-commit`);
         assert.equal(reduction.publicEvent, null);
@@ -349,19 +488,13 @@ test("plain snapshots require the explicit closed restore boundary", () => {
   assert.equal(JSON.stringify(plain), beforePlain);
 
   const corruptions = [
-    (snapshot) => { snapshot.unknown = true; },
-    (snapshot) => { snapshot.schemaVersion = 0; },
-    (snapshot) => { snapshot.agentEventSeq = "04"; },
-    (snapshot) => { snapshot.sources[0].key = "wrong-source"; },
-    (snapshot) => { snapshot.dedupe[0].key.sourceEventId = "wrong-event"; },
-    (snapshot) => { snapshot.runs[0].value.lifecycle.state = "completed"; },
-    (snapshot) => { snapshot.turns[0].key.runId = "wrong-run"; },
-    (snapshot) => { snapshot.activeTurns = []; },
-    (snapshot) => {
-      snapshot.entries[0].value.createdAgentSeq = "5";
-      snapshot.entries[0].value.lastModifiedAgentSeq = "5";
-    },
-    (snapshot) => {
+    ["closed schema", (snapshot) => { snapshot.unknown = true; }],
+    ["schema downgrade", (snapshot) => { snapshot.schemaVersion = 0; }],
+    ["source/dedupe cursor binding", (snapshot) => {
+      snapshot.dedupe[0].value.sourceSeq = "5";
+    }],
+    ["run/turn/active index mirror", (snapshot) => { snapshot.activeTurns = []; }],
+    ["entry/tombstone identity", (snapshot) => {
       snapshot.deletedEntries.push({
         key: "restore-entry",
         value: {
@@ -371,19 +504,34 @@ test("plain snapshots require the explicit closed restore boundary", () => {
           deletedAgentSeq: "4",
         },
       });
-    },
-    (snapshot) => { snapshot.limits.maxDedupeEvidenceCount = 1; },
-    (snapshot) => { snapshot.limits.maxDedupeCanonicalBytes = 1; },
+    }],
+    ["public sequence reuse", (snapshot) => {
+      snapshot.entries[0].value.createdAgentSeq = "2";
+      snapshot.entries[0].value.lastModifiedAgentSeq = "2";
+    }],
+    ["final public watermark", (snapshot) => { snapshot.agentEventSeq = "5"; }],
   ];
-  for (const corrupt of corruptions) {
+  for (const [label, corrupt] of corruptions) {
     const corrupted = structuredClone(plain);
     corrupt(corrupted);
-    assert.throws(
-      () => restoreState(corrupted),
-      (error) => error instanceof authority.RelayAgentAuthorityRestoreError
-        || error instanceof authority.RelayAgentAuthorityCapacityError,
-    );
+    assertRestoreRejectsWithoutMutation(corrupted, label);
   }
+
+  const missingActive = structuredClone(plain);
+  missingActive.activeSourceEpoch = null;
+  missingActive.activeSourceAvailability = null;
+  assertRestoreRejectsWithoutMutation(missingActive, "nonempty sources require an active source");
+
+  const dualSourceState = apply(state, sourceEvent(
+    "1",
+    "restore-new-source",
+    { mutationType: "source.started" },
+    "restore-source-new",
+  )).state;
+  const rolledBackActive = stateSnapshot(dualSourceState);
+  rolledBackActive.activeSourceEpoch = "source-main";
+  rolledBackActive.activeSourceAvailability = "connected";
+  assertRestoreRejectsWithoutMutation(rolledBackActive, "active source cannot roll back to an older activation");
   assert.throws(
     () => authority.restoreRelayAgentAuthorityState(
       plain,
@@ -636,6 +784,73 @@ test("text bytes and domain records have independent fail-closed budgets", () =>
   assert.equal(runState.runs.size, 1);
 });
 
+test("all resource count and canonical-byte budgets map to snapshot indexes", () => {
+  const state = buildBudgetState();
+  const snapshot = stateSnapshot(state);
+  const rows = [
+    ["sources", "sources", "sourceCount", "sourceCanonicalBytes", "maxSourceCount", "maxSourceCanonicalBytes", (item) => item.key],
+    ["dedupe", "dedupe", "dedupeEvidenceCount", "dedupeCanonicalBytes", "maxDedupeEvidenceCount", "maxDedupeCanonicalBytes", (item) => canonicalJson([item.key.sourceEpoch, item.key.sourceEventId])],
+    ["runs", "runs", "runCount", "runCanonicalBytes", "maxRunCount", "maxRunCanonicalBytes", (item) => item.key],
+    ["turns", "turns", "turnCount", "turnCanonicalBytes", "maxTurnCount", "maxTurnCanonicalBytes", (item) => canonicalJson([item.key.runId, item.key.turnId])],
+    ["entries", "entries", "entryCount", "entryCanonicalBytes", "maxEntryCount", "maxEntryCanonicalBytes", (item) => item.key],
+    ["tombstones", "deletedEntries", "tombstoneCount", "tombstoneCanonicalBytes", "maxTombstoneCount", "maxTombstoneCanonicalBytes", (item) => item.key],
+    ["activeTurns", "activeTurns", "activeTurnIndexCount", "activeTurnIndexCanonicalBytes", "maxActiveTurnIndexCount", "maxActiveTurnIndexCanonicalBytes", (item) => item.key],
+  ];
+
+  let independentResourceTotal = 0;
+  for (const [resource, snapshotField, countField, byteField, countLimit, byteLimit, keyOf] of rows) {
+    const items = snapshot[snapshotField];
+    const independentBytes = snapshotResourceBytes(items, keyOf);
+    assert.equal(state.usage[countField], items.length, `${resource} count mapping`);
+    assert.equal(state.usage[byteField], independentBytes, `${resource} byte mapping`);
+    independentResourceTotal += independentBytes;
+
+    const exact = structuredClone(snapshot);
+    exact.limits[countLimit] = items.length;
+    exact.limits[byteLimit] = independentBytes;
+    const exactState = restoreState(exact);
+    assert.equal(exactState.usage[countField], exactState.limits[countLimit], `${resource} exact count limit`);
+    assert.equal(exactState.usage[byteField], exactState.limits[byteLimit], `${resource} exact byte limit`);
+
+    const oneOverCount = structuredClone(exact);
+    oneOverCount.limits[countLimit] -= 1;
+    assertRestoreRejectsWithoutMutation(oneOverCount, `${resource} count +1 is unavailable`);
+    const oneOverBytes = structuredClone(exact);
+    oneOverBytes.limits[byteLimit] -= 1;
+    assertRestoreRejectsWithoutMutation(oneOverBytes, `${resource} canonical bytes +1 is unavailable`);
+  }
+  assert.equal(
+    state.usage.totalCanonicalBytes,
+    independentResourceTotal + canonicalBytes(snapshotHeader(snapshot)),
+    "total canonical bytes include every resource and the closed state header",
+  );
+
+  const exactTotalSnapshot = structuredClone(snapshot);
+  let exactTotal = state.usage.totalCanonicalBytes;
+  for (let iteration = 0; iteration < 4; iteration += 1) {
+    exactTotalSnapshot.limits.maxCanonicalBytes = exactTotal;
+    exactTotal = independentResourceTotal + canonicalBytes(snapshotHeader(exactTotalSnapshot));
+  }
+  assert.equal(exactTotalSnapshot.limits.maxCanonicalBytes, exactTotal, "total limit accounting converges");
+  const exactTotalState = buildBudgetState({ maxCanonicalBytes: exactTotal });
+  assert.equal(exactTotalState.usage.totalCanonicalBytes, exactTotal, "final transition commits exactly at total budget");
+  const exactTotalBefore = JSON.stringify(stateSnapshot(exactTotalState));
+  const oneOverInput = sourceEvent("2", "budget-map-total-overflow", {
+    mutationType: "source.availability",
+    state: "interrupted",
+    reason: "source_disconnected",
+  }, "budget-map-source-two");
+  assert.throws(
+    () => callWithMutableInputProbe(
+      oneOverInput,
+      () => authority.reduceRelayAgentAuthority(exactTotalState, oneOverInput, trustedAdapterBinding),
+    ),
+    (error) => error instanceof authority.RelayAgentAuthorityCapacityError
+      && error.resource === "total_canonical_bytes",
+  );
+  assert.equal(JSON.stringify(stateSnapshot(exactTotalState)), exactTotalBefore);
+});
+
 test("dedupe expiry cannot free saturated domain capacity", () => {
   let state = authority.createRelayAgentAuthorityState(binding, { maxRunCount: 1 });
   state = apply(state, sourceEvent("1", "domain-cap-start", { mutationType: "source.started" })).state;
@@ -727,6 +942,95 @@ test("rejected ordered events leave no cursor evidence, while redundant terminal
   })).state;
   assert.equal(state.sources.get("source-main").lastSourceSeq, "5");
   assert.equal(state.agentEventSeq, "4");
+});
+
+test("UINT64 public sequence exhaustion preserves non-public dispositions", () => {
+  let terminal = authority.createRelayAgentAuthorityState(binding);
+  terminal = apply(terminal, sourceEvent("1", "max-start", { mutationType: "source.started" })).state;
+  terminal = apply(terminal, sourceEvent("2", "max-running", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "max-run",
+    turnId: null,
+    state: "running",
+    failure: null,
+  })).state;
+  terminal = apply(terminal, sourceEvent("3", "max-completed", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "max-run",
+    turnId: null,
+    state: "completed",
+    failure: null,
+  })).state;
+  const snapshot = stateSnapshot(terminal);
+  const maxSequence = "18446744073709551615";
+  snapshot.agentEventSeq = maxSequence;
+  snapshot.runs[0].value.lifecycle.agentEventSeq = maxSequence;
+  snapshot.runs[0].value.lifecycle.lifecycleEventId = eventIdForTest(maxSequence);
+  const maxState = restoreState(snapshot);
+  const before = JSON.stringify(stateSnapshot(maxState));
+
+  const cases = [
+    ["redundant_terminal", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "max-run",
+      turnId: null,
+      state: "completed",
+      failure: null,
+    }],
+    ["invalid_transition", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "max-run",
+      turnId: null,
+      state: "waiting_for_user",
+      failure: null,
+    }],
+    ["terminal_conflict", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "max-run",
+      turnId: null,
+      state: "failed",
+      failure: { code: "different-terminal", summary: null },
+    }],
+  ];
+  for (const [disposition, mutation] of cases) {
+    const input = sourceEvent("4", `max-${disposition}`, mutation);
+    const { value: reduction } = callWithMutableInputProbe(
+      input,
+      () => authority.reduceRelayAgentAuthority(maxState, input, trustedAdapterBinding),
+    );
+    assert.equal(reduction.disposition, disposition);
+    assert.equal(reduction.agentEventSeq, maxSequence);
+    assert.equal(reduction.publicEvent, null);
+    if (disposition === "redundant_terminal") {
+      assert.notEqual(reduction.state, maxState);
+      assert.equal(reduction.state.sources.get("source-main").lastSourceSeq, "4");
+    } else {
+      assert.equal(reduction.state, maxState);
+    }
+  }
+
+  const appliedInput = sourceEvent("4", "max-applied", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-needs-public-sequence",
+    turnId: null,
+    state: "running",
+    failure: null,
+  });
+  assert.throws(
+    () => callWithMutableInputProbe(
+      appliedInput,
+      () => authority.reduceRelayAgentAuthority(maxState, appliedInput, trustedAdapterBinding),
+    ),
+    (error) => error instanceof authority.RelayAgentAuthorityStateError
+      && error.message.includes("agentEventSeq is exhausted"),
+  );
+  assert.equal(JSON.stringify(stateSnapshot(maxState)), before);
 });
 
 test("run, turn, entry, and terminal prerequisites can be corrected at the same sourceSeq", () => {

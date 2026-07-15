@@ -963,6 +963,36 @@ function commitState(
   resourceUsage: Readonly<RelayAgentAuthorityUsage>,
 ): RelayAgentAuthorityState {
   const candidate = { ...state, ...updates } as RelayAgentAuthorityState;
+  const active = candidate.activeSourceEpoch === null
+    ? undefined
+    : candidate.sources.get(candidate.activeSourceEpoch);
+  if (
+    (candidate.sources.size === 0) !== (candidate.activeSourceEpoch === null)
+    || (candidate.activeSourceEpoch === null) !== (candidate.activeSourceAvailability === null)
+    || (candidate.activeSourceEpoch !== null && active === undefined)
+    || (active !== undefined && active.availability !== candidate.activeSourceAvailability)
+  ) {
+    throw new RelayAgentAuthorityStateError("active source mirror invariant failed");
+  }
+  if (candidate.activeSourceEpoch !== state.activeSourceEpoch) {
+    if (
+      candidate.activeSourceEpoch === null
+      || state.sources.get(candidate.activeSourceEpoch) !== undefined
+      || candidate.sources.size !== state.sources.size + 1
+      || active?.availabilityAgentEventSeq !== candidate.agentEventSeq
+    ) {
+      throw new RelayAgentAuthorityStateError("active source activation invariant failed");
+    }
+  } else if (active !== undefined) {
+    const previousActive = state.sources.get(active.sourceEpoch);
+    if (
+      previousActive !== undefined
+      && active.availabilityAgentEventSeq !== previousActive.availabilityAgentEventSeq
+      && active.availabilityAgentEventSeq !== candidate.agentEventSeq
+    ) {
+      throw new RelayAgentAuthorityStateError("active source availability invariant failed");
+    }
+  }
   const usage = {
     ...resourceUsage,
     totalCanonicalBytes: resourceUsage.totalCanonicalBytes
@@ -1330,6 +1360,8 @@ export function restoreRelayAgentAuthorityState(
       if (BigInt(sequence) > maxObservedSequence) maxObservedSequence = BigInt(sequence);
     };
 
+    let latestAvailabilitySequence = 0n;
+    let latestAvailabilitySourceEpoch: string | null = null;
     for (const [index, item] of asArray(snapshot.sources, "snapshot.sources").entries()) {
       const keyed = asClosedObject(item, `snapshot.sources[${index}]`, ["key", "value"]);
       const key = parseOpaqueId(keyed.key, `snapshot.sources[${index}].key`);
@@ -1340,13 +1372,24 @@ export function restoreRelayAgentAuthorityState(
         restoreFailure(`snapshot.sources[${index}] availability event mirror mismatch`);
       }
       observeSequence(value.availabilityAgentEventSeq, `source:${key}:availability`);
+      if (BigInt(value.availabilityAgentEventSeq) > latestAvailabilitySequence) {
+        latestAvailabilitySequence = BigInt(value.availabilityAgentEventSeq);
+        latestAvailabilitySourceEpoch = key;
+      }
       [sources, usage] = setIndexed(sources, usage, "sources", key, value);
       assertBudgets(limits, usage);
     }
 
+    if ((sources.size === 0) !== (activeSourceEpoch === null)) {
+      restoreFailure("source collection and active source nullability must match");
+    }
     if (activeSourceEpoch !== null) {
       const active = sources.get(activeSourceEpoch);
-      if (!active || active.availability !== activeSourceAvailability) {
+      if (
+        !active
+        || active.availability !== activeSourceAvailability
+        || latestAvailabilitySourceEpoch !== activeSourceEpoch
+      ) {
         restoreFailure("active source mirror is missing or inconsistent");
       }
     }
@@ -1575,6 +1618,23 @@ function unchangedDomain(
   };
 }
 
+function appliedDomainPreflight(state: RelayAgentAuthorityState): DomainReduction {
+  return {
+    ...unchangedDomain(state, "invalid_transition"),
+    disposition: "applied",
+  };
+}
+
+function hasPublicIdentity(
+  agentEventSeq: string | null,
+  eventId: string | null,
+): agentEventSeq is string {
+  if ((agentEventSeq === null) !== (eventId === null)) {
+    throw new RelayAgentAuthorityStateError("public identity allocation is incomplete");
+  }
+  return agentEventSeq !== null;
+}
+
 function lifecycleRecord(
   event: RelayAgentSourceEvent,
   mutation: RelayAgentLifecycleChangedMutation,
@@ -1599,10 +1659,9 @@ function reduceLifecycle(
   state: RelayAgentAuthorityState,
   event: RelayAgentSourceEvent,
   mutation: RelayAgentLifecycleChangedMutation,
-  agentEventSeq: string,
-  eventId: string,
+  agentEventSeq: string | null,
+  eventId: string | null,
 ): DomainReduction {
-  const record = lifecycleRecord(event, mutation, agentEventSeq, eventId);
   let usage = state.usage;
   let runs = state.runs as PersistentStringIndex<RelayAgentRunRecord>;
   let turns = state.turns as PersistentStringIndex<RelayAgentTurnRecord>;
@@ -1611,6 +1670,8 @@ function reduceLifecycle(
     const existing = runs.get(mutation.runId);
     if (!existing) {
       if (mutation.state !== "running") return unchangedDomain(state, "invalid_transition");
+      if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
+      const record = lifecycleRecord(event, mutation, agentEventSeq, eventId!);
       const created = deepFreeze({
         runId: mutation.runId,
         sourceEpoch: event.sourceEpoch,
@@ -1643,6 +1704,8 @@ function reduceLifecycle(
     if (isTerminal(mutation.state) && activeIndex !== undefined) {
       return unchangedDomain(state, "invalid_transition");
     }
+    if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
+    const record = lifecycleRecord(event, mutation, agentEventSeq, eventId!);
     const updated = deepFreeze({ ...existing, state: mutation.state, lifecycle: record });
     [runs, usage] = setIndexed(runs, usage, "runs", mutation.runId, updated);
     return {
@@ -1663,6 +1726,8 @@ function reduceLifecycle(
     if (mutation.state !== "running" || run.state !== "running" || activeTurns.get(run.runId)) {
       return unchangedDomain(state, "invalid_transition");
     }
+    if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
+    const record = lifecycleRecord(event, mutation, agentEventSeq, eventId!);
     const created = deepFreeze({
       turnId,
       runId: mutation.runId,
@@ -1702,6 +1767,8 @@ function reduceLifecycle(
   if (isTerminal(run.state)) return unchangedDomain(state, "invalid_transition");
   const active = activeTurns.get(run.runId);
   if (!active || active.turnId !== turnId) return unchangedDomain(state, "invalid_transition");
+  if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
+  const record = lifecycleRecord(event, mutation, agentEventSeq, eventId!);
   [turns, usage] = setIndexed(turns, usage, "turns", key, deepFreeze({
     ...existing,
     state: mutation.state,
@@ -1724,7 +1791,7 @@ function reduceEntryAppend(
   state: RelayAgentAuthorityState,
   event: RelayAgentSourceEvent,
   mutation: RelayAgentTextEntryAppendedMutation,
-  agentEventSeq: string,
+  agentEventSeq: string | null,
 ): DomainReduction {
   if (state.deletedEntries.get(mutation.entryId)) return unchangedDomain(state, "entry_deleted");
   if (state.entries.get(mutation.entryId)) return unchangedDomain(state, "entry_id_conflict");
@@ -1742,6 +1809,7 @@ function reduceEntryAppend(
     ? turn.state === "running"
     : turn.state === "running" || turn.state === "waiting_for_user";
   if (!allowed) return unchangedDomain(state, "invalid_transition");
+  if (agentEventSeq === null) return appliedDomainPreflight(state);
   const entry: RelayAgentTextEntryRecord = deepFreeze({
     recordType: "text_entry",
     entryId: mutation.entryId,
@@ -1771,11 +1839,12 @@ function reduceEntryAppend(
 function reduceEntryRedaction(
   state: RelayAgentAuthorityState,
   mutation: RelayAgentEntryRedactedMutation,
-  agentEventSeq: string,
+  agentEventSeq: string | null,
 ): DomainReduction {
   if (state.deletedEntries.get(mutation.entryId)) return unchangedDomain(state, "entry_deleted");
   const existing = state.entries.get(mutation.entryId);
   if (!existing || existing.state !== "visible") return unchangedDomain(state, "invalid_transition");
+  if (agentEventSeq === null) return appliedDomainPreflight(state);
   const updated = deepFreeze({
     ...existing,
     state: "redacted" as const,
@@ -1799,10 +1868,11 @@ function reduceEntryDelete(
   state: RelayAgentAuthorityState,
   event: RelayAgentSourceEvent,
   mutation: RelayAgentEntryDeletedMutation,
-  agentEventSeq: string,
+  agentEventSeq: string | null,
 ): DomainReduction {
   if (state.deletedEntries.get(mutation.entryId)) return unchangedDomain(state, "entry_deleted");
   if (!state.entries.get(mutation.entryId)) return unchangedDomain(state, "invalid_transition");
+  if (agentEventSeq === null) return appliedDomainPreflight(state);
   let usage = state.usage;
   let entries = state.entries as PersistentStringIndex<RelayAgentTextEntryRecord>;
   let tombstones = state.deletedEntries as PersistentStringIndex<RelayAgentDeletedEntryTombstone>;
@@ -1826,11 +1896,12 @@ function reduceEntryDelete(
 function reduceDomain(
   state: RelayAgentAuthorityState,
   event: RelayAgentSourceEvent,
-  agentEventSeq: string,
-  eventId: string,
+  agentEventSeq: string | null,
+  eventId: string | null,
 ): DomainReduction {
   switch (event.mutation.mutationType) {
     case "source.started":
+      if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
       return {
         ...unchangedDomain(state, "invalid_transition"),
         disposition: "applied",
@@ -1845,6 +1916,7 @@ function reduceDomain(
       const source = state.sources.get(event.sourceEpoch)!;
       const expectedFrom = event.mutation.state === "connected" ? "interrupted" : "connected";
       if (source.availability !== expectedFrom) return unchangedDomain(state, "invalid_transition");
+      if (!hasPublicIdentity(agentEventSeq, eventId)) return appliedDomainPreflight(state);
       return {
         ...unchangedDomain(state, "invalid_transition"),
         disposition: "applied",
@@ -1927,11 +1999,22 @@ export function reduceRelayAgentAuthority(
     return result(state, "invalid_transition");
   }
 
-  const nextAgentEventSeq = incrementCounter(state.agentEventSeq, "agentEventSeq");
-  const eventId = eventIdFor(state.binding, nextAgentEventSeq);
-  const domain = reduceDomain(state, event, nextAgentEventSeq, eventId);
-  if (domain.disposition !== "applied" && domain.disposition !== "redundant_terminal") {
-    return result(state, domain.disposition);
+  const preflight = reduceDomain(state, event, null, null);
+  if (preflight.disposition !== "applied" && preflight.disposition !== "redundant_terminal") {
+    return result(state, preflight.disposition);
+  }
+
+  const nextAgentEventSeq = preflight.disposition === "applied"
+    ? incrementCounter(state.agentEventSeq, "agentEventSeq")
+    : state.agentEventSeq;
+  const eventId = preflight.disposition === "applied"
+    ? eventIdFor(state.binding, nextAgentEventSeq)
+    : null;
+  const domain = preflight.disposition === "applied"
+    ? reduceDomain(state, event, nextAgentEventSeq, eventId)
+    : preflight;
+  if (preflight.disposition === "applied" && domain.disposition !== "applied") {
+    throw new RelayAgentAuthorityStateError("domain materialization diverged from preflight");
   }
 
   let usage = domain.usage;
@@ -1947,7 +2030,7 @@ export function reduceRelayAgentAuthority(
     fenced: false,
     availability,
     availabilityEventId: event.mutation.mutationType === "source.started" || event.mutation.mutationType === "source.availability"
-      ? eventId
+      ? eventId!
       : source!.availabilityEventId,
     availabilityAgentEventSeq: event.mutation.mutationType === "source.started" || event.mutation.mutationType === "source.availability"
       ? nextAgentEventSeq
@@ -1997,7 +2080,7 @@ export function reduceRelayAgentAuthority(
   const publicEvent: RelayAgentAuthorityPublicEvent = deepFreeze({
     ...state.binding,
     agentEventSeq: nextAgentEventSeq,
-    eventId,
+    eventId: eventId!,
     occurredAtMs: event.occurredAtMs,
     mutation: domain.publicMutation!,
   });
