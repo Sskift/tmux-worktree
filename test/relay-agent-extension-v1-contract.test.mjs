@@ -99,11 +99,14 @@ const manifest = readJson("manifest.json");
 test("Relay Agent extension v1 fixture set is internally complete and machine-readable", () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-agent-transcript-lifecycle-extension");
   assert.equal(manifest.version, 1);
-  assert.equal(manifest.status, "frozen-extension-node-authority-and-android-reducer-foundations");
+  assert.equal(
+    manifest.status,
+    "frozen-extension-unwired-node-authority-and-android-reducer-foundations",
+  );
   assert.equal(manifest.capability, "agent.transcript-lifecycle.v1");
   assert.deepEqual(manifest.delivery, {
     artifactKind: "fixtures-plus-unwired-node-authority-and-android-reducer-foundations",
-    runtimeConsumers: "node-authority-and-android-reducer-foundations-only",
+    runtimeConsumers: "pending",
     nodeCodecConformance: false,
     androidCodecConformance: false,
     hostAuthorityMachineConformance: false,
@@ -112,7 +115,8 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
       "retention-and-pruning",
       "public-codec-and-replay-runtime",
     ],
-    androidConsumerMachineConformance: true,
+    androidConsumerMachineConformance: false,
+    androidLifecycleReducerFixtureConformance: true,
     androidReducerRuntimeIntegrated: false,
     g4Passed: false,
   });

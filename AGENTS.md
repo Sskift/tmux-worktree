@@ -8,7 +8,7 @@
 - `tw` 是 managed worktree、managed terminal、SSH Host 和自动化的 headless control plane。Dashboard 是展示与原生能力层，不应拥有第二套 worktree/tmux 生命周期实现。
 - 当前 Dashboard、`relay-server`、`relay-host` 和 Android **只实现 Relay v1**。Relay v1 使用共享 secret；broker 负责鉴权和路由，Mac 上的 `relay-host` 负责聚合、执行和终端桥接，底层 managed/live 状态仍分别由目标主机的 `tw` 与 tmux 持有。
 - Android 的 `V2Activity`、`V2ViewModel` 和“Android V2”表示新版产品/UI 架构，**不表示 Relay v2 已实现**。当前 Android 仍使用 `RelayV1ConnectionActor` 和 v1 codec。
-- `docs/relay-v2-contract.md` 是冻结的 v2 最小互操作契约；`contracts/relay/v2` 及 Node/Android 的独立 v2 codec 已形成 conformance 基础。可选 `agent.transcript-lifecycle.v1` 另有一个未接 runtime 的 Android lifecycle/notification pure reducer foundation；它没有 public extension codec、Room/actor/UI/系统通知接线。broker、relay-host、Android actor、credential/enrollment 和 capability 接线仍未交付。任何一端都不得因为 codec、契约或 reducer foundation 存在就宣告 v2/extension capability、生成 v2 enrollment、把 v1 shared secret 提升为 v2 credential，或在失败时静默降级/重试到另一协议。
+- `docs/relay-v2-contract.md` 是冻结的 v2 最小互操作契约；`contracts/relay/v2` 及 Node/Android 的独立 v2 codec 已形成 conformance 基础。可选 `agent.transcript-lifecycle.v1` 另有一个未接 runtime 的 Android lifecycle/notification pure reducer foundation；它只有独立 fixture conformance，没有 production composition consumer，也没有 public extension codec、Room/actor/UI/系统通知接线。broker、relay-host、Android actor、credential/enrollment 和 capability 接线仍未交付。任何一端都不得因为 codec、契约或 reducer foundation 存在就宣告 v2/extension capability、生成 v2 enrollment、把 v1 shared secret 提升为 v2 credential，或在失败时静默降级/重试到另一协议。
 - Relay v1 没有 Agent 入站时间线、Waiting/Failed/Completed 状态或通知事件。Android Session detail 当前只能可靠展示本机发出的消息及投递状态；不得用本地推断伪造远端 Agent 回复或状态。
 - 构建成功不等于完成生产发布：Tauri 构建、Android unsigned Release 验证、签名、TLS、上传和渠道发布是不同步骤。
 

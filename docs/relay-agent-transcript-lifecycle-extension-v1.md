@@ -4,7 +4,7 @@
 
 当前交付包含 contract/machine fixtures，以及直接消费 authority machine cases 的独立 Node 纯 reducer foundation。该 foundation 提供受信 adapter binding、显式 state restore/corruption boundary、结构化 source availability、持久索引 transition 和固定资源预算，但没有接入 relay-host 或任何 durable store。Node public codec、snapshot/replay/event log 和 retention pruning 仍为 pending，`hostAuthorityMachineConformance=false`。
 
-Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending。Node contract test只验证 fixture/manifest 自洽，Android machine conformance 只证明该独立 reducer boundary，不构成端到端或产品 capability 证据；G4 尚未通过。
+Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。共享 fixture 的 `command_status` 步骤由测试中的 base-owner composition stub处理，生产 reducer不拥有基础 command ledger，因此尚不存在 production composition consumer，`androidConsumerMachineConformance` 仍为 false；单独的 reducer fixture conformance不构成 runtime conformance。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending，G4 尚未通过。
 
 本 extension 是 Relay v2 的可选扩展，规范版本为 `1`，唯一 capability 名称为 `agent.transcript-lifecycle.v1`。它不属于 [`relay-v2-contract.md`](relay-v2-contract.md) 冻结的六项基础能力，也不修改基础 v2 envelope、command ledger、host `eventSeq`、terminal stream 或任何 Relay v1 wire。
 
@@ -273,11 +273,13 @@ Android reducer：
 
 当前独立 Android reducer foundation 还固定以下本地安全语义：
 
-- status/snapshot response 必须匹配本地 request token 与不可逆 generation；adapter unavailable、未协商和 source interrupted 只 fence intent并保留可证明的同 timeline cache，只有可信 reset、新 timelineEpoch 或明确 continuity 丢失才退休旧 lineage；
-- trusted snapshot commit 是有界 checkpoint：destructive替换 lifecycle materialization、重新建立 eventId/seq/identity witness并压缩旧 exact-event evidence；checkpoint 之前且没有 exact digest evidence 的旧 event继续 fail closed，不能猜 duplicate；
+- status/snapshot response 必须匹配本地 request token 与不可逆 generation；`adapter_unavailable`、裸 `store_unavailable`、未协商和 source interrupted 只 fence intent并保留可证明的同 timeline cache，只有可信 `timeline.reset`、新 timelineEpoch 或明确 continuity 丢失才退休旧 lineage；
+- trusted snapshot commit 是有界 checkpoint：destructive替换 lifecycle materialization并压缩旧 applied exact-evidence，但同 timeline 已见的 eventId/seq/identity/digest witness永久保留并与 snapshot新增 record合并；witness饱和后 snapshot不能遗忘证据恢复，必须 quarantine并由 authority显式轮换 timeline；
 - snapshot lifecycle record 的 agentEventSeq、lifecycleEventId、run/turn/sourceEpoch binding 必须闭合且与仍保留的 event witness一致；live transition先验证完整候选图，再原子推进 cursor/evidence/ledger；
-- 后续 resync snapshot不改首次 notification baseline。单次 snapshot候选超过有界 effect batch时，按稳定顺序只产出有界前缀，并以独立 durable snapshot suppression watermark安全抑制该 cut 的其余历史候选；下一 live seq不被吞掉；
+- 本地 `AgentEvent` 输入必须由未来可信 actor/adapter标记为 `LIVE` 或 `REPLAY`，该 provenance不是 wire字段；LIVE新 seq只接受 CONNECTED active source，REPLAY可补旧 source历史但不把不匹配 activeSourceEpoch 的 record称为当前或用于通知。当前 foundation尚未接入能可信区分 `agent.timeline.event` 与 replay page的 adapter；
+- 后续 resync snapshot不改首次 notification baseline，并保留与 retained record完整 event identity匹配的旧 notification disposition，避免清 ledger后重复 `shown`。单次 snapshot候选超过有界 effect batch时，按稳定顺序只产出有界前缀，并以独立 durable snapshot suppression watermark安全抑制该 cut 的其余历史候选；下一 live seq不被吞掉；
 - retired timeline tombstone满额时，只有已通过 request/generation fence 的可信新-lineage status/reset可以建立 compaction checkpoint；临时 unavailable不能触发 compaction，旧 queued response仍因 generation失效。
+- local generation到达 canonical uint64上界后所有需要 bump 的 reducer路径都原子返回 continuity conflict且不 wrap；恢复需要未来 repository在断连 barrier后重建 profile-scoped namespace，本 foundation不自行重置持久 generation。
 
 cursor、snapshot、availability 与 timeline lineage 的公开错误使用 §7.5 的 closed extension error code。
 
