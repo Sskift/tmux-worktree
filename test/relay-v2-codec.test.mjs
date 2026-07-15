@@ -73,16 +73,16 @@ test("Node Relay v2 dialect resolution matches the shared no-fallback matrix", (
   }
 });
 
-test("carrier.error for host.hello requires connectorId to be exactly null", () => {
+test("carrier.error uses the broker-exact correlated schema", () => {
   const frame = {
     carrierVersion: 1,
     type: "carrier.error",
-    requestId: "hello-request",
+    requestId: "host-hello-request",
     connectorId: null,
     payload: { failedType: "host.hello" },
     error: {
       code: "DUPLICATE_CONNECTOR",
-      message: "duplicate",
+      message: "Duplicate connector",
       retryable: false,
       retryAfterMs: null,
       commandDisposition: "not_applicable",
@@ -90,14 +90,22 @@ test("carrier.error for host.hello requires connectorId to be exactly null", () 
     },
   };
   assert.doesNotThrow(() => codec.encodeRelayV2WebSocketFrame("carrier", frame));
-  assert.throws(
-    () => codec.encodeRelayV2WebSocketFrame("carrier", {
+
+  for (const invalid of [
+    { ...frame, connectorId: "not-null" },
+    { ...frame, routeId: "extra-route" },
+    { ...frame, routeFence: "extra-fence" },
+    {
       ...frame,
-      connectorId: "forged-connector",
-    }),
-    (error) => error instanceof codec.RelayV2CodecError
-      && error.code === "INVALID_ENVELOPE",
-  );
+      connectorId: null,
+      payload: { failedType: "host.reauthenticate" },
+    },
+  ]) {
+    assert.throws(
+      () => codec.encodeRelayV2WebSocketFrame("carrier", invalid),
+      (error) => error instanceof codec.RelayV2CodecError,
+    );
+  }
 });
 
 test("negotiated frame limits are positive and internally consistent", () => {

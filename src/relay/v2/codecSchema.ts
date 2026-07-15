@@ -1663,12 +1663,15 @@ function carrierRoot(
   type: string,
   required: readonly string[],
   optional: readonly string[] = [],
+  nullableConnector = false,
 ): void {
   exact(frame, ["carrierVersion", "type", ...required], optional);
   literal(field(frame, "carrierVersion"), 1);
   literal(field(frame, "type"), type);
   for (const name of ["requestId", "connectorId", "routeId", "routeFence"]) {
-    if (Object.hasOwn(frame, name)) id(frame[name]!);
+    if (!Object.hasOwn(frame, name)) continue;
+    if (name === "connectorId" && nullableConnector && frame[name] === null) continue;
+    id(frame[name]!);
   }
 }
 
@@ -1875,32 +1878,52 @@ export function validateRelayV2CarrierFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["connectionId", "clientDialect", "authContext", "limits"]);
       id(field(payload, "connectionId"));
-      literal(field(payload, "clientDialect"), "tw-relay.v2");
+      const clientDialect = oneOf(
+        field(payload, "clientDialect"),
+        ["tw-relay.v1", "tw-relay.v2"] as const,
+      );
       const auth = object(field(payload, "authContext"));
-      exact(auth, [
-        "scheme",
-        "role",
-        "hostId",
-        "principalId",
-        "grantId",
-        "clientInstanceId",
-        "jti",
-        "kid",
-        "expiresAtMs",
-      ]);
-      literal(field(auth, "scheme"), "twcap2");
-      literal(field(auth, "role"), "client");
-      for (const name of [
-        "hostId",
-        "principalId",
-        "grantId",
-        "clientInstanceId",
-        "jti",
-        "kid",
-      ]) {
-        id(field(auth, name));
+      if (clientDialect === "tw-relay.v2") {
+        exact(auth, [
+          "scheme",
+          "role",
+          "hostId",
+          "principalId",
+          "grantId",
+          "clientInstanceId",
+          "jti",
+          "kid",
+          "expiresAtMs",
+        ]);
+        literal(field(auth, "scheme"), "twcap2");
+        literal(field(auth, "role"), "client");
+        for (const name of [
+          "hostId",
+          "principalId",
+          "grantId",
+          "clientInstanceId",
+          "jti",
+          "kid",
+        ]) {
+          id(field(auth, name));
+        }
+        integer(field(auth, "expiresAtMs"));
+      } else {
+        exact(auth, [
+          "scheme",
+          "role",
+          "hostId",
+          "principalId",
+          "grantId",
+          "clientInstanceId",
+        ]);
+        literal(field(auth, "scheme"), "legacy_shared_secret");
+        literal(field(auth, "role"), "client");
+        id(field(auth, "hostId"));
+        nullValue(field(auth, "principalId"));
+        nullValue(field(auth, "grantId"));
+        nullValue(field(auth, "clientInstanceId"));
       }
-      integer(field(auth, "expiresAtMs"));
       const limits = object(field(payload, "limits"));
       exact(limits, ["maxFrameBytes"]);
       integer(field(limits, "maxFrameBytes"), 1);
