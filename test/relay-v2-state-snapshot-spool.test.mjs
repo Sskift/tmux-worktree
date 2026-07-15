@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { fork } from "node:child_process";
 import { createHash } from "node:crypto";
+import { once } from "node:events";
 import {
   chmodSync,
   cpSync,
@@ -9,15 +11,72 @@ import {
   readdirSync,
   rmSync,
   statSync,
+  symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
+const snapshotSpoolChild = fileURLToPath(new URL(
+  "./fixtures/relay-v2-state-snapshot-spool-child.mjs",
+  import.meta.url,
+));
+
+function spawnSnapshotSpoolChild(root, options = {}) {
+  const child = fork(snapshotSpoolChild, [], {
+    env: {
+      ...process.env,
+      HOME: dirname(root),
+      SNAPSHOT_SPOOL_ROOT: root,
+      SNAPSHOT_SPOOL_CHILD_MODE: options.mode ?? "worker",
+      SNAPSHOT_SPOOL_OWNER: options.owner ?? `owner-${Math.random()}`,
+      SNAPSHOT_SPOOL_TAKEOVER: options.takeover ? "1" : "0",
+      SNAPSHOT_SPOOL_HOLD_FIRST: options.holdFirst ? "1" : "0",
+      SNAPSHOT_SPOOL_HOLD_STALE: options.holdStale ? "1" : "0",
+    },
+    stdio: ["ignore", "pipe", "pipe", "ipc"],
+  });
+  const queued = [];
+  const waiters = [];
+  child.on("message", (message) => {
+    const waiterIndex = waiters.findIndex((waiter) => waiter.type === message?.type);
+    if (waiterIndex >= 0) {
+      const [waiter] = waiters.splice(waiterIndex, 1);
+      waiter.resolve(message);
+    } else {
+      queued.push(message);
+    }
+  });
+  const message = (type) => {
+    const queuedIndex = queued.findIndex((item) => item?.type === type);
+    if (queuedIndex >= 0) return Promise.resolve(queued.splice(queuedIndex, 1)[0]);
+    return new Promise((resolve, reject) => {
+      const waiter = { type, resolve, reject };
+      waiters.push(waiter);
+      child.once("exit", (code) => {
+        const index = waiters.indexOf(waiter);
+        if (index >= 0) {
+          waiters.splice(index, 1);
+          reject(new Error(`snapshot spool child exited ${code} before ${type}`));
+        }
+      });
+    });
+  };
+  return {
+    child,
+    message,
+    send: (value) => child.send(value),
+    exit: () => child.exitCode === null
+      ? once(child, "exit")
+      : Promise.resolve([child.exitCode, child.signalCode]),
+  };
+}
 
 class QueueDiscovery {
   #scans = [];
@@ -487,6 +546,54 @@ test("canonical non-empty golden fixes bytes, digest, and the exact chunk bounda
   } finally {
     plusOne.cleanup();
   }
+
+  const unicodeRecords = [
+    {
+      recordType: "scope",
+      item: {
+        scopeId: "scope-ü",
+        displayName: "本地😀",
+        kind: "local",
+        reachability: "online",
+      },
+    },
+    {
+      recordType: "sessions_scope",
+      scopeId: "scope-ü",
+      revision: "2",
+      completeness: "complete",
+    },
+    {
+      recordType: "session",
+      scopeId: "scope-ü",
+      item: {
+        scopeId: "scope-ü",
+        sessionId: "会话😀",
+        label: null,
+        count: 7,
+        attached: false,
+      },
+    },
+  ];
+  const unicodeGolden = "[{\"item\":{\"displayName\":\"本地😀\",\"kind\":\"local\",\"reachability\":\"online\",\"scopeId\":\"scope-ü\"},\"recordType\":\"scope\"},{\"completeness\":\"complete\",\"recordType\":\"sessions_scope\",\"revision\":\"2\",\"scopeId\":\"scope-ü\"},{\"item\":{\"attached\":false,\"count\":7,\"label\":null,\"scopeId\":\"scope-ü\",\"sessionId\":\"会话😀\"},\"recordType\":\"session\",\"scopeId\":\"scope-ü\"}]";
+  assert.equal(Buffer.byteLength(unicodeGolden), 355);
+  const unicode = await fakeSpool({ cut: staticCut(unicodeRecords) });
+  try {
+    const chunk = await unicode.spool.get(firstRequest(
+      "authority-epoch",
+      "golden-unicode-scalars",
+    ));
+    assert.equal(chunk.totalCanonicalBytes, 355);
+    assert.equal(chunk.cutDigest, "7qXCROKD4tmhhWDcvtU_dPC7XNQdQ6hAqEyfTboDCoM");
+    const chunkFile = readdirSync(join(unicode.spool.paths.cuts, chunk.snapshotId))
+      .find((name) => name.startsWith("chunk-"));
+    assert.equal(readFileSync(
+      join(unicode.spool.paths.cuts, chunk.snapshotId, chunkFile),
+      "utf8",
+    ), unicodeGolden);
+  } finally {
+    unicode.cleanup();
+  }
 });
 
 test("host slots reach sixteen small cuts while byte quota remains independent", async (t) => {
@@ -581,7 +688,15 @@ test("host slots reach sixteen small cuts while byte quota remains independent",
       },
     ];
     const bytes = canonicalCutBytes(records).byteLength;
-    const h = await fakeSpool({
+    const exact = await fakeSpool({
+      cut: staticCut(records),
+      limits: {
+        maxChunkCanonicalBytes: bytes,
+        maxCutCanonicalBytes: bytes,
+        maxSpoolCanonicalBytes: bytes * 2,
+      },
+    });
+    const short = await fakeSpool({
       cut: staticCut(records),
       limits: {
         maxChunkCanonicalBytes: bytes,
@@ -590,19 +705,29 @@ test("host slots reach sixteen small cuts while byte quota remains independent",
       },
     });
     try {
-      await h.spool.get(firstRequest("authority-epoch", "byte-cut-one", {
+      await exact.spool.get(firstRequest("authority-epoch", "byte-exact-one", {
+        principalId: "byte-principal-one",
+      }));
+      await exact.spool.get(firstRequest("authority-epoch", "byte-exact-two", {
+        principalId: "byte-principal-two",
+        clientInstanceId: "client-two",
+      }));
+      assert.equal(readdirSync(exact.spool.paths.cuts).length, 2);
+
+      await short.spool.get(firstRequest("authority-epoch", "byte-short-one", {
         principalId: "byte-principal-one",
       }));
       await assert.rejects(
-        h.spool.get(firstRequest("authority-epoch", "byte-cut-two", {
+        short.spool.get(firstRequest("authority-epoch", "byte-short-two", {
           principalId: "byte-principal-two",
           clientInstanceId: "client-two",
         })),
         assertSpoolError("BUSY"),
       );
-      assert.equal(readdirSync(h.spool.paths.cuts).length, 1);
+      assert.equal(readdirSync(short.spool.paths.cuts).length, 1);
     } finally {
-      h.cleanup();
+      exact.cleanup();
+      short.cleanup();
     }
   });
 });
@@ -682,6 +807,10 @@ test("concurrent first build reserves once and rejects estimate undercharge befo
       assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
       assert.deepEqual(readdirSync(h.spool.paths.staging), []);
       assert.deepEqual(readdirSync(h.spool.paths.reservations), []);
+      await assert.rejects(
+        h.spool.get(firstRequest("authority-epoch", "logical-undercharged")),
+        assertSpoolError("SNAPSHOT_EXPIRED"),
+      );
     } finally {
       h.cleanup();
     }
@@ -734,13 +863,92 @@ test("concurrent first build reserves once and rejects estimate undercharge befo
       assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
       assert.deepEqual(readdirSync(h.spool.paths.staging), []);
       assert.deepEqual(readdirSync(h.spool.paths.reservations), []);
+      await assert.rejects(
+        h.spool.get(firstRequest("authority-epoch", "logical-late-undercharge")),
+        assertSpoolError("SNAPSHOT_EXPIRED"),
+      );
     } finally {
       h.cleanup();
     }
   });
 });
 
-test("durable owner takeover fences an overlapping builder before any spool write", async () => {
+test("cross-process lock initialization, dead takeover, and release ABA never overlap", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-process-lock-"));
+  const root = join(home, "spool");
+  const marker = `${root}.metadata-critical`;
+  const children = [];
+  try {
+    const incompleteRoot = join(home, "incomplete-spool");
+    mkdirSync(incompleteRoot, { mode: 0o700 });
+    const incompleteLock = join(incompleteRoot, ".metadata-lock-v2.json");
+    writeFileSync(incompleteLock, "", { mode: 0o600 });
+    utimesSync(incompleteLock, 0, 0);
+    const initializer = spawnSnapshotSpoolChild(incompleteRoot, {
+      mode: "open-close-exit",
+      owner: "incomplete-holder-successor",
+    });
+    children.push(initializer);
+    assert.match((await initializer.message("stale-observed")).identity, /^inode-/);
+    await initializer.message("opened");
+    await initializer.message("auto-closed");
+    assert.deepEqual(await initializer.exit(), [0, null]);
+
+    const crashed = spawnSnapshotSpoolChild(root, {
+      mode: "crash-lock",
+      owner: "crashed-lock-owner",
+    });
+    children.push(crashed);
+    await crashed.message("lock-enter");
+    assert.deepEqual(await crashed.exit(), [83, null]);
+    rmSync(marker, { force: true });
+
+    const staleObserver = spawnSnapshotSpoolChild(root, {
+      owner: "stale-observer-owner",
+      takeover: true,
+      holdStale: true,
+    });
+    children.push(staleObserver);
+    const stale = await staleObserver.message("stale-observed");
+    assert.match(stale.identity, /^(?:token|inode)-/);
+
+    const winner = spawnSnapshotSpoolChild(root, {
+      owner: "winner-owner",
+      takeover: true,
+      holdFirst: true,
+    });
+    children.push(winner);
+    await winner.message("lock-enter");
+    winner.send({ type: "release-acquire" });
+    await winner.message("lock-exit");
+    await winner.message("opened");
+
+    staleObserver.send({ type: "release-stale" });
+    await staleObserver.message("lock-enter");
+    await staleObserver.message("lock-exit");
+    await staleObserver.message("opened");
+
+    winner.send({ type: "cleanup" });
+    assert.deepEqual(await winner.message("cleanup-result"), {
+      type: "cleanup-result",
+      ok: false,
+      code: "INTERNAL",
+    });
+    staleObserver.send({ type: "close" });
+    assert.equal((await staleObserver.message("close-result")).ok, true);
+  } finally {
+    for (const child of children) {
+      if (child.child.exitCode === null) child.send({ type: "exit" });
+    }
+    await Promise.all(children.map(async (child) => {
+      if (child.child.exitCode === null) await child.exit();
+    }));
+    rmSync(home, { recursive: true, force: true });
+    rmSync(marker, { force: true });
+  }
+});
+
+test("owner takeover fences an accepted BUILDING request instead of rebuilding it", async () => {
   let captureStarted;
   let releaseCapture;
   const started = new Promise((resolve) => { captureStarted = resolve; });
@@ -761,18 +969,11 @@ test("durable owner takeover fences an overlapping builder before any spool writ
     const request = firstRequest("authority-epoch", "logical-owner-overlap");
     const oldBuild = h.spool.get(request);
     await started;
-    assert.equal(readdirSync(h.spool.paths.reservations).length, 1);
-    assert.deepEqual(readdirSync(h.spool.paths.staging), []);
-
-    await assert.rejects(
-      snapshotSpool.RelayV2StateSnapshotSpool.open({
-        hostId: "mac-admin",
-        cutSource: staticSource(cut).source,
-        root: h.spool.paths.root,
-        ownerInstanceId: "snapshot-owner-denied",
-      }),
-      assertSpoolError("BUSY"),
+    const reservationPath = join(
+      h.spool.paths.reservations,
+      readdirSync(h.spool.paths.reservations)[0],
     );
+    const accepted = JSON.parse(readFileSync(reservationPath, "utf8"));
     const winner = await snapshotSpool.RelayV2StateSnapshotSpool.open({
       hostId: "mac-admin",
       cutSource: staticSource(cut).source,
@@ -781,27 +982,71 @@ test("durable owner takeover fences an overlapping builder before any spool writ
       takeoverExistingOwner: true,
     });
     assert.deepEqual(readdirSync(winner.paths.reservations), []);
-    const winningCut = await winner.get(request);
+    const tombstone = JSON.parse(readFileSync(
+      join(winner.paths.tombstones, `${accepted.snapshotId}.json`),
+      "utf8",
+    ));
+    assert.equal(tombstone.snapshotId, accepted.snapshotId);
+    assert.equal(tombstone.binding.snapshotRequestId, request.snapshotRequestId);
+    await assert.rejects(winner.get(request), assertSpoolError("SNAPSHOT_EXPIRED"));
     releaseCapture();
     await assert.rejects(oldBuild, assertSpoolError("INTERNAL"));
-    await assert.rejects(h.spool.cleanupExpired(), assertSpoolError("INTERNAL"));
-    assert.equal(readdirSync(winner.paths.cuts).length, 1);
-    assert.equal((await winner.get(request)).snapshotId, winningCut.snapshotId);
-    await winner.close();
-    const successor = await snapshotSpool.RelayV2StateSnapshotSpool.open({
-      hostId: "mac-admin",
-      cutSource: staticSource(cut).source,
-      root: h.spool.paths.root,
-      ownerInstanceId: "snapshot-owner-after-close",
-    });
-    assert.equal((await successor.get(request)).snapshotId, winningCut.snapshotId);
+    assert.deepEqual(readdirSync(winner.paths.cuts), []);
   } finally {
     releaseCapture();
     h.cleanup();
   }
 });
 
-test("a post-rename fsync failure rolls back final and permits only one later cut", async () => {
+test("a crashed BUILDING reservation restarts as the same logical expired fence", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-building-crash-"));
+  const root = join(home, "spool");
+  const marker = `${root}.metadata-critical`;
+  const crashed = spawnSnapshotSpoolChild(root, {
+    mode: "crash-building",
+    owner: "building-crasher",
+  });
+  try {
+    await crashed.message("opened");
+    const accepted = await crashed.message("reservation-persisted");
+    assert.deepEqual(await crashed.exit(), [85, null]);
+    rmSync(marker, { force: true });
+    const reservationFile = readdirSync(join(root, "reservations"))[0];
+    const reservation = JSON.parse(readFileSync(
+      join(root, "reservations", reservationFile),
+      "utf8",
+    ));
+    assert.equal(reservation.snapshotId, accepted.snapshotId);
+
+    const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      hostId: "mac-admin",
+      cutSource: staticSource(staticCut()).source,
+      root,
+      ownerInstanceId: "building-successor",
+    });
+    assert.deepEqual(readdirSync(restarted.paths.reservations), []);
+    const tombstone = JSON.parse(readFileSync(
+      join(restarted.paths.tombstones, `${accepted.snapshotId}.json`),
+      "utf8",
+    ));
+    assert.equal(tombstone.snapshotId, reservation.snapshotId);
+    assert.equal(tombstone.binding.snapshotRequestId, "logical-building-crash");
+    await assert.rejects(
+      restarted.get(firstRequest("authority-epoch", "logical-building-crash")),
+      assertSpoolError("SNAPSHOT_EXPIRED"),
+    );
+    assert.deepEqual(readdirSync(restarted.paths.cuts), []);
+  } finally {
+    if (crashed.child.exitCode === null) {
+      crashed.send({ type: "exit" });
+      await crashed.exit();
+    }
+    rmSync(marker, { force: true });
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a post-rename fsync failure rolls back final and permanently expires the accepted request", async () => {
   let failPublishFsync = true;
   const h = await fakeSpool({
     options: {
@@ -821,9 +1066,9 @@ test("a post-rename fsync failure rolls back final and permits only one later cu
     assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
     assert.deepEqual(readdirSync(h.spool.paths.staging), []);
     assert.deepEqual(readdirSync(h.spool.paths.reservations), []);
-    const retry = await h.spool.get(request);
-    assert.equal(readdirSync(h.spool.paths.cuts).length, 1);
-    assert.equal((await h.spool.get(request)).snapshotId, retry.snapshotId);
+    assert.equal(readdirSync(h.spool.paths.tombstones).length, 1);
+    await assert.rejects(h.spool.get(request), assertSpoolError("SNAPSHOT_EXPIRED"));
+    assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
   } finally {
     h.cleanup();
   }
@@ -879,8 +1124,10 @@ test("idle lease extends monotonically only to absolute expiry and removes BUILD
       now: () => now,
       testLimits: { idleLeaseMs: 100, absoluteLeaseMs: 250 },
     });
-    const pending = delayedSpool.get(firstRequest("authority-epoch", "logical-building-expiry"));
+    const buildingRequest = firstRequest("authority-epoch", "logical-building-expiry");
+    const pending = delayedSpool.get(buildingRequest);
     await started;
+    const waitingRetry = delayedSpool.get(buildingRequest);
     now = 2_351;
     await delayedSpool.cleanupExpired();
     assert.deepEqual(readdirSync(delayedSpool.paths.reservations), []);
@@ -889,8 +1136,16 @@ test("idle lease extends monotonically only to absolute expiry and removes BUILD
       [],
       "an expired BUILDING reservation must be rejected before staging starts",
     );
-    releaseCapture();
     await assert.rejects(pending, assertSpoolError("SNAPSHOT_EXPIRED"));
+    await assert.rejects(waitingRetry, assertSpoolError("SNAPSHOT_EXPIRED"));
+    await assert.rejects(
+      delayedSpool.get(buildingRequest),
+      assertSpoolError("SNAPSHOT_EXPIRED"),
+    );
+    assert.equal(readdirSync(delayedSpool.paths.tombstones).length, 1);
+    releaseCapture();
+    await new Promise((resolve) => setImmediate(resolve));
+    await delayedSpool.cleanupExpired();
     assert.deepEqual(readdirSync(delayedSpool.paths.staging), []);
   } finally {
     h.cleanup();
@@ -1112,6 +1367,43 @@ test("recovery preserves tombstones over quota and fails closed on corrupt or un
       h.cleanup();
     }
   });
+
+  await t.test("cut and staging symlinks never redirect recovery outside the spool", async () => {
+    for (const location of ["cuts", "staging"]) {
+      const h = await fakeSpool();
+      const external = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-sentinel-"));
+      const sentinel = join(external, "sentinel.txt");
+      writeFileSync(sentinel, `outside-${location}`, { mode: 0o600 });
+      try {
+        const chunk = await h.spool.get(firstRequest(
+          "authority-epoch",
+          `logical-symlink-${location}`,
+        ));
+        const redirected = location === "cuts"
+          ? join(h.spool.paths.cuts, chunk.snapshotId)
+          : join(
+              h.spool.paths.staging,
+              `${chunk.snapshotId}.00000000-0000-4000-8000-000000000000.tmp`,
+            );
+        if (location === "cuts") rmSync(redirected, { recursive: true });
+        symlinkSync(external, redirected, "dir");
+        await assert.rejects(
+          snapshotSpool.RelayV2StateSnapshotSpool.open({
+            hostId: "mac-admin",
+            cutSource: h.fake.source,
+            root: h.spool.paths.root,
+            takeoverExistingOwner: true,
+          }),
+          assertSpoolError("INTERNAL"),
+        );
+        assert.equal(readFileSync(sentinel, "utf8"), `outside-${location}`);
+        assert.equal(statSync(sentinel).mode & 0o777, 0o600);
+      } finally {
+        h.cleanup();
+        rmSync(external, { recursive: true, force: true });
+      }
+    }
+  });
 });
 
 test("restart recovers valid same-epoch final cuts, cleans crash orphans, and enforces modes", async () => {
@@ -1120,8 +1412,12 @@ test("restart recovers valid same-epoch final cuts, cleans crash orphans, and en
     const epoch = h.seeded.snapshot.hostEpoch;
     const request = firstRequest(epoch, "logical-recovery");
     const first = await h.spool.get(request);
-    mkdirSync(join(h.spool.paths.staging, "building.tmp"), { mode: 0o700 });
-    writeFileSync(join(h.spool.paths.staging, "building.tmp", "partial"), "partial", {
+    const recoverableStaging = join(
+      h.spool.paths.staging,
+      `${first.snapshotId}.00000000-0000-4000-8000-000000000000.tmp`,
+    );
+    mkdirSync(recoverableStaging, { mode: 0o700 });
+    writeFileSync(join(recoverableStaging, "partial"), "partial", {
       mode: 0o600,
     });
 
@@ -1241,6 +1537,48 @@ test("restart recovers valid same-epoch final cuts, cleans crash orphans, and en
       assertSpoolError("HOST_EPOCH_MISMATCH"),
     );
   } finally {
+    h.cleanup();
+  }
+});
+
+test("a real crash after recovery fence persistence cannot reopen the logical request", async () => {
+  const h = await fakeSpool();
+  const marker = `${h.spool.paths.root}.metadata-critical`;
+  let crashed;
+  try {
+    const request = firstRequest("authority-epoch", "logical-recovery-fence-crash");
+    const chunk = await h.spool.get(request);
+    const cutDirectory = join(h.spool.paths.cuts, chunk.snapshotId);
+    const chunkFile = readdirSync(cutDirectory).find((name) => name.startsWith("chunk-"));
+    writeFileSync(join(cutDirectory, chunkFile), "[", { mode: 0o600 });
+
+    crashed = spawnSnapshotSpoolChild(h.spool.paths.root, {
+      mode: "crash-after-recovery-fence",
+      owner: "recovery-fence-crasher",
+      takeover: true,
+    });
+    const fenced = await crashed.message("recovery-fence");
+    assert.equal(fenced.snapshotId, chunk.snapshotId);
+    assert.deepEqual(await crashed.exit(), [84, null]);
+    rmSync(marker, { force: true });
+    assert.equal(readdirSync(h.spool.paths.cuts).includes(chunk.snapshotId), true);
+    assert.equal(readdirSync(h.spool.paths.tombstones).includes(`${chunk.snapshotId}.json`), true);
+
+    const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      hostId: "mac-admin",
+      cutSource: h.fake.source,
+      root: h.spool.paths.root,
+      ownerInstanceId: "recovery-fence-successor",
+    });
+    assert.deepEqual(readdirSync(restarted.paths.cuts), []);
+    await assert.rejects(restarted.get(request), assertSpoolError("SNAPSHOT_EXPIRED"));
+    assert.deepEqual(readdirSync(restarted.paths.cuts), []);
+  } finally {
+    if (crashed?.child.exitCode === null) {
+      crashed.send({ type: "exit" });
+      await crashed.exit();
+    }
+    rmSync(marker, { force: true });
     h.cleanup();
   }
 });
@@ -1376,6 +1714,44 @@ test("cursor, index, readiness, and source failures are structured and never ret
       assert.deepEqual(readdirSync(h.spool.paths.staging), []);
       assert.deepEqual(readdirSync(h.spool.paths.reservations), []);
       assert.deepEqual(readdirSync(h.spool.paths.cuts), []);
+      await assert.rejects(
+        h.spool.get(firstRequest("authority-epoch", "logical-read-failure")),
+        assertSpoolError("SNAPSHOT_EXPIRED"),
+      );
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("source codes use fixed messages and closed details", async () => {
+    const secret = "source-secret-do-not-forward";
+    const leakedPath = "/private/relay/source-state.json";
+    const sourceFailure = new Error(`${leakedPath}: ${secret}`);
+    sourceFailure.code = "BUSY";
+    sourceFailure.details = {
+      readinessInternal: secret,
+      path: leakedPath,
+    };
+    const fake = staticSource(staticCut(), {
+      capture: async () => { throw sourceFailure; },
+    });
+    const h = await fakeSpool({ source: fake });
+    try {
+      let failure;
+      try {
+        await h.spool.get(firstRequest("authority-epoch", "logical-source-redaction"));
+      } catch (error) {
+        failure = error;
+      }
+      assert.ok(assertSpoolError("BUSY")(failure));
+      assert.equal(failure.message, "materialized snapshot source is busy");
+      assert.equal(failure.details, null);
+      assert.equal(failure.message.includes(secret), false);
+      assert.equal(failure.message.includes(leakedPath), false);
+      await assert.rejects(
+        h.spool.get(firstRequest("authority-epoch", "logical-source-redaction")),
+        assertSpoolError("SNAPSHOT_EXPIRED"),
+      );
     } finally {
       h.cleanup();
     }

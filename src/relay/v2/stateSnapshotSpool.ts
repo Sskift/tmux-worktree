@@ -3,11 +3,12 @@ import {
   closeSync,
   existsSync,
   fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
+  opendirSync,
   readFileSync,
-  readdirSync,
   renameSync,
   rmSync,
   writeSync,
@@ -27,19 +28,24 @@ const LEASE_VERSION = 1 as const;
 const RESERVATION_VERSION = 1 as const;
 const TOMBSTONE_VERSION = 1 as const;
 const OWNER_VERSION = 1 as const;
-const LOCK_VERSION = 1 as const;
+const LOCK_VERSION = 2 as const;
 const MANIFEST_FILE = "manifest-v1.json";
 const BINDING_FILE = "binding-v1.json";
 const LEASE_FILE = "lease-v1.json";
 const OWNER_FILE = "owner-v1.json";
-const LOCK_DIRECTORY = ".metadata-lock-v1";
-const LOCK_HOLDER_FILE = "holder-v1.json";
+const LOCK_FILE = ".metadata-lock-v2.json";
+const LOCK_CANDIDATES_DIRECTORY = ".metadata-lock-candidates-v1";
+const LOCK_QUARANTINE_DIRECTORY = ".metadata-lock-quarantine-v1";
 const LEASE_METADATA_ALLOWANCE_BYTES = 256;
 const RELEASE_TOMBSTONE_METADATA_HEADROOM_BYTES = 16_384;
 const CONSERVATIVE_METADATA_RESERVATION_BYTES = 1_000_000;
-const COORDINATION_METADATA_ALLOWANCE_BYTES = 4_096;
+const COORDINATION_METADATA_ALLOWANCE_BYTES = 524_288;
 const LOCK_WAIT_TIMEOUT_MS = 5_000;
 const LOCK_RETRY_MS = 5;
+const MAX_ROOT_ENTRIES = 16;
+const MAX_LOCK_CANDIDATES = 1_024;
+const MAX_LOCK_QUARANTINES = 1_024;
+const MAX_TOMBSTONES = 16_384;
 
 export interface RelayV2StateSnapshotLimits {
   maxChunkRecords: number;
@@ -79,6 +85,8 @@ export interface RelayV2StateSnapshotSpoolPaths {
   tombstones: string;
   owner: string;
   lock: string;
+  lockCandidates: string;
+  lockQuarantine: string;
 }
 
 export interface RelayV2StateSnapshotSpoolTestHooks {
@@ -86,6 +94,15 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
     point: "publish_cuts" | "publish_staging" | "rollback_cuts" | "rollback_staging",
   ) => void;
   afterChunkWrite?: (index: number) => void;
+  afterMetadataLockAcquired?: (token: string) => void | Promise<void>;
+  beforeStaleLockQuarantine?: (identity: string) => void | Promise<void>;
+  beforeMetadataLockRelease?: (token: string) => void | Promise<void>;
+  afterRecoveryExpiredFencePersisted?: (snapshotId: string) => void;
+  afterReservationPersisted?: (snapshotId: string) => void;
+  afterTombstonePersisted?: (
+    snapshotId: string,
+    disposition: "released" | "expired",
+  ) => void;
 }
 
 export interface RelayV2StateSnapshotSpoolOptions {
@@ -293,7 +310,9 @@ function pathsFromRoot(root: string): RelayV2StateSnapshotSpoolPaths {
     reservations: join(root, "reservations"),
     tombstones: join(root, "tombstones"),
     owner: join(root, OWNER_FILE),
-    lock: join(root, LOCK_DIRECTORY),
+    lock: join(root, LOCK_FILE),
+    lockCandidates: join(root, LOCK_CANDIDATES_DIRECTORY),
+    lockQuarantine: join(root, LOCK_QUARANTINE_DIRECTORY),
   };
 }
 
@@ -312,6 +331,10 @@ function clone<T>(value: T): T {
 }
 
 class UnsafeSpoolPathError extends Error {}
+
+class LineageOperationError {
+  constructor(readonly cause: unknown) {}
+}
 
 function assertOwnedDirectory(path: string, requirePrivate: boolean): void {
   const metadata = lstatSync(path);
@@ -379,6 +402,8 @@ function ensureSpoolDirectories(
   ensurePrivateDirectory(paths.staging);
   ensurePrivateDirectory(paths.reservations);
   ensurePrivateDirectory(paths.tombstones);
+  ensurePrivateDirectory(paths.lockCandidates);
+  ensurePrivateDirectory(paths.lockQuarantine);
 }
 
 function fsyncDirectory(path: string): void {
@@ -450,16 +475,68 @@ function assertPrivateFile(path: string, maxBytes: number): void {
   }
 }
 
-function assertPrivateTree(path: string, maxFileBytes: number): void {
-  const metadata = lstatSync(path);
-  if (metadata.isDirectory() && !metadata.isSymbolicLink()) {
-    assertOwnedDirectory(path, true);
-    for (const entry of readdirSync(path)) {
-      assertPrivateTree(join(path, entry), maxFileBytes);
-    }
-    return;
+function assertWithinBoundary(path: string, boundary: string): void {
+  const absolutePath = resolve(path);
+  const absoluteBoundary = resolve(boundary);
+  if (absolutePath !== absoluteBoundary
+    && !absolutePath.startsWith(`${absoluteBoundary}/`)) {
+    throw new UnsafeSpoolPathError("snapshot spool path escaped its trusted boundary");
   }
-  assertPrivateFile(path, maxFileBytes);
+}
+
+function validateEntryName(name: string, label: string): void {
+  if (name.length === 0
+    || Buffer.byteLength(name, "utf8") > 255
+    || name === "."
+    || name === ".."
+    || name.includes("/")
+    || name.includes("\0")) {
+    throw new UnsafeSpoolPathError(`snapshot spool ${label} name is invalid`);
+  }
+}
+
+function visitDirectoryBounded(
+  path: string,
+  maxEntries: number,
+  visitor: (name: string) => boolean | void,
+): { count: number; complete: boolean } {
+  assertOwnedDirectory(path, true);
+  const directory = opendirSync(path);
+  let count = 0;
+  let complete = true;
+  try {
+    while (true) {
+      const entry = directory.readSync();
+      if (entry === null) break;
+      count += 1;
+      if (count > maxEntries) {
+        throw new Error("snapshot spool directory entry limit exceeded");
+      }
+      validateEntryName(entry.name, "directory entry");
+      if (visitor(entry.name) === false) {
+        complete = false;
+        break;
+      }
+    }
+  } finally {
+    directory.closeSync();
+  }
+  return { count, complete };
+}
+
+function assertPrivateFlatDirectory(
+  path: string,
+  boundary: string,
+  maxEntries: number,
+  maxFileBytes: number,
+): void {
+  assertWithinBoundary(path, boundary);
+  assertOwnedDirectory(path, true);
+  visitDirectoryBounded(path, maxEntries, (entry) => {
+    const child = join(path, entry);
+    assertWithinBoundary(child, boundary);
+    assertPrivateFile(child, maxFileBytes);
+  });
 }
 
 function jsonFile(value: unknown): Buffer {
@@ -663,18 +740,20 @@ function ownerFencedError(): RelayV2StateSnapshotSpoolError {
 }
 
 function mapSourceError(error: unknown): RelayV2StateSnapshotSpoolError {
-  if (error instanceof RelayV2StateSnapshotSpoolError) return error;
   if (isRecord(error) && typeof error.code === "string") {
     const code = error.code;
-    if (code === "BUSY"
-      || code === "CAPABILITY_UNAVAILABLE"
-      || code === "HOST_EPOCH_MISMATCH"
-      || code === "INTERNAL"
-      || code === "INVALID_ARGUMENT") {
+    const messages: Partial<Record<RelayV2StateSnapshotSpoolErrorCode, string>> = {
+      BUSY: "materialized snapshot source is busy",
+      CAPABILITY_UNAVAILABLE: "materialized snapshot source is unavailable",
+      HOST_EPOCH_MISMATCH: "materialized snapshot source changed host lineage",
+      INTERNAL: "materialized snapshot source failed",
+      INVALID_ARGUMENT: "materialized snapshot source rejected the request",
+    };
+    if (Object.hasOwn(messages, code)) {
       return new RelayV2StateSnapshotSpoolError(
-        code,
-        error instanceof Error ? error.message : "materialized snapshot source failed",
-        isRecord(error.details) ? clone(error.details) : null,
+        code as RelayV2StateSnapshotSpoolErrorCode,
+        messages[code as RelayV2StateSnapshotSpoolErrorCode]!,
+        null,
       );
     }
   }
@@ -725,6 +804,18 @@ function bindingMarkerFor(manifest: PersistedManifest): PersistedBindingMarker {
     hostId: manifest.hostId,
     binding: clone(manifest.binding),
     snapshotAbsoluteExpiresAtMs: manifest.snapshotAbsoluteExpiresAtMs,
+  };
+}
+
+function bindingMarkerForReservation(
+  reservation: PersistedReservation,
+): PersistedBindingMarker {
+  return {
+    version: SPOOL_VERSION,
+    snapshotId: reservation.snapshotId,
+    hostId: reservation.hostId,
+    binding: clone(reservation.binding),
+    snapshotAbsoluteExpiresAtMs: reservation.snapshotAbsoluteExpiresAtMs,
   };
 }
 
@@ -977,6 +1068,7 @@ export class RelayV2StateSnapshotSpool {
   private closed = false;
   private fatalUnavailable = false;
   private recoveredQuotaExceeded = false;
+  private recoveryIncomplete = false;
 
   private constructor(options: RelayV2StateSnapshotSpoolOptions) {
     assertOpaqueId(options.hostId, "hostId");
@@ -1057,15 +1149,15 @@ export class RelayV2StateSnapshotSpool {
         this.beginFirst(binding, key, estimate)
       ));
     }
-    if (decision.kind === "wait") {
-      await decision.build.promise;
-    } else if (decision.kind === "build") {
+    if (decision.kind === "build") {
+      void this.buildAndPublish(decision.reservation).then(
+        () => decision.build.resolve(),
+        (error) => decision.build.reject(error),
+      );
+    }
+    if (decision.kind === "wait" || decision.kind === "build") {
       try {
-        await this.buildAndPublish(decision.reservation);
-        decision.build.resolve();
-      } catch (error) {
-        decision.build.reject(error);
-        throw error;
+        await decision.build.promise;
       } finally {
         await this.serializeMetadata(() => {
           if (this.buildsByLogicalKey.get(key) === decision.build) {
@@ -1104,6 +1196,12 @@ export class RelayV2StateSnapshotSpool {
           alreadyReleased: true,
           releasedAtMs: existingTombstone.record.recordedAtMs,
         };
+      }
+      if (this.recoveryIncomplete) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INTERNAL",
+          "snapshot spool recovery stopped at a frozen resource boundary",
+        );
       }
       const active = this.activeById.get(request.snapshotId);
       if (!active || !sameBinding(active.manifest.binding, binding)) throw expiredError();
@@ -1153,6 +1251,12 @@ export class RelayV2StateSnapshotSpool {
   async cleanupExpired(): Promise<void> {
     const currentHostEpoch = await this.readCurrentHostEpoch();
     await this.serializeMetadata(() => {
+      if (this.recoveryIncomplete) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INTERNAL",
+          "snapshot spool recovery stopped at a frozen resource boundary",
+        );
+      }
       this.dropOtherLineages(currentHostEpoch);
       this.cleanupExpiredAt(this.readNow());
       this.enforceRecoveredQuota();
@@ -1162,6 +1266,9 @@ export class RelayV2StateSnapshotSpool {
   async close(): Promise<void> {
     await this.serializeMetadata(() => {
       try {
+        for (const reservation of [...this.reservationsById.values()]) {
+          this.expireReservation(reservation, expiredError());
+        }
         rmSync(this.paths.owner, { force: true });
         fsyncDirectory(this.paths.root);
       } catch (error) {
@@ -1175,7 +1282,7 @@ export class RelayV2StateSnapshotSpool {
       this.tombstonesById.clear();
       this.tombstonesByLogicalKey.clear();
       this.buildsByLogicalKey.clear();
-    });
+    }, true, false);
   }
 
   private validateLimits(): void {
@@ -1223,8 +1330,15 @@ export class RelayV2StateSnapshotSpool {
     operation: () => T | Promise<T>,
   ): Promise<T> {
     try {
-      return await this.cutSource.withHostEpochFence(expectedHostEpoch, operation);
+      return await this.cutSource.withHostEpochFence(expectedHostEpoch, async () => {
+        try {
+          return await operation();
+        } catch (error) {
+          throw new LineageOperationError(error);
+        }
+      });
     } catch (error) {
+      if (error instanceof LineageOperationError) throw error.cause;
       throw mapSourceError(error);
     }
   }
@@ -1266,6 +1380,7 @@ export class RelayV2StateSnapshotSpool {
   private async serializeMetadata<T>(
     operation: () => T | Promise<T>,
     requireOwner = true,
+    verifyOwnerAfter = true,
   ): Promise<T> {
     let release!: () => void;
     const previous = this.metadataTail;
@@ -1275,7 +1390,9 @@ export class RelayV2StateSnapshotSpool {
       if (this.closed) throw ownerFencedError();
       return await this.withDiskMutex(async () => {
         if (requireOwner) this.assertCurrentOwner();
-        return await operation();
+        const result = await operation();
+        if (verifyOwnerAfter) this.assertCurrentOwner();
+        return result;
       });
     } catch (error) {
       if (!(error instanceof RelayV2StateSnapshotSpoolError)) {
@@ -1290,76 +1407,181 @@ export class RelayV2StateSnapshotSpool {
   private async withDiskMutex<T>(operation: () => T | Promise<T>): Promise<T> {
     const startedAt = Date.now();
     const token = randomBytes(24).toString("base64url");
-    while (true) {
-      try {
-        mkdirSync(this.paths.lock, { mode: 0o700 });
-        try {
-          const holder: PersistedLockHolder = {
-            version: LOCK_VERSION,
-            token,
-            pid: process.pid,
-          };
-          writePrivateFile(join(this.paths.lock, LOCK_HOLDER_FILE), jsonFile(holder));
-          fsyncDirectory(this.paths.lock);
-          fsyncDirectory(this.paths.root);
-        } catch (error) {
-          rmSync(this.paths.lock, { recursive: true, force: true });
-          fsyncDirectory(this.paths.root);
-          throw error;
-        }
-        break;
-      } catch (error) {
-        if (!isRecord(error) || error.code !== "EEXIST") throw error;
-        assertOwnedDirectory(this.paths.lock, true);
-        let holder: PersistedLockHolder;
-        try {
-          holder = parseLockHolder(JSON.parse(readPrivateFile(
-            join(this.paths.lock, LOCK_HOLDER_FILE),
-            4_096,
-          ).toString("utf8")));
-        } catch (holderError) {
-          if (holderError instanceof UnsafeSpoolPathError) throw holderError;
-          if (Date.now() - lstatSync(this.paths.lock).mtimeMs >= LOCK_WAIT_TIMEOUT_MS) {
-            rmSync(this.paths.lock, { recursive: true, force: true });
-            fsyncDirectory(this.paths.root);
-            continue;
-          }
-          await delay(LOCK_RETRY_MS);
-          continue;
-        }
-        if (!processIsAlive(holder.pid)) {
-          rmSync(this.paths.lock, { recursive: true, force: true });
-          fsyncDirectory(this.paths.root);
-          continue;
-        }
-        if (Date.now() - startedAt >= LOCK_WAIT_TIMEOUT_MS) {
-          throw new RelayV2StateSnapshotSpoolError(
-            "BUSY",
-            "snapshot spool metadata owner is busy",
-          );
-        }
-        await delay(LOCK_RETRY_MS);
-      }
+    const candidate = join(this.paths.lockCandidates, `candidate-${token}.json`);
+    const candidateUsage = visitDirectoryBounded(
+      this.paths.lockCandidates,
+      MAX_LOCK_CANDIDATES,
+      () => undefined,
+    );
+    if (candidateUsage.count >= MAX_LOCK_CANDIDATES) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "BUSY",
+        "snapshot spool coordination metadata is exhausted",
+      );
     }
     try {
-      return await operation();
-    } finally {
-      let ownsLock = false;
-      try {
-        const holder = parseLockHolder(JSON.parse(readPrivateFile(
-          join(this.paths.lock, LOCK_HOLDER_FILE),
-          4_096,
-        ).toString("utf8")));
-        ownsLock = holder.token === token && holder.pid === process.pid;
-      } finally {
-        if (ownsLock) {
-          rmSync(this.paths.lock, { recursive: true, force: true });
+      const holder: PersistedLockHolder = {
+        version: LOCK_VERSION,
+        token,
+        pid: process.pid,
+      };
+      writePrivateFile(candidate, jsonFile(holder));
+      fsyncDirectory(this.paths.lockCandidates);
+    } catch (error) {
+      if (existsSync(candidate)) {
+        assertPrivateFile(candidate, 4_096);
+        rmSync(candidate);
+      }
+      fsyncDirectory(this.paths.lockCandidates);
+      throw error;
+    }
+    let acquired = false;
+    try {
+      while (true) {
+        try {
+          linkSync(candidate, this.paths.lock);
+          acquired = true;
           fsyncDirectory(this.paths.root);
-        } else {
-          this.fatalUnavailable = true;
+          rmSync(candidate);
+          fsyncDirectory(this.paths.lockCandidates);
+          break;
+        } catch (error) {
+          if (!isRecord(error) || error.code !== "EEXIST") throw error;
+          const observed = this.observeMetadataLock();
+          const incompleteStillPublishing = observed.holder === undefined
+            && Date.now() - observed.mtimeMs < LOCK_WAIT_TIMEOUT_MS;
+          if (!incompleteStillPublishing
+            && (observed.holder === undefined || !processIsAlive(observed.holder.pid))) {
+            await this.testHooks?.beforeStaleLockQuarantine?.(observed.identity);
+            this.quarantineObservedLock(observed);
+            continue;
+          }
+          if (Date.now() - startedAt >= LOCK_WAIT_TIMEOUT_MS) {
+            throw new RelayV2StateSnapshotSpoolError(
+              "BUSY",
+              "snapshot spool metadata owner is busy",
+            );
+          }
+          await delay(LOCK_RETRY_MS);
         }
       }
+      await this.testHooks?.afterMetadataLockAcquired?.(token);
+      const result = await operation();
+      this.assertMetadataLock(token);
+      return result;
+    } finally {
+      if (acquired) {
+        await this.testHooks?.beforeMetadataLockRelease?.(token);
+        this.releaseMetadataLock(token);
+      }
+      if (existsSync(candidate)) {
+        assertPrivateFile(candidate, 4_096);
+        rmSync(candidate);
+        fsyncDirectory(this.paths.lockCandidates);
+      }
     }
+  }
+
+  private observeMetadataLock(): {
+    identity: string;
+    device: number;
+    inode: number;
+    mtimeMs: number;
+    holder: PersistedLockHolder | undefined;
+  } {
+    assertWithinBoundary(this.paths.lock, this.paths.root);
+    assertPrivateFile(this.paths.lock, 4_096);
+    const metadata = lstatSync(this.paths.lock);
+    let holder: PersistedLockHolder | undefined;
+    try {
+      holder = parseLockHolder(JSON.parse(readPrivateFile(
+        this.paths.lock,
+        4_096,
+      ).toString("utf8")));
+    } catch (error) {
+      if (error instanceof UnsafeSpoolPathError) throw error;
+    }
+    return {
+      identity: holder === undefined
+        ? `inode-${metadata.dev}-${metadata.ino}`
+        : `token-${holder.token}`,
+      device: metadata.dev,
+      inode: metadata.ino,
+      mtimeMs: metadata.mtimeMs,
+      holder,
+    };
+  }
+
+  private quarantineObservedLock(observed: {
+    identity: string;
+    device: number;
+    inode: number;
+  }): void {
+    const quarantineUsage = visitDirectoryBounded(
+      this.paths.lockQuarantine,
+      MAX_LOCK_QUARANTINES,
+      () => undefined,
+    );
+    const quarantine = join(
+      this.paths.lockQuarantine,
+      `stale-${observed.identity}.json`,
+    );
+    assertWithinBoundary(quarantine, this.paths.root);
+    if (quarantineUsage.count >= MAX_LOCK_QUARANTINES && !existsSync(quarantine)) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot spool stale-lock quarantine is exhausted",
+      );
+    }
+    if (existsSync(quarantine)) {
+      assertPrivateFile(quarantine, 4_096);
+      if (!existsSync(this.paths.lock)) return;
+      const current = this.observeMetadataLock();
+      if (current.device === observed.device && current.inode === observed.inode) {
+        this.fatalUnavailable = true;
+        throw new RelayV2StateSnapshotSpoolError(
+          "INTERNAL",
+          "snapshot spool stale lock quarantine identity is duplicated",
+        );
+      }
+      return;
+    }
+    try {
+      linkSync(this.paths.lock, quarantine);
+    } catch (error) {
+      if (isRecord(error)
+        && (error.code === "ENOENT"
+          || error.code === "EEXIST")) return;
+      throw error;
+    }
+    const quarantined = lstatSync(quarantine);
+    assertPrivateFile(quarantine, 4_096);
+    fsyncDirectory(this.paths.lockQuarantine);
+    if (quarantined.dev !== observed.device || quarantined.ino !== observed.inode) {
+      return;
+    }
+    if (!existsSync(this.paths.lock)) return;
+    const current = lstatSync(this.paths.lock);
+    if (current.dev !== observed.device || current.ino !== observed.inode) return;
+    rmSync(this.paths.lock);
+    fsyncDirectory(this.paths.root);
+  }
+
+  private assertMetadataLock(token: string): void {
+    const observed = this.observeMetadataLock();
+    if (observed.holder?.token !== token || observed.holder.pid !== process.pid) {
+      this.fatalUnavailable = true;
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot spool metadata lock was lost",
+      );
+    }
+  }
+
+  private releaseMetadataLock(token: string): void {
+    this.assertMetadataLock(token);
+    rmSync(this.paths.lock);
+    fsyncDirectory(this.paths.root);
   }
 
   private acquireOwnership(): void {
@@ -1428,11 +1650,27 @@ export class RelayV2StateSnapshotSpool {
     assertOwnedDirectory(this.paths.staging, true);
     assertOwnedDirectory(this.paths.reservations, true);
     assertOwnedDirectory(this.paths.tombstones, true);
+    assertOwnedDirectory(this.paths.lockCandidates, true);
+    assertOwnedDirectory(this.paths.lockQuarantine, true);
     this.activeById.clear();
     this.activeByLogicalKey.clear();
     this.reservationsById.clear();
     this.tombstonesById.clear();
     this.tombstonesByLogicalKey.clear();
+    this.recoveredQuotaExceeded = false;
+    this.recoveryIncomplete = false;
+
+    assertPrivateFile(this.paths.lock, 4_096);
+    visitDirectoryBounded(
+      this.paths.lockCandidates,
+      MAX_LOCK_CANDIDATES,
+      (entry) => assertPrivateFile(join(this.paths.lockCandidates, entry), 4_096),
+    );
+    visitDirectoryBounded(
+      this.paths.lockQuarantine,
+      MAX_LOCK_QUARANTINES,
+      (entry) => assertPrivateFile(join(this.paths.lockQuarantine, entry), 4_096),
+    );
 
     const expectedRootEntries = new Set([
       basename(this.paths.cuts),
@@ -1440,48 +1678,30 @@ export class RelayV2StateSnapshotSpool {
       basename(this.paths.reservations),
       basename(this.paths.tombstones),
       OWNER_FILE,
-      LOCK_DIRECTORY,
+      LOCK_FILE,
+      LOCK_CANDIDATES_DIRECTORY,
+      LOCK_QUARANTINE_DIRECTORY,
     ]);
-    for (const entry of readdirSync(this.paths.root)) {
-      if (expectedRootEntries.has(entry)) continue;
+    visitDirectoryBounded(this.paths.root, MAX_ROOT_ENTRIES, (entry) => {
+      if (expectedRootEntries.has(entry)) return;
       const path = join(this.paths.root, entry);
+      assertWithinBoundary(path, this.paths.root);
       if (!isAtomicTemporaryName(entry)) {
         throw new Error("snapshot spool root contains unknown persisted state");
       }
       assertPrivateFile(path, this.limits.maxMetadataBytes);
       rmSync(path, { force: true });
-    }
-
-    for (const entry of readdirSync(this.paths.staging)) {
-      const path = join(this.paths.staging, entry);
-      assertPrivateTree(path, this.limits.maxCutCanonicalBytes);
-      rmSync(path, { recursive: true, force: true });
-    }
-    for (const entry of readdirSync(this.paths.reservations)) {
-      const path = join(this.paths.reservations, entry);
-      if (isAtomicTemporaryName(entry)) {
-        assertPrivateFile(path, this.limits.maxMetadataBytes);
-        rmSync(path, { force: true });
-        continue;
-      }
-      const reservation = parseReservation(JSON.parse(readPrivateFile(
-        path,
-        this.limits.maxMetadataBytes,
-      ).toString("utf8")));
-      if (entry !== `${reservation.reservationId}.json`
-        || reservation.hostId !== this.hostId) {
-        throw new Error("snapshot reservation identity is invalid");
-      }
-      rmSync(path, { force: true });
-    }
+    });
 
     const now = this.readNow();
-    for (const entry of readdirSync(this.paths.tombstones)) {
+    let recoveredMetadataBytes = this.ownerMetadataBytes;
+    visitDirectoryBounded(this.paths.tombstones, MAX_TOMBSTONES, (entry) => {
       const path = join(this.paths.tombstones, entry);
+      assertWithinBoundary(path, this.paths.root);
       if (isAtomicTemporaryName(entry)) {
         assertPrivateFile(path, this.limits.maxMetadataBytes);
         rmSync(path, { force: true });
-        continue;
+        return;
       }
       const record = parseTombstone(JSON.parse(
         readPrivateFile(path, this.limits.maxMetadataBytes).toString("utf8"),
@@ -1491,10 +1711,13 @@ export class RelayV2StateSnapshotSpool {
         || record.metadataBytes !== jsonFile(record).byteLength) {
         throw new Error("snapshot tombstone identity or accounting is invalid");
       }
-      if (record.binding.hostEpoch !== hostEpoch || record.expiresAtMs <= now) {
+      if (record.binding.hostEpoch !== hostEpoch
+        || (record.disposition === "released" && record.expiresAtMs <= now)) {
         rmSync(path, { force: true });
-        continue;
+        return;
       }
+      recoveredMetadataBytes += record.metadataBytes;
+      const metadataExceeded = recoveredMetadataBytes > this.limits.maxMetadataBytes;
       const tombstone = { path, record };
       const key = logicalKey(record.binding);
       if (this.tombstonesById.has(record.snapshotId)
@@ -1503,80 +1726,149 @@ export class RelayV2StateSnapshotSpool {
       }
       this.tombstonesById.set(record.snapshotId, tombstone);
       this.tombstonesByLogicalKey.set(key, tombstone);
-    }
+      if (metadataExceeded) {
+        this.recoveredQuotaExceeded = true;
+        this.recoveryIncomplete = true;
+        return false;
+      }
+    });
 
-    for (const entry of readdirSync(this.paths.cuts)) {
+    visitDirectoryBounded(
+      this.paths.reservations,
+      this.limits.maxCutsPerHost * 2 + 2,
+      (entry) => {
+      if (this.recoveryIncomplete) return false;
+      const path = join(this.paths.reservations, entry);
+      assertWithinBoundary(path, this.paths.root);
+      if (isAtomicTemporaryName(entry)) {
+        assertPrivateFile(path, this.limits.maxMetadataBytes);
+        rmSync(path, { force: true });
+        return;
+      }
+      const reservation = parseReservation(JSON.parse(readPrivateFile(
+        path,
+        this.limits.maxMetadataBytes,
+      ).toString("utf8")));
+      if (entry !== `${reservation.reservationId}.json`
+        || reservation.hostId !== this.hostId) {
+        throw new Error("snapshot reservation identity is invalid");
+      }
+      if (reservation.binding.hostEpoch !== hostEpoch) {
+        rmSync(path, { force: true });
+        return;
+      }
+      if (this.reservationsById.has(reservation.reservationId)) {
+        throw new Error("snapshot reservation identity is duplicated");
+      }
+      this.reservationsById.set(reservation.reservationId, reservation);
+    });
+
+    const stagingDirectories: Array<{ directory: string; snapshotId: string }> = [];
+    visitDirectoryBounded(
+      this.paths.staging,
+      this.limits.maxCutsPerHost * 2 + 2,
+      (entry) => {
+      if (this.recoveryIncomplete) return false;
+      const match = /^(snap_[A-Za-z0-9_-]+)\.[0-9a-f]{8}-[0-9a-f-]{27}\.tmp$/.exec(entry);
+      if (!match) throw new Error("snapshot staging directory name is invalid");
+      const snapshotId = match[1]!;
+      assertOpaqueId(snapshotId, "snapshotId");
+      const directory = join(this.paths.staging, entry);
+      assertPrivateFlatDirectory(
+        directory,
+        this.paths.root,
+        this.limits.maxCutRecords + 4,
+        this.limits.maxMetadataBytes,
+      );
+      stagingDirectories.push({ directory, snapshotId });
+    });
+
+    const principalCounts = new Map<string, number>();
+    let recoveredCanonicalBytes = 0;
+    let recoveredActiveMetadataBytes = 0;
+    visitDirectoryBounded(
+      this.paths.cuts,
+      this.limits.maxCutsPerHost * 2 + 2,
+      (entry) => {
+      if (this.recoveryIncomplete) return false;
       const directory = join(this.paths.cuts, entry);
+      assertWithinBoundary(directory, this.paths.root);
+      assertOwnedDirectory(directory, true);
+      assertPrivateFlatDirectory(
+        directory,
+        this.paths.root,
+        this.limits.maxCutRecords + 4,
+        this.limits.maxMetadataBytes,
+      );
       let removedTemporary = false;
-      for (const filename of readdirSync(directory)) {
-        if (!isAtomicTemporaryName(filename)) continue;
-        const temporary = join(directory, filename);
-        assertPrivateFile(temporary, this.limits.maxMetadataBytes);
-        rmSync(temporary, { force: true });
-        removedTemporary = true;
-      }
+      visitDirectoryBounded(
+        directory,
+        this.limits.maxCutRecords + 4,
+        (filename) => {
+          if (!isAtomicTemporaryName(filename)) return;
+          const temporary = join(directory, filename);
+          assertWithinBoundary(temporary, this.paths.root);
+          assertPrivateFile(temporary, this.limits.maxMetadataBytes);
+          rmSync(temporary, { force: true });
+          removedTemporary = true;
+        },
+      );
       if (removedTemporary) fsyncDirectory(directory);
-      assertPrivateTree(directory, this.limits.maxCutCanonicalBytes);
-      let recoverableBinding: PersistedBindingMarker | undefined;
-      let recoverableManifest: PersistedManifest | undefined;
-      let bindingFailure: unknown;
-      let manifestFailure: unknown;
-      try {
-        recoverableBinding = this.readBindingMarker(directory);
-      } catch (error) {
-        bindingFailure = error;
-      }
-      try {
-        recoverableManifest = this.readManifest(directory);
-      } catch (error) {
-        manifestFailure = error;
-      }
-      if (bindingFailure instanceof UnsafeSpoolPathError
-        || manifestFailure instanceof UnsafeSpoolPathError) {
-        throw new UnsafeSpoolPathError("snapshot cut trust check failed");
-      }
-      if (!recoverableBinding && !recoverableManifest) {
-        throw new Error("snapshot cut lost both persisted identity copies");
-      }
-      const manifestBinding = recoverableManifest === undefined
-        ? undefined
-        : bindingMarkerFor(recoverableManifest);
-      if (recoverableBinding && manifestBinding
-        && canonicalizeSnapshotJson(recoverableBinding)
-          !== canonicalizeSnapshotJson(manifestBinding)) {
-        throw new Error("snapshot cut identity copies conflict");
-      }
-      const identity = recoverableBinding ?? manifestBinding!;
+      const recovered = this.readRecoverableIdentity(directory);
+      const identity = recovered.identity;
       if (identity.snapshotId !== entry || identity.hostId !== this.hostId) {
         throw new Error("snapshot cut directory identity is invalid");
       }
       if (identity.binding.hostEpoch !== hostEpoch) {
         rmSync(directory, { recursive: true, force: true });
-        continue;
+        return;
       }
-      if (!recoverableBinding || !recoverableManifest) {
-        rmSync(directory, { recursive: true, force: true });
+      if (!recovered.binding || !recovered.manifest) {
         if (!this.tombstonesById.has(identity.snapshotId)) {
-          this.recordExpiredBinding(identity, now);
+          this.recordExpiredBinding(identity, now, true);
         }
-        continue;
-      }
-      if (this.tombstonesById.has(identity.snapshotId)) {
         rmSync(directory, { recursive: true, force: true });
-        continue;
+        fsyncDirectory(this.paths.cuts);
+        return;
+      }
+      const existingTombstone = this.tombstonesById.get(identity.snapshotId);
+      if (existingTombstone) {
+        if (!sameBinding(existingTombstone.record.binding, identity.binding)) {
+          throw new Error("snapshot cut conflicts with its persisted logical fence");
+        }
+        rmSync(directory, { recursive: true, force: true });
+        fsyncDirectory(this.paths.cuts);
+        return;
+      }
+      const manifest = recovered.manifest;
+      const principal = identity.binding.principalId;
+      const nextPrincipalCount = (principalCounts.get(principal) ?? 0) + 1;
+      const quotaWouldBeExceeded = this.recoveredQuotaExceeded
+        || this.activeById.size + 1 > this.limits.maxCutsPerHost
+        || nextPrincipalCount > this.limits.maxCutsPerPrincipal
+        || recoveredCanonicalBytes + manifest.totalCanonicalBytes
+          > this.limits.maxSpoolCanonicalBytes
+        || recoveredMetadataBytes + recoveredActiveMetadataBytes
+          + manifest.metadataBytes
+          > this.limits.maxMetadataBytes;
+      if (quotaWouldBeExceeded) {
+        this.recoveredQuotaExceeded = true;
+        this.recoveryIncomplete = true;
+        return false;
       }
       let cut: ActiveCut;
       try {
-        cut = this.loadCut(directory, recoverableManifest, recoverableBinding);
+        cut = this.loadCut(directory, manifest, recovered.binding);
         if (cut.lease.snapshotLeaseExpiresAtMs <= now
           || cut.manifest.snapshotAbsoluteExpiresAtMs <= now) {
           throw new Error("snapshot cut lease expired");
         }
       } catch (error) {
         if (error instanceof UnsafeSpoolPathError) throw error;
+        this.recordExpiredBinding(identity, now, true);
         rmSync(directory, { recursive: true, force: true });
-        this.recordExpiredBinding(identity, now);
-        continue;
+        fsyncDirectory(this.paths.cuts);
+        return;
       }
       const key = logicalKey(cut.manifest.binding);
       if (this.activeByLogicalKey.has(key) || this.activeById.has(cut.manifest.snapshotId)) {
@@ -1584,6 +1876,36 @@ export class RelayV2StateSnapshotSpool {
       }
       this.activeById.set(cut.manifest.snapshotId, cut);
       this.activeByLogicalKey.set(key, cut);
+      principalCounts.set(principal, nextPrincipalCount);
+      recoveredCanonicalBytes += cut.manifest.totalCanonicalBytes;
+      recoveredActiveMetadataBytes += cut.manifest.metadataBytes;
+    });
+
+    if (!this.recoveryIncomplete) {
+      for (const reservation of [...this.reservationsById.values()]) {
+        const active = this.activeById.get(reservation.snapshotId);
+        if (active && sameBinding(active.manifest.binding, reservation.binding)
+          && active.manifest.snapshotCreatedAtMs === reservation.snapshotCreatedAtMs
+          && active.manifest.snapshotAbsoluteExpiresAtMs
+            === reservation.snapshotAbsoluteExpiresAtMs) {
+          this.removeReservationFile(reservation);
+        } else {
+          this.expireReservation(reservation, expiredError(), true);
+        }
+      }
+      for (const staging of stagingDirectories) {
+        if (!this.activeById.has(staging.snapshotId)
+          && !this.tombstonesById.has(staging.snapshotId)) {
+          const recovered = this.readRecoverableIdentity(staging.directory);
+          this.recordExpiredBinding(recovered.identity, now, true);
+        }
+        if (!this.activeById.has(staging.snapshotId)
+          && !this.tombstonesById.has(staging.snapshotId)) {
+          throw new Error("snapshot staging state lacks durable logical evidence");
+        }
+        rmSync(staging.directory, { recursive: true, force: true });
+        fsyncDirectory(this.paths.staging);
+      }
     }
     this.enforceRecoveredQuota();
     fsyncDirectory(this.paths.staging);
@@ -1591,6 +1913,48 @@ export class RelayV2StateSnapshotSpool {
     fsyncDirectory(this.paths.tombstones);
     fsyncDirectory(this.paths.cuts);
     fsyncDirectory(this.paths.root);
+  }
+
+  private readRecoverableIdentity(directory: string): {
+    identity: PersistedBindingMarker;
+    binding: PersistedBindingMarker | undefined;
+    manifest: PersistedManifest | undefined;
+  } {
+    assertWithinBoundary(directory, this.paths.root);
+    assertOwnedDirectory(directory, true);
+    let binding: PersistedBindingMarker | undefined;
+    let manifest: PersistedManifest | undefined;
+    let bindingFailure: unknown;
+    let manifestFailure: unknown;
+    try {
+      binding = this.readBindingMarker(directory);
+    } catch (error) {
+      bindingFailure = error;
+    }
+    try {
+      manifest = this.readManifest(directory);
+    } catch (error) {
+      manifestFailure = error;
+    }
+    if (bindingFailure instanceof UnsafeSpoolPathError
+      || manifestFailure instanceof UnsafeSpoolPathError) {
+      throw new UnsafeSpoolPathError("snapshot cut trust check failed");
+    }
+    if (!binding && !manifest) {
+      throw new Error("snapshot cut lost both persisted identity copies");
+    }
+    const manifestBinding = manifest === undefined
+      ? undefined
+      : bindingMarkerFor(manifest);
+    if (binding && manifestBinding
+      && canonicalizeSnapshotJson(binding) !== canonicalizeSnapshotJson(manifestBinding)) {
+      throw new Error("snapshot cut identity copies conflict");
+    }
+    return {
+      identity: binding ?? manifestBinding!,
+      binding,
+      manifest,
+    };
   }
 
   private readManifest(directory: string): PersistedManifest {
@@ -1640,8 +2004,14 @@ export class RelayV2StateSnapshotSpool {
       LEASE_FILE,
       ...manifest.chunks.map((chunk) => chunk.file),
     ]);
-    if (readdirSync(directory).some((entry) => !expectedFiles.has(entry))
-      || readdirSync(directory).length !== expectedFiles.size) {
+    let actualFiles = 0;
+    visitDirectoryBounded(directory, expectedFiles.size + 1, (entry) => {
+      actualFiles += 1;
+      if (!expectedFiles.has(entry)) {
+        throw new Error("snapshot cut contains unexpected files");
+      }
+    });
+    if (actualFiles !== expectedFiles.size) {
       throw new Error("snapshot cut contains unexpected files");
     }
 
@@ -1714,7 +2084,9 @@ export class RelayV2StateSnapshotSpool {
       || [...this.activeById.values()].reduce((sum, cut) => (
         sum + cut.manifest.totalCanonicalBytes
       ), 0) > this.limits.maxSpoolCanonicalBytes;
-    this.recoveredQuotaExceeded = invalidActiveQuota
+    this.recoveredQuotaExceeded = this.recoveredQuotaExceeded
+      || this.recoveryIncomplete
+      || invalidActiveQuota
       || this.ownerMetadataBytes + activeMetadata + tombstoneMetadata
         > this.limits.maxMetadataBytes;
   }
@@ -1735,7 +2107,7 @@ export class RelayV2StateSnapshotSpool {
   ): FirstDecision {
     const existing = this.existingFirst(key);
     if (existing) return existing;
-    if (this.recoveredQuotaExceeded) {
+    if (this.recoveredQuotaExceeded || this.recoveryIncomplete) {
       throw new RelayV2StateSnapshotSpoolError(
         "BUSY",
         "snapshot spool recovered above its frozen quota",
@@ -1789,6 +2161,7 @@ export class RelayV2StateSnapshotSpool {
     const path = join(this.paths.reservations, `${reservation.reservationId}.json`);
     this.persistAtomic(path, jsonFile(reservation));
     this.reservationsById.set(reservation.reservationId, reservation);
+    this.testHooks?.afterReservationPersisted?.(reservation.snapshotId);
 
     let resolve!: () => void;
     let reject!: (error: unknown) => void;
@@ -1825,7 +2198,7 @@ export class RelayV2StateSnapshotSpool {
       cut = await this.cutSource.capture(reservation.binding.hostEpoch);
     } catch (error) {
       const sourceError = mapSourceError(error);
-      await this.serializeMetadata(() => this.removeReservation(reservation));
+      await this.serializeMetadata(() => this.expireReservation(reservation, sourceError));
       throw sourceError;
     }
     try {
@@ -1839,8 +2212,9 @@ export class RelayV2StateSnapshotSpool {
       assertCanonicalCounter(cut.scopesRevision, "scopesRevision");
       validateRecordStream(cut.records);
     } catch (error) {
-      await this.serializeMetadata(() => this.removeReservation(reservation));
-      throw structuredSpoolError(error);
+      const failure = structuredSpoolError(error);
+      await this.serializeMetadata(() => this.expireReservation(reservation, failure));
+      throw failure;
     }
 
     await this.serializeMetadata(async () => {
@@ -1848,9 +2222,16 @@ export class RelayV2StateSnapshotSpool {
       let finalDirectory: string | undefined;
       let publication: "precommit" | "renamed" | "published" = "precommit";
       let reservationRemoved = false;
-      const removeBuildingReservation = () => {
+      const removePublishedReservation = () => {
         if (reservationRemoved) return;
-        this.removeReservation(reservation);
+        this.removeReservationFile(reservation);
+        reservationRemoved = true;
+      };
+      const expireBuildingReservation = (
+        failure: RelayV2StateSnapshotSpoolError,
+      ) => {
+        if (reservationRemoved) return;
+        this.expireReservation(reservation, failure);
         reservationRemoved = true;
       };
       try {
@@ -1861,7 +2242,6 @@ export class RelayV2StateSnapshotSpool {
           throw expiredError();
         }
         if (this.readNow() >= reservation.snapshotAbsoluteExpiresAtMs) {
-          removeBuildingReservation();
           throw expiredError();
         }
         stagingDirectory = join(
@@ -1906,10 +2286,14 @@ export class RelayV2StateSnapshotSpool {
           };
           this.activeById.set(reservation.snapshotId, cutRecord);
           this.activeByLogicalKey.set(logicalKey(reservation.binding), cutRecord);
-          removeBuildingReservation();
+          removePublishedReservation();
         });
       } catch (error) {
+        const failure = structuredSpoolError(error);
         try {
+          if (publication !== "published") {
+            expireBuildingReservation(failure);
+          }
           if (publication === "renamed" && finalDirectory !== undefined) {
             rmSync(finalDirectory, { recursive: true, force: true });
             this.syncDirectory(this.paths.cuts, "rollback_cuts");
@@ -1920,7 +2304,6 @@ export class RelayV2StateSnapshotSpool {
             fsyncDirectory(this.paths.staging);
             stagingDirectory = undefined;
           }
-          if (publication !== "published") removeBuildingReservation();
         } catch {
           this.fatalUnavailable = true;
           throw new RelayV2StateSnapshotSpoolError(
@@ -1935,7 +2318,7 @@ export class RelayV2StateSnapshotSpool {
             "snapshot publication committed with uncertain metadata cleanup",
           );
         }
-        throw structuredSpoolError(error);
+        throw failure;
       }
     });
   }
@@ -2077,7 +2460,7 @@ export class RelayV2StateSnapshotSpool {
     snapshotId: string,
   ): Promise<RelayV2StateSnapshotChunk> {
     return this.serializeMetadata(async () => {
-      if (this.recoveredQuotaExceeded) {
+      if (this.recoveredQuotaExceeded || this.recoveryIncomplete) {
         throw new RelayV2StateSnapshotSpoolError(
           "INTERNAL",
           "snapshot spool recovered above its frozen quota",
@@ -2170,7 +2553,8 @@ export class RelayV2StateSnapshotSpool {
       }
     }
     for (const [snapshotId, tombstone] of this.tombstonesById) {
-      if (tombstone.record.expiresAtMs > now) continue;
+      if (tombstone.record.disposition !== "released"
+        || tombstone.record.expiresAtMs > now) continue;
       this.removeTombstoneFile(tombstone.path);
       this.tombstonesById.delete(snapshotId);
       const key = logicalKey(tombstone.record.binding);
@@ -2179,7 +2563,9 @@ export class RelayV2StateSnapshotSpool {
       }
     }
     for (const reservation of [...this.reservationsById.values()]) {
-      if (reservation.snapshotAbsoluteExpiresAtMs <= now) this.removeReservation(reservation);
+      if (reservation.snapshotAbsoluteExpiresAtMs <= now) {
+        this.expireReservation(reservation, expiredError());
+      }
     }
   }
 
@@ -2197,21 +2583,27 @@ export class RelayV2StateSnapshotSpool {
       }
     }
     for (const reservation of [...this.reservationsById.values()]) {
-      if (reservation.binding.hostEpoch !== hostEpoch) this.removeReservation(reservation);
+      if (reservation.binding.hostEpoch !== hostEpoch) {
+        this.removeReservationFile(reservation);
+      }
     }
   }
 
   private recordExpiredBinding(
     marker: PersistedBindingMarker,
     now: number,
+    recovery = false,
   ): void {
     const key = logicalKey(marker.binding);
-    if (this.tombstonesById.has(marker.snapshotId)
-      || this.tombstonesByLogicalKey.has(key)) return;
-    const expiresAtMs = Math.min(
-      Number.MAX_SAFE_INTEGER,
-      now + this.limits.releaseTombstoneMs,
-    );
+    const byId = this.tombstonesById.get(marker.snapshotId);
+    const byLogicalKey = this.tombstonesByLogicalKey.get(key);
+    if (byId || byLogicalKey) {
+      if (!byId || !byLogicalKey || byId !== byLogicalKey
+        || !sameBinding(byId.record.binding, marker.binding)) {
+        throw new Error("snapshot logical expiry fence conflicts with persisted evidence");
+      }
+      return;
+    }
     let tombstone: PersistedSnapshotTombstone = {
       version: TOMBSTONE_VERSION,
       snapshotId: marker.snapshotId,
@@ -2219,7 +2611,7 @@ export class RelayV2StateSnapshotSpool {
       binding: clone(marker.binding),
       disposition: "expired",
       recordedAtMs: now,
-      expiresAtMs,
+      expiresAtMs: Number.MAX_SAFE_INTEGER,
       metadataBytes: 0,
     };
     tombstone = {
@@ -2233,11 +2625,18 @@ export class RelayV2StateSnapshotSpool {
       );
     }
     this.installTombstone(tombstone);
+    if (recovery) {
+      this.testHooks?.afterRecoveryExpiredFencePersisted?.(marker.snapshotId);
+    }
   }
 
   private installTombstone(record: PersistedSnapshotTombstone): void {
     const path = join(this.paths.tombstones, `${record.snapshotId}.json`);
     this.persistAtomic(path, jsonFile(record));
+    this.testHooks?.afterTombstonePersisted?.(
+      record.snapshotId,
+      record.disposition,
+    );
     const tombstone = { path, record };
     this.tombstonesById.set(record.snapshotId, tombstone);
     this.tombstonesByLogicalKey.set(logicalKey(record.binding), tombstone);
@@ -2276,7 +2675,26 @@ export class RelayV2StateSnapshotSpool {
     if (cut) this.removeActiveCut(cut);
   }
 
-  private removeReservation(reservation: PersistedReservation): void {
+  private expireReservation(
+    reservation: PersistedReservation,
+    failure: RelayV2StateSnapshotSpoolError,
+    recovery = false,
+  ): void {
+    this.recordExpiredBinding(
+      bindingMarkerForReservation(reservation),
+      this.readNow(),
+      recovery,
+    );
+    const key = logicalKey(reservation.binding);
+    const build = this.buildsByLogicalKey.get(key);
+    if (build) {
+      build.reject(failure);
+      this.buildsByLogicalKey.delete(key);
+    }
+    this.removeReservationFile(reservation);
+  }
+
+  private removeReservationFile(reservation: PersistedReservation): void {
     try {
       rmSync(join(this.paths.reservations, `${reservation.reservationId}.json`), { force: true });
       fsyncDirectory(this.paths.reservations);
