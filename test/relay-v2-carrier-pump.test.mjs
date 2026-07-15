@@ -205,6 +205,7 @@ function createHarness(options = {}) {
     clientDialects: ["tw-relay.v2"],
     clock: () => scheduler.now,
     schedule: scheduler.schedule,
+    queueLimits: options.hostQueueLimits,
     routeSink: {
       onRouteBound(binding) {
         bound.push(binding);
@@ -1064,50 +1065,81 @@ test("mandatory teardown reserve survives a full ordinary action queue and 128-r
   assert.equal(h.pump.snapshot().terminalFailure, null);
 });
 
-test("mandatory byte overflow disconnects Broker before one registered force failure", async () => {
+test("mandatory capacity overflow beyond 128 routes stops after one registered force failure", async () => {
   let directoryAtForce = "not-called";
   let registeredAtForce = 0;
+  let routeAcceptedAtForce = true;
   let forceCalls = 0;
   let h;
   h = createHarness({
+    hostQueueLimits: {
+      maxRoutes: 256,
+    },
     queueLimits: {
       maxPendingActions: 8,
-      maxPendingActionBytes: 2_048,
+      maxPendingActionBytes: 1_048_576,
     },
     forceActionSink() {
       forceCalls += 1;
       directoryAtForce = h.broker.inspectHost(HOST_ID);
       registeredAtForce = h.pump.snapshot().mandatoryActions;
+      routeAcceptedAtForce = h.broker.forwardClientFrame(
+        "client-unbounded-opening-159",
+        publicClientFrame("must-already-be-offline"),
+      ).accepted;
       return false;
     },
   });
   await startRegistered(h);
-  for (let index = 0; index < 128; index += 1) {
+  for (let index = 0; index < 160; index += 1) {
     await openRoute(h, `client-unbounded-opening-${index.toString().padStart(3, "0")}`);
   }
+  assert.equal(h.pump.snapshot().pendingActions, 0, "normal route-open actions are consumed");
+  assert.equal(
+    h.brokerActions.filter((action) => action.kind === "route_opened").length,
+    160,
+  );
 
-  const closeBarrier = h.pump.shutdown(1013, "mandatory-byte-overflow");
+  const closeBarrier = h.pump.shutdown(1013, "mandatory-capacity-overflow");
   const receipt = await closeBarrier;
   const stableSnapshot = h.pump.snapshot();
 
   assert.equal(directoryAtForce?.state, "offline", "Broker directory is offline before force handoff");
-  assert.ok(registeredAtForce > 0, "the emergency entry is registered as forcing before callback");
+  assert.equal(routeAcceptedAtForce, false, "active routes are gone before force handoff");
+  assert.equal(registeredAtForce, 131, "the emergency entry is capacity + one before callback");
   assert.equal(forceCalls, 1);
   assert.equal(receipt.outcome, "terminal_failure");
   assert.equal(receipt.failedMandatoryActions, 1);
   assert.equal(stableSnapshot.phase, "terminal_failure");
   assert.equal(stableSnapshot.scheduledTimers, 0);
-  assert.ok(stableSnapshot.mandatoryActions <= 131, "registry is bounded at capacity plus one");
+  assert.equal(stableSnapshot.mandatoryActions, 131, "registry is hard bounded at capacity plus one");
   assert.equal(h.broker.inspectHost(HOST_ID)?.state, "offline");
+  assert.equal(h.scheduler.liveDelayedTasks().length, 0);
 
   h.pump.acceptBrokerResult({
     accepted: true,
-    actions: [{
-      kind: "close_client",
-      connectionId: "late-after-terminal-failure",
-      closeCode: 1013,
-      reason: "must-not-append",
-    }],
+    actions: [
+      {
+        kind: "close_client",
+        connectionId: "late-current-batch-after-terminal-failure",
+        closeCode: 1013,
+        reason: "must-not-append",
+      },
+      {
+        kind: "route_unavailable",
+        connectionId: "late-next-batch-after-terminal-failure",
+        hostId: HOST_ID,
+        closeCode: 1013,
+        error: {
+          code: "HOST_OFFLINE",
+          message: "must-not-append",
+          retryable: true,
+          retryAfterMs: null,
+          commandDisposition: "not_applicable",
+          details: null,
+        },
+      },
+    ],
   });
   assert.equal(forceCalls, 1);
   assert.equal(h.pump.snapshot().mandatoryActions, stableSnapshot.mandatoryActions);
