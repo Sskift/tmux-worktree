@@ -456,6 +456,70 @@
     }
   },
   {
+    "name": "terminal-input-sequence-zero",
+    "channel": "public",
+    "category": "zero-sequence",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "terminal-input",
+      "path": "/payload/inputSeq",
+      "value": "0"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "terminal-input-error-sequence-zero",
+    "channel": "public",
+    "category": "zero-sequence",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "terminal-input-error",
+      "path": "/payload/inputSeq",
+      "value": "0"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "terminal-resize-sequence-zero",
+    "channel": "public",
+    "category": "zero-sequence",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "terminal-resize",
+      "path": "/payload/resizeSeq",
+      "value": "0"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "terminal-resize-error-sequence-zero",
+    "channel": "public",
+    "category": "zero-sequence",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "terminal-resize-error",
+      "path": "/payload/resizeSeq",
+      "value": "0"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
     "name": "terminal-input-decoded-bytes-over-limit",
     "channel": "public",
     "category": "base64-decoded-limit",

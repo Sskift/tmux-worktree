@@ -77,6 +77,33 @@ test("Node Relay v2 route-envelope decoder defers command arguments until after 
   );
 });
 
+test("shared terminal ACK goldens preserve cumulative sequence baseline zero", () => {
+  for (const [fixtureName, field] of [
+    ["terminal-input-ack", "ackedThroughInputSeq"],
+    ["terminal-resize-ack", "ackedThroughResizeSeq"],
+  ]) {
+    const frame = corpus.goldenByName.get(fixtureName).frame;
+    assert.equal(frame.payload[field], "0");
+    assert.doesNotThrow(() => codec.encodeRelayV2WebSocketFrame("public", frame));
+  }
+});
+
+test("explicit client_closed remains a correlated response, never a natural event", () => {
+  const event = structuredClone(corpus.goldenByName.get("terminal-closed-event").frame);
+  event.payload.reason = "client_closed";
+  event.payload.exitCode = null;
+  assert.throws(
+    () => codec.encodeRelayV2WebSocketFrame("public", event),
+    (error) => error instanceof codec.RelayV2CodecError
+      && error.failureClass === "schema-mismatch",
+  );
+
+  const response = structuredClone(corpus.goldenByName.get("terminal-closed-response").frame);
+  response.payload.reason = "client_closed";
+  response.payload.exitCode = null;
+  assert.doesNotThrow(() => codec.encodeRelayV2WebSocketFrame("public", response));
+});
+
 test("Node Relay v2 dialect resolution matches the shared no-fallback matrix", () => {
   for (const fixture of corpus.dialect) {
     assert.deepEqual(

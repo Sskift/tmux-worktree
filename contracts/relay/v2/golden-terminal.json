@@ -301,7 +301,7 @@
       "streamId": "stream-uuid",
       "payload": {
         "generation": "generation-uuid",
-        "ackedThroughInputSeq": "1"
+        "ackedThroughInputSeq": "0"
       }
     },
     "normalized": {
@@ -383,7 +383,7 @@
       "streamId": "stream-uuid",
       "payload": {
         "generation": "generation-uuid",
-        "ackedThroughResizeSeq": "1"
+        "ackedThroughResizeSeq": "0"
       }
     },
     "normalized": {

@@ -268,6 +268,12 @@ function counter(value: RelayV2JsonValue): string {
   return value;
 }
 
+function positiveCounter(value: RelayV2JsonValue): string {
+  const parsed = counter(value);
+  if (parsed === "0") reject("invalid-argument");
+  return parsed;
+}
+
 function canonicalBase64(value: RelayV2JsonValue, maxDecodedBytes: number): string {
   if (value === null) reject("forbidden-null");
   if (typeof value !== "string") reject("type-coercion");
@@ -1621,7 +1627,7 @@ export function validateRelayV2PublicFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["generation", "inputSeq", "encoding", "data"]);
       id(field(payload, "generation"));
-      counter(field(payload, "inputSeq"));
+      positiveCounter(field(payload, "inputSeq"));
       literal(field(payload, "encoding"), "base64");
       canonicalBase64(field(payload, "data"), 65_536);
       break;
@@ -1639,7 +1645,7 @@ export function validateRelayV2PublicFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["generation", "inputSeq", "ackedThroughInputSeq", "error"]);
       id(field(payload, "generation"));
-      counter(field(payload, "inputSeq"));
+      positiveCounter(field(payload, "inputSeq"));
       counter(field(payload, "ackedThroughInputSeq"));
       validateStructuredError(field(payload, "error"));
       break;
@@ -1649,7 +1655,7 @@ export function validateRelayV2PublicFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["generation", "resizeSeq", "cols", "rows"]);
       id(field(payload, "generation"));
-      counter(field(payload, "resizeSeq"));
+      positiveCounter(field(payload, "resizeSeq"));
       integer(field(payload, "cols"), 1, 1_000);
       integer(field(payload, "rows"), 1, 500);
       break;
@@ -1667,7 +1673,7 @@ export function validateRelayV2PublicFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["generation", "resizeSeq", "ackedThroughResizeSeq", "error"]);
       id(field(payload, "generation"));
-      counter(field(payload, "resizeSeq"));
+      positiveCounter(field(payload, "resizeSeq"));
       counter(field(payload, "ackedThroughResizeSeq"));
       validateStructuredError(field(payload, "error"));
       break;

@@ -185,6 +185,7 @@
     "scope-session-and-pinned-state-snapshot",
     "sequenced-state-events",
     "terminal-open-replay-input-resize-close",
+    "terminal-positive-input-resize-sequences-with-zero-ack-baselines",
     "v1-v2-dialect-outcomes-without-fallback",
     "strict-framing-utf8-json-schema-and-allocation-limits"
   ],

@@ -35,6 +35,7 @@ test("Relay v2 base fixture manifest describes codec-only conformance without en
   ]);
   assert.deepEqual(manifest.normalizedShapes.https, ["channel", "schema"]);
   assert.ok(manifest.coverage.includes("terminal-open-replay-input-resize-close"));
+  assert.ok(manifest.coverage.includes("terminal-positive-input-resize-sequences-with-zero-ack-baselines"));
   assert.ok(manifest.coverage.includes("command-execute-status-result-and-query"));
   assert.ok(manifest.coverage.includes("command-non-message-string-outer-whitespace-rejection"));
   assert.ok(manifest.coverage.includes("https-enrollment-refresh-bootstrap-and-revoke"));
