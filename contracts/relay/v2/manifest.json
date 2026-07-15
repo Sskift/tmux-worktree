@@ -1,0 +1,161 @@
+{
+  "contract": "tmux-worktree-relay-v2-base",
+  "contractVersion": "2.0.0-android-first",
+  "fixtureFormatVersion": 1,
+  "contractStatus": "frozen",
+  "implementationStatus": "not-implemented",
+  "conformanceStatus": "fixtures-only",
+  "runtimeCodecConsumptionStatus": "pending-node-and-android-owners",
+  "capabilityAdvertisementAllowed": false,
+  "encoding": "strict-utf-8-json-text",
+  "requiredCapabilities": [
+    "error.structured.v1",
+    "command.ledger.v1",
+    "command.query.v1",
+    "snapshot.revision.v1",
+    "event.sequence.v1",
+    "terminal.stream.resume.v1"
+  ],
+  "intendedConsumers": [
+    "node-relay-v2-codec",
+    "android-relay-v2-codec"
+  ],
+  "fixtureIntegrityIsRuntimeConformance": false,
+  "limits": {
+    "publicFrameBytes": 1048576,
+    "carrierFrameBytes": 1500000,
+    "jsonMaxDepth": 16,
+    "jsonMaxDirectKeysPerObject": 256,
+    "jsonMaxTotalKeys": 1024,
+    "jsonMaxNodes": 4096,
+    "idMaxUtf8Bytes": 128,
+    "unsignedCounterMax": "18446744073709551615",
+    "jsonSafeIntegerMax": 9007199254740991
+  },
+  "commandDispositions": [
+    "not_accepted",
+    "accepted",
+    "running",
+    "completed",
+    "in_doubt",
+    "not_applicable"
+  ],
+  "errorCodes": [
+    "AUTH_REQUIRED",
+    "AUTH_INVALID",
+    "PERMISSION_DENIED",
+    "GRANT_NOT_FOUND",
+    "ROLE_MISMATCH",
+    "PROTOCOL_UNSUPPORTED",
+    "HOST_DIALECT_UNAVAILABLE",
+    "CAPABILITY_UNAVAILABLE",
+    "INVALID_ENVELOPE",
+    "INVALID_ARGUMENT",
+    "HOST_NOT_FOUND",
+    "HOST_OFFLINE",
+    "HOST_EPOCH_MISMATCH",
+    "EVENT_CURSOR_AHEAD",
+    "HOST_SUPERSEDED",
+    "DUPLICATE_CONNECTOR",
+    "SCOPE_NOT_FOUND",
+    "SCOPE_UNREACHABLE",
+    "SNAPSHOT_EXPIRED",
+    "SNAPSHOT_TOO_LARGE",
+    "PROJECT_NOT_FOUND",
+    "SESSION_NOT_FOUND",
+    "PANE_NOT_FOUND",
+    "IDEMPOTENCY_CONFLICT",
+    "COMMAND_NOT_ACCEPTED",
+    "COMMAND_WINDOW_EXPIRED",
+    "COMMAND_RESULT_EXPIRED",
+    "COMMAND_STATUS_UNKNOWN",
+    "COMMAND_IN_DOUBT",
+    "COMMAND_FAILED",
+    "RATE_LIMITED",
+    "BUSY",
+    "SLOW_CONSUMER",
+    "TERMINAL_STREAM_NOT_FOUND",
+    "TERMINAL_STREAM_CONFLICT",
+    "TERMINAL_OPEN_CONFLICT",
+    "TERMINAL_CLOSE_CONFLICT",
+    "TERMINAL_ROUTE_STALE",
+    "TERMINAL_GENERATION_STALE",
+    "TERMINAL_OFFSET_EXPIRED",
+    "TERMINAL_INVALID_ACK",
+    "TERMINAL_INPUT_GAP",
+    "TERMINAL_INPUT_CONFLICT",
+    "TERMINAL_RESIZE_GAP",
+    "TERMINAL_RESIZE_CONFLICT",
+    "INTERNAL"
+  ],
+  "fixtureInputKinds": {
+    "utf8": "wire is encoded as UTF-8 without normalization",
+    "base64": "data is decoded to the exact input bytes",
+    "repeat-ascii": "ascii is repeated count times to form the exact input bytes",
+    "nested-array": "depth nested arrays are generated around the JSON integer zero",
+    "flat-object": "keyCount distinct k0..kN JSON integer fields are generated"
+  },
+  "files": [
+    {
+      "role": "golden",
+      "channel": "public",
+      "path": "golden-public-handshake.json"
+    },
+    {
+      "role": "golden",
+      "channel": "carrier",
+      "path": "golden-carrier.json"
+    },
+    {
+      "role": "invalid",
+      "channel": "public-and-carrier",
+      "path": "invalid-vectors.json"
+    }
+  ],
+  "coverage": {
+    "included": [
+      "public-envelope",
+      "structured-error",
+      "client-handshake",
+      "host-carrier-handshake",
+      "carrier-route-open",
+      "carrier-route-data",
+      "strict-framing-and-json-rejections"
+    ],
+    "deferred": [
+      "https-enrollment-refresh-bootstrap-revoke",
+      "command-execute-status-query",
+      "scope-session-and-state-snapshot",
+      "state-events",
+      "terminal-open-replay-input-resize-close",
+      "dialect-upgrade-matrix"
+    ]
+  },
+  "acceptancePending": [
+    "node-production-codec-consumes-all-golden-and-invalid-vectors",
+    "android-production-codec-consumes-all-golden-and-invalid-vectors",
+    "node-and-android-normalized-results-match",
+    "v1-fixtures-and-codecs-remain-unchanged"
+  ],
+  "remainingGoldenMatrix": [
+    "client-hello-resume-matched-behind-and-host-epoch-changed",
+    "auth-expiring-host-presence-and-hosts-snapshot",
+    "host-reauthenticate-enrollment-and-grant-controls",
+    "route-rejected-unbind-unbound-close-and-reverse-data",
+    "https-enrollment-refresh-bootstrap-and-revoke",
+    "command-execute-status-result-and-query",
+    "scope-session-state-snapshot-and-events",
+    "terminal-open-output-replay-input-resize-and-close",
+    "four-way-v1-v2-dialect-upgrade-outcomes"
+  ],
+  "remainingInvalidMatrix": [
+    "json-total-key-and-node-limits",
+    "state-snapshot-expanded-key-and-node-limits",
+    "carrier-frame-limit",
+    "binary-frame-trailing-json-and-non-object-root",
+    "compression-and-decompression-limits",
+    "non-canonical-base64url-token-and-digest-fields",
+    "message-specific-array-byte-record-and-queue-limits",
+    "all-deferred-golden-message-closed-schema-mutations"
+  ]
+}

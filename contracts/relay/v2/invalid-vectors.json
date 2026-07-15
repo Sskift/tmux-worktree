@@ -1,0 +1,244 @@
+[
+  {
+    "name": "duplicate-request-id",
+    "channel": "public",
+    "category": "duplicate-key",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":\"hello-one\",\"requestId\":\"hello-two\",\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "duplicate-key"
+    },
+    "integrity": {
+      "kind": "duplicate-json-member",
+      "member": "requestId",
+      "occurrences": 2
+    }
+  },
+  {
+    "name": "client-hello-unknown-auth-field",
+    "channel": "public",
+    "category": "unknown-field",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":\"hello-attempt-uuid\",\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"principalId\":\"forged-principal\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "unknown-field"
+    },
+    "integrity": {
+      "kind": "member-present",
+      "path": ["payload", "principalId"],
+      "value": "forged-principal"
+    }
+  },
+  {
+    "name": "client-hello-null-request-id",
+    "channel": "public",
+    "category": "forbidden-null",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":null,\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "forbidden-null"
+    },
+    "integrity": {
+      "kind": "member-present",
+      "path": ["requestId"],
+      "value": null
+    }
+  },
+  {
+    "name": "client-hello-string-protocol-version",
+    "channel": "public",
+    "category": "type-coercion",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"protocolVersion\":\"2\",\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":\"hello-attempt-uuid\",\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "type-coercion"
+    },
+    "integrity": {
+      "kind": "member-type",
+      "path": ["protocolVersion"],
+      "type": "string"
+    }
+  },
+  {
+    "name": "route-data-leading-zero-sequence",
+    "channel": "carrier",
+    "category": "non-canonical-counter",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"carrierVersion\":1,\"type\":\"route.data\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"direction\":\"client_to_host\",\"seq\":\"01\",\"payload\":{\"opcode\":\"text\",\"encoding\":\"base64\",\"data\":\"YQ==\"}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "non-canonical-counter"
+    },
+    "integrity": {
+      "kind": "non-canonical-counter",
+      "path": ["seq"],
+      "value": "01"
+    }
+  },
+  {
+    "name": "route-data-counter-overflow",
+    "channel": "carrier",
+    "category": "counter-overflow",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"carrierVersion\":1,\"type\":\"route.data\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"direction\":\"client_to_host\",\"seq\":\"18446744073709551616\",\"payload\":{\"opcode\":\"text\",\"encoding\":\"base64\",\"data\":\"YQ==\"}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "counter-overflow"
+    },
+    "integrity": {
+      "kind": "counter-overflow",
+      "path": ["seq"],
+      "value": "18446744073709551616"
+    }
+  },
+  {
+    "name": "route-data-missing-base64-padding",
+    "channel": "carrier",
+    "category": "non-canonical-base64",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"carrierVersion\":1,\"type\":\"route.data\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"direction\":\"client_to_host\",\"seq\":\"1\",\"payload\":{\"opcode\":\"text\",\"encoding\":\"base64\",\"data\":\"YQ\"}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "non-canonical-base64"
+    },
+    "integrity": {
+      "kind": "non-canonical-base64",
+      "path": ["payload", "data"],
+      "value": "YQ"
+    }
+  },
+  {
+    "name": "public-frame-invalid-utf8",
+    "channel": "public",
+    "category": "invalid-utf8",
+    "input": {
+      "kind": "base64",
+      "data": "eyJwcm90b2NvbFZlcnNpb24iOjIsImtpbmQiOiJyZXF1ZXN0IiwidHlwZSI6ImNsaWVudC5oZWxsbyIsInJlcXVlc3RJZCI6Iv8iLCJob3N0SWQiOiJtYWMtYWRtaW4iLCJwYXlsb2FkIjp7fX0="
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-utf8"
+    },
+    "integrity": {
+      "kind": "invalid-utf8"
+    }
+  },
+  {
+    "name": "public-frame-over-byte-limit",
+    "channel": "public",
+    "category": "frame-limit",
+    "input": {
+      "kind": "repeat-ascii",
+      "ascii": "x",
+      "count": 1048577
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "frame-limit"
+    },
+    "integrity": {
+      "kind": "byte-length-over-limit",
+      "limit": 1048576
+    }
+  },
+  {
+    "name": "json-depth-over-limit",
+    "channel": "public",
+    "category": "json-depth-limit",
+    "input": {
+      "kind": "nested-array",
+      "depth": 17
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "json-depth-limit"
+    },
+    "integrity": {
+      "kind": "depth-over-limit",
+      "limit": 16
+    }
+  },
+  {
+    "name": "json-object-direct-keys-over-limit",
+    "channel": "public",
+    "category": "json-direct-key-limit",
+    "input": {
+      "kind": "flat-object",
+      "keyCount": 257
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "json-direct-key-limit"
+    },
+    "integrity": {
+      "kind": "direct-key-count-over-limit",
+      "limit": 256
+    }
+  },
+  {
+    "name": "client-hello-request-id-over-byte-limit",
+    "channel": "public",
+    "category": "id-byte-limit",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "id-byte-limit"
+    },
+    "integrity": {
+      "kind": "utf8-byte-length-over-limit",
+      "path": ["requestId"],
+      "limit": 128
+    }
+  },
+  {
+    "name": "route-open-expiry-over-safe-integer",
+    "channel": "carrier",
+    "category": "safe-integer-limit",
+    "input": {
+      "kind": "utf8",
+      "wire": "{\"carrierVersion\":1,\"type\":\"route.open\",\"requestId\":\"route-open-uuid\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"payload\":{\"connectionId\":\"client-socket-uuid\",\"clientDialect\":\"tw-relay.v2\",\"authContext\":{\"scheme\":\"twcap2\",\"role\":\"client\",\"hostId\":\"mac-admin\",\"principalId\":\"principal-opaque-id\",\"grantId\":\"grant-uuid\",\"clientInstanceId\":\"android-install-uuid\",\"jti\":\"token-instance-uuid\",\"kid\":\"key-2026-07\",\"expiresAtMs\":9007199254740992},\"limits\":{\"maxFrameBytes\":1048576}}}"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "safe-integer-limit"
+    },
+    "integrity": {
+      "kind": "unsafe-integer",
+      "path": ["payload", "authContext", "expiresAtMs"]
+    }
+  }
+]

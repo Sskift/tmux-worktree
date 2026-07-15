@@ -1,0 +1,44 @@
+[
+  {
+    "name": "host-hello",
+    "direction": "host-to-broker",
+    "phase": "carrier-handshake",
+    "type": "host.hello",
+    "wire": "{\"carrierVersion\":1,\"type\":\"host.hello\",\"requestId\":\"host-hello-uuid\",\"payload\":{\"hostId\":\"mac-admin\",\"hostEpoch\":\"authority-uuid\",\"hostInstanceId\":\"host-process-uuid\",\"clientDialects\":[\"tw-relay.v1\",\"tw-relay.v2\"],\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"limits\":{\"maxFrameBytes\":1048576,\"terminalMaxFrameBytes\":65536}}}"
+  },
+  {
+    "name": "host-registered",
+    "direction": "broker-to-host",
+    "phase": "carrier-handshake",
+    "type": "host.registered",
+    "wire": "{\"carrierVersion\":1,\"type\":\"host.registered\",\"requestId\":\"host-hello-uuid\",\"connectorId\":\"connector-uuid\",\"payload\":{\"brokerEpoch\":\"broker-process-uuid\",\"hostsRevision\":\"18\",\"disposition\":\"connected\",\"supersededHostInstanceId\":null,\"limits\":{\"maxCarrierFrameBytes\":1500000,\"brokerCarrierBufferedBytes\":16777216,\"brokerCarrierLowWaterBytes\":8388608}}}"
+  },
+  {
+    "name": "route-open",
+    "direction": "broker-to-host",
+    "phase": "route-handshake",
+    "type": "route.open",
+    "wire": "{\"carrierVersion\":1,\"type\":\"route.open\",\"requestId\":\"route-open-uuid\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"payload\":{\"connectionId\":\"client-socket-uuid\",\"clientDialect\":\"tw-relay.v2\",\"authContext\":{\"scheme\":\"twcap2\",\"role\":\"client\",\"hostId\":\"mac-admin\",\"principalId\":\"principal-opaque-id\",\"grantId\":\"grant-uuid\",\"clientInstanceId\":\"android-install-uuid\",\"jti\":\"token-instance-uuid\",\"kid\":\"key-2026-07\",\"expiresAtMs\":1783703600000},\"limits\":{\"maxFrameBytes\":1048576}}}"
+  },
+  {
+    "name": "route-opened",
+    "direction": "host-to-broker",
+    "phase": "route-handshake",
+    "type": "route.opened",
+    "wire": "{\"carrierVersion\":1,\"type\":\"route.opened\",\"requestId\":\"route-open-uuid\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"payload\":{\"acceptedAtMs\":1783700100000,\"maxFrameBytes\":1048576}}"
+  },
+  {
+    "name": "route-data-client-to-host",
+    "direction": "broker-to-host",
+    "phase": "route-data",
+    "type": "route.data",
+    "wire": "{\"carrierVersion\":1,\"type\":\"route.data\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"direction\":\"client_to_host\",\"seq\":\"1\",\"payload\":{\"opcode\":\"text\",\"encoding\":\"base64\",\"data\":\"eyJwcm90b2NvbFZlcnNpb24iOjJ9\"}}"
+  },
+  {
+    "name": "carrier-error-host-reauthenticate",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "carrier.error",
+    "wire": "{\"carrierVersion\":1,\"type\":\"carrier.error\",\"requestId\":\"request-uuid\",\"connectorId\":\"connector-uuid\",\"payload\":{\"failedType\":\"host.reauthenticate\"},\"error\":{\"code\":\"AUTH_INVALID\",\"message\":\"Replacement access token is invalid\",\"retryable\":false,\"retryAfterMs\":null,\"commandDisposition\":\"not_applicable\",\"details\":null}}"
+  }
+]
