@@ -21,6 +21,7 @@ export default defineConfig({
     "src/relay/v2/brokerCore.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
+    "src/relay/extensions/agentTranscriptLifecycle/v1/authority.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/larkCliBridge.ts",
