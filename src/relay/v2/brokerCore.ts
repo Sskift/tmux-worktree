@@ -832,7 +832,11 @@ export class RelayV2BrokerCore {
   async receiveHostFrame(
     transportId: string,
     bytes: Uint8Array,
+    signal?: AbortSignal,
   ): Promise<RelayV2BrokerResult> {
+    if (signal?.aborted) {
+      return this.failure("HOST_SUPERSEDED", "Carrier delivery was cancelled");
+    }
     const carrier = this.carriers.get(transportId);
     if (!carrier || carrier.status === "closed") {
       return this.failure("HOST_SUPERSEDED", "Carrier is no longer registered", [{
@@ -883,7 +887,7 @@ export class RelayV2BrokerCore {
       case "host.reauthenticate":
       case "enrollment.create":
       case "grant.revoke":
-        return this.handleAuthControl(carrier, frame, type);
+        return this.handleAuthControl(carrier, frame, type, signal);
       default:
         return this.protocolViolation(carrier, "unsupported_carrier_control");
     }
@@ -1135,7 +1139,7 @@ export class RelayV2BrokerCore {
    */
   drainHostCarrier(
     transportId: string,
-    options: { maxFrames?: number; maxBytes?: number } = {},
+    options: { maxFrames?: number; maxBytes?: number; controlOnly?: boolean } = {},
   ): RelayV2CarrierDelivery[] {
     const carrier = this.carriers.get(transportId);
     if (!carrier || carrier.status !== "active") return [];
@@ -1168,6 +1172,8 @@ export class RelayV2BrokerCore {
       if (!deliver(entry)) return deliveries;
       carrier.controlQueue.shift();
     }
+
+    if (options.controlOnly) return deliveries;
 
     let scansWithoutDelivery = 0;
     while (carrier.dataOrder.length > 0 && deliveries.length < maxFrames) {
@@ -1542,6 +1548,7 @@ export class RelayV2BrokerCore {
     carrier: CarrierState,
     frame: RelayV2JsonObject,
     type: "host.reauthenticate" | "enrollment.create" | "grant.revoke",
+    signal?: AbortSignal,
   ): Promise<RelayV2BrokerResult> {
     const requestId = frame.requestId as string;
     const connectorId = carrier.connectorId!;
@@ -1576,7 +1583,27 @@ export class RelayV2BrokerCore {
           currentAuthContext: Object.freeze({ ...carrier.authContext }),
     };
     try {
-      const decision = await this.authControlAuthority.handle(request);
+      const authorityResult = this.authControlAuthority.handle(request);
+      const decision = signal
+        ? await new Promise<RelayV2AuthControlDecision>((resolve, reject) => {
+            const onAbort = () => { reject(new Error("carrier delivery cancelled")); };
+            if (signal.aborted) {
+              onAbort();
+              return;
+            }
+            signal.addEventListener("abort", onAbort, { once: true });
+            void Promise.resolve(authorityResult).then(
+              (value) => {
+                signal.removeEventListener("abort", onAbort);
+                resolve(value);
+              },
+              (error: unknown) => {
+                signal.removeEventListener("abort", onAbort);
+                reject(error);
+              },
+            );
+          })
+        : await authorityResult;
       if (
         this.carriers.get(carrier.transportId) !== carrier
         || carrier.status !== "active"
@@ -1641,6 +1668,9 @@ export class RelayV2BrokerCore {
         actions: this.enqueueAuthControlResponse(carrier, response),
       };
     } catch {
+      if (signal?.aborted) {
+        return this.failure("HOST_SUPERSEDED", "Carrier delivery was cancelled");
+      }
       const error = structuredError(
         "INTERNAL",
         "Carrier auth-control authority failed",

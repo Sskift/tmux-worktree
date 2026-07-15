@@ -967,6 +967,87 @@ test("carrier pressure remains fenced while outstanding bytes equal low water", 
   assert.deepEqual(active.transport.closes, []);
 });
 
+test("an ACK crossing low water at the pressure deadline is charged before evaluation", () => {
+  let now = 8_000;
+  const timers = [];
+  const helloBytes = wire({
+    carrierVersion: 1,
+    type: "host.hello",
+    requestId: "host-hello-1",
+    payload: {
+      hostId: "mac-admin",
+      hostEpoch: "authority-uuid",
+      hostInstanceId: "host-process-uuid",
+      clientDialects: ["tw-relay.v2"],
+      capabilities: [],
+      limits: { maxFrameBytes: 1_048_576, terminalMaxFrameBytes: 65_536 },
+    },
+  }).byteLength;
+  const h = createHarness({
+    clock: () => now,
+    schedule: (delayMs, callback) => {
+      const timer = { delayMs, callback, cancelled: false };
+      timers.push(timer);
+      return () => { timer.cancelled = true; };
+    },
+    queueLimits: {
+      carrierHighWaterBytes: helloBytes,
+      carrierLowWaterBytes: Math.max(1, Math.floor(helloBytes / 2)),
+      carrierControlReserveBytes: 1,
+    },
+  });
+  const active = connect(h);
+  const deadline = timers.findLast((timer) => !timer.cancelled);
+  assert.equal(deadline.delayMs, 5_000);
+
+  now += 5_000;
+  active.connection.acknowledge(active.transport.confirmNext(helloBytes));
+
+  assert.equal(deadline.cancelled, true);
+  assert.deepEqual(active.transport.closes, []);
+  assert.equal(h.actor.status().phase, "connecting");
+});
+
+test("an unbound route with a lost transport ACK has a carrier-level liveness fence", () => {
+  let now = 9_000;
+  const timers = [];
+  const h = createHarness({
+    clock: () => now,
+    schedule: (delayMs, callback) => {
+      const timer = { delayMs, callback, cancelled: false };
+      timers.push(timer);
+      return () => { timer.cancelled = true; };
+    },
+  });
+  const active = connect(h);
+  const connectorId = register(active.connection, active.hello);
+  active.connection.receive(wire(routeOpen(connectorId)));
+  const binding = h.bound.at(-1);
+  acknowledgeAll(active.connection, active.transport);
+
+  assert.equal(h.actor.sendPublic(binding, publicV2Frame("lost-route-ack")), true);
+  active.connection.receive(wire({
+    carrierVersion: 1,
+    type: "route.unbind",
+    connectorId,
+    routeId: binding.routeId,
+    routeFence: binding.routeFence,
+    payload: { reason: "client_closed", lastClientToHostSeq: "0" },
+  }));
+  const watchdog = timers.findLast((timer) => !timer.cancelled);
+  assert.equal(watchdog.delayMs, 5_000);
+
+  now += 5_000;
+  watchdog.callback();
+
+  assert.deepEqual(active.transport.closes.at(-1), {
+    code: 1013,
+    reason: "carrier_pressure_timeout",
+  });
+  assert.equal(h.actor.status().phase, "offline");
+  assert.equal(h.unbound.at(-1).reason, "client_closed");
+});
+
 test("global pressure closes the actual occupying route, not a later rejected healthy route", () => {
   let now = 3_000;
   const timers = [];

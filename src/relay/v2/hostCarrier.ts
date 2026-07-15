@@ -190,6 +190,11 @@ export interface RelayV2HostCarrierConnection {
    * transport must first remove that frame from its own bufferedAmount view.
    */
   acknowledge(deliveryToken: string): void;
+  /**
+   * Release route.data that the broker definitively did not accept. This is
+   * not an ACK and is valid only as part of that route's close/unbind fence.
+   */
+  rejectUnaccepted(deliveryToken: string): void;
   /** Notify that the transport may write again or crossed its low water. */
   writable(): void;
   closed(code?: number): void;
@@ -258,6 +263,7 @@ interface ConnectorState {
   inFlight: OutboundItem[];
   socketUnconfirmedBytes: number;
   carrierPressureSinceMs: number | null;
+  orphanedInFlightSinceMs: number | null;
   pressureTimer: { deadlineMs: number; cancel: () => void } | null;
   flushing: boolean;
 }
@@ -481,6 +487,7 @@ export class RelayV2HostCarrierActor {
       inFlight: [],
       socketUnconfirmedBytes: 0,
       carrierPressureSinceMs: null,
+      orphanedInFlightSinceMs: null,
       pressureTimer: null,
       flushing: false,
     };
@@ -531,6 +538,9 @@ export class RelayV2HostCarrierActor {
       },
       acknowledge: (deliveryToken: string) => {
         this.acknowledge(generation, deliveryToken);
+      },
+      rejectUnaccepted: (deliveryToken: string) => {
+        this.rejectUnaccepted(generation, deliveryToken);
       },
       writable: () => { this.writable(generation); },
       closed: (code?: number) => { this.closed(generation, code); },
@@ -989,6 +999,14 @@ export class RelayV2HostCarrierActor {
     connector.routes.delete(route.binding.routeId);
     this.removeDataForRoute(connector, route);
     this.removeControlItems(connector, (item) => item.route === route);
+    if (route.outstandingCarrierBytes > 0) {
+      // The route owner is gone, so its route-level pressure timer can no
+      // longer provide liveness for transport-owned writes. Keep a carrier
+      // fence until those writes are ACKed; a lost transport ACK then closes
+      // the carrier instead of leaving unaccounted bytes alive forever.
+      connector.orphanedInFlightSinceMs ??= safeNow(this.clock);
+      this.refreshPressureTimer(connector);
+    }
     const reason = stringField(payload, "reason") as RelayV2HostRouteUnbindReason;
     try {
       this.options.routeSink.onRouteUnbound(route.binding, reason);
@@ -1351,6 +1369,9 @@ export class RelayV2HostCarrierActor {
     if (connector.carrierPressureSinceMs !== null) {
       deadlines.push(connector.carrierPressureSinceMs + 5_000);
     }
+    if (connector.orphanedInFlightSinceMs !== null) {
+      deadlines.push(connector.orphanedInFlightSinceMs + 5_000);
+    }
     for (const route of connector.routes.values()) {
       if (route.pressureSinceMs !== null && route.phase === "open") {
         deadlines.push(route.pressureSinceMs + 5_000);
@@ -1388,6 +1409,17 @@ export class RelayV2HostCarrierActor {
       return;
     }
     const now = safeNow(this.clock);
+    const hasOrphanedInFlight = connector.inFlight.some((item) => (
+      item.route !== undefined
+      && connector.routes.get(item.route.binding.routeId) !== item.route
+    ));
+    if (!hasOrphanedInFlight) {
+      connector.orphanedInFlightSinceMs = null;
+    } else if (connector.orphanedInFlightSinceMs !== null
+      && now - connector.orphanedInFlightSinceMs >= 5_000) {
+      this.failConnector(connector, 1013, "carrier_pressure_timeout");
+      return;
+    }
     for (const route of connector.routes.values()) {
       if (route.pressureSinceMs === null) continue;
       const belowLowWater = route.outstandingPayloadBytes < this.limits.routeLowWaterBytes
@@ -1450,8 +1482,6 @@ export class RelayV2HostCarrierActor {
       this.failConnector(connector, 4400, "premature_transport_ack");
       return;
     }
-    this.evaluatePressure(connector);
-    if (!this.connectorCanFlush(connector)) return;
     connector.inFlight.shift();
     connector.socketUnconfirmedBytes -= item.bytes.byteLength;
     if (item.route && item.payloadBytes !== undefined) {
@@ -1459,8 +1489,40 @@ export class RelayV2HostCarrierActor {
       item.route.outstandingPayloadBytes -= item.payloadBytes;
       item.route.outstandingCarrierBytes -= item.bytes.byteLength;
     }
+    // Pressure is evaluated against post-ACK accounting. Evaluating before
+    // the decrement can expire a five-second fence even when this exact ACK
+    // crosses low water and should recover the route/carrier.
     this.evaluatePressure(connector);
+    if (!this.connectorCanFlush(connector)) return;
     this.flush(connector);
+    if (this.connectorCanFlush(connector)) this.evaluatePressure(connector);
+  }
+
+  private rejectUnaccepted(generation: number, deliveryToken: string): void {
+    const connector = this.current;
+    if (!connector || connector.generation !== generation) return;
+    if (connector.flushing) {
+      this.failConnector(connector, 4400, "reentrant_transport_reject");
+      return;
+    }
+    const index = connector.inFlight.findIndex((candidate) => (
+      candidate.deliveryToken === deliveryToken
+    ));
+    const item = index < 0 ? undefined : connector.inFlight[index];
+    if (!item?.route || item.routeSequence === undefined || item.payloadBytes === undefined
+      || item.routeSequence !== item.route.hostToClientEmittedSeq) {
+      this.failConnector(connector, 4400, "invalid_transport_reject");
+      return;
+    }
+    connector.inFlight.splice(index, 1);
+    connector.socketUnconfirmedBytes -= item.bytes.byteLength;
+    item.route.outstandingFrames -= 1;
+    item.route.outstandingPayloadBytes -= item.payloadBytes;
+    item.route.outstandingCarrierBytes -= item.bytes.byteLength;
+    item.route.hostToClientEmittedSeq -= 1n;
+    // Do not flush synchronously. The pump must deliver the route close/unbind
+    // control before this route is allowed to produce again.
+    this.evaluatePressure(connector);
   }
 
   private writable(generation: number): void {
@@ -1565,6 +1627,7 @@ export class RelayV2HostCarrierActor {
     connector.inFlight = [];
     connector.socketUnconfirmedBytes = 0;
     connector.carrierPressureSinceMs = null;
+    connector.orphanedInFlightSinceMs = null;
     connector.pendingReauthentication = null;
   }
 
