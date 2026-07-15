@@ -269,6 +269,10 @@ export interface RelayV2MaterializedStateCutAdmissionEstimate {
  */
 export interface RelayV2MaterializedStateCutSource {
   currentHostEpoch(): Promise<string>;
+  withHostEpochFence<T>(
+    expectedHostEpoch: string,
+    operation: () => T | Promise<T>,
+  ): Promise<T>;
   admissionEstimate(
     expectedHostEpoch: string,
   ): Promise<RelayV2MaterializedStateCutAdmissionEstimate>;
@@ -2367,6 +2371,10 @@ export class RelayV2MaterializedStateFoundation {
     });
     this.snapshotCutSource = Object.freeze({
       currentHostEpoch: () => this.currentSnapshotHostEpoch(),
+      withHostEpochFence: <T>(
+        expectedHostEpoch: string,
+        operation: () => T | Promise<T>,
+      ) => this.withSnapshotHostEpochFence(expectedHostEpoch, operation),
       admissionEstimate: (expectedHostEpoch: string) => (
         this.estimateMaterializedStateCutAdmission(expectedHostEpoch)
       ),
@@ -3025,6 +3033,19 @@ export class RelayV2MaterializedStateFoundation {
       const snapshot = section.read();
       this.observeLineage(snapshot);
       return snapshot.hostEpoch;
+    });
+  }
+
+  private async withSnapshotHostEpochFence<T>(
+    expectedHostEpoch: string,
+    operation: () => T | Promise<T>,
+  ): Promise<T> {
+    validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
+    return this.store.serialize(async (section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
+      return await operation();
     });
   }
 
