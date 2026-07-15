@@ -288,7 +288,7 @@ The mobile path has three pieces:
 
 The Dashboard persists the selected Relay center as `mobileRelay.brokerHostId`. **Set up Relay** performs the normal flow in one action: it deploys the same-version bundled `tw` broker, reuses a saved fixed WSS endpoint or starts a temporary Quick Tunnel, saves the generated URL and Relay v1 token, and starts the Mac connector. When a Linux amd64/arm64 Relay center has no `cloudflared`, Dashboard downloads its pinned official Cloudflare release, verifies the published SHA-256 digest, and installs it under `~/.tmux-worktree/bin` before replacing any existing tunnel. Quick Tunnel DNS can propagate after the URL is published, so the connector remains in its explicit retry/backoff state until the trusted `wss://` endpoint resolves instead of tearing the remote setup down. A reconfiguration rotates the shared token. Android pairing is offered only after the connector reaches the trusted root `wss://` URL. The editable fields and individual Save/Start controls remain available for fixed production WSS and recovery.
 
-Relay v1 is one trusted administration domain backed by one shared token; it is not a multi-tenant credential model. Hosting unrelated users on one shared Relay service requires the future Relay v2 role-scoped enrollment implementation.
+Relay v1 is one trusted administration domain backed by one shared token; it is not a multi-tenant credential model. Hosting unrelated users on one shared Relay service requires the future Relay v2 role-scoped enrollment implementation described in the [parallel implementation plan](docs/relay-v2-implementation-plan.md).
 
 For a persistent broker setup, see [docs/remote-relay-android.md](docs/remote-relay-android.md).
 
@@ -424,6 +424,7 @@ Generated asset inputs:
 - [Android architecture](docs/android-v2-architecture.md): Compose UI V2, state management, Relay v1 limits, and Android acceptance gates.
 - [Android relay guide](docs/remote-relay-android.md): persistent broker, Mac connector, phone pairing, and APK development.
 - [Relay v2 contract](docs/relay-v2-contract.md): frozen future protocol contract; no Relay v2 implementation exists yet.
+- [Relay v2 implementation plan](docs/relay-v2-implementation-plan.md): parallel broker, relay-host, Dashboard, Android, Agent-extension work packages and their interoperability gates.
 
 ## License
 

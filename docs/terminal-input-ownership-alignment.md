@@ -2,7 +2,7 @@
 
 状态：**跨 Feishu Bridge、Dashboard、TW 本地运行时和 Relay 的架构对齐说明；本地 terminal-control v1、Feishu Bridge、Relay v1、Dashboard、`tw serve` 和受控 CLI adapter 已实现；不修改 Relay v1/v2 wire contract。**
 
-本文记录不同产品共同操作一个 TW-managed terminal 时的输入所有权边界。它是 [`relay-v2-contract.md`](relay-v2-contract.md) 的非规范性 companion，也是未来本地 terminal-control contract、Feishu Bridge 计划和各输入 adapter 的共同设计基线。
+本文记录不同产品共同操作一个 TW-managed terminal 时的输入所有权边界。它是 [`relay-v2-contract.md`](relay-v2-contract.md) 的非规范性 companion，也是已实现的本地 terminal-control、Feishu Bridge 和各输入 adapter，以及未来 Relay v2 adapter 的共同边界说明。
 
 本文不把 Feishu Bridge 合并进 Relay。二者不共享传输、鉴权、credential、配对、broker、消息 envelope 或业务协议；它们只共享同一个 canonical terminal target 和同一个本地输入所有权裁决结果。
 
@@ -89,7 +89,7 @@ React 只能通过 `DashboardBackend` 使用 binding/ownership 能力；Tauri ad
 - Relay v2 relay-host 将 `(hostEpoch, scopeId, opaque sessionId)` 映射到 `controlTargetId`，但不把后者放进公共 v2 envelope。
 - target closure 进入 `TARGET_GONE` 并撤销 lease；名称随后复用不能复活旧 target。
 
-首个 Feishu Bridge MVP 如果只支持本机 managed terminal，必须在 binding UI 和 contract 中明确拒绝 SSH target。若以后支持 remote scope，必须在目标主机部署等价 controller或定义有 fencing 的受控 SSH proxy；Mac 上仅按远端名称保存一个本地 lease 不构成全局保证。
+当前 Feishu Bridge 只支持本机 managed terminal，binding UI 和 contract 必须明确拒绝 SSH target。若以后支持 remote scope，必须在目标主机部署等价 controller或定义有 fencing 的受控 SSH proxy；Mac 上仅按远端名称保存一个本地 lease 不构成全局保证。
 
 ## 5. Owner identity
 
@@ -143,7 +143,7 @@ any state
 - `RECOVERY_REQUIRED`：无法证明旧写入、handoff 或 Feishu lease continuity；所有新写入 fail closed。只有受控本地 owner 在外部持久化取消/人工确认记录，并显式承认旧 operation 可能已生效后，才能用 force recovery 验证 exact backend、推进 fence 且不重放旧 operation；无 operation/handoff 的非 Feishu陈旧 lease 会走上面的安全回收，不要求用户确认。
 - `TARGET_GONE`：exact backend lifecycle 已结束；binding stale且不能按名称恢复。
 
-Feishu binding active 时默认长期持有独占 lease，即使当前没有 awaiting turn。MVP 中 Feishu 的 graceful/force pause 只允许本机 Dashboard 或受控本地 CLI 发起；Relay v1/v2 手机端不能远程暂停 Feishu。
+Feishu binding active 时默认长期持有独占 lease，即使当前没有 awaiting turn。当前 Feishu 的 graceful/force pause 只允许本机 Dashboard 或受控本地 CLI 发起；Relay v1/v2 手机端不能远程暂停 Feishu。
 
 ## 7. Handoff commit point 和 fencing
 

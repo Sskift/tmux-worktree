@@ -34,7 +34,7 @@ Android (Compose)
    - CLI、Dashboard 或 SSH 使用流程：`MANUAL.md`。
    - 当前 Relay v1 部署、Dashboard 配对和 Android 接入：`docs/remote-relay-android.md`。
    - Android 产品信息架构、持久层、连接状态机、Outbox 和迁移层：`docs/android-v2-architecture.md`。
-   - 未来 Relay v2 实现：完整阅读 `docs/relay-v2-contract.md`；它只规范 v2，不描述当前已交付能力。
+   - 未来 Relay v2 实现：先完整阅读 `docs/relay-v2-contract.md`，再读 `docs/relay-v2-implementation-plan.md`；前者冻结协议语义，后者只拆分并行工作与验收，不描述当前已交付能力。
 4. 修改 wire/storage/RPC 前，先读对应 `contracts/**/manifest.json`、fixture 和消费它们的测试。
 5. 最后读目标模块源码及相邻测试。测试是理解当前行为的证据之一；只有面向稳定外部行为、版本化契约或关键安全不变量的测试才构成长期兼容说明，源码形状断言不能反过来定义架构。
 

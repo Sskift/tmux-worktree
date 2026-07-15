@@ -1,5 +1,7 @@
 # Remote Relay And Android Client
 
+This guide describes the currently implemented Relay v1 deployment and pairing flow. The frozen v2 wire contract and the non-normative [parallel implementation plan](relay-v2-implementation-plan.md) are development inputs, not additional commands or capabilities available to operators today.
+
 ## Model
 
 The relay design has three roles:
