@@ -2,7 +2,9 @@
 
 ## 当前边界
 
-本文中的 **V2** 指第二代 Android 产品界面和客户端架构，即 Compose UI、`V2Activity` 与 `V2ViewModel`；它不代表 Relay v2。当前 Android、Dashboard、`relay-server` 和 `relay-host` 的运行路径仍只实现 Relay v1。Android 已有独立 Relay v2 strict codec，以及使用 v2 profile/credential、fakeable transport/clock、串行 socket ownership、双代际 fence、握手 watchdog 和显式 query/resync/reject effect 的 `RelayV2ConnectionActor` seam；其默认 action queue 为 64 个普通槽、8 个保留控制槽和 1 MiB raw UTF-8 byte budget，effect queue 为 32 项和 1 MiB raw UTF-8 byte budget。repository 必须在 actor-owned apply lease 内完成代际 effect 的整个 Room transaction；state `matchesGeneration` 只是非原子的代际预筛，不拥有 phase authority，也不能构成 disconnect/profile-switch barrier。切换时 actor 会先原子禁止旧代际取得新 lease，再等待已经进入的旧事务完成，receipt 之后 repository 才能清理旧 profile。该 actor 尚未接入 repository/composition root 或真实 OkHttp transport。该 seam 与 Node codec 共同消费冻结 fixture，但不表示已达到 runtime 互操作、capability advertisement 或生产可用状态。
+本文中的 **V2** 指第二代 Android 产品界面和客户端架构，即 Compose UI、`V2Activity` 与 `V2ViewModel`；它不代表 Relay v2。当前 Android、Dashboard、`relay-server` 和 `relay-host` 的运行路径仍只实现 Relay v1。Android 已有独立 Relay v2 strict codec，以及使用 v2 profile/credential、fakeable transport/clock、串行 socket ownership、双代际 fence、握手 watchdog 和显式 query/resync/reject effect 的 `RelayV2ConnectionActor` seam；其默认 action queue 为 64 个普通槽、8 个保留控制槽和 1 MiB raw UTF-8 byte budget，effect queue 为 32 项和 1 MiB raw UTF-8 byte budget。Android 还已有未接线的独立 `tw_mobile_relay_v2_state.db`/repository foundation：六张 v2 专用表按 `profileId+hostId+hostEpoch` 隔离 authority、Scope、opaque Session、snapshot metadata/records 和 durable event buffer，支持 welcome required watermark、pinned cut 流式 staging、连续 event 合并及单事务 commit/discard；它不包含 v2 Outbox、terminal checkpoint、token 或 credential。snapshot 每块最多 256 records/512 KiB canonical bytes，完整 cut 最多 100000 records/256 MiB canonical bytes，staged raw UTF-8 最多 512 MiB；RESYNC event buffer 最多 4096 条/16 MiB。这些是每个 state namespace 的硬上限。
+
+repository 必须在 actor-owned apply lease 内完成代际 effect 的整个 Room transaction；state `matchesGeneration` 只是非原子的代际预筛，不拥有 phase authority，也不能构成 disconnect/profile-switch barrier。切换时 actor 会先原子禁止旧代际取得新 lease，再等待已经进入的旧事务完成，receipt 之后 repository 才能通过显式 API 清理该 profile 的六张 v2 state 表。该 actor/repository 尚未接入 composition root 或真实 OkHttp transport。它们与 Node codec 共同消费冻结 fixture或按冻结契约建模，但不表示已达到 runtime 互操作、capability advertisement 或生产可用状态。
 
 Android 客户端采用原生 Kotlin + Jetpack Compose，桌面端使用 React + Tauri，双方当前通过 Relay v1 协作。原生实现直接控制 Keystore、网络切换、进程恢复、WebView 终端和系统无障碍能力。
 
@@ -158,7 +160,7 @@ Android UI V2 不会把 Relay v1 没有的数据伪造成完整功能。基础 R
 
 ## 当前交付与实施协调
 
-当前源码已实现 Compose 信息架构、Room/DataStore/Keystore 持久层、Relay v1 actor、每会话串行 Outbox、配对切换 barrier、分维快照、终端恢复、二维码 review、WSS 校验，以及尚未接入生产运行路径的 Relay v2 codec conformance 与独立 actor seam。Android repository、OkHttp adapter 和 composition root 仍只装配 v1；不得据此生成 v2 enrollment、宣告 capability 或描述为 runtime ready。Android JVM、Lint、APK build 与连接设备验证仍是不同证据；`assembleRelease` 只生成 unsigned 构建验证产物，不代表生产签名、TLS 基础设施、后台通知或渠道发布已经完成。
+当前源码已实现 Compose 信息架构、Room/DataStore/Keystore 持久层、Relay v1 actor、每会话串行 Outbox、配对切换 barrier、分维快照、终端恢复、二维码 review、WSS 校验，以及尚未接入生产运行路径的 Relay v2 codec conformance、独立 actor seam和上述 Room state-sync repository foundation。AppContainer、V2ViewModel、真实 OkHttp adapter 和 production composition root 仍只装配 v1；v2 Outbox、terminal checkpoint 及真实 Room/device 集成也尚未交付。不得据此生成 v2 enrollment、宣告 capability 或描述为 runtime ready。Android JVM、Lint、APK build 与连接设备验证仍是不同证据；`assembleRelease` 只生成 unsigned 构建验证产物，不代表生产签名、TLS 基础设施、后台通知或渠道发布已经完成。
 
 Relay v2 不再在本 Android 专题中维护单端 A/B/C 路线。broker、relay-host、Dashboard、Android 和 Agent extension 的并行工作包、硬依赖与验收门槛统一见 [`relay-v2-implementation-plan.md`](relay-v2-implementation-plan.md)；冻结 wire 语义仍以 [`relay-v2-contract.md`](relay-v2-contract.md) 为准。
 

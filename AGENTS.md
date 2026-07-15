@@ -54,7 +54,7 @@ Android (Compose)
 | `app/tests/` | renderer 可观察行为、平台依赖边界、持久化、安全和无障碍测试；不用于冻结组件拆分、函数名、导出列表或调用形状。 |
 | `app/src-tauri/` | Rust 原生适配层：Tauri IPC、PTY、Git/files、SSH、配置、catalog、持久化、Mobile Relay 进程编排，以及 bundled `tw` RPC 调用。 |
 | `app/scripts/`、`app/installer/` | 隔离开发、Dashboard/DMG 构建和安装器；不是业务逻辑来源。 |
-| `mobile/android/` | 独立 Android 生产代码与 Gradle 工程：Compose、Room、DataStore、Keystore、OkHttp Relay v1 actor、未接 actor 的独立 Relay v2 codec、未接 runtime 的可选 Agent lifecycle/notification reducer foundation、内置 xterm WebView 和 Android 测试。 |
+| `mobile/android/` | 独立 Android 生产代码与 Gradle 工程：Compose、v1 Room/DataStore/Keystore、OkHttp Relay v1 actor、未接 composition root 的独立 Relay v2 codec/actor 与隔离 Room state-sync repository foundation、未接 runtime 的可选 Agent lifecycle/notification reducer foundation、内置 xterm WebView 和 Android 测试。 |
 | `scripts/` | 仓库级文档检查和统一验证入口。 |
 | `.codex/skills/` | Agent 操作规程；不是应用运行时或用户状态。 |
 
