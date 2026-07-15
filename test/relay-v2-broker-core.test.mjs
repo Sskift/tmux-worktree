@@ -28,6 +28,7 @@ function carrierBytes(frame) {
 }
 
 function hostHello({
+  hostId = HOST_ID,
   requestId = randomUUID(),
   hostEpoch = randomUUID(),
   hostInstanceId = randomUUID(),
@@ -41,7 +42,7 @@ function hostHello({
     type: "host.hello",
     requestId,
     payload: {
-      hostId: HOST_ID,
+      hostId,
       hostEpoch,
       hostInstanceId,
       clientDialects,
@@ -55,15 +56,19 @@ function hostHello({
 }
 
 async function registerHost(core, transportId, hello = hostHello()) {
-  const directoryBefore = core.inspectHost(HOST_ID);
-  core.attachHostCarrier(transportId, authContext("host", { jti: `${transportId}-jti` }));
+  const hostId = hello.payload.hostId;
+  const directoryBefore = core.inspectHost(hostId);
+  core.attachHostCarrier(transportId, authContext("host", {
+    hostId,
+    jti: `${transportId}-jti`,
+  }));
   const result = await core.receiveHostFrame(transportId, carrierBytes(hello));
   assert.equal(result.accepted, true);
   const registration = result.actions.find((action) => (
     action.kind === "send_host" && action.frame.type === "host.registered"
   ));
   assert.ok(registration);
-  const directoryPending = core.inspectHost(HOST_ID);
+  const directoryPending = core.inspectHost(hostId);
   assert.equal(
     directoryPending?.connectorId,
     directoryBefore?.connectorId,
@@ -85,8 +90,10 @@ async function openRoute(
   transportId,
   connectionId = randomUUID(),
   openedMaxFrameBytes = 1_048_576,
+  hostId = HOST_ID,
 ) {
   const opened = core.openClientRoute(connectionId, authContext("client", {
+    hostId,
     jti: `${connectionId}-jti`,
   }));
   assert.equal(opened.accepted, true);
@@ -141,6 +148,21 @@ function clientTerminalAck(streamId = "stream-1") {
     streamId,
     payload: { generation: "generation-1", nextOffset: "0" },
   };
+}
+
+function clientSweepCapacityFrame() {
+  return publicBytes({
+    protocolVersion: 2,
+    kind: "event",
+    type: "terminal.input",
+    streamId: "sweep-capacity",
+    payload: {
+      generation: "generation-1",
+      inputSeq: "1",
+      encoding: "base64",
+      data: Buffer.alloc(241).toString("base64"),
+    },
+  });
 }
 
 function clientTerminalInputBytesOfSize(targetBytes, index) {
@@ -366,6 +388,34 @@ test("host registration commits delivery before admission and supersedes only a 
       && action.transportId === "host-old"
       && action.closeCode === 4409
   )), true);
+});
+
+test("carrier route admission hard-bounds disconnect cleanup production", async () => {
+  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const transportId = "host-route-hard-ceiling";
+  await registerHost(core, transportId);
+  const ceiling = broker.RELAY_V2_BROKER_LIMITS.maxRoutesPerCarrier;
+  assert.ok(ceiling > 128);
+
+  for (let index = 0; index < ceiling; index += 1) {
+    const connectionId = `client-hard-ceiling-${index.toString().padStart(3, "0")}`;
+    const opened = core.openClientRoute(connectionId, authContext("client", {
+      jti: `hard-ceiling-jti-${index}`,
+    }));
+    assert.equal(opened.accepted, true);
+  }
+  const overflow = core.openClientRoute("client-hard-ceiling-overflow", authContext("client", {
+    jti: "hard-ceiling-overflow-jti",
+  }));
+  assert.equal(overflow.accepted, false);
+  assert.equal(overflow.error.code, "BUSY");
+  assert.equal(overflow.actions[0].kind, "route_unavailable");
+
+  const disconnected = core.disconnectHost(transportId);
+  assert.equal(disconnected.accepted, true);
+  assert.equal(disconnected.actions.length, ceiling);
+  assert.equal(disconnected.actions.every((action) => action.kind === "route_unavailable"), true);
+  assert.equal(core.inspectHost(HOST_ID).state, "offline");
 });
 
 test("persistent auth-control authority replays reauthentication ACK and preserves old context on failure", async () => {
@@ -795,9 +845,9 @@ test("frame-count pressure resumes only below the 64-frame low water and closes 
   assert.equal(overflow.error.code, "SLOW_CONSUMER");
   assert.equal(overflow.actions.some((action) => action.kind === "close_client"), false);
   now += 4_999;
-  assert.equal(core.sweepBackpressure().actions.length, 0);
+  assert.equal(core.sweepBackpressure("host-pressure").actions.length, 0);
   now += 1;
-  const closed = core.sweepBackpressure();
+  const closed = core.sweepBackpressure("host-pressure");
   assert.equal(closed.actions.some((action) => (
     action.kind === "close_client" && action.closeCode === 1013
   )), true);
@@ -851,6 +901,149 @@ test("frame-count pressure resumes only below the 64-frame low water and closes 
     reverseDeliveries[64].deliveryId,
   );
   assert.equal(reverseResume.actions.some((action) => action.kind === "resume_host_route"), true);
+});
+
+test("backpressure sweep is carrier-scoped and its production batch is hard-bounded", async () => {
+  let now = NOW_MS;
+  const core = new broker.RelayV2BrokerCore({ now: () => now });
+  const transportA = "host-sweep-a";
+  const transportB = "host-sweep-b";
+  const hostA = "mac-sweep-a";
+  const hostB = "mac-sweep-b";
+  await registerHost(core, transportA, hostHello({ hostId: hostA }));
+  await registerHost(core, transportB, hostHello({ hostId: hostB }));
+
+  const ceiling = broker.RELAY_V2_BROKER_LIMITS.maxRoutesPerCarrier;
+  const pressureFrame = clientSweepCapacityFrame();
+  const connectionsA = [];
+  for (let routeIndex = 0; routeIndex < ceiling - 1; routeIndex += 1) {
+    const connectionId = `client-sweep-a-${routeIndex}`;
+    connectionsA.push(connectionId);
+    await openRoute(core, transportA, connectionId, 1_048_576, hostA);
+    let highWater = null;
+    for (
+      let frameIndex = 0;
+      frameIndex < broker.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames;
+      frameIndex += 1
+    ) {
+      const forwarded = core.forwardClientFrame(connectionId, pressureFrame);
+      if (forwarded.actions.some((action) => action.kind === "pause_client")) {
+        highWater = forwarded;
+        break;
+      }
+      assert.equal(forwarded.accepted, true, `${connectionId} frame ${frameIndex + 1}`);
+    }
+    assert.ok(highWater, `${connectionId} reaches a bounded pressure fence`);
+    assert.equal(highWater.actions.some((action) => action.kind === "pause_client"), true);
+  }
+
+  const inFlightA = core.drainHostCarrier(transportA, {
+    maxFrames: Number.MAX_SAFE_INTEGER,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+  });
+  assert.ok(inFlightA.length > 0, "the carrier capacity remains billed in-flight");
+  // The frozen id contract admits 128 non-NUL bytes. Their canonical JSON
+  // escaping makes this final target's unacknowledged route.open consume the
+  // remaining control capacity without inventing a private test frame.
+  const wideId = "\u0001".repeat(128);
+  const finalOpened = core.openClientRoute(wideId, authContext("client", {
+    hostId: hostA,
+    principalId: wideId,
+    grantId: wideId,
+    clientInstanceId: wideId,
+    jti: wideId,
+    kid: wideId,
+  }));
+  assert.equal(finalOpened.accepted, true);
+  const [finalOpenDelivery] = core.drainHostCarrier(transportA, {
+    maxFrames: 1,
+    controlOnly: true,
+  });
+  assert.ok(finalOpenDelivery);
+  assert.equal(finalOpenDelivery.frame.type, "route.open");
+  assert.equal((await core.receiveHostFrame(transportA, carrierBytes({
+    carrierVersion: 1,
+    type: "route.opened",
+    requestId: finalOpenDelivery.frame.requestId,
+    connectorId: finalOpenDelivery.frame.connectorId,
+    routeId: finalOpenDelivery.frame.routeId,
+    routeFence: finalOpenDelivery.frame.routeFence,
+    payload: { acceptedAtMs: now, maxFrameBytes: 1_048_576 },
+  }))).accepted, true);
+  connectionsA.push(wideId);
+  const finalPressure = core.forwardClientFrame(wideId, pressureFrame);
+  assert.equal(finalPressure.accepted, false);
+  assert.equal(finalPressure.actions.some((action) => action.kind === "pause_client"), true);
+  assert.equal(connectionsA.length, ceiling);
+
+  const connectionB = "client-sweep-b";
+  await openRoute(core, transportB, connectionB, 1_048_576, hostB);
+  let highWaterB = null;
+  for (
+    let frameIndex = 0;
+    frameIndex < broker.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames;
+    frameIndex += 1
+  ) {
+    const forwarded = core.forwardClientFrame(connectionB, pressureFrame);
+    if (forwarded.actions.some((action) => action.kind === "pause_client")) {
+      highWaterB = forwarded;
+      break;
+    }
+    assert.equal(forwarded.accepted, true);
+  }
+  assert.ok(highWaterB);
+  assert.equal(highWaterB.actions.some((action) => action.kind === "pause_client"), true);
+
+  now += 5_000;
+  const sweptA = core.sweepBackpressure(transportA);
+  assert.equal(sweptA.accepted, true);
+  const admittedUnbinds = core.drainHostCarrier(transportA, {
+    maxFrames: Number.MAX_SAFE_INTEGER,
+    maxBytes: Number.MAX_SAFE_INTEGER,
+    controlOnly: true,
+  });
+  const dataBytes = inFlightA.reduce((total, delivery) => total + delivery.wire.byteLength, 0);
+  const unbindBytes = admittedUnbinds.reduce(
+    (total, delivery) => total + delivery.wire.byteLength,
+    0,
+  );
+  assert.ok(
+    admittedUnbinds.length < ceiling,
+    `route.unbind must exhaust carrier capacity: data=${dataBytes} unbind=${unbindBytes}`,
+  );
+  assert.equal(
+    sweptA.actions.length,
+    broker.RELAY_V2_BROKER_LIMITS.maxBackpressureSweepActionsPerCarrier,
+    "each route contributes resume plus close, with one carrier close",
+  );
+  assert.equal(
+    sweptA.actions.filter((action) => action.kind === "resume_client").length,
+    ceiling,
+  );
+  assert.equal(
+    sweptA.actions.filter((action) => action.kind === "close_client").length,
+    ceiling,
+  );
+  assert.equal(sweptA.actions.filter((action) => action.kind === "close_host").length, 1);
+  assert.equal(sweptA.actions.at(-1).kind, "close_host");
+  assert.equal(sweptA.actions.at(-1).reason, "carrier_control_backpressure");
+  assert.equal(
+    sweptA.actions.filter((action) => (
+      action.kind === "close_client" || action.kind === "close_host"
+    )).length,
+    broker.RELAY_V2_BROKER_LIMITS.maxBackpressureSweepMandatoryActionsPerCarrier,
+  );
+  assert.equal(sweptA.actions.filter((action) => (
+    action.kind === "resume_client" || action.kind === "close_client"
+  )).every((action) => connectionsA.includes(action.connectionId)), true);
+  assert.equal(sweptA.actions.some((action) => action.connectionId === connectionB), false);
+
+  assert.equal(core.sweepBackpressure(transportA).actions.length, 0);
+  const sweptB = core.sweepBackpressure(transportB);
+  assert.deepEqual(
+    sweptB.actions.map((action) => [action.kind, action.connectionId]),
+    [["resume_client", connectionB], ["close_client", connectionB]],
+  );
 });
 
 test("byte pressure resumes only below the frozen 512 KiB low water", async () => {
