@@ -482,13 +482,19 @@ export function createWorkspaceActionCoordinator(
         if (!nextContext) return false;
         const confirmed = await nextContext.backend.dialog.confirm({
           title: "Delete worktree",
-          message: `Delete worktree "${orphan.name}"? This will discard any uncommitted changes.`,
+          message: orphan.hostId
+            ? `Delete remote worktree "${orphan.name}"? This will discard uncommitted changes. On Linux hosts, processes whose working directory is inside it are also stopped.`
+            : `Delete worktree "${orphan.name}"? This will discard any uncommitted changes.`,
         });
         nextContext = actionContext(action);
         if (!nextContext || !confirmed) return false;
         if (!actionContext(action)) return false;
         dispatched = true;
-        await nextContext.backend.worktrees.delete({ path: orphan.path, force: true });
+        await nextContext.backend.worktrees.delete({
+          path: orphan.path,
+          force: true,
+          ...(orphan.hostId ? { hostId: orphan.hostId } : {}),
+        });
         if (!actionContext(action)) {
           reconcileStaleMutation(action.lease.owner, { reloadOrphans: true });
           return false;

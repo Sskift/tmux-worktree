@@ -22,6 +22,10 @@ import {
 } from "./linkDetect";
 import { isTerminalProtocolReply } from "./terminal/terminalResponses";
 import { checkFileExists, openUrlInBrowser } from "./linkActions";
+import {
+  ControlledTerminalOutputFilter,
+  isControlledTerminalTransportReport,
+} from "./terminalInput";
 import "@xterm/xterm/css/xterm.css";
 
 type Props = {
@@ -347,6 +351,7 @@ export function Terminal({
       scrollback: 5000,
     });
     const fit = new FitAddon();
+    const controlledOutput = controlSession ? new ControlledTerminalOutputFilter() : null;
     term.loadAddon(fit);
     term.open(host);
 
@@ -416,6 +421,7 @@ export function Terminal({
         }
         return;
       }
+      if (controlSession && isControlledTerminalTransportReport(data)) return;
       if (ptyId) {
         ptyConnection?.write(data).catch(() => {
           ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
@@ -638,7 +644,8 @@ export function Terminal({
             ? cachedHistory
             : await dashboardBackend.sessions.captureHistory(tmuxSession).catch(() => "");
           if (history) {
-            term.write(history + "\r\n");
+            const output = history + "\r\n";
+            term.write(controlledOutput?.push(output) ?? output);
           }
         }
 
@@ -659,7 +666,8 @@ export function Terminal({
           {
             onData: (event) => {
               if (cancelled) return;
-              writePtyOutput(event.data);
+              const output = controlledOutput?.push(event.data) ?? event.data;
+              if (output) writePtyOutput(output);
               if (
                 hostId &&
                 remoteReconnectAttemptRef.current > 0 &&
@@ -677,6 +685,8 @@ export function Terminal({
             },
             onExit: async (event) => {
               if (event.id !== id) return;
+              const pendingOutput = controlledOutput?.flush();
+              if (pendingOutput) writePtyOutput(pendingOutput);
               ptyId = null;
               onAttachmentIdChangeRef.current?.(null);
               if (reconnectStabilityTimer !== null) {

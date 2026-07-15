@@ -129,6 +129,7 @@ export type OrphanedWorktree = {
   project: string;
   path: string;
   name: string;
+  hostId?: string | null;
 };
 
 export type CreateWorktreeInput = {
@@ -144,11 +145,13 @@ export type RestoreWorktreeInput = {
   path: string;
   name: string;
   aiCmd?: string;
+  hostId?: string;
 };
 
 export type DeleteWorktreeInput = {
   path: string;
   force?: boolean;
+  hostId?: string;
 };
 
 export type TmuxStatusTheme = {

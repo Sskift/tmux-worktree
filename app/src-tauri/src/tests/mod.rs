@@ -8,9 +8,8 @@ use super::{
     dashboard_layout_window_is_restorable, default_worktree_base, delete_automation_from_list,
     delete_worktree_blocking, derive_session_name, ensure_terminal_session,
     fetchable_project_paths, find_host, finish_git_fetch_target, git_fetch_args, git_graph_for,
-    git_graph_refs_for,
-    hosts_from_config, install_host_tw_from_source, invalidate_host_status_cache,
-    is_git_worktree_dir, is_managed_worktree_session,
+    git_graph_refs_for, hosts_from_config, install_host_tw_from_source,
+    invalidate_host_status_cache, is_git_worktree_dir, is_managed_worktree_session,
     json_number_texts_semantically_equal_for_test, kill_canonical_first,
     kill_legacy_plain_terminal, kill_legacy_session, kill_rpc_explicitly_allows_legacy_fallback,
     layout_backup_path, layout_lock_path, layout_revision_for_raw, list_automation_runs,
@@ -20,22 +19,23 @@ use super::{
     parse_session_key, probe_local_agents_in_paths, project_from_config,
     project_from_worktree_path, projects_from_config, projects_from_config_with_home,
     read_dashboard_config_lock_owner, remote_config_for_host, remote_file_exists_for_host,
-    remote_home_dir_for_host, remote_read_dirs_for_host, remote_read_file_bytes_for_host,
-    remote_write_file_for_host, remove_host_with_state, remove_missing_project,
-    reserve_git_fetch_target, restore_local_worktree_via_runtime, run_remote_tmux_check,
-    run_remote_tw_check, save_automation, save_hosts_config, save_layout_to_path,
-    save_pending_cleanup, save_terminals, scp_cli_command, select_local_tw_rpc_runtime,
-    should_skip_automation_overlap, ssh_command, ssh_host_candidates_from_config_text,
-    stable_output_signature, test_host, tmux_session_exists, trigger_automation_with_creator,
-    try_cleanup_worktree, tw_rpc_capabilities_compatible, update_host_config,
-    upsert_automation_from_input, validate_ssh_host_fields, worktree_has_uncommitted_changes,
-    worktrees_for_session, AddHostArgs, AgentProbeResult, Automation, AutomationOverlap,
-    AutomationRun, AutomationStatus, AutomationTriggerType, CachedHostStatus, CreateArgs,
-    CreateTerminalArgs, DashboardConfigLockOwner, DashboardLayoutClassification,
-    DeleteWorktreeArgs, EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery,
-    GitGraphRefKind, HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree,
-    Project, RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs,
-    AGENT_PROBE_SPECS, AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
+    remote_home_dir_for_host, remote_orphaned_worktrees, remote_read_dirs_for_host,
+    remote_read_file_bytes_for_host, remote_write_file_for_host, remove_host_with_state,
+    remove_missing_project, reserve_git_fetch_target, restore_local_worktree_via_runtime,
+    run_remote_tmux_check, run_remote_tw_check, save_automation, save_hosts_config,
+    save_layout_to_path, save_pending_cleanup, save_terminals, scp_cli_command,
+    select_local_tw_rpc_runtime, should_skip_automation_overlap, ssh_command,
+    ssh_host_candidates_from_config_text, stable_output_signature, test_host, tmux_session_exists,
+    trigger_automation_with_creator, try_cleanup_remote_worktree, try_cleanup_worktree,
+    tw_rpc_capabilities_compatible, update_host_config, upsert_automation_from_input,
+    validate_ssh_host_fields, worktree_has_uncommitted_changes, worktrees_for_session, AddHostArgs,
+    AgentProbeResult, Automation, AutomationOverlap, AutomationRun, AutomationStatus,
+    AutomationTriggerType, CachedHostStatus, CreateArgs, CreateTerminalArgs,
+    DashboardConfigLockOwner, DashboardLayoutClassification, DeleteWorktreeArgs,
+    EnsureTerminalArgs, GitFetchTracker, GitGraphPreset, GitGraphQuery, GitGraphRefKind,
+    HostConfig, HostState, HostStatus, LocalTwRpcRuntime, OrphanedWorktree, Project,
+    RemoveMissingProjectArgs, RestoreArgs, SaveAutomationInput, UpdateHostArgs, AGENT_PROBE_SPECS,
+    AUTOMATION_RUN_LIMIT, GIT_FETCH_INTERVAL_SECONDS,
 };
 use std::collections::HashSet;
 use std::fs;
@@ -850,7 +850,7 @@ fn no_config_orphan_scan_uses_canonical_home_default() {
     )
     .expect("git entry");
 
-    let orphans = list_orphaned_worktrees().expect("orphan scan");
+    let orphans = list_orphaned_worktrees(None).expect("orphan scan");
     assert!(orphans.iter().any(|orphan| {
         orphan.name == "demo-recover" && orphan.path == worktree.to_string_lossy()
     }));
@@ -1661,6 +1661,7 @@ printf '%s\n' '{"protocolVersion":1,"kind":"worktree","session":"demo-restored",
             path: "/tmp/demo-restored".to_string(),
             name: "demo-restored".to_string(),
             ai_cmd: "codex --quiet".to_string(),
+            host_id: None,
         },
     )
     .expect("restore through rpc");
@@ -1811,11 +1812,13 @@ fn delete_worktree_requires_force_for_dirty_worktree() {
         project: "demo".to_string(),
         path: path.clone(),
         name: "delete-dirty".to_string(),
+        host_id: None,
     }]);
 
     let err = delete_worktree_blocking(DeleteWorktreeArgs {
         path: path.clone(),
         force: false,
+        host_id: None,
     })
     .expect_err("dirty delete should require force");
     assert!(err.contains("uncommitted changes"));
@@ -1825,6 +1828,7 @@ fn delete_worktree_requires_force_for_dirty_worktree() {
     delete_worktree_blocking(DeleteWorktreeArgs {
         path: path.clone(),
         force: true,
+        host_id: None,
     })
     .expect("forced delete");
     assert!(!Path::new(&worktree).exists());
@@ -1848,6 +1852,143 @@ fn delete_worktree_requires_force_for_dirty_worktree() {
             std::env::remove_var("TW_DASHBOARD_HOME");
         }
     }
+}
+
+#[test]
+fn remote_orphan_scan_and_delete_stay_inside_the_configured_host_base() {
+    let _guard = test_env_lock().lock().expect("lock");
+    let original_home = std::env::var("HOME").ok();
+    let original_path = std::env::var("PATH").ok();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let home = temp.path().join("remote-home");
+    let bin = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let base = home.join("worktrees");
+    let worktree = base.join("demo").join("remote-orphan-a1b2c");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(&bin).expect("bin");
+    fs::create_dir_all(worktree.parent().expect("worktree parent")).expect("worktree base");
+
+    git(&["init", repo.to_str().expect("repo")]);
+    git(&[
+        "-C",
+        repo.to_str().expect("repo"),
+        "config",
+        "user.name",
+        "test",
+    ]);
+    git(&[
+        "-C",
+        repo.to_str().expect("repo"),
+        "config",
+        "user.email",
+        "test@example.com",
+    ]);
+    fs::write(repo.join("README.md"), "remote\n").expect("readme");
+    git(&["-C", repo.to_str().expect("repo"), "add", "README.md"]);
+    git(&[
+        "-C",
+        repo.to_str().expect("repo"),
+        "commit",
+        "-m",
+        "remote base",
+    ]);
+    git(&[
+        "-C",
+        repo.to_str().expect("repo"),
+        "worktree",
+        "add",
+        "-b",
+        "remote-orphan-a1b2c",
+        worktree.to_str().expect("worktree"),
+    ]);
+
+    let ssh = bin.join("ssh");
+    fs::write(
+        &ssh,
+        r#"#!/bin/sh
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--" ]; then
+    shift
+    [ "$#" -gt 0 ] && shift
+    break
+  fi
+  shift
+done
+[ "$#" -eq 1 ] || exit 90
+exec /bin/sh -c "$1"
+"#,
+    )
+    .expect("ssh shim");
+    let tmux = bin.join("tmux-remote");
+    fs::write(
+        &tmux,
+        "#!/bin/sh\nprintf '%s\\n' 'no server running on fake' >&2\nexit 1\n",
+    )
+    .expect("tmux shim");
+    for executable in [&ssh, &tmux] {
+        let mut permissions = fs::metadata(executable).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).expect("executable");
+    }
+
+    unsafe {
+        std::env::set_var("HOME", &home);
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.to_string_lossy(),
+                original_path.clone().unwrap_or_default()
+            ),
+        );
+    }
+    let host = HostConfig {
+        id: "remote-test".to_string(),
+        label: "Remote test".to_string(),
+        host: "fake-host".to_string(),
+        user: None,
+        port: None,
+        identity_file: None,
+        worktree_base: Some(base.to_string_lossy().to_string()),
+        tmux_path: Some(tmux.to_string_lossy().to_string()),
+        tw_path: None,
+    };
+
+    let orphans = remote_orphaned_worktrees(&host).expect("remote orphan scan");
+    assert_eq!(orphans.len(), 1);
+    assert_eq!(orphans[0].name, "remote-orphan");
+    assert_eq!(orphans[0].host_id.as_deref(), Some("remote-test"));
+    let remote_path = orphans[0].path.clone();
+    assert_eq!(
+        remote_path,
+        fs::canonicalize(&worktree)
+            .expect("canonical worktree")
+            .to_string_lossy()
+    );
+
+    fs::write(worktree.join("dirty.txt"), "dirty\n").expect("dirty file");
+    let error = try_cleanup_remote_worktree(&host, &remote_path, false)
+        .expect_err("dirty remote worktree should fail closed");
+    assert!(error.contains("uncommitted changes"));
+    assert!(worktree.exists());
+
+    try_cleanup_remote_worktree(&host, &remote_path, true).expect("forced remote cleanup");
+    assert!(!worktree.exists());
+    assert!(
+        git_stdout(&[
+            "-C",
+            repo.to_str().expect("repo"),
+            "show-ref",
+            "--verify",
+            "refs/heads/remote-orphan-a1b2c",
+        ])
+        .len()
+            > 12
+    );
+
+    restore_env("PATH", original_path);
+    restore_env("HOME", original_home);
 }
 
 #[test]
@@ -1904,6 +2045,7 @@ fn cleanup_pending_worktrees_removes_registered_worktree() {
         project: "demo".to_string(),
         path: worktree.to_string_lossy().to_string(),
         name: "ghost".to_string(),
+        host_id: None,
     }]);
 
     cleanup_pending_worktrees();

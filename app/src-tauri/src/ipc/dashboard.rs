@@ -150,6 +150,8 @@ pub(crate) struct OrphanedWorktree {
     pub(crate) project: String,
     pub(crate) path: String,
     pub(crate) name: String,
+    #[serde(default, rename = "hostId")]
+    pub(crate) host_id: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -170,6 +172,8 @@ pub(crate) struct RestoreArgs {
     pub(crate) name: String,
     #[serde(rename = "aiCmd", default)]
     pub(crate) ai_cmd: String,
+    #[serde(rename = "hostId", default)]
+    pub(crate) host_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,6 +181,8 @@ pub(crate) struct DeleteWorktreeArgs {
     pub(crate) path: String,
     #[serde(default)]
     pub(crate) force: bool,
+    #[serde(rename = "hostId", default)]
+    pub(crate) host_id: Option<String>,
 }
 
 #[derive(Deserialize)]

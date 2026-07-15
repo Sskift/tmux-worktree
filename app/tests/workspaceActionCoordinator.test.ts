@@ -566,6 +566,26 @@ test("stale worktree delete advances the current owner orphan revision", async (
   );
 });
 
+test("remote orphan deletion preserves the selected host boundary", async () => {
+  const backend = createFakeDashboardBackend().backend;
+  backend.dialog.confirm = async () => true;
+  const requests: unknown[] = [];
+  backend.worktrees.delete = async (args) => { requests.push(args); };
+  const harness = createHarness(backend);
+
+  assert.equal(await harness.coordinator.deleteWorktree(harness.capture(backend), {
+    name: "remote-orphan",
+    path: "/srv/worktrees/demo/remote-orphan-a1b2c",
+    project: "demo",
+    hostId: "mew-dev",
+  }), true);
+  assert.deepEqual(requests, [{
+    path: "/srv/worktrees/demo/remote-orphan-a1b2c",
+    force: true,
+    hostId: "mew-dev",
+  }]);
+});
+
 test("automation root is latest by exact owner and session incarnation", async () => {
   const backend = createFakeDashboardBackend().backend;
   const rootX1 = deferred<string>();

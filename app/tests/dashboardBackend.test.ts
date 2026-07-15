@@ -206,8 +206,14 @@ const commandCases: CommandCase[] = [
   {
     label: "worktrees.listOrphaned",
     command: "list_orphaned_worktrees",
-    args: undefined,
+    args: { hostId: null },
     call: (backend) => backend.worktrees.listOrphaned(),
+  },
+  {
+    label: "worktrees.listOrphaned remote",
+    command: "list_orphaned_worktrees",
+    args: { hostId: "mew-dev" },
+    call: (backend) => backend.worktrees.listOrphaned("mew-dev"),
   },
   {
     label: "worktrees.create",
@@ -222,10 +228,22 @@ const commandCases: CommandCase[] = [
     call: (backend) => backend.worktrees.restore(restoreArgs),
   },
   {
+    label: "worktrees.restore remote",
+    command: "restore_worktree",
+    args: { args: { ...restoreArgs, hostId: "mew-dev" } },
+    call: (backend) => backend.worktrees.restore({ ...restoreArgs, hostId: "mew-dev" }),
+  },
+  {
     label: "worktrees.delete",
     command: "delete_worktree",
     args: { args: deleteWorktreeArgs },
     call: (backend) => backend.worktrees.delete(deleteWorktreeArgs),
+  },
+  {
+    label: "worktrees.delete remote",
+    command: "delete_worktree",
+    args: { args: { ...deleteWorktreeArgs, hostId: "mew-dev" } },
+    call: (backend) => backend.worktrees.delete({ ...deleteWorktreeArgs, hostId: "mew-dev" }),
   },
   {
     label: "terminals.listTmux",

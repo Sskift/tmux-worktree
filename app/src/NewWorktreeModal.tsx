@@ -19,6 +19,7 @@ import {
   type HostConfig,
   type OrphanedWorktree as Orphan,
   type ProjectPreset as Project,
+  type RestoreWorktreeInput,
   useDashboardBackend,
 } from "./platform";
 import { RemoteDirectoryPicker } from "./RemoteDirectoryPicker";
@@ -27,11 +28,7 @@ type Props = {
   hosts: HostConfig[];
   onClose: () => void;
   onCreateWorktree(request: WorkspaceCreateWorktreeRequest): Promise<boolean>;
-  onRestoreWorktree(args: {
-    path: string;
-    name: string;
-    aiCmd: string;
-  }): Promise<boolean>;
+  onRestoreWorktree(args: RestoreWorktreeInput): Promise<boolean>;
   onDeleteWorktree(orphan: Orphan): Promise<boolean>;
 };
 
@@ -169,11 +166,6 @@ export function NewWorktreeModal({
           setProjectCatalogLoading(false);
           setError(String(e));
         });
-      void dashboardBackend.worktrees.listOrphaned()
-        .then((list) => {
-          if (requestGate.isCurrent(token)) setOrphans(list);
-        })
-        .catch(() => {});
     } else {
       void dashboardBackend.projects.listRemote(selectedHost)
         .then((list) => {
@@ -194,6 +186,14 @@ export function NewWorktreeModal({
           setError(String(e));
         });
     }
+
+    void dashboardBackend.worktrees.listOrphaned(isRemote ? selectedHost : undefined)
+      .then((list) => {
+        if (requestGate.isCurrent(token)) setOrphans(list);
+      })
+      .catch((e) => {
+        if (requestGate.isCurrent(token)) setError(String(e));
+      });
 
     return () => requestGate.cancel(token);
   }, [dashboardBackend, isRemote, selectedHost]);
@@ -286,6 +286,7 @@ export function NewWorktreeModal({
         path: orphan.path,
         name: orphan.name,
         aiCmd: aiCmd.trim() || "",
+        ...(orphan.hostId ? { hostId: orphan.hostId } : {}),
       });
       if (!accepted) {
         endBusy();
@@ -406,7 +407,7 @@ export function NewWorktreeModal({
       >
         <div className="modal__title" id={titleId}>new worktree</div>
 
-        {orphans.length > 0 && !isRemote && (
+        {orphans.length > 0 && (
           <div className="field">
             <span className="field__label">restore existing</span>
             <div className="orphan-list">
@@ -438,7 +439,7 @@ export function NewWorktreeModal({
           </div>
         )}
 
-        {orphans.length > 0 && !isRemote && (
+        {orphans.length > 0 && (
           <div className="modal__divider">or create new</div>
         )}
 

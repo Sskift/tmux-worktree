@@ -176,8 +176,11 @@ React -> Tauri/Rust -> SSH Host
 - 已连接 Host 只来自本机 `~/.tmux-worktree.json` 的显式 `hosts`；`~/.ssh/config` 只提供添加候选。
 - 远端 catalog 合并 `tw rpc list` 的 managed 条目和严格匹配的 legacy tmux/worktree 发现，按原始 tmux name 去重；RPC 条目优先。
 - 远端 create-worktree、create-terminal 和 restore 必须经过兼容的远端 `tw rpc`；缺失或 capability 不兼容时要求安装/升级，不回退到 Rust 手写 SSH git/tmux mutation。managed kill 先走 RPC，只有下文“Managed lifecycle 与兼容层”第 4 项枚举的 legacy 信号才允许 direct tmux compatibility path。
+- New worktree 对话框按所选 Host 扫描 orphan。远端扫描和删除只接受该 Host 配置的 `worktreeBase` 下 `project/worktree` 两级真实 Git worktree；删除由 Dashboard 的 SSH/Git adapter 执行，保留分支，并在用户明确强制删除时于提供 `/proc` 的 Linux Host 上终止 cwd 仍位于目标目录内的残留进程。远端 restore 仍委托目标主机的 `tw rpc restore-worktree`。
 - Dashboard 可以把 `.app` 中的 CLI 复制到 Host 并安装 wrapper；远端仍需要 Node.js、git 和 tmux。
 - PTY、文件和 git 读取按 Host 路由通过 SSH 执行，不经过 Relay broker。
+
+远端 managed terminal 的 SSH tmux attachment 保持 read-only，Dashboard 输入统一经过目标主机的 terminal-control authority。xterm 产生的 mouse/focus transport report 不得作为 `input.raw` 粘入 pane；受控 attachment 的滚轮使用显式、受 fence 保护的 `input.scroll`，不伪装成 raw mouse report。authority 进入 `RECOVERY_REQUIRED` 时，Dashboard 只有在用户明确确认后才发送 host-aware `handoff.force`，接受上一次操作可能已生效并推进 fence，不重放不确定输入。
 
 远端 UI identity 使用 `<hostId>:<rawTmuxName>`；实际远端命令始终使用 `rawTmuxName`，不能把展示用 composite key 直接传给 tmux。
 

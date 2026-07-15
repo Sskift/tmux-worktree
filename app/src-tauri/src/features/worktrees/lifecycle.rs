@@ -1,5 +1,8 @@
 use super::model::RemoteWorktreeTarget;
-use super::{remove_pending_cleanup_path, try_cleanup_worktree, worktree_has_uncommitted_changes};
+use super::{
+    remove_pending_cleanup_path, try_cleanup_remote_worktree, try_cleanup_worktree,
+    worktree_has_uncommitted_changes,
+};
 use crate::config::{
     config_worktree_base, find_host, project_from_config_with_home, remote_config_for_host,
 };
@@ -319,8 +322,25 @@ pub(crate) fn restore_local_worktree_via_runtime(
     parse_local_worktree_rpc_response(&output, runtime.audit_label())
 }
 
+fn restore_remote_worktree(host: &HostConfig, args: &RestoreArgs) -> Result<String, String> {
+    let rpc_args = build_restore_worktree_rpc_args(args)?;
+    let refs = rpc_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_remote_tw_check(host, &refs)?;
+    let session = parse_local_worktree_rpc_response(&output, "remote tw")?;
+    Ok(format!("{}:{session}", host.id))
+}
+
 #[tauri::command]
 pub(crate) fn restore_worktree(app: tauri::AppHandle, args: RestoreArgs) -> Result<String, String> {
+    if let Some(host_id) = args
+        .host_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|host_id| !host_id.is_empty())
+    {
+        let host = find_host(host_id)?;
+        return restore_remote_worktree(&host, &args);
+    }
     let home = app_home_dir().ok_or("home dir not found")?;
     let runtime = resolve_local_tw_rpc_runtime(&app, &home)?;
     let session = restore_local_worktree_via_runtime(&runtime, &args)?;
@@ -329,6 +349,15 @@ pub(crate) fn restore_worktree(app: tauri::AppHandle, args: RestoreArgs) -> Resu
 }
 
 pub(crate) fn delete_worktree_blocking(args: DeleteWorktreeArgs) -> Result<(), String> {
+    if let Some(host_id) = args
+        .host_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|host_id| !host_id.is_empty())
+    {
+        let host = find_host(host_id)?;
+        return try_cleanup_remote_worktree(&host, &args.path, args.force);
+    }
     if !args.force && worktree_has_uncommitted_changes(&args.path).unwrap_or(false) {
         return Err(format!("worktree has uncommitted changes: {}", args.path));
     }

@@ -104,7 +104,7 @@ export interface DashboardBackend {
     removeMissing(args: RemoveMissingProjectInput): Promise<RemoveMissingProjectResult>;
   };
   worktrees: {
-    listOrphaned(): Promise<OrphanedWorktree[]>;
+    listOrphaned(hostId?: string): Promise<OrphanedWorktree[]>;
     create(args: CreateWorktreeInput): Promise<string>;
     restore(args: RestoreWorktreeInput): Promise<string>;
     delete(args: DeleteWorktreeInput): Promise<void>;
@@ -452,7 +452,10 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
         transport.invoke<RemoveMissingProjectResult>("remove_missing_project", { args }),
     },
     worktrees: {
-      listOrphaned: () => transport.invoke<OrphanedWorktree[]>("list_orphaned_worktrees"),
+      listOrphaned: (hostId) => transport.invoke<OrphanedWorktree[]>(
+        "list_orphaned_worktrees",
+        { hostId: hostId ?? null },
+      ),
       create: (args) => transport.invoke<string>("create_worktree", { args }),
       restore: (args) => transport.invoke<string>("restore_worktree", { args }),
       delete: (args) => transport.invoke<void>("delete_worktree", { args }),

@@ -154,6 +154,10 @@ For a selected SSH host, the project picker reads `projects`/`repositories`/`rep
 
 The Dashboard asks the remote `tw` to run `tw rpc create-worktree`. The remote `tw` creates the git worktree under remote `worktreeBase`, starts a tmux session, and records it in remote `~/.tmux-worktree/state.json`. Agents can invoke the same operation from the Mac with `tw host rpc remote-dev create-worktree ...`.
 
+Closing a worktree from the sidebar stops its managed tmux session but intentionally keeps the worktree and branch. To restore or delete that directory, open `New worktree`, select the same remote Host, and use the `restore existing` row. Remote deletion is restricted to real Git worktrees directly under that Host's configured `worktreeBase`; the confirmation discards uncommitted files and, on Linux hosts with `/proc`, stops leftover processes whose current working directory is inside the selected worktree. The Git branch is preserved.
+
+Remote managed terminals use a read-only SSH tmux attachment and send keyboard input through the remote terminal-control authority. Mouse/focus protocol reports are not pasted into the pane, and wheel actions use the authority's fenced scroll operation instead of raw mouse reports. If an input result becomes uncertain, the terminal shows `Recover local input`; recovery requires confirmation because the previous input may already have taken effect, advances the ownership fence on the selected Host, and never replays that input.
+
 ## Create Remote Terminals From Dashboard
 
 Use `+ terminal`, choose the remote host, and choose or type the remote path. The AI command is optional; leaving it empty opens the TW-managed terminal in a login shell. Dashboard and Relay both call `tw rpc create-terminal` on the target host, so the session is recorded in managed state and visible under Terminals. Dashboard-only label/order metadata remains in `~/.tw-dashboard-terminals.json`.
