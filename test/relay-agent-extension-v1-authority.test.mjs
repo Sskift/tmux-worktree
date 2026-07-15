@@ -76,10 +76,9 @@ function buildBudgetState(capacityOverride) {
     sourceSeq += 1;
   };
   ingest("budget-map-start", { mutationType: "source.started" });
-  for (const suffix of ["one", "two"]) {
-    const runId = `budget-map-run-${suffix}`;
-    const turnId = `budget-map-turn-${suffix}`;
-    ingest(`budget-map-run-${suffix}`, {
+  for (let runNumber = 1; runNumber <= 5; runNumber += 1) {
+    const runId = `budget-map-run-${runNumber}`;
+    ingest(`budget-map-run-${runNumber}`, {
       mutationType: "lifecycle.changed",
       scope: "run",
       runId,
@@ -87,44 +86,57 @@ function buildBudgetState(capacityOverride) {
       state: "running",
       failure: null,
     });
-    ingest(`budget-map-turn-${suffix}`, {
-      mutationType: "lifecycle.changed",
-      scope: "turn",
-      runId,
-      turnId,
-      state: "running",
-      failure: null,
-    });
-    ingest(`budget-map-visible-${suffix}`, {
-      mutationType: "text_entry.appended",
-      entryId: `budget-map-visible-${suffix}`,
-      runId,
-      turnId,
-      role: "agent",
-      text: `visible ${suffix}`,
-      commandId: null,
-    });
-    ingest(`budget-map-doomed-${suffix}`, {
-      mutationType: "text_entry.appended",
-      entryId: `budget-map-doomed-${suffix}`,
-      runId,
-      turnId,
-      role: "agent",
-      text: `doomed ${suffix}`,
-      commandId: null,
-    });
-    ingest(`budget-map-delete-${suffix}`, {
-      mutationType: "entry.deleted",
-      entryId: `budget-map-doomed-${suffix}`,
-      reason: "retention",
-    });
+    const turnTotal = runNumber === 5 ? 2 : 1;
+    for (let turnNumber = 1; turnNumber <= turnTotal; turnNumber += 1) {
+      const turnId = `budget-map-turn-${runNumber}-${turnNumber}`;
+      ingest(`budget-map-turn-${runNumber}-${turnNumber}`, {
+        mutationType: "lifecycle.changed",
+        scope: "turn",
+        runId,
+        turnId,
+        state: "running",
+        failure: null,
+      });
+      if (runNumber === 1) {
+        for (let entryNumber = 1; entryNumber <= 11; entryNumber += 1) {
+          ingest(`budget-map-entry-${entryNumber}`, {
+            mutationType: "text_entry.appended",
+            entryId: `budget-map-entry-${entryNumber}`,
+            runId,
+            turnId,
+            role: "agent",
+            text: `entry ${entryNumber}`,
+            commandId: null,
+          });
+        }
+        for (let entryNumber = 1; entryNumber <= 4; entryNumber += 1) {
+          ingest(`budget-map-delete-${entryNumber}`, {
+            mutationType: "entry.deleted",
+            entryId: `budget-map-entry-${entryNumber}`,
+            reason: "retention",
+          });
+        }
+      }
+      if (runNumber >= 3) {
+        ingest(`budget-map-turn-${runNumber}-${turnNumber}-completed`, {
+          mutationType: "lifecycle.changed",
+          scope: "turn",
+          runId,
+          turnId,
+          state: "completed",
+          failure: null,
+        });
+      }
+    }
   }
-  state = apply(state, sourceEvent(
-    "1",
-    "budget-map-second-source",
-    { mutationType: "source.started" },
-    "budget-map-source-two",
-  )).state;
+  for (const suffix of ["two", "three"]) {
+    state = apply(state, sourceEvent(
+      "1",
+      `budget-map-source-${suffix}-started`,
+      { mutationType: "source.started" },
+      `budget-map-source-${suffix}`,
+    )).state;
+  }
   return state;
 }
 
@@ -208,6 +220,20 @@ function assertRestoreRejectsWithoutMutation(snapshot, label) {
     () => restoreState(snapshot),
     (error) => error instanceof authority.RelayAgentAuthorityRestoreError
       || error instanceof authority.RelayAgentAuthorityCapacityError,
+    label,
+  );
+  assert.equal(JSON.stringify(snapshot), before, `${label} leaves caller snapshot unchanged`);
+  assert.equal(Object.isFrozen(snapshot), false, `${label} leaves caller snapshot mutable`);
+}
+
+function assertCapacityRestoreRejectsWithoutMutation(snapshot, expected, label) {
+  const before = JSON.stringify(snapshot);
+  assert.throws(
+    () => restoreState(snapshot),
+    (error) => error instanceof authority.RelayAgentAuthorityCapacityError
+      && error.resource === expected.resource
+      && error.limit === expected.limit
+      && error.attempted === expected.attempted,
     label,
   );
   assert.equal(JSON.stringify(snapshot), before, `${label} leaves caller snapshot unchanged`);
@@ -796,6 +822,11 @@ test("all resource count and canonical-byte budgets map to snapshot indexes", ()
     ["tombstones", "deletedEntries", "tombstoneCount", "tombstoneCanonicalBytes", "maxTombstoneCount", "maxTombstoneCanonicalBytes", (item) => item.key],
     ["activeTurns", "activeTurns", "activeTurnIndexCount", "activeTurnIndexCanonicalBytes", "maxActiveTurnIndexCount", "maxActiveTurnIndexCanonicalBytes", (item) => item.key],
   ];
+  assert.equal(
+    new Set(rows.map(([, snapshotField]) => snapshot[snapshotField].length)).size,
+    rows.length,
+    "every resource count is distinguishable",
+  );
 
   let independentResourceTotal = 0;
   for (const [resource, snapshotField, countField, byteField, countLimit, byteLimit, keyOf] of rows) {
@@ -814,10 +845,18 @@ test("all resource count and canonical-byte budgets map to snapshot indexes", ()
 
     const oneOverCount = structuredClone(exact);
     oneOverCount.limits[countLimit] -= 1;
-    assertRestoreRejectsWithoutMutation(oneOverCount, `${resource} count +1 is unavailable`);
+    assertCapacityRestoreRejectsWithoutMutation(oneOverCount, {
+      resource,
+      limit: items.length - 1,
+      attempted: items.length,
+    }, `${resource} count +1 is unavailable`);
     const oneOverBytes = structuredClone(exact);
     oneOverBytes.limits[byteLimit] -= 1;
-    assertRestoreRejectsWithoutMutation(oneOverBytes, `${resource} canonical bytes +1 is unavailable`);
+    assertCapacityRestoreRejectsWithoutMutation(oneOverBytes, {
+      resource: `${resource}_canonical_bytes`,
+      limit: independentBytes - 1,
+      attempted: independentBytes,
+    }, `${resource} canonical bytes +1 is unavailable`);
   }
   assert.equal(
     state.usage.totalCanonicalBytes,
@@ -839,7 +878,7 @@ test("all resource count and canonical-byte budgets map to snapshot indexes", ()
     mutationType: "source.availability",
     state: "interrupted",
     reason: "source_disconnected",
-  }, "budget-map-source-two");
+  }, "budget-map-source-three");
   assert.throws(
     () => callWithMutableInputProbe(
       oneOverInput,
