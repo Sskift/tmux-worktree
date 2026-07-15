@@ -1,0 +1,344 @@
+package com.tmuxworktree.mobile.core.relay.v2.profile
+
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2CodecException
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2HttpsSchema
+import java.io.IOException
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Call
+import okhttp3.Callback
+import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
+import okhttp3.ResponseBody
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okio.Buffer
+
+internal enum class RelayV2CredentialExchangeFailureKind {
+    CONFIGURATION,
+    NETWORK,
+    HTTP,
+    AUTH,
+    SCHEMA,
+}
+
+/** A closed, redacted failure that never retains a request, response body, or transport cause. */
+internal class RelayV2CredentialExchangeException(
+    val kind: RelayV2CredentialExchangeFailureKind,
+    val httpStatus: Int? = null,
+    val errorCode: String? = null,
+    val retryable: Boolean = false,
+    val retryAfterMs: Long? = null,
+) : IOException(
+    "Relay v2 credential exchange failed (${errorCode ?: kind.name})",
+)
+
+/**
+ * Strict HTTPS redeem/refresh adapter for the existing profile repository seam.
+ *
+ * Each invocation sends exactly one caller-owned attempt. OkHttp connection retries are disabled;
+ * response-loss replay and credential CAS remain repository/broker responsibilities.
+ */
+internal class OkHttpRelayV2CredentialExchange(
+    client: OkHttpClient = defaultClient(),
+    private val codec: RelayV2Codec = RelayV2Codec(),
+) : RelayV2CredentialExchange {
+    private val client = client.newBuilder()
+        .retryOnConnectionFailure(false)
+        .followRedirects(false)
+        .followSslRedirects(false)
+        .build()
+
+    override suspend fun redeem(
+        request: RelayV2EnrollmentExchangeRequest,
+    ): RelayV2EnrollmentExchangeResponse {
+        val body = linkedMapOf<String, Any?>(
+            "exchangeAttemptId" to request.exchangeAttemptId,
+            "enrollmentId" to request.enrollmentId,
+            "enrollmentCode" to request.enrollmentCode,
+            "clientInstanceId" to request.clientInstanceId,
+            "deviceLabel" to request.deviceLabel,
+        )
+        val response = execute(
+            issuerUrl = request.issuerUrl,
+            pathname = ENROLLMENT_REDEEM_PATH,
+            requestSchema = RelayV2HttpsSchema.ENROLLMENT_REDEEM_REQUEST,
+            responseSchema = RelayV2HttpsSchema.ENROLLMENT_REDEEM_RESPONSE,
+            body = body,
+        )
+        return response.toEnrollmentResponse()
+    }
+
+    override suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse {
+        val body = linkedMapOf<String, Any?>(
+            "refreshAttemptId" to request.refreshAttemptId,
+            "grantId" to request.grantId,
+            "clientInstanceId" to request.clientInstanceId,
+            "refreshToken" to request.refreshToken,
+        )
+        val response = execute(
+            issuerUrl = request.issuerUrl,
+            pathname = CLIENT_REFRESH_PATH,
+            requestSchema = RelayV2HttpsSchema.TOKEN_REFRESH_CLIENT_REQUEST,
+            responseSchema = RelayV2HttpsSchema.TOKEN_REFRESH_CLIENT_RESPONSE,
+            body = body,
+        )
+        return response.toRefreshResponse()
+    }
+
+    private suspend fun execute(
+        issuerUrl: String,
+        pathname: String,
+        requestSchema: RelayV2HttpsSchema,
+        responseSchema: RelayV2HttpsSchema,
+        body: Map<String, Any?>,
+    ): RelayV2DecodedMessage {
+        val url = exactEndpoint(issuerUrl, pathname)
+        val encoded = try {
+            codec.encodeHttpsBody(requestSchema, body)
+        } catch (_: RelayV2CodecException) {
+            throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
+        } catch (_: Throwable) {
+            throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
+        }
+        val httpRequest = Request.Builder()
+            .url(url)
+            .post(encoded.toRequestBody(JSON_MEDIA_TYPE))
+            .header("Cache-Control", "no-store")
+            .header("Accept-Encoding", "identity")
+            .build()
+        val call = client.newCall(httpRequest)
+        return suspendCancellableCoroutine { continuation ->
+            continuation.invokeOnCancellation { call.cancel() }
+            call.enqueue(object : Callback {
+                override fun onFailure(call: Call, e: IOException) {
+                    if (continuation.isActive) {
+                        continuation.resumeWithException(
+                            failure(RelayV2CredentialExchangeFailureKind.NETWORK),
+                        )
+                    }
+                }
+
+                override fun onResponse(call: Call, response: Response) {
+                    val result = runCatching {
+                        response.use { decodeResponse(it, responseSchema) }
+                    }.recoverCatching { error ->
+                        if (error is RelayV2CredentialExchangeException) throw error
+                        throw failure(
+                            RelayV2CredentialExchangeFailureKind.SCHEMA,
+                            httpStatus = response.code,
+                        )
+                    }
+                    if (continuation.isActive) continuation.resumeWith(result)
+                }
+            })
+        }
+    }
+
+    private fun decodeResponse(
+        response: Response,
+        successSchema: RelayV2HttpsSchema,
+    ): RelayV2DecodedMessage {
+        if (!response.cacheControl.noStore) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = response.code,
+            )
+        }
+        val encodings = response.headers.values("Content-Encoding")
+        if (encodings.size > 1) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = response.code,
+            )
+        }
+        val bytes = boundedBody(response.body, response.code)
+        val schema = if (response.isSuccessful) successSchema else RelayV2HttpsSchema.ERROR_RESPONSE
+        val decoded = try {
+            codec.decodeHttpsBody(schema, bytes, encodings.singleOrNull())
+        } catch (_: RelayV2CodecException) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = response.code,
+            )
+        }
+        if (response.isSuccessful) return decoded
+
+        val error = decoded.frame["error"] as Map<*, *>
+        val errorCode = error["code"] as String
+        val retryable = error["retryable"] as Boolean
+        val retryAfterMs = error["retryAfterMs"] as? Long
+        val kind = if (response.code == 401 || response.code == 403 || errorCode in AUTH_ERROR_CODES) {
+            RelayV2CredentialExchangeFailureKind.AUTH
+        } else {
+            RelayV2CredentialExchangeFailureKind.HTTP
+        }
+        throw failure(
+            kind = kind,
+            httpStatus = response.code,
+            errorCode = errorCode,
+            retryable = retryable,
+            retryAfterMs = retryAfterMs,
+        )
+    }
+
+    private fun boundedBody(body: ResponseBody?, httpStatus: Int): ByteArray {
+        val responseBody = body ?: throw failure(
+            RelayV2CredentialExchangeFailureKind.SCHEMA,
+            httpStatus = httpStatus,
+        )
+        val declared = responseBody.contentLength()
+        if (declared > RelayV2Codec.HTTPS_BODY_BYTES) {
+            throw failure(
+                RelayV2CredentialExchangeFailureKind.SCHEMA,
+                httpStatus = httpStatus,
+                errorCode = "INVALID_ENVELOPE",
+            )
+        }
+        val source = responseBody.source()
+        val buffer = Buffer()
+        var total = 0L
+        val maximum = RelayV2Codec.HTTPS_BODY_BYTES.toLong()
+        while (total <= maximum) {
+            val read = source.read(buffer, minOf(8_192L, maximum + 1 - total))
+            if (read == -1L) return buffer.readByteArray()
+            total += read
+            if (total > maximum) {
+                throw failure(
+                    RelayV2CredentialExchangeFailureKind.SCHEMA,
+                    httpStatus = httpStatus,
+                    errorCode = "INVALID_ENVELOPE",
+                )
+            }
+        }
+        throw failure(
+            RelayV2CredentialExchangeFailureKind.SCHEMA,
+            httpStatus = httpStatus,
+            errorCode = "INVALID_ENVELOPE",
+        )
+    }
+
+    private fun exactEndpoint(issuerUrl: String, pathname: String): HttpUrl {
+        if (!RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
+            throw failure(RelayV2CredentialExchangeFailureKind.CONFIGURATION)
+        }
+        val base = issuerUrl.toHttpUrlOrNull()
+            ?: throw failure(RelayV2CredentialExchangeFailureKind.CONFIGURATION)
+        return base.newBuilder()
+            .encodedPath(pathname)
+            .query(null)
+            .fragment(null)
+            .build()
+    }
+
+    private fun RelayV2DecodedMessage.toEnrollmentResponse(): RelayV2EnrollmentExchangeResponse {
+        val response = credentialResponseFields()
+        return RelayV2EnrollmentExchangeResponse(
+            exchangeAttemptId = frame.string("exchangeAttemptId"),
+            principalId = response.principalId,
+            grantId = response.grantId,
+            hostId = response.hostId,
+            relayUrl = response.relayUrl,
+            accessToken = response.accessToken,
+            accessExpiresAtMs = response.accessExpiresAtMs,
+            refreshToken = response.refreshToken,
+            refreshExpiresAtMs = response.refreshExpiresAtMs,
+        )
+    }
+
+    private fun RelayV2DecodedMessage.toRefreshResponse(): RelayV2RefreshResponse {
+        val response = credentialResponseFields()
+        return RelayV2RefreshResponse(
+            refreshAttemptId = frame.string("refreshAttemptId"),
+            principalId = response.principalId,
+            grantId = response.grantId,
+            hostId = response.hostId,
+            relayUrl = response.relayUrl,
+            accessToken = response.accessToken,
+            accessExpiresAtMs = response.accessExpiresAtMs,
+            refreshToken = response.refreshToken,
+            refreshExpiresAtMs = response.refreshExpiresAtMs,
+        )
+    }
+
+    private fun RelayV2DecodedMessage.credentialResponseFields(): CredentialResponseFields {
+        val relayUrl = frame.string("relayUrl")
+        val accessToken = frame.string("accessToken")
+        val refreshToken = frame.string("refreshToken")
+        if (!RelayV2EndpointValidator.isRelayUrl(relayUrl) ||
+            !isSafeSecret(accessToken, "twcap2.") ||
+            !isSafeSecret(refreshToken, "twref2.")
+        ) {
+            throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
+        }
+        return CredentialResponseFields(
+            principalId = frame.string("principalId"),
+            grantId = frame.string("grantId"),
+            hostId = frame.string("hostId"),
+            relayUrl = relayUrl,
+            accessToken = accessToken,
+            accessExpiresAtMs = frame.long("accessExpiresAtMs"),
+            refreshToken = refreshToken,
+            refreshExpiresAtMs = frame.long("refreshExpiresAtMs"),
+        )
+    }
+
+    private fun isSafeSecret(value: String, prefix: String): Boolean =
+        value.startsWith(prefix) && value.length <= MAX_SECRET_BYTES &&
+            value.all { it.code in VISIBLE_ASCII_RANGE }
+
+    private data class CredentialResponseFields(
+        val principalId: String,
+        val grantId: String,
+        val hostId: String,
+        val relayUrl: String,
+        val accessToken: String,
+        val accessExpiresAtMs: Long,
+        val refreshToken: String,
+        val refreshExpiresAtMs: Long,
+    )
+
+    private companion object {
+        const val ENROLLMENT_REDEEM_PATH = "/v2/enrollments/redeem"
+        const val CLIENT_REFRESH_PATH = "/v2/tokens/refresh"
+        const val MAX_SECRET_BYTES = 8_192
+        val VISIBLE_ASCII_RANGE = 0x21..0x7E
+        val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        val AUTH_ERROR_CODES = setOf(
+            "AUTH_REQUIRED",
+            "AUTH_INVALID",
+            "PERMISSION_DENIED",
+            "GRANT_NOT_FOUND",
+            "ROLE_MISMATCH",
+        )
+
+        fun defaultClient(): OkHttpClient = OkHttpClient.Builder()
+            .retryOnConnectionFailure(false)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+
+        fun failure(
+            kind: RelayV2CredentialExchangeFailureKind,
+            httpStatus: Int? = null,
+            errorCode: String? = null,
+            retryable: Boolean = false,
+            retryAfterMs: Long? = null,
+        ): RelayV2CredentialExchangeException = RelayV2CredentialExchangeException(
+            kind = kind,
+            httpStatus = httpStatus,
+            errorCode = errorCode,
+            retryable = retryable,
+            retryAfterMs = retryAfterMs,
+        )
+    }
+}
+
+private fun Map<String, Any?>.string(name: String): String = getValue(name) as String
+
+private fun Map<String, Any?>.long(name: String): Long = (getValue(name) as Number).toLong()

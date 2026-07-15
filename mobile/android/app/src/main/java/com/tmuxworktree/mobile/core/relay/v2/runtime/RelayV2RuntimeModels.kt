@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2EndpointValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.math.BigInteger
 
@@ -204,6 +205,9 @@ internal data class RelayV2TransportOpenRequest(
     val accessToken: String,
 ) {
     init {
+        require(RelayV2EndpointValidator.isRelayUrl(relayUrl)) {
+            "Relay v2 transport endpoint is invalid"
+        }
         require(offeredSubprotocols == listOf(RelayV2Profile.RELAY_V2_SUBPROTOCOL)) {
             "Relay v2 transport must offer only tw-relay.v2"
         }

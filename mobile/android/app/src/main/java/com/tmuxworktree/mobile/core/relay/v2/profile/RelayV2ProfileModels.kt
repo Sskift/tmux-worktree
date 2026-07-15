@@ -250,14 +250,22 @@ internal fun interface RelayProfileIsolationBoundary {
 }
 
 internal data class RelayV2EnrollmentExchangeRequest(
+    val issuerUrl: String,
     val exchangeAttemptId: String,
     val enrollmentId: String,
     val enrollmentCode: String,
     val clientInstanceId: String,
     val deviceLabel: String?,
 ) {
+    init {
+        require(RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
+            "Relay v2 issuer endpoint is invalid"
+        }
+    }
+
     override fun toString(): String =
-        "RelayV2EnrollmentExchangeRequest(exchangeAttemptId=$exchangeAttemptId, " +
+        "RelayV2EnrollmentExchangeRequest(issuerUrl=$issuerUrl, " +
+            "exchangeAttemptId=$exchangeAttemptId, " +
             "enrollmentId=$enrollmentId, enrollmentCode=<redacted>, " +
             "clientInstanceId=$clientInstanceId, deviceLabel=$deviceLabel)"
 }
@@ -281,13 +289,21 @@ internal data class RelayV2EnrollmentExchangeResponse(
 }
 
 internal data class RelayV2RefreshRequest(
+    val issuerUrl: String,
     val refreshAttemptId: String,
     val grantId: String,
     val clientInstanceId: String,
     val refreshToken: String,
 ) {
+    init {
+        require(RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
+            "Relay v2 issuer endpoint is invalid"
+        }
+    }
+
     override fun toString(): String =
-        "RelayV2RefreshRequest(refreshAttemptId=$refreshAttemptId, grantId=$grantId, " +
+        "RelayV2RefreshRequest(issuerUrl=$issuerUrl, refreshAttemptId=$refreshAttemptId, " +
+            "grantId=$grantId, " +
             "clientInstanceId=$clientInstanceId, refreshToken=<redacted>)"
 }
 
@@ -309,10 +325,7 @@ internal data class RelayV2RefreshResponse(
             "refreshExpiresAtMs=$refreshExpiresAtMs)"
 }
 
-/**
- * Exchange seam for simulator/fake-backed development. There is intentionally no HTTPS
- * implementation in this slice, so these methods cannot reach a production broker.
- */
+/** Exchange seam; the OkHttp implementation remains outside production composition. */
 internal interface RelayV2CredentialExchange {
     suspend fun redeem(request: RelayV2EnrollmentExchangeRequest): RelayV2EnrollmentExchangeResponse
     suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse

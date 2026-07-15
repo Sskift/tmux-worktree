@@ -296,8 +296,8 @@ internal sealed interface RelayV2RefreshApplyResult {
 /**
  * Canonical owner for the first Relay v2 profile/credential slice.
  *
- * The injected [exchange] has no production implementation in this change. Parsing a QR never
- * reaches this repository; callers must explicitly create [RelayV2ConfirmedEnrollment].
+ * The injected [exchange] is not selected by production composition. Parsing a QR never reaches
+ * this repository; callers must explicitly create [RelayV2ConfirmedEnrollment].
  */
 internal class RelayV2ProfileRepository(
     private val credentialStore: RelayV2CredentialStore,
@@ -494,7 +494,7 @@ internal class RelayV2ProfileRepository(
                 return PreparedEnrollment.Pending(
                     credentialReference = reference,
                     expectation = existing.expectation(),
-                    request = pending.enrollmentRequest(clientInstanceId),
+                    request = pending.enrollmentRequest(existing.issuerUrl, clientInstanceId),
                 )
             }
 
@@ -519,7 +519,7 @@ internal class RelayV2ProfileRepository(
                 return PreparedEnrollment.Pending(
                     credentialReference = reference,
                     expectation = created.expectation(),
-                    request = pending.enrollmentRequest(clientInstanceId),
+                    request = pending.enrollmentRequest(created.issuerUrl, clientInstanceId),
                 )
             }
         }
@@ -570,6 +570,7 @@ internal class RelayV2ProfileRepository(
         credentialReference = profile.credentialReference,
         expectation = blob.expectation(),
         request = RelayV2RefreshRequest(
+            issuerUrl = blob.issuerUrl,
             refreshAttemptId = pending.attemptId,
             grantId = blob.grantId!!,
             clientInstanceId = blob.clientInstanceId,
@@ -628,8 +629,10 @@ internal class RelayV2ProfileRepository(
         pendingAttempt?.secretReference == expectation.pendingSecretReference
 
     private fun RelayV2PendingCredentialAttempt.enrollmentRequest(
+        issuerUrl: String,
         clientInstanceId: String,
     ): RelayV2EnrollmentExchangeRequest = RelayV2EnrollmentExchangeRequest(
+        issuerUrl = issuerUrl,
         exchangeAttemptId = attemptId,
         enrollmentId = enrollmentId!!,
         enrollmentCode = secret,
