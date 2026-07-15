@@ -289,6 +289,16 @@ function assertPublicProjection(reduction, before, input, knownEntryTexts, label
         sourceEpoch: input.sourceEpoch,
         reason: before.activeSourceEpoch === null ? null : "source_restarted",
       }, `${label} source.started projection`);
+      assert.equal(
+        reduction.state.sources.get(input.sourceEpoch).activationAgentEventSeq,
+        reduction.agentEventSeq,
+        `${label} initializes immutable activation sequence`,
+      );
+      assert.equal(
+        reduction.state.sources.get(input.sourceEpoch).activationEventId,
+        reduction.publicEvent.eventId,
+        `${label} initializes immutable activation identity`,
+      );
       break;
     case "source.availability":
       assert.deepEqual(projected, {
@@ -297,6 +307,16 @@ function assertPublicProjection(reduction, before, input, knownEntryTexts, label
         sourceEpoch: input.sourceEpoch,
         reason: input.mutation.reason,
       }, `${label} source availability projection`);
+      assert.equal(
+        reduction.state.sources.get(input.sourceEpoch).activationAgentEventSeq,
+        before.sources.get(input.sourceEpoch).activationAgentEventSeq,
+        `${label} preserves immutable activation sequence`,
+      );
+      assert.equal(
+        reduction.state.sources.get(input.sourceEpoch).activationEventId,
+        before.sources.get(input.sourceEpoch).activationEventId,
+        `${label} preserves immutable activation identity`,
+      );
       break;
     case "lifecycle.changed":
       assert.deepEqual(projected, {
@@ -555,9 +575,19 @@ test("plain snapshots require the explicit closed restore boundary", () => {
     "restore-source-new",
   )).state;
   const rolledBackActive = stateSnapshot(dualSourceState);
+  const forgedAvailabilitySequence = (BigInt(rolledBackActive.agentEventSeq) + 1n).toString();
+  const oldSource = rolledBackActive.sources.find((item) => item.key === "source-main").value;
+  oldSource.availability = "connected";
+  oldSource.availabilityAgentEventSeq = forgedAvailabilitySequence;
+  oldSource.availabilityEventId = eventIdForTest(forgedAvailabilitySequence);
+  oldSource.availabilityOccurredAtMs += 1;
+  rolledBackActive.agentEventSeq = forgedAvailabilitySequence;
   rolledBackActive.activeSourceEpoch = "source-main";
   rolledBackActive.activeSourceAvailability = "connected";
-  assertRestoreRejectsWithoutMutation(rolledBackActive, "active source cannot roll back to an older activation");
+  assertRestoreRejectsWithoutMutation(
+    rolledBackActive,
+    "mutable availability cannot revive a source with an older immutable activation",
+  );
   assert.throws(
     () => authority.restoreRelayAgentAuthorityState(
       plain,

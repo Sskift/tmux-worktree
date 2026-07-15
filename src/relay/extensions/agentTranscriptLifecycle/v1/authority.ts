@@ -201,6 +201,8 @@ export interface RelayAgentSourceAuthorityState {
   sourceEpoch: string;
   lastSourceSeq: string;
   fenced: boolean;
+  activationEventId: string;
+  activationAgentEventSeq: string;
   availability: RelayAgentSourceAvailability;
   availabilityEventId: string;
   availabilityAgentEventSeq: string;
@@ -979,7 +981,10 @@ function commitState(
       candidate.activeSourceEpoch === null
       || state.sources.get(candidate.activeSourceEpoch) !== undefined
       || candidate.sources.size !== state.sources.size + 1
+      || active?.activationAgentEventSeq !== candidate.agentEventSeq
+      || active?.activationEventId !== eventIdFor(candidate.binding, candidate.agentEventSeq)
       || active?.availabilityAgentEventSeq !== candidate.agentEventSeq
+      || active?.availabilityEventId !== active?.activationEventId
     ) {
       throw new RelayAgentAuthorityStateError("active source activation invariant failed");
     }
@@ -987,8 +992,14 @@ function commitState(
     const previousActive = state.sources.get(active.sourceEpoch);
     if (
       previousActive !== undefined
-      && active.availabilityAgentEventSeq !== previousActive.availabilityAgentEventSeq
-      && active.availabilityAgentEventSeq !== candidate.agentEventSeq
+      && (
+        active.activationAgentEventSeq !== previousActive.activationAgentEventSeq
+        || active.activationEventId !== previousActive.activationEventId
+        || (
+          active.availabilityAgentEventSeq !== previousActive.availabilityAgentEventSeq
+          && active.availabilityAgentEventSeq !== candidate.agentEventSeq
+        )
+      )
     ) {
       throw new RelayAgentAuthorityStateError("active source availability invariant failed");
     }
@@ -1171,8 +1182,8 @@ function parseSnapshotLifecycle(value: unknown, label: string): RelayAgentLifecy
 
 function parseSnapshotSource(value: unknown, label: string): RelayAgentSourceAuthorityState {
   const record = asClosedObject(value, label, [
-    "sourceEpoch", "lastSourceSeq", "fenced", "availability", "availabilityEventId",
-    "availabilityAgentEventSeq", "availabilityOccurredAtMs",
+    "sourceEpoch", "lastSourceSeq", "fenced", "activationEventId", "activationAgentEventSeq",
+    "availability", "availabilityEventId", "availabilityAgentEventSeq", "availabilityOccurredAtMs",
   ]);
   if (typeof record.fenced !== "boolean") {
     throw new RelayAgentAuthorityInputError(`${label}.fenced must be boolean`);
@@ -1181,6 +1192,12 @@ function parseSnapshotSource(value: unknown, label: string): RelayAgentSourceAut
     sourceEpoch: parseOpaqueId(record.sourceEpoch, `${label}.sourceEpoch`),
     lastSourceSeq: parseCounter(record.lastSourceSeq, `${label}.lastSourceSeq`, true),
     fenced: record.fenced,
+    activationEventId: parseOpaqueId(record.activationEventId, `${label}.activationEventId`),
+    activationAgentEventSeq: parseCounter(
+      record.activationAgentEventSeq,
+      `${label}.activationAgentEventSeq`,
+      true,
+    ),
     availability: parseAvailability(record.availability, `${label}.availability`),
     availabilityEventId: parseOpaqueId(record.availabilityEventId, `${label}.availabilityEventId`),
     availabilityAgentEventSeq: parseCounter(
@@ -1360,21 +1377,34 @@ export function restoreRelayAgentAuthorityState(
       if (BigInt(sequence) > maxObservedSequence) maxObservedSequence = BigInt(sequence);
     };
 
-    let latestAvailabilitySequence = 0n;
-    let latestAvailabilitySourceEpoch: string | null = null;
+    let latestActivationSequence = 0n;
+    let latestActivationSourceEpoch: string | null = null;
     for (const [index, item] of asArray(snapshot.sources, "snapshot.sources").entries()) {
       const keyed = asClosedObject(item, `snapshot.sources[${index}]`, ["key", "value"]);
       const key = parseOpaqueId(keyed.key, `snapshot.sources[${index}].key`);
       const value = parseSnapshotSource(keyed.value, `snapshot.sources[${index}].value`);
       if (key !== value.sourceEpoch) restoreFailure(`snapshot.sources[${index}] key mirror mismatch`);
       if (sources.get(key)) restoreFailure(`snapshot.sources[${index}] duplicate key`);
+      if (value.activationEventId !== eventIdFor(binding, value.activationAgentEventSeq)) {
+        restoreFailure(`snapshot.sources[${index}] activation event mirror mismatch`);
+      }
       if (value.availabilityEventId !== eventIdFor(binding, value.availabilityAgentEventSeq)) {
         restoreFailure(`snapshot.sources[${index}] availability event mirror mismatch`);
       }
-      observeSequence(value.availabilityAgentEventSeq, `source:${key}:availability`);
-      if (BigInt(value.availabilityAgentEventSeq) > latestAvailabilitySequence) {
-        latestAvailabilitySequence = BigInt(value.availabilityAgentEventSeq);
-        latestAvailabilitySourceEpoch = key;
+      if (BigInt(value.activationAgentEventSeq) > BigInt(value.availabilityAgentEventSeq)) {
+        restoreFailure(`snapshot.sources[${index}] activation is after availability`);
+      }
+      const activationOwner = `source:${key}:activation`;
+      observeSequence(value.activationAgentEventSeq, activationOwner);
+      observeSequence(
+        value.availabilityAgentEventSeq,
+        value.availabilityAgentEventSeq === value.activationAgentEventSeq
+          ? activationOwner
+          : `source:${key}:availability`,
+      );
+      if (BigInt(value.activationAgentEventSeq) > latestActivationSequence) {
+        latestActivationSequence = BigInt(value.activationAgentEventSeq);
+        latestActivationSourceEpoch = key;
       }
       [sources, usage] = setIndexed(sources, usage, "sources", key, value);
       assertBudgets(limits, usage);
@@ -1388,7 +1418,7 @@ export function restoreRelayAgentAuthorityState(
       if (
         !active
         || active.availability !== activeSourceAvailability
-        || latestAvailabilitySourceEpoch !== activeSourceEpoch
+        || latestActivationSourceEpoch !== activeSourceEpoch
       ) {
         restoreFailure("active source mirror is missing or inconsistent");
       }
@@ -2028,6 +2058,12 @@ export function reduceRelayAgentAuthority(
     sourceEpoch: event.sourceEpoch,
     lastSourceSeq: event.sourceSeq,
     fenced: false,
+    activationEventId: event.mutation.mutationType === "source.started"
+      ? eventId!
+      : source!.activationEventId,
+    activationAgentEventSeq: event.mutation.mutationType === "source.started"
+      ? nextAgentEventSeq
+      : source!.activationAgentEventSeq,
     availability,
     availabilityEventId: event.mutation.mutationType === "source.started" || event.mutation.mutationType === "source.availability"
       ? eventId!
