@@ -1,9 +1,15 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
+import type { RelayV2EnrollmentState } from "./dashboard/Settings/relayV2EnrollmentModel";
 import { DashboardBackendProvider, type DashboardBackend } from "./platform";
 
-async function resolveDashboardBackend(): Promise<DashboardBackend> {
+interface ResolvedDashboard {
+  backend: DashboardBackend;
+  relayV2Enrollment?: RelayV2EnrollmentState;
+}
+
+async function resolveDashboard(): Promise<ResolvedDashboard> {
   const localWebPreview =
     window.location.hostname === "localhost" ||
     window.location.hostname === "127.0.0.1";
@@ -11,21 +17,27 @@ async function resolveDashboardBackend(): Promise<DashboardBackend> {
     (import.meta.env.DEV || localWebPreview) &&
     new URLSearchParams(window.location.search).get("backend") === "fake";
   if (previewRequested) {
-    const preview = await import("./platform/previewBackend");
-    return preview.previewDashboardBackend;
+    const [preview, relayV2Preview] = await Promise.all([
+      import("./platform/previewBackend"),
+      import("./dashboard/Settings/relayV2EnrollmentPreview"),
+    ]);
+    return {
+      backend: preview.previewDashboardBackend,
+      relayV2Enrollment: relayV2Preview.previewRelayV2EnrollmentState,
+    };
   }
   const tauri = await import("./platform/tauriBackend");
-  return tauri.tauriDashboardBackend;
+  return { backend: tauri.tauriDashboardBackend };
 }
 
-function renderDashboard(dashboardBackend: DashboardBackend) {
+function renderDashboard({ backend, relayV2Enrollment }: ResolvedDashboard) {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>
-      <DashboardBackendProvider backend={dashboardBackend}>
-        <App />
+      <DashboardBackendProvider backend={backend}>
+        <App relayV2Enrollment={relayV2Enrollment} />
       </DashboardBackendProvider>
     </React.StrictMode>,
   );
 }
 
-void resolveDashboardBackend().then(renderDashboard);
+void resolveDashboard().then(renderDashboard);

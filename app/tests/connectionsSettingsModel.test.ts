@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { RelayV2EnrollmentPreviewPanel } from "../src/dashboard/Settings/RelayV2EnrollmentPreviewPanel";
 import {
   calculateHostRemovalImpact,
   createEmptyHostDraft,
@@ -9,6 +12,44 @@ import {
   validateHostDraft,
   validateRelayDraft,
 } from "../src/dashboard/Settings/connectionsModel";
+import {
+  RELAY_V2_REQUIRED_CAPABILITIES,
+  createRelayV2EnrollmentState,
+  deriveRelayV2EnrollmentView,
+  relayV2EnrollmentReducer,
+  type RelayV2EnrollmentReview,
+  type RelayV2EnrollmentState,
+} from "../src/dashboard/Settings/relayV2EnrollmentModel";
+
+const relayV2Review: RelayV2EnrollmentReview = {
+  enrollment: {
+    enrollmentId: "enrollment-preview",
+    enrollmentCode: "twenroll2.one-time-preview-code",
+    expiresAtMs: 4_000_000_000_000,
+  },
+  display: {
+    issuerUrl: "https://relay.test",
+    relayUrl: "wss://relay.test/client",
+    hostId: "mac-admin",
+    deviceLabel: "Pixel preview",
+  },
+};
+
+function reduceRelayV2(
+  initial: RelayV2EnrollmentState,
+  events: Parameters<typeof relayV2EnrollmentReducer>[1][],
+): RelayV2EnrollmentState {
+  return events.reduce(relayV2EnrollmentReducer, initial);
+}
+
+test("the existing Relay v1 UI receives no v2 preview markup without explicit fake state", () => {
+  const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
+    state: undefined,
+    v1SharedSecretConfigured: true,
+  }));
+
+  assert.equal(markup, "");
+});
 
 test("host draft normalization keeps every supported connection field", () => {
   const draft = hostConfigToDraft({
@@ -209,4 +250,118 @@ test("Relay validation requires trusted WSS or an explicit loopback diagnostic U
     hostId: "mac-admin",
     token: "secret",
   }, "start").valid, true);
+});
+
+test("Relay v2 enrollment stays visibly unavailable without host registration or one required capability", () => {
+  const unregistered = deriveRelayV2EnrollmentView(
+    createRelayV2EnrollmentState(true),
+    1_000,
+  );
+
+  assert.equal(unregistered.ready, false);
+  assert.equal(unregistered.enrollmentActionDisabled, true);
+  assert.equal(unregistered.qrPayload, null);
+  assert.match(unregistered.readinessLabel, /not registered/i);
+  assert.match(unregistered.readinessDetail, /host\.registered/);
+
+  const missingTerminalResume = reduceRelayV2(createRelayV2EnrollmentState(true), [
+    { type: "hostRegistered", hostId: "mac-admin", connectorId: "connector-1" },
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES.slice(0, -1),
+    },
+    { type: "enrollmentCreated", review: relayV2Review },
+  ]);
+  const incomplete = deriveRelayV2EnrollmentView(missingTerminalResume, 1_000);
+
+  assert.equal(incomplete.ready, false);
+  assert.deepEqual(incomplete.missingCapabilities, ["terminal.stream.resume.v1"]);
+  assert.equal(incomplete.enrollmentActionDisabled, true);
+  assert.equal(incomplete.review, null);
+  assert.equal(incomplete.qrPayload, null);
+  assert.match(incomplete.readinessDetail, /terminal\.stream\.resume\.v1/);
+
+  const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
+    state: missingTerminalResume,
+    v1SharedSecretConfigured: true,
+  }));
+  assert.match(markup, /Relay v2 capabilities incomplete/);
+  assert.match(markup, /<button[^>]*disabled=""/);
+  assert.doesNotMatch(markup, /Relay v2 one-time enrollment preview QR code/);
+});
+
+test("Relay v2 readiness exposes only a one-time enrollment review and never claims the phone is online", () => {
+  const readyState = reduceRelayV2(createRelayV2EnrollmentState(true), [
+    {
+      type: "v2CredentialReferenceObserved",
+      credentialReference: "host-grant-reference",
+    },
+    { type: "hostRegistered", hostId: "mac-admin", connectorId: "connector-1" },
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES,
+    },
+    { type: "enrollmentCreated", review: relayV2Review },
+  ]);
+  const ready = deriveRelayV2EnrollmentView(readyState, 1_000);
+
+  assert.equal(ready.ready, true);
+  assert.equal(ready.enrollmentActionDisabled, false);
+  assert.equal(ready.v1CredentialLabel, "Relay v1 shared secret configured");
+  assert.equal(ready.v2CredentialLabel, "Relay v2 credential reference available");
+  assert.match(ready.readinessDetail, /Phone connectivity is not verified/);
+  assert.doesNotMatch(ready.readinessDetail, /phone is online/i);
+  assert.ok(ready.qrPayload);
+
+  const qr = new URL(ready.qrPayload);
+  assert.equal(qr.protocol, "tmuxworktree:");
+  assert.equal(qr.hostname, "enroll");
+  assert.deepEqual([...qr.searchParams.keys()], [
+    "v",
+    "issuerUrl",
+    "relayUrl",
+    "hostId",
+    "enrollmentId",
+    "enrollmentCode",
+  ]);
+  assert.equal(qr.searchParams.get("enrollmentCode"), relayV2Review.enrollment.enrollmentCode);
+  assert.equal(qr.searchParams.has("accessToken"), false);
+  assert.equal(qr.searchParams.has("refreshToken"), false);
+
+  const markup = renderToStaticMarkup(createElement(RelayV2EnrollmentPreviewPanel, {
+    state: readyState,
+    v1SharedSecretConfigured: true,
+  }));
+  assert.match(markup, /Relay v2 connector ready for enrollment/);
+  assert.match(markup, /Fake-backed preview only/);
+  assert.match(markup, /Relay v2 one-time enrollment preview QR code/);
+});
+
+test("Relay v2 failure is isolated from both the v1 shared secret and v2 credential reference", () => {
+  const readyState = reduceRelayV2(createRelayV2EnrollmentState(true), [
+    {
+      type: "v2CredentialReferenceObserved",
+      credentialReference: "host-grant-reference",
+    },
+    { type: "hostRegistered", hostId: "mac-admin", connectorId: "connector-1" },
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES,
+    },
+  ]);
+  const v1Profile = readyState.v1Profile;
+  const v2Credential = readyState.v2Credential;
+  const failed = relayV2EnrollmentReducer(readyState, {
+    type: "enrollmentCreateFailed",
+    error: "Broker rejected the enrollment attempt.",
+  });
+  const view = deriveRelayV2EnrollmentView(failed, 1_000);
+
+  assert.strictEqual(failed.v1Profile, v1Profile);
+  assert.strictEqual(failed.v2Credential, v2Credential);
+  assert.equal(failed.v1Profile.sharedSecretConfigured, true);
+  assert.equal(failed.v2Credential.credentialReference, "host-grant-reference");
+  assert.equal(view.enrollmentActionDisabled, true);
+  assert.equal(view.qrPayload, null);
+  assert.match(view.error ?? "", /Relay v1 remains unchanged; no fallback was attempted/);
 });

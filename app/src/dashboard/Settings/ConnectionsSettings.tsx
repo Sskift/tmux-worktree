@@ -55,6 +55,8 @@ import {
   type RelayDraft,
   type RelayDraftErrors,
 } from "./connectionsModel";
+import type { RelayV2EnrollmentState } from "./relayV2EnrollmentModel";
+import { RelayV2EnrollmentPreviewPanel } from "./RelayV2EnrollmentPreviewPanel";
 
 type HostEditorMode = "view" | "add" | "edit";
 type ConnectionTab = "hosts" | "relay";
@@ -114,6 +116,7 @@ export interface ConnectionsSettingsProps {
   onInstallTw: (hostId: string) => void | Promise<void>;
   relay: RelaySettingsModel;
   relayActions: RelaySettingsActions;
+  relayV2Enrollment?: RelayV2EnrollmentState;
 }
 
 export interface RelaySettingsBindings {
@@ -224,6 +227,7 @@ export function ConnectionsSettings({
   onInstallTw,
   relay,
   relayActions,
+  relayV2Enrollment,
 }: ConnectionsSettingsProps) {
   const dashboardBackend = useDashboardBackend();
   const [activeTab, setActiveTab] = useState<ConnectionTab>("hosts");
@@ -1094,6 +1098,11 @@ export function ConnectionsSettings({
                 <MobileRelayV1ProfileQrCode payload={relay.v1PairingPayload} />
               )}
             </div>
+
+            <RelayV2EnrollmentPreviewPanel
+              state={relayV2Enrollment}
+              v1SharedSecretConfigured={relay.tokenConfigured}
+            />
 
             {(relay.error || relayNotice) && (
               <div

@@ -571,6 +571,45 @@
   border-radius: var(--shell-radius-sm);
 }
 
+.connections-relay-v2-preview {
+  display: grid;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.connections-relay-pairing--v2 {
+  margin-top: 0;
+}
+
+.connections-relay-v2-preview__review {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.connections-relay-v2-preview__review > div {
+  display: grid;
+  gap: 3px;
+  max-width: 230px;
+}
+
+.connections-relay-v2-preview__review strong,
+.connections-relay-v2-preview__review span {
+  overflow: hidden;
+  color: var(--shell-text-muted);
+  font-size: 10px;
+  line-height: 14px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.connections-relay-v2-preview__review strong {
+  color: var(--shell-text-secondary);
+  font-size: 11px;
+  line-height: 15px;
+  font-weight: 580;
+}
+
 .connections-relay-pairing__copy {
   min-width: 0;
   display: flex;
