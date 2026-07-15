@@ -24,8 +24,19 @@ const LOCK_OWNER_FILE = "owner.json";
 const LOCK_STALE_MS = 60_000;
 const LOCK_WAIT_MS = 5_000;
 const MAX_COUNTER = 18_446_744_073_709_551_615n;
-const MAX_STATE_BYTES = 512 * 1024 * 1024;
+export const RELAY_V2_HOST_STATE_MAX_PERSISTED_BYTES = 512 * 1024 * 1024;
+const MATERIALIZED_READINESS_FENCE_RESERVE_BYTES = 1_024;
 const MAX_CONTINUITY_BYTES = 16 * 1024;
+
+export type RelayV2MaterializedReadinessFenceReason =
+  | "persisted_capacity_exceeded"
+  | "reconcile_generation_conflict"
+  | "materialized_authority_conflict";
+
+export interface RelayV2MaterializedReadinessFence {
+  hostEpoch: string;
+  reason: RelayV2MaterializedReadinessFenceReason;
+}
 
 export type RelayV2HostJson =
   | null
@@ -49,6 +60,7 @@ export interface RelayV2HostStateSnapshot {
   revisions: Record<string, string>;
   commands: Record<string, RelayV2HostJson>;
   materialized: Record<string, RelayV2HostJson>;
+  materializedReadinessFence: RelayV2MaterializedReadinessFence | null;
 }
 
 export interface RelayV2HostStateCommit<T> {
@@ -64,9 +76,13 @@ export interface RelayV2HostStateTransaction {
   getMaterializedRecord(key: string): RelayV2HostJson | undefined;
   putMaterializedRecord(key: string, value: RelayV2HostJson): void;
   deleteMaterializedRecord(key: string): void;
+  getRevision(revisionKey: string): string | undefined;
   allocateRevision(revisionKey: string): string;
   allocateEventSeq(): string;
   issueOpaqueId(prefix?: string): string;
+  getMaterializedReadinessFence(): RelayV2MaterializedReadinessFence | null;
+  latchMaterializedReadinessFence(reason: RelayV2MaterializedReadinessFenceReason): void;
+  clearMaterializedReadinessFence(): void;
 }
 
 export interface RelayV2HostStateCriticalSection {
@@ -74,12 +90,17 @@ export interface RelayV2HostStateCriticalSection {
   transaction<T>(
     mutation: (transaction: RelayV2HostStateTransaction) => T,
   ): RelayV2HostStateCommit<T>;
+  latchMaterializedReadinessFence(
+    reason: RelayV2MaterializedReadinessFenceReason,
+  ): RelayV2HostStateCommit<void>;
 }
 
 export interface RelayV2HostStateStoreOptions {
   home?: string;
   paths?: RelayV2HostStatePaths;
   renameFile?: (source: string, destination: string) => void;
+  /** Tests may only shrink the frozen exact serialized state-file budget. */
+  testMaxPersistedBytes?: number;
 }
 
 interface PersistedHostStateUnsigned {
@@ -95,6 +116,7 @@ interface PersistedHostStateUnsigned {
   revisions: Record<string, string>;
   commands: Record<string, RelayV2HostJson>;
   materialized: Record<string, RelayV2HostJson>;
+  materializedReadinessFence: RelayV2MaterializedReadinessFence | null;
 }
 
 interface PersistedHostState extends PersistedHostStateUnsigned {
@@ -146,6 +168,18 @@ export class RelayV2HostStateCommitUncertainError extends Error {
   }
 }
 
+export class RelayV2HostStateCapacityError extends Error {
+  readonly code = "RELAY_V2_HOST_STATE_CAPACITY_EXCEEDED";
+
+  constructor(
+    readonly actualBytes: number,
+    readonly maxBytes: number,
+  ) {
+    super("Relay v2 persisted host state exceeds its frozen serialized budget");
+    this.name = "RelayV2HostStateCapacityError";
+  }
+}
+
 export function relayV2HostStatePaths(home = homedir()): RelayV2HostStatePaths {
   const twHome = join(home, ".tmux-worktree");
   const stateRoot = join(twHome, "relay-v2-host-state");
@@ -183,6 +217,26 @@ function isCanonicalCounter(value: unknown): value is string {
   } catch {
     return false;
   }
+}
+
+function parseMaterializedReadinessFence(
+  value: unknown,
+  hostEpoch: string,
+): RelayV2MaterializedReadinessFence | null {
+  if (value === null) return null;
+  if (!isRecord(value) || !hasExactKeys(value, ["hostEpoch", "reason"])) {
+    throw new Error("Relay v2 materialized readiness fence is malformed");
+  }
+  if (value.hostEpoch !== hostEpoch
+    || (value.reason !== "persisted_capacity_exceeded"
+      && value.reason !== "reconcile_generation_conflict"
+      && value.reason !== "materialized_authority_conflict")) {
+    throw new Error("Relay v2 materialized readiness fence crossed host lineage");
+  }
+  return {
+    hostEpoch,
+    reason: value.reason,
+  };
 }
 
 function nextCounter(value: string): string {
@@ -303,7 +357,7 @@ function sealState(state: PersistedHostStateUnsigned): PersistedHostState {
 }
 
 function parseHostState(value: unknown): PersistedHostState {
-  const keys = [
+  const legacyKeys = [
     "version",
     "hostEpoch",
     "commitSeq",
@@ -315,7 +369,9 @@ function parseHostState(value: unknown): PersistedHostState {
     "materialized",
     "checksum",
   ] as const;
-  if (!isRecord(value) || !hasExactKeys(value, keys)) {
+  const keys = [...legacyKeys.slice(0, -1), "materializedReadinessFence", "checksum"] as const;
+  if (!isRecord(value)
+    || (!hasExactKeys(value, keys) && !hasExactKeys(value, legacyKeys))) {
     throw new Error("Relay v2 host state root is malformed");
   }
   if (value.version !== RELAY_V2_HOST_STATE_VERSION) {
@@ -341,7 +397,7 @@ function parseHostState(value: unknown): PersistedHostState {
   if (typeof value.checksum !== "string" || !/^[0-9a-f]{64}$/.test(value.checksum)) {
     throw new Error("Relay v2 host state checksum is malformed");
   }
-  const unsigned: PersistedHostStateUnsigned = {
+  const base = {
     version: RELAY_V2_HOST_STATE_VERSION,
     hostEpoch: value.hostEpoch,
     commitSeq: value.commitSeq,
@@ -352,10 +408,26 @@ function parseHostState(value: unknown): PersistedHostState {
     commands: value.commands,
     materialized: value.materialized,
   };
-  if (stateChecksum(unsigned) !== value.checksum) {
+  const hasFence = Object.hasOwn(value, "materializedReadinessFence");
+  const checksummed = hasFence
+    ? {
+        ...base,
+        materializedReadinessFence: parseMaterializedReadinessFence(
+          value.materializedReadinessFence,
+          value.hostEpoch,
+        ),
+      }
+    : base;
+  if (stateChecksum(checksummed as PersistedHostStateUnsigned) !== value.checksum) {
     throw new Error("Relay v2 host state checksum does not match");
   }
-  return { ...unsigned, checksum: value.checksum };
+  return {
+    ...base,
+    materializedReadinessFence: hasFence
+      ? parseMaterializedReadinessFence(value.materializedReadinessFence, value.hostEpoch)
+      : null,
+    checksum: value.checksum,
+  };
 }
 
 function parseContinuityWitness(value: unknown): ContinuityWitness {
@@ -460,7 +532,12 @@ function atomicWriteJson(
   path: string,
   value: unknown,
   renameFile: (source: string, destination: string) => void,
+  maxBytes?: number,
 ): void {
+  const contents = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+  if (maxBytes !== undefined && contents.byteLength > maxBytes) {
+    throw new RelayV2HostStateCapacityError(contents.byteLength, maxBytes);
+  }
   const directory = dirname(path);
   ensurePrivateDirectory(directory);
   const temporary = join(directory, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
@@ -468,7 +545,6 @@ function atomicWriteJson(
   let published = false;
   try {
     descriptor = openSync(temporary, "wx", 0o600);
-    const contents = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8");
     let offset = 0;
     while (offset < contents.byteLength) {
       offset += writeSync(
@@ -608,6 +684,7 @@ function freshState(previousEpochs: Iterable<string> = []): PersistedHostState {
     revisions: Object.create(null) as Record<string, string>,
     commands: Object.create(null) as Record<string, RelayV2HostJson>,
     materialized: Object.create(null) as Record<string, RelayV2HostJson>,
+    materializedReadinessFence: null,
   });
 }
 
@@ -623,6 +700,9 @@ function snapshotFrom(
     revisions: copyStringMap(state.revisions),
     commands: copyRecordMap(state.commands),
     materialized: copyRecordMap(state.materialized),
+    materializedReadinessFence: state.materializedReadinessFence === null
+      ? null
+      : { ...state.materializedReadinessFence },
   };
 }
 
@@ -640,6 +720,9 @@ class HostStateTransaction implements RelayV2HostStateTransaction {
       revisions: copyStringMap(current.revisions),
       commands: copyRecordMap(current.commands),
       materialized: copyRecordMap(current.materialized),
+      materializedReadinessFence: current.materializedReadinessFence === null
+        ? null
+        : { ...current.materializedReadinessFence },
     };
   }
 
@@ -679,6 +762,11 @@ class HostStateTransaction implements RelayV2HostStateTransaction {
     delete this.draft.materialized[key];
   }
 
+  getRevision(revisionKey: string): string | undefined {
+    validateStoreKey(revisionKey, "revision key");
+    return this.draft.revisions[revisionKey];
+  }
+
   allocateRevision(revisionKey: string): string {
     validateStoreKey(revisionKey, "revision key");
     const next = nextCounter(this.draft.revisions[revisionKey] ?? "0");
@@ -697,6 +785,23 @@ class HostStateTransaction implements RelayV2HostStateTransaction {
     }
     return `${prefix}_${randomUUID().replaceAll("-", "")}`;
   }
+
+  clearMaterializedReadinessFence(): void {
+    this.draft.materializedReadinessFence = null;
+  }
+
+  getMaterializedReadinessFence(): RelayV2MaterializedReadinessFence | null {
+    return this.draft.materializedReadinessFence === null
+      ? null
+      : { ...this.draft.materializedReadinessFence };
+  }
+
+  latchMaterializedReadinessFence(reason: RelayV2MaterializedReadinessFenceReason): void {
+    this.draft.materializedReadinessFence = {
+      hostEpoch: this.draft.hostEpoch,
+      reason,
+    };
+  }
 }
 
 class HostStateCriticalSection implements RelayV2HostStateCriticalSection {
@@ -705,7 +810,7 @@ class HostStateCriticalSection implements RelayV2HostStateCriticalSection {
   constructor(
     current: PersistedHostState,
     private readonly hostInstanceId: string,
-    private readonly publish: (state: PersistedHostState) => void,
+    private readonly publish: (state: PersistedHostState, emergencyFence: boolean) => void,
   ) {
     this.current = current;
   }
@@ -722,6 +827,25 @@ class HostStateCriticalSection implements RelayV2HostStateCriticalSection {
     if (value && typeof (value as { then?: unknown }).then === "function") {
       throw new Error("Relay v2 host state transaction callbacks must be synchronous");
     }
+    return this.commit(transaction, value, false);
+  }
+
+  latchMaterializedReadinessFence(
+    reason: RelayV2MaterializedReadinessFenceReason,
+  ): RelayV2HostStateCommit<void> {
+    if (this.current.materializedReadinessFence?.reason === reason) {
+      return { value: undefined, snapshot: this.read() };
+    }
+    const transaction = new HostStateTransaction(this.current);
+    transaction.latchMaterializedReadinessFence(reason);
+    return this.commit(transaction, undefined, true);
+  }
+
+  private commit<T>(
+    transaction: HostStateTransaction,
+    value: T,
+    emergencyFence: boolean,
+  ): RelayV2HostStateCommit<T> {
     const next = sealState({
       ...transaction.draft,
       commitSeq: nextCounter(this.current.commitSeq),
@@ -729,7 +853,7 @@ class HostStateCriticalSection implements RelayV2HostStateCriticalSection {
       parentCommitId: this.current.commitId,
     });
     try {
-      this.publish(next);
+      this.publish(next, emergencyFence);
       this.current = next;
     } catch (error) {
       if (error instanceof RelayV2HostStateCommitUncertainError) this.current = next;
@@ -744,11 +868,19 @@ export class RelayV2HostStateStore {
   readonly hostInstanceId: string;
 
   private readonly renameFile: (source: string, destination: string) => void;
+  private readonly maxPersistedBytes: number;
   private serializerTail: Promise<void> = Promise.resolve();
 
   private constructor(options: RelayV2HostStateStoreOptions) {
     this.paths = options.paths ?? relayV2HostStatePaths(options.home);
     this.renameFile = options.renameFile ?? renameSync;
+    this.maxPersistedBytes = options.testMaxPersistedBytes
+      ?? RELAY_V2_HOST_STATE_MAX_PERSISTED_BYTES;
+    if (!Number.isSafeInteger(this.maxPersistedBytes)
+      || this.maxPersistedBytes <= MATERIALIZED_READINESS_FENCE_RESERVE_BYTES
+      || this.maxPersistedBytes > RELAY_V2_HOST_STATE_MAX_PERSISTED_BYTES) {
+      throw new Error("invalid Relay v2 persisted host state byte budget");
+    }
     // One store instance represents one relay-host process lifetime. This ID is
     // intentionally absent from every persisted schema.
     this.hostInstanceId = randomUUID();
@@ -794,7 +926,7 @@ export class RelayV2HostStateStore {
       const section = new HostStateCriticalSection(
         state,
         this.hostInstanceId,
-        (next) => this.publishState(next),
+        (next, emergencyFence) => this.publishState(next, emergencyFence),
       );
       return await operation(section);
     } finally {
@@ -806,7 +938,7 @@ export class RelayV2HostStateStore {
   private loadOrCreateState(): PersistedHostState {
     ensurePrivateDirectory(dirname(this.paths.state));
     ensurePrivateDirectory(dirname(this.paths.continuity));
-    const state = inspectJsonFile(this.paths.state, MAX_STATE_BYTES, parseHostState);
+    const state = inspectJsonFile(this.paths.state, this.maxPersistedBytes, parseHostState);
     const witness = inspectJsonFile(
       this.paths.continuity,
       MAX_CONTINUITY_BYTES,
@@ -835,14 +967,26 @@ export class RelayV2HostStateStore {
     // Missing/corrupt/mismatched files are a lineage break. Publish a wholly
     // new empty authority before its witness; no old cursor or command record
     // can become authoritative in the replacement epoch.
-    atomicWriteJson(this.paths.state, replacement, this.renameFile);
+    atomicWriteJson(
+      this.paths.state,
+      replacement,
+      this.renameFile,
+      this.maxPersistedBytes,
+    );
     atomicWriteJson(this.paths.continuity, witnessFor(replacement), this.renameFile);
     return replacement;
   }
 
-  private publishState(state: PersistedHostState): void {
+  private publishState(state: PersistedHostState, emergencyFence: boolean): void {
     try {
-      atomicWriteJson(this.paths.state, state, this.renameFile);
+      atomicWriteJson(
+        this.paths.state,
+        state,
+        this.renameFile,
+        emergencyFence
+          ? this.maxPersistedBytes
+          : this.maxPersistedBytes - MATERIALIZED_READINESS_FENCE_RESERVE_BYTES,
+      );
     } catch (error) {
       if (error instanceof AtomicPublishError && error.published) {
         throw new RelayV2HostStateCommitUncertainError(

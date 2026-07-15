@@ -6,6 +6,9 @@ import {
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
   type RelayV2HostJson,
+  type RelayV2MaterializedReadinessFence,
+  type RelayV2HostStateCommit,
+  type RelayV2HostStateCriticalSection,
   type RelayV2HostStateSnapshot,
   type RelayV2HostStateTransaction,
   RelayV2HostStateCommitUncertainError,
@@ -76,6 +79,7 @@ interface RelayV2CanonicalExecutionPlanBase {
   sessionId: string | null;
   arguments: RelayV2JsonObject;
   adapterState: RelayV2HostJson;
+  resourceReservation: RelayV2CommandResourceReservationBinding | null;
 }
 
 export interface RelayV2TwRpcExecutionPlan extends RelayV2CanonicalExecutionPlanBase {
@@ -103,6 +107,35 @@ export interface RelayV2CommandAuthorityEvidence {
   evidence: RelayV2HostJson;
 }
 
+export interface RelayV2CommandRequestFingerprint {
+  schemaVersion: typeof RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION;
+  algorithm: "sha256-rfc8785";
+  digest: string;
+}
+
+export interface RelayV2CommandResourceReservationBinding {
+  schemaVersion: typeof RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION;
+  owner: "relay_v2_resource_state";
+  reservationId: string;
+}
+
+export interface RelayV2CommandResourceReservationIntent {
+  schemaVersion: typeof RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION;
+  owner: "relay_v2_resource_state";
+  operation: "create_worktree" | "create_terminal";
+  principalId: string;
+  hostId: string;
+  hostEpoch: string;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
+  scopeId: string;
+  reservationPlan: RelayV2HostJson;
+}
+
+export type RelayV2CommandResourceReservationResult =
+  | { kind: "reserved"; binding: RelayV2CommandResourceReservationBinding }
+  | { kind: "rejected"; error: RelayV2CommandStructuredError };
+
 export interface RelayV2CommandResourceCommitIntent {
   schemaVersion: typeof RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION;
   owner: "relay_v2_resource_state";
@@ -110,8 +143,11 @@ export interface RelayV2CommandResourceCommitIntent {
   principalId: string;
   hostId: string;
   hostEpoch: string;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
   scopeId: string;
   sessionId: string | null;
+  reservationBinding: RelayV2CommandResourceReservationBinding | null;
   backendOutcome: RelayV2CanonicalBackendOutcome;
   commitIntent: RelayV2HostJson;
 }
@@ -121,6 +157,27 @@ export interface RelayV2CanonicalBackendOutcome {
   backendInstanceKey: string;
   evidence: RelayV2HostJson;
 }
+
+export interface RelayV2CommandResourceSettlementIntent {
+  schemaVersion: typeof RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION;
+  owner: "relay_v2_resource_state";
+  operation: "create_worktree" | "create_terminal";
+  principalId: string;
+  hostId: string;
+  hostEpoch: string;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
+  scopeId: string;
+  reservationBinding: RelayV2CommandResourceReservationBinding | null;
+  disposition: "release_no_side_effect" | "retain_uncertain";
+  backendOutcome: RelayV2CanonicalBackendOutcome | null;
+}
+
+export type RelayV2CommandResourceSettlementResult =
+  | "retained"
+  | "retained_fenced"
+  | "released"
+  | "consumed";
 
 export interface RelayV2CommandResourceCommitEvidence {
   schemaVersion: typeof RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION;
@@ -132,6 +189,7 @@ export interface RelayV2CommandResourceCommitEvidence {
   scopeId: string;
   sessionId: string;
   result: RelayV2JsonObject;
+  events: RelayV2JsonObject[];
   evidence: RelayV2HostJson;
 }
 
@@ -139,30 +197,56 @@ export interface RelayV2CommandResourceTransaction {
   getMaterializedRecord(key: string): RelayV2HostJson | undefined;
   putMaterializedRecord(key: string, value: RelayV2HostJson): void;
   deleteMaterializedRecord(key: string): void;
+  getRevision(revisionKey: string): string | undefined;
   allocateRevision(revisionKey: string): string;
   allocateEventSeq(): string;
   issueOpaqueId(prefix?: string): string;
+  getMaterializedReadinessFence(): RelayV2MaterializedReadinessFence | null;
+  latchMaterializedReadinessFence(reason: "materialized_authority_conflict"): void;
 }
 
 /**
- * H2 owns backend-evidence parsing, opaque Session identity allocation/reuse,
- * Session mappings, revisions, and event sequence allocation. commit is
- * synchronous and runs in the same H0 transaction as the command terminal
- * state. For create, H2 must require a post-create backendInstanceKey before
- * allocating/reusing an ID; the canonical executor cannot provide the public
- * Session result or an opaque sessionId.
+ * H2 owns backend-evidence parsing, opaque Session identity reservation/reuse,
+ * Session mappings, revisions, and event sequence allocation. reserve runs in
+ * the same H0 transaction as ACCEPTED and allocates the opaque Session ID but
+ * never predicts a backend incarnation. commit runs with the command terminal
+ * transaction and attaches only the executor's post-create backendInstanceKey.
+ * publishCommitted is a synchronous bounded enqueue before the H0 serializer
+ * is released. A throw or thenable return fences the committed cut; production
+ * implementations must not reenter H0 or perform backend/network I/O there.
+ * The canonical executor cannot provide the public Session result or ID.
  */
 export interface RelayV2CommandResourceMutationOwner {
+  reserve(
+    transaction: RelayV2CommandResourceTransaction,
+    intent: RelayV2CommandResourceReservationIntent,
+  ): RelayV2CommandResourceReservationResult;
   commit(
     transaction: RelayV2CommandResourceTransaction,
     intent: RelayV2CommandResourceCommitIntent,
   ): RelayV2CommandResourceCommitEvidence;
+  settle(
+    transaction: RelayV2CommandResourceTransaction,
+    intent: RelayV2CommandResourceSettlementIntent,
+  ): RelayV2CommandResourceSettlementResult;
+  hasPendingSettlement(
+    transaction: RelayV2CommandResourceTransaction,
+    intent: RelayV2CommandResourceSettlementIntent,
+  ): boolean;
+  publishCommitted(
+    snapshot: RelayV2HostStateSnapshot,
+    evidence: RelayV2CommandResourceCommitEvidence,
+  ): void;
+  fenceCommitUncertain(snapshot: RelayV2HostStateSnapshot): void;
+  fencePersistedCapacity(snapshot: RelayV2HostStateSnapshot): void;
+  fenceMaterializedAuthority(snapshot: RelayV2HostStateSnapshot): void;
 }
 
 export type RelayV2CommandAdmission =
   | {
       kind: "executable";
       adapterState: RelayV2HostJson;
+      resourceReservationPlan?: RelayV2HostJson;
     }
   | {
       kind: "immutable_business_failure";
@@ -190,7 +274,12 @@ export type RelayV2TwRpcExecutionOutcome =
       backendOutcome: RelayV2CanonicalBackendOutcome;
       commitIntent: RelayV2HostJson;
     }
-  | RelayV2ExecutionFailureOutcome;
+  | {
+      state: "failed";
+      sideEffect: "not_applied";
+      error: RelayV2CommandStructuredError;
+    }
+  | { state: "in_doubt" };
 
 export type RelayV2TerminalControlExecutionOutcome =
   | {
@@ -247,11 +336,7 @@ interface NormalizedCommand {
   arguments: RelayV2JsonObject;
 }
 
-interface StoredFingerprint {
-  schemaVersion: typeof RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION;
-  algorithm: "sha256-rfc8785";
-  digest: string;
-}
+type StoredFingerprint = RelayV2CommandRequestFingerprint;
 
 type StoredCommandState = "accepted" | "running" | "succeeded" | "failed" | "in_doubt";
 type StoredFinalState = "succeeded" | "failed" | "in_doubt";
@@ -334,6 +419,7 @@ class TransitionAbort extends Error {
 type AdmissionTransactionResult =
   | { kind: "epoch_mismatch"; actualHostEpoch: string }
   | { kind: "window_expired" }
+  | { kind: "resource_rejected"; error: RelayV2CommandStructuredError }
   | { kind: "existing"; record: StoredCommand }
   | { kind: "inserted"; record: StoredCommandRecord };
 
@@ -346,6 +432,18 @@ export class RelayV2HostCommandPlaneStateError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isThenable(value: unknown): boolean {
+  try {
+    const thenable = ((typeof value === "object" && value !== null)
+      || typeof value === "function")
+      && typeof (value as { then?: unknown }).then === "function";
+    if (thenable) void Promise.resolve(value).catch(() => undefined);
+    return thenable;
+  } catch {
+    return true;
+  }
 }
 
 function hasExactKeys(
@@ -398,6 +496,11 @@ function isHostStateCommitUncertain(error: unknown): boolean {
     || (isRecord(error)
       && error.code === "RELAY_V2_HOST_STATE_COMMIT_UNCERTAIN"
       && error.name === "RelayV2HostStateCommitUncertainError");
+}
+
+function isHostStateCapacityError(error: unknown): boolean {
+  return isRecord(error)
+    && error.code === "RELAY_V2_HOST_STATE_CAPACITY_EXCEEDED";
 }
 
 function assertJson(value: unknown, seen = new Set<object>()): asserts value is RelayV2HostJson {
@@ -657,6 +760,21 @@ function parseFingerprint(value: unknown): StoredFingerprint {
   return value as unknown as StoredFingerprint;
 }
 
+function parseResourceReservationBinding(
+  value: unknown,
+): RelayV2CommandResourceReservationBinding {
+  if (!isRecord(value)
+    || !hasExactKeys(value, ["schemaVersion", "owner", "reservationId"])
+    || value.schemaVersion !== RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION
+    || value.owner !== "relay_v2_resource_state"
+    || typeof value.reservationId !== "string"
+    || value.reservationId.length === 0
+    || Buffer.byteLength(value.reservationId, "utf8") > 128) {
+    throw new RelayV2HostCommandPlaneStateError("Relay v2 resource reservation binding is malformed");
+  }
+  return cloneJson(value) as unknown as RelayV2CommandResourceReservationBinding;
+}
+
 function parseStoredError(value: unknown): RelayV2CommandStructuredError {
   if (!isRecord(value)
     || !hasExactKeys(
@@ -820,6 +938,7 @@ function parseExecutionPlan(
       "sessionId",
       "arguments",
       "adapterState",
+      "resourceReservation",
     ])
     || value.schemaVersion !== RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION
     || !isCommandOperation(value.operation)
@@ -831,11 +950,17 @@ function parseExecutionPlan(
     || value.hostEpoch !== expected.hostEpoch
     || value.scopeId !== expected.scopeId
     || value.sessionId !== expected.sessionId
-    || !isRecord(value.arguments)) {
+    || !isRecord(value.arguments)
+    || ((value.operation === "create_worktree" || value.operation === "create_terminal")
+      ? value.resourceReservation === null
+      : value.resourceReservation !== null)) {
     throw new RelayV2HostCommandPlaneStateError("Relay v2 command execution plan is malformed");
   }
   assertJson(value.arguments);
   assertJson(value.adapterState);
+  if (value.resourceReservation !== null) {
+    parseResourceReservationBinding(value.resourceReservation);
+  }
   if (canonicalJson(value.arguments as RelayV2HostJson)
     !== canonicalJson(expected.arguments as unknown as RelayV2HostJson)) {
     throw new RelayV2HostCommandPlaneStateError("Relay v2 command execution plan arguments do not match ledger");
@@ -1062,6 +1187,43 @@ function readCommand(
   return record;
 }
 
+export interface RelayV2CommandReservationLedgerIdentity {
+  hostEpoch: string;
+  principalId: string;
+  hostId: string;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
+}
+
+/**
+ * Narrow read-only H1 ledger interpretation used by H2 while holding the same
+ * H0 transaction that proves an uncertain create side effect absent. H2 never
+ * receives arbitrary command-ledger mutation access.
+ */
+export function relayV2CommandReservationLedgerState(
+  source: Pick<RelayV2HostStateTransaction, "getCommandRecord">,
+  candidate: RelayV2CommandReservationLedgerIdentity,
+): "in_doubt" | "other" | "missing" {
+  const identity: CommandIdentity = {
+    hostEpoch: candidate.hostEpoch,
+    principalId: candidate.principalId,
+    hostId: candidate.hostId,
+    commandId: candidate.commandId,
+  };
+  const value = source.getCommandRecord(commandStorageKey(identity));
+  if (value === undefined) return "missing";
+  const record = parseStoredCommand(value);
+  verifyStoredIdentity(record, identity);
+  if (!fingerprintsEqual(record.fingerprint, candidate.requestFingerprint)) return "other";
+  if (record.operation !== "create_worktree" && record.operation !== "create_terminal") {
+    return "other";
+  }
+  if (record.recordType === "command_tombstone") {
+    return record.finalState === "in_doubt" ? "in_doubt" : "other";
+  }
+  return record.state === "in_doubt" ? "in_doubt" : "other";
+}
+
 function readWindow(
   source: Pick<RelayV2HostStateSnapshot, "materialized"> | RelayV2HostStateTransaction,
   hostEpoch: string,
@@ -1089,6 +1251,7 @@ function planFor(
   auth: RelayV2CommandAuthContext,
   command: NormalizedCommand,
   adapterState: RelayV2HostJson,
+  resourceReservation: RelayV2CommandResourceReservationBinding | null,
 ): RelayV2CanonicalExecutionPlan {
   const base = {
     schemaVersion: RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION,
@@ -1100,6 +1263,7 @@ function planFor(
     sessionId: command.sessionId,
     arguments: cloneJson(command.arguments),
     adapterState: cloneJson(adapterState),
+    resourceReservation: resourceReservation === null ? null : cloneJson(resourceReservation),
   };
   if (command.operation === "send_agent_message") {
     return { ...base, authority: "terminal_control", operation: command.operation };
@@ -1159,7 +1323,7 @@ function createFinalFailureRecord(
       auth,
       command,
       fingerprint,
-      planFor(auth, command, null),
+      planFor(auth, command, null, null),
       now,
     ),
     executionPlan: null,
@@ -1298,9 +1462,14 @@ function resourceTransactionFacade(
       transaction.putMaterializedRecord(key, value);
     },
     deleteMaterializedRecord: (key: string) => transaction.deleteMaterializedRecord(key),
+    getRevision: (revisionKey: string) => transaction.getRevision(revisionKey),
     allocateRevision: (revisionKey: string) => transaction.allocateRevision(revisionKey),
     allocateEventSeq: () => transaction.allocateEventSeq(),
     issueOpaqueId: (prefix?: string) => transaction.issueOpaqueId(prefix),
+    getMaterializedReadinessFence: () => transaction.getMaterializedReadinessFence(),
+    latchMaterializedReadinessFence: (reason) => (
+      transaction.latchMaterializedReadinessFence(reason)
+    ),
   });
 }
 
@@ -1349,8 +1518,11 @@ function parseResourceCommitIntent(
       "principalId",
       "hostId",
       "hostEpoch",
+      "commandId",
+      "requestFingerprint",
       "scopeId",
       "sessionId",
+      "reservationBinding",
       "backendOutcome",
       "commitIntent",
     ])
@@ -1362,9 +1534,25 @@ function parseResourceCommitIntent(
     || value.principalId !== record.principalId
     || value.hostId !== record.hostId
     || value.hostEpoch !== record.hostEpoch
+    || value.commandId !== record.commandId
     || value.scopeId !== record.scopeId
-    || value.sessionId !== record.sessionId) {
+    || value.sessionId !== record.sessionId
+    || ((record.operation === "create_worktree" || record.operation === "create_terminal")
+      ? value.reservationBinding === null
+      : value.reservationBinding !== null)) {
     throw new TypeError("H1 formed an invalid Relay v2 resource commit intent");
+  }
+  const requestFingerprint = parseFingerprint(value.requestFingerprint);
+  if (!fingerprintsEqual(requestFingerprint, record.fingerprint)) {
+    throw new TypeError("H1 resource commit fingerprint changed after admission");
+  }
+  if (value.reservationBinding !== null) {
+    const binding = parseResourceReservationBinding(value.reservationBinding);
+    if (record.executionPlan === null
+      || canonicalJson(binding as unknown as RelayV2HostJson)
+        !== canonicalJson(record.executionPlan.resourceReservation as unknown as RelayV2HostJson)) {
+      throw new TypeError("H1 resource commit reservation changed after admission");
+    }
   }
   const backendOutcome = parseCanonicalBackendOutcome(value.backendOutcome, record.operation);
   assertJson(value.commitIntent);
@@ -1392,6 +1580,7 @@ function parseResourceCommitEvidence(
       "scopeId",
       "sessionId",
       "result",
+      "events",
       "evidence",
     ])
     || value.schemaVersion !== RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION
@@ -1406,10 +1595,12 @@ function parseResourceCommitEvidence(
     || typeof value.sessionId !== "string"
     || value.sessionId.length === 0
     || (record.operation === "kill_session" && value.sessionId !== record.sessionId)
-    || !isRecord(value.result)) {
+    || !isRecord(value.result)
+    || !Array.isArray(value.events)) {
     throw new TypeError("H2 returned invalid Relay v2 resource commit evidence");
   }
   assertJson(value.evidence);
+  for (const event of value.events) checkedFrame(event);
   validateResultForRecord(record, value.result as RelayV2JsonObject);
   if ((record.operation === "create_worktree" || record.operation === "create_terminal")
     && (value.result as RelayV2JsonObject).session
@@ -1422,6 +1613,33 @@ function parseResourceCommitEvidence(
 interface PreparedExecutionOutcome {
   outcome: RelayV2FinalizedExecutionOutcome | null;
   resourceCommitIntent: RelayV2CommandResourceCommitIntent | null;
+  resourceSettlementIntent: RelayV2CommandResourceSettlementIntent | null;
+}
+
+function resourceSettlementIntentFor(
+  record: StoredCommand,
+  disposition: RelayV2CommandResourceSettlementIntent["disposition"],
+  backendOutcome: RelayV2CanonicalBackendOutcome | null,
+): RelayV2CommandResourceSettlementIntent | null {
+  if (record.operation !== "create_worktree" && record.operation !== "create_terminal") {
+    return null;
+  }
+  return {
+    schemaVersion: RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION,
+    owner: "relay_v2_resource_state",
+    operation: record.operation,
+    principalId: record.principalId,
+    hostId: record.hostId,
+    hostEpoch: record.hostEpoch,
+    commandId: record.commandId,
+    requestFingerprint: cloneJson(record.fingerprint),
+    scopeId: record.scopeId,
+    reservationBinding: record.recordType === "command"
+      ? record.executionPlan?.resourceReservation ?? null
+      : null,
+    disposition,
+    backendOutcome: backendOutcome === null ? null : cloneJson(backendOutcome),
+  };
 }
 
 function validateResultForRecord(
@@ -1639,7 +1857,9 @@ export class RelayV2HostCommandPlane {
         : undefined;
       return { existing, window } as const;
     });
-    if ("actualHostEpoch" in first) return epochMismatchFrame(command, first.actualHostEpoch);
+    if ("actualHostEpoch" in first && first.actualHostEpoch !== undefined) {
+      return epochMismatchFrame(command, first.actualHostEpoch);
+    }
     if (first.existing !== undefined) {
       return this.responseForExisting(command, first.existing, fingerprint, identity);
     }
@@ -1710,42 +1930,110 @@ export class RelayV2HostCommandPlane {
 
     let admitted: AdmissionTransactionResult;
     try {
-      const commit = await this.store.transaction((transaction) => {
-        if (transaction.hostEpoch !== command.expectedHostEpoch) {
-          throw new AdmissionAbort({
-            kind: "epoch_mismatch",
-            actualHostEpoch: transaction.hostEpoch,
-          });
-        }
-        const existing = readCommand(transaction, identity);
-        if (existing !== undefined) throw new AdmissionAbort({ kind: "existing", record: existing });
-        const window = readWindow(transaction, transaction.hostEpoch, command.dedupeWindowId);
-        const now = this.now();
-        if (window === undefined || now > window.acceptUntilMs) {
-          throw new AdmissionAbort({ kind: "window_expired" });
-        }
-        const record = admission.kind === "immutable_business_failure"
-          ? createFinalFailureRecord(
-              auth,
-              command,
-              fingerprint,
-              immutableFailure!.error,
-              immutableFailure!.authorityEvidence,
-              window,
-              now,
-            )
-          : createAcceptedRecord(
-              auth,
-              command,
-              fingerprint,
-              planFor(auth, command, admission.adapterState),
-              now,
+      const commit = await this.store.serialize((section) => {
+        try {
+          return section.transaction((transaction) => {
+            if (transaction.hostEpoch !== command.expectedHostEpoch) {
+              throw new AdmissionAbort({
+                kind: "epoch_mismatch",
+                actualHostEpoch: transaction.hostEpoch,
+              });
+            }
+            const existing = readCommand(transaction, identity);
+            if (existing !== undefined) {
+              throw new AdmissionAbort({ kind: "existing", record: existing });
+            }
+            const window = readWindow(transaction, transaction.hostEpoch, command.dedupeWindowId);
+            const now = this.now();
+            if (window === undefined || now > window.acceptUntilMs) {
+              throw new AdmissionAbort({ kind: "window_expired" });
+            }
+            let resourceReservation: RelayV2CommandResourceReservationBinding | null = null;
+            if (admission.kind === "executable"
+              && (command.operation === "create_worktree"
+                || command.operation === "create_terminal")) {
+              if (this.resourceMutationOwner === undefined) {
+                throw new AdmissionAbort({
+                  kind: "resource_rejected",
+                  error: {
+                    code: "CAPABILITY_UNAVAILABLE",
+                    message: "Relay v2 resource reservation owner is not wired",
+                    retryable: true,
+                    commandDisposition: "not_accepted",
+                    details: null,
+                  },
+                });
+              }
+              const reservationPlan = admission.resourceReservationPlan ?? null;
+              assertJson(reservationPlan);
+              const reserved = this.resourceMutationOwner.reserve(
+                resourceTransactionFacade(transaction),
+                {
+                  schemaVersion: RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION,
+                  owner: "relay_v2_resource_state",
+                  operation: command.operation,
+                  principalId: auth.principalId,
+                  hostId: command.hostId,
+                  hostEpoch: command.expectedHostEpoch,
+                  commandId: command.commandId,
+                  requestFingerprint: cloneJson(fingerprint),
+                  scopeId: command.scopeId,
+                  reservationPlan: cloneJson(reservationPlan),
+                },
+              );
+              if (reserved.kind === "rejected") {
+                const error = normalizeError(reserved.error);
+                if (error.commandDisposition !== "not_accepted") {
+                  throw new RelayV2HostCommandPlaneStateError(
+                    "H2 returned an invalid pre-admission reservation rejection",
+                  );
+                }
+                throw new AdmissionAbort({
+                  kind: "resource_rejected",
+                  error,
+                });
+              }
+              resourceReservation = parseResourceReservationBinding(reserved.binding);
+            }
+            const record = admission.kind === "immutable_business_failure"
+              ? createFinalFailureRecord(
+                  auth,
+                  command,
+                  fingerprint,
+                  immutableFailure!.error,
+                  immutableFailure!.authorityEvidence,
+                  window,
+                  now,
+                )
+              : createAcceptedRecord(
+                  auth,
+                  command,
+                  fingerprint,
+                  planFor(auth, command, admission.adapterState, resourceReservation),
+                  now,
+                );
+            transaction.putCommandRecord(
+              commandStorageKey(identity),
+              cloneJson(record) as unknown as RelayV2HostJson,
             );
-        transaction.putCommandRecord(
-          commandStorageKey(identity),
-          cloneJson(record) as unknown as RelayV2HostJson,
-        );
-        return { kind: "inserted", record } as const;
+            return { kind: "inserted", record } as const;
+          });
+        } catch (error) {
+          if (isHostStateCapacityError(error)) {
+            this.latchPersistedCapacity(section);
+            throw new AdmissionAbort({
+              kind: "resource_rejected",
+              error: {
+                code: "CAPABILITY_UNAVAILABLE",
+                message: "Relay v2 host persistence capacity is unavailable",
+                retryable: true,
+                commandDisposition: "not_accepted",
+                details: null,
+              },
+            });
+          }
+          throw error;
+        }
       });
       admitted = commit.value;
     } catch (error) {
@@ -1770,6 +2058,9 @@ export class RelayV2HostCommandPlane {
     }
     if (admitted.kind === "window_expired") {
       return commandWindowExpiredFrame(command, command.expectedHostEpoch);
+    }
+    if (admitted.kind === "resource_rejected") {
+      return this.preLedgerFailure(command, admitted.error);
     }
     if (admitted.kind === "existing") {
       return this.responseForExisting(command, admitted.record, fingerprint, identity);
@@ -1847,18 +2138,27 @@ export class RelayV2HostCommandPlane {
   async compact(): Promise<void> {
     const now = this.now();
     const snapshot = await this.store.read();
-    const commandChanges = Object.entries(snapshot.commands).flatMap(([key, value]) => {
-      if (!key.startsWith(COMMAND_KEY_PREFIX)) return [];
+    const commandChanges: Array<{
+      key: string;
+      action: "delete" | "tombstone";
+      record?: StoredCommandRecord;
+    }> = Object.entries(snapshot.commands).reduce<Array<{
+      key: string;
+      action: "delete" | "tombstone";
+      record?: StoredCommandRecord;
+    }>>((changes, [key, value]) => {
+      if (!key.startsWith(COMMAND_KEY_PREFIX)) return changes;
       const record = parseStoredCommand(value);
       if (record.recordType === "command_tombstone") {
-        return now > record.dedupeUntilMs ? [{ key, action: "delete" as const }] : [];
+        if (now > record.dedupeUntilMs) changes.push({ key, action: "delete" });
+        return changes;
       }
       if ((record.state === "succeeded" || record.state === "failed" || record.state === "in_doubt")
         && now > record.resultUntilMs!) {
-        return [{ key, action: "tombstone" as const, record }];
+        changes.push({ key, action: "tombstone", record });
       }
-      return [];
-    });
+      return changes;
+    }, []);
     const windowDeletes = Object.entries(snapshot.materialized).flatMap(([key, value]) => {
       if (!key.startsWith(WINDOW_KEY_PREFIX)) return [];
       const window = parseWindow(value);
@@ -1872,7 +2172,18 @@ export class RelayV2HostCommandPlane {
         if (currentValue === undefined) continue;
         const current = parseStoredCommand(currentValue);
         if (current.recordType === "command_tombstone") {
-          if (now > current.dedupeUntilMs) transaction.deleteCommandRecord(change.key);
+          if (now > current.dedupeUntilMs) {
+            if (current.finalState === "in_doubt"
+              && (current.operation === "create_worktree" || current.operation === "create_terminal")) {
+              if (this.resourceMutationOwner === undefined) continue;
+              const settlement = resourceSettlementIntentFor(current, "retain_uncertain", null)!;
+              if (this.resourceMutationOwner.hasPendingSettlement(
+                resourceTransactionFacade(transaction),
+                settlement,
+              )) continue;
+            }
+            transaction.deleteCommandRecord(change.key);
+          }
         } else if ((current.state === "succeeded" || current.state === "failed" || current.state === "in_doubt")
           && now > current.resultUntilMs!) {
           transaction.putCommandRecord(
@@ -1905,6 +2216,21 @@ export class RelayV2HostCommandPlane {
           if (value === undefined) continue;
           const record = parseStoredCommand(value);
           if (record.recordType !== "command" || record.state !== "running") continue;
+          const settlement = resourceSettlementIntentFor(record, "retain_uncertain", null);
+          if (settlement !== null) {
+            if (this.resourceMutationOwner === undefined) {
+              throw new RelayV2HostCommandPlaneStateError("Relay v2 resource mutation owner disappeared");
+            }
+            const disposition = this.resourceMutationOwner.settle(
+              resourceTransactionFacade(transaction),
+              settlement,
+            );
+            if (disposition === "released") {
+              throw new RelayV2HostCommandPlaneStateError(
+                "restart uncertainty released a reservation without complete proof",
+              );
+            }
+          }
           const window = readWindow(transaction, transaction.hostEpoch, record.dedupeWindowId);
           transaction.putCommandRecord(
             key,
@@ -2021,12 +2347,13 @@ export class RelayV2HostCommandPlane {
         prepared = {
           outcome: validateTerminalOutcome(running, raw),
           resourceCommitIntent: null,
+          resourceSettlementIntent: null,
         };
       } else {
         throw new RelayV2HostCommandPlaneStateError("unknown Relay v2 command execution authority");
       }
     } catch {
-      return this.markInDoubt(identity);
+      return this.markInDoubt(identity, null);
     }
 
     try {
@@ -2035,13 +2362,16 @@ export class RelayV2HostCommandPlane {
       // The side effect has already crossed its boundary. A failed or uncertain
       // final ledger commit can only converge to the committed final record or
       // IN_DOUBT; it never invokes the executor again.
-      return this.markInDoubt(identity);
+      return this.markInDoubt(identity, prepared);
     }
   }
 
   private async claimAccepted(identity: CommandIdentity): Promise<{
-    claimed: boolean;
-    record: StoredCommandRecord | StoredCommandTombstone;
+    claimed: true;
+    record: StoredCommandRecord;
+  } | {
+    claimed: false;
+    record: StoredCommand;
   }> {
     while (true) {
       try {
@@ -2089,9 +2419,21 @@ export class RelayV2HostCommandPlane {
     outcome: RelayV2TwRpcExecutionOutcome,
   ): PreparedExecutionOutcome {
     if (outcome.state !== "succeeded") {
+      if (outcome.state === "failed" && (
+        !isRecord(outcome)
+        || !hasExactKeys(outcome, ["state", "sideEffect", "error"])
+        || outcome.sideEffect !== "not_applied"
+      )) {
+        throw new TypeError("canonical TW RPC failure lacks no-side-effect proof");
+      }
       return {
         outcome: validateFailureOutcome(running, outcome),
         resourceCommitIntent: null,
+        resourceSettlementIntent: resourceSettlementIntentFor(
+          running,
+          outcome.state === "failed" ? "release_no_side_effect" : "retain_uncertain",
+          null,
+        ),
       };
     }
     if (!isRecord(outcome)
@@ -2117,14 +2459,18 @@ export class RelayV2HostCommandPlane {
       principalId: running.principalId,
       hostId: running.hostId,
       hostEpoch: running.hostEpoch,
+      commandId: running.commandId,
+      requestFingerprint: cloneJson(running.fingerprint),
       scopeId: running.scopeId,
       sessionId: running.sessionId,
+      reservationBinding: running.executionPlan.resourceReservation,
       backendOutcome,
       commitIntent: cloneJson(outcome.commitIntent),
     }, running);
     return {
       outcome: null,
       resourceCommitIntent: intent,
+      resourceSettlementIntent: null,
     };
   }
 
@@ -2133,45 +2479,94 @@ export class RelayV2HostCommandPlane {
     prepared: PreparedExecutionOutcome,
   ): Promise<StoredCommand> {
     try {
-      const commit = await this.store.transaction((transaction) => {
-        const current = readCommand(transaction, identity);
-        if (current === undefined) {
-          throw new RelayV2HostCommandPlaneStateError("running Relay v2 command disappeared");
-        }
-        if (current.recordType !== "command" || current.state !== "running") {
-          throw new TransitionAbort(current);
-        }
-        const window = readWindow(transaction, transaction.hostEpoch, current.dedupeWindowId);
-        let outcome = prepared.outcome;
-        if (prepared.resourceCommitIntent !== null) {
-          if (this.resourceMutationOwner === undefined) {
-            throw new RelayV2HostCommandPlaneStateError("Relay v2 resource mutation owner disappeared");
+      const commit = await this.store.serialize((section) => {
+        let committed: RelayV2HostStateCommit<{
+          record: StoredCommandRecord;
+          resourceEvidence: RelayV2CommandResourceCommitEvidence | null;
+        }>;
+        try {
+          committed = section.transaction((transaction) => {
+            const current = readCommand(transaction, identity);
+            if (current === undefined) {
+              throw new RelayV2HostCommandPlaneStateError("running Relay v2 command disappeared");
+            }
+            if (current.recordType !== "command" || current.state !== "running") {
+              throw new TransitionAbort(current);
+            }
+            const window = readWindow(transaction, transaction.hostEpoch, current.dedupeWindowId);
+            let outcome = prepared.outcome;
+            let resourceEvidence: RelayV2CommandResourceCommitEvidence | null = null;
+            if (prepared.resourceCommitIntent !== null) {
+              if (this.resourceMutationOwner === undefined) {
+                throw new RelayV2HostCommandPlaneStateError("Relay v2 resource mutation owner disappeared");
+              }
+              if (outcome !== null) {
+                throw new RelayV2HostCommandPlaneStateError("resource commit intent carried an early final outcome");
+              }
+              const intent = parseResourceCommitIntent(prepared.resourceCommitIntent, current);
+              const evidence = parseResourceCommitEvidence(
+                this.resourceMutationOwner.commit(resourceTransactionFacade(transaction), intent),
+                current,
+              );
+              resourceEvidence = evidence;
+              outcome = validateSucceededResult(current, evidence.result);
+            }
+            if (prepared.resourceSettlementIntent !== null) {
+              if (this.resourceMutationOwner === undefined) {
+                throw new RelayV2HostCommandPlaneStateError("Relay v2 resource mutation owner disappeared");
+              }
+              const disposition = this.resourceMutationOwner.settle(
+                resourceTransactionFacade(transaction),
+                prepared.resourceSettlementIntent,
+              );
+              if (prepared.resourceSettlementIntent.disposition === "release_no_side_effect"
+                && disposition !== "released") {
+                throw new RelayV2HostCommandPlaneStateError(
+                  "no-side-effect failure could not release its active reservation",
+                );
+              }
+            }
+            if (outcome === null) {
+              throw new RelayV2HostCommandPlaneStateError("command finalization lacks an outcome");
+            }
+            const next = this.finalizedRecord(current, outcome, window, this.now());
+            transaction.putCommandRecord(
+              commandStorageKey(identity),
+              cloneJson(next) as unknown as RelayV2HostJson,
+            );
+            return { record: next, resourceEvidence };
+          });
+        } catch (error) {
+          if (isHostStateCommitUncertain(error) && this.resourceMutationOwner !== undefined) {
+            this.resourceMutationOwner.fenceCommitUncertain(section.read());
+          } else if (isHostStateCapacityError(error)) {
+            this.latchPersistedCapacity(section);
           }
-          if (outcome !== null) {
-            throw new RelayV2HostCommandPlaneStateError("resource commit intent carried an early final outcome");
+          throw error;
+        }
+        if (committed.value.resourceEvidence !== null && this.resourceMutationOwner !== undefined) {
+          try {
+            const publication = this.resourceMutationOwner.publishCommitted(
+              committed.snapshot,
+              committed.value.resourceEvidence,
+            ) as unknown;
+            if (isThenable(publication)) {
+              throw new RelayV2HostCommandPlaneStateError(
+                "Relay v2 resource publication must be a synchronous bounded enqueue",
+              );
+            }
+          } catch {
+            this.resourceMutationOwner.fenceCommitUncertain(committed.snapshot);
           }
-          const intent = parseResourceCommitIntent(prepared.resourceCommitIntent, current);
-          const evidence = parseResourceCommitEvidence(
-            this.resourceMutationOwner.commit(resourceTransactionFacade(transaction), intent),
-            current,
-          );
-          outcome = validateSucceededResult(current, evidence.result);
         }
-        if (outcome === null) {
-          throw new RelayV2HostCommandPlaneStateError("command finalization lacks an outcome");
-        }
-        const next = this.finalizedRecord(current, outcome, window, this.now());
-        transaction.putCommandRecord(
-          commandStorageKey(identity),
-          cloneJson(next) as unknown as RelayV2HostJson,
-        );
-        return next;
+        return committed;
       });
-      return commit.value;
+      return commit.value.record;
     } catch (error) {
       if (error instanceof TransitionAbort) return error.record;
       if (isHostStateCommitUncertain(error)) {
-        const observed = await this.readIdentity(identity);
+        const snapshot = await this.store.read();
+        const observed = readCommand(snapshot, identity);
         if (observed !== undefined
           && (observed.recordType === "command_tombstone" || observed.state !== "running")) {
           return observed;
@@ -2181,25 +2576,69 @@ export class RelayV2HostCommandPlane {
     }
   }
 
-  private async markInDoubt(identity: CommandIdentity): Promise<StoredCommand> {
+  private latchPersistedCapacity(section: RelayV2HostStateCriticalSection): void {
     try {
-      const commit = await this.store.transaction((transaction) => {
-        const current = readCommand(transaction, identity);
-        if (current === undefined) {
-          throw new RelayV2HostCommandPlaneStateError("uncertain Relay v2 command disappeared");
+      const fenced = section.latchMaterializedReadinessFence(
+        "persisted_capacity_exceeded",
+      );
+      this.resourceMutationOwner?.fencePersistedCapacity(fenced.snapshot);
+    } catch (error) {
+      if (isHostStateCommitUncertain(error)) {
+        this.resourceMutationOwner?.fenceCommitUncertain(section.read());
+      }
+      throw error;
+    }
+  }
+
+  private async markInDoubt(
+    identity: CommandIdentity,
+    prepared: PreparedExecutionOutcome | null,
+  ): Promise<StoredCommand> {
+    try {
+      const commit = await this.store.serialize((section) => {
+        const committed = section.transaction((transaction) => {
+          const current = readCommand(transaction, identity);
+          if (current === undefined) {
+            throw new RelayV2HostCommandPlaneStateError("uncertain Relay v2 command disappeared");
+          }
+          if (current.recordType !== "command" || current.state !== "running") {
+            throw new TransitionAbort(current);
+          }
+          const settlement = resourceSettlementIntentFor(
+            current,
+            "retain_uncertain",
+            prepared?.resourceCommitIntent?.backendOutcome ?? null,
+          );
+          let authorityFenced = false;
+          if (settlement !== null) {
+            if (this.resourceMutationOwner === undefined) {
+              throw new RelayV2HostCommandPlaneStateError("Relay v2 resource mutation owner disappeared");
+            }
+            const disposition = this.resourceMutationOwner.settle(
+              resourceTransactionFacade(transaction),
+              settlement,
+            );
+            if (disposition === "released") {
+              throw new RelayV2HostCommandPlaneStateError(
+                "uncertain command reservation was released without complete proof",
+              );
+            }
+            authorityFenced = disposition === "retained_fenced";
+          }
+          const window = readWindow(transaction, transaction.hostEpoch, current.dedupeWindowId);
+          const next = this.finalizedRecord(current, { state: "in_doubt" }, window, this.now());
+          transaction.putCommandRecord(
+            commandStorageKey(identity),
+            cloneJson(next) as unknown as RelayV2HostJson,
+          );
+          return { record: next, authorityFenced };
+        });
+        if (committed.value.authorityFenced) {
+          this.resourceMutationOwner?.fenceMaterializedAuthority(committed.snapshot);
         }
-        if (current.recordType !== "command" || current.state !== "running") {
-          throw new TransitionAbort(current);
-        }
-        const window = readWindow(transaction, transaction.hostEpoch, current.dedupeWindowId);
-        const next = this.finalizedRecord(current, { state: "in_doubt" }, window, this.now());
-        transaction.putCommandRecord(
-          commandStorageKey(identity),
-          cloneJson(next) as unknown as RelayV2HostJson,
-        );
-        return next;
+        return committed;
       });
-      return commit.value;
+      return commit.value.record;
     } catch (error) {
       if (error instanceof TransitionAbort) return error.record;
       if (isHostStateCommitUncertain(error)) {

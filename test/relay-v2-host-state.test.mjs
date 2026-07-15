@@ -80,6 +80,7 @@ test("Relay v2 host lineage survives restart while process identity and file mod
       "eventSeq",
       "hostEpoch",
       "materialized",
+      "materializedReadinessFence",
       "parentCommitId",
       "revisions",
       "version",
@@ -207,6 +208,63 @@ test("serialized concurrent transactions allocate unique canonical revisions, ev
     assert.equal(snapshot.revisions["sessions:scope-local"], "40");
     assert.equal(Object.keys(snapshot.commands).length, 40);
     assert.equal(Object.keys(snapshot.materialized).length, 40);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("the exact full-root persisted budget rejects before rename and remains restart-readable", async () => {
+  const h = harness();
+  try {
+    const bootstrap = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    await bootstrap.transaction((transaction) => {
+      transaction.putCommandRecord("command:sentinel", {
+        state: "succeeded",
+        retainedLedgerBytes: "l".repeat(256),
+      });
+      transaction.putMaterializedRecord("resource:sentinel", {
+        backendIdentity: "backend:sentinel",
+        originReservation: { principalId: "principal-sentinel" },
+      });
+    });
+    const initialBytes = statSync(h.paths.state).size;
+    const budget = initialBytes + 2_048;
+    const constrained = await hostState.RelayV2HostStateStore.open({
+      paths: h.paths,
+      testMaxPersistedBytes: budget,
+    });
+    await constrained.transaction((transaction) => {
+      transaction.putMaterializedRecord("resource:near-budget", {
+        backendIdentity: "backend:near-budget",
+        payload: "n".repeat(256),
+      });
+    });
+    assert.ok(statSync(h.paths.state).size <= budget);
+    const before = await constrained.read();
+    const beforeContents = readFileSync(h.paths.state, "utf8");
+
+    await assert.rejects(
+      constrained.transaction((transaction) => {
+        transaction.putMaterializedRecord("resource:over-budget", {
+          backendIdentity: "backend:over-budget",
+          payload: "x".repeat(8_192),
+        });
+      }),
+      (error) => error instanceof hostState.RelayV2HostStateCapacityError
+        && error.code === "RELAY_V2_HOST_STATE_CAPACITY_EXCEEDED"
+        && error.actualBytes > error.maxBytes,
+    );
+    assert.equal(readFileSync(h.paths.state, "utf8"), beforeContents);
+
+    const restarted = await hostState.RelayV2HostStateStore.open({
+      paths: h.paths,
+      testMaxPersistedBytes: budget,
+    });
+    const after = await restarted.read();
+    assert.equal(after.hostEpoch, before.hostEpoch);
+    assert.equal(after.commitSeq, before.commitSeq);
+    assert.deepEqual(after.commands["command:sentinel"], before.commands["command:sentinel"]);
+    assert.deepEqual(after.materialized, before.materialized);
   } finally {
     h.cleanup();
   }

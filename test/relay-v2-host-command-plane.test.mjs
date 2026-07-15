@@ -51,7 +51,6 @@ function backendSessionEvidence(plan) {
   const terminal = plan.operation === "create_terminal";
   const label = terminal ? (plan.arguments.label ?? "demo") : null;
   return {
-    scopeId: plan.scopeId,
     kind: terminal ? "terminal" : "worktree",
     displayName: terminal ? label : (plan.arguments.project ?? "demo"),
     state: "running",
@@ -73,7 +72,7 @@ function successFor(plan) {
         state: "succeeded",
         backendOutcome: {
           schemaVersion: commandPlane.RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
-          backendInstanceKey: `backend-${plan.operation}`,
+          backendInstanceKey: plan.adapterState.backendInstanceKey ?? `backend-${plan.operation}`,
           evidence: { session: backendSessionEvidence(plan) },
         },
         commitIntent: { change: "upsert" },
@@ -98,6 +97,22 @@ function successFor(plan) {
         commitIntent: { change: "delete" },
       };
   }
+}
+
+function reservationPlanFor(request) {
+  if (request.operation !== "create_worktree" && request.operation !== "create_terminal") {
+    return {};
+  }
+  return {
+    resourceReservationPlan: {
+      logicalTarget: {
+        operation: request.operation,
+        scopeId: request.scopeId,
+        arguments: structuredClone(request.arguments),
+      },
+      session: backendSessionEvidence(request),
+    },
+  };
 }
 
 function authorityEvidence(request, coverage = "complete") {
@@ -125,7 +140,11 @@ function fakeExecutor(overrides = {}) {
       async resolve(request) {
         calls.resolve.push(structuredClone(request));
         if (overrides.resolve) return overrides.resolve(request);
-        return { kind: "executable", adapterState: { resolvedTarget: request.scopeId } };
+        return {
+          kind: "executable",
+          adapterState: { resolvedTarget: request.scopeId },
+          ...reservationPlanFor(request),
+        };
       },
       async executeTwRpc(plan) {
         calls.twRpc.push(structuredClone(plan));
@@ -142,10 +161,42 @@ function fakeExecutor(overrides = {}) {
 }
 
 function fakeResourceMutationOwner(overrides = {}) {
-  const calls = { commit: [] };
+  const calls = { reserve: [], commit: [], settle: [], hasPendingSettlement: [] };
+  const reservationIds = new Map();
+  const commandKey = (intent) => [
+    intent.hostEpoch,
+    intent.principalId,
+    intent.hostId,
+    intent.commandId,
+    intent.requestFingerprint.digest,
+  ].join("\0");
+  const reservationIdFor = (intent) => (
+    intent.reservationBinding?.reservationId ?? reservationIds.get(commandKey(intent))
+  );
   return {
     calls,
     owner: {
+      reserve(transaction, intent) {
+        calls.reserve.push(structuredClone(intent));
+        if (overrides.reserve) return overrides.reserve(transaction, intent);
+        const reservationId = transaction.issueOpaqueId("res");
+        const sessionId = transaction.issueOpaqueId("ses");
+        reservationIds.set(commandKey(intent), reservationId);
+        transaction.putMaterializedRecord(`test-h2-reservation:${reservationId}`, {
+          principalId: intent.principalId,
+          commandId: intent.commandId,
+          requestFingerprint: structuredClone(intent.requestFingerprint),
+          sessionId,
+        });
+        return {
+          kind: "reserved",
+          binding: {
+            schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION,
+            owner: "relay_v2_resource_state",
+            reservationId,
+          },
+        };
+      },
       commit(transaction, intent) {
         calls.commit.push(structuredClone(intent));
         assert.equal(transaction.getCommandRecord, undefined);
@@ -155,27 +206,30 @@ function fakeResourceMutationOwner(overrides = {}) {
         assert.equal(typeof intent.backendOutcome.backendInstanceKey, "string");
         assert.ok(intent.backendOutcome.backendInstanceKey.length > 0);
         if (overrides.commit) return overrides.commit(transaction, intent);
+        const reservation = intent.reservationBinding === null
+          ? null
+          : transaction.getMaterializedRecord(
+              `test-h2-reservation:${intent.reservationBinding.reservationId}`,
+            );
         const sessionId = intent.operation === "kill_session"
           ? intent.sessionId
-          : transaction.issueOpaqueId("ses");
+          : reservation?.sessionId;
+        assert.equal(typeof sessionId, "string");
         const result = intent.operation === "kill_session"
           ? { sessionId, terminated: true }
           : {
               session: {
+                scopeId: intent.scopeId,
                 ...structuredClone(intent.backendOutcome.evidence.session),
                 sessionId,
               },
             };
-        const revision = transaction.allocateRevision(`sessions:${intent.scopeId}`);
-        const eventSeq = transaction.allocateEventSeq();
-        transaction.putMaterializedRecord(`test-h2-session:${sessionId}`, {
-          schemaVersion: 1,
-          operation: intent.operation,
-          sessionId,
-          revision,
-          eventSeq,
-          backendInstanceKey: intent.backendOutcome.backendInstanceKey,
-        });
+        if (intent.reservationBinding) {
+          transaction.deleteMaterializedRecord(
+            `test-h2-reservation:${intent.reservationBinding.reservationId}`,
+          );
+          reservationIds.delete(commandKey(intent));
+        }
         return {
           schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION,
           owner: "relay_v2_resource_state",
@@ -186,14 +240,43 @@ function fakeResourceMutationOwner(overrides = {}) {
           scopeId: intent.scopeId,
           sessionId,
           result,
+          events: [],
           evidence: {
             source: "test-h2-owner",
             backendInstanceKey: intent.backendOutcome.backendInstanceKey,
-            revision,
-            eventSeq,
           },
         };
       },
+      settle(transaction, intent) {
+        calls.settle.push(structuredClone(intent));
+        if (overrides.settle) return overrides.settle(transaction, intent);
+        const reservationId = reservationIdFor(intent);
+        if (reservationId === undefined) return "released";
+        const key = `test-h2-reservation:${reservationId}`;
+        if (intent.disposition === "retain_uncertain") {
+          const existing = transaction.getMaterializedRecord(key);
+          if (existing === undefined) return "released";
+          transaction.putMaterializedRecord(key, {
+            ...existing,
+            state: "uncertain",
+            commandId: intent.commandId,
+          });
+          return "retained";
+        }
+        transaction.deleteMaterializedRecord(key);
+        reservationIds.delete(commandKey(intent));
+        return "released";
+      },
+      hasPendingSettlement(transaction, intent) {
+        calls.hasPendingSettlement.push(structuredClone(intent));
+        const reservationId = reservationIdFor(intent);
+        return reservationId !== undefined
+          && transaction.getMaterializedRecord(`test-h2-reservation:${reservationId}`) !== undefined;
+      },
+      publishCommitted() {},
+      fenceCommitUncertain() {},
+      fencePersistedCapacity() {},
+      fenceMaterializedAuthority() {},
     },
   };
 }
@@ -296,7 +379,11 @@ test("Relay v2 command fixtures persist RUNNING before routing each fixed operat
       fake.executor.resolve = async (request) => {
         fake.calls.resolve.push(structuredClone(request));
         assert.equal(request.authority, authority);
-        return { kind: "executable", adapterState: { commandId } };
+        return {
+          kind: "executable",
+          adapterState: { commandId },
+          ...reservationPlanFor(request),
+        };
       };
       const response = await configured.plane.execute(auth(), frame);
       assert.equal(response.type, "command.status", name);
@@ -666,9 +753,14 @@ test("immutable admission and canonical executor failures become durable final f
               details: null,
             },
           }
-        : { kind: "executable", adapterState: { resolvedTarget: request.scopeId } },
+        : {
+            kind: "executable",
+            adapterState: { resolvedTarget: request.scopeId },
+            ...reservationPlanFor(request),
+          },
       executeTwRpc: async () => ({
         state: "failed",
+        sideEffect: "not_applied",
         error: {
           code: "COMMAND_FAILED",
           message: "Canonical TW RPC rejected the mutation",
@@ -959,8 +1051,8 @@ test("an exception after the RUNNING boundary becomes durable in_doubt and is ne
   }
 });
 
-test("H2 resource owner allocates opaque Session identity and commits it atomically with the ledger", async (t) => {
-  await t.test("successful create commits the H2 mapping and terminal ledger in one cut", async () => {
+test("H1 consumes only the narrow H2 resource-owner result", async (t) => {
+  await t.test("successful create persists the H1 terminal ledger result", async () => {
     const h = harness();
     try {
       const fake = fakeExecutor();
@@ -981,13 +1073,12 @@ test("H2 resource owner allocates opaque Session identity and commits it atomica
       assert.match(response.payload.result.session.sessionId, /^ses_[0-9a-f]{32}$/);
       const snapshot = await configured.store.read();
       const ledger = Object.values(snapshot.commands).find(({ commandId }) => commandId === frame.commandId);
-      const mapping = snapshot.materialized[
-        `test-h2-session:${response.payload.result.session.sessionId}`
-      ];
       assert.equal(ledger.state, "succeeded");
-      assert.equal(mapping.sessionId, response.payload.result.session.sessionId);
-      assert.equal(mapping.revision, snapshot.revisions[`sessions:${frame.scopeId}`]);
-      assert.equal(mapping.eventSeq, snapshot.eventSeq);
+      assert.equal(ledger.result.session.sessionId, response.payload.result.session.sessionId);
+      assert.equal(
+        Object.keys(snapshot.materialized).some((key) => key.startsWith("test-h2-reservation:")),
+        false,
+      );
     } finally {
       h.cleanup();
     }
@@ -1031,8 +1122,8 @@ test("H2 resource owner allocates opaque Session identity and commits it atomica
       assert.equal(resource.calls.commit.length, 1);
       const snapshot = await store.read();
       assert.equal(
-        Object.keys(snapshot.materialized).some((key) => key.startsWith("test-h2-session:")),
-        false,
+        Object.keys(snapshot.materialized).some((key) => key.startsWith("test-h2-reservation:")),
+        true,
       );
       assert.equal(snapshot.revisions[`sessions:${frame.scopeId}`], undefined);
       assert.equal(snapshot.eventSeq, "0");
