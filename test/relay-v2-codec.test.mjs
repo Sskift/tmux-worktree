@@ -63,6 +63,20 @@ test("Node Relay v2 production codec rejects every shared invalid vector", () =>
   }
 });
 
+test("Node Relay v2 route-envelope decoder defers command arguments until after authorization", () => {
+  const frame = structuredClone(corpus.goldenByName.get("command-execute-create-terminal").frame);
+  frame.payload.arguments.cwd = " /repo/demo";
+  const bytes = Buffer.from(JSON.stringify(frame));
+  const routed = codec.decodeRelayV2CommandRouteEnvelope(bytes);
+  assert.equal(routed.envelope.type, "command.execute");
+  assert.equal(routed.envelope.hostId, frame.hostId);
+  assert.throws(
+    () => codec.decodeRelayV2WebSocketFrame("public", bytes),
+    (error) => error instanceof codec.RelayV2CodecError
+      && error.failureClass === "invalid-argument",
+  );
+});
+
 test("Node Relay v2 dialect resolution matches the shared no-fallback matrix", () => {
   for (const fixture of corpus.dialect) {
     assert.deepEqual(

@@ -1,9 +1,11 @@
 import {
   RelayV2SchemaError,
+  validateRelayV2CommandRouteEnvelope as validateRelayV2CommandRouteEnvelopeSchema,
   validateRelayV2CarrierFrame,
   validateRelayV2HttpsBody,
   validateRelayV2PublicFrame,
   type RelayV2HttpsSchema,
+  type RelayV2CommandRouteEnvelope,
   type RelayV2JsonObject,
   type RelayV2NormalizedMessage,
 } from "./codecSchema.js";
@@ -29,6 +31,12 @@ export interface RelayV2FrameMetadata {
 export interface RelayV2DecodedMessage {
   frame: RelayV2JsonObject;
   normalized: RelayV2NormalizedMessage;
+  canonicalWire: string;
+}
+
+export interface RelayV2DecodedCommandRouteEnvelope {
+  frame: RelayV2JsonObject;
+  envelope: RelayV2CommandRouteEnvelope;
   canonicalWire: string;
 }
 
@@ -151,6 +159,22 @@ export function decodeRelayV2WebSocketFrame(
   }
 }
 
+export function decodeRelayV2CommandRouteEnvelope(
+  bytes: Uint8Array,
+  metadata: RelayV2FrameMetadata = {},
+): RelayV2DecodedCommandRouteEnvelope {
+  try {
+    const frame = parseWebSocketObject("public", bytes, metadata);
+    return {
+      frame,
+      envelope: validateRelayV2CommandRouteEnvelopeSchema(frame),
+      canonicalWire: JSON.stringify(frame),
+    };
+  } catch (error) {
+    return codecFailure(error);
+  }
+}
+
 export function decodeRelayV2HttpsBody(
   schema: RelayV2HttpsSchema,
   bytes: Uint8Array,
@@ -196,6 +220,21 @@ export function encodeRelayV2WebSocketFrame(
         ? RELAY_V2_PUBLIC_FRAME_BYTES
         : RELAY_V2_CARRIER_FRAME_BYTES,
     );
+  } catch (error) {
+    return codecFailure(error);
+  }
+}
+
+export function validateRelayV2CommandRouteEnvelope(
+  frame: RelayV2JsonObject,
+): RelayV2CommandRouteEnvelope {
+  try {
+    const envelope = validateRelayV2CommandRouteEnvelopeSchema(frame);
+    const bytes = new TextEncoder().encode(JSON.stringify(frame));
+    if (bytes.byteLength > RELAY_V2_PUBLIC_FRAME_BYTES) {
+      throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
+    }
+    return envelope;
   } catch (error) {
     return codecFailure(error);
   }

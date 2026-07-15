@@ -57,6 +57,7 @@ export interface RelayV2HostStateCommit<T> {
 }
 
 export interface RelayV2HostStateTransaction {
+  readonly hostEpoch: string;
   getCommandRecord(key: string): RelayV2HostJson | undefined;
   putCommandRecord(key: string, value: RelayV2HostJson): void;
   deleteCommandRecord(key: string): void;
@@ -640,6 +641,10 @@ class HostStateTransaction implements RelayV2HostStateTransaction {
       commands: copyRecordMap(current.commands),
       materialized: copyRecordMap(current.materialized),
     };
+  }
+
+  get hostEpoch(): string {
+    return this.draft.hostEpoch;
   }
 
   getCommandRecord(key: string): RelayV2HostJson | undefined {

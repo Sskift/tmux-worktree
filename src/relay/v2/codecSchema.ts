@@ -577,7 +577,6 @@ function validateCommandArguments(
       }
       if (Object.hasOwn(argumentsValue, "path")) {
         stringValue(argumentsValue.path!, {
-          allowOuterWhitespace: true,
           maxBytes: 4_096,
         });
       }
@@ -591,7 +590,6 @@ function validateCommandArguments(
         stringValue(argumentsValue.branch!, { maxBytes: 255 });
       }
       stringValue(field(argumentsValue, "aiCommand"), {
-        allowOuterWhitespace: true,
         maxBytes: 4_096,
       });
       return;
@@ -599,12 +597,10 @@ function validateCommandArguments(
     case "create_terminal":
       exact(argumentsValue, ["cwd"], ["label"]);
       stringValue(field(argumentsValue, "cwd"), {
-        allowOuterWhitespace: true,
         maxBytes: 4_096,
       });
       if (Object.hasOwn(argumentsValue, "label")) {
         stringValue(argumentsValue.label!, {
-          allowOuterWhitespace: true,
           maxBytes: 128,
         });
       }
@@ -1022,6 +1018,74 @@ function validateTerminalClosedPayload(
   ));
   if (reason === "client_closed" && exitCode !== null) reject("schema-mismatch");
   if (reason === "backend_exit" && exitCode === null) reject("schema-mismatch");
+}
+
+export type RelayV2CommandRouteEnvelope =
+  | {
+      type: "command.execute";
+      requestId: string;
+      commandId: string;
+      hostId: string;
+      expectedHostEpoch: string;
+      scopeId: string;
+      sessionId: string | null;
+    }
+  | {
+      type: "command.query";
+      requestId: string;
+      hostId: string;
+      expectedHostEpoch: string;
+    };
+
+/**
+ * Validate only the strict public root and route-correlating identifiers.
+ * Operation, target relationship, query items, and command arguments remain
+ * intentionally opaque until route authorization and epoch validation pass.
+ */
+export function validateRelayV2CommandRouteEnvelope(
+  frame: RelayV2JsonObject,
+): RelayV2CommandRouteEnvelope {
+  const type = stringValue(field(frame, "type"), { maxBytes: 128 });
+  if (type === "command.execute") {
+    publicRoot(
+      frame,
+      "request",
+      type,
+      [
+        "requestId",
+        "commandId",
+        "hostId",
+        "expectedHostEpoch",
+        "scopeId",
+        "payload",
+      ],
+      ["sessionId"],
+    );
+    return {
+      type,
+      requestId: frame.requestId as string,
+      commandId: frame.commandId as string,
+      hostId: frame.hostId as string,
+      expectedHostEpoch: frame.expectedHostEpoch as string,
+      scopeId: frame.scopeId as string,
+      sessionId: Object.hasOwn(frame, "sessionId") ? frame.sessionId as string : null,
+    };
+  }
+  if (type === "command.query") {
+    publicRoot(frame, "request", type, [
+      "requestId",
+      "hostId",
+      "expectedHostEpoch",
+      "payload",
+    ]);
+    return {
+      type,
+      requestId: frame.requestId as string,
+      hostId: frame.hostId as string,
+      expectedHostEpoch: frame.expectedHostEpoch as string,
+    };
+  }
+  reject("unknown-message-type");
 }
 
 export function validateRelayV2PublicFrame(

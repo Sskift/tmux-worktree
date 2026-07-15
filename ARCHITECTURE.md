@@ -65,6 +65,7 @@ cross-surface implementation ──> versioned RPC / wire / storage contract
 | `src/relayHost.ts` | Mac admin connector；聚合 local 与显式配置的 SSH scope |
 | `src/relayServer.ts`, `src/relay/broker/` | Relay v1 鉴权、Host/Client 路由和连接生命周期 |
 | `src/relay/v1/` | Relay v1 wire model 与消息类型 |
+| `src/relay/v2/` | 未接入 runtime 的 Relay v2 strict codec、H0 事务状态库和 H1 command-plane core（ledger、durable runner、canonical executor/H2 owner seam）；不代表 H1 runtime 完成，不宣告 capability |
 | `src/terminalControl/` | 本地 input ownership contract client/server、lease/fence authority、受控 backend write 与 output cursor |
 | `src/feishuBridge*.ts`, `src/larkCliBridge.ts` | 独立 Feishu binding/event/turn/reply daemon 与 Lark adapter；不调用 Relay transport |
 
@@ -146,7 +147,7 @@ Compose screens / navigation
 
 Android 的 `V2` 指当前产品/UI 代际，不表示它已经实现 Relay v2。
 
-仓库已有相互独立的 Node 与 Android Relay v2 codec，并共同消费 `contracts/relay/v2` 的 strict framing、closed schema、limit、dialect 和 normalized-result fixture。它们尚未接入 `relay-server`、`relay-host` 或 Android connection actor，不生成 credential/enrollment，也不宣告 v2 capability；当前运行数据流仍全部是 Relay v1。
+仓库已有相互独立的 Node 与 Android Relay v2 codec，并共同消费 `contracts/relay/v2` 的 strict framing、closed schema、limit、dialect 和 normalized-result fixture。Node 侧还包含未接线的 H0 host 事务状态库与 H1 command-plane core：后者在 H0 事务上持久化 `(hostEpoch, principalId, hostId, commandId)` scoped ledger、dedupe window、durable accepted runner、结果/tombstone；`clientInstanceId` 只记录首次 route/attempt，不参与 ledger identity。四类固定 mutation 只通过注入的 `tw rpc` / terminal-control executor seam 执行；create/kill 的成功终态还要求注入 H2 resource mutation owner，在同一 H0 transaction 内签发/解析 opaque Session identity，并提交 Session mapping/revision/eventSeq 和 ledger。这里没有实现 H2 状态，也不等于 H1 runtime 已完成。真实 target resolver、canonical executor adapter、H2 mutation owner、broker carrier、`relay-host` composition root 和 Android actor 仍未接入，不生成 credential/enrollment，也不宣告 v2 capability；当前运行数据流仍全部是 Relay v1。
 
 ## 运行数据流
 

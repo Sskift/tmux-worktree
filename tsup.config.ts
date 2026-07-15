@@ -12,6 +12,7 @@ export default defineConfig({
     "src/relayServer.ts",
     "src/relay/v2/hostCarrier.ts",
     "src/relay/v2/hostState.ts",
+    "src/relay/v2/hostCommandPlane.ts",
     "src/relay/v2/token.ts",
     "src/relay/v2/issuer.ts",
     "src/relay/v2/auth.ts",

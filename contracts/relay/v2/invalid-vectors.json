@@ -392,6 +392,70 @@
     }
   },
   {
+    "name": "command-create-worktree-path-leading-whitespace",
+    "channel": "public",
+    "category": "outer-whitespace",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "command-execute-create-worktree",
+      "path": "/payload/arguments/path",
+      "value": " /repo/demo"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "command-create-worktree-ai-command-trailing-whitespace",
+    "channel": "public",
+    "category": "outer-whitespace",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "command-execute-create-worktree",
+      "path": "/payload/arguments/aiCommand",
+      "value": "codex "
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "command-create-terminal-cwd-trailing-whitespace",
+    "channel": "public",
+    "category": "outer-whitespace",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "command-execute-create-terminal",
+      "path": "/payload/arguments/cwd",
+      "value": "/repo/demo "
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
+    "name": "command-create-terminal-label-leading-whitespace",
+    "channel": "public",
+    "category": "outer-whitespace",
+    "input": {
+      "kind": "golden-set",
+      "fixture": "command-execute-create-terminal",
+      "path": "/payload/arguments/label",
+      "value": " demo shell"
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "INVALID_ENVELOPE",
+      "failureClass": "invalid-argument"
+    }
+  },
+  {
     "name": "terminal-input-decoded-bytes-over-limit",
     "channel": "public",
     "category": "base64-decoded-limit",

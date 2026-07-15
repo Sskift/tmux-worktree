@@ -181,6 +181,7 @@
     "broker-host-carrier-control-and-route-fencing",
     "https-enrollment-refresh-bootstrap-and-revoke",
     "command-execute-status-result-and-query",
+    "command-non-message-string-outer-whitespace-rejection",
     "scope-session-and-pinned-state-snapshot",
     "sequenced-state-events",
     "terminal-open-replay-input-resize-close",
