@@ -294,6 +294,7 @@ export type FeishuBridgeSnapshot = {
 export type FeishuChat = {
   chatId: string;
   name: string;
+  ownerId?: string;
 };
 
 export type FeishuLarkProfile = {

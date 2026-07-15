@@ -28,6 +28,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import select
 import signal
 import socket
@@ -117,6 +118,78 @@ def controlled_input(data):
         writable = False
         notice("input rejected; attachment is now read-only (" + str(error) + ")")
 
+def csi_reply(sequence):
+    if len(sequence) < 2:
+        return False
+    final = sequence[-1:]
+    body = sequence[:-1]
+    if re.fullmatch(br"[\x20-\x3f]*", body) is None:
+        return False
+    if final == b"c":
+        return re.fullmatch(br"[?>=][0-9;:]*", body) is not None
+    if final == b"R":
+        return re.fullmatch(br"\??[0-9]+;[0-9]+", body) is not None
+    if final == b"n":
+        return re.fullmatch(br"(?:0|\?(?:0|10|11|13|20|21|27(?:;[0-9]+)*|53))", body) is not None
+    if final == b"t":
+        return re.fullmatch(br"(?:[12]|[34689];[0-9]+;[0-9]+)", body) is not None
+    if final == b"x":
+        return re.fullmatch(br"[23](?:;[0-9]+){6}", body) is not None
+    if final == b"y":
+        return re.fullmatch(br"\??[0-9;]+\$", body) is not None
+    if final == b"u":
+        return re.fullmatch(br"\?[0-9;]+", body) is not None
+    return False
+
+def string_reply(kind, payload):
+    if kind == b"]":
+        code = payload.split(b";", 1)[0]
+        return b";" in payload and code in {
+            b"4", b"10", b"11", b"12", b"13", b"14", b"15", b"16",
+            b"17", b"18", b"19", b"50", b"52",
+        }
+    if kind == b"P":
+        return payload.startswith((b"1+r", b"0+r", b"1$r", b"0$r", b">|"))
+    return False
+
+def terminal_reply_end(data, offset):
+    if offset + 2 >= len(data) or data[offset:offset + 1] != b"\x1b":
+        return None
+    kind = data[offset + 1:offset + 2]
+    if kind == b"[":
+        for index in range(offset + 2, len(data)):
+            byte = data[index]
+            if 0x40 <= byte <= 0x7e:
+                return index + 1 if csi_reply(data[offset + 2:index + 1]) else None
+            if not 0x20 <= byte <= 0x3f:
+                return None
+        return None
+    if kind not in (b"]", b"P"):
+        return None
+    for index in range(offset + 2, len(data)):
+        if kind == b"]" and data[index] == 0x07:
+            return index + 1 if string_reply(kind, data[offset + 2:index]) else None
+        if data[index:index + 2] == b"\x1b\\":
+            return index + 2 if string_reply(kind, data[offset + 2:index]) else None
+    return None
+
+def route_terminal_input(data, master_fd):
+    # tmux asks the real terminal emulator for device/cursor/color state while
+    # attaching. Those replies belong to the read-only tmux client; treating
+    # them as user bytes would inject strings such as DA2 into the managed pane.
+    cursor = 0
+    user_start = 0
+    while cursor < len(data):
+        end = terminal_reply_end(data, cursor)
+        if end is None:
+            cursor += 1
+            continue
+        controlled_input(data[user_start:cursor])
+        os.write(master_fd, data[cursor:end])
+        cursor = end
+        user_start = end
+    controlled_input(data[user_start:])
+
 def renew_lease():
     global lease, writable, next_renewal
     if not writable or lease is None or time.monotonic() < next_renewal:
@@ -200,9 +273,9 @@ try:
                 break
             if b"\x1d" in data:
                 before, _, _after = data.partition(b"\x1d")
-                controlled_input(before)
+                route_terminal_input(before, master_fd)
                 break
-            controlled_input(data)
+            route_terminal_input(data, master_fd)
         ended, status = os.waitpid(pid, os.WNOHANG)
         if ended == pid:
             pid = 0

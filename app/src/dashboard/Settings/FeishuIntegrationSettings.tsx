@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import {
+  type FeishuBinding,
   type FeishuIntegrationStatus,
   type FeishuLarkProfile,
   useDashboardBackend,
@@ -22,22 +23,42 @@ export function FeishuIntegrationSettings() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
+  const [bindings, setBindings] = useState<FeishuBinding[] | null>(null);
+  const [bindingsError, setBindingsError] = useState<string | null>(null);
   const [addingProfile, setAddingProfile] = useState(false);
   const [newAppId, setNewAppId] = useState("");
   const [newAppSecret, setNewAppSecret] = useState("");
   const [newBrand, setNewBrand] = useState<"feishu" | "lark">("feishu");
 
+  const applyStatus = useCallback(async (next: FeishuIntegrationStatus) => {
+    setStatus(next);
+    setBindingsError(null);
+    if (!next.selectedProfile) {
+      setBindings([]);
+      return;
+    }
+    setBindings(null);
+    try {
+      const snapshot = await dashboardBackend.feishu.status();
+      setBindings(snapshot.bindings);
+      if (!next.bridgeRunning) setStatus({ ...next, bridgeRunning: true });
+    } catch (bindingError) {
+      setBindings([]);
+      setBindingsError(bindingError instanceof Error ? bindingError.message : String(bindingError));
+    }
+  }, [dashboardBackend]);
+
   const load = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await dashboardBackend.feishu.integrationStatus());
+      await applyStatus(await dashboardBackend.feishu.integrationStatus());
     } catch (loadError) {
       setError(loadError instanceof Error ? loadError.message : String(loadError));
     } finally {
       setBusy(false);
     }
-  }, [dashboardBackend]);
+  }, [applyStatus, dashboardBackend]);
 
   useEffect(() => {
     void load();
@@ -93,7 +114,7 @@ export function FeishuIntegrationSettings() {
     setWarning(null);
     try {
       const next = await dashboardBackend.feishu.selectProfile(profile);
-      setStatus(next);
+      await applyStatus(next);
       setNotice("Bot selected.");
     } catch (selectError) {
       setError(selectError instanceof Error ? selectError.message : String(selectError));
@@ -124,7 +145,7 @@ export function FeishuIntegrationSettings() {
           selectionError = selectError instanceof Error ? selectError.message : String(selectError);
         }
       }
-      setStatus(next);
+      await applyStatus(next);
       closeAddProfile();
       if (selectionError) {
         setError(selectionError);
@@ -157,12 +178,12 @@ export function FeishuIntegrationSettings() {
     setNotice(null);
     setWarning(null);
     try {
-      setStatus(await dashboardBackend.feishu.removeProfile(selected.name));
+      await applyStatus(await dashboardBackend.feishu.removeProfile(selected.name));
       setNotice("Bot deleted.");
     } catch (removeError) {
       setError(removeError instanceof Error ? removeError.message : String(removeError));
       try {
-        setStatus(await dashboardBackend.feishu.integrationStatus());
+        await applyStatus(await dashboardBackend.feishu.integrationStatus());
       } catch {
         // Keep the deletion diagnostic; the next settings open retries status.
       }
@@ -305,6 +326,56 @@ export function FeishuIntegrationSettings() {
           </div>
         </form>
       )}
+
+      <section className="feishu-integration-settings__manager feishu-integration-settings__bindings">
+        <header className="feishu-integration-settings__heading">
+          <div>
+            <strong>Group bindings</strong>
+            <span>
+              {selected
+                ? `Sessions currently linked through ${botName(selected)}.`
+                : "Choose a bot to see its session and group links."}
+            </span>
+          </div>
+          {bindings && bindings.length > 0 && (
+            <span className="feishu-integration-settings__state">
+              {bindings.length} linked
+            </span>
+          )}
+        </header>
+
+        {selectedProfile && bindings === null && (
+          <p className="feishu-integration-settings__notice" role="status">Loading group bindings…</p>
+        )}
+        {bindingsError && (
+          <p className="feishu-integration-settings__error" role="alert">
+            Could not load group bindings: {bindingsError}
+          </p>
+        )}
+        {!bindingsError && bindings?.length === 0 && (
+          <p className="feishu-integration-settings__notice">
+            {selectedProfile ? "This bot has no linked sessions." : "No bot selected."}
+          </p>
+        )}
+        {bindings && bindings.length > 0 && (
+          <div className="feishu-integration-settings__binding-list" role="list">
+            {bindings.map((binding) => (
+              <div className="feishu-integration-settings__binding" role="listitem" key={binding.id}>
+                <span className="feishu-integration-settings__binding-session" title={binding.sessionName}>
+                  {binding.sessionName}
+                </span>
+                <span className="feishu-integration-settings__binding-arrow" aria-hidden="true">→</span>
+                <span className="feishu-integration-settings__binding-group" title={binding.chatName}>
+                  {binding.chatName}
+                </span>
+                <span className={`feishu-integration-settings__binding-status feishu-integration-settings__binding-status--${binding.status}`}>
+                  {binding.status}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       <p className="feishu-integration-settings__footnote">
         Change or delete the bot after unlinking all Feishu groups.

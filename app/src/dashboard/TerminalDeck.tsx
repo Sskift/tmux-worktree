@@ -71,6 +71,8 @@ export function TerminalDeck({
   const [feishuBusy, setFeishuBusy] = useState(false);
   const [bindingTarget, setBindingTarget] = useState<{ sessionName: string; ptyId: string } | null>(null);
   const [groups, setGroups] = useState<FeishuChat[]>([]);
+  const [groupsLoading, setGroupsLoading] = useState(false);
+  const [groupsError, setGroupsError] = useState<string | null>(null);
   const [chatId, setChatId] = useState("");
   const [chatName, setChatName] = useState("");
   const [createdBy, setCreatedBy] = useState("");
@@ -138,10 +140,17 @@ export function TerminalDeck({
     setBindingTarget({ sessionName, ptyId });
     setChatId("");
     setChatName("");
+    setCreatedBy("");
     setFeishuError(null);
-    void dashboardBackend.feishu.groups().then(setGroups).catch((error) => {
-      setGroups([]);
-      setFeishuError(`Could not load the bot's groups. Enter the details manually: ${error instanceof Error ? error.message : String(error)}`);
+    setGroups([]);
+    setGroupsError(null);
+    setGroupsLoading(true);
+    void dashboardBackend.feishu.groups().then((nextGroups) => {
+      setGroups(nextGroups);
+    }).catch((error) => {
+      setGroupsError(error instanceof Error ? error.message : String(error));
+    }).finally(() => {
+      setGroupsLoading(false);
     });
   };
 
@@ -365,23 +374,49 @@ export function TerminalDeck({
             <div className="terminal-feishu-dialog__card">
               <strong>Link a Feishu group</strong>
               <p>Content inside a complete public marker in this terminal is sent to every group member. A process running as the same OS account can still bypass this product-level input lock through raw tmux or low-level RPC commands.</p>
-              {groups.length > 0 && (
-                <label>
-                  Bot groups
-                  <MenuSelect
-                    ariaLabel="Bot groups"
-                    value={chatId}
-                    options={[
-                      { value: "", label: "Select a group…" },
-                      ...groups.map((group) => ({ value: group.chatId, label: group.name })),
-                    ]}
-                    onChange={(value) => {
-                      const group = groups.find((candidate) => candidate.chatId === value);
-                      setChatId(value);
-                      if (group) setChatName(group.name);
-                    }}
-                  />
-                </label>
+              <label>
+                Bot groups
+                <MenuSelect
+                  ariaLabel="Bot groups"
+                  value={chatId}
+                  disabled={groupsLoading || groups.length === 0}
+                  options={[
+                    {
+                      value: "",
+                      label: groupsLoading
+                        ? "Loading bot groups…"
+                        : groupsError
+                          ? "Groups unavailable"
+                          : groups.length > 0
+                            ? "Select a group…"
+                            : "No groups visible to this bot",
+                    },
+                    ...groups.map((group) => {
+                      const existing = feishuSnapshot?.bindings.find((binding) => binding.chatId === group.chatId);
+                      return {
+                        value: group.chatId,
+                        label: group.name,
+                        ...(existing ? { detail: `Linked to ${existing.sessionName}` } : {}),
+                      };
+                    }),
+                  ]}
+                  onChange={(value) => {
+                    const group = groups.find((candidate) => candidate.chatId === value);
+                    setChatId(value);
+                    if (group) {
+                      setChatName(group.name);
+                      setCreatedBy(group.ownerId ?? "");
+                    }
+                  }}
+                />
+              </label>
+              {groupsError && (
+                <p className="terminal-feishu-dialog__error">
+                  Could not load this bot's groups. You can still enter the group details manually: {groupsError}
+                </p>
+              )}
+              {!groupsLoading && !groupsError && groups.length === 0 && (
+                <p>No group memberships were returned for the selected bot. Add the application bot to a group, then reopen this dialog.</p>
               )}
               <label>
                 Chat ID

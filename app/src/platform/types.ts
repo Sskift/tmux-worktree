@@ -93,6 +93,7 @@ export interface PtyConnection {
   readonly id: string;
   readonly active: boolean;
   write(data: string): Promise<void>;
+  writeTerminalReply(data: string): Promise<void>;
   scroll(direction: "up" | "down", lines: number): Promise<void>;
   resize(cols: number, rows: number): Promise<void>;
   controlStatus(): Promise<PtyControlStatus>;

@@ -2,6 +2,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 
 const MAX_LARK_OUTPUT_BYTES = 1024 * 1024;
 const LARK_COMMAND_TIMEOUT_MS = 15_000;
+const MAX_FEISHU_GROUP_PAGES = 100;
 
 export interface FeishuInboundEvent {
   type: "im.message.receive_v1";
@@ -31,6 +32,7 @@ export interface FeishuReplyResult {
 export interface FeishuChat {
   chatId: string;
   name: string;
+  ownerId?: string;
 }
 
 export interface FeishuEventSubscription {
@@ -237,11 +239,33 @@ export function parseFeishuChats(value: unknown): FeishuChat[] {
     if (!isRecord(candidate)) return;
     const chatId = pickString(candidate.chat_id, candidate.chatId);
     const name = pickString(candidate.name, candidate.chat_name, candidate.chatName);
-    if (chatId?.startsWith("oc_") && name) chats.set(chatId, { chatId, name });
+    const ownerId = pickString(candidate.owner_id, candidate.ownerId);
+    if (chatId?.startsWith("oc_") && name) {
+      chats.set(chatId, { chatId, name, ...(ownerId?.startsWith("ou_") ? { ownerId } : {}) });
+    }
     for (const child of Object.values(candidate)) visit(child);
   };
   visit(value);
   return [...chats.values()].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+export function parseFeishuChatPage(value: unknown): {
+  chats: FeishuChat[];
+  hasMore: boolean;
+  pageToken?: string;
+} {
+  const page = isRecord(value) && isRecord(value.data) ? value.data : value;
+  if (!isRecord(page)) throw new Error("invalid Feishu chat list response");
+  const hasMore = page.has_more === true || page.hasMore === true;
+  const pageToken = pickString(page.page_token, page.pageToken);
+  if (hasMore && !pageToken) {
+    throw new Error("Feishu chat list omitted the next page token");
+  }
+  return {
+    chats: parseFeishuChats(page.chats ?? page.items ?? []),
+    hasMore,
+    ...(pageToken ? { pageToken } : {}),
+  };
 }
 
 export function parseFeishuBotOpenId(value: unknown): string {
@@ -260,10 +284,15 @@ export function parseFeishuBotOpenId(value: unknown): string {
 
 export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   private readonly profile?: string;
+  private readonly runner: (args: string[]) => Promise<unknown>;
 
-  constructor(options: { profile?: string } = {}) {
+  constructor(options: {
+    profile?: string;
+    runner?: (args: string[]) => Promise<unknown>;
+  } = {}) {
     if (options.profile !== undefined) larkCliCommandArgs([], options.profile);
     this.profile = options.profile;
+    this.runner = options.runner ?? runLark;
   }
 
   private commandArgs(args: string[]): string[] {
@@ -324,7 +353,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   }
 
   async messageDetail(messageId: string): Promise<FeishuMessageDetail> {
-    const raw = await runLark(this.commandArgs([
+    const raw = await this.runner(this.commandArgs([
       "im", "+messages-mget",
       "--message-ids", messageId,
       "--as", "bot",
@@ -335,7 +364,7 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   }
 
   async reply(messageId: string, text: string, idempotencyKey: string): Promise<FeishuReplyResult> {
-    const raw = await runLark(this.commandArgs([
+    const raw = await this.runner(this.commandArgs([
       "im", "+messages-reply",
       "--message-id", messageId,
       "--text", text,
@@ -347,17 +376,33 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   }
 
   async listGroups(): Promise<FeishuChat[]> {
-    const raw = await runLark(this.commandArgs([
-      "im", "+chat-list",
-      "--as", "bot",
-      "--page-size", "100",
-      "--json",
-    ]));
-    return parseFeishuChats(raw);
+    const chats = new Map<string, FeishuChat>();
+    const seenPageTokens = new Set<string>();
+    let pageToken: string | undefined;
+    for (let pageIndex = 0; pageIndex < MAX_FEISHU_GROUP_PAGES; pageIndex++) {
+      const args = [
+        "im", "+chat-list",
+        "--as", "bot",
+        "--page-size", "100",
+        "--json",
+        ...(pageToken ? ["--page-token", pageToken] : []),
+      ];
+      const page = parseFeishuChatPage(await this.runner(this.commandArgs(args)));
+      for (const chat of page.chats) chats.set(chat.chatId, chat);
+      if (!page.hasMore) {
+        return [...chats.values()].sort((left, right) => left.name.localeCompare(right.name));
+      }
+      pageToken = page.pageToken;
+      if (!pageToken || seenPageTokens.has(pageToken)) {
+        throw new Error("Feishu chat list pagination did not advance");
+      }
+      seenPageTokens.add(pageToken);
+    }
+    throw new Error("Feishu chat list exceeded the pagination limit");
   }
 
   async botOpenId(): Promise<string> {
-    const raw = await runLark(this.commandArgs([
+    const raw = await this.runner(this.commandArgs([
       "auth", "status", "--json", "--verify",
     ]));
     return parseFeishuBotOpenId(raw);

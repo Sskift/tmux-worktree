@@ -213,6 +213,8 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
   const closeLifecycle = transport.closeLifecycle;
   const writePty = (id: string, data: string) =>
     transport.invoke<void>("pty_write", { id, data });
+  const writeTerminalReply = (id: string, data: string) =>
+    transport.invoke<void>("pty_write_terminal_reply", { id, data });
   const scrollPty = (id: string, direction: "up" | "down", lines: number) =>
     transport.invoke<void>("pty_control_scroll", { id, direction, lines });
   const resizePty = (id: string, cols: number, rows: number) =>
@@ -390,6 +392,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
           return !closed && !exited;
         },
         write: enqueueWrite,
+        writeTerminalReply: (data) => enqueueMutation(() => writeTerminalReply(args.id, data)),
         scroll: enqueueScroll,
         resize: enqueueResize,
         controlStatus: () => {

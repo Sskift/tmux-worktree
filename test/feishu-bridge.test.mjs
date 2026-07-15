@@ -17,7 +17,9 @@ const {
   canonicalTerminalControlSocketPath,
 } = await import("../dist/canonicalTerminalControlClient.js");
 const {
+  LarkCliBridgeAdapter,
   larkCliCommandArgs,
+  parseFeishuChatPage,
   parseFeishuBotOpenId,
   parseFeishuInboundEvent,
   parseFeishuMessageDetail,
@@ -753,6 +755,46 @@ test("Lark CLI bridge pins every command to an explicitly selected profile", () 
     ok: true,
     identities: { bot: { status: "ready", openId: "ou_bot_profile" } },
   }), "ou_bot_profile");
+});
+
+test("Lark CLI bridge collects every bot group page and keeps the group owner", async () => {
+  const calls = [];
+  const pages = [
+    {
+      data: {
+        chats: [{ chat_id: "oc_two", name: "Second", owner_id: "ou_owner_two" }],
+        has_more: true,
+        page_token: "next-page",
+      },
+    },
+    {
+      data: {
+        chats: [{ chat_id: "oc_one", name: "First", owner_id: "ou_owner_one" }],
+        has_more: false,
+        page_token: "",
+      },
+    },
+  ];
+  const adapter = new LarkCliBridgeAdapter({
+    profile: "bot",
+    runner: async (args) => {
+      calls.push(args);
+      return pages.shift();
+    },
+  });
+
+  assert.deepEqual(await adapter.listGroups(), [
+    { chatId: "oc_one", name: "First", ownerId: "ou_owner_one" },
+    { chatId: "oc_two", name: "Second", ownerId: "ou_owner_two" },
+  ]);
+  assert.deepEqual(calls, [
+    ["--profile", "bot", "im", "+chat-list", "--as", "bot", "--page-size", "100", "--json"],
+    ["--profile", "bot", "im", "+chat-list", "--as", "bot", "--page-size", "100", "--json", "--page-token", "next-page"],
+  ]);
+  assert.throws(
+    () => parseFeishuChatPage({ data: { chats: [], has_more: true } }),
+    /omitted the next page token/,
+  );
 });
 
 test("Feishu event and message detail parsers keep the verified routing fields", () => {

@@ -20,6 +20,7 @@ import {
   shouldActivateTerminalLink,
   type LinkMatch,
 } from "./linkDetect";
+import { isTerminalProtocolReply } from "./terminal/terminalResponses";
 import { checkFileExists, openUrlInBrowser } from "./linkActions";
 import "@xterm/xterm/css/xterm.css";
 
@@ -323,6 +324,8 @@ export function Terminal({
 
     let ptyId: string | null = null;
     let ptyConnection: PtyConnection | null = null;
+    let parsingPtyOutput = 0;
+    const pendingTerminalReplies: string[] = [];
     const ptyAbort = new AbortController();
     let reconnectTimer: number | null = null;
     let reconnectStabilityTimer: number | null = null;
@@ -396,6 +399,29 @@ export function Terminal({
       },
     };
     term.registerLinkProvider(linkProvider);
+
+    const writePtyOutput = (data: string) => {
+      parsingPtyOutput += 1;
+      term.write(data, () => {
+        parsingPtyOutput = Math.max(0, parsingPtyOutput - 1);
+      });
+    };
+
+    const dataSubscription = term.onData((data) => {
+      if (controlSession && parsingPtyOutput > 0 && isTerminalProtocolReply(data)) {
+        if (ptyConnection?.active) {
+          ptyConnection.writeTerminalReply(data).catch(() => {});
+        } else {
+          pendingTerminalReplies.push(data);
+        }
+        return;
+      }
+      if (ptyId) {
+        ptyConnection?.write(data).catch(() => {
+          ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
+        });
+      }
+    });
 
     let pendingLink: ResolvedLink | null = null;
     const consumeLinkMouseEvent = (event: MouseEvent) => {
@@ -633,7 +659,7 @@ export function Terminal({
           {
             onData: (event) => {
               if (cancelled) return;
-              term.write(event.data);
+              writePtyOutput(event.data);
               if (
                 hostId &&
                 remoteReconnectAttemptRef.current > 0 &&
@@ -715,6 +741,9 @@ export function Terminal({
           return;
         }
         ptyConnectionRef.current = ptyConnection;
+        for (const reply of pendingTerminalReplies.splice(0)) {
+          await ptyConnection.writeTerminalReply(reply).catch(() => {});
+        }
         ptyId = ptyConnection.active ? id : null;
         onAttachmentIdChangeRef.current?.(ptyId);
         if (ptyId && controlSession && !activeRef.current) {
@@ -768,14 +797,6 @@ export function Terminal({
           };
           void pollControlStatus();
         }
-
-        term.onData((data) => {
-          if (ptyId) {
-            ptyConnection?.write(data).catch(() => {
-              ptyConnection?.controlStatus().then(setControlStatus).catch(() => {});
-            });
-          }
-        });
       } catch (e) {
         if (cancelled || (e instanceof Error && e.name === "AbortError")) return;
         term.write(`\r\n\x1b[31m[pty error] ${String(e)}\x1b[0m\r\n`);
@@ -808,6 +829,7 @@ export function Terminal({
       if (blurHandler) host.removeEventListener("focusout", blurHandler);
       window.removeEventListener(THEME_CHANGED_EVENT, onThemeChange);
       resizeSubscription.dispose();
+      dataSubscription.dispose();
       void ptyConnection?.close();
       if (ptyConnectionRef.current === ptyConnection) ptyConnectionRef.current = null;
       ptyId = null;

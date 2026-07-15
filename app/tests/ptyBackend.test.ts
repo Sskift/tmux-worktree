@@ -355,6 +355,7 @@ test("PTY close is idempotent and closed connections reject write and resize", a
   );
 
   await assert.rejects(connection.write("ignored"), /PTY connection is closed/);
+  await assert.rejects(connection.writeTerminalReply("\x1b[?1;2c"), /PTY connection is closed/);
   await assert.rejects(connection.scroll("up", 1), /PTY connection is closed/);
   await assert.rejects(connection.resize(80, 24), /PTY connection is closed/);
   await assert.rejects(connection.controlStatus(), /PTY connection is closed/);
@@ -362,8 +363,31 @@ test("PTY close is idempotent and closed connections reject write and resize", a
   await assert.rejects(connection.requestRecovery(), /PTY connection is closed/);
   await assert.rejects(connection.releaseControl(), /PTY connection is closed/);
   assert.equal(transport.calls.some((call) => call.command === "pty_write"), false);
+  assert.equal(transport.calls.some((call) => call.command === "pty_write_terminal_reply"), false);
   assert.equal(transport.calls.some((call) => call.command === "pty_control_scroll"), false);
   assert.equal(transport.calls.some((call) => call.command === "pty_resize"), false);
+});
+
+test("controlled terminal replies return to the attachment instead of the pane input lane", async () => {
+  const transport = new InstrumentedPtyTransport();
+  transport.handlers.set("pty_open_managed", () => managedPtyArgs.id);
+  transport.handlers.set("pty_write_terminal_reply", () => undefined);
+  const backend = createDashboardBackend(transport);
+  const connection = await backend.pty.connect(managedPtyArgs, {
+    onData: () => {},
+    onExit: () => {},
+  });
+
+  await connection.writeTerminalReply("\x1b[>0;276;0c");
+
+  assert.deepEqual(
+    transport.calls.filter(({ command }) => command !== "pty_open_managed"),
+    [{
+      command: "pty_write_terminal_reply",
+      args: { id: managedPtyArgs.id, data: "\x1b[>0;276;0c" },
+    }],
+  );
+  await connection.close();
 });
 
 test("PTY ownership status, release, takeover, and explicit recovery stay inside the typed backend", async () => {

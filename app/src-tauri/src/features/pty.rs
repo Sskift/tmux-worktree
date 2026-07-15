@@ -583,6 +583,168 @@ pub(crate) async fn pty_write(
     .map_err(|error| format!("join PTY write: {error}"))?
 }
 
+const MAX_TERMINAL_REPLY_BYTES: usize = 8 * 1024;
+
+fn valid_csi_reply(sequence: &[u8]) -> bool {
+    let Some((&final_byte, body)) = sequence.split_last() else {
+        return false;
+    };
+    if body.is_empty() || body.iter().any(|byte| !(0x20..=0x3f).contains(byte)) {
+        return false;
+    }
+    let body = String::from_utf8_lossy(body);
+    let numeric = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b';' | b':'))
+    };
+    match final_byte {
+        b'c' => matches!(body.as_bytes().first(), Some(b'?' | b'>' | b'=')) && numeric(&body[1..]),
+        b'R' => {
+            let value = body.strip_prefix('?').unwrap_or(&body);
+            value.split_once(';').is_some_and(|(row, col)| {
+                !row.is_empty()
+                    && !col.is_empty()
+                    && row.bytes().all(|byte| byte.is_ascii_digit())
+                    && col.bytes().all(|byte| byte.is_ascii_digit())
+            })
+        }
+        b'n' => {
+            body == "0"
+                || body.strip_prefix('?').is_some_and(|value| {
+                    matches!(value, "0" | "10" | "11" | "13" | "20" | "21" | "53")
+                        || value
+                            .strip_prefix("27;")
+                            .is_some_and(|suffix| numeric(suffix))
+                })
+        }
+        b't' => {
+            matches!(body.as_ref(), "1" | "2")
+                || body.split_once(';').is_some_and(|(kind, rest)| {
+                    matches!(kind, "3" | "4" | "6" | "8" | "9")
+                        && rest.split_once(';').is_some_and(|(first, second)| {
+                            !first.is_empty()
+                                && !second.is_empty()
+                                && first.bytes().all(|byte| byte.is_ascii_digit())
+                                && second.bytes().all(|byte| byte.is_ascii_digit())
+                        })
+                })
+        }
+        b'x' => {
+            let values = body.split(';').collect::<Vec<_>>();
+            values.len() == 7
+                && matches!(values[0], "2" | "3")
+                && values[1..].iter().all(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        }
+        b'y' => body
+            .strip_suffix('$')
+            .map(|value| value.strip_prefix('?').unwrap_or(value))
+            .is_some_and(numeric),
+        b'u' => body.strip_prefix('?').is_some_and(numeric),
+        _ => false,
+    }
+}
+
+fn valid_string_reply(kind: u8, payload: &[u8]) -> bool {
+    match kind {
+        b']' => {
+            let Some(separator) = payload.iter().position(|byte| *byte == b';') else {
+                return false;
+            };
+            let code = &payload[..separator];
+            [
+                "4", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "50", "52",
+            ]
+            .iter()
+            .any(|candidate| code == candidate.as_bytes())
+        }
+        b'P' => {
+            payload.starts_with(b"1+r")
+                || payload.starts_with(b"0+r")
+                || payload.starts_with(b"1$r")
+                || payload.starts_with(b"0$r")
+                || payload.starts_with(b">|")
+        }
+        _ => false,
+    }
+}
+
+fn consume_terminal_reply(data: &[u8], offset: usize) -> Option<usize> {
+    if data.get(offset..offset + 2)?.first() != Some(&0x1b) {
+        return None;
+    }
+    let kind = data[offset + 1];
+    if kind == b'[' {
+        for index in offset + 2..data.len() {
+            let byte = data[index];
+            if (0x40..=0x7e).contains(&byte) {
+                return valid_csi_reply(&data[offset + 2..=index]).then_some(index + 1);
+            }
+            if !(0x20..=0x3f).contains(&byte) {
+                return None;
+            }
+        }
+        return None;
+    }
+    if !matches!(kind, b']' | b'P') {
+        return None;
+    }
+    for index in offset + 2..data.len() {
+        if kind == b']' && data[index] == 0x07 {
+            return valid_string_reply(kind, &data[offset + 2..index]).then_some(index + 1);
+        }
+        if data[index] == 0x1b && data.get(index + 1) == Some(&b'\\') {
+            return valid_string_reply(kind, &data[offset + 2..index]).then_some(index + 2);
+        }
+    }
+    None
+}
+
+fn valid_terminal_reply(data: &[u8]) -> bool {
+    if data.is_empty() || data.len() > MAX_TERMINAL_REPLY_BYTES || !data.is_ascii() {
+        return false;
+    }
+    let mut offset = 0;
+    while offset < data.len() {
+        let Some(next) = consume_terminal_reply(data, offset) else {
+            return false;
+        };
+        offset = next;
+    }
+    true
+}
+
+#[tauri::command]
+pub(crate) async fn pty_write_terminal_reply(
+    state: State<'_, Arc<PtyState>>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    let state = Arc::clone(state.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        if !valid_terminal_reply(data.as_bytes()) {
+            return Err("invalid terminal protocol reply".to_string());
+        }
+        let mut map = state.ptys.lock().unwrap();
+        let handle = map.get_mut(&id).ok_or("pty not found")?;
+        if handle.control_pending {
+            return Err("managed PTY control is still initializing".to_string());
+        }
+        if handle.control.is_none() {
+            return Err("terminal protocol reply requires a controlled attachment".to_string());
+        }
+        handle
+            .writer
+            .write_all(data.as_bytes())
+            .map_err(|error| format!("write terminal protocol reply: {error}"))
+    })
+    .await
+    .map_err(|error| format!("join terminal protocol reply write: {error}"))?
+}
+
 #[tauri::command]
 pub(crate) async fn pty_control_scroll(
     app: tauri::AppHandle,
@@ -688,7 +850,7 @@ pub(crate) fn release_all_pty_controls(
 mod tests {
     use super::{
         managed_ssh_attach_args, target_from_remote_shell, target_from_tmux_args,
-        validate_managed_open,
+        valid_terminal_reply, validate_managed_open,
     };
     use crate::ipc::OpenArgs;
     use crate::remote::HostConfig;
@@ -711,6 +873,35 @@ mod tests {
             env: None,
             control_session: control_session.map(str::to_string),
             control_host_id: None,
+        }
+    }
+
+    #[test]
+    fn only_terminal_protocol_replies_can_enter_the_attachment_lane() {
+        for reply in [
+            b"\x1b[?1;2c".as_slice(),
+            b"\x1b[>0;276;0c".as_slice(),
+            b"\x1b[24;80R".as_slice(),
+            b"\x1b[0n".as_slice(),
+            b"\x1b[8;24;80t".as_slice(),
+            b"\x1b[?2026;1$y".as_slice(),
+            b"\x1b]11;rgb:0d0d/0e0e/1010\x1b\\".as_slice(),
+            b"\x1bP1+r544e=787465726d2d323536636f6c6f72\x1b\\".as_slice(),
+        ] {
+            assert!(valid_terminal_reply(reply), "{reply:?}");
+        }
+        for input in [
+            b"hello".as_slice(),
+            b"\x1b[A".as_slice(),
+            b"\x1b[15~".as_slice(),
+            b"\x1b[6n".as_slice(),
+            b"\x1b[18t".as_slice(),
+            b"\x1b[1;2x".as_slice(),
+            b"\x1b[<0;10;5M".as_slice(),
+            b"\x1b[200~pasted\x1b[201~".as_slice(),
+            b"\x1b]2;title\x07".as_slice(),
+        ] {
+            assert!(!valid_terminal_reply(input), "{input:?}");
         }
     }
 

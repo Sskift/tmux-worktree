@@ -78,6 +78,7 @@ pub fn run() {
             pty_open,
             pty_open_managed,
             pty_write,
+            pty_write_terminal_reply,
             pty_control_scroll,
             pty_resize,
             pty_kill,
