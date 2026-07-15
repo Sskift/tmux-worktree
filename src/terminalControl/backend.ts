@@ -27,7 +27,10 @@ const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 // those bytes directly into a pane bypasses tmux's key translation, so TUIs
 // can receive the trailing characters as text (for example "[D" for Left).
 // Route exact single-key frames through `send-keys`; arbitrary text and paste
-// payloads still use the binary-safe load-buffer path below.
+// payloads still use the load-buffer path below. tmux 3.7 renders a DEL byte
+// pasted from a buffer as the two visible bytes "^?", so Backspace uses the
+// hexadecimal send-keys form. This preserves one literal 0x7f byte without
+// relying on tmux's named BSpace lookup.
 const TMUX_KEY_BY_RAW_HEX = new Map<string, string>([
   ["1b5b41", "Up"],
   ["1b4f41", "Up"],
@@ -50,7 +53,6 @@ const TMUX_KEY_BY_RAW_HEX = new Map<string, string>([
   ["1b5b357e", "PPage"],
   ["1b5b367e", "NPage"],
   ["1b5b5a", "BTab"],
-  ["7f", "BSpace"],
   ["0d", "Enter"],
   ["09", "Tab"],
   ["1b", "Escape"],
@@ -68,8 +70,25 @@ const TMUX_KEY_BY_RAW_HEX = new Map<string, string>([
   ["1b5b32347e", "F12"],
 ]);
 
-function tmuxKeyForRawInput(data: Buffer): string | undefined {
-  return TMUX_KEY_BY_RAW_HEX.get(data.toString("hex"));
+type TmuxRawKey =
+  | { kind: "named"; value: string }
+  | { kind: "hex"; value: string };
+
+function tmuxKeyForRawInput(data: Buffer): TmuxRawKey | undefined {
+  const rawHex = data.toString("hex");
+  if (rawHex === "7f") return { kind: "hex", value: rawHex };
+  const named = TMUX_KEY_BY_RAW_HEX.get(rawHex);
+  return named ? { kind: "named", value: named } : undefined;
+}
+
+function tmuxSendKeyArgs(paneTarget: string, key: TmuxRawKey): string[] {
+  return key.kind === "hex"
+    ? ["send-keys", "-H", "-t", paneTarget, key.value]
+    : ["send-keys", "-t", paneTarget, key.value];
+}
+
+function tmuxSendKeyCommand(paneTarget: string, key: TmuxRawKey): string {
+  return tmuxSendKeyArgs(paneTarget, key).join(" ");
 }
 
 export interface TerminalControlOutputPosition {
@@ -478,7 +497,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     if (data.byteLength === 0) return;
     const key = tmuxKeyForRawInput(data);
     if (key) {
-      await runTmux(["send-keys", "-t", paneTarget, key]);
+      await runTmux(tmuxSendKeyArgs(paneTarget, key));
       return;
     }
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
@@ -593,7 +612,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     const key = tmuxKeyForRawInput(data);
     const committed = [
       key
-        ? `send-keys -t ${paneId} ${key}`
+        ? tmuxSendKeyCommand(paneId, key)
         : `load-buffer -b ${bufferName} - ; paste-buffer -b ${bufferName} -d -r -t ${paneId}`,
       `display-message -p ${committedMarker}`,
     ].join(" ; ");

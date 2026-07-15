@@ -16,6 +16,7 @@ import test from "node:test";
 
 const {
   assertRpcMutationCapabilities,
+  createRelayLookup,
   isManagedWorktreeRow,
   isRpcManagedTerminalSession,
   isRpcManagedWorktreeSession,
@@ -34,6 +35,90 @@ const {
   sessionNameFromTwWorktreeDir,
   writeTerminalRegistryAtomic,
 } = await import("../dist/relayHost.js");
+
+function invokeLookup(lookup, hostname, options) {
+  return new Promise((resolve, reject) => {
+    lookup(hostname, options, (error, address, family) => {
+      if (error) reject(error);
+      else resolve({ address, family });
+    });
+  });
+}
+
+test("Quick Tunnel DNS bypasses a stale system negative cache without changing fixed relay lookup", async () => {
+  const negativeCacheError = Object.assign(new Error("stale system DNS result"), { code: "ENOTFOUND" });
+  let directQueries = 0;
+  const lookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "darwin",
+    resolve4: async () => {
+      directQueries += 1;
+      return ["192.0.2.10"];
+    },
+    resolve6: async () => {
+      directQueries += 1;
+      return ["2001:db8::10"];
+    },
+  });
+
+  assert.deepEqual(
+    await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true }),
+    {
+      address: [
+        { address: "192.0.2.10", family: 4 },
+        { address: "2001:db8::10", family: 6 },
+      ],
+      family: undefined,
+    },
+  );
+  assert.equal(directQueries, 2);
+
+  assert.deepEqual(
+    await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true, family: "IPv6" }),
+    {
+      address: [{ address: "2001:db8::10", family: 6 }],
+      family: undefined,
+    },
+  );
+  assert.equal(directQueries, 3);
+
+  assert.deepEqual(
+    await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: false, family: 4 }),
+    { address: "192.0.2.10", family: 4 },
+  );
+  assert.equal(directQueries, 4);
+
+  await assert.rejects(
+    invokeLookup(lookup, "relay.example.net", { all: false }),
+    (error) => error === negativeCacheError,
+  );
+  assert.equal(directQueries, 4);
+
+  const linuxLookup = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "linux",
+    resolve4: async () => {
+      directQueries += 1;
+      return ["192.0.2.20"];
+    },
+  });
+  await assert.rejects(
+    invokeLookup(linuxLookup, "fresh-tunnel.trycloudflare.com", { all: false }),
+    (error) => error === negativeCacheError,
+  );
+  assert.equal(directQueries, 4);
+
+  const unavailableDirectDns = createRelayLookup({
+    lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
+    platform: "darwin",
+    resolve4: async () => { throw new Error("no A response"); },
+    resolve6: async () => { throw new Error("no AAAA response"); },
+  });
+  await assert.rejects(
+    invokeLookup(unavailableDirectDns, "fresh-tunnel.trycloudflare.com", { all: true }),
+    (error) => error === negativeCacheError,
+  );
+});
 
 test("remote mutation requires an explicit hard-timeout RPC capability", () => {
   const supported = JSON.stringify({

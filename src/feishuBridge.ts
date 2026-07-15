@@ -19,12 +19,14 @@ import {
   type FeishuInboundEvent,
   type FeishuLarkAdapter,
 } from "./larkCliBridge.js";
+import { buildFeishuReplyCard } from "./feishuReplyCard.js";
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
 const MAX_TURN_OUTPUT_BYTES = 128 * 1024;
 const MAX_REPLY_BYTES = 16 * 1024;
 const OUTPUT_TAIL_BYTES = 64 * 1024;
+const PROCESSING_REACTION_CACHE_SIZE = 1024;
 
 interface BridgeState {
   bindings: FeishuBinding[];
@@ -32,6 +34,10 @@ interface BridgeState {
   turns: FeishuTurn[];
   replies: FeishuOutboundReply[];
 }
+
+type PendingProcessingReaction =
+  | { state: "unknown" }
+  | { state: "created"; reactionId: string };
 
 export interface CreateFeishuBindingInput {
   chatId: string;
@@ -156,8 +162,10 @@ export class FeishuBridge {
   private botOpenId?: string;
   private botMentionIds?: Set<string>;
   private readonly leases = new Map<string, CanonicalTerminalLease>();
+  private readonly pendingProcessingReactions = new Map<string, PendingProcessingReaction>();
   private state: BridgeState;
   private mutation = Promise.resolve();
+  private reactionMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -179,6 +187,10 @@ export class FeishuBridge {
   initializeAfterRestart(): void {
     let changed = false;
     for (const binding of this.state.bindings) {
+      if (!binding.options.replyAsCard) {
+        binding.options.replyAsCard = true;
+        changed = true;
+      }
       if (binding.status === "active" || binding.status === "pausing") {
         binding.status = "stale";
         binding.staleReason = "bridge restarted; ownership was not recreated automatically";
@@ -234,7 +246,7 @@ export class FeishuBridge {
         status: input.dashboardLease ? "pausing" : "active",
         options: {
           mentionOnly: input.mentionOnly !== false,
-          replyAsCard: false,
+          replyAsCard: true,
           includeQuotedContext: false,
         },
         allowedSenderIds,
@@ -350,6 +362,7 @@ export class FeishuBridge {
           this.leases.delete(binding.id);
           this.markBindingStale(binding, `lease release disposition is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           this.persist();
+          if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
           throw error;
         }
       }
@@ -358,6 +371,7 @@ export class FeishuBridge {
       delete binding.staleReason;
       binding.lastActivityAt = nowIso(this.now);
       this.persist();
+      if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
       return structuredClone(binding);
     });
   }
@@ -445,12 +459,14 @@ export class FeishuBridge {
           this.leases.delete(binding.id);
           this.markBindingStale(binding, `unbind release disposition is uncertain: ${error instanceof Error ? error.message : String(error)}`);
           this.persist();
+          if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
           throw error;
         }
       }
       this.leases.delete(binding.id);
       this.state.bindings = this.state.bindings.filter((candidate) => candidate.id !== bindingId);
       this.persist();
+      if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
     });
   }
 
@@ -528,6 +544,8 @@ export class FeishuBridge {
         this.markBindingStale(binding, `takeover disposition requires inspection: ${error instanceof Error ? error.message : String(error)}`);
         this.persist();
         throw error;
+      } finally {
+        if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
       }
     });
   }
@@ -720,12 +738,14 @@ export class FeishuBridge {
       turn.status = "awaiting";
       binding.lastActivityAt = nowIso(this.now);
       this.persist();
+      this.queueProcessingReactionStart(turn.messageId);
     });
   }
 
   renewLeases(): Promise<void> {
     return this.serial(async () => {
       let changed = false;
+      const failedTurnMessageIds: string[] = [];
       for (const [bindingId, lease] of [...this.leases]) {
         const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
         if (!binding || binding.status !== "active") continue;
@@ -751,11 +771,15 @@ export class FeishuBridge {
             turn.status = "recovery-required";
             turn.completedAt = nowIso(this.now);
             turn.error = "terminal ownership lease renewal failed";
+            failedTurnMessageIds.push(turn.messageId);
           }
           changed = true;
         }
       }
       if (changed) this.persist();
+      for (const messageId of failedTurnMessageIds) {
+        this.queueProcessingReactionSettlement(messageId, "failure");
+      }
     });
   }
 
@@ -778,6 +802,7 @@ export class FeishuBridge {
 
   async close(): Promise<void> {
     await this.serial(async () => {
+      const failedTurnMessageIds: string[] = [];
       for (const [bindingId, lease] of [...this.leases]) {
         const binding = this.state.bindings.find((candidate) => candidate.id === bindingId);
         const turn = binding ? this.activeTurn(binding.id) : undefined;
@@ -786,6 +811,7 @@ export class FeishuBridge {
           turn.completedAt = nowIso(this.now);
           turn.error = "bridge stopped before the terminal turn reached a certain disposition";
           if (binding) this.markBindingStale(binding, turn.error);
+          failedTurnMessageIds.push(turn.messageId);
           continue;
         }
         if (binding?.status === "stale") {
@@ -804,7 +830,14 @@ export class FeishuBridge {
       }
       this.leases.clear();
       this.persist();
+      for (const messageId of failedTurnMessageIds) {
+        this.queueProcessingReactionSettlement(messageId, "failure");
+      }
     });
+    // Terminal authority is already persisted/released above. Drain the
+    // independent best-effort UX lane before a clean shutdown reports done so
+    // known Typing handles are not abandoned merely because the daemon stopped.
+    await this.reactionMutation;
   }
 
   private async pollTurn(turn: FeishuTurn): Promise<void> {
@@ -815,6 +848,7 @@ export class FeishuBridge {
       turn.completedAt = nowIso(this.now);
       turn.error = "binding ownership disappeared while awaiting output";
       this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
     if (this.now() >= Date.parse(turn.deadlineAt)) {
@@ -863,6 +897,7 @@ export class FeishuBridge {
       turn.error = error instanceof Error ? error.message : String(error);
       this.markBindingStale(binding, turn.error);
       this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
     if (!turn.markerNonce) {
@@ -871,6 +906,7 @@ export class FeishuBridge {
       turn.error = "Feishu turn has no persisted marker correlation";
       this.markBindingStale(binding, turn.error);
       this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
     const marked = extractFeishuMarkedReply(turn.output, turn.markerNonce);
@@ -888,13 +924,16 @@ export class FeishuBridge {
     text: string,
     finalStatus: "completed" | "timed-out",
   ): Promise<void> {
-    const lease = this.leases.get(binding.id);
-    if (!lease) throw new Error("Feishu lease disappeared before outbound reply");
-    const target = await this.control.ownershipStatus(turn.controlTargetId);
-    this.assertTurnAuthority(turn, lease, target);
-    let attempt = this.state.replies.find((candidate) => candidate.id === turn.outboundAttemptId);
-    if (!attempt) {
-      attempt = {
+    let lease: CanonicalTerminalLease;
+    let attempt: FeishuOutboundReply;
+    try {
+      const currentLease = this.leases.get(binding.id);
+      if (!currentLease) throw new Error("Feishu lease disappeared before outbound reply");
+      lease = currentLease;
+      const target = await this.control.ownershipStatus(turn.controlTargetId);
+      this.assertTurnAuthority(turn, lease, target);
+      const existing = this.state.replies.find((candidate) => candidate.id === turn.outboundAttemptId);
+      attempt = existing ?? {
         id: turn.outboundAttemptId,
         turnId: turn.id,
         sourceMessageId: turn.messageId,
@@ -903,13 +942,28 @@ export class FeishuBridge {
         textDigest: digest(text),
         createdAt: nowIso(this.now),
       };
-      this.state.replies.push(attempt);
+      if (!existing) this.state.replies.push(attempt);
+      if (attempt.textDigest !== digest(text)) throw new Error("outbound reply payload changed after preparation");
+      turn.status = "replying";
+      this.persist();
+    } catch (error) {
+      turn.status = "recovery-required";
+      turn.completedAt = nowIso(this.now);
+      turn.error = `outbound Feishu reply was not started: ${error instanceof Error ? error.message : String(error)}`;
+      this.markBindingStale(binding, turn.error);
+      try {
+        this.persist();
+      } finally {
+        this.queueProcessingReactionSettlement(turn.messageId, "failure");
+      }
+      return;
     }
-    if (attempt.textDigest !== digest(text)) throw new Error("outbound reply payload changed after preparation");
-    turn.status = "replying";
-    this.persist();
     try {
-      const result = await this.lark.reply(turn.messageId, text, attempt.idempotencyKey);
+      const result = await this.lark.replyCard(
+        turn.messageId,
+        buildFeishuReplyCard(text, finalStatus === "timed-out" ? "status" : "answer"),
+        attempt.idempotencyKey,
+      );
       const latest = await this.control.ownershipStatus(turn.controlTargetId);
       this.assertTurnAuthority(turn, lease, latest);
       attempt.status = "sent";
@@ -919,6 +973,10 @@ export class FeishuBridge {
       turn.completedAt = nowIso(this.now);
       binding.lastActivityAt = turn.completedAt;
       this.persist();
+      this.queueProcessingReactionSettlement(
+        turn.messageId,
+        finalStatus === "completed" ? "success" : "failure",
+      );
     } catch (error) {
       attempt.status = "uncertain";
       attempt.completedAt = nowIso(this.now);
@@ -928,6 +986,7 @@ export class FeishuBridge {
       turn.error = "outbound Feishu reply disposition is uncertain";
       this.markBindingStale(binding, turn.error);
       this.persist();
+      this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
     }
   }
 
@@ -962,6 +1021,7 @@ export class FeishuBridge {
       }
       this.markBindingStale(binding, `terminal ownership entered ${target.state} during Feishu handoff reconciliation`);
       this.persist();
+      if (turn) this.queueProcessingReactionSettlement(turn.messageId, "failure");
       return;
     }
     if (this.activeTurn(binding.id)) return;
@@ -1289,8 +1349,82 @@ export class FeishuBridge {
 
   private async safeInform(messageId: string, text: string, idempotencySeed: string): Promise<void> {
     try {
-      await this.lark.reply(messageId, text, `tw-${digest(idempotencySeed).slice(0, 40)}`);
+      await this.lark.replyCard(
+        messageId,
+        buildFeishuReplyCard(text, "status"),
+        `tw-${digest(idempotencySeed).slice(0, 40)}`,
+      );
     } catch {}
+  }
+
+  private queueProcessingReactionStart(messageId: string): void {
+    if (this.pendingProcessingReactions.has(messageId)) return;
+    if (this.pendingProcessingReactions.size >= PROCESSING_REACTION_CACHE_SIZE) return;
+    // Creation may reach Feishu even if its acknowledgement is lost. Keep an
+    // explicit unknown handle before the call so a later failure never stacks
+    // CrossMark on top of a Typing reaction that we cannot identify/delete.
+    this.pendingProcessingReactions.set(messageId, { state: "unknown" });
+    this.enqueueReactionEffect(() => this.createProcessingReaction(messageId));
+  }
+
+  private async createProcessingReaction(messageId: string): Promise<void> {
+    try {
+      const result = await this.lark.addReaction(messageId, "Typing");
+      if (!result.reactionId) return;
+      this.pendingProcessingReactions.set(messageId, {
+        state: "created",
+        reactionId: result.reactionId,
+      });
+    } catch (error) {
+      process.stderr.write(`[feishu-bridge] add Typing reaction failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  private queueProcessingReactionSettlement(
+    messageId: string,
+    outcome: "success" | "failure" | "cancelled",
+  ): void {
+    // A start may be skipped when the bounded cache is full. In that case the
+    // entire reaction lifecycle is skipped rather than growing an unbounded
+    // settlement backlog or adding CrossMark without a known Typing state.
+    if (!this.pendingProcessingReactions.has(messageId)) return;
+    this.enqueueReactionEffect(() => this.settleProcessingReaction(messageId, outcome));
+  }
+
+  private async settleProcessingReaction(
+    messageId: string,
+    outcome: "success" | "failure" | "cancelled",
+  ): Promise<void> {
+    const pending = this.pendingProcessingReactions.get(messageId);
+    if (pending?.state === "unknown") {
+      this.pendingProcessingReactions.delete(messageId);
+      return;
+    }
+    if (pending?.state === "created") {
+      try {
+        await this.lark.deleteReaction(messageId, pending.reactionId);
+        this.pendingProcessingReactions.delete(messageId);
+      } catch (error) {
+        process.stderr.write(`[feishu-bridge] remove Typing reaction failed: ${error instanceof Error ? error.message : String(error)}\n`);
+        return;
+      }
+    }
+    if (outcome !== "failure") return;
+    try {
+      await this.lark.addReaction(messageId, "CrossMark");
+    } catch (error) {
+      process.stderr.write(`[feishu-bridge] add CrossMark reaction failed: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
+
+  private enqueueReactionEffect(effect: () => Promise<void>): void {
+    const result = this.reactionMutation.then(effect, effect);
+    this.reactionMutation = result.then(
+      () => undefined,
+      (error) => {
+        process.stderr.write(`[feishu-bridge] reaction effect failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    );
   }
 
   private persist(): void {

@@ -4,6 +4,8 @@ import { basename, dirname, join } from "node:path";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
+import { lookup as systemDnsLookup, promises as dnsPromises, type LookupOptions } from "node:dns";
+import type { LookupFunction } from "node:net";
 import { WebSocket } from "ws";
 import { loadConfigFile, type HostConfig } from "./config.js";
 import {
@@ -43,6 +45,84 @@ type RelayHostOptions = {
 };
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
+
+type RelayDnsResolver = (hostname: string) => Promise<string[]>;
+
+type RelayLookupDependencies = {
+  lookup: LookupFunction;
+  platform: NodeJS.Platform;
+  resolve4: RelayDnsResolver;
+  resolve6: RelayDnsResolver;
+};
+
+function isQuickTunnelHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/\.$/, "");
+  const label = normalized.slice(0, -".trycloudflare.com".length);
+  return normalized.endsWith(".trycloudflare.com") && !!label && !label.includes(".");
+}
+
+function isRetryableSystemDnsError(error: NodeJS.ErrnoException): boolean {
+  return error.code === "ENOTFOUND" || error.code === "EAI_AGAIN";
+}
+
+async function resolveQuickTunnelAddresses(
+  hostname: string,
+  family: LookupOptions["family"],
+  dependencies: RelayLookupDependencies,
+): Promise<Array<{ address: string; family: number }>> {
+  const families = family === 4 || family === "IPv4"
+    ? [4]
+    : family === 6 || family === "IPv6"
+      ? [6]
+      : [4, 6];
+  const settled = await Promise.allSettled(families.map(async (candidate) => ({
+    family: candidate,
+    addresses: await (candidate === 4 ? dependencies.resolve4(hostname) : dependencies.resolve6(hostname)),
+  })));
+  return settled.flatMap((result) => result.status === "fulfilled"
+    ? result.value.addresses.map((address) => ({ address, family: result.value.family }))
+    : []);
+}
+
+export function createRelayLookup(
+  overrides: Partial<RelayLookupDependencies> = {},
+): LookupFunction {
+  const dependencies: RelayLookupDependencies = {
+    lookup: overrides.lookup ?? systemDnsLookup,
+    platform: overrides.platform ?? process.platform,
+    resolve4: overrides.resolve4 ?? dnsPromises.resolve4,
+    resolve6: overrides.resolve6 ?? dnsPromises.resolve6,
+  };
+  return (hostname, options, callback) => {
+    dependencies.lookup(hostname, options, (error, address, family) => {
+      if (!error) {
+        callback(null, address, family);
+        return;
+      }
+      if (
+        dependencies.platform !== "darwin"
+        || !isQuickTunnelHostname(hostname)
+        || !isRetryableSystemDnsError(error)
+      ) {
+        callback(error, address, family);
+        return;
+      }
+      void resolveQuickTunnelAddresses(hostname, options.family, dependencies).then((addresses) => {
+        if (addresses.length === 0) {
+          callback(error, address, family);
+          return;
+        }
+        if (options.all) {
+          callback(null, addresses);
+          return;
+        }
+        callback(null, addresses[0].address, addresses[0].family);
+      }, () => callback(error, address, family));
+    });
+  };
+}
+
+const relayLookup = createRelayLookup();
 
 type RelayStatusOwnership = {
   instanceId: string;
@@ -2896,6 +2976,7 @@ async function runConnection(
     headers: { Authorization: `Bearer ${opts.secret}` },
     perMessageDeflate: false,
     maxPayload: MAX_RELAY_FRAME_BYTES,
+    lookup: relayLookup,
   });
   onSocket(relaySocket);
   const streams = new Map<string, LocalStream>();

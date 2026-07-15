@@ -429,7 +429,7 @@ transport.handlers.set("feishu_binding_create", (payload) => {
     backendBirthId: "birth-preview",
     sessionName: args.sessionName,
     status: "active",
-    options: { mentionOnly: true, replyAsCard: false, includeQuotedContext: false },
+    options: { mentionOnly: true, replyAsCard: true, includeQuotedContext: false },
     allowedSenderIds: [],
     createdAt: new Date().toISOString(),
     createdBy: args.createdBy,

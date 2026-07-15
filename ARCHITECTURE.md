@@ -66,7 +66,7 @@ cross-surface implementation ──> versioned RPC / wire / storage contract
 | `src/relayServer.ts`, `src/relay/broker/` | Relay v1 鉴权、Host/Client 路由和连接生命周期 |
 | `src/relay/v1/` | Relay v1 wire model 与消息类型 |
 | `src/terminalControl/` | 本地 input ownership contract client/server、lease/fence authority、受控 backend write 与 output cursor |
-| `src/feishuBridge*.ts`, `src/larkCliBridge.ts` | 独立 Feishu binding/event/turn/reply daemon 与 Lark adapter；不调用 Relay transport |
+| `src/feishuBridge*.ts`, `src/feishuReplyCard.ts`, `src/larkCliBridge.ts` | 独立 Feishu binding/event/turn/reply daemon、Card JSON 2.0 builder 与 Lark adapter；不调用 Relay transport |
 
 `tw rpc` 是给 Dashboard、Relay 和 headless agent 使用的机器接口。当前协议提供 capabilities、list、create-worktree、create-terminal、restore-worktree 和 kill-session；JSON shape 由 `contracts/tw-rpc/v1` 固化。
 
@@ -202,7 +202,7 @@ relay-host on the Mac admin machine
 
 Mac connector 是业务桥接点：它读取和 Dashboard 相同的项目、Host、terminal metadata 与 managed state，并用 Mac 的 SSH 权限聚合 local 和 remote scope。broker 只鉴权、维护 Host/Client/stream 路由和转发 frame；它不拥有 session、worktree 或 Android Outbox 状态。
 
-Dashboard 的 Rust mobile-relay feature 负责保存 Relay center 与 connector 配置、启动或停止 `tw serve` / `tw relay-host`，也可把 bundled CLI 安装到用户明确选择的稳定 SSH 主机上启动 broker。选择写入 `mobileRelay.brokerHostId`，与开发 session 运行在哪个 Host 无关。Dashboard 托管的 broker 只监听远端 loopback；一键设置优先复用该 center 已保存的固定 WSS，否则通过远端已有的 `cloudflared` 建立临时 Quick Tunnel，读取并校验生成的根 `wss://` URL。启动 connector 前，Mac 先通过不进入系统负缓存的 DNS 查询等待公网记录出现，再确认本机系统解析器可用；Relay center 不需要解析自己的公网 URL。阻塞的 SSH 与 DNS 编排运行在 Tauri 后台任务中，不占用 UI 线程。它不会创建 Mac LAN forward、公开明文 broker 或合成 `.local` URL。connector 的 Node.js 实现仍位于根 `src/`。
+Dashboard 的 Rust mobile-relay feature 负责保存 Relay center 与 connector 配置、启动或停止 `tw serve` / `tw relay-host`，也可把 bundled CLI 安装到用户明确选择的稳定 SSH 主机上启动 broker。选择写入 `mobileRelay.brokerHostId`，与开发 session 运行在哪个 Host 无关。Dashboard 托管的 broker 只监听远端 loopback；一键设置优先复用该 center 已保存的固定 WSS，否则通过远端已有的 `cloudflared` 建立临时 Quick Tunnel，读取并校验生成的根 `wss://` URL。Quick Tunnel URL 发布后，Node connector 负责重试 DNS 传播；若 macOS `getaddrinfo` 仍命中旧的负缓存而公网 A/AAAA 已可用，只对该 Quick Tunnel 使用直接解析结果建立连接，原 WSS hostname 与 TLS 校验保持不变。Relay center 不需要解析自己的公网 URL，阻塞的 SSH 编排运行在 Tauri 后台任务中，不占用 UI 线程。它不会创建 Mac LAN forward、公开明文 broker 或合成 `.local` URL。connector 的 Node.js 实现仍位于根 `src/`。
 
 broker、WSS ingress 与 connector 在后端仍是可诊断的独立生命周期，但 Dashboard 的 **Set up Relay** 会按顺序编排它们：取得可信 WSS、部署/重启远端 broker 并轮换 Relay v1 shared secret、原子保存配置，再启动 Mac connector。固定 WSS 和单独 Save/Start 仍作为高级运维与恢复入口；`Stop connector` 只管理 Mac connector 与其本地 loopback `tw serve`。Dashboard 的 `connected` 只证明 Mac connector 已连接 broker，不证明 Android 在线；broker 部署成功也只是一轮命令结果，不伪装成持续健康状态。
 
@@ -220,7 +220,7 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 
 Dashboard、受控 `tw attach`、`tw serve`、Relay v1 和 Feishu Bridge 的产品级真实写路径都映射到同一个 `controlTargetId`，并由目标主机上的 terminal-control authority 在一次 critical section 内完成 lease/fence 校验和 backend write。Relay terminal stream、Android 重连和 Feishu awaiting turn 都不是 input lease；observer 可以继续读 output，但不能据此取得或恢复写权。Dashboard、APK/Relay、受控 CLI 和 `tw serve` 在首个真实 input 时加入同一个 interactive lease/fence，多个实例可并行连接并由 single writer 串行提交 operation；某个 attachment release 只丢弃自己的本地 lease，不 fence 其他 interactive writer，最后一个登记的 producer 正常 release 时回到 `FREE`。只有 Feishu acquire/handoff 会把 interactive 端变为只读。异常退出后无人续租的 interactive lease 仍会在 exact target 复核和 output capture 换代后安全回到 `FREE`，Feishu 与不确定副作用继续 fail closed。
 
-Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 触发策略、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 的正常绑定不要求管理员 Open ID：同一群内任意真实用户均可 @Bot 发起一轮，Bot/self、非用户事件和未 @Bot 的普通消息不会注入 session。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership；它只丢弃自己的 interactive lease view。Feishu 占用时 Dashboard 的本地 takeover/pause 操作负责 drain 或取消当前 turn，再原子切回 interactive 类。Settings 只持久化非敏感的 `lark-cli` profile 名称，bot credential 继续由 `lark-cli` 拥有；更换 profile 只允许在没有任何 binding/turn 的空 Bridge 上执行。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
+Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 触发策略、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 的正常绑定不要求管理员 Open ID：同一群内任意真实用户均可 @Bot 发起一轮，Bot/self、非用户事件和未 @Bot 的普通消息不会注入 session。确定的最终回复以 Card JSON 2.0 回到源消息话题；`Typing`/`CrossMark` reaction 只是 bounded in-memory 的 best-effort 展示状态，不参与 reply disposition 或 terminal authority，daemon 硬崩溃或 reaction create/delete ACK 不确定可能留下未清理的 `Typing`。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership；它只丢弃自己的 interactive lease view。Feishu 占用时 Dashboard 的本地 takeover/pause 操作负责 drain 或取消当前 turn，再原子切回 interactive 类。Settings 只持久化非敏感的 `lark-cli` profile 名称，bot credential 继续由 `lark-cli` 拥有；更换 profile 只允许在没有任何 binding/turn 的空 Bridge 上执行。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
 
 ## 状态所有权
 

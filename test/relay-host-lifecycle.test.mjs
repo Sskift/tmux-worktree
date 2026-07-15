@@ -169,18 +169,32 @@ if (args[0] === "if-shell") {
     process.stdout.write(String(rejectedMarker || "rejected") + "\\n");
     process.exit(0);
   }
+  const hexKey = /(?:^| ; )send-keys -H -t (%\\d+) ([0-9a-f]{2})(?: ; |$)/.exec(committedCommand);
   const translatedKey = /(?:^| ; )send-keys -t (%\\d+) ([A-Za-z0-9-]+)(?: ; |$)/.exec(committedCommand);
-  if (translatedKey) {
+  if (hexKey || translatedKey) {
     if (existsSync(join(gateDir, "fail-send-keys"))) {
       process.stderr.write("simulated key input failure\\n");
       process.exit(42);
     }
+    if (translatedKey?.[2] === "BSpace" && existsSync(join(gateDir, "fail-named-backspace"))) {
+      process.stderr.write("simulated named Backspace failure\\n");
+      process.exit(43);
+    }
+    const mutationArgs = hexKey
+      ? ["send-keys", "-H", "-t", hexKey[1], hexKey[2]]
+      : ["send-keys", "-t", translatedKey[1], translatedKey[2]];
     appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({
       pid: process.pid,
-      args: ["send-keys", "-t", translatedKey[1], translatedKey[2]],
+      args: mutationArgs,
       session,
       startedAt: Date.now(),
     }) + "\\n");
+    if (hexKey) {
+      appendFileSync(
+        join(gateDir, "tmux-inputs.ndjson"),
+        JSON.stringify({ args: mutationArgs, input: Buffer.from(hexKey[2], "hex").toString("latin1") }) + "\\n",
+      );
+    }
     process.stdout.write(committedMarker + "\\n");
     process.exit(0);
   }
@@ -197,6 +211,10 @@ if (args[0] === "if-shell") {
   let input = "";
   process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
   process.stdin.on("end", () => {
+    // tmux 3.7 expands a pasted DEL byte to the two visible bytes "^?".
+    // Keep the fake aligned with that external behavior so this regression
+    // cannot pass merely by routing Backspace through paste-buffer.
+    const deliveredInput = input === "\x7f" ? "^?" : input;
     appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({
       pid: process.pid,
       args: mutationArgs,
@@ -205,7 +223,7 @@ if (args[0] === "if-shell") {
     }) + "\\n");
     appendFileSync(
       join(gateDir, "tmux-inputs.ndjson"),
-      JSON.stringify({ args: mutationArgs, input }) + "\\n",
+      JSON.stringify({ args: mutationArgs, input: deliveredInput }) + "\\n",
     );
     process.stdout.write(committedMarker + "\\n");
     process.exit(0);
@@ -1511,6 +1529,40 @@ test("application cursor input is translated by tmux inside the fenced controlle
   assert.match(translated.args[2], /^%\d+$/);
   assert.deepEqual(translated.args, ["send-keys", "-t", translated.args[2], "Left"]);
   assert.equal(existsSync(join(harness.gateDir, "tmux-inputs.ndjson")), false);
+});
+
+test("Backspace remains one DEL byte when named translation fails and later input stays writable", async (t) => {
+  const harness = await startHarness(t);
+  openTerminal(harness, "backspace-binary-input");
+  await waitFor(
+    () => harness.localConnections.some(({ session }) => session === "backspace-binary-input"),
+    "Backspace backend did not open",
+  );
+
+  writeFileSync(join(harness.gateDir, "fail-named-backspace"), "");
+  const beforeInput = harness.brokerMessages.length;
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "\x7f" });
+  await waitFor(() => {
+    const path = join(harness.gateDir, "tmux-inputs.ndjson");
+    if (!existsSync(path)) return false;
+    return readFileSync(path, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line))
+      .some((candidate) => candidate.input === "\x7f");
+  }, "Backspace was rejected when tmux key translation failed");
+
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "still-writable" });
+  await waitFor(
+    () => readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8").includes("still-writable"),
+    "Backspace left the controlled target unable to accept later input",
+  );
+  const failures = harness.brokerMessages
+    .slice(beforeInput)
+    .map(({ message }) => message)
+    .filter(({ type, streamId }) => streamId === STREAM_ID && (type === "error" || type === "terminal_exit"));
+  assert.deepEqual(failures, []);
 });
 
 test("closing one observer route does not release another route's shared client ownership", async (t) => {

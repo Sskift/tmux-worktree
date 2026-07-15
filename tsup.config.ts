@@ -12,6 +12,7 @@ export default defineConfig({
     "src/relayServer.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
+    "src/feishuReplyCard.ts",
     "src/larkCliBridge.ts",
     "src/feishuBridgeStorage.ts",
     "src/feishuBridge.ts",

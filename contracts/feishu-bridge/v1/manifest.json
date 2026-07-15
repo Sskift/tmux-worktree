@@ -39,7 +39,12 @@
     "dashboardConversationPolicy": "empty allowedSenderIds means any human user in the bound group may trigger only by mentioning the exact bot; bot/self, non-user, and unmentioned messages are ignored"
   },
   "reply": {
-    "command": "lark-cli im +messages-reply --as bot",
+    "command": "lark-cli im +messages-reply --msg-type interactive --reply-in-thread --as bot",
+    "format": "Card JSON 2.0 final card",
+    "threading": "reply in the source message topic; never fall back to a top-level chat reply",
+    "streaming": false,
+    "cardActions": false,
+    "agentMentions": "neutralized before markdown rendering",
     "startMarkerTemplate": "[[notify-group:<persisted-turn-nonce>]]",
     "endMarkerTemplate": "[[/notify-group:<persisted-turn-nonce>]]",
     "promptEchoSafe": true,
@@ -47,6 +52,14 @@
     "idempotencyRequired": true,
     "unknownAcknowledgement": "recovery-required",
     "unterminatedMarker": "never-send"
+  },
+  "reactions": {
+    "processing": "Typing",
+    "success": "remove Typing; the reply card is the success signal",
+    "failure": "remove Typing before adding CrossMark",
+    "deleteFailure": "do not add a contradictory CrossMark",
+    "authority": "best-effort UX only; reaction failures never change terminal ownership or reply disposition",
+    "durability": "reaction handles are bounded in-memory state; a hard daemon crash or uncertain create/delete acknowledgement can leave Typing until manually removed"
   },
   "storage": {
     "mode": "0600",

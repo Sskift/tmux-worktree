@@ -23,7 +23,9 @@ const {
   parseFeishuBotOpenId,
   parseFeishuInboundEvent,
   parseFeishuMessageDetail,
+  parseFeishuReactionId,
 } = await import("../dist/larkCliBridge.js");
+const { buildFeishuReplyCard } = await import("../dist/feishuReplyCard.js");
 const terminalControl = await import("../dist/terminalControl/index.js");
 
 class JointTerminalBackend {
@@ -121,6 +123,8 @@ class FakeControlClient {
     this.beforeInput = undefined;
     this.beforeCommit = undefined;
     this.failInputAfterCommit = false;
+    this.ownershipStatusCalls = 0;
+    this.failOwnershipStatusAt = undefined;
     this.outputGenerationSequence = 1;
     this.target = {
       controlEpoch: "epoch-one",
@@ -221,6 +225,12 @@ class FakeControlClient {
   async ownershipStatus(controlTargetId) {
     this.record("ownership.status", { controlTargetId });
     assert.equal(controlTargetId, this.target.controlTargetId);
+    this.ownershipStatusCalls += 1;
+    if (this.ownershipStatusCalls === this.failOwnershipStatusAt) {
+      const error = new Error("controller unavailable during outbound authority check");
+      error.code = "CONTROLLER_UNAVAILABLE";
+      throw error;
+    }
     return this.ownership();
   }
 
@@ -417,7 +427,13 @@ class FakeLark {
   constructor() {
     this.details = new Map();
     this.replies = [];
+    this.reactionCreates = [];
+    this.reactionDeletes = [];
     this.failReply = false;
+    this.failReactionCreateAcknowledgement = false;
+    this.omitReactionId = false;
+    this.failReactionDelete = false;
+    this.reactionCreateBarrier = undefined;
   }
 
   subscribe() {
@@ -433,10 +449,26 @@ class FakeLark {
     };
   }
 
-  async reply(messageId, text, idempotencyKey) {
-    this.replies.push({ messageId, text, idempotencyKey });
+  async replyCard(messageId, card, idempotencyKey) {
+    const text = card.body.elements[0].content;
+    this.replies.push({ messageId, text, card, idempotencyKey });
     if (this.failReply) throw new Error("reply acknowledgement lost");
     return { messageId: `reply-${this.replies.length}`, raw: {} };
+  }
+
+  async addReaction(messageId, emojiType) {
+    const reactionId = `reaction-${this.reactionCreates.length + 1}`;
+    this.reactionCreates.push({ messageId, emojiType, reactionId });
+    if (this.reactionCreateBarrier) await this.reactionCreateBarrier;
+    if (this.failReactionCreateAcknowledgement) {
+      throw new Error("reaction create acknowledgement lost");
+    }
+    return { ...(this.omitReactionId ? {} : { reactionId }), raw: {} };
+  }
+
+  async deleteReaction(messageId, reactionId) {
+    this.reactionDeletes.push({ messageId, reactionId });
+    if (this.failReactionDelete) throw new Error("reaction delete acknowledgement lost");
   }
 
   async listGroups() {
@@ -797,6 +829,53 @@ test("Lark CLI bridge collects every bot group page and keeps the group owner", 
   );
 });
 
+test("Lark CLI bridge sends validated Card JSON in-thread and manages bot reactions", async () => {
+  const calls = [];
+  const responses = [
+    { data: { message_id: "om-card-reply" } },
+    { data: { reaction_id: "reaction-typing" } },
+    { data: { reaction_id: "reaction-typing" } },
+  ];
+  const adapter = new LarkCliBridgeAdapter({
+    profile: "bot",
+    runner: async (args) => {
+      calls.push(args);
+      return responses.shift();
+    },
+  });
+  const card = buildFeishuReplyCard("answer <at id=\"ou-surprise\"></at>");
+
+  assert.equal((await adapter.replyCard("om-root", card, "tw-card-one")).messageId, "om-card-reply");
+  assert.equal((await adapter.addReaction("om-root", "Typing")).reactionId, "reaction-typing");
+  await adapter.deleteReaction("om-root", "reaction-typing");
+
+  assert.deepEqual(calls[0], [
+    "--profile", "bot", "im", "+messages-reply",
+    "--message-id", "om-root",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--reply-in-thread",
+    "--idempotency-key", "tw-card-one",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.config.streaming_mode, false);
+  assert.equal(card.body.elements[0].content.includes("<at"), false, "card output must not create a real mention");
+  assert.deepEqual(calls[1], [
+    "--profile", "bot", "im", "reactions", "create",
+    "--params", JSON.stringify({ message_id: "om-root" }),
+    "--data", JSON.stringify({ reaction_type: { emoji_type: "Typing" } }),
+    "--as", "bot", "--json",
+  ]);
+  assert.deepEqual(calls[2], [
+    "--profile", "bot", "im", "reactions", "delete",
+    "--params", JSON.stringify({ message_id: "om-root", reaction_id: "reaction-typing" }),
+    "--as", "bot", "--json",
+  ]);
+  assert.equal(parseFeishuReactionId({ data: { reactionId: "reaction-camel" } }), "reaction-camel");
+});
+
 test("Feishu event and message detail parsers keep the verified routing fields", () => {
   assert.equal(parseFeishuInboundEvent(event()).event_id, "evt-one");
   const detail = parseFeishuMessageDetail({
@@ -832,6 +911,7 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       createdBy: "ou-owner",
     });
     assert.equal(binding.status, "active");
+    assert.equal(binding.options.replyAsCard, true);
     assert.equal(h.control.target.owner.kind, "feishu");
 
     await h.bridge.handleEvent(event());
@@ -843,11 +923,15 @@ test("one authorized mentioned message owns the target, writes once, and posts o
     assert.equal(h.control.inputs[0].message.includes(markers.close), false, "prompt echo must not contain the parser token");
     assert.equal(h.control.inputs[0].submit, true, "prompt body and submit must be one canonical operation");
     assert.equal(h.lark.replies.length, 0);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
 
     h.control.output += `tool trace\n${marked(h, "safe group answer")}\nprivate tail`;
     await h.bridge.pollTurns();
     assert.equal(h.lark.replies.length, 1);
     assert.equal(h.lark.replies[0].text, "safe group answer");
+    assert.equal(h.lark.replies[0].card.schema, "2.0");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
     assert.equal(h.bridge.snapshot().activeTurns.length, 0);
 
     const persisted = h.store.read();
@@ -857,6 +941,37 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       assert.equal(statSync(path).mode & 0o777, 0o600);
     }
   } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a slow reaction API never blocks canonical lease renewal", async () => {
+  const h = harness();
+  let releaseReaction;
+  h.lark.reactionCreateBarrier = new Promise((resolve) => { releaseReaction = resolve; });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+
+    let timer;
+    try {
+      await Promise.race([
+        h.bridge.renewLeases(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("lease renewal waited for the reaction API")), 250);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(h.control.requests.filter(({ type }) => type === "lease.renew").length, 1);
+  } finally {
+    releaseReaction?.();
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
@@ -1145,9 +1260,57 @@ test("turn timeout stops lease renewal and requires controlled recovery", async 
     await h.bridge.renewLeases();
     assert.equal(h.control.requests.filter(({ type }) => type === "lease.renew").length, renewals);
     assert.equal(h.control.target.state, "HELD", "bridge must not release an unresolved terminal turn to FREE");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing", "CrossMark"]);
   } finally {
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a failed Typing removal never stacks a contradictory CrossMark", async () => {
+  let clock = Date.now();
+  const h = harness({ now: () => clock });
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.lark.failReactionDelete = true;
+    clock += 10 * 60_000 + 1;
+    await h.bridge.pollTurns();
+    assert.equal(currentTurn(h).status, "timed-out");
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+  } finally {
+    h.lark.failReactionDelete = false;
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("an uncertain Typing creation never stacks a contradictory CrossMark", async () => {
+  for (const scenario of ["lost-ack", "missing-id"]) {
+    let clock = Date.now();
+    const h = harness({ now: () => clock });
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      h.lark.failReactionCreateAcknowledgement = scenario === "lost-ack";
+      h.lark.omitReactionId = scenario === "missing-id";
+      await h.bridge.handleEvent(event());
+      clock += 10 * 60_000 + 1;
+      await h.bridge.pollTurns();
+      assert.equal(currentTurn(h).status, "timed-out", scenario);
+      assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"], scenario);
+      assert.deepEqual(h.lark.reactionDeletes, [], scenario);
+    } finally {
+      h.lark.failReactionCreateAcknowledgement = false;
+      h.lark.omitReactionId = false;
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -1213,9 +1376,37 @@ test("late output after a fence change and uncertain Feishu ACK fail closed", as
     assert.equal(state.replies.at(-1).status, "uncertain");
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(state.bindings[0].status, "stale");
+    assert.deepEqual(uncertain.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
+    assert.deepEqual(uncertain.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
   } finally {
     await uncertain.bridge.close();
     rmSync(uncertain.root, { recursive: true, force: true });
+  }
+});
+
+test("an outbound authority check failure settles the turn before any Card is sent", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    h.control.output = marked(h, "must stay private");
+    h.control.failOwnershipStatusAt = h.control.ownershipStatusCalls + 2;
+
+    await h.bridge.pollTurns();
+    await new Promise((resolve) => setImmediate(resolve));
+    const state = h.store.read();
+    assert.equal(h.lark.replies.length, 0);
+    assert.equal(state.replies.length, 0, "authority failure happens before an outbound attempt is prepared");
+    assert.equal(state.turns.at(-1).status, "recovery-required");
+    assert.match(state.turns.at(-1).error, /outbound Feishu reply was not started/);
+    assert.equal(state.bindings[0].status, "stale");
+    assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
+    assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing", "CrossMark"]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 
