@@ -1,0 +1,119 @@
+[
+  {
+    "name": "auth-expiring",
+    "channel": "public",
+    "direction": "broker-to-client",
+    "phase": "online-control",
+    "type": "auth.expiring",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "auth.expiring",
+      "payload": {
+        "grantId": "grant-uuid",
+        "expiresAtMs": 1783703600000,
+        "refreshRecommendedAtMs": 1783703300000
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "auth.expiring",
+      "requestId": null
+    }
+  },
+  {
+    "name": "host-presence-online",
+    "channel": "public",
+    "direction": "broker-to-client",
+    "phase": "online-control",
+    "type": "host.presence",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "host.presence",
+      "hostId": "mac-admin",
+      "payload": {
+        "brokerEpoch": "broker-process-uuid",
+        "revision": "18",
+        "state": "online",
+        "reason": "connected",
+        "hostEpoch": "authority-uuid",
+        "hostInstanceId": "host-process-uuid",
+        "previousHostInstanceId": null,
+        "observedAtMs": 1783700100000
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "host.presence",
+      "requestId": null
+    }
+  },
+  {
+    "name": "hosts-snapshot-get",
+    "channel": "public",
+    "direction": "client-to-broker",
+    "phase": "online-control",
+    "type": "hosts.snapshot.get",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "hosts.snapshot.get",
+      "requestId": "hosts-1",
+      "payload": {}
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "hosts.snapshot.get",
+      "requestId": "hosts-1"
+    }
+  },
+  {
+    "name": "hosts-snapshot",
+    "channel": "public",
+    "direction": "broker-to-client",
+    "phase": "online-control",
+    "type": "hosts.snapshot",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "hosts.snapshot",
+      "requestId": "hosts-1",
+      "payload": {
+        "brokerEpoch": "broker-process-uuid",
+        "revision": "18",
+        "items": [
+          {
+            "hostId": "mac-admin",
+            "state": "online",
+            "hostEpoch": "authority-uuid",
+            "hostInstanceId": "host-process-uuid",
+            "clientDialects": ["tw-relay.v1", "tw-relay.v2"],
+            "capabilities": [
+              "error.structured.v1",
+              "command.ledger.v1",
+              "command.query.v1",
+              "snapshot.revision.v1",
+              "event.sequence.v1",
+              "terminal.stream.resume.v1"
+            ],
+            "observedAtMs": 1783700100000
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "hosts.snapshot",
+      "requestId": "hosts-1"
+    }
+  }
+]

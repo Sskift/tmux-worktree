@@ -1,0 +1,446 @@
+[
+  {
+    "name": "command-execute-create-worktree",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "online-command",
+    "type": "command.execute",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-create-worktree",
+      "commandId": "cmd-create-worktree",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "operation": "create_worktree",
+        "arguments": {
+          "project": "demo",
+          "path": "/repo/demo",
+          "name": "fix-auth",
+          "branch": "main",
+          "aiCommand": "codex"
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-create-worktree"
+    }
+  },
+  {
+    "name": "command-execute-create-terminal",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "online-command",
+    "type": "command.execute",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-create-terminal",
+      "commandId": "cmd-create-terminal",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "operation": "create_terminal",
+        "arguments": {
+          "cwd": "/repo/demo",
+          "label": "demo shell"
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-create-terminal"
+    }
+  },
+  {
+    "name": "command-execute-send-agent-message",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "online-command",
+    "type": "command.execute",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-send-message",
+      "commandId": "cmd-send-message",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "operation": "send_agent_message",
+        "arguments": {
+          "pane": 0,
+          "message": "continue",
+          "submit": true
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-send-message"
+    }
+  },
+  {
+    "name": "command-execute-kill-session",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "online-command",
+    "type": "command.execute",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-kill-session",
+      "commandId": "cmd-kill-session",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "operation": "kill_session",
+        "arguments": {}
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "command.execute",
+      "requestId": "attempt-kill-session"
+    }
+  },
+  {
+    "name": "command-status-accepted",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "online-command",
+    "type": "command.status",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "command.status",
+      "requestId": "attempt-send-message",
+      "commandId": "cmd-send-message",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "state": "accepted",
+        "deduplicated": false,
+        "updatedAtMs": 1783700200000,
+        "dedupeUntilMs": null,
+        "result": null
+      },
+      "error": null
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "command.status",
+      "requestId": "attempt-send-message"
+    }
+  },
+  {
+    "name": "command-status-create-succeeded",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "online-command",
+    "type": "command.status",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "command.status",
+      "requestId": "attempt-create-worktree",
+      "commandId": "cmd-create-worktree",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "state": "succeeded",
+        "deduplicated": false,
+        "updatedAtMs": 1783700200000,
+        "dedupeUntilMs": 1784305000000,
+        "result": {
+          "session": {
+            "scopeId": "scope-local",
+            "sessionId": "ses_01JOPAQUE",
+            "kind": "worktree",
+            "displayName": "demo",
+            "state": "running",
+            "project": "demo",
+            "label": null,
+            "cwd": "/repo/demo",
+            "attached": false,
+            "windowCount": 1,
+            "createdAtMs": 1783700000000,
+            "activityAtMs": 1783700000000
+          }
+        }
+      },
+      "error": null
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "command.status",
+      "requestId": "attempt-create-worktree"
+    }
+  },
+  {
+    "name": "command-result-send-succeeded",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "online-command",
+    "type": "command.result",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "command.result",
+      "commandId": "cmd-send-message",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "payload": {
+        "dedupeWindowId": "dedupe-window-uuid",
+        "state": "succeeded",
+        "updatedAtMs": 1783700200000,
+        "result": {
+          "pane": 0,
+          "submit": true,
+          "messageUtf8Bytes": 8
+        }
+      },
+      "error": null
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "command.result",
+      "requestId": null
+    }
+  },
+  {
+    "name": "command-query",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "online-command-query",
+    "type": "command.query",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "command.query",
+      "requestId": "query-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "payload": {
+        "items": [
+          {
+            "commandId": "cmd-1",
+            "dedupeWindowId": "dedupe-window-uuid"
+          },
+          {
+            "commandId": "cmd-2",
+            "dedupeWindowId": "dedupe-window-uuid"
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "command.query",
+      "requestId": "query-1"
+    }
+  },
+  {
+    "name": "command-statuses-all-states",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "online-command-query",
+    "type": "command.statuses",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "command.statuses",
+      "requestId": "query-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": {
+        "dedupeWatermark": {
+          "oldestQueryableWindowSeq": "35",
+          "newestIssuedWindowSeq": "42",
+          "observedAtMs": 1783700200000
+        },
+        "items": [
+          {
+            "commandId": "cmd-not-accepted",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "not_accepted",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": null,
+            "retryable": true,
+            "retryAfterMs": 0,
+            "reissueRequired": false,
+            "result": null,
+            "error": {
+              "code": "COMMAND_NOT_ACCEPTED",
+              "message": "Command was not durably accepted",
+              "retryable": true,
+              "commandDisposition": "not_accepted",
+              "details": null
+            }
+          },
+          {
+            "commandId": "cmd-accepted",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "accepted",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": null,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": null
+          },
+          {
+            "commandId": "cmd-running",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "running",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": null,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": null
+          },
+          {
+            "commandId": "cmd-succeeded",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "succeeded",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": 1784305000000,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": {
+              "sessionId": "ses_01JOPAQUE",
+              "terminated": true
+            },
+            "error": null
+          },
+          {
+            "commandId": "cmd-failed",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "failed",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": 1784305000000,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": {
+              "code": "COMMAND_FAILED",
+              "message": "Command failed",
+              "retryable": false,
+              "commandDisposition": "completed",
+              "details": null
+            }
+          },
+          {
+            "commandId": "cmd-in-doubt",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "in_doubt",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": 1784305000000,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": {
+              "code": "COMMAND_IN_DOUBT",
+              "message": "Command outcome is uncertain",
+              "retryable": false,
+              "commandDisposition": "in_doubt",
+              "details": null
+            }
+          },
+          {
+            "commandId": "cmd-expired",
+            "dedupeWindowId": "dedupe-window-uuid",
+            "state": "expired",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": 1784305000000,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": {
+              "code": "COMMAND_RESULT_EXPIRED",
+              "message": "Command result expired",
+              "retryable": false,
+              "commandDisposition": "completed",
+              "details": {
+                "finalState": "succeeded"
+              }
+            }
+          },
+          {
+            "commandId": "cmd-unknown",
+            "dedupeWindowId": "old-window-uuid",
+            "state": "unknown",
+            "updatedAtMs": 1783700200000,
+            "dedupeUntilMs": null,
+            "retryable": false,
+            "retryAfterMs": null,
+            "reissueRequired": false,
+            "result": null,
+            "error": {
+              "code": "COMMAND_STATUS_UNKNOWN",
+              "message": "Command status cannot be proven",
+              "retryable": false,
+              "commandDisposition": "in_doubt",
+              "details": null
+            }
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "command.statuses",
+      "requestId": "query-1"
+    }
+  }
+]

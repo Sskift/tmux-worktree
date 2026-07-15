@@ -144,6 +144,8 @@ Compose screens / navigation
 
 Android 的 `V2` 指当前产品/UI 代际，不表示它已经实现 Relay v2。
 
+仓库已有相互独立的 Node 与 Android Relay v2 codec，并共同消费 `contracts/relay/v2` 的 strict framing、closed schema、limit、dialect 和 normalized-result fixture。它们尚未接入 `relay-server`、`relay-host` 或 Android connection actor，不生成 credential/enrollment，也不宣告 v2 capability；当前运行数据流仍全部是 Relay v1。
+
 ## 运行数据流
 
 ### Dashboard：本机
@@ -212,7 +214,7 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 - Waiting/Failed/Completed 等 Agent lifecycle event；
 - 幂等 command ledger 与结果查询；
 - 带 offset 的 terminal replay/resume；
-- Relay v2 的 role-scoped credential 和 enrollment。
+- role-scoped credential 和 enrollment runtime。
 
 因此 Android Session detail 的 Timeline 只把本机发起的消息及投递状态作为持久事实，不能伪造 Agent 回复或从终端输出推断 Agent lifecycle。Relay v1 shared secret 和终端内容只受 TLS 保护，生产 Android 配对必须使用可信 `wss://`。同一把 v1 secret 也不能为无关用户提供租户隔离；面向多用户的统一 Relay center 必须等待独立的 Relay v2 role-scoped credential 与 enrollment 实现。
 
@@ -303,9 +305,9 @@ Android 使用自己的 Gradle wrapper、依赖图、测试和 Lint。根 npm bu
 | `docs/android-v2-architecture.md` | 当前 Android 专题 | Compose/Room/actor/Outbox 的详细产品和实现约束 |
 | `docs/remote-relay-android.md` | 运维手册 | broker、Mac connector、TLS、配对和 Android 验证流程 |
 | `docs/terminal-input-ownership-alignment.md` | 跨产品实现 companion | terminal-control、Feishu、Dashboard、CLI 与 Relay 的 lease、handoff、拒绝行为和测试矩阵 |
-| `docs/relay-v2-contract.md` | 未来冻结契约 | 明确标记未实现；不能据此宣告 capability 或生成 v2 credential |
+| `docs/relay-v2-contract.md` | 冻结契约 | codec conformance 已落地；runtime 未接线，不能据此宣告 capability 或生成 v2 credential |
 | `docs/relay-v2-implementation-plan.md` | 非规范性实施协调 | 按 owner 拆分可并行工作、硬依赖和验收 Gate；不描述当前完成状态，也不修改冻结契约 |
-| `contracts/` | 机器契约 | Relay v1、TW RPC v1 和共享 storage fixture；协议/存储变更必须同步生产实现和 contract tests |
+| `contracts/` | 机器契约 | Relay v1/v2、TW RPC v1 和共享 storage fixture；协议/存储变更必须同步生产实现和 contract tests |
 | `.codex/skills/` | Agent 操作规程 | 固化跨机器等易误操作流程，不属于产品 runtime |
 
 历史重构计划、一次性 QA 记录、临时截图路径和已经完成的迁移清单不应伪装成当前架构基线；需要追溯时使用 Git 历史。新增文档前先判断它属于用户手册、当前架构、专题运维、未来 contract 还是 Agent 规程，避免复制同一事实到多个位置。

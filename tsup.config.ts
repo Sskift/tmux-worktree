@@ -14,6 +14,7 @@ export default defineConfig({
     "src/relay/v2/token.ts",
     "src/relay/v2/issuer.ts",
     "src/relay/v2/auth.ts",
+    "src/relay/v2/codec.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/larkCliBridge.ts",

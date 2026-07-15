@@ -1,0 +1,209 @@
+[
+  {
+    "name": "enrollment-redeem-request",
+    "channel": "https",
+    "direction": "client-to-broker",
+    "phase": "enrollment",
+    "schema": "enrollment.redeem.request",
+    "frame": {
+      "exchangeAttemptId": "enrollment-exchange-uuid",
+      "enrollmentId": "enrollment-uuid",
+      "enrollmentCode": "twenroll2.opaque",
+      "clientInstanceId": "android-install-uuid",
+      "deviceLabel": "Pixel"
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "enrollment.redeem.request"
+    }
+  },
+  {
+    "name": "enrollment-redeem-response",
+    "channel": "https",
+    "direction": "broker-to-client",
+    "phase": "enrollment",
+    "schema": "enrollment.redeem.response",
+    "frame": {
+      "exchangeAttemptId": "enrollment-exchange-uuid",
+      "principalId": "principal-opaque-id",
+      "grantId": "grant-uuid",
+      "hostId": "mac-admin",
+      "relayUrl": "wss://relay.example.com/client",
+      "accessToken": "twcap2.payload.mac",
+      "accessExpiresAtMs": 1783703600000,
+      "refreshToken": "twref2.opaque",
+      "refreshExpiresAtMs": 1786292000000
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "enrollment.redeem.response"
+    }
+  },
+  {
+    "name": "client-refresh-request",
+    "channel": "https",
+    "direction": "client-to-broker",
+    "phase": "credential-refresh",
+    "schema": "token.refresh.client.request",
+    "frame": {
+      "refreshAttemptId": "refresh-attempt-uuid",
+      "grantId": "grant-uuid",
+      "clientInstanceId": "android-install-uuid",
+      "refreshToken": "twref2.opaque"
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "token.refresh.client.request"
+    }
+  },
+  {
+    "name": "client-refresh-response",
+    "channel": "https",
+    "direction": "broker-to-client",
+    "phase": "credential-refresh",
+    "schema": "token.refresh.client.response",
+    "frame": {
+      "refreshAttemptId": "refresh-attempt-uuid",
+      "principalId": "principal-opaque-id",
+      "grantId": "grant-uuid",
+      "hostId": "mac-admin",
+      "relayUrl": "wss://relay.example.com/client",
+      "accessToken": "twcap2.payload.mac",
+      "accessExpiresAtMs": 1783703600000,
+      "refreshToken": "twref2.opaque",
+      "refreshExpiresAtMs": 1786292000000
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "token.refresh.client.response"
+    }
+  },
+  {
+    "name": "self-revoke-request",
+    "channel": "https",
+    "direction": "client-to-broker",
+    "phase": "grant-revoke",
+    "schema": "grant.self-revoke.request",
+    "frame": {
+      "reason": "user_revoked"
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "grant.self-revoke.request"
+    }
+  },
+  {
+    "name": "self-revoke-response",
+    "channel": "https",
+    "direction": "broker-to-client",
+    "phase": "grant-revoke",
+    "schema": "grant.self-revoke.response",
+    "frame": {
+      "grantId": "grant-uuid",
+      "revokedAtMs": 1783700200000,
+      "alreadyRevoked": false
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "grant.self-revoke.response"
+    }
+  },
+  {
+    "name": "host-bootstrap-request",
+    "channel": "https",
+    "direction": "host-to-broker",
+    "phase": "host-bootstrap",
+    "schema": "host.bootstrap.request",
+    "frame": {
+      "bootstrapAttemptId": "host-bootstrap-attempt-uuid",
+      "bootstrapToken": "twhostboot2.opaque",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "hostInstanceId": "host-process-uuid"
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "host.bootstrap.request"
+    }
+  },
+  {
+    "name": "host-bootstrap-response",
+    "channel": "https",
+    "direction": "broker-to-host",
+    "phase": "host-bootstrap",
+    "schema": "host.bootstrap.response",
+    "frame": {
+      "bootstrapAttemptId": "host-bootstrap-attempt-uuid",
+      "principalId": "host-principal-uuid",
+      "grantId": "host-grant-uuid",
+      "hostId": "mac-admin",
+      "accessToken": "twcap2.payload.mac",
+      "accessExpiresAtMs": 1783703600000,
+      "refreshToken": "twref2.opaque",
+      "refreshExpiresAtMs": 1786292000000
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "host.bootstrap.response"
+    }
+  },
+  {
+    "name": "host-refresh-request",
+    "channel": "https",
+    "direction": "host-to-broker",
+    "phase": "credential-refresh",
+    "schema": "token.refresh.host.request",
+    "frame": {
+      "refreshAttemptId": "host-refresh-attempt-uuid",
+      "grantId": "host-grant-uuid",
+      "hostInstanceId": "host-process-uuid",
+      "refreshToken": "twref2.opaque"
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "token.refresh.host.request"
+    }
+  },
+  {
+    "name": "host-refresh-response",
+    "channel": "https",
+    "direction": "broker-to-host",
+    "phase": "credential-refresh",
+    "schema": "token.refresh.host.response",
+    "frame": {
+      "refreshAttemptId": "host-refresh-attempt-uuid",
+      "principalId": "host-principal-uuid",
+      "grantId": "host-grant-uuid",
+      "hostId": "mac-admin",
+      "accessToken": "twcap2.payload.mac",
+      "accessExpiresAtMs": 1783703600000,
+      "refreshToken": "twref2.opaque",
+      "refreshExpiresAtMs": 1786292000000
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "token.refresh.host.response"
+    }
+  },
+  {
+    "name": "https-error-response",
+    "channel": "https",
+    "direction": "broker-to-client-or-host",
+    "phase": "https-error",
+    "schema": "error.response",
+    "frame": {
+      "error": {
+        "code": "AUTH_INVALID",
+        "message": "Credential is invalid",
+        "retryable": false,
+        "retryAfterMs": null,
+        "commandDisposition": "not_applicable",
+        "details": null
+      }
+    },
+    "normalized": {
+      "channel": "https",
+      "schema": "error.response"
+    }
+  }
+]

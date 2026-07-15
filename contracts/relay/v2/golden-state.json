@@ -1,0 +1,450 @@
+[
+  {
+    "name": "scopes-snapshot-get",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "state-read",
+    "type": "scopes.snapshot.get",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "scopes.snapshot.get",
+      "requestId": "scopes-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "payload": {}
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "scopes.snapshot.get",
+      "requestId": "scopes-1"
+    }
+  },
+  {
+    "name": "scopes-snapshot",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-read",
+    "type": "scopes.snapshot",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "scopes.snapshot",
+      "requestId": "scopes-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": {
+        "coverageComplete": true,
+        "revision": "7",
+        "throughEventSeq": null,
+        "items": [
+          {
+            "scopeId": "scope-local",
+            "displayName": "本机",
+            "kind": "local",
+            "reachability": "online"
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "scopes.snapshot",
+      "requestId": "scopes-1"
+    }
+  },
+  {
+    "name": "sessions-snapshot-get-all",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "state-read",
+    "type": "sessions.snapshot.get",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "sessions.snapshot.get",
+      "requestId": "sessions-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "payload": {
+        "scopeIds": null
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "sessions.snapshot.get",
+      "requestId": "sessions-1"
+    }
+  },
+  {
+    "name": "sessions-snapshot-complete-and-partial",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-read",
+    "type": "sessions.snapshot",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "sessions.snapshot",
+      "requestId": "sessions-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": {
+        "coverageComplete": false,
+        "throughEventSeq": null,
+        "scopes": [
+          {
+            "scopeId": "scope-local",
+            "revision": "12",
+            "completeness": "complete",
+            "items": [
+              {
+                "scopeId": "scope-local",
+                "sessionId": "ses_01JOPAQUE",
+                "kind": "worktree",
+                "displayName": "demo",
+                "state": "running",
+                "project": "demo",
+                "label": null,
+                "cwd": "/repo/demo",
+                "attached": false,
+                "windowCount": 1,
+                "createdAtMs": 1783700000000,
+                "activityAtMs": 1783700000000
+              }
+            ],
+            "error": null
+          },
+          {
+            "scopeId": "scope-devbox",
+            "revision": "20",
+            "completeness": "partial",
+            "items": [],
+            "error": {
+              "code": "SCOPE_UNREACHABLE",
+              "message": "SSH unavailable",
+              "retryable": true,
+              "commandDisposition": "not_applicable"
+            }
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "sessions.snapshot",
+      "requestId": "sessions-1"
+    }
+  },
+  {
+    "name": "state-snapshot-get-first",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "state-resync",
+    "type": "state.snapshot.get",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "state.snapshot.get",
+      "requestId": "state-attempt-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "payload": {
+        "snapshotRequestId": "logical-snapshot-uuid",
+        "snapshotId": null,
+        "cursor": null,
+        "nextChunkIndex": 0
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "state.snapshot.get",
+      "requestId": "state-attempt-1"
+    }
+  },
+  {
+    "name": "state-snapshot-chunk",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-resync",
+    "type": "state.snapshot.chunk",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "state.snapshot.chunk",
+      "requestId": "state-attempt-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": {
+        "coverageComplete": true,
+        "snapshotRequestId": "logical-snapshot-uuid",
+        "snapshotId": "pinned-cut-uuid",
+        "snapshotCreatedAtMs": 1783700000000,
+        "snapshotLeaseExpiresAtMs": 1783700300000,
+        "snapshotAbsoluteExpiresAtMs": 1783703600000,
+        "chunkIndex": 0,
+        "isLast": true,
+        "nextCursor": null,
+        "throughEventSeq": "91",
+        "scopesRevision": "7",
+        "totalRecords": 3,
+        "totalCanonicalBytes": 920,
+        "cutDigest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "records": [
+          {
+            "recordType": "scope",
+            "item": {
+              "scopeId": "scope-local",
+              "displayName": "本机",
+              "kind": "local",
+              "reachability": "online"
+            }
+          },
+          {
+            "recordType": "sessions_scope",
+            "scopeId": "scope-local",
+            "revision": "12",
+            "completeness": "complete"
+          },
+          {
+            "recordType": "session",
+            "scopeId": "scope-local",
+            "item": {
+              "scopeId": "scope-local",
+              "sessionId": "ses_01JOPAQUE",
+              "kind": "worktree",
+              "displayName": "demo",
+              "state": "running",
+              "project": "demo",
+              "label": null,
+              "cwd": "/repo/demo",
+              "attached": false,
+              "windowCount": 1,
+              "createdAtMs": 1783700000000,
+              "activityAtMs": 1783700000000
+            }
+          }
+        ]
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "state.snapshot.chunk",
+      "requestId": "state-attempt-1"
+    }
+  },
+  {
+    "name": "state-snapshot-release",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "state-resync",
+    "type": "state.snapshot.release",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "state.snapshot.release",
+      "requestId": "release-attempt-uuid",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "payload": {
+        "snapshotRequestId": "logical-snapshot-uuid",
+        "snapshotId": "pinned-cut-uuid",
+        "reason": "completed"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "state.snapshot.release",
+      "requestId": "release-attempt-uuid"
+    }
+  },
+  {
+    "name": "state-snapshot-released",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-resync",
+    "type": "state.snapshot.released",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "state.snapshot.released",
+      "requestId": "release-attempt-uuid",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": {
+        "snapshotRequestId": "logical-snapshot-uuid",
+        "snapshotId": "pinned-cut-uuid",
+        "released": true,
+        "alreadyReleased": false,
+        "releasedAtMs": 1783700200000
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "state.snapshot.released",
+      "requestId": "release-attempt-uuid"
+    }
+  },
+  {
+    "name": "sessions-changed-upsert",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-event",
+    "type": "sessions.changed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "sessions.changed",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "eventSeq": "92",
+      "payload": {
+        "dimension": "sessions",
+        "resourceKey": "scope-local",
+        "resultingRevision": "13",
+        "change": {
+          "op": "upsert",
+          "item": {
+            "scopeId": "scope-local",
+            "sessionId": "ses_01JOPAQUE",
+            "kind": "worktree",
+            "displayName": "demo",
+            "state": "running",
+            "project": "demo",
+            "label": null,
+            "cwd": "/repo/demo",
+            "attached": false,
+            "windowCount": 1,
+            "createdAtMs": 1783700000000,
+            "activityAtMs": 1783700000000
+          }
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "sessions.changed",
+      "requestId": null
+    }
+  },
+  {
+    "name": "sessions-changed-delete",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-event",
+    "type": "sessions.changed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "sessions.changed",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "eventSeq": "93",
+      "payload": {
+        "dimension": "sessions",
+        "resourceKey": "scope-local",
+        "resultingRevision": "14",
+        "change": {
+          "op": "delete",
+          "sessionId": "ses_01JOPAQUE"
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "sessions.changed",
+      "requestId": null
+    }
+  },
+  {
+    "name": "scopes-changed-upsert",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-event",
+    "type": "scopes.changed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "scopes.changed",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-devbox",
+      "eventSeq": "94",
+      "payload": {
+        "dimension": "scopes",
+        "resourceKey": "scopes",
+        "resultingRevision": "8",
+        "change": {
+          "op": "upsert",
+          "item": {
+            "scopeId": "scope-devbox",
+            "displayName": "Devbox",
+            "kind": "ssh",
+            "reachability": "unreachable"
+          }
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "scopes.changed",
+      "requestId": null
+    }
+  },
+  {
+    "name": "scopes-changed-delete",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "state-event",
+    "type": "scopes.changed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "scopes.changed",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-devbox",
+      "eventSeq": "95",
+      "payload": {
+        "dimension": "scopes",
+        "resourceKey": "scopes",
+        "resultingRevision": "9",
+        "change": {
+          "op": "delete",
+          "scopeId": "scope-devbox"
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "scopes.changed",
+      "requestId": null
+    }
+  }
+]

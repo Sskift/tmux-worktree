@@ -6,6 +6,7 @@
 
 - 这里交付原生 Kotlin + Compose Android 客户端。`V2Activity` / `V2ViewModel` 表示第二代 Android 产品与客户端架构，不表示 Relay v2。
 - 当前生产连接仍由 `RelayV1ConnectionActor` 和 `core/relay/v1` codec 驱动。Relay v1 contract 是 active-but-legacy-frozen；不得在 Android 单端添加 wire 字段或从终端文本伪造 Agent 回复、transcript、Waiting/Failed/Completed 状态。
+- `core/relay/v2/codec` 是与 Node 独立实现、共同消费 `contracts/relay/v2` 的 conformance 基础，尚未接入 connection actor、profile、credential 或 UI。codec 测试通过不得被描述为 Relay v2 runtime、配对或 capability 已交付。
 - Compose 只通过 `V2ViewModel` 进入 repository/actor；Room、DataStore、Keystore 和 WebSocket 不得成为 Screen 的直接依赖。
 - `MainActivity`、`LegacyIdentityImporter`、`TerminalWebView`、xterm assets 和 v1 actor 都仍是生产或升级兼容路径，不得因名称像 legacy 就删除。
 
@@ -40,7 +41,7 @@
 | Release-only 分支、WSS/cleartext policy、版本或发布配置 | `:app:lintRelease :app:assembleRelease`，并运行直接相关行为测试 |
 | Room DAO/repository、DataStore、Keystore、Intent/Activity 生命周期 | 最近的 JVM 或 instrumented authority-boundary case；只有真实 Android framework 行为改变时才要求 connected test |
 | Relay v1 codec，但共享 fixture 未改变 | Android 直接相关 codec/actor test；不要自动跑 Node、Dashboard 或 Rust |
-| `contracts/relay/v1` fixture 或跨 Node/Android wire 行为 | 两端最小 contract/codec consumer test；收敛后再跑 `npm run verify:all` |
+| `contracts/relay/v1` 或 `contracts/relay/v2` fixture、跨 Node/Android wire 行为 | 两端最小 contract/codec consumer test；只有 fixture/manifest 或多消费者共享行为变化才在收敛后追加一次 `npm run verify:all` |
 
 connected test 按类过滤时使用 Android instrumentation runner 参数，例如：
 

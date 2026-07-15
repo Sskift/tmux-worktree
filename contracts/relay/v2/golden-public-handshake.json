@@ -1,37 +1,297 @@
 [
   {
     "name": "relay-welcome",
+    "channel": "public",
     "direction": "broker-to-client",
     "phase": "pre-host-handshake",
     "type": "relay.welcome",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"relay.welcome\",\"payload\":{\"selectedVersion\":2,\"connectionId\":\"broker-connection-uuid\",\"brokerEpoch\":\"broker-process-uuid\",\"principalId\":\"principal-opaque-id\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"limits\":{\"maxFrameBytes\":1048576,\"maxCarrierFrameBytes\":1500000,\"brokerRouteBufferedBytesPerDirection\":1048576,\"brokerRouteLowWaterBytesPerDirection\":524288,\"brokerCarrierBufferedBytes\":16777216,\"brokerCarrierLowWaterBytes\":8388608,\"maxQueuedRouteFrames\":128,\"maxInFlightRequestsPerRoute\":64}}}"
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "relay.welcome",
+      "payload": {
+        "selectedVersion": 2,
+        "connectionId": "broker-connection-uuid",
+        "brokerEpoch": "broker-process-uuid",
+        "principalId": "principal-opaque-id",
+        "capabilities": [
+          "error.structured.v1",
+          "command.ledger.v1",
+          "command.query.v1",
+          "snapshot.revision.v1",
+          "event.sequence.v1",
+          "terminal.stream.resume.v1"
+        ],
+        "limits": {
+          "maxFrameBytes": 1048576,
+          "maxCarrierFrameBytes": 1500000,
+          "brokerRouteBufferedBytesPerDirection": 1048576,
+          "brokerRouteLowWaterBytesPerDirection": 524288,
+          "brokerCarrierBufferedBytes": 16777216,
+          "brokerCarrierLowWaterBytes": 8388608,
+          "maxQueuedRouteFrames": 128,
+          "maxInFlightRequestsPerRoute": 64
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "relay.welcome",
+      "requestId": null
+    }
   },
   {
     "name": "client-hello-fresh",
+    "channel": "public",
     "direction": "client-to-host-via-broker",
     "phase": "host-handshake",
     "type": "client.hello",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"client.hello\",\"requestId\":\"hello-attempt-uuid\",\"hostId\":\"mac-admin\",\"payload\":{\"clientInstanceId\":\"android-install-uuid\",\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"requiredCapabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"resume\":null}}"
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "client.hello",
+      "requestId": "hello-attempt-uuid",
+      "hostId": "mac-admin",
+      "payload": {
+        "clientInstanceId": "android-install-uuid",
+        "capabilities": [
+          "error.structured.v1",
+          "command.ledger.v1",
+          "command.query.v1",
+          "snapshot.revision.v1",
+          "event.sequence.v1",
+          "terminal.stream.resume.v1"
+        ],
+        "requiredCapabilities": [
+          "error.structured.v1",
+          "command.ledger.v1",
+          "command.query.v1",
+          "snapshot.revision.v1",
+          "event.sequence.v1",
+          "terminal.stream.resume.v1"
+        ],
+        "resume": null
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "client.hello",
+      "requestId": "hello-attempt-uuid"
+    }
+  },
+  {
+    "name": "client-hello-resume",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "host-handshake",
+    "type": "client.hello",
+    "deriveFrom": "client-hello-fresh",
+    "set": {
+      "/payload/resume": {
+        "hostEpoch": "authority-uuid",
+        "lastEventSeq": "91"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "client.hello",
+      "requestId": "hello-attempt-uuid"
+    }
   },
   {
     "name": "host-welcome-snapshot-required",
+    "channel": "public",
     "direction": "host-to-client-via-broker",
     "phase": "host-handshake",
     "type": "host.welcome",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"host.welcome\",\"requestId\":\"hello-attempt-uuid\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"authority-uuid\",\"hostInstanceId\":\"host-process-uuid\",\"payload\":{\"selectedVersion\":2,\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"eventSeq\":\"91\",\"resumeDisposition\":\"snapshot_required\",\"resumeReason\":\"fresh\",\"commandDedupeWindow\":{\"windowId\":\"dedupe-window-uuid\",\"windowSeq\":\"42\",\"acceptUntilMs\":1783786400000,\"queryUntilMs\":1784391200000},\"limits\":{\"commandResultRetentionMs\":86400000,\"commandDedupeRetentionMs\":604800000,\"maxCommandQueryIds\":32,\"stateSnapshotChunkBytes\":524288,\"stateSnapshotChunkRecords\":256,\"stateSnapshotMaxBytes\":268435456,\"stateSnapshotMaxRecords\":100000,\"stateSnapshotIdleLeaseMs\":300000,\"stateSnapshotMaxLifetimeMs\":3600000,\"stateSnapshotMaxPinnedPerPrincipal\":2,\"stateSnapshotMaxPinnedPerHost\":16,\"stateSnapshotPinnedBytesPerHost\":536870912,\"stateSnapshotPinnedMetadataBytesPerHost\":16777216,\"stateSnapshotChunkMaxJsonKeys\":8192,\"stateSnapshotChunkMaxJsonNodes\":16384,\"terminalReplayBytesPerStream\":4194304,\"terminalReplayBytesPerHost\":67108864,\"terminalDetachedLeaseMs\":120000,\"terminalControlDedupeRetentionMs\":600000,\"terminalMaxUnackedBytes\":524288,\"terminalMaxFrameBytes\":65536,\"terminalInputDedupeEntriesPerStream\":512,\"terminalResizeDedupeEntriesPerStream\":256,\"terminalMaxStreamsPerHost\":256,\"terminalControlRecordsPerHost\":4096,\"brokerRouteBufferedBytesPerDirection\":1048576,\"brokerRouteLowWaterBytesPerDirection\":524288}}}"
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "host.welcome",
+      "requestId": "hello-attempt-uuid",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "hostInstanceId": "host-process-uuid",
+      "payload": {
+        "selectedVersion": 2,
+        "capabilities": [
+          "error.structured.v1",
+          "command.ledger.v1",
+          "command.query.v1",
+          "snapshot.revision.v1",
+          "event.sequence.v1",
+          "terminal.stream.resume.v1"
+        ],
+        "eventSeq": "91",
+        "resumeDisposition": "snapshot_required",
+        "resumeReason": "fresh",
+        "commandDedupeWindow": {
+          "windowId": "dedupe-window-uuid",
+          "windowSeq": "42",
+          "acceptUntilMs": 1783786400000,
+          "queryUntilMs": 1784391200000
+        },
+        "limits": {
+          "commandResultRetentionMs": 86400000,
+          "commandDedupeRetentionMs": 604800000,
+          "maxCommandQueryIds": 32,
+          "stateSnapshotChunkBytes": 524288,
+          "stateSnapshotChunkRecords": 256,
+          "stateSnapshotMaxBytes": 268435456,
+          "stateSnapshotMaxRecords": 100000,
+          "stateSnapshotIdleLeaseMs": 300000,
+          "stateSnapshotMaxLifetimeMs": 3600000,
+          "stateSnapshotMaxPinnedPerPrincipal": 2,
+          "stateSnapshotMaxPinnedPerHost": 16,
+          "stateSnapshotPinnedBytesPerHost": 536870912,
+          "stateSnapshotPinnedMetadataBytesPerHost": 16777216,
+          "stateSnapshotChunkMaxJsonKeys": 8192,
+          "stateSnapshotChunkMaxJsonNodes": 16384,
+          "terminalReplayBytesPerStream": 4194304,
+          "terminalReplayBytesPerHost": 67108864,
+          "terminalDetachedLeaseMs": 120000,
+          "terminalControlDedupeRetentionMs": 600000,
+          "terminalMaxUnackedBytes": 524288,
+          "terminalMaxFrameBytes": 65536,
+          "terminalInputDedupeEntriesPerStream": 512,
+          "terminalResizeDedupeEntriesPerStream": 256,
+          "terminalMaxStreamsPerHost": 256,
+          "terminalControlRecordsPerHost": 4096,
+          "brokerRouteBufferedBytesPerDirection": 1048576,
+          "brokerRouteLowWaterBytesPerDirection": 524288
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "host.welcome",
+      "requestId": "hello-attempt-uuid"
+    }
+  },
+  {
+    "name": "host-welcome-cursor-behind",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "host-handshake",
+    "type": "host.welcome",
+    "deriveFrom": "host-welcome-snapshot-required",
+    "set": {
+      "/payload/resumeReason": "cursor_behind"
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "host.welcome",
+      "requestId": "hello-attempt-uuid"
+    }
+  },
+  {
+    "name": "host-welcome-host-epoch-changed",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "host-handshake",
+    "type": "host.welcome",
+    "deriveFrom": "host-welcome-snapshot-required",
+    "set": {
+      "/payload/resumeReason": "host_epoch_changed"
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "host.welcome",
+      "requestId": "hello-attempt-uuid"
+    }
+  },
+  {
+    "name": "host-welcome-caught-up",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "host-handshake",
+    "type": "host.welcome",
+    "deriveFrom": "host-welcome-snapshot-required",
+    "set": {
+      "/payload/resumeDisposition": "caught_up",
+      "/payload/resumeReason": "matched"
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "host.welcome",
+      "requestId": "hello-attempt-uuid"
+    }
   },
   {
     "name": "relay-unavailable-host-offline",
+    "channel": "public",
     "direction": "broker-to-client",
     "phase": "pre-host-handshake",
     "type": "relay.unavailable",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"relay.unavailable\",\"hostId\":\"mac-admin\",\"payload\":{\"error\":{\"code\":\"HOST_OFFLINE\",\"message\":\"Host became unavailable before route opened\",\"retryable\":true,\"retryAfterMs\":1000,\"commandDisposition\":\"not_applicable\",\"details\":null}}}"
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "relay.unavailable",
+      "hostId": "mac-admin",
+      "payload": {
+        "error": {
+          "code": "HOST_OFFLINE",
+          "message": "Host became unavailable before route opened",
+          "retryable": true,
+          "retryAfterMs": 1000,
+          "commandDisposition": "not_applicable",
+          "details": null
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "relay.unavailable",
+      "requestId": null
+    }
   },
   {
     "name": "client-hello-cursor-ahead-error",
+    "channel": "public",
     "direction": "host-to-client-via-broker",
     "phase": "host-handshake",
     "type": "error",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"error\",\"requestId\":\"hello-attempt-uuid\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"authority-uuid\",\"payload\":null,\"error\":{\"code\":\"EVENT_CURSOR_AHEAD\",\"message\":\"Client cursor is ahead of host authority\",\"retryable\":false,\"commandDisposition\":\"not_applicable\",\"details\":{\"clientLastEventSeq\":\"92\",\"hostEventSeq\":\"91\"}}}"
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "error",
+      "requestId": "hello-attempt-uuid",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "payload": null,
+      "error": {
+        "code": "EVENT_CURSOR_AHEAD",
+        "message": "Client cursor is ahead of host authority",
+        "retryable": false,
+        "commandDisposition": "not_applicable",
+        "details": {
+          "clientLastEventSeq": "92",
+          "hostEventSeq": "91"
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "error",
+      "requestId": "hello-attempt-uuid"
+    }
   }
 ]

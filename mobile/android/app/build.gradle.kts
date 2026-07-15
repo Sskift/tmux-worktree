@@ -41,6 +41,9 @@ android {
         getByName("test").resources.directories.add(
             rootProject.file("../../contracts/relay/v1").absolutePath,
         )
+        getByName("test").resources.directories.add(
+            rootProject.file("../../contracts/relay").absolutePath,
+        )
     }
 }
 

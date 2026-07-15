@@ -1,44 +1,510 @@
 [
   {
     "name": "host-hello",
+    "channel": "carrier",
     "direction": "host-to-broker",
     "phase": "carrier-handshake",
     "type": "host.hello",
-    "wire": "{\"carrierVersion\":1,\"type\":\"host.hello\",\"requestId\":\"host-hello-uuid\",\"payload\":{\"hostId\":\"mac-admin\",\"hostEpoch\":\"authority-uuid\",\"hostInstanceId\":\"host-process-uuid\",\"clientDialects\":[\"tw-relay.v1\",\"tw-relay.v2\"],\"capabilities\":[\"error.structured.v1\",\"command.ledger.v1\",\"command.query.v1\",\"snapshot.revision.v1\",\"event.sequence.v1\",\"terminal.stream.resume.v1\"],\"limits\":{\"maxFrameBytes\":1048576,\"terminalMaxFrameBytes\":65536}}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.hello",
+      "requestId": "host-hello-uuid",
+      "payload": {
+        "hostId": "mac-admin",
+        "hostEpoch": "authority-uuid",
+        "hostInstanceId": "host-process-uuid",
+        "clientDialects": ["tw-relay.v1", "tw-relay.v2"],
+        "capabilities": [
+          "error.structured.v1",
+          "command.ledger.v1",
+          "command.query.v1",
+          "snapshot.revision.v1",
+          "event.sequence.v1",
+          "terminal.stream.resume.v1"
+        ],
+        "limits": {
+          "maxFrameBytes": 1048576,
+          "terminalMaxFrameBytes": 65536
+        }
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.hello",
+      "requestId": "host-hello-uuid"
+    }
   },
   {
     "name": "host-registered",
+    "channel": "carrier",
     "direction": "broker-to-host",
     "phase": "carrier-handshake",
     "type": "host.registered",
-    "wire": "{\"carrierVersion\":1,\"type\":\"host.registered\",\"requestId\":\"host-hello-uuid\",\"connectorId\":\"connector-uuid\",\"payload\":{\"brokerEpoch\":\"broker-process-uuid\",\"hostsRevision\":\"18\",\"disposition\":\"connected\",\"supersededHostInstanceId\":null,\"limits\":{\"maxCarrierFrameBytes\":1500000,\"brokerCarrierBufferedBytes\":16777216,\"brokerCarrierLowWaterBytes\":8388608}}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.registered",
+      "requestId": "host-hello-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "brokerEpoch": "broker-process-uuid",
+        "hostsRevision": "18",
+        "disposition": "connected",
+        "supersededHostInstanceId": null,
+        "limits": {
+          "maxCarrierFrameBytes": 1500000,
+          "brokerCarrierBufferedBytes": 16777216,
+          "brokerCarrierLowWaterBytes": 8388608
+        }
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.registered",
+      "requestId": "host-hello-uuid"
+    }
+  },
+  {
+    "name": "enrollment-create",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "carrier-control",
+    "type": "enrollment.create",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "enrollment.create",
+      "requestId": "enroll-request-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "expiresInMs": 300000,
+        "deviceLabel": null
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "enrollment.create",
+      "requestId": "enroll-request-uuid"
+    }
+  },
+  {
+    "name": "enrollment-created",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "enrollment.created",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "enrollment.created",
+      "requestId": "enroll-request-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "deduplicated": false,
+        "enrollmentId": "enrollment-uuid",
+        "enrollmentCode": "twenroll2.opaque",
+        "hostId": "mac-admin",
+        "issuerUrl": "https://relay.example.com",
+        "relayUrl": "wss://relay.example.com/client",
+        "expiresAtMs": 1783700300000
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "enrollment.created",
+      "requestId": "enroll-request-uuid"
+    }
+  },
+  {
+    "name": "grant-revoke",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "carrier-control",
+    "type": "grant.revoke",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "grant.revoke",
+      "requestId": "revoke-request-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "grantId": "client-grant-uuid",
+        "reason": "user_revoked"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "grant.revoke",
+      "requestId": "revoke-request-uuid"
+    }
+  },
+  {
+    "name": "grant-revoked",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "grant.revoked",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "grant.revoked",
+      "requestId": "revoke-request-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "grantId": "client-grant-uuid",
+        "revokedAtMs": 1783700200000,
+        "alreadyRevoked": false
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "grant.revoked",
+      "requestId": "revoke-request-uuid"
+    }
+  },
+  {
+    "name": "host-reauthenticate",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "carrier-control",
+    "type": "host.reauthenticate",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.reauthenticate",
+      "requestId": "reauth-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "accessToken": "twcap2.new-payload.new-mac"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.reauthenticate",
+      "requestId": "reauth-uuid"
+    }
+  },
+  {
+    "name": "host-reauthenticated",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "host.reauthenticated",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.reauthenticated",
+      "requestId": "reauth-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "grantId": "host-grant-uuid",
+        "jti": "new-token-instance-uuid",
+        "expiresAtMs": 1783707200000,
+        "deduplicated": false
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.reauthenticated",
+      "requestId": "reauth-uuid"
+    }
+  },
+  {
+    "name": "host-auth-expiring",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "host.auth_expiring",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.auth_expiring",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "grantId": "host-grant-uuid",
+        "expiresAtMs": 1783703600000,
+        "refreshRecommendedAtMs": 1783703300000
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.auth_expiring",
+      "requestId": null
+    }
+  },
+  {
+    "name": "host-superseded",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "carrier-control",
+    "type": "host.superseded",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "host.superseded",
+      "connectorId": "losing-connector-uuid",
+      "payload": {
+        "hostId": "mac-admin",
+        "losingConnectorId": "losing-connector-uuid",
+        "winningConnectorId": "winning-connector-uuid",
+        "losingHostInstanceId": "old-host-process-uuid",
+        "winningHostInstanceId": "new-host-process-uuid",
+        "reason": "new_authenticated_connector"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "host.superseded",
+      "requestId": null
+    }
   },
   {
     "name": "route-open",
+    "channel": "carrier",
     "direction": "broker-to-host",
     "phase": "route-handshake",
     "type": "route.open",
-    "wire": "{\"carrierVersion\":1,\"type\":\"route.open\",\"requestId\":\"route-open-uuid\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"payload\":{\"connectionId\":\"client-socket-uuid\",\"clientDialect\":\"tw-relay.v2\",\"authContext\":{\"scheme\":\"twcap2\",\"role\":\"client\",\"hostId\":\"mac-admin\",\"principalId\":\"principal-opaque-id\",\"grantId\":\"grant-uuid\",\"clientInstanceId\":\"android-install-uuid\",\"jti\":\"token-instance-uuid\",\"kid\":\"key-2026-07\",\"expiresAtMs\":1783703600000},\"limits\":{\"maxFrameBytes\":1048576}}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.open",
+      "requestId": "route-open-uuid",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": {
+        "connectionId": "client-socket-uuid",
+        "clientDialect": "tw-relay.v2",
+        "authContext": {
+          "scheme": "twcap2",
+          "role": "client",
+          "hostId": "mac-admin",
+          "principalId": "principal-opaque-id",
+          "grantId": "grant-uuid",
+          "clientInstanceId": "android-install-uuid",
+          "jti": "token-instance-uuid",
+          "kid": "key-2026-07",
+          "expiresAtMs": 1783703600000
+        },
+        "limits": {
+          "maxFrameBytes": 1048576
+        }
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.open",
+      "requestId": "route-open-uuid"
+    }
   },
   {
     "name": "route-opened",
+    "channel": "carrier",
     "direction": "host-to-broker",
     "phase": "route-handshake",
     "type": "route.opened",
-    "wire": "{\"carrierVersion\":1,\"type\":\"route.opened\",\"requestId\":\"route-open-uuid\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"payload\":{\"acceptedAtMs\":1783700100000,\"maxFrameBytes\":1048576}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.opened",
+      "requestId": "route-open-uuid",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": {
+        "acceptedAtMs": 1783700100000,
+        "maxFrameBytes": 1048576
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.opened",
+      "requestId": "route-open-uuid"
+    }
+  },
+  {
+    "name": "route-rejected",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "route-handshake",
+    "type": "route.rejected",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.rejected",
+      "requestId": "route-open-uuid",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": null,
+      "error": {
+        "code": "HOST_DIALECT_UNAVAILABLE",
+        "message": "Requested client dialect is unavailable",
+        "retryable": false,
+        "commandDisposition": "not_applicable",
+        "details": null
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.rejected",
+      "requestId": "route-open-uuid"
+    }
   },
   {
     "name": "route-data-client-to-host",
+    "channel": "carrier",
     "direction": "broker-to-host",
     "phase": "route-data",
     "type": "route.data",
-    "wire": "{\"carrierVersion\":1,\"type\":\"route.data\",\"connectorId\":\"connector-uuid\",\"routeId\":\"route-uuid\",\"routeFence\":\"random-128-bit-uuid\",\"direction\":\"client_to_host\",\"seq\":\"1\",\"payload\":{\"opcode\":\"text\",\"encoding\":\"base64\",\"data\":\"eyJwcm90b2NvbFZlcnNpb24iOjJ9\"}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.data",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "direction": "client_to_host",
+      "seq": "1",
+      "payload": {
+        "opcode": "text",
+        "encoding": "base64",
+        "data": "eyJwcm90b2NvbFZlcnNpb24iOjJ9"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.data",
+      "requestId": null
+    }
+  },
+  {
+    "name": "route-data-host-to-client",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "route-data",
+    "type": "route.data",
+    "deriveFrom": "route-data-client-to-host",
+    "set": {
+      "/direction": "host_to_client",
+      "/seq": "2"
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.data",
+      "requestId": null
+    }
+  },
+  {
+    "name": "route-unbind",
+    "channel": "carrier",
+    "direction": "broker-to-host",
+    "phase": "route-control",
+    "type": "route.unbind",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.unbind",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": {
+        "reason": "client_closed",
+        "lastClientToHostSeq": "17"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.unbind",
+      "requestId": null
+    }
+  },
+  {
+    "name": "route-unbound",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "route-control",
+    "type": "route.unbound",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.unbound",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": {
+        "reason": "client_closed",
+        "lastClientToHostSeq": "17",
+        "lastHostToClientSeq": "23"
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.unbound",
+      "requestId": null
+    }
+  },
+  {
+    "name": "route-close",
+    "channel": "carrier",
+    "direction": "host-to-broker",
+    "phase": "route-control",
+    "type": "route.close",
+    "frame": {
+      "carrierVersion": 1,
+      "type": "route.close",
+      "connectorId": "connector-uuid",
+      "routeId": "route-uuid",
+      "routeFence": "random-128-bit-uuid",
+      "payload": {
+        "closeCode": 1013,
+        "reason": "slow_consumer",
+        "error": {
+          "code": "SLOW_CONSUMER",
+          "message": "Route cannot drain",
+          "retryable": true,
+          "commandDisposition": "not_applicable",
+          "details": null
+        }
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "route.close",
+      "requestId": null
+    }
   },
   {
     "name": "carrier-error-host-reauthenticate",
+    "channel": "carrier",
     "direction": "broker-to-host",
     "phase": "carrier-control",
     "type": "carrier.error",
-    "wire": "{\"carrierVersion\":1,\"type\":\"carrier.error\",\"requestId\":\"request-uuid\",\"connectorId\":\"connector-uuid\",\"payload\":{\"failedType\":\"host.reauthenticate\"},\"error\":{\"code\":\"AUTH_INVALID\",\"message\":\"Replacement access token is invalid\",\"retryable\":false,\"retryAfterMs\":null,\"commandDisposition\":\"not_applicable\",\"details\":null}}"
+    "frame": {
+      "carrierVersion": 1,
+      "type": "carrier.error",
+      "requestId": "request-uuid",
+      "connectorId": "connector-uuid",
+      "payload": {
+        "failedType": "host.reauthenticate"
+      },
+      "error": {
+        "code": "AUTH_INVALID",
+        "message": "Replacement access token is invalid",
+        "retryable": false,
+        "retryAfterMs": null,
+        "commandDisposition": "not_applicable",
+        "details": null
+      }
+    },
+    "normalized": {
+      "channel": "carrier",
+      "version": 1,
+      "type": "carrier.error",
+      "requestId": "request-uuid"
+    }
   }
 ]

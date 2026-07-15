@@ -1,0 +1,523 @@
+[
+  {
+    "name": "terminal-open-new",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.open",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "terminal.open",
+      "requestId": "open-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "openId": "logical-open-uuid",
+        "pane": 0,
+        "cols": 120,
+        "rows": 36,
+        "mode": "new"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.open",
+      "requestId": "open-1"
+    }
+  },
+  {
+    "name": "terminal-open-resume",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.open",
+    "deriveFrom": "terminal-open-new",
+    "set": {
+      "/requestId": "open-2",
+      "/payload/mode": "resume",
+      "/payload/resume": {
+        "generation": "generation-uuid",
+        "nextOffset": "1234",
+        "resumeToken": "opaque-token"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.open",
+      "requestId": "open-2"
+    }
+  },
+  {
+    "name": "terminal-opened",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.opened",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "terminal.opened",
+      "requestId": "open-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "hostInstanceId": "host-process-uuid",
+      "payload": {
+        "openId": "logical-open-uuid",
+        "deduplicated": false,
+        "generation": "generation-uuid",
+        "resumeToken": "opaque-token",
+        "disposition": "new",
+        "replayFromOffset": "0",
+        "bufferStartOffset": "0",
+        "tailOffset": "0",
+        "maxUnackedBytes": 524288,
+        "resetReason": null
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "terminal.opened",
+      "requestId": "open-1"
+    }
+  },
+  {
+    "name": "terminal-output",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.output",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.output",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "offset": "0",
+        "encoding": "base64",
+        "data": "aGVsbG8="
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.output",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-output-ack",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.output_ack",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.output_ack",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "nextOffset": "5"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.output_ack",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-replay-request",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-replay",
+    "type": "terminal.replay_request",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "terminal.replay_request",
+      "requestId": "replay-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "fromOffset": "5"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.replay_request",
+      "requestId": "replay-1"
+    }
+  },
+  {
+    "name": "terminal-replay-started",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-replay",
+    "type": "terminal.replay_started",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "terminal.replay_started",
+      "requestId": "replay-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "fromOffset": "5",
+        "tailOffsetAtStart": "10"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "terminal.replay_started",
+      "requestId": "replay-1"
+    }
+  },
+  {
+    "name": "terminal-reset-required-response",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-replay",
+    "type": "terminal.reset_required",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "terminal.reset_required",
+      "requestId": "replay-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "origin": "replay",
+        "generation": "generation-uuid",
+        "reason": "offset_expired",
+        "requestedOffset": "5",
+        "bufferStartOffset": "8",
+        "tailOffset": "10"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "terminal.reset_required",
+      "requestId": "replay-1"
+    }
+  },
+  {
+    "name": "terminal-reset-required-event",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.reset_required",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.reset_required",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "reason": "slow_consumer",
+        "requestedOffset": null,
+        "bufferStartOffset": "8",
+        "tailOffset": "10"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.reset_required",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-input",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.input",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.input",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "inputSeq": "1",
+        "encoding": "base64",
+        "data": "bHMK"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.input",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-input-ack",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.input_ack",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.input_ack",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "ackedThroughInputSeq": "1"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.input_ack",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-input-error",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.input_error",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.input_error",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "inputSeq": "3",
+        "ackedThroughInputSeq": "1",
+        "error": {
+          "code": "TERMINAL_INPUT_GAP",
+          "message": "Expected inputSeq 2",
+          "retryable": true,
+          "commandDisposition": "not_applicable",
+          "details": null
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.input_error",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-resize",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.resize",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.resize",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "resizeSeq": "1",
+        "cols": 120,
+        "rows": 36
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.resize",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-resize-ack",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.resize_ack",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.resize_ack",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "ackedThroughResizeSeq": "1"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.resize_ack",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-resize-error",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.resize_error",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.resize_error",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "resizeSeq": "3",
+        "ackedThroughResizeSeq": "1",
+        "error": {
+          "code": "TERMINAL_RESIZE_GAP",
+          "message": "Expected resizeSeq 2",
+          "retryable": true,
+          "commandDisposition": "not_applicable",
+          "details": null
+        }
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.resize_error",
+      "requestId": null
+    }
+  },
+  {
+    "name": "terminal-close",
+    "channel": "public",
+    "direction": "client-to-host-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.close",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "request",
+      "type": "terminal.close",
+      "requestId": "close-1",
+      "hostId": "mac-admin",
+      "expectedHostEpoch": "authority-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "closeId": "logical-close-uuid",
+        "generation": "generation-uuid",
+        "resumeToken": "opaque-token"
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "request",
+      "type": "terminal.close",
+      "requestId": "close-1"
+    }
+  },
+  {
+    "name": "terminal-closed-response",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-control",
+    "type": "terminal.closed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "response",
+      "type": "terminal.closed",
+      "requestId": "close-1",
+      "hostId": "mac-admin",
+      "hostEpoch": "authority-uuid",
+      "hostInstanceId": "host-process-uuid",
+      "scopeId": "scope-local",
+      "sessionId": "ses_01JOPAQUE",
+      "streamId": "stream-uuid",
+      "payload": {
+        "closeId": "logical-close-uuid",
+        "generation": "generation-uuid",
+        "finalOffset": "10",
+        "replayAvailable": true,
+        "bufferStartOffset": "0",
+        "reason": "backend_exit",
+        "exitCode": 0,
+        "deduplicated": false
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "response",
+      "type": "terminal.closed",
+      "requestId": "close-1"
+    }
+  },
+  {
+    "name": "terminal-closed-event",
+    "channel": "public",
+    "direction": "host-to-client-via-broker",
+    "phase": "terminal-stream",
+    "type": "terminal.closed",
+    "frame": {
+      "protocolVersion": 2,
+      "kind": "event",
+      "type": "terminal.closed",
+      "streamId": "stream-uuid",
+      "payload": {
+        "generation": "generation-uuid",
+        "finalOffset": "10",
+        "replayAvailable": false,
+        "bufferStartOffset": null,
+        "reason": "backend_exit",
+        "exitCode": 0
+      }
+    },
+    "normalized": {
+      "channel": "public",
+      "version": 2,
+      "kind": "event",
+      "type": "terminal.closed",
+      "requestId": null
+    }
+  }
+]

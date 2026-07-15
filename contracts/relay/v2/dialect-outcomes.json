@@ -1,0 +1,105 @@
+[
+  {
+    "name": "v2-client-to-capable-v2-host",
+    "input": {
+      "clientDialect": "tw-relay.v2",
+      "hostDialects": ["tw-relay.v1", "tw-relay.v2"],
+      "requiredCapabilities": [
+        "error.structured.v1",
+        "command.ledger.v1",
+        "command.query.v1",
+        "snapshot.revision.v1",
+        "event.sequence.v1",
+        "terminal.stream.resume.v1"
+      ],
+      "hostCapabilities": [
+        "error.structured.v1",
+        "command.ledger.v1",
+        "command.query.v1",
+        "snapshot.revision.v1",
+        "event.sequence.v1",
+        "terminal.stream.resume.v1"
+      ]
+    },
+    "expected": {
+      "outcome": "accept",
+      "selectedDialect": "tw-relay.v2",
+      "translation": false,
+      "fallback": false
+    }
+  },
+  {
+    "name": "v2-client-to-v1-only-host",
+    "input": {
+      "clientDialect": "tw-relay.v2",
+      "hostDialects": ["tw-relay.v1"],
+      "requiredCapabilities": [
+        "error.structured.v1",
+        "command.ledger.v1",
+        "command.query.v1",
+        "snapshot.revision.v1",
+        "event.sequence.v1",
+        "terminal.stream.resume.v1"
+      ],
+      "hostCapabilities": []
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "HOST_DIALECT_UNAVAILABLE",
+      "fallback": false
+    }
+  },
+  {
+    "name": "v2-client-to-capability-incomplete-v2-host",
+    "input": {
+      "clientDialect": "tw-relay.v2",
+      "hostDialects": ["tw-relay.v2"],
+      "requiredCapabilities": [
+        "error.structured.v1",
+        "command.ledger.v1",
+        "command.query.v1",
+        "snapshot.revision.v1",
+        "event.sequence.v1",
+        "terminal.stream.resume.v1"
+      ],
+      "hostCapabilities": [
+        "error.structured.v1",
+        "command.ledger.v1"
+      ]
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "CAPABILITY_UNAVAILABLE",
+      "fallback": false
+    }
+  },
+  {
+    "name": "v1-client-through-dual-v2-carrier",
+    "input": {
+      "clientDialect": "tw-relay.v1",
+      "hostDialects": ["tw-relay.v1", "tw-relay.v2"],
+      "requiredCapabilities": [],
+      "hostCapabilities": []
+    },
+    "expected": {
+      "outcome": "accept",
+      "selectedDialect": "tw-relay.v1",
+      "translation": false,
+      "fallback": false
+    }
+  },
+  {
+    "name": "v1-client-to-v2-only-host",
+    "input": {
+      "clientDialect": "tw-relay.v1",
+      "hostDialects": ["tw-relay.v2"],
+      "requiredCapabilities": [],
+      "hostCapabilities": []
+    },
+    "expected": {
+      "outcome": "reject",
+      "errorCode": "HOST_DIALECT_UNAVAILABLE",
+      "fallback": false
+    }
+  }
+]

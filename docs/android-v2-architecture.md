@@ -2,7 +2,7 @@
 
 ## 当前边界
 
-本文中的 **V2** 指第二代 Android 产品界面和客户端架构，即 Compose UI、`V2Activity` 与 `V2ViewModel`；它不代表 Relay v2。当前 Android、Dashboard、`relay-server` 和 `relay-host` 仍只实现 Relay v1。Relay v2 只有冻结的协议合同，尚未实现或达到互操作、生产可用状态。
+本文中的 **V2** 指第二代 Android 产品界面和客户端架构，即 Compose UI、`V2Activity` 与 `V2ViewModel`；它不代表 Relay v2。当前 Android、Dashboard、`relay-server` 和 `relay-host` 的运行路径仍只实现 Relay v1。Android 已有独立、未接入 actor 的 Relay v2 strict codec，并与 Node codec 共同消费冻结 fixture；这只是 conformance 基础，不表示已达到 runtime 互操作或生产可用状态。
 
 Android 客户端采用原生 Kotlin + Jetpack Compose，桌面端使用 React + Tauri，双方当前通过 Relay v1 协作。原生实现直接控制 Keystore、网络切换、进程恢复、WebView 终端和系统无障碍能力。
 
@@ -154,11 +154,11 @@ Android UI V2 不会把 Relay v1 没有的数据伪造成完整功能。基础 R
 - **终端恢复**：成功写入 `open_terminal` 后启动 10 秒 watchdog；首个 terminal data 证明流已打开并取消计时。超时会主动关闭旧 stream、产生明确错误并将终端置为 `UNKNOWN`，不会无限停在 `RECOVERING`。断线、同配置重连或网络暂停会清理 active stream 但保留 desired terminal，待网络恢复、session 快照确认目标仍存在后以新 generation 重开；切换到不同配置则清除 desired terminal。
 - **终端背压**：Relay actor 的所有动作都通过一个带 512 个普通槽和 16 个保留槽的固定容量单 FIFO；同一 WebSocket 的 callback 入口也串行化，因此 close / failure 不会越过先到的 terminal data 或 ACK。事件队列同样有界。UI effect 通过一个带保留容量的单 FIFO 转发，reset / clear 不会越过先到的 terminal write。终端输出按 16ms / 64K 聚合，WebView 同时只保留一笔 JavaScript write 在途，并把待写缓冲限制在 1M 字符。持续洪峰超过上限时会显示明确截断标记；协议动作队列溢出时主动断开并走恢复状态，而不是无界占用内存。
 - **严格流归属**：终端 data / exit 必须携带并精确匹配当前 `streamId`。早期省略 `streamId` 的 relay-host 不再兼容，因为流切换后的迟到数据无法安全归属；当前仓库的 relay-host 始终回传 streamId。
-- **明确限制**：当前实现没有 Relay v2 的幂等执行、远端命令结果查询、Agent 入站时间线、Agent 状态事件、通知事件或终端 offset 续传。这些能力不能由 Android 本地状态可靠推断。
+- **明确限制**：当前运行路径没有 Relay v2 的幂等执行、远端命令结果查询、Agent 入站时间线、Agent 状态事件、通知事件或终端 offset 续传。这些能力不能由 Android 本地状态可靠推断。
 
 ## 当前交付与实施协调
 
-当前源码已实现 Compose 信息架构、Room/DataStore/Keystore 持久层、Relay v1 actor、每会话串行 Outbox、配对切换 barrier、分维快照、终端恢复、二维码 review 和 WSS 校验。Android JVM、Lint、APK build 与连接设备验证仍是不同证据；`assembleRelease` 只生成 unsigned 构建验证产物，不代表生产签名、TLS 基础设施、后台通知或渠道发布已经完成。
+当前源码已实现 Compose 信息架构、Room/DataStore/Keystore 持久层、Relay v1 actor、每会话串行 Outbox、配对切换 barrier、分维快照、终端恢复、二维码 review、WSS 校验，以及尚未接入运行路径的 Relay v2 codec conformance 基础。Android JVM、Lint、APK build 与连接设备验证仍是不同证据；`assembleRelease` 只生成 unsigned 构建验证产物，不代表生产签名、TLS 基础设施、后台通知或渠道发布已经完成。
 
 Relay v2 不再在本 Android 专题中维护单端 A/B/C 路线。broker、relay-host、Dashboard、Android 和 Agent extension 的并行工作包、硬依赖与验收门槛统一见 [`relay-v2-implementation-plan.md`](relay-v2-implementation-plan.md)；冻结 wire 语义仍以 [`relay-v2-contract.md`](relay-v2-contract.md) 为准。
 
