@@ -1543,15 +1543,29 @@ test("final close drains client side effects from shutdown, host failure, and pr
     assert.equal(h.scheduler.liveDelayedTasks().length, 0);
   });
 
-  for (const forceFailure of ["throw", "nontrue"]) {
-    await t.test(`force ${forceFailure} yields an observable terminal failure receipt`, async () => {
+  for (const forceFailure of ["nontrue", "throw"]) {
+    await t.test(`force ${forceFailure} fences every handed-off owner before terminal receipt`, async () => {
       const owner = new StatefulBrokerActionOwner();
+      const pendingEffects = [];
       let teardown = false;
       let forceCalls = 0;
       const h = createHarness({
         actionSink(action, _signal, fence) {
           if (action.kind === "route_opened") return owner.apply(action, fence);
-          if (teardown && action.kind === "close_client") return new Promise(() => {});
+          if (teardown && action.kind === "close_client") {
+            // Deliberately ignore AbortSignal. The real socket owner checks
+            // its lease only immediately before a delayed external effect.
+            return new Promise((resolve) => {
+              pendingEffects.push({
+                fence,
+                settle() {
+                  if (fence.mayApply()) owner.apply(action, fence);
+                  else owner.rejectedEffects.push(`close_client:${action.connectionId}`);
+                  resolve();
+                },
+              });
+            });
+          }
           return undefined;
         },
         forceActionSink() {
@@ -1561,12 +1575,20 @@ test("final close drains client side effects from shutdown, host failure, and pr
         },
       });
       await startRegistered(h);
-      owner.trackClient(`client-force-${forceFailure}`);
-      await openRoute(h, `client-force-${forceFailure}`);
+      const connectionIds = [
+        `client-force-${forceFailure}-first`,
+        `client-force-${forceFailure}-second`,
+      ];
+      for (const connectionId of connectionIds) {
+        owner.trackClient(connectionId);
+        await openRoute(h, connectionId);
+      }
       teardown = true;
 
       const closeBarrier = h.pump.shutdown();
       assert.equal(h.pump.whenCloseSettled(), closeBarrier);
+      assert.equal(h.pump.snapshot().inFlightCloseActions, 2);
+      assert.equal(pendingEffects.length, 2);
       await h.scheduler.advance(5_000);
       const receipt = await closeBarrier;
 
@@ -1578,12 +1600,71 @@ test("final close drains client side effects from shutdown, host failure, and pr
       });
       assert.equal(h.pump.snapshot().phase, "terminal_failure");
       assert.equal(h.pump.snapshot().terminalFailure, "mandatory_force_rejected");
-      assert.equal(h.pump.snapshot().mandatoryActions, 1);
+      assert.equal(h.pump.snapshot().mandatoryActions, 2);
       assert.ok(h.pump.snapshot().mandatoryActionBytes > 0);
       assert.equal(h.pump.snapshot().closeCode, null);
-      assert.equal(owner.isOpen(`client-force-${forceFailure}`), true);
+      assert.equal(
+        pendingEffects.every((pending) => pending.fence.mayApply() === false),
+        true,
+        "terminal receipt cannot precede fencing another handed-off action",
+      );
+      for (const pending of pendingEffects) pending.settle();
+      await h.scheduler.flushReady();
+      assert.deepEqual(owner.rejectedEffects, connectionIds.map((id) => `close_client:${id}`));
+      assert.equal(connectionIds.every((id) => owner.isOpen(id)), true);
       assert.equal(forceCalls, 1, "a failed force receipt is not retried or deduped away");
       assert.equal(await h.pump.shutdown(), receipt);
+    });
+  }
+
+  for (const sinkFailure of ["async_reject", "sync_throw"]) {
+    await t.test(`${sinkFailure} force failure fences an already pending sibling`, async () => {
+      const siblingEffects = [];
+      let teardown = false;
+      let siblingFence;
+      let triggerFence;
+      let settleSibling;
+      let rejectTrigger;
+      const h = createHarness({
+        actionSink(action, _signal, fence) {
+          if (!teardown || action.kind !== "close_client") return undefined;
+          if (action.connectionId === `client-${sinkFailure}-sibling`) {
+            siblingFence = fence;
+            return new Promise((resolve) => {
+              settleSibling = () => {
+                if (fence.mayApply()) siblingEffects.push(action.connectionId);
+                resolve();
+              };
+            });
+          }
+          triggerFence = fence;
+          if (sinkFailure === "sync_throw") throw new Error("cleanup sink threw");
+          return new Promise((_resolve, reject) => { rejectTrigger = reject; });
+        },
+        forceActionSink() {
+          return false;
+        },
+      });
+      await startRegistered(h);
+      await openRoute(h, `client-${sinkFailure}-sibling`);
+      await openRoute(h, `client-${sinkFailure}-trigger`);
+      teardown = true;
+
+      const closeBarrier = h.pump.shutdown();
+      if (sinkFailure === "async_reject") {
+        assert.equal(h.pump.snapshot().inFlightCloseActions, 2);
+        rejectTrigger(new Error("cleanup sink rejected"));
+        await h.scheduler.flushReady();
+      }
+      const receipt = await closeBarrier;
+
+      assert.equal(receipt.outcome, "terminal_failure");
+      assert.equal(siblingFence.mayApply(), false);
+      assert.equal(triggerFence.mayApply(), false);
+      settleSibling();
+      await h.scheduler.flushReady();
+      assert.deepEqual(siblingEffects, []);
+      assert.equal(h.pump.snapshot().scheduledTimers, 0);
     });
   }
 

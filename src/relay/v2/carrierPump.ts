@@ -887,6 +887,12 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     for (const state of this.ownerFenceStates.get(identity) ?? []) state.fenced = true;
   }
 
+  private installAllOwnerFences(): void {
+    for (const states of this.ownerFenceStates.values()) {
+      for (const state of states) state.fenced = true;
+    }
+  }
+
   private releaseOwnerFence(state: OwnerFenceState): void {
     const states = this.ownerFenceStates.get(state.identity);
     states?.delete(state);
@@ -1798,6 +1804,11 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private finishTerminalFailure(reason: string): void {
     if (this.phase === "closed" || this.phase === "terminal_failure") return;
     this.actionAdmissionStopped = true;
+    // A terminal receipt is the final owner boundary. Fence every lease that
+    // may already have crossed an async sink before aborting or resolving the
+    // barrier; generation checks inside the pump cannot undo a late external
+    // socket effect.
+    this.installAllOwnerFences();
     this.terminalFailureReason = reason;
     this.lifecycleGeneration += 1;
     this.hostDeliveryAttempt?.abort.abort();
@@ -1822,8 +1833,8 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     const close = this.closeRequest ?? { code: 1013, reason };
     this.hostConnection?.closed(close.code);
     this.hostConnection = null;
-    // Mandatory registry and owner fence states are deliberately retained:
-    // the external socket owner did not acknowledge cleanup.
+    // Mandatory registry and its now-permanently-fenced owner states are
+    // retained because the external socket owner did not acknowledge cleanup.
     this.phase = "terminal_failure";
     this.settleCloseBarrier("terminal_failure");
   }
