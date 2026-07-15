@@ -90,6 +90,70 @@ class RelayV2CodecContractTest {
     }
 
     @Test
+    fun androidCommandSchemaRejectsOuterWhitespaceExceptInMessage() {
+        val strictFields = listOf(
+            Triple("command-execute-create-worktree", "project", " demo"),
+            Triple("command-execute-create-worktree", "path", "/repo/demo "),
+            Triple("command-execute-create-worktree", "name", " fix-auth"),
+            Triple("command-execute-create-worktree", "branch", "main "),
+            Triple("command-execute-create-worktree", "aiCommand", " codex"),
+            Triple("command-execute-create-terminal", "cwd", " /repo/demo"),
+            Triple("command-execute-create-terminal", "label", "demo shell "),
+        )
+        strictFields.forEach { (fixtureName, field, value) ->
+            val frame = fixture(fixtureName)
+            frame.commandArguments()[field] = value
+            val error = assertThrows(field, RelayV2CodecException::class.java) {
+                codec.decodeWebSocketFrame(
+                    RelayV2WebSocketChannel.PUBLIC,
+                    RelayV2StrictJson.stringify(frame).toByteArray(StandardCharsets.UTF_8),
+                )
+            }
+            assertEquals(field, "INVALID_ENVELOPE", error.code)
+            assertEquals(field, "invalid-argument", error.failureClass)
+        }
+
+        val messageFrame = fixture("command-execute-send-agent-message")
+        messageFrame.commandArguments()["message"] = " continue "
+        val decoded = codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            RelayV2StrictJson.stringify(messageFrame).toByteArray(StandardCharsets.UTF_8),
+        )
+        assertEquals("command.execute", decoded.frame["type"])
+    }
+
+    @Test
+    fun androidTerminalSequenceStartsAtOneWhileAckBaselineAllowsZero() {
+        val sequenceFields = listOf(
+            "terminal-input" to "inputSeq",
+            "terminal-input-error" to "inputSeq",
+            "terminal-resize" to "resizeSeq",
+            "terminal-resize-error" to "resizeSeq",
+        )
+        sequenceFields.forEach { (fixtureName, field) ->
+            val frame = fixture(fixtureName)
+            frame.payload()[field] = "0"
+            val error = assertThrows(fixtureName, RelayV2CodecException::class.java) {
+                decodePublic(frame)
+            }
+            assertEquals(fixtureName, "INVALID_ENVELOPE", error.code)
+            assertEquals(fixtureName, "invalid-argument", error.failureClass)
+        }
+
+        val ackBaselines = listOf(
+            "terminal-input-ack" to "ackedThroughInputSeq",
+            "terminal-input-error" to "ackedThroughInputSeq",
+            "terminal-resize-ack" to "ackedThroughResizeSeq",
+            "terminal-resize-error" to "ackedThroughResizeSeq",
+        )
+        ackBaselines.forEach { (fixtureName, field) ->
+            val frame = fixture(fixtureName)
+            frame.payload()[field] = "0"
+            assertEquals(fixtureName, frame["type"], decodePublic(frame).frame["type"])
+        }
+    }
+
+    @Test
     fun androidDialectResolutionMatchesSharedNoFallbackMatrix() {
         fixtures.dialect.forEach { fixture ->
             val clientDialect = RelayV2ClientDialect.fromWireName(
@@ -106,7 +170,43 @@ class RelayV2CodecContractTest {
             assertEquals(fixture.name, fixture.expected, outcome.asFixtureMap())
         }
     }
+
+    private fun fixture(name: String): MutableMap<String, Any?> = deepClone(
+        fixtures.golden.single { it.name == name }.frame,
+    )
+
+    private fun decodePublic(frame: Map<String, Any?>): RelayV2DecodedMessage =
+        codec.decodeWebSocketFrame(
+            RelayV2WebSocketChannel.PUBLIC,
+            RelayV2StrictJson.stringify(frame).toByteArray(StandardCharsets.UTF_8),
+        )
 }
+
+@Suppress("UNCHECKED_CAST")
+private fun MutableMap<String, Any?>.commandArguments(): MutableMap<String, Any?> =
+    payload()
+        .getValue("arguments") as MutableMap<String, Any?>
+
+@Suppress("UNCHECKED_CAST")
+private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
+    getValue("payload") as MutableMap<String, Any?>
+
+@Suppress("UNCHECKED_CAST")
+private fun deepClone(source: Map<String, Any?>): MutableMap<String, Any?> =
+    linkedMapOf<String, Any?>().apply {
+        source.forEach { (key, value) ->
+            put(
+                key,
+                when (value) {
+                    is Map<*, *> -> deepClone(value as Map<String, Any?>)
+                    is List<*> -> value.map { item ->
+                        if (item is Map<*, *>) deepClone(item as Map<String, Any?>) else item
+                    }.toMutableList()
+                    else -> value
+                },
+            )
+        }
+    }
 
 private fun Map<String, Any?>.stringValue(name: String): String =
     this[name] as? String ?: error("Fixture field must be a string: " + name)

@@ -652,12 +652,3 @@ internal class RelayV2ProfileRepository(
         ) : PreparedEnrollment
     }
 }
-
-private fun RelayV2Profile.matchesCredentialBinding(blob: RelayV2CredentialBlob): Boolean =
-    blob.hasCredentialMaterial &&
-        issuerUrl == blob.issuerUrl &&
-        relayUrl == blob.relayUrl &&
-        hostId == blob.hostId &&
-        principalId == blob.principalId &&
-        grantId == blob.grantId &&
-        clientInstanceId == blob.clientInstanceId

@@ -317,3 +317,12 @@ internal interface RelayV2CredentialExchange {
     suspend fun redeem(request: RelayV2EnrollmentExchangeRequest): RelayV2EnrollmentExchangeResponse
     suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse
 }
+
+internal fun RelayV2Profile.matchesCredentialBinding(blob: RelayV2CredentialBlob): Boolean =
+    blob.hasCredentialMaterial &&
+        issuerUrl == blob.issuerUrl &&
+        relayUrl == blob.relayUrl &&
+        hostId == blob.hostId &&
+        principalId == blob.principalId &&
+        grantId == blob.grantId &&
+        clientInstanceId == blob.clientInstanceId

@@ -354,7 +354,6 @@ private fun validateCommandArguments(operation: String, value: Any?) {
             if (arguments.containsKey("path")) {
                 jsonString(
                     arguments["path"],
-                    allowOuterWhitespace = true,
                     maxBytes = 4_096,
                 )
             }
@@ -366,7 +365,6 @@ private fun validateCommandArguments(operation: String, value: Any?) {
             }
             jsonString(
                 required(arguments, "aiCommand"),
-                allowOuterWhitespace = true,
                 maxBytes = 4_096,
             )
         }
@@ -374,13 +372,11 @@ private fun validateCommandArguments(operation: String, value: Any?) {
             exactKeys(arguments, listOf("cwd"), listOf("label"))
             jsonString(
                 required(arguments, "cwd"),
-                allowOuterWhitespace = true,
                 maxBytes = 4_096,
             )
             if (arguments.containsKey("label")) {
                 jsonString(
                     arguments["label"],
-                    allowOuterWhitespace = true,
                     maxBytes = 128,
                 )
             }
@@ -1205,7 +1201,7 @@ private fun validateTerminalInputFrame(frame: RelayV2JsonObject) {
     val payload = jsonObject(required(frame, "payload"))
     exactKeys(payload, listOf("generation", "inputSeq", "encoding", "data"))
     jsonId(required(payload, "generation"))
-    jsonCounter(required(payload, "inputSeq"))
+    jsonTerminalSequence(required(payload, "inputSeq"))
     jsonLiteral(required(payload, "encoding"), "base64")
     jsonCanonicalBase64(required(payload, "data"), maxDecodedBytes = 65_536)
 }
@@ -1226,7 +1222,7 @@ private fun validateTerminalInputErrorFrame(frame: RelayV2JsonObject) {
         listOf("generation", "inputSeq", "ackedThroughInputSeq", "error"),
     )
     jsonId(required(payload, "generation"))
-    jsonCounter(required(payload, "inputSeq"))
+    jsonTerminalSequence(required(payload, "inputSeq"))
     jsonCounter(required(payload, "ackedThroughInputSeq"))
     validateStructuredError(required(payload, "error"))
 }
@@ -1236,7 +1232,7 @@ private fun validateTerminalResizeFrame(frame: RelayV2JsonObject) {
     val payload = jsonObject(required(frame, "payload"))
     exactKeys(payload, listOf("generation", "resizeSeq", "cols", "rows"))
     jsonId(required(payload, "generation"))
-    jsonCounter(required(payload, "resizeSeq"))
+    jsonTerminalSequence(required(payload, "resizeSeq"))
     jsonInteger(required(payload, "cols"), minimum = 1, maximum = 1_000)
     jsonInteger(required(payload, "rows"), minimum = 1, maximum = 500)
 }
@@ -1257,9 +1253,13 @@ private fun validateTerminalResizeErrorFrame(frame: RelayV2JsonObject) {
         listOf("generation", "resizeSeq", "ackedThroughResizeSeq", "error"),
     )
     jsonId(required(payload, "generation"))
-    jsonCounter(required(payload, "resizeSeq"))
+    jsonTerminalSequence(required(payload, "resizeSeq"))
     jsonCounter(required(payload, "ackedThroughResizeSeq"))
     validateStructuredError(required(payload, "error"))
+}
+
+private fun jsonTerminalSequence(value: Any?): String = jsonCounter(value).also {
+    if (it == "0") schemaFailure("invalid-argument")
 }
 
 private fun validateTerminalCloseFrame(frame: RelayV2JsonObject) {
