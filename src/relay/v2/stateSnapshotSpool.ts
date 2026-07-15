@@ -1,4 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   closeSync,
   existsSync,
@@ -9,6 +10,7 @@ import {
   openSync,
   opendirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeSync,
@@ -58,6 +60,7 @@ export interface RelayV2StateSnapshotLimits {
   maxCutsPerHost: number;
   maxSpoolCanonicalBytes: number;
   maxMetadataBytes: number;
+  maxTombstones: number;
   releaseTombstoneMs: number;
 }
 
@@ -72,6 +75,7 @@ export const RELAY_V2_STATE_SNAPSHOT_LIMITS: Readonly<RelayV2StateSnapshotLimits
   maxCutsPerHost: 16,
   maxSpoolCanonicalBytes: 536_870_912,
   maxMetadataBytes: 16_777_216,
+  maxTombstones: MAX_TOMBSTONES,
   releaseTombstoneMs: 600_000,
 });
 
@@ -96,7 +100,13 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   afterChunkWrite?: (index: number) => void;
   afterMetadataLockAcquired?: (token: string) => void | Promise<void>;
   beforeStaleLockQuarantine?: (identity: string) => void | Promise<void>;
+  afterStaleLockQuarantinePersisted?: (identity: string) => void;
   beforeMetadataLockRelease?: (token: string) => void | Promise<void>;
+  beforeRecoveryChunkRead?: (index: number) => void;
+  beforeRecoveryMetadataRead?: (
+    kind: "binding" | "lease" | "manifest" | "reservation" | "tombstone",
+  ) => void;
+  processIncarnationForPid?: (pid: number) => string | null | undefined;
   afterRecoveryExpiredFencePersisted?: (snapshotId: string) => void;
   afterReservationPersisted?: (snapshotId: string) => void;
   afterTombstonePersisted?: (
@@ -265,12 +275,14 @@ interface PersistedSpoolOwner {
   fence: string;
   acquiredAtMs: number;
   pid: number;
+  processIncarnation: string;
 }
 
 interface PersistedLockHolder {
   version: typeof LOCK_VERSION;
   token: string;
   pid: number;
+  processIncarnation: string;
 }
 
 interface ActiveCut {
@@ -313,6 +325,33 @@ function pathsFromRoot(root: string): RelayV2StateSnapshotSpoolPaths {
     lock: join(root, LOCK_FILE),
     lockCandidates: join(root, LOCK_CANDIDATES_DIRECTORY),
     lockQuarantine: join(root, LOCK_QUARANTINE_DIRECTORY),
+  };
+}
+
+function physicalCustomRoot(root: string): { root: string; trustedBoundary: string } {
+  const lexicalRoot = resolve(root);
+  const rootName = basename(lexicalRoot);
+  if (rootName.length === 0) {
+    throw new UnsafeSpoolPathError("snapshot spool custom root is invalid");
+  }
+  const missingParents: string[] = [];
+  let existingParent = dirname(lexicalRoot);
+  while (!existsSync(existingParent)) {
+    const parent = dirname(existingParent);
+    if (parent === existingParent) {
+      throw new UnsafeSpoolPathError("snapshot spool custom root has no trusted parent");
+    }
+    missingParents.unshift(basename(existingParent));
+    existingParent = parent;
+  }
+  const trustedBoundary = realpathSync(existingParent);
+  const physicalParent = missingParents.reduce(
+    (parent, segment) => join(parent, segment),
+    trustedBoundary,
+  );
+  return {
+    root: join(physicalParent, rootName),
+    trustedBoundary,
   };
 }
 
@@ -541,6 +580,19 @@ function assertPrivateFlatDirectory(
 
 function jsonFile(value: unknown): Buffer {
   return Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+}
+
+function readCanonicalPrivateFile<T>(
+  path: string,
+  maxBytes: number,
+  parser: (value: unknown) => T,
+): { record: T; actualBytes: number } {
+  const contents = readPrivateFile(path, maxBytes);
+  const record = parser(JSON.parse(contents.toString("utf8")));
+  if (!contents.equals(jsonFile(record))) {
+    throw new Error("snapshot metadata is not in its canonical persisted form");
+  }
+  return { record, actualBytes: contents.byteLength };
 }
 
 function utf8Compare(left: string, right: string): number {
@@ -837,7 +889,12 @@ function parseBinding(value: unknown): SnapshotBinding {
   ])) throw new Error("snapshot binding is malformed");
   const binding = value as unknown as SnapshotBinding;
   validateBinding(binding);
-  return clone(binding);
+  return {
+    principalId: binding.principalId,
+    clientInstanceId: binding.clientInstanceId,
+    hostEpoch: binding.hostEpoch,
+    snapshotRequestId: binding.snapshotRequestId,
+  };
 }
 
 function parseManifest(value: unknown): PersistedManifest {
@@ -883,7 +940,14 @@ function parseManifest(value: unknown): PersistedManifest {
     } else {
       assertOpaqueId(chunk.nextCursor, "nextCursor", 1_024);
     }
-    return clone(chunk) as unknown as PersistedChunkIndex;
+    return {
+      index: chunk.index,
+      file: chunk.file,
+      recordCount: chunk.recordCount,
+      canonicalBytes: chunk.canonicalBytes,
+      digest: chunk.digest,
+      nextCursor: chunk.nextCursor,
+    };
   });
   return {
     version: SPOOL_VERSION,
@@ -912,7 +976,11 @@ function parseLease(value: unknown, manifest: PersistedManifest): PersistedLease
   if (value.snapshotLeaseExpiresAtMs > manifest.snapshotAbsoluteExpiresAtMs) {
     throw new Error("snapshot idle lease exceeds absolute expiry");
   }
-  return value as unknown as PersistedLease;
+  return {
+    version: LEASE_VERSION,
+    snapshotId: value.snapshotId,
+    snapshotLeaseExpiresAtMs: value.snapshotLeaseExpiresAtMs,
+  };
 }
 
 function parseBindingMarker(value: unknown): PersistedBindingMarker {
@@ -1006,6 +1074,7 @@ function parseReservation(value: unknown): PersistedReservation {
 function parseOwner(value: unknown): PersistedSpoolOwner {
   if (!isRecord(value) || !exactKeys(value, [
     "version", "hostId", "ownerInstanceId", "fence", "acquiredAtMs", "pid",
+    "processIncarnation",
   ]) || value.version !== OWNER_VERSION) {
     throw new Error("snapshot spool owner metadata is malformed");
   }
@@ -1016,11 +1085,22 @@ function parseOwner(value: unknown): PersistedSpoolOwner {
   if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
     throw new Error("snapshot spool owner pid is malformed");
   }
-  return value as unknown as PersistedSpoolOwner;
+  assertOpaqueId(value.processIncarnation, "processIncarnation");
+  return {
+    version: OWNER_VERSION,
+    hostId: value.hostId,
+    ownerInstanceId: value.ownerInstanceId,
+    fence: value.fence,
+    acquiredAtMs: value.acquiredAtMs,
+    pid: value.pid,
+    processIncarnation: value.processIncarnation,
+  };
 }
 
 function parseLockHolder(value: unknown): PersistedLockHolder {
-  if (!isRecord(value) || !exactKeys(value, ["version", "token", "pid"])
+  if (!isRecord(value) || !exactKeys(value, [
+    "version", "token", "pid", "processIncarnation",
+  ])
     || value.version !== LOCK_VERSION) {
     throw new Error("snapshot spool lock metadata is malformed");
   }
@@ -1028,16 +1108,52 @@ function parseLockHolder(value: unknown): PersistedLockHolder {
   if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
     throw new Error("snapshot spool lock pid is malformed");
   }
-  return value as unknown as PersistedLockHolder;
+  assertOpaqueId(value.processIncarnation, "processIncarnation");
+  return {
+    version: LOCK_VERSION,
+    token: value.token,
+    pid: value.pid,
+    processIncarnation: value.processIncarnation,
+  };
 }
 
-function processIsAlive(pid: number): boolean {
+function processIncarnationForPid(pid: number): string | null | undefined {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
-    return isRecord(error) && error.code === "EPERM";
+    if (isRecord(error) && error.code === "ESRCH") return null;
+    if (!isRecord(error) || error.code !== "EPERM") return undefined;
   }
+  try {
+    let witness: string;
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const startTicks = fields[19];
+      if (!startTicks || !/^[0-9]+$/.test(startTicks)) return undefined;
+      witness = `linux:${pid}:${startTicks}`;
+    } else {
+      const startedAt = execFileSync(
+        "/bin/ps",
+        ["-o", "lstart=", "-p", String(pid)],
+        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).trim();
+      if (startedAt.length === 0) return null;
+      witness = `${process.platform}:${pid}:${startedAt}`;
+    }
+    return createHash("sha256").update(witness, "utf8").digest("base64url");
+  } catch (error) {
+    if (isRecord(error) && (error.code === "ENOENT" || error.code === "ESRCH")) {
+      return null;
+    }
+    return undefined;
+  }
+}
+
+class RecoveryMetadataQuotaError extends Error {}
+
+interface RecoveryMetadataBudget {
+  actualBytes: number;
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -1056,6 +1172,8 @@ export class RelayV2StateSnapshotSpool {
   private readonly verifyTrustedAncestors: boolean;
   private readonly takeoverExistingOwner: boolean;
   private readonly testHooks: RelayV2StateSnapshotSpoolTestHooks | undefined;
+  private readonly processIncarnationProbe: (pid: number) => string | null | undefined;
+  private readonly processIncarnation: string;
   private readonly ownerFence = randomBytes(32).toString("base64url");
   private readonly activeById = new Map<string, ActiveCut>();
   private readonly activeByLogicalKey = new Map<string, ActiveCut>();
@@ -1076,16 +1194,30 @@ export class RelayV2StateSnapshotSpool {
     this.ownerInstanceId = options.ownerInstanceId ?? randomUUID();
     assertOpaqueId(this.ownerInstanceId, "ownerInstanceId");
     const home = resolve(options.home ?? homedir());
-    const root = options.root === undefined
-      ? relayV2StateSnapshotSpoolPaths(home).root
-      : resolve(options.root);
-    this.paths = pathsFromRoot(root);
-    this.trustedBoundary = options.root === undefined ? home : dirname(root);
-    this.verifyTrustedAncestors = options.root === undefined;
+    if (options.root === undefined) {
+      this.paths = relayV2StateSnapshotSpoolPaths(home);
+      this.trustedBoundary = home;
+    } else {
+      const physical = physicalCustomRoot(options.root);
+      this.paths = pathsFromRoot(physical.root);
+      this.trustedBoundary = physical.trustedBoundary;
+    }
+    this.verifyTrustedAncestors = true;
     this.takeoverExistingOwner = options.takeoverExistingOwner ?? false;
     this.cutSource = options.cutSource;
     this.now = options.now ?? Date.now;
     this.testHooks = options.testHooks;
+    this.processIncarnationProbe = options.testHooks?.processIncarnationForPid
+      ?? processIncarnationForPid;
+    const incarnation = this.processIncarnationProbe(process.pid);
+    if (incarnation === null || incarnation === undefined) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot spool cannot establish its process incarnation",
+      );
+    }
+    assertOpaqueId(incarnation, "processIncarnation");
+    this.processIncarnation = incarnation;
     this.limits = Object.freeze({
       ...RELAY_V2_STATE_SNAPSHOT_LIMITS,
       ...options.testLimits,
@@ -1424,6 +1556,7 @@ export class RelayV2StateSnapshotSpool {
         version: LOCK_VERSION,
         token,
         pid: process.pid,
+        processIncarnation: this.processIncarnation,
       };
       writePrivateFile(candidate, jsonFile(holder));
       fsyncDirectory(this.paths.lockCandidates);
@@ -1450,8 +1583,11 @@ export class RelayV2StateSnapshotSpool {
           const observed = this.observeMetadataLock();
           const incompleteStillPublishing = observed.holder === undefined
             && Date.now() - observed.mtimeMs < LOCK_WAIT_TIMEOUT_MS;
+          const holderIsCurrentIncarnation = observed.holder === undefined
+            ? false
+            : this.processIncarnationMatches(observed.holder);
           if (!incompleteStillPublishing
-            && (observed.holder === undefined || !processIsAlive(observed.holder.pid))) {
+            && (observed.holder === undefined || holderIsCurrentIncarnation === false)) {
             await this.testHooks?.beforeStaleLockQuarantine?.(observed.identity);
             this.quarantineObservedLock(observed);
             continue;
@@ -1494,10 +1630,11 @@ export class RelayV2StateSnapshotSpool {
     const metadata = lstatSync(this.paths.lock);
     let holder: PersistedLockHolder | undefined;
     try {
-      holder = parseLockHolder(JSON.parse(readPrivateFile(
+      holder = readCanonicalPrivateFile(
         this.paths.lock,
         4_096,
-      ).toString("utf8")));
+        parseLockHolder,
+      ).record;
     } catch (error) {
       if (error instanceof UnsafeSpoolPathError) throw error;
     }
@@ -1535,15 +1672,15 @@ export class RelayV2StateSnapshotSpool {
     }
     if (existsSync(quarantine)) {
       assertPrivateFile(quarantine, 4_096);
-      if (!existsSync(this.paths.lock)) return;
-      const current = this.observeMetadataLock();
-      if (current.device === observed.device && current.inode === observed.inode) {
+      const quarantined = lstatSync(quarantine);
+      if (quarantined.dev !== observed.device || quarantined.ino !== observed.inode) {
         this.fatalUnavailable = true;
         throw new RelayV2StateSnapshotSpoolError(
           "INTERNAL",
-          "snapshot spool stale lock quarantine identity is duplicated",
+          "snapshot spool stale lock quarantine identity conflicts",
         );
       }
+      this.unlinkObservedMetadataLock(observed);
       return;
     }
     try {
@@ -1560,16 +1697,35 @@ export class RelayV2StateSnapshotSpool {
     if (quarantined.dev !== observed.device || quarantined.ino !== observed.inode) {
       return;
     }
-    if (!existsSync(this.paths.lock)) return;
-    const current = lstatSync(this.paths.lock);
+    this.testHooks?.afterStaleLockQuarantinePersisted?.(observed.identity);
+    this.unlinkObservedMetadataLock(observed);
+  }
+
+  private unlinkObservedMetadataLock(observed: {
+    device: number;
+    inode: number;
+  }): void {
+    let current: ReturnType<typeof lstatSync>;
+    try {
+      current = lstatSync(this.paths.lock);
+    } catch (error) {
+      if (isRecord(error) && error.code === "ENOENT") return;
+      throw error;
+    }
     if (current.dev !== observed.device || current.ino !== observed.inode) return;
-    rmSync(this.paths.lock);
-    fsyncDirectory(this.paths.root);
+    try {
+      rmSync(this.paths.lock);
+      fsyncDirectory(this.paths.root);
+    } catch (error) {
+      if (!isRecord(error) || error.code !== "ENOENT") throw error;
+    }
   }
 
   private assertMetadataLock(token: string): void {
     const observed = this.observeMetadataLock();
-    if (observed.holder?.token !== token || observed.holder.pid !== process.pid) {
+    if (observed.holder?.token !== token
+      || observed.holder.pid !== process.pid
+      || observed.holder.processIncarnation !== this.processIncarnation) {
       this.fatalUnavailable = true;
       throw new RelayV2StateSnapshotSpoolError(
         "INTERNAL",
@@ -1587,14 +1743,16 @@ export class RelayV2StateSnapshotSpool {
   private acquireOwnership(): void {
     let previous: PersistedSpoolOwner | undefined;
     if (existsSync(this.paths.owner)) {
-      previous = parseOwner(JSON.parse(readPrivateFile(
+      previous = readCanonicalPrivateFile(
         this.paths.owner,
         this.limits.maxMetadataBytes,
-      ).toString("utf8")));
+        parseOwner,
+      ).record;
       if (previous.hostId !== this.hostId) {
         throw new Error("snapshot spool owner host does not match");
       }
-      if (processIsAlive(previous.pid) && !this.takeoverExistingOwner) {
+      const previousIsCurrentIncarnation = this.processIncarnationMatches(previous);
+      if (previousIsCurrentIncarnation !== false && !this.takeoverExistingOwner) {
         throw new RelayV2StateSnapshotSpoolError(
           "BUSY",
           "snapshot spool already has a live owner",
@@ -1608,6 +1766,7 @@ export class RelayV2StateSnapshotSpool {
       fence: this.ownerFence,
       acquiredAtMs: this.readNow(),
       pid: process.pid,
+      processIncarnation: this.processIncarnation,
     };
     this.persistAtomic(this.paths.owner, jsonFile(owner));
     this.ownerMetadataBytes = jsonFile(owner).byteLength
@@ -1615,14 +1774,16 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private assertCurrentOwner(): void {
-    const owner = parseOwner(JSON.parse(readPrivateFile(
+    const owner = readCanonicalPrivateFile(
       this.paths.owner,
       this.limits.maxMetadataBytes,
-    ).toString("utf8")));
+      parseOwner,
+    ).record;
     if (owner.hostId !== this.hostId
       || owner.ownerInstanceId !== this.ownerInstanceId
       || owner.fence !== this.ownerFence
-      || owner.pid !== process.pid) {
+      || owner.pid !== process.pid
+      || owner.processIncarnation !== this.processIncarnation) {
       throw ownerFencedError();
     }
     this.ownerMetadataBytes = jsonFile(owner).byteLength
@@ -1635,6 +1796,14 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
+  private processIncarnationMatches(
+    holder: Pick<PersistedSpoolOwner, "pid" | "processIncarnation">,
+  ): boolean | undefined {
+    const observed = this.processIncarnationProbe(holder.pid);
+    if (observed === undefined) return undefined;
+    return observed !== null && observed === holder.processIncarnation;
+  }
+
   private persistAtomic(path: string, contents: Buffer): void {
     try {
       atomicWritePrivateFile(path, contents);
@@ -1642,6 +1811,27 @@ export class RelayV2StateSnapshotSpool {
       this.fatalUnavailable = true;
       throw error;
     }
+  }
+
+  private readRecoveryMetadata<T>(
+    path: string,
+    maxFileBytes: number,
+    kind: "binding" | "lease" | "manifest" | "reservation" | "tombstone",
+    budget: RecoveryMetadataBudget,
+    parser: (value: unknown) => T,
+  ): { record: T; actualBytes: number } {
+    assertPrivateFile(path, maxFileBytes);
+    const actualBytes = lstatSync(path).size;
+    if (budget.actualBytes + actualBytes > this.limits.maxMetadataBytes) {
+      throw new RecoveryMetadataQuotaError();
+    }
+    budget.actualBytes += actualBytes;
+    this.testHooks?.beforeRecoveryMetadataRead?.(kind);
+    const recovered = readCanonicalPrivateFile(path, maxFileBytes, parser);
+    if (recovered.actualBytes !== actualBytes) {
+      throw new UnsafeSpoolPathError("snapshot metadata changed while being recovered");
+    }
+    return recovered;
   }
 
   private recover(hostEpoch: string): void {
@@ -1659,6 +1849,13 @@ export class RelayV2StateSnapshotSpool {
     this.tombstonesByLogicalKey.clear();
     this.recoveredQuotaExceeded = false;
     this.recoveryIncomplete = false;
+
+    const recoveryMetadataBudget: RecoveryMetadataBudget = {
+      actualBytes: lstatSync(this.paths.owner).size,
+    };
+    if (recoveryMetadataBudget.actualBytes > this.limits.maxMetadataBytes) {
+      throw new RecoveryMetadataQuotaError();
+    }
 
     assertPrivateFile(this.paths.lock, 4_096);
     visitDirectoryBounded(
@@ -1695,7 +1892,7 @@ export class RelayV2StateSnapshotSpool {
 
     const now = this.readNow();
     let recoveredMetadataBytes = this.ownerMetadataBytes;
-    visitDirectoryBounded(this.paths.tombstones, MAX_TOMBSTONES, (entry) => {
+    visitDirectoryBounded(this.paths.tombstones, this.limits.maxTombstones, (entry) => {
       const path = join(this.paths.tombstones, entry);
       assertWithinBoundary(path, this.paths.root);
       if (isAtomicTemporaryName(entry)) {
@@ -1703,12 +1900,17 @@ export class RelayV2StateSnapshotSpool {
         rmSync(path, { force: true });
         return;
       }
-      const record = parseTombstone(JSON.parse(
-        readPrivateFile(path, this.limits.maxMetadataBytes).toString("utf8"),
-      ));
+      const recovered = this.readRecoveryMetadata(
+        path,
+        this.limits.maxMetadataBytes,
+        "tombstone",
+        recoveryMetadataBudget,
+        parseTombstone,
+      );
+      const record = recovered.record;
       if (entry !== `${record.snapshotId}.json`
         || record.hostId !== this.hostId
-        || record.metadataBytes !== jsonFile(record).byteLength) {
+        || record.metadataBytes !== recovered.actualBytes) {
         throw new Error("snapshot tombstone identity or accounting is invalid");
       }
       if (record.binding.hostEpoch !== hostEpoch
@@ -1745,10 +1947,13 @@ export class RelayV2StateSnapshotSpool {
         rmSync(path, { force: true });
         return;
       }
-      const reservation = parseReservation(JSON.parse(readPrivateFile(
+      const reservation = this.readRecoveryMetadata(
         path,
         this.limits.maxMetadataBytes,
-      ).toString("utf8")));
+        "reservation",
+        recoveryMetadataBudget,
+        parseReservation,
+      ).record;
       if (entry !== `${reservation.reservationId}.json`
         || reservation.hostId !== this.hostId) {
         throw new Error("snapshot reservation identity is invalid");
@@ -1759,6 +1964,12 @@ export class RelayV2StateSnapshotSpool {
       }
       if (this.reservationsById.has(reservation.reservationId)) {
         throw new Error("snapshot reservation identity is duplicated");
+      }
+      if (this.wouldAddTombstoneObligation(reservation.binding)
+        && this.tombstoneObligationCount() >= this.limits.maxTombstones) {
+        this.recoveredQuotaExceeded = true;
+        this.recoveryIncomplete = true;
+        return false;
       }
       this.reservationsById.set(reservation.reservationId, reservation);
     });
@@ -1814,7 +2025,7 @@ export class RelayV2StateSnapshotSpool {
         },
       );
       if (removedTemporary) fsyncDirectory(directory);
-      const recovered = this.readRecoverableIdentity(directory);
+      const recovered = this.readRecoverableIdentity(directory, recoveryMetadataBudget);
       const identity = recovered.identity;
       if (identity.snapshotId !== entry || identity.hostId !== this.hostId) {
         throw new Error("snapshot cut directory identity is invalid");
@@ -1846,6 +2057,8 @@ export class RelayV2StateSnapshotSpool {
       const quotaWouldBeExceeded = this.recoveredQuotaExceeded
         || this.activeById.size + 1 > this.limits.maxCutsPerHost
         || nextPrincipalCount > this.limits.maxCutsPerPrincipal
+        || (this.wouldAddTombstoneObligation(identity.binding)
+          && this.tombstoneObligationCount() >= this.limits.maxTombstones)
         || recoveredCanonicalBytes + manifest.totalCanonicalBytes
           > this.limits.maxSpoolCanonicalBytes
         || recoveredMetadataBytes + recoveredActiveMetadataBytes
@@ -1858,13 +2071,19 @@ export class RelayV2StateSnapshotSpool {
       }
       let cut: ActiveCut;
       try {
-        cut = this.loadCut(directory, manifest, recovered.binding);
+        cut = this.loadCut(
+          directory,
+          manifest,
+          recovered.binding,
+          recoveryMetadataBudget,
+        );
         if (cut.lease.snapshotLeaseExpiresAtMs <= now
           || cut.manifest.snapshotAbsoluteExpiresAtMs <= now) {
           throw new Error("snapshot cut lease expired");
         }
       } catch (error) {
-        if (error instanceof UnsafeSpoolPathError) throw error;
+        if (error instanceof UnsafeSpoolPathError
+          || error instanceof RecoveryMetadataQuotaError) throw error;
         this.recordExpiredBinding(identity, now, true);
         rmSync(directory, { recursive: true, force: true });
         fsyncDirectory(this.paths.cuts);
@@ -1896,7 +2115,10 @@ export class RelayV2StateSnapshotSpool {
       for (const staging of stagingDirectories) {
         if (!this.activeById.has(staging.snapshotId)
           && !this.tombstonesById.has(staging.snapshotId)) {
-          const recovered = this.readRecoverableIdentity(staging.directory);
+          const recovered = this.readRecoverableIdentity(
+            staging.directory,
+            recoveryMetadataBudget,
+          );
           this.recordExpiredBinding(recovered.identity, now, true);
         }
         if (!this.activeById.has(staging.snapshotId)
@@ -1915,7 +2137,10 @@ export class RelayV2StateSnapshotSpool {
     fsyncDirectory(this.paths.root);
   }
 
-  private readRecoverableIdentity(directory: string): {
+  private readRecoverableIdentity(
+    directory: string,
+    recoveryMetadataBudget: RecoveryMetadataBudget,
+  ): {
     identity: PersistedBindingMarker;
     binding: PersistedBindingMarker | undefined;
     manifest: PersistedManifest | undefined;
@@ -1927,13 +2152,15 @@ export class RelayV2StateSnapshotSpool {
     let bindingFailure: unknown;
     let manifestFailure: unknown;
     try {
-      binding = this.readBindingMarker(directory);
+      binding = this.readBindingMarker(directory, recoveryMetadataBudget);
     } catch (error) {
+      if (error instanceof RecoveryMetadataQuotaError) throw error;
       bindingFailure = error;
     }
     try {
-      manifest = this.readManifest(directory);
+      manifest = this.readManifest(directory, recoveryMetadataBudget);
     } catch (error) {
+      if (error instanceof RecoveryMetadataQuotaError) throw error;
       manifestFailure = error;
     }
     if (bindingFailure instanceof UnsafeSpoolPathError
@@ -1957,30 +2184,39 @@ export class RelayV2StateSnapshotSpool {
     };
   }
 
-  private readManifest(directory: string): PersistedManifest {
+  private readManifest(
+    directory: string,
+    recoveryMetadataBudget: RecoveryMetadataBudget,
+  ): PersistedManifest {
     assertOwnedDirectory(directory, true);
-    return parseManifest(JSON.parse(
-      readPrivateFile(
-        join(directory, MANIFEST_FILE),
-        this.limits.maxMetadataBytes,
-      ).toString("utf8"),
-    ));
+    return this.readRecoveryMetadata(
+      join(directory, MANIFEST_FILE),
+      this.limits.maxMetadataBytes,
+      "manifest",
+      recoveryMetadataBudget,
+      parseManifest,
+    ).record;
   }
 
-  private readBindingMarker(directory: string): PersistedBindingMarker {
+  private readBindingMarker(
+    directory: string,
+    recoveryMetadataBudget: RecoveryMetadataBudget,
+  ): PersistedBindingMarker {
     assertOwnedDirectory(directory, true);
-    return parseBindingMarker(JSON.parse(
-      readPrivateFile(
-        join(directory, BINDING_FILE),
-        this.limits.maxMetadataBytes,
-      ).toString("utf8"),
-    ));
+    return this.readRecoveryMetadata(
+      join(directory, BINDING_FILE),
+      this.limits.maxMetadataBytes,
+      "binding",
+      recoveryMetadataBudget,
+      parseBindingMarker,
+    ).record;
   }
 
   private loadCut(
     directory: string,
     recoveredManifest: PersistedManifest,
     recoveredBinding: PersistedBindingMarker,
+    recoveryMetadataBudget: RecoveryMetadataBudget,
   ): ActiveCut {
     const manifest = recoveredManifest;
     const bindingMarker = recoveredBinding;
@@ -1988,10 +2224,13 @@ export class RelayV2StateSnapshotSpool {
       !== canonicalizeSnapshotJson(bindingMarkerFor(manifest))) {
       throw new Error("snapshot binding marker does not match its manifest");
     }
-    const lease = parseLease(JSON.parse(
-      readPrivateFile(join(directory, LEASE_FILE), LEASE_METADATA_ALLOWANCE_BYTES)
-        .toString("utf8"),
-    ), manifest);
+    const lease = this.readRecoveryMetadata(
+      join(directory, LEASE_FILE),
+      LEASE_METADATA_ALLOWANCE_BYTES,
+      "lease",
+      recoveryMetadataBudget,
+      (value) => parseLease(value, manifest),
+    ).record;
     if (manifest.totalRecords > this.limits.maxCutRecords
       || manifest.totalCanonicalBytes > this.limits.maxCutCanonicalBytes
       || manifest.metadataBytes > this.limits.maxMetadataBytes
@@ -2031,6 +2270,17 @@ export class RelayV2StateSnapshotSpool {
         if (cursors.has(chunk.nextCursor)) throw new Error("snapshot cursor is duplicated");
         cursors.add(chunk.nextCursor);
       }
+      const declaredRecordsThroughChunk = totalRecords + chunk.recordCount;
+      const declaredBytesThroughChunk = totalCanonicalBytes
+        + chunk.canonicalBytes - 2
+        + (totalRecords > 0 && chunk.recordCount > 0 ? 1 : 0);
+      if (declaredRecordsThroughChunk > manifest.totalRecords
+        || declaredRecordsThroughChunk > this.limits.maxCutRecords
+        || declaredBytesThroughChunk > manifest.totalCanonicalBytes
+        || declaredBytesThroughChunk > this.limits.maxCutCanonicalBytes) {
+        throw new Error("snapshot chunk totals exceed the manifest boundary");
+      }
+      this.testHooks?.beforeRecoveryChunkRead?.(chunk.index);
       const contents = readPrivateFile(
         join(directory, chunk.file),
         this.limits.maxChunkCanonicalBytes,
@@ -2054,7 +2304,17 @@ export class RelayV2StateSnapshotSpool {
         fullDigest.update(canonical, "utf8");
         totalCanonicalBytes += Buffer.byteLength(canonical, "utf8");
         totalRecords += 1;
+        if (totalRecords > manifest.totalRecords
+          || totalRecords > this.limits.maxCutRecords
+          || totalCanonicalBytes > manifest.totalCanonicalBytes
+          || totalCanonicalBytes > this.limits.maxCutCanonicalBytes) {
+          throw new Error("snapshot records exceed the manifest boundary");
+        }
         firstRecord = false;
+      }
+      if (totalRecords !== declaredRecordsThroughChunk
+        || totalCanonicalBytes !== declaredBytesThroughChunk) {
+        throw new Error("snapshot chunk totals do not match its manifest index");
       }
     }
     fullDigest.update("]");
@@ -2081,6 +2341,8 @@ export class RelayV2StateSnapshotSpool {
     ), 0);
     const invalidActiveQuota = this.activeById.size > this.limits.maxCutsPerHost
       || [...principalCounts.values()].some((count) => count > this.limits.maxCutsPerPrincipal)
+      || this.tombstonesById.size > this.limits.maxTombstones
+      || this.tombstoneObligationCount() > this.limits.maxTombstones
       || [...this.activeById.values()].reduce((sum, cut) => (
         sum + cut.manifest.totalCanonicalBytes
       ), 0) > this.limits.maxSpoolCanonicalBytes;
@@ -2132,6 +2394,8 @@ export class RelayV2StateSnapshotSpool {
     );
     if (principalCuts >= this.limits.maxCutsPerPrincipal
       || this.activeById.size + this.reservationsById.size >= this.limits.maxCutsPerHost
+      || (this.wouldAddTombstoneObligation(binding)
+        && this.tombstoneObligationCount() >= this.limits.maxTombstones)
       || usage.canonicalBytes + estimate.totalCanonicalBytes
         > this.limits.maxSpoolCanonicalBytes
       || usage.metadataBytes + reservedMetadataBytes > this.limits.maxMetadataBytes) {
@@ -2190,6 +2454,26 @@ export class RelayV2StateSnapshotSpool {
         sum + tombstone.record.metadataBytes
       ), 0),
     };
+  }
+
+  private tombstoneObligationCount(): number {
+    const keys = new Set(this.tombstonesByLogicalKey.keys());
+    for (const cut of this.activeById.values()) {
+      keys.add(logicalKey(cut.manifest.binding));
+    }
+    for (const reservation of this.reservationsById.values()) {
+      keys.add(logicalKey(reservation.binding));
+    }
+    return keys.size;
+  }
+
+  private wouldAddTombstoneObligation(binding: SnapshotBinding): boolean {
+    const key = logicalKey(binding);
+    return !this.tombstonesByLogicalKey.has(key)
+      && !this.activeByLogicalKey.has(key)
+      && ![...this.reservationsById.values()].some((reservation) => (
+        logicalKey(reservation.binding) === key
+      ));
   }
 
   private async buildAndPublish(reservation: PersistedReservation): Promise<void> {
@@ -2631,6 +2915,29 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private installTombstone(record: PersistedSnapshotTombstone): void {
+    const key = logicalKey(record.binding);
+    const byId = this.tombstonesById.get(record.snapshotId);
+    const byKey = this.tombstonesByLogicalKey.get(key);
+    if ((byId && !sameBinding(byId.record.binding, record.binding))
+      || (byKey && byKey.record.snapshotId !== record.snapshotId)) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot tombstone conflicts with persisted logical evidence",
+      );
+    }
+    if (!byId && this.tombstonesById.size >= this.limits.maxTombstones) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot tombstone capacity is exhausted",
+      );
+    }
+    if (this.wouldAddTombstoneObligation(record.binding)
+      && this.tombstoneObligationCount() >= this.limits.maxTombstones) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "INTERNAL",
+        "snapshot logical fence capacity is exhausted",
+      );
+    }
     const path = join(this.paths.tombstones, `${record.snapshotId}.json`);
     this.persistAtomic(path, jsonFile(record));
     this.testHooks?.afterTombstonePersisted?.(
@@ -2639,7 +2946,7 @@ export class RelayV2StateSnapshotSpool {
     );
     const tombstone = { path, record };
     this.tombstonesById.set(record.snapshotId, tombstone);
-    this.tombstonesByLogicalKey.set(logicalKey(record.binding), tombstone);
+    this.tombstonesByLogicalKey.set(key, tombstone);
   }
 
   private removeTombstoneFile(path: string): void {

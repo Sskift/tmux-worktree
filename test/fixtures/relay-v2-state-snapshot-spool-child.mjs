@@ -71,6 +71,10 @@ const hooks = {
     process.send({ type: "stale-observed", pid: process.pid, identity });
     if (process.env.SNAPSHOT_SPOOL_HOLD_STALE === "1") await staleGate;
   },
+  afterStaleLockQuarantinePersisted(identity) {
+    process.send({ type: "quarantine-persisted", pid: process.pid, identity });
+    if (mode === "crash-after-quarantine") process.exit(86);
+  },
   beforeMetadataLockRelease() {
     rmSync(criticalMarker, { force: true });
     process.send({ type: "lock-exit", pid: process.pid, acquireCount });

@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   readdirSync,
   rmSync,
   statSync,
@@ -669,6 +670,43 @@ test("host slots reach sixteen small cuts while byte quota remains independent",
     }
   });
 
+  await t.test("runtime tombstone capacity remains restartable at the exact entry cap", async () => {
+    const h = await fakeSpool({ limits: { maxTombstones: 2 } });
+    try {
+      const first = await h.spool.get(firstRequest("authority-epoch", "tombstone-cap-one"));
+      const second = await h.spool.get(firstRequest("authority-epoch", "tombstone-cap-two"));
+      const firstRelease = await h.spool.release(releaseRequest(first));
+      const secondRelease = await h.spool.release(releaseRequest(second));
+      const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+        hostId: "mac-admin",
+        cutSource: h.fake.source,
+        root: h.spool.paths.root,
+        testLimits: { maxTombstones: 2 },
+        takeoverExistingOwner: true,
+      });
+      assert.equal((await restarted.release(releaseRequest(first))).releasedAtMs,
+        firstRelease.releasedAtMs);
+      assert.equal((await restarted.release(releaseRequest(second))).releasedAtMs,
+        secondRelease.releasedAtMs);
+      const diskBefore = {
+        cuts: readdirSync(restarted.paths.cuts),
+        reservations: readdirSync(restarted.paths.reservations),
+        tombstones: readdirSync(restarted.paths.tombstones).sort(),
+      };
+      await assert.rejects(
+        restarted.get(firstRequest("authority-epoch", "tombstone-cap-overflow")),
+        assertSpoolError("BUSY"),
+      );
+      assert.deepEqual({
+        cuts: readdirSync(restarted.paths.cuts),
+        reservations: readdirSync(restarted.paths.reservations),
+        tombstones: readdirSync(restarted.paths.tombstones).sort(),
+      }, diskBefore);
+    } finally {
+      h.cleanup();
+    }
+  });
+
   await t.test("canonical byte quota", async () => {
     const records = [
       {
@@ -894,6 +932,50 @@ test("cross-process lock initialization, dead takeover, and release ABA never ov
     await initializer.message("auto-closed");
     assert.deepEqual(await initializer.exit(), [0, null]);
 
+    const quarantineCrashRoot = join(home, "quarantine-crash-spool");
+    const quarantineHolder = spawnSnapshotSpoolChild(quarantineCrashRoot, {
+      mode: "crash-lock",
+      owner: "quarantine-stale-holder",
+    });
+    children.push(quarantineHolder);
+    await quarantineHolder.message("lock-enter");
+    assert.deepEqual(await quarantineHolder.exit(), [83, null]);
+    rmSync(`${quarantineCrashRoot}.metadata-critical`, { force: true });
+    const quarantineCrasher = spawnSnapshotSpoolChild(quarantineCrashRoot, {
+      mode: "crash-after-quarantine",
+      owner: "quarantine-crasher",
+      takeover: true,
+    });
+    children.push(quarantineCrasher);
+    await quarantineCrasher.message("stale-observed");
+    await quarantineCrasher.message("quarantine-persisted");
+    assert.deepEqual(await quarantineCrasher.exit(), [86, null]);
+    const quarantineDirectory = join(
+      quarantineCrashRoot,
+      ".metadata-lock-quarantine-v1",
+    );
+    const quarantineMarker = join(
+      quarantineDirectory,
+      readdirSync(quarantineDirectory)[0],
+    );
+    const fixedAfterCrash = statSync(join(quarantineCrashRoot, ".metadata-lock-v2.json"));
+    const markerAfterCrash = statSync(quarantineMarker);
+    assert.deepEqual(
+      [fixedAfterCrash.dev, fixedAfterCrash.ino],
+      [markerAfterCrash.dev, markerAfterCrash.ino],
+      "the durable quarantine hard link proves the exact stale inode",
+    );
+    const quarantineSuccessor = spawnSnapshotSpoolChild(quarantineCrashRoot, {
+      mode: "open-close-exit",
+      owner: "quarantine-successor",
+      takeover: true,
+    });
+    children.push(quarantineSuccessor);
+    await quarantineSuccessor.message("stale-observed");
+    await quarantineSuccessor.message("opened");
+    await quarantineSuccessor.message("auto-closed");
+    assert.deepEqual(await quarantineSuccessor.exit(), [0, null]);
+
     const crashed = spawnSnapshotSpoolChild(root, {
       mode: "crash-lock",
       owner: "crashed-lock-owner",
@@ -945,6 +1027,47 @@ test("cross-process lock initialization, dead takeover, and release ABA never ov
     }));
     rmSync(home, { recursive: true, force: true });
     rmSync(marker, { force: true });
+  }
+});
+
+test("PID reuse cannot keep a stale metadata lock or spool owner live", async () => {
+  const h = await fakeSpool({
+    options: {
+      ownerInstanceId: "pid-reuse-old-owner",
+      testHooks: { processIncarnationForPid: () => "incarnation-old" },
+    },
+  });
+  try {
+    const replacement = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      hostId: "mac-admin",
+      cutSource: h.fake.source,
+      root: h.spool.paths.root,
+      ownerInstanceId: "pid-reuse-new-owner",
+      testHooks: { processIncarnationForPid: () => "incarnation-new" },
+    });
+    await assert.rejects(h.spool.cleanupExpired(), assertSpoolError("INTERNAL"));
+    await replacement.close();
+
+    writeFileSync(
+      replacement.paths.lock,
+      `${JSON.stringify({
+        version: 2,
+        token: "stale-reused-pid-lock",
+        pid: process.pid,
+        processIncarnation: "incarnation-old",
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const afterStaleLock = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      hostId: "mac-admin",
+      cutSource: h.fake.source,
+      root: h.spool.paths.root,
+      ownerInstanceId: "pid-reuse-lock-successor",
+      testHooks: { processIncarnationForPid: () => "incarnation-new" },
+    });
+    await afterStaleLock.close();
+  } finally {
+    h.cleanup();
   }
 });
 
@@ -1278,25 +1401,76 @@ test("recovery preserves tombstones over quota and fails closed on corrupt or un
     try {
       const request = firstRequest("authority-epoch", "logical-metadata-overage");
       const chunk = await h.spool.get(request);
-      const released = await h.spool.release(releaseRequest(chunk));
+      await h.spool.release(releaseRequest(chunk));
       const tombstonePath = join(h.spool.paths.tombstones, `${chunk.snapshotId}.json`);
       const metadataLimit = statSync(h.spool.paths.owner).size + statSync(tombstonePath).size - 1;
-      const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      await assert.rejects(
+        snapshotSpool.RelayV2StateSnapshotSpool.open({
+          hostId: "mac-admin",
+          cutSource: h.fake.source,
+          root: h.spool.paths.root,
+          testLimits: { maxMetadataBytes: metadataLimit },
+          takeoverExistingOwner: true,
+        }),
+        assertSpoolError("INTERNAL"),
+      );
+      assert.equal(readdirSync(h.spool.paths.tombstones).length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("recovery charges padded metadata before parsing or reading later files", async () => {
+    const h = await fakeSpool();
+    try {
+      const chunk = await h.spool.get(firstRequest(
+        "authority-epoch",
+        "logical-padded-recovery-metadata",
+      ));
+      const cutDirectory = join(h.spool.paths.cuts, chunk.snapshotId);
+      const manifestPath = join(cutDirectory, "manifest-v1.json");
+      const manifest = readFileSync(manifestPath);
+      writeFileSync(manifestPath, Buffer.concat([manifest, Buffer.alloc(4_096, 0x20)]), {
+        mode: 0o600,
+      });
+      const metadataLimit = statSync(h.spool.paths.owner).size
+        + statSync(join(cutDirectory, "binding-v1.json")).size
+        + statSync(manifestPath).size - 1;
+      const deeplyRead = [];
+      await assert.rejects(
+        snapshotSpool.RelayV2StateSnapshotSpool.open({
+          hostId: "mac-admin",
+          cutSource: h.fake.source,
+          root: h.spool.paths.root,
+          testLimits: { maxMetadataBytes: metadataLimit },
+          takeoverExistingOwner: true,
+          testHooks: {
+            beforeRecoveryMetadataRead: (kind) => deeplyRead.push(kind),
+          },
+        }),
+        assertSpoolError("INTERNAL"),
+      );
+      assert.deepEqual(deeplyRead, ["binding"]);
+      assert.equal(readFileSync(manifestPath).byteLength, manifest.byteLength + 4_096);
+      const canonicalReads = [];
+      const canonicalRestart = await snapshotSpool.RelayV2StateSnapshotSpool.open({
         hostId: "mac-admin",
         cutSource: h.fake.source,
         root: h.spool.paths.root,
-        testLimits: { maxMetadataBytes: metadataLimit },
         takeoverExistingOwner: true,
+        testHooks: {
+          beforeRecoveryMetadataRead: (kind) => canonicalReads.push(kind),
+        },
       });
-      assert.equal(readdirSync(restarted.paths.tombstones).length, 1);
-      const replay = await restarted.release(releaseRequest(chunk));
-      assert.equal(replay.alreadyReleased, true);
-      assert.equal(replay.releasedAtMs, released.releasedAtMs);
+      assert.deepEqual(canonicalReads, ["binding", "manifest"]);
+      assert.deepEqual(readdirSync(canonicalRestart.paths.cuts), []);
       await assert.rejects(
-        restarted.get(firstRequest("authority-epoch", "new-cut-over-metadata")),
-        assertSpoolError("BUSY"),
+        canonicalRestart.get(firstRequest(
+          "authority-epoch",
+          "logical-padded-recovery-metadata",
+        )),
+        assertSpoolError("SNAPSHOT_EXPIRED"),
       );
-      assert.equal(readdirSync(restarted.paths.tombstones).length, 1);
     } finally {
       h.cleanup();
     }
@@ -1319,6 +1493,49 @@ test("recovery preserves tombstones over quota and fails closed on corrupt or un
         assertSpoolError("INTERNAL"),
       );
       assert.equal(readFileSync(tombstonePath, "utf8"), "{}\n");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("recovery stops before reading chunks beyond cumulative totals", async () => {
+    const records = [
+      {
+        recordType: "scope",
+        item: { scopeId: "scope-a", displayName: "Local", kind: "local", reachability: "online" },
+      },
+      {
+        recordType: "sessions_scope",
+        scopeId: "scope-a",
+        revision: "1",
+        completeness: "complete",
+      },
+      {
+        recordType: "session",
+        scopeId: "scope-a",
+        item: { scopeId: "scope-a", sessionId: "session-a" },
+      },
+    ];
+    const h = await fakeSpool({ cut: staticCut(records), limits: { maxChunkRecords: 1 } });
+    try {
+      const request = firstRequest("authority-epoch", "logical-recovery-total-overrun");
+      const chunk = await h.spool.get(request);
+      const manifestPath = join(h.spool.paths.cuts, chunk.snapshotId, "manifest-v1.json");
+      const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+      manifest.totalRecords = 1;
+      writeFileSync(manifestPath, `${JSON.stringify(manifest)}\n`, { mode: 0o600 });
+      const reads = [];
+      const restarted = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+        hostId: "mac-admin",
+        cutSource: h.fake.source,
+        root: h.spool.paths.root,
+        testLimits: { maxChunkRecords: 1 },
+        takeoverExistingOwner: true,
+        testHooks: { beforeRecoveryChunkRead: (index) => reads.push(index) },
+      });
+      assert.deepEqual(reads, [0]);
+      assert.deepEqual(readdirSync(restarted.paths.cuts), []);
+      await assert.rejects(restarted.get(request), assertSpoolError("SNAPSHOT_EXPIRED"));
     } finally {
       h.cleanup();
     }
@@ -1402,6 +1619,38 @@ test("recovery preserves tombstones over quota and fails closed on corrupt or un
         h.cleanup();
         rmSync(external, { recursive: true, force: true });
       }
+    }
+  });
+
+  await t.test("a custom-root symlink ancestor is fixed to one physical tree", async () => {
+    const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-root-alias-"));
+    const original = join(home, "physical-original");
+    const replacement = join(home, "physical-replacement");
+    const alias = join(home, "alias");
+    mkdirSync(original, { mode: 0o700 });
+    mkdirSync(replacement, { mode: 0o700 });
+    const originalSentinel = join(original, "sentinel.txt");
+    const replacementSentinel = join(replacement, "sentinel.txt");
+    writeFileSync(originalSentinel, "original", { mode: 0o600 });
+    writeFileSync(replacementSentinel, "replacement", { mode: 0o600 });
+    symlinkSync(original, alias, "dir");
+    const fake = staticSource(staticCut());
+    try {
+      const spool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+        hostId: "mac-admin",
+        cutSource: fake.source,
+        root: join(alias, "nested", "spool"),
+      });
+      assert.equal(spool.paths.root, join(realpathSync(original), "nested", "spool"));
+      rmSync(alias);
+      symlinkSync(replacement, alias, "dir");
+      await spool.get(firstRequest("authority-epoch", "logical-physical-root"));
+      await spool.close();
+      assert.equal(readFileSync(originalSentinel, "utf8"), "original");
+      assert.equal(readFileSync(replacementSentinel, "utf8"), "replacement");
+      assert.deepEqual(readdirSync(replacement).sort(), ["sentinel.txt"]);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
     }
   });
 });
@@ -1768,6 +2017,7 @@ test("cursor, index, readiness, and source failures are structured and never ret
     maxCutsPerHost: 16,
     maxSpoolCanonicalBytes: 536_870_912,
     maxMetadataBytes: 16_777_216,
+    maxTombstones: 16_384,
     releaseTombstoneMs: 600_000,
   });
   await assert.rejects(
