@@ -14,6 +14,7 @@ export default defineConfig({
     "src/relay/v2/hostState.ts",
     "src/relay/v2/hostCommandPlane.ts",
     "src/relay/v2/resourceState.ts",
+    "src/relay/v2/stateSnapshotSpool.ts",
     "src/relay/v2/token.ts",
     "src/relay/v2/issuer.ts",
     "src/relay/v2/auth.ts",

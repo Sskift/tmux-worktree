@@ -25,12 +25,11 @@ import {
 /**
  * Relay v2 H2 materialized-state foundation only.
  *
- * This module deliberately does not export state.snapshot get/release, pinned
- * cut, cursor, lease, snapshot-request reservation/quota, or spool APIs. Those
- * capabilities require a persistent metadata/spool adapter with restart
- * recovery and must be added as a separate reviewed slice before any v2
- * capability is advertised. The capacity reservation below is only H1 create
- * admission metadata inside H0; it cannot publish or serve a state snapshot.
+ * Pinned snapshot lifecycle, cursor, lease, quota, release, and recovery belong
+ * to the separate stateSnapshotSpool foundation. This module only exposes the
+ * minimal materialized-cut source used by that owner. The capacity reservation
+ * below is only H1 create admission metadata inside H0; it cannot publish or
+ * serve a state snapshot.
  */
 
 const MATERIALIZED_STATE_KEY = "h2:resource-state:v1";
@@ -235,6 +234,45 @@ export interface RelayV2MaterializedReconcileResult {
   events: RelayV2JsonObject[];
   snapshot: RelayV2HostStateSnapshot;
   readiness: RelayV2MaterializedReadiness;
+}
+
+export type RelayV2MaterializedStateCutRecord =
+  | { recordType: "scope"; item: RelayV2Scope }
+  | {
+      recordType: "sessions_scope";
+      scopeId: string;
+      revision: string;
+      completeness: "complete";
+    }
+  | { recordType: "session"; scopeId: string; item: RelayV2Session };
+
+export interface RelayV2MaterializedStateCut {
+  hostEpoch: string;
+  throughEventSeq: string;
+  scopesRevision: string;
+  records: RelayV2MaterializedStateCutRecord[];
+}
+
+export interface RelayV2MaterializedStateCutAdmissionEstimate {
+  hostEpoch: string;
+  totalRecords: number;
+  totalCanonicalBytes: number;
+}
+
+/**
+ * Read-only H0/H2 seam for the pinned snapshot spool.
+ *
+ * capture() projects every counter and record from one H0 serializer cut. It
+ * never performs discovery or other backend I/O. admissionEstimate() uses the
+ * same materialized authority's conservative capacity measure, including H1
+ * capacity reservations that capture() deliberately does not project.
+ */
+export interface RelayV2MaterializedStateCutSource {
+  currentHostEpoch(): Promise<string>;
+  admissionEstimate(
+    expectedHostEpoch: string,
+  ): Promise<RelayV2MaterializedStateCutAdmissionEstimate>;
+  capture(expectedHostEpoch: string): Promise<RelayV2MaterializedStateCut>;
 }
 
 export type RelayV2MaterializedErrorCode =
@@ -905,24 +943,70 @@ function parseMaterializedState(snapshot: RelayV2HostStateSnapshot): PersistedMa
   return clone(raw) as unknown as PersistedMaterializedState;
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value === "boolean" || typeof value === "string") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      throw new RelayV2MaterializedStateError("INTERNAL", "non-finite materialized number");
+function hasWellFormedUnicode(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (next < 0xdc00 || next > 0xdfff) return false;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return false;
     }
-    return JSON.stringify(value);
   }
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (!isRecord(value)) {
-    throw new RelayV2MaterializedStateError("INTERNAL", "non-JSON materialized value");
-  }
-  return `{${Object.keys(value).sort().map((key) => (
-    `${JSON.stringify(key)}:${canonicalJson(value[key])}`
-  )).join(",")}}`;
+  return true;
 }
+
+/** RFC-8785/JCS-equivalent for the H2 JSON domain. */
+export function canonicalizeRelayV2MaterializedJson(value: unknown): string {
+  const seen = new Set<object>();
+  const visit = (item: unknown): string => {
+    if (item === null || typeof item === "boolean") return JSON.stringify(item);
+    if (typeof item === "string") {
+      if (!hasWellFormedUnicode(item)) {
+        throw new RelayV2MaterializedStateError("INTERNAL", "materialized string has invalid Unicode");
+      }
+      return JSON.stringify(item);
+    }
+    if (typeof item === "number") {
+      if (!Number.isFinite(item)) {
+        throw new RelayV2MaterializedStateError("INTERNAL", "non-finite materialized number");
+      }
+      return JSON.stringify(item);
+    }
+    if (typeof item !== "object") {
+      throw new RelayV2MaterializedStateError("INTERNAL", "non-JSON materialized value");
+    }
+    if (seen.has(item)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "cyclic materialized value");
+    }
+    seen.add(item);
+    let canonical: string;
+    if (Array.isArray(item)) {
+      canonical = `[${item.map((entry) => visit(entry)).join(",")}]`;
+    } else {
+      const prototype = Object.getPrototypeOf(item);
+      if (prototype !== Object.prototype && prototype !== null) {
+        throw new RelayV2MaterializedStateError("INTERNAL", "non-plain materialized object");
+      }
+      const record = item as Record<string, unknown>;
+      const keys = Object.keys(record).sort();
+      for (const key of keys) {
+        if (!hasWellFormedUnicode(key)) {
+          throw new RelayV2MaterializedStateError("INTERNAL", "materialized key has invalid Unicode");
+        }
+      }
+      canonical = `{${keys.map((key) => (
+        `${JSON.stringify(key)}:${visit(record[key])}`
+      )).join(",")}}`;
+    }
+    seen.delete(item);
+    return canonical;
+  };
+  return visit(value);
+}
+
+const canonicalJson = canonicalizeRelayV2MaterializedJson;
 
 function sameJson(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
@@ -2105,6 +2189,39 @@ function readinessFor(
   };
 }
 
+function projectMaterializedStateCut(
+  snapshot: RelayV2HostStateSnapshot,
+  state: PersistedMaterializedState,
+): RelayV2MaterializedStateCut {
+  const records: RelayV2MaterializedStateCutRecord[] = [];
+  for (const scope of [...state.scopes].sort((left, right) => (
+    utf8Compare(left.item.scopeId, right.item.scopeId)
+  ))) {
+    records.push({ recordType: "scope", item: clone(scope.item) });
+    records.push({
+      recordType: "sessions_scope",
+      scopeId: scope.item.scopeId,
+      revision: revisionFor(snapshot, sessionRevisionKey(scope.item.scopeId)),
+      completeness: "complete",
+    });
+    for (const session of [...scope.sessions].sort((left, right) => (
+      utf8Compare(left.item.sessionId, right.item.sessionId)
+    ))) {
+      records.push({
+        recordType: "session",
+        scopeId: scope.item.scopeId,
+        item: clone(session.item),
+      });
+    }
+  }
+  return {
+    hostEpoch: snapshot.hostEpoch,
+    throughEventSeq: snapshot.eventSeq,
+    scopesRevision: revisionFor(snapshot, SCOPES_REVISION_KEY),
+    records,
+  };
+}
+
 type ContinuityFenceReason = "commit_uncertain" | "host_epoch_changed";
 
 function continuityFenceReadiness(
@@ -2165,6 +2282,7 @@ export class RelayV2MaterializedStateFoundation {
   readonly capacity: MaterializedCapacity;
   readonly reservationLimits: ResourceReservationLimits;
   readonly commandResourceMutationOwner: RelayV2CommandResourceMutationOwner;
+  readonly snapshotCutSource: RelayV2MaterializedStateCutSource;
 
   private readonly discovery: RelayV2ResourceDiscovery;
   private readonly reservationSettlementAuthority: RelayV2ReservationSettlementAuthority | undefined;
@@ -2245,6 +2363,15 @@ export class RelayV2MaterializedStateFoundation {
       ),
       fenceMaterializedAuthority: (snapshot: RelayV2HostStateSnapshot) => (
         this.withdrawReadiness(snapshot, "materialized_authority_conflict")
+      ),
+    });
+    this.snapshotCutSource = Object.freeze({
+      currentHostEpoch: () => this.currentSnapshotHostEpoch(),
+      admissionEstimate: (expectedHostEpoch: string) => (
+        this.estimateMaterializedStateCutAdmission(expectedHostEpoch)
+      ),
+      capture: (expectedHostEpoch: string) => (
+        this.captureMaterializedStateCut(expectedHostEpoch)
       ),
     });
   }
@@ -2890,6 +3017,60 @@ export class RelayV2MaterializedStateFoundation {
         return continuityFenceReadiness(snapshot, this.continuityFenceReason);
       }
       return readinessFor(snapshot, parseMaterializedState(snapshot), this.capacity);
+    });
+  }
+
+  private async currentSnapshotHostEpoch(): Promise<string> {
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      return snapshot.hostEpoch;
+    });
+  }
+
+  private async captureMaterializedStateCut(
+    expectedHostEpoch: string,
+  ): Promise<RelayV2MaterializedStateCut> {
+    validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const readiness = readinessFor(snapshot, state, this.capacity);
+      if (!readiness.snapshotMaterializationReady) {
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          `materialized state is not snapshot-ready: ${readiness.reason}`,
+          { readinessReason: readiness.reason },
+        );
+      }
+      return projectMaterializedStateCut(snapshot, state);
+    });
+  }
+
+  private async estimateMaterializedStateCutAdmission(
+    expectedHostEpoch: string,
+  ): Promise<RelayV2MaterializedStateCutAdmissionEstimate> {
+    validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const readiness = readinessFor(snapshot, state, this.capacity);
+      if (!readiness.snapshotMaterializationReady) {
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          `materialized state is not snapshot-ready: ${readiness.reason}`,
+          { readinessReason: readiness.reason },
+        );
+      }
+      return {
+        hostEpoch: snapshot.hostEpoch,
+        totalRecords: readiness.totalRecords,
+        totalCanonicalBytes: readiness.totalCanonicalBytes,
+      };
     });
   }
 
