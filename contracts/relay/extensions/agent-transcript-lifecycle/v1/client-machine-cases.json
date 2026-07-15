@@ -22,10 +22,6 @@
         "expect": { "disposition": "duplicate", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
       },
       {
-        "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "6", "eventId": "event-6-conflict", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
-        "expect": { "disposition": "continuity_conflict", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
-      },
-      {
         "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "8", "eventId": "event-8", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
         "expect": { "disposition": "gap_resync", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "notification": "none" }
       },
@@ -36,6 +32,46 @@
       {
         "input": { "kind": "agent_event", "timelineEpoch": "timeline-1", "agentEventSeq": "8", "eventId": "event-8", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-1", "turnId": "turn-1", "state": "completed" } },
         "expect": { "disposition": "applied", "lastAgentSeq": "8", "lifecycleState": "completed", "notification": "shown" }
+      }
+    ]
+  },
+  {
+    "name": "continuity-conflict-quarantines-until-trusted-snapshot",
+    "scenarios": ["replay-gap", "notification-dedupe"],
+    "initial": {
+      "support": "available",
+      "timelineEpoch": "timeline-conflict",
+      "lastAgentSeq": "5",
+      "notificationBaselineAgentSeq": "5",
+      "notificationPermission": "granted",
+      "profileActive": true,
+      "lifecycleStates": { "turn:run-conflict:turn-conflict": "running" },
+      "commandStates": {}
+    },
+    "steps": [
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-conflict", "agentEventSeq": "6", "eventId": "event-conflict-6", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-conflict", "turnId": "turn-conflict", "state": "waiting_for_user" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "requiresSnapshot": false, "notification": "shown" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-conflict", "agentEventSeq": "6", "eventId": "event-conflict-6", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-conflict", "turnId": "turn-conflict", "state": "completed" } },
+        "expect": { "disposition": "continuity_conflict", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "requiresSnapshot": true, "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-conflict", "agentEventSeq": "7", "eventId": "event-conflict-7", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-conflict", "turnId": "turn-conflict", "state": "running" } },
+        "expect": { "disposition": "continuity_conflict", "lastAgentSeq": "6", "lifecycleState": "waiting_for_user", "requiresSnapshot": true, "notification": "none" }
+      },
+      {
+        "input": { "kind": "snapshot_request_started", "requestToken": "snapshot-conflict" },
+        "expect": { "disposition": "config_applied", "lastAgentSeq": "6", "requiresSnapshot": true }
+      },
+      {
+        "input": { "kind": "snapshot_commit", "timelineEpoch": "timeline-conflict", "localGeneration": "1", "requestToken": "snapshot-conflict", "throughAgentSeq": "7", "records": [{ "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-conflict", "turnId": "turn-conflict", "state": "running", "lifecycleEventId": "event-conflict-7-snapshot", "agentEventSeq": "7" }] },
+        "expect": { "disposition": "snapshot_applied", "lastAgentSeq": "7", "notificationBaselineAgentSeq": "5", "requiresSnapshot": false, "notification": "none" }
+      },
+      {
+        "input": { "kind": "agent_event", "timelineEpoch": "timeline-conflict", "agentEventSeq": "8", "eventId": "event-conflict-8", "record": { "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-conflict", "turnId": "turn-conflict", "state": "completed" } },
+        "expect": { "disposition": "applied", "lastAgentSeq": "8", "lifecycleState": "completed", "requiresSnapshot": false, "notification": "shown" }
       }
     ]
   },
@@ -122,7 +158,11 @@
     },
     "steps": [
       {
-        "input": { "kind": "snapshot_commit", "timelineEpoch": "timeline-4", "throughAgentSeq": "20", "records": [{ "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-history", "turnId": "turn-history", "state": "completed", "lifecycleEventId": "event-history", "agentEventSeq": "20" }] },
+        "input": { "kind": "snapshot_request_started", "requestToken": "snapshot-initial" },
+        "expect": { "disposition": "config_applied", "lastAgentSeq": "0", "notification": "none" }
+      },
+      {
+        "input": { "kind": "snapshot_commit", "timelineEpoch": "timeline-4", "localGeneration": "0", "requestToken": "snapshot-initial", "throughAgentSeq": "20", "records": [{ "recordType": "lifecycle", "sourceEpoch": "source-client", "scope": "turn", "runId": "run-history", "turnId": "turn-history", "state": "completed", "lifecycleEventId": "event-history", "agentEventSeq": "20" }] },
         "expect": { "disposition": "snapshot_applied", "lastAgentSeq": "20", "notificationBaselineAgentSeq": "20", "notification": "none" }
       }
     ]
@@ -142,7 +182,11 @@
     },
     "steps": [
       {
-        "input": { "kind": "status", "support": "unavailable", "reason": "agent_unsupported", "timelineEpoch": null },
+        "input": { "kind": "status_request_started", "requestToken": "status-unsupported" },
+        "expect": { "disposition": "config_applied", "lastAgentSeq": "0" }
+      },
+      {
+        "input": { "kind": "status", "support": "unavailable", "reason": "agent_unsupported", "timelineEpoch": null, "localGeneration": "0", "requestToken": "status-unsupported" },
         "expect": { "disposition": "status_applied", "support": "unavailable", "unavailableReason": "agent_unsupported", "lastAgentSeq": "0" }
       },
       {

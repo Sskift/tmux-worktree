@@ -3,6 +3,8 @@ package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -34,7 +36,7 @@ class AgentTranscriptLifecycleClientReducerTest {
     }
 
     @Test
-    fun canonicalUint64LineageAndPersistedFingerprintFenceContinuity() {
+    fun canonicalUint64LineageAndPersistedDigestFenceContinuity() {
         val unnegotiated = AgentTranscriptLifecycleClientState(identity = SESSION_IDENTITY)
         val unnegotiatedEvent = lifecycleEvent(
             timelineEpoch = "timeline-unnegotiated",
@@ -67,6 +69,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 lastAgentSeq = signedLongOverflow,
                 notificationBaselineAgentSeq = signedLongOverflow,
                 lifecycleByIdentity = mapOf(runIdentity to currentRun),
+                currentLifecycleIdentityByEventId = mapOf(currentRun.lifecycleEventId to runIdentity),
             ),
         )
         val nextSequence = "9223372036854775809"
@@ -86,10 +89,11 @@ class AgentTranscriptLifecycleClientReducerTest {
 
         val changedContentAtSameIdentity = AgentTranscriptLifecycleClientReducer.reduce(
             applied.state,
-            next.copy(closedEventFingerprint = "closed-event-large-next-mutated"),
+            next.copy(closedEventDigest = digestOf("closed-event-large-next-mutated")),
         )
         assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, changedContentAtSameIdentity.disposition)
-        assertEquals(applied.state, changedContentAtSameIdentity.state)
+        assertEquals(nextSequence, changedContentAtSameIdentity.state.extensionLane.lastAgentSeq)
+        assertTrue(changedContentAtSameIdentity.state.extensionLane.requiresSnapshot)
 
         val olderWithoutEvidence = lifecycleEvent(
             timelineEpoch = "timeline-large",
@@ -114,7 +118,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             ),
             agentEventSeq = "9223372036854775810",
             eventId = "event-wrong-lineage",
-            closedEventFingerprint = "closed-event-wrong-lineage",
+            closedEventDigest = digestOf("closed-event-wrong-lineage"),
             record = currentRun.copy(
                 lifecycleEventId = "event-wrong-lineage",
                 state = AgentLifecycleState.COMPLETED,
@@ -130,9 +134,10 @@ class AgentTranscriptLifecycleClientReducerTest {
         )
         val timelineResync = AgentTranscriptLifecycleClientReducer.reduce(applied.state, differentTimeline)
         assertEquals(AgentClientDisposition.GAP_RESYNC, timelineResync.disposition)
-        assertEquals(AgentExtensionSupport.UNKNOWN, timelineResync.state.extensionLane.support)
-        assertNull(timelineResync.state.extensionLane.timelineEpoch)
-        assertEquals("0", timelineResync.state.extensionLane.lastAgentSeq)
+        assertEquals(AgentExtensionSupport.AVAILABLE, timelineResync.state.extensionLane.support)
+        assertEquals("timeline-large", timelineResync.state.extensionLane.timelineEpoch)
+        assertEquals(nextSequence, timelineResync.state.extensionLane.lastAgentSeq)
+        assertTrue(timelineResync.state.extensionLane.requiresSnapshot)
     }
 
     @Test
@@ -156,17 +161,27 @@ class AgentTranscriptLifecycleClientReducerTest {
                         state = AgentLifecycleState.RUNNING,
                     ),
                 ),
+                currentLifecycleIdentityByEventId = mapOf("event-stale" to staleIdentity),
                 appliedEventsBySeq = mapOf(
-                    "1" to AgentAppliedEventEvidence("event-stale", "closed-event-stale"),
+                    "1" to AgentAppliedEventEvidence("event-stale", digestOf("closed-event-stale")),
                 ),
+                appliedSeqByEventId = mapOf("event-stale" to "1"),
             ),
             notificationConfig = AgentNotificationConfig(
                 permission = AgentNotificationPermission.GRANTED,
                 profileActive = true,
             ),
         )
+        val snapshotRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            initial,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-resync",
+            ),
+        ).state
         val snapshot = AgentTranscriptLifecycleClientInput.SnapshotCommit(
             lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-resync"),
+            requestFence = AgentLocalRequestFence("0", "snapshot-resync"),
             throughAgentSeq = "4",
             records = listOf(
                 lifecycleRecord(
@@ -193,12 +208,12 @@ class AgentTranscriptLifecycleClientReducerTest {
                 ),
             ),
         )
-        val resynced = AgentTranscriptLifecycleClientReducer.reduce(initial, snapshot)
+        val resynced = AgentTranscriptLifecycleClientReducer.reduce(snapshotRequested, snapshot)
         assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, resynced.disposition)
         assertEquals("1", resynced.state.extensionLane.notificationBaselineAgentSeq)
         assertFalse(resynced.state.extensionLane.lifecycleByIdentity.containsKey(staleIdentity))
         assertEquals(
-            AgentAppliedEventEvidence("event-stale", "closed-event-stale"),
+            AgentAppliedEventEvidence("event-stale", digestOf("closed-event-stale")),
             resynced.state.extensionLane.appliedEventsBySeq["1"],
         )
         assertEquals(
@@ -220,6 +235,15 @@ class AgentTranscriptLifecycleClientReducerTest {
             it.systemNotificationIntent
         }
         assertTrue(priorIntents.none { it.isAuthorizedBy(policySuppressedState) })
+        val reenabledState = AgentTranscriptLifecycleClientReducer.reduce(
+            policySuppressedState,
+            AgentTranscriptLifecycleClientInput.ClientConfigChanged(
+                policySuppressedState.notificationConfig.copy(policy = AgentNotificationPolicy.ALLOW),
+            ),
+        ).state
+        assertTrue("config toggles cannot reauthorize queued intents", priorIntents.none {
+            it.isAuthorizedBy(reenabledState)
+        })
         val running = AgentTranscriptLifecycleClientReducer.reduce(
             policySuppressedState,
             lifecycleEvent(
@@ -267,6 +291,273 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertTrue(priorIntents.none { it.isAuthorizedBy(reset.state) })
     }
 
+    @Test
+    fun resetRequiresActiveMatchingEpochAndRetiresOldStatusAndIntentGeneration() {
+        val reset = AgentTranscriptLifecycleClientInput.TimelineReset(
+            sessionIdentity = SESSION_IDENTITY,
+            previousTimelineEpoch = "timeline-reset-old",
+            newTimelineEpoch = "timeline-reset-new",
+            reason = AgentTimelineResetReason.DELETED,
+        )
+        val unnegotiated = AgentTranscriptLifecycleClientState(identity = SESSION_IDENTITY)
+        assertEquals(
+            AgentClientDisposition.EXTENSION_NOT_ACTIVE,
+            AgentTranscriptLifecycleClientReducer.reduce(unnegotiated, reset).disposition,
+        )
+        val unavailable = AgentTranscriptLifecycleClientState(
+            identity = SESSION_IDENTITY,
+            extensionLane = AgentTranscriptLifecycleExtensionState(
+                support = AgentExtensionSupport.UNAVAILABLE,
+                unavailableReason = AgentExtensionUnavailableReason.STORE_UNAVAILABLE,
+            ),
+        )
+        assertEquals(
+            AgentClientDisposition.EXTENSION_NOT_ACTIVE,
+            AgentTranscriptLifecycleClientReducer.reduce(unavailable, reset).disposition,
+        )
+
+        var active = availableState("timeline-reset-old", baseline = "0")
+        active = AgentTranscriptLifecycleClientReducer.reduce(
+            active,
+            lifecycleEvent(
+                timelineEpoch = "timeline-reset-old",
+                sequence = "1",
+                eventId = "event-reset-running",
+                scope = AgentLifecycleScope.RUN,
+                runId = "run-reset",
+                state = AgentLifecycleState.RUNNING,
+                fingerprint = "closed-reset-running",
+            ),
+        ).state
+        val completed = AgentTranscriptLifecycleClientReducer.reduce(
+            active,
+            lifecycleEvent(
+                timelineEpoch = "timeline-reset-old",
+                sequence = "2",
+                eventId = "event-reset-completed",
+                scope = AgentLifecycleScope.RUN,
+                runId = "run-reset",
+                state = AgentLifecycleState.COMPLETED,
+                fingerprint = "closed-reset-completed",
+            ),
+        )
+        val oldIntent = requireNotNull(completed.notificationDecisions.single().systemNotificationIntent)
+        val wrongEpoch = AgentTranscriptLifecycleClientReducer.reduce(
+            completed.state,
+            reset.copy(previousTimelineEpoch = "timeline-other"),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, wrongEpoch.disposition)
+        assertEquals("timeline-reset-old", wrongEpoch.state.extensionLane.timelineEpoch)
+
+        val resetApplied = AgentTranscriptLifecycleClientReducer.reduce(completed.state, reset)
+        assertEquals(AgentClientDisposition.TIMELINE_RESET, resetApplied.disposition)
+        assertEquals("1", resetApplied.state.extensionLane.localGeneration)
+        assertFalse(oldIntent.isAuthorizedBy(resetApplied.state))
+        assertTrue("timeline-reset-old" in resetApplied.state.extensionLane.retiredTimelineEpochs)
+
+        val statusRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            resetApplied.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.STATUS,
+                "status-after-reset",
+            ),
+        ).state
+        val lateOldGeneration = AgentTranscriptLifecycleClientReducer.reduce(
+            statusRequested,
+            AgentTranscriptLifecycleClientInput.StatusAvailable(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-reset-old"),
+                requestFence = AgentLocalRequestFence("0", "status-before-reset"),
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-before-reset",
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, lateOldGeneration.disposition)
+        assertEquals(statusRequested, lateOldGeneration.state)
+        val retiredStatus = AgentTranscriptLifecycleClientReducer.reduce(
+            lateOldGeneration.state,
+            AgentTranscriptLifecycleClientInput.StatusAvailable(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-reset-old"),
+                requestFence = AgentLocalRequestFence("1", "status-after-reset"),
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-after-reset",
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, retiredStatus.disposition)
+        assertEquals("timeline-reset-new", retiredStatus.state.extensionLane.timelineEpoch)
+        assertFalse(oldIntent.isAuthorizedBy(retiredStatus.state))
+    }
+
+    @Test
+    fun snapshotRejectsStaleOrInvalidCommitsAndPreservesEverTurnHistory() {
+        val runIdentity = AgentLifecycleIdentity(AgentLifecycleScope.RUN, "run-ever-turn", null)
+        val current = lifecycleRecord(
+            eventId = "event-ever-current",
+            sequence = "5",
+            scope = AgentLifecycleScope.RUN,
+            runId = "run-ever-turn",
+            state = AgentLifecycleState.RUNNING,
+            sourceEpoch = "source-ever",
+        )
+        val initial = availableState(
+            timelineEpoch = "timeline-snapshot-safe",
+            lastAgentSeq = "5",
+            baseline = "2",
+            lifecycle = mapOf(runIdentity to current),
+            runsWithTurns = setOf("run-ever-turn"),
+        )
+        val staleRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            initial,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-stale",
+            ),
+        ).state
+        val stale = AgentTranscriptLifecycleClientReducer.reduce(
+            staleRequested,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
+                requestFence = AgentLocalRequestFence("0", "snapshot-stale"),
+                throughAgentSeq = "4",
+                records = emptyList(),
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, stale.disposition)
+        assertEquals("5", stale.state.extensionLane.lastAgentSeq)
+        assertTrue(stale.state.extensionLane.requiresSnapshot)
+        assertTrue(stale.notificationDecisions.isEmpty())
+
+        val freshRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            stale.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-fresh",
+            ),
+        ).state
+        val lateOldRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            freshRequested,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
+                requestFence = AgentLocalRequestFence("0", "snapshot-stale"),
+                throughAgentSeq = "6",
+                records = emptyList(),
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, lateOldRequest.disposition)
+        assertEquals(freshRequested, lateOldRequest.state)
+
+        val recovered = AgentTranscriptLifecycleClientReducer.reduce(
+            lateOldRequest.state,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
+                requestFence = AgentLocalRequestFence("1", "snapshot-fresh"),
+                throughAgentSeq = "6",
+                records = listOf(
+                    lifecycleRecord(
+                        eventId = "event-ever-completed",
+                        sequence = "6",
+                        scope = AgentLifecycleScope.RUN,
+                        runId = "run-ever-turn",
+                        state = AgentLifecycleState.COMPLETED,
+                        sourceEpoch = "source-ever",
+                    ),
+                ),
+            ),
+        )
+        assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, recovered.disposition)
+        assertEquals("2", recovered.state.extensionLane.notificationBaselineAgentSeq)
+        assertTrue("run-ever-turn" in recovered.state.extensionLane.runsWithTurnRecords)
+        assertTrue("run fallback must remain suppressed", recovered.notificationDecisions.isEmpty())
+        assertFalse(recovered.state.extensionLane.requiresSnapshot)
+
+        val invalidRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            recovered.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-invalid-graph",
+            ),
+        ).state
+        val invalidGraph = AgentTranscriptLifecycleClientReducer.reduce(
+            invalidRequested,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
+                requestFence = AgentLocalRequestFence("1", "snapshot-invalid-graph"),
+                throughAgentSeq = "7",
+                records = listOf(
+                    lifecycleRecord(
+                        eventId = "event-graph-run",
+                        sequence = "7",
+                        scope = AgentLifecycleScope.RUN,
+                        runId = "run-graph",
+                        state = AgentLifecycleState.RUNNING,
+                        sourceEpoch = "source-graph-a",
+                    ),
+                    lifecycleRecord(
+                        eventId = "event-graph-turn",
+                        sequence = "7",
+                        scope = AgentLifecycleScope.TURN,
+                        runId = "run-graph",
+                        turnId = "turn-graph",
+                        state = AgentLifecycleState.RUNNING,
+                        sourceEpoch = "source-graph-b",
+                    ),
+                ),
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, invalidGraph.disposition)
+        assertEquals("6", invalidGraph.state.extensionLane.lastAgentSeq)
+        assertTrue(invalidGraph.state.extensionLane.requiresSnapshot)
+    }
+
+    @Test
+    fun fixedCapacitySaturationDoesNotAdvanceAndExactDuplicateStillMatches() {
+        val duplicate = lifecycleEvent(
+            timelineEpoch = "timeline-cap",
+            sequence = "1",
+            eventId = "event-cap-1",
+            scope = AgentLifecycleScope.RUN,
+            runId = "run-cap",
+            state = AgentLifecycleState.RUNNING,
+            fingerprint = "closed-cap-1",
+        )
+        val identity = duplicate.record.identity
+        val base = availableState(
+            timelineEpoch = "timeline-cap",
+            lastAgentSeq = "1",
+            baseline = "1",
+            lifecycle = mapOf(identity to duplicate.record),
+        )
+        val atCapacity = base.copy(
+            extensionLane = base.extensionLane.copy(
+                appliedEventsBySeq = mapOf(
+                    "1" to AgentAppliedEventEvidence("event-cap-1", duplicate.closedEventDigest),
+                ),
+                appliedSeqByEventId = mapOf("event-cap-1" to "1"),
+            ),
+        )
+        val limits = AgentClientReducerLimits(maxAppliedEventEvidence = 1)
+        val exact = AgentTranscriptLifecycleClientReducer.reduce(atCapacity, duplicate, limits)
+        assertEquals(AgentClientDisposition.DUPLICATE, exact.disposition)
+        assertFalse(exact.state.extensionLane.requiresSnapshot)
+
+        val saturated = AgentTranscriptLifecycleClientReducer.reduce(
+            exact.state,
+            lifecycleEvent(
+                timelineEpoch = "timeline-cap",
+                sequence = "2",
+                eventId = "event-cap-2",
+                scope = AgentLifecycleScope.RUN,
+                runId = "run-cap",
+                state = AgentLifecycleState.WAITING_FOR_USER,
+                fingerprint = "closed-cap-2",
+            ),
+            limits,
+        )
+        assertEquals(AgentClientDisposition.GAP_RESYNC, saturated.disposition)
+        assertEquals("1", saturated.state.extensionLane.lastAgentSeq)
+        assertTrue(saturated.state.extensionLane.requiresSnapshot)
+        assertEquals(atCapacity.extensionLane.appliedEventsBySeq, saturated.state.extensionLane.appliedEventsBySeq)
+    }
+
     private fun assertEveryExpectation(
         label: String,
         expected: Map<String, Any?>,
@@ -304,6 +595,11 @@ class AgentTranscriptLifecycleClientReducerTest {
                     label,
                     value.asString().toUnavailableReason(),
                     reduction.state.extensionLane.unavailableReason,
+                )
+                "requiresSnapshot" -> assertEquals(
+                    label,
+                    value as Boolean,
+                    reduction.state.extensionLane.requiresSnapshot,
                 )
                 "lifecycleState" -> assertLifecycleExpectation(label, value, input, reduction.state)
                 "commandState" -> assertCommandExpectation(label, value, input, reduction.state)
@@ -381,7 +677,7 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertEquals(label, lifecycle.record.state, decision.dedupeKey.state)
         assertEquals(
             label,
-            decision.disposition,
+            decision.ledgerEntry,
             reduction.state.extensionLane.notificationLedger[decision.dedupeKey],
         )
         if (decision.disposition == AgentNotificationDisposition.SHOWN) {
@@ -429,6 +725,9 @@ class AgentTranscriptLifecycleClientReducerTest {
                 lastAgentSeq = lastAgentSeq,
                 notificationBaselineAgentSeq = optionalString("notificationBaselineAgentSeq"),
                 lifecycleByIdentity = lifecycle,
+                currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
+                    record.lifecycleEventId to identity
+                },
                 runsWithTurnRecords = lifecycle.keys
                     .filter { it.scope == AgentLifecycleScope.TURN }
                     .mapTo(linkedSetOf(), AgentLifecycleIdentity::runId),
@@ -443,6 +742,14 @@ class AgentTranscriptLifecycleClientReducerTest {
     private fun Map<String, Any?>.toClientInput(
         state: AgentTranscriptLifecycleClientState,
     ): AgentTranscriptLifecycleClientInput = when (string("kind")) {
+        "status_request_started" -> AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+            kind = AgentLocalRequestKind.STATUS,
+            requestToken = string("requestToken"),
+        )
+        "snapshot_request_started" -> AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+            kind = AgentLocalRequestKind.SNAPSHOT,
+            requestToken = string("requestToken"),
+        )
         "command_status" -> AgentTranscriptLifecycleClientInput.CommandStatus(
             commandId = string("commandId"),
             state = string("state").toCommandState(),
@@ -457,6 +764,10 @@ class AgentTranscriptLifecycleClientReducerTest {
         "status" -> when (string("support")) {
             "unavailable" -> AgentTranscriptLifecycleClientInput.StatusUnavailable(
                 sessionIdentity = SESSION_IDENTITY,
+                requestFence = AgentLocalRequestFence(
+                    localGeneration = string("localGeneration"),
+                    requestToken = string("requestToken"),
+                ),
                 reason = string("reason").toUnavailableReason(),
             )
             else -> error("Shared fixture has unsupported status input $this")
@@ -468,12 +779,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, string("timelineEpoch")),
                 agentEventSeq = sequence,
                 eventId = eventId,
-                closedEventFingerprint = RelayV2StrictJson.stringify(this),
+                closedEventDigest = digestOf(RelayV2StrictJson.stringify(this)),
                 record = map("record").toLifecycleRecord(eventId, sequence),
             )
         }
         "snapshot_commit" -> AgentTranscriptLifecycleClientInput.SnapshotCommit(
             lineage = AgentTimelineLineage(SESSION_IDENTITY, string("timelineEpoch")),
+            requestFence = AgentLocalRequestFence(
+                localGeneration = string("localGeneration"),
+                requestToken = string("requestToken"),
+            ),
             throughAgentSeq = string("throughAgentSeq"),
             records = list("records").map { rawRecord ->
                 val record = rawRecord.asMap()
@@ -545,6 +860,42 @@ class AgentTranscriptLifecycleClientReducerTest {
     }
 }
 
+private fun availableState(
+    timelineEpoch: String,
+    lastAgentSeq: String = "0",
+    baseline: String? = lastAgentSeq,
+    lifecycle: Map<AgentLifecycleIdentity, AgentLifecycleRecord> = emptyMap(),
+    runsWithTurns: Set<String> = lifecycle.keys
+        .filter { it.scope == AgentLifecycleScope.TURN }
+        .mapTo(linkedSetOf(), AgentLifecycleIdentity::runId),
+): AgentTranscriptLifecycleClientState = AgentTranscriptLifecycleClientState(
+    identity = fixtureSessionIdentity(),
+    extensionLane = AgentTranscriptLifecycleExtensionState(
+        support = AgentExtensionSupport.AVAILABLE,
+        unavailableReason = null,
+        timelineEpoch = timelineEpoch,
+        lastAgentSeq = lastAgentSeq,
+        notificationBaselineAgentSeq = baseline,
+        lifecycleByIdentity = lifecycle,
+        currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
+            record.lifecycleEventId to identity
+        },
+        runsWithTurnRecords = runsWithTurns,
+    ),
+    notificationConfig = AgentNotificationConfig(
+        permission = AgentNotificationPermission.GRANTED,
+        profileActive = true,
+    ),
+)
+
+private fun fixtureSessionIdentity(): AgentExtensionSessionIdentity = AgentExtensionSessionIdentity(
+    profileId = "profile-fixture",
+    hostId = "mac-admin",
+    hostEpoch = "host-epoch-fixture",
+    scopeId = "scope-local",
+    sessionId = "session-fixture",
+)
+
 private fun lifecycleEvent(
     timelineEpoch: String,
     sequence: String,
@@ -558,18 +909,12 @@ private fun lifecycleEvent(
 ): AgentTranscriptLifecycleClientInput.AgentEvent =
     AgentTranscriptLifecycleClientInput.AgentEvent(
         lineage = AgentTimelineLineage(
-            AgentExtensionSessionIdentity(
-                profileId = "profile-fixture",
-                hostId = "mac-admin",
-                hostEpoch = "host-epoch-fixture",
-                scopeId = "scope-local",
-                sessionId = "session-fixture",
-            ),
+            fixtureSessionIdentity(),
             timelineEpoch,
         ),
         agentEventSeq = sequence,
         eventId = eventId,
-        closedEventFingerprint = fingerprint,
+        closedEventDigest = digestOf(fingerprint),
         record = lifecycleRecord(
             eventId = eventId,
             sequence = sequence,
@@ -595,6 +940,12 @@ private fun lifecycleRecord(
     identity = AgentLifecycleIdentity(scope, runId, turnId),
     state = state,
     agentEventSeq = sequence,
+)
+
+private fun digestOf(value: String): AgentClosedEventDigest = AgentClosedEventDigest(
+    Base64.getUrlEncoder().withoutPadding().encodeToString(
+        MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8)),
+    ),
 )
 
 private fun String.toLifecycleIdentity(): AgentLifecycleIdentity {
