@@ -803,13 +803,13 @@ test("persisted idle non-Feishu recovery self-heals but uncertain operations and
       (error) => error.code === "PERMISSION_DENIED",
     );
 
-    const current = await acquired(authority, target.controlTargetId, owner("dashboard", "handoff-owner"));
+    const current = await acquired(authority, target.controlTargetId, owner("feishu", "handoff-owner"));
     await authority.handle({
       protocolVersion: 1,
-      requestId: "non-feishu-handoff",
+      requestId: "feishu-handoff",
       type: "handoff.begin",
       controlTargetId: target.controlTargetId,
-      nextOwner: owner("relay-v2", "next-owner"),
+      nextOwner: owner("dashboard", "next-owner"),
       currentLease: current.lease,
     });
     const restarted = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });

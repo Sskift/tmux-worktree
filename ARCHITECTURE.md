@@ -12,7 +12,7 @@
 - Relay v1 是当前唯一实现的移动协议。`docs/relay-v2-contract.md` 是未来契约，不代表任何一端已经支持 v2。
 - 独立的本地 terminal-control v1 是 Dashboard、受控 CLI、Relay v1 和 Feishu Bridge 共同使用的 terminal input authority；Feishu 与 Relay 不共享 transport、鉴权、credential 或业务协议。
 
-最重要的所有权规则是：`tmux` 保存活进程事实，`tw` 保存 managed lifecycle 事实，local terminal-control 保存唯一 input owner/lease/fence，Feishu Bridge 保存 binding/turn/reply 事实，Dashboard 保存桌面展示状态，Android 保存手机侧缓存与待发送状态。展示层缓存不能决定一次写入或破坏性操作应走哪条权威路径。
+最重要的所有权规则是：`tmux` 保存活进程事实，`tw` 保存 managed lifecycle 事实，local terminal-control 保存 Feishu/interactive 两类 input ownership、共享 lease/fence 和 single-writer 顺序，Feishu Bridge 保存 binding/turn/reply 事实，Dashboard 保存桌面展示状态，Android 保存手机侧缓存与待发送状态。Dashboard、APK/Relay、受控 CLI 和 `tw serve` 属于同一个 interactive 类，彼此不争锁；只有 Feishu 会独占一个 terminal。展示层缓存不能决定一次写入或破坏性操作应走哪条权威路径。
 
 ## 顶层依赖方向与变更落点
 
@@ -218,9 +218,9 @@ Relay v1 支持 Host/Scope/Session snapshot、创建、关闭、发送 agent mes
 
 ### 共享 terminal input 与 Feishu Bridge
 
-Dashboard、受控 `tw attach`、`tw serve`、Relay v1 和 Feishu Bridge 的产品级真实写路径都映射到同一个 `controlTargetId`，并由目标主机上的 terminal-control authority 在一次 critical section 内完成 lease/fence 校验和 backend write。Relay terminal stream、Android 重连和 Feishu awaiting turn 都不是 input lease；observer 可以继续读 output，但不能据此取得或恢复写权。Dashboard mount/status 也只是 observer：首个真实 input 才 lazy-acquire，非活动 PTY 主动 release；无 in-flight/handoff 的非 Feishu 陈旧 lease 可在旧 fence 失效、exact target 复核和 output capture 换代后安全回到 `FREE`，Feishu 与不确定副作用仍 fail closed。
+Dashboard、受控 `tw attach`、`tw serve`、Relay v1 和 Feishu Bridge 的产品级真实写路径都映射到同一个 `controlTargetId`，并由目标主机上的 terminal-control authority 在一次 critical section 内完成 lease/fence 校验和 backend write。Relay terminal stream、Android 重连和 Feishu awaiting turn 都不是 input lease；observer 可以继续读 output，但不能据此取得或恢复写权。Dashboard、APK/Relay、受控 CLI 和 `tw serve` 在首个真实 input 时加入同一个 interactive lease/fence，多个实例可并行连接并由 single writer 串行提交 operation；某个 attachment release 只丢弃自己的本地 lease，不 fence 其他 interactive writer，最后一个登记的 producer 正常 release 时回到 `FREE`。只有 Feishu acquire/handoff 会把 interactive 端变为只读。异常退出后无人续租的 interactive lease 仍会在 exact target 复核和 output capture 换代后安全回到 `FREE`，Feishu 与不确定副作用继续 fail closed。
 
-Feishu Bridge 是独立本地 daemon，拥有群 binding、sender policy、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership；它只释放自己仍持有的 Dashboard PTY lease。Settings 只持久化非敏感的 `lark-cli` profile 名称，bot credential 继续由 `lark-cli` 拥有；更换 profile 只允许在没有任何 binding/turn 的空 Bridge 上执行。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
+Feishu Bridge 是独立本地 daemon，拥有群 binding、群成员精确 @Bot 触发策略、event dedup、单轮 marker/output cursor 和幂等回帖。Dashboard 的正常绑定不要求管理员 Open ID：同一群内任意真实用户均可 @Bot 发起一轮，Bot/self、非用户事件和未 @Bot 的普通消息不会注入 session。Dashboard 可以按需启动和管理它，但退出 Dashboard 不得停止共享 Bridge/controller 或隐式释放 active Feishu ownership；它只丢弃自己的 interactive lease view。Feishu 占用时 Dashboard 的本地 takeover/pause 操作负责 drain 或取消当前 turn，再原子切回 interactive 类。Settings 只持久化非敏感的 `lark-cli` profile 名称，bot credential 继续由 `lark-cli` 拥有；更换 profile 只允许在没有任何 binding/turn 的空 Bridge 上执行。完整状态机、handoff commit point、Relay v1/v2 拒绝规则和 privileged raw-tmux bypass 见 [`docs/terminal-input-ownership-alignment.md`](docs/terminal-input-ownership-alignment.md)。
 
 ## 状态所有权
 
@@ -239,7 +239,7 @@ Feishu Bridge 是独立本地 daemon，拥有群 binding、sender policy、event
 | `~/.tw-dashboard-pending-worktree-cleanup.json` | Dashboard | Dashboard Rust | session 关闭后尚未完成的本机 worktree 清理队列 |
 | `~/.tw-serve-token` | `tw serve` | `tw serve` | 本地 Web terminal bearer token |
 | `~/.tmux-worktree/mobile-relay-status.json` | connector runtime | 当前 relay-host instance | 可丢弃的连接状态，不是配置或 session 权威 |
-| `~/.tmux-worktree/terminal-control-state-v1.json` | local terminal-control | terminal-control daemon | exact target、control epoch、唯一 owner、lease/fence、handoff 与 operation disposition；严格 schema、锁和 0600 原子写 |
+| `~/.tmux-worktree/terminal-control-state-v1.json` | local terminal-control | terminal-control daemon | exact target、control epoch、Feishu/interactive ownership、共享 lease/fence、handoff 与 operation disposition；严格 schema、锁和 0600 原子写 |
 | `~/.tmux-worktree/terminal-control-output-v1/` | local terminal-control | terminal-control daemon | 有界、generation-fenced 的只读 output capture；不授予 input ownership |
 | `~/.tmux-worktree/feishu-*.json` | Feishu Bridge | Feishu bridge daemon | 私有 binding、event dedup、turn 和 outbound reply disposition；不是 lease authority |
 

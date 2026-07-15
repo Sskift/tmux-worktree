@@ -430,7 +430,7 @@ transport.handlers.set("feishu_binding_create", (payload) => {
     sessionName: args.sessionName,
     status: "active",
     options: { mentionOnly: true, replyAsCard: false, includeQuotedContext: false },
-    allowedSenderIds: [args.createdBy],
+    allowedSenderIds: [],
     createdAt: new Date().toISOString(),
     createdBy: args.createdBy,
   };

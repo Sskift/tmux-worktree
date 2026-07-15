@@ -223,12 +223,16 @@ fn dashboard_lease_from_result(
 impl PtyControl {
     pub(crate) fn status(&self) -> PtyControlStatus {
         let owned_here = self.lease.is_some();
+        let interactive_held = self.last_state == "HELD"
+            && self.last_owner_kind.is_some()
+            && self.last_owner_kind.as_deref() != Some("feishu");
         PtyControlStatus {
             controlled: true,
             // FREE is writable-on-demand: the first real input atomically
-            // acquires a lease. Merely observing or mounting a PTY must not
-            // make the session look locked or claim it pre-emptively.
-            read_only: !owned_here && self.last_state != "FREE",
+            // acquires the shared interactive lease. Dashboard, Relay/APK and
+            // other controlled interactive adapters never make one another
+            // read-only; only Feishu remains an exclusive input owner.
+            read_only: !owned_here && self.last_state != "FREE" && !interactive_held,
             state: self.last_state.clone(),
             owner_kind: self.last_owner_kind.clone(),
             can_take_over: !owned_here

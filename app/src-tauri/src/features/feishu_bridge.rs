@@ -923,17 +923,12 @@ pub(crate) fn feishu_binding_create(
     args: FeishuBindingInput,
 ) -> Result<Value, String> {
     ensure_server(&app, state.inner().as_ref())?;
-    let allowed_sender_ids = if args.allowed_sender_ids.is_empty() {
-        vec![args.created_by.clone()]
-    } else {
-        args.allowed_sender_ids
-    };
     let params = json!({
         "chatId": args.chat_id,
         "chatName": args.chat_name,
         "sessionName": args.session_name,
         "createdBy": args.created_by,
-        "allowedSenderIds": allowed_sender_ids,
+        "allowedSenderIds": args.allowed_sender_ids,
         "mentionOnly": args.mention_only,
     });
     let pty_id = args

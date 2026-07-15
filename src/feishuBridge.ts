@@ -71,6 +71,20 @@ function boundedUtf8(value: string, maxBytes: number): string {
   return result;
 }
 
+function boundedUtf8Tail(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const characters = [...value];
+  let start = characters.length;
+  let bytes = 0;
+  while (start > 0) {
+    const size = Buffer.byteLength(characters[start - 1], "utf8");
+    if (bytes + size > maxBytes) break;
+    start -= 1;
+    bytes += size;
+  }
+  return characters.slice(start).join("");
+}
+
 function sanitizeTerminalText(value: string): string {
   return value
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
@@ -140,6 +154,7 @@ export class FeishuBridge {
   private readonly store: FeishuBridgeStore;
   private readonly now: () => number;
   private botOpenId?: string;
+  private botMentionIds?: Set<string>;
   private readonly leases = new Map<string, CanonicalTerminalLease>();
   private state: BridgeState;
   private mutation = Promise.resolve();
@@ -205,9 +220,10 @@ export class FeishuBridge {
       }
       const id = `bind-${randomUUID()}`;
       const createdAt = nowIso(this.now);
-      const allowedSenderIds = [...new Set(input.allowedSenderIds?.length
-        ? input.allowedSenderIds
-        : [input.createdBy])];
+      // An explicitly empty list is the Dashboard's group-wide policy. Keep
+      // the legacy omitted-field fallback for older CLI callers that used
+      // createdBy as their single allowed sender.
+      const allowedSenderIds = [...new Set(input.allowedSenderIds ?? [input.createdBy])];
       const binding: FeishuBinding = {
         version: 1,
         id,
@@ -235,8 +251,9 @@ export class FeishuBridge {
           || dashboardLease.fence !== target.ownership.fence
           || dashboardLease.owner.kind !== "dashboard"
           || target.ownership.state !== "HELD"
-          || target.ownership.ownerKind !== "dashboard") {
-          throw new Error("Dashboard no longer owns the exact terminal selected for binding");
+          || !target.ownership.ownerKind
+          || target.ownership.ownerKind === "feishu") {
+          throw new Error("Dashboard no longer has a valid interactive lease for the selected terminal");
         }
         this.state.bindings.push(binding);
         try {
@@ -602,11 +619,12 @@ export class FeishuBridge {
       const senderType = normalizedSenderType(detail.senderType);
       if ((senderType && senderType !== "user")
         || senderId === this.botOpenId
-        || !binding.allowedSenderIds.includes(senderId)) {
+        || (binding.allowedSenderIds.length > 0 && !binding.allowedSenderIds.includes(senderId))) {
         this.rememberEvent(event.event_id);
         return;
       }
-      if (binding.options.mentionOnly && !detail.mentionedIds.includes(this.botOpenId!)) {
+      if (binding.options.mentionOnly
+        && !detail.mentionedIds.some((id) => this.botMentionIds!.has(id))) {
         this.rememberEvent(event.event_id);
         return;
       }
@@ -833,7 +851,7 @@ export class FeishuBridge {
       if (raw.byteLength > 0) {
         const decoded = decodeUtf8Incrementally(turn.outputRemainderBase64, raw);
         turn.cursor = chunk.nextCursor;
-        turn.output = boundedUtf8(`${turn.output}${decoded.text}`, MAX_TURN_OUTPUT_BYTES);
+        turn.output = boundedUtf8Tail(`${turn.output}${decoded.text}`, MAX_TURN_OUTPUT_BYTES);
         if (decoded.remainderBase64) turn.outputRemainderBase64 = decoded.remainderBase64;
         else delete turn.outputRemainderBase64;
         turn.lastOutputAt = nowIso(this.now);
@@ -1130,6 +1148,15 @@ export class FeishuBridge {
 
   private async ensureBotOpenId(): Promise<string> {
     this.botOpenId ||= await this.lark.botOpenId();
+    if (!this.botMentionIds) {
+      const mentionIds = this.lark.botMentionIds
+        ? await this.lark.botMentionIds()
+        : [this.botOpenId];
+      if (!mentionIds.includes(this.botOpenId)) {
+        throw new Error("Feishu bot identity aliases do not include its open_id");
+      }
+      this.botMentionIds = new Set(mentionIds);
+    }
     return this.botOpenId;
   }
 

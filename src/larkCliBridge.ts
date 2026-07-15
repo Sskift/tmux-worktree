@@ -29,6 +29,11 @@ export interface FeishuReplyResult {
   raw: unknown;
 }
 
+export interface FeishuBotIdentity {
+  openId: string;
+  mentionIds: string[];
+}
+
 export interface FeishuChat {
   chatId: string;
   name: string;
@@ -47,6 +52,7 @@ export interface FeishuLarkAdapter {
   reply(messageId: string, text: string, idempotencyKey: string): Promise<FeishuReplyResult>;
   listGroups(): Promise<FeishuChat[]>;
   botOpenId(): Promise<string>;
+  botMentionIds?(): Promise<string[]>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -268,7 +274,7 @@ export function parseFeishuChatPage(value: unknown): {
   };
 }
 
-export function parseFeishuBotOpenId(value: unknown): string {
+export function parseFeishuBotIdentity(value: unknown): FeishuBotIdentity {
   if (!isRecord(value)) throw new Error("invalid bot info response");
   const data = isRecord(value.data) ? value.data : value;
   const identities = isRecord(value.identities) ? value.identities : undefined;
@@ -279,12 +285,24 @@ export function parseFeishuBotOpenId(value: unknown): string {
       : data;
   const openId = pickString(bot.open_id, bot.openId);
   if (!openId?.startsWith("ou_")) throw new Error("bot info omitted open_id");
-  return openId;
+  const appId = pickString(value.app_id, value.appId, data.app_id, data.appId, bot.app_id, bot.appId);
+  return {
+    openId,
+    mentionIds: [...new Set([
+      openId,
+      ...(appId?.startsWith("cli_") ? [appId] : []),
+    ])],
+  };
+}
+
+export function parseFeishuBotOpenId(value: unknown): string {
+  return parseFeishuBotIdentity(value).openId;
 }
 
 export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
   private readonly profile?: string;
   private readonly runner: (args: string[]) => Promise<unknown>;
+  private botIdentityCache?: FeishuBotIdentity;
 
   constructor(options: {
     profile?: string;
@@ -401,10 +419,20 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     throw new Error("Feishu chat list exceeded the pagination limit");
   }
 
-  async botOpenId(): Promise<string> {
+  private async botIdentity(): Promise<FeishuBotIdentity> {
+    if (this.botIdentityCache) return this.botIdentityCache;
     const raw = await this.runner(this.commandArgs([
       "auth", "status", "--json", "--verify",
     ]));
-    return parseFeishuBotOpenId(raw);
+    this.botIdentityCache = parseFeishuBotIdentity(raw);
+    return this.botIdentityCache;
+  }
+
+  async botOpenId(): Promise<string> {
+    return (await this.botIdentity()).openId;
+  }
+
+  async botMentionIds(): Promise<string[]> {
+    return [...(await this.botIdentity()).mentionIds];
   }
 }

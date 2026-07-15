@@ -28,6 +28,7 @@ Android app
 - Session names exposed to Android are scoped as `<scope>:<raw-tmux-session>`, for example `local:app-task` or `remote-a:repo-fix`.
 - Plain tmux sessions are intentionally invisible unless they are Dashboard-managed terminals.
 - Remote WorkTrees should be created through TW so they are present in `tw rpc list` or recognizable as `<worktreeBase>/<project>/<session>-<5-hex>` with a `.git` entry.
+- Android/APK and every Dashboard window belong to the same interactive input class for a given managed session. They share one target lease/fence and the controller serializes their operations; opening, typing in, resizing, or closing one interactive attachment never locks out another. Feishu is the only exclusive owner. While a Feishu binding holds the session Android remains read-only until the Mac Dashboard uses **Take over locally** or pauses the binding.
 - `send_agent_message` remains one Relay v1 command and one acknowledgement boundary. `relay-host` maps it to the target's local terminal-control authority; that authority validates the current lease/fence, pastes the normalized body without appending a newline, waits briefly so the target TUI finishes handling the paste, and submits in a separate tmux stage while holding the same single-writer critical section. It sends `agent_message_sent` only after the controller confirms success; an uncertain paste/submit boundary is not replayed automatically.
 
 ## Commands

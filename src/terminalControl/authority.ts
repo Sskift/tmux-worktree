@@ -203,10 +203,31 @@ function validateLease(
   if (
     target.ownership.leaseId !== lease.leaseId
     || target.ownership.fence !== lease.fence
-    || !sameOwner(target.ownership.owner, lease.owner)
+    || !sameInputOwnerClass(target.ownership.owner, lease.owner)
   ) {
     throw new TerminalControlProtocolError("PERMISSION_DENIED", "terminal input lease is fenced");
   }
+}
+
+function isInteractiveOwner(owner: TerminalControlOwner): boolean {
+  return owner.kind !== "feishu";
+}
+
+function sameInputOwnerClass(left: TerminalControlOwner, right: TerminalControlOwner): boolean {
+  if (isInteractiveOwner(left) && isInteractiveOwner(right)) return true;
+  return sameOwner(left, right);
+}
+
+function leaseForOwner(
+  state: TerminalControlState,
+  target: TerminalControlTargetRecord,
+  owner: TerminalControlOwner,
+): TerminalControlLease {
+  const lease = leaseFromTarget(state, target);
+  if (!sameInputOwnerClass(lease.owner, owner)) {
+    throw new TerminalControlProtocolError("PERMISSION_DENIED", "terminal input lease is fenced");
+  }
+  return sameOwner(lease.owner, owner) ? lease : { ...lease, owner };
 }
 
 function payloadHash(kind: string, pane: string, payload: Buffer | string): string {
@@ -271,11 +292,41 @@ export class TerminalControlAuthority {
   private readonly statePath: string;
   private readonly backend: TerminalControlBackend;
   private readonly now: () => Date;
+  private readonly interactiveOwners = new Map<string, Map<string, TerminalControlOwner>>();
 
   constructor(options: AuthorityOptions = {}) {
     this.statePath = options.statePath ?? terminalControlStatePath();
     this.backend = options.backend ?? new TmuxTerminalControlBackend();
     this.now = options.now ?? (() => new Date());
+  }
+
+  private interactiveOwnerKey(owner: TerminalControlOwner): string {
+    return `${owner.kind}\0${owner.instanceId}`;
+  }
+
+  private registerInteractiveOwner(controlTargetId: string, owner: TerminalControlOwner): void {
+    if (!isInteractiveOwner(owner)) return;
+    let owners = this.interactiveOwners.get(controlTargetId);
+    if (!owners) {
+      owners = new Map();
+      this.interactiveOwners.set(controlTargetId, owners);
+    }
+    owners.set(this.interactiveOwnerKey(owner), owner);
+  }
+
+  private unregisterInteractiveOwner(
+    controlTargetId: string,
+    owner: TerminalControlOwner,
+  ): { registered: boolean; remaining?: TerminalControlOwner } {
+    const owners = this.interactiveOwners.get(controlTargetId);
+    if (!owners || !owners.delete(this.interactiveOwnerKey(owner))) return { registered: false };
+    const remaining = owners.values().next().value as TerminalControlOwner | undefined;
+    if (!remaining) this.interactiveOwners.delete(controlTargetId);
+    return { registered: true, remaining };
+  }
+
+  private resetInteractiveOwners(controlTargetId: string): void {
+    this.interactiveOwners.delete(controlTargetId);
   }
 
   async initializeContinuity(): Promise<string> {
@@ -370,6 +421,7 @@ export class TerminalControlAuthority {
       // markRecovery already advanced this fence before recovery was entered.
       fence: target.ownership.fence,
     };
+    this.resetInteractiveOwners(target.controlTargetId);
     revision(target);
     target.updatedAt = isoNow(this.now);
     saveTerminalControlState(state, this.statePath);
@@ -663,14 +715,42 @@ export class TerminalControlAuthority {
           leaseId: randomUUID(),
           leaseExpiresAt: expiresAt(this.now, ttlMs),
         };
+        this.resetInteractiveOwners(target.controlTargetId);
+        this.registerInteractiveOwner(target.controlTargetId, owner);
         revision(target);
         target.updatedAt = isoNow(this.now);
         saveTerminalControlState(state, this.statePath);
-        return { lease: leaseFromTarget(state, target), ownership: ownershipView(state, target, output.cursor) };
+        return { lease: leaseForOwner(state, target, owner), ownership: ownershipView(state, target, output.cursor) };
       }
-      if (target.ownership.state === "HELD" && sameOwner(target.ownership.owner, owner)) {
+      if (target.ownership.state === "HELD" && sameInputOwnerClass(target.ownership.owner, owner)) {
         const output = await this.prepareOutput(state, target);
-        return { lease: leaseFromTarget(state, target), ownership: ownershipView(state, target, output.cursor) };
+        if (isInteractiveOwner(owner)) {
+          this.registerInteractiveOwner(target.controlTargetId, owner);
+          target.ownership.leaseExpiresAt = expiresAt(this.now, ttlMs);
+          revision(target);
+          target.updatedAt = isoNow(this.now);
+          saveTerminalControlState(state, this.statePath);
+        }
+        return { lease: leaseForOwner(state, target, owner), ownership: ownershipView(state, target, output.cursor) };
+      }
+      if (
+        target.ownership.state === "HELD"
+        && isInteractiveOwner(target.ownership.owner)
+        && owner.kind === "feishu"
+      ) {
+        const output = await this.resetOutput(state, target);
+        this.resetInteractiveOwners(target.controlTargetId);
+        target.ownership = {
+          state: "HELD",
+          fence: nextDecimal(target.ownership.fence),
+          owner,
+          leaseId: randomUUID(),
+          leaseExpiresAt: expiresAt(this.now, ttlMs),
+        };
+        revision(target);
+        target.updatedAt = isoNow(this.now);
+        saveTerminalControlState(state, this.statePath);
+        return { lease: leaseForOwner(state, target, owner), ownership: ownershipView(state, target, output.cursor) };
       }
       if (target.ownership.state === "DRAINING" && sameOwner(target.ownership.handoff.nextOwner, owner)) {
         throw new TerminalControlProtocolError("HANDOFF_PENDING", "target is still draining its previous input owner");
@@ -693,13 +773,14 @@ export class TerminalControlAuthority {
       if (target.ownership.state === "FREE") {
         throw new TerminalControlProtocolError("PERMISSION_DENIED", "target has no current input owner");
       }
+      this.registerInteractiveOwner(target.controlTargetId, lease.owner);
       target.ownership.leaseExpiresAt = expiresAt(this.now, ttlMs);
       revision(target);
       target.updatedAt = isoNow(this.now);
       const output = await this.prepareOutput(state, target);
       saveTerminalControlState(state, this.statePath);
       return {
-        lease: leaseFromTarget(state, target),
+        lease: leaseForOwner(state, target, lease.owner),
         ownership: ownershipView(state, target, output.cursor),
       };
     });
@@ -716,7 +797,25 @@ export class TerminalControlAuthority {
           "draining ownership must commit or cancel its handoff; it cannot pass through FREE",
         );
       }
+      if (isInteractiveOwner(lease.owner)) {
+        const detached = this.unregisterInteractiveOwner(target.controlTargetId, lease.owner);
+        if (!detached.registered) {
+          const output = await this.prepareOutput(state, target);
+          return ownershipView(state, target, output.cursor);
+        }
+        if (detached.remaining) {
+          const output = await this.prepareOutput(state, target);
+          if (!sameOwner(target.ownership.owner, detached.remaining)) {
+            target.ownership.owner = detached.remaining;
+            revision(target);
+            target.updatedAt = isoNow(this.now);
+            saveTerminalControlState(state, this.statePath);
+          }
+          return ownershipView(state, target, output.cursor);
+        }
+      }
       const output = await this.resetOutput(state, target);
+      this.resetInteractiveOwners(target.controlTargetId);
       target.ownership = { state: "FREE", fence: nextDecimal(target.ownership.fence) };
       revision(target);
       target.updatedAt = isoNow(this.now);
@@ -742,6 +841,8 @@ export class TerminalControlAuthority {
           leaseId: randomUUID(),
           leaseExpiresAt: expiresAt(this.now),
         };
+        this.resetInteractiveOwners(target.controlTargetId);
+        this.registerInteractiveOwner(target.controlTargetId, nextOwner);
         revision(target);
         target.updatedAt = isoNow(this.now);
         saveTerminalControlState(state, this.statePath);
@@ -765,9 +866,10 @@ export class TerminalControlAuthority {
           "only a controlled local owner may request a lease-less graceful takeover from Feishu",
         );
       }
-      if (sameOwner(target.ownership.owner, nextOwner)) {
+      if (sameInputOwnerClass(target.ownership.owner, nextOwner)) {
         const output = await this.prepareOutput(state, target);
-        return { lease: leaseFromTarget(state, target), ownership: ownershipView(state, target, output.cursor) };
+        this.registerInteractiveOwner(target.controlTargetId, nextOwner);
+        return { lease: leaseForOwner(state, target, nextOwner), ownership: ownershipView(state, target, output.cursor) };
       }
       target.ownership = {
         state: "DRAINING",
@@ -813,6 +915,7 @@ export class TerminalControlAuthority {
       }
       const nextOwner = target.ownership.handoff.nextOwner;
       const output = await this.resetOutput(state, target);
+      this.resetInteractiveOwners(target.controlTargetId);
       target.ownership = {
         state: "HELD",
         fence: nextDecimal(target.ownership.fence),
@@ -820,6 +923,7 @@ export class TerminalControlAuthority {
         leaseId: randomUUID(),
         leaseExpiresAt: expiresAt(this.now, ttlMs),
       };
+      this.registerInteractiveOwner(target.controlTargetId, nextOwner);
       target.recovery = undefined;
       revision(target);
       target.updatedAt = isoNow(this.now);
@@ -959,6 +1063,7 @@ export class TerminalControlAuthority {
         await this.assertTargetCurrent(state, target);
       }
       const output = await this.resetOutput(state, target);
+      this.resetInteractiveOwners(target.controlTargetId);
       target.lifecycle = "ACTIVE";
       target.recovery = undefined;
       target.ownership = {
@@ -968,6 +1073,7 @@ export class TerminalControlAuthority {
         leaseId: randomUUID(),
         leaseExpiresAt: expiresAt(this.now, ttlMs),
       };
+      this.registerInteractiveOwner(target.controlTargetId, nextOwner);
       revision(target);
       target.updatedAt = isoNow(this.now);
       saveTerminalControlState(state, this.statePath);
@@ -993,6 +1099,7 @@ export class TerminalControlAuthority {
         await this.assertTargetCurrent(state, target);
       }
       validateLease(state, target, lease);
+      this.registerInteractiveOwner(target.controlTargetId, lease.owner);
       const hash = payloadHash(kind, pane, payload);
       const completed = existingOperation(
         target,

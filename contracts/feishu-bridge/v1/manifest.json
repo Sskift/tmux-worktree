@@ -35,7 +35,8 @@
       "content"
     ],
     "messageVerification": "lark-cli im +messages-mget --as bot",
-    "botIdentity": "GET /open-apis/bot/v3/info/ as bot"
+    "botIdentity": "GET /open-apis/bot/v3/info/ as bot",
+    "dashboardConversationPolicy": "empty allowedSenderIds means any human user in the bound group may trigger only by mentioning the exact bot; bot/self, non-user, and unmentioned messages are ignored"
   },
   "reply": {
     "command": "lark-cli im +messages-reply --as bot",

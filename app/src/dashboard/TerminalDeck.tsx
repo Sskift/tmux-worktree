@@ -75,7 +75,6 @@ export function TerminalDeck({
   const [groupsError, setGroupsError] = useState<string | null>(null);
   const [chatId, setChatId] = useState("");
   const [chatName, setChatName] = useState("");
-  const [createdBy, setCreatedBy] = useState("");
   const [attachmentIds, setAttachmentIds] = useState<Record<string, string>>({});
 
   const setAttachmentId = (key: string, id: string | null) => {
@@ -140,7 +139,6 @@ export function TerminalDeck({
     setBindingTarget({ sessionName, ptyId });
     setChatId("");
     setChatName("");
-    setCreatedBy("");
     setFeishuError(null);
     setGroups([]);
     setGroupsError(null);
@@ -373,7 +371,7 @@ export function TerminalDeck({
           <div className="terminal-feishu-dialog" role="dialog" aria-modal="true" aria-label="Link a Feishu group">
             <div className="terminal-feishu-dialog__card">
               <strong>Link a Feishu group</strong>
-              <p>Content inside a complete public marker in this terminal is sent to every group member. A process running as the same OS account can still bypass this product-level input lock through raw tmux or low-level RPC commands.</p>
+              <p>Anyone in the selected group can @ this bot to send one message into the session. Only terminal output explicitly marked as the public reply is sent back to the group.</p>
               <label>
                 Bot groups
                 <MenuSelect
@@ -405,7 +403,6 @@ export function TerminalDeck({
                     setChatId(value);
                     if (group) {
                       setChatName(group.name);
-                      setCreatedBy(group.ownerId ?? "");
                     }
                   }}
                 />
@@ -426,30 +423,27 @@ export function TerminalDeck({
                 Group name
                 <input value={chatName} onChange={(event) => setChatName(event.target.value)} />
               </label>
-              <label>
-                Administrator Open ID
-                <input value={createdBy} onChange={(event) => setCreatedBy(event.target.value)} placeholder="ou_…" />
-              </label>
               {feishuError && <p className="terminal-feishu-dialog__error">{feishuError}</p>}
               <div className="terminal-feishu-dialog__actions">
                 <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>Cancel</button>
                 <button
                   type="button"
-                  disabled={feishuBusy || !chatId.trim() || !chatName.trim() || !createdBy.trim()}
+                  disabled={feishuBusy || !chatId.trim() || !chatName.trim()}
                   onClick={() => void runFeishuAction(async () => {
+                    const groupOwner = groups.find((group) => group.chatId === chatId.trim())?.ownerId?.trim();
                     await dashboardBackend.feishu.create({
                       chatId: chatId.trim(),
                       chatName: chatName.trim(),
                       sessionName: bindingTarget.sessionName,
                       attachmentId: bindingTarget.ptyId,
-                      createdBy: createdBy.trim(),
-                      allowedSenderIds: [createdBy.trim()],
+                      createdBy: groupOwner || "local-dashboard",
+                      allowedSenderIds: [],
                       mentionOnly: true,
                     });
                     setBindingTarget(null);
                   })}
                 >
-                  Confirm exclusive link
+                  Confirm link
                 </button>
               </div>
             </div>
