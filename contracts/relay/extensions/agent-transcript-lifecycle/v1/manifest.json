@@ -6,11 +6,16 @@
   "baseProtocolVersion": 2,
   "capability": "agent.transcript-lifecycle.v1",
   "delivery": {
-    "artifactKind": "fixtures-only",
+    "artifactKind": "fixtures-plus-unwired-node-authority-foundation",
     "runtimeConsumers": "pending",
     "nodeCodecConformance": false,
     "androidCodecConformance": false,
     "hostAuthorityMachineConformance": false,
+    "hostAuthorityMachineConformancePending": [
+      "durable-store-continuity",
+      "retention-and-pruning",
+      "public-codec-and-replay-runtime"
+    ],
     "androidConsumerMachineConformance": false,
     "g4Passed": false
   },
@@ -161,6 +166,7 @@
     "replay-gap",
     "command-lifecycle-independent",
     "notification-dedupe",
-    "unsupported-agent"
+    "unsupported-agent",
+    "source-availability"
   ]
 }

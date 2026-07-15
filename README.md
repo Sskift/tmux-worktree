@@ -424,6 +424,7 @@ Generated asset inputs:
 - [Android architecture](docs/android-v2-architecture.md): Compose UI V2, state management, Relay v1 limits, and Android acceptance gates.
 - [Android relay guide](docs/remote-relay-android.md): persistent broker, Mac connector, phone pairing, and APK development.
 - [Relay v2 contract](docs/relay-v2-contract.md): frozen protocol contract with shared Node/Android codec conformance fixtures. Node includes an unwired materialized-only H2 foundation, but not the pinned `state.snapshot` spool; the broker, host composition root, Android actor, enrollment, and capability runtime are not wired.
+- [Relay Agent extension v1](docs/relay-agent-transcript-lifecycle-extension-v1.md): frozen optional-extension fixtures plus an unwired Node host authority reducer foundation. Durable store continuity/retention, public codec/replay runtime, Android consumer, G4, and capability advertisement remain pending.
 - [Relay v2 implementation plan](docs/relay-v2-implementation-plan.md): parallel broker, relay-host, Dashboard, Android, Agent-extension work packages and their interoperability gates.
 
 ## License

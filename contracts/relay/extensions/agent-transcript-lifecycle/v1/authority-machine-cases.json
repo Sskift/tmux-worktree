@@ -217,11 +217,37 @@
       },
       {
         "input": { "sourceEpoch": "source-7", "sourceSeq": "1", "sourceEventId": "source-7-start", "occurredAtMs": 7000, "mutation": { "mutationType": "source.started" } },
-        "expect": { "disposition": "duplicate", "agentEventSeq": "1" }
+        "expect": { "disposition": "duplicate", "agentEventSeq": "1", "sourceFenced": true }
       },
       {
         "input": { "sourceEpoch": "source-7", "sourceSeq": "2", "sourceEventId": "source-7-after-fence", "occurredAtMs": 7010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-7", "turnId": null, "state": "running", "failure": null } },
         "expect": { "disposition": "source_event_conflict", "agentEventSeq": "1", "sourceFenced": true }
+      }
+    ]
+  },
+  {
+    "name": "ordered-source-availability-interrupt-and-reconnect",
+    "scenarios": ["source-availability"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-availability", "sourceSeq": "1", "sourceEventId": "source-availability-start", "occurredAtMs": 7500, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1", "activeSourceAvailability": "connected" }
+      },
+      {
+        "input": { "sourceEpoch": "source-availability", "sourceSeq": "2", "sourceEventId": "source-availability-run", "occurredAtMs": 7510, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-availability", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2", "runState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-availability", "sourceSeq": "3", "sourceEventId": "source-availability-interrupted", "occurredAtMs": 7520, "mutation": { "mutationType": "source.availability", "state": "interrupted", "reason": "source_disconnected" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "3", "activeSourceAvailability": "interrupted", "runStates": [["run-availability", "running"]] }
+      },
+      {
+        "input": { "sourceEpoch": "source-availability", "sourceSeq": "4", "sourceEventId": "source-availability-domain-while-interrupted", "occurredAtMs": 7525, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-availability", "turnId": null, "state": "waiting_for_user", "failure": null } },
+        "expect": { "disposition": "invalid_transition", "agentEventSeq": "3", "activeSourceAvailability": "interrupted", "runState": "running" }
+      },
+      {
+        "input": { "sourceEpoch": "source-availability", "sourceSeq": "4", "sourceEventId": "source-availability-reconnected", "occurredAtMs": 7530, "mutation": { "mutationType": "source.availability", "state": "connected", "reason": "source_restarted" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "4", "activeSourceAvailability": "connected", "runStates": [["run-availability", "running"]] }
       }
     ]
   },

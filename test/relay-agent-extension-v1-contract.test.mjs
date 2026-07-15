@@ -102,11 +102,16 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
   assert.equal(manifest.status, "frozen-extension-not-implemented");
   assert.equal(manifest.capability, "agent.transcript-lifecycle.v1");
   assert.deepEqual(manifest.delivery, {
-    artifactKind: "fixtures-only",
+    artifactKind: "fixtures-plus-unwired-node-authority-foundation",
     runtimeConsumers: "pending",
     nodeCodecConformance: false,
     androidCodecConformance: false,
     hostAuthorityMachineConformance: false,
+    hostAuthorityMachineConformancePending: [
+      "durable-store-continuity",
+      "retention-and-pruning",
+      "public-codec-and-replay-runtime",
+    ],
     androidConsumerMachineConformance: false,
     g4Passed: false,
   });
@@ -248,12 +253,16 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
     assert.ok(scenarios.has(scenario), `missing machine scenario ${scenario}`);
   }
   assert.equal(manifest.machineDispositions.areWireErrorCodes, false);
-  for (const disposition of manifest.machineDispositions.authorityIngestion) {
-    assert.ok(authorityDispositions.has(disposition), `missing authority disposition ${disposition}`);
-  }
-  for (const disposition of manifest.machineDispositions.androidLocal) {
-    assert.ok(clientDispositions.has(disposition), `missing client disposition ${disposition}`);
-  }
+  assert.deepEqual(
+    [...authorityDispositions].sort(),
+    [...manifest.machineDispositions.authorityIngestion].sort(),
+    "authority fixture dispositions must equal the manifest closed set",
+  );
+  assert.deepEqual(
+    [...clientDispositions].sort(),
+    [...manifest.machineDispositions.androidLocal].sort(),
+    "client fixture dispositions must equal the manifest closed set",
+  );
   for (const outcome of [
     "none",
     "shown",
