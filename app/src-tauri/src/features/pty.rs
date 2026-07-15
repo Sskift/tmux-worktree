@@ -468,13 +468,9 @@ fn pty_open_impl(
             release_pty_control(&app, control_state, &mut control);
             return Err(format!("managed PTY fails closed: {detail}"));
         }
-        if let Err(error) = resize_pty_control(
-            &app,
-            control_state,
-            &mut control,
-            args.cols,
-            args.rows,
-        ) {
+        if let Err(error) =
+            resize_pty_control(&app, control_state, &mut control, args.cols, args.rows)
+        {
             control.last_error = Some(error.to_string());
             control.last_state = "RECOVERY_REQUIRED".to_string();
             control.last_owner_kind = None;

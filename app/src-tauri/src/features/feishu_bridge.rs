@@ -336,9 +336,7 @@ fn lark_bot_display_name_with_program(
         .or_else(|| value.pointer("/app/app_name"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|name| {
-            !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control)
-        })
+        .filter(|name| !name.is_empty() && name.len() <= 256 && !name.chars().any(char::is_control))
         .ok_or("Feishu application info omitted the bot name")?;
     Ok(display_name.to_string())
 }
@@ -349,7 +347,8 @@ fn list_lark_profiles() -> Result<Vec<FeishuLarkProfile>, String> {
         // The lark-cli profile key is an internal credential slot, not the
         // user-facing bot identity. Resolve the application name best-effort;
         // App ID remains the safe fallback when the API is unavailable.
-        profile.display_name = lark_bot_display_name_with_program(OsStr::new("lark-cli"), profile).ok();
+        profile.display_name =
+            lark_bot_display_name_with_program(OsStr::new("lark-cli"), profile).ok();
     }
     Ok(profiles)
 }
