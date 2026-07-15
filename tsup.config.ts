@@ -10,6 +10,7 @@ export default defineConfig({
     "src/state.ts",
     "src/relayHost.ts",
     "src/relayServer.ts",
+    "src/relay/v2/hostState.ts",
     "src/terminalControl/index.ts",
     "src/canonicalTerminalControlClient.ts",
     "src/larkCliBridge.ts",
