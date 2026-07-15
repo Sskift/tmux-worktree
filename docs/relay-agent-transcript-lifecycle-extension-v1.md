@@ -1,8 +1,10 @@
 # Relay Agent transcript、lifecycle 与本地通知 extension v1
 
-状态：**Frozen extension contract + 未接线的 Node host authority reducer foundation；生产 capability 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
+状态：**Frozen extension contract + 未接线的 Node host authority reducer 与 Android lifecycle/notification reducer foundations；生产 capability 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
 
-当前交付包含 contract/machine fixtures，以及直接消费 authority machine cases 的独立 Node 纯 reducer foundation。该 foundation 提供受信 adapter binding、显式 state restore/corruption boundary、结构化 source availability、持久索引 transition 和固定资源预算，但没有接入 relay-host 或任何 durable store。Node public codec、snapshot/replay/event log、retention pruning、Android codec/consumer 和所有 runtime consumers 仍为 pending，`hostAuthorityMachineConformance=false`，G4 尚未通过。
+当前交付包含 contract/machine fixtures，以及直接消费 authority machine cases 的独立 Node 纯 reducer foundation。该 foundation 提供受信 adapter binding、显式 state restore/corruption boundary、结构化 source availability、持久索引 transition 和固定资源预算，但没有接入 relay-host 或任何 durable store。Node public codec、snapshot/replay/event log 和 retention pruning 仍为 pending，`hostAuthorityMachineConformance=false`。
+
+Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending。Node contract test只验证 fixture/manifest 自洽，Android machine conformance 只证明该独立 reducer boundary，不构成端到端或产品 capability 证据；G4 尚未通过。
 
 本 extension 是 Relay v2 的可选扩展，规范版本为 `1`，唯一 capability 名称为 `agent.transcript-lifecycle.v1`。它不属于 [`relay-v2-contract.md`](relay-v2-contract.md) 冻结的六项基础能力，也不修改基础 v2 envelope、command ledger、host `eventSeq`、terminal stream 或任何 Relay v1 wire。
 
@@ -269,6 +271,14 @@ Android reducer：
 - timelineEpoch 不同：清空该 session 的 extension cache/staging/notification cursor，保留基础 Session/Outbox/terminal 状态，重新取 status/snapshot；
 - 同 seq 不同 eventId/fingerprint 是 continuity error，只隔离 extension并要求 snapshot/reset，不能按到达顺序覆盖。
 
+当前独立 Android reducer foundation 还固定以下本地安全语义：
+
+- status/snapshot response 必须匹配本地 request token 与不可逆 generation；adapter unavailable、未协商和 source interrupted 只 fence intent并保留可证明的同 timeline cache，只有可信 reset、新 timelineEpoch 或明确 continuity 丢失才退休旧 lineage；
+- trusted snapshot commit 是有界 checkpoint：destructive替换 lifecycle materialization、重新建立 eventId/seq/identity witness并压缩旧 exact-event evidence；checkpoint 之前且没有 exact digest evidence 的旧 event继续 fail closed，不能猜 duplicate；
+- snapshot lifecycle record 的 agentEventSeq、lifecycleEventId、run/turn/sourceEpoch binding 必须闭合且与仍保留的 event witness一致；live transition先验证完整候选图，再原子推进 cursor/evidence/ledger；
+- 后续 resync snapshot不改首次 notification baseline。单次 snapshot候选超过有界 effect batch时，按稳定顺序只产出有界前缀，并以独立 durable snapshot suppression watermark安全抑制该 cut 的其余历史候选；下一 live seq不被吞掉；
+- retired timeline tombstone满额时，只有已通过 request/generation fence 的可信新-lineage status/reset可以建立 compaction checkpoint；临时 unavailable不能触发 compaction，旧 queued response仍因 generation失效。
+
 cursor、snapshot、availability 与 timeline lineage 的公开错误使用 §7.5 的 closed extension error code。
 
 ### 7.4 Timeline reset
@@ -335,12 +345,15 @@ notification dedupe key：
 
 Android 必须在尝试系统通知前持久化该 key 与 disposition：`shown|suppressed_permission|suppressed_inactive_profile|suppressed_policy`。duplicate/replay、Activity 重建或进程重启不重复展示；权限拒绝不循环弹请求或重试旧通知。profile 切换后，inactive profile 的事件只能落库并标记 suppressed，不能以当前 profile 身份展示。
 
+当前 reducer 只产出不含正文的 system-call intent，并提供 generation、status/source、当前 lifecycle record与完整 event identity 的**非消费型 preflight**。它不实现 one-shot claim；未来 Room/系统通知 executor 必须在调用 `NotificationManager` 前以持久事务原子 claim，不能把重复 preflight=true 描述成防重放证明。
+
 锁屏默认使用 private policy：标题只表达 waiting/failed/completed，正文不包含 entry text、failure summary、cwd、project、session display name或 terminal bytes。只有用户在 Android 本地明确选择更宽松策略后才可使用本地已有的非敏感 label；wire 不携带通知正文模板。
 
 ## 11. 固定 limits 与安全边界
 
 - extension frame 继续受基础 v2 1 MiB raw frame、strict UTF-8、closed schema、depth/key/node 和无 compression-bomb 约束。
 - 单 text 最大 65536 UTF-8 bytes，failure summary 最大 1024 bytes，page/replay 最多 256 records/events。
+- 所有 opaque ID 与本地 request token 都必须是 well-formed Unicode、无 NUL/首尾空白且最多 128 UTF-8 bytes；当前 reducer constructor 是 foundation 的 bounded trust boundary，未来 public codec必须在构造领域输入前执行同一约束。
 - host source queue、replay log、snapshot spool、client replay buffer、Room staging 和 notification effect queue都必须有硬上限；饱和时 extension进入 unavailable/resync，不丢单个 event继续推进 cursor。
 - 未接线 Node authority foundation 对 sources、source dedupe evidence、runs、turns、entries、delete tombstones、active-turn index 分别执行不可放宽的 production count/canonical-byte budget，并对完整 authority canonical bytes执行总预算；transition 只增量核算触及记录。容量不足时整个 reducer结果不可提交，retained exact duplicate仍可命中。测试 override只能缩小预算。
 - 当前 foundation 不按 `occurredAtMs` 静默淘汰任何 evidence、entry或 tombstone。真实 retention/pruning 仍属于未来 durable store，并必须保持 dedupe、公开 replay、pinned snapshot和 tombstone保留窗口的一致性。
@@ -353,7 +366,7 @@ Android 必须在尝试系统通知前持久化该 key 与 disposition：`shown|
 
 1. G3 后的 relay-host authority adapter认证、事务 store、source dedupe/transition、snapshot/replay与 retention实现；
 2. Node 与 Android 独立 codec消费同一 extension fixture，且未协商时双方不发送 agent frame；
-3. Android 独立 Room namespace/reducer、unsupported UI、notification ledger/permission/lock-screen/profile隔离；
+3. 把现有独立 Android reducer foundation 接入独立 Room namespace、public codec/actor、unsupported UI，以及 durable notification claim/permission/lock-screen/profile隔离；
 4. 重复、source gap、公开 event gap、断线 replay、Agent重启、旧 source迟到终态、redaction/delete和store reset的跨端故障注入；
 5. 真实结构化 SDK/hook或受控 adapter证据。terminal文本、command ACK和计时测试不能替代。
 

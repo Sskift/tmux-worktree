@@ -99,11 +99,11 @@ const manifest = readJson("manifest.json");
 test("Relay Agent extension v1 fixture set is internally complete and machine-readable", () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-agent-transcript-lifecycle-extension");
   assert.equal(manifest.version, 1);
-  assert.equal(manifest.status, "frozen-extension-not-implemented");
+  assert.equal(manifest.status, "frozen-extension-node-authority-and-android-reducer-foundations");
   assert.equal(manifest.capability, "agent.transcript-lifecycle.v1");
   assert.deepEqual(manifest.delivery, {
-    artifactKind: "fixtures-plus-unwired-node-authority-foundation",
-    runtimeConsumers: "pending",
+    artifactKind: "fixtures-plus-unwired-node-authority-and-android-reducer-foundations",
+    runtimeConsumers: "node-authority-and-android-reducer-foundations-only",
     nodeCodecConformance: false,
     androidCodecConformance: false,
     hostAuthorityMachineConformance: false,
@@ -112,7 +112,8 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
       "retention-and-pruning",
       "public-codec-and-replay-runtime",
     ],
-    androidConsumerMachineConformance: false,
+    androidConsumerMachineConformance: true,
+    androidReducerRuntimeIntegrated: false,
     g4Passed: false,
   });
   assert.equal(manifest.activation.baseRequiredCapability, false);
@@ -122,6 +123,11 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
   assert.equal(manifest.boundaries.relayV1Unchanged, true);
   assert.equal(manifest.boundaries.relayV2BaseContractUnchanged, true);
   assert.equal(manifest.boundaries.productionCapabilityDelivered, false);
+  assert.equal(manifest.boundaries.androidReducerFoundationOnly, true);
+  assert.equal(manifest.boundaries.androidRoomIntegrated, false);
+  assert.equal(manifest.boundaries.androidActorIntegrated, false);
+  assert.equal(manifest.boundaries.androidUiIntegrated, false);
+  assert.equal(manifest.boundaries.androidSystemNotificationIntegrated, false);
   assert.equal(manifest.notifications.offlinePushIncluded, false);
   assert.equal(manifest.identity.baseHostEventSeqUnchanged, true);
   assert.ok(existsSync(new URL(manifest.normativeDocument, contractRoot)));

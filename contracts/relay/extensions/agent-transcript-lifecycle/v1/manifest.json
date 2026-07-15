@@ -1,13 +1,13 @@
 {
   "contract": "tmux-worktree-relay-agent-transcript-lifecycle-extension",
   "version": 1,
-  "status": "frozen-extension-not-implemented",
+  "status": "frozen-extension-node-authority-and-android-reducer-foundations",
   "normativeDocument": "../../../../../docs/relay-agent-transcript-lifecycle-extension-v1.md",
   "baseProtocolVersion": 2,
   "capability": "agent.transcript-lifecycle.v1",
   "delivery": {
-    "artifactKind": "fixtures-plus-unwired-node-authority-foundation",
-    "runtimeConsumers": "pending",
+    "artifactKind": "fixtures-plus-unwired-node-authority-and-android-reducer-foundations",
+    "runtimeConsumers": "node-authority-and-android-reducer-foundations-only",
     "nodeCodecConformance": false,
     "androidCodecConformance": false,
     "hostAuthorityMachineConformance": false,
@@ -16,7 +16,8 @@
       "retention-and-pruning",
       "public-codec-and-replay-runtime"
     ],
-    "androidConsumerMachineConformance": false,
+    "androidConsumerMachineConformance": true,
+    "androidReducerRuntimeIntegrated": false,
     "g4Passed": false
   },
   "activation": {
@@ -136,7 +137,12 @@
     "toolCallBodiesExcluded": true,
     "attachmentsExcluded": true,
     "offlinePushExcluded": true,
-    "productionCapabilityDelivered": false
+    "productionCapabilityDelivered": false,
+    "androidReducerFoundationOnly": true,
+    "androidRoomIntegrated": false,
+    "androidActorIntegrated": false,
+    "androidUiIntegrated": false,
+    "androidSystemNotificationIntegrated": false
   },
   "files": [
     { "kind": "wire-golden", "path": "golden-frames.json" },

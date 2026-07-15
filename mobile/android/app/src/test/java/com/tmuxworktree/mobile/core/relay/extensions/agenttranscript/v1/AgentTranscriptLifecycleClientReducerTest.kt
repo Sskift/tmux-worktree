@@ -12,6 +12,12 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
+private data class FixtureReduction(
+    val state: AgentTranscriptLifecycleClientState,
+    val disposition: String,
+    val notificationDecisions: List<AgentNotificationDecision>,
+)
+
 class AgentTranscriptLifecycleClientReducerTest {
     @Test
     fun androidReducerConsumesEverySharedClientMachineStep() {
@@ -21,14 +27,37 @@ class AgentTranscriptLifecycleClientReducerTest {
         cases.forEach { fixtureCase ->
             val caseName = fixtureCase.string("name")
             var state = fixtureCase.map("initial").toInitialState()
+            val baseCommandStates = fixtureCase.map("initial").map("commandStates")
+                .mapValuesTo(linkedMapOf()) { (_, value) -> value.asString() }
             fixtureCase.list("steps").forEachIndexed { stepIndex, rawStep ->
                 val step = rawStep.asMap()
                 val rawInput = step.map("input")
-                val input = rawInput.toClientInput(state)
-                val reduction = AgentTranscriptLifecycleClientReducer.reduce(state, input)
                 val label = "$caseName step ${stepIndex + 1}"
+                val commandId = rawInput.optionalString("commandId")
+                val input: AgentTranscriptLifecycleClientInput?
+                val reduction: FixtureReduction
+                if (rawInput.string("kind") == "command_status") {
+                    input = null
+                    baseCommandStates[rawInput.string("commandId")] = rawInput.string("state")
+                    reduction = FixtureReduction(state, "command_applied", emptyList())
+                } else {
+                    input = rawInput.toClientInput(state)
+                    val extensionReduction = AgentTranscriptLifecycleClientReducer.reduce(state, input)
+                    reduction = FixtureReduction(
+                        extensionReduction.state,
+                        extensionReduction.disposition.toFixtureDisposition(),
+                        extensionReduction.notificationDecisions,
+                    )
+                }
 
-                assertEveryExpectation(label, step.map("expect"), input, reduction)
+                assertEveryExpectation(
+                    label,
+                    step.map("expect"),
+                    input,
+                    reduction,
+                    baseCommandStates,
+                    commandId,
+                )
                 assertAppliedLifecycleIdentityIsPreserved(label, input, reduction)
                 state = reduction.state
             }
@@ -65,11 +94,17 @@ class AgentTranscriptLifecycleClientReducerTest {
             extensionLane = AgentTranscriptLifecycleExtensionState(
                 support = AgentExtensionSupport.AVAILABLE,
                 unavailableReason = null,
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-large",
                 timelineEpoch = "timeline-large",
                 lastAgentSeq = signedLongOverflow,
                 notificationBaselineAgentSeq = signedLongOverflow,
                 lifecycleByIdentity = mapOf(runIdentity to currentRun),
                 currentLifecycleIdentityByEventId = mapOf(currentRun.lifecycleEventId to runIdentity),
+                eventWitnessById = mapOf(
+                    currentRun.lifecycleEventId to currentRun.toEventIdentityWitness(),
+                ),
+                eventIdBySeq = mapOf(signedLongOverflow to currentRun.lifecycleEventId),
             ),
         )
         val nextSequence = "9223372036854775809"
@@ -145,10 +180,11 @@ class AgentTranscriptLifecycleClientReducerTest {
         val staleIdentity = AgentLifecycleIdentity(AgentLifecycleScope.RUN, "run-stale", null)
         val initial = AgentTranscriptLifecycleClientState(
             identity = SESSION_IDENTITY,
-            commandLane = AgentCommandLaneState(mapOf("command-keep" to AgentCommandState.AMBIGUOUS)),
             extensionLane = AgentTranscriptLifecycleExtensionState(
                 support = AgentExtensionSupport.AVAILABLE,
                 unavailableReason = null,
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-test",
                 timelineEpoch = "timeline-resync",
                 lastAgentSeq = "1",
                 notificationBaselineAgentSeq = "1",
@@ -165,7 +201,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 appliedEventsBySeq = mapOf(
                     "1" to AgentAppliedEventEvidence("event-stale", digestOf("closed-event-stale")),
                 ),
-                appliedSeqByEventId = mapOf("event-stale" to "1"),
+                eventWitnessById = mapOf(
+                    "event-stale" to lifecycleRecord(
+                        eventId = "event-stale",
+                        sequence = "1",
+                        scope = AgentLifecycleScope.RUN,
+                        runId = "run-stale",
+                        state = AgentLifecycleState.RUNNING,
+                    ).toEventIdentityWitness(digestOf("closed-event-stale")),
+                ),
+                eventIdBySeq = mapOf("1" to "event-stale"),
             ),
             notificationConfig = AgentNotificationConfig(
                 permission = AgentNotificationPermission.GRANTED,
@@ -212,17 +257,15 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, resynced.disposition)
         assertEquals("1", resynced.state.extensionLane.notificationBaselineAgentSeq)
         assertFalse(resynced.state.extensionLane.lifecycleByIdentity.containsKey(staleIdentity))
-        assertEquals(
-            AgentAppliedEventEvidence("event-stale", digestOf("closed-event-stale")),
-            resynced.state.extensionLane.appliedEventsBySeq["1"],
-        )
+        assertTrue(resynced.state.extensionLane.appliedEventsBySeq.isEmpty())
+        assertEquals("4", resynced.state.extensionLane.snapshotCheckpoint?.throughAgentSeq)
         assertEquals(
             setOf("event-run-fallback", "event-turn-completed"),
             resynced.notificationDecisions.map { it.dedupeKey.lifecycleEventId }.toSet(),
         )
         assertTrue(resynced.notificationDecisions.all {
             it.disposition == AgentNotificationDisposition.SHOWN &&
-                requireNotNull(it.systemNotificationIntent).isAuthorizedBy(resynced.state)
+                requireNotNull(it.systemNotificationIntent).isPreflightAuthorizedBy(resynced.state)
         })
 
         val policySuppressedState = AgentTranscriptLifecycleClientReducer.reduce(
@@ -234,7 +277,7 @@ class AgentTranscriptLifecycleClientReducerTest {
         val priorIntents = resynced.notificationDecisions.mapNotNull {
             it.systemNotificationIntent
         }
-        assertTrue(priorIntents.none { it.isAuthorizedBy(policySuppressedState) })
+        assertTrue(priorIntents.none { it.isPreflightAuthorizedBy(policySuppressedState) })
         val reenabledState = AgentTranscriptLifecycleClientReducer.reduce(
             policySuppressedState,
             AgentTranscriptLifecycleClientInput.ClientConfigChanged(
@@ -242,7 +285,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             ),
         ).state
         assertTrue("config toggles cannot reauthorize queued intents", priorIntents.none {
-            it.isAuthorizedBy(reenabledState)
+            it.isPreflightAuthorizedBy(reenabledState)
         })
         val running = AgentTranscriptLifecycleClientReducer.reduce(
             policySuppressedState,
@@ -284,11 +327,10 @@ class AgentTranscriptLifecycleClientReducerTest {
                 reason = AgentTimelineResetReason.DELETED,
             ),
         )
-        assertEquals(AgentCommandState.AMBIGUOUS, reset.state.commandLane.statesByCommandId["command-keep"])
         assertTrue(reset.state.extensionLane.lifecycleByIdentity.isEmpty())
         assertTrue(reset.state.extensionLane.notificationLedger.isEmpty())
         assertNull(reset.state.extensionLane.notificationBaselineAgentSeq)
-        assertTrue(priorIntents.none { it.isAuthorizedBy(reset.state) })
+        assertTrue(priorIntents.none { it.isPreflightAuthorizedBy(reset.state) })
     }
 
     @Test
@@ -352,7 +394,7 @@ class AgentTranscriptLifecycleClientReducerTest {
         val resetApplied = AgentTranscriptLifecycleClientReducer.reduce(completed.state, reset)
         assertEquals(AgentClientDisposition.TIMELINE_RESET, resetApplied.disposition)
         assertEquals("1", resetApplied.state.extensionLane.localGeneration)
-        assertFalse(oldIntent.isAuthorizedBy(resetApplied.state))
+        assertFalse(oldIntent.isPreflightAuthorizedBy(resetApplied.state))
         assertTrue("timeline-reset-old" in resetApplied.state.extensionLane.retiredTimelineEpochs)
 
         val statusRequested = AgentTranscriptLifecycleClientReducer.reduce(
@@ -384,7 +426,7 @@ class AgentTranscriptLifecycleClientReducerTest {
         )
         assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, retiredStatus.disposition)
         assertEquals("timeline-reset-new", retiredStatus.state.extensionLane.timelineEpoch)
-        assertFalse(oldIntent.isAuthorizedBy(retiredStatus.state))
+        assertFalse(oldIntent.isPreflightAuthorizedBy(retiredStatus.state))
     }
 
     @Test
@@ -480,7 +522,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             invalidRequested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
-                requestFence = AgentLocalRequestFence("1", "snapshot-invalid-graph"),
+                requestFence = AgentLocalRequestFence("2", "snapshot-invalid-graph"),
                 throughAgentSeq = "7",
                 records = listOf(
                     lifecycleRecord(
@@ -531,7 +573,12 @@ class AgentTranscriptLifecycleClientReducerTest {
                 appliedEventsBySeq = mapOf(
                     "1" to AgentAppliedEventEvidence("event-cap-1", duplicate.closedEventDigest),
                 ),
-                appliedSeqByEventId = mapOf("event-cap-1" to "1"),
+                eventWitnessById = mapOf(
+                    "event-cap-1" to duplicate.record.toEventIdentityWitness(
+                        duplicate.closedEventDigest,
+                    ),
+                ),
+                eventIdBySeq = mapOf("1" to "event-cap-1"),
             ),
         )
         val limits = AgentClientReducerLimits(maxAppliedEventEvidence = 1)
@@ -556,19 +603,426 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertEquals("1", saturated.state.extensionLane.lastAgentSeq)
         assertTrue(saturated.state.extensionLane.requiresSnapshot)
         assertEquals(atCapacity.extensionLane.appliedEventsBySeq, saturated.state.extensionLane.appliedEventsBySeq)
+
+        val snapshotRequested = AgentTranscriptLifecycleClientReducer.reduce(
+            saturated.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-cap-repair",
+            ),
+            limits,
+        ).state
+        val repaired = AgentTranscriptLifecycleClientReducer.reduce(
+            snapshotRequested,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-cap"),
+                requestFence = AgentLocalRequestFence("1", "snapshot-cap-repair"),
+                throughAgentSeq = "1",
+                records = listOf(duplicate.record),
+            ),
+            limits,
+        )
+        assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, repaired.disposition)
+        assertTrue(repaired.state.extensionLane.appliedEventsBySeq.isEmpty())
+        val afterCheckpoint = AgentTranscriptLifecycleClientReducer.reduce(
+            repaired.state,
+            lifecycleEvent(
+                timelineEpoch = "timeline-cap",
+                sequence = "2",
+                eventId = "event-cap-2",
+                scope = AgentLifecycleScope.RUN,
+                runId = "run-cap",
+                state = AgentLifecycleState.WAITING_FOR_USER,
+                fingerprint = "closed-cap-2",
+            ),
+            limits,
+        )
+        assertEquals(AgentClientDisposition.APPLIED, afterCheckpoint.disposition)
+        assertEquals("2", afterCheckpoint.state.extensionLane.lastAgentSeq)
+    }
+
+    @Test
+    fun invalidCrossRecordTransitionsAndSnapshotIdentityConflictsFailAtomically() {
+        val runWaiting = lifecycleRecord(
+            eventId = "event-run-waiting",
+            sequence = "1",
+            scope = AgentLifecycleScope.RUN,
+            runId = "run-cross",
+            state = AgentLifecycleState.WAITING_FOR_USER,
+        )
+        val turnWaiting = lifecycleRecord(
+            eventId = "event-turn-waiting",
+            sequence = "2",
+            scope = AgentLifecycleScope.TURN,
+            runId = "run-cross",
+            turnId = "turn-cross",
+            state = AgentLifecycleState.WAITING_FOR_USER,
+        )
+        val initial = availableState(
+            timelineEpoch = "timeline-cross",
+            lastAgentSeq = "2",
+            baseline = "2",
+            lifecycle = mapOf(runWaiting.identity to runWaiting, turnWaiting.identity to turnWaiting),
+        )
+        val illegalTurnResume = AgentTranscriptLifecycleClientReducer.reduce(
+            initial,
+            lifecycleEvent(
+                timelineEpoch = "timeline-cross",
+                sequence = "3",
+                eventId = "event-turn-resume",
+                scope = AgentLifecycleScope.TURN,
+                runId = "run-cross",
+                turnId = "turn-cross",
+                state = AgentLifecycleState.RUNNING,
+                fingerprint = "closed-turn-resume",
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, illegalTurnResume.disposition)
+        assertEquals("2", illegalTurnResume.state.extensionLane.lastAgentSeq)
+        assertEquals(initial.extensionLane.lifecycleByIdentity, illegalTurnResume.state.extensionLane.lifecycleByIdentity)
+        assertEquals(initial.extensionLane.notificationLedger, illegalTurnResume.state.extensionLane.notificationLedger)
+
+        val duplicateSeqBase = availableState("timeline-snapshot-seq", baseline = "0")
+        val duplicateSeqRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            duplicateSeqBase,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-duplicate-seq",
+            ),
+        ).state
+        val duplicateSeq = AgentTranscriptLifecycleClientReducer.reduce(
+            duplicateSeqRequest,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-seq"),
+                requestFence = AgentLocalRequestFence("0", "snapshot-duplicate-seq"),
+                throughAgentSeq = "1",
+                records = listOf(
+                    lifecycleRecord("event-seq-a", "1", AgentLifecycleScope.RUN, "run-seq-a", AgentLifecycleState.RUNNING),
+                    lifecycleRecord("event-seq-b", "1", AgentLifecycleScope.RUN, "run-seq-b", AgentLifecycleState.RUNNING),
+                ),
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, duplicateSeq.disposition)
+        assertEquals("0", duplicateSeq.state.extensionLane.lastAgentSeq)
+
+        val applied = AgentTranscriptLifecycleClientReducer.reduce(
+            availableState("timeline-snapshot-bind", baseline = "0"),
+            lifecycleEvent(
+                timelineEpoch = "timeline-snapshot-bind",
+                sequence = "1",
+                eventId = "event-bound",
+                scope = AgentLifecycleScope.RUN,
+                runId = "run-bound",
+                state = AgentLifecycleState.RUNNING,
+                fingerprint = "closed-bound",
+            ),
+        ).state
+        val bindRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            applied,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                AgentLocalRequestKind.SNAPSHOT,
+                "snapshot-rebind",
+            ),
+        ).state
+        val rebound = AgentTranscriptLifecycleClientReducer.reduce(
+            bindRequest,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-bind"),
+                requestFence = AgentLocalRequestFence("0", "snapshot-rebind"),
+                throughAgentSeq = "2",
+                records = listOf(
+                    lifecycleRecord("event-bound", "2", AgentLifecycleScope.RUN, "run-other", AgentLifecycleState.RUNNING),
+                ),
+            ),
+        )
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, rebound.disposition)
+        assertEquals("1", rebound.state.extensionLane.lastAgentSeq)
+        assertEquals("1", rebound.state.extensionLane.eventWitnessById["event-bound"]?.agentEventSeq)
+    }
+
+    @Test
+    fun temporaryAvailabilityAndSourceChangesPreserveLineageButFenceIntents() {
+        var state = availableState("timeline-availability", baseline = "0")
+        state = AgentTranscriptLifecycleClientReducer.reduce(
+            state,
+            lifecycleEvent("timeline-availability", "1", "event-source-run", AgentLifecycleScope.RUN, "run-source", AgentLifecycleState.RUNNING, "closed-source-run"),
+        ).state
+        val completed = AgentTranscriptLifecycleClientReducer.reduce(
+            state,
+            lifecycleEvent("timeline-availability", "2", "event-source-done", AgentLifecycleScope.RUN, "run-source", AgentLifecycleState.COMPLETED, "closed-source-done"),
+        )
+        val oldIntent = requireNotNull(completed.notificationDecisions.single().systemNotificationIntent)
+        assertTrue(oldIntent.isPreflightAuthorizedBy(completed.state))
+        assertTrue("preflight is deliberately non-consuming", oldIntent.isPreflightAuthorizedBy(completed.state))
+
+        val statusRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            completed.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-adapter-down"),
+        ).state
+        val unavailable = AgentTranscriptLifecycleClientReducer.reduce(
+            statusRequest,
+            AgentTranscriptLifecycleClientInput.StatusUnavailable(
+                SESSION_IDENTITY,
+                AgentLocalRequestFence("0", "status-adapter-down"),
+                AgentExtensionUnavailableReason.ADAPTER_UNAVAILABLE,
+            ),
+        )
+        assertEquals("timeline-availability", unavailable.state.extensionLane.timelineEpoch)
+        assertEquals(completed.state.extensionLane.lifecycleByIdentity, unavailable.state.extensionLane.lifecycleByIdentity)
+        assertTrue(unavailable.state.extensionLane.retiredTimelineEpochs.isEmpty())
+        assertFalse(oldIntent.isPreflightAuthorizedBy(unavailable.state))
+
+        val unnegotiated = AgentTranscriptLifecycleClientReducer.reduce(
+            unavailable.state,
+            AgentTranscriptLifecycleClientInput.ExtensionNotNegotiated,
+        ).state
+        assertEquals("timeline-availability", unnegotiated.extensionLane.timelineEpoch)
+        val negotiated = AgentTranscriptLifecycleClientReducer.reduce(
+            unnegotiated,
+            AgentTranscriptLifecycleClientInput.ExtensionNegotiated,
+        ).state
+        val recoveryRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            negotiated,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-recover"),
+        ).state
+        val recovered = AgentTranscriptLifecycleClientReducer.reduce(
+            recoveryRequest,
+            AgentTranscriptLifecycleClientInput.StatusAvailable(
+                AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
+                AgentLocalRequestFence("3", "status-recover"),
+                AgentLiveSourceState.CONNECTED,
+                "source-test",
+            ),
+        )
+        assertEquals(AgentClientDisposition.STATUS_APPLIED, recovered.disposition)
+        assertEquals(completed.state.extensionLane.lifecycleByIdentity, recovered.state.extensionLane.lifecycleByIdentity)
+        assertTrue(recovered.state.extensionLane.retiredTimelineEpochs.isEmpty())
+        assertFalse(oldIntent.isPreflightAuthorizedBy(recovered.state))
+
+        val interruptedRequest = AgentTranscriptLifecycleClientReducer.reduce(
+            recovered.state,
+            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-interrupted"),
+        ).state
+        val interrupted = AgentTranscriptLifecycleClientReducer.reduce(
+            interruptedRequest,
+            AgentTranscriptLifecycleClientInput.StatusAvailable(
+                AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
+                AgentLocalRequestFence("4", "status-interrupted"),
+                AgentLiveSourceState.INTERRUPTED,
+                "source-test",
+            ),
+        )
+        assertFalse(oldIntent.isPreflightAuthorizedBy(interrupted.state))
+        assertEquals("timeline-availability", interrupted.state.extensionLane.timelineEpoch)
+    }
+
+    @Test
+    fun lifecycleSnapshotNotificationAndRetiredCapacitiesHaveRecoveryPaths() {
+        val cases = listOf<Pair<String, () -> Unit>>(
+            "lifecycle" to {
+                val existing = lifecycleRecord("event-life-1", "1", AgentLifecycleScope.RUN, "run-life-1", AgentLifecycleState.RUNNING)
+                val full = availableState("timeline-life-cap", "1", "1", mapOf(existing.identity to existing))
+                val limits = AgentClientReducerLimits(maxLifecycleRecords = 1)
+                val blocked = AgentTranscriptLifecycleClientReducer.reduce(
+                    full,
+                    lifecycleEvent("timeline-life-cap", "2", "event-life-2", AgentLifecycleScope.RUN, "run-life-2", AgentLifecycleState.RUNNING, "closed-life-2"),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
+                assertEquals("1", blocked.state.extensionLane.lastAgentSeq)
+                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                    blocked.state,
+                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-life-repair"),
+                    limits,
+                ).state
+                val checkpoint = AgentTranscriptLifecycleClientReducer.reduce(
+                    requested,
+                    AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-life-cap"),
+                        AgentLocalRequestFence("1", "snapshot-life-repair"),
+                        "1",
+                        emptyList(),
+                    ),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, checkpoint.disposition)
+                assertEquals(
+                    AgentClientDisposition.APPLIED,
+                    AgentTranscriptLifecycleClientReducer.reduce(
+                        checkpoint.state,
+                        lifecycleEvent("timeline-life-cap", "2", "event-life-2", AgentLifecycleScope.RUN, "run-life-2", AgentLifecycleState.RUNNING, "closed-life-2"),
+                        limits,
+                    ).disposition,
+                )
+            },
+            "snapshot" to {
+                val initial = availableState("timeline-page-cap", baseline = "0")
+                val limits = AgentClientReducerLimits(maxSnapshotRecords = 1)
+                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                    initial,
+                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-too-wide"),
+                    limits,
+                ).state
+                val blocked = AgentTranscriptLifecycleClientReducer.reduce(
+                    requested,
+                    AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-page-cap"),
+                        AgentLocalRequestFence("0", "snapshot-too-wide"),
+                        "2",
+                        listOf(
+                            lifecycleRecord("event-page-1", "1", AgentLifecycleScope.RUN, "run-page-1", AgentLifecycleState.RUNNING),
+                            lifecycleRecord("event-page-2", "2", AgentLifecycleScope.RUN, "run-page-2", AgentLifecycleState.RUNNING),
+                        ),
+                    ),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
+                assertEquals("0", blocked.state.extensionLane.lastAgentSeq)
+                val retry = AgentTranscriptLifecycleClientReducer.reduce(
+                    blocked.state,
+                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-narrow"),
+                    limits,
+                ).state
+                assertEquals(
+                    AgentClientDisposition.SNAPSHOT_APPLIED,
+                    AgentTranscriptLifecycleClientReducer.reduce(
+                        retry,
+                        AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                            AgentTimelineLineage(SESSION_IDENTITY, "timeline-page-cap"),
+                            AgentLocalRequestFence("1", "snapshot-narrow"),
+                            "1",
+                            listOf(lifecycleRecord("event-page-1", "1", AgentLifecycleScope.RUN, "run-page-1", AgentLifecycleState.RUNNING)),
+                        ),
+                        limits,
+                    ).disposition,
+                )
+            },
+            "notification" to {
+                val initial = availableState("timeline-effect-cap", baseline = "0")
+                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                    initial,
+                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-effects"),
+                ).state
+                val limits = AgentClientReducerLimits(
+                    maxNotificationLedgerEntries = 1,
+                    maxNotificationDecisionsPerReduction = 1,
+                )
+                val committed = AgentTranscriptLifecycleClientReducer.reduce(
+                    requested,
+                    AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-effect-cap"),
+                        AgentLocalRequestFence("0", "snapshot-effects"),
+                        "3",
+                        listOf(
+                            lifecycleRecord("event-effect-1", "1", AgentLifecycleScope.RUN, "run-effect-1", AgentLifecycleState.COMPLETED),
+                            lifecycleRecord("event-effect-2", "2", AgentLifecycleScope.RUN, "run-effect-2", AgentLifecycleState.COMPLETED),
+                            lifecycleRecord("event-effect-3", "3", AgentLifecycleScope.RUN, "run-effect-3", AgentLifecycleState.COMPLETED),
+                        ),
+                    ),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, committed.disposition)
+                assertEquals(1, committed.notificationDecisions.size)
+                assertEquals(1, committed.state.extensionLane.notificationLedger.size)
+                assertEquals("3", committed.state.extensionLane.snapshotNotificationSuppressedThroughAgentSeq)
+                assertEquals(
+                    AgentClientDisposition.APPLIED,
+                    AgentTranscriptLifecycleClientReducer.reduce(
+                        committed.state,
+                        lifecycleEvent("timeline-effect-cap", "4", "event-effect-4", AgentLifecycleScope.RUN, "run-effect-4", AgentLifecycleState.RUNNING, "closed-effect-4"),
+                        limits,
+                    ).disposition,
+                )
+            },
+            "retired" to {
+                val base = availableState("timeline-retire-current", baseline = "0")
+                val full = base.copy(
+                    extensionLane = base.extensionLane.copy(
+                        retiredTimelineEpochs = setOf("timeline-retire-ancient"),
+                    ),
+                )
+                val limits = AgentClientReducerLimits(maxRetiredTimelineEpochs = 1)
+                val reset = AgentTranscriptLifecycleClientReducer.reduce(
+                    full,
+                    AgentTranscriptLifecycleClientInput.TimelineReset(
+                        SESSION_IDENTITY,
+                        "timeline-retire-current",
+                        "timeline-retire-new",
+                        AgentTimelineResetReason.DELETED,
+                    ),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.TIMELINE_RESET, reset.disposition)
+                assertEquals(setOf("timeline-retire-current"), reset.state.extensionLane.retiredTimelineEpochs)
+                assertEquals("1", reset.state.extensionLane.retiredEpochCompactionGeneration)
+                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                    reset.state,
+                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-after-compaction"),
+                    limits,
+                ).state
+                val recovered = AgentTranscriptLifecycleClientReducer.reduce(
+                    requested,
+                    AgentTranscriptLifecycleClientInput.StatusAvailable(
+                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-retire-new"),
+                        AgentLocalRequestFence("1", "status-after-compaction"),
+                        AgentLiveSourceState.CONNECTED,
+                        "source-repaired",
+                    ),
+                    limits,
+                )
+                assertEquals(AgentClientDisposition.STATUS_APPLIED, recovered.disposition)
+                assertEquals(AgentExtensionSupport.AVAILABLE, recovered.state.extensionLane.support)
+            },
+        )
+        cases.forEach { (name, verify) ->
+            try {
+                verify()
+            } catch (error: AssertionError) {
+                throw AssertionError("capacity recovery case $name failed", error)
+            }
+        }
+    }
+
+    @Test
+    fun opaqueIdentifiersAndRequestTokensAreUtf8BoundedAtTrustBoundary() {
+        val oversized = "x".repeat(129)
+        val invalidValues = listOf(
+            "profile" to {
+                AgentExtensionSessionIdentity(oversized, "host", "epoch", "scope", "session")
+            },
+            "request-token" to {
+                AgentTranscriptLifecycleClientInput.LocalRequestStarted(
+                    AgentLocalRequestKind.STATUS,
+                    oversized,
+                )
+            },
+            "malformed-unicode" to {
+                AgentExtensionSessionIdentity("\uD800", "host", "epoch", "scope", "session")
+            },
+        )
+        invalidValues.forEach { (name, construct) ->
+            try {
+                construct()
+                throw AssertionError("$name should have been rejected")
+            } catch (_: IllegalArgumentException) {
+                // Constructor is the current bounded trust boundary until a public codec exists.
+            }
+        }
     }
 
     private fun assertEveryExpectation(
         label: String,
         expected: Map<String, Any?>,
-        input: AgentTranscriptLifecycleClientInput,
-        reduction: AgentTranscriptLifecycleClientReduction,
+        input: AgentTranscriptLifecycleClientInput?,
+        reduction: FixtureReduction,
+        baseCommandStates: Map<String, String>,
+        commandId: String?,
     ) {
         expected.forEach { (key, value) ->
             when (key) {
                 "disposition" -> assertEquals(
                     label,
-                    value.asString().toDisposition(),
+                    value.asString(),
                     reduction.disposition,
                 )
                 "lastAgentSeq" -> assertEquals(
@@ -602,7 +1056,12 @@ class AgentTranscriptLifecycleClientReducerTest {
                     reduction.state.extensionLane.requiresSnapshot,
                 )
                 "lifecycleState" -> assertLifecycleExpectation(label, value, input, reduction.state)
-                "commandState" -> assertCommandExpectation(label, value, input, reduction.state)
+                "commandState" -> assertCommandExpectation(
+                    label,
+                    value,
+                    baseCommandStates,
+                    commandId,
+                )
                 "notification" -> assertNotificationExpectation(label, value.asString(), input, reduction)
                 else -> error("$label has an unconsumed expectation key $key")
             }
@@ -612,7 +1071,7 @@ class AgentTranscriptLifecycleClientReducerTest {
     private fun assertLifecycleExpectation(
         label: String,
         expected: Any?,
-        input: AgentTranscriptLifecycleClientInput,
+        input: AgentTranscriptLifecycleClientInput?,
         state: AgentTranscriptLifecycleClientState,
     ) {
         val identity = input.lifecycleIdentityOrNull()
@@ -635,21 +1094,18 @@ class AgentTranscriptLifecycleClientReducerTest {
     private fun assertCommandExpectation(
         label: String,
         expected: Any?,
-        input: AgentTranscriptLifecycleClientInput,
-        state: AgentTranscriptLifecycleClientState,
+        baseCommandStates: Map<String, String>,
+        commandId: String?,
     ) {
-        val commandId = when (input) {
-            is AgentTranscriptLifecycleClientInput.CommandStatus -> input.commandId
-            else -> state.commandLane.statesByCommandId.keys.singleOrNull()
-        }
+        val effectiveCommandId = commandId ?: baseCommandStates.keys.singleOrNull()
         if (expected == null) {
-            assertTrue(label, state.commandLane.statesByCommandId.isEmpty())
+            assertTrue(label, baseCommandStates.isEmpty())
         } else {
-            assertNotNull("$label has no command identity", commandId)
+            assertNotNull("$label has no command identity", effectiveCommandId)
             assertEquals(
                 label,
-                expected.asString().toCommandState(),
-                state.commandLane.statesByCommandId[commandId],
+                expected.asString(),
+                baseCommandStates[effectiveCommandId],
             )
         }
     }
@@ -657,8 +1113,8 @@ class AgentTranscriptLifecycleClientReducerTest {
     private fun assertNotificationExpectation(
         label: String,
         expected: String,
-        input: AgentTranscriptLifecycleClientInput,
-        reduction: AgentTranscriptLifecycleClientReduction,
+        input: AgentTranscriptLifecycleClientInput?,
+        reduction: FixtureReduction,
     ) {
         if (expected == "none") {
             assertTrue(label, reduction.notificationDecisions.isEmpty())
@@ -681,7 +1137,11 @@ class AgentTranscriptLifecycleClientReducerTest {
             reduction.state.extensionLane.notificationLedger[decision.dedupeKey],
         )
         if (decision.disposition == AgentNotificationDisposition.SHOWN) {
-            assertTrue(label, requireNotNull(decision.systemNotificationIntent).isAuthorizedBy(reduction.state))
+            assertTrue(
+                label,
+                requireNotNull(decision.systemNotificationIntent)
+                    .isPreflightAuthorizedBy(reduction.state),
+            )
         } else {
             assertNull(label, decision.systemNotificationIntent)
         }
@@ -689,10 +1149,10 @@ class AgentTranscriptLifecycleClientReducerTest {
 
     private fun assertAppliedLifecycleIdentityIsPreserved(
         label: String,
-        input: AgentTranscriptLifecycleClientInput,
-        reduction: AgentTranscriptLifecycleClientReduction,
+        input: AgentTranscriptLifecycleClientInput?,
+        reduction: FixtureReduction,
     ) {
-        if (reduction.disposition != AgentClientDisposition.APPLIED) return
+        if (reduction.disposition != "applied") return
         val lifecycle = input as? AgentTranscriptLifecycleClientInput.AgentEvent ?: return
         val stored = reduction.state.extensionLane.lifecycleByIdentity[lifecycle.record.identity]
         assertEquals(label, lifecycle.record.identity, stored?.identity)
@@ -712,21 +1172,33 @@ class AgentTranscriptLifecycleClientReducerTest {
                 agentEventSeq = lastAgentSeq,
             )
         }.toMap()
-        val commandStates = map("commandStates").mapValues { (_, value) ->
-            value.asString().toCommandState()
-        }
         return AgentTranscriptLifecycleClientState(
             identity = SESSION_IDENTITY,
-            commandLane = AgentCommandLaneState(commandStates),
             extensionLane = AgentTranscriptLifecycleExtensionState(
                 support = string("support").toSupport(),
                 unavailableReason = null,
+                liveSource = if (string("support") == "available") {
+                    AgentLiveSourceState.CONNECTED
+                } else {
+                    null
+                },
+                activeSourceEpoch = if (string("support") == "available") {
+                    "source-client"
+                } else {
+                    null
+                },
                 timelineEpoch = optionalString("timelineEpoch"),
                 lastAgentSeq = lastAgentSeq,
                 notificationBaselineAgentSeq = optionalString("notificationBaselineAgentSeq"),
                 lifecycleByIdentity = lifecycle,
                 currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
                     record.lifecycleEventId to identity
+                },
+                eventWitnessById = lifecycle.values.associate { record ->
+                    record.lifecycleEventId to record.toEventIdentityWitness()
+                },
+                eventIdBySeq = lifecycle.values.associate { record ->
+                    record.agentEventSeq to record.lifecycleEventId
                 },
                 runsWithTurnRecords = lifecycle.keys
                     .filter { it.scope == AgentLifecycleScope.TURN }
@@ -749,10 +1221,6 @@ class AgentTranscriptLifecycleClientReducerTest {
         "snapshot_request_started" -> AgentTranscriptLifecycleClientInput.LocalRequestStarted(
             kind = AgentLocalRequestKind.SNAPSHOT,
             requestToken = string("requestToken"),
-        )
-        "command_status" -> AgentTranscriptLifecycleClientInput.CommandStatus(
-            commandId = string("commandId"),
-            state = string("state").toCommandState(),
         )
         "client_config" -> AgentTranscriptLifecycleClientInput.ClientConfigChanged(
             AgentNotificationConfig(
@@ -829,7 +1297,7 @@ class AgentTranscriptLifecycleClientReducerTest {
         agentEventSeq = optionalString("agentEventSeq") ?: fallbackSequence,
     )
 
-    private fun AgentTranscriptLifecycleClientInput.lifecycleIdentityOrNull(): AgentLifecycleIdentity? =
+    private fun AgentTranscriptLifecycleClientInput?.lifecycleIdentityOrNull(): AgentLifecycleIdentity? =
         (this as? AgentTranscriptLifecycleClientInput.AgentEvent)?.record?.identity
 
     private fun readClientMachineCases(): List<Map<String, Any?>> {
@@ -873,12 +1341,20 @@ private fun availableState(
     extensionLane = AgentTranscriptLifecycleExtensionState(
         support = AgentExtensionSupport.AVAILABLE,
         unavailableReason = null,
+        liveSource = AgentLiveSourceState.CONNECTED,
+        activeSourceEpoch = lifecycle.values.firstOrNull()?.sourceEpoch ?: "source-test",
         timelineEpoch = timelineEpoch,
         lastAgentSeq = lastAgentSeq,
         notificationBaselineAgentSeq = baseline,
         lifecycleByIdentity = lifecycle,
         currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
             record.lifecycleEventId to identity
+        },
+        eventWitnessById = lifecycle.values.associate { record ->
+            record.lifecycleEventId to record.toEventIdentityWitness()
+        },
+        eventIdBySeq = lifecycle.values.associate { record ->
+            record.agentEventSeq to record.lifecycleEventId
         },
         runsWithTurnRecords = runsWithTurns,
     ),
@@ -942,6 +1418,17 @@ private fun lifecycleRecord(
     agentEventSeq = sequence,
 )
 
+private fun AgentLifecycleRecord.toEventIdentityWitness(
+    digest: AgentClosedEventDigest? = null,
+): AgentLifecycleEventIdentityWitness = AgentLifecycleEventIdentityWitness(
+    eventId = lifecycleEventId,
+    agentEventSeq = agentEventSeq,
+    lifecycleIdentity = identity,
+    sourceEpoch = sourceEpoch,
+    state = state,
+    closedEventDigest = digest,
+)
+
 private fun digestOf(value: String): AgentClosedEventDigest = AgentClosedEventDigest(
     Base64.getUrlEncoder().withoutPadding().encodeToString(
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray(StandardCharsets.UTF_8)),
@@ -963,18 +1450,16 @@ private fun String.toLifecycleIdentity(): AgentLifecycleIdentity {
     }
 }
 
-private fun String.toDisposition(): AgentClientDisposition = when (this) {
-    "applied" -> AgentClientDisposition.APPLIED
-    "duplicate" -> AgentClientDisposition.DUPLICATE
-    "gap_resync" -> AgentClientDisposition.GAP_RESYNC
-    "continuity_conflict" -> AgentClientDisposition.CONTINUITY_CONFLICT
-    "command_applied" -> AgentClientDisposition.COMMAND_APPLIED
-    "config_applied" -> AgentClientDisposition.CONFIG_APPLIED
-    "snapshot_applied" -> AgentClientDisposition.SNAPSHOT_APPLIED
-    "status_applied" -> AgentClientDisposition.STATUS_APPLIED
-    "extension_not_active" -> AgentClientDisposition.EXTENSION_NOT_ACTIVE
-    "timeline_reset" -> AgentClientDisposition.TIMELINE_RESET
-    else -> error("Unknown client disposition $this")
+private fun AgentClientDisposition.toFixtureDisposition(): String = when (this) {
+    AgentClientDisposition.APPLIED -> "applied"
+    AgentClientDisposition.DUPLICATE -> "duplicate"
+    AgentClientDisposition.GAP_RESYNC -> "gap_resync"
+    AgentClientDisposition.CONTINUITY_CONFLICT -> "continuity_conflict"
+    AgentClientDisposition.CONFIG_APPLIED -> "config_applied"
+    AgentClientDisposition.SNAPSHOT_APPLIED -> "snapshot_applied"
+    AgentClientDisposition.STATUS_APPLIED -> "status_applied"
+    AgentClientDisposition.EXTENSION_NOT_ACTIVE -> "extension_not_active"
+    AgentClientDisposition.TIMELINE_RESET -> "timeline_reset"
 }
 
 private fun String.toSupport(): AgentExtensionSupport = when (this) {
@@ -1006,17 +1491,6 @@ private fun String.toLifecycleState(): AgentLifecycleState = when (this) {
     "failed" -> AgentLifecycleState.FAILED
     "completed" -> AgentLifecycleState.COMPLETED
     else -> error("Unknown lifecycle state $this")
-}
-
-private fun String.toCommandState(): AgentCommandState = when (this) {
-    "queued" -> AgentCommandState.QUEUED
-    "sending" -> AgentCommandState.SENDING
-    "accepted" -> AgentCommandState.ACCEPTED
-    "confirming" -> AgentCommandState.CONFIRMING
-    "succeeded" -> AgentCommandState.SUCCEEDED
-    "failed_final" -> AgentCommandState.FAILED_FINAL
-    "ambiguous" -> AgentCommandState.AMBIGUOUS
-    else -> error("Unknown command state $this")
 }
 
 private fun String.toNotificationPermission(): AgentNotificationPermission = when (this) {

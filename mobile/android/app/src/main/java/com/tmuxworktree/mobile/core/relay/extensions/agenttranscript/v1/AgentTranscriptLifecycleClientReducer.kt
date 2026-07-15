@@ -1,22 +1,28 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import java.math.BigInteger
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 
 internal data class AgentClientReducerLimits(
     val maxAppliedEventEvidence: Int = PRODUCTION_MAX_APPLIED_EVENT_EVIDENCE,
+    val maxEventIdentityWitnesses: Int = PRODUCTION_MAX_EVENT_IDENTITY_WITNESSES,
     val maxLifecycleRecords: Int = PRODUCTION_MAX_LIFECYCLE_RECORDS,
     val maxEverTurnMarkers: Int = PRODUCTION_MAX_EVER_TURN_MARKERS,
     val maxNotificationLedgerEntries: Int = PRODUCTION_MAX_NOTIFICATION_LEDGER_ENTRIES,
     val maxSnapshotRecords: Int = PRODUCTION_MAX_SNAPSHOT_RECORDS,
+    val maxRetiredTimelineEpochs: Int = PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS,
     val maxNotificationDecisionsPerReduction: Int =
         PRODUCTION_MAX_NOTIFICATION_DECISIONS_PER_REDUCTION,
 ) {
     init {
         require(maxAppliedEventEvidence in 1..PRODUCTION_MAX_APPLIED_EVENT_EVIDENCE)
+        require(maxEventIdentityWitnesses in 1..PRODUCTION_MAX_EVENT_IDENTITY_WITNESSES)
         require(maxLifecycleRecords in 1..PRODUCTION_MAX_LIFECYCLE_RECORDS)
         require(maxEverTurnMarkers in 1..PRODUCTION_MAX_EVER_TURN_MARKERS)
         require(maxNotificationLedgerEntries in 1..PRODUCTION_MAX_NOTIFICATION_LEDGER_ENTRIES)
         require(maxSnapshotRecords in 1..PRODUCTION_MAX_SNAPSHOT_RECORDS)
+        require(maxRetiredTimelineEpochs in 1..PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS)
         require(
             maxNotificationDecisionsPerReduction in
                 1..PRODUCTION_MAX_NOTIFICATION_DECISIONS_PER_REDUCTION,
@@ -153,21 +159,36 @@ internal data class AgentAppliedEventEvidence(
     }
 }
 
-internal enum class AgentCommandState {
-    QUEUED,
-    SENDING,
-    ACCEPTED,
-    CONFIRMING,
-    SUCCEEDED,
-    FAILED_FINAL,
-    AMBIGUOUS,
-}
-
-internal data class AgentCommandLaneState(
-    val statesByCommandId: Map<String, AgentCommandState> = emptyMap(),
+internal data class AgentLifecycleEventIdentityWitness(
+    val eventId: String,
+    val agentEventSeq: String,
+    val lifecycleIdentity: AgentLifecycleIdentity,
+    val sourceEpoch: String,
+    val state: AgentLifecycleState,
+    val closedEventDigest: AgentClosedEventDigest?,
 ) {
     init {
-        statesByCommandId.keys.forEach { requireOpaqueId(it, "Command ID") }
+        requireOpaqueId(eventId, "Event ID")
+        requireCanonicalCounter(agentEventSeq, "Event identity sequence")
+        require(agentEventSeq != "0") { "Event identity sequence starts at one" }
+        requireOpaqueId(sourceEpoch, "Source epoch")
+    }
+
+    fun matches(record: AgentLifecycleRecord): Boolean =
+        eventId == record.lifecycleEventId &&
+            agentEventSeq == record.agentEventSeq &&
+            lifecycleIdentity == record.identity &&
+            sourceEpoch == record.sourceEpoch &&
+            state == record.state
+}
+
+internal data class AgentSnapshotCheckpoint(
+    val throughAgentSeq: String,
+    val localGeneration: String,
+) {
+    init {
+        requireCanonicalCounter(throughAgentSeq, "Snapshot checkpoint sequence")
+        requireCanonicalCounter(localGeneration, "Snapshot checkpoint generation")
     }
 }
 
@@ -217,7 +238,7 @@ internal enum class AgentNotificationDisposition {
 
 internal data class AgentNotificationLedgerEntry(
     val disposition: AgentNotificationDisposition,
-    val scope: AgentLifecycleScope,
+    val eventIdentity: AgentLifecycleEventIdentityWitness,
     val localGeneration: String,
 ) {
     init {
@@ -234,22 +255,33 @@ internal data class AgentSystemNotificationIntent(
         requireCanonicalCounter(localGeneration, "Notification intent local generation")
     }
 
-    /** Reset/timeline change revokes a queued intent via generation and ledger fences. */
-    fun isAuthorizedBy(clientState: AgentTranscriptLifecycleClientState): Boolean {
+    /**
+     * Non-consuming preflight only. A future durable system-notification executor must atomically
+     * claim an intent before calling the platform; repeated true results are not one-shot proof.
+     */
+    fun isPreflightAuthorizedBy(clientState: AgentTranscriptLifecycleClientState): Boolean {
         val identity = clientState.identity
         val extension = clientState.extensionLane
         val ledgerEntry = extension.notificationLedger[dedupeKey] ?: return false
+        val eventIdentity = ledgerEntry.eventIdentity
+        val currentRecord = extension.lifecycleByIdentity[eventIdentity.lifecycleIdentity]
         return dedupeKey.profileId == identity.profileId &&
             dedupeKey.hostId == identity.hostId &&
             dedupeKey.hostEpoch == identity.hostEpoch &&
             dedupeKey.scopeId == identity.scopeId &&
             dedupeKey.sessionId == identity.sessionId &&
             extension.timelineEpoch == dedupeKey.timelineEpoch &&
+            extension.support == AgentExtensionSupport.AVAILABLE &&
+            extension.liveSource == AgentLiveSourceState.CONNECTED &&
+            extension.activeSourceEpoch == eventIdentity.sourceEpoch &&
             !extension.requiresSnapshot &&
             localGeneration == extension.localGeneration &&
             ledgerEntry.localGeneration == localGeneration &&
             ledgerEntry.disposition == AgentNotificationDisposition.SHOWN &&
-            isNotificationCandidate(ledgerEntry.scope, dedupeKey.state) &&
+            eventIdentity.eventId == dedupeKey.lifecycleEventId &&
+            eventIdentity.state == dedupeKey.state &&
+            isNotificationCandidate(eventIdentity.lifecycleIdentity.scope, dedupeKey.state) &&
+            currentRecord != null && eventIdentity.matches(currentRecord) &&
             clientState.notificationConfig.profileActive &&
             clientState.notificationConfig.permission == AgentNotificationPermission.GRANTED &&
             clientState.notificationConfig.policy == AgentNotificationPolicy.ALLOW
@@ -270,10 +302,14 @@ internal data class AgentTranscriptLifecycleExtensionState(
     val currentLifecycleIdentityByEventId: Map<String, AgentLifecycleIdentity> = emptyMap(),
     val runsWithTurnRecords: Set<String> = emptySet(),
     val appliedEventsBySeq: Map<String, AgentAppliedEventEvidence> = emptyMap(),
-    val appliedSeqByEventId: Map<String, String> = emptyMap(),
+    val eventWitnessById: Map<String, AgentLifecycleEventIdentityWitness> = emptyMap(),
+    val eventIdBySeq: Map<String, String> = emptyMap(),
     val notificationLedger: Map<AgentNotificationDedupeKey, AgentNotificationLedgerEntry> = emptyMap(),
     val notificationKeyByLifecycleEventId: Map<String, AgentNotificationDedupeKey> = emptyMap(),
     val retiredTimelineEpochs: Set<String> = emptySet(),
+    val retiredEpochCompactionGeneration: String? = null,
+    val snapshotCheckpoint: AgentSnapshotCheckpoint? = null,
+    val snapshotNotificationSuppressedThroughAgentSeq: String? = null,
     val pendingStatusRequest: AgentLocalRequestFence? = null,
     val pendingSnapshotRequest: AgentLocalRequestFence? = null,
     val requiresSnapshot: Boolean = false,
@@ -287,9 +323,12 @@ internal data class AgentTranscriptLifecycleExtensionState(
                 "Notification baseline is ahead of the cursor"
             }
         }
-        require((support == AgentExtensionSupport.AVAILABLE) == (timelineEpoch != null)) {
-            "Only an available extension can own a timeline"
+        require(support != AgentExtensionSupport.AVAILABLE || timelineEpoch != null) {
+            "An available extension must own a timeline"
         }
+        require(support != AgentExtensionSupport.AVAILABLE ||
+            liveSource != null && activeSourceEpoch != null
+        ) { "An available extension must identify its current source status" }
         require(
             when (support) {
                 AgentExtensionSupport.AVAILABLE,
@@ -312,6 +351,26 @@ internal data class AgentTranscriptLifecycleExtensionState(
         retiredTimelineEpochs.forEach { requireOpaqueId(it, "Retired timeline epoch") }
         require(retiredTimelineEpochs.size <= PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS) {
             "Retired timeline capacity exceeded"
+        }
+        retiredEpochCompactionGeneration?.let {
+            requireCanonicalCounter(it, "Retired epoch compaction generation")
+            require(compareCounters(it, localGeneration) <= 0) {
+                "Retired epoch compaction generation is ahead of the client"
+            }
+        }
+        snapshotCheckpoint?.let {
+            require(compareCounters(it.localGeneration, localGeneration) <= 0) {
+                "Snapshot checkpoint generation is ahead of the client"
+            }
+            require(compareCounters(it.throughAgentSeq, lastAgentSeq) <= 0) {
+                "Snapshot checkpoint is ahead of the committed cursor"
+            }
+        }
+        snapshotNotificationSuppressedThroughAgentSeq?.let {
+            requireCanonicalCounter(it, "Snapshot notification suppression sequence")
+            require(compareCounters(it, lastAgentSeq) <= 0) {
+                "Snapshot notification suppression is ahead of the cursor"
+            }
         }
         pendingStatusRequest?.let {
             require(it.localGeneration == localGeneration) { "Status request generation is stale" }
@@ -353,12 +412,31 @@ internal data class AgentTranscriptLifecycleExtensionState(
                 "Applied event evidence is ahead of the cursor"
             }
         }
-        require(appliedSeqByEventId.size == appliedEventsBySeq.size) {
-            "Applied event ID index size is inconsistent"
+        require(eventWitnessById.size <= PRODUCTION_MAX_EVENT_IDENTITY_WITNESSES) {
+            "Event identity witness capacity exceeded"
+        }
+        require(eventIdBySeq.size == eventWitnessById.size) {
+            "Event sequence index size is inconsistent"
+        }
+        eventWitnessById.forEach { (eventId, witness) ->
+            require(eventId == witness.eventId) { "Event witness key is inconsistent" }
+            require(eventIdBySeq[witness.agentEventSeq] == eventId) {
+                "Event sequence index is inconsistent"
+            }
+            require(compareCounters(witness.agentEventSeq, lastAgentSeq) <= 0) {
+                "Event identity witness is ahead of the cursor"
+            }
         }
         appliedEventsBySeq.forEach { (sequence, evidence) ->
-            require(appliedSeqByEventId[evidence.eventId] == sequence) {
-                "Applied event ID index is inconsistent"
+            val witness = eventWitnessById[evidence.eventId]
+            require(witness?.agentEventSeq == sequence &&
+                witness.closedEventDigest == evidence.closedEventDigest
+            ) { "Applied evidence is not bound to its event identity" }
+        }
+        lifecycleByIdentity.forEach { (identity, record) ->
+            val witness = eventWitnessById[record.lifecycleEventId]
+            require(witness != null && witness.lifecycleIdentity == identity && witness.matches(record)) {
+                "Lifecycle record is not bound to its durable event identity"
             }
         }
         require(notificationLedger.size <= PRODUCTION_MAX_NOTIFICATION_LEDGER_ENTRIES) {
@@ -374,7 +452,13 @@ internal data class AgentTranscriptLifecycleExtensionState(
             require(compareCounters(entry.localGeneration, localGeneration) <= 0) {
                 "Notification ledger generation is ahead of the client"
             }
-            require(isNotificationCandidate(entry.scope, key.state)) {
+            require(eventWitnessById[entry.eventIdentity.eventId] == entry.eventIdentity) {
+                "Notification ledger event identity is not durable"
+            }
+            require(entry.eventIdentity.eventId == key.lifecycleEventId &&
+                entry.eventIdentity.state == key.state &&
+                isNotificationCandidate(entry.eventIdentity.lifecycleIdentity.scope, key.state)
+            ) {
                 "Notification ledger scope/state is invalid"
             }
         }
@@ -383,7 +467,6 @@ internal data class AgentTranscriptLifecycleExtensionState(
 
 internal data class AgentTranscriptLifecycleClientState(
     val identity: AgentExtensionSessionIdentity,
-    val commandLane: AgentCommandLaneState = AgentCommandLaneState(),
     val extensionLane: AgentTranscriptLifecycleExtensionState =
         AgentTranscriptLifecycleExtensionState(),
     val notificationConfig: AgentNotificationConfig = AgentNotificationConfig(),
@@ -416,15 +499,6 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
         }
     }
 
-    data class CommandStatus(
-        val commandId: String,
-        val state: AgentCommandState,
-    ) : AgentTranscriptLifecycleClientInput {
-        init {
-            requireOpaqueId(commandId, "Command ID")
-        }
-    }
-
     data class ClientConfigChanged(
         val config: AgentNotificationConfig,
     ) : AgentTranscriptLifecycleClientInput
@@ -444,15 +518,10 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
         val sessionIdentity: AgentExtensionSessionIdentity,
         val requestFence: AgentLocalRequestFence,
         val reason: AgentExtensionUnavailableReason,
-    ) : AgentTranscriptLifecycleClientInput {
-        init {
-            require(reason != AgentExtensionUnavailableReason.EXTENSION_NOT_NEGOTIATED) {
-                "Unnegotiated is a local capability state, not a host status"
-            }
-        }
-    }
+    ) : AgentTranscriptLifecycleClientInput
 
     data object ExtensionNotNegotiated : AgentTranscriptLifecycleClientInput
+    data object ExtensionNegotiated : AgentTranscriptLifecycleClientInput
 
     data class AgentEvent(
         val lineage: AgentTimelineLineage,
@@ -466,12 +535,6 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
             require(agentEventSeq != "0") { "Agent event sequence starts at one" }
             requireOpaqueId(eventId, "Event ID")
             AgentAppliedEventEvidence(eventId, closedEventDigest)
-            require(record.agentEventSeq == agentEventSeq) {
-                "Lifecycle record sequence does not match its event"
-            }
-            require(record.lifecycleEventId == eventId) {
-                "Lifecycle event ID does not match its enclosing event"
-            }
         }
     }
 
@@ -486,17 +549,6 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
             require(records.size <= PRODUCTION_MAX_SNAPSHOT_RECORDS) {
                 "Snapshot record capacity exceeded"
             }
-            require(records.none { it.agentEventSeq == "0" }) {
-                "Snapshot records start at Agent sequence one"
-            }
-            require(records.all { compareCounters(it.agentEventSeq, throughAgentSeq) <= 0 }) {
-                "Snapshot record is ahead of its watermark"
-            }
-            require(records.map { it.identity }.toSet().size == records.size) {
-                "Snapshot repeats a lifecycle identity"
-            }
-            require(records.map { it.lifecycleEventId }.toSet().size == records.size
-            ) { "Snapshot repeats a lifecycle event identity" }
         }
     }
 
@@ -508,17 +560,7 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
     ) : AgentTranscriptLifecycleClientInput {
         init {
             requireOpaqueId(previousTimelineEpoch, "Previous timeline epoch")
-            when (reason) {
-                AgentTimelineResetReason.DELETED -> {
-                    requireOpaqueId(newTimelineEpoch, "New timeline epoch")
-                    require(newTimelineEpoch != previousTimelineEpoch) {
-                        "Deleted timeline reset must rotate the timeline epoch"
-                    }
-                }
-                AgentTimelineResetReason.STORE_RESET -> require(newTimelineEpoch == null) {
-                    "Store reset cannot identify a new timeline"
-                }
-            }
+            newTimelineEpoch?.let { requireOpaqueId(it, "New timeline epoch") }
         }
     }
 }
@@ -528,7 +570,6 @@ internal enum class AgentClientDisposition {
     DUPLICATE,
     GAP_RESYNC,
     CONTINUITY_CONFLICT,
-    COMMAND_APPLIED,
     CONFIG_APPLIED,
     SNAPSHOT_APPLIED,
     STATUS_APPLIED,
@@ -539,7 +580,8 @@ internal enum class AgentClientDisposition {
 /**
  * The caller must durably commit [state] before executing intents in [notificationDecisions].
  * The notification ledger is already present in that state when an intent is returned, and the
- * intent must still pass [AgentSystemNotificationIntent.isAuthorizedBy] immediately before use.
+ * intent must still pass [AgentSystemNotificationIntent.isPreflightAuthorizedBy] immediately
+ * before a future durable executor atomically claims it.
  */
 internal data class AgentTranscriptLifecycleClientReduction(
     val state: AgentTranscriptLifecycleClientState,
@@ -562,7 +604,11 @@ internal data class AgentNotificationDecision(
         get() = ledgerEntry.disposition
 
     init {
-        require(isNotificationCandidate(ledgerEntry.scope, dedupeKey.state)) {
+        require(isNotificationCandidate(
+                ledgerEntry.eventIdentity.lifecycleIdentity.scope,
+                dedupeKey.state,
+            )
+        ) {
             "Notification decision scope/state is invalid"
         }
         require((disposition == AgentNotificationDisposition.SHOWN) ==
@@ -585,14 +631,18 @@ internal object AgentTranscriptLifecycleClientReducer {
     ): AgentTranscriptLifecycleClientReduction = when (input) {
         is AgentTranscriptLifecycleClientInput.LocalRequestStarted ->
             reduceLocalRequestStarted(state, input)
-        is AgentTranscriptLifecycleClientInput.CommandStatus -> reduceCommand(state, input)
         is AgentTranscriptLifecycleClientInput.ClientConfigChanged -> reduceConfig(state, input)
-        is AgentTranscriptLifecycleClientInput.StatusAvailable -> reduceAvailableStatus(state, input)
-        is AgentTranscriptLifecycleClientInput.StatusUnavailable -> reduceUnavailableStatus(state, input)
-        AgentTranscriptLifecycleClientInput.ExtensionNotNegotiated -> reduceUnnegotiated(state)
+        is AgentTranscriptLifecycleClientInput.StatusAvailable ->
+            reduceAvailableStatus(state, input, limits)
+        is AgentTranscriptLifecycleClientInput.StatusUnavailable ->
+            reduceUnavailableStatus(state, input, limits)
+        AgentTranscriptLifecycleClientInput.ExtensionNotNegotiated ->
+            reduceNegotiationChanged(state, negotiated = false)
+        AgentTranscriptLifecycleClientInput.ExtensionNegotiated ->
+            reduceNegotiationChanged(state, negotiated = true)
         is AgentTranscriptLifecycleClientInput.AgentEvent -> reduceAgentEvent(state, input, limits)
         is AgentTranscriptLifecycleClientInput.SnapshotCommit -> reduceSnapshot(state, input, limits)
-        is AgentTranscriptLifecycleClientInput.TimelineReset -> reduceTimelineReset(state, input)
+        is AgentTranscriptLifecycleClientInput.TimelineReset -> reduceTimelineReset(state, input, limits)
     }
 
     private fun reduceLocalRequestStarted(
@@ -616,19 +666,6 @@ internal object AgentTranscriptLifecycleClientReducer {
             disposition = AgentClientDisposition.CONFIG_APPLIED,
         )
     }
-
-    private fun reduceCommand(
-        state: AgentTranscriptLifecycleClientState,
-        input: AgentTranscriptLifecycleClientInput.CommandStatus,
-    ): AgentTranscriptLifecycleClientReduction = AgentTranscriptLifecycleClientReduction(
-        state = state.copy(
-            commandLane = state.commandLane.copy(
-                statesByCommandId = state.commandLane.statesByCommandId +
-                    (input.commandId to input.state),
-            ),
-        ),
-        disposition = AgentClientDisposition.COMMAND_APPLIED,
-    )
 
     private fun reduceConfig(
         state: AgentTranscriptLifecycleClientState,
@@ -657,6 +694,7 @@ internal object AgentTranscriptLifecycleClientReducer {
     private fun reduceAvailableStatus(
         state: AgentTranscriptLifecycleClientState,
         input: AgentTranscriptLifecycleClientInput.StatusAvailable,
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleClientReduction {
         if (input.lineage.session != state.identity) return continuityConflict(state)
         val previous = state.extensionLane
@@ -668,24 +706,34 @@ internal object AgentTranscriptLifecycleClientReducer {
             )
         }
         val extension = if (previous.timelineEpoch == input.lineage.timelineEpoch) {
+            val statusChanged = previous.support != AgentExtensionSupport.AVAILABLE ||
+                previous.liveSource != input.liveSource ||
+                previous.activeSourceEpoch != input.activeSourceEpoch
             previous.copy(
+                localGeneration = if (statusChanged) {
+                    nextCounter(previous.localGeneration)
+                } else {
+                    previous.localGeneration
+                },
                 support = AgentExtensionSupport.AVAILABLE,
                 unavailableReason = null,
                 liveSource = input.liveSource,
                 activeSourceEpoch = input.activeSourceEpoch,
                 pendingStatusRequest = null,
+                pendingSnapshotRequest = if (statusChanged) null else previous.pendingSnapshotRequest,
             )
         } else {
-            val retired = retiredWithCurrent(previous)
-                ?: return quarantine(state, clearStatusRequest = true)
+            val nextGeneration = nextCounter(previous.localGeneration)
+            val retirement = retireCurrentForNewLineage(previous, limits, nextGeneration)
             clearedTimeline(
                 previous = previous,
-                localGeneration = nextCounter(previous.localGeneration),
+                localGeneration = nextGeneration,
                 support = AgentExtensionSupport.AVAILABLE,
                 timelineEpoch = input.lineage.timelineEpoch,
                 liveSource = input.liveSource,
                 activeSourceEpoch = input.activeSourceEpoch,
-                retiredTimelineEpochs = retired,
+                retiredTimelineEpochs = retirement.epochs,
+                retiredEpochCompactionGeneration = retirement.compactionGeneration,
             )
         }
         return AgentTranscriptLifecycleClientReduction(
@@ -697,55 +745,78 @@ internal object AgentTranscriptLifecycleClientReducer {
     private fun reduceUnavailableStatus(
         state: AgentTranscriptLifecycleClientState,
         input: AgentTranscriptLifecycleClientInput.StatusUnavailable,
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleClientReduction {
         if (input.sessionIdentity != state.identity) return continuityConflict(state)
         val previous = state.extensionLane
         if (previous.support == AgentExtensionSupport.UNNEGOTIATED) return inactive(state)
         if (previous.pendingStatusRequest != input.requestFence) return continuityConflict(state)
-        val retired = retiredWithCurrent(previous)
-            ?: return quarantine(state, clearStatusRequest = true)
-        val nextGeneration = if (previous.support == AgentExtensionSupport.UNAVAILABLE &&
-            previous.timelineEpoch == null
-        ) {
-            previous.localGeneration
+        if (input.reason == AgentExtensionUnavailableReason.EXTENSION_NOT_NEGOTIATED) {
+            return continuityConflict(
+                state.copy(extensionLane = previous.copy(pendingStatusRequest = null)),
+            )
+        }
+        val nextGeneration = nextCounter(previous.localGeneration)
+        val extension = if (input.reason == AgentExtensionUnavailableReason.STORE_UNAVAILABLE) {
+            val retirement = retireCurrentForNewLineage(previous, limits, nextGeneration)
+            clearedTimeline(
+                previous = previous,
+                localGeneration = nextGeneration,
+                support = AgentExtensionSupport.UNAVAILABLE,
+                unavailableReason = input.reason,
+                retiredTimelineEpochs = retirement.epochs,
+                retiredEpochCompactionGeneration = retirement.compactionGeneration,
+            )
         } else {
-            nextCounter(previous.localGeneration)
+            previous.copy(
+                localGeneration = nextGeneration,
+                support = AgentExtensionSupport.UNAVAILABLE,
+                unavailableReason = input.reason,
+                liveSource = null,
+                activeSourceEpoch = null,
+                pendingStatusRequest = null,
+                pendingSnapshotRequest = null,
+            )
         }
         return AgentTranscriptLifecycleClientReduction(
-            state = state.copy(
-                extensionLane = clearedTimeline(
-                    previous = previous,
-                    localGeneration = nextGeneration,
-                    support = AgentExtensionSupport.UNAVAILABLE,
-                    unavailableReason = input.reason,
-                    retiredTimelineEpochs = retired,
-                ),
-            ),
+            state = state.copy(extensionLane = extension),
             disposition = AgentClientDisposition.STATUS_APPLIED,
         )
     }
 
-    private fun reduceUnnegotiated(
+    private fun reduceNegotiationChanged(
         state: AgentTranscriptLifecycleClientState,
+        negotiated: Boolean,
     ): AgentTranscriptLifecycleClientReduction {
         val previous = state.extensionLane
-        if (previous.support == AgentExtensionSupport.UNNEGOTIATED) {
+        if (!negotiated && previous.support == AgentExtensionSupport.UNNEGOTIATED ||
+            negotiated && previous.support != AgentExtensionSupport.UNNEGOTIATED
+        ) {
             return AgentTranscriptLifecycleClientReduction(
                 state = state,
                 disposition = AgentClientDisposition.STATUS_APPLIED,
             )
         }
-        val retired = retiredWithCurrent(previous) ?: return quarantine(state)
+        val nextGeneration = nextCounter(previous.localGeneration)
+        val extension = previous.copy(
+            localGeneration = nextGeneration,
+            support = if (negotiated) {
+                AgentExtensionSupport.UNKNOWN
+            } else {
+                AgentExtensionSupport.UNNEGOTIATED
+            },
+            unavailableReason = if (negotiated) {
+                null
+            } else {
+                AgentExtensionUnavailableReason.EXTENSION_NOT_NEGOTIATED
+            },
+            liveSource = null,
+            activeSourceEpoch = null,
+            pendingStatusRequest = null,
+            pendingSnapshotRequest = null,
+        )
         return AgentTranscriptLifecycleClientReduction(
-            state = state.copy(
-                extensionLane = clearedTimeline(
-                    previous = previous,
-                    localGeneration = nextCounter(previous.localGeneration),
-                    support = AgentExtensionSupport.UNNEGOTIATED,
-                    unavailableReason = AgentExtensionUnavailableReason.EXTENSION_NOT_NEGOTIATED,
-                    retiredTimelineEpochs = retired,
-                ),
-            ),
+            state = state.copy(extensionLane = extension),
             disposition = AgentClientDisposition.STATUS_APPLIED,
         )
     }
@@ -762,6 +833,11 @@ internal object AgentTranscriptLifecycleClientReducer {
         }
         if (extension.timelineEpoch != input.lineage.timelineEpoch) {
             return quarantine(state)
+        }
+        if (input.record.agentEventSeq != input.agentEventSeq ||
+            input.record.lifecycleEventId != input.eventId
+        ) {
+            return quarantine(state, AgentClientDisposition.CONTINUITY_CONFLICT)
         }
 
         val relation = compareCounters(input.agentEventSeq, extension.lastAgentSeq)
@@ -786,13 +862,14 @@ internal object AgentTranscriptLifecycleClientReducer {
                 disposition = AgentClientDisposition.GAP_RESYNC,
             )
         }
-        if (input.eventId in extension.appliedSeqByEventId ||
-            input.eventId in extension.currentLifecycleIdentityByEventId ||
-            input.eventId in extension.notificationKeyByLifecycleEventId
+        if (input.eventId in extension.eventWitnessById ||
+            extension.eventIdBySeq[input.agentEventSeq]?.let { it != input.eventId } == true
         ) {
             return quarantine(state, AgentClientDisposition.CONTINUITY_CONFLICT)
         }
-        if (extension.appliedEventsBySeq.size >= limits.maxAppliedEventEvidence) {
+        if (extension.appliedEventsBySeq.size >= limits.maxAppliedEventEvidence ||
+            extension.eventWitnessById.size >= limits.maxEventIdentityWitnesses
+        ) {
             return quarantine(state)
         }
 
@@ -804,17 +881,30 @@ internal object AgentTranscriptLifecycleClientReducer {
             is LifecycleApplicationResult.Applied -> Unit
         }
         application as LifecycleApplicationResult.Applied
-        var nextExtension = application.extension.copy(
+        val eventIdentity = AgentLifecycleEventIdentityWitness(
+            eventId = input.eventId,
+            agentEventSeq = input.agentEventSeq,
+            lifecycleIdentity = input.record.identity,
+            sourceEpoch = input.record.sourceEpoch,
+            state = input.record.state,
+            closedEventDigest = input.closedEventDigest,
+        )
+        var nextExtension = extension.copy(
             lastAgentSeq = input.agentEventSeq,
-            appliedEventsBySeq = application.extension.appliedEventsBySeq +
+            lifecycleByIdentity = application.lifecycleByIdentity,
+            currentLifecycleIdentityByEventId = application.currentLifecycleIdentityByEventId,
+            runsWithTurnRecords = application.runsWithTurnRecords,
+            appliedEventsBySeq = extension.appliedEventsBySeq +
                 (
                     input.agentEventSeq to AgentAppliedEventEvidence(
                         input.eventId,
                         input.closedEventDigest,
                     )
                     ),
-            appliedSeqByEventId = application.extension.appliedSeqByEventId +
-                (input.eventId to input.agentEventSeq),
+            eventWitnessById = extension.eventWitnessById +
+                (input.eventId to eventIdentity),
+            eventIdBySeq = extension.eventIdBySeq +
+                (input.agentEventSeq to input.eventId),
         )
         var notificationDecisions = emptyList<AgentNotificationDecision>()
         val notification = recordNotificationCandidate(
@@ -822,6 +912,7 @@ internal object AgentTranscriptLifecycleClientReducer {
             config = state.notificationConfig,
             extension = nextExtension,
             lifecycle = input.record,
+            eventIdentity = eventIdentity,
             limits = limits,
         )
         if (notification.capacityExceeded) return quarantine(state)
@@ -851,7 +942,10 @@ internal object AgentTranscriptLifecycleClientReducer {
             return continuityConflict(state)
         }
         if (previous.pendingSnapshotRequest != input.requestFence) return continuityConflict(state)
-        if (input.records.size > limits.maxSnapshotRecords) {
+        if (input.records.size > limits.maxSnapshotRecords ||
+            input.records.size > limits.maxLifecycleRecords ||
+            input.records.size > limits.maxEventIdentityWitnesses
+        ) {
             return quarantine(state, clearSnapshotRequest = true)
         }
         if (compareCounters(input.throughAgentSeq, previous.lastAgentSeq) < 0) {
@@ -861,12 +955,22 @@ internal object AgentTranscriptLifecycleClientReducer {
                 clearSnapshotRequest = true,
             )
         }
-        if (!validSnapshotGraph(
-                input.records,
-                previous.notificationLedger,
-                previous.notificationKeyByLifecycleEventId,
-            )
-        ) {
+        val recordSequences = input.records.map(AgentLifecycleRecord::agentEventSeq)
+        val recordIds = input.records.map(AgentLifecycleRecord::lifecycleEventId)
+        val recordIdentities = input.records.map(AgentLifecycleRecord::identity)
+        val snapshotShapeValid = input.records.none { it.agentEventSeq == "0" } &&
+            input.records.all { compareCounters(it.agentEventSeq, input.throughAgentSeq) <= 0 } &&
+            recordSequences.toSet().size == recordSequences.size &&
+            recordIds.toSet().size == recordIds.size &&
+            recordIdentities.toSet().size == recordIdentities.size &&
+            hasValidLifecycleGraph(input.records) &&
+            input.records.all { record ->
+                val existingById = previous.eventWitnessById[record.lifecycleEventId]
+                val existingIdAtSeq = previous.eventIdBySeq[record.agentEventSeq]
+                (existingById == null || existingById.matches(record)) &&
+                    (existingIdAtSeq == null || existingIdAtSeq == record.lifecycleEventId)
+            }
+        if (!snapshotShapeValid) {
             return quarantine(
                 state,
                 disposition = AgentClientDisposition.CONTINUITY_CONFLICT,
@@ -874,11 +978,22 @@ internal object AgentTranscriptLifecycleClientReducer {
             )
         }
         val lifecycle = input.records.associateBy(AgentLifecycleRecord::identity)
-        if (lifecycle.size > limits.maxLifecycleRecords) {
-            return quarantine(state, clearSnapshotRequest = true)
-        }
         val lifecycleEventIndex = lifecycle.entries.associate { (identity, record) ->
             record.lifecycleEventId to identity
+        }
+        val eventWitnesses = input.records.associate { record ->
+            val existing = previous.eventWitnessById[record.lifecycleEventId]
+            record.lifecycleEventId to AgentLifecycleEventIdentityWitness(
+                eventId = record.lifecycleEventId,
+                agentEventSeq = record.agentEventSeq,
+                lifecycleIdentity = record.identity,
+                sourceEpoch = record.sourceEpoch,
+                state = record.state,
+                closedEventDigest = existing?.closedEventDigest,
+            )
+        }
+        val eventIdBySeq = eventWitnesses.values.associate {
+            it.agentEventSeq to it.eventId
         }
         val retainedRunIds = lifecycle.keys.mapTo(linkedSetOf(), AgentLifecycleIdentity::runId)
         val currentTurnRunIds = lifecycle.keys
@@ -893,14 +1008,16 @@ internal object AgentTranscriptLifecycleClientReducer {
 
         val priorBaseline = previous.notificationBaselineAgentSeq
         val initialSnapshotForLineage = priorBaseline == null
+        val nextGeneration = nextCounter(previous.localGeneration)
         var extension = clearedTimeline(
             previous = previous,
-            localGeneration = previous.localGeneration,
+            localGeneration = nextGeneration,
             support = AgentExtensionSupport.AVAILABLE,
             timelineEpoch = input.lineage.timelineEpoch,
             liveSource = previous.liveSource,
             activeSourceEpoch = previous.activeSourceEpoch,
             retiredTimelineEpochs = previous.retiredTimelineEpochs,
+            retiredEpochCompactionGeneration = previous.retiredEpochCompactionGeneration,
         ).copy(
             lastAgentSeq = input.throughAgentSeq,
             notificationBaselineAgentSeq = if (initialSnapshotForLineage) {
@@ -911,14 +1028,14 @@ internal object AgentTranscriptLifecycleClientReducer {
             lifecycleByIdentity = lifecycle,
             currentLifecycleIdentityByEventId = lifecycleEventIndex,
             runsWithTurnRecords = runsWithTurns,
-            appliedEventsBySeq = previous.appliedEventsBySeq.filterKeys {
-                compareCounters(it, input.throughAgentSeq) <= 0
-            },
-            appliedSeqByEventId = previous.appliedSeqByEventId.filterValues {
-                compareCounters(it, input.throughAgentSeq) <= 0
-            },
-            notificationLedger = previous.notificationLedger,
-            notificationKeyByLifecycleEventId = previous.notificationKeyByLifecycleEventId,
+            appliedEventsBySeq = emptyMap(),
+            eventWitnessById = eventWitnesses,
+            eventIdBySeq = eventIdBySeq,
+            notificationLedger = emptyMap(),
+            notificationKeyByLifecycleEventId = emptyMap(),
+            snapshotCheckpoint = AgentSnapshotCheckpoint(input.throughAgentSeq, nextGeneration),
+            snapshotNotificationSuppressedThroughAgentSeq =
+                previous.snapshotNotificationSuppressedThroughAgentSeq,
             pendingSnapshotRequest = null,
             requiresSnapshot = false,
         )
@@ -930,23 +1047,25 @@ internal object AgentTranscriptLifecycleClientReducer {
                         .thenBy { it.lifecycleEventId },
                 )
                 .forEach { record ->
+                    if (decisions.size >= limits.maxNotificationDecisionsPerReduction ||
+                        extension.notificationLedger.size >= limits.maxNotificationLedgerEntries
+                    ) return@forEach
+                    val eventIdentity = eventWitnesses.getValue(record.lifecycleEventId)
                     val notification = recordNotificationCandidate(
                         identity = state.identity,
                         config = state.notificationConfig,
                         extension = extension,
                         lifecycle = record,
+                        eventIdentity = eventIdentity,
                         limits = limits,
                     )
-                    if (notification.capacityExceeded) {
-                        return quarantine(state, clearSnapshotRequest = true)
-                    }
                     extension = notification.extension
                     notification.decision?.let(decisions::add)
-                    if (decisions.size > limits.maxNotificationDecisionsPerReduction) {
-                        return quarantine(state, clearSnapshotRequest = true)
-                    }
                 }
         }
+        extension = extension.copy(
+            snapshotNotificationSuppressedThroughAgentSeq = input.throughAgentSeq,
+        )
         return AgentTranscriptLifecycleClientReduction(
             state = state.copy(extensionLane = extension),
             disposition = AgentClientDisposition.SNAPSHOT_APPLIED,
@@ -957,6 +1076,7 @@ internal object AgentTranscriptLifecycleClientReducer {
     private fun reduceTimelineReset(
         state: AgentTranscriptLifecycleClientState,
         input: AgentTranscriptLifecycleClientInput.TimelineReset,
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleClientReduction {
         if (input.sessionIdentity != state.identity) return continuityConflict(state)
         val previous = state.extensionLane
@@ -965,23 +1085,30 @@ internal object AgentTranscriptLifecycleClientReducer {
             return inactive(state)
         }
         if (currentEpoch != input.previousTimelineEpoch) return continuityConflict(state)
+        val newTimelineEpoch = input.newTimelineEpoch
+        if ((input.reason == AgentTimelineResetReason.DELETED &&
+                (newTimelineEpoch == null || newTimelineEpoch == input.previousTimelineEpoch)) ||
+            (input.reason == AgentTimelineResetReason.STORE_RESET && newTimelineEpoch != null)
+        ) return continuityConflict(state)
         if (input.newTimelineEpoch in previous.retiredTimelineEpochs) return continuityConflict(state)
-        val retired = retiredWithCurrent(previous) ?: return quarantine(state)
         val nextGeneration = nextCounter(previous.localGeneration)
+        val retirement = retireCurrentForNewLineage(previous, limits, nextGeneration)
         val extension = when (input.reason) {
             AgentTimelineResetReason.DELETED -> clearedTimeline(
                 previous = previous,
                 localGeneration = nextGeneration,
-                support = AgentExtensionSupport.AVAILABLE,
-                timelineEpoch = requireNotNull(input.newTimelineEpoch),
-                retiredTimelineEpochs = retired,
+                support = AgentExtensionSupport.UNKNOWN,
+                timelineEpoch = newTimelineEpoch ?: return continuityConflict(state),
+                retiredTimelineEpochs = retirement.epochs,
+                retiredEpochCompactionGeneration = retirement.compactionGeneration,
             )
             AgentTimelineResetReason.STORE_RESET -> clearedTimeline(
                 previous = previous,
                 localGeneration = nextGeneration,
                 support = AgentExtensionSupport.UNAVAILABLE,
                 unavailableReason = AgentExtensionUnavailableReason.STORE_UNAVAILABLE,
-                retiredTimelineEpochs = retired,
+                retiredTimelineEpochs = retirement.epochs,
+                retiredEpochCompactionGeneration = retirement.compactionGeneration,
             )
         }
         return AgentTranscriptLifecycleClientReduction(
@@ -991,8 +1118,11 @@ internal object AgentTranscriptLifecycleClientReducer {
     }
 
     private sealed interface LifecycleApplicationResult {
-        data class Applied(val extension: AgentTranscriptLifecycleExtensionState) :
-            LifecycleApplicationResult
+        data class Applied(
+            val lifecycleByIdentity: Map<AgentLifecycleIdentity, AgentLifecycleRecord>,
+            val currentLifecycleIdentityByEventId: Map<String, AgentLifecycleIdentity>,
+            val runsWithTurnRecords: Set<String>,
+        ) : LifecycleApplicationResult
         data object Invalid : LifecycleApplicationResult
         data object CapacityExceeded : LifecycleApplicationResult
     }
@@ -1080,12 +1210,13 @@ internal object AgentTranscriptLifecycleClientReducer {
         } else {
             extension.runsWithTurnRecords
         }
+        if (!hasValidLifecycleGraph(lifecycle.values)) {
+            return LifecycleApplicationResult.Invalid
+        }
         return LifecycleApplicationResult.Applied(
-            extension.copy(
-                lifecycleByIdentity = lifecycle,
-                currentLifecycleIdentityByEventId = lifecycleEventIndex,
-                runsWithTurnRecords = runsWithTurns,
-            ),
+            lifecycleByIdentity = lifecycle,
+            currentLifecycleIdentityByEventId = lifecycleEventIndex,
+            runsWithTurnRecords = runsWithTurns,
         )
     }
 
@@ -1100,22 +1231,33 @@ internal object AgentTranscriptLifecycleClientReducer {
         config: AgentNotificationConfig,
         extension: AgentTranscriptLifecycleExtensionState,
         lifecycle: AgentLifecycleRecord,
+        eventIdentity: AgentLifecycleEventIdentityWitness,
         limits: AgentClientReducerLimits,
     ): NotificationApplication {
         val baseline = extension.notificationBaselineAgentSeq ?: return NotificationApplication(extension)
-        if (compareCounters(lifecycle.agentEventSeq, baseline) <= 0) return NotificationApplication(extension)
+        val suppressedThrough = extension.snapshotNotificationSuppressedThroughAgentSeq
+        if (compareCounters(lifecycle.agentEventSeq, baseline) <= 0 ||
+            suppressedThrough != null && compareCounters(lifecycle.agentEventSeq, suppressedThrough) <= 0
+        ) return NotificationApplication(extension)
         val candidate = isNotificationCandidate(lifecycle.identity.scope, lifecycle.state) &&
             (lifecycle.identity.scope != AgentLifecycleScope.RUN ||
                 lifecycle.identity.runId !in extension.runsWithTurnRecords)
         if (!candidate) return NotificationApplication(extension)
+        if (extension.support != AgentExtensionSupport.AVAILABLE ||
+            extension.liveSource != AgentLiveSourceState.CONNECTED ||
+            extension.activeSourceEpoch != lifecycle.sourceEpoch ||
+            extension.lifecycleByIdentity[lifecycle.identity] != lifecycle ||
+            !eventIdentity.matches(lifecycle)
+        ) return NotificationApplication(extension)
 
+        val timelineEpoch = extension.timelineEpoch ?: return NotificationApplication(extension)
         val key = AgentNotificationDedupeKey(
             profileId = identity.profileId,
             hostId = identity.hostId,
             hostEpoch = identity.hostEpoch,
             scopeId = identity.scopeId,
             sessionId = identity.sessionId,
-            timelineEpoch = requireNotNull(extension.timelineEpoch),
+            timelineEpoch = timelineEpoch,
             lifecycleEventId = lifecycle.lifecycleEventId,
             state = lifecycle.state,
         )
@@ -1123,7 +1265,7 @@ internal object AgentTranscriptLifecycleClientReducer {
         val existingKey = extension.notificationKeyByLifecycleEventId[lifecycle.lifecycleEventId]
         if (existingKey != null) {
             val entry = extension.notificationLedger.getValue(existingKey)
-            if (existingKey != key || entry.scope != lifecycle.identity.scope) {
+            if (existingKey != key || entry.eventIdentity != eventIdentity) {
                 return NotificationApplication(extension, capacityExceeded = true)
             }
             return NotificationApplication(extension)
@@ -1141,7 +1283,7 @@ internal object AgentTranscriptLifecycleClientReducer {
         }
         val ledgerEntry = AgentNotificationLedgerEntry(
             disposition = disposition,
-            scope = lifecycle.identity.scope,
+            eventIdentity = eventIdentity,
             localGeneration = extension.localGeneration,
         )
         val next = extension.copy(
@@ -1200,29 +1342,29 @@ internal object AgentTranscriptLifecycleClientReducer {
         )
     }
 
-    private fun retiredWithCurrent(
+    private data class RetirementResult(
+        val epochs: Set<String>,
+        val compactionGeneration: String?,
+    )
+
+    /** A trusted new-lineage signal checkpoints stale-response fencing when tombstones are full. */
+    private fun retireCurrentForNewLineage(
         extension: AgentTranscriptLifecycleExtensionState,
-    ): Set<String>? {
-        val current = extension.timelineEpoch ?: return extension.retiredTimelineEpochs
-        if (current in extension.retiredTimelineEpochs) return null
-        if (extension.retiredTimelineEpochs.size >= PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS) return null
-        return extension.retiredTimelineEpochs + current
-    }
-
-    private fun validSnapshotGraph(
-        records: List<AgentLifecycleRecord>,
-        notificationLedger: Map<AgentNotificationDedupeKey, AgentNotificationLedgerEntry>,
-        notificationKeyByLifecycleEventId: Map<String, AgentNotificationDedupeKey>,
-    ): Boolean {
-        if (records.any { record ->
-                val key = notificationKeyByLifecycleEventId[record.lifecycleEventId]
-                    ?: return@any false
-                val entry = notificationLedger.getValue(key)
-                key.state != record.state || entry.scope != record.identity.scope
-            }
-        ) return false
-
-        return hasValidLifecycleGraph(records)
+        limits: AgentClientReducerLimits,
+        newGeneration: String,
+    ): RetirementResult {
+        val current = extension.timelineEpoch ?: return RetirementResult(
+            extension.retiredTimelineEpochs,
+            extension.retiredEpochCompactionGeneration,
+        )
+        return if (extension.retiredTimelineEpochs.size < limits.maxRetiredTimelineEpochs) {
+            RetirementResult(
+                extension.retiredTimelineEpochs + current,
+                extension.retiredEpochCompactionGeneration,
+            )
+        } else {
+            RetirementResult(setOf(current), newGeneration)
+        }
     }
 
     private fun clearedTimeline(
@@ -1234,6 +1376,7 @@ internal object AgentTranscriptLifecycleClientReducer {
         liveSource: AgentLiveSourceState? = null,
         activeSourceEpoch: String? = null,
         retiredTimelineEpochs: Set<String>,
+        retiredEpochCompactionGeneration: String?,
     ): AgentTranscriptLifecycleExtensionState = previous.copy(
         localGeneration = localGeneration,
         support = support,
@@ -1247,10 +1390,14 @@ internal object AgentTranscriptLifecycleClientReducer {
         currentLifecycleIdentityByEventId = emptyMap(),
         runsWithTurnRecords = emptySet(),
         appliedEventsBySeq = emptyMap(),
-        appliedSeqByEventId = emptyMap(),
+        eventWitnessById = emptyMap(),
+        eventIdBySeq = emptyMap(),
         notificationLedger = emptyMap(),
         notificationKeyByLifecycleEventId = emptyMap(),
         retiredTimelineEpochs = retiredTimelineEpochs,
+        retiredEpochCompactionGeneration = retiredEpochCompactionGeneration,
+        snapshotCheckpoint = null,
+        snapshotNotificationSuppressedThroughAgentSeq = null,
         pendingStatusRequest = null,
         pendingSnapshotRequest = null,
         requiresSnapshot = false,
@@ -1261,17 +1408,26 @@ private val UINT64_MAX = BigInteger("18446744073709551615")
 private val CANONICAL_COUNTER = Regex("^(?:0|[1-9][0-9]*)$")
 private val SHA256_BASE64URL_PATTERN = Regex("^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$")
 private const val PRODUCTION_MAX_APPLIED_EVENT_EVIDENCE = 4_096
+private const val PRODUCTION_MAX_EVENT_IDENTITY_WITNESSES = 4_096
 private const val PRODUCTION_MAX_LIFECYCLE_RECORDS = 2_048
 private const val PRODUCTION_MAX_EVER_TURN_MARKERS = 2_048
 private const val PRODUCTION_MAX_NOTIFICATION_LEDGER_ENTRIES = 4_096
-private const val PRODUCTION_MAX_SNAPSHOT_RECORDS = 4_096
+private const val PRODUCTION_MAX_SNAPSHOT_RECORDS = 2_048
 private const val PRODUCTION_MAX_NOTIFICATION_DECISIONS_PER_REDUCTION = 64
 private const val PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS = 256
+private const val MAX_OPAQUE_ID_UTF8_BYTES = 128
 
 private fun requireOpaqueId(value: String?, label: String) {
     require(!value.isNullOrBlank()) { "$label is required" }
     require(value == value.trim()) { "$label cannot contain outer whitespace" }
     require(!value.contains('\u0000')) { "$label contains NUL" }
+    val encoder = StandardCharsets.UTF_8.newEncoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    require(encoder.canEncode(value)) { "$label is not well-formed Unicode" }
+    require(value.toByteArray(StandardCharsets.UTF_8).size <= MAX_OPAQUE_ID_UTF8_BYTES) {
+        "$label exceeds $MAX_OPAQUE_ID_UTF8_BYTES UTF-8 bytes"
+    }
 }
 
 private fun requireCanonicalCounter(value: String, label: String) {
