@@ -196,9 +196,30 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
       const label = `${fixture.name}[${index}]`;
       assertMachineStepShape(step, label, "authority");
       authorityDispositions.add(step.expect.disposition);
+      if (step.arrange !== undefined) {
+        assert.deepEqual(
+          Object.keys(step.arrange),
+          ["expireSourceDedupeEvidence"],
+          `${label}.arrange must use its closed machine-fixture schema`,
+        );
+        assert.ok(step.arrange.expireSourceDedupeEvidence.length > 0, `${label}.arrange evidence`);
+        for (const [arrangeIndex, key] of step.arrange.expireSourceDedupeEvidence.entries()) {
+          assert.deepEqual(
+            Object.keys(key).sort(),
+            ["sourceEpoch", "sourceEventId"],
+            `${label}.arrange[${arrangeIndex}]`,
+          );
+          assert.match(key.sourceEpoch, /\S/, `${label}.arrange[${arrangeIndex}].sourceEpoch`);
+          assert.match(key.sourceEventId, /\S/, `${label}.arrange[${arrangeIndex}].sourceEventId`);
+        }
+      }
       const sourceKey = `${step.input.sourceEpoch}:${step.input.sourceEventId}`;
       if (sourceEvents.has(sourceKey)) {
-        assert.deepEqual(step.input, sourceEvents.get(sourceKey), `${label} duplicate must be exact`);
+        if (step.expect.disposition === "source_event_conflict") {
+          assert.notDeepEqual(step.input, sourceEvents.get(sourceKey), `${label} conflict must differ`);
+        } else {
+          assert.deepEqual(step.input, sourceEvents.get(sourceKey), `${label} duplicate must be exact`);
+        }
       } else {
         sourceEvents.set(sourceKey, step.input);
       }

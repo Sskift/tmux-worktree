@@ -18,6 +18,12 @@ const binding = Object.freeze({
   sessionId: "session-opaque",
   timelineEpoch: "timeline-opaque",
 });
+const trustedAdapterBinding = Object.freeze({
+  hostId: binding.hostId,
+  hostEpoch: binding.hostEpoch,
+  scopeId: binding.scopeId,
+  sessionId: binding.sessionId,
+});
 
 const noCommitDispositions = new Set([
   "duplicate",
@@ -35,9 +41,24 @@ function sourceEvent(sourceSeq, sourceEventId, mutation, sourceEpoch = "source-m
 }
 
 function apply(state, input, disposition = "applied") {
-  const reduction = authority.reduceRelayAgentAuthority(state, input);
+  const reduction = authority.reduceRelayAgentAuthority(state, input, trustedAdapterBinding);
   assert.equal(reduction.disposition, disposition);
   return reduction;
+}
+
+function applyFixtureArrangement(state, arrange, label) {
+  if (arrange === undefined) return state;
+  assert.deepEqual(Object.keys(arrange), ["expireSourceDedupeEvidence"], `${label}.arrange`);
+  const sources = { ...state.sources };
+  for (const key of arrange.expireSourceDedupeEvidence) {
+    const source = sources[key.sourceEpoch];
+    assert.ok(source, `${label} source exists before dedupe expiry`);
+    assert.ok(Object.hasOwn(source.dedupe, key.sourceEventId), `${label} evidence exists before expiry`);
+    const dedupe = { ...source.dedupe };
+    delete dedupe[key.sourceEventId];
+    sources[key.sourceEpoch] = { ...source, dedupe };
+  }
+  return { ...state, sources };
 }
 
 function expectedObservation(reduction, input) {
@@ -49,6 +70,7 @@ function expectedObservation(reduction, input) {
     agentEventSeq: reduction.agentEventSeq,
     expectedSourceSeq: reduction.expectedSourceSeq,
     activeSourceEpoch: state.activeSourceEpoch,
+    sourceFenced: reduction.sourceFenced,
     runState: mutation.runId === undefined ? undefined : state.runs[mutation.runId]?.state,
     turnState: mutation.turnId === undefined || mutation.turnId === null
       ? undefined
@@ -62,13 +84,91 @@ function expectedObservation(reduction, input) {
   };
 }
 
+function assertPublicProjection(reduction, before, input, knownEntryTexts, label) {
+  const projected = reduction.publicEvent.mutation;
+  switch (input.mutation.mutationType) {
+    case "source.started":
+      assert.deepEqual(projected, {
+        mutationType: "source.availability",
+        state: "connected",
+        sourceEpoch: input.sourceEpoch,
+        reason: before.activeSourceEpoch === null ? null : "source_restarted",
+      }, `${label} source.started projection`);
+      break;
+    case "lifecycle.changed":
+      assert.deepEqual(projected, {
+        mutationType: "lifecycle.changed",
+        lifecycle: {
+          recordType: "lifecycle",
+          lifecycleEventId: reduction.publicEvent.eventId,
+          sourceEpoch: input.sourceEpoch,
+          scope: input.mutation.scope,
+          runId: input.mutation.runId,
+          turnId: input.mutation.turnId,
+          state: input.mutation.state,
+          failure: input.mutation.failure,
+          occurredAtMs: input.occurredAtMs,
+          agentEventSeq: reduction.agentEventSeq,
+        },
+      }, `${label} lifecycle projection`);
+      break;
+    case "text_entry.appended":
+      assert.deepEqual(projected, {
+        mutationType: "text_entry.appended",
+        entry: {
+          recordType: "text_entry",
+          entryId: input.mutation.entryId,
+          runId: input.mutation.runId,
+          turnId: input.mutation.turnId,
+          role: input.mutation.role,
+          state: "visible",
+          text: input.mutation.text,
+          redactionReason: null,
+          commandId: input.mutation.commandId,
+          createdAtMs: input.occurredAtMs,
+          createdAgentSeq: reduction.agentEventSeq,
+          lastModifiedAgentSeq: reduction.agentEventSeq,
+        },
+      }, `${label} text append projection`);
+      knownEntryTexts.set(input.mutation.entryId, input.mutation.text);
+      break;
+    case "entry.redacted":
+      assert.deepEqual(projected, {
+        mutationType: "entry.redacted",
+        entryId: input.mutation.entryId,
+        reason: input.mutation.reason,
+      }, `${label} redaction projection excludes text`);
+      assert.equal(Object.hasOwn(projected, "text"), false, `${label} redaction has no text field`);
+      assert.ok(knownEntryTexts.has(input.mutation.entryId), `${label} tracks the removed text`);
+      assert.equal(reduction.state.entries[input.mutation.entryId].text, null, `${label} clears materialized text`);
+      break;
+    case "entry.deleted":
+      assert.deepEqual(projected, {
+        mutationType: "entry.deleted",
+        entryId: input.mutation.entryId,
+        reason: input.mutation.reason,
+      }, `${label} delete projection excludes text`);
+      assert.equal(Object.hasOwn(projected, "text"), false, `${label} delete has no text field`);
+      assert.ok(knownEntryTexts.has(input.mutation.entryId), `${label} tracks the deleted text`);
+      assert.equal(reduction.state.entries[input.mutation.entryId], undefined, `${label} removes materialized entry`);
+      assert.ok(reduction.state.deletedEntries[input.mutation.entryId], `${label} retains delete tombstone`);
+      break;
+  }
+}
+
 test("shared authority machine cases drive the production reducer and consume every expectation", () => {
   for (const fixture of authorityCases) {
     let state = authority.createRelayAgentAuthorityState(binding);
+    const knownEntryTexts = new Map();
     for (const [index, step] of fixture.steps.entries()) {
+      state = applyFixtureArrangement(state, step.arrange, `${fixture.name}[${index}]`);
       const before = state;
       const beforeJson = JSON.stringify(before);
-      const reduction = authority.reduceRelayAgentAuthority(before, step.input);
+      const reduction = authority.reduceRelayAgentAuthority(
+        before,
+        step.input,
+        trustedAdapterBinding,
+      );
       const observed = expectedObservation(reduction, step.input);
 
       for (const [key, expected] of Object.entries(step.expect)) {
@@ -82,10 +182,13 @@ test("shared authority machine cases drive the production reducer and consume ev
         assert.ok(reduction.publicEvent, `${fixture.name}[${index}] public event`);
         assert.equal(reduction.publicEvent.agentEventSeq, reduction.state.agentEventSeq);
         assert.notEqual(reduction.publicEvent.eventId, step.input.sourceEventId);
-        if (step.input.mutation.mutationType === "source.started") {
-          assert.equal(reduction.publicEvent.mutation.mutationType, "source.availability");
-          assert.equal(reduction.publicEvent.mutation.state, "connected");
-        }
+        assertPublicProjection(
+          reduction,
+          before,
+          step.input,
+          knownEntryTexts,
+          `${fixture.name}[${index}]`,
+        );
         if (step.input.mutation.mutationType === "lifecycle.changed") {
           assert.equal(reduction.publicEvent.mutation.lifecycle.lifecycleEventId, reduction.publicEvent.eventId);
           assert.notEqual(reduction.publicEvent.mutation.lifecycle.lifecycleEventId, step.input.sourceEventId);
@@ -93,6 +196,9 @@ test("shared authority machine cases drive the production reducer and consume ev
       } else if (reduction.disposition === "redundant_terminal") {
         assert.notEqual(reduction.state, before, `${fixture.name}[${index}] must consume source cursor`);
         assert.equal(reduction.publicEvent, null);
+      } else if (reduction.disposition === "source_event_conflict") {
+        assert.equal(reduction.publicEvent, null);
+        assert.equal(reduction.state.sources[step.input.sourceEpoch].fenced, true);
       } else if (noCommitDispositions.has(reduction.disposition)) {
         assert.equal(reduction.state, before, `${fixture.name}[${index}] must not half-commit`);
         assert.equal(reduction.publicEvent, null);
@@ -100,6 +206,51 @@ test("shared authority machine cases drive the production reducer and consume ev
       state = reduction.state;
     }
   }
+});
+
+test("a new source at seq 1 without source.started is invalid, while seq above 1 is a gap", () => {
+  let state = authority.createRelayAgentAuthorityState(binding);
+  state = apply(state, sourceEvent(
+    "1",
+    "old-source-start",
+    { mutationType: "source.started" },
+    "source-old",
+  )).state;
+  const before = state;
+  const nonStart = {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-new",
+    turnId: null,
+    state: "running",
+    failure: null,
+  };
+
+  const invalid = apply(state, sourceEvent(
+    "1",
+    "new-source-not-started",
+    nonStart,
+    "source-new",
+  ), "invalid_transition");
+  assert.equal(invalid.state, before);
+  assert.equal(invalid.expectedSourceSeq, null);
+
+  const gap = apply(state, sourceEvent(
+    "2",
+    "new-source-skips-start",
+    nonStart,
+    "source-new",
+  ), "source_gap");
+  assert.equal(gap.state, before);
+  assert.equal(gap.expectedSourceSeq, "1");
+
+  state = apply(state, sourceEvent(
+    "1",
+    "new-source-corrected-start",
+    { mutationType: "source.started" },
+    "source-new",
+  )).state;
+  assert.equal(state.activeSourceEpoch, "source-new");
 });
 
 test("source dedupe uses the full canonical fingerprint, fences conflicts, and expires without evidence", () => {
@@ -481,6 +632,43 @@ test("the same turnId is independent across different runs", () => {
   assert.deepEqual(state.runs["run-two"].turnIds, ["shared-turn-id"]);
 });
 
+test("trusted adapter binding is checked before source parsing and cannot be self-reported", () => {
+  const state = authority.createRelayAgentAuthorityState(binding);
+  const beforeJson = JSON.stringify(state);
+  assert.throws(
+    () => authority.reduceRelayAgentAuthority(
+      state,
+      { malformed: "source payload must not be parsed first" },
+      { ...trustedAdapterBinding, sessionId: "wrong-session" },
+    ),
+    (error) => error instanceof authority.RelayAgentAuthorityBindingError
+      && error.code === "adapter_binding_mismatch",
+  );
+  assert.equal(state.agentEventSeq, "0");
+  assert.equal(state.activeSourceEpoch, null);
+  assert.equal(JSON.stringify(state), beforeJson);
+
+  assert.throws(
+    () => authority.reduceRelayAgentAuthority(
+      state,
+      { ...sourceEvent("1", "self-reported", { mutationType: "source.started" }), sessionId: binding.sessionId },
+      trustedAdapterBinding,
+    ),
+    authority.RelayAgentAuthorityInputError,
+  );
+
+  const applied = apply(state, sourceEvent("1", "trusted-start", { mutationType: "source.started" }));
+  assert.deepEqual(
+    {
+      hostId: applied.publicEvent.hostId,
+      hostEpoch: applied.publicEvent.hostEpoch,
+      scopeId: applied.publicEvent.scopeId,
+      sessionId: applied.publicEvent.sessionId,
+    },
+    trustedAdapterBinding,
+  );
+});
+
 test("controlled source input is closed, bounded, canonical, and excludes inference events", () => {
   const initial = authority.createRelayAgentAuthorityState(binding);
   const validStart = sourceEvent("1", "start", { mutationType: "source.started" });
@@ -500,7 +688,7 @@ test("controlled source input is closed, bounded, canonical, and excludes infere
   ];
   for (const input of invalidInputs) {
     assert.throws(
-      () => authority.reduceRelayAgentAuthority(initial, input),
+      () => authority.reduceRelayAgentAuthority(initial, input, trustedAdapterBinding),
       (error) => error instanceof authority.RelayAgentAuthorityInputError
         && error.code === "invalid_source_event",
     );
@@ -585,7 +773,11 @@ test("controlled source input is closed, bounded, canonical, and excludes infere
     },
   ]) {
     assert.throws(
-      () => authority.reduceRelayAgentAuthority(state, sourceEvent("5", "invalid-bounded", mutation)),
+      () => authority.reduceRelayAgentAuthority(
+        state,
+        sourceEvent("5", "invalid-bounded", mutation),
+        trustedAdapterBinding,
+      ),
       authority.RelayAgentAuthorityInputError,
     );
     assert.equal(state, before);

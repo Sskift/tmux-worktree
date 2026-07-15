@@ -202,5 +202,46 @@
         "expect": { "disposition": "entry_deleted", "agentEventSeq": "6", "entryState": "deleted" }
       }
     ]
+  },
+  {
+    "name": "source-event-conflict-fences-active-source",
+    "scenarios": ["duplicate", "source-event-conflict"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-7", "sourceSeq": "1", "sourceEventId": "source-7-start", "occurredAtMs": 7000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-7", "sourceSeq": "1", "sourceEventId": "source-7-start", "occurredAtMs": 7001, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "source_event_conflict", "agentEventSeq": "1", "sourceFenced": true }
+      },
+      {
+        "input": { "sourceEpoch": "source-7", "sourceSeq": "2", "sourceEventId": "source-7-after-fence", "occurredAtMs": 7010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-7", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "source_event_conflict", "agentEventSeq": "1", "sourceFenced": true }
+      }
+    ]
+  },
+  {
+    "name": "old-source-sequence-without-dedupe-evidence-is-history-expired",
+    "scenarios": ["duplicate", "source-history-expired"],
+    "steps": [
+      {
+        "input": { "sourceEpoch": "source-8", "sourceSeq": "1", "sourceEventId": "source-8-start", "occurredAtMs": 8000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "applied", "agentEventSeq": "1" }
+      },
+      {
+        "input": { "sourceEpoch": "source-8", "sourceSeq": "2", "sourceEventId": "run-8-running", "occurredAtMs": 8010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-8", "turnId": null, "state": "running", "failure": null } },
+        "expect": { "disposition": "applied", "agentEventSeq": "2" }
+      },
+      {
+        "arrange": {
+          "expireSourceDedupeEvidence": [
+            { "sourceEpoch": "source-8", "sourceEventId": "source-8-start" }
+          ]
+        },
+        "input": { "sourceEpoch": "source-8", "sourceSeq": "1", "sourceEventId": "source-8-start", "occurredAtMs": 8000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "source_history_expired", "agentEventSeq": "2" }
+      }
+    ]
   }
 ]

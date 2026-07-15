@@ -36,6 +36,14 @@ export interface RelayAgentAuthorityBinding {
   timelineEpoch: string;
 }
 
+/** Authenticated adapter route binding; timelineEpoch remains host-store owned. */
+export interface RelayAgentTrustedAdapterBinding {
+  hostId: string;
+  hostEpoch: string;
+  scopeId: string;
+  sessionId: string;
+}
+
 export interface RelayAgentFailure {
   code: string;
   summary: string | null;
@@ -236,6 +244,16 @@ export class RelayAgentAuthorityStateError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "RelayAgentAuthorityStateError";
+  }
+}
+
+export class RelayAgentAuthorityBindingError extends Error {
+  constructor(
+    readonly code: "adapter_binding_invalid" | "adapter_binding_mismatch",
+    message: string,
+  ) {
+    super(message);
+    this.name = "RelayAgentAuthorityBindingError";
   }
 }
 
@@ -852,6 +870,46 @@ function fenceSource(
   return deepFreeze({ ...state, sources: Object.freeze(sources) });
 }
 
+function parseTrustedAdapterBinding(value: unknown): RelayAgentTrustedAdapterBinding {
+  try {
+    const parsed = asClosedObject(value, "trusted adapter binding", [
+      "hostId",
+      "hostEpoch",
+      "scopeId",
+      "sessionId",
+    ]);
+    return deepFreeze({
+      hostId: parseOpaqueId(parsed.hostId, "trustedAdapterBinding.hostId"),
+      hostEpoch: parseOpaqueId(parsed.hostEpoch, "trustedAdapterBinding.hostEpoch"),
+      scopeId: parseOpaqueId(parsed.scopeId, "trustedAdapterBinding.scopeId"),
+      sessionId: parseOpaqueId(parsed.sessionId, "trustedAdapterBinding.sessionId"),
+    });
+  } catch (error) {
+    if (error instanceof RelayAgentAuthorityInputError) {
+      throw new RelayAgentAuthorityBindingError("adapter_binding_invalid", error.message);
+    }
+    throw error;
+  }
+}
+
+function assertTrustedAdapterBinding(
+  state: RelayAgentAuthorityState,
+  value: unknown,
+): void {
+  const binding = parseTrustedAdapterBinding(value);
+  if (
+    binding.hostId !== state.binding.hostId
+    || binding.hostEpoch !== state.binding.hostEpoch
+    || binding.scopeId !== state.binding.scopeId
+    || binding.sessionId !== state.binding.sessionId
+  ) {
+    throw new RelayAgentAuthorityBindingError(
+      "adapter_binding_mismatch",
+      "trusted adapter binding does not match the authority state owner",
+    );
+  }
+}
+
 export function createRelayAgentAuthorityState(binding: RelayAgentAuthorityBinding): RelayAgentAuthorityState {
   const parsed = asClosedObject(binding, "authority binding", [
     "hostId",
@@ -883,13 +941,17 @@ export function createRelayAgentAuthorityState(binding: RelayAgentAuthorityBindi
 /**
  * Pure authority transition. It performs no I/O, persistence, transport,
  * capability advertisement, snapshot, replay, command, or terminal work.
+ * The trusted adapter binding is verified before the untrusted source payload
+ * is parsed; source events cannot self-report or override resource identity.
  * A caller must atomically persist the returned state and publicEvent before
  * acknowledging any result whose state differs from the input state.
  */
 export function reduceRelayAgentAuthority(
   state: RelayAgentAuthorityState,
   sourceInput: unknown,
+  trustedAdapterBinding: RelayAgentTrustedAdapterBinding,
 ): RelayAgentAuthorityReduction {
+  assertTrustedAdapterBinding(state, trustedAdapterBinding);
   const event = parseSourceEvent(sourceInput);
   const fingerprintDigest = fingerprintSourceEvent(event);
   const source = state.sources[event.sourceEpoch];
@@ -912,7 +974,7 @@ export function reduceRelayAgentAuthority(
   }
 
   if (state.activeSourceEpoch !== null && event.sourceEpoch !== state.activeSourceEpoch) {
-    if (event.mutation.mutationType !== "source.started" || event.sourceSeq !== "1") {
+    if (event.sourceSeq !== "1") {
       return result(state, "source_gap", { expectedSourceSeq: "1" });
     }
   }

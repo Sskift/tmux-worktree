@@ -57,6 +57,8 @@
       "duplicate",
       "source_gap",
       "stale_source",
+      "source_event_conflict",
+      "source_history_expired",
       "invalid_transition",
       "redundant_terminal",
       "terminal_conflict",
