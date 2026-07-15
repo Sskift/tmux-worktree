@@ -216,6 +216,10 @@
         "expect": { "disposition": "source_event_conflict", "agentEventSeq": "1", "sourceFenced": true }
       },
       {
+        "input": { "sourceEpoch": "source-7", "sourceSeq": "1", "sourceEventId": "source-7-start", "occurredAtMs": 7000, "mutation": { "mutationType": "source.started" } },
+        "expect": { "disposition": "duplicate", "agentEventSeq": "1" }
+      },
+      {
         "input": { "sourceEpoch": "source-7", "sourceSeq": "2", "sourceEventId": "source-7-after-fence", "occurredAtMs": 7010, "mutation": { "mutationType": "lifecycle.changed", "scope": "run", "runId": "run-7", "turnId": null, "state": "running", "failure": null } },
         "expect": { "disposition": "source_event_conflict", "agentEventSeq": "1", "sourceFenced": true }
       }

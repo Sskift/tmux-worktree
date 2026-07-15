@@ -6,6 +6,10 @@ const MAX_ID_UTF8_BYTES = 128;
 const MAX_TEXT_UTF8_BYTES = 65_536;
 const MAX_FAILURE_SUMMARY_UTF8_BYTES = 1_024;
 
+export const RELAY_AGENT_AUTHORITY_HARD_LIMITS = Object.freeze({
+  maxSourceDedupeEvidence: 100_000,
+});
+
 export type RelayAgentLifecycleState =
   | "running"
   | "waiting_for_user"
@@ -42,6 +46,11 @@ export interface RelayAgentTrustedAdapterBinding {
   hostEpoch: string;
   scopeId: string;
   sessionId: string;
+}
+
+/** Optional safer override. It may only reduce the production hard cap. */
+export interface RelayAgentAuthorityCapacityOverride {
+  maxSourceDedupeEvidence: number;
 }
 
 export interface RelayAgentFailure {
@@ -170,6 +179,8 @@ export interface RelayAgentSourceAuthorityState {
 export interface RelayAgentAuthorityState {
   schemaVersion: 1;
   binding: Readonly<RelayAgentAuthorityBinding>;
+  limits: Readonly<RelayAgentAuthorityCapacityOverride>;
+  dedupeEvidenceCount: number;
   agentEventSeq: string;
   activeSourceEpoch: string | null;
   sources: Readonly<Record<string, RelayAgentSourceAuthorityState>>;
@@ -257,6 +268,15 @@ export class RelayAgentAuthorityBindingError extends Error {
   }
 }
 
+export class RelayAgentAuthorityCapacityError extends Error {
+  readonly code = "authority_capacity_exceeded" as const;
+
+  constructor(readonly maxSourceDedupeEvidence: number) {
+    super("Relay Agent authority source dedupe evidence capacity is exhausted");
+    this.name = "RelayAgentAuthorityCapacityError";
+  }
+}
+
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
 interface DomainReduction {
@@ -294,6 +314,80 @@ function deepFreeze<T>(value: T): T {
     for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
+}
+
+/**
+ * State may be restored into ordinary mutable objects. Every committed
+ * transition therefore detaches the complete bounded state graph before it is
+ * frozen; no returned immutable state can freeze or retain caller-owned
+ * objects from the input graph.
+ */
+function detachedImmutableState(state: RelayAgentAuthorityState): RelayAgentAuthorityState {
+  const sources = Object.create(null) as Record<string, RelayAgentSourceAuthorityState>;
+  for (const [sourceKey, source] of Object.entries(state.sources)) {
+    const dedupe = Object.create(null) as Record<string, RelayAgentSourceDedupeEvidence>;
+    for (const [eventKey, evidence] of Object.entries(source.dedupe)) {
+      dedupe[eventKey] = { ...evidence };
+    }
+    sources[sourceKey] = {
+      sourceEpoch: source.sourceEpoch,
+      lastSourceSeq: source.lastSourceSeq,
+      fenced: source.fenced,
+      dedupe,
+    };
+  }
+
+  const runs = Object.create(null) as Record<string, RelayAgentRunRecord>;
+  for (const [runKey, run] of Object.entries(state.runs)) {
+    runs[runKey] = {
+      runId: run.runId,
+      sourceEpoch: run.sourceEpoch,
+      state: run.state,
+      turnIds: [...run.turnIds],
+      lifecycle: {
+        ...run.lifecycle,
+        failure: run.lifecycle.failure === null ? null : { ...run.lifecycle.failure },
+      },
+    };
+  }
+
+  const turns = Object.create(null) as Record<string, RelayAgentTurnRecord>;
+  for (const [turnKeyValue, turn] of Object.entries(state.turns)) {
+    turns[turnKeyValue] = {
+      turnId: turn.turnId,
+      runId: turn.runId,
+      sourceEpoch: turn.sourceEpoch,
+      state: turn.state,
+      lifecycle: {
+        ...turn.lifecycle,
+        failure: turn.lifecycle.failure === null ? null : { ...turn.lifecycle.failure },
+      },
+    };
+  }
+
+  const entries = Object.create(null) as Record<string, RelayAgentTextEntryRecord>;
+  for (const [entryKey, entry] of Object.entries(state.entries)) {
+    entries[entryKey] = { ...entry };
+  }
+
+  const deletedEntries = Object.create(null) as Record<string, RelayAgentDeletedEntryTombstone>;
+  for (const [entryKey, tombstone] of Object.entries(state.deletedEntries)) {
+    deletedEntries[entryKey] = { ...tombstone };
+  }
+
+  return deepFreeze({
+    schemaVersion: 1,
+    binding: { ...state.binding },
+    limits: { ...state.limits },
+    dedupeEvidenceCount: state.dedupeEvidenceCount,
+    agentEventSeq: state.agentEventSeq,
+    activeSourceEpoch: state.activeSourceEpoch,
+    sources,
+    runs,
+    turns,
+    entries,
+    deletedEntries,
+  });
 }
 
 function assertWellFormedUnicode(value: string, label: string): void {
@@ -631,7 +725,7 @@ function reduceLifecycle(
       return rejectedDomain(state, "invalid_transition");
     }
     const runs = cloneRecord(state.runs);
-    runs[mutation.runId] = deepFreeze({ ...existing, state: mutation.state, lifecycle: record });
+    runs[mutation.runId] = Object.freeze({ ...existing, state: mutation.state, lifecycle: record });
     return {
       disposition: "applied",
       runs: Object.freeze(runs),
@@ -664,7 +758,7 @@ function reduceLifecycle(
       lifecycle: record,
     });
     const runs = cloneRecord(state.runs);
-    runs[mutation.runId] = deepFreeze({
+    runs[mutation.runId] = Object.freeze({
       ...run,
       turnIds: Object.freeze([...run.turnIds, turnId]),
     });
@@ -690,7 +784,7 @@ function reduceLifecycle(
   }
   if (isTerminal(run.state)) return rejectedDomain(state, "invalid_transition");
   const turns = cloneRecord(state.turns);
-  turns[compositeTurnKey] = deepFreeze({ ...existing, state: mutation.state, lifecycle: record });
+  turns[compositeTurnKey] = Object.freeze({ ...existing, state: mutation.state, lifecycle: record });
   return {
     disposition: "applied",
     runs: state.runs,
@@ -850,7 +944,7 @@ function result(
     sourceFenced?: boolean;
   } = {},
 ): RelayAgentAuthorityReduction {
-  return deepFreeze({
+  return Object.freeze({
     state,
     disposition,
     agentEventSeq: state.agentEventSeq,
@@ -866,8 +960,55 @@ function fenceSource(
 ): RelayAgentAuthorityState {
   if (source.fenced) return state;
   const sources = cloneRecord(state.sources);
-  sources[source.sourceEpoch] = deepFreeze({ ...source, fenced: true });
-  return deepFreeze({ ...state, sources: Object.freeze(sources) });
+  sources[source.sourceEpoch] = Object.freeze({ ...source, fenced: true });
+  return detachedImmutableState({ ...state, sources: Object.freeze(sources) });
+}
+
+function authorityLimits(
+  override: RelayAgentAuthorityCapacityOverride | undefined,
+): Readonly<RelayAgentAuthorityCapacityOverride> {
+  if (override === undefined) return RELAY_AGENT_AUTHORITY_HARD_LIMITS;
+  if (
+    override === null
+    || typeof override !== "object"
+    || Array.isArray(override)
+    || Object.keys(override).length !== 1
+    || !Object.hasOwn(override, "maxSourceDedupeEvidence")
+    || !Number.isSafeInteger(override.maxSourceDedupeEvidence)
+    || override.maxSourceDedupeEvidence < 1
+    || override.maxSourceDedupeEvidence > RELAY_AGENT_AUTHORITY_HARD_LIMITS.maxSourceDedupeEvidence
+  ) {
+    throw new RelayAgentAuthorityStateError(
+      "Relay Agent authority capacity override must only reduce the production hard cap",
+    );
+  }
+  return Object.freeze({ maxSourceDedupeEvidence: override.maxSourceDedupeEvidence });
+}
+
+function assertDedupeCapacityForAppend(state: RelayAgentAuthorityState): number {
+  const limit = state.limits?.maxSourceDedupeEvidence;
+  if (
+    !Number.isSafeInteger(limit)
+    || limit < 1
+    || limit > RELAY_AGENT_AUTHORITY_HARD_LIMITS.maxSourceDedupeEvidence
+  ) {
+    throw new RelayAgentAuthorityStateError(
+      "Relay Agent authority state cannot relax the production hard cap",
+    );
+  }
+  const actualEvidenceCount = Object.values(state.sources).reduce(
+    (total, source) => total + Object.keys(source.dedupe).length,
+    0,
+  );
+  if (state.dedupeEvidenceCount !== actualEvidenceCount) {
+    throw new RelayAgentAuthorityStateError(
+      "Relay Agent authority dedupe evidence count does not match retained state",
+    );
+  }
+  if (actualEvidenceCount >= limit) {
+    throw new RelayAgentAuthorityCapacityError(limit);
+  }
+  return actualEvidenceCount;
 }
 
 function parseTrustedAdapterBinding(value: unknown): RelayAgentTrustedAdapterBinding {
@@ -910,7 +1051,10 @@ function assertTrustedAdapterBinding(
   }
 }
 
-export function createRelayAgentAuthorityState(binding: RelayAgentAuthorityBinding): RelayAgentAuthorityState {
+export function createRelayAgentAuthorityState(
+  binding: RelayAgentAuthorityBinding,
+  capacityOverride?: RelayAgentAuthorityCapacityOverride,
+): RelayAgentAuthorityState {
   const parsed = asClosedObject(binding, "authority binding", [
     "hostId",
     "hostEpoch",
@@ -925,9 +1069,11 @@ export function createRelayAgentAuthorityState(binding: RelayAgentAuthorityBindi
     sessionId: parseOpaqueId(parsed.sessionId, "binding.sessionId"),
     timelineEpoch: parseOpaqueId(parsed.timelineEpoch, "binding.timelineEpoch"),
   });
-  return deepFreeze({
+  return detachedImmutableState({
     schemaVersion: 1,
     binding: normalizedBinding,
+    limits: authorityLimits(capacityOverride),
+    dedupeEvidenceCount: 0,
     agentEventSeq: "0",
     activeSourceEpoch: null,
     sources: emptyRecord(),
@@ -960,14 +1106,14 @@ export function reduceRelayAgentAuthority(
     return result(state, "stale_source");
   }
 
-  if (source?.fenced) return result(state, "source_event_conflict", { sourceFenced: true });
-
   const retained = source?.dedupe[event.sourceEventId];
   if (retained) {
     if (retained.fingerprintDigest === fingerprintDigest) return result(state, "duplicate");
     const fencedState = fenceSource(state, source);
     return result(fencedState, "source_event_conflict", { sourceFenced: true });
   }
+
+  if (source?.fenced) return result(state, "source_event_conflict", { sourceFenced: true });
 
   if (source && BigInt(event.sourceSeq) <= BigInt(source.lastSourceSeq)) {
     return result(state, "source_history_expired");
@@ -996,6 +1142,7 @@ export function reduceRelayAgentAuthority(
   if (domain.disposition !== "applied" && domain.disposition !== "redundant_terminal") {
     return result(state, domain.disposition);
   }
+  const retainedEvidenceCount = assertDedupeCapacityForAppend(state);
 
   const dedupe = cloneRecord(source?.dedupe ?? emptyRecord<RelayAgentSourceDedupeEvidence>());
   dedupe[event.sourceEventId] = deepFreeze({
@@ -1007,7 +1154,7 @@ export function reduceRelayAgentAuthority(
     fingerprintAlgorithm: "sha256-canonical-json",
     fingerprintDigest,
   });
-  const nextSource: RelayAgentSourceAuthorityState = deepFreeze({
+  const nextSource: RelayAgentSourceAuthorityState = Object.freeze({
     sourceEpoch: event.sourceEpoch,
     lastSourceSeq: event.sourceSeq,
     fenced: false,
@@ -1017,7 +1164,11 @@ export function reduceRelayAgentAuthority(
   sources[event.sourceEpoch] = nextSource;
 
   if (domain.disposition === "redundant_terminal") {
-    const nextState = deepFreeze({ ...state, sources: Object.freeze(sources) });
+    const nextState = detachedImmutableState({
+      ...state,
+      dedupeEvidenceCount: retainedEvidenceCount + 1,
+      sources: Object.freeze(sources),
+    });
     return result(nextState, "redundant_terminal");
   }
 
@@ -1028,8 +1179,9 @@ export function reduceRelayAgentAuthority(
     occurredAtMs: event.occurredAtMs,
     mutation: domain.publicMutation!,
   });
-  const nextState: RelayAgentAuthorityState = deepFreeze({
+  const nextState: RelayAgentAuthorityState = detachedImmutableState({
     ...state,
+    dedupeEvidenceCount: retainedEvidenceCount + 1,
     agentEventSeq: nextAgentEventSeq,
     activeSourceEpoch: event.mutation.mutationType === "source.started"
       ? event.sourceEpoch

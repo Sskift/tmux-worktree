@@ -46,10 +46,43 @@ function apply(state, input, disposition = "applied") {
   return reduction;
 }
 
+function captureObjectGraph(root) {
+  const captured = new Map();
+  const visit = (value) => {
+    if (value === null || typeof value !== "object" || captured.has(value)) return;
+    captured.set(value, Object.isFrozen(value));
+    for (const child of Object.values(value)) visit(child);
+  };
+  visit(root);
+  return captured;
+}
+
+function reduceMutableAndAssertIsolation(mutableState, input, disposition, label) {
+  const beforeJson = JSON.stringify(mutableState);
+  const oldGraph = captureObjectGraph(mutableState);
+  const reduction = authority.reduceRelayAgentAuthority(
+    mutableState,
+    input,
+    trustedAdapterBinding,
+  );
+  assert.equal(reduction.disposition, disposition, `${label} disposition`);
+  assert.notEqual(reduction.state, mutableState, `${label} returns new state`);
+  assert.equal(JSON.stringify(mutableState), beforeJson, `${label} preserves old content`);
+  for (const [object, wasFrozen] of oldGraph) {
+    assert.equal(Object.isFrozen(object), wasFrozen, `${label} preserves old freeze state`);
+  }
+  for (const [object, isFrozen] of captureObjectGraph(reduction.state)) {
+    assert.equal(isFrozen, true, `${label} freezes the returned graph`);
+    assert.equal(oldGraph.has(object), false, `${label} detaches the returned graph`);
+  }
+  return reduction;
+}
+
 function applyFixtureArrangement(state, arrange, label) {
   if (arrange === undefined) return state;
   assert.deepEqual(Object.keys(arrange), ["expireSourceDedupeEvidence"], `${label}.arrange`);
   const sources = { ...state.sources };
+  let expiredCount = 0;
   for (const key of arrange.expireSourceDedupeEvidence) {
     const source = sources[key.sourceEpoch];
     assert.ok(source, `${label} source exists before dedupe expiry`);
@@ -57,8 +90,13 @@ function applyFixtureArrangement(state, arrange, label) {
     const dedupe = { ...source.dedupe };
     delete dedupe[key.sourceEventId];
     sources[key.sourceEpoch] = { ...source, dedupe };
+    expiredCount += 1;
   }
-  return { ...state, sources };
+  return {
+    ...state,
+    dedupeEvidenceCount: state.dedupeEvidenceCount - expiredCount,
+    sources,
+  };
 }
 
 function expectedObservation(reduction, input) {
@@ -253,6 +291,130 @@ test("a new source at seq 1 without source.started is invalid, while seq above 1
   assert.equal(state.activeSourceEpoch, "source-new");
 });
 
+test("rejected and no-op reductions do not freeze mutable caller-owned state", () => {
+  const mutableInitial = JSON.parse(JSON.stringify(
+    authority.createRelayAgentAuthorityState(binding),
+  ));
+  assert.equal(Object.isFrozen(mutableInitial), false);
+  assert.equal(Object.isFrozen(mutableInitial.binding), false);
+  assert.equal(Object.isFrozen(mutableInitial.sources), false);
+
+  const rejected = authority.reduceRelayAgentAuthority(
+    mutableInitial,
+    sourceEvent("1", "not-started", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "run-rejected",
+      turnId: null,
+      state: "running",
+      failure: null,
+    }),
+    trustedAdapterBinding,
+  );
+  assert.equal(rejected.disposition, "invalid_transition");
+  assert.equal(rejected.state, mutableInitial);
+  assert.equal(Object.isFrozen(rejected), true, "only the reduction wrapper is frozen");
+  assert.equal(Object.isFrozen(mutableInitial), false);
+  assert.equal(Object.isFrozen(mutableInitial.binding), false);
+  assert.equal(Object.isFrozen(mutableInitial.sources), false);
+
+  const started = sourceEvent("1", "mutable-start", { mutationType: "source.started" });
+  const accepted = apply(authority.createRelayAgentAuthorityState(binding), started).state;
+  const mutableAccepted = JSON.parse(JSON.stringify(accepted));
+  const mutableSource = mutableAccepted.sources["source-main"];
+  assert.equal(Object.isFrozen(mutableAccepted), false);
+  assert.equal(Object.isFrozen(mutableSource), false);
+  assert.equal(Object.isFrozen(mutableSource.dedupe), false);
+
+  const duplicate = authority.reduceRelayAgentAuthority(
+    mutableAccepted,
+    started,
+    trustedAdapterBinding,
+  );
+  assert.equal(duplicate.disposition, "duplicate");
+  assert.equal(duplicate.state, mutableAccepted);
+  assert.equal(Object.isFrozen(duplicate), true);
+  assert.equal(Object.isFrozen(mutableAccepted), false);
+  assert.equal(Object.isFrozen(mutableSource), false);
+  assert.equal(Object.isFrozen(mutableSource.dedupe), false);
+});
+
+test("committed reductions detach immutable state from mutable restored input", () => {
+  const mutableInitial = JSON.parse(JSON.stringify(
+    authority.createRelayAgentAuthorityState(binding),
+  ));
+  const started = sourceEvent("1", "detached-start", { mutationType: "source.started" });
+  const startReduction = reduceMutableAndAssertIsolation(
+    mutableInitial,
+    started,
+    "applied",
+    "source.started",
+  );
+
+  const mutableStarted = JSON.parse(JSON.stringify(startReduction.state));
+  const lifecycleReduction = reduceMutableAndAssertIsolation(
+    mutableStarted,
+    sourceEvent("2", "detached-run", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "run-detached",
+      turnId: null,
+      state: "running",
+      failure: null,
+    }),
+    "applied",
+    "lifecycle applied",
+  );
+
+  const mutableAccepted = JSON.parse(JSON.stringify(lifecycleReduction.state));
+  const conflicting = structuredClone(started);
+  conflicting.occurredAtMs += 1;
+  const conflictReduction = reduceMutableAndAssertIsolation(
+    mutableAccepted,
+    conflicting,
+    "source_event_conflict",
+    "source conflict fence",
+  );
+  assert.equal(conflictReduction.state.sources["source-main"].fenced, true);
+
+  let terminalState = authority.createRelayAgentAuthorityState(binding);
+  terminalState = apply(terminalState, sourceEvent(
+    "1",
+    "redundant-start",
+    { mutationType: "source.started" },
+  )).state;
+  terminalState = apply(terminalState, sourceEvent("2", "redundant-run", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-redundant-detached",
+    turnId: null,
+    state: "running",
+    failure: null,
+  })).state;
+  terminalState = apply(terminalState, sourceEvent("3", "redundant-completed", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-redundant-detached",
+    turnId: null,
+    state: "completed",
+    failure: null,
+  })).state;
+  const redundantReduction = reduceMutableAndAssertIsolation(
+    JSON.parse(JSON.stringify(terminalState)),
+    sourceEvent("4", "redundant-completed-again", {
+      mutationType: "lifecycle.changed",
+      scope: "run",
+      runId: "run-redundant-detached",
+      turnId: null,
+      state: "completed",
+      failure: null,
+    }),
+    "redundant_terminal",
+    "redundant terminal",
+  );
+  assert.equal(redundantReduction.publicEvent, null);
+});
+
 test("source dedupe uses the full canonical fingerprint, fences conflicts, and expires without evidence", () => {
   let state = authority.createRelayAgentAuthorityState(binding);
   const started = sourceEvent("1", "start-key", { mutationType: "source.started" });
@@ -272,6 +434,11 @@ test("source dedupe uses the full canonical fingerprint, fences conflicts, and e
   assert.equal(conflict.agentEventSeq, "1");
   assert.equal(conflict.state.sources["source-main"].lastSourceSeq, "1");
   assert.equal(conflict.publicEvent, null);
+
+  const acceptedReplay = apply(conflict.state, started, "duplicate");
+  assert.equal(acceptedReplay.state, conflict.state);
+  assert.equal(acceptedReplay.agentEventSeq, "1");
+  assert.equal(acceptedReplay.publicEvent, null);
 
   const fenced = apply(conflict.state, sourceEvent("2", "after-fence", {
     mutationType: "lifecycle.changed",
@@ -311,6 +478,7 @@ test("source dedupe uses the full canonical fingerprint, fences conflicts, and e
   delete trimmedDedupe["start-key"];
   const trimmedState = {
     ...state,
+    dedupeEvidenceCount: state.dedupeEvidenceCount - 1,
     sources: {
       ...state.sources,
       "source-main": { ...source, dedupe: trimmedDedupe },
@@ -319,6 +487,68 @@ test("source dedupe uses the full canonical fingerprint, fences conflicts, and e
   const expired = apply(trimmedState, started, "source_history_expired");
   assert.equal(expired.state, trimmedState);
   assert.equal(expired.agentEventSeq, "2");
+});
+
+test("dedupe evidence hard capacity fails closed after retained duplicates are checked", () => {
+  let state = authority.createRelayAgentAuthorityState(binding, {
+    maxSourceDedupeEvidence: 3,
+  });
+  const started = sourceEvent("1", "capacity-start", { mutationType: "source.started" });
+  const running = sourceEvent("2", "capacity-running", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-capacity",
+    turnId: null,
+    state: "running",
+    failure: null,
+  });
+  const completed = sourceEvent("3", "capacity-completed", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "run-capacity",
+    turnId: null,
+    state: "completed",
+    failure: null,
+  });
+  state = apply(state, started).state;
+  state = apply(state, running).state;
+  state = apply(state, completed).state;
+  assert.equal(state.dedupeEvidenceCount, 3);
+  assert.equal(Object.keys(state.sources["source-main"].dedupe).length, 3);
+
+  const duplicate = apply(state, structuredClone(started), "duplicate");
+  assert.equal(duplicate.state, state, "retained exact evidence wins at capacity");
+  assert.equal(duplicate.publicEvent, null);
+
+  const beforeJson = JSON.stringify(state);
+  assert.throws(
+    () => authority.reduceRelayAgentAuthority(
+      state,
+      sourceEvent("4", "capacity-redundant", {
+        mutationType: "lifecycle.changed",
+        scope: "run",
+        runId: "run-capacity",
+        turnId: null,
+        state: "completed",
+        failure: null,
+      }),
+      trustedAdapterBinding,
+    ),
+    (error) => error instanceof authority.RelayAgentAuthorityCapacityError
+      && error.code === "authority_capacity_exceeded"
+      && error.maxSourceDedupeEvidence === 3,
+  );
+  assert.equal(JSON.stringify(state), beforeJson);
+  assert.equal(state.sources["source-main"].lastSourceSeq, "3");
+  assert.equal(state.agentEventSeq, "3");
+
+  assert.throws(
+    () => authority.createRelayAgentAuthorityState(binding, {
+      maxSourceDedupeEvidence:
+        authority.RELAY_AGENT_AUTHORITY_HARD_LIMITS.maxSourceDedupeEvidence + 1,
+    }),
+    authority.RelayAgentAuthorityStateError,
+  );
 });
 
 test("rejected ordered events leave no cursor evidence, while redundant terminal advances only sourceSeq", () => {
