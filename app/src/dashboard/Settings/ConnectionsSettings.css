@@ -579,6 +579,14 @@
 
 .connections-relay-pairing--v2 {
   margin-top: 0;
+  flex-wrap: wrap;
+}
+
+.connections-relay-v2-preview__actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
 }
 
 .connections-relay-v2-preview__review {

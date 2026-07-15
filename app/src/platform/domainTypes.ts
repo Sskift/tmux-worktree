@@ -264,6 +264,165 @@ export type MobileRelayBrokerInput = {
   quickTunnel?: boolean;
 };
 
+export const MOBILE_RELAY_V2_REQUIRED_CAPABILITIES = [
+  "error.structured.v1",
+  "command.ledger.v1",
+  "command.query.v1",
+  "snapshot.revision.v1",
+  "event.sequence.v1",
+  "terminal.stream.resume.v1",
+] as const;
+
+export type MobileRelayV2RequiredCapability =
+  (typeof MOBILE_RELAY_V2_REQUIRED_CAPABILITIES)[number];
+
+export type MobileRelayV2AdapterAuthority =
+  | { kind: "unavailable"; reason: string }
+  | { kind: "fake_preview"; reason: null }
+  | { kind: "node"; reason: null };
+
+export type MobileRelayV1SharedSecretProfile = {
+  protocolVersion: 1;
+  credentialKind: "legacy_shared_secret";
+  sharedSecretConfigured: boolean;
+};
+
+export type MobileRelayV2HostCredential = {
+  protocolVersion: 2;
+  credentialKind: "twcap2_grant";
+  status: "missing" | "bootstrapping" | "ready" | "refreshing" | "failed";
+  credentialReference: string | null;
+  expiresAtMs: number | null;
+  error: string | null;
+  retryable: boolean | null;
+};
+
+type MobileRelayV2StoppedConnector = {
+  status: "stopped";
+  acknowledgement: null;
+  hostId: null;
+  connectorId: null;
+  negotiatedCapabilityIntersection: readonly [];
+  exitCode: null;
+  error: null;
+  retryable: null;
+};
+
+type MobileRelayV2StartingConnector = {
+  status: "starting";
+  acknowledgement: null;
+  hostId: string | null;
+  connectorId: null;
+  negotiatedCapabilityIntersection: readonly [];
+  exitCode: null;
+  error: null;
+  retryable: null;
+};
+
+type MobileRelayV2RegisteredConnector = {
+  status: "registered" | "registered_incomplete";
+  acknowledgement: "host.registered";
+  hostId: string;
+  connectorId: string;
+  /** Capabilities accepted by both the broker and authenticated host connector. */
+  negotiatedCapabilityIntersection: readonly string[];
+  exitCode: null;
+  error: null;
+  retryable: null;
+};
+
+type MobileRelayV2FailedConnector = {
+  status: "failed";
+  acknowledgement: null;
+  hostId: null;
+  connectorId: null;
+  negotiatedCapabilityIntersection: readonly [];
+  exitCode: null;
+  error: string;
+  retryable: boolean;
+};
+
+type MobileRelayV2SupersededConnector = {
+  status: "superseded";
+  acknowledgement: null;
+  hostId: null;
+  connectorId: null;
+  negotiatedCapabilityIntersection: readonly [];
+  exitCode: 78;
+  error: string;
+  retryable: false;
+};
+
+export type MobileRelayV2Connector =
+  | MobileRelayV2StoppedConnector
+  | MobileRelayV2StartingConnector
+  | MobileRelayV2RegisteredConnector
+  | MobileRelayV2FailedConnector
+  | MobileRelayV2SupersededConnector;
+
+export type MobileRelayV2EnrollmentReview = {
+  enrollment: {
+    enrollmentId: string;
+    enrollmentCode: string;
+    expiresAtMs: number;
+  };
+  display: {
+    issuerUrl: string;
+    relayUrl: string;
+    hostId: string;
+    deviceLabel: string | null;
+  };
+};
+
+export type MobileRelayV2Enrollment =
+  | { status: "idle" }
+  | { status: "creating"; intent: "create" | "retry" | "rebuild" }
+  | { status: "active"; review: MobileRelayV2EnrollmentReview }
+  | { status: "expired"; enrollmentId: string; expiredAtMs: number }
+  | {
+      status: "failed";
+      intent: "create" | "retry" | "rebuild";
+      error: string;
+      retryable: boolean;
+    };
+
+export type MobileRelayV2KnownClientGrant =
+  | { status: "unknown" }
+  | { status: "active"; grantId: string }
+  | { status: "revoking"; grantId: string }
+  | {
+      status: "revoked";
+      grantId: string;
+      revokedAtMs: number;
+      alreadyRevoked: boolean;
+    }
+  | { status: "failed"; grantId: string; error: string; retryable: boolean };
+
+export type MobileRelayV2DashboardState = {
+  authority: MobileRelayV2AdapterAuthority;
+  v1Profile: MobileRelayV1SharedSecretProfile;
+  hostCredential: MobileRelayV2HostCredential;
+  connector: MobileRelayV2Connector;
+  enrollment: MobileRelayV2Enrollment;
+  knownClientGrant: MobileRelayV2KnownClientGrant;
+};
+
+export type MobileRelayV2CreateEnrollmentInput = {
+  intent: "create" | "retry" | "rebuild";
+  deviceLabel?: string | null;
+};
+
+export type MobileRelayV2OperationFailure = {
+  code: string;
+  message: string;
+  retryable: boolean;
+};
+
+export type MobileRelayV2RevokeClientGrantInput = {
+  grantId: string;
+  reason: "user_revoked";
+};
+
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 
 export type FeishuBinding = {

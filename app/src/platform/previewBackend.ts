@@ -12,7 +12,12 @@ import type {
   ProjectPreset,
   Session,
 } from "./domainTypes";
+import { MOBILE_RELAY_V2_REQUIRED_CAPABILITIES } from "./domainTypes";
 import type { PtyOpenArgs } from "./types";
+import {
+  createFakeMobileRelayV2Adapter,
+  createFakeMobileRelayV2State,
+} from "./relayV2FakeAdapter";
 
 const now = new Date().toISOString();
 
@@ -282,7 +287,46 @@ const relayStatus = {
   error: null,
 };
 
-const { backend, transport } = createFakeDashboardBackend();
+const relayV2PreviewState = createFakeMobileRelayV2State(false);
+relayV2PreviewState.hostCredential = {
+  ...relayV2PreviewState.hostCredential,
+  status: "ready",
+  credentialReference: "fake-preview://relay-v2/host-grant",
+  expiresAtMs: Date.now() + 60 * 60_000,
+  retryable: null,
+};
+relayV2PreviewState.connector = {
+  status: "registered",
+  acknowledgement: "host.registered",
+  hostId: "mac-admin-preview",
+  connectorId: "fake-preview-connector",
+  negotiatedCapabilityIntersection: MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+  exitCode: null,
+  error: null,
+  retryable: null,
+};
+relayV2PreviewState.enrollment = {
+  status: "active",
+  review: {
+    enrollment: {
+      enrollmentId: "fake-preview-enrollment",
+      enrollmentCode: "twenroll2.fake-preview-not-a-live-code",
+      expiresAtMs: Date.now() + 5 * 60_000,
+    },
+    display: {
+      issuerUrl: "https://relay.preview.invalid",
+      relayUrl: "wss://relay.preview.invalid/client",
+      hostId: "mac-admin-preview",
+      deviceLabel: "Preview Android",
+    },
+  },
+};
+const relayV2PreviewAdapter = createFakeMobileRelayV2Adapter({
+  initialState: relayV2PreviewState,
+});
+const { backend, transport } = createFakeDashboardBackend(undefined, {
+  relayV2: relayV2PreviewAdapter,
+});
 const openPtys = new Set<string>();
 
 transport.selectedDirectory = previewRoot;

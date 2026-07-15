@@ -69,7 +69,6 @@ import {
   ConnectionsSettings,
   relaySettingsBindingsFromController,
 } from "./dashboard/Settings/ConnectionsSettings";
-import type { RelayV2EnrollmentState } from "./dashboard/Settings/relayV2EnrollmentModel";
 import {
   DashboardShell,
   type DashboardDrawer,
@@ -136,11 +135,7 @@ type ScratchTerm = { id: string; label: string };
 type ScratchState = { list: ScratchTerm[]; nextNum: number };
 let scratchIdCounter = 0;
 
-export interface AppProps {
-  relayV2Enrollment?: RelayV2EnrollmentState;
-}
-
-function App({ relayV2Enrollment }: AppProps) {
+function App() {
   const dashboardBackend = useDashboardBackend();
   const dashboardLayout = useDashboardLayoutState();
   const {
@@ -1412,7 +1407,6 @@ function App({ relayV2Enrollment }: AppProps) {
               onHostsMutationSettled={onHostsMutationSettled}
               installingHostId={installingHostId}
               onInstallTw={installRemoteTw}
-              relayV2Enrollment={relayV2Enrollment}
               {...relaySettingsBindings}
             />
           ),

@@ -46,6 +46,9 @@ import type {
   MobileRelayBrokerInput,
   MobileRelayConfigInput,
   MobileRelayStatus,
+  MobileRelayV2CreateEnrollmentInput,
+  MobileRelayV2DashboardState,
+  MobileRelayV2RevokeClientGrantInput,
   OrphanedWorktree,
   PlainTerminal,
   ProjectPreset,
@@ -61,6 +64,7 @@ import type {
   AutomationRunRecord,
   SaveAutomationInput,
 } from "../automationTypes";
+import { MobileRelayV2BackendOperationError } from "./relayV2Domain";
 
 type HostId = string | null | undefined;
 
@@ -78,6 +82,21 @@ export interface FeishuProductAdapter {
   remove(bindingId: string, force?: boolean): Promise<void>;
   takeover(bindingId: string, ptyId: string, force?: boolean): Promise<void>;
   returnToFeishu(bindingId: string, ptyId: string): Promise<FeishuBinding>;
+}
+
+export interface MobileRelayV2ProductAdapter {
+  /** Status reads are serialized; adapters must stop promptly when the signal aborts. */
+  status(signal?: AbortSignal): Promise<MobileRelayV2DashboardState>;
+  bootstrapHost(): Promise<MobileRelayV2DashboardState>;
+  refreshHost(): Promise<MobileRelayV2DashboardState>;
+  startConnector(): Promise<MobileRelayV2DashboardState>;
+  stopConnector(): Promise<MobileRelayV2DashboardState>;
+  createEnrollment(
+    input: MobileRelayV2CreateEnrollmentInput,
+  ): Promise<MobileRelayV2DashboardState>;
+  revokeClientGrant(
+    input: MobileRelayV2RevokeClientGrantInput,
+  ): Promise<MobileRelayV2DashboardState>;
 }
 
 export interface DashboardBackend {
@@ -180,6 +199,7 @@ export interface DashboardBackend {
     saveConfig(args: MobileRelayConfigInput): Promise<MobileRelayStatus>;
     startBroker(args: MobileRelayBrokerInput): Promise<MobileRelayStatus>;
     stop(): Promise<void>;
+    v2: MobileRelayV2ProductAdapter;
   };
   feishu: FeishuProductAdapter;
   persistence: {
@@ -200,6 +220,59 @@ export interface DashboardBackend {
   };
 }
 
+export const MOBILE_RELAY_V2_NODE_ADAPTER_GAP =
+  "Relay v2 enrollment is unavailable until the bundled Node issuer/credential control API is implemented.";
+
+export function createUnavailableMobileRelayV2Adapter(
+  reason = MOBILE_RELAY_V2_NODE_ADAPTER_GAP,
+): MobileRelayV2ProductAdapter {
+  const state = (): MobileRelayV2DashboardState => ({
+    authority: { kind: "unavailable", reason },
+    v1Profile: {
+      protocolVersion: 1,
+      credentialKind: "legacy_shared_secret",
+      sharedSecretConfigured: false,
+    },
+    hostCredential: {
+      protocolVersion: 2,
+      credentialKind: "twcap2_grant",
+      status: "missing",
+      credentialReference: null,
+      expiresAtMs: null,
+      error: null,
+      retryable: null,
+    },
+    connector: {
+      status: "stopped",
+      acknowledgement: null,
+      hostId: null,
+      connectorId: null,
+      negotiatedCapabilityIntersection: [],
+      exitCode: null,
+      error: null,
+      retryable: null,
+    },
+    enrollment: { status: "idle" },
+    knownClientGrant: { status: "unknown" },
+  });
+  const unavailable = async (): Promise<MobileRelayV2DashboardState> => {
+    throw new MobileRelayV2BackendOperationError({
+      code: "relay_v2_adapter_unavailable",
+      message: reason,
+      retryable: false,
+    });
+  };
+  return {
+    status: async () => state(),
+    bootstrapHost: unavailable,
+    refreshHost: unavailable,
+    startConnector: unavailable,
+    stopConnector: unavailable,
+    createEnrollment: unavailable,
+    revokeClientGrant: unavailable,
+  };
+}
+
 function abortError(): Error {
   const error = new Error("PTY connection aborted");
   error.name = "AbortError";
@@ -209,7 +282,10 @@ function abortError(): Error {
 const MAX_COALESCED_PTY_WRITE_BYTES = 64 * 1024;
 const ptyTextEncoder = new TextEncoder();
 
-export function createDashboardBackend(transport: DashboardTransport): DashboardBackend {
+export function createDashboardBackend(
+  transport: DashboardTransport,
+  adapters: { relayV2?: MobileRelayV2ProductAdapter } = {},
+): DashboardBackend {
   const closeLifecycle = transport.closeLifecycle;
   const writePty = (id: string, data: string) =>
     transport.invoke<void>("pty_write", { id, data });
@@ -546,6 +622,7 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       startBroker: (args) =>
         transport.invoke<MobileRelayStatus>("mobile_relay_start_broker", { args }),
       stop: () => transport.invoke<void>("mobile_relay_stop"),
+      v2: adapters.relayV2 ?? createUnavailableMobileRelayV2Adapter(),
     },
     feishu: {
       integrationStatus: () =>

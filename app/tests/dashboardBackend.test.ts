@@ -655,3 +655,20 @@ test("DashboardBackend preserves transport errors", async () => {
 
   await assert.rejects(backend.sessions.list(), (error) => error === expected);
 });
+
+test("DashboardBackend keeps Relay v2 unavailable without the Node credential adapter", async () => {
+  const { backend, transport } = createFakeDashboardBackend();
+
+  const status = await backend.relay.v2.status();
+  assert.equal(status.authority.kind, "unavailable");
+  assert.deepEqual(status.connector.negotiatedCapabilityIntersection, []);
+  assert.equal(status.enrollment.status, "idle");
+  assert.equal(transport.calls.length, 0);
+  await assert.rejects(backend.relay.v2.bootstrapHost(), (error: unknown) => (
+    error instanceof Error
+    && error.message.includes("Node issuer/credential control API")
+    && "retryable" in error
+    && error.retryable === false
+  ));
+  assert.equal(transport.calls.length, 0);
+});

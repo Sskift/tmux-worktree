@@ -1,130 +1,126 @@
-export const RELAY_V2_REQUIRED_CAPABILITIES = [
-  "error.structured.v1",
-  "command.ledger.v1",
-  "command.query.v1",
-  "snapshot.revision.v1",
-  "event.sequence.v1",
-  "terminal.stream.resume.v1",
-] as const;
+import {
+  MOBILE_RELAY_V2_REQUIRED_CAPABILITIES,
+  type MobileRelayV1SharedSecretProfile,
+  type MobileRelayV2DashboardState,
+  type MobileRelayV2EnrollmentReview,
+  type MobileRelayV2OperationFailure,
+  type MobileRelayV2RequiredCapability,
+} from "../../platform/domainTypes";
+import {
+  mobileRelayV2ConnectorReady,
+  normalizeMobileRelayV2Connector,
+  relayV2MissingNegotiatedCapabilities,
+} from "../../platform/relayV2Domain";
 
-export type RelayV2RequiredCapability = (typeof RELAY_V2_REQUIRED_CAPABILITIES)[number];
+export const RELAY_V2_REQUIRED_CAPABILITIES = MOBILE_RELAY_V2_REQUIRED_CAPABILITIES;
 
-export interface RelayV1SharedSecretProfile {
-  protocolVersion: 1;
-  credentialKind: "legacy_shared_secret";
-  sharedSecretConfigured: boolean;
-}
-
-export interface RelayV2CredentialReference {
-  protocolVersion: 2;
-  credentialKind: "twcap2_grant";
-  credentialReference: string | null;
-}
-
-export type RelayV2HostRegistration =
-  | {
-      status: "not_registered";
-      hostId: null;
-      connectorId: null;
-      error: string | null;
-    }
-  | {
-      status: "registered";
-      acknowledgement: "host.registered";
-      hostId: string;
-      connectorId: string;
-      error: null;
-    };
-
-export interface RelayV2EnrollmentReview {
-  enrollment: {
-    enrollmentId: string;
-    enrollmentCode: string;
-    expiresAtMs: number;
-  };
-  display: {
-    issuerUrl: string;
-    relayUrl: string;
-    hostId: string;
-    deviceLabel: string | null;
-  };
-}
-
-export type RelayV2EnrollmentAttempt =
-  | { status: "idle" }
-  | { status: "creating" }
-  | { status: "created"; review: RelayV2EnrollmentReview }
-  | { status: "failed"; error: string };
-
-export interface RelayV2EnrollmentState {
-  v1Profile: RelayV1SharedSecretProfile;
-  v2Credential: RelayV2CredentialReference;
-  hostRegistration: RelayV2HostRegistration;
-  capabilityIntersection: readonly string[];
-  enrollment: RelayV2EnrollmentAttempt;
-}
+export type RelayV2RequiredCapability = MobileRelayV2RequiredCapability;
+export type RelayV1SharedSecretProfile = MobileRelayV1SharedSecretProfile;
+export type RelayV2EnrollmentReview = MobileRelayV2EnrollmentReview;
+export type RelayV2EnrollmentState = MobileRelayV2DashboardState;
 
 export type RelayV2EnrollmentEvent =
+  | { type: "backendStateObserved"; state: RelayV2EnrollmentState }
+  | { type: "backendObservationFailed"; failure: MobileRelayV2OperationFailure }
+  | { type: "v1ProfileObserved"; sharedSecretConfigured: boolean }
   | { type: "v2CredentialReferenceObserved"; credentialReference: string | null }
+  | { type: "hostCredentialOperationStarted"; operation: "bootstrap" | "refresh" }
+  | { type: "hostCredentialOperationFailed"; error: string; retryable?: boolean }
   | { type: "hostRegistered"; hostId: string; connectorId: string }
-  | { type: "hostRegistrationLost"; error?: string | null }
+  | { type: "hostRegistrationLost"; error?: string | null; retryable?: boolean }
+  | { type: "connectorStarting" }
+  | { type: "connectorStopped" }
+  | { type: "connectorSuperseded"; error?: string | null }
   | { type: "capabilityIntersectionObserved"; capabilities: readonly string[] }
-  | { type: "enrollmentCreateStarted" }
+  | { type: "enrollmentCreateStarted"; intent?: "create" | "retry" | "rebuild" }
   | { type: "enrollmentCreated"; review: RelayV2EnrollmentReview }
-  | { type: "enrollmentCreateFailed"; error: string }
-  | { type: "enrollmentCleared" };
+  | {
+      type: "enrollmentCreateFailed";
+      error: string;
+      intent?: "create" | "retry" | "rebuild";
+      retryable?: boolean;
+    }
+  | { type: "enrollmentCleared" }
+  | { type: "clientGrantObserved"; grantId: string }
+  | { type: "clientGrantRevokeStarted"; grantId: string }
+  | {
+      type: "clientGrantRevoked";
+      grantId: string;
+      revokedAtMs: number;
+      alreadyRevoked: boolean;
+    }
+  | { type: "clientGrantRevokeFailed"; grantId: string; error: string; retryable?: boolean };
 
 export interface RelayV2EnrollmentView {
+  adapterAvailable: boolean;
+  previewOnly: boolean;
   ready: boolean;
   missingCapabilities: readonly RelayV2RequiredCapability[];
   readinessLabel: string;
   readinessDetail: string;
   v1CredentialLabel: string;
   v2CredentialLabel: string;
+  hostCredentialAction: "bootstrap" | "refresh" | null;
+  connectorAction: "start" | "stop" | null;
+  enrollmentAction: "create" | "retry" | "rebuild" | null;
   enrollmentActionDisabled: boolean;
   enrollmentActionLabel: string;
+  grantRevokeDisabled: boolean;
+  grantRevokeLabel: string;
   error: string | null;
   review: RelayV2EnrollmentReview | null;
   qrPayload: string | null;
 }
 
-const NOT_READY_ERROR = "Relay v2 enrollment requires host.registered and all six required capabilities.";
+const NOT_READY_ERROR =
+  "Relay v2 enrollment requires host.registered and all six required capabilities.";
 
 export function createRelayV2EnrollmentState(
   sharedSecretConfigured = false,
 ): RelayV2EnrollmentState {
   return {
+    authority: {
+      kind: "unavailable",
+      reason: "Relay v2 backend authority has not been observed.",
+    },
     v1Profile: {
       protocolVersion: 1,
       credentialKind: "legacy_shared_secret",
       sharedSecretConfigured,
     },
-    v2Credential: {
+    hostCredential: {
       protocolVersion: 2,
       credentialKind: "twcap2_grant",
+      status: "missing",
       credentialReference: null,
+      expiresAtMs: null,
+      error: null,
+      retryable: null,
     },
-    hostRegistration: {
-      status: "not_registered",
+    connector: {
+      status: "stopped",
+      acknowledgement: null,
       hostId: null,
       connectorId: null,
+      negotiatedCapabilityIntersection: [],
+      exitCode: null,
       error: null,
+      retryable: null,
     },
-    capabilityIntersection: [],
     enrollment: { status: "idle" },
+    knownClientGrant: { status: "unknown" },
   };
 }
 
 export function relayV2MissingCapabilities(
   capabilityIntersection: readonly string[],
 ): RelayV2RequiredCapability[] {
-  const negotiated = new Set(capabilityIntersection);
-  return RELAY_V2_REQUIRED_CAPABILITIES.filter((capability) => !negotiated.has(capability));
+  return relayV2MissingNegotiatedCapabilities(capabilityIntersection);
 }
 
 export function relayV2EnrollmentReady(state: RelayV2EnrollmentState): boolean {
-  return state.hostRegistration.status === "registered"
-    && relayV2MissingCapabilities(state.capabilityIntersection).length === 0;
+  return state.authority.kind !== "unavailable"
+    && mobileRelayV2ConnectorReady(state.connector);
 }
 
 export function relayV2EnrollmentReducer(
@@ -132,63 +128,242 @@ export function relayV2EnrollmentReducer(
   event: RelayV2EnrollmentEvent,
 ): RelayV2EnrollmentState {
   switch (event.type) {
+    case "backendStateObserved":
+      return event.state;
+    case "backendObservationFailed": {
+      const message = event.failure.message.trim() || "Relay v2 status observation failed.";
+      const intent = state.enrollment.status === "creating"
+        || state.enrollment.status === "failed"
+        ? state.enrollment.intent
+        : "create";
+      return {
+        ...state,
+        authority: {
+          kind: "unavailable",
+          reason: `${message} Previously observed Relay v2 readiness was cleared.`,
+        },
+        connector: {
+          status: "failed",
+          acknowledgement: null,
+          hostId: null,
+          connectorId: null,
+          negotiatedCapabilityIntersection: [],
+          exitCode: null,
+          error: message,
+          retryable: event.failure.retryable,
+        },
+        enrollment: {
+          status: "failed",
+          intent,
+          error: "Enrollment is hidden until authoritative Relay v2 status is restored.",
+          retryable: event.failure.retryable,
+        },
+      };
+    }
+    case "v1ProfileObserved":
+      return {
+        ...state,
+        v1Profile: {
+          ...state.v1Profile,
+          sharedSecretConfigured: event.sharedSecretConfigured,
+        },
+      };
     case "v2CredentialReferenceObserved":
       return {
         ...state,
-        v2Credential: {
-          ...state.v2Credential,
+        hostCredential: {
+          ...state.hostCredential,
+          status: event.credentialReference ? "ready" : "missing",
           credentialReference: event.credentialReference,
+          error: null,
+          retryable: null,
+        },
+      };
+    case "hostCredentialOperationStarted":
+      if (
+        state.hostCredential.status === "bootstrapping"
+        || state.hostCredential.status === "refreshing"
+      ) return state;
+      return {
+        ...state,
+        hostCredential: {
+          ...state.hostCredential,
+          status: event.operation === "bootstrap" ? "bootstrapping" : "refreshing",
+          error: null,
+          retryable: null,
+        },
+      };
+    case "hostCredentialOperationFailed":
+      return {
+        ...state,
+        hostCredential: {
+          ...state.hostCredential,
+          status: "failed",
+          error: event.error.trim() || "Relay v2 host credential operation failed.",
+          retryable: event.retryable === true,
         },
       };
     case "hostRegistered":
       return {
         ...state,
-        hostRegistration: {
-          status: "registered",
+        connector: normalizeMobileRelayV2Connector({
+          status: "registered_incomplete",
           acknowledgement: "host.registered",
           hostId: event.hostId,
           connectorId: event.connectorId,
+          negotiatedCapabilityIntersection:
+            state.connector.negotiatedCapabilityIntersection,
+          exitCode: null,
           error: null,
-        },
+          retryable: null,
+        }),
       };
     case "hostRegistrationLost":
       return {
         ...state,
-        hostRegistration: {
-          status: "not_registered",
+        connector: event.error
+          ? {
+              status: "failed",
+              acknowledgement: null,
+              hostId: null,
+              connectorId: null,
+              negotiatedCapabilityIntersection: [],
+              exitCode: null,
+              error: event.error.trim() || "Relay v2 connector failed.",
+              retryable: event.retryable === true,
+            }
+          : {
+              status: "stopped",
+              acknowledgement: null,
+              hostId: null,
+              connectorId: null,
+              negotiatedCapabilityIntersection: [],
+              exitCode: null,
+              error: null,
+              retryable: null,
+            },
+      };
+    case "connectorStarting":
+      if (state.connector.status === "starting") return state;
+      return {
+        ...state,
+        connector: {
+          status: "starting",
+          acknowledgement: null,
+          hostId: state.connector.hostId,
+          connectorId: null,
+          negotiatedCapabilityIntersection: [],
+          exitCode: null,
+          error: null,
+          retryable: null,
+        },
+      };
+    case "connectorStopped":
+      return relayV2EnrollmentReducer(state, { type: "hostRegistrationLost" });
+    case "connectorSuperseded":
+      return {
+        ...state,
+        connector: {
+          status: "superseded",
+          acknowledgement: null,
           hostId: null,
           connectorId: null,
-          error: event.error?.trim() || null,
+          negotiatedCapabilityIntersection: [],
+          exitCode: 78,
+          error: event.error?.trim() || "A newer authenticated connector replaced this process.",
+          retryable: false,
         },
-        enrollment: { status: "idle" },
       };
-    case "capabilityIntersectionObserved": {
-      const nextState = {
+    case "capabilityIntersectionObserved":
+      if (
+        state.connector.status !== "registered"
+        && state.connector.status !== "registered_incomplete"
+      ) return state;
+      return {
         ...state,
-        capabilityIntersection: [...new Set(event.capabilities)],
+        connector: normalizeMobileRelayV2Connector({
+          ...state.connector,
+          negotiatedCapabilityIntersection: [...new Set(event.capabilities)],
+        }),
       };
-      return relayV2EnrollmentReady(nextState)
-        ? nextState
-        : { ...nextState, enrollment: { status: "idle" } };
-    }
-    case "enrollmentCreateStarted":
+    case "enrollmentCreateStarted": {
+      if (state.enrollment.status === "creating") return state;
+      const intent = event.intent
+        ?? (state.enrollment.status === "failed"
+          ? "retry"
+          : state.enrollment.status === "expired"
+            ? "rebuild"
+            : "create");
       return relayV2EnrollmentReady(state)
-        ? { ...state, enrollment: { status: "creating" } }
-        : { ...state, enrollment: { status: "failed", error: NOT_READY_ERROR } };
+        ? { ...state, enrollment: { status: "creating", intent } }
+        : {
+            ...state,
+            enrollment: {
+              status: "failed",
+              intent,
+              error: NOT_READY_ERROR,
+              retryable: false,
+            },
+          };
+    }
     case "enrollmentCreated":
       return relayV2EnrollmentReady(state)
-        ? { ...state, enrollment: { status: "created", review: event.review } }
-        : { ...state, enrollment: { status: "failed", error: NOT_READY_ERROR } };
+        ? { ...state, enrollment: { status: "active", review: event.review } }
+        : {
+            ...state,
+            enrollment: {
+              status: "failed",
+              intent: state.enrollment.status === "creating"
+                ? state.enrollment.intent
+                : "create",
+              error: NOT_READY_ERROR,
+              retryable: false,
+            },
+          };
     case "enrollmentCreateFailed":
       return {
         ...state,
         enrollment: {
           status: "failed",
+          intent: event.intent
+            ?? (state.enrollment.status === "creating" ? state.enrollment.intent : "create"),
           error: event.error.trim() || "Relay v2 enrollment failed.",
+          retryable: event.retryable === true,
         },
       };
     case "enrollmentCleared":
       return { ...state, enrollment: { status: "idle" } };
+    case "clientGrantObserved":
+      return { ...state, knownClientGrant: { status: "active", grantId: event.grantId } };
+    case "clientGrantRevokeStarted":
+      if (
+        state.knownClientGrant.status === "revoking"
+        && state.knownClientGrant.grantId === event.grantId
+      ) return state;
+      return {
+        ...state,
+        knownClientGrant: { status: "revoking", grantId: event.grantId },
+      };
+    case "clientGrantRevoked":
+      return {
+        ...state,
+        knownClientGrant: {
+          status: "revoked",
+          grantId: event.grantId,
+          revokedAtMs: event.revokedAtMs,
+          alreadyRevoked: event.alreadyRevoked,
+        },
+      };
+    case "clientGrantRevokeFailed":
+      return {
+        ...state,
+        knownClientGrant: {
+          status: "failed",
+          grantId: event.grantId,
+          error: event.error.trim() || "Relay v2 client grant revoke failed.",
+          retryable: event.retryable === true,
+        },
+      };
   }
 }
 
@@ -209,6 +384,7 @@ function validEnrollmentReview(review: RelayV2EnrollmentReview): boolean {
       && Boolean(issuerUrl.hostname)
       && !issuerUrl.username
       && !issuerUrl.password
+      && issuerUrl.pathname === "/"
       && !issuerUrl.search
       && !issuerUrl.hash
       && relayUrl.protocol === "wss:"
@@ -242,47 +418,79 @@ export function deriveRelayV2EnrollmentView(
   state: RelayV2EnrollmentState,
   nowMs = Date.now(),
 ): RelayV2EnrollmentView {
-  const missingCapabilities = relayV2MissingCapabilities(state.capabilityIntersection);
-  const ready = state.hostRegistration.status === "registered"
-    && missingCapabilities.length === 0;
-  const createdReview = state.enrollment.status === "created" ? state.enrollment.review : null;
-  const reviewMatchesRegistration = createdReview !== null
-    && state.hostRegistration.status === "registered"
-    && createdReview.display.hostId === state.hostRegistration.hostId;
-  const reviewIsCurrent = createdReview !== null
-    && createdReview.enrollment.expiresAtMs > nowMs;
-  const review = ready && reviewMatchesRegistration && reviewIsCurrent ? createdReview : null;
+  const connector = normalizeMobileRelayV2Connector(state.connector);
+  const adapterAvailable = state.authority.kind !== "unavailable";
+  const missingCapabilities = relayV2MissingCapabilities(
+    connector.negotiatedCapabilityIntersection,
+  );
+  const ready = relayV2EnrollmentReady(state);
+  const activeReview = state.enrollment.status === "active" ? state.enrollment.review : null;
+  const reviewMatchesRegistration = activeReview !== null
+    && connector.status === "registered"
+    && activeReview.display.hostId === connector.hostId;
+  const reviewIsCurrent = activeReview !== null
+    && activeReview.enrollment.expiresAtMs > nowMs;
+  const review = ready && reviewMatchesRegistration && reviewIsCurrent ? activeReview : null;
   const qrPayload = review ? buildRelayV2EnrollmentQrPayload(review) : null;
 
   let readinessLabel: string;
   let readinessDetail: string;
-  if (state.hostRegistration.status !== "registered") {
-    readinessLabel = "Relay v2 host not registered";
-    readinessDetail = state.hostRegistration.error
-      ? `host.registered was not established: ${state.hostRegistration.error}`
-      : "Enrollment stays unavailable until the connector receives host.registered.";
-  } else if (missingCapabilities.length > 0) {
+  if (state.authority.kind === "unavailable") {
+    readinessLabel = "Relay v2 backend unavailable";
+    readinessDetail = state.authority.reason;
+  } else if (connector.status === "registered_incomplete") {
     readinessLabel = "Relay v2 capabilities incomplete";
     readinessDetail = `Enrollment stays unavailable. Missing: ${missingCapabilities.join(", ")}.`;
+  } else if (connector.status !== "registered") {
+    readinessLabel = "Relay v2 host not registered";
+    readinessDetail = connector.error
+      ? `host.registered was not established: ${connector.error}`
+      : "Enrollment stays unavailable until the connector receives host.registered.";
   } else {
     readinessLabel = "Relay v2 connector ready for enrollment";
-    readinessDetail = "The Mac host connector is registered with all six required capabilities. Phone connectivity is not verified.";
+    readinessDetail =
+      "The Mac host connector is registered with all six required capabilities. Phone connectivity is not verified.";
   }
 
-  const enrollmentActionDisabled = !ready || qrPayload === null;
-  const enrollmentActionLabel = !ready
-    ? "Enrollment unavailable"
-    : qrPayload
-      ? "Enrollment review ready"
-      : state.enrollment.status === "creating"
-        ? "Creating enrollment preview"
-        : state.enrollment.status === "failed"
-          ? "Enrollment preview failed"
-          : createdReview && !reviewIsCurrent
-            ? "Enrollment preview expired"
-            : "Enrollment adapter pending";
+  const enrollmentAction = !adapterAvailable || !ready || state.enrollment.status === "creating"
+    ? null
+    : activeReview && reviewIsCurrent
+      ? null
+      : state.enrollment.status === "failed"
+        ? state.enrollment.retryable
+          ? "retry"
+          : null
+        : state.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
+          ? "rebuild"
+          : "create";
+  const enrollmentActionLabel = !adapterAvailable
+    ? "Enrollment adapter unavailable"
+    : !ready
+      ? "Enrollment unavailable"
+      : qrPayload
+        ? "One-time enrollment active"
+        : state.enrollment.status === "creating"
+          ? state.enrollment.intent === "rebuild"
+            ? "Rebuilding enrollment"
+            : "Creating enrollment"
+          : state.enrollment.status === "failed"
+            ? state.enrollment.retryable
+              ? "Retry enrollment"
+              : "Enrollment failed — reconfigure Relay v2"
+            : state.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
+              ? "Rebuild expired enrollment"
+              : "Create one-time enrollment";
+
+  const errors = [
+    state.hostCredential.error,
+    connector.error,
+    state.enrollment.status === "failed" ? state.enrollment.error : null,
+    state.knownClientGrant.status === "failed" ? state.knownClientGrant.error : null,
+  ].filter((value): value is string => Boolean(value));
 
   return {
+    adapterAvailable,
+    previewOnly: state.authority.kind === "fake_preview",
     ready,
     missingCapabilities,
     readinessLabel,
@@ -290,13 +498,44 @@ export function deriveRelayV2EnrollmentView(
     v1CredentialLabel: state.v1Profile.sharedSecretConfigured
       ? "Relay v1 shared secret configured"
       : "Relay v1 shared secret not configured",
-    v2CredentialLabel: state.v2Credential.credentialReference
-      ? "Relay v2 credential reference available"
-      : "Relay v2 credential reference unavailable",
-    enrollmentActionDisabled,
+    v2CredentialLabel: `Relay v2 host credential ${state.hostCredential.status}`,
+    hostCredentialAction: !adapterAvailable
+      || state.hostCredential.status === "bootstrapping"
+      || state.hostCredential.status === "refreshing"
+      ? null
+      : state.hostCredential.status === "failed" && !state.hostCredential.retryable
+        ? null
+      : state.hostCredential.credentialReference
+        ? "refresh"
+        : "bootstrap",
+    connectorAction: !adapterAvailable
+      || !state.hostCredential.credentialReference
+      || connector.status === "starting"
+      || connector.status === "superseded"
+      || (connector.status === "failed" && !connector.retryable)
+      ? null
+      : connector.status === "registered" || connector.status === "registered_incomplete"
+        ? "stop"
+        : "start",
+    enrollmentAction,
+    enrollmentActionDisabled: enrollmentAction === null,
     enrollmentActionLabel,
-    error: state.enrollment.status === "failed"
-      ? `${state.enrollment.error} Relay v1 remains unchanged; no fallback was attempted.`
+    grantRevokeDisabled: !adapterAvailable || !(
+      state.knownClientGrant.status === "active"
+      || (
+        state.knownClientGrant.status === "failed"
+        && state.knownClientGrant.retryable
+      )
+    ),
+    grantRevokeLabel: state.knownClientGrant.status === "failed"
+      ? state.knownClientGrant.retryable
+        ? "Retry client grant revoke"
+        : "Client grant revoke failed — reconfigure Relay v2"
+      : state.knownClientGrant.status === "revoking"
+        ? "Revoking client grant"
+        : "Revoke known client grant",
+    error: errors.length > 0
+      ? `${errors[0]} Relay v1 remains unchanged; no fallback was attempted.`
       : null,
     review,
     qrPayload,

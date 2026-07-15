@@ -1,4 +1,8 @@
-import { createDashboardBackend, type DashboardBackend } from "./dashboardBackend.ts";
+import {
+  createDashboardBackend,
+  type DashboardBackend,
+  type MobileRelayV2ProductAdapter,
+} from "./dashboardBackend.ts";
 import type {
   BackendEventHandler,
   ConfirmDialogOptions,
@@ -122,7 +126,8 @@ export class FakeDashboardTransport implements DashboardTransport {
 
 export function createFakeDashboardBackend(
   handlers?: Record<string, FakeBackendHandler>,
+  adapters: { relayV2?: MobileRelayV2ProductAdapter } = {},
 ): { backend: DashboardBackend; transport: FakeDashboardTransport } {
   const transport = new FakeDashboardTransport(handlers);
-  return { backend: createDashboardBackend(transport), transport };
+  return { backend: createDashboardBackend(transport, adapters), transport };
 }

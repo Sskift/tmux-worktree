@@ -6,7 +6,7 @@ import {
 } from "../src/platform/previewBackend.ts";
 
 test("preview backend supplies the dashboard startup state", async () => {
-  const [sessions, projects, hosts, statuses, terminals, agents, layout] = await Promise.all([
+  const [sessions, projects, hosts, statuses, terminals, agents, layout, relayV2] = await Promise.all([
     previewDashboardBackend.sessions.list(),
     previewDashboardBackend.projects.list(),
     previewDashboardBackend.hosts.list(),
@@ -14,6 +14,7 @@ test("preview backend supplies the dashboard startup state", async () => {
     previewDashboardBackend.terminals.listTmux(),
     previewDashboardBackend.agents.probe({ kind: "local" }),
     previewDashboardBackend.persistence.loadLayout(),
+    previewDashboardBackend.relay.v2.status(),
   ]);
 
   assert.ok(sessions.length >= 3);
@@ -33,6 +34,10 @@ test("preview backend supplies the dashboard startup state", async () => {
     layout: {},
     revision: "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY",
   });
+  assert.equal(relayV2.authority.kind, "fake_preview");
+  assert.equal(relayV2.connector.acknowledgement, "host.registered");
+  assert.equal(relayV2.connector.negotiatedCapabilityIntersection.length, 6);
+  assert.equal(relayV2.enrollment.status, "active");
   assert.equal("closeLifecycle" in previewDashboardTransport, false);
   assert.equal("closeLifecycle" in previewDashboardBackend.window, false);
 });

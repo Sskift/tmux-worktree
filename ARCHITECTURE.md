@@ -95,6 +95,8 @@ DashboardBackend interface
 
 React 持有选择、打开面板、草稿和轮询状态；它不持有 managed session 的权威状态。
 
+Dashboard 已有一个通过 `DashboardBackend` 驱动的 Relay v2 enrollment/process 领域切片，用于区分 Relay v1 shared-secret profile 与 v2 host credential reference，并建模 host bootstrap/refresh、`host.registered`、六项基础 capability、一次性 enrollment、已知 client grant revoke、过期和 SUPERSEDED。浏览器 preview 使用明确标记的内存 fake；生产 Tauri adapter 在 Node issuer/credential 本地管理接口交付前只返回 unavailable，不经 renderer IPC 传递 bootstrap/access/refresh secret，也不宣告真实 capability 或生成生产二维码。因此当前生产 Relay runtime 仍然只有 v1。
+
 ### macOS 后端：模块化 Rust/Tauri
 
 `app/src-tauri/src/lib.rs` 只是 composition root：注册模块、进程级 state 和 Tauri commands，并处理应用退出清理。业务实现分布在：
