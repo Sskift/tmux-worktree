@@ -473,7 +473,7 @@ function validateRelayWelcome(value: RelayV2JsonValue): void {
     "maxQueuedRouteFrames",
     "maxInFlightRequestsPerRoute",
   ]);
-  for (const item of Object.values(limits)) integer(item);
+  for (const item of Object.values(limits)) integer(item, 1);
 }
 
 function validateClientHello(value: RelayV2JsonValue): void {
@@ -558,7 +558,7 @@ function validateHostWelcome(value: RelayV2JsonValue): void {
     "brokerRouteBufferedBytesPerDirection",
     "brokerRouteLowWaterBytesPerDirection",
   ]);
-  for (const item of Object.values(limits)) integer(item);
+  for (const item of Object.values(limits)) integer(item, 1);
 }
 
 function validateCommandArguments(
@@ -1785,15 +1785,30 @@ export function validateRelayV2CarrierFrame(
       break;
     }
     case "carrier.error": {
-      carrierRoot(
-        frame,
-        type,
-        ["connectorId", "payload", "error"],
-        ["requestId", "routeId", "routeFence"],
-      );
+      exact(frame, [
+        "carrierVersion",
+        "type",
+        "requestId",
+        "connectorId",
+        "payload",
+        "error",
+      ]);
+      literal(field(frame, "carrierVersion"), 1);
+      literal(field(frame, "type"), type);
+      id(field(frame, "requestId"));
       const payload = object(field(frame, "payload"));
       exact(payload, ["failedType"]);
-      stringValue(field(payload, "failedType"), { maxBytes: 128 });
+      const failedType = oneOf(field(payload, "failedType"), [
+        "host.hello",
+        "host.reauthenticate",
+        "enrollment.create",
+        "grant.revoke",
+      ] as const);
+      if (failedType === "host.hello") {
+        nullValue(field(frame, "connectorId"));
+      } else {
+        id(field(frame, "connectorId"));
+      }
       validateStructuredError(field(frame, "error"));
       break;
     }
@@ -1820,8 +1835,9 @@ export function validateRelayV2CarrierFrame(
       capabilities(field(payload, "capabilities"));
       const limits = object(field(payload, "limits"));
       exact(limits, ["maxFrameBytes", "terminalMaxFrameBytes"]);
-      integer(field(limits, "maxFrameBytes"));
-      integer(field(limits, "terminalMaxFrameBytes"));
+      const maxFrameBytes = integer(field(limits, "maxFrameBytes"), 1);
+      const terminalMaxFrameBytes = integer(field(limits, "terminalMaxFrameBytes"), 1);
+      if (terminalMaxFrameBytes > maxFrameBytes) reject("invalid-argument");
       break;
     }
     case "host.registered": {
@@ -1844,7 +1860,7 @@ export function validateRelayV2CarrierFrame(
         "brokerCarrierBufferedBytes",
         "brokerCarrierLowWaterBytes",
       ]);
-      for (const item of Object.values(limits)) integer(item);
+      for (const item of Object.values(limits)) integer(item, 1);
       break;
     }
     case "route.open": {
@@ -1887,7 +1903,7 @@ export function validateRelayV2CarrierFrame(
       integer(field(auth, "expiresAtMs"));
       const limits = object(field(payload, "limits"));
       exact(limits, ["maxFrameBytes"]);
-      integer(field(limits, "maxFrameBytes"));
+      integer(field(limits, "maxFrameBytes"), 1);
       break;
     }
     case "route.opened": {
@@ -1902,7 +1918,7 @@ export function validateRelayV2CarrierFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["acceptedAtMs", "maxFrameBytes"]);
       integer(field(payload, "acceptedAtMs"));
-      integer(field(payload, "maxFrameBytes"));
+      integer(field(payload, "maxFrameBytes"), 1);
       break;
     }
     case "route.rejected": {

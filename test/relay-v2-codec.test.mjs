@@ -72,3 +72,67 @@ test("Node Relay v2 dialect resolution matches the shared no-fallback matrix", (
     );
   }
 });
+
+test("carrier.error for host.hello requires connectorId to be exactly null", () => {
+  const frame = {
+    carrierVersion: 1,
+    type: "carrier.error",
+    requestId: "hello-request",
+    connectorId: null,
+    payload: { failedType: "host.hello" },
+    error: {
+      code: "DUPLICATE_CONNECTOR",
+      message: "duplicate",
+      retryable: false,
+      retryAfterMs: null,
+      commandDisposition: "not_applicable",
+      details: null,
+    },
+  };
+  assert.doesNotThrow(() => codec.encodeRelayV2WebSocketFrame("carrier", frame));
+  assert.throws(
+    () => codec.encodeRelayV2WebSocketFrame("carrier", {
+      ...frame,
+      connectorId: "forged-connector",
+    }),
+    (error) => error instanceof codec.RelayV2CodecError
+      && error.code === "INVALID_ENVELOPE",
+  );
+});
+
+test("negotiated frame limits are positive and internally consistent", () => {
+  const golden = (name) => structuredClone(
+    corpus.golden.find((fixture) => fixture.name === name).frame,
+  );
+  const rejectCarrier = (frame) => assert.throws(
+    () => codec.encodeRelayV2WebSocketFrame("carrier", frame),
+    (error) => error instanceof codec.RelayV2CodecError
+      && error.code === "INVALID_ENVELOPE"
+      && error.failureClass === "invalid-argument",
+  );
+  const helloZero = golden("host-hello");
+  helloZero.payload.limits.maxFrameBytes = 0;
+  rejectCarrier(helloZero);
+
+  const helloContradiction = golden("host-hello");
+  helloContradiction.payload.limits.maxFrameBytes = 32_768;
+  helloContradiction.payload.limits.terminalMaxFrameBytes = 65_536;
+  rejectCarrier(helloContradiction);
+
+  const routeOpenZero = golden("route-open");
+  routeOpenZero.payload.limits.maxFrameBytes = 0;
+  rejectCarrier(routeOpenZero);
+
+  const routeOpenedZero = golden("route-opened");
+  routeOpenedZero.payload.maxFrameBytes = 0;
+  rejectCarrier(routeOpenedZero);
+
+  const relayWelcomeZero = golden("relay-welcome");
+  relayWelcomeZero.payload.limits.maxFrameBytes = 0;
+  assert.throws(
+    () => codec.encodeRelayV2WebSocketFrame("public", relayWelcomeZero),
+    (error) => error instanceof codec.RelayV2CodecError
+      && error.code === "INVALID_ENVELOPE"
+      && error.failureClass === "invalid-argument",
+  );
+});
