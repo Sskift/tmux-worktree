@@ -242,6 +242,53 @@ function routeData(connectorId, routeId, routeFence, seq, bytes) {
   };
 }
 
+test("host route and identity configuration cannot exceed production ceilings", () => {
+  assert.throws(() => createHarness({
+    queueLimits: { maxRoutes: 257 },
+  }), /route limit exceeds the production ceiling/);
+  assert.doesNotThrow(() => createHarness({
+    queueLimits: { maxRoutes: 256, maxRouteIdentitiesPerConnector: 4_096 },
+  }));
+  assert.throws(() => createHarness({
+    queueLimits: { maxRouteIdentitiesPerConnector: 4_097 },
+  }), /route identity limit exceeds the production ceiling/);
+});
+
+test("post-publish connect failure rolls back connecting state and scheduled pressure", () => {
+  let scheduleCalls = 0;
+  const h = createHarness({
+    queueLimits: {
+      carrierHighWaterBytes: 1_024,
+      carrierLowWaterBytes: 512,
+      carrierControlReserveBytes: 128,
+    },
+    schedule() {
+      scheduleCalls += 1;
+      throw new Error("scheduler unavailable");
+    },
+  });
+  const transport = new FakeTransport();
+  let bufferedReads = 0;
+  transport.bufferedAmount = () => {
+    bufferedReads += 1;
+    return bufferedReads === 1 ? 0 : 1_024;
+  };
+
+  assert.throws(
+    () => h.actor.connect(transport, "credential-1"),
+    /scheduler unavailable/,
+  );
+  assert.equal(scheduleCalls, 1);
+  assert.equal(h.actor.status().phase, "offline");
+  assert.deepEqual(
+    h.statuses.map((status) => status.phase),
+    ["connecting", "offline"],
+  );
+  assert.equal(transport.pendingDeliveries.length, 0);
+  assert.doesNotThrow(() => h.actor.connect(new FakeTransport(), "credential-1"));
+  assert.equal(h.actor.status().phase, "connecting");
+});
+
 test("host.registered is a hard barrier before any client route can bind", () => {
   const h = createHarness();
   const first = connect(h);

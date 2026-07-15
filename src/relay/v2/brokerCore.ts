@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import type { RelayV2AuthContext } from "./auth.js";
+import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -28,6 +29,9 @@ export const RELAY_V2_BROKER_LIMITS = Object.freeze({
   carrierLowWaterBytes: 8_388_608,
   maxQueuedRouteFrames: 128,
   maxInFlightRequestsPerRoute: 64,
+  maxRoutesPerCarrier: RELAY_V2_CARRIER_ROUTE_HARD_LIMIT,
+  maxBackpressureSweepActionsPerCarrier: RELAY_V2_CARRIER_ROUTE_HARD_LIMIT * 2 + 1,
+  maxBackpressureSweepMandatoryActionsPerCarrier: RELAY_V2_CARRIER_ROUTE_HARD_LIMIT + 1,
 } as const);
 
 const CARRIER_CONTROL_RESERVE_BYTES = 65_536;
@@ -230,8 +234,11 @@ export type RelayV2AuthControlDecision =
 /**
  * Persistent authority boundary for carrier auth controls. Implementations
  * own transactionality, request replay records, credential writes and
- * revocation/enrollment state. The broker only commits a replacement host
- * auth context after a valid host.reauthenticated ACK is available.
+ * revocation/enrollment state. Handoff starts an authority-owned transaction
+ * that may complete after its carrier closes; it is intentionally not given a
+ * carrier AbortSignal. Carrier cancellation only fences Broker application of
+ * the eventual decision. The broker commits a replacement host auth context
+ * only after a valid host.reauthenticated ACK is available on the same carrier.
  */
 export interface RelayV2BrokerAuthControlAuthority {
   handle(
@@ -244,7 +251,8 @@ export interface RelayV2BrokerResult {
   accepted: boolean;
   /**
    * Pump actions are edge-triggered. A pause stops the named source; only a
-   * later delivery acknowledgement may emit its matching resume.
+   * later low-water acknowledgement or terminal route transition may emit
+   * its matching resume.
    */
   actions: RelayV2BrokerAction[];
   error?: RelayV2StructuredError;
@@ -333,6 +341,7 @@ type CarrierState = {
   } | null;
   controlQueue: QueuedCarrierFrame[];
   dataQueues: Map<string, QueuedCarrierFrame[]>;
+  routeIds: Set<string>;
   dataOrder: string[];
   dataCursor: number;
   queuedBytes: number;
@@ -628,6 +637,7 @@ export class RelayV2BrokerCore {
       registration: null,
       controlQueue: [],
       dataQueues: new Map(),
+      routeIds: new Set(),
       dataOrder: [],
       dataCursor: 0,
       queuedBytes: 0,
@@ -734,6 +744,26 @@ export class RelayV2BrokerCore {
       };
     }
     const carrier = this.activeCarriers.get(authContext.hostId)!;
+    if (carrier.routeIds.size >= RELAY_V2_BROKER_LIMITS.maxRoutesPerCarrier) {
+      const error = structuredError(
+        "BUSY",
+        "Host carrier route capacity is exhausted",
+        true,
+        1_000,
+        "not_accepted",
+      );
+      return {
+        accepted: false,
+        error,
+        actions: [{
+          kind: "route_unavailable",
+          connectionId,
+          hostId: authContext.hostId,
+          closeCode: 1013,
+          error,
+        }],
+      };
+    }
     if (
       this.carrierBufferedBytes(carrier)
       >= RELAY_V2_BROKER_LIMITS.carrierBufferedBytes - CARRIER_CONTROL_RESERVE_BYTES
@@ -819,6 +849,7 @@ export class RelayV2BrokerCore {
       };
     }
     this.routes.set(routeId, route);
+    carrier.routeIds.add(routeId);
     this.clients.set(connectionId, {
       connectionId,
       authContext: Object.freeze({ ...authContext }),
@@ -829,6 +860,11 @@ export class RelayV2BrokerCore {
     return { accepted: true, actions: [], routeId, routeFence };
   }
 
+  /**
+   * The optional signal bounds this carrier delivery and its Broker mutation.
+   * It does not cancel an auth-control transaction already handed to its
+   * persistent authority.
+   */
   async receiveHostFrame(
     transportId: string,
     bytes: Uint8Array,
@@ -1268,11 +1304,21 @@ export class RelayV2BrokerCore {
     };
   }
 
-  /** Close only routes that have remained above a bounded pressure fence for 5 seconds. */
-  sweepBackpressure(): RelayV2BrokerResult {
+  /** Close only this carrier's routes that remained above pressure for 5 seconds. */
+  sweepBackpressure(transportId: string): RelayV2BrokerResult {
+    const carrier = this.carriers.get(transportId);
+    if (!carrier || carrier.status !== "active") {
+      return { accepted: true, actions: [] };
+    }
     const actions: RelayV2BrokerAction[] = [];
+    let closeHost: RelayV2BrokerAction | null = null;
     const now = this.now();
-    for (const route of [...this.routes.values()]) {
+    for (const routeId of carrier.routeIds) {
+      const route = this.routes.get(routeId);
+      if (!route || route.carrierTransportId !== transportId) {
+        carrier.routeIds.delete(routeId);
+        continue;
+      }
       if (route.status !== "opened") continue;
       const pressureSince = [
         route.clientToHostPressureSinceMs,
@@ -1282,7 +1328,15 @@ export class RelayV2BrokerCore {
           earliest === null || value < earliest ? value : earliest
         ), null);
       if (pressureSince === null || now - pressureSince < BACKPRESSURE_CLOSE_MS) continue;
-      actions.push(...this.beginRouteUnbind(route, "slow_consumer"));
+      for (const action of this.beginRouteUnbind(route, "slow_consumer")) {
+        if (action.kind === "close_host") {
+          // Control admission is a carrier-level failure. Keep one terminal
+          // transport action while retaining every route's client cleanup.
+          closeHost ??= action;
+        } else {
+          actions.push(action);
+        }
+      }
       actions.push({
         kind: "close_client",
         connectionId: route.connectionId,
@@ -1290,6 +1344,10 @@ export class RelayV2BrokerCore {
         reason: "sustained_backpressure",
       });
     }
+    // Keep the carrier close last: the pump can first admit at most one
+    // resume and one client cleanup per bounded route, then begins teardown
+    // with at most maxRoutesPerCarrier + 1 mandatory actions registered.
+    if (closeHost) actions.push(closeHost);
     return { accepted: true, actions };
   }
 
@@ -1750,10 +1808,16 @@ export class RelayV2BrokerCore {
       | "broker_shutdown",
   ): RelayV2BrokerAction[] {
     if (route.status === "closed" || route.status === "closing") return [];
+    const actions: RelayV2BrokerAction[] = [];
+    if (route.clientReadPaused) {
+      route.clientReadPaused = false;
+      route.clientToHostPressureSinceMs = null;
+      actions.push({ kind: "resume_client", connectionId: route.connectionId });
+    }
     const carrier = this.carriers.get(route.carrierTransportId);
     if (!carrier || carrier.status !== "active" || carrier.connectorId !== route.connectorId) {
       this.dropRoute(route);
-      return [];
+      return actions;
     }
     this.discardQueuedRouteData(carrier, route);
     this.discardQueuedClientData(route);
@@ -1770,14 +1834,14 @@ export class RelayV2BrokerCore {
       },
     } satisfies RelayV2JsonObject;
     if (!this.enqueueCarrierControl(carrier, frame, route)) {
-      return [{
+      actions.push({
         kind: "close_host",
         transportId: carrier.transportId,
         closeCode: 1013,
         reason: "carrier_control_backpressure",
-      }];
+      });
     }
-    return [];
+    return actions;
   }
 
   private carrierBufferedBytes(carrier: CarrierState): number {
@@ -1863,8 +1927,12 @@ export class RelayV2BrokerCore {
 
   private collectCarrierResumes(carrier: CarrierState): RelayV2BrokerAction[] {
     const actions: RelayV2BrokerAction[] = [];
-    for (const route of this.routes.values()) {
-      if (route.carrierTransportId !== carrier.transportId) continue;
+    for (const routeId of carrier.routeIds) {
+      const route = this.routes.get(routeId);
+      if (!route || route.carrierTransportId !== carrier.transportId) {
+        carrier.routeIds.delete(routeId);
+        continue;
+      }
       actions.push(...this.maybeResumeClientPressure(carrier, route));
       actions.push(...this.maybeResumeHostPressure(route));
     }
@@ -1943,7 +2011,10 @@ export class RelayV2BrokerCore {
   private dropRoute(route: RouteState): void {
     if (route.status === "closed") return;
     const carrier = this.carriers.get(route.carrierTransportId);
-    if (carrier) this.discardQueuedRouteData(carrier, route);
+    if (carrier) {
+      this.discardQueuedRouteData(carrier, route);
+      carrier.routeIds.delete(route.routeId);
+    }
     const client = this.clients.get(route.connectionId);
     if (client) {
       for (const entry of client.queue) this.releaseHostToClientBytes(route, entry.bytes.byteLength);
@@ -1979,8 +2050,12 @@ export class RelayV2BrokerCore {
     actions: RelayV2BrokerAction[],
     superseded: boolean,
   ): void {
-    for (const route of [...this.routes.values()]) {
-      if (route.carrierTransportId !== carrier.transportId) continue;
+    for (const routeId of [...carrier.routeIds]) {
+      const route = this.routes.get(routeId);
+      if (!route || route.carrierTransportId !== carrier.transportId) {
+        carrier.routeIds.delete(routeId);
+        continue;
+      }
       if (route.status === "opening") {
         actions.push({
           kind: "route_unavailable",
@@ -2010,6 +2085,7 @@ export class RelayV2BrokerCore {
   private discardCarrier(carrier: CarrierState): void {
     carrier.controlQueue = [];
     carrier.dataQueues.clear();
+    carrier.routeIds.clear();
     carrier.dataOrder = [];
     carrier.dataCursor = 0;
     carrier.queuedBytes = 0;

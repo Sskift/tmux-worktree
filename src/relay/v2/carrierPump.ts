@@ -1,4 +1,5 @@
 import type { RelayV2AuthContext } from "./auth.js";
+import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
   type RelayV2BrokerAction,
   type RelayV2BrokerResult,
@@ -18,6 +19,7 @@ import type {
 const PRESSURE_TIMEOUT_MS = 5_000;
 const DEFAULT_DELIVERY_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_BYTES = 16 * 1_048_576;
+const MANDATORY_ACTION_BYTES_HARD_FLOOR = 1_048_576;
 const MAX_EMERGENCY_ACTION_BYTES = 16 * 1_048_576;
 
 export type RelayV2CarrierPumpDirection = "host_to_broker" | "broker_to_host";
@@ -69,6 +71,10 @@ export interface RelayV2BrokerActionFence {
   mayApply(): boolean;
 }
 
+/**
+ * Bounded receipt for carrier queues and mutation/action fences. It does not
+ * cancel a persistent auth-authority transaction already handed off by Broker.
+ */
 export type RelayV2CarrierPumpCloseReceipt = Readonly<{
   outcome: "closed" | "terminal_failure";
   code: number;
@@ -225,10 +231,19 @@ function makeLimits(input: RelayV2CarrierPumpQueueLimits = {}): PumpLimits {
     maxPendingActions,
     maxPendingActionBytes,
     // Mandatory cleanup has a separate reserve but stays in the same registry.
-    // The reserve admits 128 route cleanups plus terminal control and host
-    // closure even when the ordinary action budget is already exhausted.
-    maxMandatoryActions: Math.max(maxPendingActions + controlReserveFrames, 130),
-    maxMandatoryActionBytes: maxPendingActionBytes,
+    // Every legal configuration admits BrokerCore's bounded route cleanups
+    // plus its single carrier close without using the emergency entry.
+    maxMandatoryActions: Math.max(
+      maxPendingActions + controlReserveFrames,
+      RELAY_V2_CARRIER_ROUTE_HARD_LIMIT + 1,
+    ),
+    // One MiB covers the fixed 256-route producer bound even when every
+    // 128-byte identifier expands to its canonical JSON escape form. It is
+    // independent from the ordinary action byte budget and remains finite.
+    maxMandatoryActionBytes: Math.max(
+      maxPendingActionBytes,
+      MANDATORY_ACTION_BYTES_HARD_FLOOR,
+    ),
   };
 }
 
@@ -238,6 +253,30 @@ function safeNow(now: () => number): number {
     throw new Error("Relay v2 carrier pump clock returned an invalid timestamp");
   }
   return value;
+}
+
+type ActionSinkAssimilation =
+  | { kind: "synchronous" }
+  | { kind: "rejected" }
+  | { kind: "pending"; settlement: Promise<void> };
+
+function assimilateActionSinkResult(result: unknown): ActionSinkAssimilation {
+  if (result === undefined) return { kind: "synchronous" };
+  let then: unknown;
+  try {
+    then = (result as { then?: unknown }).then;
+  } catch {
+    return { kind: "rejected" };
+  }
+  if (typeof then !== "function") return { kind: "rejected" };
+  const settlement = new Promise<void>((resolve, reject) => {
+    try {
+      Reflect.apply(then, result, [() => resolve(), (error: unknown) => reject(error)]);
+    } catch (error) {
+      reject(error);
+    }
+  });
+  return { kind: "pending", settlement };
 }
 
 function frameIdentity(bytes: Uint8Array): {
@@ -468,7 +507,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   /** Deterministic sweep hook; production also schedules this automatically. */
   sweep(): void {
     if (this.phase !== "running") return;
-    const swept = this.options.broker.sweepBackpressure();
+    const swept = this.options.broker.sweepBackpressure(this.options.transportId);
     this.acceptBrokerResult(swept);
     this.notifyHostWritable = true;
     if (swept.actions.length > 0) {
@@ -940,11 +979,16 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.failBrokerAction(generation, id);
       return true;
     }
-    if (!result || typeof (result as Promise<void>).then !== "function") {
+    const assimilation = assimilateActionSinkResult(result);
+    if (assimilation.kind === "synchronous") {
       this.completeBrokerAction(generation, id);
       return true;
     }
-    void Promise.resolve(result).then(
+    if (assimilation.kind === "rejected") {
+      this.failBrokerAction(generation, id);
+      return true;
+    }
+    void assimilation.settlement.then(
       () => { weakPump.deref()?.completeBrokerAction(generation, id); },
       () => { weakPump.deref()?.failBrokerAction(generation, id); },
     );
@@ -1141,7 +1185,6 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     const attempt = this.brokerActionAttempt;
     if (!attempt || attempt.generation !== generation || attempt.id !== id
       || generation !== this.lifecycleGeneration) return;
-    attempt.abort.abort();
     attempt.cancelDeadline();
     this.requestClose(1013, "broker_action_timeout");
     this.beginCloseDrain();
@@ -1165,6 +1208,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     const attempt = this.brokerActionAttempt;
     if (!attempt || attempt.generation !== generation || attempt.id !== id
       || generation !== this.lifecycleGeneration) return;
+    this.installOwnerFence(attempt.entry.ownerFence.identity);
     attempt.abort.abort();
     attempt.cancelDeadline();
     this.removePendingAction(attempt.entry);
@@ -1396,6 +1440,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       : null;
     if (processing) this.removePendingAction(processing, true);
     if (actionAttempt) {
+      this.installOwnerFence(actionAttempt.entry.ownerFence.identity);
       actionAttempt.abort.abort();
       actionAttempt.cancelDeadline();
       // Abort is advisory: the sink may already own an external side effect.
@@ -1736,12 +1781,18 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
         if (!this.forceCloseAction(entry)) return;
         continue;
       }
-      if (!result || typeof (result as Promise<void>).then !== "function") {
+      const assimilation = assimilateActionSinkResult(result);
+      if (assimilation.kind === "synchronous") {
         this.markCloseAction(entry, "settled");
         continue;
       }
+      if (assimilation.kind === "rejected") {
+        this.closeActionFailures += 1;
+        if (!this.forceCloseAction(entry)) return;
+        continue;
+      }
       const weakPump = new WeakRef(this);
-      void Promise.resolve(result).then(
+      void assimilation.settlement.then(
         () => { weakPump.deref()?.settleCloseAction(generation, entry.id, false); },
         () => { weakPump.deref()?.settleCloseAction(generation, entry.id, true); },
       );
@@ -1753,6 +1804,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.closeAdmissionTimer?.cancel();
     this.closeAdmissionTimer = null;
     this.closeAdmissionSealed = true;
+    this.installAllOwnerFences();
     this.closeActionAbort?.abort();
     this.closeDrainGeneration += 1;
     const retired = this.retiredBrokerActionAttempt;

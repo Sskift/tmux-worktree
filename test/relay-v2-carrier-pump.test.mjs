@@ -203,8 +203,8 @@ function createHarness(options = {}) {
     credentialReferences: new FakeCredentials(),
     advertisedCapabilities: [...brokerModule.RELAY_V2_REQUIRED_CAPABILITIES],
     clientDialects: ["tw-relay.v2"],
-    clock: () => scheduler.now,
-    schedule: scheduler.schedule,
+    clock: options.hostClock ?? (() => scheduler.now),
+    schedule: options.hostSchedule ?? scheduler.schedule,
     queueLimits: options.hostQueueLimits,
     routeSink: {
       onRouteBound(binding) {
@@ -339,6 +339,20 @@ function settleActionAfter(scheduler, signal, delayMs, effect, rejectEffect = fa
   });
 }
 
+function hostileActionSinkResult(kind, observations) {
+  if (kind === "non_thenable") return { then: true };
+  return Object.defineProperty({}, "then", {
+    get() {
+      observations.getterReads += 1;
+      if (kind === "getter_throw") throw new Error("then getter failed");
+      return () => {
+        observations.thenCalls += 1;
+        throw new Error("then call failed");
+      };
+    },
+  });
+}
+
 class StatefulBrokerActionOwner {
   sockets = new Map();
   permanentlyFenced = new Set();
@@ -388,7 +402,7 @@ class StatefulBrokerActionOwner {
   }
 }
 
-test("start attach failures roll back to a settled terminal receipt", async (t) => {
+test("start attach/connect failures roll back to a settled terminal receipt", async (t) => {
   await t.test("duplicate transport leaves the existing production carrier intact", async () => {
     const first = createHarness({ transportId: "start-duplicate-transport" });
     await startRegistered(first);
@@ -424,6 +438,26 @@ test("start attach failures roll back to a settled terminal receipt", async (t) 
     assert.equal(receipt.reason, "carrier_pump_start_failure");
     assert.equal(h.pump.snapshot().phase, "closed");
     assert.equal(h.pump.snapshot().scheduledTimers, 0);
+    assert.equal(h.broker.inspectHost(HOST_ID), undefined);
+  });
+
+  await t.test("post-attach Host connect failure leaves no connecting actor or timer", async () => {
+    const h = createHarness({
+      transportId: "start-host-connect-failure",
+      hostQueueLimits: {
+        carrierHighWaterBytes: 128,
+        carrierLowWaterBytes: 64,
+        carrierControlReserveBytes: 32,
+      },
+    });
+
+    assert.throws(() => h.pump.start(), /could not queue host\.hello/);
+    const receipt = await h.pump.whenCloseSettled();
+    assert.equal(receipt.outcome, "closed");
+    assert.equal(receipt.reason, "carrier_pump_start_failure");
+    assert.equal(h.host.status().phase, "offline");
+    assert.equal(h.pump.snapshot().scheduledTimers, 0);
+    assert.equal(h.scheduler.liveDelayedTasks().length, 0);
     assert.equal(h.broker.inspectHost(HOST_ID), undefined);
   });
 });
@@ -505,6 +539,7 @@ test("registration commit, response retry, exact bidirectional bytes, ACKs and u
 
   const unbinding = h.broker.unbindClient("client-main", "client_closed");
   assert.equal(unbinding.accepted, true);
+  assert.deepEqual(unbinding.actions, [], "an unpaused terminal route emits no synthetic resume");
   h.pump.acceptBrokerResult(unbinding);
   await h.scheduler.flushReady();
   assert.equal(h.unbound.at(-1).reason, "client_closed");
@@ -815,6 +850,12 @@ test("client unbind fences pump-owned reverse data without killing a healthy rou
 
 test("five-second owner sweep closes only the pressured route and preserves a healthy route", async () => {
   const h = createHarness();
+  const sweptTransportIds = [];
+  const sweepBackpressure = h.broker.sweepBackpressure.bind(h.broker);
+  h.broker.sweepBackpressure = (transportId) => {
+    sweptTransportIds.push(transportId);
+    return sweepBackpressure(transportId);
+  };
   await startRegistered(h);
   const route = await openRoute(h, "client-pressure-timeout");
   const healthy = await openRoute(h, "client-pressure-healthy");
@@ -843,6 +884,8 @@ test("five-second owner sweep closes only the pressured route and preserves a he
   assert.equal(h.pump.snapshot().hostToBroker.frames, 1);
 
   await h.scheduler.advance(5_000);
+  assert.ok(sweptTransportIds.length > 0);
+  assert.deepEqual([...new Set(sweptTransportIds)], [h.transportId]);
   assert.equal(h.brokerActions.some((action) => (
     action.kind === "close_client"
     && action.connectionId === "client-pressure-timeout"
@@ -863,7 +906,70 @@ test("five-second owner sweep closes only the pressured route and preserves a he
   assert.equal(h.scheduler.liveDelayedTasks().length, 0);
 });
 
-test("terminal client cleanup clears paused pressure without a resume edge", async () => {
+test("Broker maximum sweep cleanup batch fits a low ordinary Pump limit", async () => {
+  const mandatoryBound = brokerModule.RELAY_V2_BROKER_LIMITS
+    .maxBackpressureSweepMandatoryActionsPerCarrier;
+  const clientCount = mandatoryBound - 1;
+  const maxEscapedIdentifier = (index) => (
+    `${index.toString(16).padStart(4, "0")}${"\u0001".repeat(124)}`
+  );
+  const transportId = maxEscapedIdentifier(clientCount);
+  const h = createHarness({
+    transportId,
+    queueLimits: {
+      maxPendingActions: 1,
+      maxPendingActionBytes: 1,
+    },
+  });
+  await startRegistered(h);
+  const connectionIds = Array.from(
+    { length: clientCount },
+    (_, index) => maxEscapedIdentifier(index),
+  );
+  assert.equal(new Set(connectionIds).size, clientCount);
+  assert.equal(connectionIds.every((connectionId) => (
+    Buffer.byteLength(connectionId, "utf8") === 128
+  )), true);
+  const actions = connectionIds.map((connectionId) => ({
+    kind: "close_client",
+    connectionId,
+    closeCode: 1013,
+    reason: "sustained_backpressure",
+  }));
+  actions.push({
+    kind: "close_host",
+    transportId: h.transportId,
+    closeCode: 1013,
+    reason: "carrier_control_backpressure",
+  });
+  assert.equal(actions.length, mandatoryBound);
+  const batchBytes = actions.reduce(
+    (total, action) => total + Buffer.byteLength(JSON.stringify(action), "utf8"),
+    0,
+  );
+  assert.ok(batchBytes > 1);
+  assert.ok(batchBytes < 1_048_576);
+
+  const closeBarrier = h.pump.whenCloseSettled();
+  h.pump.acceptBrokerResult({ accepted: true, actions });
+  await h.scheduler.flushReady();
+  const receipt = await closeBarrier;
+  const closeClients = h.brokerActions.filter((action) => action.kind === "close_client");
+  const closeHosts = h.brokerActions.filter((action) => action.kind === "close_host");
+
+  assert.equal(receipt.outcome, "closed");
+  assert.equal(receipt.failedMandatoryActions, 0);
+  assert.equal(h.pump.snapshot().phase, "closed");
+  assert.equal(h.pump.snapshot().terminalFailure, null);
+  assert.equal(closeClients.length, clientCount);
+  assert.equal(new Set(closeClients.map((action) => action.connectionId)).size, clientCount);
+  assert.equal(closeHosts.length, 1);
+  assert.equal(h.forcedBrokerActions.length, 0);
+  assert.equal(h.scheduler.liveDelayedTasks().length, 0);
+  assert.equal(h.broker.inspectHost(HOST_ID)?.state, "offline");
+});
+
+test("terminal client cleanup clears paused pressure with an explicit resume edge", async () => {
   const h = createHarness();
   await startRegistered(h);
   await openRoute(h, "client-paused-terminal");
@@ -891,7 +997,7 @@ test("terminal client cleanup clears paused pressure without a resume edge", asy
   assert.equal(h.brokerActions.some((action) => (
     action.kind === "resume_client"
       && action.connectionId === "client-paused-terminal"
-  )), false);
+  )), true);
   assert.deepEqual(h.pump.snapshot().pausedClients, []);
   assert.equal(h.pump.snapshot().phase, "running");
 
@@ -907,6 +1013,56 @@ test("terminal client cleanup clears paused pressure without a resume edge", asy
   await h.scheduler.flushReady();
   assert.deepEqual(h.received.at(-1).payload, healthyBytes);
   assert.equal(h.pump.snapshot().phase, "running");
+});
+
+test("paused client_closed emits a terminal resume and cannot poison carrier pressure", async () => {
+  const h = createHarness();
+  await startRegistered(h);
+  const pressured = await openRoute(h, "client-paused-unbind");
+  await openRoute(h, "client-paused-unbind-healthy");
+  h.pump.setWritable("broker_to_host", false);
+
+  let highWater;
+  for (let index = 0; index < brokerModule.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames; index += 1) {
+    highWater = h.broker.forwardClientFrame(
+      "client-paused-unbind",
+      publicClientFrame(`paused-unbind-${index}`),
+    );
+    assert.equal(highWater.accepted, true);
+    h.pump.acceptBrokerResult(highWater);
+    await h.scheduler.flushReady();
+  }
+  assert.equal(highWater.actions.some((action) => action.kind === "pause_client"), true);
+  assert.deepEqual(h.pump.snapshot().pausedClients, ["client-paused-unbind"]);
+
+  const unbinding = h.broker.unbindClient("client-paused-unbind", "client_closed");
+  assert.deepEqual(unbinding.actions, [{
+    kind: "resume_client",
+    connectionId: "client-paused-unbind",
+  }]);
+  h.pump.acceptBrokerResult(unbinding);
+  await h.scheduler.flushReady();
+  assert.deepEqual(h.pump.snapshot().pausedClients, []);
+
+  h.pump.setWritable("broker_to_host", true);
+  await h.scheduler.flushReady();
+  assert.deepEqual(h.pump.snapshot().brokerToHost, { frames: 0, bytes: 0 });
+  assert.equal(h.unbound.some((entry) => (
+    entry.binding.routeId === pressured.routeId && entry.reason === "client_closed"
+  )), true);
+
+  await h.scheduler.advance(5_001);
+  assert.equal(h.pump.snapshot().phase, "running");
+  assert.equal(h.broker.inspectHost(HOST_ID).state, "online");
+  const healthyBytes = publicClientFrame("healthy-after-paused-unbind");
+  const healthy = h.broker.forwardClientFrame(
+    "client-paused-unbind-healthy",
+    healthyBytes,
+  );
+  assert.equal(healthy.accepted, true);
+  h.pump.acceptBrokerResult(healthy);
+  await h.scheduler.flushReady();
+  assert.deepEqual(h.received.at(-1).payload, healthyBytes);
 });
 
 test("pump queues are byte/frame bounded with control reserve and shutdown cancels pressure timers", async () => {
@@ -1009,7 +1165,8 @@ test("mandatory teardown reserve survives a full ordinary action queue and 128-r
     },
     actionSink(action, _signal, fence) {
       if (action.kind === "route_opened") return new Promise(() => {});
-      return owner.apply(action, fence);
+      owner.apply(action, fence);
+      return undefined;
     },
     forceActionSink(action, fence) {
       return owner.force(action, fence);
@@ -1065,7 +1222,7 @@ test("mandatory teardown reserve survives a full ordinary action queue and 128-r
   assert.equal(h.pump.snapshot().terminalFailure, null);
 });
 
-test("mandatory capacity overflow beyond 128 routes stops after one registered force failure", async () => {
+test("mandatory capacity overflow stops at the hard floor plus one after Broker offline", async () => {
   let directoryAtForce = "not-called";
   let registeredAtForce = 0;
   let routeAcceptedAtForce = true;
@@ -1084,35 +1241,44 @@ test("mandatory capacity overflow beyond 128 routes stops after one registered f
       directoryAtForce = h.broker.inspectHost(HOST_ID);
       registeredAtForce = h.pump.snapshot().mandatoryActions;
       routeAcceptedAtForce = h.broker.forwardClientFrame(
-        "client-unbounded-opening-159",
+        "client-unbounded-opening-255",
         publicClientFrame("must-already-be-offline"),
       ).accepted;
       return false;
     },
   });
   await startRegistered(h);
-  for (let index = 0; index < 160; index += 1) {
+  for (let index = 0; index < 256; index += 1) {
     await openRoute(h, `client-unbounded-opening-${index.toString().padStart(3, "0")}`);
   }
   assert.equal(h.pump.snapshot().pendingActions, 0, "normal route-open actions are consumed");
   assert.equal(
     h.brokerActions.filter((action) => action.kind === "route_opened").length,
-    160,
+    256,
   );
 
+  h.pump.acceptBrokerResult({
+    accepted: true,
+    actions: ["first", "second"].map((suffix) => ({
+      kind: "close_client",
+      connectionId: `client-prequeued-overflow-${suffix}`,
+      closeCode: 1013,
+      reason: "capacity_plus_one_probe",
+    })),
+  });
   const closeBarrier = h.pump.shutdown(1013, "mandatory-capacity-overflow");
   const receipt = await closeBarrier;
   const stableSnapshot = h.pump.snapshot();
 
   assert.equal(directoryAtForce?.state, "offline", "Broker directory is offline before force handoff");
   assert.equal(routeAcceptedAtForce, false, "active routes are gone before force handoff");
-  assert.equal(registeredAtForce, 131, "the emergency entry is capacity + one before callback");
+  assert.equal(registeredAtForce, 258, "the emergency entry is capacity + one before callback");
   assert.equal(forceCalls, 1);
   assert.equal(receipt.outcome, "terminal_failure");
   assert.equal(receipt.failedMandatoryActions, 1);
   assert.equal(stableSnapshot.phase, "terminal_failure");
   assert.equal(stableSnapshot.scheduledTimers, 0);
-  assert.equal(stableSnapshot.mandatoryActions, 131, "registry is hard bounded at capacity plus one");
+  assert.equal(stableSnapshot.mandatoryActions, 258, "registry is hard bounded at capacity plus one");
   assert.equal(h.broker.inspectHost(HOST_ID)?.state, "offline");
   assert.equal(h.scheduler.liveDelayedTasks().length, 0);
 
@@ -1179,6 +1345,67 @@ test("closing admission includes a late production route_unavailable before rece
   assert.equal(h.pump.snapshot().phase, "closed");
 });
 
+test("action sinks use one fail-closed async result assimilation", async (t) => {
+  for (const invalidResult of ["getter_throw", "call_throw", "non_thenable"]) {
+    await t.test(`normal dispatch rejects ${invalidResult}`, async () => {
+      const observations = { getterReads: 0, thenCalls: 0 };
+      const h = createHarness({
+        actionSink(action) {
+          if (action.kind !== "route_opened") return undefined;
+          return hostileActionSinkResult(invalidResult, observations);
+        },
+      });
+      await startRegistered(h);
+      await openRoute(h, `client-normal-${invalidResult}`);
+      await h.scheduler.flushReady();
+
+      assert.equal(h.pump.snapshot().phase, "closed");
+      assert.equal(h.pump.snapshot().closeReason, "carrier_pump_action_sink_failure");
+      assert.equal(observations.getterReads, invalidResult === "non_thenable" ? 0 : 1);
+      assert.equal(observations.thenCalls, invalidResult === "call_throw" ? 1 : 0);
+      assert.equal(h.pump.snapshot().scheduledTimers, 0);
+    });
+
+    await t.test(`close dispatch force-cleans ${invalidResult}`, async () => {
+      const observations = { getterReads: 0, thenCalls: 0 };
+      const owner = new StatefulBrokerActionOwner();
+      let teardown = false;
+      const connectionId = `client-close-${invalidResult}`;
+      const h = createHarness({
+        actionSink(action, _signal, fence) {
+          if (action.kind === "route_opened") {
+            owner.apply(action, fence);
+            return undefined;
+          }
+          if (teardown && action.kind === "close_client") {
+            return hostileActionSinkResult(invalidResult, observations);
+          }
+          return undefined;
+        },
+        forceActionSink(action, fence) {
+          return owner.force(action, fence);
+        },
+      });
+      await startRegistered(h);
+      owner.trackClient(connectionId);
+      await openRoute(h, connectionId);
+      teardown = true;
+
+      const closeBarrier = h.pump.shutdown();
+      await h.scheduler.flushReady();
+      const receipt = await closeBarrier;
+
+      assert.equal(receipt.outcome, "closed");
+      assert.equal(owner.isOpen(connectionId), false);
+      assert.equal(owner.forceCalls.length, 1);
+      assert.equal(h.pump.snapshot().closeActionFailures, 1);
+      assert.equal(observations.getterReads, invalidResult === "non_thenable" ? 0 : 1);
+      assert.equal(observations.thenCalls, invalidResult === "call_throw" ? 1 : 0);
+      assert.equal(h.pump.snapshot().scheduledTimers, 0);
+    });
+  }
+});
+
 test("hung broker receive/auth and async action sinks are deadline fenced without leaks", async (t) => {
   await t.test("hung receive with another eligible route has no due-now churn and drains every route", async () => {
     const effects = [];
@@ -1236,10 +1463,23 @@ test("hung broker receive/auth and async action sinks are deadline fenced withou
     assert.equal(h.scheduler.liveDelayedTasks().length, 0);
   });
 
-  await t.test("never-resolving auth authority is aborted by the same deadline", async () => {
+  await t.test("auth authority may finish after the carrier mutation fence closes", async () => {
+    let authorityRequest;
+    let resolveAuthority;
+    let authorityCompleted = false;
     const h = createHarness({
       brokerOptions: {
-        authControlAuthority: { handle: () => new Promise(() => {}) },
+        authControlAuthority: {
+          handle(request) {
+            authorityRequest = request;
+            return new Promise((resolve) => {
+              resolveAuthority = (decision) => {
+                authorityCompleted = true;
+                resolve(decision);
+              };
+            });
+          },
+        },
       },
     });
     await startRegistered(h);
@@ -1252,17 +1492,55 @@ test("hung broker receive/auth and async action sinks are deadline fenced withou
     assert.equal(h.pump.snapshot().closeReason, "host_delivery_timeout");
     assert.equal(h.pump.snapshot().scheduledTimers, 0);
     assert.equal(h.scheduler.liveDelayedTasks().length, 0);
+    assert.equal(authorityCompleted, false, "carrier close does not claim authority cancellation");
+    assert.equal(h.broker.inspectHost(HOST_ID).state, "offline");
+
+    const lateExpiresAtMs = h.scheduler.now + 3_600_000;
+    resolveAuthority({
+      outcome: "success",
+      response: {
+        carrierVersion: 1,
+        type: "host.reauthenticated",
+        requestId: authorityRequest.requestId,
+        connectorId: authorityRequest.connectorId,
+        payload: {
+          grantId: authorityRequest.currentAuthContext.grantId,
+          jti: "late-authority-jti",
+          expiresAtMs: lateExpiresAtMs,
+          deduplicated: false,
+        },
+      },
+      replayed: false,
+      nextAuthContext: {
+        ...authorityRequest.currentAuthContext,
+        jti: "late-authority-jti",
+        expiresAtMs: lateExpiresAtMs,
+      },
+    });
+    await h.scheduler.flushReady();
+
+    assert.equal(authorityCompleted, true);
+    assert.equal(h.pump.snapshot().phase, "closed");
+    assert.equal(h.broker.inspectHost(HOST_ID).state, "offline");
+    assert.equal(h.brokerActions.some((action) => (
+      action.kind === "send_host" && action.frame.type === "host.reauthenticated"
+    )), false, "late authority result cannot write back into the closed carrier");
   });
 
   await t.test("hung action with another queued action has no due-now churn or late reopen", async () => {
     const owner = new StatefulBrokerActionOwner();
     let sinkSignal;
+    let abortMayApply;
     let h;
     h = createHarness({
       actionSink(action, signal, fence) {
         if (action.kind === "route_opened") {
           sinkSignal = signal;
           return new Promise((resolve) => {
+            signal.addEventListener("abort", () => {
+              abortMayApply = fence.mayApply();
+              if (abortMayApply) owner.apply(action, fence);
+            }, { once: true });
             h.scheduler.schedule(11_000, () => {
               owner.apply(action, fence);
               resolve();
@@ -1302,6 +1580,7 @@ test("hung broker receive/auth and async action sinks are deadline fenced withou
 
     await h.scheduler.advance(5_000);
     assert.equal(sinkSignal.aborted, true);
+    assert.equal(abortMayApply, false, "requestClose fences the active identity before abort");
     assert.equal(h.pump.snapshot().phase, "closing");
     assert.deepEqual(owner.effects, []);
     assert.equal(h.brokerActions.some((action) => (
@@ -1500,15 +1779,22 @@ test("final close drains client side effects from shutdown, host failure, and pr
 
   await t.test("one hung route close cannot prevent another route cleanup handoff", async () => {
     let hungSignal;
+    let abortMayApply;
     const effects = [];
     const forced = [];
     let h;
     h = createHarness({
-      actionSink(action, signal) {
+      actionSink(action, signal, fence) {
         if (action.kind !== "close_client") return undefined;
         if (action.connectionId === "client-hung-close-first") {
           hungSignal = signal;
-          return new Promise(() => {});
+          return new Promise((resolve) => {
+            signal.addEventListener("abort", () => {
+              abortMayApply = fence.mayApply();
+              if (abortMayApply) effects.push("abort-listener-duplicate-close");
+              resolve();
+            }, { once: true });
+          });
         }
         return settleActionAfter(h.scheduler, signal, 100, () => {
           effects.push(`close_client:${action.connectionId}`);
@@ -1535,6 +1821,7 @@ test("final close drains client side effects from shutdown, host failure, and pr
     await h.scheduler.advance(4_900);
 
     assert.equal(hungSignal.aborted, true);
+    assert.equal(abortMayApply, false, "close deadline fences every owner before common abort");
     assert.deepEqual(forced, ["close_client:client-hung-close-first"]);
     assert.equal(h.pump.snapshot().phase, "closed");
     assert.equal(h.pump.snapshot().inFlightCloseActions, 0);
@@ -1551,7 +1838,10 @@ test("final close drains client side effects from shutdown, host failure, and pr
       let forceCalls = 0;
       const h = createHarness({
         actionSink(action, _signal, fence) {
-          if (action.kind === "route_opened") return owner.apply(action, fence);
+          if (action.kind === "route_opened") {
+            owner.apply(action, fence);
+            return undefined;
+          }
           if (teardown && action.kind === "close_client") {
             // Deliberately ignore AbortSignal. The real socket owner checks
             // its lease only immediately before a delayed external effect.
@@ -1674,7 +1964,10 @@ test("final close drains client side effects from shutdown, host failure, and pr
     let h;
     h = createHarness({
       actionSink(action, _signal, fence) {
-        if (action.kind === "route_opened") return owner.apply(action, fence);
+        if (action.kind === "route_opened") {
+          owner.apply(action, fence);
+          return undefined;
+        }
         if (action.kind === "close_client") return new Promise(() => {});
         return undefined;
       },

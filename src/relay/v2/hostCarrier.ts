@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
+  RELAY_V2_CARRIER_ROUTE_HARD_LIMIT,
+  RELAY_V2_CARRIER_ROUTE_IDENTITY_HARD_LIMIT,
+} from "./carrierLimits.js";
+import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
   RELAY_V2_PUBLIC_FRAME_BYTES,
@@ -277,6 +281,11 @@ function positiveLimit(value: number | undefined, fallback: number): number {
 }
 
 function makeQueueLimits(input: RelayV2HostCarrierQueueLimits = {}): QueueLimits {
+  const maxRoutes = positiveLimit(input.maxRoutes, 128);
+  const maxRouteIdentitiesPerConnector = positiveLimit(
+    input.maxRouteIdentitiesPerConnector,
+    RELAY_V2_CARRIER_ROUTE_IDENTITY_HARD_LIMIT,
+  );
   const carrierHighWaterBytes = positiveLimit(
     input.carrierHighWaterBytes,
     MAX_CARRIER_BUFFER_BYTES,
@@ -291,6 +300,12 @@ function makeQueueLimits(input: RelayV2HostCarrierQueueLimits = {}): QueueLimits
   );
   const routeHighWaterBytes = positiveLimit(input.routeHighWaterBytes, 1_048_576);
   const routeLowWaterBytes = positiveLimit(input.routeLowWaterBytes, 524_288);
+  if (maxRoutes > RELAY_V2_CARRIER_ROUTE_HARD_LIMIT) {
+    throw new Error("Relay v2 host carrier route limit exceeds the production ceiling");
+  }
+  if (maxRouteIdentitiesPerConnector > RELAY_V2_CARRIER_ROUTE_IDENTITY_HARD_LIMIT) {
+    throw new Error("Relay v2 host carrier route identity limit exceeds the production ceiling");
+  }
   if (carrierHighWaterBytes > MAX_CARRIER_BUFFER_BYTES) {
     throw new Error("Relay v2 host carrier hard limit cannot exceed 16 MiB");
   }
@@ -300,11 +315,8 @@ function makeQueueLimits(input: RelayV2HostCarrierQueueLimits = {}): QueueLimits
     throw new Error("Relay v2 host carrier low water must be below high water");
   }
   return {
-    maxRoutes: positiveLimit(input.maxRoutes, 128),
-    maxRouteIdentitiesPerConnector: positiveLimit(
-      input.maxRouteIdentitiesPerConnector,
-      4_096,
-    ),
+    maxRoutes,
+    maxRouteIdentitiesPerConnector,
     maxQueuedControlFrames: positiveLimit(input.maxQueuedControlFrames, 64),
     maxQueuedDataFrames: positiveLimit(input.maxQueuedDataFrames, 1_024),
     maxQueuedDataFramesPerRoute: positiveLimit(
@@ -496,55 +508,76 @@ export class RelayV2HostCarrierActor {
     // from the old transport is therefore generation-stale and cannot emit an
     // offline transition for the new connector.
     this.current = connector;
-    this.publishStatus({
-      phase: "connecting",
-      generation: connector.generation,
-      connectorId: null,
-    });
-    if (previous) {
-      this.retireConnectorRoutes(previous, "connector_replaced");
-      this.clearQueues(previous);
-      previous.phase = "closed";
-      previous.transport.close(1000, "connector_replaced");
-    }
+    try {
+      this.publishStatus({
+        phase: "connecting",
+        generation: connector.generation,
+        connectorId: null,
+      });
+      if (previous) {
+        this.retireConnectorRoutes(previous, "connector_replaced");
+        this.clearQueues(previous);
+        previous.phase = "closed";
+        previous.transport.close(1000, "connector_replaced");
+      }
 
-    const hello: RelayV2JsonObject = {
-      carrierVersion: 1,
-      type: "host.hello",
-      requestId: connector.helloRequestId,
-      payload: {
-        hostId: this.options.hostId,
-        hostEpoch: this.options.hostEpoch,
-        hostInstanceId: this.options.hostInstanceId,
-        clientDialects: [...this.clientDialects],
-        capabilities: [...this.capabilities],
-        limits: {
-          maxFrameBytes: this.maxFrameBytes,
-          terminalMaxFrameBytes: this.terminalMaxFrameBytes,
+      const hello: RelayV2JsonObject = {
+        carrierVersion: 1,
+        type: "host.hello",
+        requestId: connector.helloRequestId,
+        payload: {
+          hostId: this.options.hostId,
+          hostEpoch: this.options.hostEpoch,
+          hostInstanceId: this.options.hostInstanceId,
+          clientDialects: [...this.clientDialects],
+          capabilities: [...this.capabilities],
+          limits: {
+            maxFrameBytes: this.maxFrameBytes,
+            terminalMaxFrameBytes: this.terminalMaxFrameBytes,
+          },
         },
-      },
-    };
-    if (!this.enqueueControl(connector, hello, {
-      onSent: () => { connector.helloSent = true; },
-    })) {
-      throw new Error("Relay v2 host carrier could not queue host.hello");
-    }
+      };
+      if (!this.enqueueControl(connector, hello, {
+        onSent: () => { connector.helloSent = true; },
+      })) {
+        throw new Error("Relay v2 host carrier could not queue host.hello");
+      }
 
-    const generation = connector.generation;
-    return Object.freeze({
-      generation,
-      receive: (frame: Uint8Array, metadata: RelayV2FrameMetadata = {}) => {
-        this.receive(generation, frame, metadata);
-      },
-      acknowledge: (deliveryToken: string) => {
-        this.acknowledge(generation, deliveryToken);
-      },
-      rejectUnaccepted: (deliveryToken: string) => {
-        this.rejectUnaccepted(generation, deliveryToken);
-      },
-      writable: () => { this.writable(generation); },
-      closed: (code?: number) => { this.closed(generation, code); },
-    });
+      const generation = connector.generation;
+      return Object.freeze({
+        generation,
+        receive: (frame: Uint8Array, metadata: RelayV2FrameMetadata = {}) => {
+          this.receive(generation, frame, metadata);
+        },
+        acknowledge: (deliveryToken: string) => {
+          this.acknowledge(generation, deliveryToken);
+        },
+        rejectUnaccepted: (deliveryToken: string) => {
+          this.rejectUnaccepted(generation, deliveryToken);
+        },
+        writable: () => { this.writable(generation); },
+        closed: (code?: number) => { this.closed(generation, code); },
+      });
+    } catch (error) {
+      this.rollbackConnectorStart(connector);
+      throw error;
+    }
+  }
+
+  private rollbackConnectorStart(connector: ConnectorState): void {
+    const wasCurrent = this.current === connector;
+    if (wasCurrent) this.current = null;
+    connector.phase = "closed";
+    this.retireConnectorRoutes(connector, "carrier_closed");
+    this.clearQueues(connector);
+    if (wasCurrent) {
+      this.publishStatus({
+        phase: "offline",
+        generation: connector.generation,
+        connectorId: connector.connectorId,
+        closeCode: 1013,
+      });
+    }
   }
 
   requestReauthentication(requestId: string, credentialReference: string): boolean {
@@ -1617,7 +1650,12 @@ export class RelayV2HostCarrierActor {
   }
 
   private clearQueues(connector: ConnectorState): void {
-    connector.pressureTimer?.cancel();
+    try {
+      connector.pressureTimer?.cancel();
+    } catch {
+      // Lifecycle cleanup remains authoritative even if a scheduler adapter's
+      // cancellation receipt is faulty.
+    }
     connector.pressureTimer = null;
     connector.controlQueue = [];
     connector.controlBytes = 0;
