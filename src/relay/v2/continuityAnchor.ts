@@ -6,14 +6,22 @@ const MAX_CAS_TOKEN_BYTES = 512;
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 
+export const RELAY_V2_CONTINUITY_DEFAULT_OPERATION_TIMEOUT_MS = 5_000;
+export const RELAY_V2_CONTINUITY_MAX_OPERATION_TIMEOUT_MS = 30_000;
+export const RELAY_V2_CONTINUITY_DEFAULT_MAX_PENDING_OPERATIONS = 64;
+export const RELAY_V2_CONTINUITY_MAX_PENDING_OPERATIONS = 1_024;
+
 export type RelayV2ContinuityAnchorErrorCode =
   | "INVALID_CHECKPOINT"
   | "INVALID_AUTHORITY_RESPONSE"
   | "ANCHOR_UNAVAILABLE"
   | "STATE_COMMIT_UNCERTAIN"
   | "ANCHOR_COMMIT_UNCERTAIN"
+  | "LOCAL_STATE_CONFLICT"
   | "CAS_CONFLICT"
-  | "ROLLBACK_DETECTED";
+  | "ROLLBACK_DETECTED"
+  | "RECONCILIATION_REQUIRED"
+  | "BUSY";
 
 export class RelayV2ContinuityAnchorError extends Error {
   readonly code: RelayV2ContinuityAnchorErrorCode;
@@ -63,6 +71,7 @@ export type RelayV2ContinuityAnchorSnapshot =
 export interface RelayV2ContinuityAnchorReadRequest {
   protocolVersion: typeof RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION;
   anchorId: string;
+  signal: AbortSignal;
 }
 
 export interface RelayV2ContinuityAnchorCasRequest {
@@ -70,6 +79,7 @@ export interface RelayV2ContinuityAnchorCasRequest {
   anchorId: string;
   expected: RelayV2ContinuityAnchorSnapshot;
   next: RelayV2ContinuityCheckpoint;
+  signal: AbortSignal;
 }
 
 /**
@@ -83,14 +93,18 @@ export interface RelayV2ContinuityAnchorCasRequest {
  * closed rather than becoming continuity evidence.
  */
 export interface RelayV2MonotonicCasAuthority {
-  read(request: RelayV2ContinuityAnchorReadRequest): Promise<unknown>;
-  compareAndSwap(request: RelayV2ContinuityAnchorCasRequest): Promise<unknown>;
+  read(request: RelayV2ContinuityAnchorReadRequest): unknown | PromiseLike<unknown>;
+  compareAndSwap(request: RelayV2ContinuityAnchorCasRequest): unknown | PromiseLike<unknown>;
 }
 
 export interface RelayV2ContinuityAnchorOptions {
   /** Stable namespace provisioned outside the rollbackable caller state. */
   anchorId: string;
   authority: RelayV2MonotonicCasAuthority;
+  /** Finite deadline for every injected read/CAS seam. */
+  operationTimeoutMs?: number;
+  /** Bounds admitted operations and separately bounds unsettled seam calls. */
+  maxPendingOperations?: number;
 }
 
 export interface RelayV2ContinuityAnchorCasResult {
@@ -111,9 +125,30 @@ export interface RelayV2ContinuityReconcileResult {
 export interface RelayV2ContinuityAdvanceInput {
   current: RelayV2ContinuityCheckpoint;
   next: RelayV2ContinuityCheckpoint;
-  /** Atomically publish the exact state represented by next before anchor CAS. */
-  publishState(next: Readonly<RelayV2ContinuityCheckpoint>): void | Promise<void>;
+  /**
+   * Cross-instance/process atomic compare-and-publish owned by the caller.
+   * A timeout/abort must be treated as uncertain; a late completion is never a
+   * synchronous success of the timed-out advance.
+   */
+  publishState(
+    expected: Readonly<RelayV2ContinuityCheckpoint>,
+    next: Readonly<RelayV2ContinuityCheckpoint>,
+    signal: AbortSignal,
+  ): unknown | PromiseLike<unknown>;
 }
+
+export type RelayV2ContinuityLocalCasResult =
+  | {
+      /**
+       * swapped means expected was atomically replaced by current=next;
+       * already_same means the same fenced read found current=next; conflict
+       * means it found a third checkpoint and made no change.
+       */
+      outcome: "swapped" | "already_same" | "conflict";
+      current: RelayV2ContinuityCheckpoint;
+    }
+  /** The adapter cannot prove whether its local transaction committed. */
+  | { outcome: "uncertain" };
 
 export interface RelayV2ContinuityAdvanceResult {
   disposition: "committed" | "converged_after_cas_conflict";
@@ -145,7 +180,11 @@ function isIdentifier(value: unknown): value is string {
 }
 
 function isCanonicalUint64(value: unknown): value is string {
-  if (typeof value !== "string" || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  if (
+    typeof value !== "string"
+    || value.length > 20
+    || !/^(0|[1-9][0-9]*)$/.test(value)
+  ) return false;
   try {
     return BigInt(value) <= MAX_UINT64;
   } catch {
@@ -154,7 +193,9 @@ function isCanonicalUint64(value: unknown): value is string {
 }
 
 function isCasToken(value: unknown): value is string {
-  if (typeof value !== "string" || value.length === 0) return false;
+  if (typeof value !== "string" || value.length === 0 || value.length > MAX_CAS_TOKEN_BYTES) {
+    return false;
+  }
   if (Buffer.byteLength(value, "utf8") > MAX_CAS_TOKEN_BYTES) return false;
   for (let index = 0; index < value.length; index += 1) {
     const code = value.charCodeAt(index);
@@ -271,6 +312,36 @@ function parseCasResult(
   };
 }
 
+function parseLocalCasResult(
+  value: unknown,
+  expectedAnchorId: string,
+): RelayV2ContinuityLocalCasResult {
+  if (!isRecord(value) || typeof value.outcome !== "string") {
+    return fail("STATE_COMMIT_UNCERTAIN", "Relay v2 local state CAS returned an invalid result");
+  }
+  if (value.outcome === "uncertain") {
+    if (!hasExactKeys(value, ["outcome"])) {
+      return fail("STATE_COMMIT_UNCERTAIN", "Relay v2 local state CAS returned an invalid result");
+    }
+    return { outcome: "uncertain" };
+  }
+  if (
+    (value.outcome !== "swapped"
+      && value.outcome !== "already_same"
+      && value.outcome !== "conflict")
+    || !hasExactKeys(value, ["outcome", "current"])
+  ) {
+    return fail("STATE_COMMIT_UNCERTAIN", "Relay v2 local state CAS returned an invalid result");
+  }
+  let current: RelayV2ContinuityCheckpoint;
+  try {
+    current = parseCheckpoint(value.current, expectedAnchorId, "caller");
+  } catch {
+    return fail("STATE_COMMIT_UNCERTAIN", "Relay v2 local state CAS returned an invalid result");
+  }
+  return { outcome: value.outcome, current };
+}
+
 function sameCheckpoint(
   left: RelayV2ContinuityCheckpoint,
   right: RelayV2ContinuityCheckpoint,
@@ -322,10 +393,22 @@ export class RelayV2ContinuityAnchor {
   readonly anchorId: string;
 
   private readonly authority: RelayV2MonotonicCasAuthority;
+  private readonly operationTimeoutMs: number;
+  private readonly maxPendingOperations: number;
   private serializerTail: Promise<void> = Promise.resolve();
+  private pendingOperations = 0;
+  private unsettledSeamCalls = 0;
+  private reconciliationRequired = false;
 
   constructor(options: RelayV2ContinuityAnchorOptions) {
-    if (!isRecord(options) || !isIdentifier(options.anchorId)) {
+    if (
+      !isRecord(options)
+      || !Object.hasOwn(options, "anchorId")
+      || Object.keys(options).some((key) => ![
+        "anchorId", "authority", "operationTimeoutMs", "maxPendingOperations",
+      ].includes(key))
+      || !isIdentifier(options.anchorId)
+    ) {
       throw new TypeError("Relay v2 continuity anchorId is invalid");
     }
     if (
@@ -335,19 +418,47 @@ export class RelayV2ContinuityAnchor {
     ) {
       throw new TypeError("Relay v2 continuity authority must be supplied by the caller");
     }
+    const operationTimeoutMs = options.operationTimeoutMs
+      ?? RELAY_V2_CONTINUITY_DEFAULT_OPERATION_TIMEOUT_MS;
+    const maxPendingOperations = options.maxPendingOperations
+      ?? RELAY_V2_CONTINUITY_DEFAULT_MAX_PENDING_OPERATIONS;
+    if (
+      !Number.isSafeInteger(operationTimeoutMs)
+      || operationTimeoutMs <= 0
+      || operationTimeoutMs > RELAY_V2_CONTINUITY_MAX_OPERATION_TIMEOUT_MS
+    ) {
+      throw new TypeError("Relay v2 continuity operation timeout is invalid");
+    }
+    if (
+      !Number.isSafeInteger(maxPendingOperations)
+      || maxPendingOperations <= 0
+      || maxPendingOperations > RELAY_V2_CONTINUITY_MAX_PENDING_OPERATIONS
+    ) {
+      throw new TypeError("Relay v2 continuity pending-operation limit is invalid");
+    }
     this.anchorId = options.anchorId;
     this.authority = options.authority as RelayV2MonotonicCasAuthority;
+    this.operationTimeoutMs = operationTimeoutMs;
+    this.maxPendingOperations = maxPendingOperations;
   }
 
   async reconcile(
     localCheckpoint: RelayV2ContinuityCheckpoint,
   ): Promise<RelayV2ContinuityReconcileResult> {
     const local = parseCheckpoint(localCheckpoint, this.anchorId, "caller");
-    return await this.serialize(() => this.reconcileInternal(local));
+    return await this.serialize(async () => {
+      const reconciled = await this.reconcileInternal(local);
+      this.reconciliationRequired = false;
+      return reconciled;
+    });
   }
 
   async advance(input: RelayV2ContinuityAdvanceInput): Promise<RelayV2ContinuityAdvanceResult> {
-    if (!isRecord(input) || typeof input.publishState !== "function") {
+    if (
+      !isRecord(input)
+      || !hasExactKeys(input, ["current", "next", "publishState"])
+      || typeof input.publishState !== "function"
+    ) {
       throw new TypeError("Relay v2 continuity advance input is invalid");
     }
     const current = parseCheckpoint(input.current, this.anchorId, "caller");
@@ -361,19 +472,18 @@ export class RelayV2ContinuityAnchor {
     }
 
     return await this.serialize(async () => {
+      if (this.reconciliationRequired) {
+        return fail(
+          "RECONCILIATION_REQUIRED",
+          "Relay v2 continuity must reconcile after an uncertain or conflicting commit",
+        );
+      }
       const reconciled = await this.reconcileInternal(current);
       if (!sameCheckpoint(reconciled.anchor.checkpoint, current)) {
         return fail("ROLLBACK_DETECTED", "Relay v2 continuity state does not match its external anchor");
       }
 
-      try {
-        await publishState(freezeCheckpoint(next));
-      } catch {
-        return fail(
-          "STATE_COMMIT_UNCERTAIN",
-          "Relay v2 continuity state publication did not provide a durable completion result",
-        );
-      }
+      await this.publishLocalState(current, next, publishState);
 
       const promoted = await this.promote(reconciled.anchor, next);
       return {
@@ -385,16 +495,26 @@ export class RelayV2ContinuityAnchor {
     });
   }
 
-  private async serialize<T>(operation: () => Promise<T>): Promise<T> {
+  private serialize<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.pendingOperations >= this.maxPendingOperations) {
+      return Promise.reject(new RelayV2ContinuityAnchorError(
+        "BUSY",
+        "Relay v2 continuity pending-operation limit was reached",
+      ));
+    }
+    this.pendingOperations += 1;
     let release!: () => void;
     const previous = this.serializerTail;
     this.serializerTail = new Promise<void>((resolve) => { release = resolve; });
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-    }
+    return (async () => {
+      await previous;
+      try {
+        return await operation();
+      } finally {
+        this.pendingOperations -= 1;
+        release();
+      }
+    })();
   }
 
   private async reconcileInternal(
@@ -435,52 +555,103 @@ export class RelayV2ContinuityAnchor {
   }
 
   private async readAnchor(): Promise<RelayV2ContinuityAnchorSnapshot> {
-    let raw: unknown;
-    try {
-      raw = await this.authority.read({
+    const raw = await this.callSeam({
+      invoke: (signal) => this.authority.read({
         protocolVersion: RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
         anchorId: this.anchorId,
-      });
-    } catch {
-      return fail("ANCHOR_UNAVAILABLE", "Relay v2 external continuity authority is unavailable");
-    }
+        signal,
+      }),
+      failureCode: "ANCHOR_UNAVAILABLE",
+      failureMessage: "Relay v2 external continuity authority is unavailable",
+      capacityCode: "BUSY",
+      requireReconciliation: false,
+    });
     return parseSnapshot(raw, this.anchorId);
+  }
+
+  private async publishLocalState(
+    expected: RelayV2ContinuityCheckpoint,
+    next: RelayV2ContinuityCheckpoint,
+    publishState: RelayV2ContinuityAdvanceInput["publishState"],
+  ): Promise<void> {
+    const raw = await this.callSeam({
+      invoke: (signal) => publishState(
+        freezeCheckpoint(expected),
+        freezeCheckpoint(next),
+        signal,
+      ),
+      failureCode: "STATE_COMMIT_UNCERTAIN",
+      failureMessage: "Relay v2 local state CAS did not provide a durable completion result",
+      capacityCode: "BUSY",
+      requireReconciliation: true,
+    });
+
+    let result: RelayV2ContinuityLocalCasResult;
+    try {
+      result = parseLocalCasResult(raw, this.anchorId);
+    } catch {
+      return this.failRequiringReconciliation(
+        "STATE_COMMIT_UNCERTAIN",
+        "Relay v2 local state CAS returned an unusable completion result",
+      );
+    }
+    if (result.outcome === "uncertain") {
+      return this.failRequiringReconciliation(
+        "STATE_COMMIT_UNCERTAIN",
+        "Relay v2 local state CAS reported an uncertain commit",
+      );
+    }
+    if (result.outcome === "swapped" || result.outcome === "already_same") {
+      if (!sameCheckpoint(result.current, next)) {
+        return this.failRequiringReconciliation(
+          "STATE_COMMIT_UNCERTAIN",
+          "Relay v2 local state CAS did not confirm the requested successor",
+        );
+      }
+      return;
+    }
+    if (sameCheckpoint(result.current, expected) || sameCheckpoint(result.current, next)) {
+      return this.failRequiringReconciliation(
+        "STATE_COMMIT_UNCERTAIN",
+        "Relay v2 local state CAS returned an inconsistent conflict result",
+      );
+    }
+    return this.failRequiringReconciliation(
+      "LOCAL_STATE_CONFLICT",
+      "Relay v2 local state CAS lost to a different checkpoint",
+    );
   }
 
   private async promote(
     expected: RelayV2ContinuityAnchorSnapshot,
     next: RelayV2ContinuityCheckpoint,
   ): Promise<PromoteResult> {
-    let raw: unknown;
-    try {
-      raw = await this.authority.compareAndSwap({
+    const raw = await this.callSeam({
+      invoke: (signal) => this.authority.compareAndSwap({
         protocolVersion: RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
         anchorId: this.anchorId,
         expected: cloneSnapshot(expected),
         next: { ...next },
-      });
-    } catch {
-      return fail(
-        "ANCHOR_COMMIT_UNCERTAIN",
-        "Relay v2 continuity anchor CAS did not provide a durable completion result",
-      );
-    }
+        signal,
+      }),
+      failureCode: "ANCHOR_COMMIT_UNCERTAIN",
+      failureMessage: "Relay v2 continuity anchor CAS did not provide a durable completion result",
+      capacityCode: "ANCHOR_COMMIT_UNCERTAIN",
+      requireReconciliation: true,
+    });
 
     let result: RelayV2ContinuityAnchorCasResult;
     try {
       result = parseCasResult(raw, this.anchorId);
-    } catch (error) {
-      if (error instanceof RelayV2ContinuityAnchorError) {
-        return fail(
-          "ANCHOR_COMMIT_UNCERTAIN",
-          "Relay v2 continuity anchor CAS returned an unusable completion result",
-        );
-      }
-      throw error;
+    } catch {
+      return this.failRequiringReconciliation(
+        "ANCHOR_COMMIT_UNCERTAIN",
+        "Relay v2 continuity anchor CAS returned an unusable completion result",
+      );
     }
 
     if (result.current.casToken === expected.casToken) {
-      return fail(
+      return this.failRequiringReconciliation(
         "ANCHOR_COMMIT_UNCERTAIN",
         "Relay v2 continuity anchor CAS did not advance its comparison token",
       );
@@ -497,14 +668,81 @@ export class RelayV2ContinuityAnchor {
       };
     }
     if (result.outcome === "swapped") {
-      return fail(
+      return this.failRequiringReconciliation(
         "ANCHOR_COMMIT_UNCERTAIN",
         "Relay v2 continuity authority acknowledged a different checkpoint",
       );
     }
-    return fail(
+    return this.failRequiringReconciliation(
       "CAS_CONFLICT",
       "Relay v2 continuity anchor CAS lost to a different checkpoint",
     );
+  }
+
+  private async callSeam(options: {
+    invoke: (signal: AbortSignal) => unknown | PromiseLike<unknown>;
+    failureCode: "ANCHOR_UNAVAILABLE" | "STATE_COMMIT_UNCERTAIN" | "ANCHOR_COMMIT_UNCERTAIN";
+    failureMessage: string;
+    capacityCode: "BUSY" | "ANCHOR_COMMIT_UNCERTAIN";
+    requireReconciliation: boolean;
+  }): Promise<unknown> {
+    if (this.unsettledSeamCalls >= this.maxPendingOperations) {
+      if (options.requireReconciliation) this.reconciliationRequired = true;
+      return fail(
+        options.capacityCode,
+        options.capacityCode === "BUSY"
+          ? "Relay v2 continuity unsettled seam-call limit was reached"
+          : options.failureMessage,
+      );
+    }
+
+    const controller = new AbortController();
+    this.unsettledSeamCalls += 1;
+    let source: Promise<unknown>;
+    try {
+      source = Promise.resolve(options.invoke(controller.signal));
+    } catch {
+      this.unsettledSeamCalls -= 1;
+      if (options.requireReconciliation) this.reconciliationRequired = true;
+      return fail(options.failureCode, options.failureMessage);
+    }
+    source.then(
+      () => { this.unsettledSeamCalls -= 1; },
+      () => { this.unsettledSeamCalls -= 1; },
+    );
+
+    return await new Promise<unknown>((resolve, reject) => {
+      let completed = false;
+      const timer = setTimeout(() => {
+        if (completed) return;
+        completed = true;
+        if (options.requireReconciliation) this.reconciliationRequired = true;
+        try { controller.abort(); } catch {}
+        reject(new RelayV2ContinuityAnchorError(options.failureCode, options.failureMessage));
+      }, this.operationTimeoutMs);
+      source.then(
+        (value) => {
+          if (completed) return;
+          completed = true;
+          clearTimeout(timer);
+          resolve(value);
+        },
+        () => {
+          if (completed) return;
+          completed = true;
+          clearTimeout(timer);
+          if (options.requireReconciliation) this.reconciliationRequired = true;
+          reject(new RelayV2ContinuityAnchorError(options.failureCode, options.failureMessage));
+        },
+      );
+    });
+  }
+
+  private failRequiringReconciliation(
+    code: "STATE_COMMIT_UNCERTAIN" | "ANCHOR_COMMIT_UNCERTAIN" | "LOCAL_STATE_CONFLICT" | "CAS_CONFLICT",
+    message: string,
+  ): never {
+    this.reconciliationRequired = true;
+    return fail(code, message);
   }
 }
