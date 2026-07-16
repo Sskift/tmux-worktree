@@ -48,7 +48,7 @@ Android (Compose)
 | `test/` | 根 CLI、RPC、storage、Relay、安全和兼容行为测试。根测试必须通过 `npm run test:cli` 串行运行。 |
 | `contracts/tw-rpc/v1/` | Dashboard/CLI 共用的冻结 RPC v1 行协议与 fixture。 |
 | `contracts/relay/v1/` | Node 与 Android 共用的 active-but-legacy-frozen Relay v1 wire fixture。 |
-| `contracts/relay/v2/` | Node 与 Android 独立 v2 codec 共用的 frozen machine fixture；通过 fixture 不等于 runtime 已接线或可宣告 capability。 |
+| `contracts/relay/v2/` | Node 与 Android 独立 v2 codec 共用的 frozen wire fixture，以及独立的 broker credential native state-store v1 interface/binary fixture；通过任一 fixture 都不等于 runtime/native adapter 已接线或可宣告 capability。 |
 | `contracts/storage/` | host config、managed state、Dashboard terminal registry 的冻结磁盘契约。 |
 | `app/src/` | React renderer、Dashboard 状态/交互模型及 `DashboardBackend` 抽象；不得直接承担 OS、tmux、SSH 或凭证操作。 |
 | `app/tests/` | renderer 可观察行为、平台依赖边界、持久化、安全和无障碍测试；不用于冻结组件拆分、函数名、导出列表或调用形状。 |

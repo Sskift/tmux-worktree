@@ -27,7 +27,7 @@
 冻结契约已经给出跨端语义，因此各模块不必等待另一端生产实现，可以先对共享 fixture、fake transport 和 simulator 开发：
 
 ```text
-             frozen Relay v2 contract + codec conformance baseline
+      frozen Relay v2 wire + broker credential state-store contracts
                                    │
           ┌────────────────────────┼────────────────────────┐
           │                        │                        │
@@ -56,6 +56,20 @@
 
 ## 工作包与验收标准
 
+### N0. broker credential native state-store 契约
+
+`contracts/relay/v2/broker-credential-state-store-v1` 是 broker credential 本地持久化的唯一串行设计输入；它冻结 `RelayV2BrokerCredentialStateStore` deep port、transaction-scoped opaque revision、closed capability/open/error union 和双 header/双 payload binary v1。它不改变 credential 业务 owner：issuer、enrollment、grant、replay、rate-limit 与 external continuity 仍由 `RelayV2BrokerCredentialAuthority` 决定。
+
+N0 之后以下 lane 可以对同一 manifest/fixture 并行，不能各自扩张 interface：
+
+- N1 Rust core：实现 binary parser/selector、generation、digest/checksum、exclusive transaction、compare-and-publish、uncertain 与 close barrier；不拥有业务 state schema。
+- N2 Darwin adapter：实现平台私有 storage container、secure object identity、locking 和 durability primitive；只在 native implementation 内处理路径/handle。
+- N3 Linux adapter：同样实现 Linux secure object 与 durability primitive；不能把 `openat`/fd/inode/cleanup 暴露给 Node port。
+- T1 authority injection：让 `RelayV2BrokerCredentialAuthority` 只通过 port 读写 opaque bytes，并保留 external continuity/业务状态机；可先使用 in-memory adapter，不等待 native packaging。
+- P1 loader：按 closed capability/open/error union optional-load N-API；module 缺失映射为 `unsupported/native_module_missing`，invalid/unsupported 都保持 v2 unavailable。
+
+上述 N1/N2/N3/T1/P1、N-API binding 与 packaging 当前均未实现。保留的 BAU path/JSON prototype 已明确未通过 native security acceptance，不是 N0 adapter；后续 lane不得修补或复用其 path rename/unlink，也不得迁移、删除或清理 prototype state/lock/temp artifact。任一 lane 单独完成都不启用 production v2、enrollment或六项 capability，也不建立到 prototype/v1 的 fallback。
+
 ### B. relay-server / broker
 
 B 内部可以按持久认证控制面、在线目录与 carrier router 三条 lane 并行，三者只通过明确的 auth context 和 connector/route contract 连接。
@@ -63,6 +77,7 @@ B 内部可以按持久认证控制面、在线目录与 carrier router 三条 l
 工作边界：
 
 - issuer keyring、一次性 client enrollment、host bootstrap、refresh rotation、exact response replay、revoke 和 socket expiry。
+- credential business authority 只经 N0 port 的 T1 injection 使用 native store；broker composition 不接收 storage path，也不拥有 native cleanup。
 - 独立 v1/v2 Upgrade dispatch；twcap2 只形成 v2 auth context，legacy shared secret 只形成 v1 route。
 - brokerEpoch、授权 host 视图、host registration、duplicate/SUPERSEDED 仲裁和 presence。
 - routeId/routeFence、双向 carrier sequence、公平调度、route/carrier backpressure 和结构化 pre-forward error。

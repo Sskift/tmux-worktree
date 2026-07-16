@@ -65,7 +65,7 @@ cross-surface implementation ──> versioned RPC / wire / storage contract
 | `src/relayHost.ts` | Mac admin connector；聚合 local 与显式配置的 SSH scope |
 | `src/relayServer.ts`, `src/relay/broker/` | Relay v1 鉴权、Host/Client 路由和连接生命周期 |
 | `src/relay/v1/` | Relay v1 wire model 与消息类型 |
-| `src/relay/v2/` | 未接入生产 runtime 的 Relay v2 strict codec、Broker/Host carrier foundations、H0 事务状态库、H1 command-plane core、H2 materialized-state 与 persistent pinned snapshot spool、process-scoped H3 terminal core，以及 bounded host route/runtime composition core；尚无完整生产 adapter/composition wiring，不宣告 capability |
+| `src/relay/v2/` | 未接入生产 runtime 的 Relay v2 strict codec、Broker/Host carrier foundations、H0 事务状态库、H1 command-plane core、H2 materialized-state 与 persistent pinned snapshot spool、process-scoped H3 terminal core、bounded host route/runtime composition core，以及 broker credential authority BAU prototype 与独立 native state-store port/closed parser；尚无完整 production/native adapter/composition wiring，不宣告 capability |
 | `src/terminalControl/` | 本地 input ownership contract client/server、lease/fence authority、受控 backend write 与 output cursor |
 | `src/feishuBridge*.ts`, `src/larkCliBridge.ts` | 独立 Feishu binding/event/turn/reply daemon 与 Lark adapter；不调用 Relay transport |
 
@@ -148,6 +148,8 @@ Compose screens / navigation
 Android 的 `V2` 指当前产品/UI 代际，不表示它已经实现 Relay v2。
 
 仓库已有相互独立的 Node 与 Android Relay v2 codec，并共同消费 `contracts/relay/v2` 的 strict framing、closed schema、limit、dialect 和 normalized-result fixture。Node 侧还包含未接线的 Broker/Host carrier foundations、H0 host 事务状态库与 H1 command-plane core：H1 在 H0 事务上持久化 `(hostEpoch, principalId, hostId, commandId)` scoped ledger、dedupe window、durable accepted runner、结果/tombstone；`clientInstanceId` 只记录首次 route/attempt，不参与 ledger identity。四类固定 mutation 只通过注入的 `tw rpc` / terminal-control executor seam 执行；create/kill 的成功终态还要求注入 H2 resource mutation owner，在同一 H0 transaction 内签发/解析 opaque Session identity，并提交 Session mapping/revision/eventSeq 和 ledger。这些 foundations 尚未接入 `relay-server` / `relay-host` composition root，不生成 credential/enrollment，也不宣告 v2 capability。
+
+Broker credential 当前还保留一个未接 production composition 的 BAU authority/continuity prototype。它直接处理 JSON state/lock path、fd/inode、rename/unlink 与 cleanup，native 安全验收失败；该结论不是授权继续修补其 path algorithm，它也不是 production adapter。`contracts/relay/v2/broker-credential-state-store-v1` 另行冻结唯一 `RelayV2BrokerCredentialStateStore` deep port、transaction-scoped opaque revision、closed native capability/open/error union，以及双 header/双 payload binary v1 fixture；`src/relay/v2/brokerCredentialStateStore.ts` 只提供 interface 与 closed parser。业务语义仍由 `RelayV2BrokerCredentialAuthority` 持有，port 不接收或暴露 storage/lock/temp path、fd/inode、`*at` 或 cleanup。当前没有 Rust core、N-API binding、Darwin/Linux adapter、optional loader、authority injection 或 packaging；prototype artifacts 不迁移、不删除，native 缺失只表示 v2 unavailable，不能进入 prototype 或 v1 fallback。因此 production v2 继续 disabled，Relay v1 build/runtime 不依赖 native module。
 
 Android 生产源码还包含可选 `agent.transcript-lifecycle.v1` extension 的独立 lifecycle/notification pure reducer foundation，并由 JVM suite直接消费共享 client machine fixture；fixture中的 `command_status` 由测试 base-owner composition stub处理，所以这只构成 reducer fixture conformance，不构成 production consumer machine conformance。它只建模有界 lineage/cursor/checkpoint、run/turn lifecycle、notification disposition与非消费型 system-intent preflight；command ledger仍属于基础 v2 owner，不在该 reducer 内复制。LIVE/REPLAY provenance目前也是仅供未来可信 adapter提供的本地输入，尚无 actor接线。该 foundation尚未接 public extension codec、Room/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose或 `NotificationManager`，也不包含 text/redaction/delete/source-availability materialization，因此当前 APK仍没有 Agent 入站 timeline/reply/lifecycle/notification runtime，不能宣告 extension capability。
 
@@ -327,7 +329,7 @@ Android 使用自己的 Gradle wrapper、依赖图、测试和 Lint。根 npm bu
 | `docs/android-v2-architecture.md` | 当前 Android 专题 | Compose/Room/actor/Outbox 的详细产品和实现约束 |
 | `docs/remote-relay-android.md` | 运维手册 | broker、Mac connector、TLS、配对和 Android 验证流程 |
 | `docs/terminal-input-ownership-alignment.md` | 跨产品实现 companion | terminal-control、Feishu、Dashboard、CLI 与 Relay 的 lease、handoff、拒绝行为和测试矩阵 |
-| `docs/relay-v2-contract.md` | 冻结契约 | codec conformance 与未接线的 H0/H1/H2 spool/H3、Android actor/Room/HTTPS/bounded RFC6455 WSS foundations 已落地；WSS foundation 尚未接 production composition，且无真实 TLS/device 互操作证据；跨端 runtime/capability 均未交付，不能据此宣告 capability 或生成 v2 credential |
+| `docs/relay-v2-contract.md` | 冻结契约 | codec conformance 与未接线的 H0/H1/H2 spool/H3、Android actor/Room/HTTPS/bounded RFC6455 WSS foundations 已落地；另有独立 native broker credential store frozen contract，但无 native implementation/injection；WSS foundation 尚未接 production composition，且无真实 TLS/device 互操作证据；跨端 runtime/capability 均未交付，不能据此宣告 capability 或生成 v2 credential |
 | `docs/relay-v2-implementation-plan.md` | 非规范性实施协调 | 按 owner 拆分可并行工作、硬依赖和验收 Gate；不描述当前完成状态，也不修改冻结契约 |
 | `contracts/` | 机器契约 | Relay v1/v2、TW RPC v1 和共享 storage fixture；协议/存储变更必须同步生产实现和 contract tests |
 | `.codex/skills/` | Agent 操作规程 | 固化跨机器等易误操作流程，不属于产品 runtime |

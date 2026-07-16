@@ -6,6 +6,8 @@
 
 当前仓库的 Dashboard、relay-server、relay-host 和 Android connection actor 仍只运行 Relay v1。Node 与 Android 已有相互独立的 strict v2 codec，共同消费 `contracts/relay/v2` fixture，但尚未接入 broker/host/client runtime。本文定义后续 v2 实现边界；任何一端都不得仅凭本文、fixture 或 codec 存在而发布 v2 capability、生成 v2 配对二维码或把 v1 credential 当作 v2 credential。
 
+Broker credential 本地持久化另有独立的 frozen [native state-store v1 contract](../contracts/relay/v2/broker-credential-state-store-v1/README.md)。它只冻结 deep port、closed native union 和 binary fixture，不修改本文 public wire，也不表示 N-API、Rust/Darwin/Linux、loader、authority injection 或 packaging 已实现。当前 BAU path/JSON prototype 的 native 安全验收失败且只保留原型；它的 state/lock/temp artifact 不迁移、不删除，不作为 fallback。Production v2 仍 disabled，Relay v1 不依赖该 native contract。
+
 非规范性 companion：[`terminal-input-ownership-alignment.md`](terminal-input-ownership-alignment.md) 记录 Feishu Bridge、Dashboard、本地 CLI 与 Relay 共同操作同一 managed terminal 时的本地输入所有权对齐。该说明不修改本首版 frozen wire、六项 requiredCapabilities、任何 closed schema 或本契约错误表；本首版 adapter 在独立 local terminal-control authority 拒绝写入时使用错误表中既有的 `PERMISSION_DENIED`。未来的 `input.ownership.observe.v1` 是独立、可协商的 capability extension，不属于本首版契约。
 
 非规范性实施拆分见 [`relay-v2-implementation-plan.md`](relay-v2-implementation-plan.md)。该计划只描述并行 owner、硬依赖和验收 Gate，不改变本文的 wire 语义，也不表示任何工作包已经完成。
