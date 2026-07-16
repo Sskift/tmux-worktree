@@ -543,11 +543,29 @@ internal class RelayV2ProfileRepository(
                 when (val state = activationCredentialState(durableActivation)) {
                     is ActivationCredentialState.ExactCompleted -> {
                         val recovery = recoverDurableActivation()
-                        val recoveredIdentity = when (recovery) {
-                            is RelayV2ActivationRecoveryResult.Activated ->
-                                recovery.profile.identity
-                            RelayV2ActivationRecoveryResult.NoPendingActivation ->
-                                profileStore.activeProfileIdentity()
+                        when (recovery) {
+                            is RelayV2ActivationRecoveryResult.Activated -> {
+                                retireEnrollmentIntent(intent)
+                                return if (durableActivation.targetCredentialReference ==
+                                    intent.credentialReference
+                                ) {
+                                    RelayV2EnrollmentResult.Activated(recovery.profile)
+                                } else {
+                                    RelayV2EnrollmentResult.Superseded(recovery.profile.identity)
+                                }
+                            }
+                            RelayV2ActivationRecoveryResult.NoPendingActivation -> {
+                                val recovered = profileStore.activeRelayV2Profile()
+                                retireEnrollmentIntent(intent)
+                                return if (durableActivation.targetCredentialReference ==
+                                    intent.credentialReference &&
+                                    recovered?.credentialReference == intent.credentialReference
+                                ) {
+                                    RelayV2EnrollmentResult.Activated(recovered)
+                                } else {
+                                    supersededEnrollment()
+                                }
+                            }
                             is RelayV2ActivationRecoveryResult.Incompatible -> {
                                 retireEnrollmentIntent(intent)
                                 return RelayV2EnrollmentResult.RecoveryRequired(
@@ -564,10 +582,6 @@ internal class RelayV2ProfileRepository(
                                 )
                             }
                         }
-                        if (!rebaseEnrollmentIntentAfterRecovery(intent, recoveredIdentity)) {
-                            return supersededEnrollment()
-                        }
-                        continue
                     }
                     ActivationCredentialState.ExactPending -> {
                         if (durableActivation.targetCredentialReference != confirmedReference) {
@@ -575,7 +589,11 @@ internal class RelayV2ProfileRepository(
                                     intent,
                                     durableActivation,
                                 )
-                            ) return enrollmentIntentResult(intent) ?: supersededEnrollment()
+                            ) {
+                                val classified = enrollmentIntentResult(intent)
+                                retireEnrollmentIntent(intent)
+                                return classified ?: supersededEnrollment()
+                            }
                         }
                     }
                     is ActivationCredentialState.Incompatible -> {
@@ -720,8 +738,11 @@ internal class RelayV2ProfileRepository(
             // possible; rollback remains atomically visible to the authoritative locked check.
             currentEnrollmentIntent = null
             prepared?.let {
-                check(profileStore.rollbackPreparedRelayV2Activation(it)) {
-                    "Prepared Relay v2 activation changed during cancellation"
+                when (rollbackExactPreparedActivationLocked(it)) {
+                    PreparedActivationRollback.ROLLED_BACK,
+                    PreparedActivationRollback.ALREADY_REMOVED,
+                    -> Unit
+                    PreparedActivationRollback.CHANGED -> return@withLock false
                 }
             }
             true
@@ -748,12 +769,22 @@ internal class RelayV2ProfileRepository(
         val profile = when (val state = activationCredentialState(journal)) {
             is ActivationCredentialState.ExactCompleted -> state.profile
             ActivationCredentialState.ExactPending -> {
-                check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
-                    "Prepared Relay v2 activation changed during recovery"
+                return when (enrollmentIntentMutex.withLock {
+                    rollbackExactPreparedActivationLocked(journal)
+                }) {
+                    PreparedActivationRollback.ROLLED_BACK ->
+                        RelayV2ActivationRecoveryResult.ReenrollmentRequired(
+                            journal.targetCredentialReference,
+                        )
+                    PreparedActivationRollback.ALREADY_REMOVED ->
+                        RelayV2ActivationRecoveryResult.NoPendingActivation
+                    PreparedActivationRollback.CHANGED ->
+                        RelayV2ActivationRecoveryResult.Incompatible(
+                            journal.targetCredentialReference,
+                            RelayV2CredentialRecoveryReason
+                                .COMPLETION_PROOF_MISSING_OR_MISMATCHED,
+                        )
                 }
-                return RelayV2ActivationRecoveryResult.ReenrollmentRequired(
-                    journal.targetCredentialReference,
-                )
             }
             is ActivationCredentialState.Incompatible ->
                 return RelayV2ActivationRecoveryResult.Incompatible(
@@ -997,24 +1028,32 @@ internal class RelayV2ProfileRepository(
         intent: EnrollmentIntent,
         journal: RelayV2ProfileActivationJournal,
     ): Boolean = enrollmentIntentMutex.withLock {
-        if (currentEnrollmentIntent !== intent ||
-            profileStore.pendingRelayV2Activation() != journal ||
-            activationCredentialState(journal) != ActivationCredentialState.ExactPending
-        ) return@withLock false
-        check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
-            "Prepared Relay v2 activation changed during supersession"
+        if (currentEnrollmentIntent !== intent) return@withLock false
+        when (rollbackExactPreparedActivationLocked(journal)) {
+            PreparedActivationRollback.ROLLED_BACK -> true
+            PreparedActivationRollback.ALREADY_REMOVED,
+            PreparedActivationRollback.CHANGED,
+            -> false
         }
-        true
     }
 
-    private suspend fun rebaseEnrollmentIntentAfterRecovery(
-        intent: EnrollmentIntent,
-        recoveredIdentity: RelayActiveProfileIdentity?,
-    ): Boolean = enrollmentIntentMutex.withLock {
-        if (currentEnrollmentIntent !== intent) return@withLock false
-        intent.expectedActiveProfile = recoveredIdentity
-        intent.expectedActiveProfileBound = true
-        true
+    /** Caller holds [enrollmentIntentMutex]; false CAS outcomes are re-read, never asserted. */
+    private suspend fun rollbackExactPreparedActivationLocked(
+        expected: RelayV2ProfileActivationJournal,
+    ): PreparedActivationRollback {
+        val current = profileStore.pendingRelayV2Activation()
+            ?: return PreparedActivationRollback.ALREADY_REMOVED
+        if (current != expected ||
+            activationCredentialState(current) != ActivationCredentialState.ExactPending
+        ) return PreparedActivationRollback.CHANGED
+        if (profileStore.rollbackPreparedRelayV2Activation(current)) {
+            return PreparedActivationRollback.ROLLED_BACK
+        }
+        return if (profileStore.pendingRelayV2Activation() == null) {
+            PreparedActivationRollback.ALREADY_REMOVED
+        } else {
+            PreparedActivationRollback.CHANGED
+        }
     }
 
     private fun enrollmentActivationAuthority(
@@ -1425,5 +1464,11 @@ internal class RelayV2ProfileRepository(
         data class Incompatible(
             val reason: RelayV2CredentialRecoveryReason,
         ) : ActivationCredentialState
+    }
+
+    private enum class PreparedActivationRollback {
+        ROLLED_BACK,
+        ALREADY_REMOVED,
+        CHANGED,
     }
 }

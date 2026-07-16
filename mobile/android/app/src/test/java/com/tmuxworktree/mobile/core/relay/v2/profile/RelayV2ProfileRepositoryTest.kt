@@ -1091,12 +1091,21 @@ class RelayV2ProfileRepositoryTest {
 
                 when (followUp) {
                     CompletedPreparedFollowUp.CONFIRM_B -> {
-                        val activatedB = harness.repository.confirmEnrollment(
-                            enrollmentDraft(
-                                "enrollment-completed-b-$suffix",
-                                "twenroll2.code-completed-b-$suffix",
-                            ).confirm(deviceLabel = "Pixel B"),
-                        ) as RelayV2EnrollmentResult.Activated
+                        val confirmedB = enrollmentDraft(
+                            "enrollment-completed-b-$suffix",
+                            "twenroll2.code-completed-b-$suffix",
+                        ).confirm(deviceLabel = "Pixel B")
+                        assertTrue(
+                            harness.repository.confirmEnrollment(confirmedB) is
+                                RelayV2EnrollmentResult.Superseded,
+                        )
+                        assertEquals(
+                            prepared.targetCredentialReference,
+                            harness.profiles.activeV2?.credentialReference,
+                        )
+                        assertEquals(2, harness.profiles.activationCount)
+                        val activatedB = harness.repository.confirmEnrollment(confirmedB)
+                            as RelayV2EnrollmentResult.Activated
                         assertEquals(activatedB.profile, harness.profiles.activeV2)
                         assertEquals(3, harness.profiles.activationCount)
                         assertEquals(
@@ -1134,6 +1143,121 @@ class RelayV2ProfileRepositoryTest {
                 }
                 assertEquals(null, harness.profiles.journal)
             }
+        }
+
+    @Test
+    fun `cancel and recovery converge when cancel owns exact pending rollback`() = runBlocking {
+        val harness = Harness()
+        val confirmed = enrollmentDraft(
+            "enrollment-rollback-cancel",
+            "twenroll2.code-rollback-cancel",
+        ).confirm(deviceLabel = "Pixel")
+        harness.credentials.failNextCasBeforeWriteCount = 2
+        assertTrue(runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure)
+        val journal = requireNotNull(harness.profiles.journal)
+        harness.restartRepository()
+
+        val exchangeGate = harness.exchange.deferEnrollment("enrollment-rollback-cancel")
+        val liveConfirmation = async { harness.repository.confirmEnrollment(confirmed) }
+        val replayRequest = exchangeGate.request.await()
+        val rollbackGate = harness.profiles.blockNextPreparedRollback()
+        val cancellation = async { harness.repository.cancelPendingEnrollment(confirmed) }
+        rollbackGate.started.await()
+        val recovery = async { harness.repository.recoverPendingActivation() }
+        yield()
+        assertFalse(recovery.isCompleted)
+
+        rollbackGate.release.complete(Unit)
+        assertTrue(cancellation.await())
+        assertEquals(
+            RelayV2ActivationRecoveryResult.NoPendingActivation,
+            recovery.await(),
+        )
+        exchangeGate.response.complete(
+            harness.exchange.completedResponse(replayRequest.exchangeAttemptId),
+        )
+        assertTrue(liveConfirmation.await() is RelayV2EnrollmentResult.Superseded)
+        assertEquals(null, harness.profiles.journal)
+        assertFalse(
+            requireNotNull(harness.credentials.read(journal.targetCredentialReference))
+                .hasCredentialMaterial,
+        )
+    }
+
+    @Test
+    fun `recovery removal retires a superseding intent with a stale journal read`() = runBlocking {
+        val harness = Harness()
+        val confirmedA = enrollmentDraft(
+            "enrollment-rollback-a",
+            "twenroll2.code-rollback-a",
+        ).confirm(deviceLabel = "Pixel A")
+        harness.credentials.failNextCasBeforeWriteCount = 2
+        assertTrue(runCatching { harness.repository.confirmEnrollment(confirmedA) }.isFailure)
+        val journal = requireNotNull(harness.profiles.journal)
+        harness.restartRepository()
+
+        val staleRead = harness.profiles.blockNextPendingActivationReadAfterSnapshot()
+        val confirmedB = enrollmentDraft(
+            "enrollment-rollback-b",
+            "twenroll2.code-rollback-b",
+        ).confirm(deviceLabel = "Pixel B")
+        val activationB = async { harness.repository.confirmEnrollment(confirmedB) }
+        staleRead.started.await()
+        assertEquals(
+            RelayV2ActivationRecoveryResult.ReenrollmentRequired(
+                journal.targetCredentialReference,
+            ),
+            harness.repository.recoverPendingActivation(),
+        )
+        staleRead.release.complete(Unit)
+
+        assertTrue(activationB.await() is RelayV2EnrollmentResult.Superseded)
+        assertFalse(harness.repository.cancelPendingEnrollment(confirmedB))
+        assertEquals(null, harness.profiles.journal)
+        assertEquals(1, harness.credentials.values().size)
+        assertFalse(harness.credentials.values().single().hasCredentialMaterial)
+    }
+
+    @Test
+    fun `same-reference joiners stop after a completed earlier activation recovers`() =
+        runBlocking {
+            val harness = Harness()
+            harness.repository.confirmEnrollment(
+                enrollmentDraft(
+                    "enrollment-join-old",
+                    "twenroll2.code-join-old",
+                ).confirm(deviceLabel = "Old Pixel"),
+            ) as RelayV2EnrollmentResult.Activated
+            val confirmedA = enrollmentDraft(
+                "enrollment-join-a",
+                "twenroll2.code-join-a",
+            ).confirm(deviceLabel = "Pixel A")
+            harness.profiles.failNextCredentialReadyBeforeWrite = true
+            assertTrue(runCatching { harness.repository.confirmEnrollment(confirmedA) }.isFailure)
+            val preparedA = requireNotNull(harness.profiles.journal)
+            harness.restartRepository()
+
+            val recoveryBarrier = harness.barrier.blockNextDisconnect()
+            val gateB = harness.exchange.deferEnrollment("enrollment-join-b")
+            val confirmedB = enrollmentDraft(
+                "enrollment-join-b",
+                "twenroll2.code-join-b",
+            ).confirm(deviceLabel = "Pixel B")
+            val firstB = async { harness.repository.confirmEnrollment(confirmedB) }
+            recoveryBarrier.started.await()
+            val joinedB = async { harness.repository.confirmEnrollment(confirmedB) }
+            yield()
+            assertFalse(gateB.request.isCompleted)
+
+            recoveryBarrier.release.complete(Unit)
+            val results = withTimeout(1_000) { listOf(firstB.await(), joinedB.await()) }
+            assertTrue(results.all { it is RelayV2EnrollmentResult.Superseded })
+            assertFalse(gateB.request.isCompleted)
+            assertEquals(
+                preparedA.targetCredentialReference,
+                harness.profiles.activeV2?.credentialReference,
+            )
+            assertFalse(harness.repository.cancelPendingEnrollment(confirmedB))
         }
 
     @Test
@@ -1834,10 +1958,23 @@ class RelayV2ProfileRepositoryTest {
         var failNextProfilePublishAfterWrite = false
         var persistedValues: Map<String, Any> = emptyMap()
         private var nextActiveProfileReadGate: SuspensionGate? = null
+        private var nextPendingActivationReadGate: SuspensionGate? = null
+        private var nextPreparedRollbackGate: SuspensionGate? = null
 
         fun blockNextActiveProfileRead(): SuspensionGate = SuspensionGate().also {
             check(nextActiveProfileReadGate == null)
             nextActiveProfileReadGate = it
+        }
+
+        fun blockNextPendingActivationReadAfterSnapshot(): SuspensionGate =
+            SuspensionGate().also {
+                check(nextPendingActivationReadGate == null)
+                nextPendingActivationReadGate = it
+            }
+
+        fun blockNextPreparedRollback(): SuspensionGate = SuspensionGate().also {
+            check(nextPreparedRollbackGate == null)
+            nextPreparedRollbackGate = it
         }
 
         override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
@@ -1851,7 +1988,15 @@ class RelayV2ProfileRepositoryTest {
 
         override suspend fun activeRelayV2Profile(): RelayV2Profile? = activeV2
 
-        override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? = journal
+        override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? {
+            val snapshot = journal
+            nextPendingActivationReadGate?.also {
+                nextPendingActivationReadGate = null
+                it.started.complete(Unit)
+                it.release.await()
+            }
+            return snapshot
+        }
 
         override suspend fun prepareRelayV2Activation(
             expectedActiveProfile: RelayActiveProfileIdentity?,
@@ -1928,6 +2073,11 @@ class RelayV2ProfileRepositoryTest {
         override suspend fun rollbackPreparedRelayV2Activation(
             journal: RelayV2ProfileActivationJournal,
         ): Boolean {
+            nextPreparedRollbackGate?.also {
+                nextPreparedRollbackGate = null
+                it.started.complete(Unit)
+                it.release.await()
+            }
             if (journal.phase != RelayV2ProfileActivationPhase.PREPARED ||
                 this.journal != journal || storedActiveIdentity != journal.previousProfile
             ) return false
