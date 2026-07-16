@@ -11,6 +11,8 @@
     "nodeCodecConformance": true,
     "nodeDurableAuthorityStoreFoundation": true,
     "nodeReplayRuntimeFoundation": true,
+    "nodeContinuityAnchorIntegrated": false,
+    "nodeDurabilitySecurityReviewPassed": false,
     "nodeRuntimeIntegrated": false,
     "androidCodecConformance": false,
     "hostAuthorityMachineConformance": true,
@@ -33,6 +35,7 @@
     "hostStoreOwner": "relay-host-agent-extension-store",
     "durableCommitBeforeSourceAck": true,
     "publicReplayLogOwner": "relay-host-agent-extension-store",
+    "independentMonotonicCasAnchorRequired": true,
     "brokerBusinessAuthority": false
   },
   "identity": {
@@ -139,6 +142,7 @@
     "attachmentsExcluded": true,
     "offlinePushExcluded": true,
     "productionCapabilityDelivered": false,
+    "pairedRollbackClosed": false,
     "nodeHostRuntimeIntegrated": false,
     "nodeCapabilityAdvertised": false,
     "androidReducerFoundationOnly": true,
@@ -161,6 +165,8 @@
     "tool-call-body",
     "attachment",
     "snapshot-page-shape",
+    "snapshot-watermark",
+    "host-epoch-error-details",
     "agent-command-correlation"
   ],
   "requiredMachineScenarios": [

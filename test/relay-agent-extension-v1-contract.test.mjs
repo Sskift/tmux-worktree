@@ -163,6 +163,8 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
     nodeCodecConformance: true,
     nodeDurableAuthorityStoreFoundation: true,
     nodeReplayRuntimeFoundation: true,
+    nodeContinuityAnchorIntegrated: false,
+    nodeDurabilitySecurityReviewPassed: false,
     nodeRuntimeIntegrated: false,
     androidCodecConformance: false,
     hostAuthorityMachineConformance: true,
@@ -178,6 +180,7 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
   assert.equal(manifest.boundaries.relayV1Unchanged, true);
   assert.equal(manifest.boundaries.relayV2BaseContractUnchanged, true);
   assert.equal(manifest.boundaries.productionCapabilityDelivered, false);
+  assert.equal(manifest.boundaries.pairedRollbackClosed, false);
   assert.equal(manifest.boundaries.nodeHostRuntimeIntegrated, false);
   assert.equal(manifest.boundaries.nodeCapabilityAdvertised, false);
   assert.equal(manifest.boundaries.androidReducerFoundationOnly, true);
