@@ -373,6 +373,61 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
   assert.match(markup, /Relay v2 one-time enrollment preview QR code/);
 });
 
+test("Relay v2 invalid active enrollment requires authoritative recovery without creating a second code", () => {
+  const ready = readyRelayV2State(true);
+  const activeState = (review: RelayV2EnrollmentReview): RelayV2EnrollmentState => ({
+    ...ready,
+    enrollment: { status: "active", review },
+  });
+  const invalidStates: Array<[string, RelayV2EnrollmentState]> = [
+    ["issuer URL", activeState({
+      ...relayV2Review,
+      display: { ...relayV2Review.display, issuerUrl: "https://relay.test/path" },
+    })],
+    ["relay URL", activeState({
+      ...relayV2Review,
+      display: { ...relayV2Review.display, relayUrl: "wss://relay.test/client?token=leak" },
+    })],
+    ["enrollment ID", activeState({
+      ...relayV2Review,
+      enrollment: { ...relayV2Review.enrollment, enrollmentId: "" },
+    })],
+    ["enrollment code", activeState({
+      ...relayV2Review,
+      enrollment: { ...relayV2Review.enrollment, enrollmentCode: "not-an-enrollment-code" },
+    })],
+    ["review host binding", activeState({
+      ...relayV2Review,
+      display: { ...relayV2Review.display, hostId: "other-host" },
+    })],
+    ["connector host binding", {
+      ...activeState(relayV2Review),
+      connector: {
+        status: "registered",
+        acknowledgement: "host.registered",
+        hostId: "other-host",
+        connectorId: "connector-1",
+        negotiatedCapabilityIntersection: RELAY_V2_REQUIRED_CAPABILITIES,
+        exitCode: null,
+        error: null,
+        retryable: null,
+      },
+    }],
+  ];
+
+  for (const [label, state] of invalidStates) {
+    const view = deriveRelayV2EnrollmentView(state, 1_000);
+    assert.equal(view.ready, false, label);
+    assert.equal(view.review, null, label);
+    assert.equal(view.qrPayload, null, label);
+    assert.equal(view.enrollmentAction, null, label);
+    assert.equal(view.enrollmentActionDisabled, true, label);
+    assert.doesNotMatch(view.enrollmentActionLabel, /active|retry|rebuild/i, label);
+    assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i, label);
+    assert.equal(view.v1CredentialLabel, "Relay v1 shared secret configured", label);
+  }
+});
+
 test("Relay v2 create retry is single-flight in UI state and backend create is idempotent", async () => {
   const readyState = readyRelayV2State();
   const creating = relayV2EnrollmentReducer(readyState, {
@@ -398,7 +453,11 @@ test("Relay v2 create retry is single-flight in UI state and backend create is i
   });
   assert.deepEqual(retrying.enrollment, { status: "creating", intent: "retry" });
 
-  const adapter = createFakeMobileRelayV2Adapter({ initialState: readyState, now: () => 10_000 });
+  const adapter = createFakeMobileRelayV2Adapter({
+    initialState: readyState,
+    hostId: "mac-admin",
+    now: () => 10_000,
+  });
   const first = await adapter.createEnrollment({ intent: "create" });
   const repeated = await adapter.createEnrollment({ intent: "retry" });
   assert.equal(first.enrollment.status, "active");
@@ -411,7 +470,11 @@ test("Relay v2 expiry drops the code, rebuilds once, and known-grant revoke is i
     ...readyRelayV2State(),
     knownClientGrant: { status: "active" as const, grantId: "known-client-grant" },
   };
-  const adapter = createFakeMobileRelayV2Adapter({ initialState: initial, now: () => nowMs });
+  const adapter = createFakeMobileRelayV2Adapter({
+    initialState: initial,
+    hostId: "mac-admin",
+    now: () => nowMs,
+  });
   const first = await adapter.createEnrollment({ intent: "create" });
   assert.equal(first.enrollment.status, "active");
   if (first.enrollment.status !== "active") return;
@@ -489,12 +552,12 @@ test("Relay v2 contradictory registered observations fail closed", async () => {
   assert.equal(view.ready, false);
   assert.equal(view.enrollmentActionDisabled, true);
   assert.equal(view.qrPayload, null);
-  assert.match(view.readinessDetail, /contradictory host registration/i);
+  assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i);
 
   const adapter = createFakeMobileRelayV2Adapter({ initialState: contradictory });
   await assert.rejects(
     adapter.createEnrollment({ intent: "create" }),
-    /host\.registered and all six required capabilities/,
+    /restore authoritative Relay v2 state/i,
   );
 });
 

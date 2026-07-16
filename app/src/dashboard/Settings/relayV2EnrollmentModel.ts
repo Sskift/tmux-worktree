@@ -8,8 +8,11 @@ import {
 } from "../../platform/domainTypes";
 import {
   mobileRelayV2ConnectorReady,
+  normalizeMobileRelayV2DashboardState,
   normalizeMobileRelayV2Connector,
+  normalizeMobileRelayV2EnrollmentReview,
   relayV2MissingNegotiatedCapabilities,
+  sanitizeMobileRelayV2DisplayMessage,
 } from "../../platform/relayV2Domain";
 
 export const RELAY_V2_REQUIRED_CAPABILITIES = MOBILE_RELAY_V2_REQUIRED_CAPABILITIES;
@@ -131,7 +134,10 @@ export function relayV2EnrollmentReducer(
     case "backendStateObserved":
       return event.state;
     case "backendObservationFailed": {
-      const message = event.failure.message.trim() || "Relay v2 status observation failed.";
+      const message = sanitizeMobileRelayV2DisplayMessage(
+        event.failure.message,
+        "Relay v2 status observation failed.",
+      );
       const intent = state.enrollment.status === "creating"
         || state.enrollment.status === "failed"
         ? state.enrollment.intent
@@ -169,16 +175,17 @@ export function relayV2EnrollmentReducer(
         },
       };
     case "v2CredentialReferenceObserved":
-      return {
+      return normalizeMobileRelayV2DashboardState({
         ...state,
         hostCredential: {
           ...state.hostCredential,
           status: event.credentialReference ? "ready" : "missing",
           credentialReference: event.credentialReference,
+          expiresAtMs: event.credentialReference ? state.hostCredential.expiresAtMs : null,
           error: null,
           retryable: null,
         },
-      };
+      });
     case "hostCredentialOperationStarted":
       if (
         state.hostCredential.status === "bootstrapping"
@@ -199,7 +206,10 @@ export function relayV2EnrollmentReducer(
         hostCredential: {
           ...state.hostCredential,
           status: "failed",
-          error: event.error.trim() || "Relay v2 host credential operation failed.",
+          error: sanitizeMobileRelayV2DisplayMessage(
+            event.error,
+            "Relay v2 host credential operation failed.",
+          ),
           retryable: event.retryable === true,
         },
       };
@@ -229,7 +239,10 @@ export function relayV2EnrollmentReducer(
               connectorId: null,
               negotiatedCapabilityIntersection: [],
               exitCode: null,
-              error: event.error.trim() || "Relay v2 connector failed.",
+              error: sanitizeMobileRelayV2DisplayMessage(
+                event.error,
+                "Relay v2 connector failed.",
+              ),
               retryable: event.retryable === true,
             }
           : {
@@ -270,7 +283,10 @@ export function relayV2EnrollmentReducer(
           connectorId: null,
           negotiatedCapabilityIntersection: [],
           exitCode: 78,
-          error: event.error?.trim() || "A newer authenticated connector replaced this process.",
+          error: sanitizeMobileRelayV2DisplayMessage(
+            event.error,
+            "A newer authenticated connector replaced this process.",
+          ),
           retryable: false,
         },
       };
@@ -308,7 +324,10 @@ export function relayV2EnrollmentReducer(
     }
     case "enrollmentCreated":
       return relayV2EnrollmentReady(state)
-        ? { ...state, enrollment: { status: "active", review: event.review } }
+        ? normalizeMobileRelayV2DashboardState({
+            ...state,
+            enrollment: { status: "active", review: event.review },
+          })
         : {
             ...state,
             enrollment: {
@@ -327,7 +346,10 @@ export function relayV2EnrollmentReducer(
           status: "failed",
           intent: event.intent
             ?? (state.enrollment.status === "creating" ? state.enrollment.intent : "create"),
-          error: event.error.trim() || "Relay v2 enrollment failed.",
+          error: sanitizeMobileRelayV2DisplayMessage(
+            event.error,
+            "Relay v2 enrollment failed.",
+          ),
           retryable: event.retryable === true,
         },
       };
@@ -360,50 +382,22 @@ export function relayV2EnrollmentReducer(
         knownClientGrant: {
           status: "failed",
           grantId: event.grantId,
-          error: event.error.trim() || "Relay v2 client grant revoke failed.",
+          error: sanitizeMobileRelayV2DisplayMessage(
+            event.error,
+            "Relay v2 client grant revoke failed.",
+          ),
           retryable: event.retryable === true,
         },
       };
   }
 }
 
-function validEnrollmentReview(review: RelayV2EnrollmentReview): boolean {
-  const { enrollment, display } = review;
-  if (
-    !enrollment.enrollmentId
-    || !enrollment.enrollmentCode.startsWith("twenroll2.")
-    || !Number.isSafeInteger(enrollment.expiresAtMs)
-    || enrollment.expiresAtMs < 0
-    || !display.hostId
-  ) return false;
-
-  try {
-    const issuerUrl = new URL(display.issuerUrl);
-    const relayUrl = new URL(display.relayUrl);
-    return issuerUrl.protocol === "https:"
-      && Boolean(issuerUrl.hostname)
-      && !issuerUrl.username
-      && !issuerUrl.password
-      && issuerUrl.pathname === "/"
-      && !issuerUrl.search
-      && !issuerUrl.hash
-      && relayUrl.protocol === "wss:"
-      && Boolean(relayUrl.hostname)
-      && !relayUrl.username
-      && !relayUrl.password
-      && relayUrl.pathname === "/client"
-      && !relayUrl.search
-      && !relayUrl.hash;
-  } catch {
-    return false;
-  }
-}
-
 export function buildRelayV2EnrollmentQrPayload(
   review: RelayV2EnrollmentReview,
 ): string | null {
-  if (!validEnrollmentReview(review)) return null;
-  const { enrollment, display } = review;
+  const normalized = normalizeMobileRelayV2EnrollmentReview(review);
+  if (!normalized) return null;
+  const { enrollment, display } = normalized;
   return [
     "tmuxworktree://enroll?v=2",
     `issuerUrl=${encodeURIComponent(display.issuerUrl)}`,
@@ -418,13 +412,16 @@ export function deriveRelayV2EnrollmentView(
   state: RelayV2EnrollmentState,
   nowMs = Date.now(),
 ): RelayV2EnrollmentView {
-  const connector = normalizeMobileRelayV2Connector(state.connector);
-  const adapterAvailable = state.authority.kind !== "unavailable";
+  const normalizedState = normalizeMobileRelayV2DashboardState(state, nowMs);
+  const connector = normalizeMobileRelayV2Connector(normalizedState.connector);
+  const adapterAvailable = normalizedState.authority.kind !== "unavailable";
   const missingCapabilities = relayV2MissingCapabilities(
     connector.negotiatedCapabilityIntersection,
   );
-  const ready = relayV2EnrollmentReady(state);
-  const activeReview = state.enrollment.status === "active" ? state.enrollment.review : null;
+  const ready = relayV2EnrollmentReady(normalizedState);
+  const activeReview = normalizedState.enrollment.status === "active"
+    ? normalizedState.enrollment.review
+    : null;
   const reviewMatchesRegistration = activeReview !== null
     && connector.status === "registered"
     && activeReview.display.hostId === connector.hostId;
@@ -435,9 +432,9 @@ export function deriveRelayV2EnrollmentView(
 
   let readinessLabel: string;
   let readinessDetail: string;
-  if (state.authority.kind === "unavailable") {
+  if (normalizedState.authority.kind === "unavailable") {
     readinessLabel = "Relay v2 backend unavailable";
-    readinessDetail = state.authority.reason;
+    readinessDetail = normalizedState.authority.reason;
   } else if (connector.status === "registered_incomplete") {
     readinessLabel = "Relay v2 capabilities incomplete";
     readinessDetail = `Enrollment stays unavailable. Missing: ${missingCapabilities.join(", ")}.`;
@@ -452,15 +449,15 @@ export function deriveRelayV2EnrollmentView(
       "The Mac host connector is registered with all six required capabilities. Phone connectivity is not verified.";
   }
 
-  const enrollmentAction = !adapterAvailable || !ready || state.enrollment.status === "creating"
+  const enrollmentAction = !adapterAvailable || !ready || normalizedState.enrollment.status === "creating"
     ? null
     : activeReview && reviewIsCurrent
       ? null
-      : state.enrollment.status === "failed"
-        ? state.enrollment.retryable
+      : normalizedState.enrollment.status === "failed"
+        ? normalizedState.enrollment.retryable
           ? "retry"
           : null
-        : state.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
+        : normalizedState.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
           ? "rebuild"
           : "create";
   const enrollmentActionLabel = !adapterAvailable
@@ -469,47 +466,49 @@ export function deriveRelayV2EnrollmentView(
       ? "Enrollment unavailable"
       : qrPayload
         ? "One-time enrollment active"
-        : state.enrollment.status === "creating"
-          ? state.enrollment.intent === "rebuild"
+        : normalizedState.enrollment.status === "creating"
+          ? normalizedState.enrollment.intent === "rebuild"
             ? "Rebuilding enrollment"
             : "Creating enrollment"
-          : state.enrollment.status === "failed"
-            ? state.enrollment.retryable
+          : normalizedState.enrollment.status === "failed"
+            ? normalizedState.enrollment.retryable
               ? "Retry enrollment"
               : "Enrollment failed — reconfigure Relay v2"
-            : state.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
+            : normalizedState.enrollment.status === "expired" || (activeReview !== null && !reviewIsCurrent)
               ? "Rebuild expired enrollment"
               : "Create one-time enrollment";
 
   const errors = [
-    state.hostCredential.error,
+    normalizedState.hostCredential.error,
     connector.error,
-    state.enrollment.status === "failed" ? state.enrollment.error : null,
-    state.knownClientGrant.status === "failed" ? state.knownClientGrant.error : null,
+    normalizedState.enrollment.status === "failed" ? normalizedState.enrollment.error : null,
+    normalizedState.knownClientGrant.status === "failed"
+      ? normalizedState.knownClientGrant.error
+      : null,
   ].filter((value): value is string => Boolean(value));
 
   return {
     adapterAvailable,
-    previewOnly: state.authority.kind === "fake_preview",
+    previewOnly: normalizedState.authority.kind === "fake_preview",
     ready,
     missingCapabilities,
     readinessLabel,
     readinessDetail,
-    v1CredentialLabel: state.v1Profile.sharedSecretConfigured
+    v1CredentialLabel: normalizedState.v1Profile.sharedSecretConfigured
       ? "Relay v1 shared secret configured"
       : "Relay v1 shared secret not configured",
-    v2CredentialLabel: `Relay v2 host credential ${state.hostCredential.status}`,
+    v2CredentialLabel: `Relay v2 host credential ${normalizedState.hostCredential.status}`,
     hostCredentialAction: !adapterAvailable
-      || state.hostCredential.status === "bootstrapping"
-      || state.hostCredential.status === "refreshing"
+      || normalizedState.hostCredential.status === "bootstrapping"
+      || normalizedState.hostCredential.status === "refreshing"
       ? null
-      : state.hostCredential.status === "failed" && !state.hostCredential.retryable
+      : normalizedState.hostCredential.status === "failed" && !normalizedState.hostCredential.retryable
         ? null
-      : state.hostCredential.credentialReference
+      : normalizedState.hostCredential.credentialReference
         ? "refresh"
         : "bootstrap",
     connectorAction: !adapterAvailable
-      || !state.hostCredential.credentialReference
+      || !normalizedState.hostCredential.credentialReference
       || connector.status === "starting"
       || connector.status === "superseded"
       || (connector.status === "failed" && !connector.retryable)
@@ -521,17 +520,17 @@ export function deriveRelayV2EnrollmentView(
     enrollmentActionDisabled: enrollmentAction === null,
     enrollmentActionLabel,
     grantRevokeDisabled: !adapterAvailable || !(
-      state.knownClientGrant.status === "active"
+      normalizedState.knownClientGrant.status === "active"
       || (
-        state.knownClientGrant.status === "failed"
-        && state.knownClientGrant.retryable
+        normalizedState.knownClientGrant.status === "failed"
+        && normalizedState.knownClientGrant.retryable
       )
     ),
-    grantRevokeLabel: state.knownClientGrant.status === "failed"
-      ? state.knownClientGrant.retryable
+    grantRevokeLabel: normalizedState.knownClientGrant.status === "failed"
+      ? normalizedState.knownClientGrant.retryable
         ? "Retry client grant revoke"
         : "Client grant revoke failed — reconfigure Relay v2"
-      : state.knownClientGrant.status === "revoking"
+      : normalizedState.knownClientGrant.status === "revoking"
         ? "Revoking client grant"
         : "Revoke known client grant",
     error: errors.length > 0

@@ -15,6 +15,7 @@ import {
 } from "../src/platform/domainTypes.ts";
 import {
   classifyMobileRelayV2OperationFailure,
+  normalizeMobileRelayV2DashboardState,
 } from "../src/platform/relayV2Domain.ts";
 import { createFakeMobileRelayV2State } from "../src/platform/relayV2FakeAdapter.ts";
 
@@ -90,6 +91,118 @@ function registeredState() {
     },
   };
 }
+
+test("Relay v2 status normalization rebuilds a closed non-sensitive projection", () => {
+  const registered = registeredState();
+  const observed = {
+    ...registered,
+    accessToken: "twcap2.root-must-not-escape",
+    hostCredential: {
+      ...registered.hostCredential,
+      refreshToken: "twref2.host-must-not-escape",
+      bootstrapSecret: "twhostboot2.host-must-not-escape",
+    },
+    connector: {
+      ...registered.connector,
+      accessToken: "twcap2.connector-must-not-escape",
+    },
+    enrollment: {
+      status: "idle",
+      enrollmentCode: "twenroll2.idle-must-not-escape",
+    },
+    knownClientGrant: {
+      status: "unknown",
+      refreshToken: "twref2.grant-must-not-escape",
+    },
+  };
+
+  const normalized = normalizeMobileRelayV2DashboardState(observed, 1_000);
+  const serialized = JSON.stringify(normalized);
+
+  assert.equal(deriveRelayV2EnrollmentView(normalized, 1_000).ready, true);
+  assert.deepEqual(Object.keys(normalized), [
+    "authority",
+    "v1Profile",
+    "hostCredential",
+    "connector",
+    "enrollment",
+    "knownClientGrant",
+  ]);
+  for (const secret of [
+    "twcap2.root-must-not-escape",
+    "twref2.host-must-not-escape",
+    "twhostboot2.host-must-not-escape",
+    "twcap2.connector-must-not-escape",
+    "twenroll2.idle-must-not-escape",
+    "twref2.grant-must-not-escape",
+  ]) assert.equal(serialized.includes(secret), false, secret);
+});
+
+test("Relay v2 malformed status clears cached readiness and preserves the v1 configured bit", () => {
+  const registered = registeredState();
+  const observed = {
+    ...registered,
+    enrollment: {
+      status: "active",
+      review: {
+        enrollment: {
+          enrollmentId: "enrollment-stale",
+          enrollmentCode: "twenroll2.must-be-cleared",
+          expiresAtMs: 50_000,
+        },
+        display: {
+          issuerUrl: "https://relay.test",
+          relayUrl: "wss://relay.test/client",
+          hostId: "mac-admin",
+          deviceLabel: null,
+        },
+      },
+    },
+    knownClientGrant: { status: "unexpected-discriminator" },
+  };
+
+  const normalized = normalizeMobileRelayV2DashboardState(observed, 1_000);
+  const view = deriveRelayV2EnrollmentView(normalized, 1_000);
+
+  assert.equal(normalized.authority.kind, "unavailable");
+  assert.equal(normalized.connector.status, "failed");
+  assert.equal(normalized.enrollment.status, "failed");
+  assert.equal(normalized.v1Profile.sharedSecretConfigured, true);
+  assert.equal(view.ready, false);
+  assert.equal(view.qrPayload, null);
+  assert.equal(view.enrollmentAction, null);
+  assert.match(view.readinessDetail, /restore authoritative Relay v2 state/i);
+  assert.doesNotMatch(JSON.stringify(normalized), /twenroll2\.must-be-cleared/);
+});
+
+test("Relay v2 credential references remain opaque but reject credential values", () => {
+  const registered = registeredState();
+  const futureReference = "node-credential-reference:v9:opaque-id";
+  const accepted = normalizeMobileRelayV2DashboardState({
+    ...registered,
+    hostCredential: {
+      ...registered.hostCredential,
+      credentialReference: futureReference,
+    },
+  }, 1_000);
+  assert.equal(accepted.hostCredential.credentialReference, futureReference);
+  assert.equal(deriveRelayV2EnrollmentView(accepted, 1_000).ready, true);
+
+  for (const credentialReference of [
+    "twcap2.payload.mac",
+    "twref2.refresh-secret",
+    "twenroll2.one-time-secret",
+    "twhostboot2.bootstrap-secret",
+  ]) {
+    const rejected = normalizeMobileRelayV2DashboardState({
+      ...registered,
+      hostCredential: { ...registered.hostCredential, credentialReference },
+    }, 1_000);
+    assert.equal(rejected.authority.kind, "unavailable", credentialReference);
+    assert.equal(rejected.hostCredential.credentialReference, null, credentialReference);
+    assert.equal(rejected.v1Profile.sharedSecretConfigured, true, credentialReference);
+  }
+});
 
 test("Relay v2 polling observes external supersede, credential, and grant changes", async () => {
   const clock = new FakeClock();
@@ -318,13 +431,37 @@ test("Relay v2 operation failures are retryable only when the backend says so", 
   const retryable = classifyMobileRelayV2OperationFailure(
     {
       code: "relay_v2_temporarily_unavailable",
-      message: "Try again later.",
+      message: "Try twcap2.payload.mac again later.",
       retryable: true,
     },
   );
-  const unknown = classifyMobileRelayV2OperationFailure(new Error("Unclassified failure"));
+  const unknown = classifyMobileRelayV2OperationFailure(
+    new Error("Refresh twref2.refresh-secret failed"),
+  );
 
   assert.equal(retryable.retryable, true);
   assert.equal(unknown.retryable, false);
-  assert.equal(unknown.message, "Unclassified failure");
+  assert.match(retryable.message, /redacted Relay v2 credential/);
+  assert.match(unknown.message, /redacted Relay v2 credential/);
+  assert.doesNotMatch(retryable.message, /twcap2\.payload\.mac/);
+  assert.doesNotMatch(unknown.message, /twref2\.refresh-secret/);
+
+  const registered = registeredState();
+  const normalized = normalizeMobileRelayV2DashboardState({
+    ...registered,
+    connector: {
+      status: "failed",
+      acknowledgement: null,
+      hostId: null,
+      connectorId: null,
+      negotiatedCapabilityIntersection: [],
+      exitCode: null,
+      error: "Connector rejected twhostboot2.bootstrap-secret",
+      retryable: false,
+    },
+  }, 1_000);
+  assert.equal(normalized.connector.status, "failed");
+  if (normalized.connector.status !== "failed") return;
+  assert.match(normalized.connector.error, /redacted Relay v2 credential/);
+  assert.doesNotMatch(normalized.connector.error, /twhostboot2\.bootstrap-secret/);
 });
