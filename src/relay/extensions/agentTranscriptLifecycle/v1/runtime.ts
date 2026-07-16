@@ -175,6 +175,7 @@ function storeFailureCode(error: unknown): {
   }
   if (code === "AGENT_AUTHORITY_STORE_CAPACITY_EXCEEDED"
     || code === "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN"
+    || code === "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE"
     || code === "AGENT_AUTHORITY_STORE_CORRUPT"
     || code === "AGENT_AUTHORITY_STORE_OWNERSHIP_UNKNOWN") {
     return { code: "AGENT_TIMELINE_UNAVAILABLE", retryable: false };
@@ -189,6 +190,7 @@ function isUnavailableStoreFailure(error: unknown): boolean {
   return code === "AGENT_AUTHORITY_STORE_CORRUPT"
     || code === "AGENT_AUTHORITY_STORE_OWNERSHIP_UNKNOWN"
     || code === "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN"
+    || code === "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE"
     || code === "AGENT_AUTHORITY_STORE_CAPACITY_EXCEEDED";
 }
 
@@ -211,11 +213,11 @@ export class RelayAgentTranscriptLifecycleRuntime {
     }
   }
 
-  handleRequest(
+  async handleRequest(
     bytes: Uint8Array,
     metadata: RelayV2FrameMetadata,
     context: RelayAgentExtensionRouteContext,
-  ): RelayAgentRuntimeDelivery {
+  ): Promise<RelayAgentRuntimeDelivery> {
     if (!context.capabilityNegotiated) throw new RelayAgentExtensionNotNegotiatedError();
     const decoded = decodeRelayAgentTranscriptLifecycleFrame(bytes, metadata);
     const request = decoded.frame;
@@ -240,7 +242,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
         case "agent.timeline.status.get": {
           let status;
           try {
-            status = this.store.status(target);
+            status = await this.store.status(target);
           } catch (error) {
             if (!isUnavailableStoreFailure(error)) throw error;
             status = {
@@ -271,7 +273,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
         }
         case "agent.timeline.snapshot.get": {
           const payload = request.payload as RelayV2JsonObject;
-          const page = this.store.snapshot({
+          const page = await this.store.snapshot({
             principalId: context.principalId,
             clientInstanceId: context.clientInstanceId,
             target,
@@ -297,7 +299,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
         }
         case "agent.timeline.replay.get": {
           const payload = request.payload as RelayV2JsonObject;
-          const page = this.store.replay({
+          const page = await this.store.replay({
             principalId: context.principalId,
             clientInstanceId: context.clientInstanceId,
             target,
@@ -337,11 +339,11 @@ export class RelayAgentTranscriptLifecycleRuntime {
     }
   }
 
-  ingestTrustedSource(
+  async ingestTrustedSource(
     binding: RelayAgentTrustedAdapterBinding,
     sourceInput: unknown,
-  ): RelayAgentTrustedIngestResult {
-    const reduction = this.store.ingest(binding, sourceInput);
+  ): Promise<RelayAgentTrustedIngestResult> {
+    const reduction = await this.store.ingest(binding, sourceInput);
     return {
       reduction,
       delivery: reduction.publicEvent === null
@@ -350,7 +352,7 @@ export class RelayAgentTranscriptLifecycleRuntime {
     };
   }
 
-  deleteTimeline(target: RelayAgentAuthorityTarget): RelayAgentRuntimeDelivery {
-    return delivery("LIVE", resetFrame(this.store.deleteTimeline(target)));
+  async deleteTimeline(target: RelayAgentAuthorityTarget): Promise<RelayAgentRuntimeDelivery> {
+    return delivery("LIVE", resetFrame(await this.store.deleteTimeline(target)));
   }
 }

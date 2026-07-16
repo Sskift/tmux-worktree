@@ -45,6 +45,14 @@ import {
   parseRelayV2JsonObject,
   RelayV2JsonError,
 } from "../../../v2/strictJson.js";
+import {
+  RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+  RelayV2ContinuityAnchor,
+  type RelayV2ContinuityAnchorErrorCode,
+  type RelayV2ContinuityAnchorOptions,
+  type RelayV2ContinuityCheckpoint,
+  type RelayV2ContinuityLocalCasResult,
+} from "../../../v2/continuityAnchor.js";
 
 export const RELAY_AGENT_AUTHORITY_STORE_VERSION = 2 as const;
 export const RELAY_AGENT_AUTHORITY_CONTINUITY_VERSION = 1 as const;
@@ -68,6 +76,7 @@ const LOCK_WAIT_MS = 5_000;
 const MAX_CONTINUITY_BYTES = 16_384;
 const WORST_CASE_WIRE_REQUEST_ID = "\u0001".repeat(128);
 const WORST_CASE_WIRE_CURSOR = "\u0001".repeat(1_024);
+const CONTINUITY_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$/;
 
 export type RelayAgentTimelineUnavailableReason =
   | "agent_unsupported"
@@ -92,6 +101,8 @@ export interface RelayAgentAuthorityStorePaths {
 }
 
 export interface RelayAgentAuthorityStoreOptions extends RelayAgentAuthorityStoreOwner {
+  /** Required rollback-independent authority; there is deliberately no default. */
+  continuityAnchor: RelayV2ContinuityAnchorOptions;
   home?: string;
   paths?: RelayAgentAuthorityStorePaths;
   eventReplayRetentionMs?: number;
@@ -299,7 +310,7 @@ interface StoreLockOwner {
 type FileInspection<T> =
   | { kind: "missing" }
   | { kind: "invalid" }
-  | { kind: "valid"; value: T };
+  | { kind: "valid"; value: T; bytes: Buffer };
 
 class AtomicPublishError extends Error {
   constructor(
@@ -348,6 +359,14 @@ export class RelayAgentAuthorityStoreCapacityError extends Error {
   }
 }
 
+export class RelayAgentAuthorityStoreContinuityUnavailableError extends Error {
+  readonly code = "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE" as const;
+  constructor(message = "Relay Agent authority continuity is unavailable") {
+    super(message);
+    this.name = "RelayAgentAuthorityStoreContinuityUnavailableError";
+  }
+}
+
 export type RelayAgentTimelineRequestErrorCode =
   | "AGENT_TIMELINE_UNAVAILABLE"
   | "AGENT_CURSOR_EXPIRED"
@@ -360,6 +379,41 @@ export class RelayAgentTimelineRequestError extends Error {
     super("Relay Agent timeline request cannot be satisfied");
     this.name = "RelayAgentTimelineRequestError";
   }
+}
+
+const CONTINUITY_ERROR_CODES = new Set<RelayV2ContinuityAnchorErrorCode>([
+  "INVALID_CHECKPOINT",
+  "INVALID_AUTHORITY_RESPONSE",
+  "ANCHOR_UNAVAILABLE",
+  "STATE_COMMIT_UNCERTAIN",
+  "ANCHOR_COMMIT_UNCERTAIN",
+  "LOCAL_STATE_CONFLICT",
+  "CAS_CONFLICT",
+  "ROLLBACK_DETECTED",
+  "RECONCILIATION_REQUIRED",
+  "BUSY",
+]);
+
+function continuityErrorCode(error: unknown): RelayV2ContinuityAnchorErrorCode | null {
+  if (error === null || typeof error !== "object" || !("code" in error)) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && CONTINUITY_ERROR_CODES.has(code as RelayV2ContinuityAnchorErrorCode)
+    ? code as RelayV2ContinuityAnchorErrorCode
+    : null;
+}
+
+function mapContinuityError(error: unknown): Error {
+  const code = continuityErrorCode(error);
+  if (code === null) return error instanceof Error ? error : new Error("unknown continuity failure");
+  if (code === "ANCHOR_UNAVAILABLE" || code === "BUSY") {
+    return new RelayAgentAuthorityStoreContinuityUnavailableError();
+  }
+  if (code === "STATE_COMMIT_UNCERTAIN"
+    || code === "ANCHOR_COMMIT_UNCERTAIN"
+    || code === "RECONCILIATION_REQUIRED") {
+    return new RelayAgentAuthorityStoreCommitUncertainError("authority continuity commit requires reconciliation");
+  }
+  return new RelayAgentAuthorityStoreCorruptError("external continuity rejected local authority state");
 }
 
 function canonicalJson(value: unknown): string {
@@ -404,6 +458,14 @@ function parseId(value: unknown, label: string): string {
   return value;
 }
 
+function parseContinuityIdentifier(value: unknown, label: string): string {
+  const identifier = parseId(value, label);
+  if (!CONTINUITY_IDENTIFIER.test(identifier)) {
+    throw new RelayAgentAuthorityStoreCorruptError(`${label} is not a continuity identifier`);
+  }
+  return identifier;
+}
+
 function parseCursor(value: unknown, label: string): string {
   if (typeof value !== "string" || value.length === 0 || value.trim() !== value
     || value.includes("\0") || Buffer.byteLength(value, "utf8") > 1_024) {
@@ -441,6 +503,35 @@ function compareCounter(left: string, right: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function checkpointForStore(
+  store: PersistedStore,
+  exactDurableBytes: Uint8Array,
+  anchorId: string,
+): RelayV2ContinuityCheckpoint {
+  return {
+    protocolVersion: RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
+    anchorId,
+    sequence: store.commitSeq,
+    commitId: parseContinuityIdentifier(store.commitId, "store checkpoint commitId"),
+    parentCommitId: store.parentCommitId === null
+      ? null
+      : parseContinuityIdentifier(store.parentCommitId, "store checkpoint parentCommitId"),
+    stateDigest: createHash("sha256").update(exactDurableBytes).digest("hex"),
+  };
+}
+
+function sameCheckpoint(
+  left: RelayV2ContinuityCheckpoint,
+  right: RelayV2ContinuityCheckpoint,
+): boolean {
+  return left.protocolVersion === right.protocolVersion
+    && left.anchorId === right.anchorId
+    && left.sequence === right.sequence
+    && left.commitId === right.commitId
+    && left.parentCommitId === right.parentCommitId
+    && left.stateDigest === right.stateDigest;
+}
+
 function compareUtf8(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
@@ -463,6 +554,20 @@ export function relayAgentAuthorityStorePaths(home = homedir()): RelayAgentAutho
   };
 }
 
+export function relayAgentAuthorityContinuityAnchorId(
+  ownerInput: RelayAgentAuthorityStoreOwner,
+): string {
+  const owner = validateOwner(ownerInput, "continuity anchor owner");
+  const digest = createHash("sha256")
+    .update(canonicalJson([
+      RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      owner.hostId,
+      owner.hostEpoch,
+    ]), "utf8")
+    .digest("hex");
+  return `relay-agent-v1:${digest}`;
+}
+
 interface PersistedJsonBudgets {
   maximumBytes: number;
   maximumKeys: number;
@@ -472,6 +577,13 @@ interface PersistedJsonBudgets {
 interface PreparedStoreCommit {
   store: PersistedStore;
   bytes: Buffer;
+  checkpoint: RelayV2ContinuityCheckpoint;
+}
+
+interface LoadedStoreCommit {
+  store: PersistedStore;
+  bytes: Buffer;
+  checkpoint: RelayV2ContinuityCheckpoint;
 }
 
 function parseStrictJsonBytes(
@@ -519,7 +631,10 @@ function parseStrictJsonBytes(
   }
 }
 
-function parseStrictJsonFile(path: string, budgets: PersistedJsonBudgets): unknown {
+function parseStrictJsonFile(
+  path: string,
+  budgets: PersistedJsonBudgets,
+): { value: unknown; bytes: Buffer } {
   const expectedSize = lstatSync(path).size;
   if (expectedSize === 0 || expectedSize > budgets.maximumBytes) {
     throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
@@ -528,7 +643,10 @@ function parseStrictJsonFile(path: string, budgets: PersistedJsonBudgets): unkno
   if (bytes.byteLength !== expectedSize) {
     throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
   }
-  return parseStrictJsonBytes(bytes, budgets, basename(path));
+  return {
+    value: parseStrictJsonBytes(bytes, budgets, basename(path)),
+    bytes,
+  };
 }
 
 function assertOwnedRegularFile(path: string): void {
@@ -1144,10 +1262,10 @@ function validateStore(value: unknown, expectedOwner: RelayAgentAuthorityStoreOw
     throw new RelayAgentAuthorityStoreCorruptError("authority store snapshot lease is unknown");
   }
   const commitSeq = parseCounter(root.commitSeq, "authority store.commitSeq");
-  const commitId = parseId(root.commitId, "authority store.commitId");
+  const commitId = parseContinuityIdentifier(root.commitId, "authority store.commitId");
   const parentCommitId = root.parentCommitId === null
     ? null
-    : parseId(root.parentCommitId, "authority store.parentCommitId");
+    : parseContinuityIdentifier(root.parentCommitId, "authority store.parentCommitId");
   if ((commitSeq === "0") !== (parentCommitId === null)) {
     throw new RelayAgentAuthorityStoreCorruptError("authority store commit lineage is malformed");
   }
@@ -1263,7 +1381,8 @@ function inspectJsonFile<T>(
   if (!existsSync(path)) return { kind: "missing" };
   try {
     assertOwnedRegularFile(path);
-    return { kind: "valid", value: validator(parseStrictJsonFile(path, budgets)) };
+    const parsed = parseStrictJsonFile(path, budgets);
+    return { kind: "valid", value: validator(parsed.value), bytes: parsed.bytes };
   } catch (error) {
     if (error instanceof RelayAgentAuthorityStoreOwnershipError) throw error;
     return { kind: "invalid" };
@@ -1354,7 +1473,7 @@ function parseLockOwner(path: string): StoreLockOwner {
     maximumBytes: MAX_CONTINUITY_BYTES,
     maximumKeys: 32,
     maximumNodes: 64,
-  });
+  }).value;
   const owner = exactRecord(value, ["owner", "pid", "createdAtMs"], "authority store lock owner");
   return {
     owner: parseId(owner.owner, "authority store lock owner.owner"),
@@ -1598,9 +1717,26 @@ export class RelayAgentAuthorityStore {
   private readonly persistedJsonBudgets: PersistedJsonBudgets;
   private readonly authorityCapacityOverride: RelayAgentAuthorityCapacityOverride | undefined;
   private readonly configuredRetentionMs: number;
+  private readonly continuityAnchor: RelayV2ContinuityAnchor;
+  private readonly continuityAnchorId: string;
 
   private constructor(options: RelayAgentAuthorityStoreOptions) {
     this.owner = Object.freeze(validateOwner({ hostId: options.hostId, hostEpoch: options.hostEpoch }, "store owner"));
+    this.continuityAnchorId = relayAgentAuthorityContinuityAnchorId(this.owner);
+    if (options.continuityAnchor === null
+      || typeof options.continuityAnchor !== "object"
+      || options.continuityAnchor.anchorId !== this.continuityAnchorId) {
+      throw new RelayAgentAuthorityStoreContinuityUnavailableError(
+        "Relay Agent authority continuity anchor is missing or bound to a different owner",
+      );
+    }
+    try {
+      this.continuityAnchor = new RelayV2ContinuityAnchor(options.continuityAnchor);
+    } catch {
+      throw new RelayAgentAuthorityStoreContinuityUnavailableError(
+        "Relay Agent authority continuity anchor cannot be constructed",
+      );
+    }
     this.paths = Object.freeze(options.paths ?? relayAgentAuthorityStorePaths(options.home));
     this.now = options.now ?? Date.now;
     this.randomId = options.randomId ?? randomUUID;
@@ -1634,9 +1770,9 @@ export class RelayAgentAuthorityStore {
     this.authorityCapacityOverride = options.authorityCapacityOverride;
   }
 
-  static open(options: RelayAgentAuthorityStoreOptions): RelayAgentAuthorityStore {
+  static async open(options: RelayAgentAuthorityStoreOptions): Promise<RelayAgentAuthorityStore> {
     const store = new RelayAgentAuthorityStore(options);
-    store.initialize();
+    await store.initialize();
     return store;
   }
 
@@ -1677,7 +1813,11 @@ export class RelayAgentAuthorityStore {
       ),
       this.owner,
     );
-    return { store, bytes };
+    return {
+      store,
+      bytes,
+      checkpoint: checkpointForStore(store, bytes, this.continuityAnchorId),
+    };
   }
 
   private atomicWriteStore(prepared: PreparedStoreCommit): void {
@@ -1690,18 +1830,26 @@ export class RelayAgentAuthorityStore {
     );
   }
 
-  private initialize(): void {
+  private async initialize(): Promise<void> {
     ensurePrivateDirectory(dirname(this.paths.continuity), this.fsyncDirectory);
     ensurePrivateDirectory(dirname(this.paths.state), this.fsyncDirectory);
     const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
     try {
-      this.loadOrCreateLocked();
+      await this.loadOrCreateLocked();
     } finally {
       releaseStoreLock(lock);
     }
   }
 
-  private loadOrCreateLocked(): PersistedStore {
+  private async reconcileCheckpoint(checkpoint: RelayV2ContinuityCheckpoint): Promise<void> {
+    try {
+      await this.continuityAnchor.reconcile(checkpoint);
+    } catch (error) {
+      throw mapContinuityError(error);
+    }
+  }
+
+  private async loadOrCreateLocked(): Promise<LoadedStoreCommit> {
     const state = inspectJsonFile(
       this.paths.state,
       this.persistedJsonBudgets,
@@ -1719,7 +1867,7 @@ export class RelayAgentAuthorityStore {
       const created = freshStore(
         this.owner,
         this.configuredRetentionMs,
-        parseId(this.randomId(), "generated store commit ID"),
+        parseContinuityIdentifier(this.randomId(), "generated store commit ID"),
         this.observedNow(),
       );
       const prepared = this.prepareStoreCommit(created);
@@ -1734,77 +1882,160 @@ export class RelayAgentAuthorityStore {
         }
         throw error;
       }
-      return prepared.store;
+      await this.reconcileCheckpoint(prepared.checkpoint);
+      return prepared;
     }
-    if (state.kind === "missing" || continuity.kind === "missing") {
-      throw new RelayAgentAuthorityStoreCorruptError("authority state/continuity pair is incomplete");
+    if (state.kind === "missing") {
+      throw new RelayAgentAuthorityStoreCorruptError("authority state is missing while local continuity remains");
     }
     if (state.value.policy.eventReplayRetentionMs !== this.configuredRetentionMs) {
       throw new RelayAgentAuthorityStoreCorruptError("configured replay retention differs from the durable policy");
     }
-    const exactMatch = state.value.commitSeq === continuity.value.commitSeq
-      && state.value.commitId === continuity.value.commitId
-      && state.value.checksum === continuity.value.stateChecksum;
-    if (exactMatch) return state.value;
-
-    const stateOneAhead = BigInt(state.value.commitSeq) === BigInt(continuity.value.commitSeq) + 1n
-      && state.value.parentCommitId === continuity.value.commitId;
-    if (!stateOneAhead) {
-      throw new RelayAgentAuthorityStoreCorruptError("authority continuity proves rollback or divergent lineage");
+    let repairLocalWitness = continuity.kind === "missing";
+    if (continuity.kind === "valid") {
+      const exactMatch = state.value.commitSeq === continuity.value.commitSeq
+        && state.value.commitId === continuity.value.commitId
+        && state.value.checksum === continuity.value.stateChecksum;
+      const stateOneAhead = BigInt(state.value.commitSeq) === BigInt(continuity.value.commitSeq) + 1n
+        && state.value.parentCommitId === continuity.value.commitId;
+      if (!exactMatch && !stateOneAhead) {
+        throw new RelayAgentAuthorityStoreCorruptError("local continuity is divergent from authority state");
+      }
+      repairLocalWitness = stateOneAhead;
     }
-    try {
-      this.atomicWriteJson(this.paths.continuity, continuityFor(state.value), MAX_CONTINUITY_BYTES);
-    } catch {
-      throw new RelayAgentAuthorityStoreCommitUncertainError("authority continuity repair could not be published");
+    const loaded: LoadedStoreCommit = {
+      store: state.value,
+      bytes: state.bytes,
+      checkpoint: checkpointForStore(state.value, state.bytes, this.continuityAnchorId),
+    };
+    await this.reconcileCheckpoint(loaded.checkpoint);
+    if (repairLocalWitness) {
+      try {
+        this.atomicWriteJson(this.paths.continuity, continuityFor(loaded.store), MAX_CONTINUITY_BYTES);
+      } catch {
+        throw new RelayAgentAuthorityStoreCommitUncertainError("local continuity repair could not be published");
+      }
     }
-    return state.value;
+    return loaded;
   }
 
-  private commitLocked(previous: PersistedStore, working: PersistedStore, observedAtMs: number): PersistedStore {
-    const commitId = parseId(this.randomId(), "generated store commit ID");
-    if (commitId === previous.commitId) {
+  private localCompareAndPublish(
+    expected: Readonly<RelayV2ContinuityCheckpoint>,
+    next: Readonly<RelayV2ContinuityCheckpoint>,
+    prepared: PreparedStoreCommit,
+    signal: AbortSignal,
+  ): RelayV2ContinuityLocalCasResult {
+    if (signal.aborted || !sameCheckpoint(prepared.checkpoint, next)) {
+      return { outcome: "uncertain" };
+    }
+    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
+    try {
+      if (signal.aborted) return { outcome: "uncertain" };
+      const state = inspectJsonFile(
+        this.paths.state,
+        this.persistedJsonBudgets,
+        (value) => validateStore(value, this.owner),
+      );
+      if (state.kind !== "valid") return { outcome: "uncertain" };
+      const continuity = inspectJsonFile(
+        this.paths.continuity,
+        { maximumBytes: MAX_CONTINUITY_BYTES, maximumKeys: 32, maximumNodes: 64 },
+        (value) => validateContinuity(value, this.owner),
+      );
+      if (continuity.kind === "invalid") return { outcome: "uncertain" };
+      if (continuity.kind === "valid") {
+        const exactLocalPair = state.value.commitSeq === continuity.value.commitSeq
+          && state.value.commitId === continuity.value.commitId
+          && state.value.checksum === continuity.value.stateChecksum;
+        const stateOneAhead = BigInt(state.value.commitSeq) === BigInt(continuity.value.commitSeq) + 1n
+          && state.value.parentCommitId === continuity.value.commitId;
+        if (!exactLocalPair && !stateOneAhead) return { outcome: "uncertain" };
+      }
+      const current = checkpointForStore(state.value, state.bytes, this.continuityAnchorId);
+      if (sameCheckpoint(current, next)) {
+        try {
+          this.atomicWriteJson(this.paths.continuity, continuityFor(state.value), MAX_CONTINUITY_BYTES);
+        } catch {
+          return { outcome: "uncertain" };
+        }
+        return { outcome: "already_same", current };
+      }
+      if (!sameCheckpoint(current, expected)) {
+        return { outcome: "conflict", current };
+      }
+      let statePublished = false;
+      try {
+        this.atomicWriteStore(prepared);
+        statePublished = true;
+        this.atomicWriteJson(this.paths.continuity, continuityFor(prepared.store), MAX_CONTINUITY_BYTES);
+      } catch (error) {
+        if (statePublished || (error instanceof AtomicPublishError && error.published)) {
+          return { outcome: "uncertain" };
+        }
+        return { outcome: "uncertain" };
+      }
+      return { outcome: "swapped", current: { ...prepared.checkpoint } };
+    } finally {
+      releaseStoreLock(lock);
+    }
+  }
+
+  private async commitExpected(
+    previous: LoadedStoreCommit,
+    working: PersistedStore,
+    observedAtMs: number,
+  ): Promise<PersistedStore> {
+    const commitId = parseContinuityIdentifier(this.randomId(), "generated store commit ID");
+    if (commitId === previous.store.commitId) {
       throw new RelayAgentAuthorityStoreCapacityError("commit_id_collision", 1, 1);
     }
     const candidate = sealStore({
       version: RELAY_AGENT_AUTHORITY_STORE_VERSION,
       owner: { ...this.owner },
       policy: { ...working.policy },
-      commitSeq: nextCounter(previous.commitSeq),
+      commitSeq: nextCounter(previous.store.commitSeq),
       commitId,
-      parentCommitId: previous.commitId,
+      parentCommitId: previous.store.commitId,
       lastObservedAtMs: observedAtMs,
       sessions: working.sessions,
     });
     const prepared = this.prepareStoreCommit(candidate);
     try {
-      this.atomicWriteStore(prepared);
+      await this.continuityAnchor.advance({
+        current: previous.checkpoint,
+        next: prepared.checkpoint,
+        publishState: (expected, next, signal) => (
+          this.localCompareAndPublish(expected, next, prepared, signal)
+        ),
+      });
     } catch (error) {
-      if (error instanceof AtomicPublishError && error.published) {
-        throw new RelayAgentAuthorityStoreCommitUncertainError("authority state commit is uncertain");
-      }
-      throw error;
-    }
-    try {
-      this.atomicWriteJson(this.paths.continuity, continuityFor(prepared.store), MAX_CONTINUITY_BYTES);
-    } catch {
-      throw new RelayAgentAuthorityStoreCommitUncertainError("authority continuity commit is uncertain");
+      throw mapContinuityError(error);
     }
     return prepared.store;
   }
 
-  private transaction<T>(mutator: (working: PersistedStore, observedAtMs: number) => StoreTransactionResult<T>): T {
+  private async transaction<T>(
+    mutator: (working: PersistedStore, observedAtMs: number) => StoreTransactionResult<T>,
+  ): Promise<T> {
     const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
+    let current: LoadedStoreCommit;
+    let observedAtMs: number;
+    let working: PersistedStore;
+    let outcome: StoreTransactionResult<T>;
+    let pruned: boolean;
     try {
-      const current = this.loadOrCreateLocked();
-      const observedAtMs = this.observedNow(current.lastObservedAtMs);
-      const working = cloneStore(current);
-      const pruned = pruneStore(working, observedAtMs);
-      const outcome = mutator(working, observedAtMs);
-      if (pruned || outcome.changed) this.commitLocked(current, working, observedAtMs);
-      return outcome.result;
+      current = await this.loadOrCreateLocked();
+      observedAtMs = this.observedNow(current.store.lastObservedAtMs);
+      working = cloneStore(current.store);
+      pruned = pruneStore(working, observedAtMs);
+      outcome = mutator(working, observedAtMs);
     } finally {
       releaseStoreLock(lock);
     }
+    if (pruned || outcome.changed) {
+      await this.commitExpected(current, working, observedAtMs);
+    }
+    return outcome.result;
   }
 
   private generatedOpaqueId(label: string): string {
@@ -1851,7 +2082,7 @@ export class RelayAgentAuthorityStore {
     };
   }
 
-  ensureTimeline(targetInput: RelayAgentAuthorityTarget): RelayAgentAuthorityBinding {
+  ensureTimeline(targetInput: RelayAgentAuthorityTarget): Promise<RelayAgentAuthorityBinding> {
     const target = validateTarget(targetInput);
     return this.transaction((working) => {
       let session = findSession(working, target);
@@ -1884,12 +2115,12 @@ export class RelayAgentAuthorityStore {
   markUnavailable(
     targetInput: RelayAgentAuthorityTarget,
     reason: Exclude<RelayAgentTimelineUnavailableReason, "store_unavailable">,
-  ): void {
+  ): Promise<void> {
     const target = validateTarget(targetInput);
     if (!["agent_unsupported", "session_not_agent_managed", "adapter_unavailable"].includes(reason)) {
       throw new TypeError("unavailable reason is not accepted by the extension contract");
     }
-    this.transaction((working) => {
+    return this.transaction((working) => {
       let session = findSession(working, target);
       if (!session) {
         if (working.sessions.length >= MAX_SESSION_COUNT) {
@@ -1907,7 +2138,7 @@ export class RelayAgentAuthorityStore {
     });
   }
 
-  status(targetInput: RelayAgentAuthorityTarget): RelayAgentTimelineStatus {
+  status(targetInput: RelayAgentAuthorityTarget): Promise<RelayAgentTimelineStatus> {
     const target = validateTarget(targetInput);
     return this.transaction((working) => {
       const session = findSession(working, target);
@@ -1947,7 +2178,7 @@ export class RelayAgentAuthorityStore {
   ingest(
     trustedAdapterBinding: RelayAgentTrustedAdapterBinding,
     sourceInput: unknown,
-  ): RelayAgentAuthorityReduction {
+  ): Promise<RelayAgentAuthorityReduction> {
     const target = validateTarget({
       scopeId: trustedAdapterBinding.scopeId,
       sessionId: trustedAdapterBinding.sessionId,
@@ -2061,7 +2292,7 @@ export class RelayAgentAuthorityStore {
     });
   }
 
-  snapshot(request: RelayAgentSnapshotGet): RelayAgentSnapshotPage {
+  snapshot(request: RelayAgentSnapshotGet): Promise<RelayAgentSnapshotPage> {
     const target = validateTarget(request.target);
     const principalId = parseId(request.principalId, "snapshot principalId");
     const clientInstanceId = parseId(request.clientInstanceId, "snapshot clientInstanceId");
@@ -2191,7 +2422,7 @@ export class RelayAgentAuthorityStore {
     });
   }
 
-  replay(request: RelayAgentReplayGet): RelayAgentReplayPage {
+  replay(request: RelayAgentReplayGet): Promise<RelayAgentReplayPage> {
     const target = validateTarget(request.target);
     const principalId = parseId(request.principalId, "replay principalId");
     const clientInstanceId = parseId(request.clientInstanceId, "replay clientInstanceId");
@@ -2302,7 +2533,7 @@ export class RelayAgentAuthorityStore {
     });
   }
 
-  deleteTimeline(targetInput: RelayAgentAuthorityTarget): RelayAgentTimelineReset {
+  deleteTimeline(targetInput: RelayAgentAuthorityTarget): Promise<RelayAgentTimelineReset> {
     const target = validateTarget(targetInput);
     return this.transaction((working) => {
       const session = findSession(working, target);
