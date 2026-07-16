@@ -1,5 +1,6 @@
 use super::{
-    refresh_pty_control_status, with_pty_control, PtyControl, PtyState, TerminalControlState,
+    acquire_pty_control, refresh_pty_control_status, with_pty_control, PtyControl, PtyState,
+    TerminalControlState,
 };
 use crate::config::{acquire_dashboard_config_file_lock, dashboard_config_write_lock};
 use crate::features::control_plane::{resolve_local_tw_rpc_runtime, LocalTwRpcRuntime};
@@ -935,7 +936,14 @@ pub(crate) fn feishu_binding_create(
         .ok_or("Feishu Dashboard binding requires a controlled PTY attachment")?;
     with_pty_control(pty_state.inner().as_ref(), &pty_id, |control| {
         control.ensure_local_transfer_target(&args.session_name)?;
-        let dashboard_lease = control.current_dashboard_lease()?;
+        // Dashboard PTYs acquire their interactive lease lazily. Linking a
+        // group is itself a transfer mutation, so refresh any cached lease and
+        // acquire one while the same PTY mutex still excludes input/resize.
+        // Feishu ownership and recovery states continue to fail closed in the
+        // canonical authority.
+        refresh_pty_control_status(&app, control_state.inner().as_ref(), control);
+        let dashboard_lease = acquire_pty_control(&app, control_state.inner().as_ref(), control)
+            .map_err(|error| error.to_string())?;
         let mut params = params;
         params
             .as_object_mut()

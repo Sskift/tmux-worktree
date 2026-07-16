@@ -831,6 +831,7 @@ private fun TerminalRoute(
         sessionTitle = session.title,
         connectionStatus = connectionStatus,
         isReadOnly = readOnly,
+        ownershipReadOnly = ownershipReadOnly,
         keyboardVisible = keyboardVisible,
         terminalFontSizeSp = fontSize,
         disconnectReason = state.terminal.resetReason.ifBlank { state.health.errorMessage }.ifBlank { null },
@@ -843,7 +844,8 @@ private fun TerminalRoute(
         },
         onDecreaseFont = { fontSize = (fontSize - 1).coerceAtLeast(10) },
         onIncreaseFont = { fontSize = (fontSize + 1).coerceAtMost(24) },
-        onToggleReadOnly = { if (!ownershipReadOnly) userReadOnly = !userReadOnly },
+        onToggleReadOnly = { userReadOnly = !userReadOnly },
+        onRetryInput = { viewModel.retryTerminalInput(session) },
         terminalContent = {
             TerminalWebView(
                 controller = controller,

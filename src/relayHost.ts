@@ -2036,16 +2036,13 @@ async function writeControlledRawInput(
     route.clientId,
     route.scope,
     route.rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
-      return {
-        type: "input.raw",
-        lease,
-        operationId,
-        pane: paneIndex,
-        dataBase64: Buffer.from(data, "utf8").toString("base64"),
-      };
-    },
+    (lease, operationId) => ({
+      type: "input.raw",
+      lease,
+      operationId,
+      pane: "0",
+      dataBase64: Buffer.from(data, "utf8").toString("base64"),
+    }),
     `stream:${route.streamId}:input`,
   );
 }
@@ -2061,17 +2058,14 @@ async function writeControlledResize(
     route.clientId,
     route.scope,
     route.rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(route.scope, route.rawName, route.pane);
-      return {
-        type: "input.resize",
-        lease,
-        operationId,
-        pane: paneIndex,
-        cols,
-        rows,
-      };
-    },
+    (lease, operationId) => ({
+      type: "input.resize",
+      lease,
+      operationId,
+      pane: "0",
+      cols,
+      rows,
+    }),
     `stream:${route.streamId}:resize`,
   );
 }
@@ -2293,7 +2287,6 @@ async function sendControlledAgentMessage(
   control: RelayTerminalControl,
   clientId: string,
   session: string,
-  pane: string | number | undefined,
   message: string,
   submit: boolean,
 ): Promise<void> {
@@ -2303,17 +2296,14 @@ async function sendControlledAgentMessage(
     clientId,
     scope,
     rawName,
-    async (lease, operationId) => {
-      const paneIndex = await resolvePaneIndex(scope, rawName, pane);
-      return {
-        type: "input.agent-message",
-        lease,
-        operationId,
-        pane: paneIndex,
-        message,
-        submit,
-      };
-    },
+    (lease, operationId) => ({
+      type: "input.agent-message",
+      lease,
+      operationId,
+      pane: "0",
+      message,
+      submit,
+    }),
     "agent-message",
   );
 }
@@ -3239,7 +3229,6 @@ async function runConnection(
             terminalControl,
             clientId,
             message.session,
-            message.pane,
             message.message,
             message.submit !== false,
           );

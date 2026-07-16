@@ -614,6 +614,18 @@ class V2ViewModel(
         }
     }
 
+    fun retryTerminalInput(session: RelaySession) {
+        if (demoMode) {
+            openTerminal(session)
+        } else {
+            relay.openTerminal(
+                hostId = session.hostId,
+                sessionName = session.name,
+                resetDisplay = true,
+            )
+        }
+    }
+
     fun closeTerminal() {
         if (!demoMode) relay.closeTerminal()
     }

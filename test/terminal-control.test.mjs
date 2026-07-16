@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   existsSync,
@@ -76,6 +76,7 @@ class FakeBackend {
   async beforeWrite(kind, value) {
     this.started?.resolve();
     if (this.gate) await this.gate.promise;
+    if (this.failWrite instanceof Error) throw this.failWrite;
     if (this.failWrite) throw new Error("injected backend uncertainty");
     this.writes.push({ kind, value });
   }
@@ -570,6 +571,93 @@ test("uncertain backend writes persist RECOVERY_REQUIRED and never auto-retry", 
     backend.failWrite = false;
     await authority.handle(rawRequest(recovered.lease, "new-owner-after-recovery", "ok"));
     assert.deepEqual(backend.writes.at(-1), { kind: "raw", value: { pane: "0", data: "ok" } });
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("invalid logical panes are rejected before an in-flight operation is persisted", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "client:logical-pane"));
+    const invalidRequests = [
+      {
+        ...rawRequest(relay.lease, "invalid-logical-raw", "must-not-write"),
+        pane: "1",
+      },
+      {
+        protocolVersion: 1,
+        requestId: "invalid-logical-agent",
+        type: "input.agent-message",
+        lease: relay.lease,
+        operationId: "invalid-logical-agent",
+        pane: "1",
+        message: "must-not-write",
+        submit: true,
+      },
+      {
+        protocolVersion: 1,
+        requestId: "invalid-logical-resize",
+        type: "input.resize",
+        lease: relay.lease,
+        operationId: "invalid-logical-resize",
+        pane: "1",
+        cols: 120,
+        rows: 40,
+      },
+    ];
+
+    for (const request of invalidRequests) {
+      await assert.rejects(
+        authority.handle(request),
+        (error) => error.code === "INVALID_REQUEST",
+      );
+      const stored = terminalControl.loadTerminalControlState(temp.path).targets[0];
+      assert.equal(stored.lifecycle, "ACTIVE");
+      assert.equal(stored.ownership.state, "HELD");
+      assert.equal(stored.inFlight, undefined);
+      assert.equal(stored.recovery, undefined);
+      assert.equal(
+        stored.completedOperations.some(({ operationId }) => operationId === request.operationId),
+        false,
+      );
+    }
+    assert.deepEqual(backend.writes, []);
+
+    const accepted = await authority.handle(rawRequest(relay.lease, "valid-after-invalid-pane", "ok"));
+    assert.equal(accepted.accepted, true);
+    assert.deepEqual(backend.writes, [{ kind: "raw", value: { pane: "0", data: "ok" } }]);
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("backend INVALID_REQUEST after an operation starts remains operation-in-doubt", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v1", "backend-invalid"));
+    backend.failWrite = new terminalControl.TerminalControlProtocolError(
+      "INVALID_REQUEST",
+      "backend rejected after entering its write boundary",
+    );
+
+    await assert.rejects(
+      authority.handle(rawRequest(relay.lease, "backend-invalid-after-start", "possibly-written")),
+      (error) => error.code === "OPERATION_IN_DOUBT",
+    );
+    const stored = terminalControl.loadTerminalControlState(temp.path).targets[0];
+    assert.equal(stored.lifecycle, "RECOVERY_REQUIRED");
+    assert.equal(stored.inFlight, undefined);
+    assert.equal(stored.recovery.reason, "OPERATION_IN_DOUBT");
+    assert.equal(stored.completedOperations.at(-1).operationId, "backend-invalid-after-start");
+    assert.equal(stored.completedOperations.at(-1).disposition, "in-doubt");
+    assert.deepEqual(backend.writes, []);
   } finally {
     temp.cleanup();
   }
@@ -1176,6 +1264,7 @@ test("production tmux backend captures bounded correlated output on an isolated 
   process.env.HOME = home;
   process.env.TW_TMUX = wrapper;
   process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = join(twHome, "terminal-control-output-v1");
+  let readonlyClient;
   try {
     const bootstrap = spawnSync(wrapper, ["new-session", "-d", "-s", "bootstrap"], {
       encoding: "utf8",
@@ -1211,6 +1300,29 @@ test("production tmux backend captures bounded correlated output on an isolated 
     });
     const target = await resolved(authority, "controlled");
     const feishu = await acquired(authority, target.controlTargetId, owner("feishu", "real-tmux:daemon-1"));
+    readonlyClient = spawn(
+      wrapper,
+      [
+        "-C",
+        "attach-session",
+        "-E",
+        "-f",
+        "read-only,ignore-size,no-output",
+        "-t",
+        "=controlled",
+      ],
+      { stdio: ["pipe", "ignore", "ignore"] },
+    );
+    const clientDeadline = Date.now() + 2_000;
+    let readonlyAttached = false;
+    while (!readonlyAttached && Date.now() < clientDeadline) {
+      const clients = spawnSync(wrapper, ["list-clients", "-F", "#{client_readonly}"], {
+        encoding: "utf8",
+      });
+      readonlyAttached = clients.status === 0 && clients.stdout.split("\n").includes("1");
+      if (!readonlyAttached) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.equal(readonlyAttached, true, "test must cover a read-only observer client");
     const raw = await authority.handle({
       protocolVersion: 1,
       requestId: "real-tmux-fenced-raw",
@@ -1351,6 +1463,10 @@ test("production tmux backend captures bounded correlated output on an isolated 
       (error) => error.code === "RECOVERY_REQUIRED" && /2 live panes/.test(error.message),
     );
   } finally {
+    if (readonlyClient) {
+      readonlyClient.stdin?.end();
+      readonlyClient.kill("SIGTERM");
+    }
     spawnSync(wrapper, ["kill-server"], { encoding: "utf8" });
     if (previous.HOME === undefined) delete process.env.HOME;
     else process.env.HOME = previous.HOME;

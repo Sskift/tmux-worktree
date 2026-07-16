@@ -91,6 +91,11 @@ const paneNumber = Array.from(session).reduce(
 );
 const paneId = "%" + paneNumber;
 const instanceId = "tmux-instance-" + paneNumber;
+const paneIndexPath = join(gateDir, key + ".pane-index");
+const configuredPaneIndex = existsSync(paneIndexPath)
+  ? readFileSync(paneIndexPath, "utf8").trim()
+  : "0";
+const paneIndex = /^\\d+$/.test(configuredPaneIndex) ? configuredPaneIndex : "0";
 appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({ pid: process.pid, args, session, startedAt: Date.now() }) + "\\n");
 if (args[0] === "list-sessions" && args.at(-1).includes("#{session_id}")) {
   let managed = [];
@@ -147,8 +152,69 @@ if (args[0] === "show-options") {
 }
 if (args[0] === "list-panes" && args.at(-1) === "#{pane_index}\\u001f#{pane_id}") {
   writeFileSync(join(gateDir, "pane-" + paneNumber + ".session"), session + "\\n");
-  process.stdout.write("0\\u001f" + paneId + "\\n");
+  process.stdout.write(paneIndex + "\\u001f" + paneId + "\\n");
   process.exit(0);
+}
+if (args[0] === "-C" && args[1] === "attach-session") {
+  let controlInput = "";
+  process.stdin.on("data", (chunk) => { controlInput += chunk.toString("utf8"); });
+  process.stdin.on("end", () => {
+    const command = controlInput.split("\\n").find((line) => line.startsWith("if-shell ")) || "";
+    const parsed = /^if-shell -F -t (%\\d+) '([^']*)' '([^']*)' '([^']*)'$/.exec(command);
+    const condition = parsed?.[2] || "";
+    const committedCommand = parsed?.[3] || "";
+    const rejectedCommand = parsed?.[4] || "";
+    const committedMarker = /display-message -p (__TW_CONTROL_RAW_COMMITTED_[A-Za-z0-9-]+__)/.exec(committedCommand)?.[1];
+    const rejectedMarker = /display-message -p (__TW_CONTROL_RAW_REJECTED_[A-Za-z0-9-]+__)/.exec(rejectedCommand)?.[1];
+    const generationPath = join(gateDir, key + ".output-generation");
+    const generation = existsSync(generationPath) ? readFileSync(generationPath, "utf8").trim() : "";
+    const ready = Boolean(
+      parsed
+      && committedMarker
+      && rejectedMarker
+      && condition.includes(instanceId)
+      && condition.includes(generation)
+      && existsSync(join(gateDir, key + ".output-pipe"))
+    );
+    const hexKey = /(?:^| ; )send-keys -H -t (%\\d+) ([0-9a-f]{2})(?: ; |$)/.exec(committedCommand);
+    const translatedKey = /(?:^| ; )send-keys -t (%\\d+) ([A-Za-z0-9-]+)(?: ; |$)/.exec(committedCommand);
+    let marker = ready ? committedMarker : rejectedMarker;
+    let failed = !parsed || !marker || (!hexKey && !translatedKey);
+    let detail = failed ? "simulated malformed control-mode key command" : "";
+    if (!failed && existsSync(join(gateDir, "fail-send-keys"))) {
+      failed = true;
+      detail = "simulated key input failure";
+    }
+    if (!failed && translatedKey?.[2] === "BSpace" && existsSync(join(gateDir, "fail-named-backspace"))) {
+      failed = true;
+      detail = "simulated named Backspace failure";
+    }
+    if (!failed && ready) {
+      const mutationArgs = hexKey
+        ? ["send-keys", "-H", "-t", hexKey[1], hexKey[2]]
+        : ["send-keys", "-t", translatedKey[1], translatedKey[2]];
+      appendFileSync(join(gateDir, "calls.ndjson"), JSON.stringify({
+        pid: process.pid,
+        args: mutationArgs,
+        session,
+        startedAt: Date.now(),
+      }) + "\\n");
+      if (hexKey) {
+        appendFileSync(
+          join(gateDir, "tmux-inputs.ndjson"),
+          JSON.stringify({ args: mutationArgs, input: Buffer.from(hexKey[2], "hex").toString("latin1") }) + "\\n",
+        );
+      }
+    }
+    process.stdout.write("%begin 1 1 0\\n%end 1 1 0\\n%session-changed $0 " + session + "\\n");
+    process.stdout.write("%begin 1 2 1\\n");
+    if (detail) process.stdout.write(detail + "\\n");
+    if (marker) process.stdout.write(marker + "\\n");
+    process.stdout.write((failed ? "%error" : "%end") + " 1 2 1\\n%exit\\n");
+    process.exit(0);
+  });
+  process.stdin.resume();
+  return;
 }
 if (args[0] === "if-shell") {
   const condition = String(args.at(-3) || "");
@@ -254,7 +320,7 @@ if (existsSync(join(gateDir, key + ".spawn-grandchild"))) {
 }
 
 const finish = () => {
-  process.stdout.write("0\\x1f1\\n");
+  process.stdout.write(paneIndex + "\\x1f1\\n");
   process.exit(0);
 };
 
@@ -674,6 +740,13 @@ function openScopedTerminalAs(harness, clientId, session, streamId) {
   });
 }
 
+function setPhysicalPaneIndex(harness, session, paneIndex) {
+  writeFileSync(
+    join(harness.gateDir, `${safeGateName(session)}.pane-index`),
+    `${paneIndex}\n`,
+  );
+}
+
 function setGate(harness, session, suffix) {
   writeFileSync(join(harness.gateDir, `${safeGateName(session)}.${suffix}`), "");
 }
@@ -773,6 +846,62 @@ test("local bridge discards inherited query and fragment credentials", async (t)
   assert.equal(connection.requestUrl.includes("stale-url-token"), false);
   assert.equal(connection.requestUrl.includes("stale-other"), false);
   assert.equal(connection.requestUrl.includes("stale-fragment"), false);
+});
+
+test("Relay keeps controlled input on logical pane zero when the physical pane index starts at one", async (t) => {
+  const harness = await startHarness(t);
+  const session = "pane-base-one";
+  setPhysicalPaneIndex(harness, session, 1);
+  openTerminal(harness, session);
+  const connection = await waitFor(
+    () => harness.localConnections.find((candidate) => candidate.session === session),
+    "local bridge did not open the pane-base-index=1 session",
+  );
+  assert.equal(connection.pane, "1", "attach must continue to use the physical pane index");
+
+  const before = harness.brokerMessages.length;
+  sendToHost(harness, {
+    type: "terminal_input",
+    streamId: STREAM_ID,
+    data: "raw-on-logical-zero",
+  });
+  sendToHost(harness, {
+    type: "resize",
+    streamId: STREAM_ID,
+    cols: 111,
+    rows: 37,
+  });
+  sendToHost(harness, {
+    type: "send_agent_message",
+    requestId: "pane-base-one-agent",
+    session: `local:${session}`,
+    pane: 0,
+    message: "agent-on-logical-zero",
+    submit: false,
+  });
+
+  await waitFor(
+    () => {
+      const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+        .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      const input = existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
+        ? readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
+        : "";
+      return input.includes("raw-on-logical-zero")
+        && input.includes("agent-on-logical-zero")
+        && calls.some(({ args }) => (
+          args[0] === "resize-window" && args.includes("111") && args.includes("37")
+        ))
+        && harness.brokerMessages.some(({ message }) => (
+          message.type === "agent_message_sent" && message.requestId === "pane-base-one-agent"
+        ));
+    },
+    `controlled input did not map through logical pane zero; output:\n${harness.output()}`,
+  );
+  assert.equal(
+    harness.brokerMessages.slice(before).some(({ message }) => message.type === "error"),
+    false,
+  );
 });
 
 test("local agent submit paces paste and submit while preserving exact normalized text", async (t) => {
@@ -1091,6 +1220,7 @@ test("remote agent messages use the canonical controller and acknowledge only ac
     .map((line) => JSON.parse(line));
   assert.equal(inputs.length, 1);
   assert.equal(inputs[0].type, "input.agent-message");
+  assert.equal(inputs[0].pane, "0");
   assert.equal(inputs[0].message, "remote;\r\nbody");
   assert.equal(inputs[0].submit, true);
   assert.equal(inputs[0].lease.owner.kind, "relay-v1");

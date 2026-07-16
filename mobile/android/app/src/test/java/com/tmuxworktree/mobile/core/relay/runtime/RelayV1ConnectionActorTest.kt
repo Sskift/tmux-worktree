@@ -179,8 +179,9 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
-    fun `ownership rejection makes terminal read only and never replays later input`() = runBlocking {
+    fun `ownership rejection stays read only until a fresh retry and never replays input`() = runBlocking {
         val terminalInputs = CopyOnWriteArrayList<String>()
+        val openedStreams = CopyOnWriteArrayList<String>()
         val resizeCount = AtomicInteger(0)
         val server = MockWebServer()
         server.enqueue(
@@ -192,9 +193,12 @@ class RelayV1ConnectionActorTest {
                 override fun onMessage(webSocket: WebSocket, text: String) {
                     val payload = TinyJson.parseObject(text)
                     when (payload.string("type")) {
-                        "open_terminal" -> webSocket.send(
-                            "{\"type\":\"terminal_data\",\"streamId\":\"${payload.string("streamId")}\",\"data\":\"ready\"}",
-                        )
+                        "open_terminal" -> {
+                            openedStreams += payload.string("streamId")
+                            webSocket.send(
+                                "{\"type\":\"terminal_data\",\"streamId\":\"${payload.string("streamId")}\",\"data\":\"ready\"}",
+                            )
+                        }
                         "terminal_input" -> {
                             terminalInputs += payload.string("data")
                             webSocket.send(
@@ -220,6 +224,11 @@ class RelayV1ConnectionActorTest {
                 ),
             )
             withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.ONLINE } }
+            val terminalOpenings = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events.filterIsInstance<RelayClientEvent.TerminalOpening>().take(2).toList()
+                }
+            }
             actor.openTerminal("mac-admin", "local:owned")
             withTimeout(5_000) { actor.terminal.first { it.status.name == "ONLINE" } }
             actor.sendTerminalInput("first")
@@ -231,6 +240,33 @@ class RelayV1ConnectionActorTest {
             delay(150)
             assertEquals(listOf("first"), terminalInputs.toList())
             assertEquals(0, resizeCount.get())
+
+            val retriedStreamId = actor.openTerminal(
+                hostId = "mac-admin",
+                sessionName = "local:owned",
+                resetDisplay = true,
+            )
+            val opening = terminalOpenings.await().last()
+            assertEquals(retriedStreamId, opening.streamId)
+            assertTrue(opening.resetDisplay)
+            withTimeout(5_000) {
+                actor.terminal.first {
+                    it.streamId == retriedStreamId &&
+                        it.status.name == "ONLINE" &&
+                        !it.inputReadOnly
+                }
+            }
+            assertEquals(2, openedStreams.distinct().size)
+            assertFalse(actor.terminal.value.inputReadOnly)
+
+            actor.sendTerminalInput("retry-attempt")
+            withTimeout(5_000) {
+                actor.terminal.first { it.streamId == retriedStreamId && it.inputReadOnly }
+            }
+            actor.sendTerminalInput("still-must-not-replay")
+            delay(150)
+            assertEquals(listOf("first", "retry-attempt"), terminalInputs.toList())
+            assertTrue(actor.terminal.value.inputReadOnly)
         } finally {
             actor.close()
             scope.cancel()

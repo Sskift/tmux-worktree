@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.feature
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsFocused
@@ -315,6 +316,7 @@ class CoreScreensInstrumentedTest {
                     sessionTitle = "demo",
                     connectionStatus = ConnectionStatus.ONLINE,
                     isReadOnly = false,
+                    ownershipReadOnly = false,
                     keyboardVisible = true,
                     terminalFontSizeSp = fontSize,
                     disconnectReason = null,
@@ -325,6 +327,7 @@ class CoreScreensInstrumentedTest {
                     onDecreaseFont = { fontSize-- },
                     onIncreaseFont = { fontSize++ },
                     onToggleReadOnly = {},
+                    onRetryInput = {},
                     terminalContent = {},
                 )
             }
@@ -343,6 +346,46 @@ class CoreScreensInstrumentedTest {
             .assertIsNotEnabled()
         composeRule.onNodeWithTag("terminal_font_decrease")
             .assertIsEnabled()
+    }
+
+    @Test
+    fun ownershipReadOnlyOffersRetryWithoutTogglingTheLocalReadOnlyControl() {
+        var retryCount = 0
+        var toggleCount = 0
+        composeRule.setContent {
+            TwTheme {
+                TerminalScreen(
+                    sessionTitle = "owned elsewhere",
+                    connectionStatus = ConnectionStatus.ONLINE,
+                    isReadOnly = true,
+                    ownershipReadOnly = true,
+                    keyboardVisible = false,
+                    terminalFontSizeSp = 14,
+                    disconnectReason = null,
+                    onBack = {},
+                    onConnectionStatusClick = {},
+                    onReconnect = {},
+                    onToggleKeyboard = {},
+                    onDecreaseFont = {},
+                    onIncreaseFont = {},
+                    onToggleReadOnly = { toggleCount++ },
+                    onRetryInput = { retryCount++ },
+                    terminalContent = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag("terminal_retry_input")
+            .assertIsDisplayed()
+            .performClick()
+        composeRule.onNodeWithTag("terminal_read_only")
+            .assertContentDescriptionEquals("Retry terminal input")
+            .performClick()
+
+        composeRule.runOnIdle {
+            assertEquals(2, retryCount)
+            assertEquals(0, toggleCount)
+        }
     }
 
     @Test

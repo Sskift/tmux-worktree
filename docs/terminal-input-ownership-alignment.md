@@ -55,6 +55,7 @@ Dashboard 的 Integrations 页面只持久化非敏感 `lark-cli` profile 名称
 ### 2.4 Relay v1/v2
 
 - Relay v1 保持 legacy-frozen wire，只在 relay-host 内部增加 controller adapter；不增加 status、takeover、error code 或 input ACK 字段。
+- managed single-pane 在 terminal-control 边界内只有逻辑 pane `"0"`。tmux 的物理 `pane_index`（可以因 `pane-base-index` 从 `1` 开始）只用于本地/SSH attach 选 pane，Relay adapter 不得把它作为 `input.raw`、`input.resize` 或 `input.agent-message` 的逻辑 pane。
 - Relay v2 继续拥有 twcap2、carrier、command ledger、snapshot/eventSeq、terminal stream generation、inputSeq、ring 和 detached lease。relay-host 在最终 backend write 前调用 controller，但 broker 永不感知或裁决本地 ownership。
 - Relay v2 public `sessionId` 和 terminal-control `controlTargetId` 是不同 namespace，只在 relay-host 内部映射。
 
@@ -228,7 +229,7 @@ Relay v1 wire不变：
 - list/session snapshot、terminal open和output继续可用。
 - `send_agent_message` 由relay-host先严格映射target，再调用controller。Feishu持有时返回现有v1 `error`，尽可能回显原requestId；不调用tmux，不产生`agent_message_sent`。
 - Feishu 独占时，`terminal_input`/resize在stream write前被controller拒绝，relay-host发送现有带streamId的v1 `error`；不得缓存、重开stream后重放或写backend，output仍可继续。Dashboard 或另一个 APK 已持有 interactive lease 时，Relay v1 复用同一 lease/fence并正常写入。
-- relay-host只在既有`error.message`内加稳定的`[input-ownership:<local-code>]`分类标记；不增加wire字段或message type。Android v1把该拒绝视为不可自动重试的只读结果，停止input/resize；v1没有可提前查询owner或发起takeover的协议能力。
+- relay-host只在既有`error.message`内加稳定的`[input-ownership:<local-code>]`分类标记；不增加wire字段或message type。Android v1把该拒绝视为不可自动重试的只读结果，停止input/resize；锁定图标表示客户端的 fail-closed latch，不表示 APK 持有服务端 lease。用户可以用 `Retry input` 显式创建一个 fresh stream 并清除旧 latch，但旧按键永不重放；若 authority 仍拒绝，下一次新输入会再次进入只读。v1没有可提前查询owner或发起takeover的协议能力。
 - socket/stream关闭不能把旧pending input交给新connection；Relay v1原有AMBIGUOUS语义保持不变。
 
 ### 9.2 Relay v2

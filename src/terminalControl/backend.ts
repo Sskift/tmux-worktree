@@ -233,6 +233,122 @@ function runTmux(
   });
 }
 
+function controlCommandMarker(
+  stdout: string,
+  markers: readonly string[],
+): string {
+  const expected = new Set(markers);
+  let block: { timestamp: string; command: string; output: string[] } | undefined;
+  for (const line of stdout.replaceAll("\r\n", "\n").split("\n")) {
+    const begin = /^%begin (\d+) (\d+) \d+$/.exec(line);
+    if (begin) {
+      block = { timestamp: begin[1], command: begin[2], output: [] };
+      continue;
+    }
+    if (!block) continue;
+    const end = /^%(end|error) (\d+) (\d+) \d+$/.exec(line);
+    if (!end) {
+      block.output.push(line);
+      continue;
+    }
+    if (end[2] !== block.timestamp || end[3] !== block.command) {
+      throw new Error("tmux control-mode command boundary was malformed");
+    }
+    const marker = block.output.find((candidate) => expected.has(candidate));
+    if (marker) {
+      if (end[1] === "error") {
+        const detail = block.output.filter((candidate) => candidate !== marker).join(" ").trim();
+        throw new Error(`tmux control-mode key command failed${detail ? `: ${detail}` : ""}`);
+      }
+      return marker;
+    }
+    block = undefined;
+  }
+  throw new Error("tmux control-mode client did not confirm the key command boundary");
+}
+
+/**
+ * A Dashboard observes managed sessions through a read-only tmux client. tmux
+ * rejects `send-keys` commands whose command context is that client, even when
+ * the caller targets the pane explicitly. Use a short-lived, no-output control
+ * client as the command context for translated special keys. It never receives
+ * user input, does not resize the session, and returns a structured command
+ * block whose `%end` is the proof that the key command and marker both ran.
+ */
+function runTmuxWritableControlCommand(
+  sessionName: string,
+  command: string,
+  markers: readonly string[],
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(tmuxBin(), [
+      "-C",
+      "attach-session",
+      "-E",
+      "-f",
+      "ignore-size,no-output",
+      "-t",
+      `=${sessionName}`,
+    ], { stdio: ["pipe", "pipe", "pipe"] });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        reject(error);
+        return;
+      }
+      try {
+        resolve(controlCommandMarker(Buffer.concat(stdout, stdoutBytes).toString("utf8"), markers));
+      } catch (parseError) {
+        reject(parseError);
+      }
+    };
+    const timer = setTimeout(() => {
+      try { child.kill("SIGKILL"); } catch {}
+      finish(new Error("tmux control-mode key command timed out"));
+    }, COMMAND_TIMEOUT_MS);
+    timer.unref();
+
+    child.stdout!.on("data", (raw: Buffer) => {
+      stdoutBytes += raw.byteLength;
+      if (stdoutBytes > MAX_COMMAND_OUTPUT_BYTES) {
+        try { child.kill("SIGKILL"); } catch {}
+        finish(new Error("tmux control-mode stdout exceeded the terminal-control limit"));
+        return;
+      }
+      stdout.push(Buffer.from(raw));
+    });
+    child.stderr!.on("data", (raw: Buffer) => {
+      stderrBytes += raw.byteLength;
+      if (stderrBytes > MAX_COMMAND_OUTPUT_BYTES) {
+        try { child.kill("SIGKILL"); } catch {}
+        finish(new Error("tmux control-mode stderr exceeded the terminal-control limit"));
+        return;
+      }
+      stderr.push(Buffer.from(raw));
+    });
+    child.once("error", (error) => finish(error));
+    child.once("close", (code, signal) => {
+      if (code === 0 && signal === null) {
+        finish();
+        return;
+      }
+      const detail = Buffer.concat(stderr, stderrBytes).toString("utf8").trim()
+        || Buffer.concat(stdout, stdoutBytes).toString("utf8").trim()
+        || `exit ${String(code)}${signal ? ` (${signal})` : ""}`;
+      finish(new Error(`tmux control-mode key command failed: ${detail}`));
+    });
+    child.stdin!.once("error", (error) => finish(error));
+    child.stdin!.end(`${command}\ndetach-client\n`);
+  });
+}
+
 function exactManagedSession(sessionName: string, home = homedir()): ManagedSession {
   validateSessionName(sessionName);
   let state;
@@ -328,7 +444,7 @@ async function requirePane(
 ): Promise<{ sessionId: string; paneTarget: string }> {
   if (pane !== "0") {
     throw new TerminalControlProtocolError(
-      "TARGET_NOT_FOUND",
+      "INVALID_REQUEST",
       `managed single-pane target has no logical pane: ${pane}`,
     );
   }
@@ -497,7 +613,12 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     if (data.byteLength === 0) return;
     const key = tmuxKeyForRawInput(data);
     if (key) {
-      await runTmux(tmuxSendKeyArgs(paneTarget, key));
+      const marker = `__TW_CONTROL_RAW_COMMITTED_${randomUUID()}__`;
+      await runTmuxWritableControlCommand(
+        sessionName,
+        `${tmuxSendKeyCommand(paneTarget, key)} ; display-message -p ${marker}`,
+        [marker],
+      );
       return;
     }
     const bufferName = `tw-control-${process.pid}-${randomUUID()}`;
@@ -539,7 +660,7 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
   ): Promise<void> {
     if (pane !== "0") {
       throw new TerminalControlProtocolError(
-        "TARGET_NOT_FOUND",
+        "INVALID_REQUEST",
         `managed single-pane target has no logical pane: ${pane}`,
       );
     }
@@ -616,19 +737,33 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
         : `load-buffer -b ${bufferName} - ; paste-buffer -b ${bufferName} -d -r -t ${paneId}`,
       `display-message -p ${committedMarker}`,
     ].join(" ; ");
-    const result = await runTmux(
-      [
-        "if-shell",
-        "-F",
-        "-t",
-        paneId,
-        condition,
-        committed,
-        `display-message -p ${rejectedMarker}`,
-      ],
-      key ? {} : { input: data },
-    );
-    const response = result.stdout.trim();
+    const rejected = `display-message -p ${rejectedMarker}`;
+    const response = key
+      ? await runTmuxWritableControlCommand(
+        expected.name,
+        [
+          "if-shell",
+          "-F",
+          "-t",
+          paneId,
+          shellQuote(condition),
+          shellQuote(committed),
+          shellQuote(rejected),
+        ].join(" "),
+        [committedMarker, rejectedMarker],
+      )
+      : (await runTmux(
+        [
+          "if-shell",
+          "-F",
+          "-t",
+          paneId,
+          condition,
+          committed,
+          rejected,
+        ],
+        { input: data },
+      )).stdout.trim();
     if (response === rejectedMarker) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",

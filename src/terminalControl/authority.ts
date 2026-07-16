@@ -1099,6 +1099,16 @@ export class TerminalControlAuthority {
         await this.assertTargetCurrent(state, target);
       }
       validateLease(state, target, lease);
+      if (pane !== "0") {
+        // The managed single-pane contract exposes one logical pane regardless
+        // of the tmux pane-base-index. Reject it before preparing output or
+        // persisting an in-flight operation so backend error codes never need
+        // to imply whether a write may already have happened.
+        throw new TerminalControlProtocolError(
+          "INVALID_REQUEST",
+          `managed single-pane target has no logical pane: ${pane}`,
+        );
+      }
       this.registerInteractiveOwner(target.controlTargetId, lease.owner);
       const hash = payloadHash(kind, pane, payload);
       const completed = existingOperation(
