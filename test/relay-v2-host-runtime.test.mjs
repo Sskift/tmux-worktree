@@ -329,6 +329,7 @@ function actualTerminalRuntimeHarness(options = {}) {
   let manager;
   let nextId = 0;
   let nextToken = 0;
+  let now = 1_000_000;
   const closeRecords = new Map();
   const backend = {
     opens: [],
@@ -400,12 +401,29 @@ function actualTerminalRuntimeHarness(options = {}) {
     lineage,
     backend,
     terminalControl: {},
-    send: async (route, frame) => h.runtime.sendTerminalFrame({ ...route }, frame),
+    send: async (route, frame, responseLineage) => {
+      const deliver = () => h.runtime.sendTerminalFrame(
+        { ...route },
+        frame,
+        responseLineage === undefined ? undefined : { ...responseLineage },
+      );
+      if (options.terminalSend) {
+        return options.terminalSend(route, frame, responseLineage, deliver);
+      }
+      return deliver();
+    },
+    now: () => now,
     issueId: () => `actual-runtime-id-${++nextId}`,
     issueToken: () => `actual-runtime-token-${++nextToken}`,
     limits: options.terminalLimits,
   });
-  return { h, manager, backend, lineage };
+  return {
+    h,
+    manager,
+    backend,
+    lineage,
+    advance(milliseconds) { now += milliseconds; },
+  };
 }
 
 test("host runtime dispatches strict public requests only to their H1, H2, and H3 owners", async () => {
@@ -770,6 +788,71 @@ test("readiness withdrawal tombstones an observed generation after its routes un
   assert.equal(h.runtime.onRouteBound(nextGeneration), undefined);
 });
 
+test("a capability-rejected connector generation is observed and tombstoned", () => {
+  const missingCapability = "event.sequence.v1";
+  const h = createHarness({ capabilityOverrides: { [missingCapability]: false } });
+  const rejected = binding({
+    connectorId: "rejected-generation-connector",
+    routeId: "rejected-generation-route",
+    routeFence: "rejected-generation-fence",
+    connectionId: "rejected-generation-connection",
+    authContext: { jti: "rejected-generation-jti" },
+  });
+  assert.equal(h.runtime.onRouteBound(rejected).code, "CAPABILITY_UNAVAILABLE");
+
+  h.state.capabilities[missingCapability] = true;
+  assert.equal(h.readiness.publish(), true);
+  const sameGeneration = binding({
+    connectorId: rejected.connectorId,
+    routeId: "rejected-generation-restored-route",
+    routeFence: "rejected-generation-restored-fence",
+    connectionId: "rejected-generation-restored-connection",
+    authContext: { jti: "rejected-generation-restored-jti" },
+  });
+  assert.equal(h.runtime.onRouteBound(sameGeneration).code, "CAPABILITY_UNAVAILABLE");
+
+  const nextGeneration = binding({
+    connectorGeneration: rejected.connectorGeneration + 1,
+    connectorId: rejected.connectorId,
+    routeId: "rejected-generation-next-route",
+    routeFence: "rejected-generation-next-fence",
+    connectionId: "rejected-generation-next-connection",
+    authContext: { jti: "rejected-generation-next-jti" },
+  });
+  assert.equal(h.runtime.onRouteBound(nextGeneration), undefined);
+});
+
+test("readiness withdrawal publishes 4406 before a synchronous H3 unbind failure", async () => {
+  const h = createHarness({ testLimits: { maxRoutes: 1 } });
+  const routeBinding = await ready(h);
+  h.terminals.unbind = (auth, route) => {
+    h.state.calls.unbind.push({ auth: structuredClone(auth), route: structuredClone(route) });
+    throw new Error("synchronous H3 unbind failure");
+  };
+  const closesBefore = h.state.closes.length;
+  h.state.capabilities["event.sequence.v1"] = false;
+  assert.equal(h.readiness.publish(), true);
+  await settle(6);
+
+  assert.deepEqual(h.state.closes.slice(closesBefore).map(({ code, reason }) => ({ code, reason })), [{
+    code: 4406,
+    reason: "capability_withdrawn",
+  }]);
+  assert.equal(h.state.calls.unbind.length, 1);
+  h.state.capabilities["event.sequence.v1"] = true;
+  assert.equal(h.readiness.publish(), true);
+  const replacement = binding({
+    connectorGeneration: routeBinding.connectorGeneration + 1,
+    connectorId: "withdraw-unbind-next-connector",
+    routeId: "withdraw-unbind-next-route",
+    routeFence: "withdraw-unbind-next-fence",
+    connectionId: "withdraw-unbind-next-connection",
+    authContext: { jti: "withdraw-unbind-next-jti" },
+  });
+  assert.equal(h.runtime.onRouteBound(replacement).code, "BUSY");
+  assert.equal(h.state.calls.unbind.length, 1, "failed unbind must remain draining without retry");
+});
+
 test("readiness withdrawal during hello leaves no welcome or subscriber gap", async () => {
   let releaseWindow;
   const window = new Promise((resolve) => { releaseWindow = resolve; });
@@ -823,6 +906,27 @@ test("welcome builder TOCTOU withdrawal rejects the synchronous H2 sink without 
   assert.equal(h.state.closes.at(-1).reason, "capability_withdrawn");
 });
 
+test("welcome cut hostInstance replacement fences 4409 without a false epoch mismatch", async () => {
+  const h = createHarness({
+    hello: async ({ cut, buildWelcome }) => buildWelcome({
+      ...cut,
+      hostInstanceId: "replacement-welcome-host-instance",
+    }),
+  });
+  const routeBinding = binding();
+  h.runtime.onRouteBound(routeBinding);
+  const hello = fixture("client-hello-fresh");
+  hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+  send(h.runtime, routeBinding, hello);
+  await settle(8);
+
+  assert.equal(h.state.sent.length, 0);
+  assert.equal(h.state.closes.at(-1).code, 4409);
+  assert.equal(h.state.closes.at(-1).reason, "host_superseded");
+  assert.equal(h.state.calls.unsubscribe.includes("host-route-1"), true);
+  assert.equal(h.state.calls.unbind.length, 1);
+});
+
 test("pre-commit H2 welcome rejection returns correlated BUSY before fencing", async () => {
   const h = createHarness({
     testLimits: { maxPendingOperationsPerRoute: 1 },
@@ -853,6 +957,70 @@ test("pre-commit H2 welcome rejection returns correlated BUSY before fencing", a
   assert.equal(h.state.closes.at(-1).code, 1013);
   assert.equal(h.state.calls.commandExecute.length, 0);
   assert.equal(h.state.calls.terminal.length, 0);
+});
+
+test("H2 welcome owns the real bounded outbound slot before its barrier commits", async (t) => {
+  await t.test("byte capacity rejection leaves the barrier uncommitted and returns BUSY", async () => {
+    let barrierCommits = 0;
+    let sinkAccepted = null;
+    const h = createHarness({
+      testLimits: { maxOutboundBytesPerRoute: 1_000 },
+      hello: async ({ cut, buildWelcome }, sink) => {
+        const welcome = buildWelcome(cut);
+        assert.ok(codec.encodeRelayV2WebSocketFrame("public", welcome).byteLength > 1_000);
+        sinkAccepted = sink.enqueue(welcome);
+        if (!sinkAccepted) {
+          const error = new resourceState.RelayV2MaterializedStateError(
+            "BUSY",
+            "actual H2 welcome slot reservation was rejected",
+          );
+          sink.close(error);
+          throw error;
+        }
+        barrierCommits += 1;
+        return welcome;
+      },
+    });
+    const routeBinding = binding();
+    h.runtime.onRouteBound(routeBinding);
+    const hello = fixture("client-hello-fresh");
+    hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+    send(h.runtime, routeBinding, hello);
+    await settle(8);
+
+    assert.equal(sinkAccepted, false);
+    assert.equal(barrierCommits, 0);
+    assert.equal(h.state.sent.some(({ frame }) => frame.type === "host.welcome"), false);
+    const response = h.state.sent.find(({ frame }) => frame.requestId === hello.requestId)?.frame;
+    assert.equal(response.type, "error");
+    assert.equal(response.error.code, "BUSY");
+    assert.equal(response.error.commandDisposition, "not_applicable");
+    assert.equal(h.state.closes.at(-1).code, 1013);
+  });
+
+  await t.test("a successful reservation is converted and released exactly once", async () => {
+    let barrierCommits = 0;
+    const h = createHarness({
+      testLimits: { maxOutboundFramesPerRoute: 1 },
+      hello: async ({ cut, buildWelcome }, sink) => {
+        const welcome = buildWelcome(cut);
+        assert.equal(sink.enqueue(welcome), true);
+        barrierCommits += 1;
+        return welcome;
+      },
+    });
+    const routeBinding = await ready(h);
+    const query = fixture("command-query");
+    query.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, query);
+    await settle(8);
+
+    assert.equal(barrierCommits, 1);
+    assert.equal(h.state.sent.filter(({ frame }) => frame.type === "host.welcome").length, 1);
+    assert.equal(h.state.calls.commandQuery.length, 1);
+    assert.equal(h.state.sent.filter(({ frame }) => frame.requestId === query.requestId).length, 1);
+    assert.equal(h.state.closes.length, 0);
+  });
 });
 
 test("every awaited authority and transport receipt revalidates binding and H0 lineage", async (t) => {
@@ -1041,13 +1209,18 @@ test("H3 callbacks use copied exact tokens and each frozen terminal frame schema
     reset.payload.generation = opened.payload.generation;
     await h.runtime.sendTerminalFrame({ ...authorityRoute }, reset);
     assert.equal(h.state.sent.at(-1).frame.type, "terminal.reset_required");
+    assert.equal(h.state.calls.unbind.length, 1);
+    assert.equal(
+      h.state.calls.unbind[0].route.runtimeBindingToken,
+      authorityRoute.runtimeBindingToken,
+    );
 
     const late = fixture("terminal-output");
     late.streamId = opened.streamId;
     late.payload.generation = opened.payload.generation;
     await assert.rejects(
       h.runtime.sendTerminalFrame({ ...authorityRoute }, late),
-      /stream lineage/,
+      /stale route binding/,
     );
   });
 
@@ -1173,6 +1346,200 @@ test("actual H3 correlated reset revokes the old token before late stream output
       authContext: { jti: "jti-after-reset-drain" },
     });
     assert.equal(h.runtime.onRouteBound(replacement), undefined);
+  } finally {
+    h.runtime.dispose();
+    await manager.shutdown();
+  }
+});
+
+test("actual H3 async reset revokes its token before every late stream callback", async () => {
+  const actual = actualTerminalRuntimeHarness({
+    terminalLimits: {
+      streamRingBytes: 8,
+      hostRingBytes: 16,
+      maxUnackedBytes: 4,
+      maxFrameBytes: 4,
+    },
+  });
+  const { h, manager, backend } = actual;
+  try {
+    const routeBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.hostId = HOST_ID;
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, open);
+    await settle(12);
+    const opened = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+    assert.equal(opened.type, "terminal.opened");
+    const oldBinding = h.state.calls.terminal.find(({ method }) => method === "open").request.route;
+    const oversize = new Proxy({}, {
+      get(_target, property) {
+        if (property === "byteLength") return 5;
+        throw new Error(`oversize callback read unexpected ${String(property)}`);
+      },
+    });
+
+    await backend.opens[0].observer.onBytes(oversize);
+    await settle(16);
+    const reset = h.state.sent.find(({ frame }) => (
+      frame.kind === "event" && frame.type === "terminal.reset_required"
+    ))?.frame;
+    assert.ok(reset);
+    assert.equal(reset.streamId, opened.streamId);
+    assert.equal(reset.payload.generation, opened.payload.generation);
+    assert.equal(h.state.calls.unbind.length, 1);
+    assert.equal(h.state.calls.unbind[0].route.runtimeBindingToken, oldBinding.runtimeBindingToken);
+
+    const beforeLateCallbacks = h.state.sent.length;
+    for (const name of [
+      "terminal-output",
+      "terminal-input-ack",
+      "terminal-resize-ack",
+      "terminal-closed-event",
+    ]) {
+      const late = fixture(name);
+      late.streamId = opened.streamId;
+      late.payload.generation = opened.payload.generation;
+      await assert.rejects(
+        h.runtime.sendTerminalFrame({ ...oldBinding }, late),
+        /stale route binding/,
+      );
+    }
+    assert.equal(h.state.sent.length, beforeLateCallbacks);
+    assert.equal(backend.opens[0].handle.closeCalls, 1);
+    assert.deepEqual(h.state.closes, []);
+  } finally {
+    h.runtime.dispose();
+    await manager.shutdown();
+  }
+});
+
+test("actual H3 durable mode=new retry correlates its retained generation and offset", async () => {
+  let dropInitialOpened = true;
+  const actual = actualTerminalRuntimeHarness({
+    terminalSend: async (_route, frame, _lineage, deliver) => {
+      if (dropInitialOpened && frame.type === "terminal.opened") {
+        dropInitialOpened = false;
+        return;
+      }
+      await deliver();
+    },
+  });
+  const { h, manager, backend } = actual;
+  try {
+    const firstBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.hostId = HOST_ID;
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, firstBinding, open);
+    await settle(12);
+    assert.equal(
+      h.state.sent.some(({ frame }) => frame.requestId === open.requestId),
+      false,
+      "the first correlated response is intentionally lost before runtime",
+    );
+    assert.equal(backend.opens.length, 1);
+
+    h.runtime.onRouteUnbound(firstBinding, "client_closed");
+    await settle(8);
+    actual.advance(terminalManager.RELAY_V2_TERMINAL_DETACHED_LEASE_MS + 1);
+    await manager.sweep();
+    assert.equal(backend.opens[0].handle.closeCalls, 1);
+
+    const rebound = binding({
+      connectorGeneration: firstBinding.connectorGeneration + 1,
+      routeId: "durable-new-retry-route",
+      routeFence: "durable-new-retry-fence",
+      connectionId: "durable-new-retry-connection",
+      authContext: { jti: "durable-new-retry-jti" },
+    });
+    await ready(h, rebound);
+    const retry = structuredClone(open);
+    retry.requestId = "durable-new-retry-request";
+    send(h.runtime, rebound, retry);
+    await settle(16);
+
+    const reset = h.state.sent.find(({ frame }) => frame.requestId === retry.requestId)?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.origin, "open");
+    assert.equal(reset.payload.generation, "actual-runtime-id-1");
+    assert.equal(reset.payload.requestedOffset, "0");
+    assert.equal(backend.opens.length, 1, "durable exact retry must not create a second backend");
+  } finally {
+    h.runtime.dispose();
+    await manager.shutdown();
+  }
+});
+
+test("actual H3 durable mode=reset retry correlates the replacement generation", async () => {
+  let dropResetOpened = true;
+  const actual = actualTerminalRuntimeHarness({
+    terminalSend: async (_route, frame, _lineage, deliver) => {
+      if (dropResetOpened
+        && frame.type === "terminal.opened"
+        && frame.payload.disposition === "reset") {
+        dropResetOpened = false;
+        return;
+      }
+      await deliver();
+    },
+  });
+  const { h, manager, backend } = actual;
+  try {
+    const firstBinding = await ready(h);
+    const initialOpen = fixture("terminal-open-new");
+    initialOpen.hostId = HOST_ID;
+    initialOpen.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, firstBinding, initialOpen);
+    await settle(12);
+    const initial = h.state.sent.find(({ frame }) => frame.requestId === initialOpen.requestId)?.frame;
+    assert.equal(initial.type, "terminal.opened");
+
+    const resetOpen = fixture("terminal-open-resume");
+    resetOpen.requestId = "durable-reset-first-request";
+    resetOpen.hostId = HOST_ID;
+    resetOpen.expectedHostEpoch = HOST_EPOCH;
+    resetOpen.streamId = initial.streamId;
+    resetOpen.payload.openId = "durable-reset-open-id";
+    resetOpen.payload.mode = "reset";
+    resetOpen.payload.resume.generation = initial.payload.generation;
+    resetOpen.payload.resume.nextOffset = "0";
+    resetOpen.payload.resume.resumeToken = initial.payload.resumeToken;
+    send(h.runtime, firstBinding, resetOpen);
+    await settle(16);
+    assert.equal(
+      h.state.sent.some(({ frame }) => frame.requestId === resetOpen.requestId),
+      false,
+      "the replacement terminal.opened is intentionally lost before runtime",
+    );
+    assert.equal(backend.opens.length, 2);
+    assert.equal(backend.opens[0].handle.closeCalls, 1);
+
+    h.runtime.onRouteUnbound(firstBinding, "client_closed");
+    await settle(8);
+    actual.advance(terminalManager.RELAY_V2_TERMINAL_DETACHED_LEASE_MS + 1);
+    await manager.sweep();
+    assert.equal(backend.opens[1].handle.closeCalls, 1);
+
+    const rebound = binding({
+      connectorGeneration: firstBinding.connectorGeneration + 1,
+      routeId: "durable-reset-retry-route",
+      routeFence: "durable-reset-retry-fence",
+      connectionId: "durable-reset-retry-connection",
+      authContext: { jti: "durable-reset-retry-jti" },
+    });
+    await ready(h, rebound);
+    const retry = structuredClone(resetOpen);
+    retry.requestId = "durable-reset-retry-request";
+    send(h.runtime, rebound, retry);
+    await settle(16);
+
+    const reset = h.state.sent.find(({ frame }) => frame.requestId === retry.requestId)?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.origin, "open");
+    assert.equal(reset.payload.generation, "actual-runtime-id-2");
+    assert.equal(reset.payload.requestedOffset, "0");
+    assert.equal(backend.opens.length, 2, "durable reset retry must not replace the backend twice");
   } finally {
     h.runtime.dispose();
     await manager.shutdown();
@@ -1356,6 +1723,19 @@ test("request ownership and response metadata fence cross-owner or retargeted fr
       }
 
       const reset = correlatedTerminalFixture("terminal-reset-required-response", open);
+      if (mode === "new") {
+        await assert.rejects(
+          h.runtime.sendTerminalFrame({ ...authorityRoute }, reset, {
+            owner: "terminal.open",
+            requestId: open.requestId,
+            openId: open.payload.openId,
+            mode,
+            generation: "forged-durable-generation",
+            requestedOffset: "0",
+          }),
+          /durable open lineage/,
+        );
+      }
       const wrongResetGeneration = structuredClone(reset);
       wrongResetGeneration.payload.generation = reset.payload.generation === null
         ? "forged-reset-generation"
@@ -1628,23 +2008,24 @@ test("raw frame and transport-owned outbound capacity are hard bounded", async (
   });
 
   await t.test("transport ownership remains charged until its receipt", async () => {
+    let eventSink;
     const h = createHarness({
       testLimits: { maxOutboundFramesPerRoute: 1 },
       trySend: () => true,
       hello: async ({ cut, buildWelcome }, sink) => {
+        eventSink = sink;
         assert.equal(sink.enqueue(buildWelcome(cut)), true);
-        const event = fixture("sessions-changed-upsert");
-        event.hostId = HOST_ID;
-        event.hostEpoch = HOST_EPOCH;
-        assert.equal(sink.enqueue(event), true);
       },
     });
-    const routeBinding = binding();
-    h.runtime.onRouteBound(routeBinding);
-    const hello = fixture("client-hello-fresh");
-    hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
-    send(h.runtime, routeBinding, hello);
-    await settle(6);
+    await ready(h);
+    const event = fixture("sessions-changed-upsert");
+    event.hostId = HOST_ID;
+    event.hostEpoch = HOST_EPOCH;
+    assert.equal(eventSink.enqueue(event), false);
+    eventSink.close(new resourceState.RelayV2MaterializedStateError(
+      "BUSY",
+      "actual H2 subscriber exhausted its outbound slot",
+    ));
     assert.equal(h.state.closes.at(-1).code, 1013);
     assert.equal(h.state.closes.at(-1).reason, "slow_consumer");
   });
@@ -1699,27 +2080,24 @@ test("per-route request and outbound capacity return BUSY or SLOW_CONSUMER witho
   });
 
   await t.test("outbound frame saturation closes the exact route as a slow consumer", async () => {
+    let eventSink;
     const h = createHarness({
       testLimits: { maxOutboundFramesPerRoute: 1 },
       trySend: () => true,
       hello: async ({ cut, buildWelcome }, sink) => {
+        eventSink = sink;
         assert.equal(sink.enqueue(buildWelcome(cut)), true);
-        const event = fixture("sessions-changed-upsert");
-        event.hostId = HOST_ID;
-        event.hostEpoch = HOST_EPOCH;
-        if (!sink.enqueue(event)) {
-          const error = new Error("bounded H2 subscriber rejected event");
-          error.code = "BUSY";
-          throw error;
-        }
       },
     });
-    const routeBinding = binding();
-    h.runtime.onRouteBound(routeBinding);
-    const hello = fixture("client-hello-fresh");
-    hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
-    send(h.runtime, routeBinding, hello);
-    await settle(6);
+    const routeBinding = await ready(h);
+    const event = fixture("sessions-changed-upsert");
+    event.hostId = HOST_ID;
+    event.hostEpoch = HOST_EPOCH;
+    assert.equal(eventSink.enqueue(event), false);
+    eventSink.close(new resourceState.RelayV2MaterializedStateError(
+      "BUSY",
+      "actual H2 subscriber exhausted its outbound slot",
+    ));
     assert.deepEqual(h.state.closes.at(-1).binding, routeBinding);
     assert.equal(h.state.closes.at(-1).reason, "slow_consumer");
   });
@@ -2045,7 +2423,11 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
       },
       backend: {},
       terminalControl: {},
-      send: async (route, frame) => runtime.sendTerminalFrame({ ...route }, frame),
+      send: async (route, frame, responseLineage) => runtime.sendTerminalFrame(
+        { ...route },
+        frame,
+        responseLineage === undefined ? undefined : { ...responseLineage },
+      ),
     });
     const ports = runtimeModule.createRelayV2HostRuntimeAuthorityPorts({
       h0: store,

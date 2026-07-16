@@ -181,6 +181,21 @@ export interface RelayV2TerminalOpenRequest extends RelayV2TerminalRequestContex
   resume?: RelayV2TerminalResume;
 }
 
+/**
+ * Process-local H3 callback evidence for an origin=open reset response. The
+ * durable winner may contain a generation/offset that did not exist in the
+ * original mode=new/reset request. This evidence is never wire or durable
+ * state; the runtime consumes it only to arm its exact pending correlation.
+ */
+export interface RelayV2TerminalOpenResponseLineage {
+  owner: "terminal.open";
+  requestId: string;
+  openId: string;
+  mode: "new" | "resume" | "reset";
+  generation: string | null;
+  requestedOffset: string | null;
+}
+
 export interface RelayV2TerminalReplayRequest extends RelayV2TerminalRequestContext {
   generation: string;
   fromOffset: string;
@@ -490,7 +505,11 @@ export interface RelayV2TerminalManagerOptions {
   lineage: RelayV2TerminalDurableLineage;
   backend: RelayV2TerminalByteBackend;
   terminalControl: RelayV2TerminalControlAuthority;
-  send(route: RelayV2TerminalRuntimeBinding, frame: RelayV2JsonObject): Promise<void>;
+  send(
+    route: RelayV2TerminalRuntimeBinding,
+    frame: RelayV2JsonObject,
+    lineage?: RelayV2TerminalOpenResponseLineage,
+  ): Promise<void>;
   now?: () => number;
   issueId?: () => string;
   issueToken?: () => string;
@@ -2678,6 +2697,26 @@ export class RelayV2TerminalManager {
     outcome: Extract<OpenRecordOutcome, { kind: "reset" }>,
     origin: "open" | "replay",
   ): Promise<void> {
+    let lineage: RelayV2TerminalOpenResponseLineage | undefined;
+    if (origin === "open") {
+      if (!("openId" in request)
+        || !("mode" in request)
+        || !isOpaqueId(request.openId)
+        || !(request.mode === "new" || request.mode === "resume" || request.mode === "reset")) {
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "terminal open reset lost its process-local request lineage",
+        );
+      }
+      lineage = Object.freeze({
+        owner: "terminal.open",
+        requestId: request.requestId,
+        openId: request.openId,
+        mode: request.mode,
+        generation: outcome.generation,
+        requestedOffset: outcome.requestedOffset?.toString(10) ?? null,
+      });
+    }
     await this.sendFrame(request.route, asJson({
       protocolVersion: 2,
       kind: "response",
@@ -2696,7 +2735,7 @@ export class RelayV2TerminalManager {
         bufferStartOffset: outcome.bufferStartOffset?.toString(10) ?? null,
         tailOffset: outcome.tailOffset?.toString(10) ?? null,
       },
-    }));
+    }), lineage);
   }
 
   private async replayInternal(request: RelayV2TerminalReplayRequest): Promise<void> {

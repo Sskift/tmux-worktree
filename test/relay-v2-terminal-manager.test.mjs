@@ -384,7 +384,7 @@ function harness(options = {}) {
     issueId: () => `generation-${++nextId}`,
     issueToken: () => `resume-token-${++nextToken}`,
     limits: options.limits,
-    send: async (route, frame) => {
+    send: async (route, frame, responseLineage) => {
       // Every manager output must remain consumable by the frozen production codec.
       codec.encodeRelayV2WebSocketFrame("public", frame);
       const dropIndex = drops.findIndex((drop) => (
@@ -394,7 +394,11 @@ function harness(options = {}) {
         drops.splice(dropIndex, 1);
         return;
       }
-      sent.push({ route: clone(route), frame: clone(frame) });
+      sent.push({
+        route: clone(route),
+        frame: clone(frame),
+        responseLineage: responseLineage === undefined ? null : clone(responseLineage),
+      });
     },
   });
   return {
@@ -834,8 +838,17 @@ test("detached lease expiry fences the generation and exact open retry never cre
     requestId: "open-after-expiry",
   });
   const reset = h.sent.find(({ frame }) => frame.requestId === "open-after-expiry").frame;
+  const resetDelivery = h.sent.find(({ frame }) => frame.requestId === "open-after-expiry");
   assert.equal(reset.type, "terminal.reset_required");
   assert.equal(reset.payload.reason, "stream_lost");
+  assert.deepEqual(resetDelivery.responseLineage, {
+    owner: "terminal.open",
+    requestId: "open-after-expiry",
+    openId: request.openId,
+    mode: "new",
+    generation: reset.payload.generation,
+    requestedOffset: "0",
+  });
   assert.equal(h.backend.opens.length, 1);
 });
 

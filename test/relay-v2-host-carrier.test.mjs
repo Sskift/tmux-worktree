@@ -398,35 +398,96 @@ test("v2 route bytes pass the production public codec and negotiated frame limit
   });
 });
 
-test("encoded-length preflight rejects negotiated oversize before public base64 decode", () => {
-  let decoderCalls = 0;
-  const h = createHarness({
+test("route.data text validation precedes negotiated preflight and its only decoded allocation", () => {
+  let oversizeDecoderCalls = 0;
+  const oversize = createHarness({
     publicPayloadDecoder: {
       decodeCanonicalBase64() {
-        decoderCalls += 1;
+        oversizeDecoderCalls += 1;
         throw new Error("oversize payload reached the decoder");
       },
     },
   });
-  const active = connect(h);
-  const connectorId = register(active.connection, active.hello);
+  const oversizeActive = connect(oversize);
+  const oversizeConnectorId = register(oversizeActive.connection, oversizeActive.hello);
   const negotiatedMax = 128;
-  active.connection.receive(wire(routeOpen(connectorId, { maxFrameBytes: negotiatedMax })));
-  const binding = h.bound.at(-1);
+  oversizeActive.connection.receive(wire(routeOpen(
+    oversizeConnectorId,
+    { maxFrameBytes: negotiatedMax },
+  )));
+  const oversizeBinding = oversize.bound.at(-1);
 
-  active.connection.receive(wire(routeData(
-    connectorId,
-    binding.routeId,
-    binding.routeFence,
+  oversizeActive.connection.receive(wire(routeData(
+    oversizeConnectorId,
+    oversizeBinding.routeId,
+    oversizeBinding.routeFence,
     1,
     Buffer.alloc(negotiatedMax + 1, 0x61),
   )));
 
-  assert.equal(decoderCalls, 0);
-  assert.equal(h.received.length, 0);
-  assert.deepEqual(active.transport.closes.at(-1), {
+  assert.equal(oversizeDecoderCalls, 0);
+  assert.equal(oversize.received.length, 0);
+  assert.deepEqual(oversizeActive.transport.closes.at(-1), {
     code: 4400,
     reason: "route_frame_limit",
+  });
+
+  let legalDecoderCalls = 0;
+  const legal = createHarness({
+    publicPayloadDecoder: {
+      decodeCanonicalBase64(encoded) {
+        legalDecoderCalls += 1;
+        return Buffer.from(encoded, "base64");
+      },
+    },
+  });
+  const legalActive = connect(legal);
+  const legalConnectorId = register(legalActive.connection, legalActive.hello);
+  const legalBytes = publicV2Frame("decode-once");
+  legalActive.connection.receive(wire(routeOpen(legalConnectorId, {
+    maxFrameBytes: legalBytes.byteLength,
+  })));
+  const legalBinding = legal.bound.at(-1);
+  legalActive.connection.receive(wire(routeData(
+    legalConnectorId,
+    legalBinding.routeId,
+    legalBinding.routeFence,
+    1,
+    legalBytes,
+  )));
+  assert.equal(legalDecoderCalls, 1);
+  assert.equal(legal.received.length, 1);
+  assert.deepEqual(legal.received[0].payload, legalBytes);
+
+  let malformedDecoderCalls = 0;
+  const malformed = createHarness({
+    publicPayloadDecoder: {
+      decodeCanonicalBase64() {
+        malformedDecoderCalls += 1;
+        throw new Error("malformed payload reached the decoder");
+      },
+    },
+  });
+  const malformedActive = connect(malformed);
+  const malformedConnectorId = register(malformedActive.connection, malformedActive.hello);
+  malformedActive.connection.receive(wire(routeOpen(malformedConnectorId, {
+    maxFrameBytes: 128,
+  })));
+  const malformedBinding = malformed.bound.at(-1);
+  const malformedFrame = routeData(
+    malformedConnectorId,
+    malformedBinding.routeId,
+    malformedBinding.routeFence,
+    1,
+    Buffer.from("M"),
+  );
+  malformedFrame.payload.data = "TR==";
+  malformedActive.connection.receive(Buffer.from(JSON.stringify(malformedFrame), "utf8"));
+  assert.equal(malformedDecoderCalls, 0);
+  assert.equal(malformed.received.length, 0);
+  assert.deepEqual(malformedActive.transport.closes.at(-1), {
+    code: 4400,
+    reason: "invalid_carrier_frame",
   });
 });
 

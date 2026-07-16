@@ -274,6 +274,8 @@ function positiveCounter(value: RelayV2JsonValue): string {
   return parsed;
 }
 
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 function canonicalBase64(value: RelayV2JsonValue, maxDecodedBytes: number): string {
   if (value === null) reject("forbidden-null");
   if (typeof value !== "string") reject("type-coercion");
@@ -289,7 +291,16 @@ function canonicalBase64(value: RelayV2JsonValue, maxDecodedBytes: number): stri
   const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
   const decodedBytes = (encoded.length / 4) * 3 - padding;
   if (decodedBytes > maxDecodedBytes) reject("base64-decoded-limit");
-  if (Buffer.from(encoded, "base64").toString("base64") !== encoded) {
+  // Canonical padding requires every unused low bit in the final sextet to be
+  // zero. Checking the text directly preserves exact validation without ever
+  // allocating the decoded payload before a route-specific byte limit runs.
+  const finalSextet = padding === 2
+    ? BASE64_ALPHABET.indexOf(encoded[encoded.length - 3])
+    : padding === 1
+      ? BASE64_ALPHABET.indexOf(encoded[encoded.length - 2])
+      : 0;
+  if ((padding === 2 && (finalSextet & 0x0f) !== 0)
+    || (padding === 1 && (finalSextet & 0x03) !== 0)) {
     reject("non-canonical-base64");
   }
   return encoded;
