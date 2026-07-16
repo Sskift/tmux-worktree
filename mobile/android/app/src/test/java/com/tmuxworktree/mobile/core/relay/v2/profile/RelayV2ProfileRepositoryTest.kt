@@ -710,15 +710,18 @@ class RelayV2ProfileRepositoryTest {
                     ).confirm(deviceLabel = "Pixel B"),
                 )
             }
-            val newerRequest = newerGate.request.await()
+            yield()
+            assertFalse(newerGate.request.isCompleted)
             assertFalse(harness.credentials.values().single {
                 it.pendingAttempt?.enrollmentId == "enrollment-disconnect-a"
             }.hasCredentialMaterial)
             harness.barrier.release.complete(Unit)
 
             assertTrue(older.await() is RelayV2EnrollmentResult.Superseded)
+            val newerRequest = withTimeout(1_000) { newerGate.request.await() }
             assertEquals(0, harness.isolationCalls)
             assertEquals(0, harness.profiles.activationCount)
+            assertEquals(null, harness.profiles.journal)
             assertFalse(harness.credentials.values().single {
                 it.pendingAttempt?.enrollmentId == "enrollment-disconnect-a"
             }.hasCredentialMaterial)
@@ -748,12 +751,18 @@ class RelayV2ProfileRepositoryTest {
             harness.barrier.started.await()
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
 
-            assertTrue(harness.repository.cancelPendingEnrollment(confirmed))
+            val cancellation = async {
+                harness.repository.cancelPendingEnrollment(confirmed)
+            }
+            yield()
+            assertFalse(cancellation.isCompleted)
             harness.barrier.release.complete(Unit)
 
             assertTrue(pending.await() is RelayV2EnrollmentResult.Superseded)
+            assertTrue(cancellation.await())
             assertEquals(0, harness.isolationCalls)
             assertEquals(0, harness.profiles.activationCount)
+            assertEquals(null, harness.profiles.journal)
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
             assertSameReferenceRetryRedeems(
                 harness = harness,

@@ -703,21 +703,21 @@ internal class RelayV2ProfileRepository(
             }
             return false
         }
-        return enrollmentIntentMutex.withLock {
+        val cancelled = enrollmentIntentMutex.withLock {
             if (currentEnrollmentIntent?.credentialReference != reference) return@withLock false
-            profileStore.pendingRelayV2Activation()?.let {
-                if (it.targetCredentialReference == reference) {
-                    if (activationCredentialState(it) != ActivationCredentialState.ExactPending) {
-                        return@withLock false
-                    }
-                    check(profileStore.rollbackPreparedRelayV2Activation(it)) {
-                        "Prepared Relay v2 activation changed during cancellation"
-                    }
-                }
-            }
             currentEnrollmentIntent = null
             true
         }
+        if (!cancelled) return false
+        activationOperationMutex.withLock {
+            val pending = profileStore.pendingRelayV2Activation()
+            if (pending?.targetCredentialReference == reference) {
+                rollbackExactPreparedActivationWithLease(pending) {
+                    currentEnrollmentIntent == null
+                }
+            }
+        }
+        return true
     }
 
     /**
@@ -740,8 +740,12 @@ internal class RelayV2ProfileRepository(
         val profile = when (val state = activationCredentialState(journal)) {
             is ActivationCredentialState.ExactCompleted -> state.profile
             ActivationCredentialState.ExactPending -> {
-                check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
-                    "Prepared Relay v2 activation changed during recovery"
+                check(
+                    rollbackExactPreparedActivationWithLease(journal) {
+                        currentEnrollmentIntent == null
+                    },
+                ) {
+                    "Prepared Relay v2 activation is owned by a live enrollment"
                 }
                 return RelayV2ActivationRecoveryResult.ReenrollmentRequired(
                     journal.targetCredentialReference,
@@ -988,13 +992,24 @@ internal class RelayV2ProfileRepository(
     private suspend fun rollbackPreparedForSupersedingIntent(
         intent: EnrollmentIntent,
         journal: RelayV2ProfileActivationJournal,
+    ): Boolean = activationOperationMutex.withLock {
+        rollbackExactPreparedActivationWithLease(journal) {
+            currentEnrollmentIntent === intent
+        }
+    }
+
+    /** Requires [activationOperationMutex]; acquires intent authority before durable rollback. */
+    private suspend fun rollbackExactPreparedActivationWithLease(
+        journal: RelayV2ProfileActivationJournal,
+        hasIntentAuthority: () -> Boolean,
     ): Boolean = enrollmentIntentMutex.withLock {
-        if (currentEnrollmentIntent !== intent ||
-            profileStore.pendingRelayV2Activation() != journal ||
-            activationCredentialState(journal) != ActivationCredentialState.ExactPending
+        if (!hasIntentAuthority()) return@withLock false
+        val current = profileStore.pendingRelayV2Activation()
+        if (current != journal ||
+            activationCredentialState(current) != ActivationCredentialState.ExactPending
         ) return@withLock false
-        check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
-            "Prepared Relay v2 activation changed during supersession"
+        check(profileStore.rollbackPreparedRelayV2Activation(current)) {
+            "Exact prepared Relay v2 activation changed during rollback"
         }
         true
     }
