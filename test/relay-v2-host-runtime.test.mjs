@@ -9,6 +9,7 @@ import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 const broker = await import("../dist/relay/v2/brokerCore.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
+const hostCarrier = await import("../dist/relay/v2/hostCarrier.js");
 const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const snapshotSpool = await import("../dist/relay/v2/stateSnapshotSpool.js");
@@ -80,6 +81,31 @@ function errorResponse(request, code = "BUSY") {
       details: null,
     },
   };
+}
+
+function correlatedTerminalFixture(name, request) {
+  const frame = fixture(name);
+  frame.requestId = request.requestId;
+  frame.hostId = request.hostId;
+  frame.hostEpoch = HOST_EPOCH;
+  frame.scopeId = request.scopeId;
+  frame.sessionId = request.sessionId;
+  frame.streamId = request.streamId;
+  if (name === "terminal-opened") frame.payload.openId = request.payload.openId;
+  if (name === "terminal-replay-started") {
+    frame.payload.generation = request.payload.generation;
+    frame.payload.fromOffset = request.payload.fromOffset;
+  }
+  if (name === "terminal-reset-required-response") {
+    frame.payload.origin = request.type === "terminal.open" ? "open" : "replay";
+    frame.payload.generation = request.payload.generation ?? request.payload.resume?.generation ?? null;
+    frame.payload.requestedOffset = request.payload.fromOffset ?? request.payload.resume?.nextOffset ?? null;
+  }
+  if (name === "terminal-closed-response") {
+    frame.payload.closeId = request.payload.closeId;
+    frame.payload.generation = request.payload.generation;
+  }
+  return frame;
 }
 
 function hostWelcome(input) {
@@ -205,6 +231,7 @@ function createHarness(options = {}) {
   }]));
   terminals.unbind = async (auth, route) => {
     state.calls.unbind.push({ auth: structuredClone(auth), route: structuredClone(route) });
+    return options.unbind?.(auth, route);
   };
   const outbound = {
     trySend(routeBinding, bytes, receipt) {
@@ -475,7 +502,7 @@ test("the six-capability intersection has no optimistic default and gates mutati
   });
   assert.deepEqual(h.runtime.advertisedCapabilities(), []);
   const routeBinding = binding();
-  h.runtime.onRouteBound(routeBinding);
+  const rejection = h.runtime.onRouteBound(routeBinding);
   const hello = fixture("client-hello-fresh");
   hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
   send(h.runtime, routeBinding, hello);
@@ -483,8 +510,13 @@ test("the six-capability intersection has no optimistic default and gates mutati
 
   assert.equal(h.state.calls.hello.length, 0);
   assert.equal(h.state.sent.length, 0);
-  assert.equal(h.state.closes.at(-1).code, 4406);
-  assert.equal(h.state.closes.at(-1).reason, "capability_withdrawn");
+  assert.deepEqual(rejection, {
+    accepted: false,
+    code: "CAPABILITY_UNAVAILABLE",
+    message: "Relay v2 host capability intersection is unavailable",
+    retryable: false,
+  });
+  assert.equal(h.state.closes.length, 0);
   assert.equal(h.state.calls.commandExecute.length, 0);
   assert.equal(h.state.calls.terminal.length, 0);
 
@@ -494,6 +526,63 @@ test("the six-capability intersection has no optimistic default and gates mutati
     h.runtime.advertisedCapabilities(),
     [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
   );
+});
+
+test("HostCarrier turns a runtime readiness rejection into route.rejected", () => {
+  const h = createHarness({
+    capabilityOverrides: { "terminal.stream.resume.v1": false },
+  });
+  const sent = [];
+  const deliveries = [];
+  const transport = {
+    trySend(bytes, deliveryToken) {
+      sent.push(Uint8Array.from(bytes));
+      deliveries.push(deliveryToken);
+      return true;
+    },
+    bufferedAmount() { return 0; },
+    close() {},
+  };
+  const actor = new hostCarrier.RelayV2HostCarrierActor({
+    hostId: HOST_ID,
+    hostEpoch: HOST_EPOCH,
+    hostInstanceId: HOST_INSTANCE_ID,
+    credentialReferences: {
+      read(reference) {
+        return {
+          reference,
+          version: "1",
+          grantId: "test-host-grant",
+          accessJti: "test-host-access-jti",
+          accessToken: "twcap2.test.payload.mac",
+        };
+      },
+      acknowledgeReauthentication() { return true; },
+    },
+    advertisedCapabilities: [],
+    clientDialects: ["tw-relay.v2"],
+    idFactory: () => "host-hello-runtime-rejection",
+    clock: () => 1_783_700_100_000,
+    routeSink: h.runtime,
+  });
+  const connection = actor.connect(transport, "test-host-credential");
+  const hello = codec.decodeRelayV2WebSocketFrame("carrier", sent.at(-1)).frame;
+  connection.acknowledge(deliveries.shift());
+  const registered = fixture("host-registered");
+  registered.requestId = hello.requestId;
+  registered.connectorId = "runtime-rejection-connector";
+  connection.receive(codec.encodeRelayV2WebSocketFrame("carrier", registered));
+  while (deliveries.length > 0) connection.acknowledge(deliveries.shift());
+
+  const routeOpen = fixture("route-open");
+  routeOpen.connectorId = registered.connectorId;
+  routeOpen.payload.authContext.hostId = HOST_ID;
+  connection.receive(codec.encodeRelayV2WebSocketFrame("carrier", routeOpen));
+  const rejected = codec.decodeRelayV2WebSocketFrame("carrier", sent.at(-1)).frame;
+  assert.equal(rejected.type, "route.rejected");
+  assert.equal(rejected.requestId, routeOpen.requestId);
+  assert.equal(rejected.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(rejected.error.commandDisposition, "not_applicable");
 });
 
 test("bounded readiness withdrawal synchronously fences every established route", async () => {
@@ -517,6 +606,41 @@ test("bounded readiness withdrawal synchronously fences every established route"
     await settle();
     assert.equal(h.state.calls.commandExecute.length, 0);
   }
+});
+
+test("readiness withdrawal permanently fences the current connector generation", async () => {
+  const h = createHarness();
+  const first = await ready(h);
+  h.state.capabilities["event.sequence.v1"] = false;
+  assert.equal(h.readiness.publish(), true);
+  assert.equal(h.state.closes.at(-1).code, 4406);
+
+  h.state.capabilities["event.sequence.v1"] = true;
+  assert.equal(h.readiness.publish(), true);
+  assert.deepEqual(h.runtime.advertisedCapabilities(), [...broker.RELAY_V2_REQUIRED_CAPABILITIES]);
+
+  const sameConnector = binding({
+    routeId: "route-after-restore",
+    routeFence: "fence-after-restore",
+    connectionId: "connection-after-restore",
+    authContext: { jti: "jti-after-restore" },
+  });
+  assert.deepEqual(h.runtime.onRouteBound(sameConnector), {
+    accepted: false,
+    code: "CAPABILITY_UNAVAILABLE",
+    message: "Relay v2 capability was withdrawn for this connector generation",
+    retryable: false,
+  });
+
+  const replacementConnector = binding({
+    connectorGeneration: first.connectorGeneration + 1,
+    connectorId: "connector-replacement",
+    routeId: "route-replacement",
+    routeFence: "fence-replacement",
+    connectionId: "connection-replacement",
+    authContext: { jti: "jti-replacement" },
+  });
+  assert.equal(h.runtime.onRouteBound(replacementConnector), undefined);
 });
 
 test("readiness withdrawal during hello leaves no welcome or subscriber gap", async () => {
@@ -703,7 +827,188 @@ test("every awaited authority and transport receipt revalidates binding and H0 l
   });
 });
 
+test("H3 callbacks use copied exact tokens and each frozen terminal frame schema", async (t) => {
+  async function openStream() {
+    let authorityRoute;
+    const h = createHarness({
+      terminal: async (method, request) => {
+        if (method === "open") authorityRoute = request.route;
+      },
+    });
+    const routeBinding = await ready(h);
+    const request = fixture("terminal-open-new");
+    request.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, request);
+    await settle(3);
+    const opened = correlatedTerminalFixture("terminal-opened", request);
+    await h.runtime.sendTerminalFrame({ ...authorityRoute }, opened);
+    return { h, routeBinding, request, opened, authorityRoute };
+  }
+
+  await t.test("stream-scoped events omit host fields and retain exact stream lineage", async () => {
+    const { h, opened, authorityRoute } = await openStream();
+    for (const name of [
+      "terminal-output",
+      "terminal-input-ack",
+      "terminal-input-error",
+      "terminal-resize-ack",
+      "terminal-resize-error",
+    ]) {
+      const event = fixture(name);
+      event.streamId = opened.streamId;
+      event.payload.generation = opened.payload.generation;
+      assert.equal(Object.hasOwn(event, "hostId"), false);
+      assert.equal(Object.hasOwn(event, "hostEpoch"), false);
+      await h.runtime.sendTerminalFrame({ ...authorityRoute }, event);
+    }
+    const reset = fixture("terminal-reset-required-event");
+    reset.streamId = opened.streamId;
+    reset.payload.generation = opened.payload.generation;
+    await h.runtime.sendTerminalFrame({ ...authorityRoute }, reset);
+    assert.equal(h.state.sent.at(-1).frame.type, "terminal.reset_required");
+
+    const late = fixture("terminal-output");
+    late.streamId = opened.streamId;
+    late.payload.generation = opened.payload.generation;
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, late),
+      /stream lineage/,
+    );
+  });
+
+  await t.test("natural terminal.closed is a stream event and consumes no request", async () => {
+    const { h, opened, authorityRoute } = await openStream();
+    const closed = fixture("terminal-closed-event");
+    closed.streamId = opened.streamId;
+    closed.payload.generation = opened.payload.generation;
+    await h.runtime.sendTerminalFrame({ ...authorityRoute }, closed);
+    assert.equal(h.state.sent.at(-1).frame.kind, "event");
+    assert.equal(h.state.sent.at(-1).frame.type, "terminal.closed");
+  });
+
+  await t.test("wrong token, tuple, lineage, or callback type is rejected", async () => {
+    const { h, opened, authorityRoute } = await openStream();
+    const output = fixture("terminal-output");
+    output.streamId = opened.streamId;
+    output.payload.generation = opened.payload.generation;
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({
+        ...authorityRoute,
+        runtimeBindingToken: "forged-runtime-binding-token",
+      }, output),
+      /stale route binding/,
+    );
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute, routeFence: "forged-fence" }, output),
+      /stale route binding/,
+    );
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, {
+        ...output,
+        payload: { ...output.payload, generation: "forged-generation" },
+      }),
+      /stream lineage/,
+    );
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, fixture("sessions-changed-upsert")),
+      /another authority's event/,
+    );
+  });
+
+  await t.test("delayed close response survives H3 Promise completion and consumes once", async () => {
+    const { h, routeBinding, opened } = await openStream();
+    let closeRoute;
+    h.terminals.close = async (request) => {
+      h.state.calls.terminal.push({ method: "close", request: structuredClone(request) });
+      closeRoute = request.route;
+    };
+    const close = fixture("terminal-close");
+    close.expectedHostEpoch = HOST_EPOCH;
+    close.streamId = opened.streamId;
+    close.payload.generation = opened.payload.generation;
+    close.payload.resumeToken = opened.payload.resumeToken;
+    send(h.runtime, routeBinding, close);
+    await settle(4);
+
+    const response = correlatedTerminalFixture("terminal-closed-response", close);
+    const wrong = structuredClone(response);
+    wrong.payload.closeId = "wrong-close-owner";
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...closeRoute }, wrong),
+      /close owner/,
+    );
+    await h.runtime.sendTerminalFrame({ ...closeRoute }, response);
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...closeRoute }, response),
+      /not owned by a terminal request/,
+    );
+    assert.equal(h.state.sent.filter(({ frame }) => frame.requestId === close.requestId).length, 1);
+  });
+});
+
 test("request ownership and response metadata fence cross-owner or retargeted frames", async (t) => {
+  await t.test("openId and reset origin are exact terminal request metadata", async () => {
+    let authorityRoute;
+    const h = createHarness({
+      terminal: async (method, request) => {
+        if (method === "open") authorityRoute = request.route;
+      },
+    });
+    const routeBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, open);
+    await settle(3);
+
+    const wrongOpen = correlatedTerminalFixture("terminal-opened", open);
+    wrongOpen.payload.openId = "forged-open-id";
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongOpen),
+      /openId owner/,
+    );
+    const wrongOrigin = correlatedTerminalFixture("terminal-reset-required-response", open);
+    wrongOrigin.payload.origin = "replay";
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongOrigin),
+      /wrong request origin/,
+    );
+    await h.runtime.sendTerminalFrame(
+      { ...authorityRoute },
+      correlatedTerminalFixture("terminal-opened", open),
+    );
+  });
+
+  await t.test("replay generation and fromOffset are exact request metadata", async () => {
+    let authorityRoute;
+    const h = createHarness({
+      terminal: async (_method, request) => { authorityRoute = request.route; },
+    });
+    const routeBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, open);
+    await settle(3);
+    const opened = correlatedTerminalFixture("terminal-opened", open);
+    await h.runtime.sendTerminalFrame({ ...authorityRoute }, opened);
+
+    const replay = fixture("terminal-replay-request");
+    replay.expectedHostEpoch = HOST_EPOCH;
+    replay.streamId = opened.streamId;
+    replay.payload.generation = opened.payload.generation;
+    send(h.runtime, routeBinding, replay);
+    await settle(3);
+    const wrong = correlatedTerminalFixture("terminal-replay-started", replay);
+    wrong.payload.fromOffset = String(BigInt(replay.payload.fromOffset) + 1n);
+    await assert.rejects(
+      h.runtime.sendTerminalFrame({ ...authorityRoute }, wrong),
+      /generation or offset owner/,
+    );
+    await h.runtime.sendTerminalFrame(
+      { ...authorityRoute },
+      correlatedTerminalFixture("terminal-replay-started", replay),
+    );
+  });
+
   await t.test("H3 cannot borrow a pending command requestId", async () => {
     let finishCommand;
     let authorityRoute;
@@ -713,11 +1018,14 @@ test("request ownership and response metadata fence cross-owner or retargeted fr
       terminal: async (_method, request) => { authorityRoute = request.route; },
     });
     const routeBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, open);
+    await settle(3);
+    assert.equal(typeof authorityRoute?.runtimeBindingToken, "string");
     const command = fixture("command-execute-send-agent-message");
     command.expectedHostEpoch = HOST_EPOCH;
     send(h.runtime, routeBinding, command);
-    const ack = fixture("terminal-output-ack");
-    send(h.runtime, routeBinding, ack);
     await settle(3);
 
     await assert.rejects(
@@ -762,9 +1070,33 @@ test("request ownership and response metadata fence cross-owner or retargeted fr
       send(h.runtime, routeBinding, command);
       await settle(6);
       assert.equal(h.state.sent.some(({ frame }) => frame.requestId === command.requestId), false);
-      assert.equal(h.state.closes.at(-1).code, 1013);
+      assert.equal(h.state.closes.at(-1).code, 1011);
     });
   }
+
+  await t.test("generic error fields expected absent must also be absent", async () => {
+    for (const [field, forged] of [
+      ["commandId", "forged-optional-command"],
+      ["scopeId", "forged-optional-scope"],
+      ["sessionId", "forged-optional-session"],
+      ["streamId", "forged-optional-stream"],
+    ]) {
+      const h = createHarness({
+        query: async (_auth, request) => ({
+          ...errorResponse(request),
+          [field]: forged,
+        }),
+      });
+      const routeBinding = await ready(h);
+      const query = fixture("command-query");
+      query.requestId = `generic-error-optional-${field}`;
+      query.expectedHostEpoch = HOST_EPOCH;
+      send(h.runtime, routeBinding, query);
+      await settle(6);
+      assert.equal(h.state.sent.some(({ frame }) => frame.requestId === query.requestId), false);
+      assert.equal(h.state.closes.at(-1).code, 1011);
+    }
+  });
 });
 
 test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol semantics", async (t) => {
@@ -774,12 +1106,18 @@ test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol 
     const routeBinding = await ready(h);
     const command = fixture("command-execute-send-agent-message");
     command.expectedHostEpoch = HOST_EPOCH;
+    const queued = structuredClone(command);
+    queued.requestId = "command-after-owner-throw";
+    queued.commandId = "command-after-owner-throw-id";
     send(h.runtime, routeBinding, command);
+    send(h.runtime, routeBinding, queued);
     await settle(6);
 
+    assert.equal(h.state.calls.commandExecute.length, 1);
     assert.equal(h.state.sent.some(({ frame }) => frame.requestId === command.requestId), false);
+    assert.equal(h.state.sent.some(({ frame }) => frame.requestId === queued.requestId), false);
     assert.equal(JSON.stringify(h.state.sent).includes(secret), false);
-    assert.equal(h.state.closes.at(-1).code, 1013);
+    assert.equal(h.state.closes.at(-1).code, 1011);
     assert.equal(h.state.closes.at(-1).reason, "authority_failure");
   });
 
@@ -812,6 +1150,45 @@ test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol 
   });
 });
 
+test("typed H3 negative outcomes become correlated redacted not_applicable errors", async (t) => {
+  for (const code of [
+    "BUSY",
+    "INVALID_ARGUMENT",
+    "PERMISSION_DENIED",
+    "TERMINAL_OPEN_CONFLICT",
+    "TERMINAL_STREAM_CONFLICT",
+    "TERMINAL_CLOSE_CONFLICT",
+    "TERMINAL_ROUTE_STALE",
+  ]) {
+    await t.test(code, async () => {
+      const secret = `secret-owner-message-${code}`;
+      const h = createHarness({
+        terminal: async (method) => {
+          if (method === "open") {
+            throw new terminalManager.RelayV2TerminalManagerError(code, secret);
+          }
+        },
+      });
+      const routeBinding = await ready(h);
+      const open = fixture("terminal-open-new");
+      open.expectedHostEpoch = HOST_EPOCH;
+      send(h.runtime, routeBinding, open);
+      await settle(8);
+
+      const response = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+      assert.equal(response.type, "error");
+      assert.equal(response.error.code, code);
+      assert.equal(response.error.commandDisposition, "not_applicable");
+      assert.equal(response.error.retryable, code === "BUSY");
+      assert.equal(response.scopeId, open.scopeId);
+      assert.equal(response.sessionId, open.sessionId);
+      assert.equal(response.streamId, open.streamId);
+      assert.equal(JSON.stringify(response).includes(secret), false);
+      assert.equal(h.state.closes.some((close) => close.code === 1013), false);
+    });
+  }
+});
+
 test("raw frame and transport-owned outbound capacity are hard bounded", async (t) => {
   await t.test("raw bytes are rejected before codec or authority work", async () => {
     for (const { maxFrameBytes, rawBytes } of [
@@ -836,7 +1213,7 @@ test("raw frame and transport-owned outbound capacity are hard bounded", async (
         const event = fixture("sessions-changed-upsert");
         event.hostId = HOST_ID;
         event.hostEpoch = HOST_EPOCH;
-        assert.equal(sink.enqueue(event), false);
+        assert.equal(sink.enqueue(event), true);
       },
     });
     const routeBinding = binding();
@@ -925,6 +1302,182 @@ test("per-route request and outbound capacity return BUSY or SLOW_CONSUMER witho
   });
 });
 
+test("H2 events await bounded sequenced lineage validation before outbound", async () => {
+  let eventSink;
+  let holdIdentity = false;
+  let releaseIdentity;
+  let identityStarted;
+  const identityGate = new Promise((resolve) => { releaseIdentity = resolve; });
+  const started = new Promise((resolve) => { identityStarted = resolve; });
+  const current = { hostEpoch: HOST_EPOCH, hostInstanceId: HOST_INSTANCE_ID };
+  const h = createHarness({
+    testLimits: { maxPendingOperationsPerRoute: 2 },
+    trySend: () => true,
+    currentIdentity: async () => {
+      if (holdIdentity) {
+        identityStarted();
+        await identityGate;
+      }
+      return { ...current };
+    },
+    hello: async ({ cut, buildWelcome }, sink) => {
+      eventSink = sink;
+      const welcome = buildWelcome(cut);
+      assert.equal(sink.enqueue(welcome), true);
+      return welcome;
+    },
+  });
+  const routeBinding = await ready(h);
+  const sentBefore = h.state.sent.length;
+  holdIdentity = true;
+  const first = fixture("sessions-changed-upsert");
+  first.hostId = HOST_ID;
+  first.hostEpoch = HOST_EPOCH;
+  const second = fixture("scopes-changed-upsert");
+  second.hostId = HOST_ID;
+  second.hostEpoch = HOST_EPOCH;
+  const third = fixture("sessions-changed-delete");
+  third.hostId = HOST_ID;
+  third.hostEpoch = HOST_EPOCH;
+  assert.equal(eventSink.enqueue(first), true);
+  await started;
+  assert.equal(eventSink.enqueue(second), true);
+  assert.equal(eventSink.enqueue(third), false);
+  current.hostEpoch = "replacement-host-epoch";
+  releaseIdentity();
+  await settle(8);
+
+  assert.equal(h.state.sent.length, sentBefore);
+  assert.equal(h.state.closes.at(-1).code, 4400);
+});
+
+test("per-route inbound sequencing preserves FIFO authority entry", async () => {
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
+  let inputCalls = 0;
+  const h = createHarness({
+    terminal: async (method) => {
+      if (method !== "input") return;
+      inputCalls += 1;
+      if (inputCalls === 1) await firstGate;
+    },
+  });
+  const routeBinding = await ready(h);
+  const first = fixture("terminal-input");
+  const second = structuredClone(first);
+  second.payload.inputSeq = String(BigInt(first.payload.inputSeq) + 1n);
+  send(h.runtime, routeBinding, first);
+  send(h.runtime, routeBinding, second);
+  await settle(4);
+  assert.equal(inputCalls, 1);
+  releaseFirst();
+  await settle(6);
+  assert.equal(inputCalls, 2);
+});
+
+test("unbound work and transport receipts retain a global draining route budget", async (t) => {
+  await t.test("an unresolved authority call prevents route churn from escaping maxRoutes", async () => {
+    let finishQuery;
+    const queryResult = new Promise((resolve) => { finishQuery = resolve; });
+    const h = createHarness({
+      testLimits: { maxRoutes: 1 },
+      query: async () => queryResult,
+    });
+    const first = await ready(h);
+    const query = fixture("command-query");
+    query.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, first, query);
+    await settle(3);
+    assert.equal(h.state.calls.commandQuery.length, 1);
+    h.runtime.onRouteUnbound(first, "client_closed");
+
+    const next = binding({
+      connectorGeneration: 2,
+      connectorId: "draining-connector-two",
+      routeId: "draining-route-two",
+      routeFence: "draining-fence-two",
+      connectionId: "draining-connection-two",
+      authContext: { jti: "draining-jti-two" },
+    });
+    assert.equal(h.runtime.onRouteBound(next).code, "BUSY");
+    finishQuery(errorResponse(query));
+    await settle(8);
+    assert.equal(h.runtime.onRouteBound(next), undefined);
+  });
+
+  await t.test("transport ownership remains charged after unbind until receipt", async () => {
+    let welcomeReceipt;
+    const h = createHarness({
+      testLimits: { maxRoutes: 1 },
+      trySend: (_binding, _bytes, frame, receipt) => {
+        if (frame.type === "host.welcome") welcomeReceipt = receipt;
+        return true;
+      },
+    });
+    const first = await ready(h);
+    h.runtime.onRouteUnbound(first, "client_closed");
+    const next = binding({
+      connectorGeneration: 2,
+      connectorId: "receipt-connector-two",
+      routeId: "receipt-route-two",
+      routeFence: "receipt-fence-two",
+      connectionId: "receipt-connection-two",
+      authContext: { jti: "receipt-jti-two" },
+    });
+    assert.equal(h.runtime.onRouteBound(next).code, "BUSY");
+    welcomeReceipt.settle(true);
+    await settle(6);
+    assert.equal(h.runtime.onRouteBound(next), undefined);
+  });
+
+  await t.test("an H3 serializer identity lookup remains in the draining registry", async () => {
+    let holdIdentity = false;
+    let releaseIdentity;
+    let identityStarted;
+    const gate = new Promise((resolve) => { releaseIdentity = resolve; });
+    const started = new Promise((resolve) => { identityStarted = resolve; });
+    let authorityRoute;
+    const h = createHarness({
+      testLimits: { maxRoutes: 1 },
+      currentIdentity: async () => {
+        if (holdIdentity) {
+          identityStarted();
+          await gate;
+        }
+        return { hostEpoch: HOST_EPOCH, hostInstanceId: HOST_INSTANCE_ID };
+      },
+      terminal: async (method, request) => {
+        if (method === "open") authorityRoute = request.route;
+      },
+    });
+    const first = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, first, open);
+    await settle(3);
+    holdIdentity = true;
+    const callback = h.runtime.sendTerminalFrame(
+      { ...authorityRoute },
+      correlatedTerminalFixture("terminal-opened", open),
+    );
+    await started;
+    h.runtime.onRouteUnbound(first, "client_closed");
+    const next = binding({
+      connectorGeneration: 2,
+      connectorId: "serializer-connector-two",
+      routeId: "serializer-route-two",
+      routeFence: "serializer-fence-two",
+      connectionId: "serializer-connection-two",
+      authContext: { jti: "serializer-jti-two" },
+    });
+    assert.equal(h.runtime.onRouteBound(next).code, "BUSY");
+    releaseIdentity();
+    await assert.rejects(callback, /lost its route fence/);
+    await settle(6);
+    assert.equal(h.runtime.onRouteBound(next), undefined);
+  });
+});
+
 test("correlated responses return only to the originating exact binding", async () => {
   const pending = new Map();
   const h = createHarness({
@@ -964,6 +1517,7 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-runtime-actual-"));
   let spool;
   let h3;
+  let runtime;
   try {
     const store = await hostState.RelayV2HostStateStore.open({ home });
     const now = 1_783_700_000_000;
@@ -973,7 +1527,28 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
       recover: false,
       now: () => now,
       executor: {
-        async resolve() { throw new Error("actual adapter test never executes a command"); },
+        async resolve(request) {
+          return {
+            kind: "immutable_business_failure",
+            authorityEvidence: {
+              schemaVersion: commandPlane.RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
+              coverage: "complete",
+              authority: request.authority,
+              hostId: request.hostId,
+              hostEpoch: request.hostEpoch,
+              scopeId: request.scopeId,
+              sessionId: request.sessionId,
+              evidence: { source: "actual-port-test-authority" },
+            },
+            error: {
+              code: "SESSION_NOT_FOUND",
+              message: "Actual command authority found no retained Session",
+              retryable: false,
+              commandDisposition: "completed",
+              details: null,
+            },
+          };
+        },
         async executeTwRpc() { throw new Error("actual adapter test never executes tw rpc"); },
         async executeTerminalControl() {
           throw new Error("actual adapter test never executes terminal control");
@@ -1000,10 +1575,24 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
       hostEpoch: reconciled.snapshot.hostEpoch,
       hostInstanceId: reconciled.snapshot.hostInstanceId,
       resolver: {},
-      lineage: {},
+      lineage: {
+        async claimOpen(claim) {
+          return {
+            status: "replay",
+            outcome: {
+              kind: "reset",
+              generation: claim.previousGeneration,
+              reason: "stream_lost",
+              requestedOffset: claim.requestedOffset,
+              bufferStartOffset: null,
+              tailOffset: null,
+            },
+          };
+        },
+      },
       backend: {},
       terminalControl: {},
-      send: async () => {},
+      send: async (route, frame) => runtime.sendTerminalFrame({ ...route }, frame),
     });
     const ports = runtimeModule.createRelayV2HostRuntimeAuthorityPorts({
       h0: store,
@@ -1018,7 +1607,7 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
     });
     const sent = [];
     const closes = [];
-    const runtime = new runtimeModule.RelayV2HostRuntime({
+    runtime = new runtimeModule.RelayV2HostRuntime({
       hostId: HOST_ID,
       hostEpoch: reconciled.snapshot.hostEpoch,
       hostInstanceId: reconciled.snapshot.hostInstanceId,
@@ -1057,6 +1646,29 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
     assert.equal(welcome.hostEpoch, reconciled.snapshot.hostEpoch);
     assert.equal(welcome.hostInstanceId, reconciled.snapshot.hostInstanceId);
     assert.equal(typeof welcome.payload.commandDedupeWindow.windowId, "string");
+    const execute = fixture("command-execute-kill-session");
+    execute.hostId = HOST_ID;
+    execute.expectedHostEpoch = reconciled.snapshot.hostEpoch;
+    execute.payload.dedupeWindowId = welcome.payload.commandDedupeWindow.windowId;
+    send(runtime, routeBinding, execute);
+    await settle(12);
+    const commandStatus = sent.find(({ frame }) => frame.requestId === execute.requestId)?.frame;
+    assert.equal(commandStatus.type, "command.status");
+    assert.equal(commandStatus.payload.state, "failed");
+    assert.equal(commandStatus.error.code, "SESSION_NOT_FOUND");
+
+    const query = fixture("command-query");
+    query.hostId = HOST_ID;
+    query.expectedHostEpoch = reconciled.snapshot.hostEpoch;
+    query.payload.items = [{
+      commandId: execute.commandId,
+      dedupeWindowId: welcome.payload.commandDedupeWindow.windowId,
+    }];
+    send(runtime, routeBinding, query);
+    await settle(10);
+    const statuses = sent.find(({ frame }) => frame.requestId === query.requestId)?.frame;
+    assert.equal(statuses.type, "command.statuses");
+    assert.equal(statuses.payload.items[0].state, "failed");
     const scopes = fixture("scopes-snapshot-get");
     scopes.hostId = HOST_ID;
     scopes.expectedHostEpoch = reconciled.snapshot.hostEpoch;
@@ -1073,6 +1685,15 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
     assert.equal(sent.at(-1).frame.type, "state.snapshot.chunk");
     assert.equal(sent.at(-1).frame.hostEpoch, reconciled.snapshot.hostEpoch);
     assert.deepEqual(sent.at(-1).frame.payload.records, []);
+
+    const terminalOpen = fixture("terminal-open-new");
+    terminalOpen.hostId = HOST_ID;
+    terminalOpen.expectedHostEpoch = reconciled.snapshot.hostEpoch;
+    send(runtime, routeBinding, terminalOpen);
+    await settle(12);
+    const reset = sent.find(({ frame }) => frame.requestId === terminalOpen.requestId)?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.origin, "open");
     assert.deepEqual(closes, []);
     runtime.onRouteUnbound(routeBinding, "client_closed");
     runtime.dispose();
@@ -1083,7 +1704,7 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
   }
 });
 
-test("a misrouted v1 dialect is rejected as 4406 without entering the v2 runtime", () => {
+test("a misrouted v1 dialect returns the typed rejection consumed as route.rejected", () => {
   const h = createHarness();
   const legacyBinding = {
     ...binding(),
@@ -1097,9 +1718,13 @@ test("a misrouted v1 dialect is rejected as 4406 without entering the v2 runtime
       clientInstanceId: null,
     },
   };
-  h.runtime.onRouteBound(legacyBinding);
-  assert.equal(h.state.closes.at(-1).code, 4406);
-  assert.equal(h.state.closes.at(-1).reason, "route_unavailable");
+  assert.deepEqual(h.runtime.onRouteBound(legacyBinding), {
+    accepted: false,
+    code: "HOST_DIALECT_UNAVAILABLE",
+    message: "Requested Relay dialect is unavailable",
+    retryable: false,
+  });
+  assert.equal(h.state.closes.length, 0);
   assert.equal(h.state.calls.hello.length, 0);
   assert.equal(h.state.calls.commandExecute.length, 0);
   assert.equal(h.state.calls.terminal.length, 0);

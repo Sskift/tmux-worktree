@@ -69,7 +69,13 @@ export type RelayV2TerminalErrorCode =
   | "TERMINAL_RESIZE_CONFLICT"
   | "INTERNAL";
 
+const RELAY_V2_TERMINAL_MANAGER_ERROR = Symbol.for(
+  "tmux-worktree.relay-v2.terminal-manager-error",
+);
+
 export class RelayV2TerminalManagerError extends Error {
+  readonly [RELAY_V2_TERMINAL_MANAGER_ERROR] = true;
+
   constructor(
     readonly code: RelayV2TerminalErrorCode,
     message: string,
@@ -77,6 +83,14 @@ export class RelayV2TerminalManagerError extends Error {
     super(message);
     this.name = "RelayV2TerminalManagerError";
   }
+}
+
+export function isRelayV2TerminalManagerError(
+  error: unknown,
+): error is RelayV2TerminalManagerError {
+  return !!error
+    && typeof error === "object"
+    && (error as Record<PropertyKey, unknown>)[RELAY_V2_TERMINAL_MANAGER_ERROR] === true;
 }
 
 export interface RelayV2TerminalAuthContext {

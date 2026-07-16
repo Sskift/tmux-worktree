@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -7,6 +8,7 @@ import { RELAY_V2_REQUIRED_CAPABILITIES } from "./brokerCore.js";
 import type {
   RelayV2HostCarrierRouteSink,
   RelayV2HostLocalUnbindReason,
+  RelayV2HostRouteBindingRejection,
   RelayV2HostRouteBinding,
 } from "./hostCarrier.js";
 import type {
@@ -46,6 +48,7 @@ import type {
   RelayV2TerminalResize,
   RelayV2TerminalRoute,
 } from "./terminalManager.js";
+import { isRelayV2TerminalManagerError } from "./terminalManager.js";
 
 export const RELAY_V2_HOST_RUNTIME_LIMITS = Object.freeze({
   maxRoutes: 256,
@@ -53,6 +56,8 @@ export const RELAY_V2_HOST_RUNTIME_LIMITS = Object.freeze({
   maxPendingOperationsPerRoute: 128,
   maxOutboundFramesPerRoute: 128,
   maxOutboundBytesPerRoute: 1_048_576,
+  maxTerminalLineagesPerRoute: 256,
+  maxConnectorFences: 1_024,
   outboundReceiptTimeoutMs: 5_000,
 } as const);
 
@@ -159,12 +164,12 @@ export interface RelayV2HostRuntimeTerminalPort {
 }
 
 export interface RelayV2HostRuntimeAuthorityRoute extends RelayV2TerminalRoute {
-  /** Process-local exact binding token. Never serialized. */
-  readonly runtimeBindingId: string;
+  /** Opaque exact-binding token copied by H3 but never emitted on public wire. */
+  readonly runtimeBindingToken: string;
 }
 
 export type RelayV2HostRuntimeClose = Readonly<{
-  code: 4400 | 4406 | 1013;
+  code: 4400 | 4406 | 1011 | 1013;
   reason:
     | "protocol_error"
     | "event_cursor_ahead"
@@ -303,8 +308,21 @@ export type RelayV2HostRuntimeAuthorityErrorCode =
   | "HOST_EPOCH_MISMATCH"
   | "INTERNAL"
   | "INVALID_ARGUMENT"
+  | "PERMISSION_DENIED"
   | "SCOPE_NOT_FOUND"
-  | "SNAPSHOT_EXPIRED";
+  | "SNAPSHOT_EXPIRED"
+  | "TERMINAL_STREAM_NOT_FOUND"
+  | "TERMINAL_STREAM_CONFLICT"
+  | "TERMINAL_OPEN_CONFLICT"
+  | "TERMINAL_CLOSE_CONFLICT"
+  | "TERMINAL_ROUTE_STALE"
+  | "TERMINAL_GENERATION_STALE"
+  | "TERMINAL_OFFSET_EXPIRED"
+  | "TERMINAL_INVALID_ACK"
+  | "TERMINAL_INPUT_GAP"
+  | "TERMINAL_INPUT_CONFLICT"
+  | "TERMINAL_RESIZE_GAP"
+  | "TERMINAL_RESIZE_CONFLICT";
 
 /** A typed serializer/adapter failure; its message is never sent to clients. */
 export class RelayV2HostRuntimeAuthorityError extends Error {
@@ -329,6 +347,11 @@ interface PendingRequest {
   scopeId: string | null;
   sessionId: string | null;
   streamId: string | null;
+  openId: string | null;
+  closeId: string | null;
+  generation: string | null;
+  fromOffset: string | null;
+  resetOrigin: "open" | "replay" | null;
 }
 
 interface OutboundItem {
@@ -348,11 +371,19 @@ interface RouteState {
   phase: "bound" | "hello_pending" | "ready" | "closing" | "closed";
   accepting: boolean;
   welcomeAccepted: boolean;
+  resourceUnsubscribed: boolean;
   terminalUnbound: boolean;
   closeSent: boolean;
   closeAfterDrain: RelayV2HostRuntimeClose | null;
   pendingOperations: number;
   pendingRequests: Map<string, PendingRequest>;
+  /** Routing lineage only: H3 remains the terminal lifecycle/state authority. */
+  terminalLineages: Map<string, string>;
+  /** Inbound carrier order is the exact order in which authorities are entered. */
+  operationTail: Promise<void>;
+  /** H2/H3 callbacks and transport receipts are validated and delivered FIFO. */
+  callbackTail: Promise<void>;
+  terminalUnbindPending: boolean;
   outbound: OutboundItem[];
   outboundBytes: number;
   sending: boolean;
@@ -390,6 +421,8 @@ const TERMINAL_OUTBOUND_EVENT_TYPES = new Set([
   "terminal.input_error",
   "terminal.resize_ack",
   "terminal.resize_error",
+  "terminal.reset_required",
+  "terminal.closed",
 ]);
 
 const RESPONSE_TYPES = new Map<string, ReadonlySet<string>>([
@@ -416,8 +449,21 @@ const AUTHORITY_ERROR_MESSAGES: Readonly<Record<RelayV2HostRuntimeAuthorityError
   HOST_EPOCH_MISMATCH: "Client targets a stale host lineage",
   INTERNAL: "Relay v2 authority failed",
   INVALID_ARGUMENT: "Relay v2 request is invalid",
+  PERMISSION_DENIED: "Relay v2 terminal request is not permitted",
   SCOPE_NOT_FOUND: "Relay v2 scope was not found",
   SNAPSHOT_EXPIRED: "Relay v2 snapshot is unavailable",
+  TERMINAL_STREAM_NOT_FOUND: "Relay v2 terminal stream was not found",
+  TERMINAL_STREAM_CONFLICT: "Relay v2 terminal stream conflicts with retained state",
+  TERMINAL_OPEN_CONFLICT: "Relay v2 terminal open conflicts with retained state",
+  TERMINAL_CLOSE_CONFLICT: "Relay v2 terminal close conflicts with retained state",
+  TERMINAL_ROUTE_STALE: "Relay v2 terminal route is stale",
+  TERMINAL_GENERATION_STALE: "Relay v2 terminal generation is stale",
+  TERMINAL_OFFSET_EXPIRED: "Relay v2 terminal offset is unavailable",
+  TERMINAL_INVALID_ACK: "Relay v2 terminal acknowledgement is invalid",
+  TERMINAL_INPUT_GAP: "Relay v2 terminal input sequence has a gap",
+  TERMINAL_INPUT_CONFLICT: "Relay v2 terminal input conflicts with retained state",
+  TERMINAL_RESIZE_GAP: "Relay v2 terminal resize sequence has a gap",
+  TERMINAL_RESIZE_CONFLICT: "Relay v2 terminal resize conflicts with retained state",
 };
 
 function positiveLimit(value: number | undefined, production: number, name: string): number {
@@ -450,6 +496,16 @@ function resolveLimits(input: Partial<RuntimeLimits> = {}): RuntimeLimits {
       input.maxOutboundBytesPerRoute,
       RELAY_V2_HOST_RUNTIME_LIMITS.maxOutboundBytesPerRoute,
       "maxOutboundBytesPerRoute",
+    ),
+    maxTerminalLineagesPerRoute: positiveLimit(
+      input.maxTerminalLineagesPerRoute,
+      RELAY_V2_HOST_RUNTIME_LIMITS.maxTerminalLineagesPerRoute,
+      "maxTerminalLineagesPerRoute",
+    ),
+    maxConnectorFences: positiveLimit(
+      input.maxConnectorFences,
+      RELAY_V2_HOST_RUNTIME_LIMITS.maxConnectorFences,
+      "maxConnectorFences",
     ),
     outboundReceiptTimeoutMs: positiveLimit(
       input.outboundReceiptTimeoutMs,
@@ -537,6 +593,10 @@ function pendingRequest(frame: RelayV2JsonObject): PendingRequest {
   const type = stringField(frame, "type");
   const allowed = RESPONSE_TYPES.get(type);
   if (!allowed) throw new Error("Relay v2 request has no response owner");
+  const payload = objectField(frame, "payload");
+  const resume = type === "terminal.open" && Object.hasOwn(payload, "resume")
+    ? objectField(payload, "resume")
+    : null;
   return Object.freeze({
     requestId: stringField(frame, "requestId"),
     owner: requestOwner(type),
@@ -547,6 +607,19 @@ function pendingRequest(frame: RelayV2JsonObject): PendingRequest {
     scopeId: optionalString(frame, "scopeId"),
     sessionId: optionalString(frame, "sessionId"),
     streamId: optionalString(frame, "streamId"),
+    openId: type === "terminal.open" ? optionalString(payload, "openId") : null,
+    closeId: type === "terminal.close" ? optionalString(payload, "closeId") : null,
+    generation: type === "terminal.replay_request" || type === "terminal.close"
+      ? optionalString(payload, "generation")
+      : optionalString(resume ?? {}, "generation"),
+    fromOffset: type === "terminal.replay_request"
+      ? optionalString(payload, "fromOffset")
+      : null,
+    resetOrigin: type === "terminal.open"
+      ? "open"
+      : type === "terminal.replay_request"
+        ? "replay"
+        : null,
   });
 }
 
@@ -556,10 +629,14 @@ function structuredAuthorityError(error: unknown): {
 } | null {
   if (error instanceof RelayV2HostRuntimeAuthorityError
     || error instanceof RelayV2MaterializedStateError
-    || error instanceof RelayV2StateSnapshotSpoolError) {
+    || error instanceof RelayV2StateSnapshotSpoolError
+    || isRelayV2TerminalManagerError(error)) {
     const code = error.code as RelayV2HostRuntimeAuthorityErrorCode;
     if (!Object.hasOwn(AUTHORITY_ERROR_MESSAGES, code)) return null;
-    return { code, details: error.details };
+    const details = Object.hasOwn(error, "details")
+      ? (error as { details?: Readonly<Record<string, unknown>> | null }).details ?? null
+      : null;
+    return { code, details };
   }
   return null;
 }
@@ -628,16 +705,23 @@ function snapshotReleasedFrame(
 /**
  * Unwired host route/runtime composition foundation. It owns v2 public frame
  * dispatch, exact route fencing, readiness withdrawal and bounded delivery;
- * every business transition remains in H0/H1/H2/spool/H3.
+ * every business transition remains in H0/H1/H2/spool/H3. Each route has two
+ * bounded FIFO lanes: inbound authority work and validated callback delivery.
+ * Both lanes share the route pending-operation limit and remain charged while
+ * asynchronous work drains after a fence.
  */
 export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
   readonly limits: RuntimeLimits;
 
   private readonly routesByCarrierKey = new Map<string, RouteState>();
-  private readonly routesByRuntimeId = new Map<string, RouteState>();
+  private readonly routesByRuntimeToken = new Map<string, RouteState>();
+  /** Active and asynchronously draining routes share one hard admission budget. */
+  private readonly routeRegistry = new Set<RouteState>();
+  private readonly withdrawnConnectorGenerations = new Set<string>();
   private readonly readinessSubscription: RelayV2HostReadinessSubscription;
   private activeCapabilities: readonly RelayV2RequiredCapability[] | null = null;
   private readinessObserved = false;
+  private allConnectorGenerationsFenced = false;
   private nextBindingId = 0;
 
   constructor(private readonly options: RelayV2HostRuntimeOptions) {
@@ -669,40 +753,67 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
   dispose(): void {
     this.activeCapabilities = null;
     for (const route of [...this.routesByCarrierKey.values()]) {
-      this.closeImmediately(route, { code: 1013, reason: "host_shutdown" });
+      this.closeImmediately(route, { code: 1011, reason: "host_shutdown" });
     }
     try { this.readinessSubscription.unsubscribe(); } catch {}
   }
 
-  onRouteBound(input: RelayV2HostRouteBinding): void {
+  onRouteBound(input: RelayV2HostRouteBinding): void | RelayV2HostRouteBindingRejection {
     if (input.clientDialect !== "tw-relay.v2"
-      || input.authContext.scheme !== "twcap2"
-      || input.authContext.role !== "client"
+      || input.authContext.scheme !== "twcap2") {
+      return this.bindingRejection(
+        "HOST_DIALECT_UNAVAILABLE",
+        "Requested Relay dialect is unavailable",
+        false,
+      );
+    }
+    if (input.authContext.role !== "client"
       || input.authContext.hostId !== this.options.hostId) {
-      this.closeBinding(input, { code: 4406, reason: "route_unavailable" });
-      return;
+      return this.bindingRejection(
+        "PERMISSION_DENIED",
+        "Route authorization does not match this host",
+        false,
+      );
     }
     if (this.activeCapabilities === null
       || this.activeCapabilities.length !== RELAY_V2_REQUIRED_CAPABILITIES.length) {
-      this.closeBinding(input, { code: 4406, reason: "capability_withdrawn" });
-      return;
+      return this.bindingRejection(
+        "CAPABILITY_UNAVAILABLE",
+        "Relay v2 host capability intersection is unavailable",
+        false,
+      );
     }
-    if (this.routesByCarrierKey.size >= this.limits.maxRoutes) {
-      this.closeBinding(input, { code: 1013, reason: "slow_consumer" });
-      return;
+    if (this.allConnectorGenerationsFenced
+      || this.withdrawnConnectorGenerations.has(this.connectorGenerationKey(input))) {
+      return this.bindingRejection(
+        "CAPABILITY_UNAVAILABLE",
+        "Relay v2 capability was withdrawn for this connector generation",
+        false,
+      );
+    }
+    if (this.routeRegistry.size >= this.limits.maxRoutes) {
+      return this.bindingRejection(
+        "BUSY",
+        "Relay v2 host route capacity is exhausted",
+        true,
+      );
     }
     const binding = immutableBinding(input);
     const key = this.carrierKey(binding);
     if (this.routesByCarrierKey.has(key)) {
-      this.closeBinding(binding, { code: 4400, reason: "protocol_error" });
-      return;
+      return this.bindingRejection(
+        "BUSY",
+        "Relay v2 route binding is already active",
+        true,
+      );
     }
-    const runtimeBindingId = `host-route-${++this.nextBindingId}`;
+    const subscriberId = `host-route-${++this.nextBindingId}`;
+    const runtimeBindingToken = randomBytes(32).toString("base64url");
     const authorityRoute = Object.freeze({
       connectorId: binding.connectorId,
       routeId: binding.routeId,
       routeFence: binding.routeFence,
-      runtimeBindingId,
+      runtimeBindingToken,
     });
     const route: RouteState = {
       binding,
@@ -712,22 +823,28 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         clientInstanceId: input.authContext.clientInstanceId,
         hostId: input.authContext.hostId,
       }),
-      subscriberId: runtimeBindingId,
+      subscriberId,
       phase: "bound",
       accepting: true,
       welcomeAccepted: false,
+      resourceUnsubscribed: false,
       terminalUnbound: false,
       closeSent: false,
       closeAfterDrain: null,
       pendingOperations: 0,
       pendingRequests: new Map(),
+      terminalLineages: new Map(),
+      operationTail: Promise.resolve(),
+      callbackTail: Promise.resolve(),
+      terminalUnbindPending: false,
       outbound: [],
       outboundBytes: 0,
       sending: false,
       validatingReceipt: false,
     };
     this.routesByCarrierKey.set(key, route);
-    this.routesByRuntimeId.set(runtimeBindingId, route);
+    this.routesByRuntimeToken.set(runtimeBindingToken, route);
+    this.routeRegistry.add(route);
   }
 
   onClientFrame(binding: RelayV2HostRouteBinding, payload: Uint8Array): void {
@@ -791,7 +908,24 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         return;
       }
     }
-    if (route.pendingOperations >= this.limits.maxPendingOperationsPerRoute) {
+    if (pending) route.pendingRequests.set(pending.requestId, pending);
+    const operation = this.scheduleRouteTask(route, "operationTail", async () => {
+      try {
+        await this.dispatch(route, frame, pending);
+      } catch (error) {
+        try {
+          // Failure handling stays in the inbound FIFO lane so a later frame
+          // cannot enter an authority before this result is fenced or emitted.
+          await this.handleAuthorityFailure(route, pending, error);
+        } catch {
+          if (this.isAdmitted(route)) {
+            this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
+          }
+        }
+      }
+    });
+    if (!operation) {
+      if (pending) route.pendingRequests.delete(pending.requestId);
       if (pending && this.enqueueError(
         route,
         pending,
@@ -802,15 +936,9 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
       return;
     }
-
-    route.pendingOperations += 1;
-    if (pending) route.pendingRequests.set(pending.requestId, pending);
-    void this.dispatch(route, frame, pending).catch((error) => {
-      this.handleAuthorityFailure(route, pending, error);
-    }).finally(() => {
-      route.pendingOperations = Math.max(0, route.pendingOperations - 1);
-      if (pending && route.pendingRequests.get(pending.requestId) === pending) {
-        route.pendingRequests.delete(pending.requestId);
+    void operation.catch(() => {
+      if (this.isAdmitted(route)) {
+        this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       }
     });
   }
@@ -837,36 +965,53 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     authorityRoute: RelayV2HostRuntimeAuthorityRoute,
     frame: RelayV2JsonObject,
   ): Promise<void> {
-    const route = this.routesByRuntimeId.get(authorityRoute.runtimeBindingId);
-    if (!route
-      || route.authorityRoute !== authorityRoute
-      || route.phase !== "ready"
-      || !this.isAdmitted(route)) {
+    const route = this.exactAuthorityRoute(authorityRoute);
+    if (!route || route.phase !== "ready" || !this.isAdmitted(route)) {
       throw new Error("Relay v2 terminal callback targets a stale route binding");
     }
-    const identity = await this.verifyCurrentIdentity(route, null, true);
-    if (!identity) throw new Error("Relay v2 terminal callback lost its route fence");
-    if (frame.kind === "response") {
-      const requestId = optionalString(frame, "requestId");
-      const pending = requestId === null ? undefined : route.pendingRequests.get(requestId);
-      if (!pending || pending.owner !== "terminal") {
-        throw new Error("Relay v2 terminal callback is not owned by a terminal request");
+    const delivery = this.scheduleRouteTask(route, "callbackTail", async () => {
+      if (this.exactAuthorityRoute(authorityRoute) !== route
+        || route.phase !== "ready"
+        || !this.isAdmitted(route)) {
+        throw new Error("Relay v2 terminal callback targets a stale route binding");
       }
-      this.assertCorrelatedResponse(route, pending, frame, identity);
-    } else if (frame.kind === "event") {
-      if (!TERMINAL_OUTBOUND_EVENT_TYPES.has(String(frame.type))) {
-        throw new Error("Relay v2 terminal callback returned another authority's event");
+      const identity = await this.verifyCurrentIdentity(route, null, true);
+      if (!identity) throw new Error("Relay v2 terminal callback lost its route fence");
+      this.assertPublicFrameSchema(frame);
+      let pending: PendingRequest | undefined;
+      if (frame.kind === "response") {
+        const requestId = optionalString(frame, "requestId");
+        pending = requestId === null ? undefined : route.pendingRequests.get(requestId);
+        if (!pending || pending.owner !== "terminal") {
+          throw new Error("Relay v2 terminal callback is not owned by a terminal request");
+        }
+        this.assertCorrelatedResponse(route, pending, frame, identity);
+      } else if (frame.kind === "event") {
+        if (!TERMINAL_OUTBOUND_EVENT_TYPES.has(String(frame.type))) {
+          throw new Error("Relay v2 terminal callback returned another authority's event");
+        }
+        this.assertTerminalEventLineage(route, frame);
+      } else {
+        throw new Error("Relay v2 terminal callback returned an invalid frame kind");
       }
-      this.assertRouteFrameIdentity(route, frame, identity);
-    } else {
-      throw new Error("Relay v2 terminal callback returned an invalid frame kind");
-    }
-    if (!this.enqueueOutbound(route, frame)) {
+      if (!this.enqueueOutbound(route, frame)) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        throw new Error("Relay v2 terminal callback exceeded bounded route capacity");
+      }
+      if (pending) {
+        this.applyTerminalResponseLineage(route, pending, frame);
+        this.consumePending(route, pending);
+      } else {
+        this.applyTerminalEventLineage(route, frame);
+      }
+      const afterCallback = await this.verifyCurrentIdentity(route, null, true);
+      if (!afterCallback) throw new Error("Relay v2 terminal callback lost its post-send fence");
+    });
+    if (!delivery) {
       this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
       throw new Error("Relay v2 terminal callback exceeded bounded route capacity");
     }
-    const afterCallback = await this.verifyCurrentIdentity(route, null, true);
-    if (!afterCallback) throw new Error("Relay v2 terminal callback lost its post-send fence");
+    await delivery;
   }
 
   private applyReadiness(snapshot: RelayV2HostReadinessSnapshot): boolean {
@@ -891,8 +1036,21 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     this.readinessObserved = true;
     this.activeCapabilities = null;
     for (const route of [...this.routesByCarrierKey.values()]) {
+      this.fenceConnectorGeneration(route.binding);
       this.closeImmediately(route, { code: 4406, reason: "capability_withdrawn" });
     }
+  }
+
+  private fenceConnectorGeneration(binding: RelayV2HostRouteBinding): void {
+    if (this.allConnectorGenerationsFenced) return;
+    const key = this.connectorGenerationKey(binding);
+    if (this.withdrawnConnectorGenerations.has(key)) return;
+    if (this.withdrawnConnectorGenerations.size >= this.limits.maxConnectorFences) {
+      this.withdrawnConnectorGenerations.clear();
+      this.allConnectorGenerationsFenced = true;
+      return;
+    }
+    this.withdrawnConnectorGenerations.add(key);
   }
 
   private async dispatch(
@@ -1055,10 +1213,23 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     if (!afterWindow || afterWindow.hostEpoch !== identity.hostEpoch) return;
     if (!this.isAdmitted(route)) return;
 
+    let welcomeDelivery: Promise<void> | null = null;
     const sink: RelayV2StateEventSink<RelayV2JsonObject> = Object.freeze({
-      enqueue: (outbound: RelayV2JsonObject) => this.enqueueResourceEvent(route, pending, outbound),
+      enqueue: (outbound: RelayV2JsonObject) => {
+        if (!route.welcomeAccepted
+          && outbound.type === "host.welcome"
+          && welcomeDelivery !== null) return false;
+        const delivery = this.enqueueResourceEvent(route, pending, outbound);
+        if (!delivery) return false;
+        if (!route.welcomeAccepted && outbound.type === "host.welcome") {
+          welcomeDelivery = delivery;
+        } else {
+          void delivery.catch((error) => this.handleResourceCallbackFailure(route, error));
+        }
+        return true;
+      },
       close: (error: RelayV2MaterializedStateError) => {
-        if (!this.isCurrent(route)) return;
+        if (!this.isAdmitted(route)) return;
         const close = error.code === "CAPABILITY_UNAVAILABLE"
           ? { code: 4406, reason: "capability_withdrawn" } as const
           : error.code === "BUSY"
@@ -1091,9 +1262,13 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         return welcome;
       },
     );
+    if (welcomeDelivery === null) {
+      this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
+      return;
+    }
+    await welcomeDelivery;
     const afterWelcome = await this.verifyCurrentIdentity(route, pending, true);
-    if (!afterWelcome) return;
-    if (!route.welcomeAccepted) {
+    if (afterWelcome && !route.welcomeAccepted) {
       this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
     }
   }
@@ -1102,43 +1277,46 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     route: RouteState,
     hello: PendingRequest,
     frame: RelayV2JsonObject,
-  ): boolean {
-    if (!this.isAdmitted(route)) return false;
-    if (!route.welcomeAccepted) {
-      const payload = frame.payload as RelayV2JsonObject | undefined;
-      if (route.phase !== "hello_pending"
-        || frame.type !== "host.welcome"
-        || frame.kind !== "response"
-        || frame.requestId !== hello.requestId
-        || frame.hostId !== this.options.hostId
-        || frame.hostEpoch !== this.options.hostEpoch
-        || frame.hostInstanceId !== this.options.hostInstanceId
-        || !payload
-        || !Array.isArray(payload.capabilities)
-        || payload.capabilities.length !== RELAY_V2_REQUIRED_CAPABILITIES.length
-        || RELAY_V2_REQUIRED_CAPABILITIES.some((capability) => (
-          !(payload.capabilities as string[]).includes(capability)
-        ))) {
-        this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
-        return false;
+  ): Promise<void> | null {
+    if (!this.isAdmitted(route)) return null;
+    return this.scheduleRouteTask(route, "callbackTail", async () => {
+      const identity = await this.verifyCurrentIdentity(route, null, true);
+      if (!identity || !this.isAdmitted(route)) return;
+      this.assertPublicFrameSchema(frame);
+      if (!route.welcomeAccepted) {
+        const payload = frame.payload as RelayV2JsonObject | undefined;
+        if (route.phase !== "hello_pending"
+          || frame.type !== "host.welcome"
+          || frame.kind !== "response"
+          || frame.requestId !== hello.requestId
+          || frame.hostId !== route.auth.hostId
+          || frame.hostEpoch !== identity.hostEpoch
+          || frame.hostInstanceId !== identity.hostInstanceId
+          || !payload
+          || !Array.isArray(payload.capabilities)
+          || payload.capabilities.length !== RELAY_V2_REQUIRED_CAPABILITIES.length
+          || RELAY_V2_REQUIRED_CAPABILITIES.some((capability) => (
+            !(payload.capabilities as string[]).includes(capability)
+          ))) {
+          throw new Error("Relay v2 H2 welcome crossed its route lineage");
+        }
+      } else if (frame.type === "host.welcome"
+        || (frame.type !== "scopes.changed" && frame.type !== "sessions.changed")) {
+        throw new Error("Relay v2 H2 callback returned an unsupported frame");
+      } else {
+        this.assertRouteFrameIdentity(route, frame, identity);
       }
-      route.welcomeAccepted = true;
-      route.phase = "ready";
-    } else if (frame.type === "host.welcome"
-      || (frame.type !== "scopes.changed" && frame.type !== "sessions.changed")
-      || frame.hostId !== route.auth.hostId
-      || frame.hostEpoch !== this.options.hostEpoch) {
-      this.closeImmediately(route, { code: 4400, reason: "protocol_error" });
-      return false;
-    }
-    if (!this.isAdmitted(route) || !this.enqueueOutbound(route, frame)) {
-      if (this.isCurrent(route)) {
+      if (!this.enqueueOutbound(route, frame)) {
         this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        throw new Error("Relay v2 H2 callback exceeded bounded route capacity");
       }
-      return false;
-    }
-    void this.verifyCurrentIdentity(route, null, true);
-    return true;
+      if (!route.welcomeAccepted) {
+        route.welcomeAccepted = true;
+        route.phase = "ready";
+        this.consumePending(route, hello);
+      }
+      await this.verifyCurrentIdentity(route, null, true);
+    });
   }
 
   private async dispatchTerminal(route: RouteState, frame: RelayV2JsonObject): Promise<void> {
@@ -1226,10 +1404,13 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     identity: RelayV2HostRuntimeIdentity,
   ): void {
     if (!this.isAdmitted(route)) return;
+    this.assertPublicFrameSchema(response);
     this.assertCorrelatedResponse(route, pending, response, identity);
     if (!this.enqueueOutbound(route, response)) {
       this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      return;
     }
+    this.consumePending(route, pending);
   }
 
   private assertCorrelatedResponse(
@@ -1245,15 +1426,19 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     }
     this.assertRouteFrameIdentity(route, response, identity);
     for (const [field, expected] of [
+      ["hostId", pending.hostId],
       ["commandId", pending.commandId],
       ["scopeId", pending.scopeId],
       ["sessionId", pending.sessionId],
       ["streamId", pending.streamId],
     ] as const) {
-      if (expected !== null && response[field] !== expected) {
+      const present = Object.hasOwn(response, field);
+      if ((expected === null && present)
+        || (expected !== null && (!present || response[field] !== expected))) {
         throw new Error(`Relay v2 authority response ${field} does not match its request owner`);
       }
     }
+    this.assertTerminalCorrelatedMetadata(route, pending, response);
   }
 
   private assertRouteFrameIdentity(
@@ -1269,31 +1454,167 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     }
   }
 
-  private handleAuthorityFailure(
+  private assertTerminalCorrelatedMetadata(
+    route: RouteState,
+    pending: PendingRequest,
+    response: RelayV2JsonObject,
+  ): void {
+    if (pending.owner !== "terminal" || response.type === "error") return;
+    const payload = objectField(response, "payload");
+    if (response.type === "terminal.opened" && payload.openId !== pending.openId) {
+      throw new Error("Relay v2 terminal.opened does not match its openId owner");
+    }
+    if (response.type === "terminal.opened"
+      && pending.streamId !== null
+      && !route.terminalLineages.has(pending.streamId)
+      && route.terminalLineages.size >= this.limits.maxTerminalLineagesPerRoute) {
+      throw new Error("Relay v2 terminal lineage capacity is exhausted");
+    }
+    if (response.type === "terminal.reset_required") {
+      if (payload.origin !== pending.resetOrigin) {
+        throw new Error("Relay v2 terminal.reset_required has the wrong request origin");
+      }
+      if (pending.resetOrigin === "replay"
+        && (payload.generation !== pending.generation
+          || payload.requestedOffset !== pending.fromOffset)) {
+        throw new Error("Relay v2 terminal replay reset crossed its generation or offset owner");
+      }
+    }
+    if (response.type === "terminal.replay_started"
+      && (payload.generation !== pending.generation
+        || payload.fromOffset !== pending.fromOffset)) {
+      throw new Error("Relay v2 terminal replay response crossed its generation or offset owner");
+    }
+    if (response.type === "terminal.replay_started"
+      && route.terminalLineages.get(pending.streamId!) !== pending.generation) {
+      throw new Error("Relay v2 terminal replay response targets an inactive stream lineage");
+    }
+    if (response.type === "terminal.closed"
+      && (payload.closeId !== pending.closeId
+        || payload.generation !== pending.generation)) {
+      throw new Error("Relay v2 terminal close response crossed its close owner");
+    }
+  }
+
+  private assertTerminalEventLineage(route: RouteState, frame: RelayV2JsonObject): void {
+    const streamId = stringField(frame, "streamId");
+    const generation = stringField(objectField(frame, "payload"), "generation");
+    if (route.terminalLineages.get(streamId) !== generation) {
+      throw new Error("Relay v2 terminal event crossed its stream lineage");
+    }
+  }
+
+  private applyTerminalResponseLineage(
+    route: RouteState,
+    pending: PendingRequest,
+    response: RelayV2JsonObject,
+  ): void {
+    if (response.type === "terminal.opened") {
+      const generation = stringField(objectField(response, "payload"), "generation");
+      route.terminalLineages.set(pending.streamId!, generation);
+    } else if (response.type === "terminal.closed") {
+      route.terminalLineages.delete(pending.streamId!);
+    }
+  }
+
+  private applyTerminalEventLineage(route: RouteState, frame: RelayV2JsonObject): void {
+    if (frame.type === "terminal.reset_required" || frame.type === "terminal.closed") {
+      route.terminalLineages.delete(stringField(frame, "streamId"));
+    }
+  }
+
+  private consumePending(route: RouteState, pending: PendingRequest): void {
+    if (route.pendingRequests.get(pending.requestId) !== pending) {
+      throw new Error("Relay v2 response attempted to consume an inactive request owner");
+    }
+    route.pendingRequests.delete(pending.requestId);
+  }
+
+  private assertPublicFrameSchema(frame: RelayV2JsonObject): void {
+    encodeRelayV2WebSocketFrame("public", frame);
+  }
+
+  private handleResourceCallbackFailure(route: RouteState, _error: unknown): void {
+    if (!this.isAdmitted(route)) return;
+    this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
+  }
+
+  private scheduleRouteTask(
+    route: RouteState,
+    lane: "operationTail" | "callbackTail",
+    task: () => Promise<void>,
+    allowClosing = false,
+  ): Promise<void> | null {
+    const eligible = allowClosing
+      ? this.isCurrent(route) && route.phase !== "closed"
+      : this.isAdmitted(route);
+    if (!eligible || route.pendingOperations >= this.limits.maxPendingOperationsPerRoute) {
+      return null;
+    }
+    route.pendingOperations += 1;
+    const execution = route[lane].then(task);
+    const tracked = execution.finally(() => {
+      route.pendingOperations = Math.max(0, route.pendingOperations - 1);
+      this.maybeRetireRoute(route);
+    });
+    route[lane] = tracked.catch(() => undefined);
+    return tracked;
+  }
+
+  private async handleAuthorityFailure(
     route: RouteState,
     pending: PendingRequest | null,
     error: unknown,
-  ): void {
-    if (!this.isCurrent(route)) return;
+  ): Promise<void> {
+    if (!this.isAdmitted(route)) return;
+    if (pending && route.pendingRequests.get(pending.requestId) !== pending) {
+      this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
+      return;
+    }
     // H1/H3 may already have crossed a mutation boundary. A thrown error can
     // never be converted into not_accepted, retryable, or an invented result.
-    if (!pending || pending.owner === "command" || pending.owner === "terminal") {
-      this.closeImmediately(route, { code: 1013, reason: "authority_failure" });
+    if (!pending || pending.owner === "command") {
+      this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       return;
     }
     const structured = structuredAuthorityError(error);
     if (!structured) {
-      this.closeImmediately(route, { code: 1013, reason: "authority_failure" });
+      this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       return;
     }
     if (structured.code === "INTERNAL") {
-      this.closeImmediately(route, { code: 1013, reason: "authority_failure" });
+      this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
+      return;
+    }
+    const identity = await this.verifyCurrentIdentity(route, pending, true);
+    if (!identity || !this.isAdmitted(route)) return;
+    if (pending.owner === "terminal") {
+      const details = structured.code === "HOST_EPOCH_MISMATCH"
+        ? {
+            expectedHostEpoch: this.options.hostEpoch,
+            actualHostEpoch: identity.hostEpoch,
+          }
+        : null;
+      if (!this.enqueueError(
+        route,
+        pending,
+        structured.code,
+        AUTHORITY_ERROR_MESSAGES[structured.code],
+        structured.code === "BUSY",
+        false,
+        details,
+        identity.hostEpoch,
+      )) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+        return;
+      }
+      this.consumePending(route, pending);
       return;
     }
     const exactDetails = exactErrorDetails(structured.code, structured.details);
     if ((structured.code === "HOST_EPOCH_MISMATCH"
       || structured.code === "EVENT_CURSOR_AHEAD") && exactDetails === null) {
-      this.closeImmediately(route, { code: 1013, reason: "authority_failure" });
+      this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       return;
     }
     const actualHostEpoch = structured.code === "HOST_EPOCH_MISMATCH"
@@ -1306,7 +1627,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         : structured.code === "CAPABILITY_UNAVAILABLE"
           ? { code: 4406, reason: "route_unavailable" } as const
           : pending.owner === "hello"
-            ? { code: 1013, reason: "authority_failure" } as const
+            ? { code: 1011, reason: "authority_failure" } as const
             : null;
     if (close) {
       this.drainLocalError(
@@ -1328,7 +1649,11 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       false,
       exactDetails,
       actualHostEpoch,
-    )) this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+    )) {
+      this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+    } else {
+      this.consumePending(route, pending);
+    }
   }
 
   private enqueueError(
@@ -1405,7 +1730,11 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       true,
       details,
       actualHostEpoch,
-    )) this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+    )) {
+      this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+    } else if (route.pendingRequests.get(pending.requestId) === pending) {
+      this.consumePending(route, pending);
+    }
   }
 
   private async verifyCurrentIdentity(
@@ -1418,8 +1747,8 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     try {
       identity = await this.options.identity.current();
     } catch {
-      if (this.isCurrent(route)) {
-        this.closeImmediately(route, { code: 1013, reason: "authority_failure" });
+      if (this.isAdmitted(route)) {
+        this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
       }
       return null;
     }
@@ -1451,7 +1780,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     try {
       bytes = encodeRelayV2WebSocketFrame("public", frame);
     } catch {
-      return false;
+      throw new Error("Relay v2 authority returned a frame outside the frozen schema");
     }
     if (bytes.byteLength > Math.min(MAX_PUBLIC_FRAME_BYTES, route.binding.maxFrameBytes)
       || route.outbound.length >= this.limits.maxOutboundFramesPerRoute
@@ -1518,12 +1847,19 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     route.outbound.shift();
     route.outboundBytes -= item.bytes.byteLength;
     route.sending = false;
+    if (route.phase === "closed") {
+      this.maybeRetireRoute(route);
+      return;
+    }
     if (!accepted) {
-      this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      if (this.isAdmitted(route)) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      }
       return;
     }
     route.validatingReceipt = true;
-    void this.verifyCurrentIdentity(route, null, true, true).then((identity) => {
+    const validation = this.scheduleRouteTask(route, "callbackTail", async () => {
+      const identity = await this.verifyCurrentIdentity(route, null, true, true);
       route.validatingReceipt = false;
       if (!this.isCurrent(route)) return;
       if (!identity) {
@@ -1531,6 +1867,23 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
         return;
       }
       this.flushOutbound(route);
+    }, true);
+    if (!validation) {
+      route.validatingReceipt = false;
+      if (route.closeAfterDrain) {
+        this.finishClose(route, route.closeAfterDrain);
+      } else if (this.isAdmitted(route)) {
+        this.closeImmediately(route, { code: 1013, reason: "slow_consumer" });
+      }
+      return;
+    }
+    void validation.catch(() => {
+      route.validatingReceipt = false;
+      if (route.closeAfterDrain) {
+        this.finishClose(route, route.closeAfterDrain);
+      } else if (this.isAdmitted(route)) {
+        this.closeImmediately(route, { code: 1011, reason: "authority_failure" });
+      }
     });
   }
 
@@ -1544,7 +1897,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     if (route.phase === "closed" || route.closeSent) return;
     route.phase = "closing";
     route.closeSent = true;
-    this.clearOutbound(route);
+    this.fenceAdmission(route, false);
     this.closeBinding(route.binding, close);
   }
 
@@ -1556,30 +1909,78 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
     route.accepting = false;
     route.closeAfterDrain = null;
     if (remove) route.phase = "closed";
-    try { this.options.resources.unsubscribe(route.subscriberId); } catch {}
+    if (!route.resourceUnsubscribed) {
+      route.resourceUnsubscribed = true;
+      try { this.options.resources.unsubscribe(route.subscriberId); } catch {}
+    }
+    route.pendingRequests.clear();
+    route.terminalLineages.clear();
     if (!route.terminalUnbound) {
       route.terminalUnbound = true;
+      route.terminalUnbindPending = true;
       try {
         void this.options.terminals.unbind(terminalAuth(route), route.authorityRoute)
-          .catch(() => undefined);
-      } catch {}
+          .catch(() => undefined)
+          .finally(() => {
+            route.terminalUnbindPending = false;
+            this.maybeRetireRoute(route);
+          });
+      } catch {
+        route.terminalUnbindPending = false;
+      }
     }
-    this.clearOutbound(route);
+    this.fenceOutbound(route);
     if (remove) {
       this.routesByCarrierKey.delete(this.carrierKey(route.binding));
-      this.routesByRuntimeId.delete(route.authorityRoute.runtimeBindingId);
+      this.routesByRuntimeToken.delete(route.authorityRoute.runtimeBindingToken);
     }
+    this.maybeRetireRoute(route);
   }
 
-  private clearOutbound(route: RouteState): void {
-    for (const item of route.outbound) {
+  private fenceOutbound(route: RouteState): void {
+    const inTransport = route.outbound[0];
+    const retainTransport = !!inTransport
+      && !inTransport.receiptSettled
+      && route.sending
+      && (!inTransport.admissionKnown || inTransport.admitted);
+    for (const item of retainTransport ? route.outbound.slice(1) : route.outbound) {
       if (item.receiptTimer) clearTimeout(item.receiptTimer);
       item.receiptSettled = true;
     }
-    route.outbound = [];
-    route.outboundBytes = 0;
-    route.sending = false;
+    route.outbound = retainTransport ? [inTransport] : [];
+    route.outboundBytes = retainTransport ? inTransport.bytes.byteLength : 0;
+    if (!retainTransport) route.sending = false;
     route.validatingReceipt = false;
+  }
+
+  private maybeRetireRoute(route: RouteState): void {
+    if (route.phase !== "closed"
+      || route.pendingOperations !== 0
+      || route.terminalUnbindPending
+      || route.outbound.length !== 0
+      || route.validatingReceipt) return;
+    this.routeRegistry.delete(route);
+  }
+
+  private exactAuthorityRoute(
+    authorityRoute: RelayV2HostRuntimeAuthorityRoute,
+  ): RouteState | undefined {
+    if (!authorityRoute || typeof authorityRoute !== "object") return undefined;
+    const route = this.routesByRuntimeToken.get(authorityRoute.runtimeBindingToken);
+    if (!route
+      || authorityRoute.runtimeBindingToken !== route.authorityRoute.runtimeBindingToken
+      || authorityRoute.connectorId !== route.authorityRoute.connectorId
+      || authorityRoute.routeId !== route.authorityRoute.routeId
+      || authorityRoute.routeFence !== route.authorityRoute.routeFence) return undefined;
+    return route;
+  }
+
+  private bindingRejection(
+    code: RelayV2HostRouteBindingRejection["code"],
+    message: string,
+    retryable: boolean,
+  ): RelayV2HostRouteBindingRejection {
+    return Object.freeze({ accepted: false, code, message, retryable });
   }
 
   private currentRoute(binding: RelayV2HostRouteBinding): RouteState | undefined {
@@ -1608,7 +2009,7 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
   private isCurrent(route: RouteState): boolean {
     return route.phase !== "closed"
       && this.routesByCarrierKey.get(this.carrierKey(route.binding)) === route
-      && this.routesByRuntimeId.get(route.authorityRoute.runtimeBindingId) === route;
+      && this.routesByRuntimeToken.get(route.authorityRoute.runtimeBindingToken) === route;
   }
 
   private isAdmitted(route: RouteState): boolean {
@@ -1627,5 +2028,12 @@ export class RelayV2HostRuntime implements RelayV2HostCarrierRouteSink {
       binding.routeId,
       binding.routeFence,
     ]);
+  }
+
+  private connectorGenerationKey(binding: Pick<
+    RelayV2HostRouteBinding,
+    "connectorGeneration" | "connectorId"
+  >): string {
+    return JSON.stringify([binding.connectorGeneration, binding.connectorId]);
   }
 }

@@ -133,8 +133,33 @@ export type RelayV2HostLocalUnbindReason =
   | "connector_replaced"
   | "host_superseded";
 
+export interface RelayV2HostRouteBindingRejection {
+  readonly accepted: false;
+  readonly code:
+    | "BUSY"
+    | "PERMISSION_DENIED"
+    | "HOST_DIALECT_UNAVAILABLE"
+    | "CAPABILITY_UNAVAILABLE"
+    | "INTERNAL";
+  readonly message: string;
+  readonly retryable: boolean;
+}
+
+const HOST_ROUTE_BINDING_REJECTION_CODES = new Set<
+  RelayV2HostRouteBindingRejection["code"]
+>([
+  "BUSY",
+  "PERMISSION_DENIED",
+  "HOST_DIALECT_UNAVAILABLE",
+  "CAPABILITY_UNAVAILABLE",
+  "INTERNAL",
+]);
+
 export interface RelayV2HostCarrierRouteSink {
-  onRouteBound(binding: RelayV2HostRouteBinding): void;
+  /** A typed rejection prevents route.opened from being emitted. */
+  onRouteBound(
+    binding: RelayV2HostRouteBinding,
+  ): void | RelayV2HostRouteBindingRejection;
   onClientFrame(binding: RelayV2HostRouteBinding, payload: Uint8Array): void;
   onRouteUnbound(
     binding: RelayV2HostRouteBinding,
@@ -925,7 +950,24 @@ export class RelayV2HostCarrierActor {
     };
     connector.routes.set(routeId, route);
     try {
-      this.options.routeSink.onRouteBound(binding);
+      const rejection = this.options.routeSink.onRouteBound(binding);
+      if (rejection !== undefined) {
+        if (rejection.accepted !== false
+          || !HOST_ROUTE_BINDING_REJECTION_CODES.has(rejection.code)
+          || typeof rejection.message !== "string"
+          || typeof rejection.retryable !== "boolean") {
+          throw new Error("Route sink returned an invalid binding result");
+        }
+        connector.routes.delete(routeId);
+        this.rejectRoute(
+          connector,
+          frame,
+          rejection.code,
+          rejection.message,
+          rejection.retryable,
+        );
+        return;
+      }
     } catch {
       connector.routes.delete(routeId);
       this.rejectRoute(connector, frame, "INTERNAL", "Route sink rejected binding", true);
@@ -957,7 +999,12 @@ export class RelayV2HostCarrierActor {
   private rejectRoute(
     connector: ConnectorState,
     request: RelayV2JsonObject,
-    code: "BUSY" | "PERMISSION_DENIED" | "HOST_DIALECT_UNAVAILABLE" | "INTERNAL",
+    code:
+      | "BUSY"
+      | "PERMISSION_DENIED"
+      | "HOST_DIALECT_UNAVAILABLE"
+      | "CAPABILITY_UNAVAILABLE"
+      | "INTERNAL",
     message: string,
     retryable: boolean,
   ): void {
