@@ -599,6 +599,23 @@ test("runtime runExclusive requires exactly one settled callback without identit
   );
   await duplicate.close();
 
+  const duplicateAfterTerminalFence = openRaw(async (callback) => {
+    await callback(inertTransaction);
+    try { await callback(inertTransaction); } catch {}
+  });
+  await assert.rejects(
+    duplicateAfterTerminalFence.runExclusive(async (transaction) => {
+      const current = await transaction.read();
+      return transaction.compareAndPublish(current.revision, new Uint8Array([1]));
+    }),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  await assert.rejects(
+    duplicateAfterTerminalFence.runExclusive(() => undefined),
+    (error) => error.code === "STORE_CLOSED",
+  );
+  await duplicateAfterTerminalFence.close();
+
   for (const settlement of ["resolve", "reject", "throw"]) {
     const release = deferred();
     const entered = deferred();
