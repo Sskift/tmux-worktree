@@ -1,6 +1,6 @@
 # Relay v2 Broker Credential State Store v1
 
-状态：**Frozen native storage contract；已有 TypeScript closed decoder/wrapper 与未接线 optional loader，没有 native implementation、authority injection、ready capability 或 production wiring。**
+状态：**Frozen native storage contract；已有独立未接线的纯 Rust binary/publication core、TypeScript closed decoder/wrapper 与未接线 optional loader，没有 N-API binary、Darwin/Linux platform adapter、authority injection、ready capability 或 production wiring。**
 
 本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不重新引入已被拒绝且未纳入当前交付源码的 unsafe BAU path/JSON 设计，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
 
