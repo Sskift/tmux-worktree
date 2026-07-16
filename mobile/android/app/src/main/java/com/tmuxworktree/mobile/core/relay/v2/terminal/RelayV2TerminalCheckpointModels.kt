@@ -4,7 +4,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
 
 /** Frozen and local bounds for the unwired Android terminal checkpoint core. */
 internal object RelayV2TerminalCheckpointLimits {
-    const val SCHEMA_VERSION = 4
+    const val SCHEMA_VERSION = 5
     const val IDENTITY_VERSION = 3
     const val MAX_ID_UTF8_BYTES = 128
     const val MAX_CREDENTIAL_REFERENCE_UTF8_BYTES = 256
@@ -14,6 +14,7 @@ internal object RelayV2TerminalCheckpointLimits {
     const val MAX_PENDING_INPUT_BYTES = 524_288
     const val MAX_INPUT_RECORDS = 512
     const val MAX_RESIZE_RECORDS = 256
+    const val MAX_NETWORK_REQUEST_IDS = 256
     const val MAX_CHECKPOINT_BYTES = 2_097_152
 }
 
@@ -236,6 +237,18 @@ internal data class RelayV2TerminalEffectFence(
         get() = identity.target()
 }
 
+/** Revocable authority checked immediately before a queued input or resize is written. */
+internal data class RelayV2TerminalControlDispatchLease(
+    val fence: RelayV2TerminalEffectFence,
+)
+
+internal enum class RelayV2TerminalControlDispatchAuthorization {
+    AUTHORIZED,
+    REVOKED,
+    STALE_AUTHORITY,
+    PAYLOAD_MISMATCH,
+}
+
 internal data class RelayV2TerminalOpenFence(
     override val target: RelayV2TerminalOpenTarget,
     override val deliveryToken: RelayV2TerminalDeliveryToken,
@@ -377,6 +390,7 @@ internal data class RelayV2TerminalPendingReplay(
 
 internal data class RelayV2TerminalPendingOpen(
     val requestId: String,
+    val issuedRequestIds: List<String>,
     val deliveryToken: RelayV2TerminalDeliveryToken,
     val openAttempt: RelayV2TerminalOpenAttempt,
     val mode: RelayV2TerminalOpenMode,
@@ -391,6 +405,7 @@ internal data class RelayV2TerminalPendingOpen(
 internal data class RelayV2TerminalPendingClose(
     val closeAttempt: RelayV2TerminalCloseAttempt,
     val requestId: String,
+    val issuedRequestIds: List<String>,
 )
 
 internal data class RelayV2TerminalOpenResultLineage(
@@ -428,6 +443,7 @@ internal data class RelayV2TerminalCheckpoint(
     val openMode: RelayV2TerminalOpenMode,
     val openRequestResume: RelayV2TerminalOpenResume?,
     val openResult: RelayV2TerminalOpenResultLineage,
+    val openRequestIds: List<String>,
     val deliveryToken: RelayV2TerminalDeliveryToken,
     val parserContinuityId: String,
     val phase: RelayV2TerminalPhase,
@@ -437,6 +453,7 @@ internal data class RelayV2TerminalCheckpoint(
     val networkReceivedThrough: String,
     val nextParserOperationSeq: String,
     val nextReplayRequestSeq: String,
+    val replayRequestIds: List<String> = emptyList(),
     val parserResetCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val parserInFlightCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val lastAppliedParserCallbackToken: RelayV2TerminalParserCallbackToken? = null,
@@ -450,6 +467,7 @@ internal data class RelayV2TerminalCheckpoint(
     val nextResizeSeq: String = "1",
     val ackedThroughResizeSeq: String = "0",
     val pendingResizes: List<RelayV2PendingResize> = emptyList(),
+    val activeControlDispatchLease: RelayV2TerminalControlDispatchLease? = null,
     val ambiguousInputs: List<RelayV2AmbiguousInput> = emptyList(),
     val pendingClose: RelayV2TerminalPendingClose? = null,
     val closed: RelayV2TerminalClosedState? = null,
@@ -470,10 +488,7 @@ internal enum class RelayV2TerminalParserOperationStatus {
 }
 
 internal data class RelayV2TerminalParserRestoreProof(
-    val parserContinuityId: String,
-    val operationId: String,
-    val startOffset: String,
-    val endOffset: String,
+    val callbackToken: RelayV2TerminalParserCallbackToken,
     val parserAppliedNextOffset: String,
     val status: RelayV2TerminalParserOperationStatus,
 )
@@ -718,19 +733,21 @@ internal sealed interface RelayV2TerminalEffect {
     ) : RelayV2TerminalEffect
 
     data class SendInput(
-        override val fence: RelayV2TerminalEffectFence,
+        val dispatchLease: RelayV2TerminalControlDispatchLease,
         val generation: String,
         val inputSeq: String,
         val bytes: RelayV2TerminalBytes,
+        override val fence: RelayV2TerminalEffectFence = dispatchLease.fence,
         override val priority: RelayV2TerminalEffectPriority = RelayV2TerminalEffectPriority.CONTROL,
     ) : RelayV2TerminalEffect
 
     data class SendResize(
-        override val fence: RelayV2TerminalEffectFence,
+        val dispatchLease: RelayV2TerminalControlDispatchLease,
         val generation: String,
         val resizeSeq: String,
         val cols: Int,
         val rows: Int,
+        override val fence: RelayV2TerminalEffectFence = dispatchLease.fence,
         override val priority: RelayV2TerminalEffectPriority = RelayV2TerminalEffectPriority.CONTROL,
     ) : RelayV2TerminalEffect
 
@@ -794,6 +811,8 @@ internal enum class RelayV2TerminalIgnoredReason {
     STALE_OPEN_RESPONSE,
     STALE_RESET_RESPONSE,
     STALE_CLOSE_RESPONSE,
+    STALE_REPLAY_RESPONSE,
+    NETWORK_REQUEST_ID_REUSED,
 }
 
 internal enum class RelayV2TerminalControlRejectionReason {
