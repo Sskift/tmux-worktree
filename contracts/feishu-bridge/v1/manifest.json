@@ -16,6 +16,7 @@
     "bridge.shutdown",
     "groups.list",
     "binding.create",
+    "binding.update",
     "binding.pause",
     "binding.resume",
     "binding.repair",
@@ -34,10 +35,11 @@
     "currentCapabilities": [
       "binding.lifecycle-notices.v1",
       "binding.create.session-summary.v1",
-      "binding.target-reconciliation.v1"
+      "binding.target-reconciliation.v1",
+      "binding.reply-mode.v1"
     ],
-    "rollingUpgrade": "a Dashboard may reuse a daemon only when the selected larkProfile and required capabilities match; an empty legacy daemon may be shut down and replaced; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
-    "legacyCreate": "fail with FEISHU_BRIDGE_UPGRADE_REQUIRED; never send sessionSummary to an old closed binding.create parser"
+    "rollingUpgrade": "a Dashboard may reuse a daemon only when the selected larkProfile and required capabilities match; an empty daemon missing required capabilities may be shut down and replaced; an occupied daemon missing only binding.reply-mode.v1 remains available for status, canonical removal, and topic-mode creation that omits replyMode, while direct creation and binding.update fail with FEISHU_BRIDGE_UPGRADE_REQUIRED; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
+    "legacyCreate": "topic-mode creation may use an occupied daemon missing only binding.reply-mode.v1 by omitting replyMode; direct creation fails with FEISHU_BRIDGE_UPGRADE_REQUIRED; never send fields unsupported by an old closed binding.create parser"
   },
   "eventSource": {
     "command": "lark-cli event consume im.message.receive_v1 --as bot --quiet",
@@ -56,9 +58,12 @@
     "dashboardConversationPolicy": "empty allowedSenderIds means any human user in the bound group may trigger only by mentioning the exact bot; bot/self, non-user, and unmentioned messages are ignored"
   },
   "reply": {
-    "command": "lark-cli im +messages-reply --msg-type interactive --reply-in-thread --as bot",
+    "topicCommand": "lark-cli im +messages-reply --msg-type interactive --reply-in-thread --as bot",
+    "directCommand": "lark-cli im +messages-reply --msg-type interactive --as bot",
     "format": "Card JSON 2.0 final card",
-    "threading": "reply in the source message topic; never fall back to a top-level chat reply",
+    "bindingMode": "topic or direct; persisted per binding and changed only by the closed binding.update operation while no turn is active",
+    "defaultMode": "topic, including legacy version 1 binding records that omit options.replyMode",
+    "threading": "topic replies appear in the source message topic; direct replies preserve the source-message reply relationship but appear in the main chat; delivery never falls back from one configured mode to the other",
     "streaming": false,
     "cardActions": false,
     "agentMentions": "neutralized before markdown rendering",
@@ -94,6 +99,7 @@
     "directoryMode": "0700",
     "atomicReplace": true,
     "failClosed": true,
+    "bindingReplyModeMigration": "a version 1 binding missing options.replyMode is read as topic and the next write persists it explicitly; unknown fields and unknown reply modes remain malformed state; after replyMode is written, an older strict daemon fails closed on downgrade instead of silently changing the configured mode",
     "handoffDrainPersistedBeforeCommit": true,
     "utf8TailRemainderPersisted": true,
     "files": [

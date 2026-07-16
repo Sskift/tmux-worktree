@@ -5,6 +5,7 @@ import type {
   CreateTerminalInput,
   CreateWorktreeInput,
   EnsureTerminalInput,
+  FeishuBindingInput,
   PlainTerminal,
   TmuxStatusTheme,
 } from "../src/platform/domainTypes.ts";
@@ -99,6 +100,17 @@ const relayArgs = {
 };
 const layout = { schemaVersion: 2, sidebar: { width: 280 } };
 const layoutRevision = "twlr1_sXxMImuzfZTgkc_67MCwlyAPnRg6pgLHfSRIUVhE-nY";
+const feishuBindingArgs: FeishuBindingInput = {
+  chatId: "oc_release",
+  chatName: "Release room",
+  sessionName: "tmux-release",
+  sessionSummary: "Release verification",
+  createdBy: "local-dashboard",
+  allowedSenderIds: [],
+  mentionOnly: true,
+  replyMode: "direct",
+  attachmentId: "pty-release",
+};
 
 const commandCases: CommandCase[] = [
   {
@@ -610,6 +622,18 @@ const commandCases: CommandCase[] = [
     command: "feishu_integration_remove_profile",
     args: { profile: "bot-profile" },
     call: (backend) => backend.feishu.removeProfile("bot-profile"),
+  },
+  {
+    label: "feishu.create",
+    command: "feishu_binding_create",
+    args: { args: feishuBindingArgs },
+    call: (backend) => backend.feishu.create(feishuBindingArgs),
+  },
+  {
+    label: "feishu.updateReplyMode",
+    command: "feishu_binding_update_reply_mode",
+    args: { bindingId: "binding-1", replyMode: "direct" },
+    call: (backend) => backend.feishu.updateReplyMode("binding-1", "direct"),
   },
   {
     label: "persistence.homeDirectory",

@@ -3,6 +3,7 @@ import {
   type FeishuBinding,
   type FeishuIntegrationStatus,
   type FeishuLarkProfile,
+  type FeishuReplyMode,
   useDashboardBackend,
 } from "../../platform";
 import { MenuSelect } from "../../MenuSelect";
@@ -27,6 +28,7 @@ export function FeishuIntegrationSettings() {
   const [bindings, setBindings] = useState<FeishuBinding[] | null>(null);
   const [bindingsError, setBindingsError] = useState<string | null>(null);
   const [unlinkingBindingId, setUnlinkingBindingId] = useState<string | null>(null);
+  const [updatingBindingId, setUpdatingBindingId] = useState<string | null>(null);
   const [addingProfile, setAddingProfile] = useState(false);
   const [newAppId, setNewAppId] = useState("");
   const [newAppSecret, setNewAppSecret] = useState("");
@@ -224,6 +226,26 @@ export function FeishuIntegrationSettings() {
     }
   };
 
+  const updateReplyMode = async (binding: FeishuBinding, replyMode: FeishuReplyMode) => {
+    if (busy || (binding.options.replyMode ?? "topic") === replyMode) return;
+    setBusy(true);
+    setUpdatingBindingId(binding.id);
+    setError(null);
+    setNotice(null);
+    setWarning(null);
+    try {
+      const updated = await dashboardBackend.feishu.updateReplyMode(binding.id, replyMode);
+      setBindings((current) => current?.map((candidate) =>
+        candidate.id === binding.id ? updated : candidate) ?? current);
+      setNotice(`Changed ${binding.chatName} to ${replyMode === "topic" ? "topic replies" : "direct replies"}.`);
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : String(updateError));
+    } finally {
+      setUpdatingBindingId(null);
+      setBusy(false);
+    }
+  };
+
   const bridgeLabel = status === null
     ? "Loading"
     : status.bridgeRunning
@@ -394,7 +416,9 @@ export function FeishuIntegrationSettings() {
             bindings={bindings}
             disabled={busy}
             unlinkingBindingId={unlinkingBindingId}
+            updatingBindingId={updatingBindingId}
             onUnlink={(binding) => void unlinkBinding(binding)}
+            onReplyModeChange={(binding, replyMode) => void updateReplyMode(binding, replyMode)}
           />
         )}
       </section>

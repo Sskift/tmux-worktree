@@ -28,17 +28,37 @@ test("group bindings expose an unlink action and its pending state", () => {
     bindings: [binding],
     disabled: false,
     unlinkingBindingId: null,
+    updatingBindingId: null,
     onUnlink() {},
+    onReplyModeChange() {},
   }));
   assert.match(ready, /aria-label="Unlink Release room from tmux-release"/);
   assert.match(ready, />Unlink<\/button>/);
+  assert.match(ready, /aria-label="Reply placement for Release room"/);
+  assert.match(ready, /automation-menu-select__label">Topic reply<\/span>/);
 
-  const pending = renderToStaticMarkup(createElement(FeishuBindingList, {
+  const saving = renderToStaticMarkup(createElement(FeishuBindingList, {
+    bindings: [{
+      ...binding,
+      options: { ...binding.options, replyMode: "direct" },
+    }],
+    disabled: false,
+    unlinkingBindingId: null,
+    updatingBindingId: binding.id,
+    onUnlink() {},
+    onReplyModeChange() {},
+  }));
+  assert.match(saving, /aria-label="Reply placement for Release room"[^>]*disabled=""/);
+  assert.match(saving, /automation-menu-select__label">Direct reply<\/span>/);
+  assert.match(saving, />Saving…<\/span>/);
+
+  const unlinking = renderToStaticMarkup(createElement(FeishuBindingList, {
     bindings: [binding],
     disabled: true,
     unlinkingBindingId: binding.id,
+    updatingBindingId: null,
     onUnlink() {},
+    onReplyModeChange() {},
   }));
-  assert.match(pending, /disabled=""/);
-  assert.match(pending, />Unlinking…<\/button>/);
+  assert.match(unlinking, />Unlinking…<\/button>/);
 });

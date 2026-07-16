@@ -3,6 +3,7 @@ import {
   type FeishuBinding,
   type FeishuBridgeSnapshot,
   type FeishuChat,
+  type FeishuReplyMode,
   type HostConfig,
   type PlainTerminal,
   type Session,
@@ -83,6 +84,7 @@ export function TerminalDeck({
   const [groupsError, setGroupsError] = useState<string | null>(null);
   const [chatId, setChatId] = useState("");
   const [chatName, setChatName] = useState("");
+  const [replyMode, setReplyMode] = useState<FeishuReplyMode>("topic");
   const [attachmentIds, setAttachmentIds] = useState<Record<string, string>>({});
 
   const setAttachmentId = (key: string, id: string | null) => {
@@ -147,6 +149,7 @@ export function TerminalDeck({
     setBindingTarget({ sessionName, ptyId, sessionSummary: sessionSummary.slice(0, 256) });
     setChatId("");
     setChatName("");
+    setReplyMode("topic");
     setFeishuError(null);
     setGroups([]);
     setGroupsError(null);
@@ -449,6 +452,26 @@ export function TerminalDeck({
                     : current)}
                 />
               </label>
+              <label>
+                Reply placement
+                <MenuSelect
+                  ariaLabel="Reply placement"
+                  value={replyMode}
+                  options={[
+                    {
+                      value: "topic",
+                      label: "Topic reply",
+                      detail: "Keep each answer inside the question's topic",
+                    },
+                    {
+                      value: "direct",
+                      label: "Direct reply",
+                      detail: "Post each answer in the group's main timeline",
+                    },
+                  ]}
+                  onChange={(value) => setReplyMode(value === "direct" ? "direct" : "topic")}
+                />
+              </label>
               {feishuError && <p className="terminal-feishu-dialog__error">{feishuError}</p>}
               <div className="terminal-feishu-dialog__actions">
                 <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>Cancel</button>
@@ -469,6 +492,7 @@ export function TerminalDeck({
                       createdBy: groupOwner || "local-dashboard",
                       allowedSenderIds: [],
                       mentionOnly: true,
+                      replyMode,
                     });
                     setBindingTarget(null);
                   })}

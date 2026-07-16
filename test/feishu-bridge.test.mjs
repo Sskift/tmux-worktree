@@ -465,9 +465,9 @@ class FakeLark {
     };
   }
 
-  async replyCard(messageId, card, idempotencyKey) {
+  async replyCard(messageId, card, idempotencyKey, replyMode) {
     const text = card.body.elements[0].content;
-    this.replies.push({ messageId, text, card, idempotencyKey });
+    this.replies.push({ messageId, text, card, idempotencyKey, replyMode });
     if (this.failReply) throw new Error("reply acknowledgement lost");
     return { messageId: `reply-${this.replies.length}`, raw: {} };
   }
@@ -879,10 +879,11 @@ test("Lark CLI bridge collects every bot group page and keeps the group owner", 
   );
 });
 
-test("Lark CLI bridge sends Card JSON to a group or source thread and manages bot reactions", async () => {
+test("Lark CLI bridge selects topic or direct Card replies and manages bot reactions", async () => {
   const calls = [];
   const responses = [
     { data: { message_id: "om-card-reply" } },
+    { data: { message_id: "om-direct-reply" } },
     { data: { message_id: "om-group-card" } },
     { data: { reaction_id: "reaction-typing" } },
     { data: { reaction_id: "reaction-typing" } },
@@ -896,7 +897,8 @@ test("Lark CLI bridge sends Card JSON to a group or source thread and manages bo
   });
   const card = buildFeishuReplyCard("answer <at id=\"ou-surprise\"></at>");
 
-  assert.equal((await adapter.replyCard("om-root", card, "tw-card-one")).messageId, "om-card-reply");
+  assert.equal((await adapter.replyCard("om-root", card, "tw-card-one", "topic")).messageId, "om-card-reply");
+  assert.equal((await adapter.replyCard("om-root", card, "tw-card-direct", "direct")).messageId, "om-direct-reply");
   assert.equal((await adapter.sendCard("oc-one", card, "tw-card-two")).messageId, "om-group-card");
   assert.equal((await adapter.addReaction("om-root", "Typing")).reactionId, "reaction-typing");
   await adapter.deleteReaction("om-root", "reaction-typing");
@@ -915,6 +917,15 @@ test("Lark CLI bridge sends Card JSON to a group or source thread and manages bo
   assert.equal(card.config.streaming_mode, false);
   assert.equal(card.body.elements[0].content.includes("<at"), false, "card output must not create a real mention");
   assert.deepEqual(calls[1], [
+    "--profile", "bot", "im", "+messages-reply",
+    "--message-id", "om-root",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--idempotency-key", "tw-card-direct",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.deepEqual(calls[2], [
     "--profile", "bot", "im", "+messages-send",
     "--chat-id", "oc-one",
     "--msg-type", "interactive",
@@ -923,17 +934,22 @@ test("Lark CLI bridge sends Card JSON to a group or source thread and manages bo
     "--as", "bot",
     "--json",
   ]);
-  assert.deepEqual(calls[2], [
+  assert.deepEqual(calls[3], [
     "--profile", "bot", "im", "reactions", "create",
     "--params", JSON.stringify({ message_id: "om-root" }),
     "--data", JSON.stringify({ reaction_type: { emoji_type: "Typing" } }),
     "--as", "bot", "--json",
   ]);
-  assert.deepEqual(calls[3], [
+  assert.deepEqual(calls[4], [
     "--profile", "bot", "im", "reactions", "delete",
     "--params", JSON.stringify({ message_id: "om-root", reaction_id: "reaction-typing" }),
     "--as", "bot", "--json",
   ]);
+  await assert.rejects(
+    adapter.replyCard("om-root", card, "tw-card-invalid", "future"),
+    /invalid Feishu reply mode/,
+  );
+  assert.equal(calls.length, 5, "an unknown mode must fail before invoking lark-cli");
   assert.equal(parseFeishuReactionId({ data: { reactionId: "reaction-camel" } }), "reaction-camel");
 });
 
@@ -1061,6 +1077,7 @@ test("one authorized mentioned message owns the target, writes once, and posts o
     });
     assert.equal(binding.status, "active");
     assert.equal(binding.options.replyAsCard, true);
+    assert.equal(binding.options.replyMode, "topic");
     assert.equal(h.control.target.owner.kind, "feishu");
 
     await h.bridge.handleEvent(event());
@@ -1078,6 +1095,7 @@ test("one authorized mentioned message owns the target, writes once, and posts o
     await h.bridge.pollTurns();
     assert.equal(h.lark.replies.length, 1);
     assert.equal(h.lark.replies[0].text, "safe group answer");
+    assert.equal(h.lark.replies[0].replyMode, "topic");
     assert.equal(h.lark.replies[0].card.schema, "2.0");
     assert.deepEqual(h.lark.reactionDeletes, [{ messageId: "om-one", reactionId: "reaction-1" }]);
     assert.deepEqual(h.lark.reactionCreates.map(({ emojiType }) => emojiType), ["Typing"]);
@@ -1090,6 +1108,71 @@ test("one authorized mentioned message owns the target, writes once, and posts o
       assert.equal(statSync(path).mode & 0o777, 0o600);
     }
   } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("binding reply mode is durable, applies to source replies, and cannot change during an active turn", async () => {
+  const h = harness();
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      replyMode: "direct",
+    });
+    assert.equal(binding.options.replyMode, "direct");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "direct");
+
+    await h.bridge.handleEvent(event());
+    await assert.rejects(
+      h.bridge.updateBinding(binding.id, "topic"),
+      /active Feishu turn/,
+    );
+    await h.bridge.handleEvent(event({ event_id: "evt-busy", message_id: "om-busy" }));
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].replyMode, "direct", "busy status follows the binding mode");
+
+    h.control.output += marked(h, "direct group answer");
+    await h.bridge.pollTurns();
+    assert.equal(h.lark.replies.length, 2);
+    assert.equal(h.lark.replies[1].text, "direct group answer");
+    assert.equal(h.lark.replies[1].replyMode, "direct", "final answer follows the binding mode");
+
+    const updated = await h.bridge.updateBinding(binding.id, "topic");
+    assert.equal(updated.options.replyMode, "topic");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "topic");
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("binding reply mode remains unchanged in memory when persistence fails", async () => {
+  const h = harness();
+  const write = h.store.write.bind(h.store);
+  try {
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      createdBy: "ou-owner",
+      replyMode: "direct",
+    });
+    h.store.write = () => {
+      throw new Error("injected reply mode persistence failure");
+    };
+
+    await assert.rejects(
+      h.bridge.updateBinding(binding.id, "topic"),
+      /injected reply mode persistence failure/,
+    );
+    assert.equal(h.bridge.snapshot().bindings[0].options.replyMode, "direct");
+    assert.equal(h.store.read().bindings[0].options.replyMode, "direct");
+  } finally {
+    h.store.write = write;
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
@@ -2012,6 +2095,7 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
         "binding.lifecycle-notices.v1",
         "binding.create.session-summary.v1",
         "binding.target-reconciliation.v1",
+        "binding.reply-mode.v1",
       ],
     });
     await assert.rejects(
@@ -2029,10 +2113,25 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
       sessionName: "managed-one",
       sessionSummary: "UDS lifecycle summary",
       createdBy: "ou-owner",
+      replyMode: "direct",
     });
     await flushBestEffortEffects();
     assert.equal(binding.status, "active");
+    assert.equal(binding.options.replyMode, "direct");
     assert.match(cardText(h.lark.groupCards.at(-1).card), /UDS lifecycle summary/);
+    const updated = await client.request("binding.update", {
+      bindingId: binding.id,
+      replyMode: "topic",
+    });
+    assert.equal(updated.options.replyMode, "topic");
+    await assert.rejects(
+      client.request("binding.update", { bindingId: binding.id, replyMode: "future" }),
+      /invalid binding.update params/,
+    );
+    await assert.rejects(
+      client.request("binding.update", { bindingId: binding.id, replyMode: "topic", unknown: true }),
+      /invalid binding.update params/,
+    );
     await assert.rejects(
       client.request("binding.pause", { bindingId: binding.id, unknown: true }),
       /invalid binding.pause params/,
@@ -2085,6 +2184,52 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
   } finally {
     await boundServer.stop();
     rmSync(bound.root, { recursive: true, force: true });
+  }
+});
+
+test("legacy binding reply mode defaults to topic while unknown modes remain fail closed", () => {
+  const h = harness();
+  try {
+    const legacy = {
+      version: 1,
+      bindings: [{
+        version: 1,
+        id: "bind-legacy-topic",
+        chatId: "oc-legacy",
+        chatName: "legacy group",
+        controlTargetId: "ct-legacy",
+        sessionName: "managed-legacy",
+        status: "paused",
+        options: {
+          mentionOnly: true,
+          replyAsCard: true,
+          includeQuotedContext: false,
+        },
+        allowedSenderIds: [],
+        createdAt: "2026-07-16T00:00:00.000Z",
+        createdBy: "ou-owner",
+      }],
+    };
+    assert.throws(() => h.store.write({
+      bindings: legacy.bindings,
+      eventIds: [],
+      turns: [],
+      replies: [],
+    }), /malformed Feishu bridge state/, "new writes require an explicit reply mode");
+    writeFileSync(h.paths.bindings, `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+
+    const normalized = h.store.read();
+    assert.equal(normalized.bindings[0].options.replyMode, "topic");
+    h.store.write(normalized);
+    const persisted = JSON.parse(readFileSync(h.paths.bindings, "utf8"));
+    assert.equal(persisted.bindings[0].options.replyMode, "topic");
+
+    persisted.bindings[0].options.replyMode = "future-mode";
+    writeFileSync(h.paths.bindings, `${JSON.stringify(persisted)}\n`, { mode: 0o600 });
+    assert.throws(() => h.store.read(), /malformed Feishu bridge state/);
+    assert.match(readFileSync(h.paths.bindings, "utf8"), /future-mode/);
+  } finally {
+    rmSync(h.root, { recursive: true, force: true });
   }
 });
 

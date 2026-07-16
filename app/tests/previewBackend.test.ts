@@ -55,3 +55,25 @@ test("preview PTY follows the same facade and emits deterministic output", async
   assert.equal(previewDashboardTransport.listenerCount(`pty:${id}`), 0);
   assert.equal(previewDashboardTransport.listenerCount(`pty-exit:${id}`), 0);
 });
+
+test("preview Feishu bindings preserve and update reply placement", async () => {
+  const created = await previewDashboardBackend.feishu.create({
+    chatId: "oc_preview",
+    chatName: "TW Preview Group",
+    sessionName: "dashboard-redesign",
+    sessionSummary: "Dashboard redesign",
+    attachmentId: "preview-pty",
+    createdBy: "local-dashboard",
+    allowedSenderIds: [],
+    mentionOnly: true,
+    replyMode: "direct",
+  });
+  assert.equal(created.options.replyMode, "direct");
+
+  const updated = await previewDashboardBackend.feishu.updateReplyMode(created.id, "topic");
+  assert.equal(updated.options.replyMode, "topic");
+  assert.equal(
+    (await previewDashboardBackend.feishu.status()).bindings[0]?.options.replyMode,
+    "topic",
+  );
+});

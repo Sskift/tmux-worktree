@@ -21,6 +21,7 @@ export const FEISHU_TURN_HISTORY_LIMIT = 256;
 export const FEISHU_REPLY_HISTORY_LIMIT = 256;
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
+export type FeishuReplyMode = "topic" | "direct";
 
 export interface FeishuHandoffRecord {
   handoffId: string;
@@ -51,6 +52,7 @@ export interface FeishuBinding {
     mentionOnly: boolean;
     replyAsCard: boolean;
     includeQuotedContext: boolean;
+    replyMode: FeishuReplyMode;
   };
   allowedSenderIds: string[];
   createdAt: string;
@@ -109,7 +111,14 @@ export interface FeishuOutboundReply {
   error?: string;
 }
 
+type StoredFeishuBinding = Omit<FeishuBinding, "options"> & {
+  options: Omit<FeishuBinding["options"], "replyMode"> & {
+    replyMode?: FeishuReplyMode;
+  };
+};
+
 interface BindingsFile { version: 1; bindings: FeishuBinding[] }
+interface StoredBindingsFile { version: 1; bindings: StoredFeishuBinding[] }
 interface DedupFile { version: 1; eventIds: string[] }
 interface TurnsFile { version: 1; turns: FeishuTurn[] }
 interface RepliesFile { version: 1; replies: FeishuOutboundReply[] }
@@ -185,7 +194,7 @@ function isIso(value: unknown): value is string {
   return typeof value === "string" && Number.isFinite(Date.parse(value));
 }
 
-function isBinding(value: unknown): value is FeishuBinding {
+function isBinding(value: unknown): value is StoredFeishuBinding {
   if (!isRecord(value) || !exactKeys(value, [
     "version", "id", "chatId", "chatName", "controlTargetId",
     "sessionName", "status", "options", "allowedSenderIds", "createdAt", "createdBy",
@@ -199,14 +208,21 @@ function isBinding(value: unknown): value is FeishuBinding {
     && value.status !== "paused" && value.status !== "stale") return false;
   if (!isRecord(value.options) || !exactKeys(value.options, [
     "mentionOnly", "replyAsCard", "includeQuotedContext",
-  ]) || typeof value.options.mentionOnly !== "boolean"
+  ], ["replyMode"]) || typeof value.options.mentionOnly !== "boolean"
     || typeof value.options.replyAsCard !== "boolean"
-    || typeof value.options.includeQuotedContext !== "boolean") return false;
+    || typeof value.options.includeQuotedContext !== "boolean"
+    || (value.options.replyMode !== undefined
+      && value.options.replyMode !== "topic"
+      && value.options.replyMode !== "direct")) return false;
   return Array.isArray(value.allowedSenderIds)
     && value.allowedSenderIds.every((item) => isSafeText(item))
     && (value.lastActivityAt === undefined || isIso(value.lastActivityAt))
     && (value.staleReason === undefined || isSafeText(value.staleReason))
     && (value.handoff === undefined || isHandoffRecord(value.handoff));
+}
+
+function isCanonicalBinding(value: unknown): value is FeishuBinding {
+  return isBinding(value) && value.options.replyMode !== undefined;
 }
 
 function isHandoffRecord(value: unknown): value is FeishuHandoffRecord {
@@ -393,9 +409,14 @@ function atomicWrite(path: string, value: unknown): void {
   }
 }
 
-function validateBindings(value: unknown): value is BindingsFile {
+function validateStoredBindings(value: unknown): value is StoredBindingsFile {
   return isRecord(value) && exactKeys(value, ["version", "bindings"])
     && value.version === 1 && Array.isArray(value.bindings) && value.bindings.every(isBinding);
+}
+function validateBindings(value: unknown): value is BindingsFile {
+  return isRecord(value) && exactKeys(value, ["version", "bindings"])
+    && value.version === 1 && Array.isArray(value.bindings)
+    && value.bindings.every(isCanonicalBinding);
 }
 function validateDedup(value: unknown): value is DedupFile {
   return isRecord(value) && exactKeys(value, ["version", "eventIds"])
@@ -430,7 +451,17 @@ export class FeishuBridgeStore {
     const lock = acquireFeishuBridgeStorageLock(this.paths.lock);
     try {
       return {
-        bindings: loadFile(this.paths.bindings, { version: 1, bindings: [] } as BindingsFile, validateBindings).bindings,
+        bindings: loadFile(
+          this.paths.bindings,
+          { version: 1, bindings: [] } as StoredBindingsFile,
+          validateStoredBindings,
+        ).bindings.map((binding): FeishuBinding => ({
+          ...binding,
+          options: {
+            ...binding.options,
+            replyMode: binding.options.replyMode ?? "topic",
+          },
+        })),
         eventIds: loadFile(this.paths.dedup, { version: 1, eventIds: [] } as DedupFile, validateDedup).eventIds,
         turns: loadFile(this.paths.turns, { version: 1, turns: [] } as TurnsFile, validateTurns).turns,
         replies: loadFile(this.paths.replies, { version: 1, replies: [] } as RepliesFile, validateReplies).replies,

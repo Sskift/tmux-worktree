@@ -93,6 +93,7 @@ pub fn run() {
             feishu_bridge_status,
             feishu_groups_list,
             feishu_binding_create,
+            feishu_binding_update_reply_mode,
             feishu_binding_pause,
             feishu_binding_resume,
             feishu_binding_repair,

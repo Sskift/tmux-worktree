@@ -30,6 +30,7 @@ export const FEISHU_BRIDGE_CAPABILITIES = [
   "binding.lifecycle-notices.v1",
   "binding.create.session-summary.v1",
   "binding.target-reconciliation.v1",
+  "binding.reply-mode.v1",
 ] as const;
 
 type FeishuBridgeOperation =
@@ -38,6 +39,7 @@ type FeishuBridgeOperation =
   | "bridge.shutdown"
   | "groups.list"
   | "binding.create"
+  | "binding.update"
   | "binding.pause"
   | "binding.resume"
   | "binding.repair"
@@ -122,7 +124,7 @@ function parseRequest(value: unknown): BridgeRequest {
   }
   text(value.requestId, "requestId");
   const operations: FeishuBridgeOperation[] = [
-    "bridge.info", "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
+    "bridge.info", "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.update", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
     "binding.takeover", "binding.return",
   ];
   if (!operations.includes(value.operation as FeishuBridgeOperation)) throw new Error("unknown Feishu bridge operation");
@@ -156,7 +158,7 @@ async function dispatch(
       return lark.listGroups();
     case "binding.create": {
       if (!exactKeys(params, ["chatId", "chatName", "sessionName", "createdBy"], [
-        "sessionSummary", "allowedSenderIds", "mentionOnly", "dashboardLease",
+        "sessionSummary", "allowedSenderIds", "mentionOnly", "replyMode", "dashboardLease",
       ])) throw new Error("invalid binding.create params");
       if (params.allowedSenderIds !== undefined
         && (!Array.isArray(params.allowedSenderIds)
@@ -165,6 +167,11 @@ async function dispatch(
       }
       if (params.mentionOnly !== undefined && typeof params.mentionOnly !== "boolean") {
         throw new Error("invalid mentionOnly");
+      }
+      if (params.replyMode !== undefined
+        && params.replyMode !== "topic"
+        && params.replyMode !== "direct") {
+        throw new Error("invalid replyMode");
       }
       const dashboardLease = params.dashboardLease === undefined
         ? undefined
@@ -181,9 +188,19 @@ async function dispatch(
           allowedSenderIds: params.allowedSenderIds.map((item) => text(item, "allowedSenderId")),
         }),
         ...(params.mentionOnly === undefined ? {} : { mentionOnly: params.mentionOnly }),
+        ...(params.replyMode === undefined ? {} : { replyMode: params.replyMode }),
         ...(dashboardLease === undefined ? {} : { dashboardLease }),
       } satisfies CreateFeishuBindingInput);
     }
+    case "binding.update":
+      if (!exactKeys(params, ["bindingId", "replyMode"])
+        || (params.replyMode !== "topic" && params.replyMode !== "direct")) {
+        throw new Error("invalid binding.update params");
+      }
+      return bridge.updateBinding(
+        text(params.bindingId, "bindingId"),
+        params.replyMode,
+      );
     case "binding.pause":
       if (!exactKeys(params, ["bindingId"], ["force"]) || (params.force !== undefined && typeof params.force !== "boolean")) {
         throw new Error("invalid binding.pause params");

@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
+import type { FeishuReplyMode } from "./feishuBridgeStorage.js";
 import type { FeishuReplyCard } from "./feishuReplyCard.js";
 
 const MAX_LARK_OUTPUT_BYTES = 1024 * 1024;
@@ -58,7 +59,12 @@ export interface FeishuLarkAdapter {
   subscribe(onEvent: (event: FeishuInboundEvent) => Promise<void>): FeishuEventSubscription;
   messageDetail(messageId: string): Promise<FeishuMessageDetail>;
   sendCard(chatId: string, card: FeishuReplyCard, idempotencyKey: string): Promise<FeishuReplyResult>;
-  replyCard(messageId: string, card: FeishuReplyCard, idempotencyKey: string): Promise<FeishuReplyResult>;
+  replyCard(
+    messageId: string,
+    card: FeishuReplyCard,
+    idempotencyKey: string,
+    replyMode: FeishuReplyMode,
+  ): Promise<FeishuReplyResult>;
   addReaction(messageId: string, emojiType: FeishuReactionEmoji): Promise<FeishuReactionResult>;
   deleteReaction(messageId: string, reactionId: string): Promise<void>;
   listGroups(): Promise<FeishuChat[]>;
@@ -414,13 +420,17 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
     messageId: string,
     card: FeishuReplyCard,
     idempotencyKey: string,
+    replyMode: FeishuReplyMode,
   ): Promise<FeishuReplyResult> {
+    if (replyMode !== "topic" && replyMode !== "direct") {
+      throw new Error("invalid Feishu reply mode");
+    }
     const raw = await this.runner(this.commandArgs([
       "im", "+messages-reply",
       "--message-id", messageId,
       "--msg-type", "interactive",
       "--content", JSON.stringify(card),
-      "--reply-in-thread",
+      ...(replyMode === "topic" ? ["--reply-in-thread"] : []),
       "--idempotency-key", idempotencyKey,
       "--as", "bot",
       "--json",

@@ -14,6 +14,7 @@ import {
   type FeishuBinding,
   type FeishuHandoffRecord,
   type FeishuOutboundReply,
+  type FeishuReplyMode,
   type FeishuTurn,
 } from "./feishuBridgeStorage.js";
 import {
@@ -52,6 +53,7 @@ export interface CreateFeishuBindingInput {
   sessionSummary?: string;
   allowedSenderIds?: string[];
   mentionOnly?: boolean;
+  replyMode?: FeishuReplyMode;
   dashboardLease?: CanonicalTerminalLease;
 }
 
@@ -255,6 +257,7 @@ export class FeishuBridge {
           mentionOnly: input.mentionOnly !== false,
           replyAsCard: true,
           includeQuotedContext: false,
+          replyMode: input.replyMode ?? "topic",
         },
         allowedSenderIds,
         createdAt,
@@ -349,6 +352,27 @@ export class FeishuBridge {
         sessionKind: target.managedSession.kind,
         sessionSummary: input.sessionSummary?.trim(),
       });
+      return structuredClone(binding);
+    });
+  }
+
+  updateBinding(bindingId: string, replyMode: FeishuReplyMode): Promise<FeishuBinding> {
+    return this.serial(async () => {
+      if (replyMode !== "topic" && replyMode !== "direct") {
+        throw new Error("invalid Feishu reply mode");
+      }
+      const binding = this.requireBinding(bindingId);
+      if (this.activeTurn(binding.id)) {
+        throw new Error("binding has an active Feishu turn; wait for it to finish before changing reply mode");
+      }
+      const previousReplyMode = binding.options.replyMode;
+      binding.options.replyMode = replyMode;
+      try {
+        this.persist();
+      } catch (error) {
+        binding.options.replyMode = previousReplyMode;
+        throw error;
+      }
       return structuredClone(binding);
     });
   }
@@ -668,7 +692,12 @@ export class FeishuBridge {
       }
       if (this.activeTurn(binding.id)) {
         this.rememberEvent(event.event_id);
-        await this.safeInform(event.message_id, "当前终端正在处理上一条群消息，请等待回复后再试。", `busy-${event.event_id}`);
+        await this.safeInform(
+          binding,
+          event.message_id,
+          "当前终端正在处理上一条群消息，请等待回复后再试。",
+          `busy-${event.event_id}`,
+        );
         return;
       }
 
@@ -676,6 +705,7 @@ export class FeishuBridge {
       if (this.isFeishuDrainingView(binding, lease, target)) {
         this.rememberEvent(event.event_id);
         await this.safeInform(
+          binding,
           event.message_id,
           "当前终端正在安全交接给本地控制端，本条消息未注入终端。",
           `handoff-${event.event_id}`,
@@ -1028,6 +1058,7 @@ export class FeishuBridge {
         turn.messageId,
         buildFeishuReplyCard(text, finalStatus === "timed-out" ? "status" : "answer"),
         attempt.idempotencyKey,
+        binding.options.replyMode,
       );
       const latest = await this.control.ownershipStatus(turn.controlTargetId);
       this.assertTurnAuthority(turn, lease, latest);
@@ -1275,6 +1306,11 @@ export class FeishuBridge {
         || input.sessionSummary.includes("\0")
         || Buffer.byteLength(input.sessionSummary, "utf8") > 1024)) {
       throw new Error("invalid sessionSummary");
+    }
+    if (input.replyMode !== undefined
+      && input.replyMode !== "topic"
+      && input.replyMode !== "direct") {
+      throw new Error("invalid replyMode");
     }
   }
 
@@ -1551,12 +1587,18 @@ export class FeishuBridge {
     }
   }
 
-  private async safeInform(messageId: string, text: string, idempotencySeed: string): Promise<void> {
+  private async safeInform(
+    binding: FeishuBinding,
+    messageId: string,
+    text: string,
+    idempotencySeed: string,
+  ): Promise<void> {
     try {
       await this.lark.replyCard(
         messageId,
         buildFeishuReplyCard(text, "status"),
         `tw-${digest(idempotencySeed).slice(0, 40)}`,
+        binding.options.replyMode,
       );
     } catch {}
   }

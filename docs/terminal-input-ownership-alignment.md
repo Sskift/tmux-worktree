@@ -46,7 +46,7 @@ terminal-control plane 负责：
 
 ### 2.3 Feishu Bridge
 
-Feishu Bridge 拥有 Lark event 消费、群 binding、群成员精确 @Bot 触发策略、event dedup、单个 awaiting turn、`[[notify-group]]` 提取、话题内 Card JSON 2.0 回复和相关审计。Dashboard 的正常绑定把空 `allowedSenderIds` 解释为同群任意真实用户，不要求用户填写管理员 Open ID；显式非空列表仅保留给兼容 CLI 调用。Bot/self、非用户事件和未精确 @Bot 的消息仍被过滤。处理中的 `Typing` 及确定失败时的 `CrossMark` 是 best-effort reaction，不得改变 terminal lease、turn 或 outbound reply 的确定性。Bridge 必须通过 terminal-control plane 取得 lease 和发送输入，不能保存或裁决全局 lease，也不能调用 Relay transport。
+Feishu Bridge 拥有 Lark event 消费、群 binding、群成员精确 @Bot 触发策略、event dedup、单个 awaiting turn、`[[notify-group]]` 提取、Card JSON 2.0 回复位置和相关审计。每个 binding 持久化 `replyMode=topic|direct`：默认 `topic` 使用源消息话题，`direct` 仍回复源消息但不进入话题；两者不得互相 fallback，旧 binding 缺字段时归一化为 `topic`。该配置由 Bridge 的串行 mutation 修改，active turn 存在时拒绝修改，避免同一轮的出站位置在执行中变化。Dashboard 的正常绑定把空 `allowedSenderIds` 解释为同群任意真实用户，不要求用户填写管理员 Open ID；显式非空列表仅保留给兼容 CLI 调用。Bot/self、非用户事件和未精确 @Bot 的消息仍被过滤。处理中的 `Typing` 及确定失败时的 `CrossMark` 是 best-effort reaction，不得改变 terminal lease、turn 或 outbound reply 的确定性。Bridge 必须通过 terminal-control plane 取得 lease 和发送输入，不能保存或裁决全局 lease，也不能调用 Relay transport。
 
 Feishu Bridge 是共享的本地 daemon。Dashboard 可以在首次管理 binding 时按需启动它，但 Dashboard 退出不得停止 daemon、释放 Feishu lease 或把 active binding 隐式改成 paused；daemon 的显式停止、崩溃和重启分别按 shutdown/recovery 规则处理，不能伪装成用户 handoff。
 

@@ -23,11 +23,12 @@ const START_ATTEMPTS: usize = 80;
 const STOP_ATTEMPTS: usize = 200;
 const START_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_LARK_PROFILE_OUTPUT_BYTES: usize = 1024 * 1024;
-const REQUIRED_BRIDGE_CAPABILITIES: [&str; 3] = [
+const BASE_REQUIRED_BRIDGE_CAPABILITIES: [&str; 3] = [
     "binding.lifecycle-notices.v1",
     "binding.create.session-summary.v1",
     "binding.target-reconciliation.v1",
 ];
+const REPLY_MODE_BRIDGE_CAPABILITY: &str = "binding.reply-mode.v1";
 const UNKNOWN_BRIDGE_INFO_ERROR: &str = "BRIDGE_ERROR: unknown Feishu bridge operation";
 
 #[derive(Default)]
@@ -48,6 +49,8 @@ pub(crate) struct FeishuBindingInput {
     allowed_sender_ids: Vec<String>,
     #[serde(default = "default_true")]
     mention_only: bool,
+    #[serde(default = "default_reply_mode")]
+    reply_mode: String,
     attachment_id: Option<String>,
 }
 
@@ -92,6 +95,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_reply_mode() -> String {
+    "topic".to_string()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BridgeResponse {
@@ -124,15 +131,40 @@ enum BridgeProbeDisposition {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeishuReplyMode {
+    Topic,
+    Direct,
+}
+
+impl FeishuReplyMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "topic" => Ok(Self::Topic),
+            "direct" => Ok(Self::Direct),
+            _ => Err("replyMode must be either topic or direct".to_string()),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Topic => "topic",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LegacyBindingRemoveAction {
     UseLegacy,
     UpgradeCurrent,
     AlreadyRemoved,
 }
 
+#[derive(Debug)]
 struct BridgeProbe {
     snapshot: Value,
     disposition: BridgeProbeDisposition,
+    capabilities: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -579,15 +611,19 @@ fn classify_bridge_probe(
     snapshot: &Value,
     info_result: Result<Value, String>,
     expected_profile: &str,
-) -> Result<BridgeProbeDisposition, String> {
+) -> Result<BridgeProbe, String> {
     let snapshot_is_empty = bridge_snapshot_is_empty(snapshot)?;
     let info_value = match info_result {
         Ok(value) => value,
         Err(error) if error == UNKNOWN_BRIDGE_INFO_ERROR => {
-            return Ok(if snapshot_is_empty {
-                BridgeProbeDisposition::LegacyEmpty
-            } else {
-                BridgeProbeDisposition::LegacyOccupied
+            return Ok(BridgeProbe {
+                snapshot: snapshot.clone(),
+                disposition: if snapshot_is_empty {
+                    BridgeProbeDisposition::LegacyEmpty
+                } else {
+                    BridgeProbeDisposition::LegacyOccupied
+                },
+                capabilities: Vec::new(),
             });
         }
         Err(error) => return Err(format!("FEISHU_BRIDGE_PROBE_FAILED: {error}")),
@@ -612,7 +648,7 @@ fn classify_bridge_probe(
                 .to_string(),
         );
     }
-    let missing = REQUIRED_BRIDGE_CAPABILITIES
+    let missing = BASE_REQUIRED_BRIDGE_CAPABILITIES
         .iter()
         .filter(|required| {
             !info
@@ -628,7 +664,11 @@ fn classify_bridge_probe(
             missing.join(", ")
         ));
     }
-    Ok(BridgeProbeDisposition::Current)
+    Ok(BridgeProbe {
+        snapshot: snapshot.clone(),
+        disposition: BridgeProbeDisposition::Current,
+        capabilities: info.capabilities,
+    })
 }
 
 fn probe_bridge(expected_profile: &str) -> Result<BridgeProbe, String> {
@@ -637,11 +677,45 @@ fn probe_bridge(expected_profile: &str) -> Result<BridgeProbe, String> {
     // exact unknown-operation response is the sole legacy signal.
     let snapshot = request("bridge.snapshot", json!({}))?;
     let info_result = request("bridge.info", json!({}));
-    let disposition = classify_bridge_probe(&snapshot, info_result, expected_profile)?;
-    Ok(BridgeProbe {
-        snapshot,
-        disposition,
-    })
+    classify_bridge_probe(&snapshot, info_result, expected_profile)
+}
+
+fn bridge_has_reply_mode_capability(probe: &BridgeProbe) -> bool {
+    probe
+        .capabilities
+        .iter()
+        .any(|capability| capability == REPLY_MODE_BRIDGE_CAPABILITY)
+}
+
+fn reply_mode_create_param(
+    probe: &BridgeProbe,
+    reply_mode: FeishuReplyMode,
+) -> Result<Option<&'static str>, String> {
+    if bridge_has_reply_mode_capability(probe) {
+        return Ok(Some(reply_mode.as_str()));
+    }
+    if reply_mode == FeishuReplyMode::Topic {
+        return Ok(None);
+    }
+    Err(format!(
+        "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capability: {REPLY_MODE_BRIDGE_CAPABILITY}"
+    ))
+}
+
+fn require_reply_mode_capability(probe: &BridgeProbe) -> Result<(), String> {
+    if bridge_has_reply_mode_capability(probe) {
+        Ok(())
+    } else {
+        Err(format!(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capability: {REPLY_MODE_BRIDGE_CAPABILITY}"
+        ))
+    }
+}
+
+fn should_upgrade_empty_bridge(probe: &BridgeProbe) -> Result<bool, String> {
+    Ok(bridge_snapshot_is_empty(&probe.snapshot)?
+        && (probe.disposition == BridgeProbeDisposition::LegacyEmpty
+            || !bridge_has_reply_mode_capability(probe)))
 }
 
 fn start_server(
@@ -729,7 +803,7 @@ fn ensure_server(
         start_server(app, state, &profile, false)?;
     }
     let probe = probe_bridge(&profile)?;
-    if probe.disposition != BridgeProbeDisposition::LegacyEmpty {
+    if !should_upgrade_empty_bridge(&probe)? {
         return Ok(probe);
     }
 
@@ -738,7 +812,9 @@ fn ensure_server(
     wait_for_bridge_stop(state)?;
     start_server(app, state, &profile, true)?;
     let upgraded = probe_bridge(&profile)?;
-    if upgraded.disposition != BridgeProbeDisposition::Current {
+    if upgraded.disposition != BridgeProbeDisposition::Current
+        || !bridge_has_reply_mode_capability(&upgraded)
+    {
         return Err(
             "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled daemon did not provide the current bridge capabilities"
                 .to_string(),
@@ -1243,6 +1319,7 @@ pub(crate) fn feishu_binding_create(
     control_state: State<'_, Arc<TerminalControlState>>,
     args: FeishuBindingInput,
 ) -> Result<Value, String> {
+    let reply_mode = FeishuReplyMode::parse(&args.reply_mode)?;
     let probe = ensure_server(&app, state.inner().as_ref())?;
     if probe.disposition != BridgeProbeDisposition::Current {
         return Err(
@@ -1250,6 +1327,7 @@ pub(crate) fn feishu_binding_create(
                 .to_string(),
         );
     }
+    let reply_mode_param = reply_mode_create_param(&probe, reply_mode)?;
     let mut params = json!({
         "chatId": args.chat_id,
         "chatName": args.chat_name,
@@ -1263,6 +1341,12 @@ pub(crate) fn feishu_binding_create(
             .as_object_mut()
             .ok_or("binding.create params are invalid")?
             .insert("sessionSummary".to_string(), json!(session_summary));
+    }
+    if let Some(reply_mode) = reply_mode_param {
+        params
+            .as_object_mut()
+            .ok_or("binding.create params are invalid")?
+            .insert("replyMode".to_string(), json!(reply_mode));
     }
     let pty_id = args
         .attachment_id
@@ -1286,6 +1370,25 @@ pub(crate) fn feishu_binding_create(
         refresh_after_transfer_attempt(&app, control_state.inner().as_ref(), control);
         result
     })
+}
+
+#[tauri::command]
+pub(crate) fn feishu_binding_update_reply_mode(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<FeishuBridgeRuntimeState>>,
+    binding_id: String,
+    reply_mode: String,
+) -> Result<Value, String> {
+    let reply_mode = FeishuReplyMode::parse(&reply_mode)?;
+    let probe = ensure_server(&app, state.inner().as_ref())?;
+    require_reply_mode_capability(&probe)?;
+    request(
+        "binding.update",
+        json!({
+            "bindingId": binding_id,
+            "replyMode": reply_mode.as_str(),
+        }),
+    )
 }
 
 #[tauri::command]
@@ -1418,10 +1521,12 @@ pub(crate) fn feishu_binding_return(
 mod tests {
     use super::{
         add_lark_profile_with_program, classify_bridge_probe, configured_profile_from_file,
-        effective_profile, empty_lark_profile_config, generated_lark_profile_name,
-        lark_cli_error_message, legacy_binding_remove_action, save_configured_profile,
-        validate_bridge_shutdown, BridgeProbeDisposition, FeishuLarkProfile,
-        LegacyBindingRemoveAction, REQUIRED_BRIDGE_CAPABILITIES, UNKNOWN_BRIDGE_INFO_ERROR,
+        default_reply_mode, effective_profile, empty_lark_profile_config,
+        generated_lark_profile_name, lark_cli_error_message, legacy_binding_remove_action,
+        reply_mode_create_param, require_reply_mode_capability, save_configured_profile,
+        should_upgrade_empty_bridge, validate_bridge_shutdown, BridgeProbeDisposition,
+        FeishuBindingInput, FeishuLarkProfile, FeishuReplyMode, LegacyBindingRemoveAction,
+        BASE_REQUIRED_BRIDGE_CAPABILITIES, REPLY_MODE_BRIDGE_CAPABILITY, UNKNOWN_BRIDGE_INFO_ERROR,
     };
     use serde_json::json;
     use std::fs;
@@ -1606,15 +1711,15 @@ mod tests {
         let info = json!({
             "daemonVersion": "1.0.7",
             "larkProfile": "team-bot",
-            "capabilities": REQUIRED_BRIDGE_CAPABILITIES,
+            "capabilities": BASE_REQUIRED_BRIDGE_CAPABILITIES,
         });
-        assert_eq!(
-            classify_bridge_probe(&snapshot, Ok(info.clone()), "team-bot").expect("current daemon"),
-            BridgeProbeDisposition::Current
-        );
+        let current =
+            classify_bridge_probe(&snapshot, Ok(info.clone()), "team-bot").expect("current daemon");
+        assert_eq!(current.disposition, BridgeProbeDisposition::Current);
+        assert_eq!(current.capabilities, BASE_REQUIRED_BRIDGE_CAPABILITIES);
 
         let mut missing_capability = info.clone();
-        missing_capability["capabilities"] = json!([REQUIRED_BRIDGE_CAPABILITIES[0]]);
+        missing_capability["capabilities"] = json!([BASE_REQUIRED_BRIDGE_CAPABILITIES[0]]);
         assert!(
             classify_bridge_probe(&snapshot, Ok(missing_capability), "team-bot")
                 .expect_err("missing capability must fail closed")
@@ -1627,17 +1732,96 @@ mod tests {
     }
 
     #[test]
+    fn reply_mode_rollout_upgrades_only_empty_daemons_and_gates_new_mutations() {
+        let empty = json!({ "bindings": [], "activeTurns": [] });
+        let occupied = json!({
+            "bindings": [{ "id": "binding-1", "status": "active" }],
+            "activeTurns": [],
+        });
+        let base_info = json!({
+            "daemonVersion": "1.0.7",
+            "larkProfile": "team-bot",
+            "capabilities": BASE_REQUIRED_BRIDGE_CAPABILITIES,
+        });
+        let empty_base = classify_bridge_probe(&empty, Ok(base_info.clone()), "team-bot")
+            .expect("empty base-capability daemon");
+        let occupied_base = classify_bridge_probe(&occupied, Ok(base_info), "team-bot")
+            .expect("occupied base-capability daemon");
+
+        assert!(should_upgrade_empty_bridge(&empty_base).expect("valid empty snapshot"));
+        assert!(!should_upgrade_empty_bridge(&occupied_base).expect("valid occupied snapshot"));
+        assert_eq!(
+            reply_mode_create_param(&occupied_base, FeishuReplyMode::Topic)
+                .expect("legacy topic create stays compatible"),
+            None,
+        );
+        assert!(
+            reply_mode_create_param(&occupied_base, FeishuReplyMode::Direct)
+                .expect_err("direct mode requires the feature capability")
+                .contains(REPLY_MODE_BRIDGE_CAPABILITY)
+        );
+        assert!(require_reply_mode_capability(&occupied_base)
+            .expect_err("updates require the feature capability")
+            .contains(REPLY_MODE_BRIDGE_CAPABILITY));
+
+        let current_info = json!({
+            "daemonVersion": "1.0.8",
+            "larkProfile": "team-bot",
+            "capabilities": [
+                BASE_REQUIRED_BRIDGE_CAPABILITIES[0],
+                BASE_REQUIRED_BRIDGE_CAPABILITIES[1],
+                BASE_REQUIRED_BRIDGE_CAPABILITIES[2],
+                REPLY_MODE_BRIDGE_CAPABILITY,
+            ],
+        });
+        let current = classify_bridge_probe(&empty, Ok(current_info), "team-bot")
+            .expect("reply-mode-capable daemon");
+        assert!(!should_upgrade_empty_bridge(&current).expect("valid current snapshot"));
+        assert_eq!(
+            reply_mode_create_param(&current, FeishuReplyMode::Topic).expect("current topic mode"),
+            Some("topic"),
+        );
+        assert_eq!(
+            reply_mode_create_param(&current, FeishuReplyMode::Direct)
+                .expect("current direct mode"),
+            Some("direct"),
+        );
+        require_reply_mode_capability(&current).expect("current update capability");
+    }
+
+    #[test]
+    fn reply_mode_input_defaults_to_topic_and_rejects_unknown_values() {
+        let input: FeishuBindingInput = serde_json::from_value(json!({
+            "chatId": "oc-one",
+            "chatName": "Team",
+            "sessionName": "managed-one",
+            "createdBy": "ou-owner",
+        }))
+        .expect("binding input without replyMode");
+        assert_eq!(input.reply_mode, default_reply_mode());
+        assert_eq!(FeishuReplyMode::parse("topic"), Ok(FeishuReplyMode::Topic));
+        assert_eq!(
+            FeishuReplyMode::parse("direct"),
+            Ok(FeishuReplyMode::Direct)
+        );
+        assert!(FeishuReplyMode::parse("thread").is_err());
+        assert!(FeishuReplyMode::parse("").is_err());
+    }
+
+    #[test]
     fn bridge_probe_only_marks_an_exact_unknown_info_operation_as_legacy() {
         let empty = json!({ "bindings": [], "activeTurns": [] });
+        let empty_legacy = classify_bridge_probe(
+            &empty,
+            Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
+            "team-bot",
+        )
+        .expect("empty legacy daemon");
         assert_eq!(
-            classify_bridge_probe(
-                &empty,
-                Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
-                "team-bot"
-            )
-            .expect("empty legacy daemon"),
+            empty_legacy.disposition,
             BridgeProbeDisposition::LegacyEmpty
         );
+        assert!(empty_legacy.capabilities.is_empty());
 
         for occupied in [
             json!({ "bindings": [{ "id": "binding-1" }], "activeTurns": [] }),
@@ -1649,7 +1833,8 @@ mod tests {
                     Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
                     "team-bot"
                 )
-                .expect("occupied legacy daemon"),
+                .expect("occupied legacy daemon")
+                .disposition,
                 BridgeProbeDisposition::LegacyOccupied
             );
         }
@@ -1680,7 +1865,7 @@ mod tests {
             Ok(json!({
                 "daemonVersion": "1.0.7",
                 "larkProfile": "team-bot",
-                "capabilities": REQUIRED_BRIDGE_CAPABILITIES,
+                "capabilities": BASE_REQUIRED_BRIDGE_CAPABILITIES,
                 "unexpected": true,
             })),
             "team-bot"

@@ -1,6 +1,9 @@
 import type { AutomationRecord, AutomationRunRecord } from "../automationTypes";
 import { createFakeDashboardBackend } from "./fakeBackend";
 import type {
+  FeishuBinding,
+  FeishuBindingInput,
+  FeishuReplyMode,
   GitGraphCommit,
   GitGraphRef,
   GitGraphRefs,
@@ -409,9 +412,10 @@ transport.handlers.set("feishu_integration_remove_profile", value({
   bridgeRunning: false,
   profiles: [],
 }));
-transport.handlers.set("feishu_bridge_status", value({
+let previewFeishuBindings: FeishuBinding[] = [];
+transport.handlers.set("feishu_bridge_status", () => ({
   instanceId: "preview-feishu",
-  bindings: [],
+  bindings: previewFeishuBindings,
   activeTurns: [],
   uncertainReplies: [],
 }));
@@ -419,8 +423,8 @@ transport.handlers.set("feishu_groups_list", value([
   { chatId: "oc_preview", name: "TW Preview Group" },
 ]));
 transport.handlers.set("feishu_binding_create", (payload) => {
-  const { args } = payload as { args: { chatId: string; chatName: string; sessionName: string; createdBy: string } };
-  return {
+  const { args } = payload as { args: FeishuBindingInput };
+  const binding: FeishuBinding = {
     version: 1,
     id: "bind-preview",
     chatId: args.chatId,
@@ -429,11 +433,33 @@ transport.handlers.set("feishu_binding_create", (payload) => {
     backendBirthId: "birth-preview",
     sessionName: args.sessionName,
     status: "active",
-    options: { mentionOnly: true, replyAsCard: true, includeQuotedContext: false },
+    options: {
+      mentionOnly: args.mentionOnly !== false,
+      replyAsCard: true,
+      includeQuotedContext: false,
+      replyMode: args.replyMode,
+    },
     allowedSenderIds: [],
     createdAt: new Date().toISOString(),
     createdBy: args.createdBy,
   };
+  previewFeishuBindings = [binding];
+  return binding;
+});
+transport.handlers.set("feishu_binding_update_reply_mode", (payload) => {
+  const { bindingId, replyMode } = payload as {
+    bindingId: string;
+    replyMode: FeishuReplyMode;
+  };
+  const binding = previewFeishuBindings.find((candidate) => candidate.id === bindingId);
+  if (!binding) throw new Error("preview Feishu binding was not found");
+  const updated: FeishuBinding = {
+    ...binding,
+    options: { ...binding.options, replyMode },
+  };
+  previewFeishuBindings = previewFeishuBindings.map((candidate) =>
+    candidate.id === bindingId ? updated : candidate);
+  return updated;
 });
 transport.handlers.set("feishu_binding_pause", nothing);
 transport.handlers.set("feishu_binding_resume", nothing);

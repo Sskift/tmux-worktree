@@ -266,6 +266,8 @@ export type MobileRelayBrokerInput = {
 
 export type FeishuBindingStatus = "active" | "pausing" | "paused" | "stale";
 
+export type FeishuReplyMode = "topic" | "direct";
+
 export type FeishuBinding = {
   version: 1;
   id: string;
@@ -279,6 +281,7 @@ export type FeishuBinding = {
     mentionOnly: boolean;
     replyAsCard: boolean;
     includeQuotedContext: boolean;
+    replyMode?: FeishuReplyMode;
   };
   allowedSenderIds: string[];
   createdAt: string;
@@ -338,6 +341,7 @@ export type FeishuBindingInput = {
   createdBy: string;
   allowedSenderIds?: string[];
   mentionOnly?: boolean;
+  replyMode: FeishuReplyMode;
   attachmentId?: string;
 };
 

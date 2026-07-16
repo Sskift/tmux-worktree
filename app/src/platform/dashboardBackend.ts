@@ -36,6 +36,7 @@ import type {
   FeishuAddProfileInput,
   FeishuAddProfileResult,
   FeishuIntegrationStatus,
+  FeishuReplyMode,
   GitGraphQuery,
   GitGraphRefs,
   GitGraphResponse,
@@ -72,6 +73,7 @@ export interface FeishuProductAdapter {
   status(): Promise<FeishuBridgeSnapshot>;
   groups(): Promise<FeishuChat[]>;
   create(args: FeishuBindingInput): Promise<FeishuBinding>;
+  updateReplyMode(bindingId: string, replyMode: FeishuReplyMode): Promise<FeishuBinding>;
   pause(bindingId: string, force?: boolean): Promise<FeishuBinding>;
   resume(bindingId: string): Promise<FeishuBinding>;
   repair(bindingId: string): Promise<FeishuBinding>;
@@ -563,6 +565,11 @@ export function createDashboardBackend(transport: DashboardTransport): Dashboard
       status: () => transport.invoke<FeishuBridgeSnapshot>("feishu_bridge_status"),
       groups: () => transport.invoke<FeishuChat[]>("feishu_groups_list"),
       create: (args) => transport.invoke<FeishuBinding>("feishu_binding_create", { args }),
+      updateReplyMode: (bindingId, replyMode) =>
+        transport.invoke<FeishuBinding>("feishu_binding_update_reply_mode", {
+          bindingId,
+          replyMode,
+        }),
       pause: (bindingId, force) => transport.invoke<FeishuBinding>("feishu_binding_pause", {
         bindingId,
         force: force ?? false,
