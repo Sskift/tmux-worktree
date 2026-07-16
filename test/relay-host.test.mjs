@@ -43,7 +43,9 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
     "--relay", "wss://legacy.example.test",
     "--host-id", "legacy-host",
     "--secret", "legacy-shared-secret",
-  ], {});
+  ], {
+    TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE: "relay-v2-host-credential-ref:coexisting-v2",
+  });
   assert.equal(v1.profile, "v1");
   assert.equal(v1.secret, "legacy-shared-secret");
   assert.equal(Object.hasOwn(v1, "credentialReference"), false);
@@ -52,31 +54,76 @@ test("relay-host profiles keep v1 secrets and v2 credential references disjoint"
     "--profile", "v2",
     "--relay", "wss://relay.example.test",
     "--host-id", "v2-host",
-    "--credential-reference", "host-primary-v1",
-  ], {});
+    "--credential-reference", "relay-v2-host-credential-ref:primary",
+  ], {
+    TW_RELAY_SECRET: "coexisting-v1-secret",
+  });
   assert.equal(v2.profile, "v2");
-  assert.equal(v2.credentialReference, "host-primary-v1");
+  assert.equal(v2.credentialReference, "relay-v2-host-credential-ref:primary");
   assert.equal(Object.hasOwn(v2, "secret"), false);
   assert.equal(relayV2HostCarrierUrl(v2.relay), "wss://relay.example.test/host");
 
   assert.throws(() => parseRelayHostOptions([
     "--profile", "v2",
     "--relay", "wss://relay.example.test",
-    "--credential-reference", "host-primary-v1",
+    "--credential-reference", "relay-v2-host-credential-ref:primary",
     "--secret", "must-not-be-promoted",
   ], {}), /cannot read or promote Relay v1 shared secret|不能读取或提升/);
-  assert.throws(() => parseRelayHostOptions([
-    "--profile", "v2",
-    "--relay", "wss://relay.example.test",
-    "--credential-reference", "host-primary-v1",
-  ], {
-    TW_RELAY_SECRET: "must-not-be-promoted",
-  }), /cannot read or promote Relay v1 shared secret|不能读取或提升/);
   assert.throws(() => parseRelayHostOptions([
     "--relay", "wss://legacy.example.test",
     "--secret", "legacy-shared-secret",
     "--credential-reference", "must-not-cross-profile",
   ], {}), /cannot read Relay v2 credential reference|不能读取 Relay v2 credential reference/);
+});
+
+test("Relay v2 host credential argv accepts only a non-sensitive reference namespace", () => {
+  const sensitiveValues = [
+    "twcap2.payload.mac",
+    "twref2.opaque",
+    "twenroll2.opaque",
+    "twhostboot2.opaque",
+  ];
+  for (const credentialReference of [
+    "host-primary-v1",
+    ...sensitiveValues,
+    ...sensitiveValues.map((value) => `relay-v2-host-credential-ref:${value}`),
+  ]) {
+    assert.throws(() => parseRelayHostOptions([
+      "--profile", "v2",
+      "--relay", "wss://relay.example.test",
+      "--credential-reference", credentialReference,
+    ], {}), /non-sensitive credential reference|非敏感 credential reference/);
+  }
+});
+
+test("Relay v2 host missing URL names its isolated environment variable", () => {
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--credential-reference", "relay-v2-host-credential-ref:primary",
+  ], {}), /TW_RELAY_V2_URL/);
+});
+
+test("relay-host help marks Relay v2 unavailable instead of advertising runnable usage", async () => {
+  const child = spawn(process.execPath, ["dist/cli.cjs", "relay-host", "--help"], {
+    env: {
+      HOME: process.env.HOME,
+      PATH: process.env.PATH,
+      TMPDIR: process.env.TMPDIR,
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = [];
+  const stderr = [];
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => stderr.push(chunk));
+  const code = await new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  const output = Buffer.concat(stdout).toString("utf8");
+  assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
+  assert.match(output, /当前未启用 Relay v2/);
+  assert.doesNotMatch(output, /tw relay-host --profile v2/);
 });
 
 test("Relay v2 host carrier URL is exact WSS without URL credentials or fallback paths", () => {
@@ -110,7 +157,7 @@ test("explicit Relay v2 profile fails before constructing any network transport"
       "--profile", "v2",
       "--relay", "wss://relay.example.test",
       "--host-id", "v2-host",
-      "--credential-reference", "host-primary-v1",
+      "--credential-reference", "relay-v2-host-credential-ref:primary",
     ];
     await assert.rejects(
       run(),

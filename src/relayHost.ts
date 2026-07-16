@@ -584,10 +584,24 @@ function relayHostProfile(argv: readonly string[], env: NodeJS.ProcessEnv): Rela
   return profile;
 }
 
+const RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE = "relay-v2-host-credential-ref:";
+const RELAY_V2_SENSITIVE_CREDENTIAL_PREFIXES = [
+  "twcap2.",
+  "twref2.",
+  "twenroll2.",
+  "twhostboot2.",
+] as const;
+
 function validCredentialReference(value: string): boolean {
-  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
-    && !value.startsWith("twcap2.")
-    && !value.startsWith("twhostboot2.");
+  if (RELAY_V2_SENSITIVE_CREDENTIAL_PREFIXES.some((prefix) => value.startsWith(prefix))) {
+    return false;
+  }
+  if (!value.startsWith(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE) || value.length > 128) {
+    return false;
+  }
+  const identifier = value.slice(RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE.length);
+  return /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(identifier)
+    && !RELAY_V2_SENSITIVE_CREDENTIAL_PREFIXES.some((prefix) => identifier.startsWith(prefix));
 }
 
 export function relayV2HostCarrierUrl(relay: string): string {
@@ -662,10 +676,14 @@ export function parseRelayHostOptions(
     }
   }
 
-  if (!relay) throw new CliError("relay-host 需要 --relay 或 TW_RELAY_URL");
+  if (!relay) {
+    throw new CliError(profile === "v2"
+      ? "Relay v2 host profile 需要 --relay 或 TW_RELAY_V2_URL"
+      : "relay-host 需要 --relay 或 TW_RELAY_URL");
+  }
   if (!hostId || !isValidHostId(hostId)) throw new CliError("relay-host 需要合法 --host-id（字母、数字、点、下划线）");
   if (profile === "v1") {
-    if (sawV2CredentialReference || env.TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE) {
+    if (sawV2CredentialReference) {
       throw new CliError("Relay v1 host profile 不能读取 Relay v2 credential reference");
     }
     if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
@@ -679,12 +697,14 @@ export function parseRelayHostOptions(
       statusFile,
     };
   }
-  if (sawV1Secret || env.TW_RELAY_SECRET) {
+  if (sawV1Secret) {
     throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
   }
   if (!credentialReference || !validCredentialReference(credentialReference)) {
     throw new CliError(
-      "Relay v2 host profile 需要独立的 --credential-reference 或 TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE",
+      "Relay v2 host profile 需要独立的非敏感 credential reference "
+      + `${RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE}<id>`
+      + "（--credential-reference 或 TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE）",
     );
   }
   relayV2HostCarrierUrl(relay);
@@ -705,8 +725,10 @@ function printHelp(): void {
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
 
-  tw relay-host --profile v2 --relay wss://relay.example.com --host-id mac-admin \\
-    --credential-reference <opaque-reference>
+Relay v2:
+  production relay-host 当前未启用 Relay v2。--profile v2 只校验隔离配置，然后在创建任何
+  network transport 前 fail closed；它不会读取 v1 secret、宣告 capability 或回退到 v1。
+  预留的非敏感 reference namespace 是 ${RELAY_V2_HOST_CREDENTIAL_REFERENCE_NAMESPACE}<id>；不接受 token 或 enrollment code。
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
