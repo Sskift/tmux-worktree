@@ -497,8 +497,8 @@ class RelayV2OutboxAuthorityCoreTest {
                     entryId = pendingReplacement.id,
                     observedHostEpoch = "epoch-revalidated",
                     currentDedupeWindowId = "window-revalidated",
-                    verifiedScopeId = "revalidated-scope",
-                    verifiedSessionId = "revalidated-session",
+                    verifiedScopeId = pendingReplacement.scopeId,
+                    verifiedSessionId = pendingReplacement.sessionId,
                 ),
             ),
         )
@@ -506,8 +506,8 @@ class RelayV2OutboxAuthorityCoreTest {
             it.commandId == replacement.commandId
         }
         assertEquals("epoch-revalidated", confirmedReplacement.expectedHostEpoch)
-        assertEquals("revalidated-scope", confirmedReplacement.scopeId)
-        assertEquals("revalidated-session", confirmedReplacement.sessionId)
+        assertEquals(replacement.scopeId, confirmedReplacement.scopeId)
+        assertEquals(replacement.sessionId, confirmedReplacement.sessionId)
         assertEquals(null, confirmedReplacement.targetRevalidation)
         val firstLineageProof = confirmedReplacement.reissueLineageProof!!
         assertEquals(original.expectedHostEpoch, firstLineageProof.parentExpectedHostEpoch)
@@ -563,6 +563,81 @@ class RelayV2OutboxAuthorityCoreTest {
             pendingAgain.targetRevalidation?.sourceConfirmedTarget,
         )
         assertEquals(2L, pendingAgain.targetRevalidation?.confirmationOrdinal)
+        val pendingProof = pendingAgain.targetRevalidation!!
+        val frozenProposedTarget = pendingProof.proposedTarget
+        assertEquals(pendingAgain.expectedHostEpoch, frozenProposedTarget.expectedHostEpoch)
+        assertEquals(pendingAgain.dedupeWindowId, frozenProposedTarget.dedupeWindowId)
+        assertEquals(pendingAgain.scopeId, frozenProposedTarget.scopeId)
+        assertEquals(pendingAgain.sessionId, frozenProposedTarget.sessionId)
+        assertEquals(pendingAgain.requestFingerprint, frozenProposedTarget.requestFingerprint)
+        assertEquals(firstConfirmedTarget.confirmedTarget.scopeId, frozenProposedTarget.scopeId)
+        assertEquals(firstConfirmedTarget.confirmedTarget.sessionId, frozenProposedTarget.sessionId)
+
+        val retargetedFingerprint = enqueue(
+            RelayV2OutboxState.empty(),
+            draft(
+                commandId = "self-consistent-retarget",
+                expectedHostEpoch = pendingAgain.expectedHostEpoch,
+                dedupeWindowId = pendingAgain.dedupeWindowId,
+                scopeId = "retargeted-scope",
+                sessionId = "retargeted-session",
+                arguments = pendingAgain.canonicalRequestArguments.value,
+            ),
+            0,
+        ).state.entries.single().requestFingerprint
+        val retargetedProposedTarget = RelayV2ReissueTargetSnapshot(
+            expectedHostEpoch = pendingAgain.expectedHostEpoch,
+            dedupeWindowId = pendingAgain.dedupeWindowId,
+            scopeId = "retargeted-scope",
+            sessionId = "retargeted-session",
+            requestFingerprint = retargetedFingerprint,
+        )
+        val corruptedPendingEntries = listOf(
+            pendingAgain.copy(targetRevalidation = null),
+            pendingAgain.copy(
+                scopeId = "retargeted-scope",
+                sessionId = "retargeted-session",
+                requestFingerprint = retargetedFingerprint,
+            ),
+            pendingAgain.copy(
+                targetRevalidation = pendingProof.copy(
+                    proposedTarget = frozenProposedTarget.copy(scopeId = "mismatched-proposal"),
+                ),
+            ),
+            pendingAgain.copy(
+                scopeId = retargetedProposedTarget.scopeId,
+                sessionId = retargetedProposedTarget.sessionId,
+                requestFingerprint = retargetedProposedTarget.requestFingerprint,
+                targetRevalidation = pendingProof.copy(
+                    proposedTarget = retargetedProposedTarget,
+                ),
+            ),
+        )
+        corruptedPendingEntries.forEach { corruptedPending ->
+            restoreFailure(
+                secondEpochPending.state.entries.map { entry ->
+                    if (entry.commandId == replacement.commandId) corruptedPending else entry
+                },
+                secondEpochPending.state.nextCreationOrder,
+            )
+        }
+        val retargetingConfirm = rejected(
+            core.reduce(
+                secondEpochPending.state,
+                RelayV2OutboxAction.ConfirmQueuedTarget(
+                    entryId = pendingAgain.id,
+                    observedHostEpoch = pendingAgain.expectedHostEpoch,
+                    currentDedupeWindowId = pendingAgain.dedupeWindowId,
+                    verifiedScopeId = "retargeted-scope",
+                    verifiedSessionId = "retargeted-session",
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH,
+            retargetingConfirm.reason,
+        )
+        assertTrue(retargetingConfirm.state === secondEpochPending.state)
         val pendingDispatch = rejected(
             core.reduce(
                 secondEpochPending.state,
@@ -589,8 +664,8 @@ class RelayV2OutboxAuthorityCoreTest {
                     entryId = checkpointedPending.id,
                     observedHostEpoch = "epoch-revalidated-again",
                     currentDedupeWindowId = "window-revalidated-again",
-                    verifiedScopeId = "revalidated-scope-again",
-                    verifiedSessionId = "revalidated-session-again",
+                    verifiedScopeId = checkpointedPending.scopeId,
+                    verifiedSessionId = checkpointedPending.sessionId,
                 ),
             ),
         )
@@ -737,8 +812,8 @@ class RelayV2OutboxAuthorityCoreTest {
             entryId = arbitraryPendingReplacement.id,
             observedHostEpoch = "epoch-arbitrary-source",
             currentDedupeWindowId = "window-arbitrary-source",
-            verifiedScopeId = "arbitrary-confirmed-scope",
-            verifiedSessionId = "arbitrary-confirmed-session",
+            verifiedScopeId = arbitraryPendingReplacement.scopeId,
+            verifiedSessionId = arbitraryPendingReplacement.sessionId,
         )
         val countCapacity = rejected(
             RelayV2OutboxAuthorityCore(
@@ -1150,6 +1225,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val attemptedId = state.entries.single { it.commandId == "attempted" }.id
         state = dispatch(state, mapOf(attemptedId to "attempt-old")).state
         val oldAttempted = state.entry(attemptedId)!!
+        val oldQueued = state.entries.single { it.commandId == "queued" }
 
         val changed = applied(
             core.reduce(
@@ -1181,17 +1257,17 @@ class RelayV2OutboxAuthorityCoreTest {
                     entryId = queued.id,
                     observedHostEpoch = "epoch-b",
                     currentDedupeWindowId = "window-b",
-                    verifiedScopeId = "opaque-scope-b",
-                    verifiedSessionId = "opaque-session-b",
+                    verifiedScopeId = queued.scopeId,
+                    verifiedSessionId = queued.sessionId,
                 ),
             ),
         ).state.entries.single { it.commandId == "queued" }
         assertEquals("epoch-b", revalidated.expectedHostEpoch)
-        assertEquals("opaque-session-b", revalidated.sessionId)
+        assertEquals(queued.sessionId, revalidated.sessionId)
         assertEquals(null, revalidated.targetRevalidation)
         assertEquals(null, revalidated.reissueLineageProof)
         assertNotEquals(
-            queued.requestFingerprint.sha256Hex,
+            oldQueued.requestFingerprint.sha256Hex,
             revalidated.requestFingerprint.sha256Hex,
         )
 
@@ -1987,6 +2063,8 @@ class RelayV2OutboxAuthorityCoreTest {
         commandId: String,
         profileId: String = "profile-a",
         principalId: String = "principal-a",
+        expectedHostEpoch: String = "epoch-a",
+        dedupeWindowId: String = "window-a",
         scopeId: String = "scope-a",
         sessionId: String? = "session-a",
         arguments: RelayV2OutboxArguments = RelayV2OutboxArguments.sendAgentMessage(
@@ -1998,8 +2076,8 @@ class RelayV2OutboxAuthorityCoreTest {
         profileId = profileId,
         principalId = principalId,
         hostId = "host-a",
-        expectedHostEpoch = "epoch-a",
-        dedupeWindowId = "window-a",
+        expectedHostEpoch = expectedHostEpoch,
+        dedupeWindowId = dedupeWindowId,
         commandId = commandId,
         scopeId = scopeId,
         sessionId = sessionId,

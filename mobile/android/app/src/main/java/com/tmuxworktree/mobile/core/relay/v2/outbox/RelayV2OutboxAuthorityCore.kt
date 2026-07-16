@@ -310,12 +310,15 @@ internal data class RelayV2OutboxAttempt(
 internal data class RelayV2QueuedTargetRevalidation(
     val observedHostEpoch: String,
     val dedupeWindowId: String,
+    val proposedTarget: RelayV2ReissueTargetSnapshot,
     val sourceConfirmedTarget: RelayV2ReissueTargetSnapshot? = null,
     val confirmationOrdinal: Long? = null,
 ) {
     init {
         requireOutboxId(observedHostEpoch)
         requireOutboxId(dedupeWindowId)
+        require(proposedTarget.expectedHostEpoch == observedHostEpoch)
+        require(proposedTarget.dedupeWindowId == dedupeWindowId)
         require((sourceConfirmedTarget == null) == (confirmationOrdinal == null))
         confirmationOrdinal?.let { require(it in 1..MAX_JSON_INTEGER) }
     }
@@ -512,6 +515,10 @@ internal data class RelayV2OutboxEntry(
             }
         }
         require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
+        require(
+            targetRevalidation == null ||
+                targetRevalidation.proposedTarget == reissueTargetSnapshot(),
+        )
         require((reissuedFromCommandId == null) == (reissueLineageProof == null))
         require(reissueConfirmedTargetHistory.isEmpty() || reissueLineageProof != null)
         require(
@@ -579,6 +586,7 @@ internal data class RelayV2OutboxEntry(
                     "confirmationOrdinal" to it.confirmationOrdinal,
                     "dedupeWindowId" to it.dedupeWindowId,
                     "observedHostEpoch" to it.observedHostEpoch,
+                    "proposedTarget" to it.proposedTarget.canonicalMap(),
                     "sourceConfirmedTarget" to it.sourceConfirmedTarget?.canonicalMap(),
                 )
             },
@@ -1627,15 +1635,11 @@ internal class RelayV2OutboxAuthorityCore(
                         existingPending?.confirmationOrdinal
                             ?: (entry.reissueConfirmedTargetHistory.size + 1).toLong()
                     }
-                    val revalidation = RelayV2QueuedTargetRevalidation(
-                        action.observedHostEpoch,
-                        action.currentDedupeWindowId,
-                        sourceConfirmedTarget,
-                        confirmationOrdinal,
-                    )
-                    val updated = entry.copy(
+                    val proposedTarget = RelayV2ReissueTargetSnapshot(
                         expectedHostEpoch = action.observedHostEpoch,
                         dedupeWindowId = action.currentDedupeWindowId,
+                        scopeId = entry.scopeId,
+                        sessionId = entry.sessionId,
                         requestFingerprint = calculateRequestFingerprint(
                             entry.requestFingerprint.schemaVersion,
                             entry.operation,
@@ -1646,6 +1650,18 @@ internal class RelayV2OutboxAuthorityCore(
                             entry.sessionId,
                             entry.canonicalRequestArguments,
                         ),
+                    )
+                    val revalidation = RelayV2QueuedTargetRevalidation(
+                        action.observedHostEpoch,
+                        action.currentDedupeWindowId,
+                        proposedTarget,
+                        sourceConfirmedTarget,
+                        confirmationOrdinal,
+                    )
+                    val updated = entry.copy(
+                        expectedHostEpoch = proposedTarget.expectedHostEpoch,
+                        dedupeWindowId = proposedTarget.dedupeWindowId,
+                        requestFingerprint = proposedTarget.requestFingerprint,
                         targetRevalidation = revalidation,
                     )
                     mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
@@ -1704,27 +1720,16 @@ internal class RelayV2OutboxAuthorityCore(
         if (runCatching { requireTargetShape(entry.operation, action.verifiedSessionId) }.isFailure) {
             return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
         }
-        val canonical = entry.canonicalRequestArguments
         if (entry.reissuedFromCommandId != null && entry.reissueLineageProof == null) {
             return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
         }
-        val updatedFingerprint = calculateRequestFingerprint(
-            entry.requestFingerprint.schemaVersion,
-            entry.operation,
-            action.currentDedupeWindowId,
-            action.observedHostEpoch,
-            entry.hostId,
-            action.verifiedScopeId,
-            action.verifiedSessionId,
-            canonical,
-        )
-        val confirmedTarget = RelayV2ReissueTargetSnapshot(
-            expectedHostEpoch = action.observedHostEpoch,
-            dedupeWindowId = action.currentDedupeWindowId,
-            scopeId = action.verifiedScopeId,
-            sessionId = action.verifiedSessionId,
-            requestFingerprint = updatedFingerprint,
-        )
+        val confirmedTarget = pending.proposedTarget
+        if (confirmedTarget != entry.reissueTargetSnapshot() ||
+            action.verifiedScopeId != confirmedTarget.scopeId ||
+            action.verifiedSessionId != confirmedTarget.sessionId
+        ) {
+            return state.reject(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH)
+        }
         val confirmedTargetHistory = entry.reissueLineageProof?.let { lineageProof ->
             val sourceTarget = pending.sourceConfirmedTarget
                 ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
@@ -1749,11 +1754,11 @@ internal class RelayV2OutboxAuthorityCore(
             immutableListSnapshot(entry.reissueConfirmedTargetHistory + step)
         }
         val updated = entry.copy(
-            expectedHostEpoch = action.observedHostEpoch,
-            dedupeWindowId = action.currentDedupeWindowId,
-            scopeId = action.verifiedScopeId,
-            sessionId = action.verifiedSessionId,
-            requestFingerprint = updatedFingerprint,
+            expectedHostEpoch = confirmedTarget.expectedHostEpoch,
+            dedupeWindowId = confirmedTarget.dedupeWindowId,
+            scopeId = confirmedTarget.scopeId,
+            sessionId = confirmedTarget.sessionId,
+            requestFingerprint = confirmedTarget.requestFingerprint,
             targetRevalidation = null,
             reissueConfirmedTargetHistory = confirmedTargetHistory
                 ?: entry.reissueConfirmedTargetHistory,
@@ -2159,6 +2164,7 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
             step.sourceTarget.cheapCanonicalLowerBound() +
                 step.confirmedTarget.cheapCanonicalLowerBound()
         } +
+        (targetRevalidation?.proposedTarget?.cheapCanonicalLowerBound() ?: 0L) +
         (targetRevalidation?.sourceConfirmedTarget?.cheapCanonicalLowerBound() ?: 0L) +
         attempts.sumOf { it.requestId.length.toLong() }
 
@@ -2355,10 +2361,13 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
         val pendingOrdinal = pending.confirmationOrdinal
         pendingSource != null &&
             pendingOrdinal != null &&
+            pending.proposedTarget == currentTarget &&
             pending.observedHostEpoch == currentTarget.expectedHostEpoch &&
             pending.dedupeWindowId == currentTarget.dedupeWindowId &&
             currentTarget.matchesFingerprint(other) &&
             currentTarget != pendingSource &&
+            currentTarget.scopeId == pendingSource.scopeId &&
+            currentTarget.sessionId == pendingSource.sessionId &&
             pendingSource == confirmedHistoryTail &&
             pendingOrdinal == (other.reissueConfirmedTargetHistory.size + 1).toLong()
     } else {
