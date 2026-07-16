@@ -1,0 +1,394 @@
+package com.tmuxworktree.mobile.core.relay.v2.state
+
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxMutation
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalCheckpointReducer
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenMode
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOutcome
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalRestoreInvalidity
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
+import java.util.concurrent.ConcurrentHashMap
+
+internal class RelayV2TerminalRestoreRequiredException :
+    IllegalStateException("Terminal checkpoint must pass the restore barrier before reduction")
+
+internal data class RelayV2PersistedOutboxMeta(
+    val namespace: RelayV2OutboxAuthorityNamespace,
+    val nextCreationOrder: Long,
+    val payload: RelayV2EncodedPayload,
+)
+
+internal data class RelayV2PersistedOutboxEntry(
+    val namespace: RelayV2OutboxAuthorityNamespace,
+    val hostId: String,
+    val expectedHostEpoch: String,
+    val commandId: String,
+    val createdOrder: Long,
+    val payload: RelayV2EncodedPayload,
+)
+
+internal data class RelayV2PersistedTerminalCheckpoint(
+    val key: RelayV2TerminalCheckpointKey,
+    val kind: String,
+    val payload: RelayV2EncodedPayload,
+)
+
+/** Minimal transaction port implemented only by Room in production and memory stores in tests. */
+internal interface RelayV2DurableStateStore {
+    suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T
+}
+
+internal interface RelayV2DurableStateTransaction {
+    fun outboxMeta(namespace: RelayV2OutboxAuthorityNamespace): RelayV2PersistedOutboxMeta?
+
+    fun outboxEntries(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2PersistedOutboxEntry>
+
+    fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta)
+
+    fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry)
+
+    fun replaceOutboxEntry(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        previousId: RelayV2OutboxEntryId,
+        replacement: RelayV2PersistedOutboxEntry,
+    ): Boolean
+
+    fun terminalCheckpoint(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2PersistedTerminalCheckpoint?
+
+    fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint)
+}
+
+/**
+ * Single transaction owner for the accepted pure Outbox and terminal authorities.
+ *
+ * The actor apply lease is an entry precondition; this core deliberately does not inspect actor
+ * generation state itself. Effects in returned results become dispatchable only after this method's
+ * transaction has committed.
+ */
+internal class RelayV2DurableStateRepositoryCore(
+    private val store: RelayV2DurableStateStore,
+    private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
+) {
+    private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
+    private val resetAuthorizedTerminalKeys =
+        ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
+
+    suspend fun loadOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): RelayV2OutboxState = store.transaction {
+        decodeOutbox(namespace)
+    }
+
+    suspend fun reduceOutboxUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        action: RelayV2OutboxAction,
+    ): RelayV2OutboxResult = store.transaction {
+        val current = decodeOutbox(namespace)
+        val result = outboxAuthority.reduce(current, action)
+        requireOutboxNamespace(namespace, result.state)
+        if (result is RelayV2OutboxResult.Applied) {
+            applyOutboxPlan(namespace, current, result)
+            putOutboxMeta(
+                RelayV2PersistedOutboxMeta(
+                    namespace,
+                    result.state.nextCreationOrder,
+                    RelayV2OutboxStorageCodec.encodeMeta(
+                        namespace,
+                        result.state.nextCreationOrder,
+                    ),
+                ),
+            )
+        }
+        result
+    }
+
+    suspend fun loadTerminal(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalStoredCheckpoint = store.transaction { decodeTerminal(key) }
+
+    suspend fun reduceTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction {
+        val result = store.transaction {
+            val stored = decodeTerminal(key)
+            val replacesAfterReset = key in resetAuthorizedTerminalKeys &&
+                action is RelayV2TerminalAction.BeginOpenAttempt &&
+                action.mode == RelayV2TerminalOpenMode.RESET &&
+                key == RelayV2TerminalCheckpointKey.from(action.target)
+            if (stored is RelayV2TerminalStoredCheckpoint.Invalid && !replacesAfterReset) {
+                throw stored.asStorageException()
+            }
+            if (stored !is RelayV2TerminalStoredCheckpoint.Missing &&
+                key !in restoredTerminalKeys && !replacesAfterReset
+            ) {
+                throw RelayV2TerminalRestoreRequiredException()
+            }
+            val reduction = if (replacesAfterReset) {
+                RelayV2TerminalCheckpointReducer.reduce(null, action)
+            } else when (stored) {
+                RelayV2TerminalStoredCheckpoint.Missing ->
+                    RelayV2TerminalCheckpointReducer.reduce(null, action)
+                is RelayV2TerminalStoredCheckpoint.PreOpen ->
+                    RelayV2TerminalCheckpointReducer.reduce(stored.checkpoint, action)
+                is RelayV2TerminalStoredCheckpoint.Present ->
+                    RelayV2TerminalCheckpointReducer.reduce(stored.checkpoint, action)
+                is RelayV2TerminalStoredCheckpoint.Invalid -> error("Handled above")
+            }
+            persistTerminalReduction(key, reduction)
+            reduction
+        }
+        result.rememberReducedKey(key)
+        return result
+    }
+
+    suspend fun restoreTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        expectedIdentity: RelayV2TerminalIdentity,
+        expectedOpenAttempt: RelayV2TerminalOpenAttempt,
+        currentDeliveryToken: RelayV2TerminalDeliveryToken,
+        currentParserContinuityId: String?,
+        parserOperationProof: RelayV2TerminalParserRestoreProof? = null,
+    ): RelayV2TerminalReduction {
+        val result = store.transaction {
+            require(key == RelayV2TerminalCheckpointKey.from(expectedIdentity.target()))
+            val stored = decodeTerminal(key)
+            val reduction = RelayV2TerminalCheckpointReducer.restore(
+                stored,
+                expectedIdentity,
+                expectedOpenAttempt,
+                currentDeliveryToken,
+                currentParserContinuityId,
+                parserOperationProof,
+            )
+            if (stored !is RelayV2TerminalStoredCheckpoint.Invalid) {
+                persistTerminalReduction(key, reduction)
+            }
+            reduction
+        }
+        result.rememberRestoreOutcome(key)
+        return result
+    }
+
+    suspend fun restorePreOpenTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        expectedOpenAttempt: RelayV2TerminalOpenAttempt,
+        currentDeliveryToken: RelayV2TerminalDeliveryToken,
+        currentParserContinuityId: String?,
+    ): RelayV2TerminalReduction {
+        val result = store.transaction {
+            val stored = decodeTerminal(key)
+            val reduction = RelayV2TerminalCheckpointReducer.restorePreOpen(
+                stored,
+                key.toTarget(),
+                expectedOpenAttempt,
+                currentDeliveryToken,
+                currentParserContinuityId,
+            )
+            if (stored !is RelayV2TerminalStoredCheckpoint.Invalid) {
+                persistTerminalReduction(key, reduction)
+            }
+            reduction
+        }
+        result.rememberRestoreOutcome(key)
+        return result
+    }
+
+    fun forgetProfileAfterDisconnect(profileId: String) {
+        restoredTerminalKeys.removeIf { it.profileId == profileId }
+        resetAuthorizedTerminalKeys.removeIf { it.profileId == profileId }
+    }
+
+    private fun RelayV2DurableStateTransaction.decodeOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): RelayV2OutboxState {
+        val meta = outboxMeta(namespace)
+        val rows = outboxEntries(namespace)
+        if (meta == null) {
+            if (rows.isNotEmpty()) {
+                throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+            }
+            return RelayV2OutboxState.empty()
+        }
+        if (meta.namespace != namespace) {
+            throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+        }
+        val nextCreationOrder = RelayV2OutboxStorageCodec.decodeMeta(
+            namespace,
+            meta.nextCreationOrder,
+            meta.payload,
+        )
+        val entries = rows.map { row ->
+            if (row.namespace != namespace) {
+                throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+            }
+            RelayV2OutboxStorageCodec.decodeEntry(
+                namespace,
+                row.hostId,
+                row.expectedHostEpoch,
+                row.commandId,
+                row.createdOrder,
+                row.payload,
+            )
+        }
+        return try {
+            RelayV2OutboxState.restore(entries, nextCreationOrder).also {
+                requireOutboxNamespace(namespace, it)
+            }
+        } catch (failure: RelayV2StorageException) {
+            throw failure
+        } catch (_: IllegalArgumentException) {
+            throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+        }
+    }
+
+    private fun RelayV2DurableStateTransaction.applyOutboxPlan(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        current: RelayV2OutboxState,
+        result: RelayV2OutboxResult.Applied,
+    ) {
+        result.transaction.mutations.forEach { mutation ->
+            when (mutation) {
+                is RelayV2OutboxMutation.Insert -> {
+                    requireOutboxEntryNamespace(namespace, mutation.entry)
+                    insertOutboxEntry(mutation.entry.toPersisted(namespace))
+                }
+                is RelayV2OutboxMutation.Replace -> {
+                    val previous = current.entry(mutation.previousId)
+                        ?: throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+                    requireOutboxEntryNamespace(namespace, mutation.entry)
+                    if (previous.createdOrder != mutation.entry.createdOrder ||
+                        !replaceOutboxEntry(
+                            namespace,
+                            mutation.previousId,
+                            mutation.entry.toPersisted(namespace),
+                        )
+                    ) {
+                        throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun RelayV2OutboxEntry.toPersisted(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): RelayV2PersistedOutboxEntry = RelayV2PersistedOutboxEntry(
+        namespace,
+        hostId,
+        expectedHostEpoch,
+        commandId,
+        createdOrder,
+        RelayV2OutboxStorageCodec.encodeEntry(namespace, this),
+    )
+
+    private fun RelayV2TerminalReduction.rememberReducedKey(
+        key: RelayV2TerminalCheckpointKey,
+    ) {
+        if (checkpoint != null || preOpenCheckpoint != null) {
+            restoredTerminalKeys += key
+            resetAuthorizedTerminalKeys -= key
+        } else {
+            restoredTerminalKeys -= key
+        }
+    }
+
+    private fun RelayV2TerminalReduction.rememberRestoreOutcome(
+        key: RelayV2TerminalCheckpointKey,
+    ) {
+        if (checkpoint != null || preOpenCheckpoint != null) {
+            restoredTerminalKeys += key
+            resetAuthorizedTerminalKeys -= key
+        } else {
+            restoredTerminalKeys -= key
+            if (outcome is RelayV2TerminalOutcome.ResetRequired) {
+                resetAuthorizedTerminalKeys += key
+            } else {
+                resetAuthorizedTerminalKeys -= key
+            }
+        }
+    }
+
+    private fun RelayV2DurableStateTransaction.decodeTerminal(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalStoredCheckpoint {
+        val row = terminalCheckpoint(key) ?: return RelayV2TerminalStoredCheckpoint.Missing
+        if (row.key != key) {
+            return RelayV2TerminalStoredCheckpoint.Invalid(
+                RelayV2TerminalRestoreInvalidity.CORRUPT_QUEUE,
+            )
+        }
+        return RelayV2TerminalCheckpointCodec.decode(key, row.kind, row.payload)
+    }
+
+    private fun RelayV2DurableStateTransaction.persistTerminalReduction(
+        key: RelayV2TerminalCheckpointKey,
+        result: RelayV2TerminalReduction,
+    ) {
+        val stored = when {
+            result.checkpoint != null -> RelayV2TerminalStoredCheckpoint.Present(result.checkpoint)
+            result.preOpenCheckpoint != null ->
+                RelayV2TerminalStoredCheckpoint.PreOpen(result.preOpenCheckpoint)
+            else -> return
+        }
+        val encoded = RelayV2TerminalCheckpointCodec.encode(key, stored)
+        putTerminalCheckpoint(
+            RelayV2PersistedTerminalCheckpoint(
+                key = key,
+                kind = encoded.kind.name,
+                payload = encoded.payload,
+            ),
+        )
+    }
+
+    private fun requireOutboxNamespace(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        state: RelayV2OutboxState,
+    ) {
+        if (state.entries.any {
+                it.profileId != namespace.profileId || it.principalId != namespace.principalId
+            }
+        ) {
+            throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+        }
+    }
+
+    private fun requireOutboxEntryNamespace(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        entry: RelayV2OutboxEntry,
+    ) {
+        if (entry.profileId != namespace.profileId || entry.principalId != namespace.principalId) {
+            throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+        }
+    }
+
+    private fun RelayV2TerminalStoredCheckpoint.Invalid.asStorageException():
+        RelayV2StorageException = RelayV2StorageException(
+        when (reason) {
+            RelayV2TerminalRestoreInvalidity.SCHEMA_INCOMPATIBLE ->
+                RelayV2StorageFailure.SCHEMA_INCOMPATIBLE
+            RelayV2TerminalRestoreInvalidity.MISSING_REQUIRED_FIELD ->
+                RelayV2StorageFailure.MISSING_REQUIRED_FIELD
+            RelayV2TerminalRestoreInvalidity.LIMIT_EXCEEDED ->
+                RelayV2StorageFailure.LIMIT_EXCEEDED
+            RelayV2TerminalRestoreInvalidity.MALFORMED_COUNTER,
+            RelayV2TerminalRestoreInvalidity.CORRUPT_QUEUE,
+            -> RelayV2StorageFailure.MALFORMED
+        },
+    )
+}

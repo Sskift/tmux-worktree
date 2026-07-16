@@ -1,10 +1,21 @@
 package com.tmuxworktree.mobile.core.relay.v2.state
 
 import androidx.room.withTransaction
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalDeliveryToken
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalIdentity
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalOpenAttempt
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalParserRestoreProof
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalReduction
+import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheckpoint
 
 /**
- * Unwired Room-backed Relay v2 state synchronization repository.
+ * Unwired Room-backed Relay v2 state repository.
  *
  * Every generation-scoped method must be called while the caller holds the actor apply lease. The
  * method then keeps the complete reducer operation inside one Room transaction. No method consults
@@ -14,6 +25,9 @@ internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
 ) {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
+    private val durableCore = RelayV2DurableStateRepositoryCore(
+        RoomRelayV2DurableStateStore(database),
+    )
 
     suspend fun applyHelloUnderApplyLease(hello: RelayV2StateHello): RelayV2StateSyncResult =
         core.applyHelloUnderApplyLease(hello)
@@ -35,9 +49,244 @@ internal class RelayV2StateRepository(
         namespace: RelayV2StateNamespace,
     ): RelayV2SnapshotReleaseDirective? = core.discardSnapshotUnderApplyLease(namespace)
 
-    suspend fun clearProfileAfterDisconnect(receipt: RelayProfileDisconnectReceipt) =
+    suspend fun loadOutbox(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): RelayV2OutboxState = durableCore.loadOutbox(namespace)
+
+    suspend fun reduceOutboxUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        action: RelayV2OutboxAction,
+    ): RelayV2OutboxResult = durableCore.reduceOutboxUnderApplyLease(namespace, action)
+
+    suspend fun loadTerminal(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2TerminalStoredCheckpoint = durableCore.loadTerminal(key)
+
+    suspend fun reduceTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction = durableCore.reduceTerminalUnderApplyLease(key, action)
+
+    suspend fun restoreTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        expectedIdentity: RelayV2TerminalIdentity,
+        expectedOpenAttempt: RelayV2TerminalOpenAttempt,
+        currentDeliveryToken: RelayV2TerminalDeliveryToken,
+        currentParserContinuityId: String?,
+        parserOperationProof: RelayV2TerminalParserRestoreProof? = null,
+    ): RelayV2TerminalReduction = durableCore.restoreTerminalUnderApplyLease(
+        key,
+        expectedIdentity,
+        expectedOpenAttempt,
+        currentDeliveryToken,
+        currentParserContinuityId,
+        parserOperationProof,
+    )
+
+    suspend fun restorePreOpenTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        expectedOpenAttempt: RelayV2TerminalOpenAttempt,
+        currentDeliveryToken: RelayV2TerminalDeliveryToken,
+        currentParserContinuityId: String?,
+    ): RelayV2TerminalReduction = durableCore.restorePreOpenTerminalUnderApplyLease(
+        key,
+        expectedOpenAttempt,
+        currentDeliveryToken,
+        currentParserContinuityId,
+    )
+
+    suspend fun clearProfileAfterDisconnect(receipt: RelayProfileDisconnectReceipt) {
         core.clearProfileAfterDisconnect(receipt)
+        durableCore.forgetProfileAfterDisconnect(receipt.profile.profileId)
+    }
 }
+
+private class RoomRelayV2DurableStateStore(
+    private val database: RelayV2StateDatabase,
+) : RelayV2DurableStateStore {
+    private val dao = database.stateDao()
+
+    override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T =
+        database.withTransaction { RoomDurableTransaction(dao).block() }
+}
+
+private class RoomDurableTransaction(
+    private val dao: RelayV2StateDao,
+) : RelayV2DurableStateTransaction {
+    override fun outboxMeta(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): RelayV2PersistedOutboxMeta? = dao.outboxMeta(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+    )?.toPersisted()
+
+    override fun outboxEntries(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2PersistedOutboxEntry> = dao.outboxEntries(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+    ).map(RelayV2OutboxEntryEntity::toPersisted)
+
+    override fun putOutboxMeta(meta: RelayV2PersistedOutboxMeta) {
+        dao.putOutboxMeta(meta.toEntity())
+    }
+
+    override fun insertOutboxEntry(entry: RelayV2PersistedOutboxEntry) {
+        dao.insertOutboxEntry(entry.toEntity())
+    }
+
+    override fun replaceOutboxEntry(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        previousId: RelayV2OutboxEntryId,
+        replacement: RelayV2PersistedOutboxEntry,
+    ): Boolean {
+        val deleted = dao.deleteOutboxEntry(
+            namespace.profileId,
+            namespace.profileActivationGeneration,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            previousId.hostId,
+            previousId.expectedHostEpoch,
+            previousId.commandId,
+        )
+        if (deleted != 1) return false
+        dao.insertOutboxEntry(replacement.toEntity())
+        return true
+    }
+
+    override fun terminalCheckpoint(
+        key: RelayV2TerminalCheckpointKey,
+    ): RelayV2PersistedTerminalCheckpoint? = dao.terminalCheckpoint(
+        key.profileId,
+        key.profileActivationGeneration,
+        key.principalId,
+        key.clientInstanceId,
+        key.hostId,
+        key.hostEpoch,
+        key.scopeId,
+        key.sessionId,
+        key.streamId,
+        key.pane,
+    )?.let { entity ->
+        RelayV2PersistedTerminalCheckpoint(
+            key = entity.toCheckpointKey(),
+            kind = entity.checkpointKind,
+            payload = RelayV2EncodedPayload(
+                codecVersion = entity.codecVersion,
+                payloadUtf8Bytes = entity.payloadUtf8Bytes,
+                canonicalJson = entity.payloadCanonicalJson,
+                sha256 = entity.payloadSha256,
+            ),
+        )
+    }
+
+    override fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint) {
+        val key = checkpoint.key
+        dao.putTerminalCheckpoint(
+            RelayV2TerminalCheckpointEntity(
+                profileId = key.profileId,
+                profileActivationGeneration = key.profileActivationGeneration,
+                principalId = key.principalId,
+                clientInstanceId = key.clientInstanceId,
+                hostId = key.hostId,
+                hostEpoch = key.hostEpoch,
+                scopeId = key.scopeId,
+                sessionId = key.sessionId,
+                streamId = key.streamId,
+                pane = key.pane,
+                checkpointKind = checkpoint.kind,
+                codecVersion = checkpoint.payload.codecVersion,
+                payloadUtf8Bytes = checkpoint.payload.payloadUtf8Bytes,
+                payloadCanonicalJson = checkpoint.payload.canonicalJson,
+                payloadSha256 = checkpoint.payload.sha256,
+            ),
+        )
+    }
+}
+
+private fun RelayV2OutboxMetaEntity.toPersisted(): RelayV2PersistedOutboxMeta =
+    RelayV2PersistedOutboxMeta(
+        namespace = RelayV2OutboxAuthorityNamespace(
+            profileId = profileId,
+            profileActivationGeneration = profileActivationGeneration,
+            principalId = principalId,
+            clientInstanceId = clientInstanceId,
+        ),
+        nextCreationOrder = nextCreationOrder,
+        payload = RelayV2EncodedPayload(
+            codecVersion = codecVersion,
+            payloadUtf8Bytes = payloadUtf8Bytes,
+            canonicalJson = payloadCanonicalJson,
+            sha256 = payloadSha256,
+        ),
+    )
+
+private fun RelayV2PersistedOutboxMeta.toEntity(): RelayV2OutboxMetaEntity =
+    RelayV2OutboxMetaEntity(
+        profileId = namespace.profileId,
+        profileActivationGeneration = namespace.profileActivationGeneration,
+        principalId = namespace.principalId,
+        clientInstanceId = namespace.clientInstanceId,
+        nextCreationOrder = nextCreationOrder,
+        codecVersion = payload.codecVersion,
+        payloadUtf8Bytes = payload.payloadUtf8Bytes,
+        payloadCanonicalJson = payload.canonicalJson,
+        payloadSha256 = payload.sha256,
+    )
+
+private fun RelayV2OutboxEntryEntity.toPersisted(): RelayV2PersistedOutboxEntry =
+    RelayV2PersistedOutboxEntry(
+        namespace = RelayV2OutboxAuthorityNamespace(
+            profileId = profileId,
+            profileActivationGeneration = profileActivationGeneration,
+            principalId = principalId,
+            clientInstanceId = clientInstanceId,
+        ),
+        hostId = hostId,
+        expectedHostEpoch = expectedHostEpoch,
+        commandId = commandId,
+        createdOrder = createdOrder,
+        payload = RelayV2EncodedPayload(
+            codecVersion = codecVersion,
+            payloadUtf8Bytes = payloadUtf8Bytes,
+            canonicalJson = payloadCanonicalJson,
+            sha256 = payloadSha256,
+        ),
+    )
+
+private fun RelayV2PersistedOutboxEntry.toEntity(): RelayV2OutboxEntryEntity =
+    RelayV2OutboxEntryEntity(
+        profileId = namespace.profileId,
+        profileActivationGeneration = namespace.profileActivationGeneration,
+        principalId = namespace.principalId,
+        clientInstanceId = namespace.clientInstanceId,
+        hostId = hostId,
+        expectedHostEpoch = expectedHostEpoch,
+        commandId = commandId,
+        createdOrder = createdOrder,
+        codecVersion = payload.codecVersion,
+        payloadUtf8Bytes = payload.payloadUtf8Bytes,
+        payloadCanonicalJson = payload.canonicalJson,
+        payloadSha256 = payload.sha256,
+    )
+
+private fun RelayV2TerminalCheckpointEntity.toCheckpointKey(): RelayV2TerminalCheckpointKey =
+    RelayV2TerminalCheckpointKey(
+        profileId = profileId,
+        profileActivationGeneration = profileActivationGeneration,
+        principalId = principalId,
+        clientInstanceId = clientInstanceId,
+        hostId = hostId,
+        hostEpoch = hostEpoch,
+        scopeId = scopeId,
+        sessionId = sessionId,
+        streamId = streamId,
+        pane = pane,
+    )
 
 private class RoomRelayV2StateStore(
     private val database: RelayV2StateDatabase,
@@ -92,6 +341,9 @@ private class RoomTransaction(
     }
 
     override fun deleteProfileState(profileId: String) {
+        dao.deleteProfileTerminalCheckpoints(profileId)
+        dao.deleteProfileOutboxEntries(profileId)
+        dao.deleteProfileOutboxMeta(profileId)
         dao.deleteProfileEvents(profileId)
         dao.deleteProfileSnapshotRecords(profileId)
         dao.deleteProfileSnapshots(profileId)

@@ -102,7 +102,10 @@ internal interface RelayV2StateTransaction {
     /** Deletes all six v2 state categories for this exact namespace, never v1 or credentials. */
     fun deleteNamespaceState(namespace: RelayV2StateNamespace)
 
-    /** Deletes all six v2 state categories for this profile, never v1 or credentials. */
+    /**
+     * Deletes all six state-sync categories plus every activation-scoped Outbox and terminal row
+     * for this profile, never v1 rows or credentials.
+     */
     fun deleteProfileState(profileId: String)
 
     fun scope(namespace: RelayV2StateNamespace, scopeId: String): RelayV2StoredScope?

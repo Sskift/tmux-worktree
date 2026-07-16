@@ -262,3 +262,110 @@ internal data class RelayV2StateEventEntity(
     val rawUtf8Bytes: Int,
     val canonicalJson: String,
 )
+
+/**
+ * One Outbox authority cursor for an isolated Relay v2 profile activation and principal.
+ *
+ * The canonical payload repeats the explicit columns and is digest protected. Entry content lives
+ * in [RelayV2OutboxEntryEntity]; the repository updates both tables in one transaction.
+ */
+@Entity(
+    tableName = "relay_v2_outbox_meta",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+    ],
+)
+internal data class RelayV2OutboxMetaEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val nextCreationOrder: Long,
+    val codecVersion: Int,
+    val payloadUtf8Bytes: Int,
+    val payloadCanonicalJson: String,
+    val payloadSha256: String,
+)
+
+/** One durable Outbox entry inside an exact activation/principal authority namespace. */
+@Entity(
+    tableName = "relay_v2_outbox_entries",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "expectedHostEpoch",
+        "commandId",
+    ],
+    indices = [
+        Index(
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "createdOrder",
+            ],
+            unique = true,
+        ),
+    ],
+)
+internal data class RelayV2OutboxEntryEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val expectedHostEpoch: String,
+    val commandId: String,
+    val createdOrder: Long,
+    val codecVersion: Int,
+    val payloadUtf8Bytes: Int,
+    val payloadCanonicalJson: String,
+    val payloadSha256: String,
+)
+
+/**
+ * One atomically replaced terminal checkpoint union for an exact profile activation and target.
+ *
+ * Host process/generation lineage stays inside the versioned payload because an explicit reset may
+ * replace it while retaining the same stable target. Access, refresh, enrollment, and resume token
+ * values are never columns or payload fields.
+ */
+@Entity(
+    tableName = "relay_v2_terminal_checkpoints",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "streamId",
+        "pane",
+    ],
+)
+internal data class RelayV2TerminalCheckpointEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val streamId: String,
+    val pane: Int,
+    val checkpointKind: String,
+    val codecVersion: Int,
+    val payloadUtf8Bytes: Int,
+    val payloadCanonicalJson: String,
+    val payloadSha256: String,
+)

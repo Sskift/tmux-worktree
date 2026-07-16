@@ -321,6 +321,86 @@ internal interface RelayV2StateDao {
     )
 
     @Query(
+        "SELECT * FROM relay_v2_outbox_meta WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId LIMIT 1",
+    )
+    fun outboxMeta(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+    ): RelayV2OutboxMetaEntity?
+
+    @Query(
+        "SELECT * FROM relay_v2_outbox_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "ORDER BY createdOrder, commandId",
+    )
+    fun outboxEntries(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+    ): List<RelayV2OutboxEntryEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun putOutboxMeta(meta: RelayV2OutboxMetaEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertOutboxEntry(entry: RelayV2OutboxEntryEntity)
+
+    @Query(
+        "DELETE FROM relay_v2_outbox_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND expectedHostEpoch = :expectedHostEpoch " +
+            "AND commandId = :commandId",
+    )
+    fun deleteOutboxEntry(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        expectedHostEpoch: String,
+        commandId: String,
+    ): Int
+
+    @Query("DELETE FROM relay_v2_outbox_entries WHERE profileId = :profileId")
+    fun deleteProfileOutboxEntries(profileId: String)
+
+    @Query("DELETE FROM relay_v2_outbox_meta WHERE profileId = :profileId")
+    fun deleteProfileOutboxMeta(profileId: String)
+
+    @Query(
+        "SELECT * FROM relay_v2_terminal_checkpoints WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND streamId = :streamId AND pane = :pane LIMIT 1",
+    )
+    fun terminalCheckpoint(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        streamId: String,
+        pane: Int,
+    ): RelayV2TerminalCheckpointEntity?
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    fun putTerminalCheckpoint(checkpoint: RelayV2TerminalCheckpointEntity)
+
+    @Query("DELETE FROM relay_v2_terminal_checkpoints WHERE profileId = :profileId")
+    fun deleteProfileTerminalCheckpoints(profileId: String)
+
+    @Query(
         "DELETE FROM relay_v2_authority WHERE profileId = :profileId " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch",
@@ -333,7 +413,7 @@ internal interface RelayV2StateDao {
         hostEpoch: String,
     )
 
-    // These six profile-wide deletes are reserved for the disconnect-receipt barrier. Unlike every
+    // These profile-wide deletes are reserved for the disconnect-receipt barrier. Unlike every
     // namespace operation above, they intentionally remove every isolated binding for profileId.
     @Query("DELETE FROM relay_v2_authority WHERE profileId = :profileId")
     fun deleteProfileAuthorities(profileId: String)
