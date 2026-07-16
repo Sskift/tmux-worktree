@@ -460,7 +460,6 @@ function parseHostCredential(
 function parseEnrollment(
   value: unknown,
   connector: MobileRelayV2Connector,
-  authorityAvailable: boolean,
   nowMs: number,
 ): Parsed<MobileRelayV2DashboardState["enrollment"]> {
   const input = record(value);
@@ -472,12 +471,12 @@ function parseEnrollment(
   ) return { valid: true, value: { status: "creating", intent: input.intent } };
   if (input.status === "active" && own(input, "review")) {
     const review = normalizeMobileRelayV2EnrollmentReview(input.review);
-    if (
-      !review
-      || !authorityAvailable
-      || !mobileRelayV2ConnectorReady(connector)
-      || review.display.hostId !== connector.hostId
-    ) return { valid: false };
+    if (!review) return { valid: false };
+    const connectorRegistered = connector.status === "registered"
+      || connector.status === "registered_incomplete";
+    if (connectorRegistered && review.display.hostId !== connector.hostId) {
+      return { valid: false };
+    }
     if (review.enrollment.expiresAtMs <= nowMs) {
       return {
         valid: true,
@@ -634,7 +633,6 @@ export function normalizeMobileRelayV2DashboardState(
   const enrollment = parseEnrollment(
     input.enrollment,
     connector.value,
-    authority.value.kind !== "unavailable",
     observationTime,
   );
   if (!enrollment.valid) return unavailableDashboardState(sharedSecretConfigured);

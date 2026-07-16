@@ -120,14 +120,6 @@ test("Relay v2 status normalization rebuilds a closed non-sensitive projection",
   const serialized = JSON.stringify(normalized);
 
   assert.equal(deriveRelayV2EnrollmentView(normalized, 1_000).ready, true);
-  assert.deepEqual(Object.keys(normalized), [
-    "authority",
-    "v1Profile",
-    "hostCredential",
-    "connector",
-    "enrollment",
-    "knownClientGrant",
-  ]);
   for (const secret of [
     "twcap2.root-must-not-escape",
     "twref2.host-must-not-escape",

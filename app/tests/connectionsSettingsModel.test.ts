@@ -373,6 +373,36 @@ test("Relay v2 readiness exposes only a one-time enrollment review and never cla
   assert.match(markup, /Relay v2 one-time enrollment preview QR code/);
 });
 
+test("Relay v2 active enrollment survives connector stop and restores the same QR after restart", async () => {
+  const adapter = createFakeMobileRelayV2Adapter({
+    hostId: "mac-admin",
+    now: () => 1_000,
+  });
+  await adapter.bootstrapHost();
+  await adapter.startConnector();
+  const active = await adapter.createEnrollment({ intent: "create" });
+  assert.equal(active.enrollment.status, "active");
+  if (active.enrollment.status !== "active") return;
+  const originalEnrollment = active.enrollment;
+  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrPayload;
+  assert.ok(originalQr);
+
+  await adapter.stopConnector();
+  const stopped = await adapter.status();
+  const stoppedView = deriveRelayV2EnrollmentView(stopped, 1_000);
+  assert.equal(stopped.authority.kind, "fake_preview");
+  assert.equal(stopped.connector.status, "stopped");
+  assert.deepEqual(stopped.enrollment, originalEnrollment);
+  assert.equal(stoppedView.adapterAvailable, true);
+  assert.equal(stoppedView.ready, false);
+  assert.equal(stoppedView.qrPayload, null);
+  assert.equal(stoppedView.enrollmentAction, null);
+
+  const restarted = await adapter.startConnector();
+  assert.deepEqual(restarted.enrollment, originalEnrollment);
+  assert.equal(deriveRelayV2EnrollmentView(restarted, 1_000).qrPayload, originalQr);
+});
+
 test("Relay v2 invalid active enrollment requires authoritative recovery without creating a second code", () => {
   const ready = readyRelayV2State(true);
   const activeState = (review: RelayV2EnrollmentReview): RelayV2EnrollmentState => ({
@@ -561,20 +591,28 @@ test("Relay v2 contradictory registered observations fail closed", async () => {
   );
 });
 
-test("Relay v2 SUPERSEDED is terminal for that connector process and hides enrollment readiness", () => {
+test("Relay v2 SUPERSEDED preserves active enrollment and exit 78 while hiding its QR", async () => {
   const active = reduceRelayV2(readyRelayV2State(true), [
     { type: "enrollmentCreated", review: relayV2Review },
   ]);
   const superseded = relayV2EnrollmentReducer(active, {
     type: "connectorSuperseded",
   });
-  const view = deriveRelayV2EnrollmentView(superseded, 1_000);
+  const adapter = createFakeMobileRelayV2Adapter({
+    initialState: superseded,
+    hostId: "mac-admin",
+    now: () => 1_000,
+  });
+  const observed = await adapter.status();
+  const view = deriveRelayV2EnrollmentView(observed, 1_000);
 
-  assert.equal(superseded.connector.status, "superseded");
-  assert.equal(superseded.connector.exitCode, 78);
+  assert.equal(observed.authority.kind, "fake_preview");
+  assert.equal(observed.connector.status, "superseded");
+  assert.equal(observed.connector.exitCode, 78);
+  assert.equal(observed.enrollment.status, "active");
   assert.equal(view.ready, false);
   assert.equal(view.qrPayload, null);
-  assert.equal(superseded.v1Profile.sharedSecretConfigured, true);
+  assert.equal(observed.v1Profile.sharedSecretConfigured, true);
 });
 
 test("Relay v2 renderer state and QR omit bootstrap, access, refresh, and v1 secret values", () => {
