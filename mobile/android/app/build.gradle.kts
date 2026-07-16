@@ -13,8 +13,8 @@ android {
         applicationId = "com.tmuxworktree.mobile"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20003
-        versionName = "1.0.6"
+        versionCode = 20004
+        versionName = "1.0.7"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
