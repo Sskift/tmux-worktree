@@ -242,27 +242,46 @@ function isModuleNotFound(error: unknown): boolean {
     && Object.getOwnPropertyDescriptor(error, "code")?.value === "MODULE_NOT_FOUND";
 }
 
-const loadMappedNativeArtifact: RelayV2BrokerCredentialStateStoreNativeArtifactModuleLoader =
-  (artifact) => {
-    let resolved: string;
-    try {
-      resolved = nativeRequire.resolve(artifact.moduleSpecifier);
-    } catch (error) {
-      // Resolution happens before evaluation. Only absence of this exact,
-      // fixed mapped artifact is optional; every failure after resolution is
-      // an invalid native boundary and must not be disguised as missing.
-      if (isModuleNotFound(error)) return Object.freeze({ status: "missing" });
-      throw error;
-    }
-    return Object.freeze({ status: "loaded", binding: nativeRequire(resolved) });
-  };
+/**
+ * Fixed-mapping module-runtime adapter seam. Callers may replace resolve/load
+ * operations for tests, but cannot provide an artifact specifier or map. The
+ * loaded binding remains opaque here and is decoded only by the N0 wrapper.
+ */
+export function createRelayV2BrokerCredentialStateStoreNativeLoaderWithModuleRuntime(
+  target: unknown,
+  resolveArtifact: (fixedModuleSpecifier: string) => string,
+  loadResolvedArtifact: (resolvedArtifact: string) => unknown,
+): RelayV2BrokerCredentialStateStoreNativeLoader {
+  const loadMappedNativeArtifact: RelayV2BrokerCredentialStateStoreNativeArtifactModuleLoader =
+    (artifact) => {
+      let resolved: string;
+      try {
+        resolved = resolveArtifact(artifact.moduleSpecifier);
+      } catch (error) {
+        // Resolution happens before evaluation. Only absence of this exact,
+        // fixed mapped artifact is optional; every failure after resolution is
+        // an invalid native boundary and must not be disguised as missing.
+        if (isModuleNotFound(error)) return Object.freeze({ status: "missing" });
+        throw error;
+      }
+      if (typeof resolved !== "string" || resolved.length === 0) {
+        throw new Error("native artifact resolver returned an invalid identity");
+      }
+      return Object.freeze({ status: "loaded", binding: loadResolvedArtifact(resolved) });
+    };
+  return createRelayV2BrokerCredentialStateStoreNativeLoader(
+    target,
+    loadMappedNativeArtifact,
+  );
+}
 
 export const relayV2BrokerCredentialStateStoreNativeLoader =
-  createRelayV2BrokerCredentialStateStoreNativeLoader(
+  createRelayV2BrokerCredentialStateStoreNativeLoaderWithModuleRuntime(
     Object.freeze({
       platform: process.platform,
       architecture: process.arch,
       napiVersion: Number(process.versions.napi),
     }),
-    loadMappedNativeArtifact,
+    (fixedModuleSpecifier) => nativeRequire.resolve(fixedModuleSpecifier),
+    (resolvedArtifact) => nativeRequire(resolvedArtifact),
   );

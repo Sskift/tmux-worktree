@@ -255,24 +255,76 @@ test("loaded raw binding identity is cached once and decoded only by N0", async 
   assert.equal(bindingGetterReads, 0, "P1a passes the identity to N0 without invoking accessors");
 });
 
-test("only resolver-confirmed fixed artifact absence is optional", async (t) => {
-  const currentTarget = `${process.platform}-${process.arch}`;
-  if (!new Set(["darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64"]).has(currentTarget)) {
-    t.skip("current Node target is not a mapped native target");
-    return;
-  }
-  const missing = loaderModule.relayV2BrokerCredentialStateStoreNativeLoader.capability();
-  assert.deepEqual(missing, {
+test("only fixed-artifact resolve MODULE_NOT_FOUND is optional", async () => {
+  const fixedSpecifier =
+    "./native/relay-v2-broker-credential-state-store-v1-darwin-arm64.node";
+  let resolveCalls = 0;
+  let loadCalls = 0;
+  const missing = loaderModule.createRelayV2BrokerCredentialStateStoreNativeLoaderWithModuleRuntime(
+    target(),
+    (specifier) => {
+      resolveCalls += 1;
+      assert.equal(specifier, fixedSpecifier);
+      throw Object.assign(new Error("fixed artifact is absent"), {
+        code: "MODULE_NOT_FOUND",
+      });
+    },
+    () => {
+      loadCalls += 1;
+      throw new Error("must not load an unresolved artifact");
+    },
+  );
+  assert.deepEqual(
+    missing.capability(),
+    { status: "unsupported", reason: "native_artifact_missing" },
+  );
+  assert.deepEqual(await missing.open("/Users/caller-root"), {
     status: "unsupported",
     reason: "native_artifact_missing",
   });
-  assert.deepEqual(
-    await loaderModule.relayV2BrokerCredentialStateStoreNativeLoader.open(
-      "/Users/caller-root",
-    ),
-    { status: "unsupported", reason: "native_artifact_missing" },
-  );
+  assert.equal(resolveCalls, 1);
+  assert.equal(loadCalls, 0);
+});
 
+test("resolve failures other than self-missing remain closed invalid", async () => {
+  const failures = [
+    Object.assign(new Error("permission denied at /sensitive/path"), { code: "EACCES" }),
+    Object.assign(new Error("resolver initialization exposed /sensitive/path"), {
+      code: "ERR_INVALID_ARG_VALUE",
+    }),
+  ];
+  for (const failure of failures) {
+    let resolveCalls = 0;
+    let loadCalls = 0;
+    const closed =
+      loaderModule.createRelayV2BrokerCredentialStateStoreNativeLoaderWithModuleRuntime(
+        target(),
+        (specifier) => {
+          resolveCalls += 1;
+          assert.equal(
+            specifier,
+            "./native/relay-v2-broker-credential-state-store-v1-darwin-arm64.node",
+          );
+          throw failure;
+        },
+        () => {
+          loadCalls += 1;
+          throw new Error("must not load after resolver failure");
+        },
+      );
+    const capability = closed.capability();
+    assert.deepEqual(capability, {
+      status: "invalid",
+      error: { code: "NATIVE_INTERFACE_INVALID" },
+    });
+    assert.doesNotMatch(JSON.stringify(capability), /sensitive|path|permission|resolver/i);
+    assert.deepEqual(await closed.open("/Users/caller-root"), capability);
+    assert.equal(resolveCalls, 1);
+    assert.equal(loadCalls, 0);
+  }
+});
+
+test("failures after successful fixed-artifact resolution remain closed invalid", async () => {
   const failures = [
     Object.assign(new Error("nested dependency missing at /sensitive/path"), {
       code: "MODULE_NOT_FOUND",
@@ -280,22 +332,27 @@ test("only resolver-confirmed fixed artifact absence is optional", async (t) => 
     Object.assign(new Error("dlopen failed at /sensitive/path"), {
       code: "ERR_DLOPEN_FAILED",
     }),
-    Object.assign(new Error("permission denied at /sensitive/path"), { code: "EACCES" }),
-    new Error("native initialization exposed /sensitive/path"),
   ];
   for (const failure of failures) {
-    let loads = 0;
-    const closed = loaderModule.createRelayV2BrokerCredentialStateStoreNativeLoader(
-      target(process.platform, process.arch, Number(process.versions.napi)),
-      (artifact) => {
-        loads += 1;
-        assert.equal(
-          artifact.moduleSpecifier,
-          `./native/relay-v2-broker-credential-state-store-v1-${currentTarget}.node`,
-        );
-        throw failure;
-      },
-    );
+    let resolveCalls = 0;
+    let loadCalls = 0;
+    const closed =
+      loaderModule.createRelayV2BrokerCredentialStateStoreNativeLoaderWithModuleRuntime(
+        target(),
+        (specifier) => {
+          resolveCalls += 1;
+          assert.equal(
+            specifier,
+            "./native/relay-v2-broker-credential-state-store-v1-darwin-arm64.node",
+          );
+          return "fixed-resolved-artifact";
+        },
+        (resolvedArtifact) => {
+          loadCalls += 1;
+          assert.equal(resolvedArtifact, "fixed-resolved-artifact");
+          throw failure;
+        },
+      );
     const capability = closed.capability();
     assert.deepEqual(capability, {
       status: "invalid",
@@ -303,7 +360,8 @@ test("only resolver-confirmed fixed artifact absence is optional", async (t) => 
     });
     assert.doesNotMatch(JSON.stringify(capability), /sensitive|path|dlopen|permission/i);
     assert.deepEqual(await closed.open("/Users/caller-root"), capability);
-    assert.equal(loads, 1, "load failure is fixed and never tries a fallback artifact");
+    assert.equal(resolveCalls, 1);
+    assert.equal(loadCalls, 1, "resolved load failure never tries a fallback artifact");
   }
 });
 
