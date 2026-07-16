@@ -57,6 +57,7 @@ internal class RelayV2ConnectionActor(
     private val attemptId: () -> String = { UUID.randomUUID().toString() },
     private val watchdogDelay: suspend (Long) -> Unit = { delay(it) },
     private val beforeTransportCommit: suspend () -> Unit = {},
+    private val betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
     private val relayWelcomeTimeoutMs: Long = RELAY_WELCOME_TIMEOUT_MS,
     private val hostWelcomeTimeoutMs: Long = HOST_WELCOME_TIMEOUT_MS,
     normalActionCapacity: Int = DEFAULT_ACTION_CAPACITY,
@@ -145,6 +146,10 @@ internal class RelayV2ConnectionActor(
     private val completedTransportRetirements: MutableSet<RelayV2Transport> =
         Collections.newSetFromMap(IdentityHashMap())
     private val queuedTransportCallbacks = IdentityHashMap<RelayV2Transport, Int>()
+    private val terminalCallbackLeases = linkedMapOf<
+        CallbackOwnerKey,
+        MutableSet<RelayV2Transport>,
+        >()
     private var activeProfile: RelayV2Profile? = null
     private var requestedResume: RelayV2ResumeCursor? = null
     private var pendingHelloRequestId: String? = null
@@ -601,8 +606,8 @@ internal class RelayV2ConnectionActor(
         val callbackSource = owner.callbackSource
         if (owner.sourceMismatch || (callbackSource != null && callbackSource !== source)) {
             owner.sourceMismatch = true
-            transportFences.add(source)
-            callbackSource?.let(transportFences::add)
+            addTransportFenceLocked(source)
+            callbackSource?.let(::addTransportFenceLocked)
             FactorySourceBinding.MISMATCH
         } else {
             FactorySourceBinding.MATCHED
@@ -613,7 +618,7 @@ internal class RelayV2ConnectionActor(
         owner: ProvisionalCallbackOwner,
         source: RelayV2Transport,
     ): CallbackSourceRegistration = synchronized(lifecycleLock) {
-        transportFences.add(source)
+        addTransportFenceLocked(source)
         val callbackSource = owner.callbackSource
         val factorySource = owner.factorySource
         val mismatch = owner.sourceMismatch ||
@@ -631,7 +636,7 @@ internal class RelayV2ConnectionActor(
                 callbackSource?.let(::add)
                 factorySource?.let(::add)
             }
-            sources.forEach(transportFences::add)
+            sources.forEach(::addTransportFenceLocked)
             CallbackSourceRegistration.Mismatch(expected, sources)
         } else {
             if (callbackSource == null) owner.callbackSource = source
@@ -662,6 +667,7 @@ internal class RelayV2ConnectionActor(
                 enqueueSourceMismatch(
                     owner.key,
                     expected,
+                    registration.sources,
                 )
             }
             beginRetirement(
@@ -870,6 +876,7 @@ internal class RelayV2ConnectionActor(
     private fun enqueueSourceMismatch(
         owner: CallbackOwnerKey,
         source: RelayV2Transport,
+        leaseSources: Collection<RelayV2Transport>,
     ) = enqueueTerminalAction(
         owner,
         source,
@@ -879,6 +886,7 @@ internal class RelayV2ConnectionActor(
             source,
         ),
         TerminalIntentCause.SourceMismatch,
+        leaseSources = leaseSources,
     )
 
     private fun enqueueTerminalAction(
@@ -887,6 +895,7 @@ internal class RelayV2ConnectionActor(
         action: Action,
         intentCause: TerminalIntentCause,
         cancelOnRetry: Boolean = true,
+        leaseSources: Collection<RelayV2Transport> = listOfNotNull(source),
     ) {
         require(
             action is Action.TerminateConnection ||
@@ -901,6 +910,7 @@ internal class RelayV2ConnectionActor(
                 !acceptsCallbackLocked(owner, source) -> CallbackEnqueue.STALE
                 else -> {
                     recordTerminalIntentLocked(owner, intentCause)
+                    retainTerminalCallbackLeasesLocked(owner, leaseSources)
                     when {
                         !lastTerminationGeneration.compareAndSet(null, owner.effectGeneration) ->
                             CallbackEnqueue.COALESCED
@@ -929,21 +939,32 @@ internal class RelayV2ConnectionActor(
             beginRetirement(listOf(source), closeCode = null, forceCancel = true)
         }
         scope.launch {
-            while (!resourcesClosed.get()) {
-                val retry = synchronized(lifecycleLock) {
-                    when {
-                        lifecycleState != LifecycleState.OPEN ||
-                            !acceptsCallbackLocked(owner, source) -> CallbackEnqueue.STOPPED
-                        actions.trySendReserved(action) -> CallbackEnqueue.ENQUEUED
-                        else -> CallbackEnqueue.RETRY
+            var handedOff = false
+            try {
+                while (!resourcesClosed.get()) {
+                    val retry = synchronized(lifecycleLock) {
+                        when {
+                            lifecycleState != LifecycleState.OPEN ||
+                                !acceptsCallbackLocked(owner, source) -> CallbackEnqueue.STOPPED
+                            actions.trySendReserved(action) -> CallbackEnqueue.ENQUEUED
+                            else -> CallbackEnqueue.RETRY
+                        }
+                    }
+                    when (retry) {
+                        CallbackEnqueue.ENQUEUED -> {
+                            handedOff = true
+                            return@launch
+                        }
+                        CallbackEnqueue.STOPPED -> return@launch
+                        CallbackEnqueue.RETRY -> delay(CONTROL_ENQUEUE_RETRY_MS)
+                        else -> error("Unexpected termination retry state")
                     }
                 }
-                when (retry) {
-                    CallbackEnqueue.ENQUEUED,
-                    CallbackEnqueue.STOPPED,
-                    -> return@launch
-                    CallbackEnqueue.RETRY -> delay(CONTROL_ENQUEUE_RETRY_MS)
-                    else -> error("Unexpected termination retry state")
+            } finally {
+                if (!handedOff) {
+                    synchronized(lifecycleLock) {
+                        releaseTerminalCallbackLeasesLocked(owner)
+                    }
                 }
             }
         }
@@ -956,9 +977,33 @@ internal class RelayV2ConnectionActor(
         val pending = pendingTerminalIntent
         if (pending == null || pending.owner != owner) {
             pendingTerminalIntent = PendingTerminalIntent(owner, cause)
-        } else if (cause.priority > pending.cause.priority) {
+        } else if (terminalSemanticPriority(cause) > terminalSemanticPriority(pending.cause)) {
             pending.cause = cause
         }
+    }
+
+    private fun terminalSemanticPriority(cause: TerminalIntentCause): Int = when (cause) {
+        TerminalIntentCause.SourceMismatch -> 3
+        is TerminalIntentCause.Transport ->
+            if (terminalDisposition(cause).queueOverridable) 0 else 2
+        TerminalIntentCause.QueueSaturated -> 1
+    }
+
+    private fun retainTerminalCallbackLeasesLocked(
+        owner: CallbackOwnerKey,
+        sources: Collection<RelayV2Transport>,
+    ) {
+        if (sources.isEmpty()) return
+        val leases = terminalCallbackLeases.getOrPut(owner) { identitySetOf() }
+        sources.forEach { source ->
+            if (leases.add(source)) {
+                queuedTransportCallbacks[source] = (queuedTransportCallbacks[source] ?: 0) + 1
+            }
+        }
+    }
+
+    private fun releaseTerminalCallbackLeasesLocked(owner: CallbackOwnerKey) {
+        terminalCallbackLeases.remove(owner)?.forEach(::releaseQueuedTransportCallbackLocked)
     }
 
     private fun signalQueueSaturation(
@@ -1534,70 +1579,185 @@ internal class RelayV2ConnectionActor(
         owner: CallbackOwnerKey,
         source: RelayV2Transport?,
     ) {
-        val cause = synchronized(lifecycleLock) {
+        val claim = synchronized(lifecycleLock) {
             if (!isCurrentCallbackLocked(owner, source)) return@synchronized null
-            pendingTerminalIntent?.takeIf { it.owner == owner }?.cause
+            val pending = pendingTerminalIntent?.takeIf { it.owner == owner }
+                ?: return@synchronized null
+            val terminalCause = pending.cause
+            val profile = activeProfile
+            val terminalSource = activeTransport ?: source
+            betweenTerminalCauseReadAndOwnerRevoke()
+            provisionalCallbackOwner = null
+            committedCallbackOwner = null
+            publishedEffectGeneration.set(null)
+            effectApplyGate.invalidateAndDrain()
+            activeTransport = null
+            pendingTerminalIntent = null
+            ClaimedTerminal(
+                cause = terminalCause,
+                profile = profile,
+                effectGeneration = owner.effectGeneration,
+                source = terminalSource,
+            )
         } ?: return
-        when (cause) {
-            TerminalIntentCause.SourceMismatch ->
-                failConnection(sourceMismatchFailure(), closeCode = null)
-            TerminalIntentCause.QueueSaturated ->
-                failConnection(
-                    RelayV2FailureKind.QUEUE_SATURATED,
-                    "SLOW_CONSUMER",
-                    retryable = true,
-                    closeCode = 1013,
-                )
-            is TerminalIntentCause.Transport -> when (val transport = cause.cause) {
-                is TerminationCause.TransportClosed -> {
-                    val terminalSource = source ?: return
-                    transportClosed(terminalSource, transport.code)
-                }
-                is TerminationCause.TransportFailed -> transportFailed(transport.failure)
-            }
-        }
+        completeTerminalClaim(claim)
     }
 
-    private fun transportClosed(source: RelayV2Transport, closeCode: Int) {
+    private fun completeTerminalClaim(claim: ClaimedTerminal) {
         cancelHandshakeWatchdogs()
-        val (kind, code, retryable) = when (closeCode) {
-            4400 -> Triple(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false)
-            4401 -> Triple(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false)
-            4403 -> Triple(RelayV2FailureKind.AUTH, "AUTH_INVALID", false)
-            4406 -> Triple(RelayV2FailureKind.DIALECT, "PROTOCOL_UNSUPPORTED", false)
-            4408 -> Triple(RelayV2FailureKind.TRANSPORT, "HANDSHAKE_TIMEOUT", true)
-            else -> Triple(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true)
+        val disposition = terminalDisposition(claim.cause)
+        claim.source?.let { source ->
+            when (claim.cause) {
+                is TerminalIntentCause.Transport -> when (claim.cause.cause) {
+                    is TerminationCause.TransportClosed -> markTransportTerminal(source)
+                    is TerminationCause.TransportFailed -> beginRetirement(
+                        listOf(source),
+                        closeCode = null,
+                    )
+                }
+                TerminalIntentCause.QueueSaturated -> beginRetirement(
+                    listOf(source),
+                    closeCode = 1013,
+                    reason = "relay v2 slow consumer",
+                )
+                TerminalIntentCause.SourceMismatch -> beginRetirement(
+                    listOf(source),
+                    reason = "relay v2 transport source mismatch",
+                )
+            }
         }
-        val generation = activeProfile?.let(::currentEffectGeneration)
-        invalidateConnectionOwnershipAndDrain()
-        activeTransport = null
-        retainTransportFence(source)
-        val failure = RelayV2ConnectionFailure(kind, code, retryable)
-        updateState(RelayV2ConnectionPhase.FAILED, activeProfile, failure)
+        pendingHelloRequestId = null
+        updateState(RelayV2ConnectionPhase.FAILED, claim.profile, disposition.failure)
         emitEffect(
             RelayV2RuntimeEffect.ConnectionFailed(
-                activeProfile?.identity,
-                generation,
-                failure,
+                claim.profile?.identity,
+                claim.effectGeneration,
+                disposition.failure,
             ),
         )
     }
 
-    private fun transportFailed(failure: RelayV2TransportFailure) {
-        when (failure.kind) {
-            RelayV2TransportFailureKind.PROTOCOL ->
-                failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, null)
-            RelayV2TransportFailureKind.TLS_VALIDATION ->
-                failConnection(RelayV2FailureKind.SECURITY, "TLS_VALIDATION_FAILED", false, null)
-            RelayV2TransportFailureKind.NETWORK ->
-                failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
-            RelayV2TransportFailureKind.UPGRADE -> when (failure.httpStatus) {
-                101 -> failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, null)
-                401 -> failConnection(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false, null)
-                403 -> failConnection(RelayV2FailureKind.AUTH, "PERMISSION_DENIED", false, null)
-                426 -> failConnection(RelayV2FailureKind.DIALECT, "PROTOCOL_UNSUPPORTED", false, null)
-                503 -> failConnection(RelayV2FailureKind.ROUTE, "HOST_OFFLINE", true, null)
-                else -> failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
+    private fun terminalDisposition(cause: TerminalIntentCause): TerminalDisposition = when (cause) {
+        TerminalIntentCause.SourceMismatch -> TerminalDisposition(sourceMismatchFailure())
+        TerminalIntentCause.QueueSaturated -> TerminalDisposition(
+            RelayV2ConnectionFailure(
+                RelayV2FailureKind.QUEUE_SATURATED,
+                "SLOW_CONSUMER",
+                retryable = true,
+            ),
+        )
+        is TerminalIntentCause.Transport -> when (val transport = cause.cause) {
+            is TerminationCause.TransportClosed -> transportClosedDisposition(transport.code)
+            is TerminationCause.TransportFailed -> transportFailedDisposition(transport.failure)
+        }
+    }
+
+    private fun transportClosedDisposition(closeCode: Int): TerminalDisposition =
+        when (closeCode) {
+            4400 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
+            )
+            4401 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false),
+            )
+            4403 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_INVALID", false),
+            )
+            4406 -> TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.DIALECT,
+                    "PROTOCOL_UNSUPPORTED",
+                    false,
+                ),
+            )
+            4408 -> TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.TRANSPORT,
+                    "HANDSHAKE_TIMEOUT",
+                    true,
+                ),
+            )
+            4409 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.ROUTE, "HOST_SUPERSEDED", false),
+            )
+            4411 -> TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.ROUTE,
+                    "DUPLICATE_CONNECTOR",
+                    false,
+                ),
+            )
+            in 4000..4999 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
+            )
+            else -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true),
+                queueOverridable = true,
+            )
+        }
+
+    private fun transportFailedDisposition(
+        failure: RelayV2TransportFailure,
+    ): TerminalDisposition = when (failure.kind) {
+        RelayV2TransportFailureKind.PROTOCOL ->
+            TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.SCHEMA,
+                    "INVALID_ENVELOPE",
+                    false,
+                ),
+            )
+        RelayV2TransportFailureKind.TLS_VALIDATION ->
+            TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.SECURITY,
+                    "TLS_VALIDATION_FAILED",
+                    false,
+                ),
+            )
+        RelayV2TransportFailureKind.NETWORK ->
+            TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.TRANSPORT,
+                    "HOST_OFFLINE",
+                    true,
+                ),
+                queueOverridable = true,
+            )
+        RelayV2TransportFailureKind.UPGRADE -> when (failure.httpStatus) {
+            101 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
+            )
+            401 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false),
+            )
+            403 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.AUTH, "PERMISSION_DENIED", false),
+            )
+            426 -> TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.DIALECT,
+                    "PROTOCOL_UNSUPPORTED",
+                    false,
+                ),
+            )
+            503 -> TerminalDisposition(
+                RelayV2ConnectionFailure(RelayV2FailureKind.ROUTE, "HOST_OFFLINE", true),
+            )
+            else -> TerminalDisposition(
+                RelayV2ConnectionFailure(
+                    RelayV2FailureKind.TRANSPORT,
+                    "HOST_OFFLINE",
+                    true,
+                ),
+            )
+        }
+    }
+
+    private fun markTransportTerminal(source: RelayV2Transport) {
+        synchronized(lifecycleLock) {
+            if (addTransportFenceLocked(source)) {
+                transportRetirements.add(source)
             }
         }
     }
@@ -1677,12 +1837,6 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private fun retainTransportFence(source: RelayV2Transport) {
-        synchronized(lifecycleLock) {
-            transportFences.add(source)
-        }
-    }
-
     private fun beginRetirement(
         sources: Collection<RelayV2Transport>,
         closeCode: Int? = 1000,
@@ -1694,7 +1848,7 @@ internal class RelayV2ConnectionActor(
         }
         val lifecycleSources = synchronized(lifecycleLock) {
             sources.filter { source ->
-                transportFences.add(source)
+                if (!addTransportFenceLocked(source)) return@filter false
                 val first = transportRetirements.add(source)
                 when {
                     closeCode != null -> first
@@ -1715,43 +1869,53 @@ internal class RelayV2ConnectionActor(
     private fun <T> identitySetOf(): MutableSet<T> =
         Collections.newSetFromMap(IdentityHashMap())
 
+    private fun addTransportFenceLocked(source: RelayV2Transport): Boolean {
+        if (source in completedTransportRetirements) return false
+        transportFences.add(source)
+        return true
+    }
+
     private suspend fun awaitTransportFences(
         requiredSources: Set<RelayV2Transport>? = null,
     ): Boolean {
+        val checkedSources = identitySetOf<RelayV2Transport>()
         var allTerminated = true
+        synchronized(lifecycleLock) {
+            requiredSources?.forEach(::addTransportFenceLocked)
+        }
         while (true) {
-            val sources = synchronized(lifecycleLock) {
-                val candidates = requiredSources ?: transportFences
-                candidates.filter { it in transportFences }
+            val source = synchronized(lifecycleLock) {
+                transportFences.firstOrNull { checkedSources.add(it) }
+            } ?: return allTerminated
+            if (!source.awaitTermination()) {
+                beginRetirement(listOf(source), closeCode = null, forceCancel = true)
+                allTerminated = false
+                continue
             }
-            if (sources.isEmpty()) return allTerminated
-            for (source in sources) {
-                if (!source.awaitTermination()) {
-                    beginRetirement(listOf(source), closeCode = null, forceCancel = true)
-                    allTerminated = false
-                    continue
-                }
-                synchronized(lifecycleLock) {
-                    transportFences.remove(source)
-                    if (source in transportRetirements) {
-                        completedTransportRetirements.add(source)
-                        clearCompletedRetirementIfDrainedLocked(source)
-                    }
+            synchronized(lifecycleLock) {
+                transportFences.remove(source)
+                if (source in transportRetirements) {
+                    completedTransportRetirements.add(source)
+                    clearCompletedRetirementIfDrainedLocked(source)
                 }
             }
-            if (requiredSources != null) return allTerminated
-            if (!allTerminated) return false
         }
     }
 
     private fun releaseQueuedTransportCallback(action: Action) {
-        val source = when (action) {
-            is Action.TransportOpened -> action.source
-            is Action.TransportFrame -> action.source
-            is Action.TransportFrameTooLarge -> action.source
-            else -> null
-        } ?: return
-        synchronized(lifecycleLock) { releaseQueuedTransportCallbackLocked(source) }
+        synchronized(lifecycleLock) {
+            when (action) {
+                is Action.TransportOpened -> releaseQueuedTransportCallbackLocked(action.source)
+                is Action.TransportFrame -> releaseQueuedTransportCallbackLocked(action.source)
+                is Action.TransportFrameTooLarge ->
+                    releaseQueuedTransportCallbackLocked(action.source)
+                is Action.TransportSourceMismatch ->
+                    releaseTerminalCallbackLeasesLocked(action.owner)
+                is Action.TerminateConnection -> releaseTerminalCallbackLeasesLocked(action.owner)
+                is Action.QueueSaturated -> releaseTerminalCallbackLeasesLocked(action.owner)
+                else -> Unit
+            }
+        }
     }
 
     private fun releaseQueuedTransportCallbackLocked(source: RelayV2Transport) {
@@ -1772,6 +1936,7 @@ internal class RelayV2ConnectionActor(
         ) {
             return
         }
+        transportFences.remove(source)
         transportRetirements.remove(source)
         transportCancellations.remove(source)
     }
@@ -2109,20 +2274,22 @@ internal class RelayV2ConnectionActor(
         var cause: TerminalIntentCause,
     )
 
+    private data class ClaimedTerminal(
+        val cause: TerminalIntentCause,
+        val profile: RelayV2Profile?,
+        val effectGeneration: RelayV2EffectGeneration,
+        val source: RelayV2Transport?,
+    )
+
+    private data class TerminalDisposition(
+        val failure: RelayV2ConnectionFailure,
+        val queueOverridable: Boolean = false,
+    )
+
     private sealed interface TerminalIntentCause {
-        val priority: Int
-
-        data class Transport(val cause: TerminationCause) : TerminalIntentCause {
-            override val priority: Int = 1
-        }
-
-        data object QueueSaturated : TerminalIntentCause {
-            override val priority: Int = 2
-        }
-
-        data object SourceMismatch : TerminalIntentCause {
-            override val priority: Int = 3
-        }
+        data class Transport(val cause: TerminationCause) : TerminalIntentCause
+        data object QueueSaturated : TerminalIntentCause
+        data object SourceMismatch : TerminalIntentCause
     }
 
     private data class QueuedEffect(
