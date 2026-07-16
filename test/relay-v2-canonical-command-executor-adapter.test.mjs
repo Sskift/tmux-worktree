@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import test from "node:test";
 
 const adapterModule = await import("../dist/relay/v2/canonicalCommandExecutorAdapter.js");
@@ -636,6 +637,51 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
       },
     });
     assert.equal((await executorFor(validPorts).resolve(request)).kind, "executable");
+
+    const rootPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        const project = "project";
+        answer.target.execution.canonicalRepoPath = "/";
+        answer.target.execution.effectiveProject = project;
+        answer.target.execution.publicDisplayName = `${project}-1`;
+        answer.target.execution.worktreePath = `/worktrees/${project}/${WORKTREE_BRANCH}`;
+        answer.target.publicDisplayName = `${project}-1`;
+        answer.target.prospectiveSession.displayName = `${project}-1`;
+        answer.target.prospectiveSession.project = project;
+        answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
+        return answer;
+      },
+    });
+    assert.equal((await executorFor(rootPorts).resolve(request)).kind, "executable");
+  });
+
+  await t.test("explicit project remains an exact bounded public value", async () => {
+    for (const project of ["team/demo", ".", ".."]) {
+      const request = canonicalRequest("create_worktree", {
+        arguments: {
+          project,
+          path: "/catalog/link",
+          name: "fix",
+          branch: "main",
+          aiCommand: "codex",
+        },
+      });
+      const ports = fakePorts({
+        resolve: (accepted) => {
+          const answer = resolvedFor(accepted);
+          answer.target.execution.worktreePath = join(
+            answer.target.execution.worktreeBase,
+            project,
+            WORKTREE_BRANCH,
+          );
+          answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
+          return answer;
+        },
+      });
+      assert.equal((await executorFor(ports).resolve(request)).kind, "executable", project);
+      assert.equal(ports.calls.process.length, 0);
+    }
   });
 
   await t.test("omitted terminal label is derived from canonical cwd", async () => {

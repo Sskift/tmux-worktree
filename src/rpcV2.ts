@@ -258,7 +258,7 @@ export function parseRpcV2CreateResolvedWorktreeRequest(
     "canonicalRepoPath",
   );
   const effectiveProject = boundedString(value.execution.effectiveProject, "effectiveProject", 128);
-  const derivedProject = basename(canonicalRepoPath);
+  const derivedProject = basename(canonicalRepoPath) || "project";
   const effectiveBaseBranch = boundedString(
     value.execution.effectiveBaseBranch,
     "effectiveBaseBranch",
@@ -276,10 +276,7 @@ export function parseRpcV2CreateResolvedWorktreeRequest(
   const worktreeBase = normalizedAbsolutePath(value.execution.worktreeBase, "worktreeBase");
   const worktreePath = normalizedAbsolutePath(value.execution.worktreePath, "worktreePath");
   const worktreeBranch = boundedString(value.execution.worktreeBranch, "worktreeBranch", 255);
-  if (basename(effectiveProject) !== effectiveProject
-    || effectiveProject === "."
-    || effectiveProject === ".."
-    || (args.project !== undefined
+  if ((args.project !== undefined
       ? args.project !== effectiveProject
       : effectiveProject !== derivedProject)
     || (args.branch !== undefined && args.branch !== effectiveBaseBranch)
