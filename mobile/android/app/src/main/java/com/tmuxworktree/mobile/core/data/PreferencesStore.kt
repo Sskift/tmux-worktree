@@ -13,7 +13,6 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.tmuxworktree.mobile.core.model.RelayProfile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
-import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ActiveProfileGuardResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationAuthority
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
@@ -287,7 +286,7 @@ class PreferencesStore(context: Context) {
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
         authority: RelayV2ProfileActivationAuthority,
-    ): RelayV2Profile? = authority.commitIfCurrent {
+    ): RelayV2Profile? = authority.commitIfCurrent { commit ->
         var activated: RelayV2Profile? = null
         store.edit { preferences ->
             if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) == expectedActiveProfile) {
@@ -310,27 +309,12 @@ class PreferencesStore(context: Context) {
                 } else {
                     profile
                 }
+                if (!commit.commitCredential()) return@edit
                 RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, resolved)
                 activated = resolved
             }
         }
         activated
-    }
-
-    internal suspend fun <T> withActiveProfileIdentity(
-        expectedActiveProfile: RelayActiveProfileIdentity?,
-        block: suspend () -> T,
-    ): RelayV2ActiveProfileGuardResult<T> {
-        var result: RelayV2ActiveProfileGuardResult<T>? = null
-        store.edit { preferences ->
-            val activeProfile = RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
-            result = if (activeProfile == expectedActiveProfile) {
-                RelayV2ActiveProfileGuardResult.Matched(block())
-            } else {
-                RelayV2ActiveProfileGuardResult.Mismatch(activeProfile)
-            }
-        }
-        return checkNotNull(result)
     }
 
     internal suspend fun updateRelayV2CredentialVersion(
@@ -469,14 +453,6 @@ internal class PreferencesRelayV2ProfileStore(
         expectedActiveProfile,
         profile,
         authority,
-    )
-
-    override suspend fun <T> withActiveProfileIdentity(
-        expectedActiveProfile: RelayActiveProfileIdentity?,
-        block: suspend () -> T,
-    ): RelayV2ActiveProfileGuardResult<T> = preferencesStore.withActiveProfileIdentity(
-        expectedActiveProfile,
-        block,
     )
 
     override suspend fun updateRelayV2CredentialVersion(

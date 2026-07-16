@@ -219,12 +219,6 @@ internal sealed interface RelayV2CredentialCasResult {
     data class Stale(val currentCredentialVersion: Long?) : RelayV2CredentialCasResult
 }
 
-internal fun interface RelayV2CredentialCasAuthority {
-    suspend fun commitIfCurrent(
-        commit: () -> RelayV2CredentialCasResult,
-    ): RelayV2CredentialCasResult?
-}
-
 internal interface RelayV2CredentialStore {
     fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob?
 
@@ -238,30 +232,23 @@ internal interface RelayV2CredentialStore {
         replacement: RelayV2CredentialBlob,
     ): RelayV2CredentialCasResult
 
-    /** Runs the actual replace only while the caller's exact live intent still owns authority. */
-    suspend fun compareAndSetAuthorized(
+    /** Removes only the exact blob written by a failed cross-store activation commit. */
+    fun clearIfUnchanged(
         reference: RelayV2CredentialReference,
-        expectation: RelayV2CredentialCasExpectation,
-        replacement: RelayV2CredentialBlob,
-        authority: RelayV2CredentialCasAuthority,
-    ): RelayV2CredentialCasResult? = authority.commitIfCurrent {
-        compareAndSet(reference, expectation, replacement)
-    }
+        expected: RelayV2CredentialBlob,
+    ): Boolean = error("Exact Relay v2 credential compensation is unsupported")
 
     fun clear(reference: RelayV2CredentialReference)
 }
 
-internal fun interface RelayV2ProfileActivationAuthority {
-    suspend fun commitIfCurrent(
-        activate: suspend () -> RelayV2Profile?,
-    ): RelayV2Profile?
+internal fun interface RelayV2ProfileActivationCommit {
+    fun commitCredential(): Boolean
 }
 
-internal sealed interface RelayV2ActiveProfileGuardResult<out T> {
-    data class Matched<T>(val value: T) : RelayV2ActiveProfileGuardResult<T>
-    data class Mismatch(
-        val activeProfile: RelayActiveProfileIdentity?,
-    ) : RelayV2ActiveProfileGuardResult<Nothing>
+internal fun interface RelayV2ProfileActivationAuthority {
+    suspend fun commitIfCurrent(
+        activate: suspend (RelayV2ProfileActivationCommit) -> RelayV2Profile?,
+    ): RelayV2Profile?
 }
 
 internal interface RelayV2ProfileStore {
@@ -274,12 +261,6 @@ internal interface RelayV2ProfileStore {
         profile: RelayV2Profile,
         authority: RelayV2ProfileActivationAuthority,
     ): RelayV2Profile?
-
-    /** Holds the active-profile storage transaction across [block]. */
-    suspend fun <T> withActiveProfileIdentity(
-        expectedActiveProfile: RelayActiveProfileIdentity?,
-        block: suspend () -> T,
-    ): RelayV2ActiveProfileGuardResult<T>
 
     suspend fun updateRelayV2CredentialVersion(
         profileId: String,

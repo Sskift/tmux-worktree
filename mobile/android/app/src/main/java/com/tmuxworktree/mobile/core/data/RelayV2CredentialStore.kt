@@ -62,6 +62,17 @@ internal class AndroidKeystoreRelayV2CredentialStore(context: Context) : RelayV2
         RelayV2CredentialCasResult.Updated(replacement.credentialVersion)
     }
 
+    override fun clearIfUnchanged(
+        reference: RelayV2CredentialReference,
+        expected: RelayV2CredentialBlob,
+    ): Boolean = synchronized(PROCESS_LOCK) {
+        if (readUnlocked(reference) != expected) return@synchronized false
+        check(preferences.edit().remove(entryKey(reference)).commit()) {
+            "Relay v2 credential compensation could not be persisted"
+        }
+        true
+    }
+
     override fun clear(reference: RelayV2CredentialReference) = synchronized(PROCESS_LOCK) {
         check(preferences.edit().remove(entryKey(reference)).commit()) {
             "Relay v2 credential could not be cleared"
