@@ -2,6 +2,10 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
 import test from "node:test";
 
+const codec = await import(
+  "../dist/relay/extensions/agentTranscriptLifecycle/v1/codec.js"
+);
+
 const contractRoot = new URL(
   "../contracts/relay/extensions/agent-transcript-lifecycle/v1/",
   import.meta.url,
@@ -96,18 +100,65 @@ function collectPublicEvents(frame) {
 
 const manifest = readJson("manifest.json");
 
+test("Node Relay Agent extension codec consumes the frozen public wire corpus", () => {
+  for (const fixture of readJson("golden-frames.json")) {
+    const bytes = Buffer.from(fixture.wire, "utf8");
+    const decoded = codec.decodeRelayAgentTranscriptLifecycleFrame(bytes, {
+      opcode: "text",
+      compressed: false,
+    });
+    assert.equal(decoded.normalized.channel, "public", fixture.name);
+    assert.equal(decoded.normalized.version, 2, fixture.name);
+    assert.equal(decoded.normalized.capability, manifest.capability, fixture.name);
+    assert.equal(decoded.normalized.type, fixture.type, fixture.name);
+    assert.equal(decoded.canonicalWire, fixture.wire, fixture.name);
+    assert.deepEqual(
+      Buffer.from(codec.encodeRelayAgentTranscriptLifecycleFrame(decoded.frame)),
+      bytes,
+      fixture.name,
+    );
+  }
+});
+
+test("Node Relay Agent extension codec rejects every frozen invalid vector and strict framing violation", () => {
+  for (const fixture of readJson("invalid-frames.json")) {
+    assert.throws(
+      () => codec.decodeRelayAgentTranscriptLifecycleFrame(Buffer.from(fixture.wire)),
+      (error) => error instanceof codec.RelayV2CodecError
+        && error.code === fixture.expectedError,
+      fixture.name,
+    );
+  }
+
+  const golden = readJson("golden-frames.json")[0].wire;
+  for (const [name, bytes, metadata, expectedCode] of [
+    ["duplicate JSON key", Buffer.from(golden.replace('"payload":{}', '"payload":{},"payload":{}')), {}, "INVALID_ENVELOPE"],
+    ["binary frame", Buffer.from(golden), { opcode: "binary" }, "INVALID_ENVELOPE"],
+    ["compressed frame", Buffer.from(golden), { compressed: true }, "PROTOCOL_UNSUPPORTED"],
+  ]) {
+    assert.throws(
+      () => codec.decodeRelayAgentTranscriptLifecycleFrame(bytes, metadata),
+      (error) => error instanceof codec.RelayV2CodecError && error.code === expectedCode,
+      name,
+    );
+  }
+});
+
 test("Relay Agent extension v1 fixture set is internally complete and machine-readable", () => {
   assert.equal(manifest.contract, "tmux-worktree-relay-agent-transcript-lifecycle-extension");
   assert.equal(manifest.version, 1);
   assert.equal(
     manifest.status,
-    "frozen-extension-unwired-node-authority-and-android-reducer-foundations",
+    "frozen-extension-unwired-node-durable-authority-codec-replay-and-android-reducer-foundations",
   );
   assert.equal(manifest.capability, "agent.transcript-lifecycle.v1");
   assert.deepEqual(manifest.delivery, {
-    artifactKind: "fixtures-plus-unwired-node-authority-and-android-reducer-foundations",
+    artifactKind: "fixtures-plus-unwired-node-durable-authority-codec-replay-and-android-reducer-foundations",
     runtimeConsumers: "pending",
-    nodeCodecConformance: false,
+    nodeCodecConformance: true,
+    nodeDurableAuthorityStoreFoundation: true,
+    nodeReplayRuntimeFoundation: true,
+    nodeRuntimeIntegrated: false,
     androidCodecConformance: false,
     hostAuthorityMachineConformance: true,
     androidConsumerMachineConformance: false,
@@ -122,6 +173,8 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
   assert.equal(manifest.boundaries.relayV1Unchanged, true);
   assert.equal(manifest.boundaries.relayV2BaseContractUnchanged, true);
   assert.equal(manifest.boundaries.productionCapabilityDelivered, false);
+  assert.equal(manifest.boundaries.nodeHostRuntimeIntegrated, false);
+  assert.equal(manifest.boundaries.nodeCapabilityAdvertised, false);
   assert.equal(manifest.boundaries.androidReducerFoundationOnly, true);
   assert.equal(manifest.boundaries.androidRoomIntegrated, false);
   assert.equal(manifest.boundaries.androidActorIntegrated, false);

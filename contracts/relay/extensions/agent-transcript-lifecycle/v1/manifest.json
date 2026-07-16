@@ -1,14 +1,17 @@
 {
   "contract": "tmux-worktree-relay-agent-transcript-lifecycle-extension",
   "version": 1,
-  "status": "frozen-extension-unwired-node-authority-and-android-reducer-foundations",
+  "status": "frozen-extension-unwired-node-durable-authority-codec-replay-and-android-reducer-foundations",
   "normativeDocument": "../../../../../docs/relay-agent-transcript-lifecycle-extension-v1.md",
   "baseProtocolVersion": 2,
   "capability": "agent.transcript-lifecycle.v1",
   "delivery": {
-    "artifactKind": "fixtures-plus-unwired-node-authority-and-android-reducer-foundations",
+    "artifactKind": "fixtures-plus-unwired-node-durable-authority-codec-replay-and-android-reducer-foundations",
     "runtimeConsumers": "pending",
-    "nodeCodecConformance": false,
+    "nodeCodecConformance": true,
+    "nodeDurableAuthorityStoreFoundation": true,
+    "nodeReplayRuntimeFoundation": true,
+    "nodeRuntimeIntegrated": false,
     "androidCodecConformance": false,
     "hostAuthorityMachineConformance": true,
     "androidConsumerMachineConformance": false,
@@ -28,6 +31,8 @@
     "acceptedSources": ["agent-sdk-hook", "controlled-agent-adapter"],
     "forbiddenInferenceSources": ["terminal-text", "command-ack", "local-timer", "process-exit"],
     "hostStoreOwner": "relay-host-agent-extension-store",
+    "durableCommitBeforeSourceAck": true,
+    "publicReplayLogOwner": "relay-host-agent-extension-store",
     "brokerBusinessAuthority": false
   },
   "identity": {
@@ -134,6 +139,8 @@
     "attachmentsExcluded": true,
     "offlinePushExcluded": true,
     "productionCapabilityDelivered": false,
+    "nodeHostRuntimeIntegrated": false,
+    "nodeCapabilityAdvertised": false,
     "androidReducerFoundationOnly": true,
     "androidRoomIntegrated": false,
     "androidActorIntegrated": false,

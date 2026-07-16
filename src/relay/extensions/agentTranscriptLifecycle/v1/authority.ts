@@ -1133,6 +1133,54 @@ export function createRelayAgentAuthorityState(
   return createEmptyState(parseBinding(binding, "authority binding"), authorityLimits(capacityOverride));
 }
 
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+/**
+ * Produce the only closed durable-state projection accepted by restore.
+ *
+ * The reducer still does not perform I/O. A durable owner must commit this
+ * projection together with its public event log and an external continuity
+ * witness; serializing it alone is not rollback evidence.
+ */
+export function snapshotRelayAgentAuthorityState(
+  state: RelayAgentAuthorityState,
+): RelayAgentAuthoritySnapshotV1 {
+  assertVerifiedState(state);
+  const sorted = <V>(index: RelayAgentAuthorityIndex<V>): readonly (readonly [string, V])[] => (
+    [...index.entries()].sort((left, right) => compareUtf8(left[0], right[0]))
+  );
+  return deepFreeze({
+    schemaVersion: 1,
+    binding: { ...state.binding },
+    limits: { ...state.limits },
+    agentEventSeq: state.agentEventSeq,
+    activeSourceEpoch: state.activeSourceEpoch,
+    activeSourceAvailability: state.activeSourceAvailability,
+    sources: sorted(state.sources).map(([key, value]) => ({ key, value })),
+    dedupe: [...state.dedupe.values()]
+      .sort((left, right) => compareUtf8(
+        compositeKey(left.sourceEpoch, left.sourceEventId),
+        compositeKey(right.sourceEpoch, right.sourceEventId),
+      ))
+      .map((value) => ({
+        key: { sourceEpoch: value.sourceEpoch, sourceEventId: value.sourceEventId },
+        value,
+      })),
+    runs: sorted(state.runs).map(([key, value]) => ({ key, value })),
+    turns: [...state.turns.values()]
+      .sort((left, right) => compareUtf8(
+        compositeKey(left.runId, left.turnId),
+        compositeKey(right.runId, right.turnId),
+      ))
+      .map((value) => ({ key: { runId: value.runId, turnId: value.turnId }, value })),
+    activeTurns: sorted(state.activeTurns).map(([key, value]) => ({ key, value })),
+    entries: sorted(state.entries).map(([key, value]) => ({ key, value })),
+    deletedEntries: sorted(state.deletedEntries).map(([key, value]) => ({ key, value })),
+  });
+}
+
 function parseSnapshotLimits(value: unknown): RelayAgentAuthorityLimits {
   const keys = Object.keys(RELAY_AGENT_AUTHORITY_HARD_LIMITS);
   const record = asClosedObject(value, "snapshot.limits", keys);
