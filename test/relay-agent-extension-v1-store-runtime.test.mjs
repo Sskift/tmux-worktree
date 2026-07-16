@@ -75,6 +75,20 @@ function clone(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function nextTurn() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 class MemoryMonotonicCasAuthority {
   constructor(anchorId) {
     this.anchorId = anchorId;
@@ -885,6 +899,75 @@ test("two store writers use the locked local CAS and only one successor reaches 
     createHash("sha256").update(exactStateBytes).digest("hex"),
   );
   assert.equal((await (await h.open()).status(target)).currentAgentSeq, "4");
+});
+
+test("deferred anchor overlap never holds the file lock across reconcile", async (t) => {
+  const h = await harness(t);
+  const runtime = runtimeFor(h.store);
+  await establishConversation(runtime);
+  const advanceReadStarted = deferred();
+  const releaseAdvanceRead = deferred();
+  const readsBeforeOverlap = h.continuityAuthority.readCalls;
+  const casCallsBeforeOverlap = h.continuityAuthority.casCalls;
+  let controlledReads = 0;
+  h.continuityAuthority.onRead = async (_request, snapshot) => {
+    controlledReads += 1;
+    const captured = snapshot();
+    if (controlledReads === 2) {
+      h.continuityAuthority.onRead = null;
+      advanceReadStarted.resolve();
+      await releaseAdvanceRead.promise;
+    }
+    return captured;
+  };
+
+  const winner = runtime.ingestTrustedSource(trustedBinding, sourceEvent(4, "overlap-winner", {
+    mutationType: "text_entry.appended",
+    entryId: "entry-overlap-winner",
+    runId: "run-1",
+    turnId: "turn-1",
+    role: "agent",
+    text: "winner",
+    commandId: null,
+  }));
+  await advanceReadStarted.promise;
+  const loser = runtime.ingestTrustedSource(trustedBinding, sourceEvent(4, "overlap-loser", {
+    mutationType: "text_entry.appended",
+    entryId: "entry-overlap-loser",
+    runId: "run-1",
+    turnId: "turn-1",
+    role: "agent",
+    text: "loser",
+    commandId: null,
+  }));
+  await nextTurn();
+
+  const releasedAtMs = Date.now();
+  releaseAdvanceRead.resolve();
+  await nextTurn();
+  assert.ok(
+    Date.now() - releasedAtMs < 2_000,
+    "releasing the deferred anchor read must not expose the five-second blocking lock wait",
+  );
+
+  const [winnerResult, loserResult] = await Promise.all([winner, loser]);
+  assert.equal(winnerResult.reduction.disposition, "applied");
+  assert.equal(loserResult.reduction.disposition, "source_history_expired");
+  assert.ok(
+    h.continuityAuthority.readCalls >= readsBeforeOverlap + 4,
+    "the stale reconcile must re-read the winner checkpoint before running its mutator",
+  );
+  assert.equal(
+    h.continuityAuthority.casCalls,
+    casCallsBeforeOverlap + 1,
+    "the stale loser must not publish a second external checkpoint",
+  );
+  const durable = JSON.parse(readFileSync(h.store.paths.state));
+  assert.deepEqual(
+    durable.sessions[0].timeline.authority.entries.map((item) => item.key),
+    ["entry-overlap-winner"],
+  );
+  assert.equal(h.continuityAuthority.current.checkpoint.sequence, durable.commitSeq);
 });
 
 test("missing or unavailable external continuity keeps the extension foundation unavailable", async (t) => {

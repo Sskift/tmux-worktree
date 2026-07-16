@@ -73,6 +73,7 @@ const MAX_SNAPSHOT_TOMBSTONES_PER_STORE = 1_024;
 const LOCK_OWNER_FILE = "owner.json";
 const LOCK_STALE_MS = 60_000;
 const LOCK_WAIT_MS = 5_000;
+const MAX_RECONCILE_REVALIDATION_ATTEMPTS = 16;
 const MAX_CONTINUITY_BYTES = 16_384;
 const WORST_CASE_WIRE_REQUEST_ID = "\u0001".repeat(128);
 const WORST_CASE_WIRE_CURSOR = "\u0001".repeat(1_024);
@@ -584,6 +585,10 @@ interface LoadedStoreCommit {
   store: PersistedStore;
   bytes: Buffer;
   checkpoint: RelayV2ContinuityCheckpoint;
+}
+
+interface LocalStoreCommit extends LoadedStoreCommit {
+  repairLocalWitness: boolean;
 }
 
 function parseStrictJsonBytes(
@@ -1833,12 +1838,7 @@ export class RelayAgentAuthorityStore {
   private async initialize(): Promise<void> {
     ensurePrivateDirectory(dirname(this.paths.continuity), this.fsyncDirectory);
     ensurePrivateDirectory(dirname(this.paths.state), this.fsyncDirectory);
-    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
-    try {
-      await this.loadOrCreateLocked();
-    } finally {
-      releaseStoreLock(lock);
-    }
+    await this.withReconciledLocalSnapshot(() => undefined);
   }
 
   private async reconcileCheckpoint(checkpoint: RelayV2ContinuityCheckpoint): Promise<void> {
@@ -1849,7 +1849,7 @@ export class RelayAgentAuthorityStore {
     }
   }
 
-  private async loadOrCreateLocked(): Promise<LoadedStoreCommit> {
+  private loadOrCreateLocalLocked(createIfMissing: boolean): LocalStoreCommit {
     const state = inspectJsonFile(
       this.paths.state,
       this.persistedJsonBudgets,
@@ -1864,6 +1864,11 @@ export class RelayAgentAuthorityStore {
       throw new RelayAgentAuthorityStoreCorruptError();
     }
     if (state.kind === "missing" && continuity.kind === "missing") {
+      if (!createIfMissing) {
+        throw new RelayAgentAuthorityStoreCorruptError(
+          "authority state disappeared during continuity reconciliation",
+        );
+      }
       const created = freshStore(
         this.owner,
         this.configuredRetentionMs,
@@ -1882,8 +1887,7 @@ export class RelayAgentAuthorityStore {
         }
         throw error;
       }
-      await this.reconcileCheckpoint(prepared.checkpoint);
-      return prepared;
+      return { ...prepared, repairLocalWitness: false };
     }
     if (state.kind === "missing") {
       throw new RelayAgentAuthorityStoreCorruptError("authority state is missing while local continuity remains");
@@ -1903,20 +1907,78 @@ export class RelayAgentAuthorityStore {
       }
       repairLocalWitness = stateOneAhead;
     }
-    const loaded: LoadedStoreCommit = {
+    return {
       store: state.value,
       bytes: state.bytes,
       checkpoint: checkpointForStore(state.value, state.bytes, this.continuityAnchorId),
+      repairLocalWitness,
     };
-    await this.reconcileCheckpoint(loaded.checkpoint);
-    if (repairLocalWitness) {
-      try {
-        this.atomicWriteJson(this.paths.continuity, continuityFor(loaded.store), MAX_CONTINUITY_BYTES);
-      } catch {
-        throw new RelayAgentAuthorityStoreCommitUncertainError("local continuity repair could not be published");
-      }
+  }
+
+  private readLocalSnapshot(createIfMissing: boolean): LocalStoreCommit {
+    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
+    try {
+      return this.loadOrCreateLocalLocked(createIfMissing);
+    } finally {
+      releaseStoreLock(lock);
     }
-    return loaded;
+  }
+
+  private useRevalidatedLocalSnapshot<T>(
+    expected: LoadedStoreCommit,
+    reconciliationFailure: unknown | null,
+    consumer: (current: LoadedStoreCommit) => T,
+  ): { disposition: "retry" } | { disposition: "used"; value: T } {
+    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
+    try {
+      const current = this.loadOrCreateLocalLocked(false);
+      if (!sameCheckpoint(current.checkpoint, expected.checkpoint)) {
+        return { disposition: "retry" };
+      }
+      if (reconciliationFailure !== null) throw reconciliationFailure;
+      if (current.repairLocalWitness) {
+        try {
+          this.atomicWriteJson(this.paths.continuity, continuityFor(current.store), MAX_CONTINUITY_BYTES);
+        } catch {
+          throw new RelayAgentAuthorityStoreCommitUncertainError(
+            "local continuity repair could not be published",
+          );
+        }
+      }
+      return {
+        disposition: "used",
+        value: consumer({
+          store: current.store,
+          bytes: current.bytes,
+          checkpoint: current.checkpoint,
+        }),
+      };
+    } finally {
+      releaseStoreLock(lock);
+    }
+  }
+
+  private async withReconciledLocalSnapshot<T>(
+    consumer: (current: LoadedStoreCommit) => T,
+  ): Promise<T> {
+    for (let attempt = 0; attempt < MAX_RECONCILE_REVALIDATION_ATTEMPTS; attempt += 1) {
+      const observed = this.readLocalSnapshot(attempt === 0);
+      let reconciliationFailure: unknown | null = null;
+      try {
+        await this.reconcileCheckpoint(observed.checkpoint);
+      } catch (error) {
+        reconciliationFailure = error;
+      }
+      const revalidated = this.useRevalidatedLocalSnapshot(
+        observed,
+        reconciliationFailure,
+        consumer,
+      );
+      if (revalidated.disposition === "used") return revalidated.value;
+    }
+    throw new RelayAgentAuthorityStoreContinuityUnavailableError(
+      "authority state changed repeatedly during continuity reconciliation",
+    );
   }
 
   private localCompareAndPublish(
@@ -2017,25 +2079,17 @@ export class RelayAgentAuthorityStore {
   private async transaction<T>(
     mutator: (working: PersistedStore, observedAtMs: number) => StoreTransactionResult<T>,
   ): Promise<T> {
-    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
-    let current: LoadedStoreCommit;
-    let observedAtMs: number;
-    let working: PersistedStore;
-    let outcome: StoreTransactionResult<T>;
-    let pruned: boolean;
-    try {
-      current = await this.loadOrCreateLocked();
-      observedAtMs = this.observedNow(current.store.lastObservedAtMs);
-      working = cloneStore(current.store);
-      pruned = pruneStore(working, observedAtMs);
-      outcome = mutator(working, observedAtMs);
-    } finally {
-      releaseStoreLock(lock);
+    const prepared = await this.withReconciledLocalSnapshot((current) => {
+      const observedAtMs = this.observedNow(current.store.lastObservedAtMs);
+      const working = cloneStore(current.store);
+      const pruned = pruneStore(working, observedAtMs);
+      const outcome = mutator(working, observedAtMs);
+      return { current, observedAtMs, working, pruned, outcome };
+    });
+    if (prepared.pruned || prepared.outcome.changed) {
+      await this.commitExpected(prepared.current, prepared.working, prepared.observedAtMs);
     }
-    if (pruned || outcome.changed) {
-      await this.commitExpected(current, working, observedAtMs);
-    }
-    return outcome.result;
+    return prepared.outcome.result;
   }
 
   private generatedOpaqueId(label: string): string {
