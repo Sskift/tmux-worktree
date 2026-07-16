@@ -66,7 +66,7 @@ internal object BoundedRfc6455Handshake {
         val response = readResponse(input)
         if (response.status != 101) throw RelayV2UpgradeException(response.status)
         if (response.headers.containsKey("sec-websocket-extensions")) {
-            throw RelayV2UpgradeException(101)
+            throw RelayV2WebSocketProtocolException()
         }
         val upgrade = response.singleHeader("upgrade")
         val connectionTokens = response.singleHeader("connection")
@@ -79,7 +79,7 @@ internal object BoundedRfc6455Handshake {
             accept != expectedAccept(key) ||
             selected != RelayV2Profile.RELAY_V2_SUBPROTOCOL
         ) {
-            throw RelayV2UpgradeException(101)
+            throw RelayV2WebSocketProtocolException()
         }
         return selected
     }
@@ -111,27 +111,23 @@ internal object BoundedRfc6455Handshake {
     private fun readResponse(input: InputStream): UpgradeResponse {
         val total = HeaderByteBudget(MAX_HEADER_BYTES)
         val statusLine = readCrlfLine(input, MAX_STATUS_LINE_BYTES, total)
-        val match = STATUS_LINE.matchEntire(statusLine) ?: throw RelayV2UpgradeException()
+        val match = STATUS_LINE.matchEntire(statusLine) ?: throw RelayV2WebSocketProtocolException()
         val status = match.groupValues[1].toInt()
         val headers = linkedMapOf<String, MutableList<String>>()
         var count = 0
         while (true) {
-            val line = try {
-                readCrlfLine(input, MAX_HEADER_LINE_BYTES, total)
-            } catch (_: RelayV2UpgradeException) {
-                throw RelayV2UpgradeException(status)
-            }
+            val line = readCrlfLine(input, MAX_HEADER_LINE_BYTES, total)
             if (line.isEmpty()) break
             count += 1
             if (count > MAX_HEADER_COUNT || line.startsWith(' ') || line.startsWith('\t')) {
-                throw RelayV2UpgradeException(status)
+                throw RelayV2WebSocketProtocolException()
             }
             val separator = line.indexOf(':')
-            if (separator <= 0) throw RelayV2UpgradeException(status)
+            if (separator <= 0) throw RelayV2WebSocketProtocolException()
             val name = line.substring(0, separator)
             val value = line.substring(separator + 1).trim()
             if (!name.all(::isHeaderNameCharacter) || value.any(::isForbiddenHeaderValueCharacter)) {
-                throw RelayV2UpgradeException(status)
+                throw RelayV2WebSocketProtocolException()
             }
             headers.getOrPut(name.lowercase()) { mutableListOf() } += value
         }
@@ -148,12 +144,14 @@ internal object BoundedRfc6455Handshake {
             val value = input.readHeaderByte(total)
             when (value) {
                 '\r'.code -> {
-                    if (input.readHeaderByte(total) != '\n'.code) throw RelayV2UpgradeException()
+                    if (input.readHeaderByte(total) != '\n'.code) {
+                        throw RelayV2WebSocketProtocolException()
+                    }
                     return output.toString(Charsets.ISO_8859_1.name())
                 }
-                '\n'.code -> throw RelayV2UpgradeException()
+                '\n'.code -> throw RelayV2WebSocketProtocolException()
                 else -> {
-                    if (output.size() >= maximumBytes) throw RelayV2UpgradeException()
+                    if (output.size() >= maximumBytes) throw RelayV2WebSocketProtocolException()
                     output.write(value)
                 }
             }
@@ -168,9 +166,9 @@ internal object BoundedRfc6455Handshake {
     }
 
     private fun UpgradeResponse.singleHeader(name: String): String {
-        val values = headers[name] ?: throw RelayV2UpgradeException(status)
+        val values = headers[name] ?: throw RelayV2WebSocketProtocolException()
         if (values.size != 1 || ',' in values.single() && name != "connection") {
-            throw RelayV2UpgradeException(status)
+            throw RelayV2WebSocketProtocolException()
         }
         return values.single()
     }
@@ -202,7 +200,7 @@ internal object BoundedRfc6455Handshake {
 
         fun consume() {
             consumed += 1
-            if (consumed > maximum) throw RelayV2UpgradeException()
+            if (consumed > maximum) throw RelayV2WebSocketProtocolException()
         }
     }
 

@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import java.io.IOException
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -17,18 +18,21 @@ import kotlin.concurrent.thread
 /**
  * Unwired, bounded RFC6455 transport foundation for the existing Relay v2 actor seam.
  *
- * This adapter owns only one TLS socket, one HTTP/1.1 Upgrade, RFC6455 framing, and its bounded
- * write queues. It never retries, redirects, authenticates a challenge, reconnects, decodes Relay
- * JSON, or owns an actor generation/phase.
+ * This adapter owns only one bounded/cancellable address resolution, one TLS socket, one HTTP/1.1
+ * Upgrade, RFC6455 framing, and its bounded write queues. It never retries, redirects,
+ * authenticates a challenge, reconnects, decodes Relay JSON, or owns an actor generation/phase.
  */
 internal class BoundedRelayV2TransportFactory(
     private val sslSocketFactory: SSLSocketFactory = systemTrustSocketFactory(),
     private val additionalHostnameVerifier: HostnameVerifier? = null,
+    private val addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
     private val randomFactory: () -> SecureRandom = ::SecureRandom,
+    private val resolveTimeoutMs: Int = DEFAULT_RESOLVE_TIMEOUT_MS,
     private val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
     private val handshakeTimeoutMs: Int = DEFAULT_HANDSHAKE_TIMEOUT_MS,
 ) : RelayV2TransportFactory {
     init {
+        require(resolveTimeoutMs > 0)
         require(connectTimeoutMs > 0)
         require(handshakeTimeoutMs > 0)
     }
@@ -44,13 +48,16 @@ internal class BoundedRelayV2TransportFactory(
             listener = listener,
             sslSocketFactory = sslSocketFactory,
             additionalHostnameVerifier = additionalHostnameVerifier,
+            addressResolver = addressResolver,
             random = randomFactory(),
+            resolveTimeoutMs = resolveTimeoutMs,
             connectTimeoutMs = connectTimeoutMs,
             handshakeTimeoutMs = handshakeTimeoutMs,
         ).also(BoundedRelayV2Transport::start)
     }
 
     private companion object {
+        const val DEFAULT_RESOLVE_TIMEOUT_MS = 10_000
         const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000
         const val DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000
 
@@ -65,12 +72,16 @@ private class BoundedRelayV2Transport(
     private val listener: RelayV2TransportListener,
     private val sslSocketFactory: SSLSocketFactory,
     private val additionalHostnameVerifier: HostnameVerifier?,
+    private val addressResolver: RelayV2AddressResolver,
     private val random: SecureRandom,
+    private val resolveTimeoutMs: Int,
     private val connectTimeoutMs: Int,
     private val handshakeTimeoutMs: Int,
 ) : RelayV2Transport {
     private val callbackLock = Any()
     private val terminal = AtomicBoolean(false)
+    private val protocolFailureInProgress = AtomicBoolean(false)
+    private val resolution = AtomicReference<RelayV2AddressResolution?>()
     private val socket = AtomicReference<Socket?>()
     private val writer = AtomicReference<BoundedRfc6455Writer?>()
     private val connectionThread = AtomicReference<Thread?>()
@@ -106,9 +117,11 @@ private class BoundedRelayV2Transport(
     private fun connectAndRead() {
         var raw: Socket? = null
         try {
+            val address = resolveAddress() ?: return
+            if (terminal.get()) return
             raw = Socket()
             if (!registerSocket(raw)) return
-            raw.connect(InetSocketAddress(endpoint.host, endpoint.port), connectTimeoutMs)
+            raw.connect(InetSocketAddress(address, endpoint.port), connectTimeoutMs)
             if (terminal.get()) return
 
             val tls = sslSocketFactory.createSocket(
@@ -141,7 +154,11 @@ private class BoundedRelayV2Transport(
             val frameWriter = BoundedRfc6455Writer(
                 output = tls.outputStream,
                 random = random,
-                onFailure = { completeFailure(RelayV2TransportFailureKind.NETWORK) },
+                onFailure = {
+                    if (!protocolFailureInProgress.get()) {
+                        completeFailure(RelayV2TransportFailureKind.NETWORK)
+                    }
+                },
                 onLocalCloseComplete = ::terminateSilently,
             )
             if (!writer.compareAndSet(null, frameWriter) || terminal.get()) {
@@ -171,7 +188,7 @@ private class BoundedRelayV2Transport(
         } catch (failure: RelayV2UpgradeException) {
             completeFailure(RelayV2TransportFailureKind.UPGRADE, failure.httpStatus)
         } catch (_: RelayV2WebSocketProtocolException) {
-            completeFailure(RelayV2TransportFailureKind.UPGRADE, SWITCHING_PROTOCOLS_STATUS)
+            completeProtocolFailure()
         } catch (_: SocketTimeoutException) {
             completeFailure(RelayV2TransportFailureKind.NETWORK)
         } catch (_: IOException) {
@@ -181,6 +198,30 @@ private class BoundedRelayV2Transport(
         } finally {
             raw?.closeQuietly()
         }
+    }
+
+    private fun resolveAddress(): InetAddress? {
+        val pending = addressResolver.resolve(endpoint.host)
+        if (!registerResolution(pending)) return null
+        return try {
+            pending.await(resolveTimeoutMs).firstOrNull()
+                ?: throw IOException("Relay v2 address resolution returned no address")
+        } finally {
+            resolution.compareAndSet(pending, null)
+        }
+    }
+
+    private fun registerResolution(candidate: RelayV2AddressResolution): Boolean {
+        if (terminal.get() || !resolution.compareAndSet(null, candidate)) {
+            candidate.cancel()
+            return false
+        }
+        if (terminal.get()) {
+            resolution.compareAndSet(candidate, null)
+            candidate.cancel()
+            return false
+        }
+        return true
     }
 
     private fun registerSocket(candidate: Socket): Boolean {
@@ -214,6 +255,12 @@ private class BoundedRelayV2Transport(
         synchronized(callbackLock) {
             listener.onFailure(this, RelayV2TransportFailure(kind, status))
         }
+    }
+
+    private fun completeProtocolFailure() {
+        protocolFailureInProgress.set(true)
+        writer.get()?.sendProtocolClose(PROTOCOL_CLOSE_TIMEOUT_MS)
+        completeFailure(RelayV2TransportFailureKind.PROTOCOL)
     }
 
     private fun completeClosed(code: Int) {
@@ -253,6 +300,7 @@ private class BoundedRelayV2Transport(
 
     private fun closeResources() {
         opened.set(false)
+        resolution.getAndSet(null)?.cancel()
         writer.getAndSet(null)?.stop()
         socket.getAndSet(null)?.closeQuietly()
         connectionThread.get()?.takeUnless { it === Thread.currentThread() }?.interrupt()
@@ -264,6 +312,6 @@ private class BoundedRelayV2Transport(
 
     private companion object {
         const val CLOSE_REPLY_TIMEOUT_MS = 1_000L
-        const val SWITCHING_PROTOCOLS_STATUS = 101
+        const val PROTOCOL_CLOSE_TIMEOUT_MS = 1_000L
     }
 }

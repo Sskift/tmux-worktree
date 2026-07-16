@@ -223,6 +223,7 @@ internal data class RelayV2TransportOpenRequest(
 internal enum class RelayV2TransportFailureKind {
     NETWORK,
     UPGRADE,
+    PROTOCOL,
 }
 
 internal data class RelayV2TransportFailure(

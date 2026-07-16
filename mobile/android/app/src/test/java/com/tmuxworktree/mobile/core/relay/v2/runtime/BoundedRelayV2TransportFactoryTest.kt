@@ -1,6 +1,12 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasExpectation
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialCasResult
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -25,6 +31,13 @@ import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 import okhttp3.tls.HandshakeCertificates
 import okhttp3.tls.HeldCertificate
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -120,8 +133,8 @@ class BoundedRelayV2TransportFactoryTest {
             val transport = server.factory().open(openRequest(server.url()), listener)
             assertTrue(headerSent.await(3, TimeUnit.SECONDS))
             assertTrue("client waited for an absent oversize body", listener.terminal.await(3, TimeUnit.SECONDS))
-            assertEquals(RelayV2TransportFailureKind.UPGRADE, listener.failure?.kind)
-            assertEquals(101, listener.failure?.httpStatus)
+            assertEquals(RelayV2TransportFailureKind.PROTOCOL, listener.failure?.kind)
+            assertNull(listener.failure?.httpStatus)
             assertEquals(1, listener.terminalCount.get())
             assertSameTransportForEveryCallback(transport, listener)
         }
@@ -197,8 +210,8 @@ class BoundedRelayV2TransportFactoryTest {
             val transport = server.factory().open(openRequest(server.url()), listener)
             assertTrue(listener.terminal.await(3, TimeUnit.SECONDS))
             assertNull(listener.openedSubprotocol)
-            assertEquals(RelayV2TransportFailureKind.UPGRADE, listener.failure?.kind)
-            assertEquals(101, listener.failure?.httpStatus)
+            assertEquals(RelayV2TransportFailureKind.PROTOCOL, listener.failure?.kind)
+            assertNull(listener.failure?.httpStatus)
             assertSameTransportForEveryCallback(transport, listener)
             assertFalse(server.requests.single().contains("Sec-WebSocket-Extensions", true))
         }
@@ -330,7 +343,7 @@ class BoundedRelayV2TransportFactoryTest {
                     SecureRandom(),
                 )
                 fail("$name should fail")
-            } catch (_: RelayV2UpgradeException) {
+            } catch (_: RelayV2WebSocketProtocolException) {
                 // Expected at the production handshake reader boundary.
             }
         }
@@ -391,15 +404,33 @@ class BoundedRelayV2TransportFactoryTest {
                 val transport = server.factory().open(request, listener)
                 assertTrue("selected=$selected", listener.terminal.await(3, TimeUnit.SECONDS))
                 assertNull(listener.openedSubprotocol)
-                assertEquals(RelayV2TransportFailureKind.UPGRADE, listener.failure?.kind)
-                assertEquals(101, listener.failure?.httpStatus)
+                assertEquals(RelayV2TransportFailureKind.PROTOCOL, listener.failure?.kind)
+                assertNull(listener.failure?.httpStatus)
                 assertFalse(listener.failure.toString().contains(TOKEN))
                 assertFalse(request.toString().contains(TOKEN))
                 assertFalse(transport.toString().contains(TOKEN))
                 assertFalse(server.requests.single().substringBefore(" HTTP/1.1").contains(TOKEN))
                 assertEquals(1, listener.terminalCount.get())
+                Thread.sleep(100)
+                assertEquals(1, server.acceptedCount.get())
                 assertSameTransportForEveryCallback(transport, listener)
             }
+        }
+
+        RawTlsWebSocketServer().use { server ->
+            server.start { socket ->
+                val request = server.readRequest(socket)
+                server.writeValidUpgrade(socket, request, acceptOverride = "invalid-accept")
+            }
+            val listener = RecordingListener()
+            val transport = server.factory().open(openRequest(server.url()), listener)
+            assertTrue(listener.terminal.await(3, TimeUnit.SECONDS))
+            assertEquals(RelayV2TransportFailureKind.PROTOCOL, listener.failure?.kind)
+            assertNull(listener.failure?.httpStatus)
+            Thread.sleep(100)
+            assertEquals(1, server.acceptedCount.get())
+            assertEquals(1, server.requests.size)
+            assertSameTransportForEveryCallback(transport, listener)
         }
     }
 
@@ -568,6 +599,168 @@ class BoundedRelayV2TransportFactoryTest {
         }
         assertFalse(controlBoundWriter.enqueuePong(byteArrayOf(1)))
         controlBoundWriter.stop()
+
+        val protocolCloseOutput = GatedOutputStream()
+        val protocolCloseWriter = BoundedRfc6455Writer(
+            protocolCloseOutput,
+            SecureRandom(),
+            onFailure = {},
+            onLocalCloseComplete = {},
+        )
+        protocolCloseWriter.start()
+        assertTrue(protocolCloseWriter.enqueueText("in-flight".toByteArray()))
+        assertTrue(protocolCloseOutput.firstWrite.await(3, TimeUnit.SECONDS))
+        val closeStartedAt = System.nanoTime()
+        assertFalse(protocolCloseWriter.sendProtocolClose(timeoutMs = 100))
+        val closeElapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - closeStartedAt)
+        assertTrue("protocol close took ${closeElapsedMs}ms", closeElapsedMs < 500)
+        protocolCloseWriter.stop()
+        assertTrue(protocolCloseOutput.interrupted.await(3, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun productionProtocolViolationReachesActorAsNonRetryableInvalidEnvelopeAndSendsClose() =
+        runBlocking {
+            RawTlsWebSocketServer().use { server ->
+                val observedClose = AtomicReference<ObservedClientFrame?>()
+                server.start { socket ->
+                    val request = server.readRequest(socket)
+                    server.writeValidUpgrade(socket, request)
+                    socket.outputStream.write(0x82)
+                    socket.outputStream.flush()
+                    observedClose.set(readClientFrame(socket.inputStream))
+                }
+
+                val credentialReference = RelayV2CredentialReference("credential-integration")
+                val profile = RelayV2Profile(
+                    profileId = "profile-integration",
+                    issuerUrl = "https://issuer.example.com",
+                    relayUrl = server.url(),
+                    hostId = "host-integration",
+                    principalId = "principal-integration",
+                    grantId = "grant-integration",
+                    clientInstanceId = "client-integration",
+                    credentialReference = credentialReference,
+                    credentialVersion = 1,
+                    activationGeneration = 1,
+                )
+                val credential = RelayV2CredentialBlob(
+                    credentialVersion = 1,
+                    issuerUrl = profile.issuerUrl,
+                    relayUrl = profile.relayUrl,
+                    hostId = profile.hostId,
+                    clientInstanceId = profile.clientInstanceId,
+                    principalId = profile.principalId,
+                    grantId = profile.grantId,
+                    accessToken = TOKEN,
+                    accessExpiresAtMs = 2_000_000,
+                    refreshToken = "twref2.integration",
+                    refreshExpiresAtMs = 3_000_000,
+                )
+                val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+                val actor = RelayV2ConnectionActor(
+                    parentScope = parent,
+                    transportFactory = server.factory(),
+                    credentialStore = ReadOnlyCredentialStore(credentialReference, credential),
+                    codec = RelayV2Codec(),
+                    clock = { 1_000_000 },
+                )
+                try {
+                    assertTrue(actor.connect(profile, resume = null))
+                    val failed = withTimeout(5_000) {
+                        actor.state.first { it.phase == RelayV2ConnectionPhase.FAILED }
+                    }
+                    assertEquals(RelayV2FailureKind.SCHEMA, failed.failure?.kind)
+                    assertEquals("INVALID_ENVELOPE", failed.failure?.code)
+                    assertFalse(requireNotNull(failed.failure).retryable)
+                    assertTrue(waitUntil { observedClose.get() != null })
+                    val close = requireNotNull(observedClose.get())
+                    assertEquals(OPCODE_CLOSE, close.opcode)
+                    assertTrue(close.masked)
+                    assertEquals(1002, close.closeCode())
+                    assertEquals(1, server.acceptedCount.get())
+                } finally {
+                    actor.close()
+                    parent.cancel()
+                }
+            }
+        }
+
+    @Test
+    fun boundedResolverCancelFencesLateResultAndCapsWorkersAndQueuedTasks() {
+        RawTlsWebSocketServer().use { server ->
+            val lookupEntered = CountDownLatch(1)
+            val releaseLookup = CountDownLatch(1)
+            val lookupFinished = CountDownLatch(1)
+            val resolver = BoundedRelayV2AddressResolver(
+                lookup = {
+                    lookupEntered.countDown()
+                    awaitIgnoringInterrupt(releaseLookup)
+                    lookupFinished.countDown()
+                    arrayOf(InetAddress.getLoopbackAddress())
+                },
+                workerCount = 1,
+                queuedTaskCapacity = 1,
+            )
+            try {
+                server.start { }
+                val listener = RecordingListener()
+                val transport = server.factory(
+                    addressResolver = resolver,
+                    resolveTimeoutMs = 5_000,
+                ).open(openRequest(server.url()), listener)
+                assertTrue(lookupEntered.await(3, TimeUnit.SECONDS))
+                val startedAt = System.nanoTime()
+                transport.cancel()
+                val cancelMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                assertTrue("DNS cancel took ${cancelMs}ms", cancelMs < 500)
+                releaseLookup.countDown()
+                assertTrue(lookupFinished.await(3, TimeUnit.SECONDS))
+                Thread.sleep(100)
+                assertEquals(0, server.acceptedCount.get())
+                assertTrue(listener.events.isEmpty())
+                assertEquals(0, listener.terminalCount.get())
+            } finally {
+                resolver.close()
+            }
+        }
+
+        val workers = CopyOnWriteArrayList<String>()
+        val workersEntered = CountDownLatch(2)
+        val releaseWorkers = CountDownLatch(1)
+        val bounded = BoundedRelayV2AddressResolver(
+            lookup = {
+                workers += Thread.currentThread().name
+                workersEntered.countDown()
+                awaitIgnoringInterrupt(releaseWorkers)
+                arrayOf(InetAddress.getLoopbackAddress())
+            },
+        )
+        try {
+            val admitted = List(18) { bounded.resolve("resolver-test.invalid") }
+            assertTrue(workersEntered.await(3, TimeUnit.SECONDS))
+            try {
+                bounded.resolve("resolver-overflow.invalid")
+                fail("resolver queue saturation should fail")
+            } catch (error: IOException) {
+                assertFalse(error.message.orEmpty().contains("resolver-overflow.invalid"))
+            }
+            admitted.forEach(RelayV2AddressResolution::cancel)
+            admitted.forEach { resolution ->
+                val startedAt = System.nanoTime()
+                try {
+                    resolution.await(5_000)
+                    fail("cancelled lookup should not resolve")
+                } catch (_: IOException) {
+                    val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+                    assertTrue("cancelled await took ${elapsedMs}ms", elapsedMs < 500)
+                }
+            }
+            assertEquals(2, workers.distinct().size)
+        } finally {
+            releaseWorkers.countDown()
+            bounded.close()
+        }
     }
 
     private fun openRequest(url: String, token: String = TOKEN) = RelayV2TransportOpenRequest(
@@ -644,6 +837,27 @@ private class RecordingListener : RelayV2TransportListener {
     }
 }
 
+private class ReadOnlyCredentialStore(
+    private val reference: RelayV2CredentialReference,
+    private val credential: RelayV2CredentialBlob,
+) : RelayV2CredentialStore {
+    override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? =
+        credential.takeIf { reference == this.reference }
+
+    override fun create(
+        reference: RelayV2CredentialReference,
+        blob: RelayV2CredentialBlob,
+    ): Boolean = false
+
+    override fun compareAndSet(
+        reference: RelayV2CredentialReference,
+        expectation: RelayV2CredentialCasExpectation,
+        replacement: RelayV2CredentialBlob,
+    ): RelayV2CredentialCasResult = error("Credential mutation is outside transport integration")
+
+    override fun clear(reference: RelayV2CredentialReference) = Unit
+}
+
 private class RawTlsWebSocketServer(
     certificateHostname: String = "localhost",
 ) : Closeable {
@@ -697,8 +911,13 @@ private class RawTlsWebSocketServer(
 
     fun url(host: String = "localhost"): String = "wss://$host:${serverSocket.localPort}/client"
 
-    fun factory(): BoundedRelayV2TransportFactory = BoundedRelayV2TransportFactory(
+    fun factory(
+        addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
+        resolveTimeoutMs: Int = 2_000,
+    ): BoundedRelayV2TransportFactory = BoundedRelayV2TransportFactory(
         sslSocketFactory = clientCertificates.sslSocketFactory(),
+        addressResolver = addressResolver,
+        resolveTimeoutMs = resolveTimeoutMs,
         connectTimeoutMs = 2_000,
         handshakeTimeoutMs = 2_000,
     )
@@ -714,6 +933,7 @@ private class RawTlsWebSocketServer(
         request: String,
         selectedSubprotocol: String? = RelayV2Profile.RELAY_V2_SUBPROTOCOL,
         additionalHeaders: List<String> = emptyList(),
+        acceptOverride: String? = null,
     ) {
         val key = request.lineSequence()
             .first { it.startsWith("Sec-WebSocket-Key: ", ignoreCase = true) }
@@ -723,11 +943,12 @@ private class RawTlsWebSocketServer(
         val extra = additionalHeaders.joinToString(separator = "", postfix = if (additionalHeaders.isEmpty()) "" else "") {
             "$it\r\n"
         }
+        val accept = acceptOverride ?: webSocketAccept(key)
         socket.outputStream.writeAscii(
             "HTTP/1.1 101 Switching Protocols\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
-                "Sec-WebSocket-Accept: ${webSocketAccept(key)}\r\n" +
+                "Sec-WebSocket-Accept: $accept\r\n" +
                 selectedHeader +
                 extra +
                 "\r\n",
@@ -802,6 +1023,11 @@ private data class ObservedClientFrame(
     val masked: Boolean,
     val payload: ByteArray,
 )
+
+private fun ObservedClientFrame.closeCode(): Int {
+    check(payload.size >= 2)
+    return ((payload[0].toInt() and 0xff) shl 8) or (payload[1].toInt() and 0xff)
+}
 
 private fun readAllClientFrames(bytes: ByteArray): List<ObservedClientFrame> {
     val input = ByteArrayInputStream(bytes)
@@ -929,4 +1155,15 @@ private fun waitUntil(timeoutMs: Long = 3_000, predicate: () -> Boolean): Boolea
         Thread.yield()
     }
     return predicate()
+}
+
+private fun awaitIgnoringInterrupt(latch: CountDownLatch) {
+    while (true) {
+        try {
+            latch.await()
+            return
+        } catch (_: InterruptedException) {
+            // Model platform resolvers that do not honor Future.cancel(true).
+        }
+    }
 }

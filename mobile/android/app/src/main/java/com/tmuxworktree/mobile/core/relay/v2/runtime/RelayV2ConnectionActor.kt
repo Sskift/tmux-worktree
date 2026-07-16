@@ -1338,13 +1338,19 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun transportFailed(failure: RelayV2TransportFailure) {
-        val status = failure.httpStatus
-        when (status) {
-            401 -> failConnection(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false, null)
-            403 -> failConnection(RelayV2FailureKind.AUTH, "PERMISSION_DENIED", false, null)
-            426 -> failConnection(RelayV2FailureKind.DIALECT, "PROTOCOL_UNSUPPORTED", false, null)
-            503 -> failConnection(RelayV2FailureKind.ROUTE, "HOST_OFFLINE", true, null)
-            else -> failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
+        when (failure.kind) {
+            RelayV2TransportFailureKind.PROTOCOL ->
+                failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, null)
+            RelayV2TransportFailureKind.NETWORK ->
+                failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
+            RelayV2TransportFailureKind.UPGRADE -> when (failure.httpStatus) {
+                101 -> failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, null)
+                401 -> failConnection(RelayV2FailureKind.AUTH, "AUTH_REQUIRED", false, null)
+                403 -> failConnection(RelayV2FailureKind.AUTH, "PERMISSION_DENIED", false, null)
+                426 -> failConnection(RelayV2FailureKind.DIALECT, "PROTOCOL_UNSUPPORTED", false, null)
+                503 -> failConnection(RelayV2FailureKind.ROUTE, "HOST_OFFLINE", true, null)
+                else -> failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
+            }
         }
     }
 

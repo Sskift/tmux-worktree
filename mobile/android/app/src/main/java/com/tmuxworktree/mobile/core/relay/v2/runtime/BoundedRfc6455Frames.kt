@@ -212,21 +212,15 @@ internal class BoundedRfc6455Writer(
 
     fun replyToClose(payload: ByteArray, timeoutMs: Long): Boolean {
         val completion = CountDownLatch(1)
-        val queued = synchronized(lock) {
-            if (stopped || payload.size > 125) return false
-            acceptingMessages = false
-            clearQueuedMessagesLocked()
-            controls.clear()
-            queuedControlBytes = 0
-            enqueueControlLocked(OPCODE_CLOSE, payload.copyOf(), completion, false)
-        }
-        if (!queued) return false
-        return try {
-            completion.await(timeoutMs, TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
+        if (!enqueueTerminalClose(payload, completion)) return false
+        return awaitCompletion(completion, timeoutMs)
+    }
+
+    fun sendProtocolClose(timeoutMs: Long): Boolean {
+        val payload = closePayload(1002, "protocol violation") ?: return false
+        val completion = CountDownLatch(1)
+        if (!enqueueTerminalClose(payload, completion)) return false
+        return awaitCompletion(completion, timeoutMs)
     }
 
     fun close(code: Int, reason: String): Boolean {
@@ -266,6 +260,23 @@ internal class BoundedRfc6455Writer(
         localClose: Boolean,
     ): Boolean = synchronized(lock) {
         enqueueControlLocked(opcode, payload.copyOf(), completion, localClose)
+    }
+
+    private fun enqueueTerminalClose(payload: ByteArray, completion: CountDownLatch): Boolean =
+        synchronized(lock) {
+            if (stopped || payload.size > 125) return@synchronized false
+            acceptingMessages = false
+            clearQueuedMessagesLocked()
+            controls.clear()
+            queuedControlBytes = 0
+            enqueueControlLocked(OPCODE_CLOSE, payload.copyOf(), completion, false)
+        }
+
+    private fun awaitCompletion(completion: CountDownLatch, timeoutMs: Long): Boolean = try {
+        completion.await(timeoutMs, TimeUnit.MILLISECONDS)
+    } catch (_: InterruptedException) {
+        Thread.currentThread().interrupt()
+        false
     }
 
     private fun enqueueControlLocked(

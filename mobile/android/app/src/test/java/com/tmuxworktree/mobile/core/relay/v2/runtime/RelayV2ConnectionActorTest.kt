@@ -1134,6 +1134,28 @@ class RelayV2ConnectionActorTest {
         }
     }
 
+    @Test
+    fun `legacy upgrade 101 classification is non retryable invalid envelope`() = runBlocking {
+        val harness = Harness()
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0)
+            transport.fail(
+                RelayV2TransportFailure(
+                    RelayV2TransportFailureKind.UPGRADE,
+                    httpStatus = 101,
+                ),
+            )
+
+            val failed = harness.actor.awaitFailure(RelayV2FailureKind.SCHEMA)
+            assertEquals("INVALID_ENVELOPE", failed.failure?.code)
+            assertFalse(requireNotNull(failed.failure).retryable)
+            assertEquals(1, transport.cancelCount)
+        } finally {
+            harness.close()
+        }
+    }
+
     private inner class Harness(
         val factory: FakeTransportFactory = FakeTransportFactory(),
         normalActionCapacity: Int = RelayV2ConnectionActor.DEFAULT_ACTION_CAPACITY,
