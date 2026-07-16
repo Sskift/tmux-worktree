@@ -11,6 +11,7 @@ const SCOPE_ID = "scope-local";
 const INCARNATION = `twinc2.${"A".repeat(43)}`;
 const OTHER_INCARNATION = `twinc2.${"B".repeat(43)}`;
 const CREATED_AT = "2026-07-12T00:00:01.000Z";
+const RAW_WORKTREE_NAME = "tw-demo-fix-backend-a1b2c";
 
 function fingerprint(seed = "a") {
   return {
@@ -62,15 +63,15 @@ function evidence(coverage = "complete") {
   };
 }
 
-function prospectiveSession(operation) {
+function prospectiveSession(operation, args) {
   const terminal = operation === "create_terminal";
   return {
     kind: terminal ? "terminal" : "worktree",
-    displayName: terminal ? "demo" : "demo-fix",
+    displayName: terminal ? args.label : args.name,
     state: "running",
-    project: terminal ? null : "demo",
-    label: terminal ? "demo" : null,
-    cwd: terminal ? "/repo/demo" : "/worktrees/demo/demo-fix",
+    project: terminal ? null : args.project,
+    label: terminal ? args.label : null,
+    cwd: terminal ? args.cwd : "/worktrees/demo/demo-fix",
     attached: false,
     windowCount: 1,
     createdAtMs: 1_783_700_001_000,
@@ -81,6 +82,7 @@ function prospectiveSession(operation) {
 function resolvedFor(request) {
   const base = { kind: "resolved", ...evidence() };
   if (request.operation === "create_worktree" || request.operation === "create_terminal") {
+    const args = structuredClone(request.arguments);
     return {
       ...base,
       target: {
@@ -92,8 +94,9 @@ function resolvedFor(request) {
           targetId: request.operation === "create_terminal" ? "configured-devbox" : "bundled-local-cli",
         },
         capabilities: [...rpcV2.RPC_V2_CAPABILITIES],
-        arguments: structuredClone(request.arguments),
-        prospectiveSession: prospectiveSession(request.operation),
+        arguments: args,
+        publicDisplayName: request.operation === "create_terminal" ? args.label : args.name,
+        prospectiveSession: prospectiveSession(request.operation, args),
       },
     };
   }
@@ -147,7 +150,7 @@ function exitedJson(value, overrides = {}) {
 function createSession(operation, reservationCorrelation) {
   const terminal = operation === "create-terminal";
   return {
-    name: terminal ? "tw-term-a1b2c" : "demo-fix",
+    name: terminal ? "tw-term-a1b2c" : RAW_WORKTREE_NAME,
     kind: terminal ? "terminal" : "worktree",
     profile: "dashboard",
     project: terminal ? null : "demo",
@@ -325,14 +328,26 @@ test("canonical executor translates all four operations to one exact authority c
     assert.equal(hasKey(outcomes[operation].backendOutcome.evidence, "sessionId"), false);
     assert.equal(hasKey(outcomes[operation].commitIntent, "sessionId"), false);
   }
-  assert.equal(outcomes.create_worktree.backendOutcome.backendInstanceKey, OTHER_INCARNATION);
-  assert.equal(outcomes.create_terminal.backendOutcome.backendInstanceKey, INCARNATION);
-  assert.equal(outcomes.kill_session.backendOutcome.backendInstanceKey, INCARNATION);
+  for (const operation of ["create_worktree", "create_terminal", "kill_session"]) {
+    assert.match(outcomes[operation].backendOutcome.backendInstanceKey, /^twbk2\.[A-Za-z0-9_-]{43}$/);
+  }
+  assert.notEqual(outcomes.create_worktree.backendOutcome.backendInstanceKey, OTHER_INCARNATION);
+  assert.notEqual(outcomes.create_terminal.backendOutcome.backendInstanceKey, INCARNATION);
+  assert.notEqual(
+    outcomes.create_terminal.backendOutcome.backendInstanceKey,
+    outcomes.kill_session.backendOutcome.backendInstanceKey,
+  );
+  assert.equal(outcomes.create_worktree.backendOutcome.evidence.session.displayName, "fix");
+  assert.equal(JSON.stringify(outcomes.create_worktree.backendOutcome.evidence).includes(RAW_WORKTREE_NAME), false);
+  assert.equal(outcomes.create_terminal.backendOutcome.evidence.session.displayName, "demo");
+  assert.equal(outcomes.create_terminal.backendOutcome.evidence.session.label, "demo");
 
-  assert.deepEqual(ports.calls.terminal[0], {
+  const { operationId, ...terminalCall } = ports.calls.terminal[0];
+  assert.match(operationId, /^twmsg2\.[A-Za-z0-9_-]{43}$/);
+  assert.ok(Buffer.byteLength(operationId, "utf8") <= 192);
+  assert.deepEqual(terminalCall, {
     scopeId: SCOPE_ID,
     lease: resolvedFor(canonicalRequest("send_agent_message")).target.lease,
-    operationId: "relay-v2:cmd-send_agent_message",
     pane: "0",
     message: "continue",
     submit: true,
@@ -394,6 +409,119 @@ test("resolver coverage alone controls immutable not-found admission", async () 
   assert.equal(unavailable.kind, "transient_admission_failure");
   assert.equal(unavailable.error.code, "CAPABILITY_UNAVAILABLE");
   assert.equal(unavailable.error.commandDisposition, "not_accepted");
+});
+
+test("resolver cannot rewrite accepted pure create arguments", async (t) => {
+  const cases = [
+    ["aiCommand", "create_worktree", (target) => { target.arguments.aiCommand = "other-agent"; }],
+    ["name", "create_worktree", (target) => { target.arguments.name = "other-name"; }],
+    ["project", "create_worktree", (target) => { target.arguments.project = "other-project"; }],
+    ["branch", "create_worktree", (target) => { target.arguments.branch = "other-branch"; }],
+    ["public display", "create_worktree", (target) => {
+      target.publicDisplayName = "other-display";
+      target.prospectiveSession.displayName = "other-display";
+    }],
+    ["label", "create_terminal", (target) => { target.arguments.label = "other-label"; }],
+  ];
+  for (const [name, operation, mutate] of cases) {
+    await t.test(name, async () => {
+      const ports = fakePorts({
+        resolve: (request) => {
+          const resolved = resolvedFor(request);
+          mutate(resolved.target);
+          return resolved;
+        },
+      });
+      const admission = await executorFor(ports).resolve(canonicalRequest(operation));
+      assert.equal(admission.kind, "transient_admission_failure");
+      assert.equal(admission.error.commandDisposition, "not_accepted");
+      assert.equal(ports.calls.process.length, 0);
+      assert.equal(ports.calls.terminal.length, 0);
+    });
+  }
+
+  await t.test("enumerated canonical path and cwd derivation", async () => {
+    const ports = fakePorts({
+      resolve: (request) => {
+        const resolved = resolvedFor(request);
+        if (request.operation === "create_worktree") {
+          resolved.target.arguments.path = "/canonical/repo/demo";
+        } else {
+          resolved.target.arguments.cwd = "/canonical/repo/demo";
+          resolved.target.prospectiveSession.cwd = "/canonical/repo/demo";
+        }
+        return resolved;
+      },
+    });
+    const executor = executorFor(ports);
+    assert.equal((await executor.resolve(canonicalRequest("create_worktree"))).kind, "executable");
+    assert.equal((await executor.resolve(canonicalRequest("create_terminal"))).kind, "executable");
+    assert.equal(ports.calls.process.length, 0);
+  });
+});
+
+test("backend instance keys bind process target and remain consistent for kill", async () => {
+  const targets = [
+    { kind: "local", scopeId: SCOPE_ID, targetId: "same-stable-target" },
+    { kind: "ssh", scopeId: SCOPE_ID, targetId: "same-stable-target" },
+    { kind: "ssh", scopeId: SCOPE_ID, targetId: "configured-devbox-two" },
+  ];
+  const keys = [];
+  for (const target of targets) {
+    const ports = fakePorts({
+      resolve: (request) => {
+        const resolved = resolvedFor(request);
+        resolved.target.processTarget = structuredClone(target);
+        return resolved;
+      },
+    });
+    const executor = executorFor(ports);
+    const create = await executor.executeTwRpc(await executionPlan(
+      executor,
+      canonicalRequest("create_terminal"),
+    ));
+    const kill = await executor.executeTwRpc(await executionPlan(
+      executor,
+      canonicalRequest("kill_session"),
+    ));
+    assert.equal(create.state, "succeeded");
+    assert.equal(kill.state, "succeeded");
+    const materializedBackendKey = create.backendOutcome.backendInstanceKey;
+    assert.equal(kill.backendOutcome.backendInstanceKey, materializedBackendKey);
+    assert.notEqual(materializedBackendKey, INCARNATION);
+    keys.push(materializedBackendKey);
+  }
+  assert.equal(new Set(keys).size, targets.length);
+});
+
+test("terminal operation identity binds the full trusted ledger tuple", async () => {
+  const ports = fakePorts();
+  const executor = executorFor(ports);
+  const requests = [
+    canonicalRequest("send_agent_message", { commandId: "cmd-shared" }),
+    canonicalRequest("send_agent_message", {
+      commandId: "cmd-shared",
+      principalId: "principal-two",
+    }),
+    canonicalRequest("send_agent_message", {
+      commandId: "cmd-shared",
+      hostEpoch: "host-epoch-2",
+    }),
+    canonicalRequest("send_agent_message", {
+      commandId: "cmd-shared",
+      hostId: "mac-admin-two",
+    }),
+    canonicalRequest("send_agent_message", { commandId: "cmd-shared" }),
+  ];
+  for (const request of requests) {
+    assert.equal((await executor.executeTerminalControl(
+      await executionPlan(executor, request),
+    )).state, "succeeded");
+  }
+  const operationIds = ports.calls.terminal.map((call) => call.operationId);
+  assert.equal(operationIds[0], operationIds[4]);
+  assert.equal(new Set(operationIds).size, requests.length - 1);
+  assert.ok(operationIds.every((value) => Buffer.byteLength(value, "utf8") <= 192));
 });
 
 test("TW RPC maps only explicit no-side-effect failure and strict correlated success", async (t) => {
