@@ -221,6 +221,7 @@
         "invocationCount": "exactly-one",
         "nativeSettlesAfterCallback": true,
         "protocolViolation": "NATIVE_INTERFACE_INVALID-and-terminal-close-before-current-or-delayed-callback-can-operate",
+        "delayedCallbackAfterTerminalFence": "reject-NATIVE_INTERFACE_INVALID-before-business-operation",
         "operationResultOwner": "typescript-wrapper",
         "nativeIdentityEchoRequired": false,
         "businessExceptionRoundTripThroughNativeRequired": false

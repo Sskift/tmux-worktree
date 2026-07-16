@@ -715,6 +715,9 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
     let operationValue: Result;
     let operationError: unknown;
     const nativeCallback = async (rawTransaction: unknown): Promise<unknown> => {
+      if (this.#terminalPoisoned) {
+        throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
+      }
       if (callbackInvoked) {
         protocolViolation = true;
         this.terminalFence();

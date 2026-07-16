@@ -671,11 +671,13 @@ test("runtime runExclusive requires exactly one settled callback without identit
     await early.close();
   }
 
-  for (const settlement of ["reject-before-callback", "throw-before-callback"]) {
-    const release = deferred();
-    const entered = deferred();
-    const observed = deferred();
+  for (const settlement of [
+    "resolve-before-callback",
+    "reject-before-callback",
+    "throw-before-callback",
+  ]) {
     const rawBacking = { publicationAttempts: 0 };
+    let operationInvocations = 0;
     const rawRevision = Object.freeze({});
     const transaction = Object.freeze({
       read: async () => ({ outcome: "missing", revision: rawRevision }),
@@ -687,26 +689,19 @@ test("runtime runExclusive requires exactly one settled callback without identit
     let delayedCallback;
     const delayed = openRaw((callback) => {
       delayedCallback = callback;
+      if (settlement === "resolve-before-callback") return undefined;
       if (settlement === "reject-before-callback") {
         return Promise.reject(rawFailure("STORE_BUSY"));
       }
       throw rawFailure("STORE_BUSY");
     });
     const running = delayed.runExclusive(async (wrappedTransaction) => {
-      entered.resolve();
-      await release.promise;
-      const readCode = await wrappedTransaction.read().then(
-        () => "resolved",
-        (error) => error.code,
-      );
-      const publishCode = await wrappedTransaction.compareAndPublish(
-        Object.freeze({}),
+      operationInvocations += 1;
+      const current = await wrappedTransaction.read();
+      await wrappedTransaction.compareAndPublish(
+        current.revision,
         new Uint8Array([1]),
-      ).then(
-        () => "resolved",
-        (error) => error.code,
       );
-      observed.resolve({ readCode, publishCode });
     });
     await assert.rejects(
       running,
@@ -720,14 +715,12 @@ test("runtime runExclusive requires exactly one settled callback without identit
     );
 
     assert.equal(typeof delayedCallback, "function");
-    const callbackPending = delayedCallback(transaction);
-    await entered.promise;
-    release.resolve();
-    await callbackPending;
-    assert.deepEqual(await observed.promise, {
-      readCode: "STORE_CLOSED",
-      publishCode: "STORE_CLOSED",
-    });
+    await assert.rejects(
+      delayedCallback(transaction),
+      (error) => error.code === "NATIVE_INTERFACE_INVALID" && error.retryable === false,
+      `${settlement} rejects the delayed callback before business operation`,
+    );
+    assert.equal(operationInvocations, 0, `${settlement} never invokes business operation`);
     assert.equal(
       rawBacking.publicationAttempts,
       0,
