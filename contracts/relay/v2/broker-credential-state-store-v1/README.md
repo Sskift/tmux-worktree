@@ -1,6 +1,6 @@
 # Relay v2 Broker Credential State Store v1
 
-状态：**Frozen native storage contract；只有 TypeScript closed decoder/wrapper，没有 native implementation、loader、authority injection、ready capability 或 production wiring。**
+状态：**Frozen native storage contract；已有 TypeScript closed decoder/wrapper 与未接线 optional loader，没有 native implementation、authority injection、ready capability 或 production wiring。**
 
 本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不重新引入已被拒绝且未纳入当前交付源码的 unsafe BAU path/JSON 设计，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
 
@@ -144,4 +144,4 @@ Durability 名称冻结为语义 `payload_then_header_durable_v1`，不把某个
 
 [`test/support/relayV2BrokerCredentialStateStoreConformance.mjs`](../../../../test/support/relayV2BrokerCredentialStateStoreConformance.mjs) 是未来 Rust/Darwin/Linux adapter 可复用的 authority-facing conformance harness。当前 in-memory raw adapter 只证明 TypeScript wrapper/port contract，**不是 native、device、filesystem、kernel-lock 或 power-loss durability 证据**。
 
-Rust core、Darwin/Linux adapter、N-API binary、optional loader、authority injection、packaging 和 production Gate 均未实现。Port/manifest/fixture/self-check contract 的存在不表示 native 已 open，更不表示 continuity 或 ready；production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。
+当前另有未接 production composition 的 optional loader：它只做显式 target、最低 N-API、固定 artifact selection，固定一次 raw binding identity，并把 capability/open 原样交给本 contract 的 TypeScript wrapper；只有固定目标 artifact 本身在 resolve 阶段确实缺失才映射 `native_artifact_missing`。Rust core、Darwin/Linux adapter、N-API binary、authority injection、packaging 和 production Gate 均未实现。Port/manifest/fixture/self-check/loader 的存在不表示 native 已 open，更不表示 continuity 或 ready；production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。
