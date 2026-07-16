@@ -39,6 +39,7 @@ const BACKPRESSURE_CLOSE_MS = 5_000;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const CLIENT_TO_HOST_PUBLIC_TYPES = new Set([
+  "hosts.snapshot.get",
   "client.hello",
   "command.execute",
   "command.query",
@@ -76,6 +77,8 @@ const HOST_TO_CLIENT_PUBLIC_TYPES = new Set([
   "terminal.resize_error",
   "terminal.closed",
 ]);
+
+type RelayV2PresenceReason = "connected" | "reconnected" | "superseded" | "disconnected";
 
 export type RelayBrokerRole = "client" | "host";
 
@@ -164,7 +167,7 @@ export type RelayV2BrokerAction =
   | {
       kind: "close_host";
       transportId: string;
-      closeCode: 1013 | 4400 | 4403 | 4409 | 4411;
+      closeCode: 1013 | 4400 | 4401 | 4403 | 4409 | 4411;
       reason: string;
     }
   | {
@@ -181,7 +184,7 @@ export type RelayV2BrokerAction =
       kind: "route_unavailable";
       connectionId: string;
       hostId: string;
-      closeCode: 1013 | 4403 | 4406;
+      closeCode: 1013 | 4401 | 4403 | 4406;
       error: RelayV2StructuredError;
     }
   | {
@@ -291,6 +294,26 @@ export interface RelayV2HostDirectoryView {
   observedAtMs: number;
 }
 
+export type RelayV2LiveAuthFence =
+  | {
+      reason: "access_expired";
+      role: RelayBrokerRole;
+      hostId: string;
+      jti: string;
+    }
+  | {
+      reason: "grant_revoked";
+      role: RelayBrokerRole;
+      hostId: string;
+      grantId: string;
+    }
+  | {
+      reason: "kid_removed";
+      role?: RelayBrokerRole;
+      hostId?: string;
+      kid: string;
+    };
+
 export type RelayV2ClientAdmission =
   | {
       outcome: "accept";
@@ -300,7 +323,7 @@ export type RelayV2ClientAdmission =
     }
   | {
       outcome: "reject";
-      status: 426 | 503;
+      status: 401 | 403 | 426 | 503;
       error: RelayV2StructuredError;
     };
 
@@ -376,6 +399,7 @@ type RouteState = {
   carrierTransportId: string;
   authContext: RelayV2AuthContext;
   status: "opening" | "opened" | "closing" | "closed";
+  firstApplicationFrame: "pending" | "welcome" | "unavailable";
   maxFrameBytes: number;
   nextClientToHostSeq: bigint;
   lastClientToHostDispatchedSeq: bigint;
@@ -401,6 +425,8 @@ type DirectoryRecord = {
   clientDialects: ("tw-relay.v1" | "tw-relay.v2")[];
   capabilities: string[];
   observedAtMs: number;
+  presenceReason: RelayV2PresenceReason;
+  previousHostInstanceId: string | null;
 };
 
 function roleForPath(pathname: string): RelayBrokerRole | undefined {
@@ -593,6 +619,19 @@ function lastAcceptedHostSeq(route: RouteState): string {
   return (route.expectedHostToClientSeq - 1n).toString(10);
 }
 
+function completeBaseReadiness(hello: HostHello): string[] {
+  if (
+    !hello.clientDialects.includes("tw-relay.v2")
+    || !RELAY_V2_REQUIRED_CAPABILITIES.every((capability) => (
+      hello.capabilities.includes(capability)
+    ))
+  ) return [];
+  // The frozen base set is an atomic readiness result. Arbitrary values from
+  // host.hello are never copied into a broker-produced welcome or directory
+  // capability view.
+  return [...RELAY_V2_REQUIRED_CAPABILITIES];
+}
+
 export class RelayV2BrokerCore {
   readonly brokerEpoch: string;
 
@@ -602,18 +641,30 @@ export class RelayV2BrokerCore {
   private readonly directory = new Map<string, DirectoryRecord>();
   private readonly routes = new Map<string, RouteState>();
   private readonly clients = new Map<string, ClientState>();
+  private readonly pendingLiveAuthFences: RelayV2LiveAuthFence[] = [];
   private readonly now: () => number;
   private readonly authControlAuthority: RelayV2BrokerAuthControlAuthority | undefined;
+  private readonly baseCapabilityReadiness: string[];
 
   constructor(options: {
     brokerEpoch?: string;
     now?: () => number;
     authControlAuthority?: RelayV2BrokerAuthControlAuthority;
+    /**
+     * Explicit complete base-v2 composition receipt. Omission keeps
+     * advertisement disabled even when host.hello claims the base set.
+     */
+    baseCapabilityReadiness?: readonly string[];
   } = {}) {
     this.brokerEpoch = options.brokerEpoch ?? randomUUID();
     if (!isIdentifier(this.brokerEpoch)) throw new Error("invalid Relay v2 broker epoch");
     this.now = options.now ?? Date.now;
     this.authControlAuthority = options.authControlAuthority;
+    this.baseCapabilityReadiness = RELAY_V2_REQUIRED_CAPABILITIES.every((capability) => (
+      options.baseCapabilityReadiness?.includes(capability)
+    ))
+      ? [...RELAY_V2_REQUIRED_CAPABILITIES]
+      : [];
   }
 
   /** Attach only after dispatchRelayBrokerUpgrade accepted a role=host v2 Upgrade. */
@@ -663,6 +714,68 @@ export class RelayV2BrokerCore {
     };
   }
 
+  /**
+   * Broker-authoritative, claim-scoped directory snapshot. Unknown and
+   * unauthorized claims are deliberately indistinguishable and never fall
+   * back to a global/empty directory view.
+   */
+  readHostsSnapshot(
+    authContext: Readonly<RelayV2AuthContext>,
+    requestId: string,
+  ): RelayV2JsonObject | undefined {
+    if (!this.isDirectoryClient(authContext) || !isIdentifier(requestId)) return undefined;
+    const record = this.directory.get(authContext.hostId);
+    if (!record) return undefined;
+    const frame = {
+      protocolVersion: 2,
+      kind: "response",
+      type: "hosts.snapshot",
+      requestId,
+      payload: {
+        brokerEpoch: this.brokerEpoch,
+        revision: record.revision.toString(10),
+        items: [{
+          hostId: record.hostId,
+          state: record.state,
+          hostEpoch: record.hostEpoch!,
+          hostInstanceId: record.hostInstanceId!,
+          clientDialects: [...record.clientDialects],
+          capabilities: [...record.capabilities],
+          observedAtMs: record.observedAtMs,
+        }],
+      },
+    } satisfies RelayV2JsonObject;
+    encodeRelayV2WebSocketFrame("public", frame);
+    return cloneFrame(frame);
+  }
+
+  /** Latest claim-scoped presence transition for gap/revision recovery. */
+  readHostPresence(
+    authContext: Readonly<RelayV2AuthContext>,
+  ): RelayV2JsonObject | undefined {
+    if (!this.isDirectoryClient(authContext)) return undefined;
+    const record = this.directory.get(authContext.hostId);
+    if (!record) return undefined;
+    const frame = {
+      protocolVersion: 2,
+      kind: "event",
+      type: "host.presence",
+      hostId: record.hostId,
+      payload: {
+        brokerEpoch: this.brokerEpoch,
+        revision: record.revision.toString(10),
+        state: record.state,
+        reason: record.presenceReason,
+        hostEpoch: record.hostEpoch!,
+        hostInstanceId: record.hostInstanceId!,
+        previousHostInstanceId: record.previousHostInstanceId,
+        observedAtMs: record.observedAtMs,
+      },
+    } satisfies RelayV2JsonObject;
+    encodeRelayV2WebSocketFrame("public", frame);
+    return cloneFrame(frame);
+  }
+
   inspectClientAdmission(authContext: RelayV2AuthContext): RelayV2ClientAdmission {
     if (
       authContext.scheme !== "twcap2"
@@ -673,6 +786,14 @@ export class RelayV2BrokerCore {
         outcome: "reject",
         status: 503,
         error: structuredError("PERMISSION_DENIED", "Client authorization is not valid"),
+      };
+    }
+    const liveAuthFence = this.pendingLiveAuthFence(authContext);
+    if (liveAuthFence) {
+      return {
+        outcome: "reject",
+        status: liveAuthFence.reason === "access_expired" ? 401 : 403,
+        error: structuredError("AUTH_INVALID", "Client authorization is fenced"),
       };
     }
     const carrier = this.activeCarriers.get(authContext.hostId);
@@ -693,7 +814,7 @@ export class RelayV2BrokerCore {
       clientDialect: "tw-relay.v2",
       hostDialects: carrier.hello.clientDialects,
       requiredCapabilities: RELAY_V2_REQUIRED_CAPABILITIES,
-      hostCapabilities: carrier.hello.capabilities,
+      hostCapabilities: completeBaseReadiness(carrier.hello),
     });
     if (dialect.outcome === "reject") {
       return {
@@ -713,6 +834,44 @@ export class RelayV2BrokerCore {
       hostEpoch: carrier.hello.hostEpoch,
       hostInstanceId: carrier.hello.hostInstanceId,
     };
+  }
+
+  /**
+   * Synchronous live-authorization commit hook for the persistent B-AUTH
+   * owner. The fence is installed before commit is entered, so re-entrant
+   * frame admission is denied; literal true is the only successful commit
+   * receipt. Any other result still closes matching live state fail-closed
+   * and reports that production composition is unavailable.
+   *
+   * This core deliberately does not retain revocation, expiry, kid, grant or
+   * issuer state. New Upgrade authorization remains B-AUTH's responsibility.
+   */
+  linearizeLiveAuthFence(
+    fence: RelayV2LiveAuthFence,
+    commit: () => unknown,
+  ): RelayV2BrokerResult {
+    const installedFence = Object.freeze({ ...fence }) as RelayV2LiveAuthFence;
+    this.validateLiveAuthFence(installedFence);
+    this.pendingLiveAuthFences.push(installedFence);
+    let committed = false;
+    let actions: RelayV2BrokerAction[] = [];
+    try {
+      committed = commit() === true;
+    } catch {
+      committed = false;
+    }
+    try {
+      actions = this.applyLiveAuthFence(installedFence);
+    } finally {
+      const index = this.pendingLiveAuthFences.indexOf(installedFence);
+      if (index >= 0) this.pendingLiveAuthFences.splice(index, 1);
+    }
+    if (committed) return { accepted: true, actions };
+    const error = structuredError(
+      "CAPABILITY_UNAVAILABLE",
+      "Live authorization fence did not receive a synchronous commit receipt",
+    );
+    return { accepted: false, error, actions };
   }
 
   /**
@@ -738,7 +897,13 @@ export class RelayV2BrokerCore {
           kind: "route_unavailable",
           connectionId,
           hostId: authContext.hostId,
-          closeCode: admission.status === 426 ? 4406 : 1013,
+          closeCode: admission.status === 426
+            ? 4406
+            : admission.status === 401
+              ? 4401
+              : admission.status === 403
+                ? 4403
+                : 1013,
           error: admission.error,
         }],
       };
@@ -793,6 +958,7 @@ export class RelayV2BrokerCore {
       carrierTransportId: carrier.transportId,
       authContext: Object.freeze({ ...authContext }),
       status: "opening",
+      firstApplicationFrame: "pending",
       maxFrameBytes: Math.min(
         RELAY_V2_BROKER_LIMITS.maxFrameBytes,
         carrier.hello!.maxFrameBytes,
@@ -881,6 +1047,9 @@ export class RelayV2BrokerCore {
         closeCode: 4409,
         reason: "host_superseded",
       }]);
+    }
+    if (this.isLiveAuthAdmissionBlocked(carrier.authContext)) {
+      return this.failure("AUTH_INVALID", "Carrier authorization is being fenced");
     }
     let frame: RelayV2JsonObject;
     try {
@@ -973,7 +1142,23 @@ export class RelayV2BrokerCore {
     carrier.registration = null;
     carrier.status = "active";
     this.activeCarriers.set(carrier.authContext.hostId, carrier);
-    this.publishDirectory(carrier, "online");
+    const directoryBefore = this.directory.get(carrier.authContext.hostId);
+    const presenceReason: RelayV2PresenceReason = previous
+      ? "superseded"
+      : directoryBefore?.state === "offline"
+          && directoryBefore.hostEpoch === carrier.hello.hostEpoch
+        ? "reconnected"
+        : "connected";
+    this.publishDirectory(
+      carrier,
+      "online",
+      presenceReason,
+      presenceReason === "superseded"
+        ? previous?.hello?.hostInstanceId ?? null
+        : presenceReason === "reconnected"
+          ? directoryBefore?.hostInstanceId ?? null
+          : null,
+    );
     const actions: RelayV2BrokerAction[] = [];
     if (previous?.connectorId && previous.hello) {
       previous.status = "superseded";
@@ -1026,6 +1211,9 @@ export class RelayV2BrokerCore {
     if (!client || !route || route.status !== "opened") {
       return this.failure("INVALID_ENVELOPE", "Client route is not open");
     }
+    if (this.isLiveAuthAdmissionBlocked(route.authContext)) {
+      return this.failure("AUTH_INVALID", "Client authorization is being fenced");
+    }
     let publicFrame: RelayV2JsonObject;
     try {
       publicFrame = decodeRelayV2WebSocketFrame("public", bytes).frame;
@@ -1051,6 +1239,40 @@ export class RelayV2BrokerCore {
         reason: "invalid_public_identity",
       });
       return this.failure("INVALID_ENVELOPE", "Client public identity is not authorized", actions);
+    }
+    if (publicFrame.type === "hosts.snapshot.get") {
+      const snapshot = this.readHostsSnapshot(
+        route.authContext,
+        publicFrame.requestId as string,
+      );
+      if (!snapshot) {
+        return this.failure("HOST_OFFLINE", "Authorized host directory is unavailable");
+      }
+      const responseBytes = encodeRelayV2WebSocketFrame("public", snapshot);
+      const carrier = this.carriers.get(route.carrierTransportId);
+      if (
+        !carrier
+        || route.hostToClientFrames + 1 > RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames
+        || route.hostToClientBufferedBytes + responseBytes.byteLength
+          > RELAY_V2_BROKER_LIMITS.routeBufferedBytesPerDirection
+        || this.carrierBufferedBytes(carrier) + responseBytes.byteLength
+          > RELAY_V2_BROKER_LIMITS.carrierBufferedBytes - CARRIER_CONTROL_RESERVE_BYTES
+      ) {
+        const error = structuredError("SLOW_CONSUMER", "Client directory route cannot drain", true, 1_000);
+        const actions = this.beginRouteUnbind(route, "slow_consumer");
+        actions.push({
+          kind: "close_client",
+          connectionId,
+          closeCode: 1013,
+          reason: "slow_consumer",
+        });
+        return { accepted: false, error, actions };
+      }
+      route.hostToClientFrames += 1;
+      route.hostToClientBufferedBytes += responseBytes.byteLength;
+      carrier.hostToClientBufferedBytes += responseBytes.byteLength;
+      client.queue.push({ bytes: responseBytes, route });
+      return { accepted: true, actions: [] };
     }
     const carrier = this.carriers.get(route.carrierTransportId);
     if (
@@ -1160,7 +1382,7 @@ export class RelayV2BrokerCore {
       && this.activeCarriers.get(carrier.authContext.hostId) === carrier
     ) {
       this.activeCarriers.delete(carrier.authContext.hostId);
-      this.publishDirectory(carrier, "offline");
+      this.publishDirectory(carrier, "offline", "disconnected", null);
       this.invalidateConnectorRoutes(carrier, actions, false);
     }
     this.discardCarrier(carrier);
@@ -1455,15 +1677,34 @@ export class RelayV2BrokerCore {
 
   private routeOpened(carrier: CarrierState, frame: RelayV2JsonObject): RelayV2BrokerResult {
     const route = this.currentRouteForFrame(carrier, frame);
-    if (!route || route.status !== "opening" || frame.requestId !== route.openRequestId) {
+    const openedMaxFrameBytes = (frame.payload as RelayV2JsonObject).maxFrameBytes as number;
+    if (
+      route?.status === "closing"
+      && route.firstApplicationFrame === "unavailable"
+      && frame.requestId === route.openRequestId
+    ) {
+      // route.open crossed the carrier handoff before an auth/offline fence.
+      // Its already-queued route.unbind remains the only Host cleanup; a late
+      // opened ACK must never resurrect relay.welcome.
+      if (openedMaxFrameBytes <= 0 || openedMaxFrameBytes > route.maxFrameBytes) {
+        return this.protocolViolation(carrier, "invalid_route_frame_limit");
+      }
+      return { accepted: true, actions: [] };
+    }
+    if (
+      !route
+      || route.status !== "opening"
+      || route.firstApplicationFrame !== "pending"
+      || frame.requestId !== route.openRequestId
+    ) {
       return this.protocolViolation(carrier, "stale_route_opened");
     }
-    const openedMaxFrameBytes = (frame.payload as RelayV2JsonObject).maxFrameBytes as number;
     if (openedMaxFrameBytes <= 0 || openedMaxFrameBytes > route.maxFrameBytes) {
       return this.protocolViolation(carrier, "invalid_route_frame_limit");
     }
     route.maxFrameBytes = openedMaxFrameBytes;
     route.status = "opened";
+    route.firstApplicationFrame = "welcome";
     return {
       accepted: true,
       actions: [{
@@ -1474,16 +1715,13 @@ export class RelayV2BrokerCore {
         hostId: route.authContext.hostId,
         hostEpoch: carrier.hello!.hostEpoch,
         hostInstanceId: carrier.hello!.hostInstanceId,
-        capabilities: [...carrier.hello!.capabilities],
+        capabilities: this.advertisedBaseCapabilities(carrier.hello!),
       }],
     };
   }
 
   private routeRejected(carrier: CarrierState, frame: RelayV2JsonObject): RelayV2BrokerResult {
     const route = this.currentRouteForFrame(carrier, frame);
-    if (!route || route.status !== "opening" || frame.requestId !== route.openRequestId) {
-      return this.protocolViolation(carrier, "stale_route_rejected");
-    }
     const source = frame.error as RelayV2JsonObject;
     const allowedCodes = new Set<RelayV2StructuredError["code"]>([
       "BUSY",
@@ -1495,7 +1733,24 @@ export class RelayV2BrokerCore {
     if (!allowedCodes.has(source.code as RelayV2StructuredError["code"])) {
       return this.protocolViolation(carrier, "invalid_route_rejection_code");
     }
+    if (
+      route?.status === "closing"
+      && route.firstApplicationFrame === "unavailable"
+      && frame.requestId === route.openRequestId
+    ) {
+      this.dropRoute(route);
+      return { accepted: true, actions: [] };
+    }
+    if (
+      !route
+      || route.status !== "opening"
+      || route.firstApplicationFrame !== "pending"
+      || frame.requestId !== route.openRequestId
+    ) {
+      return this.protocolViolation(carrier, "stale_route_rejected");
+    }
     const error = cloneFrame(source) as unknown as RelayV2StructuredError;
+    route.firstApplicationFrame = "unavailable";
     this.dropRoute(route);
     const closeCode = error.code === "PERMISSION_DENIED"
       ? 4403
@@ -1744,6 +1999,132 @@ export class RelayV2BrokerCore {
         ),
       };
     }
+  }
+
+  private isDirectoryClient(authContext: Readonly<RelayV2AuthContext>): boolean {
+    return authContext.scheme === "twcap2"
+      && authContext.role === "client"
+      && authContext.clientInstanceId !== null
+      && !this.isLiveAuthAdmissionBlocked(authContext);
+  }
+
+  private advertisedBaseCapabilities(hello: HostHello): string[] {
+    if (
+      this.baseCapabilityReadiness.length !== RELAY_V2_REQUIRED_CAPABILITIES.length
+      || completeBaseReadiness(hello).length !== RELAY_V2_REQUIRED_CAPABILITIES.length
+    ) return [];
+    return [...RELAY_V2_REQUIRED_CAPABILITIES];
+  }
+
+  private validateLiveAuthFence(fence: RelayV2LiveAuthFence): void {
+    if (fence.reason === "kid_removed") {
+      if (!isIdentifier(fence.kid)
+        || (fence.hostId !== undefined && !isIdentifier(fence.hostId))) {
+        throw new Error("invalid Relay v2 kid-removal live-auth fence");
+      }
+      return;
+    }
+    if (!isIdentifier(fence.hostId)) {
+      throw new Error("invalid Relay v2 live-auth host fence");
+    }
+    const identifier = fence.reason === "grant_revoked" ? fence.grantId : fence.jti;
+    if (!isIdentifier(identifier)) throw new Error("invalid Relay v2 live-auth identity fence");
+  }
+
+  private authMatchesLiveFence(
+    authContext: Readonly<RelayV2AuthContext>,
+    fence: RelayV2LiveAuthFence,
+  ): boolean {
+    if (authContext.scheme !== "twcap2") return false;
+    if (fence.reason === "kid_removed") {
+      return authContext.kid === fence.kid
+        && (fence.role === undefined || authContext.role === fence.role)
+        && (fence.hostId === undefined || authContext.hostId === fence.hostId);
+    }
+    if (authContext.role !== fence.role || authContext.hostId !== fence.hostId) return false;
+    return fence.reason === "grant_revoked"
+      ? authContext.grantId === fence.grantId
+      : authContext.jti === fence.jti;
+  }
+
+  private isLiveAuthAdmissionBlocked(
+    authContext: Readonly<RelayV2AuthContext>,
+  ): boolean {
+    return this.pendingLiveAuthFence(authContext) !== undefined;
+  }
+
+  private pendingLiveAuthFence(
+    authContext: Readonly<RelayV2AuthContext>,
+  ): RelayV2LiveAuthFence | undefined {
+    return this.pendingLiveAuthFences.find((fence) => (
+      this.authMatchesLiveFence(authContext, fence)
+    ));
+  }
+
+  private applyLiveAuthFence(fence: RelayV2LiveAuthFence): RelayV2BrokerAction[] {
+    const closeCode = fence.reason === "access_expired" ? 4401 : 4403;
+    const unbindReason = fence.reason === "access_expired" ? "auth_expired" : "auth_revoked";
+    const actions: RelayV2BrokerAction[] = [];
+
+    // Host auth is fenced first because it owns every route on the carrier.
+    // This avoids producing duplicate client cleanup when a kid fence matches
+    // both the host carrier and its client routes.
+    for (const carrier of [...this.carriers.values()]) {
+      if (!this.authMatchesLiveFence(carrier.authContext, fence)) continue;
+      if (
+        carrier.status === "active"
+        && this.activeCarriers.get(carrier.authContext.hostId) === carrier
+      ) {
+        this.activeCarriers.delete(carrier.authContext.hostId);
+        this.publishDirectory(carrier, "offline", "disconnected", null);
+        this.invalidateConnectorRoutes(carrier, actions, false);
+      }
+      if (carrier.status === "registering") {
+        if (this.registeringCarriers.get(carrier.authContext.hostId) === carrier) {
+          this.registeringCarriers.delete(carrier.authContext.hostId);
+        }
+        carrier.registration = null;
+      }
+      carrier.status = "closed";
+      this.discardCarrier(carrier);
+      this.carriers.delete(carrier.transportId);
+      actions.push({
+        kind: "close_host",
+        transportId: carrier.transportId,
+        closeCode,
+        reason: unbindReason,
+      });
+    }
+
+    for (const route of [...this.routes.values()]) {
+      if (!this.authMatchesLiveFence(route.authContext, fence)) continue;
+      if (route.status === "opening" && route.firstApplicationFrame === "pending") {
+        route.firstApplicationFrame = "unavailable";
+        const error = structuredError(
+          "AUTH_INVALID",
+          fence.reason === "access_expired"
+            ? "Client authorization expired before route opened"
+            : "Client authorization was revoked before route opened",
+        );
+        actions.push(...this.beginRouteUnbind(route, unbindReason));
+        actions.push({
+          kind: "route_unavailable",
+          connectionId: route.connectionId,
+          hostId: route.authContext.hostId,
+          closeCode,
+          error,
+        });
+        continue;
+      }
+      actions.push(...this.beginRouteUnbind(route, unbindReason));
+      actions.push({
+        kind: "close_client",
+        connectionId: route.connectionId,
+        closeCode,
+        reason: unbindReason,
+      });
+    }
+    return actions;
   }
 
   private isClientPublicFrameAuthorized(
@@ -2008,11 +2389,24 @@ export class RelayV2BrokerCore {
     }
   }
 
+  private discardQueuedRouteControl(carrier: CarrierState, route: RouteState): void {
+    const retained: QueuedCarrierFrame[] = [];
+    for (const entry of carrier.controlQueue) {
+      if (entry.route !== route) {
+        retained.push(entry);
+        continue;
+      }
+      carrier.queuedBytes -= entry.wireBytes;
+    }
+    carrier.controlQueue = retained;
+  }
+
   private dropRoute(route: RouteState): void {
     if (route.status === "closed") return;
     const carrier = this.carriers.get(route.carrierTransportId);
     if (carrier) {
       this.discardQueuedRouteData(carrier, route);
+      this.discardQueuedRouteControl(carrier, route);
       carrier.routeIds.delete(route.routeId);
     }
     const client = this.clients.get(route.connectionId);
@@ -2056,7 +2450,8 @@ export class RelayV2BrokerCore {
         carrier.routeIds.delete(routeId);
         continue;
       }
-      if (route.status === "opening") {
+      if (route.status === "opening" && route.firstApplicationFrame === "pending") {
+        route.firstApplicationFrame = "unavailable";
         actions.push({
           kind: "route_unavailable",
           connectionId: route.connectionId,
@@ -2113,7 +2508,12 @@ export class RelayV2BrokerCore {
     this.carriers.delete(carrier.transportId);
   }
 
-  private publishDirectory(carrier: CarrierState, state: "online" | "offline"): string {
+  private publishDirectory(
+    carrier: CarrierState,
+    state: "online" | "offline",
+    presenceReason: RelayV2PresenceReason,
+    previousHostInstanceId: string | null,
+  ): string {
     const previous = this.directory.get(carrier.authContext.hostId);
     const revision = (previous?.revision ?? 0n) + 1n;
     const hello = carrier.hello;
@@ -2125,8 +2525,12 @@ export class RelayV2BrokerCore {
       hostInstanceId: hello?.hostInstanceId ?? previous?.hostInstanceId ?? null,
       connectorId: state === "online" ? carrier.connectorId : null,
       clientDialects: hello ? [...hello.clientDialects] : [...previous?.clientDialects ?? []],
-      capabilities: hello ? [...hello.capabilities] : [...previous?.capabilities ?? []],
+      capabilities: hello
+        ? this.advertisedBaseCapabilities(hello)
+        : [...previous?.capabilities ?? []],
       observedAtMs: this.now(),
+      presenceReason,
+      previousHostInstanceId,
     });
     return revision.toString(10);
   }
@@ -2198,7 +2602,7 @@ export class RelayV2BrokerCore {
       && this.activeCarriers.get(carrier.authContext.hostId) === carrier
     ) {
       this.activeCarriers.delete(carrier.authContext.hostId);
-      this.publishDirectory(carrier, "offline");
+      this.publishDirectory(carrier, "offline", "disconnected", null);
       this.invalidateConnectorRoutes(carrier, actions, false);
     }
     if (carrier.status === "registering") {

@@ -116,7 +116,7 @@ async function openRoute(
   }));
   assert.equal(acknowledged.accepted, true);
   assert.equal(acknowledged.actions[0].kind, "route_opened");
-  return { connectionId, routeOpen };
+  return { connectionId, routeOpen, acknowledged };
 }
 
 function publicBytes(frame) {
@@ -137,6 +137,35 @@ function clientHello(requestId = randomUUID(), overrides = {}) {
       resume: null,
     },
     ...overrides,
+  };
+}
+
+function hostsSnapshotGet(requestId = randomUUID()) {
+  return {
+    protocolVersion: 2,
+    kind: "request",
+    type: "hosts.snapshot.get",
+    requestId,
+    payload: {},
+  };
+}
+
+function commandExecute(requestId, commandId, hostEpoch) {
+  return {
+    protocolVersion: 2,
+    kind: "request",
+    type: "command.execute",
+    requestId,
+    commandId,
+    hostId: HOST_ID,
+    expectedHostEpoch: hostEpoch,
+    scopeId: "scope-local",
+    sessionId: "session-opaque",
+    payload: {
+      dedupeWindowId: "dedupe-window",
+      operation: "send_agent_message",
+      arguments: { pane: 0, message: "continue", submit: true },
+    },
   };
 }
 
@@ -325,6 +354,25 @@ test("host registration commits delivery before admission and supersedes only a 
   );
   assert.equal(fenceCore.inspectHost(HOST_ID).state, "online");
 
+  const lostAckCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  lostAckCore.attachHostCarrier("host-registration-ack-lost", authContext("host"));
+  const ackLost = await lostAckCore.receiveHostFrame(
+    "host-registration-ack-lost",
+    carrierBytes(hostHello()),
+  );
+  const lostDelivery = ackLost.actions.find((action) => action.deliveryId);
+  assert.ok(lostDelivery);
+  assert.equal(lostAckCore.disconnectHost("host-registration-ack-lost").accepted, true);
+  assert.equal(lostAckCore.inspectHost(HOST_ID), undefined);
+  assert.equal(
+    lostAckCore.acknowledgeHostControlDelivery(
+      "host-registration-ack-lost",
+      lostDelivery.deliveryId,
+    ).accepted,
+    false,
+    "a lost host.registered ACK cannot resurrect the disconnected newcomer",
+  );
+
   const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
   const hostEpoch = randomUUID();
   const firstInstance = randomUUID();
@@ -333,6 +381,28 @@ test("host registration commits delivery before admission and supersedes only a 
   assert.equal(firstDirectory.state, "online");
   assert.equal(firstDirectory.revision, "1");
   assert.equal(firstDirectory.connectorId, first.connectorId);
+  assert.deepEqual(core.readHostPresence(authContext("client")).payload, {
+    brokerEpoch: core.brokerEpoch,
+    revision: "1",
+    state: "online",
+    reason: "connected",
+    hostEpoch,
+    hostInstanceId: firstInstance,
+    previousHostInstanceId: null,
+    observedAtMs: NOW_MS,
+  });
+  const firstSnapshot = core.readHostsSnapshot(authContext("client"), "hosts-first");
+  assert.equal(firstSnapshot.payload.items.length, 1);
+  assert.equal(firstSnapshot.payload.items[0].hostId, HOST_ID);
+  assert.equal(
+    core.readHostsSnapshot(authContext("client", { hostId: "other-host" }), "hosts-other"),
+    undefined,
+    "directory reads never fall back to a global or empty-list view",
+  );
+  assert.equal(
+    core.readHostPresence(authContext("client", { hostId: "other-host" })),
+    undefined,
+  );
 
   core.attachHostCarrier("host-duplicate", authContext("host", { jti: "duplicate-jti" }));
   const duplicate = await core.receiveHostFrame("host-duplicate", carrierBytes(hostHello({
@@ -377,6 +447,16 @@ test("host registration commits delivery before admission and supersedes only a 
   assert.equal(directory.revision, "2");
   assert.equal(directory.hostInstanceId, winningInstance);
   assert.equal(directory.connectorId, winner.connectorId);
+  assert.deepEqual(core.readHostPresence(authContext("client")).payload, {
+    brokerEpoch: core.brokerEpoch,
+    revision: "2",
+    state: "online",
+    reason: "superseded",
+    hostEpoch,
+    hostInstanceId: winningInstance,
+    previousHostInstanceId: firstInstance,
+    observedAtMs: NOW_MS,
+  });
   const superseded = winner.result.actions.find((action) => (
     action.kind === "send_host" && action.frame.type === "host.superseded"
   ));
@@ -388,6 +468,26 @@ test("host registration commits delivery before admission and supersedes only a 
       && action.transportId === "host-old"
       && action.closeCode === 4409
   )), true);
+
+  core.disconnectHost("host-winner");
+  const offline = core.readHostsSnapshot(authContext("client"), "hosts-offline");
+  assert.equal(offline.payload.items.length, 1);
+  assert.equal(offline.payload.items[0].state, "offline");
+  assert.equal(offline.payload.items[0].hostEpoch, hostEpoch);
+  assert.equal(offline.payload.items[0].hostInstanceId, winningInstance);
+  assert.equal(core.readHostPresence(authContext("client")).payload.reason, "disconnected");
+  assert.equal(core.readHostPresence(authContext("client")).payload.revision, "3");
+
+  const reconnectedInstance = randomUUID();
+  await registerHost(core, "host-reconnected", hostHello({
+    hostEpoch,
+    hostInstanceId: reconnectedInstance,
+  }));
+  const reconnectedPresence = core.readHostPresence(authContext("client")).payload;
+  assert.equal(reconnectedPresence.revision, "4");
+  assert.equal(reconnectedPresence.reason, "reconnected");
+  assert.equal(reconnectedPresence.hostInstanceId, reconnectedInstance);
+  assert.equal(reconnectedPresence.previousHostInstanceId, winningInstance);
 });
 
 test("carrier route admission hard-bounds disconnect cleanup production", async () => {
@@ -416,6 +516,64 @@ test("carrier route admission hard-bounds disconnect cleanup production", async 
   assert.equal(disconnected.actions.length, ceiling);
   assert.equal(disconnected.actions.every((action) => action.kind === "route_unavailable"), true);
   assert.equal(core.inspectHost(HOST_ID).state, "offline");
+});
+
+test("claim-scoped hosts.snapshot stays in broker and readiness never copies hello extensions", async () => {
+  const claimedCapabilities = [
+    ...broker.RELAY_V2_REQUIRED_CAPABILITIES,
+    "agent.transcript-lifecycle.v1",
+  ];
+  const disabled = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(disabled, "host-directory-disabled", hostHello({
+    capabilities: claimedCapabilities,
+  }));
+  assert.deepEqual(disabled.inspectHost(HOST_ID).capabilities, []);
+  const disabledRoute = await openRoute(
+    disabled,
+    "host-directory-disabled",
+    "client-directory-disabled",
+  );
+  assert.deepEqual(disabledRoute.acknowledged.actions[0].capabilities, []);
+
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    baseCapabilityReadiness: broker.RELAY_V2_REQUIRED_CAPABILITIES,
+  });
+  await registerHost(core, "host-directory", hostHello({
+    capabilities: claimedCapabilities,
+  }));
+  const directory = core.readHostsSnapshot(authContext("client"), "hosts-direct");
+  assert.deepEqual(
+    directory.payload.items[0].capabilities,
+    [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+  );
+
+  const route = await openRoute(core, "host-directory", "client-directory");
+  const openedAction = route.acknowledged.actions.find((action) => (
+    action.kind === "route_opened"
+  ));
+  assert.deepEqual(
+    openedAction.capabilities,
+    [...broker.RELAY_V2_REQUIRED_CAPABILITIES],
+  );
+
+  const snapshotRequest = core.forwardClientFrame(
+    route.connectionId,
+    publicBytes(hostsSnapshotGet("hosts-routed")),
+  );
+  assert.equal(snapshotRequest.accepted, true);
+  assert.equal(
+    core.drainHostCarrier("host-directory").length,
+    0,
+    "broker-authoritative directory requests never reach relay-host",
+  );
+  const [delivery] = core.drainClient(route.connectionId, { maxFrames: 1 });
+  assert.ok(delivery);
+  const response = codec.decodeRelayV2WebSocketFrame("public", delivery.bytes).frame;
+  assert.equal(response.type, "hosts.snapshot");
+  assert.equal(response.requestId, "hosts-routed");
+  assert.deepEqual(response.payload.items.map((item) => item.hostId), [HOST_ID]);
+  core.acknowledgeClientDelivery(route.connectionId, delivery.deliveryId);
 });
 
 test("persistent auth-control authority replays reauthentication ACK and preserves old context on failure", async () => {
@@ -471,6 +629,8 @@ test("persistent auth-control authority replays reauthentication ACK and preserv
     authControlAuthority: authority,
   });
   const host = await registerHost(core, "host-auth");
+  const directoryBefore = core.inspectHost(HOST_ID);
+  const presenceBefore = core.readHostPresence(authContext("client"));
   const requestId = randomUUID();
   const reauth = (accessToken) => carrierBytes({
     carrierVersion: 1,
@@ -499,6 +659,8 @@ test("persistent auth-control authority replays reauthentication ACK and preserv
   );
   assert.equal(replayedAck.frame.payload.deduplicated, true);
   assert.deepEqual(seenJtis, ["host-auth-jti", "host-auth-jti", "replacement-jti"]);
+  assert.deepEqual(core.inspectHost(HOST_ID), directoryBefore);
+  assert.deepEqual(core.readHostPresence(authContext("client")), presenceBefore);
 });
 
 test("unconfigured enrollment authority returns correlated capability failure without killing carrier", async () => {
@@ -517,6 +679,140 @@ test("unconfigured enrollment authority returns correlated capability failure wi
   assert.equal(failure.frame.type, "carrier.error");
   assert.equal(result.actions.some((action) => action.kind === "close_host"), false);
   assert.equal(core.openClientRoute(randomUUID(), authContext("client")).accepted, true);
+});
+
+test("live-auth commit fence blocks re-entrant admission and fails closed without a synchronous receipt", async () => {
+  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(core, "host-live-auth");
+  const route = await openRoute(core, "host-live-auth", "client-live-auth");
+  let reentrant;
+  const revoked = core.linearizeLiveAuthFence({
+    reason: "grant_revoked",
+    role: "client",
+    hostId: HOST_ID,
+    grantId: "client-grant",
+  }, () => {
+    reentrant = core.forwardClientFrame(
+      route.connectionId,
+      publicBytes(clientTerminalAck("must-not-cross-revoke")),
+    );
+    return true;
+  });
+  assert.equal(reentrant.accepted, false);
+  assert.equal(reentrant.error.code, "AUTH_INVALID");
+  assert.equal(revoked.accepted, true);
+  assert.equal(revoked.actions.some((action) => (
+    action.kind === "close_client"
+      && action.connectionId === route.connectionId
+      && action.closeCode === 4403
+  )), true);
+  const revokedCarrier = core.drainHostCarrier("host-live-auth");
+  assert.deepEqual(revokedCarrier.map((delivery) => delivery.frame.type), ["route.unbind"]);
+  assert.equal(
+    core.forwardClientFrame(
+      route.connectionId,
+      publicBytes(clientTerminalAck("after-revoke")),
+    ).accepted,
+    false,
+  );
+
+  const opening = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(opening, "host-live-auth-opening");
+  assert.equal(opening.openClientRoute(
+    "client-live-auth-opening",
+    authContext("client", { jti: "client-live-auth-opening-jti" }),
+  ).accepted, true);
+  const [openingDelivery] = opening.drainHostCarrier(
+    "host-live-auth-opening",
+    { maxFrames: 1 },
+  );
+  opening.acknowledgeHostDelivery(
+    "host-live-auth-opening",
+    openingDelivery.deliveryId,
+  );
+  const openingFence = opening.linearizeLiveAuthFence({
+    reason: "grant_revoked",
+    role: "client",
+    hostId: HOST_ID,
+    grantId: "client-grant",
+  }, () => true);
+  assert.deepEqual(openingFence.actions.map((action) => action.kind), ["route_unavailable"]);
+  const lateOpeningAck = await opening.receiveHostFrame(
+    "host-live-auth-opening",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "route.opened",
+      requestId: openingDelivery.frame.requestId,
+      connectorId: openingDelivery.frame.connectorId,
+      routeId: openingDelivery.frame.routeId,
+      routeFence: openingDelivery.frame.routeFence,
+      payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+    }),
+  );
+  assert.equal(lateOpeningAck.accepted, true);
+  assert.deepEqual(lateOpeningAck.actions, []);
+  assert.deepEqual(
+    opening.drainHostCarrier("host-live-auth-opening").map((delivery) => delivery.frame.type),
+    ["route.unbind"],
+  );
+
+  const expiryRace = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(expiryRace, "host-live-auth-expiry-race");
+  const expiringClient = authContext("client", { jti: "client-expiry-race-jti" });
+  let expiryAdmission;
+  const expiryFence = expiryRace.linearizeLiveAuthFence({
+    reason: "access_expired",
+    role: "client",
+    hostId: HOST_ID,
+    jti: expiringClient.jti,
+  }, () => {
+    expiryAdmission = expiryRace.openClientRoute(
+      "client-live-auth-expiry-race",
+      expiringClient,
+    );
+    return true;
+  });
+  assert.equal(expiryFence.accepted, true);
+  assert.equal(expiryAdmission.accepted, false);
+  assert.equal(expiryAdmission.actions[0].kind, "route_unavailable");
+  assert.equal(expiryAdmission.actions[0].closeCode, 4401);
+
+  const unsupported = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(unsupported, "host-live-auth-async");
+  const asyncRoute = await openRoute(
+    unsupported,
+    "host-live-auth-async",
+    "client-live-auth-async",
+  );
+  const asyncCommit = unsupported.linearizeLiveAuthFence({
+    reason: "access_expired",
+    role: "client",
+    hostId: HOST_ID,
+    jti: "client-live-auth-async-jti",
+  }, () => Promise.resolve(true));
+  assert.equal(asyncCommit.accepted, false);
+  assert.equal(asyncCommit.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(asyncCommit.actions.some((action) => (
+    action.kind === "close_client"
+      && action.connectionId === asyncRoute.connectionId
+      && action.closeCode === 4401
+  )), true);
+
+  const hostFence = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(hostFence, "host-live-auth-kid");
+  const removedKid = hostFence.linearizeLiveAuthFence({
+    reason: "kid_removed",
+    role: "host",
+    hostId: HOST_ID,
+    kid: "key-2026-07",
+  }, () => true);
+  assert.equal(removedKid.accepted, true);
+  assert.equal(hostFence.inspectHost(HOST_ID).state, "offline");
+  assert.equal(removedKid.actions.some((action) => (
+    action.kind === "close_host"
+      && action.transportId === "host-live-auth-kid"
+      && action.closeCode === 4403
+  )), true);
 });
 
 test("broker public codec rejects forged identity and limits each route to 64 in-flight requests", async () => {
@@ -634,6 +930,61 @@ test("route rejection preserves frozen error semantics and close class", async (
     assert.deepEqual(rejected.error, frozenError);
     assert.equal(rejected.actions[0].closeCode, closeCode);
   }
+});
+
+test("post-101 route races choose exactly one welcome or unavailable outcome", async () => {
+  const unavailableCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(unavailableCore, "host-race-unavailable");
+  const connectionId = "client-race-unavailable";
+  assert.equal(
+    unavailableCore.openClientRoute(connectionId, authContext("client")).accepted,
+    true,
+  );
+  const [openDelivery] = unavailableCore.drainHostCarrier(
+    "host-race-unavailable",
+    { maxFrames: 1 },
+  );
+  unavailableCore.acknowledgeHostDelivery(
+    "host-race-unavailable",
+    openDelivery.deliveryId,
+  );
+  const disconnected = unavailableCore.disconnectHost("host-race-unavailable");
+  assert.deepEqual(
+    disconnected.actions.map((action) => action.kind),
+    ["route_unavailable"],
+  );
+  assert.equal(disconnected.actions[0].connectionId, connectionId);
+  assert.equal(disconnected.actions[0].error.code, "HOST_OFFLINE");
+  const lateOpened = await unavailableCore.receiveHostFrame(
+    "host-race-unavailable",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "route.opened",
+      requestId: openDelivery.frame.requestId,
+      connectorId: openDelivery.frame.connectorId,
+      routeId: openDelivery.frame.routeId,
+      routeFence: openDelivery.frame.routeFence,
+      payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+    }),
+  );
+  assert.equal(lateOpened.accepted, false);
+  assert.equal(lateOpened.actions.some((action) => action.kind === "route_opened"), false);
+  assert.equal(lateOpened.actions.some((action) => action.kind === "route_unavailable"), false);
+
+  const welcomeCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(welcomeCore, "host-race-welcome");
+  const welcome = await openRoute(
+    welcomeCore,
+    "host-race-welcome",
+    "client-race-welcome",
+  );
+  assert.deepEqual(
+    welcome.acknowledged.actions.map((action) => action.kind),
+    ["route_opened"],
+  );
+  const afterWelcome = welcomeCore.disconnectHost("host-race-welcome");
+  assert.equal(afterWelcome.actions.some((action) => action.kind === "route_unavailable"), false);
+  assert.equal(afterWelcome.actions.some((action) => action.kind === "close_client"), true);
 });
 
 test("route frame limit is the minimum of broker, host hello, and route.opened", async () => {
@@ -794,6 +1145,47 @@ test("route ownership rejects stale connector, fence, and sequence without forwa
   assert.equal(staleFence.error.code, "INVALID_ENVELOPE");
   assert.equal(fenceCore.inspectHost(HOST_ID).state, "offline");
   assert.equal(fenceCore.drainClient(fenceRoute.connectionId).length, 0);
+});
+
+test("carrier takeover and transport teardown never invent command or terminal finality", async () => {
+  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  const registered = await registerHost(core, "host-takeover");
+  const route = await openRoute(core, "host-takeover", "client-takeover");
+  const commandBytes = publicBytes(commandExecute(
+    "command-attempt",
+    "command-logical",
+    registered.hello.payload.hostEpoch,
+  ));
+  assert.equal(core.forwardClientFrame(route.connectionId, commandBytes).accepted, true);
+  const [takenOver] = core.drainHostCarrier("host-takeover", { maxFrames: 1 });
+  assert.equal(takenOver.frame.type, "route.data");
+  assert.deepEqual(
+    Buffer.from(takenOver.frame.payload.data, "base64"),
+    Buffer.from(commandBytes),
+  );
+
+  const disconnected = core.disconnectHost("host-takeover");
+  const serialized = JSON.stringify(disconnected.actions);
+  assert.equal(serialized.includes("command.status"), false);
+  assert.equal(serialized.includes("command.result"), false);
+  assert.equal(serialized.includes("terminal.closed"), false);
+  assert.equal(serialized.includes("not_accepted"), false);
+  assert.deepEqual(disconnected.actions.map((action) => action.kind), ["close_client"]);
+
+  const unbindCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(unbindCore, "host-unbind-finality");
+  const unbindRoute = await openRoute(
+    unbindCore,
+    "host-unbind-finality",
+    "client-unbind-finality",
+  );
+  assert.equal(unbindCore.unbindClient(unbindRoute.connectionId).accepted, true);
+  const [unbind] = unbindCore.drainHostCarrier(
+    "host-unbind-finality",
+    { maxFrames: 1 },
+  );
+  assert.equal(unbind.frame.type, "route.unbind");
+  assert.equal(JSON.stringify(unbind.frame).includes("terminal.closed"), false);
 });
 
 test("frame-count pressure resumes only below the 64-frame low water and closes after five seconds", async () => {
