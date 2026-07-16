@@ -1,0 +1,12 @@
+{
+  "contract": "tmux-worktree-managed-incarnation-v1",
+  "version": 1,
+  "status": "frozen-extension",
+  "parentContract": "tmux-worktree-managed-state-v1",
+  "extensionContainer": "sessions[].extensions",
+  "extensionKey": "tw.rpc-v2.lifecycle.v1",
+  "birthMarkerOption": "@tw_rpc_v2_birth_marker_v1",
+  "reservationCorrelationOption": "@tw_rpc_v2_reservation_correlation_v1",
+  "legacyMarker": "absent-not-synthesized",
+  "fixture": "cases.json"
+}

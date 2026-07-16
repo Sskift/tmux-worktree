@@ -1,0 +1,46 @@
+{
+  "legacy": {
+    "name": "tw-term-legacy",
+    "kind": "terminal",
+    "profile": "dashboard",
+    "cwd": "/repo/demo",
+    "createdAt": "2026-07-12T00:00:00.000Z"
+  },
+  "extended": {
+    "name": "tw-term-a1b2c",
+    "kind": "terminal",
+    "profile": "dashboard",
+    "cwd": "/repo/demo",
+    "createdAt": "2026-07-12T00:00:01.000Z",
+    "extensions": {
+      "future.extension": { "preserve": true },
+      "tw.rpc-v2.lifecycle.v1": {
+        "schemaVersion": 1,
+        "incarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+        "tmux": {
+          "serverSocketPath": "/tmp/tmux-501/default",
+          "serverPid": "4200",
+          "serverStarted": "1783700000",
+          "sessionId": "$7",
+          "rawName": "tw-term-a1b2c",
+          "sessionCreated": "1783700010",
+          "birthMarker": "twbirth2.ABCDEFGHIJKLMNOPQRSTUV"
+        },
+        "reservationCorrelation": {
+          "schemaVersion": 1,
+          "reservationId": "res_opaque_1",
+          "hostEpoch": "host-epoch-1",
+          "principalId": "principal-1",
+          "hostId": "mac-admin",
+          "commandId": "command-1",
+          "requestFingerprint": {
+            "schemaVersion": 1,
+            "algorithm": "sha256-rfc8785",
+            "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        },
+        "displayLabel": "demo"
+      }
+    }
+  }
+}

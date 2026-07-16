@@ -17,7 +17,16 @@ import { listSessions, run, sessionExists, tmuxBin, type SessionEntry } from "./
 
 export const RPC_PROTOCOL_VERSION = 1;
 
-export interface RpcManagedSession extends ManagedSession {
+export interface RpcManagedSession {
+  name: string;
+  kind: "worktree" | "terminal";
+  profile: "cli" | "dashboard";
+  project?: string;
+  repoPath?: string;
+  worktreePath?: string;
+  branch?: string;
+  baseBranch?: string;
+  createdAt: string;
   attached: boolean;
   windows: number;
   created: number;
@@ -104,14 +113,26 @@ export function buildRpcListResponse(
   const sessions = state.sessions.flatMap((managed) => {
     const live = liveByName.get(managed.name);
     if (!live) return [];
+    const projected: Omit<RpcManagedSession, "attached" | "windows" | "created" | "activity" | "cwd"> & { cwd?: string } = {
+      name: managed.name,
+      kind: managed.kind,
+      profile: managed.profile,
+      ...(managed.project !== undefined ? { project: managed.project } : {}),
+      ...(managed.repoPath !== undefined ? { repoPath: managed.repoPath } : {}),
+      ...(managed.worktreePath !== undefined ? { worktreePath: managed.worktreePath } : {}),
+      ...(managed.branch !== undefined ? { branch: managed.branch } : {}),
+      ...(managed.baseBranch !== undefined ? { baseBranch: managed.baseBranch } : {}),
+      ...(managed.cwd !== undefined ? { cwd: managed.cwd } : {}),
+      createdAt: managed.createdAt,
+    };
     return [{
-      ...managed,
+      ...projected,
       attached: live.attached,
       windows: live.windows,
       created: live.created,
       activity: live.activity,
       cwd: live.cwd,
-    }];
+    } satisfies RpcManagedSession];
   });
   return {
     protocolVersion: RPC_PROTOCOL_VERSION,

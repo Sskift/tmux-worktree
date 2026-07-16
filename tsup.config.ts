@@ -6,6 +6,7 @@ export default defineConfig({
     "src/automation.ts",
     "src/hosts.ts",
     "src/rpc.ts",
+    "src/rpcV2.ts",
     "src/session.ts",
     "src/state.ts",
     "src/relayHost.ts",

@@ -16,6 +16,11 @@ const COMMAND_KILL_SETTLE_MS = 250;
 const COMMAND_MAX_OUTPUT_BYTES = 1 * 1024 * 1024;
 const COMMAND_HELPER_MAX_BUFFER_BYTES = 2 * 1024 * 1024;
 
+export const TMUX_RPC_V2_BIRTH_MARKER_OPTION = "@tw_rpc_v2_birth_marker_v1";
+export const TMUX_RPC_V2_RESERVATION_CORRELATION_OPTION = "@tw_rpc_v2_reservation_correlation_v1";
+const TMUX_RPC_V2_BIRTH_MARKER_PATTERN = /^twbirth2\.[A-Za-z0-9_-]{22}$/;
+const TMUX_RPC_V2_CORRELATION_PATTERN = /^[A-Za-z0-9_-]{1,4096}$/;
+
 type CommandMode = "query" | "run" | "exec";
 
 type CommandHelperStatus = {
@@ -494,6 +499,183 @@ export interface SessionEntry {
   created: number;
   activity: number;
   cwd: string;
+}
+
+export interface TmuxSessionLifecycleEntry extends SessionEntry {
+  serverSocketPath: string;
+  serverPid: string;
+  serverStarted: string;
+  sessionId: string;
+  rawName: string;
+  sessionCreated: string;
+  birthMarker: string | null;
+  reservationCorrelation: string | null;
+  lifecycleMarkersValid: boolean;
+}
+
+export type TmuxExactKillResult = "killed" | "not_found" | "mismatch" | "in_doubt";
+
+function isCanonicalUnsignedCounter(value: string): boolean {
+  return /^(0|[1-9][0-9]*)$/.test(value);
+}
+
+function isKnownAbsentTmuxServer(result: SyncCommandResult): boolean {
+  return result.status?.kind === "exit"
+    && result.status.code !== 0
+    && /no server running|failed to connect to server/i.test(result.stderr);
+}
+
+function parseLifecycleEntry(line: string): TmuxSessionLifecycleEntry {
+  const fields = line.split("\x1f");
+  if (fields.length !== 12) {
+    throw new CliError("tmux returned malformed lifecycle identity fields");
+  }
+  const [
+    serverSocketPath,
+    serverPid,
+    serverStarted,
+    sessionId,
+    rawName,
+    sessionCreated,
+    rawBirthMarker,
+    rawReservationCorrelation,
+    attached,
+    windows,
+    activity,
+    cwd,
+  ] = fields;
+  if (!serverSocketPath
+    || !isCanonicalUnsignedCounter(serverPid)
+    || !isCanonicalUnsignedCounter(serverStarted)
+    || !/^\$(0|[1-9][0-9]*)$/.test(sessionId)
+    || !rawName
+    || !isCanonicalUnsignedCounter(sessionCreated)
+    || !isCanonicalUnsignedCounter(attached)
+    || !isCanonicalUnsignedCounter(windows)
+    || !isCanonicalUnsignedCounter(activity)) {
+    throw new CliError("tmux returned invalid lifecycle identity fields");
+  }
+  const hasBirthMarker = rawBirthMarker.length > 0;
+  const hasCorrelation = rawReservationCorrelation.length > 0;
+  const birthMarkerValid = !hasBirthMarker || TMUX_RPC_V2_BIRTH_MARKER_PATTERN.test(rawBirthMarker);
+  const correlationValid = !hasCorrelation || TMUX_RPC_V2_CORRELATION_PATTERN.test(rawReservationCorrelation);
+  const lifecycleMarkersValid = birthMarkerValid
+    && correlationValid
+    && hasBirthMarker === hasCorrelation;
+  return {
+    name: rawName,
+    rawName,
+    attached: attached !== "0",
+    windows: Number(windows),
+    created: Number(sessionCreated),
+    activity: Number(activity),
+    cwd,
+    serverSocketPath,
+    serverPid,
+    serverStarted,
+    sessionId,
+    sessionCreated,
+    birthMarker: lifecycleMarkersValid && hasBirthMarker ? rawBirthMarker : null,
+    reservationCorrelation: lifecycleMarkersValid && hasCorrelation
+      ? rawReservationCorrelation
+      : null,
+    lifecycleMarkersValid,
+  };
+}
+
+/**
+ * Strict lifecycle discovery used by RPC v2. Unlike the legacy catalog query,
+ * transport/format failures are never converted into an empty authoritative cut.
+ */
+export function listTmuxSessionLifecycleEntries(): TmuxSessionLifecycleEntry[] {
+  const format = [
+    "#{socket_path}",
+    "#{pid}",
+    "#{start_time}",
+    "#{session_id}",
+    "#{session_name}",
+    "#{session_created}",
+    `#{${TMUX_RPC_V2_BIRTH_MARKER_OPTION}}`,
+    `#{${TMUX_RPC_V2_RESERVATION_CORRELATION_OPTION}}`,
+    "#{session_attached}",
+    "#{session_windows}",
+    "#{session_activity}",
+    "#{pane_current_path}",
+  ].join("\x1f");
+  const result = runSyncCommand(tmuxBin(), ["list-sessions", "-F", format], 5_000, "run");
+  if (isKnownAbsentTmuxServer(result)) return [];
+  if (!commandSucceeded(result)) {
+    throw new CliError(`unable to read tmux lifecycle identity: ${commandFailureDetail(result)}`);
+  }
+  const output = result.stdout.trim();
+  if (!output) return [];
+  return output.split("\n").map(parseLifecycleEntry);
+}
+
+export function sameTmuxSessionLifecycleIdentity(
+  left: TmuxSessionLifecycleEntry,
+  right: TmuxSessionLifecycleEntry,
+): boolean {
+  return left.serverSocketPath === right.serverSocketPath
+    && left.serverPid === right.serverPid
+    && left.serverStarted === right.serverStarted
+    && left.sessionId === right.sessionId
+    && left.rawName === right.rawName
+    && left.sessionCreated === right.sessionCreated
+    && left.birthMarker === right.birthMarker;
+}
+
+function exactKillCondition(identity: TmuxSessionLifecycleEntry): string {
+  const comparisons = [
+    `#{==:#{pid},${identity.serverPid}}`,
+    `#{==:#{start_time},${identity.serverStarted}}`,
+    `#{==:#{session_id},${identity.sessionId}}`,
+    `#{==:#{session_created},${identity.sessionCreated}}`,
+    identity.birthMarker === null
+      ? `#{==:#{${TMUX_RPC_V2_BIRTH_MARKER_OPTION}},}`
+      : `#{==:#{${TMUX_RPC_V2_BIRTH_MARKER_OPTION}},${identity.birthMarker}}`,
+  ];
+  return comparisons.slice(1).reduce(
+    (condition, comparison) => `#{&&:${condition},${comparison}}`,
+    comparisons[0],
+  );
+}
+
+/**
+ * Kill one exact tmux incarnation. The format fence and kill execute inside one
+ * tmux command queue, so a server restart or same-name replacement cannot turn
+ * the preflight identity into a name-based kill.
+ */
+export function killTmuxSessionByLifecycleIdentity(
+  identity: TmuxSessionLifecycleEntry,
+): TmuxExactKillResult {
+  if (!identity.lifecycleMarkersValid) return "mismatch";
+  const result = runSyncCommand(tmuxBin(), [
+    "if-shell",
+    "-F",
+    "-t",
+    `=${identity.rawName}:`,
+    exactKillCondition(identity),
+    `display-message -p tw_rpc_v2_killed ; kill-session -t ${identity.sessionId}`,
+    "display-message -p tw_rpc_v2_mismatch",
+  ], 30_000, "run");
+  if (commandSucceeded(result)) {
+    const disposition = result.stdout.trim();
+    if (disposition === "tw_rpc_v2_killed") return "killed";
+    if (disposition === "tw_rpc_v2_mismatch") return "mismatch";
+    return "in_doubt";
+  }
+  if (result.status?.kind !== "exit") return "in_doubt";
+  try {
+    const current = listTmuxSessionLifecycleEntries()
+      .find((session) => session.rawName === identity.rawName);
+    // Once the exact command was attempted, absence cannot distinguish an
+    // external disappearance from a kill whose acknowledgement was lost.
+    if (!current) return "in_doubt";
+    return sameTmuxSessionLifecycleIdentity(current, identity) ? "in_doubt" : "mismatch";
+  } catch {
+    return "in_doubt";
+  }
 }
 
 /** 列出 tmux session（默认排除内部 tw-term-/tw-mobile-）。 */

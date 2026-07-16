@@ -1,0 +1,16 @@
+{
+  "contract": "tmux-worktree-tw-rpc-v2",
+  "version": 2,
+  "status": "frozen",
+  "transport": "utf-8-json-line-on-stdout",
+  "entrypoint": "rpc-v2",
+  "commands": [
+    "capabilities",
+    "list",
+    "create-worktree",
+    "create-terminal",
+    "kill-session"
+  ],
+  "requestEncoding": "--request-json",
+  "fixture": "cases.json"
+}

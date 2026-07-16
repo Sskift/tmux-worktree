@@ -46,6 +46,14 @@ RPC:
                               停止并移除一个 TW-managed session 记录
   tw rpc capabilities         输出 Dashboard 可消费的协议能力 JSON
 
+RPC v2（与冻结 v1 并行）:
+  tw rpc-v2 capabilities      输出原子 v2 lifecycle capability JSON
+  tw rpc-v2 list              输出带 opaque incarnation 的 managed session JSON
+  tw rpc-v2 create-worktree --request-json <json>
+  tw rpc-v2 create-terminal --request-json <json>
+  tw rpc-v2 kill-session --request-json <json>
+                              correlated create 与 expected-incarnation kill
+
 飞书终端桥:
   tw feishu-bridge serve      启动本机飞书事件、单轮回复与 ownership 服务
   tw feishu-bridge status     查看 binding、活跃 turn 与不确定回复
@@ -175,6 +183,11 @@ async function main() {
     case "rpc": {
       const { rpcCmd } = await import("./rpc.js");
       await rpcCmd(process.argv.slice(3));
+      return;
+    }
+    case "rpc-v2": {
+      const { rpcV2Cmd } = await import("./rpcV2.js");
+      await rpcV2Cmd(process.argv.slice(3));
       return;
     }
     case "automation":

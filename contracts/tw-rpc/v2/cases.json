@@ -1,0 +1,286 @@
+{
+  "capabilities": {
+    "argv": ["rpc-v2", "capabilities"],
+    "stdout": "{\"protocolVersion\":2,\"app\":\"tmux-worktree\",\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\"]}\n",
+    "normalized": {
+      "protocolVersion": 2,
+      "app": "tmux-worktree",
+      "capabilities": [
+        "incarnation-list.v1",
+        "reservation-correlation.v1",
+        "correlated-create-worktree.v1",
+        "correlated-create-terminal.v1",
+        "expected-incarnation-kill-session.v1",
+        "hard-timeout.v1"
+      ]
+    }
+  },
+  "wire": {
+    "list": {
+      "normalized": {
+        "protocolVersion": 2,
+        "sessions": [
+          {
+            "name": "tw-term-a1b2c",
+            "kind": "terminal",
+            "profile": "dashboard",
+            "project": null,
+            "label": "demo",
+            "repoPath": null,
+            "worktreePath": null,
+            "branch": null,
+            "baseBranch": null,
+            "cwd": "/repo/demo",
+            "createdAt": "2026-07-12T00:00:01.000Z",
+            "attached": false,
+            "windows": 1,
+            "created": 1783700010,
+            "activity": 1783700020,
+            "incarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+            "lifecycleMarked": true,
+            "reservationCorrelation": {
+              "schemaVersion": 1,
+              "reservationId": "res_opaque_1",
+              "hostEpoch": "host-epoch-1",
+              "principalId": "principal-1",
+              "hostId": "mac-admin",
+              "commandId": "command-1",
+              "requestFingerprint": {
+                "schemaVersion": 1,
+                "algorithm": "sha256-rfc8785",
+                "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "createWorktree": {
+      "request": {
+        "arguments": {
+          "project": "demo",
+          "name": "fix",
+          "branch": "main",
+          "aiCommand": "codex"
+        },
+        "reservationCorrelation": {
+          "schemaVersion": 1,
+          "reservationId": "res_opaque_1",
+          "hostEpoch": "host-epoch-1",
+          "principalId": "principal-1",
+          "hostId": "mac-admin",
+          "commandId": "command-1",
+          "requestFingerprint": {
+            "schemaVersion": 1,
+            "algorithm": "sha256-rfc8785",
+            "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        }
+      },
+      "normalized": {
+        "protocolVersion": 2,
+        "operation": "create-worktree",
+        "state": "succeeded",
+        "session": {
+          "name": "demo-fix",
+          "kind": "worktree",
+          "profile": "dashboard",
+          "project": "demo",
+          "label": null,
+          "repoPath": "/repo/demo",
+          "worktreePath": "/worktrees/demo/demo-fix-abc12",
+          "branch": "demo-fix-abc12",
+          "baseBranch": "main",
+          "cwd": "/worktrees/demo/demo-fix-abc12",
+          "createdAt": "2026-07-12T00:00:01.000Z",
+          "attached": false,
+          "windows": 1,
+          "created": 1783700012,
+          "activity": 1783700020,
+          "incarnation": "twinc2.o3_VQ1gGehiOD7Kria-v61EKe1-VMUrkkgQdIosbTC0",
+          "lifecycleMarked": true,
+          "reservationCorrelation": {
+            "schemaVersion": 1,
+            "reservationId": "res_opaque_1",
+            "hostEpoch": "host-epoch-1",
+            "principalId": "principal-1",
+            "hostId": "mac-admin",
+            "commandId": "command-1",
+            "requestFingerprint": {
+              "schemaVersion": 1,
+              "algorithm": "sha256-rfc8785",
+              "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          }
+        }
+      }
+    },
+    "createTerminal": {
+      "request": {
+        "arguments": {
+          "cwd": "/repo/demo",
+          "label": "demo"
+        },
+        "reservationCorrelation": {
+          "schemaVersion": 1,
+          "reservationId": "res_opaque_1",
+          "hostEpoch": "host-epoch-1",
+          "principalId": "principal-1",
+          "hostId": "mac-admin",
+          "commandId": "command-1",
+          "requestFingerprint": {
+            "schemaVersion": 1,
+            "algorithm": "sha256-rfc8785",
+            "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        }
+      },
+      "normalized": {
+        "protocolVersion": 2,
+        "operation": "create-terminal",
+        "state": "succeeded",
+        "session": {
+          "name": "tw-term-a1b2c",
+          "kind": "terminal",
+          "profile": "dashboard",
+          "project": null,
+          "label": "demo",
+          "repoPath": null,
+          "worktreePath": null,
+          "branch": null,
+          "baseBranch": null,
+          "cwd": "/repo/demo",
+          "createdAt": "2026-07-12T00:00:01.000Z",
+          "attached": false,
+          "windows": 1,
+          "created": 1783700010,
+          "activity": 1783700020,
+          "incarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+          "lifecycleMarked": true,
+          "reservationCorrelation": {
+            "schemaVersion": 1,
+            "reservationId": "res_opaque_1",
+            "hostEpoch": "host-epoch-1",
+            "principalId": "principal-1",
+            "hostId": "mac-admin",
+            "commandId": "command-1",
+            "requestFingerprint": {
+              "schemaVersion": 1,
+              "algorithm": "sha256-rfc8785",
+              "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          }
+        }
+      }
+    },
+    "killSession": {
+      "request": {
+        "name": "tw-term-a1b2c",
+        "expectedIncarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y"
+      },
+      "normalized": {
+        "protocolVersion": 2,
+        "operation": "kill-session",
+        "state": "succeeded",
+        "name": "tw-term-a1b2c",
+        "kind": "terminal",
+        "incarnation": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+        "terminated": true,
+        "sessionId": "$7"
+      }
+    },
+    "outcomes": {
+      "createFailed": {
+        "protocolVersion": 2,
+        "operation": "create-terminal",
+        "state": "failed",
+        "sideEffect": "not_applied",
+        "error": {
+          "code": "CREATE_FAILED",
+          "message": "canonical preflight rejected the request"
+        }
+      },
+      "createInDoubt": {
+        "protocolVersion": 2,
+        "operation": "create-terminal",
+        "state": "in_doubt",
+        "error": {
+          "code": "IN_DOUBT",
+          "message": "canonical create result is uncertain"
+        }
+      },
+      "killFailed": {
+        "protocolVersion": 2,
+        "operation": "kill-session",
+        "state": "failed",
+        "sideEffect": "not_applied",
+        "code": "INCARNATION_MISMATCH",
+        "message": "managed session incarnation changed"
+      },
+      "killInDoubt": {
+        "protocolVersion": 2,
+        "operation": "kill-session",
+        "state": "in_doubt",
+        "code": "IN_DOUBT",
+        "message": "exact tmux kill result is uncertain"
+      }
+    }
+  },
+  "reservationCorrelation": {
+    "schemaVersion": 1,
+    "reservationId": "res_opaque_1",
+    "hostEpoch": "host-epoch-1",
+    "principalId": "principal-1",
+    "hostId": "mac-admin",
+    "commandId": "command-1",
+    "requestFingerprint": {
+      "schemaVersion": 1,
+      "algorithm": "sha256-rfc8785",
+      "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+    }
+  },
+  "incarnation": {
+    "baseIdentity": {
+      "serverSocketPath": "/tmp/tmux-501/default",
+      "serverPid": "4200",
+      "serverStarted": "1783700000",
+      "sessionId": "$7",
+      "rawName": "tw-term-a1b2c",
+      "sessionCreated": "1783700010",
+      "birthMarker": "twbirth2.ABCDEFGHIJKLMNOPQRSTUV"
+    },
+    "base": "twinc2.gc_bIXn8CD2Splozj4dKk3uWGWjBBvNbBAKhIIy_E3Y",
+    "changes": [
+      {
+        "field": "serverPid",
+        "value": "4201",
+        "incarnation": "twinc2.dhTLCrfd83WgR4jgi4r65zoH-kAW7L958E2CAUMv_0I"
+      },
+      {
+        "field": "serverStarted",
+        "value": "1783700001",
+        "incarnation": "twinc2.5BvqFlZIh8eVGdybenbZvoLcvOtm0Md_zwwskE6GT0Y"
+      },
+      {
+        "field": "sessionId",
+        "value": "$8",
+        "incarnation": "twinc2.TVZqQqjZxR6hb8GJsucDNXfM7Y7wzeuC1YNd5NLYIUQ"
+      },
+      {
+        "field": "rawName",
+        "value": "tw-term-a1b2d",
+        "incarnation": "twinc2.O0L3p-yeMj9-B2_5sfoUHS8WQxukXhtUM0FjTBzeju8"
+      },
+      {
+        "field": "sessionCreated",
+        "value": "1783700011",
+        "incarnation": "twinc2.fNCbQcQovQtW3S7BYnojqacWJDAX5MYClj95r32X6Os"
+      },
+      {
+        "field": "birthMarker",
+        "value": "twbirth2.VUTSRQPONMLKJIHGFEDCBA",
+        "incarnation": "twinc2.Ocel0vDt3b4ziUEBuH-29Mcb7tF_ZE7scNtSN7R_f44"
+      }
+    ]
+  }
+}

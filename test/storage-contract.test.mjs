@@ -55,6 +55,11 @@ test("storage manifests freeze paths, modes, locks, and schema versions", () => 
   assert.equal(hosts.path, "~/.tmux-worktree.json");
   assert.deepEqual(hosts.collectionAliases, ["hosts", "remotes", "remoteHosts"]);
   assert.equal(hosts.fileMode, "0600");
+
+  const incarnation = readContract("managed-incarnation-v1", "manifest.json");
+  assert.equal(incarnation.parentContract, "tmux-worktree-managed-state-v1");
+  assert.equal(incarnation.extensionKey, state.MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY);
+  assert.equal(incarnation.legacyMarker, "absent-not-synthesized");
 });
 
 test("managed-state-v1 normalizes compatible records and writes exact private JSON", () => {
@@ -92,6 +97,35 @@ test("managed-state-v1 mutations fail closed and preserve invalid bytes", () => 
       );
       assert.equal(readFileSync(path, "utf8"), fixture.contents, fixture.id);
     }
+  });
+});
+
+test("managed incarnation extension is optional and survives unrelated state mutation", () => {
+  const cases = readContract("managed-incarnation-v1", "cases.json");
+  withTempDir("tw-managed-incarnation-contract-", (root) => {
+    const path = join(root, "state.json");
+    writeFileSync(path, `${JSON.stringify({
+      version: 1,
+      sessions: [cases.legacy, cases.extended],
+    }, null, 2)}\n`);
+
+    const loaded = state.loadManagedStateForMutation(path);
+    assert.equal(state.managedSessionLifecycleExtension(loaded.sessions[0]), undefined);
+    const extension = state.managedSessionLifecycleExtension(loaded.sessions[1]);
+    assert.equal(extension.incarnation, cases.extended.extensions["tw.rpc-v2.lifecycle.v1"].incarnation);
+    assert.deepEqual(extension.reservationCorrelation, cases.extended.extensions["tw.rpc-v2.lifecycle.v1"].reservationCorrelation);
+
+    state.recordManagedSession({
+      name: "tw-term-unrelated",
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: "/repo/other",
+      createdAt: "2026-07-12T00:00:02.000Z",
+    }, path);
+    const mutated = state.loadManagedStateForMutation(path);
+    const preserved = mutated.sessions.find((session) => session.name === cases.extended.name);
+    assert.deepEqual(preserved.extensions, cases.extended.extensions);
+    assert.deepEqual(mutated.sessions.find((session) => session.name === cases.legacy.name), cases.legacy);
   });
 });
 

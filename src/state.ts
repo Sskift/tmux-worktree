@@ -7,11 +7,14 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 export const MANAGED_STATE_VERSION = 1;
+export const MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY = "tw.rpc-v2.lifecycle.v1";
+export const MANAGED_SESSION_LIFECYCLE_EXTENSION_VERSION = 1;
 const MANAGED_STATE_LOCK_OWNER_FILE = "owner.json";
 const MANAGED_STATE_LOCK_STALE_MS = 60_000;
 
@@ -29,6 +32,39 @@ export interface ManagedSession {
   baseBranch?: string;
   cwd?: string;
   createdAt: string;
+  extensions?: Record<string, unknown>;
+}
+
+export interface ManagedSessionReservationCorrelationV1 {
+  schemaVersion: 1;
+  reservationId: string;
+  hostEpoch: string;
+  principalId: string;
+  hostId: string;
+  commandId: string;
+  requestFingerprint: {
+    schemaVersion: 1;
+    algorithm: "sha256-rfc8785";
+    digest: string;
+  };
+}
+
+export interface ManagedTmuxIncarnationIdentityV1 {
+  serverSocketPath: string;
+  serverPid: string;
+  serverStarted: string;
+  sessionId: string;
+  rawName: string;
+  sessionCreated: string;
+  birthMarker: string | null;
+}
+
+export interface ManagedSessionLifecycleExtensionV1 {
+  schemaVersion: 1;
+  incarnation: string;
+  tmux: ManagedTmuxIncarnationIdentityV1 & { birthMarker: string };
+  reservationCorrelation: ManagedSessionReservationCorrelationV1;
+  displayLabel: string | null;
 }
 
 export interface ManagedState {
@@ -79,6 +115,211 @@ function isManagedSession(value: unknown): value is ManagedSession {
     (raw.profile === "cli" || raw.profile === "dashboard") &&
     typeof raw.createdAt === "string"
   );
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function isBoundedString(value: unknown, maxBytes = 4_096): value is string {
+  return typeof value === "string"
+    && value.length > 0
+    && value.trim() === value
+    && !value.includes("\0")
+    && Buffer.byteLength(value, "utf8") <= maxBytes;
+}
+
+function assertManagedTmuxIncarnationIdentity(
+  identity: ManagedTmuxIncarnationIdentityV1,
+): void {
+  if (!isBoundedString(identity.serverSocketPath, 4_096)
+    || !/^(0|[1-9][0-9]*)$/.test(identity.serverPid)
+    || !/^(0|[1-9][0-9]*)$/.test(identity.serverStarted)
+    || !/^\$(0|[1-9][0-9]*)$/.test(identity.sessionId)
+    || !isBoundedString(identity.rawName, 128)
+    || !/^(0|[1-9][0-9]*)$/.test(identity.sessionCreated)
+    || (identity.birthMarker !== null
+      && !/^twbirth2\.[A-Za-z0-9_-]{22}$/.test(identity.birthMarker))) {
+    throw new Error("invalid managed tmux incarnation identity");
+  }
+}
+
+export function normalizeManagedSessionReservationCorrelation(
+  value: unknown,
+): ManagedSessionReservationCorrelationV1 {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "schemaVersion",
+    "reservationId",
+    "hostEpoch",
+    "principalId",
+    "hostId",
+    "commandId",
+    "requestFingerprint",
+  ]) || value.schemaVersion !== 1) {
+    throw new Error("invalid managed reservation correlation");
+  }
+  for (const field of ["reservationId", "hostEpoch", "principalId", "hostId", "commandId"] as const) {
+    if (!isBoundedString(value[field], 128)) {
+      throw new Error(`invalid managed reservation correlation ${field}`);
+    }
+  }
+  const fingerprint = value.requestFingerprint;
+  if (!isRecord(fingerprint) || !hasExactKeys(fingerprint, ["schemaVersion", "algorithm", "digest"])
+    || fingerprint.schemaVersion !== 1
+    || fingerprint.algorithm !== "sha256-rfc8785"
+    || typeof fingerprint.digest !== "string"
+    || !/^[0-9a-f]{64}$/.test(fingerprint.digest)) {
+    throw new Error("invalid managed reservation correlation requestFingerprint");
+  }
+  return {
+    schemaVersion: 1,
+    reservationId: value.reservationId as string,
+    hostEpoch: value.hostEpoch as string,
+    principalId: value.principalId as string,
+    hostId: value.hostId as string,
+    commandId: value.commandId as string,
+    requestFingerprint: {
+      schemaVersion: 1,
+      algorithm: "sha256-rfc8785",
+      digest: fingerprint.digest,
+    },
+  };
+}
+
+export function issueManagedSessionIncarnation(
+  identity: ManagedTmuxIncarnationIdentityV1,
+): string {
+  assertManagedTmuxIncarnationIdentity(identity);
+  const canonical = JSON.stringify({
+    schemaVersion: 1,
+    serverSocketPath: identity.serverSocketPath,
+    serverPid: identity.serverPid,
+    serverStarted: identity.serverStarted,
+    sessionId: identity.sessionId,
+    rawName: identity.rawName,
+    sessionCreated: identity.sessionCreated,
+    birthMarker: identity.birthMarker,
+  });
+  return `twinc2.${createHash("sha256").update(canonical, "utf8").digest("base64url")}`;
+}
+
+export function buildManagedSessionLifecycleExtension(
+  identity: ManagedTmuxIncarnationIdentityV1 & { birthMarker: string },
+  reservationCorrelation: ManagedSessionReservationCorrelationV1,
+  displayLabel: string | null,
+): ManagedSessionLifecycleExtensionV1 {
+  assertManagedTmuxIncarnationIdentity(identity);
+  if (displayLabel !== null && !isBoundedString(displayLabel, 128)) {
+    throw new Error("invalid managed session display label");
+  }
+  return {
+    schemaVersion: MANAGED_SESSION_LIFECYCLE_EXTENSION_VERSION,
+    incarnation: issueManagedSessionIncarnation(identity),
+    tmux: { ...identity },
+    reservationCorrelation: normalizeManagedSessionReservationCorrelation(reservationCorrelation),
+    displayLabel,
+  };
+}
+
+/**
+ * Return an exact v2 lifecycle extension. Absence is a supported legacy record;
+ * a present but malformed extension is authority corruption and fails closed.
+ */
+export function managedSessionLifecycleExtension(
+  session: ManagedSession,
+): ManagedSessionLifecycleExtensionV1 | undefined {
+  const extensions = session.extensions;
+  if (extensions === undefined || !Object.hasOwn(extensions, MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY)) {
+    return undefined;
+  }
+  const value = extensions[MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY];
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "schemaVersion",
+    "incarnation",
+    "tmux",
+    "reservationCorrelation",
+    "displayLabel",
+  ]) || value.schemaVersion !== MANAGED_SESSION_LIFECYCLE_EXTENSION_VERSION
+    || !isBoundedString(value.incarnation, 128)
+    || (value.displayLabel !== null && !isBoundedString(value.displayLabel, 128))) {
+    throw new Error(`managed session ${session.name} has a malformed ${MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY} extension`);
+  }
+  const tmux = value.tmux;
+  if (!isRecord(tmux) || !hasExactKeys(tmux, [
+    "serverSocketPath",
+    "serverPid",
+    "serverStarted",
+    "sessionId",
+    "rawName",
+    "sessionCreated",
+    "birthMarker",
+  ])) {
+    throw new Error(`managed session ${session.name} has malformed tmux incarnation evidence`);
+  }
+  for (const field of [
+    "serverSocketPath",
+    "serverPid",
+    "serverStarted",
+    "sessionId",
+    "rawName",
+    "sessionCreated",
+    "birthMarker",
+  ] as const) {
+    if (!isBoundedString(tmux[field], field === "serverSocketPath" ? 4_096 : 128)) {
+      throw new Error(`managed session ${session.name} has invalid tmux incarnation ${field}`);
+    }
+  }
+  const identity = tmux as unknown as ManagedTmuxIncarnationIdentityV1 & { birthMarker: string };
+  try {
+    assertManagedTmuxIncarnationIdentity(identity);
+  } catch {
+    throw new Error(`managed session ${session.name} has invalid tmux incarnation identity`);
+  }
+  if (identity.rawName !== session.name || issueManagedSessionIncarnation(identity) !== value.incarnation) {
+    throw new Error(`managed session ${session.name} has inconsistent incarnation evidence`);
+  }
+  return {
+    schemaVersion: 1,
+    incarnation: value.incarnation,
+    tmux: { ...identity },
+    reservationCorrelation: normalizeManagedSessionReservationCorrelation(value.reservationCorrelation),
+    displayLabel: value.displayLabel,
+  };
+}
+
+export function withManagedSessionLifecycleExtension(
+  session: ManagedSession,
+  extension: ManagedSessionLifecycleExtensionV1,
+): ManagedSession {
+  return {
+    ...session,
+    extensions: {
+      ...(session.extensions ?? {}),
+      [MANAGED_SESSION_LIFECYCLE_EXTENSION_KEY]: extension,
+    },
+  };
+}
+
+/** V2 authority accepts legacy records, but never ambiguous names or malformed extensions. */
+export function assertManagedStateLifecycleV2Authority(state: ManagedState): void {
+  const names = new Set<string>();
+  for (const session of state.sessions) {
+    if (names.has(session.name)) {
+      throw new Error(`managed state has duplicate session authority for ${session.name}`);
+    }
+    names.add(session.name);
+    if (session.extensions !== undefined && !isRecord(session.extensions)) {
+      throw new Error(`managed session ${session.name} has a malformed extensions container`);
+    }
+    managedSessionLifecycleExtension(session);
+  }
 }
 
 export function loadManagedState(path = managedStatePath()): ManagedState {
@@ -268,18 +509,7 @@ function sameManagedSessionRecord(
   current: ManagedSession,
   expected: ManagedSession,
 ): boolean {
-  return (
-    current.name === expected.name
-    && current.kind === expected.kind
-    && current.profile === expected.profile
-    && current.project === expected.project
-    && current.repoPath === expected.repoPath
-    && current.worktreePath === expected.worktreePath
-    && current.branch === expected.branch
-    && current.baseBranch === expected.baseBranch
-    && current.cwd === expected.cwd
-    && current.createdAt === expected.createdAt
-  );
+  return isDeepStrictEqual(current, expected);
 }
 
 /**
