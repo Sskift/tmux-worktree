@@ -14,6 +14,7 @@ import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineStart
@@ -1061,6 +1062,26 @@ class RelayV2ConnectionActorTest {
                 )
             },
             Scenario(
+                "close-1002",
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
+            ) { it.closed(1002) },
+            Scenario(
+                "close-1007",
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
+            ) { it.closed(1007) },
+            Scenario(
+                "close-1008",
+                RelayV2ConnectionFailure(RelayV2FailureKind.SECURITY, "POLICY_VIOLATION", false),
+            ) { it.closed(1008) },
+            Scenario(
+                "close-1009",
+                RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "FRAME_TOO_LARGE", false),
+            ) { it.closed(1009) },
+            Scenario(
+                "close-1011",
+                RelayV2ConnectionFailure(RelayV2FailureKind.ROUTE, "SERVER_ERROR", true),
+            ) { it.closed(1011) },
+            Scenario(
                 "close-4400",
                 RelayV2ConnectionFailure(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false),
             ) { it.closed(4400) },
@@ -1137,6 +1158,54 @@ class RelayV2ConnectionActorTest {
                         as RelayV2RuntimeEffect.ConnectionFailed
                     assertEquals("${scenario.name}:$order", scenario.expected, effect.failure)
                     assertEquals("${scenario.name}:$order", listOf(1013), transport.closeCodes)
+                } finally {
+                    releaseCommit.complete(Unit)
+                    harness.factory.transports.forEach { it.completeTermination() }
+                    harness.close()
+                }
+            }
+        }
+    }
+
+    @Test
+    fun `only normal close and network failure yield to saturation`() = runBlocking {
+        val ordinaryCauses = listOf<Pair<String, (FakeTransport) -> Unit>>(
+            "close-1000" to { it.closed(1000) },
+            "network" to {
+                it.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+            },
+        )
+        ordinaryCauses.forEach { (name, terminate) ->
+            listOf("terminal-first", "saturation-first").forEach { order ->
+                val commitEntered = CompletableDeferred<Unit>()
+                val releaseCommit = CompletableDeferred<Unit>()
+                val harness = Harness(
+                    actionByteCapacity = 64,
+                    beforeTransportCommit = {
+                        commitEntered.complete(Unit)
+                        releaseCommit.await()
+                    },
+                )
+                try {
+                    assertTrue("$name:$order", harness.actor.connect(harness.profile, null))
+                    withTimeout(TIMEOUT_MS) { commitEntered.await() }
+                    val transport = harness.awaitTransport(0)
+                    val saturate = { transport.sendRaw(ByteArray(65)) }
+                    if (order == "terminal-first") {
+                        terminate(transport)
+                        saturate()
+                    } else {
+                        saturate()
+                        terminate(transport)
+                    }
+                    releaseCommit.complete(Unit)
+
+                    val failure = harness.actor.awaitFailure(
+                        RelayV2FailureKind.QUEUE_SATURATED,
+                    ).failure
+                    assertEquals("$name:$order", "SLOW_CONSUMER", failure?.code)
+                    assertTrue("$name:$order", requireNotNull(failure).retryable)
+                    assertEquals("$name:$order", listOf(1013), transport.closeCodes)
                 } finally {
                     releaseCommit.complete(Unit)
                     harness.factory.transports.forEach { it.completeTermination() }
@@ -1283,9 +1352,8 @@ class RelayV2ConnectionActorTest {
                     completeTerminationOnClose = false
                     open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 }
-                withTimeout(TIMEOUT_MS) {
-                    while (lateSource.closeCodes.isEmpty()) delay(1)
-                }
+                assertEquals(1, lateSource.cancelCount)
+                assertTrue(lateSource.closeCodes.isEmpty())
 
                 assertTrue(harness.actor.connect(harness.profile, null))
                 val barrier = async {
@@ -1300,18 +1368,11 @@ class RelayV2ConnectionActorTest {
                 assertFalse(falseIndex.toString(), barrier.isCompleted)
                 assertEquals(falseIndex.toString(), 1, factory.requests.size)
                 sources[pendingIndex].completeTermination()
-                withTimeout(TIMEOUT_MS) {
-                    while (lateSource.awaitTerminationCount.get() == 0) delay(1)
-                }
-                delay(25)
-                assertFalse(falseIndex.toString(), barrier.isCompleted)
-                assertEquals(falseIndex.toString(), 1, factory.requests.size)
-                lateSource.completeTermination()
                 val result = withTimeout(TIMEOUT_MS) { barrier.await() }
                 assertTrue(falseIndex.toString(), result.exceptionOrNull() is IllegalStateException)
                 assertTrue(sources[0].awaitTerminationCount.get() > 0)
                 assertTrue(sources[1].awaitTerminationCount.get() > 0)
-                assertTrue(lateSource.awaitTerminationCount.get() > 0)
+                assertEquals(0, lateSource.awaitTerminationCount.get())
                 assertEquals(falseIndex.toString(), 1, factory.requests.size)
             } finally {
                 factory.transports.forEach { it.completeTermination() }
@@ -1443,6 +1504,144 @@ class RelayV2ConnectionActorTest {
                 raceHarness.close()
             }
         }
+
+    @Test
+    fun `handshake timeout shares terminal precedence and atomic claim ownership`() = runBlocking {
+        val beforeClaim = CountDownLatch(1)
+        val releaseBeforeClaim = CountDownLatch(1)
+        val blockBeforeClaim = AtomicBoolean(true)
+        val tlsWatchdog = ManualWatchdog()
+        val tlsHarness = Harness(
+            watchdogDelay = tlsWatchdog::await,
+            beforeTerminalClaim = {
+                if (blockBeforeClaim.compareAndSet(true, false)) {
+                    beforeClaim.countDown()
+                    check(releaseBeforeClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                }
+            },
+        )
+        try {
+            assertTrue(tlsHarness.actor.connect(tlsHarness.profile, null))
+            val transport = tlsHarness.awaitTransport(0)
+            transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            tlsHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            tlsWatchdog.fire(0)
+            assertTrue(beforeClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            transport.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION))
+            releaseBeforeClaim.countDown()
+
+            val failure = tlsHarness.actor.awaitFailure(RelayV2FailureKind.SECURITY).failure
+            assertEquals("TLS_VALIDATION_FAILED", failure?.code)
+            assertFalse(requireNotNull(failure).retryable)
+            assertEquals(1, transport.cancelCount)
+        } finally {
+            releaseBeforeClaim.countDown()
+            tlsHarness.close()
+        }
+
+        val claimEntered = CountDownLatch(1)
+        val releaseClaim = CountDownLatch(1)
+        val callbackAdmitted = CountDownLatch(1)
+        val observeAdmission = AtomicBoolean(false)
+        val mismatchWatchdog = ManualWatchdog()
+        val mismatchHarness = Harness(
+            watchdogDelay = mismatchWatchdog::await,
+            betweenTerminalCauseReadAndOwnerRevoke = {
+                claimEntered.countDown()
+                check(releaseClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            },
+            afterCallbackAdmission = {
+                if (observeAdmission.get()) callbackAdmitted.countDown()
+            },
+        )
+        try {
+            assertTrue(mismatchHarness.actor.connect(mismatchHarness.profile, null))
+            val committed = mismatchHarness.awaitTransport(0)
+            committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            mismatchHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            mismatchWatchdog.fire(0)
+            assertTrue(claimEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            val mismatched = mismatchHarness.factory.createCallbackSource()
+            observeAdmission.set(true)
+            val callback = async(Dispatchers.Default) {
+                mismatched.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            }
+            assertTrue(callbackAdmitted.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            releaseClaim.countDown()
+            withTimeout(TIMEOUT_MS) { callback.await() }
+
+            val failure = mismatchHarness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT).failure
+            assertEquals("HANDSHAKE_TIMEOUT", failure?.code)
+            assertTrue(requireNotNull(failure).retryable)
+            assertEquals(listOf(4408), committed.closeCodes)
+            assertEquals(listOf(1000), mismatched.closeCodes)
+        } finally {
+            releaseClaim.countDown()
+            mismatchHarness.factory.transports.forEach { it.completeTermination() }
+            mismatchHarness.close()
+        }
+    }
+
+    @Test
+    fun `disconnect seals admitted callback before final empty fence observation`() = runBlocking {
+        val callbackEntered = CountDownLatch(1)
+        val releaseCallback = CountDownLatch(1)
+        val blockCallback = AtomicBoolean(false)
+        val harness = Harness(
+            afterCallbackAdmission = {
+                if (blockCallback.get()) {
+                    callbackEntered.countDown()
+                    check(releaseCallback.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                }
+            },
+        )
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val committed = harness.awaitTransport(0)
+            committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+
+            val lateSource = harness.factory.createCallbackSource().apply {
+                completeTerminationOnClose = false
+            }
+            blockCallback.set(true)
+            val callback = async(Dispatchers.Default) {
+                lateSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            }
+            assertTrue(callbackEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val receipt = async {
+                harness.actor.disconnectAndDrain(
+                    harness.profile.identity,
+                    "callback-admission-seal",
+                )
+            }
+            withTimeout(TIMEOUT_MS) {
+                while (committed.awaitTerminationCount.get() == 0) delay(1)
+            }
+            delay(25)
+            assertFalse(receipt.isCompleted)
+
+            releaseCallback.countDown()
+            withTimeout(TIMEOUT_MS) { callback.await() }
+            withTimeout(TIMEOUT_MS) {
+                while (lateSource.awaitTerminationCount.get() == 0) delay(1)
+            }
+            delay(25)
+            assertFalse(receipt.isCompleted)
+            lateSource.completeTermination()
+            assertEquals(
+                "callback-admission-seal",
+                withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+            )
+            assertEquals(listOf(1000), committed.closeCodes)
+            assertEquals(listOf(1000), lateSource.closeCodes)
+        } finally {
+            releaseCallback.countDown()
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
 
     @Test
     fun `bounded action and event queues fail closed on saturation`() = runBlocking {
@@ -1883,7 +2082,9 @@ class RelayV2ConnectionActorTest {
         effectByteCapacity: Long = RelayV2ConnectionActor.DEFAULT_EFFECT_BYTE_CAPACITY,
         watchdogDelay: suspend (Long) -> Unit = { delay(it) },
         beforeTransportCommit: suspend () -> Unit = {},
+        beforeTerminalClaim: () -> Unit = {},
         betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
+        afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -1896,8 +2097,10 @@ class RelayV2ConnectionActorTest {
             clock = { NOW_MS },
             watchdogDelay = watchdogDelay,
             beforeTransportCommit = beforeTransportCommit,
+            beforeTerminalClaim = beforeTerminalClaim,
             betweenTerminalCauseReadAndOwnerRevoke =
                 betweenTerminalCauseReadAndOwnerRevoke,
+            afterCallbackAdmission = afterCallbackAdmission,
             normalActionCapacity = normalActionCapacity,
             reservedActionCapacity = reservedActionCapacity,
             eventCapacity = eventCapacity,
