@@ -625,8 +625,16 @@ export function sameTmuxSessionLifecycleIdentity(
     && left.birthMarker === right.birthMarker;
 }
 
+function escapeTmuxFormatLiteral(value: string): string {
+  return value
+    .replaceAll("#", "##")
+    .replaceAll(",", "#,")
+    .replaceAll("}", "#}");
+}
+
 function exactKillCondition(identity: TmuxSessionLifecycleEntry): string {
   const comparisons = [
+    `#{==:#{socket_path},${escapeTmuxFormatLiteral(identity.serverSocketPath)}}`,
     `#{==:#{pid},${identity.serverPid}}`,
     `#{==:#{start_time},${identity.serverStarted}}`,
     `#{==:#{session_id},${identity.sessionId}}`,

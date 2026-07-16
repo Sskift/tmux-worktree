@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -347,6 +348,8 @@ test("expected-incarnation kill targets one session ID and removes only the matc
       statePath: path,
       listTmuxSessionLifecycleEntries: () => [liveSession()],
       killTmuxSessionByLifecycleIdentity: (identity) => {
+        assert.equal(existsSync(`${path}.lock`), true);
+        assert.equal(JSON.parse(readFileSync(path, "utf8")).sessions.length, 1);
         killed.push(identity.sessionId);
         return "killed";
       },
@@ -359,10 +362,11 @@ test("expected-incarnation kill targets one session ID and removes only the matc
     }, cases.wire.killSession.normalized);
     assert.deepEqual(killed, ["$7"]);
     assert.deepEqual(JSON.parse(readFileSync(path, "utf8")).sessions, []);
+    assert.equal(existsSync(`${path}.lock`), false);
   });
 });
 
-test("exact tmux kill fences same-name replacement and server restart on an isolated server", (t) => {
+test("exact tmux kill fences socket identity, same-name replacement, and server restart", (t) => {
   const probe = spawnSync("tmux", ["-V"], { encoding: "utf8" });
   if (probe.status !== 0) {
     t.skip("tmux is unavailable");
@@ -370,12 +374,13 @@ test("exact tmux kill fences same-name replacement and server restart on an isol
   }
   withTempDir("tw-rpc-v2-real-tmux-", (root) => {
     const wrapper = join(root, "isolated-tmux");
-    const socketName = `tw-rpc-v2-${process.pid}-${Date.now()}`;
-    writeFileSync(
+    const socketName = `tw-rpc-v2-${process.pid}-${Date.now()},hash#}socket`;
+    const writeWrapper = (failExactKill = false) => writeFileSync(
       wrapper,
-      `#!/bin/sh\nexec tmux -L ${socketName} -f /dev/null "$@"\n`,
+      `#!/bin/sh\n${failExactKill ? 'if [ "$1" = "if-shell" ]; then exit 1; fi\n' : ""}exec tmux -L '${socketName}' -f /dev/null "$@"\n`,
       { mode: 0o700 },
     );
+    writeWrapper();
     const previousTmux = process.env.TW_TMUX;
     process.env.TW_TMUX = wrapper;
     const command = (args) => spawnSync(wrapper, args, { encoding: "utf8" });
@@ -525,7 +530,31 @@ test("exact tmux kill fences same-name replacement and server restart on an isol
         restarted.serverPid,
       );
 
+      const wrongSocketIdentity = {
+        ...restarted,
+        serverSocketPath: `${restarted.serverSocketPath}-other`,
+      };
+      const wrongSocketIncarnation = writeIncarnationState(statePath, wrongSocketIdentity);
+      const socketMismatch = session.killManagedSessionV2({
+        name: "same-name",
+        expectedIncarnation: wrongSocketIncarnation,
+      }, { statePath, listTmuxSessionLifecycleEntries: () => [wrongSocketIdentity] });
+      assert.equal(socketMismatch.state, "failed");
+      assert.equal(socketMismatch.code, "INCARNATION_MISMATCH");
+      assert.equal(inspect().sessionId, restarted.sessionId);
+      assert.equal(JSON.parse(readFileSync(statePath, "utf8")).sessions.length, 1);
+
       const restartedIncarnation = writeIncarnationState(statePath, restarted);
+      writeWrapper(true);
+      const diagnosticOnly = session.killManagedSessionV2({
+        name: "same-name",
+        expectedIncarnation: restartedIncarnation,
+      }, { statePath, listTmuxSessionLifecycleEntries: () => [restarted] });
+      assert.equal(diagnosticOnly.state, "in_doubt");
+      assert.equal(inspect().sessionId, restarted.sessionId);
+      assert.equal(JSON.parse(readFileSync(statePath, "utf8")).sessions.length, 1);
+
+      writeWrapper();
       const killed = session.killManagedSessionV2({
         name: "same-name",
         expectedIncarnation: restartedIncarnation,
