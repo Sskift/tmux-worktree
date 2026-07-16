@@ -217,7 +217,7 @@ internal class BoundedRfc6455Writer(
     }
 
     fun sendProtocolClose(timeoutMs: Long): Boolean {
-        val payload = closePayload(1002, "protocol violation") ?: return false
+        val payload = closePayload(4400, "protocol violation") ?: return false
         val completion = CountDownLatch(1)
         if (!enqueueTerminalClose(payload, completion)) return false
         return awaitCompletion(completion, timeoutMs)

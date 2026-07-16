@@ -783,7 +783,7 @@ class BoundedRelayV2TransportFactoryTest {
                     val close = requireNotNull(observedClose.get())
                     assertEquals(OPCODE_CLOSE, close.opcode)
                     assertTrue(close.masked)
-                    assertEquals(1002, close.closeCode())
+                    assertEquals(4400, close.closeCode())
                     assertEquals(1, server.acceptedCount.get())
                 } finally {
                     actor.close()
