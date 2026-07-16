@@ -900,12 +900,14 @@ function freezeReplayEventPages(
   if (events.length === 0) return [[]];
   const pages: RelayAgentAuthorityPublicEvent[][] = [];
   let page: RelayAgentAuthorityPublicEvent[] = [];
-  for (const event of events) {
+  for (let index = 0; index < events.length; index += 1) {
+    const event = events[index]!;
+    const candidateCursor = index === events.length - 1 ? null : WORST_CASE_WIRE_CURSOR;
     const candidate = [...page, event];
     if (candidate.length <= limit && frameFitsWire(replayPageFrame(
       context,
       candidate,
-      WORST_CASE_WIRE_CURSOR,
+      candidateCursor,
     ))) {
       page = candidate;
       continue;
@@ -915,7 +917,7 @@ function freezeReplayEventPages(
     }
     pages.push(page);
     page = [event];
-    if (!frameFitsWire(replayPageFrame(context, page, WORST_CASE_WIRE_CURSOR))) {
+    if (!frameFitsWire(replayPageFrame(context, page, candidateCursor))) {
       throw new RelayAgentAuthorityStoreCapacityError("replay_wire_page", 1, 1);
     }
   }

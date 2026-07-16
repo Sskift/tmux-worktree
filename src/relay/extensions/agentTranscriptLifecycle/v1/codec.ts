@@ -506,8 +506,8 @@ function validateStatusPayload(value: RelayV2JsonValue): void {
   oneOf(field(payload, "liveSource"), ["connected", "interrupted"] as const);
   id(field(payload, "activeSourceEpoch"));
   id(field(payload, "timelineEpoch"));
-  const current = counter(field(payload, "currentAgentSeq"));
-  const earliest = counter(field(payload, "earliestReplaySeq"));
+  const current = positiveCounter(field(payload, "currentAgentSeq"));
+  const earliest = positiveCounter(field(payload, "earliestReplaySeq"));
   if (compareCounter(earliest, current) > 0) reject("schema-mismatch");
   const limits = object(field(payload, "limits"));
   exact(limits, ["maxTextUtf8Bytes", "maxPageRecords", "eventReplayRetentionMs", "snapshotLeaseMs"]);
@@ -583,8 +583,8 @@ export function validateRelayAgentTranscriptLifecycleFrame(
       const isLast = booleanValue(field(payload, "isLast"));
       const next = nullable(field(payload, "nextCursor"), cursor);
       if (isLast === (next !== null)) reject("schema-mismatch");
-      const through = counter(field(payload, "throughAgentSeq"));
-      const earliest = counter(field(payload, "earliestRetainedSeq"));
+      const through = positiveCounter(field(payload, "throughAgentSeq"));
+      const earliest = positiveCounter(field(payload, "earliestRetainedSeq"));
       if (compareCounter(earliest, through) > 0) reject("schema-mismatch");
       validateSnapshotRecords(field(payload, "records"), through);
       break;
@@ -624,7 +624,7 @@ export function validateRelayAgentTranscriptLifecycleFrame(
         }
         previous = event.agentEventSeq as string;
       }, RELAY_AGENT_MAX_PAGE_RECORDS);
-      if (!isLast && events.length === 0) reject("schema-mismatch");
+      if (!isLast && (events.length === 0 || previous === through)) reject("schema-mismatch");
       if (isLast && (
         (events.length === 0 && after !== through)
         || (events.length > 0 && previous !== through)
@@ -650,10 +650,11 @@ export function validateRelayAgentTranscriptLifecycleFrame(
       const payload = object(field(frame, "payload"));
       exact(payload, ["capability", "previousTimelineEpoch", "newTimelineEpoch", "reason"]);
       literal(field(payload, "capability"), RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY);
-      id(field(payload, "previousTimelineEpoch"));
+      const previous = id(field(payload, "previousTimelineEpoch"));
       const next = nullable(field(payload, "newTimelineEpoch"), id);
       const reason = oneOf(field(payload, "reason"), ["deleted", "store_reset"] as const);
       if ((reason === "deleted") !== (next !== null)) reject("schema-mismatch");
+      if (next !== null && next === previous) reject("schema-mismatch");
       break;
     }
     case "error": {

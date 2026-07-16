@@ -36,6 +36,18 @@
     "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.replay.get\",\"requestId\":\"agent-replay-1\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"timelineEpoch\":\"timeline-1\",\"afterAgentSeq\":\"8\",\"cursor\":null,\"limit\":256}}"
   },
   {
+    "name": "replay-get-genesis-cursor",
+    "direction": "client-to-host",
+    "type": "agent.timeline.replay.get",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"request\",\"type\":\"agent.timeline.replay.get\",\"requestId\":\"agent-replay-genesis\",\"hostId\":\"mac-admin\",\"expectedHostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"timelineEpoch\":\"timeline-genesis\",\"afterAgentSeq\":\"0\",\"cursor\":null,\"limit\":256}}"
+  },
+  {
+    "name": "replay-page-empty-genesis-cut",
+    "direction": "host-to-client",
+    "type": "agent.timeline.replay.page",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.replay.page\",\"requestId\":\"agent-replay-genesis\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-genesis\",\"afterAgentSeq\":\"0\",\"replayThroughAgentSeq\":\"0\",\"isLast\":true,\"nextCursor\":null,\"events\":[]}}"
+  },
+  {
     "name": "replay-page-lifecycle-and-entry",
     "direction": "host-to-client",
     "type": "agent.timeline.replay.page",

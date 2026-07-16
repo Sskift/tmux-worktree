@@ -39,14 +39,56 @@
     "category": "nonpositive-agent-event-sequence",
     "type": "agent.timeline.snapshot.page",
     "expectedError": "INVALID_ENVELOPE",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-lifecycle\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-lifecycle\",\"snapshotId\":\"cut-zero-lifecycle\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"0\",\"records\":[{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-zero-snapshot-lifecycle\",\"sourceEpoch\":\"source-zero\",\"scope\":\"run\",\"runId\":\"run-zero\",\"turnId\":null,\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"0\"}]}}"
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-lifecycle\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-lifecycle\",\"snapshotId\":\"cut-zero-lifecycle\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"1\",\"records\":[{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-zero-snapshot-lifecycle\",\"sourceEpoch\":\"source-zero\",\"scope\":\"run\",\"runId\":\"run-zero\",\"turnId\":null,\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"0\"}]}}"
   },
   {
     "name": "snapshot-text-record-sequences-zero",
     "category": "nonpositive-agent-event-sequence",
     "type": "agent.timeline.snapshot.page",
     "expectedError": "INVALID_ENVELOPE",
-    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-text\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-text\",\"snapshotId\":\"cut-zero-text\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"0\",\"records\":[{\"recordType\":\"text_entry\",\"entryId\":\"entry-zero-snapshot\",\"runId\":\"run-zero\",\"turnId\":\"turn-zero\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"invalid zero sequence\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"0\",\"lastModifiedAgentSeq\":\"0\"}]}}"
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-text\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-text\",\"snapshotId\":\"cut-zero-text\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"1\",\"records\":[{\"recordType\":\"text_entry\",\"entryId\":\"entry-zero-snapshot\",\"runId\":\"run-zero\",\"turnId\":\"turn-zero\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"invalid zero sequence\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"0\",\"lastModifiedAgentSeq\":\"0\"}]}}"
+  },
+  {
+    "name": "available-status-current-sequence-zero",
+    "category": "nonpositive-available-cut-sequence",
+    "type": "agent.timeline.status",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.status\",\"requestId\":\"bad-zero-status-current\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"support\":\"available\",\"reason\":null,\"liveSource\":\"connected\",\"activeSourceEpoch\":\"source-zero\",\"timelineEpoch\":\"timeline-zero\",\"currentAgentSeq\":\"0\",\"earliestReplaySeq\":\"0\",\"limits\":{\"maxTextUtf8Bytes\":65536,\"maxPageRecords\":256,\"eventReplayRetentionMs\":604800000,\"snapshotLeaseMs\":300000}}}"
+  },
+  {
+    "name": "available-status-earliest-sequence-zero",
+    "category": "nonpositive-available-cut-sequence",
+    "type": "agent.timeline.status",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.status\",\"requestId\":\"bad-zero-status-earliest\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"support\":\"available\",\"reason\":null,\"liveSource\":\"connected\",\"activeSourceEpoch\":\"source-one\",\"timelineEpoch\":\"timeline-one\",\"currentAgentSeq\":\"1\",\"earliestReplaySeq\":\"0\",\"limits\":{\"maxTextUtf8Bytes\":65536,\"maxPageRecords\":256,\"eventReplayRetentionMs\":604800000,\"snapshotLeaseMs\":300000}}}"
+  },
+  {
+    "name": "snapshot-through-sequence-zero",
+    "category": "nonpositive-available-cut-sequence",
+    "type": "agent.timeline.snapshot.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-through\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-zero-through\",\"snapshotRequestId\":\"logical-zero-through\",\"snapshotId\":\"cut-zero-through\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"0\",\"earliestRetainedSeq\":\"0\",\"records\":[]}}"
+  },
+  {
+    "name": "snapshot-earliest-retained-sequence-zero",
+    "category": "nonpositive-available-cut-sequence",
+    "type": "agent.timeline.snapshot.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-earliest\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-zero-earliest\",\"snapshotRequestId\":\"logical-zero-earliest\",\"snapshotId\":\"cut-zero-earliest\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"0\",\"records\":[]}}"
+  },
+  {
+    "name": "deleted-reset-reuses-timeline-lineage",
+    "category": "timeline-reset-lineage-rotation",
+    "type": "agent.timeline.reset",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.reset\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"previousTimelineEpoch\":\"timeline-same\",\"newTimelineEpoch\":\"timeline-same\",\"reason\":\"deleted\"}}"
+  },
+  {
+    "name": "replay-nonfinal-page-already-reaches-pinned-through",
+    "category": "replay-page-continuation",
+    "type": "agent.timeline.replay.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.replay.page\",\"requestId\":\"bad-replay-continuation\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"afterAgentSeq\":\"8\",\"replayThroughAgentSeq\":\"9\",\"isLast\":false,\"nextCursor\":\"cursor-bogus-continuation\",\"events\":[{\"agentEventSeq\":\"9\",\"eventId\":\"event-bogus-continuation\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"entry.deleted\",\"entryId\":\"entry-bogus-continuation\",\"reason\":\"retention\"}}]}}"
   },
   {
     "name": "run-lifecycle-carries-turn-id",
