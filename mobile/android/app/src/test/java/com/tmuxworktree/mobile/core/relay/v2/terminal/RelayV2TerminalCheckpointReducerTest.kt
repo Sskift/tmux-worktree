@@ -139,6 +139,64 @@ class RelayV2TerminalCheckpointReducerTest {
             RelayV2TerminalResetReason.IDENTITY_CHANGED,
             (activationChanged.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
+
+        val resetBarrier = parserResetToken(checkpoint, "restore-reset")
+        val exactCorruptClosed = checkpoint.copy(
+            phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+            parserResetCallbackToken = resetBarrier,
+            closed = closedWatermark(
+                finalOffset = "0",
+                replayAvailable = true,
+                bufferStartOffset = "1",
+            ),
+        )
+        val queued = requireNotNull(output(checkpoint, "0", "x").checkpoint)
+        val corruptClosedCheckpoints = listOf(
+            exactCorruptClosed,
+            checkpoint.copy(
+                phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                parserResetCallbackToken = resetBarrier,
+            ),
+            queued.copy(
+                phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                closed = closedWatermark(
+                    finalOffset = "0",
+                    replayAvailable = true,
+                    bufferStartOffset = "0",
+                ),
+            ),
+            queued.copy(
+                phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                parserResetCallbackToken = resetBarrier,
+                closed = closedWatermark(
+                    finalOffset = "1",
+                    replayAvailable = true,
+                    bufferStartOffset = "0",
+                ),
+            ),
+            checkpoint.copy(
+                phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                parserResetCallbackToken = resetBarrier,
+                closed = closedWatermark(
+                    finalOffset = "0",
+                    replayAvailable = false,
+                    bufferStartOffset = "0",
+                ),
+            ),
+        )
+        corruptClosedCheckpoints.forEach { corrupt ->
+            val rejected = RelayV2TerminalCheckpointReducer.restore(
+                RelayV2TerminalStoredCheckpoint.Present(corrupt),
+                identity,
+                checkpoint.deliveryToken,
+                PARSER_CONTINUITY,
+            )
+            assertEquals(
+                RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+                (rejected.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+            )
+            assertTrue(rejected.effects.single() is RelayV2TerminalEffect.ResetRequired)
+        }
     }
 
     @Test
@@ -385,6 +443,19 @@ class RelayV2TerminalCheckpointReducerTest {
     @Test
     fun `closed waits for received bytes to apply and finalized state rejects late revival`() {
         var checkpoint = open()
+        val oldDelivery = checkpoint.deliveryToken
+        val activeDelivery = delivery(deliverySequence = 2, connectionGeneration = 2)
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.RebindDelivery(
+                    checkpoint.identity,
+                    checkpoint.deliveryToken,
+                    activeDelivery,
+                    checkpoint.parserContinuityId,
+                ),
+            ).checkpoint,
+        )
         val queued = output(checkpoint, "0", "abc")
         checkpoint = requireNotNull(queued.checkpoint)
         val callback = queued.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>()
@@ -415,9 +486,84 @@ class RelayV2TerminalCheckpointReducerTest {
             result.effects.map { it::class },
         )
 
-        val lateOutput = output(finalized, "3", "x")
-        val lateCallback = reduce(finalized, RelayV2TerminalAction.ParserApplied(callback))
-        listOf(lateOutput, lateCallback).forEach { late ->
+        val lateActions: List<RelayV2TerminalAction> = listOf(
+            RelayV2TerminalAction.VerifyContinuity(
+                finalized.identity,
+                finalized.deliveryToken,
+                finalized.parserContinuityId,
+            ),
+            RelayV2TerminalAction.RebindDelivery(
+                finalized.identity,
+                finalized.deliveryToken,
+                delivery(deliverySequence = 3, connectionGeneration = 3),
+                finalized.parserContinuityId,
+            ),
+            RelayV2TerminalAction.Output(
+                actionFence(finalized),
+                "3",
+                RelayV2TerminalBytes.utf8("x"),
+            ),
+            RelayV2TerminalAction.Output(
+                actionFence(finalized, deliveryToken = oldDelivery),
+                "3",
+                RelayV2TerminalBytes.utf8("x"),
+            ),
+            RelayV2TerminalAction.ReplayStarted(
+                finalized.identity,
+                finalized.deliveryToken,
+                requestId = "late-replay",
+                fromOffset = "3",
+                tailOffsetAtStart = "3",
+            ),
+            RelayV2TerminalAction.ParserApplied(callback),
+            RelayV2TerminalAction.ParserFailed(callback),
+            RelayV2TerminalAction.ParserResetApplied(callback),
+            RelayV2TerminalAction.EnqueueInput(
+                finalized.deliveryToken,
+                RelayV2TerminalBytes.utf8("x"),
+            ),
+            RelayV2TerminalAction.InputSent(actionFence(finalized), "1"),
+            RelayV2TerminalAction.InputAck(actionFence(finalized), "1"),
+            RelayV2TerminalAction.InputError(
+                actionFence(finalized),
+                inputSeq = "1",
+                ackedThroughInputSeq = "0",
+                error = RelayV2TerminalControlError.GAP,
+            ),
+            RelayV2TerminalAction.EnqueueResize(finalized.deliveryToken, 120, 36),
+            RelayV2TerminalAction.ResizeSent(actionFence(finalized), "1"),
+            RelayV2TerminalAction.ResizeAck(actionFence(finalized), "1"),
+            RelayV2TerminalAction.ResizeError(
+                actionFence(finalized),
+                resizeSeq = "1",
+                ackedThroughResizeSeq = "0",
+                error = RelayV2TerminalControlError.GAP,
+            ),
+            RelayV2TerminalAction.RetryUnackedControls(finalized.deliveryToken),
+            RelayV2TerminalAction.RequestClose(finalized.deliveryToken),
+            closedAction(
+                finalized,
+                finalOffset = "3",
+                replayAvailable = true,
+                bufferStartOffset = "0",
+            ),
+            RelayV2TerminalAction.HostResetRequired(
+                actionFence(finalized),
+                RelayV2TerminalResetReason.STREAM_LOST,
+                requestedOffset = "3",
+                bufferStartOffset = null,
+                tailOffset = null,
+            ),
+            RelayV2TerminalAction.HostResetRequired(
+                actionFence(finalized, deliveryToken = oldDelivery),
+                RelayV2TerminalResetReason.STREAM_LOST,
+                requestedOffset = "3",
+                bufferStartOffset = null,
+                tailOffset = null,
+            ),
+        )
+        lateActions.forEach { action ->
+            val late = reduce(finalized, action)
             assertEquals(
                 RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
                 (late.outcome as RelayV2TerminalOutcome.Ignored).reason,
@@ -425,6 +571,91 @@ class RelayV2TerminalCheckpointReducerTest {
             assertEquals(finalized, late.checkpoint)
             assertTrue(late.effects.isEmpty())
         }
+    }
+
+    @Test
+    fun `parser reset remains a hard barrier across closed replay and queued output`() {
+        val previous = open()
+        val resetIdentity = previous.identity.copy(
+            generation = "generation-2",
+            resumeTokenCredentialReference = "resume-token-ref-2",
+        )
+        var result = reduce(
+            previous,
+            RelayV2TerminalAction.Opened(
+                resetIdentity,
+                previous.deliveryToken,
+                PARSER_CONTINUITY,
+                RelayV2TerminalOpenDisposition.RESET,
+                cols = 120,
+                rows = 36,
+                replayFromOffset = "0",
+                tailOffset = "0",
+            ),
+        )
+        var checkpoint = requireNotNull(result.checkpoint)
+        val resetCallback = result.effects.filterIsInstance<RelayV2TerminalEffect.ResetParser>()
+            .single().callbackToken
+
+        result = reduce(
+            checkpoint,
+            closedAction(
+                checkpoint,
+                finalOffset = "2",
+                replayAvailable = true,
+                bufferStartOffset = "0",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        val replay = result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>().single()
+        assertNotNull(checkpoint.parserResetCallbackToken)
+
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ReplayStarted(
+                checkpoint.identity,
+                checkpoint.deliveryToken,
+                replay.requestId,
+                fromOffset = "0",
+                tailOffsetAtStart = "2",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(RelayV2TerminalPhase.REPLAYING, checkpoint.phase)
+        assertTrue(result.effects.isEmpty())
+
+        result = output(checkpoint, "0", "ab")
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals("2", checkpoint.networkReceivedThrough)
+        assertEquals("0", checkpoint.parserAppliedNextOffset)
+        assertNull(checkpoint.parserInFlightCallbackToken)
+        assertTrue(result.effects.none { it is RelayV2TerminalEffect.WriteParser })
+        assertTrue(result.effects.none { it is RelayV2TerminalEffect.OutputAck })
+        assertNotNull(checkpoint.closed)
+
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ParserResetApplied(resetCallback),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        val write = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        assertNull(checkpoint.parserResetCallbackToken)
+        assertEquals(write.callbackToken, checkpoint.parserInFlightCallbackToken)
+        assertNotNull(checkpoint.closed)
+
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ParserApplied(write.callbackToken),
+        )
+        assertEquals(RelayV2TerminalPhase.FINALIZED, result.checkpoint?.phase)
+        assertEquals("2", result.checkpoint?.parserAppliedNextOffset)
+        assertEquals(
+            listOf(
+                RelayV2TerminalEffect.OutputAck::class,
+                RelayV2TerminalEffect.FinalizeClosed::class,
+            ),
+            result.effects.map { it::class },
+        )
     }
 
     @Test
@@ -841,6 +1072,30 @@ class RelayV2TerminalCheckpointReducerTest {
         RelayV2TerminalCloseReason.BACKEND_EXIT,
         exitCode = 0,
         closeId = null,
+    )
+
+    private fun closedWatermark(
+        finalOffset: String,
+        replayAvailable: Boolean,
+        bufferStartOffset: String?,
+    ): RelayV2TerminalClosedWatermark = RelayV2TerminalClosedWatermark(
+        finalOffset,
+        replayAvailable,
+        bufferStartOffset,
+        RelayV2TerminalCloseReason.BACKEND_EXIT,
+        exitCode = 0,
+        closeId = null,
+    )
+
+    private fun parserResetToken(
+        checkpoint: RelayV2TerminalCheckpoint,
+        operationId: String,
+    ): RelayV2TerminalParserCallbackToken = RelayV2TerminalParserCallbackToken(
+        RelayV2TerminalEffectFence(checkpoint.identity, checkpoint.deliveryToken),
+        checkpoint.parserContinuityId,
+        operationId,
+        startOffset = "0",
+        endOffset = "0",
     )
 
     private fun open(

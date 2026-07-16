@@ -87,6 +87,12 @@ internal object RelayV2TerminalCheckpointReducer {
     ): RelayV2TerminalReduction {
         if (action is RelayV2TerminalAction.Opened) return opened(checkpoint, action)
         val current = checkpoint ?: return missingReset(null, RelayV2TerminalResetReason.MISSING_CHECKPOINT)
+        if (current.phase == RelayV2TerminalPhase.FINALIZED) {
+            return reduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT),
+            )
+        }
         actionGuard(current, action)?.let { return it }
         if (current.phase == RelayV2TerminalPhase.RESET_REQUIRED &&
             action !is RelayV2TerminalAction.VerifyContinuity &&
@@ -468,7 +474,7 @@ internal object RelayV2TerminalCheckpointReducer {
             ?: return reset(current, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
 
         if (end <= expected) {
-            val effects = if (end <= applied) {
+            val effects = if (end <= applied && current.parserResetCallbackToken == null) {
                 listOf(
                     RelayV2TerminalEffect.OutputAck(
                         effectFence(current),
@@ -525,7 +531,7 @@ internal object RelayV2TerminalCheckpointReducer {
             pendingOutput = current.pendingOutput + pending,
         )
         val effects = mutableListOf<RelayV2TerminalEffect>()
-        if (candidate.parserInFlightCallbackToken == null && canDispatchParser(candidate.phase)) {
+        if (candidate.parserInFlightCallbackToken == null && canDispatchParser(candidate)) {
             candidate = candidate.copy(parserInFlightCallbackToken = pending.callbackToken)
             effects += pending.writeEffect()
         }
@@ -559,10 +565,12 @@ internal object RelayV2TerminalCheckpointReducer {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         var candidate = current.copy(
-            phase = if (tail == from && current.closed == null) {
-                RelayV2TerminalPhase.LIVE
-            } else {
-                RelayV2TerminalPhase.REPLAYING
+            phase = when {
+                tail == from && current.closed == null &&
+                    current.parserResetCallbackToken != null ->
+                    RelayV2TerminalPhase.RESETTING_PARSER
+                tail == from && current.closed == null -> RelayV2TerminalPhase.LIVE
+                else -> RelayV2TerminalPhase.REPLAYING
             },
             replayTargetOffset = if (tail == from && current.closed == null) {
                 null
@@ -574,7 +582,7 @@ internal object RelayV2TerminalCheckpointReducer {
         val effects = mutableListOf<RelayV2TerminalEffect>()
         if (candidate.parserInFlightCallbackToken == null &&
             candidate.pendingOutput.isNotEmpty() &&
-            canDispatchParser(candidate.phase)
+            canDispatchParser(candidate)
         ) {
             val head = candidate.pendingOutput.first()
             candidate = candidate.copy(parserInFlightCallbackToken = head.callbackToken)
@@ -592,6 +600,14 @@ internal object RelayV2TerminalCheckpointReducer {
             return reduction(
                 current,
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT),
+            )
+        }
+        if (current.parserResetCallbackToken != null) {
+            return reduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.OUT_OF_ORDER_PARSER_CALLBACK,
+                ),
             )
         }
         if (action.callbackToken == current.lastAppliedParserCallbackToken) {
@@ -664,7 +680,7 @@ internal object RelayV2TerminalCheckpointReducer {
                 RelayV2TerminalPhase.FINALIZED,
                 RelayV2TerminalPhase.RESET_REQUIRED,
             ) && candidate.parserInFlightCallbackToken == null &&
-            candidate.pendingOutput.isNotEmpty() && canDispatchParser(candidate.phase)
+            candidate.pendingOutput.isNotEmpty() && canDispatchParser(candidate)
         ) {
             val nextWrite = candidate.pendingOutput.first()
             candidate = candidate.copy(parserInFlightCallbackToken = nextWrite.callbackToken)
@@ -745,7 +761,8 @@ internal object RelayV2TerminalCheckpointReducer {
         if (candidate.phase !in setOf(
                 RelayV2TerminalPhase.FINALIZED,
                 RelayV2TerminalPhase.RESET_REQUIRED,
-            ) && candidate.pendingOutput.isNotEmpty()
+            ) && candidate.parserInFlightCallbackToken == null &&
+            candidate.pendingOutput.isNotEmpty() && canDispatchParser(candidate)
         ) {
             val head = candidate.pendingOutput.first()
             candidate = candidate.copy(parserInFlightCallbackToken = head.callbackToken)
@@ -1256,7 +1273,10 @@ internal object RelayV2TerminalCheckpointReducer {
                     listOf(watermark.finalizeEffect(current)),
                 )
             }
-            candidate = candidate.copy(phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER)
+            candidate = candidate.copy(
+                phase = RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                replayTargetOffset = null,
+            )
             return commit(current, candidate, RelayV2TerminalOutcome.Applied)
         }
 
@@ -1716,10 +1736,13 @@ internal object RelayV2TerminalCheckpointReducer {
             return CheckpointValidity.INVALID
         }
         if (checkpoint.parserResetCallbackToken != null &&
-            checkpoint.phase in setOf(
-                RelayV2TerminalPhase.FINALIZED,
-                RelayV2TerminalPhase.RESET_REQUIRED,
-            )
+            (checkpoint.parserInFlightCallbackToken != null ||
+                checkpoint.phase !in setOf(
+                    RelayV2TerminalPhase.RESETTING_PARSER,
+                    RelayV2TerminalPhase.REPLAY_REQUESTED,
+                    RelayV2TerminalPhase.REPLAYING,
+                    RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                ))
         ) {
             return CheckpointValidity.INVALID
         }
@@ -1770,6 +1793,16 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return CheckpointValidity.INVALID
         }
+        if (checkpoint.parserInFlightCallbackToken != null &&
+            checkpoint.phase !in setOf(
+                RelayV2TerminalPhase.LIVE,
+                RelayV2TerminalPhase.REPLAYING,
+                RelayV2TerminalPhase.REPLAY_REQUESTED,
+                RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+            )
+        ) {
+            return CheckpointValidity.INVALID
+        }
         checkpoint.lastAppliedParserCallbackToken?.let {
             if (!validCallbackToken(checkpoint, it, requireCurrentDelivery = false)) {
                 return CheckpointValidity.INVALID
@@ -1794,14 +1827,60 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return CheckpointValidity.INVALID
         }
+        if ((checkpoint.phase == RelayV2TerminalPhase.REPLAYING) !=
+            (checkpoint.replayTargetOffset != null)
+        ) {
+            return CheckpointValidity.INVALID
+        }
+        if (checkpoint.pendingOutput.isNotEmpty() &&
+            checkpoint.parserInFlightCallbackToken == null &&
+            checkpoint.parserResetCallbackToken == null &&
+            canDispatchParser(checkpoint)
+        ) {
+            return CheckpointValidity.INVALID
+        }
         if (!validInputQueue(checkpoint) || !validResizeQueue(checkpoint)) {
             return CheckpointValidity.INVALID
         }
         checkpoint.closed?.let {
             val finalOffset = parseCounter(it.finalOffset) ?: return CheckpointValidity.INVALID
+            val bufferStart = it.bufferStartOffset?.let(::parseCounter)
             if (finalOffset < received ||
-                (it.replayAvailable && it.bufferStartOffset?.let(::parseCounter) == null) ||
-                (!it.replayAvailable && it.bufferStartOffset != null)
+                (it.replayAvailable && (bufferStart == null || bufferStart > finalOffset)) ||
+                (!it.replayAvailable && it.bufferStartOffset != null) ||
+                checkpoint.phase !in setOf(
+                    RelayV2TerminalPhase.REPLAY_REQUESTED,
+                    RelayV2TerminalPhase.REPLAYING,
+                    RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                    RelayV2TerminalPhase.FINALIZED,
+                    RelayV2TerminalPhase.RESET_REQUIRED,
+                )
+            ) {
+                return CheckpointValidity.INVALID
+            }
+            if ((checkpoint.phase == RelayV2TerminalPhase.REPLAY_REQUESTED &&
+                    finalOffset <= received) ||
+                (checkpoint.phase == RelayV2TerminalPhase.REPLAYING &&
+                    parseCounter(checkpoint.replayTargetOffset ?: "") != finalOffset)
+            ) {
+                return CheckpointValidity.INVALID
+            }
+        }
+        if (checkpoint.closed == null &&
+            checkpoint.phase in setOf(
+                RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+                RelayV2TerminalPhase.FINALIZED,
+            )
+        ) {
+            return CheckpointValidity.INVALID
+        }
+        if (checkpoint.phase == RelayV2TerminalPhase.CLOSED_WAITING_PARSER) {
+            val finalOffset = checkpoint.closed?.finalOffset?.let(::parseCounter)
+                ?: return CheckpointValidity.INVALID
+            if (finalOffset != received || checkpoint.pendingReplay != null ||
+                checkpoint.replayTargetOffset != null ||
+                (checkpoint.parserResetCallbackToken == null &&
+                    checkpoint.pendingOutput.isEmpty())
             ) {
                 return CheckpointValidity.INVALID
             }
@@ -1969,12 +2048,13 @@ internal object RelayV2TerminalCheckpointReducer {
             RelayV2TerminalPhase.REPLAY_REQUESTED,
         )
 
-    private fun canDispatchParser(phase: RelayV2TerminalPhase): Boolean = phase in setOf(
-        RelayV2TerminalPhase.LIVE,
-        RelayV2TerminalPhase.REPLAYING,
-        RelayV2TerminalPhase.REPLAY_REQUESTED,
-        RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
-    )
+    private fun canDispatchParser(checkpoint: RelayV2TerminalCheckpoint): Boolean =
+        checkpoint.parserResetCallbackToken == null && checkpoint.phase in setOf(
+            RelayV2TerminalPhase.LIVE,
+            RelayV2TerminalPhase.REPLAYING,
+            RelayV2TerminalPhase.REPLAY_REQUESTED,
+            RelayV2TerminalPhase.CLOSED_WAITING_PARSER,
+        )
 
     private fun sameResetTarget(
         old: RelayV2TerminalIdentity,
