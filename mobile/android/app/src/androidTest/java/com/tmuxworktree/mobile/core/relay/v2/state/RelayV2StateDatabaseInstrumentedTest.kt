@@ -4,6 +4,9 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -68,6 +71,42 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertNamespaceFreshReset(base)
         assertNamespacePresent(principalOnly, "principal")
         assertNamespacePresent(clientOnly, "client")
+    }
+
+    @Test
+    fun disconnectReceiptClearsEveryActivationAndLeavesAnotherProfile() = runBlocking {
+        val stateNamespace = namespace("principal-base", "client-base")
+        putAllSixCategories(stateNamespace, "clear")
+        val first = durableNamespace("profile", activation = 1)
+        val second = durableNamespace("profile", activation = 2)
+        val retained = durableNamespace("other-profile", activation = 1)
+        listOf(first, second, retained).forEach(::putDurableAuthorities)
+        listOf(first, second, retained).forEach(::assertDurablePayloadByteCounts)
+
+        RelayV2StateRepository(database).clearProfileAfterDisconnect(
+            RelayProfileDisconnectReceipt(
+                RelayActiveProfileIdentity("profile", RelayProfileDialect.V2, 2),
+                "disconnect-profile-2",
+            ),
+        )
+
+        assertNull(authority(stateNamespace))
+        assertNull(scope(stateNamespace))
+        assertNull(session(stateNamespace))
+        assertNull(snapshot(stateNamespace))
+        assertEquals(emptyList<RelayV2SnapshotRecordEntity>(), snapshotRecords(stateNamespace))
+        assertNull(bufferedEvent(stateNamespace))
+        listOf(first, second).forEach { cleared ->
+            assertNull(outboxMeta(cleared))
+            assertEquals(emptyList<RelayV2OutboxEntryEntity>(), outboxEntries(cleared))
+            assertNull(terminalCheckpoint(cleared))
+        }
+        assertEquals(1L, outboxMeta(retained)?.nextCreationOrder)
+        assertEquals(1, outboxEntries(retained).size)
+        assertEquals(
+            RelayV2TerminalCheckpointKind.PRE_OPEN.name,
+            terminalCheckpoint(retained)?.checkpointKind,
+        )
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
@@ -209,6 +248,67 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
     }
 
+    private fun putDurableAuthorities(namespace: RelayV2OutboxAuthorityNamespace) {
+        fun payload(kind: String) = RelayV2StorageJson.encode(
+            codecVersion = 1,
+            value = linkedMapOf(
+                "fixtureKind" to kind,
+                "activation" to namespace.profileActivationGeneration.toString(),
+            ),
+        )
+        val metaPayload = payload("outbox-meta")
+        dao.putOutboxMeta(
+            RelayV2OutboxMetaEntity(
+                profileId = namespace.profileId,
+                profileActivationGeneration = namespace.profileActivationGeneration,
+                principalId = namespace.principalId,
+                clientInstanceId = namespace.clientInstanceId,
+                nextCreationOrder = 1,
+                codecVersion = metaPayload.codecVersion,
+                payloadUtf8Bytes = metaPayload.payloadUtf8Bytes,
+                payloadCanonicalJson = metaPayload.canonicalJson,
+                payloadSha256 = metaPayload.sha256,
+            ),
+        )
+        val entryPayload = payload("outbox-entry")
+        dao.insertOutboxEntry(
+            RelayV2OutboxEntryEntity(
+                profileId = namespace.profileId,
+                profileActivationGeneration = namespace.profileActivationGeneration,
+                principalId = namespace.principalId,
+                clientInstanceId = namespace.clientInstanceId,
+                hostId = "host",
+                expectedHostEpoch = "epoch",
+                commandId = "command-${namespace.profileActivationGeneration}",
+                createdOrder = 0,
+                codecVersion = entryPayload.codecVersion,
+                payloadUtf8Bytes = entryPayload.payloadUtf8Bytes,
+                payloadCanonicalJson = entryPayload.canonicalJson,
+                payloadSha256 = entryPayload.sha256,
+            ),
+        )
+        val terminalPayload = payload("terminal-checkpoint")
+        dao.putTerminalCheckpoint(
+            RelayV2TerminalCheckpointEntity(
+                profileId = namespace.profileId,
+                profileActivationGeneration = namespace.profileActivationGeneration,
+                principalId = namespace.principalId,
+                clientInstanceId = namespace.clientInstanceId,
+                hostId = "host",
+                hostEpoch = "epoch",
+                scopeId = SCOPE_ID,
+                sessionId = SESSION_ID,
+                streamId = "stream-${namespace.profileActivationGeneration}",
+                pane = 0,
+                checkpointKind = RelayV2TerminalCheckpointKind.PRE_OPEN.name,
+                codecVersion = terminalPayload.codecVersion,
+                payloadUtf8Bytes = terminalPayload.payloadUtf8Bytes,
+                payloadCanonicalJson = terminalPayload.canonicalJson,
+                payloadSha256 = terminalPayload.sha256,
+            ),
+        )
+    }
+
     private fun assertNamespacePresent(namespace: RelayV2StateNamespace, suffix: String) {
         assertEquals(namespace.principalId, authority(namespace)?.principalId)
         assertEquals("scope-$suffix", scope(namespace)?.displayName)
@@ -216,6 +316,24 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals("request-$suffix", snapshot(namespace)?.snapshotRequestId)
         assertEquals("{\"record\":\"$suffix\"}", snapshotRecords(namespace).single().canonicalJson)
         assertEquals("{\"event\":\"$suffix\"}", bufferedEvent(namespace)?.canonicalJson)
+    }
+
+    private fun assertDurablePayloadByteCounts(namespace: RelayV2OutboxAuthorityNamespace) {
+        val meta = requireNotNull(outboxMeta(namespace))
+        assertEquals(
+            meta.payloadCanonicalJson.toByteArray(Charsets.UTF_8).size,
+            meta.payloadUtf8Bytes,
+        )
+        val entry = outboxEntries(namespace).single()
+        assertEquals(
+            entry.payloadCanonicalJson.toByteArray(Charsets.UTF_8).size,
+            entry.payloadUtf8Bytes,
+        )
+        val terminal = requireNotNull(terminalCheckpoint(namespace))
+        assertEquals(
+            terminal.payloadCanonicalJson.toByteArray(Charsets.UTF_8).size,
+            terminal.payloadUtf8Bytes,
+        )
     }
 
     private fun assertNamespaceFreshReset(namespace: RelayV2StateNamespace) {
@@ -304,6 +422,44 @@ class RelayV2StateDatabaseInstrumentedTest {
         hostId = "host",
         hostEpoch = "epoch",
     )
+
+    private fun durableNamespace(
+        profileId: String,
+        activation: Long,
+    ) = RelayV2OutboxAuthorityNamespace(
+        profileId,
+        activation,
+        "principal-base",
+        "client-base",
+    )
+
+    private fun outboxMeta(namespace: RelayV2OutboxAuthorityNamespace) = dao.outboxMeta(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+    )
+
+    private fun outboxEntries(namespace: RelayV2OutboxAuthorityNamespace) = dao.outboxEntries(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+    )
+
+    private fun terminalCheckpoint(namespace: RelayV2OutboxAuthorityNamespace) =
+        dao.terminalCheckpoint(
+            namespace.profileId,
+            namespace.profileActivationGeneration,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            "host",
+            "epoch",
+            SCOPE_ID,
+            SESSION_ID,
+            "stream-${namespace.profileActivationGeneration}",
+            0,
+        )
 
     private companion object {
         const val SCOPE_ID = "scope"

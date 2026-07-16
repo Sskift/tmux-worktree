@@ -414,7 +414,7 @@ class RelayV2StateSyncRepositoryCoreTest {
     }
 
     @Test
-    fun `profile clear requires disconnect receipt and clears only that profiles six v2 tables`() = runBlocking {
+    fun `profile clear requires exact v2 disconnect receipt for state-sync categories`() = runBlocking {
         val store = FakeStateStore(v1Sentinel = "v1-still-present")
         val repository = RelayV2StateSyncRepositoryCore(store)
         val first = namespace(profileId = "profile-one", hostEpoch = "epoch-one")
@@ -457,6 +457,28 @@ class RelayV2StateSyncRepositoryCoreTest {
             hello(second, "1", null, RelayV2StateHelloDisposition.FRESH),
         )
         commitCut(repository, second, "1", session("session-two", "two"))
+
+        listOf(
+            RelayProfileDisconnectReceipt(
+                RelayActiveProfileIdentity("profile-one", RelayProfileDialect.V1, 9),
+                "wrong-dialect",
+            ),
+            RelayProfileDisconnectReceipt(
+                RelayActiveProfileIdentity("profile-one", RelayProfileDialect.V2, 0),
+                "missing-activation",
+            ),
+            RelayProfileDisconnectReceipt(
+                RelayActiveProfileIdentity("profile-one", RelayProfileDialect.V2, 9),
+                "",
+            ),
+        ).forEach { invalidReceipt ->
+            assertTrue(
+                runCatching {
+                    repository.clearProfileAfterDisconnect(invalidReceipt)
+                }.isFailure,
+            )
+            assertNotNull(store.authority(first))
+        }
 
         repository.clearProfileAfterDisconnect(
             RelayProfileDisconnectReceipt(
