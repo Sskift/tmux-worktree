@@ -259,7 +259,7 @@ internal interface RelayV2ProfileStore {
     suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-        authority: RelayV2ProfileActivationAuthority,
+        commit: RelayV2ProfileActivationCommit,
     ): RelayV2Profile?
 
     suspend fun updateRelayV2CredentialVersion(

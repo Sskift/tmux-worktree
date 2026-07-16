@@ -14,7 +14,7 @@ import com.tmuxworktree.mobile.core.model.RelayProfile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
-import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationAuthority
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationCommit
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileStore
 import java.io.IOException
@@ -285,8 +285,8 @@ class PreferencesStore(context: Context) {
     internal suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-        authority: RelayV2ProfileActivationAuthority,
-    ): RelayV2Profile? = authority.commitIfCurrent { commit ->
+        commit: RelayV2ProfileActivationCommit,
+    ): RelayV2Profile? {
         var activated: RelayV2Profile? = null
         store.edit { preferences ->
             if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) == expectedActiveProfile) {
@@ -314,7 +314,7 @@ class PreferencesStore(context: Context) {
                 activated = resolved
             }
         }
-        activated
+        return activated
     }
 
     internal suspend fun updateRelayV2CredentialVersion(
@@ -448,11 +448,11 @@ internal class PreferencesRelayV2ProfileStore(
     override suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-        authority: RelayV2ProfileActivationAuthority,
+        commit: RelayV2ProfileActivationCommit,
     ): RelayV2Profile? = preferencesStore.activateRelayV2Profile(
         expectedActiveProfile,
         profile,
-        authority,
+        commit,
     )
 
     override suspend fun updateRelayV2CredentialVersion(

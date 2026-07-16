@@ -69,11 +69,10 @@ internal class RelayV2ProfileSwitchStateMachine(
                 state = RelayV2ProfileSwitchState.Idle
                 return@withLock null
             }
-            val committed = profileStore.activateRelayV2Profile(
-                previous,
-                restored,
-                activationAuthority,
-            )
+            val committed = activationAuthority.commitIfCurrent { commit ->
+                state = RelayV2ProfileSwitchState.Activating(restored.profileId)
+                profileStore.activateRelayV2Profile(previous, restored, commit)
+            }
             if (committed == null) {
                 state = RelayV2ProfileSwitchState.Idle
                 return@withLock null
@@ -87,31 +86,30 @@ internal class RelayV2ProfileSwitchStateMachine(
         ) + 1
         val activated = profile.copy(activationGeneration = nextGeneration)
 
-        if (previous != null) {
+        val receipt = if (previous != null) {
             val barrierId = "profile-v2-${newId()}"
             state = RelayV2ProfileSwitchState.Draining(previous, barrierId)
-            val receipt = disconnectBarrier.disconnectAndDrain(previous, barrierId)
-            check(receipt.profile == previous && receipt.barrierId == barrierId) {
+            val validated = disconnectBarrier.disconnectAndDrain(previous, barrierId)
+            check(validated.profile == previous && validated.barrierId == barrierId) {
                 "Disconnect barrier did not drain the expected profile"
             }
             if (!isStillCurrent()) {
                 state = RelayV2ProfileSwitchState.Idle
                 return@withLock null
             }
-            state = RelayV2ProfileSwitchState.Isolating(receipt)
-            isolationBoundary.clearAfterDisconnect(receipt)
-            if (!isStillCurrent()) {
-                state = RelayV2ProfileSwitchState.Idle
-                return@withLock null
-            }
+            validated
+        } else {
+            null
         }
 
-        state = RelayV2ProfileSwitchState.Activating(activated.profileId)
-        val committed = profileStore.activateRelayV2Profile(
-            previous,
-            activated,
-            activationAuthority,
-        )
+        val committed = activationAuthority.commitIfCurrent { commit ->
+            if (receipt != null) {
+                state = RelayV2ProfileSwitchState.Isolating(receipt)
+                isolationBoundary.clearAfterDisconnect(receipt)
+            }
+            state = RelayV2ProfileSwitchState.Activating(activated.profileId)
+            profileStore.activateRelayV2Profile(previous, activated, commit)
+        }
         if (committed == null) {
             state = RelayV2ProfileSwitchState.Idle
             return@withLock null
