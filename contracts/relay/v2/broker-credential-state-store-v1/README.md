@@ -2,11 +2,11 @@
 
 状态：**Frozen native storage contract；只有 TypeScript closed decoder/wrapper，没有 native implementation、loader、authority injection、ready capability 或 production wiring。**
 
-本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不把保留的 unsafe BAU path/JSON prototype 提升为 production，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
+本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不重新引入已被拒绝且未纳入当前交付源码的 unsafe BAU path/JSON 设计，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
 
 ## Owner 与 deep port
 
-业务 owner 始终是 `RelayV2BrokerCredentialAuthority`。它拥有 issuer、enrollment、grant、replay、rate-limit、ready withdrawal 与 external continuity；store 只拥有 opaque bytes 的排他事务、持久 publication、本地 revision 和 native resource lifetime。
+业务 owner 必须由 T1 建立为唯一 `RelayV2BrokerCredentialAuthority`。它拥有 issuer、enrollment、grant、replay、rate-limit、ready withdrawal 与 external continuity；当前 N0 尚未注入该 owner，store 只拥有 opaque bytes 的排他事务、持久 publication、本地 revision 和 native resource lifetime。
 
 唯一 authority-facing port 是：
 
@@ -70,7 +70,7 @@ Capability/open 都是 exact `supported|unsupported|invalid` closed union。`sup
 1. capability `supported`；
 2. `open(options)` 返回 `opened`；
 3. native owner/mode/link/identity/format/locking/durability self-check 返回 `passed`；
-4. `RelayV2BrokerCredentialAuthority` 完成 external continuity。
+4. T1 注入的 `RelayV2BrokerCredentialAuthority` 完成 external continuity。
 
 `unsupported` 只允许在未观察 store 前表示 `native_artifact_missing`、`target_unsupported` 或 `interface_version_unsupported`。一旦观察 existing disk，unknown format、corruption/partial、wrong owner/mode、link/identity uncertain、I/O 或 durability unavailable 都必须 `invalid` 并保留状态：
 
@@ -140,7 +140,7 @@ Durability 名称冻结为语义 `payload_then_header_durable_v1`，不把某个
 
 ## Legacy、conformance 与 production 边界
 
-保留的 unsafe BAU path/JSON prototype 直接处理 state/lock/temp path、fd/inode、rename/unlink 与 cleanup，native security acceptance 仍失败。N0 不修补、不包装、不迁移、不删除其 artifact，也没有任何 fallback。
+此前被拒绝的 unsafe BAU path/JSON 设计直接处理 state/lock/temp path、fd/inode、rename/unlink 与 cleanup，未通过 native security acceptance，也未纳入当前交付源码。N0 不修补、不包装或重新引入该设计，不自动迁移或删除可能遗留的 artifact，也没有任何 fallback。
 
 [`test/support/relayV2BrokerCredentialStateStoreConformance.mjs`](../../../../test/support/relayV2BrokerCredentialStateStoreConformance.mjs) 是未来 Rust/Darwin/Linux adapter 可复用的 authority-facing conformance harness。当前 in-memory raw adapter 只证明 TypeScript wrapper/port contract，**不是 native、device、filesystem、kernel-lock 或 power-loss durability 证据**。
 
