@@ -375,9 +375,6 @@ class PreferencesStore internal constructor(
         store.edit { preferences ->
             val current = activationJournal(preferences)
             val rawActive = RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
-            if (rawActive != expectedActiveProfile ||
-                current?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true
-            ) return@edit
             val journal = RelayV2ProfileActivationJournal(
                 operationId = operationId,
                 previousProfile = rawActive,
@@ -392,8 +389,15 @@ class PreferencesStore internal constructor(
                 targetActivationGeneration = profile.activationGeneration,
                 phase = RelayV2ProfileActivationPhase.PREPARED,
             )
-            writeActivationJournal(preferences, journal)
-            prepared = journal
+            if (rawActive != expectedActiveProfile) return@edit
+            when {
+                current == null -> {
+                    writeActivationJournal(preferences, journal)
+                    prepared = journal
+                }
+                current == journal -> prepared = current
+                else -> Unit
+            }
         }
         return prepared
     }

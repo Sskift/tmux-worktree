@@ -195,6 +195,18 @@ class RelayV2ProfileRepositoryTest {
             legacyBlob,
             RelayV2CredentialBlobCodec.decode(RelayV2CredentialBlobCodec.encode(legacyBlob)),
         )
+        val legacyCompletedBlob = refreshBlob.copy(
+            schemaVersion = RelayV2CredentialBlob.LEGACY_SCHEMA_VERSION,
+            pendingAttempt = null,
+            completedAttemptId = null,
+            completedSecretReference = null,
+        )
+        assertEquals(
+            legacyCompletedBlob,
+            RelayV2CredentialBlobCodec.decode(
+                RelayV2CredentialBlobCodec.encode(legacyCompletedBlob),
+            ),
+        )
 
         val unknownTag = exchangeBytes.copyOf()
         ByteBuffer.wrap(unknownTag).putInt(pendingKindOffset(unknownTag), 99)
@@ -236,6 +248,34 @@ class RelayV2ProfileRepositoryTest {
                 val store = PreferencesRelayV2ProfileStore(preferences)
                 assertEquals(prepared, store.pendingRelayV2Activation())
                 assertEquals(prepared.previousProfile, store.activeProfileIdentity())
+                assertEquals(
+                    prepared,
+                    store.prepareRelayV2Activation(
+                        expectedActiveProfile = prepared.previousProfile,
+                        operationId = prepared.operationId,
+                        profile = target,
+                        targetBindingDigest = prepared.targetBindingDigest,
+                        targetCredentialAttemptId = prepared.targetCredentialAttemptId,
+                        targetCredentialSecretReference =
+                            prepared.targetCredentialSecretReference,
+                        barrierId = prepared.barrierId,
+                        previousCredentialReference = prepared.previousCredentialReference,
+                    ),
+                )
+                assertEquals(
+                    null,
+                    store.prepareRelayV2Activation(
+                        expectedActiveProfile = prepared.previousProfile,
+                        operationId = "activation-overwrite-rejected",
+                        profile = target.copy(profileId = "different-target-profile"),
+                        targetBindingDigest = "different-binding",
+                        targetCredentialAttemptId = "different-attempt",
+                        targetCredentialSecretReference = "different-secret-reference",
+                        barrierId = "different-barrier",
+                        previousCredentialReference = null,
+                    ),
+                )
+                assertEquals(prepared, store.pendingRelayV2Activation())
                 val connectionWatcher = async { preferences.values.take(2).toList() }
                 yield()
                 assertV1ProfileMutationsRejected(preferences)
@@ -322,6 +362,82 @@ class RelayV2ProfileRepositoryTest {
             )
             directory.toFile().deleteRecursively()
             Unit
+        }
+
+    @Test
+    fun `legacy completed credential requires safe reenrollment without deleting active blob`() =
+        runBlocking {
+            val harness = Harness()
+            val gate = harness.exchange.deferEnrollment("enrollment-legacy-completed")
+            val confirmed = enrollmentDraft(
+                "enrollment-legacy-completed",
+                "twenroll2.code-legacy-completed",
+            ).confirm(deviceLabel = "Legacy Pixel")
+            val first = async { harness.repository.confirmEnrollment(confirmed) }
+            val request = gate.request.await()
+            assertTrue(harness.repository.cancelPendingEnrollment(confirmed))
+            val response = enrollmentResponse(request, "legacy-completed")
+            gate.response.complete(response)
+            assertTrue(first.await() is RelayV2EnrollmentResult.Superseded)
+
+            val (reference, pending) = harness.credentials.entries().entries.single()
+            val legacyCompleted = pending.copy(
+                schemaVersion = RelayV2CredentialBlob.LEGACY_SCHEMA_VERSION,
+                credentialVersion = 1,
+                principalId = response.principalId,
+                grantId = response.grantId,
+                accessToken = response.accessToken,
+                accessExpiresAtMs = response.accessExpiresAtMs,
+                refreshToken = response.refreshToken,
+                refreshExpiresAtMs = response.refreshExpiresAtMs,
+                pendingAttempt = null,
+                completedAttemptId = null,
+                completedSecretReference = null,
+            )
+            assertEquals(
+                RelayV2CredentialCasResult.Updated(1),
+                harness.credentials.compareAndSet(
+                    reference,
+                    pending.expectation(),
+                    legacyCompleted,
+                ),
+            )
+            val activeLegacy = RelayV2Profile(
+                profileId = "legacy-completed-active",
+                issuerUrl = legacyCompleted.issuerUrl,
+                relayUrl = legacyCompleted.relayUrl,
+                hostId = legacyCompleted.hostId,
+                principalId = requireNotNull(legacyCompleted.principalId),
+                grantId = requireNotNull(legacyCompleted.grantId),
+                clientInstanceId = legacyCompleted.clientInstanceId,
+                credentialReference = reference,
+                credentialVersion = legacyCompleted.credentialVersion,
+                activationGeneration = 7,
+            )
+            assertEquals(
+                activeLegacy,
+                harness.profiles.forceActivateRelayV2Profile(
+                    expectedActiveProfile = harness.profiles.activeIdentity,
+                    profile = activeLegacy,
+                ),
+            )
+            val activationCount = harness.profiles.activationCount
+            val redeemCalls = harness.exchange.redeemCalls
+            harness.restartRepository()
+
+            assertEquals(
+                RelayV2EnrollmentResult.RecoveryRequired(
+                    reference,
+                    RelayV2CredentialRecoveryReason
+                        .INCOMPATIBLE_LEGACY_COMPLETED_CREDENTIAL,
+                ),
+                harness.repository.confirmEnrollment(confirmed),
+            )
+            assertEquals(legacyCompleted, harness.credentials.read(reference))
+            assertEquals(activeLegacy, harness.profiles.activeV2)
+            assertEquals(activationCount, harness.profiles.activationCount)
+            assertEquals(redeemCalls, harness.exchange.redeemCalls)
+            assertEquals(null, harness.profiles.journal)
         }
 
     @Test
@@ -866,6 +982,91 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `completed prepared winner rolls forward before replace cancel or same-reference retry`() =
+        runBlocking {
+            CompletedPreparedFollowUp.entries.forEach { followUp ->
+                val suffix = followUp.name.lowercase()
+                val harness = Harness()
+                harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-completed-old-$suffix",
+                        "twenroll2.code-completed-old-$suffix",
+                    ).confirm(deviceLabel = "Old Pixel"),
+                ) as RelayV2EnrollmentResult.Activated
+                val confirmedA = enrollmentDraft(
+                    "enrollment-completed-a-$suffix",
+                    "twenroll2.code-completed-a-$suffix",
+                ).confirm(deviceLabel = "Pixel A")
+                harness.profiles.failNextCredentialReadyBeforeWrite = true
+
+                assertTrue(
+                    runCatching { harness.repository.confirmEnrollment(confirmedA) }.isFailure,
+                )
+                val prepared = requireNotNull(harness.profiles.journal)
+                assertEquals(RelayV2ProfileActivationPhase.PREPARED, prepared.phase)
+                val completedWinner = requireNotNull(
+                    harness.credentials.read(prepared.targetCredentialReference),
+                )
+                assertTrue(completedWinner.hasCredentialMaterial)
+                assertEquals(
+                    prepared.targetCredentialAttemptId,
+                    completedWinner.completedAttemptId,
+                )
+                assertEquals(
+                    prepared.targetCredentialSecretReference,
+                    completedWinner.completedSecretReference,
+                )
+                val redeemCalls = harness.exchange.redeemCalls
+                harness.restartRepository()
+
+                when (followUp) {
+                    CompletedPreparedFollowUp.CONFIRM_B -> {
+                        val activatedB = harness.repository.confirmEnrollment(
+                            enrollmentDraft(
+                                "enrollment-completed-b-$suffix",
+                                "twenroll2.code-completed-b-$suffix",
+                            ).confirm(deviceLabel = "Pixel B"),
+                        ) as RelayV2EnrollmentResult.Activated
+                        assertEquals(activatedB.profile, harness.profiles.activeV2)
+                        assertEquals(3, harness.profiles.activationCount)
+                        assertEquals(
+                            null,
+                            harness.credentials.read(prepared.targetCredentialReference),
+                        )
+                    }
+                    CompletedPreparedFollowUp.CANCEL_A -> {
+                        assertFalse(harness.repository.cancelPendingEnrollment(confirmedA))
+                        assertEquals(
+                            prepared.targetCredentialReference,
+                            harness.profiles.activeV2?.credentialReference,
+                        )
+                        assertEquals(
+                            completedWinner,
+                            harness.credentials.read(prepared.targetCredentialReference),
+                        )
+                        assertEquals(2, harness.profiles.activationCount)
+                        assertEquals(redeemCalls, harness.exchange.redeemCalls)
+                    }
+                    CompletedPreparedFollowUp.CONFIRM_A_AGAIN -> {
+                        val activatedA = harness.repository.confirmEnrollment(confirmedA)
+                            as RelayV2EnrollmentResult.Activated
+                        assertEquals(
+                            prepared.targetCredentialReference,
+                            activatedA.profile.credentialReference,
+                        )
+                        assertEquals(
+                            completedWinner,
+                            harness.credentials.read(prepared.targetCredentialReference),
+                        )
+                        assertEquals(2, harness.profiles.activationCount)
+                        assertEquals(redeemCalls, harness.exchange.redeemCalls)
+                    }
+                }
+                assertEquals(null, harness.profiles.journal)
+            }
+        }
+
+    @Test
     fun `post-commit IO ambiguity rolls forward without repeating one-time enrollment`() =
         runBlocking {
             ActivationPostCommitAmbiguity.entries.forEach { boundary ->
@@ -972,13 +1173,22 @@ class RelayV2ProfileRepositoryTest {
 
                 val redeemCallsBeforeReopen = harness.exchange.redeemCalls
                 harness.restartRepository()
-                assertTrue(
-                    runCatching { harness.repository.recoverPendingActivation() }.isFailure,
+                assertEquals(
+                    RelayV2ActivationRecoveryResult.Incompatible(
+                        targetReference,
+                        RelayV2CredentialRecoveryReason
+                            .COMPLETION_PROOF_MISSING_OR_MISMATCHED,
+                    ),
+                    harness.repository.recoverPendingActivation(),
                 )
-                val reconfirmed = runCatching {
-                    harness.repository.confirmEnrollment(confirmed)
-                }
-                assertFalse(reconfirmed.getOrNull() is RelayV2EnrollmentResult.Activated)
+                assertEquals(
+                    RelayV2EnrollmentResult.RecoveryRequired(
+                        targetReference,
+                        RelayV2CredentialRecoveryReason
+                            .COMPLETION_PROOF_MISSING_OR_MISMATCHED,
+                    ),
+                    harness.repository.confirmEnrollment(confirmed),
+                )
                 assertEquals(redeemCallsBeforeReopen, harness.exchange.redeemCalls)
                 assertEquals(corruptBlob, harness.credentials.read(targetReference))
                 assertEquals(old.profile.identity, harness.profiles.activeIdentity)
@@ -1475,9 +1685,6 @@ class RelayV2ProfileRepositoryTest {
                 error("Relay v2 activation prepare failed before write")
             }
             val current = journal
-            if (storedActiveIdentity != expectedActiveProfile ||
-                current?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true
-            ) return null
             val prepared = RelayV2ProfileActivationJournal(
                 operationId = operationId,
                 previousProfile = storedActiveIdentity,
@@ -1492,7 +1699,12 @@ class RelayV2ProfileRepositoryTest {
                 targetActivationGeneration = profile.activationGeneration,
                 phase = RelayV2ProfileActivationPhase.PREPARED,
             )
-            journal = prepared
+            if (storedActiveIdentity != expectedActiveProfile) return null
+            when {
+                current == null -> journal = prepared
+                current == prepared -> Unit
+                else -> return null
+            }
             if (failNextPrepareAfterWrite) {
                 failNextPrepareAfterWrite = false
                 error("Relay v2 activation prepare outcome is ambiguous")
@@ -1858,6 +2070,12 @@ class RelayV2ProfileRepositoryTest {
     private enum class DuringIsolationInterleaving {
         CANCEL_A,
         CONFIRM_B,
+    }
+
+    private enum class CompletedPreparedFollowUp {
+        CONFIRM_B,
+        CANCEL_A,
+        CONFIRM_A_AGAIN,
     }
 
     private enum class ActivationPreCommitFailure {
