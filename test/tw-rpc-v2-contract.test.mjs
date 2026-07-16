@@ -619,7 +619,7 @@ test("resolved worktree lifecycle uses only the frozen branch, placement, raw ta
       worktreePath: "/worktrees/demo/demo-fix-abc12",
     },
   }, {
-    existsSync: () => true,
+    existsSync: (path) => path !== "/worktrees/demo/demo-fix-abc12",
     realpathSync: (path) => path,
     isGitRepo: () => true,
     gitQuery: () => { throw new Error("resolved execution must not query origin HEAD"); },
@@ -681,7 +681,7 @@ test("resolved worktree owner consumes safe placement independently of public pr
         worktreePath,
       },
     }, {
-      existsSync: () => true,
+      existsSync: (path) => path !== worktreePath,
       realpathSync: (path) => path,
       isGitRepo: () => true,
       exec: (bin, args) => {
@@ -703,6 +703,32 @@ test("resolved worktree owner consumes safe placement independently of public pr
     "origin/main",
     "--quiet",
   ]);
+});
+
+test("resolved worktree owner fails closed when the frozen target path already exists", () => {
+  const calls = [];
+  let currentListCalls = 0;
+  const result = rpcV2.executeRpcV2CreateResolvedWorktree(
+    cases.wire.createResolvedWorktree.request,
+    {
+      worktreeSessionDeps: {
+        existsSync: () => true,
+        realpathSync: (path) => path,
+        exec: (...args) => calls.push(args),
+        loadManagedStateForMutation: () => ({ version: 1, sessions: [] }),
+      },
+      currentList: () => {
+        currentListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assert.equal(result.state, "failed");
+  assert.equal(result.sideEffect, "not_applied");
+  assert.equal(result.error.code, "CREATE_FAILED");
+  assert.match(result.error.message, /worktree target already exists/);
+  assert.deepEqual(calls, []);
+  assert.equal(currentListCalls, 0);
 });
 
 test("resolved worktree owner rejects base and child symlinks before git mutation", () => {

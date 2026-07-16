@@ -658,7 +658,10 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
   });
 
   await t.test("explicit project remains an exact bounded public value", async () => {
-    for (const project of ["team/demo", ".", "..", "../../.ssh", "/absolute"]) {
+    const unsafeProject = "../../.ssh";
+    const reservedLiteral = "project-PIVZgQC8mKZcG4Xp-v7DRcD_F-QPqah-gzvuM-Voz3Q";
+    const resolvedPaths = new Map();
+    for (const project of ["team/demo", ".", "..", unsafeProject, reservedLiteral, "/absolute"]) {
       const request = canonicalRequest("create_worktree", {
         arguments: {
           project,
@@ -681,14 +684,45 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
           return answer;
         },
       });
-      assert.equal((await executorFor(ports).resolve(request)).kind, "executable", project);
+      const admission = await executorFor(ports).resolve(request);
+      assert.equal(admission.kind, "executable", project);
+      resolvedPaths.set(project, admission.adapterState.target.execution.worktreePath);
       assert.equal(ports.calls.process.length, 0);
     }
     assert.equal(worktreePlacement.canonicalWorktreePlacementSegment("demo"), "demo");
     assert.equal(
-      worktreePlacement.canonicalWorktreePlacementSegment("../../.ssh"),
-      "project-PIVZgQC8mKZcG4Xp-v7DRcD_F-QPqah-gzvuM-Voz3Q",
+      worktreePlacement.canonicalWorktreePlacementSegment(unsafeProject),
+      reservedLiteral,
     );
+    assert.notEqual(resolvedPaths.get(unsafeProject), resolvedPaths.get(reservedLiteral));
+
+    const collisionPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        answer.target.execution.worktreePath = join(
+          answer.target.execution.worktreeBase,
+          worktreePlacement.canonicalWorktreePlacementSegment(unsafeProject),
+          WORKTREE_BRANCH,
+        );
+        answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
+        return answer;
+      },
+    });
+    const collisionAdmission = await executorFor(collisionPorts).resolve(canonicalRequest(
+      "create_worktree",
+      {
+        arguments: {
+          project: reservedLiteral,
+          path: "/catalog/link",
+          name: "fix",
+          branch: "main",
+          aiCommand: "codex",
+        },
+      },
+    ));
+    assert.equal(collisionAdmission.kind, "transient_admission_failure");
+    assert.equal(collisionAdmission.error.commandDisposition, "not_accepted");
+    assert.equal(collisionPorts.calls.process.length, 0);
   });
 
   await t.test("frozen placement cannot escape its canonical worktree base", async () => {

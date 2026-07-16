@@ -513,6 +513,11 @@ export function createManagedWorktreeSession(
     : null;
   if (resolvedPlacement) {
     assertCanonicalWorktreePlacementFilesystem(resolvedPlacement, { existsSync, realpathSync });
+    if (existsSync(resolvedPlacement.worktreePath)) {
+      throw new CliError(
+        `resolved RPC v2 worktree target already exists: ${resolvedPlacement.worktreePath}`,
+      );
+    }
   }
 
   const session = params.resolvedV2
@@ -551,6 +556,9 @@ export function createManagedWorktreeSession(
           resolvedPlacement,
           { existsSync, realpathSync },
         );
+        if (existsSync(worktreeDir)) {
+          throw new CliError(`resolved RPC v2 worktree target already exists: ${worktreeDir}`);
+        }
       } catch (error) {
         if (preparedLifecycle) {
           throw new ManagedSessionLifecycleV2InDoubtError(
@@ -566,6 +574,9 @@ export function createManagedWorktreeSession(
     log(`🌿 创建 worktree 分支: ${branchName}`);
     log(`   路径: ${worktreeDir}`);
     try {
+      if (resolvedPlacement && existsSync(worktreeDir)) {
+        throw new CliError(`resolved RPC v2 worktree target already exists: ${worktreeDir}`);
+      }
       exec("git", [
         "-C",
         params.projectDir,

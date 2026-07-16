@@ -7,6 +7,7 @@ const BRANCH_BYTES = 255;
 const SEGMENT_BYTES = 128;
 const MAX_RELATIVE_SEGMENTS = 32;
 const SAFE_SEGMENT = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const RESERVED_PLACEMENT_PREFIX = "project-";
 const PLACEMENT_HASH_DOMAIN = "tmux-worktree/canonical-worktree-placement/v1\0";
 
 export interface CanonicalWorktreePlacement {
@@ -60,14 +61,16 @@ function safeRelativeSegments(value: string, label: string): string[] {
 /** Stable resolver-owned mapping; public project identity is never used as a path segment directly. */
 export function canonicalWorktreePlacementSegment(project: unknown): string {
   const identity = boundedString(project, "project identity", PROJECT_BYTES);
-  if (SAFE_SEGMENT.test(identity) && Buffer.byteLength(identity, "utf8") <= SEGMENT_BYTES) {
+  if (SAFE_SEGMENT.test(identity)
+    && Buffer.byteLength(identity, "utf8") <= SEGMENT_BYTES
+    && !identity.toLowerCase().startsWith(RESERVED_PLACEMENT_PREFIX)) {
     return identity;
   }
   const digest = createHash("sha256")
     .update(PLACEMENT_HASH_DOMAIN, "utf8")
     .update(identity, "utf8")
     .digest("base64url");
-  return `project-${digest}`;
+  return `${RESERVED_PLACEMENT_PREFIX}${digest}`;
 }
 
 /** Parses the resolver-frozen final placement without consulting public project identity. */
