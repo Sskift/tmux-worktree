@@ -1,0 +1,166 @@
+{
+  "contract": "tmux-worktree-relay-v2-broker-credential-state-store",
+  "contractVersion": 1,
+  "fixtureFormatVersion": 1,
+  "status": "frozen",
+  "scope": "native-storage-seam-only",
+  "productionCapabilityEffect": "none",
+  "businessOwner": "RelayV2BrokerCredentialAuthority",
+  "nativeInterface": {
+    "abi": "napi",
+    "minimumNapiVersion": 9,
+    "exports": {
+      "capability": "relayV2BrokerCredentialStateCapability",
+      "open": "openRelayV2BrokerCredentialStateStore"
+    },
+    "openArguments": [],
+    "storeMethods": ["runExclusive", "close"],
+    "transactionMethods": ["read", "compareAndPublish"],
+    "forbiddenSurface": [
+      "statePath",
+      "lockPath",
+      "temporaryPath",
+      "fileDescriptor",
+      "directoryDescriptor",
+      "device",
+      "inode",
+      "openat",
+      "renameat",
+      "unlinkat",
+      "cleanup"
+    ]
+  },
+  "capability": {
+    "supported": {
+      "status": "supported",
+      "nativeAbi": "napi",
+      "interfaceVersion": 1,
+      "storageFormatVersion": 1,
+      "maxStateBytes": 67108864,
+      "features": [
+        "exclusive_transaction_v1",
+        "opaque_transaction_revision_v1",
+        "compare_and_publish_v1",
+        "close_barrier_v1",
+        "dual_slot_binary_v1"
+      ],
+      "durability": "payload_then_header_fsync_v1"
+    },
+    "unsupportedReasons": [
+      "native_module_missing",
+      "platform_unsupported",
+      "runtime_unsupported",
+      "interface_version_unsupported",
+      "storage_format_unsupported"
+    ],
+    "partialSupportAllowed": false
+  },
+  "openUnion": {
+    "discriminator": "status",
+    "variants": {
+      "opened": ["status", "store"],
+      "unsupported": ["status", "reason"],
+      "invalid": ["status", "error"]
+    },
+    "arguments": [],
+    "pathConfigurationAllowed": false
+  },
+  "errorUnion": {
+    "shape": ["code"],
+    "codes": [
+      "NATIVE_INTERFACE_INVALID",
+      "STORE_BUSY",
+      "STORE_CLOSED",
+      "STORE_CORRUPT",
+      "STORE_FORMAT_UNSUPPORTED",
+      "STORE_IO",
+      "INVALID_ARGUMENT",
+      "INVALID_REVISION",
+      "STATE_TOO_LARGE",
+      "GENERATION_EXHAUSTED"
+    ],
+    "retryableCodes": ["STORE_BUSY"],
+    "dynamicMessageAllowed": false
+  },
+  "port": {
+    "runExclusive": {
+      "concurrency": "one-callback-per-store",
+      "revisionScope": "issuing-transaction-only",
+      "revisionSerializable": false,
+      "readOutcomes": {
+        "missing": ["outcome", "revision"],
+        "present": ["outcome", "revision", "bytes"]
+      },
+      "compareAndPublishOutcomes": {
+        "swapped": ["outcome", "revision"],
+        "already_same": ["outcome", "revision"],
+        "conflict": ["outcome", "revision"],
+        "uncertain": ["outcome"]
+      },
+      "alreadySameRule": "exact-current-bytes-equal-next-before-revision-conflict",
+      "uncertainRule": "no-revision-and-reconcile-by-a-new-exclusive-read",
+      "byteOwnership": "read-returns-copy-and-publish-captures-copy-before-await"
+    },
+    "close": {
+      "idempotent": true,
+      "rejectsNewTransactionsAtBarrierStart": true,
+      "waitsForAdmittedTransactions": true,
+      "resolvesAfterNativeResourcesClose": true
+    }
+  },
+  "binaryStorage": {
+    "formatVersion": 1,
+    "logicalObjects": ["header0", "header1", "payload0", "payload1"],
+    "headerBytes": 128,
+    "maxPayloadBytes": 67108864,
+    "byteOrder": "little-endian",
+    "digest": "sha256",
+    "headerLayout": [
+      { "name": "magic", "offset": 0, "bytes": 8, "valueAscii": "TWV2BCS1" },
+      { "name": "formatVersion", "offset": 8, "bytes": 2, "type": "u16", "value": 1 },
+      { "name": "slot", "offset": 10, "bytes": 1, "type": "u8", "values": [0, 1] },
+      { "name": "flags", "offset": 11, "bytes": 1, "type": "u8", "value": 0 },
+      { "name": "headerLength", "offset": 12, "bytes": 4, "type": "u32", "value": 128 },
+      { "name": "generation", "offset": 16, "bytes": 8, "type": "u64", "minimum": "1", "maximum": "18446744073709551615" },
+      { "name": "payloadLength", "offset": 24, "bytes": 8, "type": "u64", "minimum": "1", "maximum": "67108864" },
+      { "name": "payloadDigest", "offset": 32, "bytes": 32, "type": "sha256-raw" },
+      { "name": "reserved", "offset": 64, "bytes": 32, "value": "all-zero" },
+      { "name": "headerChecksum", "offset": 96, "bytes": 32, "type": "sha256-raw", "covers": [0, 96] }
+    ],
+    "selection": {
+      "missing": "all-four-logical-objects-absent",
+      "present": "highest-complete-generation",
+      "validDualGenerationDelta": "exactly-one",
+      "slotRule": "slot-equals-generation-minus-one-modulo-two",
+      "sameOrSkippedGeneration": "STORE_CORRUPT",
+      "singleHeaderRule": "only-complete-generation-one-slot-zero",
+      "unknownChecksumValidVersionOrFlags": "STORE_FORMAT_UNSUPPORTED",
+      "highestIncompleteOrAmbiguous": "STORE_CORRUPT",
+      "lowerIncompleteOrHeaderlessInactivePayload": "ignored-only-when-a-complete-immediate-successor-exists"
+    },
+    "publication": [
+      "hold-the-exclusive-transaction",
+      "select-the-inactive-slot-and-next-generation",
+      "atomically-replace-and-durably-sync-the-inactive-payload-object",
+      "atomically-replace-and-durably-sync-the-matching-header-object",
+      "durably-sync-container-metadata-required-by-the-platform",
+      "return-swapped-only-after-all-durability-steps-are-proven"
+    ],
+    "uncertainCommit": "any-unprovable-publication-boundary-returns-uncertain-without-a-revision",
+    "unknownOrPartial": "never-visible-as-new-state-and-fail-closed-unless-the-selection-rule-proves-a-complete-immediate-successor",
+    "legacyPrototypeArtifacts": "never-read-imported-migrated-renamed-unlinked-or-cleaned"
+  },
+  "files": [
+    { "role": "specification", "path": "README.md" },
+    { "role": "golden-binary", "path": "golden-binary.json" },
+    { "role": "corrupt-binary", "path": "corrupt-binary.json" },
+    { "role": "native-interface", "path": "native-interface-cases.json" }
+  ],
+  "acceptance": [
+    "rust-core-and-darwin-linux-adapters-consume-the-same-binary-fixtures",
+    "loader-and-authority-injection-consume-the-closed-native-unions-and-port",
+    "missing-native-is-unsupported-and-never-a-v2-or-v1-fallback-signal",
+    "prototype-json-lock-temp-artifacts-remain-untouched",
+    "relay-v2-production-capability-remains-disabled"
+  ]
+}

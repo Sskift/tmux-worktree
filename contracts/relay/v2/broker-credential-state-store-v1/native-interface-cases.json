@@ -1,0 +1,113 @@
+{
+  "fixtureFormatVersion": 1,
+  "capabilityCases": [
+    {
+      "name": "supported-complete-capability",
+      "input": {
+        "status": "supported",
+        "nativeAbi": "napi",
+        "interfaceVersion": 1,
+        "storageFormatVersion": 1,
+        "maxStateBytes": 67108864,
+        "features": [
+          "exclusive_transaction_v1",
+          "opaque_transaction_revision_v1",
+          "compare_and_publish_v1",
+          "close_barrier_v1",
+          "dual_slot_binary_v1"
+        ],
+        "durability": "payload_then_header_fsync_v1"
+      },
+      "expected": { "status": "supported" }
+    },
+    {
+      "name": "native-module-missing",
+      "input": { "status": "unsupported", "reason": "native_module_missing" },
+      "expected": { "status": "unsupported", "reason": "native_module_missing" }
+    },
+    {
+      "name": "platform-unsupported",
+      "input": { "status": "unsupported", "reason": "platform_unsupported" },
+      "expected": { "status": "unsupported", "reason": "platform_unsupported" }
+    },
+    {
+      "name": "runtime-unsupported",
+      "input": { "status": "unsupported", "reason": "runtime_unsupported" },
+      "expected": { "status": "unsupported", "reason": "runtime_unsupported" }
+    },
+    {
+      "name": "interface-version-unsupported",
+      "input": { "status": "unsupported", "reason": "interface_version_unsupported" },
+      "expected": { "status": "unsupported", "reason": "interface_version_unsupported" }
+    },
+    {
+      "name": "storage-format-unsupported",
+      "input": { "status": "unsupported", "reason": "storage_format_unsupported" },
+      "expected": { "status": "unsupported", "reason": "storage_format_unsupported" }
+    },
+    {
+      "name": "native-reported-invalid-store",
+      "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" } },
+      "expected": { "status": "invalid", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "partial-capability-is-invalid",
+      "input": {
+        "status": "supported",
+        "nativeAbi": "napi",
+        "interfaceVersion": 1,
+        "storageFormatVersion": 1,
+        "maxStateBytes": 67108864,
+        "features": ["exclusive_transaction_v1"],
+        "durability": "payload_then_header_fsync_v1"
+      },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    },
+    {
+      "name": "unknown-capability-field-is-invalid",
+      "input": { "status": "unsupported", "reason": "native_module_missing", "fallback": "v1" },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    }
+  ],
+  "openCases": [
+    {
+      "name": "opened-opaque-store",
+      "input": { "status": "opened", "store": "materialize-test-store" },
+      "expected": { "status": "opened" }
+    },
+    {
+      "name": "open-native-module-missing",
+      "input": { "status": "unsupported", "reason": "native_module_missing" },
+      "expected": { "status": "unsupported", "reason": "native_module_missing" }
+    },
+    {
+      "name": "open-corrupt-store",
+      "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" } },
+      "expected": { "status": "invalid", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "open-unknown-field-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" }, "path": "forbidden" },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    },
+    {
+      "name": "open-non-store-handle-is-invalid",
+      "input": { "status": "opened", "store": {} },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    }
+  ],
+  "errorCases": [
+    { "name": "native-interface-invalid", "input": { "code": "NATIVE_INTERFACE_INVALID" }, "expectedCode": "NATIVE_INTERFACE_INVALID" },
+    { "name": "store-busy", "input": { "code": "STORE_BUSY" }, "expectedCode": "STORE_BUSY" },
+    { "name": "store-closed", "input": { "code": "STORE_CLOSED" }, "expectedCode": "STORE_CLOSED" },
+    { "name": "store-corrupt", "input": { "code": "STORE_CORRUPT" }, "expectedCode": "STORE_CORRUPT" },
+    { "name": "format-unsupported", "input": { "code": "STORE_FORMAT_UNSUPPORTED" }, "expectedCode": "STORE_FORMAT_UNSUPPORTED" },
+    { "name": "store-io", "input": { "code": "STORE_IO" }, "expectedCode": "STORE_IO" },
+    { "name": "invalid-argument", "input": { "code": "INVALID_ARGUMENT" }, "expectedCode": "INVALID_ARGUMENT" },
+    { "name": "invalid-revision", "input": { "code": "INVALID_REVISION" }, "expectedCode": "INVALID_REVISION" },
+    { "name": "state-too-large", "input": { "code": "STATE_TOO_LARGE" }, "expectedCode": "STATE_TOO_LARGE" },
+    { "name": "generation-exhausted", "input": { "code": "GENERATION_EXHAUSTED" }, "expectedCode": "GENERATION_EXHAUSTED" },
+    { "name": "unknown-error-code", "input": { "code": "UNKNOWN" }, "expectedCode": "NATIVE_INTERFACE_INVALID" },
+    { "name": "error-detail-is-closed", "input": { "code": "STORE_IO", "detail": "forbidden" }, "expectedCode": "NATIVE_INTERFACE_INVALID" }
+  ]
+}

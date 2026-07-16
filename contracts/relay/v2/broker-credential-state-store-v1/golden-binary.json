@@ -1,0 +1,45 @@
+{
+  "fixtureFormatVersion": 1,
+  "cases": [
+    {
+      "name": "missing-store",
+      "objects": {
+        "header0": null,
+        "header1": null,
+        "payload0": null,
+        "payload1": null
+      },
+      "expected": { "outcome": "missing" }
+    },
+    {
+      "name": "generation-one-slot-zero",
+      "objects": {
+        "header0": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c=",
+        "header1": null,
+        "payload0": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo=",
+        "payload1": null
+      },
+      "expected": {
+        "outcome": "present",
+        "generation": "1",
+        "payloadBase64": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo=",
+        "payloadSha256": "m25BsxUpAZBVK8NTB2MTpmfhi4Ttp7XAfsTXF4Kt_Pw"
+      }
+    },
+    {
+      "name": "generation-two-slot-one",
+      "objects": {
+        "header0": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c=",
+        "header1": "VFdWMkJDUzEBAAEAgAAAAAIAAAAAAAAAHQAAAAAAAACJncuTLTwUUE637lSh68EyF7WNBtwfjxUqDwbXt2OidAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA56wuyoSGs0Kr5qc1Yg1riMzlogTeTFyvyioKI83VFIg=",
+        "payload0": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo=",
+        "payload1": "eyJmaXh0dXJlIjoibmV4dCIsInZhbHVlIjoyfQo="
+      },
+      "expected": {
+        "outcome": "present",
+        "generation": "2",
+        "payloadBase64": "eyJmaXh0dXJlIjoibmV4dCIsInZhbHVlIjoyfQo=",
+        "payloadSha256": "iZ3Lky08FFBOt-5UoevBMhe1jQbcH48VKg8G17djonQ"
+      }
+    }
+  ]
+}

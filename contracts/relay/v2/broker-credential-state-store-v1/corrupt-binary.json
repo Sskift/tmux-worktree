@@ -1,0 +1,130 @@
+{
+  "fixtureFormatVersion": 1,
+  "vectors": [
+    {
+      "name": "unknown-format-version",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "write-u16-le", "object": "header1", "offset": 8, "value": 2 },
+        { "kind": "recompute-header-checksum", "object": "header1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_FORMAT_UNSUPPORTED" }
+    },
+    {
+      "name": "unknown-header-flags",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "write-byte", "object": "header1", "offset": 11, "value": 1 },
+        { "kind": "recompute-header-checksum", "object": "header1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_FORMAT_UNSUPPORTED" }
+    },
+    {
+      "name": "truncated-active-header",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "truncate", "object": "header1", "length": 96 }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "active-header-checksum-mismatch",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "xor-byte", "object": "header1", "offset": 127, "value": 1 }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "active-payload-digest-mismatch",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "xor-byte", "object": "payload1", "offset": 0, "value": 1 }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "active-payload-missing",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "remove-object", "object": "payload1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "historical-header-missing-after-generation-one",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "remove-object", "object": "header0" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "payload-without-any-header",
+      "deriveFrom": "generation-one-slot-zero",
+      "mutations": [
+        { "kind": "remove-object", "object": "header0" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "generation-gap",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "write-u64-le", "object": "header1", "offset": 16, "value": "3" },
+        { "kind": "recompute-header-checksum", "object": "header1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "same-generation-in-both-slots",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "write-u64-le", "object": "header1", "offset": 16, "value": "1" },
+        { "kind": "recompute-header-checksum", "object": "header1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "payload-length-over-frozen-limit",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "write-u64-le", "object": "header1", "offset": 24, "value": "67108865" },
+        { "kind": "recompute-header-checksum", "object": "header1" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_CORRUPT" }
+    },
+    {
+      "name": "unknown-logical-object",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "add-object", "object": "future0", "base64": "AA==" }
+      ],
+      "expected": { "outcome": "reject", "errorCode": "STORE_FORMAT_UNSUPPORTED" }
+    },
+    {
+      "name": "lower-inactive-payload-is-incomplete",
+      "deriveFrom": "generation-two-slot-one",
+      "mutations": [
+        { "kind": "xor-byte", "object": "payload0", "offset": 0, "value": 1 }
+      ],
+      "expected": {
+        "outcome": "present",
+        "generation": "2",
+        "payloadSha256": "iZ3Lky08FFBOt-5UoevBMhe1jQbcH48VKg8G17djonQ"
+      }
+    },
+    {
+      "name": "headerless-inactive-payload-is-never-visible",
+      "deriveFrom": "generation-one-slot-zero",
+      "mutations": [
+        { "kind": "add-object", "object": "payload1", "base64": "aW5jb21wbGV0ZQ==" }
+      ],
+      "expected": {
+        "outcome": "present",
+        "generation": "1",
+        "payloadSha256": "m25BsxUpAZBVK8NTB2MTpmfhi4Ttp7XAfsTXF4Kt_Pw"
+      }
+    }
+  ]
+}
