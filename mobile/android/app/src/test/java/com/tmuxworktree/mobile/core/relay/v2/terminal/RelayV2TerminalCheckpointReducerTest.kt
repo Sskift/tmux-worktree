@@ -897,9 +897,33 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         assertEquals(
-            RelayV2TerminalIgnoredReason.STALE_REPLAY_RESPONSE,
-            (wrongCorrelation.outcome as RelayV2TerminalOutcome.Ignored).reason,
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (wrongCorrelation.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
+        listOf(
+            RelayV2TerminalAction.ReplayStarted(
+                replaying.identity,
+                replaying.openAttempt.openId,
+                replaying.deliveryToken,
+                requestId = request.requestId,
+                fromOffset = "1",
+                tailOffsetAtStart = "3",
+            ),
+            RelayV2TerminalAction.ReplayStarted(
+                replaying.identity,
+                replaying.openAttempt.openId,
+                delivery(connectionGeneration = 2, deliverySequence = 2),
+                requestId = request.requestId,
+                fromOffset = "0",
+                tailOffsetAtStart = "3",
+            ),
+        ).forEach { conflictingCurrentResponse ->
+            val rejected = reduce(replaying, conflictingCurrentResponse)
+            assertEquals(
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+                (rejected.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+            )
+        }
 
         result = reduce(
             replaying,
@@ -1468,7 +1492,7 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         assertEquals(
-            RelayV2TerminalIgnoredReason.STALE_DELIVERY,
+            RelayV2TerminalIgnoredReason.STALE_REPLAY_RESPONSE,
             (oldCallback.outcome as RelayV2TerminalOutcome.Ignored).reason,
         )
 
@@ -1903,6 +1927,21 @@ class RelayV2TerminalCheckpointReducerTest {
             "close-current-request",
             result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>().single().requestId,
         )
+        val conflictingCurrentClose = reduce(
+            checkpoint,
+            closedAction(
+                checkpoint,
+                finalOffset = "0",
+                replayAvailable = false,
+                bufferStartOffset = null,
+                closeId = "close-conflicting",
+                requestId = "close-current-request",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (conflictingCurrentClose.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
         val duplicateCloseAttempt = reduce(
             checkpoint,
             RelayV2TerminalAction.RequestClose(
@@ -2007,6 +2046,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 replayAvailable = false,
                 bufferStartOffset = null,
                 closeId = "close-old",
+                requestId = "close-after-rebind-request",
             ),
         )
         assertEquals(
@@ -2205,6 +2245,25 @@ class RelayV2TerminalCheckpointReducerTest {
         assertEquals(
             "open-request-a",
             result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>().single().requestId,
+        )
+        val conflictingCurrentOpen = RelayV2TerminalCheckpointReducer.reduce(
+            preOpen,
+            RelayV2TerminalAction.Opened(
+                identity = identity,
+                requestId = "open-request-a",
+                openAttempt = attempt.copy(fingerprint = "conflicting-current-fingerprint"),
+                deliveryToken = preOpen.deliveryToken,
+                parserContinuityId = PARSER_CONTINUITY,
+                disposition = RelayV2TerminalOpenDisposition.NEW,
+                cols = 120,
+                rows = 36,
+                replayFromOffset = "0",
+                tailOffset = "0",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (conflictingCurrentOpen.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
 
         val retryBegin = firstBegin.copy(requestId = "open-request-b")
@@ -2439,6 +2498,16 @@ class RelayV2TerminalCheckpointReducerTest {
             requestedOffset = null,
             bufferStartOffset = null,
             tailOffset = null,
+        )
+        val conflictingCurrentFence = RelayV2TerminalCheckpointReducer.reduce(
+            preOpen,
+            correlatedReset.copy(
+                fence = consumedFence.copy(cols = consumedFence.cols + 1),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (conflictingCurrentFence.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
         result = RelayV2TerminalCheckpointReducer.reduce(preOpen, correlatedReset)
         preOpen = requireNotNull(result.preOpenCheckpoint)

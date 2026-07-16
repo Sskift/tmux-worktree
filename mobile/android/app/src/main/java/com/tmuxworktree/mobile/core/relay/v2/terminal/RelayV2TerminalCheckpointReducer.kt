@@ -139,7 +139,12 @@ internal object RelayV2TerminalCheckpointReducer {
         is RelayV2TerminalStoredCheckpoint.Present,
         -> missingReset(null, RelayV2TerminalResetReason.MISSING_CHECKPOINT)
         is RelayV2TerminalStoredCheckpoint.PreOpen -> {
-            val checkpoint = stored.checkpoint
+            val checkpoint = stored.checkpoint.copy(
+                openRequestIds = stored.checkpoint.openRequestIds.toList(),
+                pendingOpen = stored.checkpoint.pendingOpen?.copy(
+                    issuedRequestIds = stored.checkpoint.pendingOpen.issuedRequestIds.toList(),
+                ),
+            )
             when {
                 !validPreOpenCheckpoint(checkpoint) ->
                     missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
@@ -354,6 +359,14 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
+        if (action.requestId in current.openRequestIds) {
+            return reduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.NETWORK_REQUEST_ID_REUSED,
+                ),
+            )
+        }
         current.pendingOpen?.let { pending ->
             if (!pending.sameLogicalAttempt(action)) {
                 return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
@@ -368,6 +381,8 @@ internal object RelayV2TerminalCheckpointReducer {
             }
             val issuedRequestIds = appendRequestId(pending.issuedRequestIds, action.requestId)
                 ?: return reset(current, RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED)
+            val openRequestIds = appendRequestId(current.openRequestIds, action.requestId)
+                ?: return reset(current, RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED)
             val retried = pending.copy(
                 requestId = action.requestId,
                 issuedRequestIds = issuedRequestIds,
@@ -376,7 +391,10 @@ internal object RelayV2TerminalCheckpointReducer {
             )
             return commit(
                 current,
-                current.copy(pendingOpen = retried),
+                current.copy(
+                    pendingOpen = retried,
+                    openRequestIds = openRequestIds,
+                ),
                 RelayV2TerminalOutcome.Applied,
                 listOf(retried.sendOpen(current)),
             )
@@ -404,16 +422,6 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return reset(current, RelayV2TerminalResetReason.PARSER_CONTINUITY_LOST)
         }
-        if (action.openAttempt == current.openAttempt &&
-            action.requestId in current.openRequestIds
-        ) {
-            return reduction(
-                current,
-                RelayV2TerminalOutcome.Ignored(
-                    RelayV2TerminalIgnoredReason.NETWORK_REQUEST_ID_REUSED,
-                ),
-            )
-        }
         val pending = if (action.openAttempt == current.openAttempt) {
             val issuedRequestIds = appendRequestId(current.openRequestIds, action.requestId)
                 ?: return reset(current, RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED)
@@ -426,7 +434,14 @@ internal object RelayV2TerminalCheckpointReducer {
         }
         return commit(
             current,
-            current.copy(pendingOpen = pending),
+            current.copy(
+                pendingOpen = pending,
+                openRequestIds = appendRequestId(current.openRequestIds, action.requestId)
+                    ?: return reset(
+                        current,
+                        RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+                    ),
+            ),
             RelayV2TerminalOutcome.Applied,
             listOf(pending.sendOpen(current)),
         )
@@ -452,6 +467,7 @@ internal object RelayV2TerminalCheckpointReducer {
                 target = action.target,
                 deliveryToken = action.deliveryToken,
                 parserContinuityId = action.parserContinuityId,
+                openRequestIds = listOf(action.requestId),
                 phase = RelayV2TerminalPreOpenPhase.PENDING_OPEN,
                 pendingOpen = pending,
             )
@@ -479,6 +495,14 @@ internal object RelayV2TerminalCheckpointReducer {
         }
         if (action.target != current.target) {
             return preOpenReset(current, RelayV2TerminalResetReason.IDENTITY_CHANGED)
+        }
+        if (action.requestId in current.openRequestIds) {
+            return preOpenReduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.NETWORK_REQUEST_ID_REUSED,
+                ),
+            )
         }
         val existingPending = current.pendingOpen
         existingPending?.let { pending ->
@@ -515,6 +539,11 @@ internal object RelayV2TerminalCheckpointReducer {
             target = action.target,
             deliveryToken = action.deliveryToken,
             parserContinuityId = action.parserContinuityId,
+            openRequestIds = appendRequestId(current.openRequestIds, action.requestId)
+                ?: return preOpenReset(
+                    current,
+                    RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+                ),
             phase = RelayV2TerminalPreOpenPhase.PENDING_OPEN,
             pendingOpen = pending,
             resetFence = null,
@@ -531,17 +560,30 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalPreOpenCheckpoint,
         action: RelayV2TerminalAction.Opened,
     ): RelayV2TerminalReduction {
-        val pending = current.pendingOpen ?: return preOpenReduction(
-            current,
-            RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE),
-        )
-        if (action.requestId != pending.requestId || action.openAttempt != pending.openAttempt ||
-            action.deliveryToken != current.deliveryToken
-        ) {
-            return preOpenReduction(
+        val pending = current.pendingOpen
+        when (networkResponseCorrelation(
+            action.requestId,
+            pending?.requestId,
+            current.openRequestIds,
+        )) {
+            NetworkResponseCorrelation.ISSUED_OLD -> return preOpenReduction(
                 current,
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE),
             )
+            NetworkResponseCorrelation.UNKNOWN -> return preOpenReset(
+                current,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+            NetworkResponseCorrelation.CURRENT -> Unit
+        }
+        pending ?: return preOpenReset(
+            current,
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+        )
+        if (action.openAttempt != pending.openAttempt ||
+            action.deliveryToken != current.deliveryToken
+        ) {
+            return preOpenReset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         val replayFrom = parseCounter(action.replayFromOffset)
         val tail = parseCounter(action.tailOffset)
@@ -561,7 +603,13 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return preOpenReset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
-        return newGenerationCheckpoint(action, emptyList(), pending, newlyAmbiguousCount = 0)
+        return newGenerationCheckpoint(
+            action,
+            emptyList(),
+            pending,
+            current.openRequestIds,
+            newlyAmbiguousCount = 0,
+        )
     }
 
     private fun preOpenResetRequired(
@@ -569,13 +617,27 @@ internal object RelayV2TerminalCheckpointReducer {
         action: RelayV2TerminalAction.PreOpenResetRequired,
     ): RelayV2TerminalReduction {
         val pending = current.pendingOpen
-        if (pending == null || action.requestId != pending.requestId ||
-            action.fence != openFence(current, pending)
-        ) {
-            return preOpenReduction(
+        when (networkResponseCorrelation(
+            action.requestId,
+            pending?.requestId,
+            current.openRequestIds,
+        )) {
+            NetworkResponseCorrelation.ISSUED_OLD -> return preOpenReduction(
                 current,
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_RESET_RESPONSE),
             )
+            NetworkResponseCorrelation.UNKNOWN -> return preOpenReset(
+                current,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+            NetworkResponseCorrelation.CURRENT -> Unit
+        }
+        pending ?: return preOpenReset(
+            current,
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+        )
+        if (action.fence != openFence(current, pending)) {
+            return preOpenReset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         val reason = validatedHostResetReason(
             action.reason,
@@ -614,7 +676,13 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.Closed,
     ): RelayV2TerminalReduction {
-        fenceGuard(current, action.fence)?.let { return it }
+        val correlatedCloseAttempt = when (val correlation =
+            closedResponseCorrelation(current, action)
+        ) {
+            is ClosedResponseCorrelation.Current -> correlation.closeAttempt
+            ClosedResponseCorrelation.Natural -> null
+            is ClosedResponseCorrelation.Rejected -> return correlation.reduction
+        }
         val finalOffset = parseCounter(action.finalOffset)
         val bufferStart = action.bufferStartOffset?.let(::parseCounter)
         if (action.fence.openId != current.openAttempt.openId ||
@@ -623,17 +691,6 @@ internal object RelayV2TerminalCheckpointReducer {
             (!action.replayAvailable && action.bufferStartOffset != null)
         ) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
-        }
-        val correlatedCloseAttempt = action.closeId?.let { closeId ->
-            current.pendingClose?.takeIf {
-                it.closeAttempt.closeId == closeId && it.requestId == action.requestId
-            }?.closeAttempt
-                ?: return reduction(
-                    current,
-                    RelayV2TerminalOutcome.Ignored(
-                        RelayV2TerminalIgnoredReason.STALE_CLOSE_RESPONSE,
-                    ),
-                )
         }
         val incoming = RelayV2TerminalClosedState(
             tombstone = closedTombstone(current, action, correlatedCloseAttempt),
@@ -686,7 +743,30 @@ internal object RelayV2TerminalCheckpointReducer {
         previous: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.Opened,
     ): RelayV2TerminalReduction {
-        deliveryGuard(previous, action.deliveryToken)?.let { return it }
+        val pendingOpen = previous.pendingOpen
+        val issuedRequestIds = previous.openRequestIds +
+            pendingOpen?.issuedRequestIds.orEmpty()
+        when (networkResponseCorrelation(
+            action.requestId,
+            pendingOpen?.requestId,
+            issuedRequestIds,
+        )) {
+            NetworkResponseCorrelation.ISSUED_OLD -> return reduction(
+                previous,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE,
+                ),
+            )
+            NetworkResponseCorrelation.UNKNOWN -> return reset(
+                previous,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+            NetworkResponseCorrelation.CURRENT -> Unit
+        }
+        pendingOpen ?: return reset(
+            previous,
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+        )
         val from = parseCounter(action.replayFromOffset)
         val tail = parseCounter(action.tailOffset)
         if (from == null || tail == null || tail < from ||
@@ -700,26 +780,14 @@ internal object RelayV2TerminalCheckpointReducer {
             return reset(previous, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
         }
 
-        val pendingOpen = previous.pendingOpen
-        if (pendingOpen == null || pendingOpen.requestId != action.requestId ||
-            pendingOpen.deliveryToken != action.deliveryToken ||
+        if (pendingOpen.deliveryToken != action.deliveryToken ||
             pendingOpen.openAttempt != action.openAttempt ||
             pendingOpen.cols != action.cols || pendingOpen.rows != action.rows ||
             pendingOpen.target != action.identity.target() ||
             pendingOpen.parserContinuityId != action.parserContinuityId ||
             !dispositionMatches(pendingOpen.mode, action.disposition)
         ) {
-            if ((pendingOpen?.openAttempt?.openId == action.openAttempt.openId &&
-                    pendingOpen.openAttempt != action.openAttempt) ||
-                (previous.openAttempt.openId == action.openAttempt.openId &&
-                    previous.openAttempt != action.openAttempt)
-            ) {
-                return reset(previous, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
-            }
-            return reduction(
-                previous,
-                RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE),
-            )
+            return reset(previous, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         if (pendingOpen.requiresDeduplicatedResponse && !action.deduplicated) {
             return reset(previous, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
@@ -755,10 +823,18 @@ internal object RelayV2TerminalCheckpointReducer {
                 RelayV2AmbiguousInput(it.generation, it.inputSeq, it.bytes)
             }
             val ambiguousInputs = previous.ambiguousInputs + newlyAmbiguous
+            val openRequestIds = mergeRequestIds(
+                previous.openRequestIds,
+                pendingOpen.issuedRequestIds,
+            ) ?: return reset(
+                previous,
+                RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+            )
             return newGenerationCheckpoint(
                 action,
                 ambiguousInputs,
                 pendingOpen,
+                openRequestIds,
                 newlyAmbiguous.size,
             )
         }
@@ -814,12 +890,19 @@ internal object RelayV2TerminalCheckpointReducer {
         ) {
             return reset(previous, RelayV2TerminalResetReason.OFFSET_EXPIRED)
         }
+        val openRequestIds = mergeRequestIds(
+            previous.openRequestIds,
+            pendingOpen.issuedRequestIds,
+        ) ?: return reset(
+            previous,
+            RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+        )
         var candidate = previous.copy(
             openAttempt = action.openAttempt,
             openMode = pendingOpen.mode,
             openRequestResume = pendingOpen.resume,
             openResult = action.openResult(),
-            openRequestIds = pendingOpen.issuedRequestIds,
+            openRequestIds = openRequestIds,
             openedCols = action.cols,
             openedRows = action.rows,
             phase = when {
@@ -865,6 +948,7 @@ internal object RelayV2TerminalCheckpointReducer {
         action: RelayV2TerminalAction.Opened,
         ambiguousInputs: List<RelayV2AmbiguousInput>,
         pendingOpen: RelayV2TerminalPendingOpen,
+        openRequestIds: List<String>,
         newlyAmbiguousCount: Int,
     ): RelayV2TerminalReduction {
         val resetting = action.disposition == RelayV2TerminalOpenDisposition.RESET
@@ -892,7 +976,7 @@ internal object RelayV2TerminalCheckpointReducer {
             openMode = pendingOpen.mode,
             openRequestResume = pendingOpen.resume,
             openResult = action.openResult(),
-            openRequestIds = pendingOpen.issuedRequestIds,
+            openRequestIds = openRequestIds,
             deliveryToken = action.deliveryToken,
             parserContinuityId = action.parserContinuityId,
             phase = when {
@@ -1131,36 +1215,40 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.ReplayStarted,
     ): RelayV2TerminalReduction {
-        if (action.identity != current.identity) {
-            return reset(current, identityChangeReason(current.identity, action.identity))
-        }
-        if (action.openId != current.openAttempt.openId) {
-            return reduction(
-                current,
-                RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_DELIVERY),
-            )
-        }
-        deliveryGuard(current, action.deliveryToken)?.let { return it }
-        if (current.phase != RelayV2TerminalPhase.REPLAY_REQUESTED) {
-            return reduction(
+        val pendingReplay = current.pendingReplay
+        when (networkResponseCorrelation(
+            action.requestId,
+            pendingReplay?.requestId,
+            current.replayRequestIds,
+        )) {
+            NetworkResponseCorrelation.ISSUED_OLD -> return reduction(
                 current,
                 RelayV2TerminalOutcome.Ignored(
                     RelayV2TerminalIgnoredReason.STALE_REPLAY_RESPONSE,
                 ),
             )
+            NetworkResponseCorrelation.UNKNOWN -> return reset(
+                current,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+            NetworkResponseCorrelation.CURRENT -> Unit
+        }
+        pendingReplay ?: return reset(
+            current,
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+        )
+        if (action.identity != current.identity) {
+            return reset(current, identityChangeReason(current.identity, action.identity))
+        }
+        if (action.openId != current.openAttempt.openId ||
+            action.deliveryToken != current.deliveryToken ||
+            current.phase != RelayV2TerminalPhase.REPLAY_REQUESTED
+        ) {
+            return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         val from = parseCounter(action.fromOffset)
         val tail = parseCounter(action.tailOffsetAtStart)
         val expected = parseCounter(current.networkReceivedThrough)
-        val pendingReplay = current.pendingReplay
-        if (pendingReplay == null || action.requestId != pendingReplay.requestId) {
-            return reduction(
-                current,
-                RelayV2TerminalOutcome.Ignored(
-                    RelayV2TerminalIgnoredReason.STALE_REPLAY_RESPONSE,
-                ),
-            )
-        }
         if (action.fromOffset != pendingReplay.fromOffset ||
             pendingReplay.fence != effectFence(current) || from == null || tail == null ||
             expected == null || from != expected || tail < from
@@ -1856,22 +1944,12 @@ internal object RelayV2TerminalCheckpointReducer {
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT),
             )
         }
-        if (action.fence.openId != current.openAttempt.openId) {
-            return reset(current, RelayV2TerminalResetReason.IDENTITY_CHANGED)
-        }
-        val correlatedCloseAttempt = action.closeId?.let { closeId ->
-            val pending = current.pendingClose
-            if (pending == null || pending.closeAttempt.closeId != closeId ||
-                pending.requestId != action.requestId
-            ) {
-                return reduction(
-                    current,
-                    RelayV2TerminalOutcome.Ignored(
-                        RelayV2TerminalIgnoredReason.STALE_CLOSE_RESPONSE,
-                    ),
-                )
-            }
-            pending.closeAttempt
+        val correlatedCloseAttempt = when (val correlation =
+            closedResponseCorrelation(current, action)
+        ) {
+            is ClosedResponseCorrelation.Current -> correlation.closeAttempt
+            ClosedResponseCorrelation.Natural -> null
+            is ClosedResponseCorrelation.Rejected -> return correlation.reduction
         }
         if (!validClose(action)) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
@@ -2297,8 +2375,7 @@ internal object RelayV2TerminalCheckpointReducer {
         is RelayV2TerminalAction.RebindDelivery ->
             deliveryGuard(current, action.currentDeliveryToken)
         is RelayV2TerminalAction.Output -> fenceGuard(current, action.fence)
-        is RelayV2TerminalAction.ReplayStarted ->
-            deliveryGuard(current, action.deliveryToken)
+        is RelayV2TerminalAction.ReplayStarted -> null
         is RelayV2TerminalAction.ParserApplied ->
             parserCallbackGuard(current, action.callbackToken)
         is RelayV2TerminalAction.ParserFailed ->
@@ -2317,7 +2394,7 @@ internal object RelayV2TerminalCheckpointReducer {
             deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RetryReplay -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RequestClose -> deliveryGuard(current, action.deliveryToken)
-        is RelayV2TerminalAction.Closed -> fenceGuard(current, action.fence)
+        is RelayV2TerminalAction.Closed -> null
         is RelayV2TerminalAction.CorrelatedResetRequired -> fenceGuard(current, action.fence)
         is RelayV2TerminalAction.AsyncResetRequired -> fenceGuard(current, action.fence)
     }
@@ -2780,7 +2857,8 @@ internal object RelayV2TerminalCheckpointReducer {
             checkpoint.deliveryToken.actorGeneration.profileId != checkpoint.target.profileId ||
             checkpoint.deliveryToken.actorGeneration.profileGeneration !=
             checkpoint.target.profileActivationGeneration ||
-            !validParserContinuity(checkpoint.parserContinuityId)
+            !validParserContinuity(checkpoint.parserContinuityId) ||
+            !validRequestIdHistory(checkpoint.openRequestIds)
         ) {
             return false
         }
@@ -2793,6 +2871,7 @@ internal object RelayV2TerminalCheckpointReducer {
                             pending.issuedRequestIds,
                             pending.requestId,
                         ) &&
+                        pending.requestId in checkpoint.openRequestIds &&
                         (pending.issuedRequestIds.size == 1 ||
                             pending.requiresDeduplicatedResponse) &&
                         pending.deliveryToken == checkpoint.deliveryToken &&
@@ -3406,6 +3485,27 @@ internal object RelayV2TerminalCheckpointReducer {
         null
     }
 
+    private fun networkResponseCorrelation(
+        requestId: String,
+        currentRequestId: String?,
+        issuedRequestIds: List<String>,
+    ): NetworkResponseCorrelation = when {
+        requestId == currentRequestId -> NetworkResponseCorrelation.CURRENT
+        requestId in issuedRequestIds -> NetworkResponseCorrelation.ISSUED_OLD
+        else -> NetworkResponseCorrelation.UNKNOWN
+    }
+
+    private fun mergeRequestIds(
+        existing: List<String>,
+        added: List<String>,
+    ): List<String>? {
+        val merged = existing + added.filterNot(existing::contains)
+        return merged.takeIf {
+            it.size <= RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS &&
+                it.distinct().size == it.size
+        }
+    }
+
     private fun validRequestIdHistory(
         issued: List<String>,
         currentRequestId: String? = null,
@@ -3555,6 +3655,14 @@ internal object RelayV2TerminalCheckpointReducer {
         checkpoint.openAttempt,
     )
 
+    private fun actionFence(
+        checkpoint: RelayV2TerminalCheckpoint,
+    ): RelayV2TerminalActionFence = RelayV2TerminalActionFence(
+        checkpoint.identity.binding(),
+        checkpoint.deliveryToken,
+        checkpoint.openAttempt.openId,
+    )
+
     private fun RelayV2TerminalCheckpoint.controlDispatchLeaseWhenWritable():
         RelayV2TerminalControlDispatchLease? = if (terminalWritable(this)) {
         RelayV2TerminalControlDispatchLease(effectFence(this))
@@ -3593,6 +3701,58 @@ internal object RelayV2TerminalCheckpointReducer {
             closeAttempt.closeId,
             requestId,
         )
+    }
+
+    private fun closedResponseCorrelation(
+        checkpoint: RelayV2TerminalCheckpoint,
+        action: RelayV2TerminalAction.Closed,
+    ): ClosedResponseCorrelation {
+        val requestId = action.requestId
+        if (requestId == null) {
+            if (action.closeId != null) {
+                return ClosedResponseCorrelation.Rejected(
+                    reset(checkpoint, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT),
+                )
+            }
+            val guarded = fenceGuard(checkpoint, action.fence)
+            return if (guarded == null) {
+                ClosedResponseCorrelation.Natural
+            } else {
+                ClosedResponseCorrelation.Rejected(guarded)
+            }
+        }
+        val pending = checkpoint.pendingClose
+        return when (networkResponseCorrelation(
+            requestId,
+            pending?.requestId,
+            pending?.issuedRequestIds.orEmpty(),
+        )) {
+            NetworkResponseCorrelation.ISSUED_OLD -> ClosedResponseCorrelation.Rejected(
+                reduction(
+                    checkpoint,
+                    RelayV2TerminalOutcome.Ignored(
+                        RelayV2TerminalIgnoredReason.STALE_CLOSE_RESPONSE,
+                    ),
+                ),
+            )
+            NetworkResponseCorrelation.UNKNOWN -> ClosedResponseCorrelation.Rejected(
+                reset(checkpoint, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT),
+            )
+            NetworkResponseCorrelation.CURRENT -> {
+                if (pending == null || action.closeId != pending.closeAttempt.closeId ||
+                    action.fence != actionFence(checkpoint)
+                ) {
+                    ClosedResponseCorrelation.Rejected(
+                        reset(
+                            checkpoint,
+                            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+                        ),
+                    )
+                } else {
+                    ClosedResponseCorrelation.Current(pending.closeAttempt)
+                }
+            }
+        }
     }
 
     private fun closedTombstone(
@@ -3730,6 +3890,22 @@ internal object RelayV2TerminalCheckpointReducer {
         data class Applied(val checkpoint: RelayV2TerminalCheckpoint) : ResizeAckApply
         data object Duplicate : ResizeAckApply
         data object Rejected : ResizeAckApply
+    }
+
+    private sealed interface ClosedResponseCorrelation {
+        data object Natural : ClosedResponseCorrelation
+        data class Current(
+            val closeAttempt: RelayV2TerminalCloseAttempt,
+        ) : ClosedResponseCorrelation
+        data class Rejected(
+            val reduction: RelayV2TerminalReduction,
+        ) : ClosedResponseCorrelation
+    }
+
+    private enum class NetworkResponseCorrelation {
+        CURRENT,
+        ISSUED_OLD,
+        UNKNOWN,
     }
 
     private data class ParserOperation(val id: String, val next: String)
