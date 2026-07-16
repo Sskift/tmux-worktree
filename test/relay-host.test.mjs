@@ -25,15 +25,105 @@ const {
   liveDashboardTerminalName,
   mutateTerminalRegistry,
   parseDashboardTerminalPayload,
+  parseRelayHostOptions,
   parseRpcCreateWorktreeResponse,
   parseRpcCreateTerminalResponse,
   persistCreatedTerminalMetadata,
   projectNameFromTwWorktreePath,
   remoteAttachCommand,
   relaySshConnectionArgs,
+  relayV2HostCarrierUrl,
+  run,
   sessionNameFromTwWorktreeDir,
   writeTerminalRegistryAtomic,
 } = await import("../dist/relayHost.js");
+
+test("relay-host profiles keep v1 secrets and v2 credential references disjoint", () => {
+  const v1 = parseRelayHostOptions([
+    "--relay", "wss://legacy.example.test",
+    "--host-id", "legacy-host",
+    "--secret", "legacy-shared-secret",
+  ], {});
+  assert.equal(v1.profile, "v1");
+  assert.equal(v1.secret, "legacy-shared-secret");
+  assert.equal(Object.hasOwn(v1, "credentialReference"), false);
+
+  const v2 = parseRelayHostOptions([
+    "--profile", "v2",
+    "--relay", "wss://relay.example.test",
+    "--host-id", "v2-host",
+    "--credential-reference", "host-primary-v1",
+  ], {});
+  assert.equal(v2.profile, "v2");
+  assert.equal(v2.credentialReference, "host-primary-v1");
+  assert.equal(Object.hasOwn(v2, "secret"), false);
+  assert.equal(relayV2HostCarrierUrl(v2.relay), "wss://relay.example.test/host");
+
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--relay", "wss://relay.example.test",
+    "--credential-reference", "host-primary-v1",
+    "--secret", "must-not-be-promoted",
+  ], {}), /cannot read or promote Relay v1 shared secret|不能读取或提升/);
+  assert.throws(() => parseRelayHostOptions([
+    "--profile", "v2",
+    "--relay", "wss://relay.example.test",
+    "--credential-reference", "host-primary-v1",
+  ], {
+    TW_RELAY_SECRET: "must-not-be-promoted",
+  }), /cannot read or promote Relay v1 shared secret|不能读取或提升/);
+  assert.throws(() => parseRelayHostOptions([
+    "--relay", "wss://legacy.example.test",
+    "--secret", "legacy-shared-secret",
+    "--credential-reference", "must-not-cross-profile",
+  ], {}), /cannot read Relay v2 credential reference|不能读取 Relay v2 credential reference/);
+});
+
+test("Relay v2 host carrier URL is exact WSS without URL credentials or fallback paths", () => {
+  for (const invalid of [
+    "ws://relay.example.test",
+    "wss://user@relay.example.test",
+    "wss://relay.example.test/host",
+    "wss://relay.example.test/?hostId=legacy",
+    "wss://relay.example.test/#fragment",
+  ]) {
+    assert.throws(() => relayV2HostCarrierUrl(invalid));
+  }
+});
+
+test("explicit Relay v2 profile fails before constructing any network transport", async () => {
+  const previousArgv = process.argv;
+  const isolatedKeys = [
+    "TW_RELAY_HOST_PROFILE",
+    "TW_RELAY_SECRET",
+    "TW_RELAY_V2_URL",
+    "TW_RELAY_V2_HOST_ID",
+    "TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE",
+  ];
+  const previousEnv = new Map(isolatedKeys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of isolatedKeys) delete process.env[key];
+    process.argv = [
+      process.execPath,
+      "cli.cjs",
+      "relay-host",
+      "--profile", "v2",
+      "--relay", "wss://relay.example.test",
+      "--host-id", "v2-host",
+      "--credential-reference", "host-primary-v1",
+    ];
+    await assert.rejects(
+      run(),
+      /production dependencies are not configured; no v1 fallback was attempted/,
+    );
+  } finally {
+    process.argv = previousArgv;
+    for (const [key, value] of previousEnv) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
 
 test("remote mutation requires an explicit hard-timeout RPC capability", () => {
   const supported = JSON.stringify({

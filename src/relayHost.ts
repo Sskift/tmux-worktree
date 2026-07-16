@@ -33,14 +33,28 @@ import {
   type TerminalControlRequestInput,
 } from "./terminalControl/index.js";
 
-type RelayHostOptions = {
+export type RelayHostProfile = "v1" | "v2";
+
+type RelayHostCommonOptions = {
+  profile: RelayHostProfile;
   relay: string;
   hostId: string;
   displayName: string;
-  secret: string;
   local: string;
   statusFile: string;
 };
+
+export type RelayV1HostOptions = RelayHostCommonOptions & {
+  profile: "v1";
+  secret: string;
+};
+
+export type RelayV2HostOptions = RelayHostCommonOptions & {
+  profile: "v2";
+  credentialReference: string;
+};
+
+export type RelayHostOptions = RelayV1HostOptions | RelayV2HostOptions;
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
 
@@ -559,24 +573,83 @@ async function localTwOutput(args: string[], timeout: number): Promise<string> {
   return (await execFileTracked("tw", args, commandExecOptions(timeout))).stdout;
 }
 
-function parseArgs(argv: string[]): RelayHostOptions {
-  let relay = process.env.TW_RELAY_URL || "";
-  let hostId = process.env.TW_RELAY_HOST_ID || "mac-admin";
-  let displayName = process.env.TW_RELAY_DISPLAY_NAME || `${hostname()} admin`;
-  let secret = process.env.TW_RELAY_SECRET || "";
-  let local = process.env.TW_SERVE_URL || "http://127.0.0.1:8311";
-  let statusFile = process.env.TW_RELAY_STATUS_FILE || "";
+function relayHostProfile(argv: readonly string[], env: NodeJS.ProcessEnv): RelayHostProfile {
+  let profile = env.TW_RELAY_HOST_PROFILE?.trim() || "v1";
+  for (let index = 0; index < argv.length; index += 1) {
+    if (argv[index] === "--profile") profile = argv[index + 1] || "";
+  }
+  if (profile !== "v1" && profile !== "v2") {
+    throw new CliError("relay-host --profile 只接受 v1 或 v2");
+  }
+  return profile;
+}
+
+function validCredentialReference(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)
+    && !value.startsWith("twcap2.")
+    && !value.startsWith("twhostboot2.");
+}
+
+export function relayV2HostCarrierUrl(relay: string): string {
+  let base: URL;
+  try {
+    base = new URL(relay);
+  } catch {
+    throw new CliError("Relay v2 host profile 需要合法的 wss:// root URL");
+  }
+  if (base.protocol !== "wss:"
+    || base.username !== ""
+    || base.password !== ""
+    || base.pathname !== "/"
+    || base.search !== ""
+    || base.hash !== "") {
+    throw new CliError(
+      "Relay v2 host profile 只接受不含凭证、path、query 或 fragment 的 wss:// root URL",
+    );
+  }
+  base.pathname = "/host";
+  return base.toString();
+}
+
+export function parseRelayHostOptions(
+  argv: string[],
+  env: NodeJS.ProcessEnv = process.env,
+): RelayHostOptions {
+  const profile = relayHostProfile(argv, env);
+  let relay = profile === "v2" ? env.TW_RELAY_V2_URL || "" : env.TW_RELAY_URL || "";
+  let hostId = profile === "v2"
+    ? env.TW_RELAY_V2_HOST_ID || "mac-admin"
+    : env.TW_RELAY_HOST_ID || "mac-admin";
+  let displayName = profile === "v2"
+    ? env.TW_RELAY_V2_DISPLAY_NAME || `${hostname()} admin`
+    : env.TW_RELAY_DISPLAY_NAME || `${hostname()} admin`;
+  let secret = profile === "v1" ? env.TW_RELAY_SECRET || "" : "";
+  let credentialReference = profile === "v2"
+    ? env.TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE || ""
+    : "";
+  let local = env.TW_SERVE_URL || "http://127.0.0.1:8311";
+  let statusFile = profile === "v2"
+    ? env.TW_RELAY_V2_STATUS_FILE || ""
+    : env.TW_RELAY_STATUS_FILE || "";
+  let sawV1Secret = false;
+  let sawV2CredentialReference = false;
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--relay") {
+    if (arg === "--profile") {
+      i += 1;
+    } else if (arg === "--relay") {
       relay = argv[++i] || "";
     } else if (arg === "--host-id") {
       hostId = argv[++i] || "";
     } else if (arg === "--display-name") {
       displayName = argv[++i] || displayName;
     } else if (arg === "--secret") {
+      sawV1Secret = true;
       secret = argv[++i] || "";
+    } else if (arg === "--credential-reference") {
+      sawV2CredentialReference = true;
+      credentialReference = argv[++i] || "";
     } else if (arg === "--local") {
       local = argv[++i] || local;
     } else if (arg === "--status-file") {
@@ -591,9 +664,39 @@ function parseArgs(argv: string[]): RelayHostOptions {
 
   if (!relay) throw new CliError("relay-host 需要 --relay 或 TW_RELAY_URL");
   if (!hostId || !isValidHostId(hostId)) throw new CliError("relay-host 需要合法 --host-id（字母、数字、点、下划线）");
-  if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
-
-  return { relay, hostId, displayName, secret, local: local.replace(/\/+$/, ""), statusFile };
+  if (profile === "v1") {
+    if (sawV2CredentialReference || env.TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE) {
+      throw new CliError("Relay v1 host profile 不能读取 Relay v2 credential reference");
+    }
+    if (!secret) throw new CliError("relay-host 需要 --secret 或 TW_RELAY_SECRET");
+    return {
+      profile,
+      relay,
+      hostId,
+      displayName,
+      secret,
+      local: local.replace(/\/+$/, ""),
+      statusFile,
+    };
+  }
+  if (sawV1Secret || env.TW_RELAY_SECRET) {
+    throw new CliError("Relay v2 host profile 不能读取或提升 Relay v1 shared secret");
+  }
+  if (!credentialReference || !validCredentialReference(credentialReference)) {
+    throw new CliError(
+      "Relay v2 host profile 需要独立的 --credential-reference 或 TW_RELAY_V2_HOST_CREDENTIAL_REFERENCE",
+    );
+  }
+  relayV2HostCarrierUrl(relay);
+  return {
+    profile,
+    relay,
+    hostId,
+    displayName,
+    credentialReference,
+    local: local.replace(/\/+$/, ""),
+    statusFile,
+  };
 }
 
 function printHelp(): void {
@@ -601,6 +704,9 @@ function printHelp(): void {
 
 用法:
   TW_RELAY_SECRET=<secret> tw relay-host --relay wss://relay.example.com --host-id mac-admin
+
+  tw relay-host --profile v2 --relay wss://relay.example.com --host-id mac-admin \\
+    --credential-reference <opaque-reference>
 
 说明:
   relay-server 可以跑在一台稳定可达的 broker 机器上；relay-host 应跑在 Mac Dashboard 所在机器上。
@@ -625,7 +731,7 @@ function requireServeToken(): string {
   return token;
 }
 
-function relayUrl(opts: RelayHostOptions): string {
+function relayUrl(opts: RelayV1HostOptions): string {
   const base = new URL(opts.relay);
   base.pathname = "/host";
   base.searchParams.set("hostId", opts.hostId);
@@ -2761,7 +2867,7 @@ async function openRouteStream(
   control: RelayTerminalControl,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
-  opts: RelayHostOptions,
+  opts: RelayV1HostOptions,
   stream: LocalStream,
 ): Promise<void> {
   stream.openTaskActive = true;
@@ -2791,7 +2897,7 @@ async function reopenRoutedStream(
   lease: RelayConnectionLease,
   streams: Map<string, LocalStream>,
   routes: Map<string, StreamRoute>,
-  opts: RelayHostOptions,
+  opts: RelayV1HostOptions,
   route: StreamRoute,
   pendingInput?: string,
   pendingResize?: { cols: number; rows: number },
@@ -2877,7 +2983,7 @@ function rejectTerminalOpen(
 }
 
 async function runConnection(
-  opts: RelayHostOptions,
+  opts: RelayV1HostOptions,
   statusOwnership: RelayStatusOwnership,
   admissionLedger: StreamAdmissionLedger,
   commandAdmissionLedger: CommandAdmissionLedger,
@@ -3311,7 +3417,12 @@ async function runConnection(
 }
 
 export async function run(): Promise<void> {
-  const opts = parseArgs(process.argv.slice(3));
+  const opts = parseRelayHostOptions(process.argv.slice(3));
+  if (opts.profile === "v2") {
+    throw new CliError(
+      "Relay v2 host production dependencies are not configured; no v1 fallback was attempted",
+    );
+  }
   const statusOwnership: RelayStatusOwnership = {
     instanceId: randomUUID(),
     claimed: false,
