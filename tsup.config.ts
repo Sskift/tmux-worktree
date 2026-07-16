@@ -3,6 +3,7 @@ import { defineConfig } from "tsup";
 export default defineConfig({
   entry: [
     "src/config.ts",
+    "src/canonicalWorktreePlacement.ts",
     "src/automation.ts",
     "src/hosts.ts",
     "src/rpc.ts",

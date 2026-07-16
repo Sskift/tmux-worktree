@@ -1,6 +1,14 @@
-import { existsSync as fsExistsSync, mkdirSync as fsMkdirSync } from "node:fs";
+import {
+  existsSync as fsExistsSync,
+  mkdirSync as fsMkdirSync,
+  realpathSync as fsRealpathSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
 import { basename, dirname, join } from "node:path";
+import {
+  assertCanonicalWorktreePlacementFilesystem,
+  parseCanonicalWorktreePlacement,
+} from "./canonicalWorktreePlacement";
 import {
   CliError,
   deleteBranch,
@@ -141,6 +149,7 @@ export interface RestoreManagedWorktreeSessionParams {
 export interface CreateManagedWorktreeSessionDeps {
   existsSync?: (path: string) => boolean;
   mkdirSync?: (path: string, options: { recursive: true }) => unknown;
+  realpathSync?: (path: string) => string;
   isGitRepo?: (path: string) => boolean;
   gitQuery?: (repoDir: string, args: string[], timeout?: number) => string;
   exec?: (bin: string, args: string[], timeout?: number) => void;
@@ -463,6 +472,7 @@ export function createManagedWorktreeSession(
 ): CreatedManagedWorktreeSession {
   const existsSync = deps.existsSync ?? fsExistsSync;
   const mkdirSync = deps.mkdirSync ?? fsMkdirSync;
+  const realpathSync = deps.realpathSync ?? fsRealpathSync;
   const isGitRepo = deps.isGitRepo ?? defaultIsGitRepo;
   const gitQuery = deps.gitQuery ?? defaultGitQuery;
   const exec = deps.exec ?? defaultExec;
@@ -494,6 +504,17 @@ export function createManagedWorktreeSession(
     throw new CliError(`目录不存在: ${params.projectDir}`);
   }
 
+  const resolvedPlacement = params.resolvedV2
+    ? parseCanonicalWorktreePlacement({
+        worktreeBase: params.worktreeBase,
+        worktreePath: params.resolvedV2.worktreePath,
+        worktreeBranch: params.resolvedV2.worktreeBranch,
+      })
+    : null;
+  if (resolvedPlacement) {
+    assertCanonicalWorktreePlacementFilesystem(resolvedPlacement, { existsSync, realpathSync });
+  }
+
   const session = params.resolvedV2
     ? params.sessionName
     : resolveSessionName(params.sessionName, sessionExists);
@@ -519,13 +540,28 @@ export function createManagedWorktreeSession(
     log(`🔄 正在从远程拉取最新代码 (${targetBranch})...`);
     exec("git", ["-C", params.projectDir, "fetch", "origin", targetBranch, "--quiet"]);
 
-    const branchName = params.resolvedV2?.worktreeBranch ?? `${session}-${randomId()}`;
-    const projectWorktreeRoot = join(params.worktreeBase, label);
-    const worktreeDir = params.resolvedV2?.worktreePath ?? join(projectWorktreeRoot, branchName);
-    if (params.resolvedV2 && worktreeDir !== join(projectWorktreeRoot, branchName)) {
-      throw new CliError("resolved RPC v2 worktree placement is inconsistent");
+    const branchName = resolvedPlacement?.worktreeBranch ?? `${session}-${randomId()}`;
+    const worktreeDir = resolvedPlacement?.worktreePath
+      ?? join(params.worktreeBase, label, branchName);
+    const worktreeParent = resolvedPlacement ? dirname(worktreeDir) : join(params.worktreeBase, label);
+    if (resolvedPlacement) {
+      try {
+        mkdirSync(worktreeParent, { recursive: true });
+        assertCanonicalWorktreePlacementFilesystem(
+          resolvedPlacement,
+          { existsSync, realpathSync },
+        );
+      } catch (error) {
+        if (preparedLifecycle) {
+          throw new ManagedSessionLifecycleV2InDoubtError(
+            `RPC v2 worktree placement preparation is uncertain for ${worktreeDir}: ${errorDetail(error)}`,
+          );
+        }
+        throw error;
+      }
+    } else {
+      mkdirSync(worktreeParent, { recursive: true });
     }
-    mkdirSync(projectWorktreeRoot, { recursive: true });
 
     log(`🌿 创建 worktree 分支: ${branchName}`);
     log(`   路径: ${worktreeDir}`);

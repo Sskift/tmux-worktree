@@ -1,4 +1,8 @@
-import { basename, isAbsolute, join, normalize } from "node:path";
+import { basename, isAbsolute, normalize } from "node:path";
+import {
+  canonicalWorktreePlacementSegment,
+  parseCanonicalWorktreePlacement,
+} from "./canonicalWorktreePlacement";
 import { expandHomePath, loadConfigFile, resolveWorktreeBase } from "./config";
 import {
   createManagedTerminalSession,
@@ -273,15 +277,17 @@ export function parseRpcV2CreateResolvedWorktreeRequest(
     "publicDisplayName",
     128,
   );
-  const worktreeBase = normalizedAbsolutePath(value.execution.worktreeBase, "worktreeBase");
-  const worktreePath = normalizedAbsolutePath(value.execution.worktreePath, "worktreePath");
-  const worktreeBranch = boundedString(value.execution.worktreeBranch, "worktreeBranch", 255);
+  const placement = parseCanonicalWorktreePlacement({
+    worktreeBase: value.execution.worktreeBase,
+    worktreePath: value.execution.worktreePath,
+    worktreeBranch: value.execution.worktreeBranch,
+  });
   if ((args.project !== undefined
       ? args.project !== effectiveProject
       : effectiveProject !== derivedProject)
     || (args.branch !== undefined && args.branch !== effectiveBaseBranch)
     || !publicDisplayMatches(args.name ?? effectiveProject, publicDisplayName)
-    || worktreePath !== join(worktreeBase, effectiveProject, worktreeBranch)) {
+    || placement.placementSegment !== canonicalWorktreePlacementSegment(effectiveProject)) {
     throw new Error("resolved create-worktree execution is not bound to accepted arguments");
   }
   return {
@@ -292,9 +298,9 @@ export function parseRpcV2CreateResolvedWorktreeRequest(
       effectiveBaseBranch,
       rawSessionName,
       publicDisplayName,
-      worktreeBase,
-      worktreePath,
-      worktreeBranch,
+      worktreeBase: placement.worktreeBase,
+      worktreePath: placement.worktreePath,
+      worktreeBranch: placement.worktreeBranch,
     },
     reservationCorrelation,
   };

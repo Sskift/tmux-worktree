@@ -5,7 +5,9 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -21,6 +23,7 @@ const storageCases = JSON.parse(readFileSync(
   "utf8",
 ));
 const cli = fileURLToPath(new URL("../dist/cli.cjs", import.meta.url));
+const worktreePlacement = await import("../dist/canonicalWorktreePlacement.js");
 const rpc = await import("../dist/rpc.js");
 const rpcV2 = await import("../dist/rpcV2.js");
 const session = await import("../dist/session.js");
@@ -617,6 +620,7 @@ test("resolved worktree lifecycle uses only the frozen branch, placement, raw ta
     },
   }, {
     existsSync: () => true,
+    realpathSync: (path) => path,
     isGitRepo: () => true,
     gitQuery: () => { throw new Error("resolved execution must not query origin HEAD"); },
     exec: (bin, args) => { execCalls.push([bin, structuredClone(args)]); },
@@ -653,6 +657,101 @@ test("resolved worktree lifecycle uses only the frozen branch, placement, raw ta
   const extension = state.managedSessionLifecycleExtension(managedState.sessions[0]);
   assert.equal(extension.displayLabel, "fix-1");
   assert.equal(extension.incarnation, cases.wire.createResolvedWorktree.normalized.session.incarnation);
+});
+
+test("resolved worktree owner consumes safe placement independently of public project identity", () => {
+  const project = "../../.ssh";
+  const placementSegment = worktreePlacement.canonicalWorktreePlacementSegment(project);
+  const worktreePath = `/worktrees/${placementSegment}/${cases.wire.createResolvedWorktree.request.execution.worktreeBranch}`;
+  const calls = [];
+  assert.throws(
+    () => session.createManagedWorktreeSession({
+      aiCmd: "codex",
+      projectDir: "/repo/demo",
+      sessionName: "demo-fix-1",
+      useWorktree: true,
+      worktreeBase: "/worktrees",
+      projectKey: project,
+      branch: "main",
+      profile: "dashboard",
+      quiet: true,
+      resolvedV2: {
+        baseBranch: "main",
+        worktreeBranch: cases.wire.createResolvedWorktree.request.execution.worktreeBranch,
+        worktreePath,
+      },
+    }, {
+      existsSync: () => true,
+      realpathSync: (path) => path,
+      isGitRepo: () => true,
+      exec: (bin, args) => {
+        calls.push([bin, structuredClone(args)]);
+        if (bin === "git" && args.includes("worktree")) throw new Error("stop after capture");
+      },
+      mkdirSync: () => {},
+      tmuxBin: () => "tmux",
+      sessionExists: () => false,
+      randomId: () => { throw new Error("resolved placement must not allocate a path"); },
+      setupClipboardBindings: () => {},
+    }),
+    /stop after capture/,
+  );
+  assert.deepEqual(calls.find(([bin, args]) => bin === "git" && args.includes("worktree"))[1], [
+    "-C", "/repo/demo", "worktree", "add", "-b",
+    cases.wire.createResolvedWorktree.request.execution.worktreeBranch,
+    worktreePath,
+    "origin/main",
+    "--quiet",
+  ]);
+});
+
+test("resolved worktree owner rejects base and child symlinks before git mutation", () => {
+  withTempDir("tw-rpc-v2-placement-symlink-", (temporaryRoot) => {
+    const root = realpathSync(temporaryRoot);
+    const repo = join(root, "repo");
+    const actualBase = join(root, "actual-worktrees");
+    const outside = join(root, "outside");
+    const baseAlias = join(root, "base-alias");
+    mkdirSync(repo, { recursive: true });
+    mkdirSync(actualBase, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(actualBase, baseAlias, "dir");
+    symlinkSync(outside, join(actualBase, "demo"), "dir");
+
+    for (const [name, worktreeBase, worktreePath] of [
+      ["base symlink", baseAlias, join(baseAlias, "demo", "demo-fix-abc12")],
+      ["child symlink", actualBase, join(actualBase, "demo", "demo-fix-abc12")],
+    ]) {
+      const calls = [];
+      assert.throws(
+        () => session.createManagedWorktreeSession({
+          aiCmd: "codex",
+          projectDir: repo,
+          sessionName: "demo-fix-1",
+          useWorktree: true,
+          worktreeBase,
+          projectKey: "demo",
+          branch: "main",
+          profile: "dashboard",
+          quiet: true,
+          resolvedV2: {
+            baseBranch: "main",
+            worktreeBranch: "demo-fix-abc12",
+            worktreePath,
+          },
+        }, {
+          isGitRepo: () => true,
+          exec: (...args) => calls.push(args),
+          tmuxBin: () => "tmux",
+          sessionExists: () => false,
+          setupClipboardBindings: () => {},
+        }),
+        /crosses a symlink/,
+        name,
+      );
+      assert.deepEqual(calls, [], name);
+    }
+  });
 });
 
 test("a v2 worktree mutation error is IN_DOUBT rather than false no-side-effect evidence", () => {

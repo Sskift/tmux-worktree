@@ -4,6 +4,7 @@ import { join } from "node:path";
 import test from "node:test";
 
 const adapterModule = await import("../dist/relay/v2/canonicalCommandExecutorAdapter.js");
+const worktreePlacement = await import("../dist/canonicalWorktreePlacement.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const rpcV2 = await import("../dist/rpcV2.js");
 const backendIdentityFixture = JSON.parse(readFileSync(
@@ -657,7 +658,7 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
   });
 
   await t.test("explicit project remains an exact bounded public value", async () => {
-    for (const project of ["team/demo", ".", ".."]) {
+    for (const project of ["team/demo", ".", "..", "../../.ssh", "/absolute"]) {
       const request = canonicalRequest("create_worktree", {
         arguments: {
           project,
@@ -670,9 +671,10 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
       const ports = fakePorts({
         resolve: (accepted) => {
           const answer = resolvedFor(accepted);
+          const placementSegment = worktreePlacement.canonicalWorktreePlacementSegment(project);
           answer.target.execution.worktreePath = join(
             answer.target.execution.worktreeBase,
-            project,
+            placementSegment,
             WORKTREE_BRANCH,
           );
           answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
@@ -681,6 +683,40 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
       });
       assert.equal((await executorFor(ports).resolve(request)).kind, "executable", project);
       assert.equal(ports.calls.process.length, 0);
+    }
+    assert.equal(worktreePlacement.canonicalWorktreePlacementSegment("demo"), "demo");
+    assert.equal(
+      worktreePlacement.canonicalWorktreePlacementSegment("../../.ssh"),
+      "project-PIVZgQC8mKZcG4Xp-v7DRcD_F-QPqah-gzvuM-Voz3Q",
+    );
+  });
+
+  await t.test("frozen placement cannot escape its canonical worktree base", async () => {
+    for (const [name, mutate] of [
+      ["parent traversal", (target) => {
+        target.execution.worktreePath = `/worktrees/demo/../outside/${WORKTREE_BRANCH}`;
+        target.prospectiveSession.cwd = target.execution.worktreePath;
+      }],
+      ["absolute outside", (target) => {
+        target.execution.worktreePath = `/outside/demo/${WORKTREE_BRANCH}`;
+        target.prospectiveSession.cwd = target.execution.worktreePath;
+      }],
+      ["base itself", (target) => {
+        target.execution.worktreePath = target.execution.worktreeBase;
+        target.prospectiveSession.cwd = target.execution.worktreePath;
+      }],
+    ]) {
+      const ports = fakePorts({
+        resolve: (accepted) => {
+          const answer = resolvedFor(accepted);
+          mutate(answer.target);
+          return answer;
+        },
+      });
+      const admission = await executorFor(ports).resolve(canonicalRequest("create_worktree"));
+      assert.equal(admission.kind, "transient_admission_failure", name);
+      assert.equal(admission.error.commandDisposition, "not_accepted", name);
+      assert.equal(ports.calls.process.length, 0, name);
     }
   });
 
