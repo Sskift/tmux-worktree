@@ -135,6 +135,7 @@ export interface RelayV2StructuredError {
     | "AUTH_INVALID"
     | "CAPABILITY_UNAVAILABLE"
     | "DUPLICATE_CONNECTOR"
+    | "GRANT_NOT_FOUND"
     | "HOST_DIALECT_UNAVAILABLE"
     | "HOST_OFFLINE"
     | "HOST_SUPERSEDED"
@@ -142,6 +143,7 @@ export interface RelayV2StructuredError {
     | "INTERNAL"
     | "INVALID_ENVELOPE"
     | "PERMISSION_DENIED"
+    | "ROLE_MISMATCH"
     | "SLOW_CONSUMER";
   message: string;
   retryable: boolean;
