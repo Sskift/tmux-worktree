@@ -293,10 +293,6 @@ internal data class RelayV2OutboxAttempt(
     }
 }
 
-/**
- * Durable target proof. It is pending while its epoch/window differ from the entry and confirmed
- * once ConfirmQueuedTarget atomically moves the entry to the recorded authority coordinates.
- */
 internal data class RelayV2QueuedTargetRevalidation(
     val observedHostEpoch: String,
     val dedupeWindowId: String,
@@ -305,6 +301,29 @@ internal data class RelayV2QueuedTargetRevalidation(
         requireOutboxId(observedHostEpoch)
         requireOutboxId(dedupeWindowId)
     }
+}
+
+internal data class RelayV2ReissueLineageProof(
+    val parentExpectedHostEpoch: String,
+    val parentDedupeWindowId: String,
+    val parentScopeId: String,
+    val parentSessionId: String?,
+    val firstConfirmedHostEpoch: String?,
+) {
+    init {
+        listOf(
+            parentExpectedHostEpoch,
+            parentDedupeWindowId,
+            parentScopeId,
+        ).forEach(::requireOutboxId)
+        parentSessionId?.let(::requireOutboxId)
+        firstConfirmedHostEpoch?.let {
+            requireOutboxId(it)
+            require(parentExpectedHostEpoch != it)
+        }
+    }
+
+    override fun toString(): String = "RelayV2ReissueLineageProof(<redacted>)"
 }
 
 internal data class RelayV2OutboxEntry(
@@ -327,6 +346,7 @@ internal data class RelayV2OutboxEntry(
     val replacementCommandId: String? = null,
     val reissuedFromCommandId: String? = null,
     val targetRevalidation: RelayV2QueuedTargetRevalidation? = null,
+    val reissueLineageProof: RelayV2ReissueLineageProof? = null,
 ) {
     val id: RelayV2OutboxEntryId = RelayV2OutboxEntryId(
         profileId,
@@ -422,11 +442,8 @@ internal data class RelayV2OutboxEntry(
                 require(replacementCommandId != null)
             }
         }
-        require(
-            targetRevalidation == null ||
-                state == RelayV2OutboxStateTag.QUEUED ||
-                hasConfirmedTargetRevalidation()
-        )
+        require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
+        require(reissueLineageProof == null || reissuedFromCommandId != null)
     }
 
     override fun toString(): String =
@@ -453,6 +470,15 @@ internal data class RelayV2OutboxEntry(
             "principalId" to principalId,
             "profileId" to profileId,
             "reissuedFromCommandId" to reissuedFromCommandId,
+            "reissueLineageProof" to reissueLineageProof?.let {
+                mapOf(
+                    "firstConfirmedHostEpoch" to it.firstConfirmedHostEpoch,
+                    "parentDedupeWindowId" to it.parentDedupeWindowId,
+                    "parentExpectedHostEpoch" to it.parentExpectedHostEpoch,
+                    "parentScopeId" to it.parentScopeId,
+                    "parentSessionId" to it.parentSessionId,
+                )
+            },
             "replacementCommandId" to replacementCommandId,
             "requestFingerprint" to requestFingerprint.sha256Hex,
             "requestFingerprintSchemaVersion" to requestFingerprint.schemaVersion,
@@ -1425,6 +1451,14 @@ internal class RelayV2OutboxAuthorityCore(
                 createdOrder = state.nextCreationOrder,
                 createdAtMillis = reissue.replacementCreatedAtMillis,
                 reissuedFromCommandId = entry.commandId,
+            ).copy(
+                reissueLineageProof = RelayV2ReissueLineageProof(
+                    parentExpectedHostEpoch = entry.expectedHostEpoch,
+                    parentDedupeWindowId = entry.dedupeWindowId,
+                    parentScopeId = entry.scopeId,
+                    parentSessionId = entry.sessionId,
+                    firstConfirmedHostEpoch = null,
+                ),
             )
             if (state.entry(replacement.id) != null) {
                 return state.reject(RelayV2OutboxRejection.DUPLICATE_COMMAND)
@@ -1516,9 +1550,6 @@ internal class RelayV2OutboxAuthorityCore(
             ?: return state.reject(RelayV2OutboxRejection.ENTRY_NOT_FOUND)
         val pending = entry.targetRevalidation
             ?: return state.reject(RelayV2OutboxRejection.TARGET_REVALIDATION_REQUIRED)
-        if (!entry.requiresTargetRevalidation()) {
-            return state.reject(RelayV2OutboxRejection.TARGET_REVALIDATION_REQUIRED)
-        }
         if (entry.state != RelayV2OutboxStateTag.QUEUED ||
             pending.observedHostEpoch != action.observedHostEpoch ||
             pending.dedupeWindowId != action.currentDedupeWindowId
@@ -1529,6 +1560,16 @@ internal class RelayV2OutboxAuthorityCore(
             return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
         }
         val canonical = entry.canonicalRequestArguments
+        if (entry.reissuedFromCommandId != null && entry.reissueLineageProof == null) {
+            return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
+        }
+        val reissueLineageProof = entry.reissueLineageProof?.let { proof ->
+            if (proof.firstConfirmedHostEpoch == null) {
+                proof.copy(firstConfirmedHostEpoch = action.observedHostEpoch)
+            } else {
+                proof
+            }
+        }
         val updated = entry.copy(
             expectedHostEpoch = action.observedHostEpoch,
             dedupeWindowId = action.currentDedupeWindowId,
@@ -1544,7 +1585,8 @@ internal class RelayV2OutboxAuthorityCore(
                 action.verifiedSessionId,
                 canonical,
             ),
-            targetRevalidation = pending,
+            targetRevalidation = null,
+            reissueLineageProof = reissueLineageProof,
         )
         if (state.entries.any { it.id == updated.id && it.id != entry.id }) {
             return state.reject(RelayV2OutboxRejection.DUPLICATE_COMMAND)
@@ -1669,13 +1711,8 @@ private fun RelayV2OutboxEntry.appendAttempt(
     state = nextState,
 )
 
-private fun RelayV2OutboxEntry.hasConfirmedTargetRevalidation(): Boolean =
-    targetRevalidation?.let {
-        it.observedHostEpoch == expectedHostEpoch && it.dedupeWindowId == dedupeWindowId
-    } == true
-
 private fun RelayV2OutboxEntry.requiresTargetRevalidation(): Boolean =
-    targetRevalidation != null && !hasConfirmedTargetRevalidation()
+    targetRevalidation != null
 
 private fun RelayV2OutboxEntry.command(): RelayV2OutboxCommand = RelayV2OutboxCommand(
     entryId = id,
@@ -1891,6 +1928,13 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
         commandId.length +
         scopeId.length +
         (sessionId?.length ?: 0) +
+        (targetRevalidation?.observedHostEpoch?.length ?: 0) +
+        (targetRevalidation?.dedupeWindowId?.length ?: 0) +
+        (reissueLineageProof?.parentExpectedHostEpoch?.length ?: 0) +
+        (reissueLineageProof?.parentDedupeWindowId?.length ?: 0) +
+        (reissueLineageProof?.parentScopeId?.length ?: 0) +
+        (reissueLineageProof?.parentSessionId?.length ?: 0) +
+        (reissueLineageProof?.firstConfirmedHostEpoch?.length ?: 0) +
         attempts.sumOf { it.requestId.length.toLong() }
 
 private fun <T> immutableListSnapshot(values: List<T>): List<T> =
@@ -1939,34 +1983,50 @@ private fun validateAttemptOwnership(entries: List<RelayV2OutboxEntry>) {
     }
 }
 
+private data class RelayV2ReissueLineageKey(
+    val profileId: String,
+    val principalId: String,
+    val hostId: String,
+    val commandId: String,
+)
+
+private fun RelayV2OutboxEntry.reissueLineageKey(
+    commandId: String = this.commandId,
+): RelayV2ReissueLineageKey = RelayV2ReissueLineageKey(
+    profileId,
+    principalId,
+    hostId,
+    commandId,
+)
+
 private fun validateReissueGraph(entries: List<RelayV2OutboxEntry>) {
-    fun parentFor(child: RelayV2OutboxEntry): RelayV2OutboxEntry {
-        val parentCommandId = child.reissuedFromCommandId
-            ?: error("replacement lacks reverse pointer")
-        return entries.singleOrNull { candidate ->
-            candidate.profileId == child.profileId &&
-                candidate.principalId == child.principalId &&
-                candidate.hostId == child.hostId &&
-                candidate.commandId == parentCommandId &&
-                candidate.replacementCommandId == child.commandId
-        } ?: error("reissue replacement is orphaned or ambiguous")
+    val entriesByKey = HashMap<RelayV2ReissueLineageKey, RelayV2OutboxEntry>(entries.size)
+    entries.forEach { entry ->
+        require(entriesByKey.put(entry.reissueLineageKey(), entry) == null) {
+            "duplicate stable reissue lineage key"
+        }
     }
 
-    fun childFor(parent: RelayV2OutboxEntry): RelayV2OutboxEntry {
-        val replacementCommandId = parent.replacementCommandId
-            ?: error("REISSUED entry lacks replacement pointer")
-        return entries.singleOrNull { candidate ->
-            candidate.profileId == parent.profileId &&
-                candidate.principalId == parent.principalId &&
-                candidate.hostId == parent.hostId &&
-                candidate.commandId == replacementCommandId &&
-                candidate.reissuedFromCommandId == parent.commandId
-        } ?: error("REISSUED entry lacks a unique replacement")
-    }
-
+    val parentToChild =
+        HashMap<RelayV2ReissueLineageKey, RelayV2ReissueLineageKey>(entries.size)
+    val childToParent =
+        HashMap<RelayV2ReissueLineageKey, RelayV2ReissueLineageKey>(entries.size)
     entries.forEach { child ->
-        if (child.reissuedFromCommandId == null) return@forEach
-        val parent = parentFor(child)
+        val parentCommandId = child.reissuedFromCommandId ?: return@forEach
+        val childKey = child.reissueLineageKey()
+        val parentKey = child.reissueLineageKey(parentCommandId)
+        require(parentToChild.put(parentKey, childKey) == null) {
+            "reissue parent has multiple replacements"
+        }
+        require(childToParent.put(childKey, parentKey) == null) {
+            "reissue replacement has multiple parents"
+        }
+    }
+
+    childToParent.forEach { (childKey, parentKey) ->
+        val child = entriesByKey.getValue(childKey)
+        val parent = entriesByKey[parentKey]
+            ?: error("reissue replacement is orphaned")
         require(parent.state == RelayV2OutboxStateTag.REISSUED) {
             "reissue parent is not REISSUED"
         }
@@ -1975,35 +2035,62 @@ private fun validateReissueGraph(entries: List<RelayV2OutboxEntry>) {
         }
         require(parent.hasSameReissueIntent(child)) { "reissue intent or authority mismatch" }
     }
-    entries.filter { it.state == RelayV2OutboxStateTag.REISSUED }.forEach { parent ->
-        val child = childFor(parent)
-        require(child.reissuedFromCommandId == parent.commandId) {
+    entries.forEach { parent ->
+        if (parent.state != RelayV2OutboxStateTag.REISSUED) return@forEach
+        val parentKey = parent.reissueLineageKey()
+        val replacementCommandId = parent.replacementCommandId
+            ?: error("REISSUED entry lacks replacement pointer")
+        val expectedChildKey = parent.reissueLineageKey(replacementCommandId)
+        val childKey = parentToChild[parentKey]
+            ?: error("REISSUED entry lacks replacement")
+        require(childKey == expectedChildKey && childToParent[childKey] == parentKey) {
             "reissue forward pointer mismatch"
         }
+        val child = entriesByKey[childKey]
+            ?: error("REISSUED entry lacks replacement")
         require(parent.hasSameReissueIntent(child)) { "reissue intent or authority mismatch" }
     }
-    entries.forEach { start ->
-        val visited = mutableSetOf<RelayV2OutboxEntryId>()
-        var current: RelayV2OutboxEntry? = start
-        while (current?.state == RelayV2OutboxStateTag.REISSUED) {
-            require(visited.add(current.id)) { "reissue graph contains a cycle" }
-            current = childFor(current)
+
+    // Each indexed link is followed once: a key moves from unseen to visiting to done only once.
+    val colors = HashMap<RelayV2ReissueLineageKey, Int>(entries.size)
+    entriesByKey.keys.forEach { start ->
+        if (colors[start] == REISSUE_GRAPH_DONE) return@forEach
+        val path = mutableListOf<RelayV2ReissueLineageKey>()
+        var current: RelayV2ReissueLineageKey? = start
+        while (current != null && colors[current] == null) {
+            colors[current] = REISSUE_GRAPH_VISITING
+            path += current
+            current = parentToChild[current]
         }
+        require(current == null || colors[current] != REISSUE_GRAPH_VISITING) {
+            "reissue graph contains a cycle"
+        }
+        path.forEach { colors[it] = REISSUE_GRAPH_DONE }
     }
 }
+
+private const val REISSUE_GRAPH_VISITING = 1
+private const val REISSUE_GRAPH_DONE = 2
 
 private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): Boolean {
     val sameHistoricalTarget = expectedHostEpoch == other.expectedHostEpoch &&
         scopeId == other.scopeId &&
         sessionId == other.sessionId
-    val explicitlyRevalidatedTarget = expectedHostEpoch != other.expectedHostEpoch &&
-        other.hasConfirmedTargetRevalidation()
+    val lineageProofMatchesParent = other.reissueLineageProof?.let { proof ->
+        proof.parentExpectedHostEpoch == expectedHostEpoch &&
+            proof.parentDedupeWindowId == dedupeWindowId &&
+            proof.parentScopeId == scopeId &&
+            proof.parentSessionId == sessionId
+    } ?: true
+    val explicitlyRevalidatedTarget = lineageProofMatchesParent &&
+        other.reissueLineageProof?.firstConfirmedHostEpoch != null
     return profileId == other.profileId &&
         principalId == other.principalId &&
         hostId == other.hostId &&
         operation == other.operation &&
         canonicalRequestArguments == other.canonicalRequestArguments &&
         dedupeWindowId != other.dedupeWindowId &&
+        lineageProofMatchesParent &&
         (sameHistoricalTarget || explicitlyRevalidatedTarget)
 }
 

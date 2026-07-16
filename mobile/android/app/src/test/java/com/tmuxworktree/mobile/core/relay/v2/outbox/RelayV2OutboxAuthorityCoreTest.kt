@@ -502,24 +502,78 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals("epoch-revalidated", confirmedReplacement.expectedHostEpoch)
         assertEquals("revalidated-scope", confirmedReplacement.scopeId)
         assertEquals("revalidated-session", confirmedReplacement.sessionId)
-        assertEquals(
-            "epoch-revalidated",
-            confirmedReplacement.targetRevalidation?.observedHostEpoch,
-        )
+        assertEquals(null, confirmedReplacement.targetRevalidation)
+        val firstLineageProof = confirmedReplacement.reissueLineageProof!!
+        assertEquals(original.expectedHostEpoch, firstLineageProof.parentExpectedHostEpoch)
+        assertEquals(original.dedupeWindowId, firstLineageProof.parentDedupeWindowId)
+        assertEquals("epoch-revalidated", firstLineageProof.firstConfirmedHostEpoch)
         assertNotEquals(
             replacement.requestFingerprint.sha256Hex,
             confirmedReplacement.requestFingerprint.sha256Hex,
         )
 
-        val restored = RelayV2OutboxState.restore(
+        val firstCheckpoint = RelayV2OutboxState.restore(
             confirmed.state.entries,
             confirmed.state.nextCreationOrder,
         )
-        val restoredReplacement = restored.entries.single {
+        val secondEpochPending = applied(
+            core.reduce(
+                firstCheckpoint,
+                RelayV2OutboxAction.HostEpochChanged(
+                    profileId = original.profileId,
+                    principalId = original.principalId,
+                    hostId = original.hostId,
+                    previousHostEpoch = "epoch-revalidated",
+                    observedHostEpoch = "epoch-revalidated-again",
+                    currentDedupeWindowId = "window-revalidated-again",
+                    oldLineageAvailability = RelayV2OldLineageAvailability.LOST,
+                ),
+            ),
+        )
+        val pendingAgain = secondEpochPending.state.entries.single {
+            it.commandId == replacement.commandId
+        }
+        assertEquals(
+            "epoch-revalidated-again",
+            pendingAgain.targetRevalidation?.observedHostEpoch,
+        )
+        assertEquals(firstLineageProof, pendingAgain.reissueLineageProof)
+
+        val pendingCheckpoint = RelayV2OutboxState.restore(
+            secondEpochPending.state.entries,
+            secondEpochPending.state.nextCreationOrder,
+        )
+        val checkpointedPending = pendingCheckpoint.entries.single {
+            it.commandId == replacement.commandId
+        }
+        val confirmedAgain = applied(
+            core.reduce(
+                pendingCheckpoint,
+                RelayV2OutboxAction.ConfirmQueuedTarget(
+                    entryId = checkpointedPending.id,
+                    observedHostEpoch = "epoch-revalidated-again",
+                    currentDedupeWindowId = "window-revalidated-again",
+                    verifiedScopeId = "revalidated-scope-again",
+                    verifiedSessionId = "revalidated-session-again",
+                ),
+            ),
+        )
+        val confirmedAgainReplacement = confirmedAgain.state.entries.single {
+            it.commandId == replacement.commandId
+        }
+        assertEquals("epoch-revalidated-again", confirmedAgainReplacement.expectedHostEpoch)
+        assertEquals(null, confirmedAgainReplacement.targetRevalidation)
+        assertEquals(firstLineageProof, confirmedAgainReplacement.reissueLineageProof)
+
+        val finalCheckpoint = RelayV2OutboxState.restore(
+            confirmedAgain.state.entries,
+            confirmedAgain.state.nextCreationOrder,
+        )
+        val restoredReplacement = finalCheckpoint.entries.single {
             it.commandId == replacement.commandId
         }
         val dispatchedReplacement = dispatch(
-            restored,
+            finalCheckpoint,
             mapOf(restoredReplacement.id to "revalidated-replacement-attempt"),
         )
         assertEquals(
@@ -894,8 +948,8 @@ class RelayV2OutboxAuthorityCoreTest {
         ).state.entries.single { it.commandId == "queued" }
         assertEquals("epoch-b", revalidated.expectedHostEpoch)
         assertEquals("opaque-session-b", revalidated.sessionId)
-        assertEquals("epoch-b", revalidated.targetRevalidation?.observedHostEpoch)
-        assertEquals("window-b", revalidated.targetRevalidation?.dedupeWindowId)
+        assertEquals(null, revalidated.targetRevalidation)
+        assertEquals(null, revalidated.reissueLineageProof)
         assertNotEquals(
             queued.requestFingerprint.sha256Hex,
             revalidated.requestFingerprint.sha256Hex,
@@ -1262,6 +1316,74 @@ class RelayV2OutboxAuthorityCoreTest {
             reissuedFromCommandId = parent.commandId,
         )
         restoreFailure(listOf(cyclicParent, cyclicChild), valid.nextCreationOrder)
+    }
+
+    @Test(timeout = 15_000)
+    fun `maximum reissue chain restores and applies a terminal dispatch within bounded work`() {
+        val templates = sourceState(RelayV2OutboxStateTag.REISSUED)
+        val firstWindowTemplate = templates.entries.single { it.dedupeWindowId == "window-a" }
+        val secondWindowTemplate = templates.entries.single { it.dedupeWindowId == "window-b" }
+        val entryCount = RelayV2OutboxLimits.MAX_ENTRIES
+        val chain = List(entryCount) { index ->
+            val template = if (index % 2 == 0) firstWindowTemplate else secondWindowTemplate
+            val parentTemplate = if (index % 2 == 0) secondWindowTemplate else firstWindowTemplate
+            val commandId = "bounded-chain-$index"
+            val isLast = index == entryCount - 1
+            template.copy(
+                commandId = commandId,
+                state = if (isLast) {
+                    RelayV2OutboxStateTag.QUEUED
+                } else {
+                    RelayV2OutboxStateTag.REISSUED
+                },
+                acceptanceEvidence = RelayV2OutboxAcceptanceEvidence.NONE,
+                attempts = if (isLast) {
+                    emptyList()
+                } else {
+                    listOf(
+                        RelayV2OutboxAttempt(
+                            "bounded-chain-attempt-$index",
+                            RelayV2OutboxAttemptKind.EXECUTE,
+                            1,
+                        ),
+                    )
+                },
+                createdOrder = index.toLong(),
+                createdAtMillis = index.toLong(),
+                replacementCommandId = if (isLast) null else "bounded-chain-${index + 1}",
+                reissuedFromCommandId = if (index == 0) null else "bounded-chain-${index - 1}",
+                targetRevalidation = null,
+                reissueLineageProof = if (index == 0) {
+                    null
+                } else {
+                    RelayV2ReissueLineageProof(
+                        parentExpectedHostEpoch = parentTemplate.expectedHostEpoch,
+                        parentDedupeWindowId = parentTemplate.dedupeWindowId,
+                        parentScopeId = parentTemplate.scopeId,
+                        parentSessionId = parentTemplate.sessionId,
+                        firstConfirmedHostEpoch = null,
+                    )
+                },
+            )
+        }
+
+        val restored = RelayV2OutboxState.restore(chain, entryCount.toLong())
+        assertEquals(entryCount, restored.entries.size)
+        val terminal = restored.entries.single { it.commandId == "bounded-chain-${entryCount - 1}" }
+        val dispatched = applied(
+            core.reduce(
+                restored,
+                RelayV2OutboxAction.DispatchEligible(
+                    mapOf(terminal.id to "bounded-chain-terminal-dispatch"),
+                    effectBudget = 1,
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2OutboxStateTag.SENDING,
+            dispatched.state.entries.single { it.commandId == terminal.commandId }.state,
+        )
+        assertTrue(dispatched.effects.single() is RelayV2OutboxEffect.ExecuteCommand)
     }
 
     @Test
