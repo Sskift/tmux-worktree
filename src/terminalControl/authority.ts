@@ -805,6 +805,12 @@ export class TerminalControlAuthority {
         }
         if (detached.remaining) {
           const output = await this.prepareOutput(state, target);
+          if (target.ownership.state !== "HELD") {
+            throw new TerminalControlProtocolError(
+              "INTERNAL",
+              "terminal-control release no longer owns the target",
+            );
+          }
           if (!sameOwner(target.ownership.owner, detached.remaining)) {
             target.ownership.owner = detached.remaining;
             revision(target);

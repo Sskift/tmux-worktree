@@ -1475,6 +1475,10 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       ));
   }
 
+  private isTerminalFailure(): boolean {
+    return this.phase === "terminal_failure";
+  }
+
   private canDrainBrokerControlNow(): boolean {
     if (!this.shouldDrainBrokerControl()) return false;
     return this.brokerToHost.entries.some((entry) => (
@@ -1513,7 +1517,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
           "pending",
           entry.emergency,
         );
-        if (this.phase === "terminal_failure") return;
+        if (this.isTerminalFailure()) return;
       }
       const retired = this.retiredBrokerActionAttempt;
       if (retired && retired.entry.mandatory) {
@@ -1525,13 +1529,13 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
         );
       }
       const disconnected = this.disconnectBrokerForClose();
-      if (!disconnected || this.phase === "terminal_failure") return;
+      if (!disconnected || this.isTerminalFailure()) return;
       for (const entry of [...this.closeActions]) {
         if (entry.emergency && entry.state === "pending"
           && !this.forceRegisteredOverflow(entry)) return;
       }
       for (const action of disconnected.actions) {
-        if (this.actionAdmissionStopped || this.phase === "terminal_failure") break;
+        if (this.actionAdmissionStopped || this.isTerminalFailure()) break;
         let bytes = 0;
         try {
           bytes = Buffer.byteLength(JSON.stringify(action), "utf8");
@@ -1547,7 +1551,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
           "pending",
         );
       }
-      if (this.phase === "terminal_failure") return;
+      if (this.isTerminalFailure()) return;
       const weakPump = new WeakRef(this);
       const cancel = this.schedule(this.deliveryTimeoutMs, () => {
         const pump = weakPump.deref();

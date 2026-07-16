@@ -916,29 +916,37 @@ function parseManifest(value: unknown): PersistedManifest {
   assertCanonicalCounter(value.throughEventSeq, "throughEventSeq");
   assertCanonicalCounter(value.scopesRevision, "scopesRevision");
   for (const field of ["totalRecords", "totalCanonicalBytes", "metadataBytes"] as const) {
-    if (!Number.isSafeInteger(value[field]) || (value[field] as number) < 0) {
+    if (typeof value[field] !== "number"
+      || !Number.isSafeInteger(value[field])
+      || value[field] < 0) {
       throw new Error(`snapshot manifest ${field} is invalid`);
     }
   }
+  const totalRecords = value.totalRecords as number;
+  const totalCanonicalBytes = value.totalCanonicalBytes as number;
+  const metadataBytes = value.metadataBytes as number;
   assertDigest(value.cutDigest, "cut digest");
   if (value.snapshotAbsoluteExpiresAtMs <= value.snapshotCreatedAtMs
     || value.chunks.length === 0) {
     throw new Error("snapshot manifest lifetime or chunks are invalid");
   }
-  const chunks = value.chunks.map((chunk, index) => {
+  const rawChunks = value.chunks;
+  const chunks = rawChunks.map((chunk, index) => {
     if (!isRecord(chunk) || !exactKeys(chunk, [
       "index", "file", "recordCount", "canonicalBytes", "digest", "nextCursor",
     ])
       || chunk.index !== index
       || chunk.file !== chunkFilename(index)
+      || typeof chunk.recordCount !== "number"
       || !Number.isSafeInteger(chunk.recordCount)
       || chunk.recordCount < 0
+      || typeof chunk.canonicalBytes !== "number"
       || !Number.isSafeInteger(chunk.canonicalBytes)
       || chunk.canonicalBytes < 2) {
       throw new Error("snapshot chunk index is malformed");
     }
     assertDigest(chunk.digest, "chunk digest");
-    if (index === value.chunks.length - 1) {
+    if (index === rawChunks.length - 1) {
       if (chunk.nextCursor !== null) throw new Error("last snapshot chunk has a cursor");
     } else {
       assertOpaqueId(chunk.nextCursor, "nextCursor", 1_024);
@@ -961,10 +969,10 @@ function parseManifest(value: unknown): PersistedManifest {
     snapshotAbsoluteExpiresAtMs: value.snapshotAbsoluteExpiresAtMs,
     throughEventSeq: value.throughEventSeq,
     scopesRevision: value.scopesRevision,
-    totalRecords: value.totalRecords,
-    totalCanonicalBytes: value.totalCanonicalBytes,
+    totalRecords,
+    totalCanonicalBytes,
     cutDigest: value.cutDigest,
-    metadataBytes: value.metadataBytes,
+    metadataBytes,
     chunks,
   };
 }
@@ -1020,7 +1028,8 @@ function parseTombstone(value: unknown): PersistedSnapshotTombstone {
   }
   assertSafeTimestamp(value.recordedAtMs, "tombstone time");
   assertSafeTimestamp(value.expiresAtMs, "tombstone expiry");
-  if (!Number.isSafeInteger(value.metadataBytes) || value.metadataBytes <= 0
+  if (typeof value.metadataBytes !== "number"
+    || !Number.isSafeInteger(value.metadataBytes) || value.metadataBytes <= 0
     || value.expiresAtMs <= value.recordedAtMs) {
     throw new Error("snapshot release tombstone fields are invalid");
   }
@@ -1051,10 +1060,13 @@ function parseReservation(value: unknown): PersistedReservation {
   const binding = parseBinding(value.binding);
   assertSafeTimestamp(value.snapshotCreatedAtMs, "createdAt");
   assertSafeTimestamp(value.snapshotAbsoluteExpiresAtMs, "absolute expiry");
-  if (!Number.isSafeInteger(value.reservedRecords)
+  if (typeof value.reservedRecords !== "number"
+    || !Number.isSafeInteger(value.reservedRecords)
     || value.reservedRecords < 0
+    || typeof value.reservedCanonicalBytes !== "number"
     || !Number.isSafeInteger(value.reservedCanonicalBytes)
     || value.reservedCanonicalBytes <= 0
+    || typeof value.reservedMetadataBytes !== "number"
     || !Number.isSafeInteger(value.reservedMetadataBytes)
     || value.reservedMetadataBytes <= 0) {
     throw new Error("snapshot reservation quota is invalid");
@@ -1085,7 +1097,7 @@ function parseOwner(value: unknown): PersistedSpoolOwner {
   assertOpaqueId(value.ownerInstanceId, "ownerInstanceId");
   assertOpaqueId(value.fence, "ownerFence");
   assertSafeTimestamp(value.acquiredAtMs, "owner acquisition");
-  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
+  if (typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0) {
     throw new Error("snapshot spool owner pid is malformed");
   }
   assertOpaqueId(value.processIncarnation, "processIncarnation");
@@ -1108,7 +1120,7 @@ function parseLockHolder(value: unknown): PersistedLockHolder {
     throw new Error("snapshot spool lock metadata is malformed");
   }
   assertOpaqueId(value.token, "lockToken");
-  if (!Number.isSafeInteger(value.pid) || value.pid <= 0) {
+  if (typeof value.pid !== "number" || !Number.isSafeInteger(value.pid) || value.pid <= 0) {
     throw new Error("snapshot spool lock pid is malformed");
   }
   assertOpaqueId(value.processIncarnation, "processIncarnation");
@@ -2684,6 +2696,7 @@ export class RelayV2StateSnapshotSpool {
       let stagingDirectory: string | undefined;
       let finalDirectory: string | undefined;
       let publication: "precommit" | "renamed" | "published" = "precommit";
+      const publicationState = (): "precommit" | "renamed" | "published" => publication;
       let reservationRemoved = false;
       const removePublishedReservation = () => {
         if (reservationRemoved) return;
@@ -2754,15 +2767,15 @@ export class RelayV2StateSnapshotSpool {
       } catch (error) {
         const failure = structuredSpoolError(error);
         try {
-          if (publication !== "published") {
+          if (publicationState() !== "published") {
             expireBuildingReservation(failure);
           }
-          if (publication === "renamed" && finalDirectory !== undefined) {
+          if (publicationState() === "renamed" && finalDirectory !== undefined) {
             rmSync(finalDirectory, { recursive: true, force: true });
             this.syncDirectory(this.paths.cuts, "rollback_cuts");
             this.syncDirectory(this.paths.staging, "rollback_staging");
             stagingDirectory = undefined;
-          } else if (publication === "precommit" && stagingDirectory !== undefined) {
+          } else if (publicationState() === "precommit" && stagingDirectory !== undefined) {
             rmSync(stagingDirectory, { recursive: true, force: true });
             fsyncDirectory(this.paths.staging);
             stagingDirectory = undefined;
@@ -2774,7 +2787,7 @@ export class RelayV2StateSnapshotSpool {
             "snapshot publication rollback is uncertain and the spool is fail-closed",
           );
         }
-        if (publication === "published") {
+        if (publicationState() === "published") {
           this.fatalUnavailable = true;
           throw new RelayV2StateSnapshotSpoolError(
             "INTERNAL",

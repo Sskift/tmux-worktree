@@ -107,6 +107,11 @@ export interface RelayV2HostCarrierDialectAdapter {
   validate(payload: Uint8Array): void;
 }
 
+export interface RelayV2HostCarrierPublicPayloadDecoder {
+  /** Called only after canonical encoded-length preflight passed. */
+  decodeCanonicalBase64(encoded: string): Uint8Array;
+}
+
 export interface RelayV2HostRouteBinding {
   readonly connectorGeneration: number;
   readonly connectorId: string;
@@ -133,14 +138,17 @@ export type RelayV2HostLocalUnbindReason =
   | "connector_replaced"
   | "host_superseded";
 
+export type RelayV2HostCarrierStructuredErrorCode =
+  | "BUSY"
+  | "PERMISSION_DENIED"
+  | "HOST_DIALECT_UNAVAILABLE"
+  | "CAPABILITY_UNAVAILABLE"
+  | "SLOW_CONSUMER"
+  | "INTERNAL";
+
 export interface RelayV2HostRouteBindingRejection {
   readonly accepted: false;
-  readonly code:
-    | "BUSY"
-    | "PERMISSION_DENIED"
-    | "HOST_DIALECT_UNAVAILABLE"
-    | "CAPABILITY_UNAVAILABLE"
-    | "INTERNAL";
+  readonly code: Exclude<RelayV2HostCarrierStructuredErrorCode, "SLOW_CONSUMER">;
   readonly message: string;
   readonly retryable: boolean;
 }
@@ -189,6 +197,7 @@ export interface RelayV2HostCarrierOptions {
   routeSink: RelayV2HostCarrierRouteSink;
   clientDialects?: readonly RelayV2HostCarrierClientDialect[];
   dialectAdapters?: Partial<Record<RelayV2HostCarrierClientDialect, RelayV2HostCarrierDialectAdapter>>;
+  publicPayloadDecoder?: RelayV2HostCarrierPublicPayloadDecoder;
   /** Defaults to no base capabilities. The actor is not a readiness signal. */
   advertisedCapabilities?: readonly string[];
   maxFrameBytes?: number;
@@ -376,8 +385,17 @@ function counterField(object: RelayV2JsonObject, name: string): bigint {
   return BigInt(stringField(object, name));
 }
 
+function canonicalBase64DecodedLength(encoded: string): number | null {
+  if (encoded.length % 4 !== 0) return null;
+  const quartets = encoded.length / 4;
+  if (!Number.isSafeInteger(quartets)
+    || quartets > Math.floor((Number.MAX_SAFE_INTEGER + 2) / 3)) return null;
+  const padding = encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0;
+  return quartets * 3 - padding;
+}
+
 function publicBytes(encoded: string): Uint8Array {
-  return Uint8Array.from(Buffer.from(encoded, "base64"));
+  return Buffer.from(encoded, "base64");
 }
 
 function copyCredentialMetadata(
@@ -419,12 +437,7 @@ function validateCredentialRecord(
 }
 
 function structuredError(
-  code:
-    | "BUSY"
-    | "PERMISSION_DENIED"
-    | "HOST_DIALECT_UNAVAILABLE"
-    | "SLOW_CONSUMER"
-    | "INTERNAL",
+  code: RelayV2HostCarrierStructuredErrorCode,
   message: string,
   retryable: boolean,
 ): RelayV2JsonObject {
@@ -446,6 +459,7 @@ export class RelayV2HostCarrierActor {
   private readonly capabilities: string[];
   private readonly clientDialects: RelayV2HostCarrierClientDialect[];
   private readonly v1DialectAdapter?: RelayV2HostCarrierDialectAdapter;
+  private readonly publicPayloadDecoder: RelayV2HostCarrierPublicPayloadDecoder;
   private readonly maxFrameBytes: number;
   private readonly terminalMaxFrameBytes: number;
   private generation = 0;
@@ -465,6 +479,9 @@ export class RelayV2HostCarrierActor {
     this.capabilities = [...(options.advertisedCapabilities ?? [])];
     this.clientDialects = [...(options.clientDialects ?? ["tw-relay.v2"])];
     this.v1DialectAdapter = options.dialectAdapters?.["tw-relay.v1"];
+    this.publicPayloadDecoder = options.publicPayloadDecoder ?? {
+      decodeCanonicalBase64: publicBytes,
+    };
     if (this.clientDialects.length === 0
       || new Set(this.clientDialects).size !== this.clientDialects.length
       || this.clientDialects.some((dialect) => (
@@ -999,12 +1016,7 @@ export class RelayV2HostCarrierActor {
   private rejectRoute(
     connector: ConnectorState,
     request: RelayV2JsonObject,
-    code:
-      | "BUSY"
-      | "PERMISSION_DENIED"
-      | "HOST_DIALECT_UNAVAILABLE"
-      | "CAPABILITY_UNAVAILABLE"
-      | "INTERNAL",
+    code: RelayV2HostRouteBindingRejection["code"],
     message: string,
     retryable: boolean,
   ): void {
@@ -1044,9 +1056,27 @@ export class RelayV2HostCarrierActor {
       return;
     }
     const payload = objectField(frame, "payload");
-    const bytes = publicBytes(stringField(payload, "data"));
-    if (bytes.byteLength > route.binding.maxFrameBytes) {
+    const encoded = stringField(payload, "data");
+    const decodedLength = canonicalBase64DecodedLength(encoded);
+    if (decodedLength === null) {
+      this.failConnector(connector, 4400, "invalid_public_route_frame");
+      return;
+    }
+    if (decodedLength > route.binding.maxFrameBytes) {
       this.failConnector(connector, 4400, "route_frame_limit");
+      return;
+    }
+    let bytes: Uint8Array;
+    try {
+      bytes = this.publicPayloadDecoder.decodeCanonicalBase64(encoded);
+    } catch {
+      this.failConnector(connector, 4400, "invalid_public_route_frame");
+      return;
+    }
+    if (!(bytes instanceof Uint8Array)
+      || bytes.byteLength !== decodedLength
+      || bytes.byteLength > route.binding.maxFrameBytes) {
+      this.failConnector(connector, 4400, "invalid_public_route_frame");
       return;
     }
     try {

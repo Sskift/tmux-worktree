@@ -65,7 +65,7 @@ export async function runTerminalControlProxy(options: {
   const output = options.output ?? stdout;
   const requestFn = options.request
     ?? ((request) => requestTerminalControl(request, { autoStart: true }));
-  let pending = Buffer.alloc(0);
+  let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
 
   for await (const chunk of input) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, "utf8");

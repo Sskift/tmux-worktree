@@ -29,10 +29,21 @@ const ROUTE_ONE = {
   connectorId: "connector-one",
   routeId: "route-one",
   routeFence: "fence-one",
+  runtimeBindingToken: "runtime-binding-one",
 };
 
 function clone(value) {
   return structuredClone(value);
+}
+
+function exactRoute(route) {
+  route.runtimeBindingToken ??= [
+    "runtime-binding",
+    route.connectorId,
+    route.routeId,
+    route.routeFence,
+  ].join(":");
+  return clone(route);
 }
 
 function managerError(code) {
@@ -407,7 +418,6 @@ function goldenOpen(overrides = {}) {
   const frame = clone(fixtures.goldenByName.get("terminal-open-new").frame);
   return {
     auth: clone(AUTH),
-    route: clone(ROUTE_ONE),
     requestId: frame.requestId,
     expectedHostEpoch: frame.expectedHostEpoch,
     target: clone(TARGET),
@@ -418,6 +428,7 @@ function goldenOpen(overrides = {}) {
     rows: frame.payload.rows,
     mode: frame.payload.mode,
     ...overrides,
+    route: exactRoute(overrides.route ?? ROUTE_ONE),
   };
 }
 
@@ -430,7 +441,7 @@ function opened(sent, requestId) {
 function streamContext(openedFrame, route = ROUTE_ONE, overrides = {}) {
   return {
     auth: clone(AUTH),
-    route: clone(route),
+    route: exactRoute(route),
     streamId: openedFrame.streamId,
     generation: openedFrame.payload.generation,
     ...overrides,
@@ -440,7 +451,7 @@ function streamContext(openedFrame, route = ROUTE_ONE, overrides = {}) {
 function closeRequest(openedFrame, route = ROUTE_ONE, overrides = {}) {
   return {
     auth: clone(AUTH),
-    route: clone(route),
+    route: exactRoute(route),
     requestId: "close-attempt",
     expectedHostEpoch: HOST_EPOCH,
     target: clone(TARGET),
@@ -483,7 +494,7 @@ test("lost open and close responses replay retained control results without dupl
   };
 
   const reboundRoute = { connectorId: "connector-two", routeId: "route-two", routeFence: "fence-two" };
-  const retry = { ...first, route: reboundRoute, requestId: "open-retry" };
+  const retry = { ...first, route: exactRoute(reboundRoute), requestId: "open-retry" };
   await h.manager.open(retry);
   const retryOpened = opened(h.sent, "open-retry");
   assert.ok(retryOpened);
@@ -501,6 +512,21 @@ test("lost open and close responses replay retained control results without dupl
   await h.manager.close(closeRequest(retryOpened, reboundRoute));
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
   assert.equal(h.sent.some(({ frame }) => frame.type === "terminal.closed"), false);
+  assert.equal(
+    Object.hasOwn(h.lineage.claimCloseCalls[0].intent.requestRoute, "runtimeBindingToken"),
+    false,
+    "process-local binding tokens must not enter durable lineage",
+  );
+  assert.deepEqual(
+    Reflect.ownKeys(h.lineage.claimCloseCalls[0].intent.requestRoute).sort(),
+    ["connectorId", "routeFence", "routeId"],
+  );
+  assert.equal(h.lineage.serializedSnapshot().includes("runtimeBindingToken"), false);
+  assert.equal(
+    h.sent.find(({ frame }) => frame.requestId === "open-retry").route.runtimeBindingToken,
+    reboundRoute.runtimeBindingToken,
+    "the typed in-memory adapter must retain the exact runtime token",
+  );
 
   const closeRetryRoute = { connectorId: "connector-three", routeId: "route-three", routeFence: "fence-three" };
   await h.manager.close(closeRequest(retryOpened, closeRetryRoute, {
@@ -597,8 +623,19 @@ test("route and generation fences reject stale input, and output ACK cannot exce
   );
 
   const routeTwo = { connectorId: "connector-two", routeId: "route-two", routeFence: "fence-two" };
-  await h.manager.open({ ...request, route: routeTwo, requestId: "open-rebind" });
+  await h.manager.open({ ...request, route: exactRoute(routeTwo), requestId: "open-rebind" });
   const rebound = opened(h.sent, "open-rebind");
+  await assert.rejects(
+    h.manager.input({
+      ...streamContext(rebound, {
+        ...routeTwo,
+        runtimeBindingToken: "forged-runtime-binding-token",
+      }),
+      inputSeq: "1",
+      data: Buffer.from([0x61]),
+    }),
+    managerError("TERMINAL_ROUTE_STALE"),
+  );
   await assert.rejects(
     h.manager.input({
       ...streamContext(rebound, {
@@ -789,7 +826,11 @@ test("detached lease expiry fences the generation and exact open retry never cre
 
   await h.manager.open({
     ...request,
-    route: { connectorId: "connector-after-expiry", routeId: "route-after-expiry", routeFence: "fence-after-expiry" },
+    route: exactRoute({
+      connectorId: "connector-after-expiry",
+      routeId: "route-after-expiry",
+      routeFence: "fence-after-expiry",
+    }),
     requestId: "open-after-expiry",
   });
   const reset = h.sent.find(({ frame }) => frame.requestId === "open-after-expiry").frame;
@@ -966,7 +1007,7 @@ test("input and resize sequence zero fail protocol without reaching terminal-con
   assert.equal(h.authority.resizeCalls.length, 0);
 });
 
-test("retained explicit close resumes as opened, replay, then client_closed", async () => {
+test("retained explicit close isolates the old request and replays it for a new route request", async () => {
   const h = harness();
   const request = goldenOpen();
   await h.manager.open(request);
@@ -1001,16 +1042,27 @@ test("retained explicit close resumes as opened, replay, then client_closed", as
   assert.deepEqual(resumed.map(({ frame }) => frame.type), [
     "terminal.opened",
     "terminal.output",
-    "terminal.closed",
   ]);
   assert.deepEqual(outputBytes(resumed), bytes);
-  assert.equal(resumed.at(-1).frame.kind, "response");
-  assert.equal(resumed.at(-1).frame.requestId, "close-attempt");
-  assert.equal(resumed.at(-1).frame.payload.deduplicated, true);
-  assert.equal(resumed.at(-1).frame.payload.reason, "client_closed");
-  assert.equal(resumed.at(-1).frame.payload.exitCode, null);
-  assert.equal(resumed.at(-1).frame.payload.finalOffset, String(bytes.byteLength));
-  assert.equal(resumed.at(-1).frame.payload.replayAvailable, true);
+  assert.equal(
+    h.sent.some(({ frame }) => frame.requestId === "close-attempt"),
+    false,
+  );
+
+  const resumedOpened = opened(h.sent, "resume-closed-attempt");
+  await h.manager.close(closeRequest(resumedOpened, routeTwo, {
+    requestId: "close-retry-new-route",
+  }));
+  const retried = h.sent.find(({ frame }) => frame.requestId === "close-retry-new-route");
+  assert.ok(retried);
+  assert.deepEqual(retried.route, routeTwo);
+  assert.equal(retried.frame.kind, "response");
+  assert.equal(retried.frame.payload.deduplicated, true);
+  assert.equal(retried.frame.payload.reason, "client_closed");
+  assert.equal(retried.frame.payload.exitCode, null);
+  assert.equal(retried.frame.payload.finalOffset, String(bytes.byteLength));
+  assert.equal(retried.frame.payload.replayAvailable, true);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
 });
 
 test("natural-close tombstone query responds on the current request route", async () => {
@@ -1036,6 +1088,31 @@ test("natural-close tombstone query responds on the current request route", asyn
   assert.equal(response.frame.kind, "response");
   assert.equal(response.frame.payload.reason, "backend_exit");
   assert.equal(response.frame.payload.finalOffset, "3");
+});
+
+test("durable close route validation rejects process tokens and every extra key", async () => {
+  for (const forbidden of ["runtimeBindingToken", "unexpectedRouteField"]) {
+    const lineage = new FakeDurableLineage();
+    const first = harness({ lineage });
+    const request = goldenOpen({ requestId: `durable-route-open-${forbidden}` });
+    await first.manager.open(request);
+    const frame = opened(first.sent, request.requestId);
+    await first.manager.close(closeRequest(frame));
+    const retained = [...lineage.closes.values()][0];
+    retained.value.requestRoute[forbidden] = "must-not-survive";
+
+    const restarted = harness({ lineage });
+    await assert.rejects(
+      restarted.manager.close(closeRequest(frame, {
+        connectorId: `durable-route-${forbidden}`,
+        routeId: `durable-route-id-${forbidden}`,
+        routeFence: `durable-route-fence-${forbidden}`,
+      }, {
+        requestId: `durable-route-retry-${forbidden}`,
+      })),
+      managerError("INTERNAL"),
+    );
+  }
 });
 
 test("durable lineage fences process-restart open retry and serves close tombstone", async () => {
@@ -1447,6 +1524,7 @@ test("credit-blocked close survives rebind and same close retry responds on the 
       && frame.payload.reason === "client_closed"),
     false,
   );
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
 });
 
 test("an uncertain input remains generation-bound and is never applied to a reset backend", async () => {

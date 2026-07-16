@@ -103,6 +103,7 @@ function createHarness(options = {}) {
     advertisedCapabilities: [],
     clientDialects,
     dialectAdapters: options.dialectAdapters,
+    publicPayloadDecoder: options.publicPayloadDecoder,
     clock: options.clock ?? (() => 1_783_700_100_000),
     schedule: options.schedule,
     idFactory: () => `host-hello-${nextId++}`,
@@ -110,6 +111,7 @@ function createHarness(options = {}) {
     routeSink: {
       onRouteBound(binding) {
         bound.push(binding);
+        return options.onRouteBound?.(binding);
       },
       onClientFrame(binding, payload) {
         received.push({ binding, payload: Uint8Array.from(payload) });
@@ -312,6 +314,26 @@ test("host.registered is a hard barrier before any client route can bind", () =>
   assert.equal(decoded(second.transport.sent).at(-1).type, "route.opened");
 });
 
+test("typed CAPABILITY_UNAVAILABLE bind rejection never emits route.opened", () => {
+  const h = createHarness({
+    onRouteBound: () => ({
+      accepted: false,
+      code: "CAPABILITY_UNAVAILABLE",
+      message: "host readiness was withdrawn",
+      retryable: false,
+    }),
+  });
+  const active = connect(h);
+  const connectorId = register(active.connection, active.hello);
+  active.connection.receive(wire(routeOpen(connectorId)));
+
+  const response = decoded(active.transport.sent).at(-1);
+  assert.equal(response.type, "route.rejected");
+  assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(response.error.retryable, false);
+  assert.equal(decoded(active.transport.sent).some(({ type }) => type === "route.opened"), false);
+});
+
 test("a pre-registration DUPLICATE_CONNECTOR carrier error closes only the newcomer with 4411", () => {
   const h = createHarness();
   const active = connect(h);
@@ -373,6 +395,38 @@ test("v2 route bytes pass the production public codec and negotiated frame limit
   assert.deepEqual(active.transport.closes.at(-1), {
     code: 4400,
     reason: "invalid_public_route_frame",
+  });
+});
+
+test("encoded-length preflight rejects negotiated oversize before public base64 decode", () => {
+  let decoderCalls = 0;
+  const h = createHarness({
+    publicPayloadDecoder: {
+      decodeCanonicalBase64() {
+        decoderCalls += 1;
+        throw new Error("oversize payload reached the decoder");
+      },
+    },
+  });
+  const active = connect(h);
+  const connectorId = register(active.connection, active.hello);
+  const negotiatedMax = 128;
+  active.connection.receive(wire(routeOpen(connectorId, { maxFrameBytes: negotiatedMax })));
+  const binding = h.bound.at(-1);
+
+  active.connection.receive(wire(routeData(
+    connectorId,
+    binding.routeId,
+    binding.routeFence,
+    1,
+    Buffer.alloc(negotiatedMax + 1, 0x61),
+  )));
+
+  assert.equal(decoderCalls, 0);
+  assert.equal(h.received.length, 0);
+  assert.deepEqual(active.transport.closes.at(-1), {
+    code: 4400,
+    reason: "route_frame_limit",
   });
 });
 

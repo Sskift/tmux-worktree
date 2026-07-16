@@ -1467,7 +1467,7 @@ function resourceTransactionFacade(
     allocateEventSeq: () => transaction.allocateEventSeq(),
     issueOpaqueId: (prefix?: string) => transaction.issueOpaqueId(prefix),
     getMaterializedReadinessFence: () => transaction.getMaterializedReadinessFence(),
-    latchMaterializedReadinessFence: (reason) => (
+    latchMaterializedReadinessFence: (reason: "materialized_authority_conflict") => (
       transaction.latchMaterializedReadinessFence(reason)
     ),
   });

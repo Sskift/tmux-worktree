@@ -98,10 +98,40 @@ export interface RelayV2TerminalAuthContext {
   clientInstanceId: string;
 }
 
+/** Frozen public route lineage. This is the only route shape allowed durably. */
 export interface RelayV2TerminalRoute {
   connectorId: string;
   routeId: string;
   routeFence: string;
+}
+
+declare const RELAY_V2_TERMINAL_RUNTIME_BINDING_TOKEN: unique symbol;
+
+export type RelayV2TerminalRuntimeBindingToken = string & {
+  readonly [RELAY_V2_TERMINAL_RUNTIME_BINDING_TOKEN]: true;
+};
+
+/** Process-local runtime↔H3 envelope. Never persisted or put on the wire. */
+export interface RelayV2TerminalRuntimeBinding extends RelayV2TerminalRoute {
+  runtimeBindingToken: RelayV2TerminalRuntimeBindingToken;
+}
+
+export function createRelayV2TerminalRuntimeBinding(
+  route: RelayV2TerminalRoute,
+  runtimeBindingToken: string,
+): RelayV2TerminalRuntimeBinding {
+  if (!isOpaqueId(route.connectorId)
+    || !isOpaqueId(route.routeId)
+    || !isOpaqueId(route.routeFence)
+    || !isOpaqueId(runtimeBindingToken)) {
+    throw new RelayV2TerminalManagerError("INVALID_ARGUMENT", "terminal runtime binding is invalid");
+  }
+  return Object.freeze({
+    connectorId: route.connectorId,
+    routeId: route.routeId,
+    routeFence: route.routeFence,
+    runtimeBindingToken: runtimeBindingToken as RelayV2TerminalRuntimeBindingToken,
+  });
 }
 
 export interface RelayV2TerminalWireTarget {
@@ -129,7 +159,7 @@ export interface RelayV2TerminalCanonicalResolver {
 
 export interface RelayV2TerminalRequestContext {
   auth: RelayV2TerminalAuthContext;
-  route: RelayV2TerminalRoute;
+  route: RelayV2TerminalRuntimeBinding;
   requestId: string;
   expectedHostEpoch: string;
   target: RelayV2TerminalWireTarget;
@@ -164,7 +194,7 @@ export interface RelayV2TerminalCloseRequest extends RelayV2TerminalRequestConte
 
 export interface RelayV2TerminalStreamContext {
   auth: RelayV2TerminalAuthContext;
-  route: RelayV2TerminalRoute;
+  route: RelayV2TerminalRuntimeBinding;
   streamId: string;
   generation: string;
 }
@@ -460,7 +490,7 @@ export interface RelayV2TerminalManagerOptions {
   lineage: RelayV2TerminalDurableLineage;
   backend: RelayV2TerminalByteBackend;
   terminalControl: RelayV2TerminalControlAuthority;
-  send(route: RelayV2TerminalRoute, frame: RelayV2JsonObject): Promise<void>;
+  send(route: RelayV2TerminalRuntimeBinding, frame: RelayV2JsonObject): Promise<void>;
   now?: () => number;
   issueId?: () => string;
   issueToken?: () => string;
@@ -482,7 +512,7 @@ type StreamStatus = "live" | "detached" | "closed" | "lost";
 type BindingPhase = "replay" | "live";
 
 interface TerminalBinding {
-  route: RelayV2TerminalRoute;
+  route: RelayV2TerminalRuntimeBinding;
   ackedOffset: bigint;
   sentThroughOffset: bigint;
   phase: BindingPhase;
@@ -517,7 +547,7 @@ interface TerminalCondition {
 
 interface PendingCloseResponse {
   requestId: string;
-  route: RelayV2TerminalRoute;
+  route: RelayV2TerminalRuntimeBinding;
   closeRecordKey: string;
   deduplicated: boolean;
 }
@@ -860,6 +890,16 @@ function isOpaqueId(value: unknown): value is string {
     && value.trim() === value;
 }
 
+function hasExactOwnKeys(
+  value: unknown,
+  expected: readonly string[],
+): value is Record<string, unknown> {
+  if (!value || typeof value !== "object") return false;
+  const keys = Reflect.ownKeys(value);
+  return keys.length === expected.length
+    && expected.every((key) => Object.hasOwn(value, key));
+}
+
 function safeHashEqual(left: string, right: string): boolean {
   const leftBytes = Buffer.from(left, "hex");
   const rightBytes = Buffer.from(right, "hex");
@@ -867,14 +907,45 @@ function safeHashEqual(left: string, right: string): boolean {
     && timingSafeEqual(leftBytes, rightBytes);
 }
 
-function sameRoute(left: RelayV2TerminalRoute, right: RelayV2TerminalRoute): boolean {
+function sameRuntimeBinding(
+  left: RelayV2TerminalRuntimeBinding,
+  right: RelayV2TerminalRuntimeBinding,
+): boolean {
+  return sameDurableRoute(left, right)
+    && left.runtimeBindingToken === right.runtimeBindingToken;
+}
+
+function sameDurableRoute(
+  left: RelayV2TerminalRoute,
+  right: RelayV2TerminalRoute,
+): boolean {
   return left.connectorId === right.connectorId
     && left.routeId === right.routeId
     && left.routeFence === right.routeFence;
 }
 
-function routeRequestKey(route: RelayV2TerminalRoute, requestId: string): string {
-  return JSON.stringify([route.connectorId, route.routeId, route.routeFence, requestId]);
+function cloneRuntimeBinding(
+  binding: RelayV2TerminalRuntimeBinding,
+): RelayV2TerminalRuntimeBinding {
+  return createRelayV2TerminalRuntimeBinding(binding, binding.runtimeBindingToken);
+}
+
+function durableRoute(route: RelayV2TerminalRoute): RelayV2TerminalRoute {
+  return {
+    connectorId: route.connectorId,
+    routeId: route.routeId,
+    routeFence: route.routeFence,
+  };
+}
+
+function routeRequestKey(route: RelayV2TerminalRuntimeBinding, requestId: string): string {
+  return JSON.stringify([
+    route.connectorId,
+    route.routeId,
+    route.routeFence,
+    route.runtimeBindingToken,
+    requestId,
+  ]);
 }
 
 function sameAuth(left: RelayV2TerminalAuthContext, right: RelayV2TerminalAuthContext): boolean {
@@ -927,7 +998,7 @@ function sameDurableClose(
     && left.streamId === right.streamId
     && left.closeId === right.closeId
     && left.requestId === right.requestId
-    && sameRoute(left.requestRoute, right.requestRoute)
+    && sameDurableRoute(left.requestRoute, right.requestRoute)
     && left.generation === right.generation
     && left.finalOffset === right.finalOffset
     && left.reason === right.reason
@@ -1260,12 +1331,12 @@ export class RelayV2TerminalManager {
     return this.enqueue(() => this.closeInternal(request));
   }
 
-  unbind(auth: RelayV2TerminalAuthContext, route: RelayV2TerminalRoute): Promise<void> {
+  unbind(auth: RelayV2TerminalAuthContext, route: RelayV2TerminalRuntimeBinding): Promise<void> {
     return this.enqueue(async () => {
       await this.sweepInternal();
       for (const stream of this.streams.values()) {
         if (!sameAuth(stream.auth, auth) || !stream.binding) continue;
-        if (!sameRoute(stream.binding.route, route)) continue;
+        if (!sameRuntimeBinding(stream.binding.route, route)) continue;
         stream.binding = undefined;
         if (stream.status === "live") {
           await this.endRouteControl(stream);
@@ -2505,7 +2576,7 @@ export class RelayV2TerminalManager {
 
   private prepareClosedNotification(
     stream: TerminalStream,
-    route: RelayV2TerminalRoute,
+    route: RelayV2TerminalRuntimeBinding,
   ): "event" | null {
     if (!stream.close) return null;
     const record = [...this.closeRecords.values()].find((candidate) => (
@@ -2513,10 +2584,7 @@ export class RelayV2TerminalManager {
       && candidate.generation === stream.generation
       && (stream.closeId === undefined || candidate.closeId === stream.closeId)
     ));
-    if (record) {
-      this.queueCloseResponse(stream, route, record.requestId, record.key, true);
-      return null;
-    }
+    if (record) return null;
     if (stream.close.reason === "client_closed") {
       throw new RelayV2TerminalManagerError(
         "INTERNAL",
@@ -2528,7 +2596,7 @@ export class RelayV2TerminalManager {
 
   private queueCloseResponse(
     stream: TerminalStream,
-    route: RelayV2TerminalRoute,
+    route: RelayV2TerminalRuntimeBinding,
     requestId: string,
     closeRecordKey: string,
     deduplicated: boolean,
@@ -2539,7 +2607,7 @@ export class RelayV2TerminalManager {
     }
     stream.pendingCloseResponses.set(key, {
       requestId,
-      route: { ...route },
+      route: cloneRuntimeBinding(route),
       closeRecordKey,
       deduplicated,
     });
@@ -2547,10 +2615,13 @@ export class RelayV2TerminalManager {
 
   private async fenceChangedBinding(
     stream: TerminalStream,
-    nextRoute: RelayV2TerminalRoute,
+    nextRoute: RelayV2TerminalRuntimeBinding,
   ): Promise<void> {
-    if (!stream.binding || sameRoute(stream.binding.route, nextRoute)) return;
+    if (!stream.binding || sameRuntimeBinding(stream.binding.route, nextRoute)) return;
     await this.endRouteControl(stream);
+    for (const [key, pending] of stream.pendingCloseResponses) {
+      if (!sameRuntimeBinding(pending.route, nextRoute)) stream.pendingCloseResponses.delete(key);
+    }
   }
 
   private async bindOpened(
@@ -2565,7 +2636,7 @@ export class RelayV2TerminalManager {
     stream.status = stream.close ? "closed" : "live";
     stream.detachedUntil = undefined;
     stream.binding = {
-      route: { ...request.route },
+      route: cloneRuntimeBinding(request.route),
       ackedOffset: replayFromOffset,
       sentThroughOffset: replayFromOffset,
       phase: "replay",
@@ -2644,7 +2715,7 @@ export class RelayV2TerminalManager {
       }, "replay");
       return;
     }
-    if (!stream.binding || !sameRoute(stream.binding.route, request.route)) {
+    if (!stream.binding || !sameRuntimeBinding(stream.binding.route, request.route)) {
       throw new RelayV2TerminalManagerError(
         "TERMINAL_ROUTE_STALE",
         "terminal route binding is stale",
@@ -2692,7 +2763,7 @@ export class RelayV2TerminalManager {
     }
     await this.fenceChangedBinding(stream, request.route);
     stream.binding = {
-      route: { ...request.route },
+      route: cloneRuntimeBinding(request.route),
       ackedOffset: fromOffset,
       sentThroughOffset: fromOffset,
       phase: "replay",
@@ -2732,7 +2803,7 @@ export class RelayV2TerminalManager {
         "terminal stream is not retained",
       );
     }
-    if (!stream.binding || !sameRoute(stream.binding.route, context.route)) {
+    if (!stream.binding || !sameRuntimeBinding(stream.binding.route, context.route)) {
       throw new RelayV2TerminalManagerError(
         "TERMINAL_ROUTE_STALE",
         "terminal route binding is stale",
@@ -3162,7 +3233,8 @@ export class RelayV2TerminalManager {
           "terminal generation already has a different closeId",
         );
       }
-      if (stream.status !== "closed" && (!stream.binding || !sameRoute(stream.binding.route, request.route))) {
+      if (stream.status !== "closed"
+        && (!stream.binding || !sameRuntimeBinding(stream.binding.route, request.route))) {
         throw new RelayV2TerminalManagerError(
           "TERMINAL_ROUTE_STALE",
           "only the current connector route may close a live terminal stream",
@@ -3183,7 +3255,7 @@ export class RelayV2TerminalManager {
         streamId: stream.streamId,
         closeId: request.closeId,
         requestId: request.requestId,
-        requestRoute: { ...request.route },
+        requestRoute: durableRoute(request.route),
         generation: stream.generation,
         finalOffset: winner.finalOffset.toString(10),
         reason: winner.reason,
@@ -3274,7 +3346,7 @@ export class RelayV2TerminalManager {
     if (
       stream?.binding
       && stream.generation === record.generation
-      && sameRoute(stream.binding.route, request.route)
+      && sameRuntimeBinding(stream.binding.route, request.route)
     ) {
       this.queueCloseResponse(
         stream,
@@ -3299,7 +3371,7 @@ export class RelayV2TerminalManager {
       streamId: record.streamId,
       closeId: record.closeId,
       requestId: record.requestId,
-      requestRoute: { ...record.requestRoute },
+      requestRoute: durableRoute(record.requestRoute),
       generation: record.generation,
       finalOffset: record.finalOffset.toString(10),
       reason: record.reason,
@@ -3345,6 +3417,7 @@ export class RelayV2TerminalManager {
       && isOpaqueId(value.requestRoute?.connectorId)
       && isOpaqueId(value.requestRoute?.routeId)
       && isOpaqueId(value.requestRoute?.routeFence)
+      && hasExactOwnKeys(value.requestRoute, ["connectorId", "routeId", "routeFence"])
       && isOpaqueId(value.generation)
       && Number.isSafeInteger(value.expiresAtMs)
       && value.expiresAtMs > this.now()
@@ -3373,7 +3446,7 @@ export class RelayV2TerminalManager {
       streamId: value.streamId,
       closeId: value.closeId,
       requestId: value.requestId,
-      requestRoute: { ...value.requestRoute },
+      requestRoute: durableRoute(value.requestRoute),
       generation: value.generation,
       finalOffset,
       reason,
@@ -3407,7 +3480,7 @@ export class RelayV2TerminalManager {
   }
 
   private async sendCloseResponse(
-    route: RelayV2TerminalRoute,
+    route: RelayV2TerminalRuntimeBinding,
     requestId: string,
     record: CloseRecord,
     stream: TerminalStream | undefined,
@@ -3609,7 +3682,7 @@ export class RelayV2TerminalManager {
       return;
     }
     for (const [key, pending] of stream.pendingCloseResponses) {
-      if (!sameRoute(pending.route, binding.route)) continue;
+      if (!sameRuntimeBinding(pending.route, binding.route)) continue;
       const record = this.closeRecords.get(pending.closeRecordKey);
       if (!record) continue;
       await this.sendCloseResponse(

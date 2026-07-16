@@ -617,6 +617,43 @@ async function seedLocalScope(h) {
   return { seeded, scopeId };
 }
 
+test("oversized convenience session snapshots direct clients to state.snapshot", async () => {
+  const h = await harness();
+  try {
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "large-local",
+        displayName: "Large local",
+        kind: "local",
+        sessions: Array.from({ length: 300 }, (_, index) => terminal(
+          `pane:large:${index}`,
+          `large-${index}`,
+        )).map((item, index) => ({
+          ...item,
+          cwd: `/${String(index).padStart(4, "0")}/${"x".repeat(4_000)}`,
+        })),
+      })],
+    });
+    const reconciled = await h.foundation.reconcile();
+    await assert.rejects(
+      h.foundation.sessionsSnapshot(
+        "oversized-convenience-snapshot",
+        reconciled.snapshot.hostEpoch,
+        null,
+      ),
+      (error) => {
+        assert.ok(error instanceof resourceState.RelayV2MaterializedStateError);
+        assert.equal(error.code, "SNAPSHOT_TOO_LARGE");
+        assert.deepEqual({ ...error.details }, { useStateSnapshot: true });
+        return true;
+      },
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
 async function openCommandPlane(h, executor, options = {}) {
   return commandPlane.RelayV2HostCommandPlane.open({
     store: options.store ?? h.store,

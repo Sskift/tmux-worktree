@@ -91,7 +91,21 @@ function correlatedTerminalFixture(name, request) {
   frame.scopeId = request.scopeId;
   frame.sessionId = request.sessionId;
   frame.streamId = request.streamId;
-  if (name === "terminal-opened") frame.payload.openId = request.payload.openId;
+  if (name === "terminal-opened") {
+    frame.payload.openId = request.payload.openId;
+    frame.payload.disposition = request.payload.mode === "resume"
+      ? "resumed"
+      : request.payload.mode;
+    frame.payload.replayFromOffset = request.payload.mode === "resume"
+      ? request.payload.resume.nextOffset
+      : "0";
+    if (request.payload.mode === "resume") {
+      frame.payload.generation = request.payload.resume.generation;
+    } else if (request.payload.mode === "reset"
+      && frame.payload.generation === request.payload.resume?.generation) {
+      frame.payload.generation = "reset-generation-uuid";
+    }
+  }
   if (name === "terminal-replay-started") {
     frame.payload.generation = request.payload.generation;
     frame.payload.fromOffset = request.payload.fromOffset;
@@ -309,6 +323,89 @@ async function ready(harness, routeBinding = binding()) {
   await settle();
   assert.equal(harness.state.sent.at(-1).frame.type, "host.welcome");
   return routeBinding;
+}
+
+function actualTerminalRuntimeHarness(options = {}) {
+  let manager;
+  let nextId = 0;
+  let nextToken = 0;
+  const closeRecords = new Map();
+  const backend = {
+    opens: [],
+    async open(_target, _openOptions, observer) {
+      const handle = {
+        closeCalls: 0,
+        async pause() {},
+        async resume() {},
+        async setDisplaySizeHint() {},
+        async close() { this.closeCalls += 1; },
+      };
+      backend.opens.push({ observer, handle });
+      return handle;
+    },
+  };
+  const lineage = {
+    claimCloseCalls: [],
+    async claimOpen(claim) {
+      return {
+        status: "claimed",
+        claimToken: `actual-claim-${claim.key}`,
+        fence: `actual-fence-${claim.key}`,
+      };
+    },
+    async completeOpen(input) {
+      return { status: "committed", outcome: structuredClone(input.outcome) };
+    },
+    async failOpen(input) {
+      return { status: "committed", outcome: structuredClone(input.outcome) };
+    },
+    async claimClose(input) {
+      lineage.claimCloseCalls.push(structuredClone(input));
+      const retained = closeRecords.get(input.key);
+      if (retained) {
+        return retained.state === "final"
+          ? { status: "final", tombstone: structuredClone(retained.value) }
+          : { status: "existing_intent", intent: structuredClone(retained.value) };
+      }
+      if (!input.intent) return { status: "not_found" };
+      closeRecords.set(input.key, { state: "intent", value: structuredClone(input.intent) });
+      return { status: "claimed", intent: structuredClone(input.intent) };
+    },
+    async finalizeClose(input) {
+      const retained = closeRecords.get(input.key);
+      assert.ok(retained);
+      retained.state = "final";
+      return structuredClone(retained.value);
+    },
+  };
+  const h = createHarness({
+    testLimits: options.runtimeLimits,
+    terminal: (method, request) => manager[method](request),
+    unbind: (auth, route) => manager.unbind(auth, route),
+  });
+  manager = new terminalManager.RelayV2TerminalManager({
+    hostId: HOST_ID,
+    hostEpoch: HOST_EPOCH,
+    hostInstanceId: HOST_INSTANCE_ID,
+    resolver: {
+      async resolve(input) {
+        return {
+          ...structuredClone(input.target),
+          pane: input.pane,
+          canonicalTargetId: "actual-runtime-canonical-target",
+          controlTargetId: "actual-runtime-control-target",
+        };
+      },
+    },
+    lineage,
+    backend,
+    terminalControl: {},
+    send: async (route, frame) => h.runtime.sendTerminalFrame({ ...route }, frame),
+    issueId: () => `actual-runtime-id-${++nextId}`,
+    issueToken: () => `actual-runtime-token-${++nextToken}`,
+    limits: options.terminalLimits,
+  });
+  return { h, manager, backend, lineage };
 }
 
 test("host runtime dispatches strict public requests only to their H1, H2, and H3 owners", async () => {
@@ -643,6 +740,36 @@ test("readiness withdrawal permanently fences the current connector generation",
   assert.equal(h.runtime.onRouteBound(replacementConnector), undefined);
 });
 
+test("readiness withdrawal tombstones an observed generation after its routes unbind", async () => {
+  const h = createHarness();
+  const first = await ready(h);
+  h.runtime.onRouteUnbound(first, "client_closed");
+  await settle(5);
+
+  h.state.capabilities["event.sequence.v1"] = false;
+  assert.equal(h.readiness.publish(), true);
+  h.state.capabilities["event.sequence.v1"] = true;
+  assert.equal(h.readiness.publish(), true);
+
+  const sameGeneration = binding({
+    routeId: "route-observed-after-withdrawal",
+    routeFence: "fence-observed-after-withdrawal",
+    connectionId: "connection-observed-after-withdrawal",
+    authContext: { jti: "jti-observed-after-withdrawal" },
+  });
+  assert.equal(h.runtime.onRouteBound(sameGeneration).code, "CAPABILITY_UNAVAILABLE");
+
+  const nextGeneration = binding({
+    connectorGeneration: first.connectorGeneration + 1,
+    connectorId: first.connectorId,
+    routeId: "route-next-generation",
+    routeFence: "fence-next-generation",
+    connectionId: "connection-next-generation",
+    authContext: { jti: "jti-next-generation" },
+  });
+  assert.equal(h.runtime.onRouteBound(nextGeneration), undefined);
+});
+
 test("readiness withdrawal during hello leaves no welcome or subscriber gap", async () => {
   let releaseWindow;
   const window = new Promise((resolve) => { releaseWindow = resolve; });
@@ -694,6 +821,38 @@ test("welcome builder TOCTOU withdrawal rejects the synchronous H2 sink without 
   assert.equal(h.state.calls.unbind.length, 1);
   assert.equal(h.state.closes.at(-1).code, 4406);
   assert.equal(h.state.closes.at(-1).reason, "capability_withdrawn");
+});
+
+test("pre-commit H2 welcome rejection returns correlated BUSY before fencing", async () => {
+  const h = createHarness({
+    testLimits: { maxPendingOperationsPerRoute: 1 },
+    hello: async ({ cut, buildWelcome }, sink) => {
+      const welcome = buildWelcome(cut);
+      if (!sink.enqueue(welcome)) {
+        const error = new resourceState.RelayV2MaterializedStateError(
+          "BUSY",
+          "actual H2 subscriber rejected host.welcome",
+        );
+        sink.close(error);
+        throw error;
+      }
+      return welcome;
+    },
+  });
+  const routeBinding = binding();
+  h.runtime.onRouteBound(routeBinding);
+  const hello = fixture("client-hello-fresh");
+  hello.payload.clientInstanceId = routeBinding.authContext.clientInstanceId;
+  send(h.runtime, routeBinding, hello);
+  await settle(8);
+
+  const response = h.state.sent.find(({ frame }) => frame.requestId === hello.requestId)?.frame;
+  assert.equal(response.type, "error");
+  assert.equal(response.error.code, "BUSY");
+  assert.equal(response.error.commandDisposition, "not_applicable");
+  assert.equal(h.state.closes.at(-1).code, 1013);
+  assert.equal(h.state.calls.commandExecute.length, 0);
+  assert.equal(h.state.calls.terminal.length, 0);
 });
 
 test("every awaited authority and transport receipt revalidates binding and H0 lineage", async (t) => {
@@ -758,7 +917,23 @@ test("every awaited authority and transport receipt revalidates binding and H0 l
 
     assert.equal(h.state.sent.length, sentBefore);
     assert.equal(h.state.sent.some(({ frame }) => frame.requestId === request.requestId), false);
-    assert.equal(h.state.closes.at(-1).code, 4400);
+    assert.equal(h.state.closes.at(-1).code, 4409);
+    assert.equal(h.state.closes.at(-1).reason, "host_superseded");
+  });
+
+  await t.test("same-epoch host process replacement never fabricates an epoch mismatch", async () => {
+    const h = createHarness();
+    const routeBinding = await ready(h);
+    h.state.identity.hostInstanceId = "replacement-host-instance";
+    const command = fixture("command-execute-send-agent-message");
+    command.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, command);
+    await settle(6);
+
+    assert.equal(h.state.calls.commandExecute.length, 0);
+    assert.equal(h.state.sent.some(({ frame }) => frame.requestId === command.requestId), false);
+    assert.equal(h.state.closes.at(-1).code, 4409);
+    assert.equal(h.state.closes.at(-1).reason, "host_superseded");
   });
 
   await t.test("H3 callback and awaited completion cannot cross a lineage change", async () => {
@@ -946,6 +1121,161 @@ test("H3 callbacks use copied exact tokens and each frozen terminal frame schema
   });
 });
 
+test("actual H3 correlated reset revokes the old token before late stream output", async () => {
+  const actual = actualTerminalRuntimeHarness({ runtimeLimits: { maxRoutes: 1 } });
+  const { h, manager, backend } = actual;
+  try {
+    const routeBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.hostId = HOST_ID;
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, open);
+    await settle(12);
+    const opened = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+    assert.equal(opened.type, "terminal.opened");
+    const oldBinding = h.state.calls.terminal.find(({ method }) => method === "open").request.route;
+
+    const replay = fixture("terminal-replay-request");
+    replay.requestId = "actual-reset-replay";
+    replay.hostId = HOST_ID;
+    replay.expectedHostEpoch = HOST_EPOCH;
+    replay.streamId = opened.streamId;
+    replay.payload.generation = "actual-stale-replay-generation";
+    replay.payload.fromOffset = "0";
+    send(h.runtime, routeBinding, replay);
+    await settle(16);
+
+    const reset = h.state.sent.find(({ frame }) => frame.requestId === replay.requestId)?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.origin, "replay");
+    assert.equal(h.state.calls.unbind.length, 1);
+    assert.equal(
+      h.state.calls.unbind[0].route.runtimeBindingToken,
+      oldBinding.runtimeBindingToken,
+      "the reset must detach the exact old in-memory binding",
+    );
+    const beforeLateOutput = h.state.sent.length;
+    await backend.opens[0].observer.onBytes(Buffer.from([1, 2, 3]));
+    await settle(8);
+    assert.equal(h.state.sent.length, beforeLateOutput);
+    assert.equal(
+      h.state.sent.some(({ frame }) => frame.type === "terminal.output"),
+      false,
+    );
+    assert.deepEqual(h.state.closes, []);
+
+    h.runtime.onRouteUnbound(routeBinding, "client_closed");
+    await settle(8);
+    const replacement = binding({
+      routeId: "route-after-reset-drain",
+      routeFence: "fence-after-reset-drain",
+      connectionId: "connection-after-reset-drain",
+      authContext: { jti: "jti-after-reset-drain" },
+    });
+    assert.equal(h.runtime.onRouteBound(replacement), undefined);
+  } finally {
+    h.runtime.dispose();
+    await manager.shutdown();
+  }
+});
+
+test("actual H3 credit-blocked close keeps its request on the old route and replays once for retry", async () => {
+  const actual = actualTerminalRuntimeHarness({
+    terminalLimits: {
+      streamRingBytes: 16,
+      hostRingBytes: 32,
+      maxUnackedBytes: 4,
+      maxFrameBytes: 4,
+    },
+  });
+  const { h, manager, backend, lineage } = actual;
+  try {
+    const firstBinding = await ready(h);
+    const open = fixture("terminal-open-new");
+    open.hostId = HOST_ID;
+    open.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, firstBinding, open);
+    await settle(12);
+    const opened = h.state.sent.find(({ frame }) => frame.requestId === open.requestId)?.frame;
+    assert.equal(opened.type, "terminal.opened");
+    await backend.opens[0].observer.onBytes(Buffer.from([1, 2, 3, 4]));
+    await backend.opens[0].observer.onBytes(Buffer.from([5, 6, 7, 8]));
+
+    const firstClose = fixture("terminal-close");
+    firstClose.requestId = "actual-close-old-request";
+    firstClose.hostId = HOST_ID;
+    firstClose.expectedHostEpoch = HOST_EPOCH;
+    firstClose.streamId = opened.streamId;
+    firstClose.payload.generation = opened.payload.generation;
+    firstClose.payload.resumeToken = opened.payload.resumeToken;
+    send(h.runtime, firstBinding, firstClose);
+    await settle(12);
+    assert.equal(
+      h.state.sent.some(({ frame }) => frame.requestId === firstClose.requestId),
+      false,
+    );
+    assert.equal(backend.opens[0].handle.closeCalls, 1);
+
+    h.runtime.onRouteUnbound(firstBinding, "client_closed");
+    await settle(10);
+    const secondBinding = binding({
+      routeId: "actual-close-route-two",
+      routeFence: "actual-close-fence-two",
+      connectionId: "actual-close-connection-two",
+      authContext: { jti: "actual-close-jti-two" },
+    });
+    await ready(h, secondBinding);
+    const resume = fixture("terminal-open-resume");
+    resume.requestId = "actual-close-resume";
+    resume.hostId = HOST_ID;
+    resume.expectedHostEpoch = HOST_EPOCH;
+    resume.streamId = opened.streamId;
+    resume.payload.openId = "actual-close-resume-open";
+    resume.payload.resume.generation = opened.payload.generation;
+    resume.payload.resume.nextOffset = "0";
+    resume.payload.resume.resumeToken = opened.payload.resumeToken;
+    send(h.runtime, secondBinding, resume);
+    await settle(14);
+    assert.equal(
+      h.state.sent.some(({ binding: delivered, frame }) => (
+        delivered === secondBinding && frame.requestId === firstClose.requestId
+      )),
+      false,
+    );
+
+    const retry = structuredClone(firstClose);
+    retry.requestId = "actual-close-new-request";
+    send(h.runtime, secondBinding, retry);
+    await settle(8);
+    const ack = fixture("terminal-output-ack");
+    ack.streamId = opened.streamId;
+    ack.payload.generation = opened.payload.generation;
+    ack.payload.nextOffset = "4";
+    send(h.runtime, secondBinding, ack);
+    await settle(16);
+
+    const responses = h.state.sent.filter(({ frame }) => frame.requestId === retry.requestId);
+    assert.equal(responses.length, 1);
+    assert.deepEqual(responses[0].binding, secondBinding);
+    assert.equal(responses[0].frame.type, "terminal.closed");
+    assert.equal(responses[0].frame.payload.deduplicated, true);
+    assert.equal(backend.opens[0].handle.closeCalls, 1);
+    assert.equal(
+      h.state.sent.some(({ frame }) => frame.kind === "event"
+        && frame.type === "terminal.closed"
+        && frame.payload.reason === "client_closed"),
+      false,
+    );
+    assert.deepEqual(
+      Reflect.ownKeys(lineage.claimCloseCalls[0].intent.requestRoute).sort(),
+      ["connectorId", "routeFence", "routeId"],
+    );
+  } finally {
+    h.runtime.dispose();
+    await manager.shutdown();
+  }
+});
+
 test("request ownership and response metadata fence cross-owner or retargeted frames", async (t) => {
   await t.test("openId and reset origin are exact terminal request metadata", async () => {
     let authorityRoute;
@@ -976,6 +1306,75 @@ test("request ownership and response metadata fence cross-owner or retargeted fr
       { ...authorityRoute },
       correlatedTerminalFixture("terminal-opened", open),
     );
+  });
+
+  await t.test("terminal.open mode, generation, and offset truth table is exact", async () => {
+    for (const mode of ["new", "resume", "reset"]) {
+      let authorityRoute;
+      const h = createHarness({
+        terminal: async (method, request) => {
+          if (method === "open") authorityRoute = request.route;
+        },
+      });
+      const routeBinding = await ready(h);
+      const open = fixture(mode === "new" ? "terminal-open-new" : "terminal-open-resume");
+      open.requestId = `open-truth-table-${mode}`;
+      open.expectedHostEpoch = HOST_EPOCH;
+      open.payload.mode = mode;
+      send(h.runtime, routeBinding, open);
+      await settle(3);
+
+      const validOpened = correlatedTerminalFixture("terminal-opened", open);
+      const wrongDisposition = structuredClone(validOpened);
+      wrongDisposition.payload.disposition = mode === "new" ? "resumed" : "new";
+      await assert.rejects(
+        h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongDisposition),
+        /open mode lineage/,
+      );
+      const wrongReplayOffset = structuredClone(validOpened);
+      wrongReplayOffset.payload.replayFromOffset = String(
+        BigInt(validOpened.payload.replayFromOffset) + 1n,
+      );
+      await assert.rejects(
+        h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongReplayOffset),
+        /open mode lineage/,
+      );
+      if (mode === "resume") {
+        const wrongGeneration = structuredClone(validOpened);
+        wrongGeneration.payload.generation = "forged-resume-generation";
+        await assert.rejects(
+          h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongGeneration),
+          /open mode lineage/,
+        );
+      } else if (mode === "reset") {
+        const reusedGeneration = structuredClone(validOpened);
+        reusedGeneration.payload.generation = open.payload.resume.generation;
+        await assert.rejects(
+          h.runtime.sendTerminalFrame({ ...authorityRoute }, reusedGeneration),
+          /open mode lineage/,
+        );
+      }
+
+      const reset = correlatedTerminalFixture("terminal-reset-required-response", open);
+      const wrongResetGeneration = structuredClone(reset);
+      wrongResetGeneration.payload.generation = reset.payload.generation === null
+        ? "forged-reset-generation"
+        : "different-reset-generation";
+      await assert.rejects(
+        h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongResetGeneration),
+        /open reset crossed its generation or offset owner/,
+      );
+      const wrongRequestedOffset = structuredClone(reset);
+      wrongRequestedOffset.payload.requestedOffset = reset.payload.requestedOffset === null
+        ? "0"
+        : String(BigInt(reset.payload.requestedOffset) + 1n);
+      await assert.rejects(
+        h.runtime.sendTerminalFrame({ ...authorityRoute }, wrongRequestedOffset),
+        /open reset crossed its generation or offset owner/,
+      );
+
+      await h.runtime.sendTerminalFrame({ ...authorityRoute }, validOpened);
+    }
   });
 
   await t.test("replay generation and fromOffset are exact request metadata", async () => {
@@ -1147,6 +1546,30 @@ test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol 
     });
     assert.equal(h.state.closes.at(-1).code, 4400);
     assert.equal(h.state.closes.at(-1).reason, "event_cursor_ahead");
+  });
+
+  await t.test("convenience snapshot overflow preserves SNAPSHOT_TOO_LARGE guidance", async () => {
+    const h = createHarness({
+      scopesSnapshot: async () => {
+        throw new resourceState.RelayV2MaterializedStateError(
+          "SNAPSHOT_TOO_LARGE",
+          "oversized authority message must be redacted",
+          { useStateSnapshot: true },
+        );
+      },
+    });
+    const routeBinding = await ready(h);
+    const request = fixture("scopes-snapshot-get");
+    request.expectedHostEpoch = HOST_EPOCH;
+    send(h.runtime, routeBinding, request);
+    await settle(8);
+
+    const response = h.state.sent.find(({ frame }) => frame.requestId === request.requestId)?.frame;
+    assert.equal(response.type, "error");
+    assert.equal(response.error.code, "SNAPSHOT_TOO_LARGE");
+    assert.deepEqual({ ...response.error.details }, { useStateSnapshot: true });
+    assert.equal(JSON.stringify(response).includes("oversized authority message"), false);
+    assert.equal(h.state.closes.some(({ code }) => code === 4406), false);
   });
 });
 
@@ -1476,6 +1899,36 @@ test("unbound work and transport receipts retain a global draining route budget"
     await settle(6);
     assert.equal(h.runtime.onRouteBound(next), undefined);
   });
+
+  for (const failure of ["reject", "throw"]) {
+    await t.test(`H3 unbind ${failure} quarantines its draining slot without retry`, async () => {
+      const h = createHarness({ testLimits: { maxRoutes: 1 } });
+      const first = await ready(h);
+      h.terminals.unbind = (auth, route) => {
+        h.state.calls.unbind.push({ auth: structuredClone(auth), route: structuredClone(route) });
+        if (failure === "throw") throw new Error("synchronous unbind failure");
+        return Promise.reject(new Error("asynchronous unbind failure"));
+      };
+      h.runtime.onRouteUnbound(first, "client_closed");
+      await settle(6);
+
+      const next = binding({
+        connectorGeneration: 2,
+        connectorId: `unbind-${failure}-connector-two`,
+        routeId: `unbind-${failure}-route-two`,
+        routeFence: `unbind-${failure}-fence-two`,
+        connectionId: `unbind-${failure}-connection-two`,
+        authContext: { jti: `unbind-${failure}-jti-two` },
+      });
+      assert.equal(h.runtime.onRouteBound(next).code, "BUSY");
+      assert.equal(h.state.calls.unbind.length, 1);
+      assert.equal(h.state.closes.at(-1).code, 1011);
+      assert.equal(h.state.closes.at(-1).reason, "authority_failure");
+      await settle(8);
+      assert.equal(h.state.calls.unbind.length, 1, "unbind failure must not start an unbounded retry");
+      assert.equal(h.runtime.onRouteBound(next).code, "BUSY");
+    });
+  }
 });
 
 test("correlated responses return only to the originating exact binding", async () => {

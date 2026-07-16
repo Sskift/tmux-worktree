@@ -286,9 +286,16 @@ export type RelayV2MaterializedErrorCode =
   | "IDEMPOTENCY_CONFLICT"
   | "INTERNAL"
   | "INVALID_ARGUMENT"
+  | "SNAPSHOT_TOO_LARGE"
   | "SCOPE_NOT_FOUND";
 
+const RELAY_V2_MATERIALIZED_STATE_ERROR = Symbol.for(
+  "tmux-worktree.relay-v2.materialized-state-error",
+);
+
 export class RelayV2MaterializedStateError extends Error {
+  readonly [RELAY_V2_MATERIALIZED_STATE_ERROR] = true;
+
   constructor(
     readonly code: RelayV2MaterializedErrorCode,
     message: string,
@@ -297,6 +304,14 @@ export class RelayV2MaterializedStateError extends Error {
     super(message);
     this.name = "RelayV2MaterializedStateError";
   }
+}
+
+export function isRelayV2MaterializedStateError(
+  error: unknown,
+): error is RelayV2MaterializedStateError {
+  return !!error
+    && typeof error === "object"
+    && (error as Record<PropertyKey, unknown>)[RELAY_V2_MATERIALIZED_STATE_ERROR] === true;
 }
 
 interface PersistedSession {
@@ -876,7 +891,12 @@ function parseMaterializedState(snapshot: RelayV2HostStateSnapshot): PersistedMa
     ) {
       throw new RelayV2MaterializedStateError("INTERNAL", "capacity reservation charge is invalid");
     }
-    const commandTuple = canonicalReservationTuple(reservation);
+    const commandTuple = canonicalReservationTuple({
+      hostEpoch: reservation.hostEpoch as string,
+      principalId: reservation.principalId as string,
+      hostId: reservation.hostId as string,
+      commandId: reservation.commandId as string,
+    });
     const logicalTargetKey = `${reservation.scopeId}\0${canonicalJson(reservation.logicalTarget)}`;
     const boundBackendAuthorityKey = reservation.boundBackendIdentity === null
       ? null
@@ -1984,7 +2004,7 @@ function normalizeFencedNegativeEvidence(
       || (evidence.operation !== "create_worktree" && evidence.operation !== "create_terminal")) {
       throw new RelayV2MaterializedStateError("INTERNAL", "negative settlement evidence is malformed");
     }
-    const normalized = clone(evidence) as RelayV2FencedNegativeEvidence;
+    const normalized = clone(evidence) as unknown as RelayV2FencedNegativeEvidence;
     parseRequestFingerprint(normalized.requestFingerprint);
     const candidate = candidateById.get(normalized.reservationId);
     if (candidate === undefined || !sameFencedNegativeIdentity(candidate, normalized)) {
@@ -2275,8 +2295,9 @@ function ensureConvenienceFrame(frame: RelayV2JsonObject): void {
     encodeRelayV2WebSocketFrame("public", frame);
   } catch {
     throw new RelayV2MaterializedStateError(
-      "CAPABILITY_UNAVAILABLE",
-      "single-frame snapshot exceeds its frozen wire boundary",
+      "SNAPSHOT_TOO_LARGE",
+      "single-frame snapshot exceeds its frozen boundary; use state.snapshot",
+      { useStateSnapshot: true },
     );
   }
 }
