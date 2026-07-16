@@ -90,18 +90,16 @@ class RelayV2TerminalCheckpointReducerTest {
         )
 
         val nextDelivery = delivery(deliverySequence = 2, connectionGeneration = 2)
-        val requiresRebind = RelayV2TerminalCheckpointReducer.restore(
+        val restoredFreshAuthority = RelayV2TerminalCheckpointReducer.restore(
             RelayV2TerminalStoredCheckpoint.Present(checkpoint),
             identity,
             checkpoint.openAttempt,
             nextDelivery,
             PARSER_CONTINUITY,
         )
-        assertEquals(
-            RelayV2TerminalResetReason.IDENTITY_CHANGED,
-            (requiresRebind.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
-        )
-        assertNull(requiresRebind.checkpoint)
+        assertTrue(restoredFreshAuthority.outcome is RelayV2TerminalOutcome.Restored)
+        assertEquals(nextDelivery, restoredFreshAuthority.checkpoint?.deliveryToken)
+        assertTrue(restoredFreshAuthority.effects.isEmpty())
         val rebound = reduce(
             checkpoint,
             RelayV2TerminalAction.RebindDelivery(
@@ -229,7 +227,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 ),
             ),
             finalizedClosed.copy(
-                pendingClose = RelayV2TerminalPendingClose(closeAttempt()),
+                pendingClose = RelayV2TerminalPendingClose(closeAttempt(), "close-request-corrupt"),
                 closed = finalizedClosed.closed?.copy(
                     tombstone = finalizedClosed.closed.tombstone.copy(
                         closeAttempt = closeAttempt(),
@@ -345,6 +343,51 @@ class RelayV2TerminalCheckpointReducerTest {
     }
 
     @Test
+    fun `live output queues behind received replay tail until parser crosses exact boundary`() {
+        val initial = open()
+        var result = output(initial, "1", "b")
+        var checkpoint = requireNotNull(result.checkpoint)
+        val replay = result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>().single()
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ReplayStarted(
+                checkpoint.identity,
+                checkpoint.openAttempt.openId,
+                checkpoint.deliveryToken,
+                replay.requestId,
+                fromOffset = "0",
+                tailOffsetAtStart = "1",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+
+        result = output(checkpoint, "0", "a")
+        checkpoint = requireNotNull(result.checkpoint)
+        val replayWrite = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>()
+            .single()
+        result = output(checkpoint, "1", "b")
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(RelayV2TerminalPhase.REPLAYING, checkpoint.phase)
+        assertEquals("1", checkpoint.replayTargetOffset)
+        assertEquals("0", checkpoint.parserAppliedNextOffset)
+        assertEquals("2", checkpoint.networkReceivedThrough)
+        assertEquals(2, checkpoint.pendingOutput.size)
+        assertTrue(result.effects.isEmpty())
+
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ParserApplied(replayWrite.callbackToken),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(RelayV2TerminalPhase.LIVE, checkpoint.phase)
+        assertEquals("1", checkpoint.parserAppliedNextOffset)
+        val liveWrite = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(liveWrite.callbackToken))
+        assertEquals("2", result.checkpoint?.parserAppliedNextOffset)
+        assertTrue(result.outcome is RelayV2TerminalOutcome.ParserAdvanced)
+    }
+
+    @Test
     fun `parser callback token fences full identity delivery continuity and exact range`() {
         var checkpoint = open()
         val queued = output(checkpoint, "0", "abc")
@@ -423,7 +466,11 @@ class RelayV2TerminalCheckpointReducerTest {
 
         val closeAtLimit = reduce(
             itemFull,
-            RelayV2TerminalAction.RequestClose(itemFull.deliveryToken, closeAttempt()),
+            RelayV2TerminalAction.RequestClose(
+                itemFull.deliveryToken,
+                closeAttempt(),
+                "close-limit-request",
+            ),
         )
         assertTrue(closeAtLimit.effects.first() is RelayV2TerminalEffect.SendClose)
 
@@ -441,7 +488,11 @@ class RelayV2TerminalCheckpointReducerTest {
 
         result = reduce(
             itemReset,
-            RelayV2TerminalAction.RequestClose(itemReset.deliveryToken, closeAttempt()),
+            RelayV2TerminalAction.RequestClose(
+                itemReset.deliveryToken,
+                closeAttempt(),
+                "close-reset-request",
+            ),
         )
         assertEquals(
             listOf(
@@ -598,7 +649,12 @@ class RelayV2TerminalCheckpointReducerTest {
                 error = RelayV2TerminalControlError.GAP,
             ),
             RelayV2TerminalAction.RetryUnackedControls(finalized.deliveryToken),
-            RelayV2TerminalAction.RequestClose(finalized.deliveryToken, closeAttempt()),
+            RelayV2TerminalAction.RetryReplay(finalized.deliveryToken, "late-replay-request"),
+            RelayV2TerminalAction.RequestClose(
+                finalized.deliveryToken,
+                closeAttempt(),
+                "late-close-request",
+            ),
             closedAction(
                 finalized,
                 finalOffset = "3",
@@ -637,7 +693,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
                 (late.outcome as RelayV2TerminalOutcome.Ignored).reason,
             )
-            assertEquals(finalized, late.checkpoint)
+            assertTrue(finalized === late.checkpoint)
             assertTrue(late.effects.isEmpty())
         }
         val unauthorizedOpenAttempt = openAttempt("late-open", "late-open-fingerprint")
@@ -647,6 +703,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 finalized.identity.copy(
                     generation = "generation-late",
                     resumeTokenCredentialReference = "resume-token-ref-late",
+                    resumeTokenCredentialFingerprint = "resume-token-fingerprint-late",
                 ),
                 requestId = "late-open-request",
                 openAttempt = unauthorizedOpenAttempt,
@@ -660,23 +717,38 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         assertEquals(
-            RelayV2TerminalIgnoredReason.STALE_OPEN_RESPONSE,
+            RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
             (unauthorizedOpen.outcome as RelayV2TerminalOutcome.Ignored).reason,
         )
-        assertEquals(finalized, unauthorizedOpen.checkpoint)
+        assertTrue(finalized === unauthorizedOpen.checkpoint)
         assertTrue(unauthorizedOpen.effects.isEmpty())
-        val authorizedPending = beginOpen(
+        val lateBegin = reduce(
             finalized,
-            unauthorizedOpenAttempt,
-            "late-open-request",
-            RelayV2TerminalOpenMode.RESET,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                finalized.deliveryToken,
+                requestId = "late-open-request",
+                openAttempt = unauthorizedOpenAttempt,
+                mode = RelayV2TerminalOpenMode.RESET,
+                cols = finalized.openedCols,
+                rows = finalized.openedRows,
+                target = finalized.identity.target(),
+                parserContinuityId = finalized.parserContinuityId,
+                resume = openResume(finalized, null),
+            ),
         )
+        assertEquals(
+            RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
+            (lateBegin.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertTrue(finalized === lateBegin.checkpoint)
+        val authorizedPending = requireNotNull(lateBegin.checkpoint)
         val authorizedOpen = reduce(
             authorizedPending,
             RelayV2TerminalAction.Opened(
                 finalized.identity.copy(
                     generation = "generation-late",
                     resumeTokenCredentialReference = "resume-token-ref-late",
+                    resumeTokenCredentialFingerprint = "resume-token-fingerprint-late",
                 ),
                 requestId = "late-open-request",
                 openAttempt = unauthorizedOpenAttempt,
@@ -689,8 +761,12 @@ class RelayV2TerminalCheckpointReducerTest {
                 tailOffset = "0",
             ),
         )
-        assertEquals(RelayV2TerminalPhase.RESETTING_PARSER, authorizedOpen.checkpoint?.phase)
-        assertTrue(authorizedOpen.effects.single() is RelayV2TerminalEffect.ResetParser)
+        assertEquals(
+            RelayV2TerminalIgnoredReason.FINALIZED_LATE_EVENT,
+            (authorizedOpen.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertTrue(finalized === authorizedOpen.checkpoint)
+        assertTrue(authorizedOpen.effects.isEmpty())
     }
 
     @Test
@@ -1234,6 +1310,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 initial.openedRows,
                 initial.identity.target(),
                 initial.parserContinuityId,
+                openResume(initial, initial.parserAppliedNextOffset),
             ),
         )
         assertEquals(
@@ -1277,28 +1354,58 @@ class RelayV2TerminalCheckpointReducerTest {
     }
 
     @Test
-    fun `replay rebind uses actor generation local token and stale reset cannot kill timeline`() {
+    fun `replay rebind requires fresh request redrive and stale reset cannot kill timeline`() {
         val initial = open()
         var result = output(initial, "1", "x")
         val requested = requireNotNull(result.checkpoint)
         val firstRequest = result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>()
             .single()
+        val restored = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(requested),
+            requested.identity,
+            requested.openAttempt,
+            requested.deliveryToken,
+            requested.parserContinuityId,
+        )
+        assertTrue(restored.effects.isEmpty())
+        result = reduce(
+            requireNotNull(restored.checkpoint),
+            RelayV2TerminalAction.RetryReplay(
+                requested.deliveryToken,
+                requestId = "replay-after-restore",
+            ),
+        )
+        val restoredRequested = requireNotNull(result.checkpoint)
+        assertEquals(
+            "replay-after-restore",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>().single().requestId,
+        )
         val reboundDelivery = delivery(connectionGeneration = 1, deliverySequence = 2)
         result = reduce(
-            requested,
+            restoredRequested,
             RelayV2TerminalAction.RebindDelivery(
-                requested.identity,
-                requested.deliveryToken,
+                restoredRequested.identity,
+                restoredRequested.deliveryToken,
                 reboundDelivery,
-                requested.parserContinuityId,
+                restoredRequested.parserContinuityId,
             ),
         )
         var rebound = requireNotNull(result.checkpoint)
+        assertTrue(result.effects.isEmpty())
+        assertEquals(reboundDelivery, rebound.pendingReplay?.fence?.deliveryToken)
+
+        result = reduce(
+            rebound,
+            RelayV2TerminalAction.RetryReplay(
+                rebound.deliveryToken,
+                requestId = "replay-after-rebind",
+            ),
+        )
+        rebound = requireNotNull(result.checkpoint)
         val reboundRequest = result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>()
             .single()
-        assertEquals(firstRequest.requestId, reboundRequest.requestId)
+        assertEquals("replay-after-rebind", reboundRequest.requestId)
         assertEquals(reboundDelivery, reboundRequest.fence.deliveryToken)
-        assertEquals(reboundDelivery, rebound.pendingReplay?.fence?.deliveryToken)
 
         val oldCallback = reduce(
             rebound,
@@ -1322,7 +1429,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 RelayV2TerminalAction.ReplayStarted(
                     rebound.identity,
                     rebound.openAttempt.openId,
-                    rebound.deliveryToken,
+                rebound.deliveryToken,
                     reboundRequest.requestId,
                     fromOffset = "0",
                     tailOffsetAtStart = "0",
@@ -1364,6 +1471,86 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, exactReset.checkpoint?.phase)
+    }
+
+    @Test
+    fun `rebind and resumed redrive pending controls only with the current delivery fence`() {
+        var checkpoint = open()
+        val oldDelivery = checkpoint.deliveryToken
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.EnqueueInput(
+                    oldDelivery,
+                    RelayV2TerminalBytes.utf8("pending-input"),
+                ),
+            ).checkpoint,
+        )
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.EnqueueResize(oldDelivery, 100, 40),
+            ).checkpoint,
+        )
+
+        val reboundDelivery = delivery(connectionGeneration = 2, deliverySequence = 1)
+        var result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RebindDelivery(
+                checkpoint.identity,
+                oldDelivery,
+                reboundDelivery,
+                checkpoint.parserContinuityId,
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(
+            listOf(
+                RelayV2TerminalEffect.SendInput::class,
+                RelayV2TerminalEffect.SendResize::class,
+            ),
+            result.effects.map { it::class },
+        )
+        assertTrue(result.effects.all { it.fence?.deliveryToken == reboundDelivery })
+
+        val staleAck = reduce(
+            checkpoint,
+            RelayV2TerminalAction.InputAck(
+                actionFence(checkpoint, deliveryToken = oldDelivery),
+                "1",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalIgnoredReason.STALE_DELIVERY,
+            (staleAck.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertEquals("0", staleAck.checkpoint?.ackedThroughInputSeq)
+
+        val resumeAttempt = openAttempt("open-controls-resume", "controls-resume-fingerprint")
+        checkpoint = beginOpen(checkpoint, resumeAttempt, "controls-resume-request")
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.Opened(
+                checkpoint.identity,
+                requestId = "controls-resume-request",
+                openAttempt = resumeAttempt,
+                deliveryToken = reboundDelivery,
+                parserContinuityId = checkpoint.parserContinuityId,
+                disposition = RelayV2TerminalOpenDisposition.RESUMED,
+                cols = checkpoint.openedCols,
+                rows = checkpoint.openedRows,
+                replayFromOffset = "0",
+                tailOffset = "0",
+            ),
+        )
+        assertEquals(
+            listOf(
+                RelayV2TerminalEffect.SendInput::class,
+                RelayV2TerminalEffect.SendResize::class,
+            ),
+            result.effects.map { it::class },
+        )
+        assertTrue(result.effects.all { it.fence?.deliveryToken == reboundDelivery })
     }
 
     @Test
@@ -1419,7 +1606,11 @@ class RelayV2TerminalCheckpointReducerTest {
         assertTrue(
             reduce(
                 frozen,
-                RelayV2TerminalAction.RequestClose(frozen.deliveryToken, closeAttempt()),
+                RelayV2TerminalAction.RequestClose(
+                    frozen.deliveryToken,
+                    closeAttempt(),
+                    "frozen-close-request",
+                ),
             ).effects.isEmpty(),
         )
 
@@ -1535,6 +1726,83 @@ class RelayV2TerminalCheckpointReducerTest {
             RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
             (lowTail.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
+        val highAttempt = openAttempt("open-high-tail", "high-tail-fingerprint")
+        val highPending = beginOpen(knownClosed, highAttempt, "high-tail-request")
+        val highTail = reduce(
+            highPending,
+            RelayV2TerminalAction.Opened(
+                highPending.identity,
+                requestId = "high-tail-request",
+                openAttempt = highAttempt,
+                deliveryToken = highPending.deliveryToken,
+                parserContinuityId = PARSER_CONTINUITY,
+                disposition = RelayV2TerminalOpenDisposition.RESUMED,
+                cols = 120,
+                rows = 36,
+                replayFromOffset = "0",
+                tailOffset = "3",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (highTail.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
+        var noRing = open()
+        var noRingResult = output(noRing, "0", "ab")
+        noRing = requireNotNull(noRingResult.checkpoint)
+        val noRingWrite = noRingResult.effects
+            .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        noRing = requireNotNull(
+            reduce(
+                noRing,
+                RelayV2TerminalAction.ParserApplied(noRingWrite.callbackToken),
+            ).checkpoint,
+        )
+        val noRingCloseAttempt = closeAttempt("close-no-ring", "close-no-ring-fingerprint")
+        noRing = requireNotNull(
+            reduce(
+                noRing,
+                RelayV2TerminalAction.RequestClose(
+                    noRing.deliveryToken,
+                    noRingCloseAttempt,
+                    "close-no-ring-request",
+                ),
+            ).checkpoint,
+        )
+        noRing = requireNotNull(
+            reduce(
+                noRing,
+                closedAction(
+                    noRing,
+                    finalOffset = "2",
+                    replayAvailable = false,
+                    bufferStartOffset = null,
+                ),
+            ).checkpoint,
+        )
+        assertEquals(RelayV2TerminalPhase.CLOSED_WAITING_CLOSE, noRing.phase)
+        val noRingResume = openAttempt("open-no-ring", "open-no-ring-fingerprint")
+        val noRingPending = beginOpen(noRing, noRingResume, "open-no-ring-request")
+        noRingResult = reduce(
+            noRingPending,
+            RelayV2TerminalAction.Opened(
+                noRingPending.identity,
+                requestId = "open-no-ring-request",
+                openAttempt = noRingResume,
+                deliveryToken = noRingPending.deliveryToken,
+                parserContinuityId = noRingPending.parserContinuityId,
+                disposition = RelayV2TerminalOpenDisposition.RESUMED,
+                cols = noRingPending.openedCols,
+                rows = noRingPending.openedRows,
+                replayFromOffset = "2",
+                tailOffset = "2",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.OFFSET_EXPIRED,
+            (noRingResult.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
     }
 
     @Test
@@ -1543,11 +1811,17 @@ class RelayV2TerminalCheckpointReducerTest {
         val closeAttempt = closeAttempt("close-current", "close-current-fingerprint")
         var result = reduce(
             checkpoint,
-            RelayV2TerminalAction.RequestClose(checkpoint.deliveryToken, closeAttempt),
+            RelayV2TerminalAction.RequestClose(
+                checkpoint.deliveryToken,
+                closeAttempt,
+                "close-current-request",
+            ),
         )
         checkpoint = requireNotNull(result.checkpoint)
-        assertEquals("close-current", result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>()
-            .single().closeId)
+        assertEquals(
+            "close-current-request",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>().single().requestId,
+        )
 
         val reboundDelivery = delivery(connectionGeneration = 2, deliverySequence = 2)
         result = reduce(
@@ -1560,8 +1834,20 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         checkpoint = requireNotNull(result.checkpoint)
-        assertEquals("close-current", result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>()
-            .single().closeId)
+        assertTrue(result.effects.isEmpty())
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RequestClose(
+                checkpoint.deliveryToken,
+                closeAttempt,
+                "close-after-rebind-request",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(
+            "close-after-rebind-request",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>().single().requestId,
+        )
 
         val resumeAttempt = openAttempt("open-after-disconnect", "disconnect-fingerprint")
         checkpoint = beginOpen(checkpoint, resumeAttempt, "disconnect-resume-request")
@@ -1582,8 +1868,20 @@ class RelayV2TerminalCheckpointReducerTest {
         )
         checkpoint = requireNotNull(result.checkpoint)
         assertEquals(closeAttempt, checkpoint.pendingClose?.closeAttempt)
-        assertEquals("close-current", result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>()
-            .single().closeId)
+        assertTrue(result.effects.isEmpty())
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RequestClose(
+                checkpoint.deliveryToken,
+                closeAttempt,
+                "close-after-resume-request",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(
+            "close-after-resume-request",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.SendClose>().single().requestId,
+        )
         assertEquals(
             RelayV2TerminalControlRejectionReason.TERMINAL_NOT_WRITABLE,
             (reduce(
@@ -1617,6 +1915,30 @@ class RelayV2TerminalCheckpointReducerTest {
         assertEquals(closeAttempt, checkpoint.pendingClose?.closeAttempt)
         assertNull(checkpoint.closed?.tombstone?.closeAttempt)
 
+        val restoredWaitingClose = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(checkpoint),
+            checkpoint.identity,
+            checkpoint.openAttempt,
+            checkpoint.deliveryToken,
+            checkpoint.parserContinuityId,
+        )
+        checkpoint = requireNotNull(restoredWaitingClose.checkpoint)
+        assertTrue(restoredWaitingClose.effects.isEmpty())
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RequestClose(
+                checkpoint.deliveryToken,
+                closeAttempt,
+                "close-query-after-restore",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
+        assertEquals(
+            "close-query-after-restore",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.QueryCloseCorrelation>()
+                .single().requestId,
+        )
+
         val closedRebind = delivery(connectionGeneration = 3, deliverySequence = 1)
         result = reduce(
             checkpoint,
@@ -1628,10 +1950,21 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         checkpoint = requireNotNull(result.checkpoint)
+        assertTrue(result.effects.isEmpty())
+        result = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RequestClose(
+                checkpoint.deliveryToken,
+                closeAttempt,
+                "close-query-after-rebind",
+            ),
+        )
+        checkpoint = requireNotNull(result.checkpoint)
         val query = result.effects.filterIsInstance<
             RelayV2TerminalEffect.QueryCloseCorrelation
             >().single()
         assertEquals(closeAttempt.closeId, query.closeId)
+        assertEquals("close-query-after-rebind", query.requestId)
         assertEquals(closedRebind, query.fence.deliveryToken)
 
         val correlated = reduce(
@@ -1758,6 +2091,7 @@ class RelayV2TerminalCheckpointReducerTest {
             rows = 36,
             target = identity.target(),
             parserContinuityId = PARSER_CONTINUITY,
+            resume = null,
         )
         var result = RelayV2TerminalCheckpointReducer.reduce(null, firstBegin)
         var preOpen = requireNotNull(result.preOpenCheckpoint)
@@ -1791,20 +2125,29 @@ class RelayV2TerminalCheckpointReducerTest {
             PARSER_CONTINUITY,
         )
         assertTrue(processRestored.outcome is RelayV2TerminalOutcome.Restored)
-        assertEquals(
-            "open-request-b",
-            processRestored.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
-                .single().requestId,
+        assertTrue(processRestored.effects.isEmpty())
+        val restoredPreOpen = requireNotNull(processRestored.preOpenCheckpoint)
+        result = RelayV2TerminalCheckpointReducer.reduce(
+            restoredPreOpen,
+            firstBegin.copy(
+                deliveryToken = restoredDelivery,
+                requestId = "open-request-restored",
+            ),
         )
+        val retriedAfterRestore = requireNotNull(result.preOpenCheckpoint)
         assertEquals(
             restoredDelivery,
-            processRestored.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+            result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
                 .single().openFence.deliveryToken,
+        )
+        assertEquals(
+            "open-request-restored",
+            result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>().single().requestId,
         )
 
         val firstOpened = RelayV2TerminalAction.Opened(
             identity = identity,
-            requestId = "open-request-b",
+            requestId = "open-request-restored",
             openAttempt = attempt,
             deliveryToken = restoredDelivery,
             parserContinuityId = PARSER_CONTINUITY,
@@ -1812,15 +2155,28 @@ class RelayV2TerminalCheckpointReducerTest {
             cols = 120,
             rows = 36,
             replayFromOffset = "0",
-            tailOffset = "0",
+            tailOffset = "2",
             deduplicated = true,
         )
         result = RelayV2TerminalCheckpointReducer.reduce(
-            requireNotNull(processRestored.preOpenCheckpoint),
+            retriedAfterRestore,
             firstOpened,
         )
-        val active = requireNotNull(result.checkpoint)
+        var active = requireNotNull(result.checkpoint)
         assertEquals(attempt, active.openAttempt)
+        assertEquals(RelayV2TerminalPhase.REPLAYING, active.phase)
+        assertEquals("2", active.replayTargetOffset)
+        result = output(active, "0", "ab")
+        active = requireNotNull(result.checkpoint)
+        val responseLossReplay = result.effects
+            .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        active = requireNotNull(
+            reduce(
+                active,
+                RelayV2TerminalAction.ParserApplied(responseLossReplay.callbackToken),
+            ).checkpoint,
+        )
+        assertEquals(RelayV2TerminalPhase.LIVE, active.phase)
 
         val unsolicited = RelayV2TerminalCheckpointReducer.reduce(null, firstOpened)
         assertNull(unsolicited.checkpoint)
@@ -1901,12 +2257,265 @@ class RelayV2TerminalCheckpointReducerTest {
                 disposition = RelayV2TerminalOpenDisposition.RESUMED,
                 cols = 140,
                 rows = 50,
-                replayFromOffset = "0",
-                tailOffset = "0",
+                replayFromOffset = "2",
+                tailOffset = "2",
             ),
         )
         assertEquals(140, attachment.checkpoint?.openedCols)
         assertEquals(50, attachment.checkpoint?.openedRows)
+    }
+
+    @Test
+    fun `pre-open correlated reset persists the consumed open authority fence`() {
+        val identity = identity()
+        val firstAttempt = openAttempt("open-pre-reset", "pre-reset-fingerprint")
+        var result = RelayV2TerminalCheckpointReducer.reduce(
+            null,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = delivery(),
+                requestId = "pre-reset-request",
+                openAttempt = firstAttempt,
+                mode = RelayV2TerminalOpenMode.NEW,
+                cols = 120,
+                rows = 36,
+                target = identity.target(),
+                parserContinuityId = PARSER_CONTINUITY,
+                resume = null,
+            ),
+        )
+        var preOpen = requireNotNull(result.preOpenCheckpoint)
+        val consumedFence = result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>()
+            .single().openFence
+        val correlatedReset = RelayV2TerminalAction.PreOpenResetRequired(
+            fence = consumedFence,
+            requestId = "pre-reset-request",
+            reason = RelayV2TerminalResetReason.STREAM_LOST,
+            requestedOffset = null,
+            bufferStartOffset = null,
+            tailOffset = null,
+        )
+        result = RelayV2TerminalCheckpointReducer.reduce(preOpen, correlatedReset)
+        preOpen = requireNotNull(result.preOpenCheckpoint)
+        assertEquals(RelayV2TerminalPreOpenPhase.RESET_REQUIRED, preOpen.phase)
+        assertEquals(consumedFence, preOpen.resetFence)
+        assertEquals(
+            consumedFence,
+            result.effects.filterIsInstance<RelayV2TerminalEffect.ResetRequired>().single().fence,
+        )
+
+        val restored = RelayV2TerminalCheckpointReducer.restorePreOpen(
+            RelayV2TerminalStoredCheckpoint.PreOpen(preOpen),
+            identity.target(),
+            firstAttempt,
+            delivery(),
+            PARSER_CONTINUITY,
+        )
+        assertEquals(
+            consumedFence,
+            restored.effects.filterIsInstance<RelayV2TerminalEffect.ResetRequired>().single().fence,
+        )
+
+        val replacementAttempt = openAttempt("open-pre-reset-2", "pre-reset-fingerprint-2")
+        result = RelayV2TerminalCheckpointReducer.reduce(
+            requireNotNull(restored.preOpenCheckpoint),
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = delivery(),
+                requestId = "pre-reset-request-2",
+                openAttempt = replacementAttempt,
+                mode = RelayV2TerminalOpenMode.RESET,
+                cols = 100,
+                rows = 40,
+                target = identity.target(),
+                parserContinuityId = "parser-pre-reset-2",
+                resume = RelayV2TerminalOpenResume(
+                    generation = identity.generation,
+                    nextOffset = null,
+                    resumeTokenCredentialReference = identity.resumeTokenCredentialReference,
+                    resumeTokenCredentialFingerprint =
+                    identity.resumeTokenCredentialFingerprint,
+                ),
+            ),
+        )
+        val replacement = requireNotNull(result.preOpenCheckpoint)
+        val late = RelayV2TerminalCheckpointReducer.reduce(replacement, correlatedReset)
+        assertEquals(
+            RelayV2TerminalIgnoredReason.STALE_RESET_RESPONSE,
+            (late.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertTrue(replacement === late.preOpenCheckpoint)
+    }
+
+    @Test
+    fun `open effects freeze resume authority and new request retries require exact dedupe`() {
+        val current = open()
+        val attempt = openAttempt("open-frozen-resume", "frozen-resume-fingerprint")
+        val frozenResume = openResume(current, current.parserAppliedNextOffset)
+        val firstAction = RelayV2TerminalAction.BeginOpenAttempt(
+            deliveryToken = current.deliveryToken,
+            requestId = "resume-network-1",
+            openAttempt = attempt,
+            mode = RelayV2TerminalOpenMode.RESUME,
+            cols = 101,
+            rows = 41,
+            target = current.identity.target(),
+            parserContinuityId = current.parserContinuityId,
+            resume = frozenResume,
+        )
+        var result = reduce(current, firstAction)
+        var pending = requireNotNull(result.checkpoint)
+        val firstSend = result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>().single()
+        assertEquals(RelayV2TerminalOpenMode.RESUME, firstSend.openFence.mode)
+        assertEquals(101, firstSend.openFence.cols)
+        assertEquals(41, firstSend.openFence.rows)
+        assertEquals(frozenResume, firstSend.openFence.resume)
+        assertEquals(frozenResume, firstSend.resume)
+
+        result = reduce(pending, firstAction.copy(requestId = "resume-network-2"))
+        pending = requireNotNull(result.checkpoint)
+        val retrySend = result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>().single()
+        assertEquals(firstSend.openFence, retrySend.openFence)
+        assertEquals("resume-network-2", retrySend.requestId)
+        assertTrue(pending.pendingOpen?.requiresDeduplicatedResponse == true)
+
+        val replayedResult = RelayV2TerminalAction.Opened(
+            identity = current.identity,
+            requestId = "resume-network-2",
+            openAttempt = attempt,
+            deliveryToken = current.deliveryToken,
+            parserContinuityId = current.parserContinuityId,
+            disposition = RelayV2TerminalOpenDisposition.RESUMED,
+            cols = 101,
+            rows = 41,
+            replayFromOffset = "0",
+            tailOffset = "0",
+            deduplicated = true,
+        )
+        val missingDedupe = reduce(pending, replayedResult.copy(deduplicated = false))
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (missingDedupe.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+        val wrongOriginalGeneration = reduce(
+            pending,
+            replayedResult.copy(
+                identity = current.identity.copy(generation = "generation-other"),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.GENERATION_STALE,
+            (wrongOriginalGeneration.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+        val wrongOriginalToken = reduce(
+            pending,
+            replayedResult.copy(
+                identity = current.identity.copy(
+                    resumeTokenCredentialReference = "resume-token-ref-other",
+                    resumeTokenCredentialFingerprint = "resume-token-fingerprint-other",
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.IDENTITY_CHANGED,
+            (wrongOriginalToken.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+        val accepted = reduce(pending, replayedResult)
+        assertEquals(attempt, accepted.checkpoint?.openAttempt)
+        assertEquals(frozenResume, accepted.checkpoint?.openRequestResume)
+
+        val resetAttempt = openAttempt("open-frozen-reset", "frozen-reset-fingerprint")
+        result = reduce(
+            current,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = current.deliveryToken,
+                requestId = "reset-network-1",
+                openAttempt = resetAttempt,
+                mode = RelayV2TerminalOpenMode.RESET,
+                cols = 90,
+                rows = 30,
+                target = current.identity.target(),
+                parserContinuityId = "parser-after-frozen-reset",
+                resume = openResume(current, null),
+            ),
+        )
+        val resetSend = result.effects.filterIsInstance<RelayV2TerminalEffect.SendOpen>().single()
+        assertEquals(current.identity.generation, resetSend.resume?.generation)
+        assertNull(resetSend.resume?.nextOffset)
+        assertEquals(
+            current.identity.resumeTokenCredentialFingerprint,
+            resetSend.resume?.resumeTokenCredentialFingerprint,
+        )
+        val firstResetPending = requireNotNull(result.checkpoint)
+        val prematureTail = reduce(
+            firstResetPending,
+            RelayV2TerminalAction.Opened(
+                identity = current.identity.copy(
+                    generation = "generation-reset-tail",
+                    resumeTokenCredentialReference = "resume-token-ref-reset-tail",
+                    resumeTokenCredentialFingerprint = "resume-token-fingerprint-reset-tail",
+                ),
+                requestId = "reset-network-1",
+                openAttempt = resetAttempt,
+                deliveryToken = current.deliveryToken,
+                parserContinuityId = "parser-after-frozen-reset",
+                disposition = RelayV2TerminalOpenDisposition.RESET,
+                cols = 90,
+                rows = 30,
+                replayFromOffset = "0",
+                tailOffset = "2",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.GENERATION_STALE,
+            (prematureTail.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
+        result = reduce(
+            firstResetPending,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                deliveryToken = current.deliveryToken,
+                requestId = "reset-network-2",
+                openAttempt = resetAttempt,
+                mode = RelayV2TerminalOpenMode.RESET,
+                cols = 90,
+                rows = 30,
+                target = current.identity.target(),
+                parserContinuityId = "parser-after-frozen-reset",
+                resume = openResume(current, null),
+            ),
+        )
+        val retriedReset = requireNotNull(result.checkpoint)
+        result = reduce(
+            retriedReset,
+            RelayV2TerminalAction.Opened(
+                identity = current.identity.copy(
+                    generation = "generation-reset-tail",
+                    resumeTokenCredentialReference = "resume-token-ref-reset-tail",
+                    resumeTokenCredentialFingerprint = "resume-token-fingerprint-reset-tail",
+                ),
+                requestId = "reset-network-2",
+                openAttempt = resetAttempt,
+                deliveryToken = current.deliveryToken,
+                parserContinuityId = "parser-after-frozen-reset",
+                disposition = RelayV2TerminalOpenDisposition.RESET,
+                cols = 90,
+                rows = 30,
+                replayFromOffset = "0",
+                tailOffset = "2",
+                deduplicated = true,
+            ),
+        )
+        var replayingReset = requireNotNull(result.checkpoint)
+        assertEquals(RelayV2TerminalPhase.REPLAYING, replayingReset.phase)
+        assertEquals("2", replayingReset.replayTargetOffset)
+        val resetParser = result.effects.filterIsInstance<RelayV2TerminalEffect.ResetParser>().single()
+        result = output(replayingReset, "0", "ab")
+        replayingReset = requireNotNull(result.checkpoint)
+        assertTrue(result.effects.none { it is RelayV2TerminalEffect.WriteParser })
+        result = reduce(
+            replayingReset,
+            RelayV2TerminalAction.ParserResetApplied(resetParser.callbackToken),
+        )
+        assertTrue(result.effects.any { it is RelayV2TerminalEffect.WriteParser })
     }
 
     @Test
@@ -1943,6 +2552,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 rows = 30,
                 target = resetRequired.identity.target(),
                 parserContinuityId = "replacement-parser-continuity",
+                resume = openResume(resetRequired, null),
             ),
         )
         resetRequired = requireNotNull(result.checkpoint)
@@ -1996,6 +2606,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 rows = 36,
                 target = dirtyReset.identity.target(),
                 parserContinuityId = dirtyReset.parserContinuityId,
+                resume = openResume(dirtyReset, dirtyReset.parserAppliedNextOffset),
             ),
         )
         assertEquals(
@@ -2015,6 +2626,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 rows = 24,
                 target = dirtyReset.identity.target(),
                 parserContinuityId = "parser-after-reset",
+                resume = openResume(dirtyReset, null),
             ),
         )
         val dirtyPendingReset = requireNotNull(result.checkpoint)
@@ -2025,6 +2637,7 @@ class RelayV2TerminalCheckpointReducerTest {
             hostInstanceId = "host-process-2",
             generation = "generation-2",
             resumeTokenCredentialReference = "resume-token-ref-2",
+            resumeTokenCredentialFingerprint = "resume-token-fingerprint-2",
         )
         result = reduce(
             dirtyPendingReset,
@@ -2059,6 +2672,7 @@ class RelayV2TerminalCheckpointReducerTest {
                     rows = 24,
                     target = replaced.identity.target(),
                     parserContinuityId = "parser-after-reset",
+                    resume = replaced.openRequestResume,
                 ),
             ).checkpoint,
         )
@@ -2177,8 +2791,36 @@ class RelayV2TerminalCheckpointReducerTest {
                 PARSER_CONTINUITY,
             ),
         )
-        assertEquals(8L, newerProfile.checkpoint?.identity?.profileActivationGeneration)
-        assertEquals(1L, newerProfile.checkpoint?.deliveryToken?.localDispatchToken)
+        assertEquals(
+            RelayV2TerminalIgnoredReason.STALE_DELIVERY,
+            (newerProfile.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertTrue(initial === newerProfile.checkpoint)
+
+        val restartedAuthority = delivery(
+            connectionGeneration = 1,
+            deliverySequence = 1,
+            authorityGeneration = 2,
+        )
+        val afterProcessRestart = reduce(
+            requireNotNull(newerConnection.checkpoint),
+            RelayV2TerminalAction.RebindDelivery(
+                requireNotNull(newerConnection.checkpoint).identity,
+                requireNotNull(newerConnection.checkpoint).deliveryToken,
+                restartedAuthority,
+                PARSER_CONTINUITY,
+            ),
+        )
+        assertEquals(restartedAuthority, afterProcessRestart.checkpoint?.deliveryToken)
+        val restoredAfterProcessRestart = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(initial),
+            initial.identity,
+            initial.openAttempt,
+            restartedAuthority,
+            initial.parserContinuityId,
+        )
+        assertTrue(restoredAfterProcessRestart.outcome is RelayV2TerminalOutcome.Restored)
+        assertEquals(restartedAuthority, restoredAfterProcessRestart.checkpoint?.deliveryToken)
 
         var closed = open()
         var result = reduce(
@@ -2193,6 +2835,26 @@ class RelayV2TerminalCheckpointReducerTest {
         closed = requireNotNull(result.checkpoint)
         val replayRequest = result.effects.filterIsInstance<RelayV2TerminalEffect.RequestReplay>()
             .single()
+        listOf(
+            RelayV2TerminalRetainedBuffer(false, null),
+            RelayV2TerminalRetainedBuffer(true, "1"),
+        ).forEach { unavailable ->
+            val unavailableReplay = reduce(
+                closed.copy(closed = closed.closed?.copy(retainedBuffer = unavailable)),
+                RelayV2TerminalAction.ReplayStarted(
+                    closed.identity,
+                    closed.openAttempt.openId,
+                    closed.deliveryToken,
+                    replayRequest.requestId,
+                    fromOffset = "0",
+                    tailOffsetAtStart = "2",
+                ),
+            )
+            assertEquals(
+                RelayV2TerminalResetReason.OFFSET_EXPIRED,
+                (unavailableReplay.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+            )
+        }
         val shortTail = reduce(
             closed,
             RelayV2TerminalAction.ReplayStarted(
@@ -2221,6 +2883,21 @@ class RelayV2TerminalCheckpointReducerTest {
         )
         assertEquals(RelayV2TerminalPhase.REPLAYING, exactTail.checkpoint?.phase)
         assertEquals("2", exactTail.checkpoint?.replayTargetOffset)
+        val longTail = reduce(
+            closed,
+            RelayV2TerminalAction.ReplayStarted(
+                closed.identity,
+                closed.openAttempt.openId,
+                closed.deliveryToken,
+                replayRequest.requestId,
+                fromOffset = "0",
+                tailOffsetAtStart = "3",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            (longTail.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
 
         val expiredStored = closed.copy(
             closed = closed.closed?.copy(
@@ -2494,6 +3171,11 @@ class RelayV2TerminalCheckpointReducerTest {
         replayAvailable: Boolean,
         bufferStartOffset: String?,
         closeId: String? = null,
+        requestId: String? = closeId?.let {
+            checkpoint.pendingClose?.takeIf { pending ->
+                pending.closeAttempt.closeId == closeId
+            }?.requestId ?: "close-request-1"
+        },
     ): RelayV2TerminalAction.Closed = RelayV2TerminalAction.Closed(
         actionFence(checkpoint),
         finalOffset,
@@ -2502,6 +3184,7 @@ class RelayV2TerminalCheckpointReducerTest {
         RelayV2TerminalCloseReason.BACKEND_EXIT,
         exitCode = 0,
         closeId = closeId,
+        requestId = requestId,
     )
 
     private fun closedWatermark(
@@ -2559,6 +3242,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 rows = 36,
                 target = identity.target(),
                 parserContinuityId = parserContinuityId,
+                resume = null,
             ),
         )
         return requireNotNull(
@@ -2593,6 +3277,14 @@ class RelayV2TerminalCheckpointReducerTest {
         cols: Int = checkpoint.openedCols,
         rows: Int = checkpoint.openedRows,
         parserContinuityId: String = checkpoint.parserContinuityId,
+        resume: RelayV2TerminalOpenResume? = when (mode) {
+            RelayV2TerminalOpenMode.NEW -> null
+            RelayV2TerminalOpenMode.RESUME -> openResume(
+                checkpoint,
+                checkpoint.parserAppliedNextOffset,
+            )
+            RelayV2TerminalOpenMode.RESET -> openResume(checkpoint, null)
+        },
     ): RelayV2TerminalCheckpoint = requireNotNull(
         reduce(
             checkpoint,
@@ -2605,6 +3297,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 rows,
                 checkpoint.identity.target(),
                 parserContinuityId,
+                resume,
             ),
         ).checkpoint,
     )
@@ -2634,6 +3327,7 @@ class RelayV2TerminalCheckpointReducerTest {
         streamId = "stream-1",
         generation = "generation-1",
         resumeTokenCredentialReference = "resume-token-ref-1",
+        resumeTokenCredentialFingerprint = "resume-token-fingerprint-1",
         pane = 0,
     )
 
@@ -2641,13 +3335,26 @@ class RelayV2TerminalCheckpointReducerTest {
         profileActivationGeneration: Long = 7,
         connectionGeneration: Long = 1,
         deliverySequence: Long = 1,
+        authorityGeneration: Long = 1,
     ): RelayV2TerminalDeliveryToken = RelayV2TerminalDeliveryToken(
         actorGeneration = RelayV2EffectGeneration(
             profileId = "profile-v2",
             profileGeneration = profileActivationGeneration,
             connectionGeneration = connectionGeneration,
         ),
+        authorityGeneration = authorityGeneration,
         localDispatchToken = deliverySequence,
+    )
+
+    private fun openResume(
+        checkpoint: RelayV2TerminalCheckpoint,
+        nextOffset: String?,
+    ): RelayV2TerminalOpenResume = RelayV2TerminalOpenResume(
+        generation = checkpoint.identity.generation,
+        nextOffset = nextOffset,
+        resumeTokenCredentialReference = checkpoint.identity.resumeTokenCredentialReference,
+        resumeTokenCredentialFingerprint =
+        checkpoint.identity.resumeTokenCredentialFingerprint,
     )
 
     private fun openAttempt(
