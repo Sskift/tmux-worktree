@@ -131,9 +131,13 @@ internal data class RelayV2CredentialBlob(
     val refreshToken: String? = null,
     val refreshExpiresAtMs: Long? = null,
     val pendingAttempt: RelayV2PendingCredentialAttempt? = null,
+    val completedAttemptId: String? = null,
+    val completedSecretReference: String? = null,
 ) {
     init {
-        require(schemaVersion == SCHEMA_VERSION) { "Unsupported credential schema" }
+        require(schemaVersion in LEGACY_SCHEMA_VERSION..SCHEMA_VERSION) {
+            "Unsupported credential schema"
+        }
         require(credentialVersion >= 0) { "Credential version cannot be negative" }
         require(RelayV2EndpointValidator.isIssuerUrl(issuerUrl)) {
             "Relay v2 issuer endpoint is invalid"
@@ -147,6 +151,14 @@ internal data class RelayV2CredentialBlob(
         require(pendingAttempt?.oldCredentialVersion == null ||
             pendingAttempt.oldCredentialVersion == credentialVersion
         ) { "Pending attempt version does not match the credential" }
+        require(
+            (completedAttemptId == null && completedSecretReference == null) ||
+                (!completedAttemptId.isNullOrBlank() &&
+                    !completedSecretReference.isNullOrBlank()),
+        ) { "Completed credential attempt identity is incomplete" }
+        require(schemaVersion >= SCHEMA_VERSION || completedAttemptId == null) {
+            "Legacy credential schema cannot store completed attempt identity"
+        }
 
         val completedFields = listOf(
             principalId,
@@ -171,6 +183,14 @@ internal data class RelayV2CredentialBlob(
                 "Credential expiry cannot be negative"
             }
         }
+        if (completedAttemptId != null) {
+            require(hasCredentialMaterial) {
+                "Completed attempt identity requires credential material"
+            }
+            require(pendingAttempt?.kind != RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE) {
+                "Completed enrollment cannot retain a pending enrollment attempt"
+            }
+        }
         if (pendingAttempt?.kind == RelayV2CredentialAttemptKind.REFRESH) {
             require(hasCredentialMaterial) { "Refresh requires an existing credential" }
             require(pendingAttempt.secret == refreshToken) {
@@ -188,10 +208,12 @@ internal data class RelayV2CredentialBlob(
             "clientInstanceId=$clientInstanceId, principalId=$principalId, grantId=$grantId, " +
             "accessToken=<redacted>, accessExpiresAtMs=$accessExpiresAtMs, " +
             "refreshToken=<redacted>, refreshExpiresAtMs=$refreshExpiresAtMs, " +
-            "pendingAttempt=$pendingAttempt)"
+            "pendingAttempt=$pendingAttempt, completedAttemptId=$completedAttemptId, " +
+            "completedSecretReference=$completedSecretReference)"
 
     companion object {
-        const val SCHEMA_VERSION = 1
+        const val SCHEMA_VERSION = 2
+        const val LEGACY_SCHEMA_VERSION = 1
     }
 }
 
@@ -232,17 +254,14 @@ internal interface RelayV2CredentialStore {
         replacement: RelayV2CredentialBlob,
     ): RelayV2CredentialCasResult
 
-    /** Removes only the exact blob written by a failed cross-store activation commit. */
-    fun clearIfUnchanged(
-        reference: RelayV2CredentialReference,
-        expected: RelayV2CredentialBlob,
-    ): Boolean = error("Exact Relay v2 credential compensation is unsupported")
-
     fun clear(reference: RelayV2CredentialReference)
 }
 
 internal fun interface RelayV2ProfileActivationCommit {
-    fun commitCredential(): Boolean
+    suspend fun installCredential(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
+    ): RelayV2CredentialBlob?
 }
 
 internal fun interface RelayV2ProfileActivationAuthority {
@@ -254,12 +273,32 @@ internal fun interface RelayV2ProfileActivationAuthority {
 internal interface RelayV2ProfileStore {
     suspend fun activeProfileIdentity(): RelayActiveProfileIdentity?
     suspend fun activeRelayV2Profile(): RelayV2Profile?
+    suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal?
 
-    /** Atomically activates [profile] only while the exact previous identity is still active. */
-    suspend fun activateRelayV2Profile(
+    suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,
+        operationId: String,
         profile: RelayV2Profile,
-        commit: RelayV2ProfileActivationCommit,
+        targetBindingDigest: String,
+        targetCredentialAttemptId: String,
+        barrierId: String?,
+        previousCredentialReference: RelayV2CredentialReference?,
+    ): RelayV2ProfileActivationJournal?
+
+    suspend fun fenceRelayV2Activation(
+        operationId: String,
+        receipt: RelayProfileDisconnectReceipt?,
+    ): RelayV2ProfileActivationJournal?
+
+    suspend fun markRelayV2CredentialReady(
+        operationId: String,
+        credentialVersion: Long,
+    ): RelayV2ProfileActivationJournal?
+
+    /** Publishes [profile] and removes its exact durable activation journal in one DataStore edit. */
+    suspend fun activateRelayV2Profile(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
     ): RelayV2Profile?
 
     suspend fun updateRelayV2CredentialVersion(
@@ -283,9 +322,82 @@ internal data class RelayProfileDisconnectReceipt(
     val barrierId: String,
 )
 
+internal enum class RelayV2ProfileActivationPhase {
+    PREPARED,
+    OLD_FENCED,
+    CREDENTIAL_READY,
+}
+
+/** Non-sensitive durable recovery record; credential material remains Keystore-only. */
+internal data class RelayV2ProfileActivationJournal(
+    val operationId: String,
+    val previousProfile: RelayActiveProfileIdentity?,
+    val barrierId: String?,
+    val previousCredentialReference: RelayV2CredentialReference?,
+    val targetProfileId: String,
+    val targetCredentialReference: RelayV2CredentialReference,
+    val targetCredentialVersion: Long,
+    val targetBindingDigest: String,
+    val targetCredentialAttemptId: String,
+    val targetActivationGeneration: Long,
+    val phase: RelayV2ProfileActivationPhase,
+) {
+    init {
+        require(operationId.isNotBlank()) { "Activation operation ID is required" }
+        require(previousProfile?.profileId?.isNotBlank() != false) {
+            "Previous profile ID is invalid"
+        }
+        require(previousProfile?.activationGeneration?.let { it >= 0 } != false) {
+            "Previous activation generation cannot be negative"
+        }
+        require(barrierId == null || previousProfile != null) {
+            "Activation barrier has no previous profile"
+        }
+        require(barrierId?.isNotBlank() != false) { "Activation barrier ID is invalid" }
+        require(targetProfileId.isNotBlank()) { "Target profile ID is required" }
+        require(targetCredentialVersion > 0) { "Target credential version must be positive" }
+        require(targetBindingDigest.isNotBlank()) { "Target binding digest is required" }
+        require(targetCredentialAttemptId.isNotBlank()) {
+            "Target credential attempt ID is required"
+        }
+        require(targetActivationGeneration >= 0) {
+            "Target activation generation cannot be negative"
+        }
+        require(previousProfile != null || previousCredentialReference == null) {
+            "Previous credential reference has no previous profile"
+        }
+        require(barrierId != null || previousCredentialReference == null) {
+            "Previous credential reference has no isolation barrier"
+        }
+        require(previousProfile?.dialect != RelayProfileDialect.V2 ||
+            barrierId == null || previousCredentialReference != null
+        ) { "Relay v2 isolation is missing the previous credential reference" }
+    }
+
+    fun targets(profile: RelayV2Profile): Boolean =
+        targetProfileId == profile.profileId &&
+            targetCredentialReference == profile.credentialReference &&
+            targetCredentialVersion == profile.credentialVersion &&
+            targetActivationGeneration == profile.activationGeneration
+
+    fun targetsCredential(blob: RelayV2CredentialBlob): Boolean =
+        blob.credentialVersion >= targetCredentialVersion &&
+            targetCredentialAttemptId == blob.completedAttemptId
+
+    fun validatedReceipt(): RelayProfileDisconnectReceipt? {
+        check(phase != RelayV2ProfileActivationPhase.PREPARED) {
+            "Prepared activation has no validated disconnect receipt"
+        }
+        return barrierId?.let { RelayProfileDisconnectReceipt(requireNotNull(previousProfile), it) }
+    }
+}
+
 /** Clears the old profile's Room cache, Outbox, drafts, terminal queue, and credential. */
 internal fun interface RelayProfileIsolationBoundary {
-    suspend fun clearAfterDisconnect(receipt: RelayProfileDisconnectReceipt)
+    suspend fun clearAfterDisconnect(
+        receipt: RelayProfileDisconnectReceipt,
+        previousCredentialReference: RelayV2CredentialReference?,
+    )
 }
 
 internal data class RelayV2EnrollmentExchangeRequest(

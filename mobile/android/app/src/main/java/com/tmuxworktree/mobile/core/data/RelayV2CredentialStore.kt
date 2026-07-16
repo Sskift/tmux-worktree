@@ -62,17 +62,6 @@ internal class AndroidKeystoreRelayV2CredentialStore(context: Context) : RelayV2
         RelayV2CredentialCasResult.Updated(replacement.credentialVersion)
     }
 
-    override fun clearIfUnchanged(
-        reference: RelayV2CredentialReference,
-        expected: RelayV2CredentialBlob,
-    ): Boolean = synchronized(PROCESS_LOCK) {
-        if (readUnlocked(reference) != expected) return@synchronized false
-        check(preferences.edit().remove(entryKey(reference)).commit()) {
-            "Relay v2 credential compensation could not be persisted"
-        }
-        true
-    }
-
     override fun clear(reference: RelayV2CredentialReference) = synchronized(PROCESS_LOCK) {
         check(preferences.edit().remove(entryKey(reference)).commit()) {
             "Relay v2 credential could not be cleared"
@@ -196,6 +185,10 @@ internal object RelayV2CredentialBlobCodec {
                 data.writeNullableString(pending.enrollmentId)
                 data.writeNullableString(pending.deviceLabel)
             }
+            if (blob.schemaVersion >= RelayV2CredentialBlob.SCHEMA_VERSION) {
+                data.writeNullableString(blob.completedAttemptId)
+                data.writeNullableString(blob.completedSecretReference)
+            }
         }
         return output.toByteArray().also {
             require(it.size <= MAX_BLOB_BYTES) { "Relay v2 credential blob is oversized" }
@@ -207,6 +200,10 @@ internal object RelayV2CredentialBlobCodec {
         val input = ByteArrayInputStream(bytes)
         val data = DataInputStream(input)
         val schemaVersion = data.readInt()
+        require(
+            schemaVersion in RelayV2CredentialBlob.LEGACY_SCHEMA_VERSION..
+                RelayV2CredentialBlob.SCHEMA_VERSION,
+        ) { "Unsupported credential schema" }
         val credentialVersion = data.readLong()
         val issuerUrl = data.readBoundedString()
         val relayUrl = data.readBoundedString()
@@ -232,6 +229,15 @@ internal object RelayV2CredentialBlobCodec {
         } else {
             null
         }
+        val completedAttemptId: String?
+        val completedSecretReference: String?
+        if (schemaVersion >= RelayV2CredentialBlob.SCHEMA_VERSION) {
+            completedAttemptId = data.readNullableString()
+            completedSecretReference = data.readNullableString()
+        } else {
+            completedAttemptId = null
+            completedSecretReference = null
+        }
         require(input.available() == 0) { "Relay v2 credential blob has trailing data" }
         return RelayV2CredentialBlob(
             schemaVersion = schemaVersion,
@@ -247,6 +253,8 @@ internal object RelayV2CredentialBlobCodec {
             refreshToken = refreshToken,
             refreshExpiresAtMs = refreshExpiresAtMs,
             pendingAttempt = pendingAttempt,
+            completedAttemptId = completedAttemptId,
+            completedSecretReference = completedSecretReference,
         )
     }
 

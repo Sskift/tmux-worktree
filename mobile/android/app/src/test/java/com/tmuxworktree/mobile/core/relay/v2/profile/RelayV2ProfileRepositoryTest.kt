@@ -146,6 +146,8 @@ class RelayV2ProfileRepositoryTest {
                 secretReference = "refresh-secret-1",
                 secret = REFRESH_TOKEN_1,
             ),
+            completedAttemptId = "exchange-completed-1",
+            completedSecretReference = "enrollment-secret-completed-1",
         )
 
         val exchangeBytes = RelayV2CredentialBlobCodec.encode(exchangeBlob)
@@ -159,6 +161,14 @@ class RelayV2ProfileRepositoryTest {
         assertEquals(
             RelayV2CredentialAttemptKind.REFRESH,
             RelayV2CredentialBlobCodec.decode(refreshBytes).pendingAttempt?.kind,
+        )
+        assertEquals(refreshBlob, RelayV2CredentialBlobCodec.decode(refreshBytes))
+        val legacyBlob = exchangeBlob.copy(
+            schemaVersion = RelayV2CredentialBlob.LEGACY_SCHEMA_VERSION,
+        )
+        assertEquals(
+            legacyBlob,
+            RelayV2CredentialBlobCodec.decode(RelayV2CredentialBlobCodec.encode(legacyBlob)),
         )
 
         val unknownTag = exchangeBytes.copyOf()
@@ -194,7 +204,14 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(RelayV2Profile.RELAY_V2_SUBPROTOCOL, profile.offeredSubprotocol)
             assertFalse(profile.autoConnect)
             assertEquals(
-                listOf("exchange", "disconnect:start", "disconnect:end", "clear", "activate"),
+                listOf(
+                    "exchange",
+                    "disconnect:start",
+                    "disconnect:end",
+                    "credential:ready",
+                    "clear",
+                    "activate",
+                ),
                 harness.events,
             )
             assertSame(harness.barrier.returnedReceipt, harness.isolationReceipts.single())
@@ -316,10 +333,9 @@ class RelayV2ProfileRepositoryTest {
             val replacement = relayV2Profile().copy(profileId = "replacement-profile")
             assertEquals(
                 replacement,
-                switched.profiles.activateRelayV2Profile(
+                switched.profiles.forceActivateRelayV2Profile(
                     switched.profiles.activeIdentity,
                     replacement,
-                    RelayV2ProfileActivationCommit { true },
                 ),
             )
             switchedGate.response.complete(enrollmentResponse(switchedRequest, "switched-late"))
@@ -448,11 +464,21 @@ class RelayV2ProfileRepositoryTest {
                 }
                 isolationGate.started.await()
 
-                assertEquals(old.profile.identity, harness.profiles.activeIdentity)
+                assertEquals(null, harness.profiles.activeIdentity)
+                assertEquals(
+                    old.profile.identity,
+                    harness.profiles.journal?.previousProfile,
+                )
+                assertEquals(
+                    RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+                    harness.profiles.journal?.phase,
+                )
                 assertEquals(null, harness.credentials.read(old.profile.credentialReference))
-                assertFalse(harness.credentials.values().single {
-                    it.pendingAttempt?.enrollmentId == "enrollment-isolation-a"
-                }.hasCredentialMaterial)
+                assertTrue(
+                    harness.credentials.read(
+                        requireNotNull(harness.profiles.journal).targetCredentialReference,
+                    )?.hasCredentialMaterial == true,
+                )
 
                 when (interleaving) {
                     DuringIsolationInterleaving.CANCEL_A -> {
@@ -510,27 +536,243 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
-    fun `activation failure after credential CAS compensates the exact completed blob`() =
+    fun `durable activation journal resumes every pre-commit failure after reopen`() =
         runBlocking {
-            val harness = Harness()
-            val confirmed = enrollmentDraft(
-                "enrollment-compensate",
-                "twenroll2.code-compensate",
-            ).confirm(deviceLabel = "Pixel")
-            harness.profiles.failNextActivationAfterCredentialCommit = true
+            ActivationPreCommitFailure.entries.forEach { boundary ->
+                val suffix = boundary.name.lowercase()
+                val harness = Harness()
+                val old = harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-journal-old-$suffix",
+                        "twenroll2.code-journal-old-$suffix",
+                    ).confirm(deviceLabel = "Old Pixel"),
+                ) as RelayV2EnrollmentResult.Activated
+                val enrollmentId = "enrollment-journal-target-$suffix"
+                val enrollmentCode = "twenroll2.code-journal-target-$suffix"
+                val confirmed = enrollmentDraft(
+                    enrollmentId,
+                    enrollmentCode,
+                ).confirm(deviceLabel = "Target Pixel")
 
-            assertTrue(runCatching {
-                harness.repository.confirmEnrollment(confirmed)
-            }.isFailure)
-            assertTrue(harness.credentials.isEmpty())
-            assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
-            assertEquals(0, harness.profiles.activationCount)
+                when (boundary) {
+                    ActivationPreCommitFailure.PREPARE ->
+                        harness.profiles.failNextPrepareBeforeWrite = true
+                    ActivationPreCommitFailure.OLD_FENCE ->
+                        harness.profiles.failNextFenceBeforeWrite = true
+                    ActivationPreCommitFailure.CREDENTIAL_CAS ->
+                        harness.credentials.failNextCasBeforeWriteCount = 2
+                    ActivationPreCommitFailure.CREDENTIAL_READY ->
+                        harness.profiles.failNextCredentialReadyBeforeWrite = true
+                    ActivationPreCommitFailure.ISOLATION ->
+                        harness.isolation.failNextAfterDestructiveMutation = true
+                    ActivationPreCommitFailure.PROFILE_PUBLISH ->
+                        harness.profiles.failNextProfilePublishBeforeWrite = true
+                }
 
-            val recovered = harness.repository.confirmEnrollment(confirmed)
-                as RelayV2EnrollmentResult.Activated
-            assertEquals(2, harness.exchange.redeemCalls)
-            assertEquals(recovered.profile, harness.profiles.activeV2)
-            assertTrue(harness.credentials.values().single().hasCredentialMaterial)
+                assertTrue(
+                    "Expected injected failure at $boundary",
+                    runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure,
+                )
+                assertEquals(1, harness.exchange.enrollmentCodeConsumptions(enrollmentCode))
+
+                val targetReference = harness.profiles.journal?.targetCredentialReference
+                    ?: harness.credentials.entries().entries.firstOrNull {
+                        it.value.pendingAttempt?.enrollmentId == enrollmentId
+                    }?.key
+                    ?: requireNotNull(harness.profiles.activeV2).credentialReference
+                val afterFailure = requireNotNull(harness.credentials.read(targetReference))
+                val completedBeforeRetry = afterFailure.takeIf { it.hasCredentialMaterial }
+                val expectedPhase = when (boundary) {
+                    ActivationPreCommitFailure.PREPARE -> null
+                    ActivationPreCommitFailure.OLD_FENCE ->
+                        RelayV2ProfileActivationPhase.PREPARED
+                    ActivationPreCommitFailure.CREDENTIAL_CAS,
+                    ActivationPreCommitFailure.CREDENTIAL_READY,
+                    -> RelayV2ProfileActivationPhase.OLD_FENCED
+                    ActivationPreCommitFailure.ISOLATION,
+                    ActivationPreCommitFailure.PROFILE_PUBLISH,
+                    -> RelayV2ProfileActivationPhase.CREDENTIAL_READY
+                }
+                assertEquals(expectedPhase, harness.profiles.journal?.phase)
+                if (expectedPhase != null &&
+                    expectedPhase != RelayV2ProfileActivationPhase.PREPARED
+                ) {
+                    assertEquals(null, harness.profiles.activeIdentity)
+                    assertEquals(null, harness.profiles.activeV2)
+                } else {
+                    assertEquals(old.profile.identity, harness.profiles.activeIdentity)
+                }
+                if (boundary == ActivationPreCommitFailure.ISOLATION ||
+                    boundary == ActivationPreCommitFailure.PROFILE_PUBLISH
+                ) {
+                    assertEquals(null, harness.credentials.read(old.profile.credentialReference))
+                } else {
+                    assertTrue(
+                        harness.credentials.read(old.profile.credentialReference)
+                            ?.hasCredentialMaterial == true,
+                    )
+                }
+                when (boundary) {
+                    ActivationPreCommitFailure.CREDENTIAL_READY,
+                    ActivationPreCommitFailure.ISOLATION,
+                    ActivationPreCommitFailure.PROFILE_PUBLISH,
+                    -> {
+                        assertTrue(afterFailure.hasCredentialMaterial)
+                        assertEquals(1L, afterFailure.credentialVersion)
+                        assertEquals(null, afterFailure.pendingAttempt)
+                        assertNotNull(afterFailure.completedAttemptId)
+                        assertNotNull(afterFailure.completedSecretReference)
+                    }
+                    else -> {
+                        assertFalse(
+                            "Expected pending credential after $boundary",
+                            afterFailure.hasCredentialMaterial,
+                        )
+                        assertEquals(0L, afterFailure.credentialVersion)
+                        assertNotNull(afterFailure.pendingAttempt)
+                    }
+                }
+
+                val redeemCallsBeforeRetry = harness.exchange.redeemCalls
+                harness.restartRepository()
+                val recovered = harness.repository.confirmEnrollment(confirmed)
+                    as RelayV2EnrollmentResult.Activated
+                val recoveredBlob = requireNotNull(harness.credentials.read(targetReference))
+
+                assertEquals(targetReference, recovered.profile.credentialReference)
+                assertEquals(recovered.profile, harness.profiles.activeV2)
+                assertEquals(recovered.profile.identity, harness.profiles.activeIdentity)
+                assertEquals(null, harness.profiles.journal)
+                assertTrue(recoveredBlob.hasCredentialMaterial)
+                assertEquals(1L, recoveredBlob.credentialVersion)
+                assertEquals(1, harness.exchange.enrollmentCodeConsumptions(enrollmentCode))
+                if (completedBeforeRetry != null) {
+                    assertEquals(completedBeforeRetry, recoveredBlob)
+                    assertEquals(redeemCallsBeforeRetry, harness.exchange.redeemCalls)
+                } else {
+                    assertEquals(redeemCallsBeforeRetry + 1, harness.exchange.redeemCalls)
+                }
+            }
+        }
+
+    @Test
+    fun `post-commit IO ambiguity rolls forward without repeating one-time enrollment`() =
+        runBlocking {
+            ActivationPostCommitAmbiguity.entries.forEach { boundary ->
+                val suffix = boundary.name.lowercase()
+                val harness = Harness()
+                val old = harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-post-old-$suffix",
+                        "twenroll2.code-post-old-$suffix",
+                    ).confirm(deviceLabel = "Old Pixel"),
+                ) as RelayV2EnrollmentResult.Activated
+                val enrollmentCode = "twenroll2.code-post-target-$suffix"
+                val confirmed = enrollmentDraft(
+                    "enrollment-post-target-$suffix",
+                    enrollmentCode,
+                ).confirm(deviceLabel = "Target Pixel")
+
+                when (boundary) {
+                    ActivationPostCommitAmbiguity.PREPARE ->
+                        harness.profiles.failNextPrepareAfterWrite = true
+                    ActivationPostCommitAmbiguity.OLD_FENCE ->
+                        harness.profiles.failNextFenceAfterWrite = true
+                    ActivationPostCommitAmbiguity.CREDENTIAL_CAS ->
+                        harness.credentials.failNextCasAfterWriteWithHigherVersion = true
+                    ActivationPostCommitAmbiguity.CREDENTIAL_READY ->
+                        harness.profiles.failNextCredentialReadyAfterWrite = true
+                    ActivationPostCommitAmbiguity.PROFILE_PUBLISH ->
+                        harness.profiles.failNextProfilePublishAfterWrite = true
+                }
+
+                val activated = harness.repository.confirmEnrollment(confirmed)
+                    as RelayV2EnrollmentResult.Activated
+                val credential = requireNotNull(
+                    harness.credentials.read(activated.profile.credentialReference),
+                )
+
+                assertEquals(activated.profile, harness.profiles.activeV2)
+                assertEquals(null, harness.profiles.journal)
+                assertEquals(null, harness.credentials.read(old.profile.credentialReference))
+                val expectedVersion = if (
+                    boundary == ActivationPostCommitAmbiguity.CREDENTIAL_CAS
+                ) 2L else 1L
+                assertEquals(expectedVersion, credential.credentialVersion)
+                assertEquals(expectedVersion, activated.profile.credentialVersion)
+                assertTrue(credential.hasCredentialMaterial)
+                assertNotNull(credential.completedAttemptId)
+                assertNotNull(credential.completedSecretReference)
+                assertEquals(1, harness.exchange.enrollmentCodeConsumptions(enrollmentCode))
+            }
+        }
+
+    @Test
+    fun `credential CAS missing or mismatched outcome fails closed without rebuilding version zero`() =
+        runBlocking {
+            CredentialCasCorruption.entries.forEach { corruption ->
+                val suffix = corruption.name.lowercase()
+                val harness = Harness()
+                val old = harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-corrupt-old-$suffix",
+                        "twenroll2.code-corrupt-old-$suffix",
+                    ).confirm(deviceLabel = "Old Pixel"),
+                ) as RelayV2EnrollmentResult.Activated
+                val enrollmentCode = "twenroll2.code-corrupt-target-$suffix"
+                val confirmed = enrollmentDraft(
+                    "enrollment-corrupt-target-$suffix",
+                    enrollmentCode,
+                ).confirm(deviceLabel = "Target Pixel")
+
+                when (corruption) {
+                    CredentialCasCorruption.MISSING ->
+                        harness.credentials.failNextCasWithMissingBlob = true
+                    CredentialCasCorruption.BINDING_MISMATCH ->
+                        harness.credentials.failNextCasWithBindingMismatch = true
+                }
+                assertTrue(runCatching {
+                    harness.repository.confirmEnrollment(confirmed)
+                }.isFailure)
+                val targetReference = requireNotNull(
+                    harness.profiles.journal,
+                ).targetCredentialReference
+                assertEquals(
+                    RelayV2ProfileActivationPhase.OLD_FENCED,
+                    harness.profiles.journal?.phase,
+                )
+                assertEquals(null, harness.profiles.activeIdentity)
+                assertTrue(
+                    harness.credentials.read(old.profile.credentialReference)
+                        ?.hasCredentialMaterial == true,
+                )
+                val corruptBlob = harness.credentials.read(targetReference)
+                when (corruption) {
+                    CredentialCasCorruption.MISSING -> assertEquals(null, corruptBlob)
+                    CredentialCasCorruption.BINDING_MISMATCH -> {
+                        assertEquals("different-host", corruptBlob?.hostId)
+                        assertEquals(1L, corruptBlob?.credentialVersion)
+                        assertTrue(corruptBlob?.hasCredentialMaterial == true)
+                    }
+                }
+
+                val redeemCallsBeforeReopen = harness.exchange.redeemCalls
+                harness.restartRepository()
+                val reopened = runCatching {
+                    harness.repository.confirmEnrollment(confirmed)
+                }
+                when (corruption) {
+                    CredentialCasCorruption.MISSING -> assertEquals(
+                        RelayV2EnrollmentResult.StaleCredentialResponse(null),
+                        reopened.getOrThrow(),
+                    )
+                    CredentialCasCorruption.BINDING_MISMATCH -> assertTrue(reopened.isFailure)
+                }
+                assertEquals(redeemCallsBeforeReopen, harness.exchange.redeemCalls)
+                assertEquals(corruptBlob, harness.credentials.read(targetReference))
+                assertEquals(1, harness.profiles.activationCount)
+                assertEquals(1, harness.exchange.enrollmentCodeConsumptions(enrollmentCode))
+            }
         }
 
     @Test
@@ -555,6 +797,7 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(1, results.count { it is RelayV2EnrollmentResult.StaleCredentialResponse })
             assertFalse(results.any { it is RelayV2EnrollmentResult.Superseded })
             assertEquals(2, harness.exchange.redeemCalls)
+            assertEquals(1, harness.exchange.enrollmentCodeConsumptions("twenroll2.code-replay"))
             assertEquals(1, harness.profiles.activationCount)
             assertEquals(1L, harness.credentials.values().single().credentialVersion)
         }
@@ -699,10 +942,9 @@ class RelayV2ProfileRepositoryTest {
             )
             assertEquals(
                 replacement,
-                switched.profiles.activateRelayV2Profile(
+                switched.profiles.forceActivateRelayV2Profile(
                     expectedActiveProfile = oldActivation.profile.identity,
                     profile = replacement,
-                    commit = RelayV2ProfileActivationCommit { true },
                 ),
             )
             val activationCountBeforeResponse = switched.profiles.activationCount
@@ -786,8 +1028,19 @@ class RelayV2ProfileRepositoryTest {
             )
             harness.profiles.failNextCredentialVersionUpdate = true
             assertTrue(runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure)
-            assertEquals(1L, harness.profiles.activeV2?.credentialVersion)
+            assertEquals(null, harness.profiles.activeV2)
+            assertEquals(
+                RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+                harness.profiles.journal?.phase,
+            )
             assertNotNull(harness.credentials.read(first.profile.credentialReference))
+            assertEquals(isolationCalls, harness.isolationCalls)
+
+            val recovered = harness.repository.confirmEnrollment(confirmed)
+                as RelayV2EnrollmentResult.Activated
+            assertEquals(2L, recovered.profile.credentialVersion)
+            assertEquals(2L, harness.profiles.activeV2?.credentialVersion)
+            assertEquals(null, harness.profiles.journal)
             assertEquals(isolationCalls, harness.isolationCalls)
         }
 
@@ -796,7 +1049,7 @@ class RelayV2ProfileRepositoryTest {
         disconnectReceipt: ((RelayActiveProfileIdentity, String) -> RelayProfileDisconnectReceipt)? = null,
     ) {
         val events = mutableListOf<String>()
-        val credentials = MemoryCredentialStore()
+        val credentials = MemoryCredentialStore(events)
         val profiles = MemoryProfileStore(events)
         val barrier = RecordingDisconnectBarrier(events, blockDisconnect, disconnectReceipt)
         val isolation = RecordingIsolationBoundary(events, profiles, credentials)
@@ -807,13 +1060,24 @@ class RelayV2ProfileRepositoryTest {
         private val ids = AtomicInteger()
         private val idFactory = { "test-${ids.incrementAndGet()}" }
         val exchange = FakeCredentialExchange(events)
-        val profileSwitch = RelayV2ProfileSwitchStateMachine(
+        var profileSwitch = newProfileSwitch()
+            private set
+        var repository = newRepository()
+            private set
+
+        fun restartRepository() {
+            profileSwitch = newProfileSwitch()
+            repository = newRepository()
+        }
+
+        private fun newProfileSwitch() = RelayV2ProfileSwitchStateMachine(
             profileStore = profiles,
             disconnectBarrier = barrier,
             isolationBoundary = isolation,
             newId = idFactory,
         )
-        val repository = RelayV2ProfileRepository(
+
+        private fun newRepository() = RelayV2ProfileRepository(
             credentialStore = credentials,
             profileStore = profiles,
             profileSwitch = profileSwitch,
@@ -823,8 +1087,15 @@ class RelayV2ProfileRepositoryTest {
         )
     }
 
-    private class MemoryCredentialStore : RelayV2CredentialStore {
+    private class MemoryCredentialStore(
+        private val events: MutableList<String>,
+    ) : RelayV2CredentialStore {
         private val blobs = linkedMapOf<RelayV2CredentialReference, RelayV2CredentialBlob>()
+        var failNextCasBeforeWriteCount = 0
+        var failNextCasAfterWrite = false
+        var failNextCasAfterWriteWithHigherVersion = false
+        var failNextCasWithMissingBlob = false
+        var failNextCasWithBindingMismatch = false
 
         @Synchronized
         override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? =
@@ -847,28 +1118,49 @@ class RelayV2ProfileRepositoryTest {
             replacement: RelayV2CredentialBlob,
         ): RelayV2CredentialCasResult = compareAndSetLocked(reference, expectation, replacement)
 
-        @Synchronized
-        override fun clearIfUnchanged(
-            reference: RelayV2CredentialReference,
-            expected: RelayV2CredentialBlob,
-        ): Boolean {
-            if (blobs[reference] != expected) return false
-            blobs.remove(reference)
-            return true
-        }
-
         private fun compareAndSetLocked(
             reference: RelayV2CredentialReference,
             expectation: RelayV2CredentialCasExpectation,
             replacement: RelayV2CredentialBlob,
         ): RelayV2CredentialCasResult {
+            if (failNextCasBeforeWriteCount > 0) {
+                failNextCasBeforeWriteCount -= 1
+                error("Relay v2 credential CAS failed before write")
+            }
             val current = blobs[reference]
                 ?: return RelayV2CredentialCasResult.Stale(null)
             if (!current.matchesExpectation(expectation)) {
                 return RelayV2CredentialCasResult.Stale(current.credentialVersion)
             }
+            if (failNextCasWithMissingBlob) {
+                failNextCasWithMissingBlob = false
+                blobs.remove(reference)
+                error("Relay v2 credential disappeared during CAS")
+            }
+            if (failNextCasWithBindingMismatch) {
+                failNextCasWithBindingMismatch = false
+                blobs[reference] = replacement.copy(hostId = "different-host")
+                error("Relay v2 credential binding changed during CAS")
+            }
             require(replacement.credentialVersion >= current.credentialVersion)
             blobs[reference] = replacement
+            if (current.pendingAttempt?.kind ==
+                RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE &&
+                replacement.hasCredentialMaterial
+            ) {
+                events += "credential:ready"
+            }
+            if (failNextCasAfterWriteWithHigherVersion) {
+                failNextCasAfterWriteWithHigherVersion = false
+                blobs[reference] = replacement.copy(
+                    credentialVersion = replacement.credentialVersion + 1,
+                )
+                error("Relay v2 credential CAS advanced before an ambiguous failure")
+            }
+            if (failNextCasAfterWrite) {
+                failNextCasAfterWrite = false
+                error("Relay v2 credential CAS outcome is ambiguous")
+            }
             return RelayV2CredentialCasResult.Updated(replacement.credentialVersion)
         }
 
@@ -886,20 +1178,39 @@ class RelayV2ProfileRepositoryTest {
         fun isEmpty(): Boolean = blobs.isEmpty()
         @Synchronized
         fun values(): List<RelayV2CredentialBlob> = blobs.values.toList()
+        @Synchronized
+        fun entries(): Map<RelayV2CredentialReference, RelayV2CredentialBlob> = blobs.toMap()
     }
 
     private class MemoryProfileStore(
         private val events: MutableList<String>,
     ) : RelayV2ProfileStore {
-        var activeIdentity: RelayActiveProfileIdentity? = RelayActiveProfileIdentity(
+        private var storedActiveIdentity: RelayActiveProfileIdentity? = RelayActiveProfileIdentity(
             profileId = "legacy-v1",
             dialect = RelayProfileDialect.V1,
             activationGeneration = 0,
         )
-        var activeV2: RelayV2Profile? = null
+        private var storedActiveV2: RelayV2Profile? = null
+        var journal: RelayV2ProfileActivationJournal? = null
+            private set
+        val activeIdentity: RelayActiveProfileIdentity?
+            get() = storedActiveIdentity.takeIf {
+                journal == null || journal?.phase == RelayV2ProfileActivationPhase.PREPARED
+            }
+        val activeV2: RelayV2Profile?
+            get() = storedActiveV2.takeIf {
+                journal == null || journal?.phase == RelayV2ProfileActivationPhase.PREPARED
+            }
         var activationCount = 0
         var failNextCredentialVersionUpdate = false
-        var failNextActivationAfterCredentialCommit = false
+        var failNextPrepareBeforeWrite = false
+        var failNextPrepareAfterWrite = false
+        var failNextFenceBeforeWrite = false
+        var failNextFenceAfterWrite = false
+        var failNextCredentialReadyBeforeWrite = false
+        var failNextCredentialReadyAfterWrite = false
+        var failNextProfilePublishBeforeWrite = false
+        var failNextProfilePublishAfterWrite = false
         var persistedValues: Map<String, Any> = emptyMap()
         private var nextActiveProfileReadGate: SuspensionGate? = null
 
@@ -919,13 +1230,145 @@ class RelayV2ProfileRepositoryTest {
 
         override suspend fun activeRelayV2Profile(): RelayV2Profile? = activeV2
 
+        override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? = journal
+
+        override suspend fun prepareRelayV2Activation(
+            expectedActiveProfile: RelayActiveProfileIdentity?,
+            operationId: String,
+            profile: RelayV2Profile,
+            targetBindingDigest: String,
+            targetCredentialAttemptId: String,
+            barrierId: String?,
+            previousCredentialReference: RelayV2CredentialReference?,
+        ): RelayV2ProfileActivationJournal? {
+            if (failNextPrepareBeforeWrite) {
+                failNextPrepareBeforeWrite = false
+                error("Relay v2 activation prepare failed before write")
+            }
+            val current = journal
+            if (storedActiveIdentity != expectedActiveProfile ||
+                current?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true
+            ) return null
+            val prepared = RelayV2ProfileActivationJournal(
+                operationId = operationId,
+                previousProfile = storedActiveIdentity,
+                barrierId = barrierId,
+                previousCredentialReference = previousCredentialReference,
+                targetProfileId = profile.profileId,
+                targetCredentialReference = profile.credentialReference,
+                targetCredentialVersion = profile.credentialVersion,
+                targetBindingDigest = targetBindingDigest,
+                targetCredentialAttemptId = targetCredentialAttemptId,
+                targetActivationGeneration = profile.activationGeneration,
+                phase = RelayV2ProfileActivationPhase.PREPARED,
+            )
+            journal = prepared
+            if (failNextPrepareAfterWrite) {
+                failNextPrepareAfterWrite = false
+                error("Relay v2 activation prepare outcome is ambiguous")
+            }
+            return prepared
+        }
+
+        override suspend fun fenceRelayV2Activation(
+            operationId: String,
+            receipt: RelayProfileDisconnectReceipt?,
+        ): RelayV2ProfileActivationJournal? {
+            if (failNextFenceBeforeWrite) {
+                failNextFenceBeforeWrite = false
+                error("Relay v2 old-profile fence failed before write")
+            }
+            val current = journal?.takeIf { it.operationId == operationId } ?: return null
+            val updated = when (current.phase) {
+                RelayV2ProfileActivationPhase.PREPARED -> {
+                    if (storedActiveIdentity != current.previousProfile) return null
+                    require(
+                        (receipt?.profile == current.previousProfile &&
+                            receipt?.barrierId == current.barrierId) ||
+                            (receipt == null && current.barrierId == null),
+                    )
+                    current.copy(phase = RelayV2ProfileActivationPhase.OLD_FENCED)
+                }
+                RelayV2ProfileActivationPhase.OLD_FENCED,
+                RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+                -> current
+            }
+            journal = updated
+            if (failNextFenceAfterWrite) {
+                failNextFenceAfterWrite = false
+                error("Relay v2 old-profile fence outcome is ambiguous")
+            }
+            return updated
+        }
+
+        override suspend fun markRelayV2CredentialReady(
+            operationId: String,
+            credentialVersion: Long,
+        ): RelayV2ProfileActivationJournal? {
+            if (failNextCredentialReadyBeforeWrite) {
+                failNextCredentialReadyBeforeWrite = false
+                error("Relay v2 credential-ready phase failed before write")
+            }
+            val current = journal?.takeIf { it.operationId == operationId } ?: return null
+            val updated = when (current.phase) {
+                RelayV2ProfileActivationPhase.PREPARED -> return null
+                RelayV2ProfileActivationPhase.OLD_FENCED -> current.copy(
+                    targetCredentialVersion = credentialVersion.also {
+                        require(it >= current.targetCredentialVersion)
+                    },
+                    phase = RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+                )
+                RelayV2ProfileActivationPhase.CREDENTIAL_READY -> when {
+                    credentialVersion < current.targetCredentialVersion -> return null
+                    credentialVersion == current.targetCredentialVersion -> current
+                    else -> current.copy(targetCredentialVersion = credentialVersion)
+                }
+            }
+            journal = updated
+            if (failNextCredentialReadyAfterWrite) {
+                failNextCredentialReadyAfterWrite = false
+                error("Relay v2 credential-ready phase outcome is ambiguous")
+            }
+            return updated
+        }
+
         override suspend fun activateRelayV2Profile(
+            journal: RelayV2ProfileActivationJournal,
+            profile: RelayV2Profile,
+        ): RelayV2Profile? {
+            if (this.journal != journal ||
+                journal.phase != RelayV2ProfileActivationPhase.CREDENTIAL_READY ||
+                !journal.targets(profile) ||
+                storedActiveIdentity != journal.previousProfile
+            ) return null
+            if (failNextProfilePublishBeforeWrite) {
+                failNextProfilePublishBeforeWrite = false
+                error("Relay v2 profile publish failed before write")
+            }
+            val resolved = resolveProfile(profile)
+            publishProfile(resolved)
+            this.journal = null
+            if (failNextProfilePublishAfterWrite) {
+                failNextProfilePublishAfterWrite = false
+                error("Relay v2 profile publish outcome is ambiguous")
+            }
+            return resolved
+        }
+
+        fun forceActivateRelayV2Profile(
             expectedActiveProfile: RelayActiveProfileIdentity?,
             profile: RelayV2Profile,
-            commit: RelayV2ProfileActivationCommit,
         ): RelayV2Profile? {
-            if (activeIdentity != expectedActiveProfile) return null
-            val current = activeV2
+            if (journal != null || storedActiveIdentity != expectedActiveProfile) return null
+            val resolved = resolveProfile(profile)
+            publishProfile(resolved)
+            return resolved
+        }
+
+        fun destructiveActiveV2(): RelayV2Profile? = storedActiveV2
+
+        private fun resolveProfile(profile: RelayV2Profile): RelayV2Profile {
+            val current = storedActiveV2
             val sameActivation = current?.identity == profile.identity &&
                 current.credentialReference == profile.credentialReference
             if (current != null &&
@@ -946,17 +1389,18 @@ class RelayV2ProfileRepositoryTest {
             } else {
                 profile
             }
-            if (!commit.commitCredential()) return null
-            if (failNextActivationAfterCredentialCommit) {
-                failNextActivationAfterCredentialCommit = false
-                error("Relay v2 profile activation failed after credential commit")
-            }
+            return resolved
+        }
+
+        private fun publishProfile(resolved: RelayV2Profile) {
+            val sameActivation = storedActiveV2?.identity == resolved.identity &&
+                storedActiveV2?.credentialReference == resolved.credentialReference
             if (!sameActivation) {
                 activationCount += 1
                 events += "activate"
             }
-            activeV2 = resolved
-            activeIdentity = resolved.identity
+            storedActiveV2 = resolved
+            storedActiveIdentity = resolved.identity
             persistedValues = mapOf(
                 "profileId" to resolved.profileId,
                 "issuerUrl" to resolved.issuerUrl,
@@ -971,7 +1415,6 @@ class RelayV2ProfileRepositoryTest {
                 "credentialKind" to "twcap2_grant",
                 "offeredSubprotocol" to resolved.offeredSubprotocol,
             )
-            return resolved
         }
 
         override suspend fun updateRelayV2CredentialVersion(
@@ -985,15 +1428,18 @@ class RelayV2ProfileRepositoryTest {
                 failNextCredentialVersionUpdate = false
                 return false
             }
-            val current = activeV2 ?: return false
+            if (journal?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true) {
+                return false
+            }
+            val current = storedActiveV2 ?: return false
             if (current.profileId != profileId ||
                 current.credentialReference != credentialReference ||
                 current.activationGeneration != expectedActivationGeneration ||
                 current.credentialVersion != expectedVersion
             ) return false
             val updated = current.copy(credentialVersion = newVersion)
-            activeV2 = updated
-            activeIdentity = updated.identity
+            storedActiveV2 = updated
+            storedActiveIdentity = updated.identity
             persistedValues = persistedValues + ("credentialVersion" to newVersion)
             return true
         }
@@ -1038,6 +1484,7 @@ class RelayV2ProfileRepositoryTest {
         private val credentials: MemoryCredentialStore,
     ) : RelayProfileIsolationBoundary {
         var calls = 0
+        var failNextAfterDestructiveMutation = false
         val receipts = mutableListOf<RelayProfileDisconnectReceipt>()
         private var nextGate: SuspensionGate? = null
 
@@ -1046,14 +1493,24 @@ class RelayV2ProfileRepositoryTest {
             nextGate = it
         }
 
-        override suspend fun clearAfterDisconnect(receipt: RelayProfileDisconnectReceipt) {
+        override suspend fun clearAfterDisconnect(
+            receipt: RelayProfileDisconnectReceipt,
+            previousCredentialReference: RelayV2CredentialReference?,
+        ) {
             calls += 1
             receipts += receipt
             events += "clear"
             // Model the real boundary's credential deletion responsibility before pausing.
-            profiles.activeV2
+            profiles.destructiveActiveV2()
                 ?.takeIf { it.identity == receipt.profile }
-                ?.let { credentials.clear(it.credentialReference) }
+                ?.let { previous ->
+                    require(previous.credentialReference == previousCredentialReference)
+                    credentials.clear(previous.credentialReference)
+                }
+            if (failNextAfterDestructiveMutation) {
+                failNextAfterDestructiveMutation = false
+                error("Relay v2 isolation failed after destructive mutation")
+            }
             nextGate?.also {
                 nextGate = null
                 it.started.complete(Unit)
@@ -1067,20 +1524,41 @@ class RelayV2ProfileRepositoryTest {
     ) : RelayV2CredentialExchange {
         var redeemCalls = 0
         private val deferredRedeems = linkedMapOf<String, DeferredRedeem>()
+        private val enrollmentCodeOwners = linkedMapOf<String, String>()
+        private val completedAttempts = linkedMapOf<String, RelayV2EnrollmentExchangeResponse>()
 
         fun deferEnrollment(enrollmentId: String): DeferredRedeem = DeferredRedeem().also {
             check(deferredRedeems.put(enrollmentId, it) == null)
         }
+
+        fun enrollmentCodeConsumptions(code: String): Int =
+            if (enrollmentCodeOwners.containsKey(code)) 1 else 0
+
+        fun completedResponse(attemptId: String): RelayV2EnrollmentExchangeResponse =
+            requireNotNull(completedAttempts[attemptId])
 
         override suspend fun redeem(
             request: RelayV2EnrollmentExchangeRequest,
         ): RelayV2EnrollmentExchangeResponse {
             redeemCalls += 1
             events += "exchange"
+            val completed = completedAttempts[request.exchangeAttemptId]
+            val attemptOwner = enrollmentCodeOwners[request.enrollmentCode]
+            require(attemptOwner == null || attemptOwner == request.exchangeAttemptId) {
+                "Enrollment code was already consumed by another attempt"
+            }
+            enrollmentCodeOwners[request.enrollmentCode] = request.exchangeAttemptId
             deferredRedeems[request.enrollmentId]?.let { deferred ->
                 deferred.record(request)
-                return deferred.response.await()
+                return deferred.response.await().also { response ->
+                    require(response.exchangeAttemptId == request.exchangeAttemptId)
+                    require(completed == null || completed == response) {
+                        "Exact enrollment attempt replay changed its completed result"
+                    }
+                    completedAttempts.putIfAbsent(request.exchangeAttemptId, response)
+                }
             }
+            completed?.let { return it }
             return RelayV2EnrollmentExchangeResponse(
                 exchangeAttemptId = request.exchangeAttemptId,
                 principalId = "principal-1",
@@ -1091,7 +1569,7 @@ class RelayV2ProfileRepositoryTest {
                 accessExpiresAtMs = 2_000,
                 refreshToken = REFRESH_TOKEN_1,
                 refreshExpiresAtMs = 3_000,
-            )
+            ).also { completedAttempts[request.exchangeAttemptId] = it }
         }
 
         override suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse =
@@ -1130,7 +1608,9 @@ class RelayV2ProfileRepositoryTest {
         assertEquals(redeemCallsBeforeRetry + 1, harness.exchange.redeemCalls)
         assertEquals(pendingBeforeRetry.pendingAttempt?.attemptId, retryRequest.exchangeAttemptId)
         assertTrue(harness.repository.cancelPendingEnrollment(confirmed))
-        retryGate.response.complete(enrollmentResponse(retryRequest, "cancelled-retry"))
+        retryGate.response.complete(
+            harness.exchange.completedResponse(retryRequest.exchangeAttemptId),
+        )
         assertTrue(retry.await() is RelayV2EnrollmentResult.Superseded)
         assertEquals(pendingBeforeRetry, harness.credentials.values().single {
             it.pendingAttempt?.enrollmentId == enrollmentId
@@ -1147,6 +1627,28 @@ class RelayV2ProfileRepositoryTest {
     private enum class DuringIsolationInterleaving {
         CANCEL_A,
         CONFIRM_B,
+    }
+
+    private enum class ActivationPreCommitFailure {
+        PREPARE,
+        OLD_FENCE,
+        CREDENTIAL_CAS,
+        CREDENTIAL_READY,
+        ISOLATION,
+        PROFILE_PUBLISH,
+    }
+
+    private enum class ActivationPostCommitAmbiguity {
+        PREPARE,
+        OLD_FENCE,
+        CREDENTIAL_CAS,
+        CREDENTIAL_READY,
+        PROFILE_PUBLISH,
+    }
+
+    private enum class CredentialCasCorruption {
+        MISSING,
+        BINDING_MISMATCH,
     }
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(

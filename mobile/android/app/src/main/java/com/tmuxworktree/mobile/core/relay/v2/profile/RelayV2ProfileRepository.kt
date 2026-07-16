@@ -3,7 +3,6 @@ package com.tmuxworktree.mobile.core.relay.v2.profile
 import java.security.MessageDigest
 import java.util.Base64
 import java.util.UUID
-import kotlin.math.max
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -38,78 +37,102 @@ internal class RelayV2ProfileSwitchStateMachine(
 
     suspend fun switchTo(
         profile: RelayV2Profile,
+        targetBindingDigest: String,
+        targetCredentialAttemptId: String,
         expectedPrevious: RelayActiveProfileIdentity?,
         isStillCurrent: () -> Boolean,
         activationAuthority: RelayV2ProfileActivationAuthority,
     ): RelayV2Profile? = mutex.withLock {
+        val pendingJournal = profileStore.pendingRelayV2Activation()
         val previous = profileStore.activeProfileIdentity()
         if (previous != expectedPrevious || !isStillCurrent()) {
             return@withLock null
         }
         val previousV2 = profileStore.activeRelayV2Profile()
-        if (previousV2 != null &&
-            previousV2.profileId == profile.profileId &&
+        val sameActiveTarget = previousV2?.profileId == profile.profileId &&
             previousV2.credentialReference == profile.credentialReference
-        ) {
-            require(previousV2.issuerUrl == profile.issuerUrl &&
-                previousV2.relayUrl == profile.relayUrl &&
-                previousV2.hostId == profile.hostId &&
-                previousV2.principalId == profile.principalId &&
-                previousV2.grantId == profile.grantId &&
-                previousV2.clientInstanceId == profile.clientInstanceId
-            ) { "Active Relay v2 profile binding conflicts with the target" }
-            val restored = if (profile.credentialVersion > previousV2.credentialVersion) {
-                previousV2.copy(credentialVersion = profile.credentialVersion)
-            } else {
-                previousV2
-            }
-            // Re-confirming the exact target is a recovery/no-op path. It must not invoke the
-            // isolation boundary because that boundary owns deletion of the previous credential.
-            if (!isStillCurrent()) {
-                state = RelayV2ProfileSwitchState.Idle
-                return@withLock null
-            }
-            val committed = activationAuthority.commitIfCurrent { commit ->
-                state = RelayV2ProfileSwitchState.Activating(restored.profileId)
-                profileStore.activateRelayV2Profile(previous, restored, commit)
-            }
-            if (committed == null) {
-                state = RelayV2ProfileSwitchState.Idle
-                return@withLock null
-            }
-            state = RelayV2ProfileSwitchState.Active(committed.identity)
-            return@withLock committed
-        }
-        val nextGeneration = max(
-            previous?.activationGeneration ?: 0,
-            (state as? RelayV2ProfileSwitchState.Active)?.identity?.activationGeneration ?: 0,
-        ) + 1
-        val activated = profile.copy(activationGeneration = nextGeneration)
-
-        val receipt = if (previous != null) {
-            val barrierId = "profile-v2-${newId()}"
-            state = RelayV2ProfileSwitchState.Draining(previous, barrierId)
-            val validated = disconnectBarrier.disconnectAndDrain(previous, barrierId)
-            check(validated.profile == previous && validated.barrierId == barrierId) {
-                "Disconnect barrier did not drain the expected profile"
-            }
-            if (!isStillCurrent()) {
-                state = RelayV2ProfileSwitchState.Idle
-                return@withLock null
-            }
-            validated
+        if (sameActiveTarget) requireSameProfileBinding(requireNotNull(previousV2), profile)
+        val samePendingTarget = pendingJournal?.matchesTarget(
+            profile = profile,
+            bindingDigest = targetBindingDigest,
+            attemptId = targetCredentialAttemptId,
+        ) == true
+        if (pendingJournal != null &&
+            pendingJournal.phase != RelayV2ProfileActivationPhase.PREPARED &&
+            !samePendingTarget
+        ) return@withLock null
+        val nextGeneration = if (samePendingTarget) {
+            pendingJournal!!.targetActivationGeneration
+        } else if (sameActiveTarget) {
+            requireNotNull(previousV2).activationGeneration
         } else {
-            null
+            maxOf(
+                previous?.activationGeneration ?: 0,
+                pendingJournal?.previousProfile?.activationGeneration ?: 0,
+                pendingJournal?.targetActivationGeneration ?: 0,
+                (state as? RelayV2ProfileSwitchState.Active)
+                    ?.identity?.activationGeneration ?: 0,
+            ) + 1
         }
-
-        val committed = activationAuthority.commitIfCurrent { commit ->
-            if (receipt != null) {
-                state = RelayV2ProfileSwitchState.Isolating(receipt)
-                isolationBoundary.clearAfterDisconnect(receipt)
+        val activated = profile.copy(
+            credentialVersion = if (samePendingTarget) {
+                maxOf(profile.credentialVersion, pendingJournal!!.targetCredentialVersion)
+            } else {
+                profile.credentialVersion
+            },
+            activationGeneration = nextGeneration,
+        )
+        val requiresIsolation = previous != null && !sameActiveTarget
+        val prepared = if (samePendingTarget) {
+            requireNotNull(pendingJournal)
+        } else {
+            val operationId = "activation-v2-${newId()}"
+            val barrierId = if (requiresIsolation) "profile-v2-${newId()}" else null
+            prepareWithRecovery(
+                expectedPrevious = previous,
+                operationId = operationId,
+                profile = activated,
+                targetBindingDigest = targetBindingDigest,
+                targetCredentialAttemptId = targetCredentialAttemptId,
+                barrierId = barrierId,
+                previousCredentialReference = if (requiresIsolation) {
+                    previousV2?.credentialReference
+                } else {
+                    null
+                },
+            ) ?: return@withLock null
+        }
+        val receipt = if (prepared.phase == RelayV2ProfileActivationPhase.PREPARED &&
+            prepared.barrierId != null
+        ) {
+            val barrierPrevious = requireNotNull(prepared.previousProfile)
+            state = RelayV2ProfileSwitchState.Draining(
+                barrierPrevious,
+                prepared.barrierId,
+            )
+            disconnectBarrier.disconnectAndDrain(
+                barrierPrevious,
+                prepared.barrierId,
+            ).also { validated ->
+                check(validated.profile == barrierPrevious &&
+                    validated.barrierId == prepared.barrierId
+                ) { "Disconnect barrier did not drain the expected profile" }
             }
-            state = RelayV2ProfileSwitchState.Activating(activated.profileId)
-            profileStore.activateRelayV2Profile(previous, activated, commit)
+        } else if (prepared.phase == RelayV2ProfileActivationPhase.PREPARED) {
+            null
+        } else {
+            prepared.validatedReceipt()
         }
+        if (!isStillCurrent()) {
+            state = RelayV2ProfileSwitchState.Idle
+            return@withLock null
+        }
+        val committed = commitPreparedActivation(
+            prepared = prepared,
+            profile = activated,
+            receipt = receipt,
+            activationAuthority = activationAuthority,
+        )
         if (committed == null) {
             state = RelayV2ProfileSwitchState.Idle
             return@withLock null
@@ -117,6 +140,159 @@ internal class RelayV2ProfileSwitchStateMachine(
         state = RelayV2ProfileSwitchState.Active(committed.identity)
         committed
     }
+
+    private suspend fun commitPreparedActivation(
+        prepared: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
+        receipt: RelayProfileDisconnectReceipt?,
+        activationAuthority: RelayV2ProfileActivationAuthority,
+    ): RelayV2Profile? = activationAuthority.commitIfCurrent { commit ->
+        var journal = prepared
+        if (journal.phase == RelayV2ProfileActivationPhase.PREPARED) {
+            journal = fenceWithRecovery(journal, receipt) ?: return@commitIfCurrent null
+        }
+        if (journal.phase == RelayV2ProfileActivationPhase.OLD_FENCED ||
+            journal.phase == RelayV2ProfileActivationPhase.CREDENTIAL_READY
+        ) {
+            val installed = commit.installCredential(journal, profile)
+                ?: return@commitIfCurrent null
+            if (journal.phase == RelayV2ProfileActivationPhase.OLD_FENCED ||
+                installed.credentialVersion > journal.targetCredentialVersion
+            ) {
+                journal = credentialReadyWithRecovery(journal, installed.credentialVersion)
+                    ?: return@commitIfCurrent null
+            }
+        }
+        check(journal.phase == RelayV2ProfileActivationPhase.CREDENTIAL_READY)
+        (receipt ?: journal.validatedReceipt())?.let { durableReceipt ->
+            state = RelayV2ProfileSwitchState.Isolating(durableReceipt)
+            isolationBoundary.clearAfterDisconnect(
+                durableReceipt,
+                journal.previousCredentialReference,
+            )
+        }
+        val readyProfile = profile.copy(credentialVersion = journal.targetCredentialVersion)
+        state = RelayV2ProfileSwitchState.Activating(readyProfile.profileId)
+        activateWithRecovery(journal, readyProfile)
+    }
+
+    private suspend fun prepareWithRecovery(
+        expectedPrevious: RelayActiveProfileIdentity?,
+        operationId: String,
+        profile: RelayV2Profile,
+        targetBindingDigest: String,
+        targetCredentialAttemptId: String,
+        barrierId: String?,
+        previousCredentialReference: RelayV2CredentialReference?,
+    ): RelayV2ProfileActivationJournal? = recoverStoreWrite(
+        write = {
+            profileStore.prepareRelayV2Activation(
+                expectedActiveProfile = expectedPrevious,
+                operationId = operationId,
+                profile = profile,
+                targetBindingDigest = targetBindingDigest,
+                targetCredentialAttemptId = targetCredentialAttemptId,
+                barrierId = barrierId,
+                previousCredentialReference = previousCredentialReference,
+            )
+        },
+        recover = {
+            profileStore.pendingRelayV2Activation()?.takeIf {
+                it.operationId == operationId &&
+                    it.phase == RelayV2ProfileActivationPhase.PREPARED &&
+                    it.previousProfile == expectedPrevious && it.barrierId == barrierId &&
+                    it.previousCredentialReference == previousCredentialReference &&
+                    it.targetCredentialVersion == profile.credentialVersion &&
+                    it.targetActivationGeneration == profile.activationGeneration &&
+                    it.matchesTarget(
+                        profile,
+                        targetBindingDigest,
+                        targetCredentialAttemptId,
+                    )
+            }
+        },
+    )
+
+    private suspend fun fenceWithRecovery(
+        prepared: RelayV2ProfileActivationJournal,
+        receipt: RelayProfileDisconnectReceipt?,
+    ): RelayV2ProfileActivationJournal? = recoverStoreWrite(
+        write = { profileStore.fenceRelayV2Activation(prepared.operationId, receipt) },
+        recover = {
+            profileStore.pendingRelayV2Activation()?.takeIf {
+                it.operationId == prepared.operationId &&
+                    it.phase == RelayV2ProfileActivationPhase.OLD_FENCED &&
+                    it.copy(phase = RelayV2ProfileActivationPhase.PREPARED) == prepared
+            }
+        },
+    )
+
+    private suspend fun credentialReadyWithRecovery(
+        fenced: RelayV2ProfileActivationJournal,
+        credentialVersion: Long,
+    ): RelayV2ProfileActivationJournal? {
+        val expected = fenced.copy(
+            targetCredentialVersion = credentialVersion,
+            phase = RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+        )
+        return recoverStoreWrite(
+            write = {
+                profileStore.markRelayV2CredentialReady(fenced.operationId, credentialVersion)
+            },
+            recover = {
+                profileStore.pendingRelayV2Activation()?.takeIf { it == expected }
+            },
+        )
+    }
+
+    private suspend fun activateWithRecovery(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
+    ): RelayV2Profile? = recoverStoreWrite(
+        write = { profileStore.activateRelayV2Profile(journal, profile) },
+        recover = {
+            if (profileStore.pendingRelayV2Activation() != null) {
+                null
+            } else {
+                profileStore.activeRelayV2Profile()?.takeIf {
+                    it.sameProfileBinding(profile) &&
+                        it.identity == profile.identity &&
+                        it.credentialVersion >= profile.credentialVersion
+                }
+            }
+        },
+    )
+
+    private suspend fun <T> recoverStoreWrite(
+        write: suspend () -> T?,
+        recover: suspend () -> T?,
+    ): T? = try {
+        write()
+    } catch (error: Throwable) {
+        recover() ?: throw error
+    }
+
+    private fun RelayV2ProfileActivationJournal.matchesTarget(
+        profile: RelayV2Profile,
+        bindingDigest: String,
+        attemptId: String,
+    ): Boolean = targetProfileId == profile.profileId &&
+        targetCredentialReference == profile.credentialReference &&
+        targetBindingDigest == bindingDigest &&
+        targetCredentialAttemptId == attemptId
+
+    private fun requireSameProfileBinding(current: RelayV2Profile, target: RelayV2Profile) {
+        require(current.sameProfileBinding(target)) {
+            "Active Relay v2 profile binding conflicts with the target"
+        }
+    }
+
+    private fun RelayV2Profile.sameProfileBinding(other: RelayV2Profile): Boolean =
+        profileId == other.profileId &&
+            issuerUrl == other.issuerUrl && relayUrl == other.relayUrl &&
+            hostId == other.hostId && principalId == other.principalId &&
+            grantId == other.grantId && clientInstanceId == other.clientInstanceId &&
+            credentialReference == other.credentialReference
 
     fun accepts(callback: RelayProfileCallbackScope): Boolean {
         val active = (state as? RelayV2ProfileSwitchState.Active)?.identity ?: return false
@@ -337,7 +513,21 @@ internal class RelayV2ProfileRepository(
     ): RelayV2EnrollmentResult {
         val intent = beginEnrollmentIntent(credentialReference(confirmed.draft))
             ?: return supersededEnrollment()
-        val prepared = prepareEnrollment(confirmed)
+        val durableActivation = profileStore.pendingRelayV2Activation()
+        if (durableActivation?.phase != null &&
+            durableActivation.phase != RelayV2ProfileActivationPhase.PREPARED &&
+            durableActivation.targetCredentialReference != intent.credentialReference
+        ) {
+            retireEnrollmentIntent(intent)
+            return supersededEnrollment()
+        }
+        val prepared = prepareEnrollment(
+            confirmed = confirmed,
+            allowCreate = durableActivation?.targetCredentialReference != intent.credentialReference,
+        ) ?: run {
+            retireEnrollmentIntent(intent)
+            return RelayV2EnrollmentResult.StaleCredentialResponse(null)
+        }
         check(prepared.credentialReference == intent.credentialReference)
         val activation = when (prepared) {
             is PreparedEnrollment.Completed -> PreparedEnrollmentActivation(
@@ -366,8 +556,16 @@ internal class RelayV2ProfileRepository(
             return supersededEnrollment()
         }
         val profile = profileFromCredential(prepared.credentialReference, activation.blob)
+        val completedAttemptId = requireNotNull(activation.blob.completedAttemptId) {
+            "Enrollment credential has no completed attempt identity"
+        }
+        requireNotNull(
+            activation.blob.completedSecretReference,
+        ) { "Enrollment credential has no completed secret reference" }
         val activated = profileSwitch.switchTo(
             profile = profile,
+            targetBindingDigest = credentialBindingDigest(activation.blob),
+            targetCredentialAttemptId = completedAttemptId,
             expectedPrevious = intent.expectedActiveProfile,
             isStillCurrent = { currentEnrollmentIntent === intent },
             activationAuthority = enrollmentActivationAuthority(
@@ -456,6 +654,7 @@ internal class RelayV2ProfileRepository(
         ) { "Refresh response binding does not match" }
 
         val replacement = current.copy(
+            schemaVersion = RelayV2CredentialBlob.SCHEMA_VERSION,
             credentialVersion = current.credentialVersion + 1,
             accessToken = response.accessToken,
             accessExpiresAtMs = response.accessExpiresAtMs,
@@ -523,7 +722,10 @@ internal class RelayV2ProfileRepository(
         )
     }
 
-    private fun prepareEnrollment(confirmed: RelayV2ConfirmedEnrollment): PreparedEnrollment {
+    private fun prepareEnrollment(
+        confirmed: RelayV2ConfirmedEnrollment,
+        allowCreate: Boolean,
+    ): PreparedEnrollment? {
         val draft = confirmed.draft
         val reference = credentialReference(draft)
         while (true) {
@@ -551,6 +753,7 @@ internal class RelayV2ProfileRepository(
                 )
             }
 
+            if (!allowCreate) return null
             val pending = RelayV2PendingCredentialAttempt(
                 kind = RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE,
                 attemptId = newId(),
@@ -607,62 +810,107 @@ internal class RelayV2ProfileRepository(
     ): RelayV2ProfileActivationAuthority = RelayV2ProfileActivationAuthority { activate ->
         enrollmentIntentMutex.withLock {
             if (currentEnrollmentIntent !== intent) return@withLock null
-            var credentialWritten = false
-            try {
-                val activated = activate(
-                    RelayV2ProfileActivationCommit {
-                        if (credentialCommit == null) {
-                            true
-                        } else {
-                            when (val result = credentialStore.compareAndSet(
-                                credentialCommit.credentialReference,
-                                credentialCommit.expectation,
-                                credentialCommit.replacement,
-                            )) {
-                                is RelayV2CredentialCasResult.Stale -> {
-                                    intent.terminalResult =
-                                        RelayV2EnrollmentResult.StaleCredentialResponse(
-                                            result.currentCredentialVersion,
-                                        )
-                                    false
-                                }
-                                is RelayV2CredentialCasResult.Updated -> {
-                                    credentialWritten = true
-                                    check(
-                                        result.credentialVersion ==
-                                            credentialCommit.replacement.credentialVersion,
-                                    ) { "Enrollment credential CAS returned an unexpected version" }
-                                    true
-                                }
-                            }
-                        }
+            val activated = try {
+                activate(
+                    RelayV2ProfileActivationCommit { journal, profile ->
+                        installEnrollmentCredential(
+                            intent = intent,
+                            journal = journal,
+                            profile = profile,
+                            credentialCommit = credentialCommit,
+                        )
                     },
                 )
-                if (activated == null) {
-                    compensateCredentialCommit(credentialCommit, credentialWritten)
-                    if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
-                    return@withLock null
-                }
-                intent.activationCommitted = true
-                currentEnrollmentIntent = null
-                activated
             } catch (error: Throwable) {
-                compensateCredentialCommit(credentialCommit, credentialWritten)
+                if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
                 throw error
             }
+            if (activated == null) {
+                if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
+                return@withLock null
+            }
+            intent.activationCommitted = true
+            currentEnrollmentIntent = null
+            activated
         }
     }
 
-    private fun compensateCredentialCommit(
+    private fun installEnrollmentCredential(
+        intent: EnrollmentIntent,
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
         credentialCommit: PreparedEnrollmentCredentialCommit?,
-        credentialWritten: Boolean,
-    ) {
-        if (!credentialWritten || credentialCommit == null) return
-        credentialStore.clearIfUnchanged(
-            credentialCommit.credentialReference,
-            credentialCommit.replacement,
+    ): RelayV2CredentialBlob? {
+        val current = credentialStore.read(journal.targetCredentialReference)
+        if (current != null && journal.targetsProfile(profile) &&
+            journal.targetsCredential(current) && current.pendingAttempt == null &&
+            profile.matchesCredentialBinding(current) &&
+            journal.targetBindingDigest == credentialBindingDigest(current)
+        ) return current
+        if (credentialCommit == null ||
+            credentialCommit.credentialReference != journal.targetCredentialReference ||
+            credentialCommit.replacement.credentialVersion != journal.targetCredentialVersion ||
+            credentialCommit.expectation.pendingAttemptId !=
+            journal.targetCredentialAttemptId ||
+            credentialCommit.replacement.completedAttemptId !=
+            journal.targetCredentialAttemptId ||
+            credentialCommit.expectation.pendingSecretReference !=
+            credentialCommit.replacement.completedSecretReference ||
+            journal.targetBindingDigest != credentialBindingDigest(credentialCommit.replacement) ||
+            !profile.matchesCredentialBinding(credentialCommit.replacement)
+        ) {
+            intent.terminalResult = RelayV2EnrollmentResult.StaleCredentialResponse(
+                current?.credentialVersion,
+            )
+            return null
+        }
+        var lastResult: RelayV2CredentialCasResult? = null
+        repeat(2) { attempt ->
+            try {
+                lastResult = credentialStore.compareAndSet(
+                    credentialCommit.credentialReference,
+                    credentialCommit.expectation,
+                    credentialCommit.replacement,
+                )
+            } catch (error: Throwable) {
+                val observed = credentialStore.read(credentialCommit.credentialReference)
+                if (observed.isExactInstalledCredential(journal, profile)) return observed
+                if (attempt == 0 && observed?.matches(credentialCommit.expectation) == true) {
+                    return@repeat
+                }
+                throw error
+            }
+            val observed = credentialStore.read(credentialCommit.credentialReference)
+            if (observed.isExactInstalledCredential(journal, profile)) return observed
+            if (lastResult is RelayV2CredentialCasResult.Stale) return@repeat
+        }
+        val installed = credentialStore.read(credentialCommit.credentialReference)
+        if (installed.isExactInstalledCredential(journal, profile)) return installed
+        intent.terminalResult = RelayV2EnrollmentResult.StaleCredentialResponse(
+            when (val result = lastResult) {
+                is RelayV2CredentialCasResult.Stale -> result.currentCredentialVersion
+                is RelayV2CredentialCasResult.Updated -> installed?.credentialVersion
+                null -> installed?.credentialVersion
+            },
         )
+        return null
     }
+
+    private fun RelayV2CredentialBlob?.isExactInstalledCredential(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
+    ): Boolean = this != null && pendingAttempt == null &&
+        journal.targetsProfile(profile) &&
+        journal.targetsCredential(this) &&
+        profile.matchesCredentialBinding(this) &&
+        journal.targetBindingDigest == credentialBindingDigest(this)
+
+    private fun RelayV2ProfileActivationJournal.targetsProfile(
+        profile: RelayV2Profile,
+    ): Boolean = targetProfileId == profile.profileId &&
+        targetCredentialReference == profile.credentialReference &&
+        profile.credentialVersion >= targetCredentialVersion &&
+        targetActivationGeneration == profile.activationGeneration
 
     private suspend fun retireEnrollmentIntent(intent: EnrollmentIntent) =
         enrollmentIntentMutex.withLock {
@@ -715,6 +963,7 @@ internal class RelayV2ProfileRepository(
         }
 
         val replacement = current.copy(
+            schemaVersion = RelayV2CredentialBlob.SCHEMA_VERSION,
             credentialVersion = current.credentialVersion + 1,
             principalId = response.principalId,
             grantId = response.grantId,
@@ -723,6 +972,8 @@ internal class RelayV2ProfileRepository(
             refreshToken = response.refreshToken,
             refreshExpiresAtMs = response.refreshExpiresAtMs,
             pendingAttempt = null,
+            completedAttemptId = prepared.expectation.pendingAttemptId,
+            completedSecretReference = prepared.expectation.pendingSecretReference,
         )
         return PreparedEnrollmentResponse.Ready(
             PreparedEnrollmentCredentialCommit(
@@ -782,6 +1033,17 @@ internal class RelayV2ProfileRepository(
         "relay-v2-${digest(
             "${blob.issuerUrl}\u0000${blob.hostId}\u0000${blob.principalId}\u0000${blob.grantId}",
         )}"
+
+    private fun credentialBindingDigest(blob: RelayV2CredentialBlob): String = digest(
+        listOf(
+            blob.issuerUrl,
+            blob.relayUrl,
+            blob.hostId,
+            blob.clientInstanceId,
+            blob.principalId,
+            blob.grantId,
+        ).joinToString("\u0000"),
+    )
 
     private fun digest(value: String): String = Base64.getUrlEncoder().withoutPadding().encodeToString(
         MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)),

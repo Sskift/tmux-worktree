@@ -12,10 +12,12 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.tmuxworktree.mobile.core.model.RelayProfile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
-import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationCommit
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationJournal
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationPhase
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileStore
 import java.io.IOException
 import java.util.UUID
@@ -65,7 +67,51 @@ private object Keys {
     val relayV2ActivationGeneration = longPreferencesKey("relay_v2_profile_activation_generation")
     val relayV2AutoConnect = booleanPreferencesKey("relay_v2_profile_auto_connect")
     val relayV2InstallClientInstanceId = stringPreferencesKey("relay_v2_install_client_instance_id")
+    val relayV2ActivationJournalSchemaVersion = intPreferencesKey(
+        "relay_v2_activation_journal_schema_version",
+    )
+    val relayV2ActivationJournalId = stringPreferencesKey("relay_v2_activation_journal_id")
+    val relayV2ActivationJournalPhase = stringPreferencesKey("relay_v2_activation_journal_phase")
+    val relayV2ActivationPreviousProfileId = stringPreferencesKey(
+        "relay_v2_activation_previous_profile_id",
+    )
+    val relayV2ActivationPreviousDialect = stringPreferencesKey(
+        "relay_v2_activation_previous_dialect",
+    )
+    val relayV2ActivationPreviousGeneration = longPreferencesKey(
+        "relay_v2_activation_previous_generation",
+    )
+    val relayV2ActivationBarrierId = stringPreferencesKey("relay_v2_activation_barrier_id")
+    val relayV2ActivationPreviousCredentialReference = stringPreferencesKey(
+        "relay_v2_activation_previous_credential_reference",
+    )
+    val relayV2ActivationTargetProfileId = stringPreferencesKey(
+        "relay_v2_activation_target_profile_id",
+    )
+    val relayV2ActivationTargetCredentialReference = stringPreferencesKey(
+        "relay_v2_activation_target_credential_reference",
+    )
+    val relayV2ActivationTargetCredentialVersion = longPreferencesKey(
+        "relay_v2_activation_target_credential_version",
+    )
+    val relayV2ActivationTargetBindingDigest = stringPreferencesKey(
+        "relay_v2_activation_target_binding_digest",
+    )
+    val relayV2ActivationTargetCredentialAttemptId = stringPreferencesKey(
+        "relay_v2_activation_target_credential_attempt_id",
+    )
+    val relayV2ActivationTargetGeneration = longPreferencesKey(
+        "relay_v2_activation_target_generation",
+    )
+    val relayV2ActiveSwitchOperationId = stringPreferencesKey(
+        "relay_v2_active_switch_operation_id",
+    )
 }
+
+private const val ACTIVATION_JOURNAL_SCHEMA_VERSION = 1
+private const val ACTIVATION_PHASE_PREPARED = "prepared"
+private const val ACTIVATION_PHASE_OLD_FENCED = "old_fenced"
+private const val ACTIVATION_PHASE_CREDENTIAL_READY = "credential_ready"
 
 /**
  * The on-disk active-profile discriminator used by the real DataStore owner.
@@ -78,6 +124,17 @@ internal object RelayProfilePreferencesCodec {
     private const val DIALECT_V2_TAG = "tw-relay.v2"
     private const val CREDENTIAL_V1_TAG = "legacy_shared_secret"
     private const val CREDENTIAL_V2_TAG = "twcap2_grant"
+
+    fun dialectStorageTag(dialect: RelayProfileDialect): String = when (dialect) {
+        RelayProfileDialect.V1 -> DIALECT_V1_TAG
+        RelayProfileDialect.V2 -> DIALECT_V2_TAG
+    }
+
+    fun dialectFromStorageTag(tag: String): RelayProfileDialect = when (tag) {
+        DIALECT_V1_TAG -> RelayProfileDialect.V1
+        DIALECT_V2_TAG -> RelayProfileDialect.V2
+        else -> error("Unknown Relay profile dialect tag")
+    }
 
     fun activeProfileIdentity(preferences: Preferences): RelayActiveProfileIdentity? =
         when (val active = decodeActive(preferences)) {
@@ -264,32 +321,138 @@ class PreferencesStore(context: Context) {
 
     val values: Flow<AppPreferences> = readableData.map(::toAppPreferences)
 
-    val profile: Flow<RelayProfile> = values.map { preferences ->
-        RelayProfile(
-            relayUrl = preferences.relayUrl,
-            hostId = preferences.preferredHostId,
-            autoConnect = preferences.autoConnect,
-            hasCredential = false,
-        )
+    val profile: Flow<RelayProfile> = readableData.map { stored ->
+        if (activeProfileIsUsable(stored)) {
+            toAppPreferences(stored).let { preferences ->
+                RelayProfile(
+                    relayUrl = preferences.relayUrl,
+                    hostId = preferences.preferredHostId,
+                    autoConnect = preferences.autoConnect,
+                    hasCredential = false,
+                )
+            }
+        } else {
+            RelayProfile()
+        }
     }
 
     /** Independent non-sensitive Relay v2 profile namespace. Tokens are not representable here. */
     internal val relayV2Profile: Flow<RelayV2Profile?> =
-        readableData.map(RelayProfilePreferencesCodec::toRelayV2Profile)
+        readableData.map { preferences ->
+            if (activeProfileIsUsable(preferences)) {
+                RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+            } else {
+                null
+            }
+        }
 
-    internal suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? =
-        RelayProfilePreferencesCodec.activeProfileIdentity(readableData.first())
+    internal suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
+        val preferences = readableData.first()
+        return if (activeProfileIsUsable(preferences)) {
+            RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
+        } else {
+            null
+        }
+    }
 
     internal suspend fun activeRelayV2Profile(): RelayV2Profile? = relayV2Profile.first()
 
-    internal suspend fun activateRelayV2Profile(
+    internal suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? =
+        activationJournal(readableData.first())
+
+    internal suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,
+        operationId: String,
         profile: RelayV2Profile,
-        commit: RelayV2ProfileActivationCommit,
+        targetBindingDigest: String,
+        targetCredentialAttemptId: String,
+        barrierId: String?,
+        previousCredentialReference: RelayV2CredentialReference?,
+    ): RelayV2ProfileActivationJournal? {
+        var prepared: RelayV2ProfileActivationJournal? = null
+        store.edit { preferences ->
+            val current = activationJournal(preferences)
+            val rawActive = RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
+            if (rawActive != expectedActiveProfile ||
+                current?.phase?.let { it != RelayV2ProfileActivationPhase.PREPARED } == true
+            ) return@edit
+            val journal = RelayV2ProfileActivationJournal(
+                operationId = operationId,
+                previousProfile = rawActive,
+                barrierId = barrierId,
+                previousCredentialReference = previousCredentialReference,
+                targetProfileId = profile.profileId,
+                targetCredentialReference = profile.credentialReference,
+                targetCredentialVersion = profile.credentialVersion,
+                targetBindingDigest = targetBindingDigest,
+                targetCredentialAttemptId = targetCredentialAttemptId,
+                targetActivationGeneration = profile.activationGeneration,
+                phase = RelayV2ProfileActivationPhase.PREPARED,
+            )
+            writeActivationJournal(preferences, journal)
+            prepared = journal
+        }
+        return prepared
+    }
+
+    internal suspend fun fenceRelayV2Activation(
+        operationId: String,
+        receipt: RelayProfileDisconnectReceipt?,
+    ): RelayV2ProfileActivationJournal? = updateActivationJournal(operationId) {
+            preferences, journal ->
+        when (journal.phase) {
+            RelayV2ProfileActivationPhase.PREPARED -> {
+                if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) !=
+                    journal.previousProfile
+                ) return@updateActivationJournal null
+                require(
+                    (receipt?.profile == journal.previousProfile &&
+                        receipt?.barrierId == journal.barrierId) ||
+                        (receipt == null && journal.barrierId == null),
+                ) { "Disconnect receipt does not match the prepared activation" }
+                journal.copy(phase = RelayV2ProfileActivationPhase.OLD_FENCED)
+            }
+            RelayV2ProfileActivationPhase.OLD_FENCED,
+            RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+            -> journal
+        }
+    }
+
+    internal suspend fun markRelayV2CredentialReady(
+        operationId: String,
+        credentialVersion: Long,
+    ): RelayV2ProfileActivationJournal? = updateActivationJournal(operationId) { _, journal ->
+        when (journal.phase) {
+            RelayV2ProfileActivationPhase.PREPARED -> null
+            RelayV2ProfileActivationPhase.OLD_FENCED -> journal.copy(
+                targetCredentialVersion = credentialVersion.also {
+                    require(it >= journal.targetCredentialVersion) {
+                        "Credential-ready version cannot move backwards"
+                    }
+                },
+                phase = RelayV2ProfileActivationPhase.CREDENTIAL_READY,
+            )
+            RelayV2ProfileActivationPhase.CREDENTIAL_READY -> when {
+                credentialVersion < journal.targetCredentialVersion -> null
+                credentialVersion == journal.targetCredentialVersion -> journal
+                else -> journal.copy(targetCredentialVersion = credentialVersion)
+            }
+        }
+    }
+
+    internal suspend fun activateRelayV2Profile(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
     ): RelayV2Profile? {
         var activated: RelayV2Profile? = null
         store.edit { preferences ->
-            if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) == expectedActiveProfile) {
+            val currentJournal = activationJournal(preferences)
+            if (currentJournal == journal &&
+                journal.phase == RelayV2ProfileActivationPhase.CREDENTIAL_READY &&
+                journal.targets(profile) &&
+                RelayProfilePreferencesCodec.activeProfileIdentity(preferences) ==
+                journal.previousProfile
+            ) {
                 val current = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
                 val resolved = if (current?.identity == profile.identity) {
                     if (current.credentialReference != profile.credentialReference ||
@@ -309,13 +472,192 @@ class PreferencesStore(context: Context) {
                 } else {
                     profile
                 }
-                if (!commit.commitCredential()) return@edit
                 RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, resolved)
+                clearActivationJournal(preferences)
                 activated = resolved
             }
         }
         return activated
     }
+
+    private suspend fun updateActivationJournal(
+        operationId: String,
+        transform: (
+            MutablePreferences,
+            RelayV2ProfileActivationJournal,
+        ) -> RelayV2ProfileActivationJournal?,
+    ): RelayV2ProfileActivationJournal? {
+        var updated: RelayV2ProfileActivationJournal? = null
+        store.edit { preferences ->
+            val current = activationJournal(preferences)
+                ?.takeIf { it.operationId == operationId }
+                ?: return@edit
+            val replacement = transform(preferences, current) ?: return@edit
+            writeActivationJournal(preferences, replacement)
+            updated = replacement
+        }
+        return updated
+    }
+
+    private fun activationJournal(
+        preferences: Preferences,
+    ): RelayV2ProfileActivationJournal? {
+        val operationId = preferences[Keys.relayV2ActivationJournalId]
+        if (operationId == null) {
+            check(preferences[Keys.relayV2ActivationJournalSchemaVersion] == null &&
+                preferences[Keys.relayV2ActivationJournalPhase] == null &&
+                preferences[Keys.relayV2ActivationPreviousProfileId] == null &&
+                preferences[Keys.relayV2ActivationPreviousDialect] == null &&
+                preferences[Keys.relayV2ActivationPreviousGeneration] == null &&
+                preferences[Keys.relayV2ActivationBarrierId] == null &&
+                preferences[Keys.relayV2ActivationPreviousCredentialReference] == null &&
+                preferences[Keys.relayV2ActivationTargetProfileId] == null &&
+                preferences[Keys.relayV2ActivationTargetCredentialReference] == null &&
+                preferences[Keys.relayV2ActivationTargetCredentialVersion] == null &&
+                preferences[Keys.relayV2ActivationTargetBindingDigest] == null &&
+                preferences[Keys.relayV2ActivationTargetCredentialAttemptId] == null &&
+                preferences[Keys.relayV2ActivationTargetGeneration] == null &&
+                preferences[Keys.relayV2ActiveSwitchOperationId] == null
+            ) { "Relay v2 activation journal is incomplete" }
+            return null
+        }
+        require(operationId.isNotBlank()) { "Relay v2 activation journal ID is invalid" }
+        require(
+            preferences[Keys.relayV2ActivationJournalSchemaVersion] ==
+                ACTIVATION_JOURNAL_SCHEMA_VERSION,
+        ) { "Unsupported Relay v2 activation journal schema" }
+        val previousProfileId = preferences[Keys.relayV2ActivationPreviousProfileId]
+        val previousDialect = preferences[Keys.relayV2ActivationPreviousDialect]
+        val previousGeneration = preferences[Keys.relayV2ActivationPreviousGeneration]
+        require(
+            listOf(previousProfileId, previousDialect, previousGeneration).all { it == null } ||
+                listOf(previousProfileId, previousDialect, previousGeneration).all { it != null },
+        ) { "Relay v2 activation previous profile is incomplete" }
+        val previous = if (previousProfileId == null) {
+            null
+        } else {
+            RelayActiveProfileIdentity(
+                profileId = previousProfileId,
+                dialect = RelayProfilePreferencesCodec.dialectFromStorageTag(previousDialect!!),
+                activationGeneration = previousGeneration!!,
+            )
+        }
+        val barrierId = preferences[Keys.relayV2ActivationBarrierId]
+        require(barrierId == null || previous != null) {
+            "Relay v2 activation barrier has no previous profile"
+        }
+        val phase = when (preferences[Keys.relayV2ActivationJournalPhase]) {
+            ACTIVATION_PHASE_PREPARED -> RelayV2ProfileActivationPhase.PREPARED
+            ACTIVATION_PHASE_OLD_FENCED -> RelayV2ProfileActivationPhase.OLD_FENCED
+            ACTIVATION_PHASE_CREDENTIAL_READY ->
+                RelayV2ProfileActivationPhase.CREDENTIAL_READY
+            else -> error("Unknown Relay v2 activation journal phase")
+        }
+        val switchingOperationId = preferences[Keys.relayV2ActiveSwitchOperationId]
+        require(
+            (phase == RelayV2ProfileActivationPhase.PREPARED &&
+                switchingOperationId == null) ||
+                (phase != RelayV2ProfileActivationPhase.PREPARED &&
+                    switchingOperationId == operationId),
+        ) { "Relay v2 active usability does not match the activation journal" }
+        val previousCredentialReference =
+            preferences[Keys.relayV2ActivationPreviousCredentialReference]?.let(
+                ::RelayV2CredentialReference,
+            )
+        require(previousCredentialReference == null || previous != null) {
+            "Relay v2 previous credential reference has no profile"
+        }
+        return RelayV2ProfileActivationJournal(
+            operationId = operationId,
+            previousProfile = previous,
+            barrierId = barrierId,
+            previousCredentialReference = previousCredentialReference,
+            targetProfileId = requireNotNull(
+                preferences[Keys.relayV2ActivationTargetProfileId],
+            ),
+            targetCredentialReference = RelayV2CredentialReference(
+                requireNotNull(
+                    preferences[Keys.relayV2ActivationTargetCredentialReference],
+                ),
+            ),
+            targetCredentialVersion = requireNotNull(
+                preferences[Keys.relayV2ActivationTargetCredentialVersion],
+            ),
+            targetBindingDigest = requireNotNull(
+                preferences[Keys.relayV2ActivationTargetBindingDigest],
+            ),
+            targetCredentialAttemptId = requireNotNull(
+                preferences[Keys.relayV2ActivationTargetCredentialAttemptId],
+            ),
+            targetActivationGeneration = requireNotNull(
+                preferences[Keys.relayV2ActivationTargetGeneration],
+            ),
+            phase = phase,
+        )
+    }
+
+    private fun writeActivationJournal(
+        preferences: MutablePreferences,
+        journal: RelayV2ProfileActivationJournal,
+    ) {
+        clearActivationJournal(preferences)
+        preferences[Keys.relayV2ActivationJournalSchemaVersion] =
+            ACTIVATION_JOURNAL_SCHEMA_VERSION
+        preferences[Keys.relayV2ActivationJournalId] = journal.operationId
+        preferences[Keys.relayV2ActivationJournalPhase] = when (journal.phase) {
+            RelayV2ProfileActivationPhase.PREPARED -> ACTIVATION_PHASE_PREPARED
+            RelayV2ProfileActivationPhase.OLD_FENCED -> ACTIVATION_PHASE_OLD_FENCED
+            RelayV2ProfileActivationPhase.CREDENTIAL_READY ->
+                ACTIVATION_PHASE_CREDENTIAL_READY
+        }
+        journal.previousProfile?.let { previous ->
+            preferences[Keys.relayV2ActivationPreviousProfileId] = previous.profileId
+            preferences[Keys.relayV2ActivationPreviousDialect] =
+                RelayProfilePreferencesCodec.dialectStorageTag(previous.dialect)
+            preferences[Keys.relayV2ActivationPreviousGeneration] =
+                previous.activationGeneration
+        }
+        journal.barrierId?.let { preferences[Keys.relayV2ActivationBarrierId] = it }
+        journal.previousCredentialReference?.let {
+            preferences[Keys.relayV2ActivationPreviousCredentialReference] = it.value
+        }
+        preferences[Keys.relayV2ActivationTargetProfileId] = journal.targetProfileId
+        preferences[Keys.relayV2ActivationTargetCredentialReference] =
+            journal.targetCredentialReference.value
+        preferences[Keys.relayV2ActivationTargetCredentialVersion] =
+            journal.targetCredentialVersion
+        preferences[Keys.relayV2ActivationTargetBindingDigest] = journal.targetBindingDigest
+        preferences[Keys.relayV2ActivationTargetCredentialAttemptId] =
+            journal.targetCredentialAttemptId
+        preferences[Keys.relayV2ActivationTargetGeneration] =
+            journal.targetActivationGeneration
+        if (journal.phase != RelayV2ProfileActivationPhase.PREPARED) {
+            preferences[Keys.relayV2ActiveSwitchOperationId] = journal.operationId
+        }
+    }
+
+    private fun clearActivationJournal(preferences: MutablePreferences) {
+        preferences.remove(Keys.relayV2ActivationJournalSchemaVersion)
+        preferences.remove(Keys.relayV2ActivationJournalId)
+        preferences.remove(Keys.relayV2ActivationJournalPhase)
+        preferences.remove(Keys.relayV2ActivationPreviousProfileId)
+        preferences.remove(Keys.relayV2ActivationPreviousDialect)
+        preferences.remove(Keys.relayV2ActivationPreviousGeneration)
+        preferences.remove(Keys.relayV2ActivationBarrierId)
+        preferences.remove(Keys.relayV2ActivationPreviousCredentialReference)
+        preferences.remove(Keys.relayV2ActivationTargetProfileId)
+        preferences.remove(Keys.relayV2ActivationTargetCredentialReference)
+        preferences.remove(Keys.relayV2ActivationTargetCredentialVersion)
+        preferences.remove(Keys.relayV2ActivationTargetBindingDigest)
+        preferences.remove(Keys.relayV2ActivationTargetCredentialAttemptId)
+        preferences.remove(Keys.relayV2ActivationTargetGeneration)
+        preferences.remove(Keys.relayV2ActiveSwitchOperationId)
+    }
+
+    private fun activeProfileIsUsable(preferences: Preferences): Boolean =
+        activationJournal(preferences)?.phase?.let {
+            it == RelayV2ProfileActivationPhase.PREPARED
+        } ?: true
 
     internal suspend fun updateRelayV2CredentialVersion(
         profileId: String,
@@ -327,6 +669,10 @@ class PreferencesStore(context: Context) {
         require(newVersion > expectedVersion) { "Credential version must advance" }
         var updated = false
         store.edit { preferences ->
+            if (activationJournal(preferences)?.phase?.let {
+                    it != RelayV2ProfileActivationPhase.PREPARED
+                } == true
+            ) return@edit
             val current = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
             if (current?.profileId == profileId &&
                 current.credentialReference == credentialReference &&
@@ -354,6 +700,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun saveProfile(relayUrl: String, hostId: String, autoConnect: Boolean) {
         store.edit { preferences ->
+            requireNoRelayV2Activation(preferences)
             RelayProfilePreferencesCodec.saveRelayV1Profile(
                 preferences = preferences,
                 relayUrl = relayUrl,
@@ -365,6 +712,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun setPreferredHost(hostId: String) {
         store.edit {
+            requireNoRelayV2Activation(it)
             RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.hostId] = hostId
         }
@@ -372,6 +720,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun setPreferredHostAndScope(hostId: String, scopeId: String) {
         store.edit {
+            requireNoRelayV2Activation(it)
             RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.hostId] = hostId
             it[Keys.scopeId] = scopeId
@@ -380,6 +729,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun setPreferredScope(scopeId: String) {
         store.edit {
+            requireNoRelayV2Activation(it)
             RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.scopeId] = scopeId
         }
@@ -387,6 +737,7 @@ class PreferencesStore(context: Context) {
 
     suspend fun setAutoConnect(enabled: Boolean) {
         store.edit {
+            requireNoRelayV2Activation(it)
             RelayProfilePreferencesCodec.requireV1MutationAllowed(it)
             it[Keys.autoConnect] = enabled
         }
@@ -411,7 +762,14 @@ class PreferencesStore(context: Context) {
 
     suspend fun clearProfile() {
         store.edit { preferences ->
+            requireNoRelayV2Activation(preferences)
             RelayProfilePreferencesCodec.clearRelayV1Profile(preferences)
+        }
+    }
+
+    private fun requireNoRelayV2Activation(preferences: Preferences) {
+        check(activationJournal(preferences) == null) {
+            "Relay profile is immutable while Relay v2 activation is pending"
         }
     }
 
@@ -445,14 +803,49 @@ internal class PreferencesRelayV2ProfileStore(
     override suspend fun activeRelayV2Profile(): RelayV2Profile? =
         preferencesStore.activeRelayV2Profile()
 
-    override suspend fun activateRelayV2Profile(
+    override suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? =
+        preferencesStore.pendingRelayV2Activation()
+
+    override suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,
+        operationId: String,
         profile: RelayV2Profile,
-        commit: RelayV2ProfileActivationCommit,
-    ): RelayV2Profile? = preferencesStore.activateRelayV2Profile(
+        targetBindingDigest: String,
+        targetCredentialAttemptId: String,
+        barrierId: String?,
+        previousCredentialReference: RelayV2CredentialReference?,
+    ): RelayV2ProfileActivationJournal? = preferencesStore.prepareRelayV2Activation(
         expectedActiveProfile,
+        operationId,
         profile,
-        commit,
+        targetBindingDigest,
+        targetCredentialAttemptId,
+        barrierId,
+        previousCredentialReference,
+    )
+
+    override suspend fun fenceRelayV2Activation(
+        operationId: String,
+        receipt: RelayProfileDisconnectReceipt?,
+    ): RelayV2ProfileActivationJournal? = preferencesStore.fenceRelayV2Activation(
+        operationId,
+        receipt,
+    )
+
+    override suspend fun markRelayV2CredentialReady(
+        operationId: String,
+        credentialVersion: Long,
+    ): RelayV2ProfileActivationJournal? = preferencesStore.markRelayV2CredentialReady(
+        operationId,
+        credentialVersion,
+    )
+
+    override suspend fun activateRelayV2Profile(
+        journal: RelayV2ProfileActivationJournal,
+        profile: RelayV2Profile,
+    ): RelayV2Profile? = preferencesStore.activateRelayV2Profile(
+        journal,
+        profile,
     )
 
     override suspend fun updateRelayV2CredentialVersion(
