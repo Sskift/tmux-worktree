@@ -7,6 +7,7 @@ import java.util.Collections
 internal object RelayV2OutboxLimits {
     const val MAX_ENTRIES = 4_096
     const val MAX_ATTEMPTS_PER_ENTRY = 64
+    const val MAX_QUERY_ITEMS_PER_BATCH = 32
     const val MAX_ARGUMENTS_CANONICAL_BYTES = 131_072
     const val MAX_ENTRY_CANONICAL_BYTES = 262_144
     const val MAX_STATE_CANONICAL_BYTES = 16_777_216
@@ -540,6 +541,11 @@ internal enum class RelayV2OldLineageAvailability {
     LOST,
 }
 
+internal enum class RelayV2NonLineageTransportChange {
+    HOST_INSTANCE_CHANGED,
+    BROKER_EPOCH_CHANGED,
+}
+
 internal sealed interface RelayV2OutboxAction {
     data class Enqueue(
         val draft: RelayV2OutboxDraft,
@@ -552,14 +558,38 @@ internal sealed interface RelayV2OutboxAction {
 
     data class DispatchEligible(
         val attemptRequestIds: Map<RelayV2OutboxEntryId, String>,
-    ) : RelayV2OutboxAction
-
-    data class BeginQuery(
-        val entryId: RelayV2OutboxEntryId,
-        val attemptRequestId: String,
+        val effectBudget: Int,
     ) : RelayV2OutboxAction {
         init {
-            requireOutboxId(attemptRequestId)
+            require(effectBudget in 0..RelayV2OutboxLimits.MAX_ENTRIES)
+        }
+    }
+
+    data class BeginQueries(
+        val entryIds: List<RelayV2OutboxEntryId>,
+        val attemptRequestIds: List<String>,
+    ) : RelayV2OutboxAction {
+        init {
+            require(entryIds.isNotEmpty())
+            require(entryIds.toSet().size == entryIds.size)
+            require(attemptRequestIds.isNotEmpty())
+            attemptRequestIds.forEach(::requireOutboxId)
+        }
+    }
+
+    /**
+     * A transport adapter uses this only after observing the same authority epoch. Broker and
+     * host-instance generations are intentionally absent because neither is command lineage.
+     */
+    data class HostContinuityObserved(
+        val profileId: String,
+        val principalId: String,
+        val hostId: String,
+        val hostEpoch: String,
+        val change: RelayV2NonLineageTransportChange,
+    ) : RelayV2OutboxAction {
+        init {
+            listOf(profileId, principalId, hostId, hostEpoch).forEach(::requireOutboxId)
         }
     }
 
@@ -624,9 +654,40 @@ internal sealed interface RelayV2OutboxMutation {
     ) : RelayV2OutboxMutation
 }
 
-internal data class RelayV2OutboxTransactionPlan(
-    val mutations: List<RelayV2OutboxMutation>,
-)
+internal sealed interface RelayV2OutboxTransactionPlan {
+    val mutations: List<RelayV2OutboxMutation>
+
+    data class MutationSet(
+        override val mutations: List<RelayV2OutboxMutation>,
+    ) : RelayV2OutboxTransactionPlan
+
+    data class AtomicReissue(
+        val original: RelayV2OutboxMutation.Replace,
+        val replacement: RelayV2OutboxMutation.Insert,
+    ) : RelayV2OutboxTransactionPlan {
+        override val mutations: List<RelayV2OutboxMutation> = listOf(original, replacement)
+
+        init {
+            require(original.entry.id == original.previousId)
+            require(original.entry.state == RelayV2OutboxStateTag.REISSUED)
+            require(replacement.entry.state == RelayV2OutboxStateTag.QUEUED)
+            require(original.entry.replacementCommandId == replacement.entry.commandId)
+            require(replacement.entry.reissuedFromCommandId == original.previousId.commandId)
+            require(
+                original.previousId ==
+                    replacement.entry.id.copy(commandId = original.previousId.commandId),
+            )
+            require(original.entry.dedupeWindowId != replacement.entry.dedupeWindowId)
+            require(original.entry.operation == replacement.entry.operation)
+            require(original.entry.scopeId == replacement.entry.scopeId)
+            require(original.entry.sessionId == replacement.entry.sessionId)
+            require(
+                original.entry.canonicalRequestArguments ==
+                    replacement.entry.canonicalRequestArguments,
+            )
+        }
+    }
+}
 
 internal data class RelayV2OutboxCommand(
     val entryId: RelayV2OutboxEntryId,
@@ -638,6 +699,26 @@ internal data class RelayV2OutboxCommand(
     val requestFingerprint: RelayV2RequestFingerprint,
 )
 
+internal data class RelayV2OutboxQueryAuthority(
+    val profileId: String,
+    val principalId: String,
+    val hostId: String,
+    val expectedHostEpoch: String,
+) {
+    init {
+        listOf(profileId, principalId, hostId, expectedHostEpoch).forEach(::requireOutboxId)
+    }
+}
+
+internal data class RelayV2OutboxQueryItem(
+    val entryId: RelayV2OutboxEntryId,
+    val dedupeWindowId: String,
+) {
+    init {
+        requireOutboxId(dedupeWindowId)
+    }
+}
+
 internal sealed interface RelayV2OutboxEffect {
     data class ExecuteCommand(
         val command: RelayV2OutboxCommand,
@@ -645,11 +726,23 @@ internal sealed interface RelayV2OutboxEffect {
         val retryAfterMs: Long? = null,
     ) : RelayV2OutboxEffect
 
-    data class QueryCommand(
-        val entryId: RelayV2OutboxEntryId,
-        val dedupeWindowId: String,
-        val attempt: RelayV2OutboxAttempt,
-    ) : RelayV2OutboxEffect
+    data class QueryCommands(
+        val authority: RelayV2OutboxQueryAuthority,
+        val attemptRequestId: String,
+        val items: List<RelayV2OutboxQueryItem>,
+    ) : RelayV2OutboxEffect {
+        init {
+            requireOutboxId(attemptRequestId)
+            require(items.size in 1..RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH)
+            require(items.map { it.entryId }.toSet().size == items.size)
+            require(items.all {
+                it.entryId.profileId == authority.profileId &&
+                    it.entryId.principalId == authority.principalId &&
+                    it.entryId.hostId == authority.hostId &&
+                    it.entryId.expectedHostEpoch == authority.expectedHostEpoch
+            })
+        }
+    }
 
     data class RevalidateOpaqueTarget(
         val entryId: RelayV2OutboxEntryId,
@@ -705,7 +798,8 @@ internal class RelayV2OutboxAuthorityCore(
     ): RelayV2OutboxResult = when (action) {
         is RelayV2OutboxAction.Enqueue -> enqueue(state, action)
         is RelayV2OutboxAction.DispatchEligible -> dispatchEligible(state, action)
-        is RelayV2OutboxAction.BeginQuery -> beginQuery(state, action)
+        is RelayV2OutboxAction.BeginQueries -> beginQueries(state, action)
+        is RelayV2OutboxAction.HostContinuityObserved -> hostContinuityObserved(state, action)
         is RelayV2OutboxAction.AttemptInterrupted -> interruptAttempt(state, action)
         is RelayV2OutboxAction.ReconcileStatus -> reconcileStatus(state, action)
         is RelayV2OutboxAction.HostEpochChanged -> hostEpochChanged(state, action)
@@ -746,9 +840,7 @@ internal class RelayV2OutboxAuthorityCore(
         }
 
         val blocked = mutableSetOf<RelayV2OutboxLaneKey>()
-        val mutations = mutableListOf<RelayV2OutboxMutation>()
-        val effects = mutableListOf<RelayV2OutboxEffect>()
-        val consumed = mutableSetOf<RelayV2OutboxEntryId>()
+        val eligible = mutableListOf<RelayV2OutboxEntry>()
         state.entries.forEach { entry ->
             when (entry.state) {
                 RelayV2OutboxStateTag.SENDING,
@@ -757,18 +849,9 @@ internal class RelayV2OutboxAuthorityCore(
                 RelayV2OutboxStateTag.AMBIGUOUS,
                 -> blocked += entry.laneKey
                 RelayV2OutboxStateTag.QUEUED -> {
-                    if (!blocked.add(entry.laneKey)) return@forEach
-                    if (entry.targetRevalidation != null) return@forEach
-                    val requestId = action.attemptRequestIds[entry.id] ?: return@forEach
-                    val updated = entry.appendAttempt(
-                        requestId,
-                        RelayV2OutboxAttemptKind.EXECUTE,
-                        RelayV2OutboxStateTag.SENDING,
-                    )
-                    val attempt = updated.attempts.last()
-                    mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
-                    effects += RelayV2OutboxEffect.ExecuteCommand(updated.command(), attempt)
-                    consumed += entry.id
+                    if (blocked.add(entry.laneKey) && entry.targetRevalidation == null) {
+                        eligible += entry
+                    }
                 }
                 RelayV2OutboxStateTag.SUCCEEDED,
                 RelayV2OutboxStateTag.FAILED_FINAL,
@@ -776,40 +859,93 @@ internal class RelayV2OutboxAuthorityCore(
                 -> Unit
             }
         }
-        if (consumed != action.attemptRequestIds.keys) {
+        if (!eligible.map { it.id }.toSet().containsAll(action.attemptRequestIds.keys)) {
             return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
+        }
+
+        val mutations = mutableListOf<RelayV2OutboxMutation>()
+        val effects = mutableListOf<RelayV2OutboxEffect>()
+        eligible.forEach { entry ->
+            if (effects.size >= action.effectBudget) return@forEach
+            val requestId = action.attemptRequestIds[entry.id] ?: return@forEach
+            val updated = entry.appendAttempt(
+                requestId,
+                RelayV2OutboxAttemptKind.EXECUTE,
+                RelayV2OutboxStateTag.SENDING,
+            )
+            val attempt = updated.attempts.last()
+            mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
+            effects += RelayV2OutboxEffect.ExecuteCommand(updated.command(), attempt)
         }
         return apply(state, mutations, effects)
     }
 
-    private fun beginQuery(
+    private fun beginQueries(
         state: RelayV2OutboxState,
-        action: RelayV2OutboxAction.BeginQuery,
+        action: RelayV2OutboxAction.BeginQueries,
     ): RelayV2OutboxResult {
-        val entry = state.entry(action.entryId)
-            ?: return state.reject(RelayV2OutboxRejection.ENTRY_NOT_FOUND)
-        if (state.hasAttemptRequestId(action.attemptRequestId)) {
+        if (action.attemptRequestIds.toSet().size != action.attemptRequestIds.size ||
+            action.attemptRequestIds.any { state.hasAttemptRequestId(it) }
+        ) {
             return state.reject(RelayV2OutboxRejection.DUPLICATE_ATTEMPT_REQUEST_ID)
         }
-        if (entry.state !in QUERYABLE_STATES) {
+        val selectedIds = action.entryIds.toSet()
+        val entries = state.entries.filter { it.id in selectedIds }
+        if (entries.size != selectedIds.size) {
+            return state.reject(RelayV2OutboxRejection.ENTRY_NOT_FOUND)
+        }
+        if (entries.any { it.state !in QUERYABLE_STATES }) {
             return state.reject(RelayV2OutboxRejection.INVALID_TRANSITION)
         }
-        val queryState = if (entry.state == RelayV2OutboxStateTag.AMBIGUOUS) {
-            RelayV2OutboxStateTag.AMBIGUOUS
-        } else {
-            RelayV2OutboxStateTag.CONFIRMING
+
+        val groups = linkedMapOf<RelayV2OutboxQueryAuthority, MutableList<RelayV2OutboxEntry>>()
+        entries.forEach { entry ->
+            groups.getOrPut(entry.queryAuthority()) { mutableListOf() } += entry
         }
-        val updated = entry.appendAttempt(
-            action.attemptRequestId,
-            RelayV2OutboxAttemptKind.QUERY,
-            queryState,
-        )
-        val attempt = updated.attempts.last()
-        return apply(
-            state,
-            listOf(RelayV2OutboxMutation.Replace(entry.id, updated)),
-            listOf(RelayV2OutboxEffect.QueryCommand(updated.id, updated.dedupeWindowId, attempt)),
-        )
+        val batches = groups.flatMap { (authority, authorityEntries) ->
+            authorityEntries.chunked(RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH).map {
+                authority to it
+            }
+        }
+        if (batches.size != action.attemptRequestIds.size) {
+            return state.reject(RelayV2OutboxRejection.RECOVERY_INPUT_MISMATCH)
+        }
+
+        val mutations = mutableListOf<RelayV2OutboxMutation>()
+        val effects = mutableListOf<RelayV2OutboxEffect>()
+        batches.forEachIndexed { index, (authority, batchEntries) ->
+            val requestId = action.attemptRequestIds[index]
+            val items = batchEntries.map { entry ->
+                val queryState = if (entry.state == RelayV2OutboxStateTag.AMBIGUOUS) {
+                    RelayV2OutboxStateTag.AMBIGUOUS
+                } else {
+                    RelayV2OutboxStateTag.CONFIRMING
+                }
+                val updated = entry.appendAttempt(
+                    requestId,
+                    RelayV2OutboxAttemptKind.QUERY,
+                    queryState,
+                )
+                mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
+                RelayV2OutboxQueryItem(updated.id, updated.dedupeWindowId)
+            }
+            effects += RelayV2OutboxEffect.QueryCommands(authority, requestId, items)
+        }
+        return apply(state, mutations, effects)
+    }
+
+    private fun hostContinuityObserved(
+        state: RelayV2OutboxState,
+        action: RelayV2OutboxAction.HostContinuityObserved,
+    ): RelayV2OutboxResult {
+        val matches = state.entries.any {
+            it.profileId == action.profileId &&
+                it.principalId == action.principalId &&
+                it.hostId == action.hostId &&
+                it.expectedHostEpoch == action.hostEpoch
+        }
+        if (!matches) return state.reject(RelayV2OutboxRejection.ENTRY_NOT_FOUND)
+        return apply(state, emptyList())
     }
 
     private fun interruptAttempt(
@@ -1054,16 +1190,18 @@ internal class RelayV2OutboxAuthorityCore(
                 state = RelayV2OutboxStateTag.REISSUED,
                 replacementCommandId = replacement.commandId,
             )
+            val transaction = RelayV2OutboxTransactionPlan.AtomicReissue(
+                original = RelayV2OutboxMutation.Replace(entry.id, original),
+                replacement = RelayV2OutboxMutation.Insert(replacement),
+            )
             return apply(
                 state,
-                mutations = listOf(
-                    RelayV2OutboxMutation.Replace(entry.id, original),
-                    RelayV2OutboxMutation.Insert(replacement),
-                ),
+                mutations = transaction.mutations,
                 effects = listOf(
                     RelayV2OutboxEffect.ReissueCreated(entry.id, replacement.id),
                 ),
                 nextCreationOrder = state.nextCreationOrder + 1,
+                transactionPlan = transaction,
             )
         }
         return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
@@ -1176,11 +1314,14 @@ internal class RelayV2OutboxAuthorityCore(
         mutations: List<RelayV2OutboxMutation>,
         effects: List<RelayV2OutboxEffect> = emptyList(),
         nextCreationOrder: Long = state.nextCreationOrder,
+        transactionPlan: RelayV2OutboxTransactionPlan =
+            RelayV2OutboxTransactionPlan.MutationSet(mutations.toList()),
     ): RelayV2OutboxResult {
+        require(transactionPlan.mutations == mutations)
         if (mutations.isEmpty()) {
             return RelayV2OutboxResult.Applied(
                 state,
-                RelayV2OutboxTransactionPlan(emptyList()),
+                transactionPlan,
                 effects.toList(),
             )
         }
@@ -1216,7 +1357,7 @@ internal class RelayV2OutboxAuthorityCore(
         }
         return RelayV2OutboxResult.Applied(
             state = candidate,
-            transaction = RelayV2OutboxTransactionPlan(mutations.toList()),
+            transaction = transactionPlan,
             effects = effects.toList(),
         )
     }
@@ -1287,6 +1428,14 @@ private fun RelayV2OutboxEntry.command(): RelayV2OutboxCommand = RelayV2OutboxCo
     canonicalRequestArguments = canonicalRequestArguments,
     requestFingerprint = requestFingerprint,
 )
+
+private fun RelayV2OutboxEntry.queryAuthority(): RelayV2OutboxQueryAuthority =
+    RelayV2OutboxQueryAuthority(
+        profileId = profileId,
+        principalId = principalId,
+        hostId = hostId,
+        expectedHostEpoch = expectedHostEpoch,
+    )
 
 private fun RelayV2OutboxState.hasAttemptRequestId(requestId: String): Boolean =
     entries.any { entry -> entry.attempts.any { it.requestId == requestId } }

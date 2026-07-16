@@ -149,6 +149,19 @@ class RelayV2OutboxAuthorityCoreTest {
             ),
         ).state.entry(entry.id)
         assertEquals(RelayV2OutboxStateTag.CONFIRMING, running?.state)
+
+        val directRunningSource = sourceState(RelayV2OutboxStateTag.SENDING)
+        val directRunningEntry = directRunningSource.entries.single()
+        val directRunning = applied(
+            core.reduce(
+                directRunningSource,
+                RelayV2OutboxAction.ReconcileStatus(
+                    acceptedEvidence(directRunningEntry, RelayV2CommandStatusState.RUNNING),
+                ),
+            ),
+        ).state.entry(directRunningEntry.id)
+        assertEquals(RelayV2OutboxStateTag.CONFIRMING, directRunning?.state)
+        assertEquals(RelayV2OutboxAcceptanceEvidence.DURABLE, directRunning?.acceptanceEvidence)
     }
 
     @Test
@@ -169,6 +182,10 @@ class RelayV2OutboxAuthorityCoreTest {
             IllegalCase(
                 sourceState(RelayV2OutboxStateTag.REISSUED),
                 RelayV2CommandStatusState.NOT_ACCEPTED,
+            ),
+            IllegalCase(
+                sourceState(RelayV2OutboxStateTag.REISSUED),
+                RelayV2CommandStatusState.SUCCEEDED,
             ),
             IllegalCase(
                 sourceState(RelayV2OutboxStateTag.AMBIGUOUS),
@@ -233,6 +250,25 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals(entry.commandId, effect.command.entryId.commandId)
         assertEquals(entry.dedupeWindowId, effect.command.dedupeWindowId)
         assertEquals(0L, effect.retryAfterMs)
+        assertEquals(
+            listOf(RelayV2OutboxAttemptKind.EXECUTE, RelayV2OutboxAttemptKind.EXECUTE),
+            retried.attempts.map { it.kind },
+        )
+
+        val oldAttemptFinal = applied(
+            core.reduce(
+                result.state,
+                RelayV2OutboxAction.ReconcileStatus(
+                    terminalEvidence(retried, RelayV2CommandStatusState.SUCCEEDED).copy(
+                        attemptRequestId = entry.attempts.single().requestId,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2OutboxStateTag.SUCCEEDED,
+            oldAttemptFinal.state.entry(entry.id)?.state,
+        )
 
         val misleadingMessage = retryableNotAccepted(entry).copy(
             errorCode = "BUSY",
@@ -241,6 +277,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val invalidShapes = listOf(
             misleadingMessage,
             retryableNotAccepted(entry).copy(retryable = false),
+            retryableNotAccepted(entry).copy(retryAfterMs = null),
             retryableNotAccepted(entry).copy(reissueRequired = true),
             retryableNotAccepted(entry).copy(
                 commandDisposition = RelayV2CommandDisposition.IN_DOUBT,
@@ -260,6 +297,34 @@ class RelayV2OutboxAuthorityCoreTest {
             assertEquals(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING, rejected.reason)
             assertTrue(rejected.state === source)
         }
+
+        listOf(
+            retryableNotAccepted(entry).copy(dedupeWindowId = "wrong-window"),
+            retryableNotAccepted(entry).copy(hostEpoch = "wrong-epoch"),
+        ).forEachIndexed { index, wrongIdentity ->
+            val rejected = rejected(
+                core.reduce(
+                    source,
+                    RelayV2OutboxAction.ReconcileStatus(
+                        wrongIdentity,
+                        RelayV2OutboxRecovery.RetrySameCommand("wrong-identity-$index"),
+                    ),
+                ),
+            )
+            assertEquals(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH, rejected.reason)
+            assertTrue(rejected.state === source)
+        }
+        val wrongState = rejected(
+            core.reduce(
+                source,
+                RelayV2OutboxAction.ReconcileStatus(
+                    retryableNotAccepted(entry).copy(state = RelayV2CommandStatusState.ACCEPTED),
+                    RelayV2OutboxRecovery.RetrySameCommand("wrong-state"),
+                ),
+            ),
+        )
+        assertEquals(RelayV2OutboxRejection.RECOVERY_INPUT_MISMATCH, wrongState.reason)
+        assertTrue(wrongState.state === source)
     }
 
     @Test
@@ -292,6 +357,11 @@ class RelayV2OutboxAuthorityCoreTest {
             replacement.requestFingerprint.sha256Base64Url,
         )
         assertEquals(2, result.transaction.mutations.size)
+        assertTrue(result.transaction is RelayV2OutboxTransactionPlan.AtomicReissue)
+        val bundle = result.transaction as RelayV2OutboxTransactionPlan.AtomicReissue
+        assertEquals(original.id, bundle.original.previousId)
+        assertEquals("command-replacement", bundle.original.entry.replacementCommandId)
+        assertEquals("command-a", bundle.replacement.entry.reissuedFromCommandId)
         assertTrue(result.transaction.mutations[0] is RelayV2OutboxMutation.Replace)
         assertTrue(result.transaction.mutations[1] is RelayV2OutboxMutation.Insert)
         assertTrue(result.effects.single() is RelayV2OutboxEffect.ReissueCreated)
@@ -299,6 +369,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val invalidShapes = listOf(
             reissueRequiredNotAccepted(original).copy(errorCode = "COMMAND_NOT_ACCEPTED"),
             reissueRequiredNotAccepted(original).copy(retryable = true),
+            reissueRequiredNotAccepted(original).copy(retryAfterMs = 0),
             reissueRequiredNotAccepted(original).copy(reissueRequired = false),
             reissueRequiredNotAccepted(original).copy(
                 commandDisposition = RelayV2CommandDisposition.IN_DOUBT,
@@ -322,6 +393,23 @@ class RelayV2OutboxAuthorityCoreTest {
             assertEquals(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING, rejected.reason)
             assertTrue(rejected.state === source)
         }
+        val wrongState = rejected(
+            core.reduce(
+                source,
+                RelayV2OutboxAction.ReconcileStatus(
+                    reissueRequiredNotAccepted(original).copy(
+                        state = RelayV2CommandStatusState.EXPIRED,
+                    ),
+                    RelayV2OutboxRecovery.Reissue(
+                        "wrong-state-replacement",
+                        "wrong-state-window",
+                        0,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(RelayV2OutboxRejection.RECOVERY_INPUT_MISMATCH, wrongState.reason)
+        assertTrue(wrongState.state === source)
 
         var identityScoped = enqueue(
             source,
@@ -378,7 +466,7 @@ class RelayV2OutboxAuthorityCoreTest {
     }
 
     @Test
-    fun `disconnect timeout lineage loss and host epoch revalidation fail closed`() {
+    fun `disconnect timeout same epoch transport continuity and host epoch changes fail closed`() {
         listOf(
             RelayV2AttemptInterruptionCause.DISCONNECTED,
             RelayV2AttemptInterruptionCause.TIMEOUT,
@@ -403,6 +491,24 @@ class RelayV2OutboxAuthorityCoreTest {
 
         val queryableSource = sourceState(RelayV2OutboxStateTag.SENDING)
         val queryableEntry = queryableSource.entries.single()
+        RelayV2NonLineageTransportChange.entries.forEach { change ->
+            val sameEpochTransportChange = applied(
+                core.reduce(
+                    queryableSource,
+                    RelayV2OutboxAction.HostContinuityObserved(
+                        profileId = queryableEntry.profileId,
+                        principalId = queryableEntry.principalId,
+                        hostId = queryableEntry.hostId,
+                        hostEpoch = queryableEntry.expectedHostEpoch,
+                        change = change,
+                    ),
+                ),
+            )
+            assertTrue("$change changed Outbox lineage", sameEpochTransportChange.state === queryableSource)
+            assertTrue(sameEpochTransportChange.transaction.mutations.isEmpty())
+            assertTrue(sameEpochTransportChange.effects.isEmpty())
+        }
+
         val queryable = applied(
             core.reduce(
                 queryableSource,
@@ -507,7 +613,11 @@ class RelayV2OutboxAuthorityCoreTest {
         var state = RelayV2OutboxState.empty()
         val drafts = listOf(
             draft(commandId = "session-a-first", sessionId = "session-a"),
-            draft(commandId = "session-a-second", sessionId = "session-a"),
+            draft(
+                commandId = "session-a-second",
+                sessionId = "session-a",
+                arguments = RelayV2OutboxArguments.killSession(),
+            ),
             draft(commandId = "session-b", sessionId = "session-b"),
             draft(
                 commandId = "other-principal",
@@ -535,6 +645,15 @@ class RelayV2OutboxAuthorityCoreTest {
                 sessionId = null,
                 arguments = RelayV2OutboxArguments.createTerminal("/repo/demo"),
             ),
+            draft(
+                commandId = "create-worktree-other-scope",
+                scopeId = "scope-b",
+                sessionId = null,
+                arguments = RelayV2OutboxArguments.createWorktree(
+                    project = "demo",
+                    aiCommand = "codex",
+                ),
+            ),
         )
         drafts.forEachIndexed { index, value -> state = enqueue(state, value, index.toLong()).state }
         val byCommand = state.entries.associateBy { it.commandId }
@@ -544,10 +663,11 @@ class RelayV2OutboxAuthorityCoreTest {
             "other-principal",
             "create-worktree-first",
             "create-terminal",
+            "create-worktree-other-scope",
         ).associate { name -> byCommand.getValue(name).id to "attempt-$name" }
         val dispatched = dispatch(state, selected)
 
-        assertEquals(5, dispatched.effects.filterIsInstance<RelayV2OutboxEffect.ExecuteCommand>().size)
+        assertEquals(6, dispatched.effects.filterIsInstance<RelayV2OutboxEffect.ExecuteCommand>().size)
         assertEquals(
             RelayV2OutboxStateTag.QUEUED,
             dispatched.state.entries.single { it.commandId == "session-a-second" }.state,
@@ -577,7 +697,10 @@ class RelayV2OutboxAuthorityCoreTest {
         val blocked = rejected(
             core.reduce(
                 ambiguous,
-                RelayV2OutboxAction.DispatchEligible(mapOf(sameLane.id to "blocked-attempt")),
+                RelayV2OutboxAction.DispatchEligible(
+                    mapOf(sameLane.id to "blocked-attempt"),
+                    effectBudget = 1,
+                ),
             ),
         )
         assertEquals(RelayV2OutboxRejection.INVALID_TRANSITION, blocked.reason)
@@ -590,6 +713,62 @@ class RelayV2OutboxAuthorityCoreTest {
         val independent = withIndependent.entries.single { it.commandId == "session-c" }
         val parallel = dispatch(withIndependent, mapOf(independent.id to "parallel-attempt"))
         assertEquals(RelayV2OutboxStateTag.SENDING, parallel.state.entry(independent.id)?.state)
+    }
+
+    @Test
+    fun `query attempts preserve execute history and batch thirty three commands by authority`() {
+        var state = RelayV2OutboxState.empty()
+        repeat(33) { index ->
+            state = enqueue(
+                state,
+                draft(
+                    commandId = "query-command-$index",
+                    sessionId = "query-session-$index",
+                ),
+                index.toLong(),
+            ).state
+        }
+        val executeAttempts = state.entries.associate { entry ->
+            entry.id to "execute-${entry.commandId}"
+        }
+        state = dispatch(state, executeAttempts).state
+        val queried = applied(
+            core.reduce(
+                state,
+                RelayV2OutboxAction.BeginQueries(
+                    entryIds = state.entries.map { it.id },
+                    attemptRequestIds = listOf("query-batch-1", "query-batch-2"),
+                ),
+            ),
+        )
+
+        val batches = queried.effects.filterIsInstance<RelayV2OutboxEffect.QueryCommands>()
+        assertEquals(listOf(32, 1), batches.map { it.items.size })
+        assertEquals(listOf("query-batch-1", "query-batch-2"), batches.map { it.attemptRequestId })
+        assertEquals(1, batches.map { it.authority }.toSet().size)
+        queried.state.entries.forEach { entry ->
+            assertEquals(RelayV2OutboxStateTag.CONFIRMING, entry.state)
+            assertEquals(
+                listOf(RelayV2OutboxAttemptKind.EXECUTE, RelayV2OutboxAttemptKind.QUERY),
+                entry.attempts.map { it.kind },
+            )
+            assertEquals("execute-${entry.commandId}", entry.attempts.first().requestId)
+            assertTrue(entry.attempts.last().requestId.startsWith("query-batch-"))
+        }
+    }
+
+    @Test
+    fun `execute effect budget dispatches one lane and preserves other eligible rows`() {
+        var state = RelayV2OutboxState.empty()
+        state = enqueue(state, draft(commandId = "budget-a", sessionId = "budget-session-a"), 0).state
+        state = enqueue(state, draft(commandId = "budget-b", sessionId = "budget-session-b"), 1).state
+        val attempts = state.entries.associate { it.id to "attempt-${it.commandId}" }
+        val result = dispatchWith(core, state, attempts, effectBudget = 1)
+
+        assertEquals(1, result.effects.filterIsInstance<RelayV2OutboxEffect.ExecuteCommand>().size)
+        assertEquals(RelayV2OutboxStateTag.SENDING, result.state.entries[0].state)
+        assertEquals(RelayV2OutboxStateTag.QUEUED, result.state.entries[1].state)
+        assertTrue(result.state.entries[1].attempts.isEmpty())
     }
 
     @Test
@@ -696,7 +875,10 @@ class RelayV2OutboxAuthorityCoreTest {
             return applied(
                 core.reduce(
                     state,
-                    RelayV2OutboxAction.BeginQuery(entry.id, "query-command-a"),
+                    RelayV2OutboxAction.BeginQueries(
+                        entryIds = listOf(entry.id),
+                        attemptRequestIds = listOf("query-command-a"),
+                    ),
                 ),
             ).state
         }
@@ -753,6 +935,7 @@ class RelayV2OutboxAuthorityCoreTest {
         commandId: String,
         profileId: String = "profile-a",
         principalId: String = "principal-a",
+        scopeId: String = "scope-a",
         sessionId: String? = "session-a",
         arguments: RelayV2OutboxArguments = RelayV2OutboxArguments.sendAgentMessage(
             pane = 0,
@@ -766,7 +949,7 @@ class RelayV2OutboxAuthorityCoreTest {
         expectedHostEpoch = "epoch-a",
         dedupeWindowId = "window-a",
         commandId = commandId,
-        scopeId = "scope-a",
+        scopeId = scopeId,
         sessionId = sessionId,
         arguments = arguments,
     )
@@ -848,8 +1031,12 @@ class RelayV2OutboxAuthorityCoreTest {
         targetCore: RelayV2OutboxAuthorityCore,
         state: RelayV2OutboxState,
         attempts: Map<RelayV2OutboxEntryId, String>,
+        effectBudget: Int = attempts.size,
     ) = applied(
-        targetCore.reduce(state, RelayV2OutboxAction.DispatchEligible(attempts)),
+        targetCore.reduce(
+            state,
+            RelayV2OutboxAction.DispatchEligible(attempts, effectBudget),
+        ),
     )
 
     private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied {
