@@ -36,15 +36,17 @@ import {
   RELAY_AGENT_MAX_PAGE_RECORDS,
   RELAY_AGENT_MIN_REPLAY_RETENTION_MS,
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+  encodeRelayAgentTranscriptLifecycleFrame,
   validateRelayAgentTranscriptLifecycleFrame,
 } from "./codec.js";
 import type { RelayV2JsonObject } from "../../../v2/codecSchema.js";
 import {
   decodeRelayV2StrictUtf8,
   parseRelayV2JsonObject,
+  RelayV2JsonError,
 } from "../../../v2/strictJson.js";
 
-export const RELAY_AGENT_AUTHORITY_STORE_VERSION = 1 as const;
+export const RELAY_AGENT_AUTHORITY_STORE_VERSION = 2 as const;
 export const RELAY_AGENT_AUTHORITY_CONTINUITY_VERSION = 1 as const;
 export const RELAY_AGENT_AUTHORITY_STORE_MAX_PERSISTED_BYTES = 268_435_456;
 
@@ -52,6 +54,8 @@ const UINT64_MAX = 18_446_744_073_709_551_615n;
 const MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 const MAX_STATE_JSON_KEYS = 1_000_000;
 const MAX_STATE_JSON_NODES = 2_000_000;
+const MAX_STATE_JSON_DEPTH = 32;
+const MAX_STATE_JSON_DIRECT_KEYS = 256;
 const MAX_SESSION_COUNT = 256;
 const MAX_PUBLIC_EVENTS_PER_TIMELINE = 100_000;
 const MAX_SNAPSHOTS_PER_STORE = 16;
@@ -62,6 +66,8 @@ const LOCK_OWNER_FILE = "owner.json";
 const LOCK_STALE_MS = 60_000;
 const LOCK_WAIT_MS = 5_000;
 const MAX_CONTINUITY_BYTES = 16_384;
+const WORST_CASE_WIRE_REQUEST_ID = "\u0001".repeat(128);
+const WORST_CASE_WIRE_CURSOR = "\u0001".repeat(1_024);
 
 export type RelayAgentTimelineUnavailableReason =
   | "agent_unsupported"
@@ -94,8 +100,12 @@ export interface RelayAgentAuthorityStoreOptions extends RelayAgentAuthorityStor
   randomId?: () => string;
   randomCursor?: () => string;
   renameFile?: (source: string, destination: string) => void;
+  fsyncDirectory?: (path: string) => void;
   /** Tests may only shrink the exact serialized-file budget. */
   testMaxPersistedBytes?: number;
+  /** Tests may only shrink the production strict-JSON budgets. */
+  testMaxPersistedJsonKeys?: number;
+  testMaxPersistedJsonNodes?: number;
 }
 
 export interface RelayAgentTimelineStatusAvailable {
@@ -207,7 +217,7 @@ interface PersistedSnapshotCut {
   expiresAtMs: number;
   throughAgentSeq: string;
   earliestRetainedSeq: string;
-  records: (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[];
+  recordPages: (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[][];
   pageCursors: string[];
 }
 
@@ -227,7 +237,7 @@ interface PersistedReplayCut {
   replayThroughAgentSeq: string;
   createdAtMs: number;
   expiresAtMs: number;
-  events: RelayAgentAuthorityPublicEvent[];
+  eventPages: RelayAgentAuthorityPublicEvent[][];
   pageCursors: string[];
 }
 
@@ -453,27 +463,72 @@ export function relayAgentAuthorityStorePaths(home = homedir()): RelayAgentAutho
   };
 }
 
-function parseStrictJsonFile(path: string, maximumBytes: number): unknown {
-  const expectedSize = lstatSync(path).size;
-  if (expectedSize === 0 || expectedSize > maximumBytes) {
-    throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
-  }
-  const bytes = readFileSync(path);
-  if (bytes.byteLength !== expectedSize || bytes.byteLength > maximumBytes) {
-    throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
+interface PersistedJsonBudgets {
+  maximumBytes: number;
+  maximumKeys: number;
+  maximumNodes: number;
+}
+
+interface PreparedStoreCommit {
+  store: PersistedStore;
+  bytes: Buffer;
+}
+
+function parseStrictJsonBytes(
+  bytes: Uint8Array,
+  budgets: PersistedJsonBudgets,
+  label: string,
+  capacityPreflight = false,
+): unknown {
+  if (bytes.byteLength === 0 || bytes.byteLength > budgets.maximumBytes) {
+    if (capacityPreflight && bytes.byteLength > budgets.maximumBytes) {
+      throw new RelayAgentAuthorityStoreCapacityError(
+        "serialized_bytes",
+        budgets.maximumBytes,
+        bytes.byteLength,
+      );
+    }
+    throw new RelayAgentAuthorityStoreCorruptError(`${label} has an invalid size`);
   }
   try {
     return parseRelayV2JsonObject(decodeRelayV2StrictUtf8(bytes), {
-      maxDepth: 32,
-      maxDirectKeys: 256,
-      maxTotalKeys: MAX_STATE_JSON_KEYS,
-      maxNodes: MAX_STATE_JSON_NODES,
+      maxDepth: MAX_STATE_JSON_DEPTH,
+      maxDirectKeys: MAX_STATE_JSON_DIRECT_KEYS,
+      maxTotalKeys: budgets.maximumKeys,
+      maxNodes: budgets.maximumNodes,
     });
   } catch (error) {
+    if (capacityPreflight && error instanceof RelayV2JsonError && (
+      error.failureClass === "json-depth-limit"
+      || error.failureClass === "json-direct-key-limit"
+      || error.failureClass === "json-total-key-limit"
+      || error.failureClass === "json-node-limit"
+    )) {
+      const limit = error.failureClass === "json-total-key-limit"
+        ? budgets.maximumKeys
+        : error.failureClass === "json-node-limit"
+          ? budgets.maximumNodes
+          : error.failureClass === "json-depth-limit"
+            ? MAX_STATE_JSON_DEPTH
+            : MAX_STATE_JSON_DIRECT_KEYS;
+      throw new RelayAgentAuthorityStoreCapacityError(error.failureClass, limit, limit + 1);
+    }
     throw new RelayAgentAuthorityStoreCorruptError(
-      `${basename(path)} is not strict JSON: ${error instanceof Error ? error.message : "invalid JSON"}`,
+      `${label} is not strict JSON: ${error instanceof Error ? error.message : "invalid JSON"}`,
     );
   }
+}
+
+function parseStrictJsonFile(path: string, budgets: PersistedJsonBudgets): unknown {
+  const expectedSize = lstatSync(path).size;
+  if (expectedSize === 0 || expectedSize > budgets.maximumBytes) {
+    throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
+  }
+  const bytes = readFileSync(path);
+  if (bytes.byteLength !== expectedSize) {
+    throw new RelayAgentAuthorityStoreCorruptError(`${basename(path)} has an invalid size`);
+  }
+  return parseStrictJsonBytes(bytes, budgets, basename(path));
 }
 
 function assertOwnedRegularFile(path: string): void {
@@ -488,8 +543,16 @@ function assertOwnedRegularFile(path: string): void {
   chmodSync(path, 0o600);
 }
 
-function ensurePrivateDirectory(path: string): void {
-  if (!existsSync(path)) mkdirSync(path, { recursive: true, mode: 0o700 });
+function fsyncDirectorySync(path: string): void {
+  const descriptor = openSync(path, "r");
+  try {
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function assertOwnedDirectory(path: string, harden: boolean): void {
   const information = lstatSync(path);
   if (!information.isDirectory() || information.isSymbolicLink()) {
     throw new RelayAgentAuthorityStoreOwnershipError(`${basename(path)} is not an owned directory`);
@@ -498,7 +561,21 @@ function ensurePrivateDirectory(path: string): void {
   if (uid !== null && information.uid !== uid) {
     throw new RelayAgentAuthorityStoreOwnershipError(`${basename(path)} has an unexpected owner`);
   }
-  chmodSync(path, 0o700);
+  if (harden) chmodSync(path, 0o700);
+}
+
+function ensurePrivateDirectory(path: string, fsyncDirectory: (path: string) => void): void {
+  if (existsSync(path)) {
+    assertOwnedDirectory(path, true);
+    return;
+  }
+  const parent = dirname(path);
+  if (!existsSync(parent)) ensurePrivateDirectory(parent, fsyncDirectory);
+  else assertOwnedDirectory(parent, false);
+  mkdirSync(path, { mode: 0o700 });
+  assertOwnedDirectory(path, true);
+  fsyncDirectory(path);
+  fsyncDirectory(parent);
 }
 
 function validateOwner(value: unknown, label: string): RelayAgentAuthorityStoreOwner {
@@ -565,40 +642,171 @@ function validatePublicEvent(
   return event;
 }
 
-function validateSnapshotRecordPages(records: unknown[], label: string): void {
-  for (let offset = 0; offset < Math.max(records.length, 1); offset += RELAY_AGENT_MAX_PAGE_RECORDS) {
-    const page = records.slice(offset, offset + RELAY_AGENT_MAX_PAGE_RECORDS);
-    try {
-      validateRelayAgentTranscriptLifecycleFrame({
-        protocolVersion: 2,
-        kind: "response",
-        type: "agent.timeline.snapshot.page",
-        requestId: "store-validation",
-        hostId: "store-validation",
-        hostEpoch: "store-validation",
-        scopeId: "store-validation",
-        sessionId: "store-validation",
-        payload: {
-          capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
-          timelineEpoch: "store-validation",
-          snapshotRequestId: "store-validation",
-          snapshotId: "store-validation",
-          pageIndex: Math.floor(offset / RELAY_AGENT_MAX_PAGE_RECORDS),
-          isLast: offset + RELAY_AGENT_MAX_PAGE_RECORDS >= records.length,
-          nextCursor: offset + RELAY_AGENT_MAX_PAGE_RECORDS >= records.length ? null : "store-validation",
-          throughAgentSeq: "18446744073709551615",
-          earliestRetainedSeq: "0",
-          records: page,
-        },
-      } as unknown as RelayV2JsonObject);
-    } catch {
-      throw new RelayAgentAuthorityStoreCorruptError(`${label} contains invalid records`);
-    }
-    if (records.length === 0) break;
+interface SnapshotWireContext {
+  owner: RelayAgentAuthorityStoreOwner;
+  target: RelayAgentAuthorityTarget;
+  timelineEpoch: string;
+  snapshotRequestId: string;
+  snapshotId: string;
+  throughAgentSeq: string;
+  earliestRetainedSeq: string;
+}
+
+interface ReplayWireContext {
+  owner: RelayAgentAuthorityStoreOwner;
+  target: RelayAgentAuthorityTarget;
+  timelineEpoch: string;
+  afterAgentSeq: string;
+  replayThroughAgentSeq: string;
+}
+
+function snapshotPageFrame(
+  context: SnapshotWireContext,
+  pageIndex: number,
+  records: readonly (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[],
+  nextCursor: string | null,
+): RelayV2JsonObject {
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "agent.timeline.snapshot.page",
+    requestId: WORST_CASE_WIRE_REQUEST_ID,
+    hostId: context.owner.hostId,
+    hostEpoch: context.owner.hostEpoch,
+    scopeId: context.target.scopeId,
+    sessionId: context.target.sessionId,
+    payload: {
+      capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      timelineEpoch: context.timelineEpoch,
+      snapshotRequestId: context.snapshotRequestId,
+      snapshotId: context.snapshotId,
+      pageIndex,
+      isLast: nextCursor === null,
+      nextCursor,
+      throughAgentSeq: context.throughAgentSeq,
+      earliestRetainedSeq: context.earliestRetainedSeq,
+      records,
+    },
+  } as unknown as RelayV2JsonObject;
+}
+
+function replayPageFrame(
+  context: ReplayWireContext,
+  events: readonly RelayAgentAuthorityPublicEvent[],
+  nextCursor: string | null,
+): RelayV2JsonObject {
+  return {
+    protocolVersion: 2,
+    kind: "response",
+    type: "agent.timeline.replay.page",
+    requestId: WORST_CASE_WIRE_REQUEST_ID,
+    hostId: context.owner.hostId,
+    hostEpoch: context.owner.hostEpoch,
+    scopeId: context.target.scopeId,
+    sessionId: context.target.sessionId,
+    payload: {
+      capability: RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+      timelineEpoch: context.timelineEpoch,
+      afterAgentSeq: context.afterAgentSeq,
+      replayThroughAgentSeq: context.replayThroughAgentSeq,
+      isLast: nextCursor === null,
+      nextCursor,
+      events: events.map(toReplayEvent),
+    },
+  } as unknown as RelayV2JsonObject;
+}
+
+function frameFitsWire(frame: RelayV2JsonObject): boolean {
+  try {
+    encodeRelayAgentTranscriptLifecycleFrame(frame);
+    return true;
+  } catch {
+    return false;
   }
+}
+
+function assertFrozenWireFrame(frame: RelayV2JsonObject, label: string): void {
+  try {
+    encodeRelayAgentTranscriptLifecycleFrame(frame);
+  } catch {
+    throw new RelayAgentAuthorityStoreCorruptError(`${label} is not a wire-encodable frozen page`);
+  }
+}
+
+function freezeSnapshotRecordPages(
+  context: SnapshotWireContext,
+  records: readonly (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[],
+): (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[][] {
+  if (records.length === 0) return [[]];
+  const pages: (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[][] = [];
+  let page: (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[] = [];
+  for (const record of records) {
+    const candidate = [...page, record];
+    if (candidate.length <= RELAY_AGENT_MAX_PAGE_RECORDS && frameFitsWire(snapshotPageFrame(
+      context,
+      Number.MAX_SAFE_INTEGER,
+      candidate,
+      WORST_CASE_WIRE_CURSOR,
+    ))) {
+      page = candidate;
+      continue;
+    }
+    if (page.length === 0) {
+      throw new RelayAgentAuthorityStoreCapacityError("snapshot_wire_page", 1, 1);
+    }
+    pages.push(page);
+    page = [record];
+    if (!frameFitsWire(snapshotPageFrame(
+      context,
+      Number.MAX_SAFE_INTEGER,
+      page,
+      WORST_CASE_WIRE_CURSOR,
+    ))) {
+      throw new RelayAgentAuthorityStoreCapacityError("snapshot_wire_page", 1, 1);
+    }
+  }
+  pages.push(page);
+  return pages;
+}
+
+function freezeReplayEventPages(
+  context: ReplayWireContext,
+  events: readonly RelayAgentAuthorityPublicEvent[],
+  limit: number,
+): RelayAgentAuthorityPublicEvent[][] {
+  if (events.length === 0) return [[]];
+  const pages: RelayAgentAuthorityPublicEvent[][] = [];
+  let page: RelayAgentAuthorityPublicEvent[] = [];
+  for (const event of events) {
+    const candidate = [...page, event];
+    if (candidate.length <= limit && frameFitsWire(replayPageFrame(
+      context,
+      candidate,
+      WORST_CASE_WIRE_CURSOR,
+    ))) {
+      page = candidate;
+      continue;
+    }
+    if (page.length === 0) {
+      throw new RelayAgentAuthorityStoreCapacityError("replay_wire_page", 1, 1);
+    }
+    pages.push(page);
+    page = [event];
+    if (!frameFitsWire(replayPageFrame(context, page, WORST_CASE_WIRE_CURSOR))) {
+      throw new RelayAgentAuthorityStoreCapacityError("replay_wire_page", 1, 1);
+    }
+  }
+  pages.push(page);
+  return pages;
+}
+
+function validateSnapshotRecordOrder(
+  records: readonly (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[],
+  label: string,
+): void {
   for (let index = 1; index < records.length; index += 1) {
-    const previous = records[index - 1] as RelayAgentLifecycleRecord | RelayAgentTextEntryRecord;
-    const current = records[index] as RelayAgentLifecycleRecord | RelayAgentTextEntryRecord;
+    const previous = records[index - 1]!;
+    const current = records[index]!;
     const previousSeq = previous.recordType === "lifecycle" ? previous.agentEventSeq : previous.createdAgentSeq;
     const currentSeq = current.recordType === "lifecycle" ? current.agentEventSeq : current.createdAgentSeq;
     const previousId = previous.recordType === "lifecycle" ? previous.lifecycleEventId : previous.entryId;
@@ -610,8 +818,69 @@ function validateSnapshotRecordPages(records: unknown[], label: string): void {
   }
 }
 
-function expectedPageCursorCount(itemCount: number, pageSize: number): number {
-  return Math.max(0, Math.ceil(itemCount / pageSize) - 1);
+function validateSnapshotCutPages(
+  cut: PersistedSnapshotCut,
+  owner: RelayAgentAuthorityStoreOwner,
+  target: RelayAgentAuthorityTarget,
+  timelineEpoch: string,
+  label: string,
+): void {
+  if (cut.recordPages.length === 0) {
+    throw new RelayAgentAuthorityStoreCorruptError(`${label} has no frozen pages`);
+  }
+  const context: SnapshotWireContext = {
+    owner,
+    target,
+    timelineEpoch,
+    snapshotRequestId: cut.snapshotRequestId,
+    snapshotId: cut.snapshotId,
+    throughAgentSeq: cut.throughAgentSeq,
+    earliestRetainedSeq: cut.earliestRetainedSeq,
+  };
+  for (let pageIndex = 0; pageIndex < cut.recordPages.length; pageIndex += 1) {
+    const records = cut.recordPages[pageIndex]!;
+    if (records.length > RELAY_AGENT_MAX_PAGE_RECORDS
+      || (records.length === 0 && cut.recordPages.length !== 1)) {
+      throw new RelayAgentAuthorityStoreCorruptError(`${label}[${pageIndex}] has an invalid record count`);
+    }
+    assertFrozenWireFrame(snapshotPageFrame(
+      context,
+      pageIndex,
+      records,
+      pageIndex < cut.pageCursors.length ? cut.pageCursors[pageIndex]! : null,
+    ), `${label}[${pageIndex}]`);
+  }
+  validateSnapshotRecordOrder(cut.recordPages.flat(), label);
+}
+
+function validateReplayCutPages(
+  cut: PersistedReplayCut,
+  owner: RelayAgentAuthorityStoreOwner,
+  target: RelayAgentAuthorityTarget,
+  timelineEpoch: string,
+  label: string,
+): void {
+  if (cut.eventPages.length === 0) {
+    throw new RelayAgentAuthorityStoreCorruptError(`${label} has no frozen pages`);
+  }
+  const context: ReplayWireContext = {
+    owner,
+    target,
+    timelineEpoch,
+    afterAgentSeq: cut.afterAgentSeq,
+    replayThroughAgentSeq: cut.replayThroughAgentSeq,
+  };
+  for (let pageIndex = 0; pageIndex < cut.eventPages.length; pageIndex += 1) {
+    const events = cut.eventPages[pageIndex]!;
+    if (events.length > cut.limit || (events.length === 0 && cut.eventPages.length !== 1)) {
+      throw new RelayAgentAuthorityStoreCorruptError(`${label}[${pageIndex}] has an invalid event count`);
+    }
+    assertFrozenWireFrame(replayPageFrame(
+      context,
+      events,
+      pageIndex < cut.pageCursors.length ? cut.pageCursors[pageIndex]! : null,
+    ), `${label}[${pageIndex}]`);
+  }
 }
 
 function validateUniqueCursors(value: unknown, expected: number, label: string): string[] {
@@ -695,10 +964,19 @@ function validateTimeline(
   const snapshots = timeline.snapshots.map((item, index) => {
     const record = exactRecord(item, [
       "principalId", "clientInstanceId", "snapshotRequestId", "snapshotId", "createdAtMs",
-      "expiresAtMs", "throughAgentSeq", "earliestRetainedSeq", "records", "pageCursors",
+      "expiresAtMs", "throughAgentSeq", "earliestRetainedSeq", "recordPages", "pageCursors",
     ], `${label}.snapshots[${index}]`);
-    if (!Array.isArray(record.records)) throw new RelayAgentAuthorityStoreCorruptError(`${label}.snapshots[${index}].records is invalid`);
-    validateSnapshotRecordPages(record.records, `${label}.snapshots[${index}].records`);
+    if (!Array.isArray(record.recordPages)) {
+      throw new RelayAgentAuthorityStoreCorruptError(`${label}.snapshots[${index}].recordPages is invalid`);
+    }
+    const recordPages = record.recordPages.map((page, pageIndex) => {
+      if (!Array.isArray(page)) {
+        throw new RelayAgentAuthorityStoreCorruptError(
+          `${label}.snapshots[${index}].recordPages[${pageIndex}] is invalid`,
+        );
+      }
+      return page as (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[];
+    });
     const cut: PersistedSnapshotCut = {
       principalId: parseId(record.principalId, `${label}.snapshots[${index}].principalId`),
       clientInstanceId: parseId(record.clientInstanceId, `${label}.snapshots[${index}].clientInstanceId`),
@@ -708,10 +986,10 @@ function validateTimeline(
       expiresAtMs: parseInteger(record.expiresAtMs, `${label}.snapshots[${index}].expiresAtMs`),
       throughAgentSeq: parseCounter(record.throughAgentSeq, `${label}.snapshots[${index}].throughAgentSeq`),
       earliestRetainedSeq: parseCounter(record.earliestRetainedSeq, `${label}.snapshots[${index}].earliestRetainedSeq`),
-      records: record.records as (RelayAgentLifecycleRecord | RelayAgentTextEntryRecord)[],
+      recordPages,
       pageCursors: validateUniqueCursors(
         record.pageCursors,
-        expectedPageCursorCount(record.records.length, RELAY_AGENT_MAX_PAGE_RECORDS),
+        Math.max(0, recordPages.length - 1),
         `${label}.snapshots[${index}].pageCursors`,
       ),
     };
@@ -720,6 +998,13 @@ function validateTimeline(
       || compareCounter(cut.throughAgentSeq, authority.agentEventSeq) > 0) {
       throw new RelayAgentAuthorityStoreCorruptError(`${label}.snapshots[${index}] has invalid watermarks`);
     }
+    validateSnapshotCutPages(
+      cut,
+      owner,
+      target,
+      timelineEpoch,
+      `${label}.snapshots[${index}].recordPages`,
+    );
     return cut;
   });
 
@@ -743,17 +1028,29 @@ function validateTimeline(
   const replayCuts = timeline.replayCuts.map((item, index) => {
     const record = exactRecord(item, [
       "principalId", "clientInstanceId", "afterAgentSeq", "limit", "replayThroughAgentSeq",
-      "createdAtMs", "expiresAtMs", "events", "pageCursors",
+      "createdAtMs", "expiresAtMs", "eventPages", "pageCursors",
     ], `${label}.replayCuts[${index}]`);
     const afterAgentSeq = parseCounter(record.afterAgentSeq, `${label}.replayCuts[${index}].afterAgentSeq`);
     const replayThroughAgentSeq = parseCounter(record.replayThroughAgentSeq, `${label}.replayCuts[${index}].replayThroughAgentSeq`);
     const limit = parseInteger(record.limit, `${label}.replayCuts[${index}].limit`);
-    if (limit < 1 || limit > RELAY_AGENT_MAX_PAGE_RECORDS || !Array.isArray(record.events)) {
+    if (limit < 1 || limit > RELAY_AGENT_MAX_PAGE_RECORDS || !Array.isArray(record.eventPages)) {
       throw new RelayAgentAuthorityStoreCorruptError(`${label}.replayCuts[${index}] has invalid paging`);
     }
-    const replayEvents = record.events.map((event, eventIndex) => validatePublicEvent(
-      event, owner, target, timelineEpoch, `${label}.replayCuts[${index}].events[${eventIndex}]`,
-    ));
+    const eventPages = record.eventPages.map((page, pageIndex) => {
+      if (!Array.isArray(page)) {
+        throw new RelayAgentAuthorityStoreCorruptError(
+          `${label}.replayCuts[${index}].eventPages[${pageIndex}] is invalid`,
+        );
+      }
+      return page.map((event, eventIndex) => validatePublicEvent(
+        event,
+        owner,
+        target,
+        timelineEpoch,
+        `${label}.replayCuts[${index}].eventPages[${pageIndex}][${eventIndex}]`,
+      ));
+    });
+    const replayEvents = eventPages.flat();
     let expected = BigInt(afterAgentSeq);
     for (const event of replayEvents) {
       expected += 1n;
@@ -769,7 +1066,7 @@ function validateTimeline(
     const createdAtMs = parseInteger(record.createdAtMs, `${label}.replayCuts[${index}].createdAtMs`);
     const expiresAtMs = parseInteger(record.expiresAtMs, `${label}.replayCuts[${index}].expiresAtMs`);
     if (expiresAtMs < createdAtMs) throw new RelayAgentAuthorityStoreCorruptError(`${label}.replayCuts[${index}] expired before creation`);
-    return {
+    const cut: PersistedReplayCut = {
       principalId: parseId(record.principalId, `${label}.replayCuts[${index}].principalId`),
       clientInstanceId: parseId(record.clientInstanceId, `${label}.replayCuts[${index}].clientInstanceId`),
       afterAgentSeq,
@@ -777,13 +1074,21 @@ function validateTimeline(
       replayThroughAgentSeq,
       createdAtMs,
       expiresAtMs,
-      events: replayEvents,
+      eventPages,
       pageCursors: validateUniqueCursors(
         record.pageCursors,
-        expectedPageCursorCount(replayEvents.length, limit),
+        Math.max(0, eventPages.length - 1),
         `${label}.replayCuts[${index}].pageCursors`,
       ),
     };
+    validateReplayCutPages(
+      cut,
+      owner,
+      target,
+      timelineEpoch,
+      `${label}.replayCuts[${index}].eventPages`,
+    );
+    return cut;
   });
 
   const allCursorValues = [
@@ -950,11 +1255,15 @@ function validateContinuity(value: unknown, expectedOwner: RelayAgentAuthoritySt
   };
 }
 
-function inspectJsonFile<T>(path: string, maximumBytes: number, validator: (value: unknown) => T): FileInspection<T> {
+function inspectJsonFile<T>(
+  path: string,
+  budgets: PersistedJsonBudgets,
+  validator: (value: unknown) => T,
+): FileInspection<T> {
   if (!existsSync(path)) return { kind: "missing" };
   try {
     assertOwnedRegularFile(path);
-    return { kind: "valid", value: validator(parseStrictJsonFile(path, maximumBytes)) };
+    return { kind: "valid", value: validator(parseStrictJsonFile(path, budgets)) };
   } catch (error) {
     if (error instanceof RelayAgentAuthorityStoreOwnershipError) throw error;
     return { kind: "invalid" };
@@ -970,14 +1279,14 @@ function writeAll(fd: number, bytes: Uint8Array): void {
   }
 }
 
-function atomicWritePrivateJson(
+function atomicWritePrivateBytes(
   path: string,
-  value: unknown,
+  bytes: Buffer,
   renameFile: (source: string, destination: string) => void,
   maximumBytes: number,
+  fsyncDirectory: (path: string) => void,
 ): void {
-  ensurePrivateDirectory(dirname(path));
-  const bytes = Buffer.from(`${JSON.stringify(value)}\n`, "utf8");
+  ensurePrivateDirectory(dirname(path), fsyncDirectory);
   if (bytes.byteLength > maximumBytes) {
     throw new RelayAgentAuthorityStoreCapacityError("serialized_bytes", maximumBytes, bytes.byteLength);
   }
@@ -993,12 +1302,7 @@ function atomicWritePrivateJson(
     renameFile(temporary, path);
     published = true;
     chmodSync(path, 0o600);
-    const directoryFd = openSync(dirname(path), "r");
-    try {
-      fsyncSync(directoryFd);
-    } finally {
-      closeSync(directoryFd);
-    }
+    fsyncDirectory(dirname(path));
   } catch (error) {
     if (!published && existsSync(path)) {
       try {
@@ -1012,6 +1316,22 @@ function atomicWritePrivateJson(
     if (fd !== null) closeSync(fd);
     if (existsSync(temporary)) rmSync(temporary, { force: true });
   }
+}
+
+function atomicWritePrivateJson(
+  path: string,
+  value: unknown,
+  renameFile: (source: string, destination: string) => void,
+  maximumBytes: number,
+  fsyncDirectory: (path: string) => void,
+): void {
+  atomicWritePrivateBytes(
+    path,
+    Buffer.from(`${JSON.stringify(value)}\n`, "utf8"),
+    renameFile,
+    maximumBytes,
+    fsyncDirectory,
+  );
 }
 
 function processIsAlive(pid: number): boolean {
@@ -1030,7 +1350,11 @@ function waitBriefly(milliseconds: number): void {
 
 function parseLockOwner(path: string): StoreLockOwner {
   assertOwnedRegularFile(path);
-  const value = parseStrictJsonFile(path, MAX_CONTINUITY_BYTES);
+  const value = parseStrictJsonFile(path, {
+    maximumBytes: MAX_CONTINUITY_BYTES,
+    maximumKeys: 32,
+    maximumNodes: 64,
+  });
   const owner = exactRecord(value, ["owner", "pid", "createdAtMs"], "authority store lock owner");
   return {
     owner: parseId(owner.owner, "authority store lock owner.owner"),
@@ -1039,13 +1363,19 @@ function parseLockOwner(path: string): StoreLockOwner {
   };
 }
 
-function acquireStoreLock(path: string, now: () => number, randomId: () => string): StoreLock {
-  ensurePrivateDirectory(dirname(path));
+function acquireStoreLock(
+  path: string,
+  now: () => number,
+  randomId: () => string,
+  fsyncDirectory: (path: string) => void,
+): StoreLock {
+  ensurePrivateDirectory(dirname(path), fsyncDirectory);
   const deadline = Date.now() + LOCK_WAIT_MS;
   const owner = randomId();
   for (;;) {
     try {
       mkdirSync(path, { mode: 0o700 });
+      fsyncDirectory(dirname(path));
       writeFileSync(join(path, LOCK_OWNER_FILE), JSON.stringify({
         owner,
         pid: process.pid,
@@ -1263,7 +1593,9 @@ export class RelayAgentAuthorityStore {
   private readonly randomId: () => string;
   private readonly randomCursor: () => string;
   private readonly renameFile: (source: string, destination: string) => void;
+  private readonly fsyncDirectory: (path: string) => void;
   private readonly maximumPersistedBytes: number;
+  private readonly persistedJsonBudgets: PersistedJsonBudgets;
   private readonly authorityCapacityOverride: RelayAgentAuthorityCapacityOverride | undefined;
   private readonly configuredRetentionMs: number;
 
@@ -1274,12 +1606,26 @@ export class RelayAgentAuthorityStore {
     this.randomId = options.randomId ?? randomUUID;
     this.randomCursor = options.randomCursor ?? (() => randomBytes(32).toString("base64url"));
     this.renameFile = options.renameFile ?? renameSync;
+    this.fsyncDirectory = options.fsyncDirectory ?? fsyncDirectorySync;
     this.maximumPersistedBytes = options.testMaxPersistedBytes ?? RELAY_AGENT_AUTHORITY_STORE_MAX_PERSISTED_BYTES;
     if (!Number.isSafeInteger(this.maximumPersistedBytes)
       || this.maximumPersistedBytes < 1
       || this.maximumPersistedBytes > RELAY_AGENT_AUTHORITY_STORE_MAX_PERSISTED_BYTES) {
       throw new RangeError("testMaxPersistedBytes may only shrink the production store budget");
     }
+    const maximumKeys = options.testMaxPersistedJsonKeys ?? MAX_STATE_JSON_KEYS;
+    const maximumNodes = options.testMaxPersistedJsonNodes ?? MAX_STATE_JSON_NODES;
+    if (!Number.isSafeInteger(maximumKeys) || maximumKeys < 1 || maximumKeys > MAX_STATE_JSON_KEYS) {
+      throw new RangeError("testMaxPersistedJsonKeys may only shrink the production store budget");
+    }
+    if (!Number.isSafeInteger(maximumNodes) || maximumNodes < 1 || maximumNodes > MAX_STATE_JSON_NODES) {
+      throw new RangeError("testMaxPersistedJsonNodes may only shrink the production store budget");
+    }
+    this.persistedJsonBudgets = Object.freeze({
+      maximumBytes: this.maximumPersistedBytes,
+      maximumKeys,
+      maximumNodes,
+    });
     this.configuredRetentionMs = options.eventReplayRetentionMs ?? RELAY_AGENT_DEFAULT_REPLAY_RETENTION_MS;
     if (!Number.isSafeInteger(this.configuredRetentionMs)
       || this.configuredRetentionMs < RELAY_AGENT_MIN_REPLAY_RETENTION_MS) {
@@ -1300,14 +1646,54 @@ export class RelayAgentAuthorityStore {
     return Math.max(previous, value);
   }
 
-  private atomicWrite(path: string, value: unknown, maximumBytes: number): void {
-    atomicWritePrivateJson(path, value, this.renameFile, maximumBytes);
+  private atomicWriteJson(path: string, value: unknown, maximumBytes: number): void {
+    atomicWritePrivateJson(
+      path,
+      value,
+      this.renameFile,
+      maximumBytes,
+      this.fsyncDirectory,
+    );
+  }
+
+  private prepareStoreCommit(candidate: PersistedStore): PreparedStoreCommit {
+    const firstBytes = Buffer.from(`${JSON.stringify(candidate)}\n`, "utf8");
+    const first = validateStore(
+      parseStrictJsonBytes(
+        firstBytes,
+        this.persistedJsonBudgets,
+        "candidate authority state",
+        true,
+      ),
+      this.owner,
+    );
+    const bytes = Buffer.from(`${JSON.stringify(first)}\n`, "utf8");
+    const store = validateStore(
+      parseStrictJsonBytes(
+        bytes,
+        this.persistedJsonBudgets,
+        "final candidate authority state",
+        true,
+      ),
+      this.owner,
+    );
+    return { store, bytes };
+  }
+
+  private atomicWriteStore(prepared: PreparedStoreCommit): void {
+    atomicWritePrivateBytes(
+      this.paths.state,
+      prepared.bytes,
+      this.renameFile,
+      this.maximumPersistedBytes,
+      this.fsyncDirectory,
+    );
   }
 
   private initialize(): void {
-    ensurePrivateDirectory(dirname(this.paths.continuity));
-    ensurePrivateDirectory(dirname(this.paths.state));
-    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId);
+    ensurePrivateDirectory(dirname(this.paths.continuity), this.fsyncDirectory);
+    ensurePrivateDirectory(dirname(this.paths.state), this.fsyncDirectory);
+    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
     try {
       this.loadOrCreateLocked();
     } finally {
@@ -1318,12 +1704,12 @@ export class RelayAgentAuthorityStore {
   private loadOrCreateLocked(): PersistedStore {
     const state = inspectJsonFile(
       this.paths.state,
-      this.maximumPersistedBytes,
+      this.persistedJsonBudgets,
       (value) => validateStore(value, this.owner),
     );
     const continuity = inspectJsonFile(
       this.paths.continuity,
-      MAX_CONTINUITY_BYTES,
+      { maximumBytes: MAX_CONTINUITY_BYTES, maximumKeys: 32, maximumNodes: 64 },
       (value) => validateContinuity(value, this.owner),
     );
     if (state.kind === "invalid" || continuity.kind === "invalid") {
@@ -1336,18 +1722,19 @@ export class RelayAgentAuthorityStore {
         parseId(this.randomId(), "generated store commit ID"),
         this.observedNow(),
       );
+      const prepared = this.prepareStoreCommit(created);
       let statePublished = false;
       try {
-        this.atomicWrite(this.paths.state, created, this.maximumPersistedBytes);
+        this.atomicWriteStore(prepared);
         statePublished = true;
-        this.atomicWrite(this.paths.continuity, continuityFor(created), MAX_CONTINUITY_BYTES);
+        this.atomicWriteJson(this.paths.continuity, continuityFor(prepared.store), MAX_CONTINUITY_BYTES);
       } catch (error) {
         if (statePublished || (error instanceof AtomicPublishError && error.published)) {
           throw new RelayAgentAuthorityStoreCommitUncertainError("initial authority store publication is uncertain");
         }
         throw error;
       }
-      return created;
+      return prepared.store;
     }
     if (state.kind === "missing" || continuity.kind === "missing") {
       throw new RelayAgentAuthorityStoreCorruptError("authority state/continuity pair is incomplete");
@@ -1366,7 +1753,7 @@ export class RelayAgentAuthorityStore {
       throw new RelayAgentAuthorityStoreCorruptError("authority continuity proves rollback or divergent lineage");
     }
     try {
-      this.atomicWrite(this.paths.continuity, continuityFor(state.value), MAX_CONTINUITY_BYTES);
+      this.atomicWriteJson(this.paths.continuity, continuityFor(state.value), MAX_CONTINUITY_BYTES);
     } catch {
       throw new RelayAgentAuthorityStoreCommitUncertainError("authority continuity repair could not be published");
     }
@@ -1388,10 +1775,9 @@ export class RelayAgentAuthorityStore {
       lastObservedAtMs: observedAtMs,
       sessions: working.sessions,
     });
-    // Run the same complete restore boundary before publication.
-    const validated = validateStore(candidate, this.owner);
+    const prepared = this.prepareStoreCommit(candidate);
     try {
-      this.atomicWrite(this.paths.state, validated, this.maximumPersistedBytes);
+      this.atomicWriteStore(prepared);
     } catch (error) {
       if (error instanceof AtomicPublishError && error.published) {
         throw new RelayAgentAuthorityStoreCommitUncertainError("authority state commit is uncertain");
@@ -1399,15 +1785,15 @@ export class RelayAgentAuthorityStore {
       throw error;
     }
     try {
-      this.atomicWrite(this.paths.continuity, continuityFor(validated), MAX_CONTINUITY_BYTES);
+      this.atomicWriteJson(this.paths.continuity, continuityFor(prepared.store), MAX_CONTINUITY_BYTES);
     } catch {
       throw new RelayAgentAuthorityStoreCommitUncertainError("authority continuity commit is uncertain");
     }
-    return validated;
+    return prepared.store;
   }
 
   private transaction<T>(mutator: (working: PersistedStore, observedAtMs: number) => StoreTransactionResult<T>): T {
-    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId);
+    const lock = acquireStoreLock(this.paths.lock, this.now, this.randomId, this.fsyncDirectory);
     try {
       const current = this.loadOrCreateLocked();
       const observedAtMs = this.observedNow(current.lastObservedAtMs);
@@ -1743,11 +2129,21 @@ export class RelayAgentAuthorityStore {
             principalSnapshotCount + 1,
           );
         }
-        const records = materializedRecords(timeline);
-        const cursorCount = expectedPageCursorCount(records.length, RELAY_AGENT_MAX_PAGE_RECORDS);
+        const snapshotCutId = this.generatedOpaqueId("generated snapshot ID");
+        const throughAgentSeq = timeline.authority.agentEventSeq;
+        const earliestRetainedSeq = replayFloor(timeline);
+        const recordPages = freezeSnapshotRecordPages({
+          owner: this.owner,
+          target,
+          timelineEpoch: timeline.timelineEpoch,
+          snapshotRequestId,
+          snapshotId: snapshotCutId,
+          throughAgentSeq,
+          earliestRetainedSeq,
+        }, materializedRecords(timeline));
         const pageCursors: string[] = [];
         const reservedCursors = new Set<string>();
-        for (let index = 0; index < cursorCount; index += 1) {
+        for (let index = 1; index < recordPages.length; index += 1) {
           const generated = this.generatedCursor(working, "generated snapshot cursor", reservedCursors);
           pageCursors.push(generated);
           reservedCursors.add(generated);
@@ -1756,14 +2152,15 @@ export class RelayAgentAuthorityStore {
           principalId,
           clientInstanceId,
           snapshotRequestId,
-          snapshotId: this.generatedOpaqueId("generated snapshot ID"),
+          snapshotId: snapshotCutId,
           createdAtMs: observedAtMs,
           expiresAtMs: Math.min(MAX_SAFE_INTEGER, observedAtMs + working.policy.snapshotLeaseMs),
-          throughAgentSeq: timeline.authority.agentEventSeq,
-          earliestRetainedSeq: replayFloor(timeline),
-          records,
+          throughAgentSeq,
+          earliestRetainedSeq,
+          recordPages,
           pageCursors,
         };
+        validateSnapshotCutPages(cut, this.owner, target, timeline.timelineEpoch, "new snapshot cut");
         timeline.snapshots.push(cut);
         changed = true;
       }
@@ -1775,11 +2172,10 @@ export class RelayAgentAuthorityStore {
       } else if (cursor !== null) {
         throw new RelayAgentTimelineRequestError("AGENT_SNAPSHOT_EXPIRED");
       }
-      const start = pageIndex * RELAY_AGENT_MAX_PAGE_RECORDS;
-      if (start > cut.records.length || (start === cut.records.length && pageIndex !== 0)) {
+      if (pageIndex >= cut.recordPages.length) {
         throw new RelayAgentTimelineRequestError("AGENT_SNAPSHOT_EXPIRED");
       }
-      const records = cut.records.slice(start, start + RELAY_AGENT_MAX_PAGE_RECORDS);
+      const records = cut.recordPages[pageIndex]!;
       const isLast = pageIndex >= cut.pageCursors.length;
       return { changed, result: {
         timelineEpoch: timeline.timelineEpoch,
@@ -1846,10 +2242,16 @@ export class RelayAgentAuthorityStore {
             .filter((item) => compareCounter(item.agentEventSeq, afterAgentSeq) > 0
               && compareCounter(item.agentEventSeq, through) <= 0)
             .map(cloneStore);
-          const cursorCount = expectedPageCursorCount(events.length, request.limit);
+          const eventPages = freezeReplayEventPages({
+            owner: this.owner,
+            target,
+            timelineEpoch,
+            afterAgentSeq,
+            replayThroughAgentSeq: through,
+          }, events, request.limit);
           const pageCursors: string[] = [];
           const reservedCursors = new Set<string>();
-          for (let index = 0; index < cursorCount; index += 1) {
+          for (let index = 1; index < eventPages.length; index += 1) {
             const generated = this.generatedCursor(working, "generated replay cursor", reservedCursors);
             pageCursors.push(generated);
             reservedCursors.add(generated);
@@ -1862,9 +2264,10 @@ export class RelayAgentAuthorityStore {
             replayThroughAgentSeq: through,
             createdAtMs: observedAtMs,
             expiresAtMs: Math.min(MAX_SAFE_INTEGER, observedAtMs + working.policy.snapshotLeaseMs),
-            events,
+            eventPages,
             pageCursors,
           };
+          validateReplayCutPages(cut, this.owner, target, timelineEpoch, "new replay cut");
           timeline.replayCuts.push(cut);
           changed = true;
         }
@@ -1883,8 +2286,10 @@ export class RelayAgentAuthorityStore {
         }
         if (!cut) throw new RelayAgentTimelineRequestError("AGENT_CURSOR_EXPIRED");
       }
-      const start = pageIndex * cut.limit;
-      const events = cut.events.slice(start, start + cut.limit).map(toReplayEvent);
+      if (pageIndex >= cut.eventPages.length) {
+        throw new RelayAgentTimelineRequestError("AGENT_CURSOR_EXPIRED");
+      }
+      const events = cut.eventPages[pageIndex]!.map(toReplayEvent);
       const isLast = pageIndex >= cut.pageCursors.length;
       return { changed, result: {
         timelineEpoch,

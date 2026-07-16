@@ -1,6 +1,5 @@
 import {
   RELAY_V2_PUBLIC_FRAME_BYTES,
-  RelayV2CodecError,
   type RelayV2FrameMetadata,
 } from "../../../v2/codec.js";
 import type {
@@ -23,6 +22,51 @@ export const RELAY_AGENT_MAX_PAGE_RECORDS = 256;
 export const RELAY_AGENT_MIN_REPLAY_RETENTION_MS = 86_400_000;
 export const RELAY_AGENT_DEFAULT_REPLAY_RETENTION_MS = 604_800_000;
 export const RELAY_AGENT_DEFAULT_SNAPSHOT_LEASE_MS = 300_000;
+export const RELAY_AGENT_CODEC_ERROR_DOMAIN =
+  "relay-agent-transcript-lifecycle-codec-v1" as const;
+
+export type RelayAgentCodecErrorCode = "INVALID_ENVELOPE" | "PROTOCOL_UNSUPPORTED";
+
+export interface RelayAgentCodecFailure {
+  domain: typeof RELAY_AGENT_CODEC_ERROR_DOMAIN;
+  code: RelayAgentCodecErrorCode;
+  failureClass: string;
+}
+
+export class RelayAgentTranscriptLifecycleCodecError extends Error
+  implements RelayAgentCodecFailure {
+  readonly domain = RELAY_AGENT_CODEC_ERROR_DOMAIN;
+
+  constructor(
+    readonly code: RelayAgentCodecErrorCode,
+    readonly failureClass: string,
+  ) {
+    super(
+      code === "PROTOCOL_UNSUPPORTED"
+        ? "Relay Agent extension transport encoding is unsupported"
+        : "Relay Agent extension frame is invalid",
+    );
+    this.name = "RelayAgentTranscriptLifecycleCodecError";
+  }
+}
+
+/** Stable cross-bundle classification seam; callers must not use instanceof. */
+export function relayAgentCodecFailure(error: unknown): RelayAgentCodecFailure | null {
+  if (error === null || typeof error !== "object") return null;
+  const candidate = error as Partial<RelayAgentCodecFailure>;
+  if (candidate.domain !== RELAY_AGENT_CODEC_ERROR_DOMAIN
+    || (candidate.code !== "INVALID_ENVELOPE" && candidate.code !== "PROTOCOL_UNSUPPORTED")
+    || typeof candidate.failureClass !== "string"
+    || candidate.failureClass.length === 0
+    || Buffer.byteLength(candidate.failureClass, "utf8") > 128) {
+    return null;
+  }
+  return Object.freeze({
+    domain: RELAY_AGENT_CODEC_ERROR_DOMAIN,
+    code: candidate.code,
+    failureClass: candidate.failureClass,
+  });
+}
 
 const UINT64_MAX = 18_446_744_073_709_551_615n;
 const STANDARD_JSON_LIMITS: RelayV2JsonLimits = Object.freeze({
@@ -78,9 +122,9 @@ function reject(failureClass: string): never {
 }
 
 function codecFailure(error: unknown): never {
-  if (error instanceof RelayV2CodecError) throw error;
+  if (relayAgentCodecFailure(error) !== null) throw error;
   if (error instanceof RelayV2JsonError || error instanceof RelayAgentSchemaError) {
-    throw new RelayV2CodecError("INVALID_ENVELOPE", error.failureClass);
+    throw new RelayAgentTranscriptLifecycleCodecError("INVALID_ENVELOPE", error.failureClass);
   }
   throw error;
 }
@@ -404,13 +448,22 @@ function snapshotRecordOrder(record: RelayV2JsonObject): readonly [string, strin
   return [record.createdAgentSeq as string, record.entryId as string];
 }
 
-function validateSnapshotRecords(value: RelayV2JsonValue): void {
+function validateSnapshotRecords(value: RelayV2JsonValue, throughAgentSeq: string): void {
   let previous: readonly [string, string] | null = null;
   array(value, (item) => {
     const record = object(item);
-    if (record.recordType === "lifecycle") validateLifecycleRecord(record);
-    else if (record.recordType === "text_entry") validateTextEntryRecord(record);
-    else reject("schema-mismatch");
+    if (record.recordType === "lifecycle") {
+      validateLifecycleRecord(record);
+      if (compareCounter(record.agentEventSeq as string, throughAgentSeq) > 0) {
+        reject("schema-mismatch");
+      }
+    } else if (record.recordType === "text_entry") {
+      validateTextEntryRecord(record);
+      if (compareCounter(record.createdAgentSeq as string, throughAgentSeq) > 0
+        || compareCounter(record.lastModifiedAgentSeq as string, throughAgentSeq) > 0) {
+        reject("schema-mismatch");
+      }
+    } else reject("schema-mismatch");
     const current = snapshotRecordOrder(record);
     if (previous !== null) {
       const sequenceOrder = compareCounter(previous[0], current[0]);
@@ -469,8 +522,12 @@ function validateStructuredError(value: RelayV2JsonValue): void {
   if (Object.hasOwn(error, "retryAfterMs")) {
     nullable(field(error, "retryAfterMs"), (item) => integer(item));
   }
-  if (!Object.hasOwn(error, "details") || error.details === null) return;
-  if (code !== "HOST_EPOCH_MISMATCH") reject("schema-mismatch");
+  if (code === "HOST_EPOCH_MISMATCH") {
+    if (!Object.hasOwn(error, "details") || error.details === null) reject("schema-mismatch");
+  } else {
+    if (!Object.hasOwn(error, "details") || error.details === null) return;
+    reject("schema-mismatch");
+  }
   const details = object(error.details);
   exact(details, ["expectedHostEpoch", "actualHostEpoch"]);
   id(field(details, "expectedHostEpoch"));
@@ -523,7 +580,7 @@ export function validateRelayAgentTranscriptLifecycleFrame(
       const through = counter(field(payload, "throughAgentSeq"));
       const earliest = counter(field(payload, "earliestRetainedSeq"));
       if (compareCounter(earliest, through) > 0) reject("schema-mismatch");
-      validateSnapshotRecords(field(payload, "records"));
+      validateSnapshotRecords(field(payload, "records"), through);
       break;
     }
     case "agent.timeline.replay.get": {
@@ -616,13 +673,13 @@ export function validateRelayAgentTranscriptLifecycleFrame(
 
 function parseFrame(bytes: Uint8Array, metadata: RelayV2FrameMetadata): RelayV2JsonObject {
   if ((metadata.opcode ?? "text") !== "text") {
-    throw new RelayV2CodecError("INVALID_ENVELOPE", "binary-frame");
+    throw new RelayAgentTranscriptLifecycleCodecError("INVALID_ENVELOPE", "binary-frame");
   }
   if (metadata.compressed === true) {
-    throw new RelayV2CodecError("PROTOCOL_UNSUPPORTED", "compression-not-allowed");
+    throw new RelayAgentTranscriptLifecycleCodecError("PROTOCOL_UNSUPPORTED", "compression-not-allowed");
   }
   if (bytes.byteLength > RELAY_V2_PUBLIC_FRAME_BYTES) {
-    throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
+    throw new RelayAgentTranscriptLifecycleCodecError("INVALID_ENVELOPE", "frame-limit");
   }
   const source = decodeRelayV2StrictUtf8(bytes);
   const inspection = inspectRelayV2Json(source, PAGED_JSON_LIMITS);
@@ -632,10 +689,10 @@ function parseFrame(bytes: Uint8Array, metadata: RelayV2FrameMetadata): RelayV2J
     ? PAGED_JSON_LIMITS
     : STANDARD_JSON_LIMITS;
   if (inspection.totalKeys > limits.maxTotalKeys) {
-    throw new RelayV2CodecError("INVALID_ENVELOPE", "json-total-key-limit");
+    throw new RelayAgentTranscriptLifecycleCodecError("INVALID_ENVELOPE", "json-total-key-limit");
   }
   if (inspection.totalNodes > limits.maxNodes) {
-    throw new RelayV2CodecError("INVALID_ENVELOPE", "json-node-limit");
+    throw new RelayAgentTranscriptLifecycleCodecError("INVALID_ENVELOPE", "json-node-limit");
   }
   return parseRelayV2JsonObject(source, limits);
 }
@@ -662,13 +719,12 @@ export function encodeRelayAgentTranscriptLifecycleFrame(
   try {
     validateRelayAgentTranscriptLifecycleFrame(frame);
     const bytes = new TextEncoder().encode(JSON.stringify(frame));
-    if (bytes.byteLength > RELAY_V2_PUBLIC_FRAME_BYTES) {
-      throw new RelayV2CodecError("INVALID_ENVELOPE", "frame-limit");
-    }
+    // The outbound boundary must enforce the same byte, direct-key, total-key,
+    // node, depth, UTF-8, and closed-schema limits as the inbound boundary.
+    // This also makes the durable page freezer a faithful wire preflight.
+    validateRelayAgentTranscriptLifecycleFrame(parseFrame(bytes, {}));
     return bytes;
   } catch (error) {
     return codecFailure(error);
   }
 }
-
-export { RelayV2CodecError };

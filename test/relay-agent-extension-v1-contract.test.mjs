@@ -100,6 +100,12 @@ function collectPublicEvents(frame) {
 
 const manifest = readJson("manifest.json");
 
+function hasCodecCode(error, expectedCode) {
+  const failure = codec.relayAgentCodecFailure(error);
+  return failure?.domain === codec.RELAY_AGENT_CODEC_ERROR_DOMAIN
+    && failure.code === expectedCode;
+}
+
 test("Node Relay Agent extension codec consumes the frozen public wire corpus", () => {
   for (const fixture of readJson("golden-frames.json")) {
     const bytes = Buffer.from(fixture.wire, "utf8");
@@ -124,8 +130,7 @@ test("Node Relay Agent extension codec rejects every frozen invalid vector and s
   for (const fixture of readJson("invalid-frames.json")) {
     assert.throws(
       () => codec.decodeRelayAgentTranscriptLifecycleFrame(Buffer.from(fixture.wire)),
-      (error) => error instanceof codec.RelayV2CodecError
-        && error.code === fixture.expectedError,
+      (error) => hasCodecCode(error, fixture.expectedError),
       fixture.name,
     );
   }
@@ -138,7 +143,7 @@ test("Node Relay Agent extension codec rejects every frozen invalid vector and s
   ]) {
     assert.throws(
       () => codec.decodeRelayAgentTranscriptLifecycleFrame(bytes, metadata),
-      (error) => error instanceof codec.RelayV2CodecError && error.code === expectedCode,
+      (error) => hasCodecCode(error, expectedCode),
       name,
     );
   }

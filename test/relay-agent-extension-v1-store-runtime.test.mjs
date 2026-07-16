@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import {
   chmodSync,
+  closeSync,
+  fsyncSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -47,6 +50,23 @@ function sourceEvent(sourceSeq, sourceEventId, mutation, sourceEpoch = "source-a
 function sequentialIds(prefix) {
   let sequence = 0;
   return () => `${prefix}-${++sequence}`;
+}
+
+function strictJsonCounts(value) {
+  let keys = 0;
+  let nodes = 0;
+  const visit = (item) => {
+    nodes += 1;
+    if (Array.isArray(item)) {
+      item.forEach(visit);
+    } else if (item !== null && typeof item === "object") {
+      const entries = Object.entries(item);
+      keys += entries.length;
+      entries.forEach(([, child]) => visit(child));
+    }
+  };
+  visit(value);
+  return { keys, nodes };
 }
 
 function harness(t, overrides = {}) {
@@ -333,6 +353,68 @@ test("durable host authority emits real reply/lifecycle identity and pins discon
   assert.equal(mode(h.store.paths.continuity), 0o600);
 });
 
+test("snapshot and replay cuts freeze only pages that pass the full public wire budget", (t) => {
+  const h = harness(t);
+  const runtime = runtimeFor(h.store);
+  establishConversation(runtime);
+  for (let index = 0; index < 16; index += 1) {
+    ingest(runtime, index + 4, `large-entry-source-${index}`, {
+      mutationType: "text_entry.appended",
+      entryId: `large-entry-${index}`,
+      runId: "run-1",
+      turnId: "turn-1",
+      role: "agent",
+      text: "w".repeat(codecModule.RELAY_AGENT_MAX_TEXT_UTF8_BYTES),
+      commandId: null,
+    });
+  }
+
+  const snapshotPages = [];
+  let snapshotId = null;
+  let snapshotCursor = null;
+  do {
+    const pageIndex = snapshotPages.length;
+    const page = runtime.handleRequest(requestBytes("agent.timeline.snapshot.get", {
+      snapshotRequestId: "wire-budget-snapshot",
+      snapshotId,
+      cursor: snapshotCursor,
+      nextPageIndex: pageIndex,
+    }, `wire-budget-snapshot-${pageIndex}`), {}, routeContext());
+    assert.ok(page.bytes.byteLength <= 1_048_576);
+    assert.ok(page.frame.payload.records.length <= codecModule.RELAY_AGENT_MAX_PAGE_RECORDS);
+    snapshotPages.push(page);
+    snapshotId = page.frame.payload.snapshotId;
+    snapshotCursor = page.frame.payload.nextCursor;
+  } while (snapshotCursor !== null);
+  assert.ok(snapshotPages.length > 1, "the aggregate materialized cut exceeds one wire frame");
+  assert.equal(
+    snapshotPages.flatMap((page) => page.frame.payload.records)
+      .filter((record) => record.recordType === "text_entry").length,
+    16,
+  );
+
+  const timelineEpoch = h.store.status(target).timelineEpoch;
+  const replayPages = [];
+  let replayCursor = null;
+  do {
+    const page = runtime.handleRequest(requestBytes("agent.timeline.replay.get", {
+      timelineEpoch,
+      afterAgentSeq: "3",
+      cursor: replayCursor,
+      limit: 256,
+    }, `wire-budget-replay-${replayPages.length}`), {}, routeContext());
+    assert.ok(page.bytes.byteLength <= 1_048_576);
+    assert.ok(page.frame.payload.events.length <= codecModule.RELAY_AGENT_MAX_PAGE_RECORDS);
+    replayPages.push(page);
+    replayCursor = page.frame.payload.nextCursor;
+  } while (replayCursor !== null);
+  assert.ok(replayPages.length > 1, "the aggregate replay cut exceeds one wire frame");
+  assert.deepEqual(
+    replayPages.flatMap((page) => page.frame.payload.events).map((event) => event.agentEventSeq),
+    Array.from({ length: 16 }, (_, index) => String(index + 4)),
+  );
+});
+
 test("redaction/delete revoke body-bearing cuts, advance a prefix floor, and retain used entry identity", (t) => {
   const h = harness(t);
   const runtime = runtimeFor(h.store);
@@ -473,6 +555,28 @@ test("redaction/delete revoke body-bearing cuts, advance a prefix floor, and ret
   assert.equal(h.open().status(target).currentAgentSeq, "7");
 });
 
+test("first durable directory creation fsyncs every new layer and its parent", (t) => {
+  const fsyncedDirectories = [];
+  const h = harness(t, {
+    fsyncDirectory(path) {
+      fsyncedDirectories.push(path);
+      const descriptor = openSync(path, "r");
+      try {
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+    },
+  });
+  const twHome = join(h.home, ".tmux-worktree");
+  const extensionHome = dirname(h.store.paths.state);
+  assert.ok(fsyncedDirectories.includes(h.home), "creating ~/.tmux-worktree must fsync HOME");
+  assert.ok(fsyncedDirectories.includes(twHome), "new extension and state entries must fsync ~/.tmux-worktree");
+  assert.ok(fsyncedDirectories.includes(extensionHome), "state publication must fsync its private directory");
+  assert.equal(mode(twHome), 0o700);
+  assert.equal(mode(extensionHome), 0o700);
+});
+
 test("continuity repair accepts only a published one-ahead commit and rejects rollback/corruption/unknown ownership", (t) => {
   const h = harness(t);
   let runtime = runtimeFor(h.store);
@@ -541,6 +645,30 @@ test("continuity repair accepts only a published one-ahead commit and rejects ro
   );
   assert.equal(h.open().status(target).currentAgentSeq, "3");
 
+  const strictState = readFileSync(h.store.paths.state);
+  const strictCounts = strictJsonCounts(JSON.parse(strictState));
+  for (const [budgetName, budget] of [
+    ["testMaxPersistedJsonKeys", strictCounts.keys + 10],
+    ["testMaxPersistedJsonNodes", strictCounts.nodes + 10],
+  ]) {
+    const strictCapped = h.open({ [budgetName]: budget });
+    assert.throws(
+      () => strictCapped.ingest(trustedBinding, sourceEvent(4, `strict-${budgetName}`, {
+        mutationType: "text_entry.appended",
+        entryId: `strict-${budgetName}`,
+        runId: "run-1",
+        turnId: "turn-1",
+        role: "agent",
+        text: "must not be ACKed",
+        commandId: null,
+      })),
+      storeModule.RelayAgentAuthorityStoreCapacityError,
+      budgetName,
+    );
+    assert.deepEqual(readFileSync(h.store.paths.state), strictState, `${budgetName} must reject before publish`);
+    assert.equal(h.open({ [budgetName]: budget }).status(target).currentAgentSeq, "3");
+  }
+
   let failPublishedState = true;
   const uncertain = h.open({
     renameFile(source, destination) {
@@ -574,6 +702,17 @@ test("continuity repair accepts only a published one-ahead commit and rejects ro
 test("standalone runtime is capability/route gated and isolates host-epoch and store failures", (t) => {
   const h = harness(t);
   const runtime = runtimeFor(h.store);
+  let malformedError;
+  try {
+    runtime.handleRequest(Buffer.from("{"), {}, routeContext());
+  } catch (error) {
+    malformedError = error;
+  }
+  assert.deepEqual(codecModule.relayAgentCodecFailure(malformedError), {
+    domain: codecModule.RELAY_AGENT_CODEC_ERROR_DOMAIN,
+    code: "INVALID_ENVELOPE",
+    failureClass: "malformed-json",
+  });
   assert.throws(
     () => runtime.handleRequest(
       requestBytes("agent.timeline.status.get", {}),
