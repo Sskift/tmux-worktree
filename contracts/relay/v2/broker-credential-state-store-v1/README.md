@@ -1,94 +1,143 @@
 # Relay v2 Broker Credential State Store v1
 
-状态：**Frozen native storage contract；无 native implementation、loader、authority injection 或 production capability。**
+状态：**Frozen native storage contract；只有 TypeScript closed decoder/wrapper，没有 native implementation、loader、authority injection、ready capability 或 production wiring。**
 
-本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不把 BAU prototype 提升为 production，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
+本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不把保留的 unsafe BAU path/JSON prototype 提升为 production，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
 
-## Owner 与 interface
+## Owner 与 deep port
 
-业务 owner 始终是 `RelayV2BrokerCredentialAuthority`。它拥有 issuer、enrollment、grant、replay、rate-limit 与 external continuity 的业务语义；store 只拥有 bytes 的排他事务、持久 publication 与本地 storage revision。
+业务 owner 始终是 `RelayV2BrokerCredentialAuthority`。它拥有 issuer、enrollment、grant、replay、rate-limit、ready withdrawal 与 external continuity；store 只拥有 opaque bytes 的排他事务、持久 publication、本地 revision 和 native resource lifetime。
 
-唯一 port 是 `RelayV2BrokerCredentialStateStore`：
+唯一 authority-facing port 是：
 
 ```text
 store.runExclusive(transaction => ...)
   transaction.read()
     -> missing(revision) | present(revision, bytes)
   transaction.compareAndPublish(revision, nextBytes)
-    -> swapped(revision)
-     | already_same(revision)
-     | conflict(revision)
+    -> swapped(current)
+     | already_same(current)
+     | conflict(current)
      | uncertain
 
 store.close() -> barrier
 ```
 
-Interface 不接受或暴露 state/lock/temp path、fd、directory handle、device/inode、`*at` primitive 或 cleanup。平台位置、secure object identity、locking、recovery 和清理全部在 native implementation 内。N-API open 无参数，只打开该用户唯一的 broker credential store。
+`current` 是 fresh `missing|present` snapshot 和当前 transaction revision；`swapped` / `already_same` 的 current 必须是 `present`。这让 authority 在同一 transaction 内收敛，而不读取 generation、path、digest 或 native handle。
 
-`runExclusive` 是完整 critical section，同一 store 一次只运行一个 callback。revision 是 adapter 签发的 opaque object：没有 generation/path/digest 等公开字段，不能序列化，只能传回签发它的同一个 transaction；callback settle 后永久失效。`read` 返回独立 byte copy，`compareAndPublish` 在任何 await 或 I/O 前捕获独立 input copy。
+Interface 不接受或暴露 state/lock/temp path、fd、directory handle、device/inode、`*at` primitive 或 cleanup。唯一 open 参数是 exact closed options：
 
-`compareAndPublish` 先验证 revision 属于当前 transaction，再在同一已锁定 observation 中按以下顺序判定：
+```text
+{
+  trustedHome: absolute caller-supplied account-owned root,
+  maxStateBytes: 67108864
+}
+```
 
-1. current bytes 与 `nextBytes` 逐 byte 相同：`already_same`。
-2. expected revision 不再表示 current：`conflict`。
-3. publication 的全部 durability commit point 可证明：`swapped`。
-4. I/O 已开始而 commit 与否不能证明：只返回 `{outcome:"uncertain"}`，不得附 revision、猜测 conflict 或自动重试。业务 owner 必须在新的 `runExclusive` 中重读并结合 external continuity 收敛。
+`trustedHome` 不能由 binding 隐式读取 `HOME`，也不能替换为 derived state/lock/temp path。TypeScript 边界先在一个 `try` 内取得 exact own **data descriptor** snapshot；accessor 被拒绝，hostile getter 不执行，每个 data value 只捕获一次。Native open 必须验证 caller ownership；`maxStateBytes` 是实际 read/publish admission limit，不是 advisory metadata。
 
-`close()` 幂等。barrier 一开始就拒绝新 transaction，等待已经 admission 的 callback settle，再关闭 native resource 后 resolve。不得把 close 变成 callback 外的 lock/unlink cleanup interface。
+## Raw N-API 与 TypeScript 边界
 
-## Closed native unions
+N-API raw store、transaction、revision 和 bytes 都不能进入业务 owner。`src/relay/v2/brokerCredentialStateStore.ts` 捕获并包装 raw `runExclusive/read/compareAndPublish/close`：
 
-N-API binding 只导出 manifest 中两个固定函数。Capability 必须是完整 `supported`、枚举的 `unsupported` 或 `invalid(error)`；缺一个 feature、常量不匹配、未知字段或未知 variant 都是 `NATIVE_INTERFACE_INVALID`，不能按“部分可用”继续。
+- 每个 closed union、binding/store/transaction method record 都先做一次 exact own-data-descriptor snapshot，再逐字段、逐 variant decode；accessor（包括先返回合法值再变化的 getter）、proxy/raw shape 异常映射为 `NATIVE_INTERFACE_INVALID`。Raw `Uint8Array` 用捕获的 TypedArray intrinsic brand/length/buffer/set 复制，不重复读取可变 getter。
+- Native 抛出的 exact `{code}` 只接受 frozen error union，并重新封装为本地 `RelayV2BrokerCredentialStateStoreError`；普通 raw exception 不穿透。
+- Raw revision 只保存在 wrapper 的 `WeakMap`；业务拿到的新 opaque object 无字段、不可 JSON 序列化，只能用于签发它的同一 transaction。伪造、跨 transaction、callback settle 后使用均为 `INVALID_REVISION`。
+- Raw read/current bytes 每次复制为 caller-local `Uint8Array`；调用者修改结果不能改变 store。Publish input 在任何 await/native I/O 前同步复制，调用者随后修改原 buffer 不能改变 publication。
+- Native `runExclusive` 必须 exactly once 调 callback，并在 callback settle 后才 settle；业务 callback 的 result/error 由 wrapper 本地保存，不要求 native identity-echo result，也不要求业务异常穿过 native 再返回。
 
-Open 只有：
+这个 TypeScript adapter 是 native seam 的 closed boundary，不是 optional artifact loader，也不是 production authority injection。
 
-- `opened(store)`：返回上面的唯一 port；
-- `unsupported(reason)`：包括 native module 缺失、平台/runtime/interface/storage format 不支持；
-- `invalid(error)`：native contract、store format、corruption 或 open 结果无法信任。
+## Transaction、uncertain 与 close
 
-Error 只跨 seam 传 `{code}`，不传动态 message、path、errno detail 或 cleanup object。只有 `STORE_BUSY` 是 retryable；unsupported/invalid 都不授权 v1 fallback、v2 capability 或 alternate store。
+`runExclusive` 是完整 critical section。同一 store 一次只运行一个 callback。`compareAndPublish` 先验证本 transaction revision，再在同一 locked observation 中依次判定：
 
-## Binary storage v1
+1. current bytes 与 copied `nextBytes` 完全相同：`already_same(current)`；
+2. expected revision 不再表示 current：`conflict(current)`；
+3. payload/header 的全部 durability commit point 可证明：`swapped(current)`；
+4. publication 已开始但 commit 与否无法证明：只返回 `{outcome:"uncertain"}`。
 
-Native store 私有地拥有四个 logical object：`header0`、`header1`、`payload0`、`payload1`。这些是 format role，不是 interface path。payload 是业务 owner 提供的 opaque bytes，长度为 1..67,108,864。
+`uncertain` 会立即 terminal-close **整个 store instance**。当前 transaction 的后续 read/publish 和同 instance 的任何新 `runExclusive` 都以 `STORE_CLOSED` 闭合；不得自动 retry、猜测 committed、在原 instance 重读或清理。Authority 必须同步撤销 ready，完成 `close()`，显式重新 `open(options)`，通过新 self-check，再完成 external continuity 后才可恢复。
 
-每个 header 固定 128 bytes，使用 little-endian integer：
+普通 `close()` 与 uncertain poison 不同：barrier 开始后拒绝新 admission，但已 admission 的 callback 仍可完成 read/publish；close 等它们 settle，并在 native resource 与 lock 都关闭后 resolve。Close 幂等。只有 uncertain 会让已 admission transaction 立即 `STORE_CLOSED`。
 
-| Offset | Bytes | Field | Rule |
+## Closed capability、open、error 与 readiness
+
+Capability/open 都是 exact `supported|unsupported|invalid` closed union。`supported` 只证明 artifact target/interface manifest 可用，**不等于 ready**。Ready 的必要顺序是：
+
+1. capability `supported`；
+2. `open(options)` 返回 `opened`；
+3. native owner/mode/link/identity/format/locking/durability self-check 返回 `passed`；
+4. `RelayV2BrokerCredentialAuthority` 完成 external continuity。
+
+`unsupported` 只允许在未观察 store 前表示 `native_artifact_missing`、`target_unsupported` 或 `interface_version_unsupported`。一旦观察 existing disk，unknown format、corruption/partial、wrong owner/mode、link/identity uncertain、I/O 或 durability unavailable 都必须 `invalid` 并保留状态：
+
+- unknown checksum-valid format：`STORE_FORMAT_UNSUPPORTED`；
+- corrupt/ambiguous/invalid length：`STORE_CORRUPT`；
+- wrong owner/mode：`STORE_PERMISSION_INVALID`；
+- link、identity race 或无法证明 object identity：`STORE_IDENTITY_UNCERTAIN`；
+- 无法满足 frozen durability：`DURABILITY_UNSUPPORTED`。
+
+它们绝不能伪装成 `missing` 后重建。Error seam 只传 `{code}`，不传动态 message、path、errno detail 或 cleanup object。只有 `STORE_BUSY` retryable；任何 unsupported/invalid 都不授权 v1 fallback、prototype fallback、v2 capability 或 alternate store。
+
+## Single descriptor binary storage v1
+
+Native store 私有地拥有一个固定长度 `134,217,984` bytes 的 descriptor-backed container。打开后所有选择、read 与 publication 只使用该 descriptor。四个固定 range 是 format role，不是 interface path：
+
+| Range | Absolute offset | Capacity |
+| --- | ---: | ---: |
+| `header0` | 0 | 128 |
+| `header1` | 128 | 128 |
+| `payload0` | 256 | 67,108,864 |
+| `payload1` | 67,109,120 | 67,108,864 |
+
+Container 不存在时，native 才能安全创建 owner-only 单文件、设定 exact length、把两个 header range 初始化为全零，并证明文件 metadata 与目录 entry durable 后返回 `opened`。Existing object 长度错误、ownership/identity 不安全或部分初始化必须 invalid 并原样保留，不能 truncate/recreate。
+
+Open 必须在同一 container descriptor 上 **nonblocking** 取得 process-wide exclusive kernel lock，然后才做 identity 与完整 self-check。锁贯穿 store lifetime、所有 transaction、idle 和 uncertain terminal 状态；竞争返回 `STORE_BUSY`。不得创建 lock file，不得在 transaction 结束时释放。`close()` 等 admitted callback 后，以释放该 lock/descriptor 作为最后 native barrier 动作。
+
+每个 header 固定 128 bytes，integer 为 little-endian：
+
+| Offset | Length | Field | Rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | ASCII `TWV2BCS1` |
 | 8 | 2 | formatVersion | u16 = 1 |
-| 10 | 1 | slot | u8 = 0 or 1；必须等于 `(generation - 1) mod 2` |
-| 11 | 1 | flags | u8 = 0 |
+| 10 | 1 | slot | 0/1；等于 `(generation - 1) mod 2` |
+| 11 | 1 | flags | 0 |
 | 12 | 4 | headerLength | u32 = 128 |
 | 16 | 8 | generation | u64，1..2^64-1 |
 | 24 | 8 | payloadLength | u64，1..67,108,864 |
-| 32 | 32 | payloadDigest | raw SHA-256(payload exact bytes) |
+| 32 | 32 | payloadDigest | raw SHA-256(exact payload bytes) |
 | 64 | 32 | reserved | 全零 |
-| 96 | 32 | headerChecksum | raw SHA-256(header bytes 0..95) |
+| 96 | 32 | headerChecksum | raw SHA-256(header offset 0, length 96) |
 
-全空的四个 object 才是 `missing`。一个完整 header 必须通过 length、magic、version、slot、flags、reserved、checksum，并与同 slot payload 的 exact length/digest 一致。
+Container absent，或 exact-length container 的两个 header 与两个 payload range 都逻辑全零，才表示 `missing`。两个 header 全零但任一 payload 有首次 publication crash residue是 `STORE_CORRUPT`，不能伪装 missing。完整 candidate 要求 header checksum/字段通过，并与同 slot payload 的 exact declared length/digest 一致。
 
 Selection closed rules：
 
-- 首次 commit 是 slot 0 / generation 1；只有该状态允许恰好一个 header。后续严格交替 slot，generation 每次只加 1，两个 header 必须都存在。
-- 两个完整 candidate 只能相差一个 generation，选择更高者；同 generation、跳号或 generation 回绕均 fail closed。
-- 最高 generation 的 header/payload 不完整、checksum/digest 不符或选择有歧义是 `STORE_CORRUPT`，绝不回退到更旧 state。
-- checksum-valid 但未知 magic/version/flags 或出现未知 logical object 是 `STORE_FORMAT_UNSUPPORTED`，即使另一个 slot 可读也不能忽略未来格式。
-- 只有已经存在一个完整 immediate successor 时，才允许忽略它的低 generation inactive payload 不完整。Generation 1 的首次 publication 尚无 header 1 时，可以忽略没有 header 的 inactive payload；generation 大于 1 时缺任一历史 header 都是 corruption。它们永不成为新 state，也不授权 cleanup。
-- 没有完整 candidate 且又非全空时是 `STORE_CORRUPT`；unknown/partial 永远不能伪装成 `missing`。
+- 首次 commit 是 slot 0 / generation 1；只有该状态允许另一个 header 全零。之后严格交替 slot，两个 header generation 必须恰差 1，选择较高完整 generation。
+- 同 generation、跳号、generation 0/回绕、最高 candidate 不完整、valid header 对应 payload digest 不符均 `STORE_CORRUPT`，不回退旧 state。
+- checksum-valid 但未知 magic/version/flags 是 `STORE_FORMAT_UNSUPPORTED`，即使另一 slot 可读也不能忽略未来格式。
+- 只有另一个 slot 是完整 immediate successor 时，才可忽略 lower inactive payload 被下一次 positional write 部分覆盖后的 digest mismatch。
+- Torn/invalid header fail closed；选择阶段绝不 repair/rewrite/cleanup。
 
-## Publication 与 durability
+Golden fixture 用 `fileLength + [{offset,bytesBase64}]` 表示一个完整 zero-filled container；未编码 byte 严格为 0，segments 必须排序后不重叠且界内。Oracle 用 sparse range reader 只读取两个 header 与声明 payload range；corrupt mutation 全部是 absolute container offset。Rust 可直接 `ftruncate(fileLength)` 后按 offset positional write segments/mutations，corpus schema 错误不算 native `STORE_FORMAT_UNSUPPORTED` 证据。
 
-`compareAndPublish` 在 exclusive transaction 内选择 inactive slot 和 `generation+1`：
+## Positional publication 与 durability
 
-1. atomically replace inactive payload object，并证明 payload data/metadata durable；
-2. 以 payload length/digest 构造 header，atomically replace matching header object，并证明 header durable；
-3. 执行 Darwin/Linux 所需的 container metadata durability barrier；
-4. 所有步骤都已证明后才返回 `swapped` 和新 transaction revision。
+Publication 只能使用 explicit-offset positional `pwrite` / `write_at` 等价 primitive；禁止 shared cursor 和普通 `write`，也禁止 named replace、rename、temporary publication 或 unlink cleanup：
 
-Active slot 在新 header durable 前不能修改。实现必须使用平台 adapter 提供的 secure object primitives，不能从 Node 传 path 或在 JS 中补 rename/unlink。失败若能证明 header 未发布，返回 closed error；只要 commit 与否不确定就返回 `uncertain`，不得清理后声称 rollback、返回 conflict 或重试 publication。
+1. 在 single descriptor/exclusive transaction 内选 inactive payload absolute range 与 `generation+1`；
+2. 完整 positional write copied payload，处理 short write/interruption，并通过 payload durability barrier；
+3. 只有 payload barrier 成功后才构造并 positional write inactive header；
+4. 通过 header durability barrier及任何必要的 container metadata barrier；
+5. 全部可证明后才返回 `swapped(fresh current snapshot)`。
 
-## Legacy 与 production 边界
+Durability 名称冻结为语义 `payload_then_header_durable_v1`，不把某个 syscall 名当跨平台契约。Darwin 与 Linux adapter 都必须证明此前 range 及所需 allocation/descriptor metadata 已到 stable storage、可承受 power loss，ordinary cache flush 不足。创建 container 时还要证明 exact length 与目录 entry durable。目标 filesystem/device 无法提供该保证时必须 `invalid/DURABILITY_UNSUPPORTED`，existing state 保留。
 
-BAU prototype 的 JSON state、lock、temporary 或 cleanup artifact 不属于本格式。Native open 不读取、导入、迁移、重命名、删除或清理它们；不存在任何 legacy fallback。直到 Rust core、Darwin/Linux adapter、N-API、loader、authority injection、packaging 和生产 Gate 全部完成，production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。
+## Legacy、conformance 与 production 边界
+
+保留的 unsafe BAU path/JSON prototype 直接处理 state/lock/temp path、fd/inode、rename/unlink 与 cleanup，native security acceptance 仍失败。N0 不修补、不包装、不迁移、不删除其 artifact，也没有任何 fallback。
+
+[`test/support/relayV2BrokerCredentialStateStoreConformance.mjs`](../../../../test/support/relayV2BrokerCredentialStateStoreConformance.mjs) 是未来 Rust/Darwin/Linux adapter 可复用的 authority-facing conformance harness。当前 in-memory raw adapter 只证明 TypeScript wrapper/port contract，**不是 native、device、filesystem、kernel-lock 或 power-loss durability 证据**。
+
+Rust core、Darwin/Linux adapter、N-API binary、optional loader、authority injection、packaging 和 production Gate 均未实现。Port/manifest/fixture/self-check contract 的存在不表示 native 已 open，更不表示 continuity 或 ready；production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。

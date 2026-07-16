@@ -58,17 +58,19 @@
 
 ### N0. broker credential native state-store 契约
 
-`contracts/relay/v2/broker-credential-state-store-v1` 是 broker credential 本地持久化的唯一串行设计输入；它冻结 `RelayV2BrokerCredentialStateStore` deep port、transaction-scoped opaque revision、closed capability/open/error union 和双 header/双 payload binary v1。它不改变 credential 业务 owner：issuer、enrollment、grant、replay、rate-limit 与 external continuity 仍由 `RelayV2BrokerCredentialAuthority` 决定。
+`contracts/relay/v2/broker-credential-state-store-v1` 是 broker credential 本地持久化的唯一串行设计输入。它冻结 exact `open({trustedHome, maxStateBytes})`、TypeScript raw-store/transaction/revision/bytes closed wrapper、`RelayV2BrokerCredentialStateStore` deep port、transaction-scoped opaque revision、closed capability/open/error union，以及 single descriptor-backed binary v1。Container 固定 134,217,984 bytes：header0/header1 位于 absolute offset 0/128，payload0/payload1 位于 256/67,109,120，各 payload capacity 67,108,864。它不改变 credential 业务 owner：issuer、enrollment、grant、replay、rate-limit、ready withdrawal 与 external continuity 仍由 `RelayV2BrokerCredentialAuthority` 决定。
+
+Capability `supported` 只表示 pre-open artifact/target/interface 完整，不表示 ready。Ready 仍依次要求 exact open、native self-check 和 T1 external continuity。Existing unknown/corrupt/unsafe/identity-uncertain/durability-unsupported store 一律 `invalid` 并保留；`unsupported` 只允许 `native_artifact_missing`、`target_unsupported`、`interface_version_unsupported`，不得把磁盘失败伪装为 missing 重建。
 
 N0 之后以下 lane 可以对同一 manifest/fixture 并行，不能各自扩张 interface：
 
-- N1 Rust core：实现 binary parser/selector、generation、digest/checksum、exclusive transaction、compare-and-publish、uncertain 与 close barrier；不拥有业务 state schema。
-- N2 Darwin adapter：实现平台私有 storage container、secure object identity、locking 和 durability primitive；只在 native implementation 内处理路径/handle。
-- N3 Linux adapter：同样实现 Linux secure object 与 durability primitive；不能把 `openat`/fd/inode/cleanup 暴露给 Node port。
+- N1 Rust core：实现 fixed-length sparse fixture parser/selector、generation、digest/checksum、absolute-offset positional write、exclusive transaction、compare-and-publish、terminal uncertain 与 close barrier；不拥有业务 state schema。
+- N2 Darwin adapter：只在 native implementation 内派生并打开 single container descriptor；nonblocking 取得同 descriptor 的 process-wide exclusive kernel lock后做 identity/self-check，并把锁持有到 close 最后一步。Publication 必须依次完成 inactive payload positional write + stable-storage durability barrier、inactive header positional write + barrier；不使用 shared cursor、named replace/rename 或 lock file。
+- N3 Linux adapter：实现同一 descriptor/offset/lock/lifetime 与两阶段 durability 语义；不能把 `openat`/fd/inode/cleanup 暴露给 Node port，filesystem/device 无法证明 durability 时返回 `invalid/DURABILITY_UNSUPPORTED`。
 - T1 authority injection：让 `RelayV2BrokerCredentialAuthority` 只通过 port 读写 opaque bytes，并保留 external continuity/业务状态机；可先使用 in-memory adapter，不等待 native packaging。
-- P1 loader：按 closed capability/open/error union optional-load N-API；module 缺失映射为 `unsupported/native_module_missing`，invalid/unsupported 都保持 v2 unavailable。
+- P1 loader：按 closed capability/open/error union optional-load N-API；artifact 缺失映射为 `unsupported/native_artifact_missing`。它必须传 caller-owned absolute `trustedHome` 与 frozen admission limit，且只有 open+self-check+T1 continuity 全部成功才允许 ready；invalid/unsupported 都保持 v2 unavailable。
 
-上述 N1/N2/N3/T1/P1、N-API binding 与 packaging 当前均未实现。保留的 BAU path/JSON prototype 已明确未通过 native security acceptance，不是 N0 adapter；后续 lane不得修补或复用其 path rename/unlink，也不得迁移、删除或清理 prototype state/lock/temp artifact。任一 lane 单独完成都不启用 production v2、enrollment或六项 capability，也不建立到 prototype/v1 的 fallback。
+上述 N1/N2/N3/T1/P1、N-API binding 与 packaging 当前均未实现。当前 in-memory conformance 只证明 TypeScript closed wrapper 的 revision/snapshot/terminal-close 行为，不是 native、跨进程 lock、filesystem 或 power-loss durability 证据，也不证明真实 continuity readiness。保留的 unsafe BAU path/JSON prototype 已明确未通过 native security acceptance，不是 N0 adapter；后续 lane不得修补或复用其 path rename/unlink，也不得迁移、删除或清理 prototype state/lock/temp artifact。任一 lane 单独完成都不启用 production v2、enrollment或六项 capability，也不建立到 prototype/v1 的 fallback。
 
 ### B. relay-server / broker
 

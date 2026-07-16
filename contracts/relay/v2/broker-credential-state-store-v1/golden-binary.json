@@ -1,23 +1,31 @@
 {
   "fixtureFormatVersion": 1,
+  "encoding": "zero-filled-exact-file-with-absolute-segments",
   "cases": [
     {
-      "name": "missing-store",
-      "objects": {
-        "header0": null,
-        "header1": null,
-        "payload0": null,
-        "payload1": null
-      },
+      "name": "absent-container",
+      "container": null,
+      "expected": { "outcome": "missing", "initialization": "create-exact-empty-container" }
+    },
+    {
+      "name": "initialized-empty-container",
+      "container": { "fileLength": 134217984, "segments": [] },
       "expected": { "outcome": "missing" }
     },
     {
       "name": "generation-one-slot-zero",
-      "objects": {
-        "header0": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c=",
-        "header1": null,
-        "payload0": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo=",
-        "payload1": null
+      "container": {
+        "fileLength": 134217984,
+        "segments": [
+          {
+            "offset": 0,
+            "bytesBase64": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c="
+          },
+          {
+            "offset": 256,
+            "bytesBase64": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo="
+          }
+        ]
       },
       "expected": {
         "outcome": "present",
@@ -28,11 +36,26 @@
     },
     {
       "name": "generation-two-slot-one",
-      "objects": {
-        "header0": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c=",
-        "header1": "VFdWMkJDUzEBAAEAgAAAAAIAAAAAAAAAHQAAAAAAAACJncuTLTwUUE637lSh68EyF7WNBtwfjxUqDwbXt2OidAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA56wuyoSGs0Kr5qc1Yg1riMzlogTeTFyvyioKI83VFIg=",
-        "payload0": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo=",
-        "payload1": "eyJmaXh0dXJlIjoibmV4dCIsInZhbHVlIjoyfQo="
+      "container": {
+        "fileLength": 134217984,
+        "segments": [
+          {
+            "offset": 0,
+            "bytesBase64": "VFdWMkJDUzEBAAAAgAAAAAEAAAAAAAAAIAAAAAAAAACbbkGzFSkBkFUrw1MHYxOmZ+GLhO2ntcB+xNcXgq38/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAALxcjQn2Lt2DvpmmPNZqpW0cKKWWJB+J4Bp4VjvrL8c="
+          },
+          {
+            "offset": 128,
+            "bytesBase64": "VFdWMkJDUzEBAAEAgAAAAAIAAAAAAAAAHQAAAAAAAACJncuTLTwUUE637lSh68EyF7WNBtwfjxUqDwbXt2OidAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA56wuyoSGs0Kr5qc1Yg1riMzlogTeTFyvyioKI83VFIg="
+          },
+          {
+            "offset": 256,
+            "bytesBase64": "eyJmaXh0dXJlIjoiaW5pdGlhbCIsInZhbHVlIjoxfQo="
+          },
+          {
+            "offset": 67109120,
+            "bytesBase64": "eyJmaXh0dXJlIjoibmV4dCIsInZhbHVlIjoyfQo="
+          }
+        ]
       },
       "expected": {
         "outcome": "present",

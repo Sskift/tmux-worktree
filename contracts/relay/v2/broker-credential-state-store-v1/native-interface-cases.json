@@ -1,8 +1,34 @@
 {
   "fixtureFormatVersion": 1,
+  "openOptionsCases": [
+    {
+      "name": "absolute-trusted-home-and-exact-limit",
+      "input": { "trustedHome": "/Users/fixture-owner", "maxStateBytes": 67108864 },
+      "expected": "valid"
+    },
+    {
+      "name": "relative-home-is-closed",
+      "input": { "trustedHome": "relative/home", "maxStateBytes": 67108864 },
+      "expected": "invalid"
+    },
+    {
+      "name": "wrong-admission-limit-is-closed",
+      "input": { "trustedHome": "/Users/fixture-owner", "maxStateBytes": 1024 },
+      "expected": "invalid"
+    },
+    {
+      "name": "derived-state-path-is-closed",
+      "input": {
+        "trustedHome": "/Users/fixture-owner",
+        "maxStateBytes": 67108864,
+        "statePath": "/tmp/forbidden"
+      },
+      "expected": "invalid"
+    }
+  ],
   "capabilityCases": [
     {
-      "name": "supported-complete-capability",
+      "name": "supported-complete-capability-not-readiness",
       "input": {
         "status": "supported",
         "nativeAbi": "napi",
@@ -10,45 +36,46 @@
         "storageFormatVersion": 1,
         "maxStateBytes": 67108864,
         "features": [
+          "process_wide_kernel_lock_v1",
           "exclusive_transaction_v1",
           "opaque_transaction_revision_v1",
           "compare_and_publish_v1",
           "close_barrier_v1",
           "dual_slot_binary_v1"
         ],
-        "durability": "payload_then_header_fsync_v1"
+        "durability": "payload_then_header_durable_v1"
       },
       "expected": { "status": "supported" }
     },
     {
-      "name": "native-module-missing",
-      "input": { "status": "unsupported", "reason": "native_module_missing" },
-      "expected": { "status": "unsupported", "reason": "native_module_missing" }
+      "name": "native-artifact-missing-before-open",
+      "input": { "status": "unsupported", "reason": "native_artifact_missing" },
+      "expected": { "status": "unsupported", "reason": "native_artifact_missing" }
     },
     {
-      "name": "platform-unsupported",
-      "input": { "status": "unsupported", "reason": "platform_unsupported" },
-      "expected": { "status": "unsupported", "reason": "platform_unsupported" }
+      "name": "target-unsupported-before-open",
+      "input": { "status": "unsupported", "reason": "target_unsupported" },
+      "expected": { "status": "unsupported", "reason": "target_unsupported" }
     },
     {
-      "name": "runtime-unsupported",
-      "input": { "status": "unsupported", "reason": "runtime_unsupported" },
-      "expected": { "status": "unsupported", "reason": "runtime_unsupported" }
-    },
-    {
-      "name": "interface-version-unsupported",
+      "name": "interface-version-unsupported-before-open",
       "input": { "status": "unsupported", "reason": "interface_version_unsupported" },
       "expected": { "status": "unsupported", "reason": "interface_version_unsupported" }
     },
     {
-      "name": "storage-format-unsupported",
-      "input": { "status": "unsupported", "reason": "storage_format_unsupported" },
-      "expected": { "status": "unsupported", "reason": "storage_format_unsupported" }
+      "name": "runtime-is-not-an-unsupported-variant",
+      "input": { "status": "unsupported", "reason": "runtime_unsupported" },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
     },
     {
-      "name": "native-reported-invalid-store",
-      "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" } },
-      "expected": { "status": "invalid", "errorCode": "STORE_CORRUPT" }
+      "name": "storage-format-is-not-an-unsupported-variant",
+      "input": { "status": "unsupported", "reason": "storage_format_unsupported" },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    },
+    {
+      "name": "durability-unavailable-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "DURABILITY_UNSUPPORTED" } },
+      "expected": { "status": "invalid", "errorCode": "DURABILITY_UNSUPPORTED" }
     },
     {
       "name": "partial-capability-is-invalid",
@@ -59,40 +86,69 @@
         "storageFormatVersion": 1,
         "maxStateBytes": 67108864,
         "features": ["exclusive_transaction_v1"],
-        "durability": "payload_then_header_fsync_v1"
+        "durability": "payload_then_header_durable_v1"
       },
       "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
     },
     {
       "name": "unknown-capability-field-is-invalid",
-      "input": { "status": "unsupported", "reason": "native_module_missing", "fallback": "v1" },
+      "input": { "status": "unsupported", "reason": "native_artifact_missing", "fallback": "v1" },
       "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
     }
   ],
   "openCases": [
     {
-      "name": "opened-opaque-store",
-      "input": { "status": "opened", "store": "materialize-test-store" },
+      "name": "opened-self-checked-raw-store",
+      "input": { "status": "opened", "selfCheck": "passed", "store": "materialize-test-store" },
       "expected": { "status": "opened" }
     },
     {
-      "name": "open-native-module-missing",
-      "input": { "status": "unsupported", "reason": "native_module_missing" },
-      "expected": { "status": "unsupported", "reason": "native_module_missing" }
+      "name": "open-pre-open-artifact-missing",
+      "input": { "status": "unsupported", "reason": "native_artifact_missing" },
+      "expected": { "status": "unsupported", "reason": "native_artifact_missing" }
     },
     {
-      "name": "open-corrupt-store",
+      "name": "open-unknown-format-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "STORE_FORMAT_UNSUPPORTED" } },
+      "expected": { "status": "invalid", "errorCode": "STORE_FORMAT_UNSUPPORTED" }
+    },
+    {
+      "name": "open-corrupt-store-is-invalid",
       "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" } },
       "expected": { "status": "invalid", "errorCode": "STORE_CORRUPT" }
     },
     {
+      "name": "open-wrong-owner-mode-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "STORE_PERMISSION_INVALID" } },
+      "expected": { "status": "invalid", "errorCode": "STORE_PERMISSION_INVALID" }
+    },
+    {
+      "name": "open-link-or-identity-race-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "STORE_IDENTITY_UNCERTAIN" } },
+      "expected": { "status": "invalid", "errorCode": "STORE_IDENTITY_UNCERTAIN" }
+    },
+    {
+      "name": "open-durability-unavailable-is-invalid",
+      "input": { "status": "invalid", "error": { "code": "DURABILITY_UNSUPPORTED" } },
+      "expected": { "status": "invalid", "errorCode": "DURABILITY_UNSUPPORTED" }
+    },
+    {
+      "name": "opened-without-self-check-is-invalid",
+      "input": { "status": "opened", "store": "materialize-test-store" },
+      "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
+    },
+    {
       "name": "open-unknown-field-is-invalid",
-      "input": { "status": "invalid", "error": { "code": "STORE_CORRUPT" }, "path": "forbidden" },
+      "input": {
+        "status": "invalid",
+        "error": { "code": "STORE_CORRUPT" },
+        "path": "forbidden"
+      },
       "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
     },
     {
       "name": "open-non-store-handle-is-invalid",
-      "input": { "status": "opened", "store": {} },
+      "input": { "status": "opened", "selfCheck": "passed", "store": {} },
       "expected": { "status": "invalid", "errorCode": "NATIVE_INTERFACE_INVALID" }
     }
   ],
@@ -102,7 +158,10 @@
     { "name": "store-closed", "input": { "code": "STORE_CLOSED" }, "expectedCode": "STORE_CLOSED" },
     { "name": "store-corrupt", "input": { "code": "STORE_CORRUPT" }, "expectedCode": "STORE_CORRUPT" },
     { "name": "format-unsupported", "input": { "code": "STORE_FORMAT_UNSUPPORTED" }, "expectedCode": "STORE_FORMAT_UNSUPPORTED" },
+    { "name": "identity-uncertain", "input": { "code": "STORE_IDENTITY_UNCERTAIN" }, "expectedCode": "STORE_IDENTITY_UNCERTAIN" },
     { "name": "store-io", "input": { "code": "STORE_IO" }, "expectedCode": "STORE_IO" },
+    { "name": "permission-invalid", "input": { "code": "STORE_PERMISSION_INVALID" }, "expectedCode": "STORE_PERMISSION_INVALID" },
+    { "name": "durability-unsupported", "input": { "code": "DURABILITY_UNSUPPORTED" }, "expectedCode": "DURABILITY_UNSUPPORTED" },
     { "name": "invalid-argument", "input": { "code": "INVALID_ARGUMENT" }, "expectedCode": "INVALID_ARGUMENT" },
     { "name": "invalid-revision", "input": { "code": "INVALID_REVISION" }, "expectedCode": "INVALID_REVISION" },
     { "name": "state-too-large", "input": { "code": "STATE_TOO_LARGE" }, "expectedCode": "STATE_TOO_LARGE" },

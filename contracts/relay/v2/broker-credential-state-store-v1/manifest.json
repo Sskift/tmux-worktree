@@ -13,9 +13,43 @@
       "capability": "relayV2BrokerCredentialStateCapability",
       "open": "openRelayV2BrokerCredentialStateStore"
     },
-    "openArguments": [],
+    "openArguments": [
+      {
+        "name": "options",
+        "exactKeys": ["trustedHome", "maxStateBytes"],
+        "trustedHome": {
+          "type": "absolute-path",
+          "authority": "caller-supplied-account-owned-root",
+          "implicitHomeLookupAllowed": false
+        },
+        "maxStateBytes": {
+          "type": "integer",
+          "value": 67108864,
+          "enforcedAsAdmissionLimit": true
+        }
+      }
+    ],
     "storeMethods": ["runExclusive", "close"],
     "transactionMethods": ["read", "compareAndPublish"],
+    "runtimeDecode": {
+      "exactFields": true,
+      "copyDecodedValues": true,
+      "singleOwnDataDescriptorSnapshot": [
+        "open-options",
+        "capability-open-error-unions",
+        "binding-store-transaction-methods",
+        "read-publish-unions"
+      ],
+      "accessorFieldsAllowed": false,
+      "byteCopy": "captured-typed-array-intrinsic-brand-length-buffer-and-set",
+      "getterThrow": "NATIVE_INTERFACE_INVALID",
+      "rawExactErrorCode": "copy-and-rewrap-local-store-error",
+      "unstructuredRawThrow": "NATIVE_INTERFACE_INVALID",
+      "rawStoreEscapesToBusinessOwner": false,
+      "rawTransactionEscapesToBusinessOwner": false,
+      "rawRevisionEscapesToBusinessOwner": false,
+      "rawBytesEscapeToBusinessOwner": false
+    },
     "forbiddenSurface": [
       "statePath",
       "lockPath",
@@ -25,7 +59,9 @@
       "device",
       "inode",
       "openat",
+      "rename",
       "renameat",
+      "unlink",
       "unlinkat",
       "cleanup"
     ]
@@ -38,32 +74,65 @@
       "storageFormatVersion": 1,
       "maxStateBytes": 67108864,
       "features": [
+        "process_wide_kernel_lock_v1",
         "exclusive_transaction_v1",
         "opaque_transaction_revision_v1",
         "compare_and_publish_v1",
         "close_barrier_v1",
         "dual_slot_binary_v1"
       ],
-      "durability": "payload_then_header_fsync_v1"
+      "durability": "payload_then_header_durable_v1"
     },
+    "supportedMeansReady": false,
+    "unsupportedPhase": "pre-open-without-store-observation-only",
     "unsupportedReasons": [
-      "native_module_missing",
-      "platform_unsupported",
-      "runtime_unsupported",
-      "interface_version_unsupported",
-      "storage_format_unsupported"
+      "native_artifact_missing",
+      "target_unsupported",
+      "interface_version_unsupported"
     ],
     "partialSupportAllowed": false
   },
   "openUnion": {
     "discriminator": "status",
     "variants": {
-      "opened": ["status", "store"],
+      "opened": ["status", "selfCheck", "store"],
       "unsupported": ["status", "reason"],
       "invalid": ["status", "error"]
     },
-    "arguments": [],
-    "pathConfigurationAllowed": false
+    "arguments": {
+      "exactKeys": ["trustedHome", "maxStateBytes"],
+      "trustedHome": "absolute-caller-supplied-account-owned-root",
+      "maxStateBytes": 67108864
+    },
+    "pathConfigurationAllowed": false,
+    "implicitHomeLookupAllowed": false,
+    "openedSelfCheck": "passed",
+    "selfCheckScope": [
+      "trusted-home-owner-and-mode",
+      "container-owner-mode-link-and-stable-identity",
+      "exact-container-length-and-binary-selection",
+      "exclusive-lock-and-required-durability-support"
+    ],
+    "existingStoreFailures": {
+      "unknownFormat": "invalid/STORE_FORMAT_UNSUPPORTED",
+      "corruptOrPartial": "invalid/STORE_CORRUPT",
+      "wrongOwnerOrMode": "invalid/STORE_PERMISSION_INVALID",
+      "linkOrUnprovableIdentity": "invalid/STORE_IDENTITY_UNCERTAIN",
+      "requiredDurabilityUnavailable": "invalid/DURABILITY_UNSUPPORTED",
+      "preserveObservedState": true,
+      "neverReclassifyAsMissing": true
+    }
+  },
+  "readiness": {
+    "requiredInOrder": [
+      "capability-supported",
+      "open-opened",
+      "native-self-check-passed",
+      "authority-external-continuity-passed"
+    ],
+    "owner": "RelayV2BrokerCredentialAuthority",
+    "automaticRetryOrReopenAllowed": false,
+    "anyFailure": "production-v2-unavailable"
   },
   "errorUnion": {
     "shape": ["code"],
@@ -73,7 +142,10 @@
       "STORE_CLOSED",
       "STORE_CORRUPT",
       "STORE_FORMAT_UNSUPPORTED",
+      "STORE_IDENTITY_UNCERTAIN",
       "STORE_IO",
+      "STORE_PERMISSION_INVALID",
+      "DURABILITY_UNSUPPORTED",
       "INVALID_ARGUMENT",
       "INVALID_REVISION",
       "STATE_TOO_LARGE",
@@ -87,67 +159,159 @@
       "concurrency": "one-callback-per-store",
       "revisionScope": "issuing-transaction-only",
       "revisionSerializable": false,
+      "revisionForgery": "INVALID_REVISION",
+      "revisionAfterTransaction": "INVALID_REVISION",
       "readOutcomes": {
         "missing": ["outcome", "revision"],
         "present": ["outcome", "revision", "bytes"]
       },
       "compareAndPublishOutcomes": {
-        "swapped": ["outcome", "revision"],
-        "already_same": ["outcome", "revision"],
-        "conflict": ["outcome", "revision"],
+        "swapped": ["outcome", "current"],
+        "already_same": ["outcome", "current"],
+        "conflict": ["outcome", "current"],
         "uncertain": ["outcome"]
       },
+      "definitiveCurrent": "fresh-read-snapshot-with-current-transaction-revision",
       "alreadySameRule": "exact-current-bytes-equal-next-before-revision-conflict",
-      "uncertainRule": "no-revision-and-reconcile-by-a-new-exclusive-read",
-      "byteOwnership": "read-returns-copy-and-publish-captures-copy-before-await"
+      "uncertainRule": "terminal-close-store-instance-without-current-or-revision",
+      "uncertainPoison": {
+        "currentTransactionFurtherOperations": "STORE_CLOSED",
+        "futureRunExclusiveOnSameStore": "STORE_CLOSED",
+        "automaticRetryAllowed": false,
+        "recovery": "close-then-explicit-open-self-check-and-authority-continuity"
+      },
+      "byteOwnership": {
+        "read": "fresh-native-copy-per-result-caller-mutation-never-aliases-store",
+        "definitiveCurrent": "fresh-native-copy-caller-mutation-never-aliases-store",
+        "publish": "native-copies-input-synchronously-before-await-or-io"
+      },
+      "nativeCallbackContract": {
+        "invocationCount": "exactly-one",
+        "nativeSettlesAfterCallback": true,
+        "operationResultOwner": "typescript-wrapper",
+        "nativeIdentityEchoRequired": false,
+        "businessExceptionRoundTripThroughNativeRequired": false
+      }
     },
     "close": {
       "idempotent": true,
       "rejectsNewTransactionsAtBarrierStart": true,
       "waitsForAdmittedTransactions": true,
-      "resolvesAfterNativeResourcesClose": true
+      "admittedTransactionsRemainUsableDuringOrdinaryClose": true,
+      "onlyUncertainPoisonsAdmittedTransactions": true,
+      "resolvesAfterNativeResourcesClose": true,
+      "requiredBeforeReopenAfterUncertain": true
     }
   },
   "binaryStorage": {
     "formatVersion": 1,
-    "logicalObjects": ["header0", "header1", "payload0", "payload1"],
+    "container": {
+      "kind": "single-descriptor-backed-fixed-length",
+      "fileLengthBytes": 134217984,
+      "descriptorOnlyAfterOpen": true,
+      "positionalIoOnly": ["pwrite", "write_at"],
+      "sharedCursorOrWriteAllowed": false,
+      "namedReplaceAllowed": false,
+      "renameAllowed": false,
+      "regions": [
+        { "name": "header0", "offset": 0, "length": 128, "capacity": 128 },
+        { "name": "header1", "offset": 128, "length": 128, "capacity": 128 },
+        { "name": "payload0", "offset": 256, "length": "header0.payloadLength", "capacity": 67108864 },
+        { "name": "payload1", "offset": 67109120, "length": "header1.payloadLength", "capacity": 67108864 }
+      ],
+      "missingInitialization": {
+        "absentContainer": "securely-create-one-owner-only-container-at-exact-file-length",
+        "initialHeaders": "both-128-byte-regions-all-zero",
+        "durabilityRequiredBeforeOpened": true,
+        "existingWrongLength": "STORE_CORRUPT",
+        "existingUnsafeObject": "preserve-and-return-invalid"
+      },
+      "locking": {
+        "primitive": "process-wide-exclusive-kernel-lock-on-the-same-container-descriptor",
+        "acquisition": "nonblocking-before-container-identity-and-self-check",
+        "contention": "STORE_BUSY",
+        "heldAcross": [
+          "self-check",
+          "all-runExclusive-callbacks",
+          "ordinary-idle-time",
+          "uncertain-terminal-state"
+        ],
+        "release": "final-close-barrier-native-action-after-admitted-callbacks-drain",
+        "perTransactionReleaseAllowed": false,
+        "lockFileAllowed": false
+      }
+    },
     "headerBytes": 128,
     "maxPayloadBytes": 67108864,
     "byteOrder": "little-endian",
     "digest": "sha256",
     "headerLayout": [
-      { "name": "magic", "offset": 0, "bytes": 8, "valueAscii": "TWV2BCS1" },
-      { "name": "formatVersion", "offset": 8, "bytes": 2, "type": "u16", "value": 1 },
-      { "name": "slot", "offset": 10, "bytes": 1, "type": "u8", "values": [0, 1] },
-      { "name": "flags", "offset": 11, "bytes": 1, "type": "u8", "value": 0 },
-      { "name": "headerLength", "offset": 12, "bytes": 4, "type": "u32", "value": 128 },
-      { "name": "generation", "offset": 16, "bytes": 8, "type": "u64", "minimum": "1", "maximum": "18446744073709551615" },
-      { "name": "payloadLength", "offset": 24, "bytes": 8, "type": "u64", "minimum": "1", "maximum": "67108864" },
-      { "name": "payloadDigest", "offset": 32, "bytes": 32, "type": "sha256-raw" },
-      { "name": "reserved", "offset": 64, "bytes": 32, "value": "all-zero" },
-      { "name": "headerChecksum", "offset": 96, "bytes": 32, "type": "sha256-raw", "covers": [0, 96] }
+      { "name": "magic", "offset": 0, "length": 8, "valueAscii": "TWV2BCS1" },
+      { "name": "formatVersion", "offset": 8, "length": 2, "type": "u16", "value": 1 },
+      { "name": "slot", "offset": 10, "length": 1, "type": "u8", "values": [0, 1] },
+      { "name": "flags", "offset": 11, "length": 1, "type": "u8", "value": 0 },
+      { "name": "headerLength", "offset": 12, "length": 4, "type": "u32", "value": 128 },
+      { "name": "generation", "offset": 16, "length": 8, "type": "u64", "minimum": "1", "maximum": "18446744073709551615" },
+      { "name": "payloadLength", "offset": 24, "length": 8, "type": "u64", "minimum": "1", "maximum": "67108864" },
+      { "name": "payloadDigest", "offset": 32, "length": 32, "type": "sha256-raw" },
+      { "name": "reserved", "offset": 64, "length": 32, "value": "all-zero" },
+      { "name": "headerChecksum", "offset": 96, "length": 32, "type": "sha256-raw", "covers": { "offset": 0, "length": 96 } }
     ],
     "selection": {
-      "missing": "all-four-logical-objects-absent",
+      "missing": "container-absent-or-exact-length-container-with-all-four-regions-logically-all-zero",
       "present": "highest-complete-generation",
       "validDualGenerationDelta": "exactly-one",
       "slotRule": "slot-equals-generation-minus-one-modulo-two",
       "sameOrSkippedGeneration": "STORE_CORRUPT",
-      "singleHeaderRule": "only-complete-generation-one-slot-zero",
-      "unknownChecksumValidVersionOrFlags": "STORE_FORMAT_UNSUPPORTED",
-      "highestIncompleteOrAmbiguous": "STORE_CORRUPT",
-      "lowerIncompleteOrHeaderlessInactivePayload": "ignored-only-when-a-complete-immediate-successor-exists"
+      "singleHeaderRule": "only-complete-generation-one-slot-zero-with-other-header-all-zero",
+      "checksumValidUnknownMagicVersionOrFlags": "STORE_FORMAT_UNSUPPORTED",
+      "invalidHeaderOrHighestIncomplete": "STORE_CORRUPT",
+      "lowerIncompletePayload": "ignored-only-when-the-other-slot-is-a-complete-immediate-successor"
+    },
+    "crashSelection": {
+      "initialPayloadWriteBeforeFirstHeader": "STORE_CORRUPT-on-reopen-never-missing",
+      "laterInactivePayloadWriteBeforeHeader": "old-active-remains-selected-when-the-old-inactive-candidate-is-incomplete-under-the-lower-incomplete-rule",
+      "completeNewHeaderAndPayload": "select-new-higher-generation",
+      "tornOrInvalidHeader": "STORE_CORRUPT",
+      "validHeaderWithIncompletePayload": "STORE_CORRUPT",
+      "unknownChecksumValidHeader": "STORE_FORMAT_UNSUPPORTED",
+      "neverRepairOrRewriteDuringSelection": true
     },
     "publication": [
-      "hold-the-exclusive-transaction",
-      "select-the-inactive-slot-and-next-generation",
-      "atomically-replace-and-durably-sync-the-inactive-payload-object",
-      "atomically-replace-and-durably-sync-the-matching-header-object",
-      "durably-sync-container-metadata-required-by-the-platform",
-      "return-swapped-only-after-all-durability-steps-are-proven"
+      "hold-the-exclusive-transaction-and-single-open-descriptor",
+      "select-the-inactive-fixed-payload-range-and-next-generation",
+      "positionally-write-the-complete-copied-payload-to-its-absolute-offset-without-a-shared-cursor",
+      "pass-the-payload-durability-barrier-before-any-header-write",
+      "positionally-write-the-complete-matching-header-to-its-absolute-offset-without-a-shared-cursor",
+      "pass-the-header-durability-barrier",
+      "prove-any-required-container-metadata-durable",
+      "return-swapped-with-a-fresh-current-snapshot-only-after-all-durability-steps-are-proven"
     ],
-    "uncertainCommit": "any-unprovable-publication-boundary-returns-uncertain-without-a-revision",
+    "durabilityBarriers": {
+      "semantic": "all-prior-bytes-and-required-allocation-metadata-survive-power-loss-before-the-next-publication-stage-is-eligible",
+      "darwin": "adapter-must-prove-the-written-range-and-required-descriptor-metadata-reached-stable-storage;ordinary-cache-flush-is-insufficient",
+      "linux": "adapter-must-prove-the-written-range-and-required-descriptor-metadata-reached-stable-storage-on-the-selected-filesystem-and-device",
+      "containerCreation": "exact-length-owner-only-container-and-its-directory-entry-are-durable-before-opened",
+      "unsupportedGuarantee": "invalid/DURABILITY_UNSUPPORTED-with-existing-state-preserved"
+    },
+    "forbiddenPublication": [
+      "shared-file-cursor",
+      "write",
+      "named-file-replace",
+      "rename",
+      "temporary-file-publication",
+      "unlink-cleanup"
+    ],
+    "uncertainCommit": "any-unprovable-publication-boundary-returns-uncertain-and-terminal-closes-the-store-instance",
     "unknownOrPartial": "never-visible-as-new-state-and-fail-closed-unless-the-selection-rule-proves-a-complete-immediate-successor",
+    "fixtureEncoding": {
+      "kind": "zero-filled-exact-file-with-absolute-segments",
+      "unencodedBytes": "zero",
+      "segments": ["offset", "bytesBase64"],
+      "corruptMutationCoordinates": "absolute-container-offsets",
+      "rustMaterialization": "ftruncate-fileLength-then-positional-write-each-segment-and-mutation",
+      "corpusSchemaFailureIsNativeFormatEvidence": false
+    },
     "legacyPrototypeArtifacts": "never-read-imported-migrated-renamed-unlinked-or-cleaned"
   },
   "files": [
@@ -157,9 +321,11 @@
     { "role": "native-interface", "path": "native-interface-cases.json" }
   ],
   "acceptance": [
-    "rust-core-and-darwin-linux-adapters-consume-the-same-binary-fixtures",
+    "rust-core-and-darwin-linux-adapters-consume-the-same-binary-fixtures-and-port-conformance-harness",
     "loader-and-authority-injection-consume-the-closed-native-unions-and-port",
     "missing-native-is-unsupported-and-never-a-v2-or-v1-fallback-signal",
+    "existing-invalid-state-is-preserved-and-never-reclassified-as-missing",
+    "uncertain-terminal-closes-the-store-until-close-explicit-open-self-check-and-continuity",
     "prototype-json-lock-temp-artifacts-remain-untouched",
     "relay-v2-production-capability-remains-disabled"
   ]

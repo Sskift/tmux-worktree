@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { registerRelayV2BrokerCredentialStateStoreConformance } from "./support/relayV2BrokerCredentialStateStoreConformance.mjs";
 import {
   captureContractFailure,
   loadRelayV2BrokerCredentialStateStoreCorpus,
   materializeRelayV2BrokerCredentialCorruptCases,
-  parseRelayV2BrokerCredentialBinaryObjects,
+  parseRelayV2BrokerCredentialBinaryContainer,
 } from "./support/relayV2BrokerCredentialStateStoreFixtures.mjs";
 
 const stateStore = await import("../dist/relay/v2/brokerCredentialStateStore.js");
@@ -18,17 +19,18 @@ function deferred() {
   return { promise, resolve };
 }
 
-function bytes(value) {
-  return Buffer.from(value, "utf8");
+function rawFailure(code) {
+  return Object.freeze({ code });
 }
 
-function storeError(code) {
-  return new stateStore.RelayV2BrokerCredentialStateStoreError(code);
+class RawMemoryBacking {
+  bytes = null;
+  generation = 0;
+  publicationAttempts = 0;
 }
 
-class MemoryConformanceStore {
-  #bytes = null;
-  #generation = 0;
+class RawMemoryStore {
+  #backing;
   #tail = Promise.resolve();
   #closing = false;
   #closePromise = null;
@@ -38,74 +40,76 @@ class MemoryConformanceStore {
   #publishCaptureBarrier = null;
   nativeClosed = false;
 
-  setUncertainMode(mode) {
+  constructor(backing) {
+    this.#backing = backing;
+    this.handle = Object.freeze({
+      runExclusive: this.runExclusive.bind(this),
+      close: this.close.bind(this),
+    });
+  }
+
+  armUncertain(mode) {
     this.#uncertainMode = mode;
   }
 
-  setPublishCaptureBarrier(barrier) {
+  armPublishCapture(barrier) {
     this.#publishCaptureBarrier = barrier;
   }
 
-  runExclusive(operation) {
-    if (this.#closing) return Promise.reject(storeError("STORE_CLOSED"));
+  runExclusive(callback) {
+    if (this.#closing) return Promise.reject(rawFailure("STORE_CLOSED"));
     const transactionId = ++this.#transactionSequence;
     const run = this.#tail.then(async () => {
       let active = true;
       const issueRevision = () => {
-        const revision = Object.create(null);
-        Object.defineProperty(revision, "toJSON", {
-          value() {
-            throw storeError("INVALID_REVISION");
-          },
+        const revision = Object.freeze(Object.create(null));
+        this.#revisions.set(revision, {
+          transactionId,
+          generation: this.#backing.generation,
         });
-        Object.freeze(revision);
-        this.#revisions.set(revision, { transactionId, generation: this.#generation });
         return revision;
       };
-      const assertActive = () => {
-        if (!active) throw storeError("INVALID_REVISION");
-      };
-      const transaction = {
+      const current = () => this.#backing.bytes === null
+        ? { outcome: "missing", revision: issueRevision() }
+        : {
+            outcome: "present",
+            revision: issueRevision(),
+            bytes: this.#backing.bytes,
+          };
+      const transaction = Object.freeze({
         read: async () => {
-          assertActive();
-          const revision = issueRevision();
-          return this.#bytes === null
-            ? { outcome: "missing", revision }
-            : { outcome: "present", revision, bytes: Buffer.from(this.#bytes) };
+          if (!active) throw rawFailure("INVALID_REVISION");
+          return current();
         },
-        compareAndPublish: async (expected, nextValue) => {
-          assertActive();
+        compareAndPublish: async (expected, next) => {
+          if (!active) throw rawFailure("INVALID_REVISION");
           const expectedRevision = this.#revisions.get(expected);
           if (!expectedRevision || expectedRevision.transactionId !== transactionId) {
-            throw storeError("INVALID_REVISION");
+            throw rawFailure("INVALID_REVISION");
           }
-          if (!(nextValue instanceof Uint8Array) || nextValue.byteLength === 0) {
-            throw storeError("INVALID_ARGUMENT");
-          }
-          if (nextValue.byteLength > stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES) {
-            throw storeError("STATE_TOO_LARGE");
-          }
-          const next = Buffer.from(nextValue);
           const captureBarrier = this.#publishCaptureBarrier;
           this.#publishCaptureBarrier = null;
           if (captureBarrier) await captureBarrier();
-          if (this.#bytes !== null && this.#bytes.equals(next)) {
-            return { outcome: "already_same", revision: issueRevision() };
+          const copied = Buffer.from(next);
+          if (this.#backing.bytes !== null && this.#backing.bytes.equals(copied)) {
+            return { outcome: "already_same", current: current() };
           }
-          if (expectedRevision.generation !== this.#generation) {
-            return { outcome: "conflict", revision: issueRevision() };
+          if (expectedRevision.generation !== this.#backing.generation) {
+            return { outcome: "conflict", current: current() };
           }
+          this.#backing.publicationAttempts += 1;
           const uncertainMode = this.#uncertainMode;
           this.#uncertainMode = null;
           if (uncertainMode === "before") return { outcome: "uncertain" };
-          this.#bytes = next;
-          this.#generation += 1;
+          this.#backing.bytes = copied;
+          this.#backing.generation += 1;
           if (uncertainMode === "after") return { outcome: "uncertain" };
-          return { outcome: "swapped", revision: issueRevision() };
+          return { outcome: "swapped", current: current() };
         },
-      };
+      });
       try {
-        return await operation(transaction);
+        await callback(transaction);
+        return "native-does-not-echo-operation-result";
       } finally {
         active = false;
       }
@@ -124,28 +128,122 @@ class MemoryConformanceStore {
   }
 }
 
-test("N0 manifest freezes one deep native seam without paths or production capability", () => {
+class MemoryAdapterContext {
+  #backing = new RawMemoryBacking();
+  #activeRawStore = null;
+
+  constructor() {
+    this.binding = Object.freeze({
+      relayV2BrokerCredentialStateCapability: () => corpus.manifest.capability.supported,
+      openRelayV2BrokerCredentialStateStore: (options) => {
+        assert.deepEqual(options, {
+          trustedHome: "/Users/fixture-owner",
+          maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+        });
+        assert.equal(Object.isFrozen(options), true);
+        this.#activeRawStore = new RawMemoryStore(this.#backing);
+        return {
+          status: "opened",
+          selfCheck: "passed",
+          store: this.#activeRawStore.handle,
+        };
+      },
+    });
+  }
+
+  deferred() {
+    return deferred();
+  }
+
+  open() {
+    return stateStore.openRelayV2BrokerCredentialStateStoreNativeBinding(
+      this.binding,
+      {
+        trustedHome: "/Users/fixture-owner",
+        maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+      },
+    );
+  }
+
+  armUncertain(mode) {
+    this.#activeRawStore.armUncertain(mode);
+  }
+
+  armPublishCapture(barrier) {
+    this.#activeRawStore.armPublishCapture(barrier);
+  }
+
+  publicationAttempts() {
+    return this.#backing.publicationAttempts;
+  }
+
+  nativeClosed() {
+    return this.#activeRawStore.nativeClosed;
+  }
+
+}
+
+test("manifest and fixtures freeze one deep descriptor-backed seam without production readiness", () => {
   const { manifest } = corpus;
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-broker-credential-state-store");
   assert.equal(manifest.contractVersion, 1);
+  assert.equal(manifest.fixtureFormatVersion, corpus.goldenFixtureFormatVersion);
+  assert.equal(manifest.fixtureFormatVersion, corpus.corruptFile.fixtureFormatVersion);
+  assert.equal(manifest.fixtureFormatVersion, corpus.nativeInterface.fixtureFormatVersion);
+  assert.equal(corpus.goldenEncoding, "zero-filled-exact-file-with-absolute-segments");
   assert.equal(manifest.status, "frozen");
   assert.equal(manifest.scope, "native-storage-seam-only");
   assert.equal(manifest.productionCapabilityEffect, "none");
   assert.equal(manifest.businessOwner, "RelayV2BrokerCredentialAuthority");
-  assert.deepEqual(manifest.nativeInterface.openArguments, []);
+  assert.equal(manifest.capability.supportedMeansReady, false);
+  assert.equal(
+    manifest.capability.supported.maxStateBytes,
+    stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+  );
+  assert.equal(
+    manifest.capability.supported.durability,
+    stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_STORE_DURABILITY,
+  );
+  assert.deepEqual(
+    manifest.capability.supported.features,
+    [...stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_STORE_FEATURES],
+  );
+  assert.equal(manifest.nativeInterface.openArguments[0].exactKeys.join(","),
+    "trustedHome,maxStateBytes");
+  assert.equal(manifest.openUnion.pathConfigurationAllowed, false);
+  assert.equal(manifest.openUnion.implicitHomeLookupAllowed, false);
   assert.deepEqual(manifest.nativeInterface.storeMethods, ["runExclusive", "close"]);
   assert.deepEqual(manifest.nativeInterface.transactionMethods, ["read", "compareAndPublish"]);
-  assert.equal(manifest.openUnion.pathConfigurationAllowed, false);
-  assert.equal(manifest.port.runExclusive.revisionScope, "issuing-transaction-only");
-  assert.equal(manifest.port.runExclusive.revisionSerializable, false);
   assert.deepEqual(manifest.port.runExclusive.compareAndPublishOutcomes.uncertain, ["outcome"]);
+  assert.equal(manifest.port.close.admittedTransactionsRemainUsableDuringOrdinaryClose, true);
+  assert.equal(manifest.binaryStorage.container.fileLengthBytes, 134217984);
+  assert.deepEqual(
+    manifest.binaryStorage.container.regions.map(({ name, offset, capacity }) => ({ name, offset, capacity })),
+    [
+      { name: "header0", offset: 0, capacity: 128 },
+      { name: "header1", offset: 128, capacity: 128 },
+      { name: "payload0", offset: 256, capacity: 67108864 },
+      { name: "payload1", offset: 67109120, capacity: 67108864 },
+    ],
+  );
+  const checksum = manifest.binaryStorage.headerLayout.find(({ name }) => name === "headerChecksum");
+  assert.deepEqual(checksum.covers, { offset: 0, length: 96 });
+  assert.deepEqual(manifest.binaryStorage.container.positionalIoOnly, ["pwrite", "write_at"]);
+  assert.equal(manifest.binaryStorage.container.sharedCursorOrWriteAllowed, false);
+  assert.equal(
+    manifest.binaryStorage.container.locking.primitive,
+    "process-wide-exclusive-kernel-lock-on-the-same-container-descriptor",
+  );
+  assert.equal(manifest.binaryStorage.container.locking.contention, "STORE_BUSY");
+  assert.equal(manifest.binaryStorage.container.locking.perTransactionReleaseAllowed, false);
+  assert.equal(manifest.binaryStorage.container.locking.lockFileAllowed, false);
   assert.equal(manifest.binaryStorage.legacyPrototypeArtifacts,
     "never-read-imported-migrated-renamed-unlinked-or-cleaned");
 });
 
-test("binary v1 golden objects select one exact generation and payload", () => {
+test("binary v1 exact-container golden fixtures select committed state", () => {
   for (const fixture of corpus.golden) {
-    const parsed = parseRelayV2BrokerCredentialBinaryObjects(fixture.objects);
+    const parsed = parseRelayV2BrokerCredentialBinaryContainer(fixture.container);
     assert.equal(parsed.outcome, fixture.expected.outcome, fixture.name);
     if (parsed.outcome === "present") {
       assert.equal(parsed.generation, fixture.expected.generation, fixture.name);
@@ -155,10 +253,10 @@ test("binary v1 golden objects select one exact generation and payload", () => {
   }
 });
 
-test("binary v1 corruption, unknown formats, and inert partial slots are closed", () => {
+test("binary v1 corrupt, unknown, and crash-selection fixtures are closed", () => {
   for (const vector of materializeRelayV2BrokerCredentialCorruptCases(corpus)) {
     const captured = captureContractFailure(() => (
-      parseRelayV2BrokerCredentialBinaryObjects(vector.objects)
+      parseRelayV2BrokerCredentialBinaryContainer(vector.container, vector.mutations)
     ));
     assert.equal(captured.outcome, vector.expected.outcome === "reject" ? "reject" : "success", vector.name);
     if (vector.expected.outcome === "reject") {
@@ -171,7 +269,14 @@ test("binary v1 corruption, unknown formats, and inert partial slots are closed"
   }
 });
 
-test("native capability, open, and error fixtures normalize to closed unions", () => {
+test("native options, capability, open, and errors decode as closed copied values", async () => {
+  for (const fixture of corpus.nativeInterface.openOptionsCases) {
+    assert.equal(
+      stateStore.isRelayV2BrokerCredentialStateStoreOpenOptions(fixture.input),
+      fixture.expected === "valid",
+      fixture.name,
+    );
+  }
   for (const fixture of corpus.nativeInterface.capabilityCases) {
     const parsed = stateStore.parseRelayV2BrokerCredentialStateStoreCapability(fixture.input);
     assert.equal(parsed.status, fixture.expected.status, fixture.name);
@@ -179,14 +284,15 @@ test("native capability, open, and error fixtures normalize to closed unions", (
     if (parsed.status === "invalid") assert.equal(parsed.error.code, fixture.expected.errorCode, fixture.name);
   }
 
-  const markerStore = new MemoryConformanceStore();
+  const marker = new RawMemoryStore(new RawMemoryBacking());
   for (const fixture of corpus.nativeInterface.openCases) {
     const input = structuredClone(fixture.input);
-    if (input.store === "materialize-test-store") input.store = markerStore;
+    if (input.store === "materialize-test-store") input.store = marker.handle;
     const parsed = stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult(input);
     assert.equal(parsed.status, fixture.expected.status, fixture.name);
     if (parsed.status === "unsupported") assert.equal(parsed.reason, fixture.expected.reason, fixture.name);
     if (parsed.status === "invalid") assert.equal(parsed.error.code, fixture.expected.errorCode, fixture.name);
+    if (parsed.status === "opened") await parsed.store.close();
   }
 
   for (const fixture of corpus.nativeInterface.errorCases) {
@@ -195,96 +301,235 @@ test("native capability, open, and error fixtures normalize to closed unions", (
   }
 });
 
-test("in-memory port conformance keeps revisions transaction-scoped and compare outcomes exact", async () => {
-  const store = new MemoryConformanceStore();
-  let escapedRevision;
-  await store.runExclusive(async (transaction) => {
-    const missing = await transaction.read();
-    assert.equal(missing.outcome, "missing");
-    assert.deepEqual(Object.keys(missing.revision), []);
-    assert.throws(() => JSON.stringify(missing.revision), (error) => error.code === "INVALID_REVISION");
-    escapedRevision = missing.revision;
-
-    const swapped = await transaction.compareAndPublish(missing.revision, bytes("alpha"));
-    assert.equal(swapped.outcome, "swapped");
-    const sameFromStaleRevision = await transaction.compareAndPublish(missing.revision, bytes("alpha"));
-    assert.equal(sameFromStaleRevision.outcome, "already_same");
-    const conflict = await transaction.compareAndPublish(missing.revision, bytes("beta"));
-    assert.equal(conflict.outcome, "conflict");
+test("runtime boundary rejects accessors, raw throws, and malformed raw store values", async () => {
+  let accessorReads = 0;
+  const accessorOptions = { maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES };
+  Object.defineProperty(accessorOptions, "trustedHome", {
+    enumerable: true,
+    get() {
+      accessorReads += 1;
+      return "/Users/fixture-owner";
+    },
   });
-
-  await assert.rejects(
-    store.runExclusive((transaction) => transaction.compareAndPublish(escapedRevision, bytes("alpha"))),
-    (error) => error.code === "INVALID_REVISION",
+  const neverCalledBinding = Object.freeze({
+    relayV2BrokerCredentialStateCapability: () => corpus.manifest.capability.supported,
+    openRelayV2BrokerCredentialStateStore: () => { throw new Error("must not run"); },
+  });
+  const accessorResult = await stateStore.openRelayV2BrokerCredentialStateStoreNativeBinding(
+    neverCalledBinding,
+    accessorOptions,
   );
+  assert.equal(accessorResult.status, "invalid");
+  assert.equal(accessorResult.error.code, "INVALID_ARGUMENT");
+  assert.equal(accessorReads, 0, "accessor options are rejected without invoking the getter");
 
-  await store.runExclusive(async (transaction) => {
-    const present = await transaction.read();
-    assert.equal(present.outcome, "present");
-    present.bytes[0] ^= 1;
+  let descriptorReads = 0;
+  let receivedOptions;
+  const descriptorSnapshot = new Proxy({}, {
+    ownKeys: () => ["trustedHome", "maxStateBytes"],
+    getOwnPropertyDescriptor: (_target, property) => {
+      descriptorReads += 1;
+      return {
+        configurable: true,
+        enumerable: true,
+        writable: true,
+        value: property === "trustedHome"
+          ? "/Users/fixture-owner"
+          : stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+      };
+    },
   });
-  await store.runExclusive(async (transaction) => {
-    const present = await transaction.read();
-    assert.equal(present.bytes.toString("utf8"), "alpha", "read bytes do not alias store state");
+  const raw = new RawMemoryStore(new RawMemoryBacking());
+  const snapshotBinding = Object.freeze({
+    relayV2BrokerCredentialStateCapability: () => corpus.manifest.capability.supported,
+    openRelayV2BrokerCredentialStateStore: (options) => {
+      receivedOptions = options;
+      return { status: "opened", selfCheck: "passed", store: raw.handle };
+    },
   });
+  const snapshotResult = await stateStore.openRelayV2BrokerCredentialStateStoreNativeBinding(
+    snapshotBinding,
+    descriptorSnapshot,
+  );
+  assert.equal(snapshotResult.status, "opened");
+  assert.equal(descriptorReads, 2, "each own data descriptor is captured once");
+  assert.deepEqual(receivedOptions, {
+    trustedHome: "/Users/fixture-owner",
+    maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+  });
+  await snapshotResult.store.close();
 
-  const captured = deferred();
-  const release = deferred();
-  store.setPublishCaptureBarrier(async () => {
-    captured.resolve();
-    await release.promise;
+  const capabilityGetter = {};
+  Object.defineProperty(capabilityGetter, "status", { get() { throw new Error("getter"); } });
+  assert.equal(
+    stateStore.parseRelayV2BrokerCredentialStateStoreCapability(capabilityGetter).error.code,
+    "NATIVE_INTERFACE_INVALID",
+  );
+  let changingReasonReads = 0;
+  const changingUnsupported = { status: "unsupported" };
+  Object.defineProperty(changingUnsupported, "reason", {
+    enumerable: true,
+    get() {
+      changingReasonReads += 1;
+      return changingReasonReads === 1 ? "native_artifact_missing" : "evil";
+    },
   });
-  const callerBytes = bytes("captured");
-  const publishing = store.runExclusive(async (transaction) => {
-    const present = await transaction.read();
-    return transaction.compareAndPublish(present.revision, callerBytes);
+  const changingUnsupportedResult =
+    stateStore.parseRelayV2BrokerCredentialStateStoreCapability(changingUnsupported);
+  assert.equal(changingUnsupportedResult.status, "invalid");
+  assert.equal(changingUnsupportedResult.error.code, "NATIVE_INTERFACE_INVALID");
+  assert.equal(changingReasonReads, 0, "changing union accessors are never evaluated");
+  const throwingBinding = Object.freeze({
+    relayV2BrokerCredentialStateCapability: () => { throw new Error("raw"); },
+    openRelayV2BrokerCredentialStateStore: () => { throw new Error("raw"); },
   });
-  await captured.promise;
-  callerBytes.fill(0);
-  release.resolve();
-  assert.equal((await publishing).outcome, "swapped");
-  await store.runExclusive(async (transaction) => {
-    const present = await transaction.read();
-    assert.equal(present.bytes.toString("utf8"), "captured", "publish captures its own byte copy");
+  assert.equal(
+    stateStore.readRelayV2BrokerCredentialStateStoreNativeCapability(throwingBinding).error.code,
+    "NATIVE_INTERFACE_INVALID",
+  );
+  const rawOpenThrow = await stateStore.openRelayV2BrokerCredentialStateStoreNativeBinding(
+    throwingBinding,
+    { trustedHome: "/Users/fixture-owner", maxStateBytes: 67108864 },
+  );
+  assert.equal(rawOpenThrow.error.code, "NATIVE_INTERFACE_INVALID");
+
+  const hostileStore = {};
+  Object.defineProperties(hostileStore, {
+    runExclusive: { enumerable: true, get() { throw new Error("getter"); } },
+    close: { enumerable: true, value: () => undefined },
   });
+  const hostileOpen = stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult({
+    status: "opened",
+    selfCheck: "passed",
+    store: hostileStore,
+  });
+  assert.equal(hostileOpen.status, "invalid");
+  assert.equal(hostileOpen.error.code, "NATIVE_INTERFACE_INVALID");
 });
 
-test("uncertain publication exposes no revision and only a later transaction reconciles", async () => {
-  const store = new MemoryConformanceStore();
-  store.setUncertainMode("after");
-  const uncertain = await store.runExclusive(async (transaction) => {
-    const missing = await transaction.read();
-    return transaction.compareAndPublish(missing.revision, bytes("possibly-committed"));
+test("runtime store wrapper closes raw operation shapes and legal error codes", async () => {
+  const rawTransaction = (read) => Object.freeze({
+    read,
+    compareAndPublish: async () => ({ outcome: "uncertain" }),
   });
-  assert.deepEqual(uncertain, { outcome: "uncertain" });
+  const openRaw = (transaction) => stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult({
+    status: "opened",
+    selfCheck: "passed",
+    store: Object.freeze({
+      runExclusive: async (callback) => { await callback(transaction); },
+      close: async () => undefined,
+    }),
+  });
 
-  await store.runExclusive(async (transaction) => {
-    const observed = await transaction.read();
-    assert.equal(observed.outcome, "present");
-    assert.equal(observed.bytes.toString("utf8"), "possibly-committed");
+  const legal = openRaw(rawTransaction(async () => { throw rawFailure("STORE_BUSY"); }));
+  await assert.rejects(
+    legal.store.runExclusive((transaction) => transaction.read()),
+    (error) => error.code === "STORE_BUSY" && error.retryable === true,
+  );
+  await legal.store.close();
+
+  const rawError = openRaw(rawTransaction(async () => { throw new Error("raw"); }));
+  await assert.rejects(
+    rawError.store.runExclusive((transaction) => transaction.read()),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  await rawError.store.close();
+
+  let forgedCodeReads = 0;
+  const forgedLocalError = Object.create(
+    stateStore.RelayV2BrokerCredentialStateStoreError.prototype,
+  );
+  Object.defineProperty(forgedLocalError, "code", {
+    enumerable: true,
+    get() {
+      forgedCodeReads += 1;
+      return "STORE_BUSY";
+    },
   });
+  const forged = openRaw(rawTransaction(async () => { throw forgedLocalError; }));
+  await assert.rejects(
+    forged.store.runExclusive((transaction) => transaction.read()),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  assert.equal(forgedCodeReads, 0, "forged local error code accessor is never evaluated");
+  await forged.store.close();
+
+  const getterValue = {};
+  Object.defineProperty(getterValue, "outcome", { get() { throw new Error("getter"); } });
+  const getter = openRaw(rawTransaction(async () => getterValue));
+  await assert.rejects(
+    getter.store.runExclusive((transaction) => transaction.read()),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  await getter.store.close();
+
+  let changingBytesReads = 0;
+  const changingBytesValue = {
+    outcome: "present",
+    revision: Object.freeze({}),
+  };
+  Object.defineProperty(changingBytesValue, "bytes", {
+    enumerable: true,
+    get() {
+      changingBytesReads += 1;
+      return changingBytesReads === 1 ? new Uint8Array([1]) : new Uint8Array(67108865);
+    },
+  });
+  const changingBytes = openRaw(rawTransaction(async () => changingBytesValue));
+  await assert.rejects(
+    changingBytes.store.runExclusive((transaction) => transaction.read()),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  assert.equal(changingBytesReads, 0, "changing bytes accessor cannot bypass size decode");
+  await changingBytes.store.close();
 });
 
-test("close is an idempotent barrier over already-admitted transactions", async () => {
-  const store = new MemoryConformanceStore();
-  const entered = deferred();
-  const release = deferred();
-  const active = store.runExclusive(async () => {
-    entered.resolve();
-    await release.promise;
+test("runtime runExclusive requires exactly one settled callback without identity echo", async () => {
+  const rawRevision = Object.freeze({});
+  const transaction = Object.freeze({
+    read: async () => ({ outcome: "missing", revision: rawRevision }),
+    compareAndPublish: async () => ({ outcome: "uncertain" }),
   });
-  await entered.promise;
+  const openRaw = (runExclusive) => stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult({
+    status: "opened",
+    selfCheck: "passed",
+    store: Object.freeze({ runExclusive, close: async () => undefined }),
+  }).store;
 
-  const close = store.close();
-  assert.strictEqual(store.close(), close);
-  let closed = false;
-  close.then(() => { closed = true; });
-  await Promise.resolve();
-  assert.equal(closed, false);
-  await assert.rejects(store.runExclusive(() => undefined), (error) => error.code === "STORE_CLOSED");
+  const noEcho = openRaw(async (callback) => {
+    await callback(transaction);
+    return "unrelated-native-result";
+  });
+  assert.equal(await noEcho.runExclusive(() => "wrapper-result"), "wrapper-result");
+  await noEcho.close();
 
+  const duplicate = openRaw(async (callback) => {
+    await callback(transaction);
+    try { await callback(transaction); } catch {}
+  });
+  await assert.rejects(
+    duplicate.runExclusive(() => undefined),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
+  await duplicate.close();
+
+  const release = deferred();
+  const early = openRaw((callback) => {
+    void callback(transaction);
+    return undefined;
+  });
+  await assert.rejects(
+    early.runExclusive(async () => { await release.promise; }),
+    (error) => error.code === "NATIVE_INTERFACE_INVALID",
+  );
   release.resolve();
-  await active;
-  await close;
-  assert.equal(store.nativeClosed, true);
+  await early.close();
+});
+
+registerRelayV2BrokerCredentialStateStoreConformance({
+  test,
+  assert,
+  stateStore,
+  label: "in-memory raw-adapter model (not native evidence)",
+  createContext: () => new MemoryAdapterContext(),
 });

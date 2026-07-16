@@ -6,8 +6,14 @@ const contractRoot = new URL(
   import.meta.url,
 );
 
-const OBJECT_NAMES = ["header0", "header1", "payload0", "payload1"];
 const HEADER_BYTES = 128;
+const HEADER0_OFFSET = 0;
+const HEADER1_OFFSET = 128;
+const HEADER_CHECKSUM_OFFSET = 0;
+const HEADER_CHECKSUM_LENGTH = 96;
+const PAYLOAD0_OFFSET = 256;
+const PAYLOAD1_OFFSET = 67109120;
+const CONTAINER_FILE_BYTES = 134217984;
 const MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const MAGIC = Buffer.from("TWV2BCS1", "ascii");
 
@@ -22,18 +28,15 @@ function decodeBase64(value, label) {
   return bytes;
 }
 
-function decodeObjects(objects) {
-  return Object.fromEntries(Object.entries(objects).map(([name, value]) => [
-    name,
-    value === null ? null : decodeBase64(value, name),
-  ]));
-}
-
-function cloneObjects(objects) {
-  return Object.fromEntries(Object.entries(objects).map(([name, value]) => [
-    name,
-    value === null ? null : Buffer.from(value),
-  ]));
+function decodeContainer(container) {
+  if (container === null) return null;
+  return {
+    fileLength: container.fileLength,
+    segments: container.segments.map((segment, index) => ({
+      offset: segment.offset,
+      bytes: decodeBase64(segment.bytesBase64, `segments[${index}]`),
+    })),
+  };
 }
 
 export function loadRelayV2BrokerCredentialStateStoreCorpus() {
@@ -41,65 +44,24 @@ export function loadRelayV2BrokerCredentialStateStoreCorpus() {
   const goldenFile = readJson("golden-binary.json");
   const golden = goldenFile.cases.map((fixture) => ({
     ...fixture,
-    objects: decodeObjects(fixture.objects),
+    container: decodeContainer(fixture.container),
   }));
   return {
     manifest,
     golden,
+    goldenEncoding: goldenFile.encoding,
+    goldenFixtureFormatVersion: goldenFile.fixtureFormatVersion,
     goldenByName: new Map(golden.map((fixture) => [fixture.name, fixture])),
-    corrupt: readJson("corrupt-binary.json").vectors,
+    corruptFile: readJson("corrupt-binary.json"),
     nativeInterface: readJson("native-interface-cases.json"),
   };
 }
 
-function applyMutation(objects, mutation) {
-  const current = objects[mutation.object];
-  switch (mutation.kind) {
-    case "write-byte":
-      if (!Buffer.isBuffer(current)) throw new Error("mutation target is absent");
-      current.writeUInt8(mutation.value, mutation.offset);
-      return;
-    case "write-u16-le":
-      if (!Buffer.isBuffer(current)) throw new Error("mutation target is absent");
-      current.writeUInt16LE(mutation.value, mutation.offset);
-      return;
-    case "write-u64-le":
-      if (!Buffer.isBuffer(current)) throw new Error("mutation target is absent");
-      current.writeBigUInt64LE(BigInt(mutation.value), mutation.offset);
-      return;
-    case "truncate":
-      if (!Buffer.isBuffer(current)) throw new Error("mutation target is absent");
-      objects[mutation.object] = current.subarray(0, mutation.length);
-      return;
-    case "xor-byte":
-      if (!Buffer.isBuffer(current)) throw new Error("mutation target is absent");
-      current[mutation.offset] ^= mutation.value;
-      return;
-    case "remove-object":
-      if (!Object.hasOwn(objects, mutation.object)) throw new Error("unknown mutation object");
-      objects[mutation.object] = null;
-      return;
-    case "add-object":
-      objects[mutation.object] = decodeBase64(mutation.base64, mutation.object);
-      return;
-    case "recompute-header-checksum":
-      if (!Buffer.isBuffer(current) || current.byteLength !== HEADER_BYTES) {
-        throw new Error("header checksum target is invalid");
-      }
-      createHash("sha256").update(current.subarray(0, 96)).digest().copy(current, 96);
-      return;
-    default:
-      throw new Error(`unknown broker credential fixture mutation ${mutation.kind}`);
-  }
-}
-
 export function materializeRelayV2BrokerCredentialCorruptCases(corpus) {
-  return corpus.corrupt.map((vector) => {
+  return corpus.corruptFile.vectors.map((vector) => {
     const source = corpus.goldenByName.get(vector.deriveFrom);
     if (!source) throw new Error(`unknown broker credential fixture ${vector.deriveFrom}`);
-    const objects = cloneObjects(source.objects);
-    for (const mutation of vector.mutations) applyMutation(objects, mutation);
-    return { ...vector, objects };
+    return { ...vector, container: source.container };
   });
 }
 
@@ -114,10 +76,184 @@ function reject(code) {
   throw new ContractFailure(code);
 }
 
-function parseHeader(bytes, expectedSlot) {
-  if (bytes === null) return null;
-  if (!Buffer.isBuffer(bytes) || bytes.byteLength !== HEADER_BYTES) reject("STORE_CORRUPT");
-  const checksum = createHash("sha256").update(bytes.subarray(0, 96)).digest();
+function exactObjectKeys(value, expected, label) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} is not an object`);
+  }
+  const actual = Object.keys(value).sort();
+  const sortedExpected = [...expected].sort();
+  if (
+    actual.length !== sortedExpected.length
+    || !actual.every((key, index) => key === sortedExpected[index])
+  ) throw new Error(`${label} has an invalid schema`);
+}
+
+function assertRange(offset, length) {
+  if (
+    !Number.isSafeInteger(offset)
+    || !Number.isSafeInteger(length)
+    || offset < 0
+    || length < 0
+    || offset + length > CONTAINER_FILE_BYTES
+  ) throw new Error("fixture range is outside the container");
+}
+
+class SparseRangeReader {
+  #segments;
+  #overlays = [];
+
+  constructor(segments) {
+    this.#segments = segments;
+  }
+
+  addOverlay(offset, bytes) {
+    assertRange(offset, bytes.byteLength);
+    this.#overlays.push({ offset, bytes: Buffer.from(bytes) });
+  }
+
+  read(offset, length) {
+    assertRange(offset, length);
+    const result = Buffer.alloc(length, 0);
+    const apply = (segment) => {
+      const start = Math.max(offset, segment.offset);
+      const end = Math.min(offset + length, segment.offset + segment.bytes.byteLength);
+      if (start >= end) return;
+      segment.bytes.copy(
+        result,
+        start - offset,
+        start - segment.offset,
+        end - segment.offset,
+      );
+    };
+    for (const segment of this.#segments) apply(segment);
+    for (const overlay of this.#overlays) apply(overlay);
+    return result;
+  }
+
+  hasNonZero(offset, length) {
+    assertRange(offset, length);
+    const end = offset + length;
+    const entries = [...this.#segments, ...this.#overlays].filter((entry) => (
+      entry.offset < end && entry.offset + entry.bytes.byteLength > offset
+    ));
+    const boundaries = new Set([offset, end]);
+    for (const entry of entries) {
+      boundaries.add(Math.max(offset, entry.offset));
+      boundaries.add(Math.min(end, entry.offset + entry.bytes.byteLength));
+    }
+    const ordered = [...boundaries].sort((left, right) => left - right);
+    for (let index = 0; index + 1 < ordered.length; index += 1) {
+      const start = ordered[index];
+      const rangeLength = ordered[index + 1] - start;
+      if (
+        rangeLength > 0
+        && entries.some((entry) => (
+          entry.offset < start + rangeLength && entry.offset + entry.bytes.byteLength > start
+        ))
+        && this.read(start, rangeLength).some((value) => value !== 0)
+      ) return true;
+    }
+    return false;
+  }
+}
+
+function applyMutation(reader, mutation) {
+  switch (mutation.kind) {
+    case "set-file-length":
+      return;
+    case "write-byte": {
+      const write = Buffer.alloc(1);
+      write.writeUInt8(mutation.value);
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "write-u16-le": {
+      const write = Buffer.alloc(2);
+      write.writeUInt16LE(mutation.value);
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "write-u32-le": {
+      const write = Buffer.alloc(4);
+      write.writeUInt32LE(mutation.value);
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "write-u64-le": {
+      const write = Buffer.alloc(8);
+      write.writeBigUInt64LE(BigInt(mutation.value));
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "xor-byte": {
+      const write = reader.read(mutation.offset, 1);
+      write[0] ^= mutation.value;
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "zero-range":
+      assertRange(mutation.offset, mutation.length);
+      reader.addOverlay(mutation.offset, Buffer.alloc(mutation.length));
+      return;
+    case "write-bytes": {
+      const write = decodeBase64(mutation.bytesBase64, "mutation bytes");
+      reader.addOverlay(mutation.offset, write);
+      return;
+    }
+    case "recompute-header-checksum": {
+      assertRange(mutation.headerOffset, HEADER_BYTES);
+      const checksum = createHash("sha256")
+        .update(reader.read(
+          mutation.headerOffset + HEADER_CHECKSUM_OFFSET,
+          HEADER_CHECKSUM_LENGTH,
+        ))
+        .digest();
+      reader.addOverlay(mutation.headerOffset + 96, checksum);
+      return;
+    }
+    default:
+      throw new Error(`unknown broker credential fixture mutation ${mutation.kind}`);
+  }
+}
+
+function openSparseContainer(container, mutations) {
+  exactObjectKeys(container, ["fileLength", "segments"], "container");
+  if (!Array.isArray(container.segments)) throw new Error("container segments are not an array");
+  let fileLength = container.fileLength;
+  for (const mutation of mutations) {
+    if (mutation.kind === "set-file-length") fileLength = mutation.value;
+  }
+  if (fileLength !== CONTAINER_FILE_BYTES) reject("STORE_CORRUPT");
+
+  const segments = container.segments.map((segment, index) => {
+    exactObjectKeys(segment, ["offset", "bytes"], `segment[${index}]`);
+    if (
+      !Number.isSafeInteger(segment.offset)
+      || segment.offset < 0
+      || !Buffer.isBuffer(segment.bytes)
+      || segment.offset + segment.bytes.byteLength > CONTAINER_FILE_BYTES
+    ) throw new Error(`segment[${index}] is outside the container`);
+    return segment;
+  }).sort((left, right) => left.offset - right.offset);
+  let previousEnd = 0;
+  for (const segment of segments) {
+    if (segment.offset < previousEnd) throw new Error("fixture segments overlap");
+    previousEnd = segment.offset + segment.bytes.byteLength;
+  }
+  const reader = new SparseRangeReader(segments);
+  for (const mutation of mutations) applyMutation(reader, mutation);
+  return reader;
+}
+
+function parseHeader(reader, headerOffset, expectedSlot) {
+  const bytes = reader.read(headerOffset, HEADER_BYTES);
+  if (bytes.every((value) => value === 0)) return null;
+  const checksum = createHash("sha256")
+    .update(bytes.subarray(
+      HEADER_CHECKSUM_OFFSET,
+      HEADER_CHECKSUM_OFFSET + HEADER_CHECKSUM_LENGTH,
+    ))
+    .digest();
   if (!checksum.equals(bytes.subarray(96, 128))) reject("STORE_CORRUPT");
   if (!bytes.subarray(0, 8).equals(MAGIC)) reject("STORE_FORMAT_UNSUPPORTED");
   if (bytes.readUInt16LE(8) !== 1 || bytes.readUInt8(11) !== 0) {
@@ -144,36 +280,49 @@ function parseHeader(bytes, expectedSlot) {
   };
 }
 
-function completeCandidate(header, payload) {
-  if (header === null || !Buffer.isBuffer(payload)) return null;
-  if (payload.byteLength !== header.payloadLength) return null;
-  const digest = createHash("sha256").update(payload).digest();
+function completeCandidate(reader, header) {
+  if (header === null) return null;
+  const offset = header.slot === 0 ? PAYLOAD0_OFFSET : PAYLOAD1_OFFSET;
+  const hash = createHash("sha256");
+  const chunkBytes = 64 * 1024;
+  for (let readOffset = 0; readOffset < header.payloadLength; readOffset += chunkBytes) {
+    const length = Math.min(chunkBytes, header.payloadLength - readOffset);
+    hash.update(reader.read(offset + readOffset, length));
+  }
+  const digest = hash.digest();
   if (!digest.equals(header.payloadDigest)) return null;
-  return { header, payload };
+  return { header, payloadOffset: offset };
 }
 
-export function parseRelayV2BrokerCredentialBinaryObjects(objects) {
-  const keys = Object.keys(objects).sort();
-  if (
-    keys.length !== OBJECT_NAMES.length
-    || !keys.every((key, index) => key === [...OBJECT_NAMES].sort()[index])
-  ) reject("STORE_FORMAT_UNSUPPORTED");
-  if (OBJECT_NAMES.every((name) => objects[name] === null)) return { outcome: "missing" };
-
-  const headers = [parseHeader(objects.header0, 0), parseHeader(objects.header1, 1)];
+export function parseRelayV2BrokerCredentialBinaryContainer(container, mutations = []) {
+  if (container === null) {
+    if (mutations.length !== 0) throw new Error("absent container cannot have mutations");
+    return { outcome: "missing" };
+  }
+  const reader = openSparseContainer(container, mutations);
+  const headers = [
+    parseHeader(reader, HEADER0_OFFSET, 0),
+    parseHeader(reader, HEADER1_OFFSET, 1),
+  ];
+  if (headers[0] === null && headers[1] === null) {
+    if (
+      reader.hasNonZero(PAYLOAD0_OFFSET, MAX_PAYLOAD_BYTES)
+      || reader.hasNonZero(PAYLOAD1_OFFSET, MAX_PAYLOAD_BYTES)
+    ) reject("STORE_CORRUPT");
+    return { outcome: "missing" };
+  }
   const candidates = [
-    completeCandidate(headers[0], objects.payload0),
-    completeCandidate(headers[1], objects.payload1),
+    completeCandidate(reader, headers[0]),
+    completeCandidate(reader, headers[1]),
   ];
   const presentHeaders = headers.filter((header) => header !== null);
-  if (presentHeaders.length === 0) reject("STORE_CORRUPT");
 
   let active;
   if (presentHeaders.length === 1) {
     if (presentHeaders[0].generation !== 1n || presentHeaders[0].slot !== 0) {
       reject("STORE_CORRUPT");
     }
-    active = candidates[presentHeaders[0].slot];
+    active = candidates[0];
     if (active === null) reject("STORE_CORRUPT");
   } else {
     const [left, right] = headers;
@@ -185,11 +334,12 @@ export function parseRelayV2BrokerCredentialBinaryObjects(objects) {
     active = candidates[higher.slot];
     if (active === null) reject("STORE_CORRUPT");
   }
+  const payload = reader.read(active.payloadOffset, active.header.payloadLength);
   return {
     outcome: "present",
     generation: active.header.generation.toString(10),
-    payload: Buffer.from(active.payload),
-    payloadSha256: createHash("sha256").update(active.payload).digest("base64url"),
+    payload,
+    payloadSha256: createHash("sha256").update(payload).digest("base64url"),
   };
 }
 
