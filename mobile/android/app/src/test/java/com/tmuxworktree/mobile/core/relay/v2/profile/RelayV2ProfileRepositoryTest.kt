@@ -15,6 +15,8 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -193,6 +195,7 @@ class RelayV2ProfileRepositoryTest {
                 listOf("exchange", "disconnect:start", "disconnect:end", "clear", "activate"),
                 harness.events,
             )
+            assertSame(harness.barrier.returnedReceipt, harness.isolationReceipts.single())
 
             val nonSensitivePersistence = harness.profiles.persistedValues.values.joinToString("|")
             assertFalse(nonSensitivePersistence.contains(ENROLLMENT_CODE))
@@ -201,6 +204,145 @@ class RelayV2ProfileRepositoryTest {
             val secureBlob = harness.credentials.read(profile.credentialReference)
             assertEquals(ACCESS_TOKEN_1, secureBlob?.accessToken)
             assertEquals(REFRESH_TOKEN_1, secureBlob?.refreshToken)
+        }
+
+    @Test
+    fun `disconnect receipt must match exactly and the validated proof reaches isolation unchanged`() =
+        runBlocking {
+            val mismatches = listOf<(
+                RelayActiveProfileIdentity,
+                String,
+            ) -> RelayProfileDisconnectReceipt>(
+                { profile, barrierId ->
+                    RelayProfileDisconnectReceipt(
+                        profile.copy(activationGeneration = profile.activationGeneration + 1),
+                        barrierId,
+                    )
+                },
+                { profile, barrierId ->
+                    RelayProfileDisconnectReceipt(profile, "$barrierId-wrong")
+                },
+            )
+
+            mismatches.forEach { mismatch ->
+                val harness = Harness(disconnectReceipt = mismatch)
+
+                assertTrue(
+                    runCatching {
+                        harness.repository.confirmEnrollment(
+                            enrollmentDraft().confirm(deviceLabel = "Pixel"),
+                        )
+                    }.isFailure,
+                )
+                assertEquals(0, harness.isolationCalls)
+                assertTrue(harness.isolationReceipts.isEmpty())
+                assertEquals(0, harness.profiles.activationCount)
+                assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
+            }
+        }
+
+    @Test
+    fun `late success from an older enrollment intent cannot replace the latest activation`() =
+        runBlocking {
+            val harness = Harness()
+            val firstGate = harness.exchange.deferEnrollment("enrollment-a")
+            val secondGate = harness.exchange.deferEnrollment("enrollment-b")
+
+            val first = async {
+                harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        enrollmentId = "enrollment-a",
+                        enrollmentCode = "twenroll2.code-a",
+                    ).confirm(deviceLabel = "Pixel A"),
+                )
+            }
+            val firstRequest = firstGate.request.await()
+            val second = async {
+                harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        enrollmentId = "enrollment-b",
+                        enrollmentCode = "twenroll2.code-b",
+                    ).confirm(deviceLabel = "Pixel B"),
+                )
+            }
+            val secondRequest = secondGate.request.await()
+
+            secondGate.response.complete(enrollmentResponse(secondRequest, identitySuffix = "b"))
+            val secondResult = second.await() as RelayV2EnrollmentResult.Activated
+            val winningProfile = secondResult.profile
+            val isolationCallsAfterWinner = harness.isolationCalls
+            val activationCallsAfterWinner = harness.profiles.activationCount
+
+            firstGate.response.complete(enrollmentResponse(firstRequest, identitySuffix = "a"))
+            assertEquals(
+                RelayV2EnrollmentResult.Superseded(winningProfile.identity),
+                first.await(),
+            )
+
+            assertEquals(winningProfile, harness.profiles.activeV2)
+            assertEquals(isolationCallsAfterWinner, harness.isolationCalls)
+            assertEquals(activationCallsAfterWinner, harness.profiles.activationCount)
+            val winningCredential = requireNotNull(
+                harness.credentials.read(winningProfile.credentialReference),
+            )
+            assertEquals(1L, winningCredential.credentialVersion)
+            assertEquals("twcap2.access-b", winningCredential.accessToken)
+            assertEquals("twref2.refresh-b", winningCredential.refreshToken)
+            val losingCredential = harness.credentials.values().single { !it.hasCredentialMaterial }
+            assertEquals(0L, losingCredential.credentialVersion)
+            assertNotNull(losingCredential.pendingAttempt)
+            assertNull(losingCredential.accessToken)
+            assertNull(losingCredential.refreshToken)
+
+            val switched = Harness()
+            val switchedGate = switched.exchange.deferEnrollment("enrollment-switch")
+            val lateAfterSwitch = async {
+                switched.repository.confirmEnrollment(
+                    enrollmentDraft("enrollment-switch", "twenroll2.code-switch")
+                        .confirm(deviceLabel = "Pixel"),
+                )
+            }
+            val switchedRequest = switchedGate.request.await()
+            val replacement = relayV2Profile().copy(profileId = "replacement-profile")
+            assertTrue(
+                switched.profiles.activateRelayV2Profile(
+                    switched.profiles.activeIdentity,
+                    replacement,
+                ),
+            )
+            switchedGate.response.complete(enrollmentResponse(switchedRequest, "switched-late"))
+            assertEquals(
+                RelayV2EnrollmentResult.Superseded(replacement.identity),
+                lateAfterSwitch.await(),
+            )
+            assertEquals(0, switched.barrier.calls)
+            assertTrue(switched.credentials.values().single().hasCredentialMaterial.not())
+
+            val cancelled = Harness()
+            val cancelledGate = cancelled.exchange.deferEnrollment("enrollment-cancel")
+            val lateAfterCancel = async {
+                cancelled.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        enrollmentId = "enrollment-cancel",
+                        enrollmentCode = "twenroll2.code-cancel",
+                    ).confirm(deviceLabel = "Pixel"),
+                )
+            }
+            val cancelledRequest = cancelledGate.request.await()
+            assertTrue(cancelled.repository.cancelPendingEnrollment())
+            assertFalse(cancelled.repository.cancelPendingEnrollment())
+            cancelledGate.response.complete(
+                enrollmentResponse(cancelledRequest, identitySuffix = "cancelled-late"),
+            )
+            assertEquals(
+                RelayV2EnrollmentResult.Superseded(cancelled.profiles.activeIdentity),
+                lateAfterCancel.await(),
+            )
+            assertEquals(RelayProfileDialect.V1, cancelled.profiles.activeIdentity?.dialect)
+            assertEquals(0, cancelled.barrier.calls)
+            assertEquals(0, cancelled.isolationCalls)
+            assertEquals(0, cancelled.profiles.activationCount)
+            assertTrue(cancelled.credentials.values().single().hasCredentialMaterial.not())
         }
 
     @Test
@@ -341,7 +483,12 @@ class RelayV2ProfileRepositoryTest {
                 oldActivation.profile.credentialReference,
                 replacement.credentialReference,
             )
-            switched.profiles.activateRelayV2Profile(replacement)
+            assertTrue(
+                switched.profiles.activateRelayV2Profile(
+                    expectedActiveProfile = oldActivation.profile.identity,
+                    profile = replacement,
+                ),
+            )
             val activationCountBeforeResponse = switched.profiles.activationCount
 
             assertEquals(
@@ -428,25 +575,30 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(isolationCalls, harness.isolationCalls)
         }
 
-    private class Harness(blockDisconnect: Boolean = false) {
+    private class Harness(
+        blockDisconnect: Boolean = false,
+        disconnectReceipt: ((RelayActiveProfileIdentity, String) -> RelayProfileDisconnectReceipt)? = null,
+    ) {
         val events = mutableListOf<String>()
         val credentials = MemoryCredentialStore()
         val profiles = MemoryProfileStore(events)
-        val barrier = RecordingDisconnectBarrier(events, blockDisconnect)
+        val barrier = RecordingDisconnectBarrier(events, blockDisconnect, disconnectReceipt)
         var isolationCalls = 0
+        val isolationReceipts = mutableListOf<RelayProfileDisconnectReceipt>()
         private val ids = AtomicInteger()
         private val idFactory = { "test-${ids.incrementAndGet()}" }
         val exchange = FakeCredentialExchange(events)
         val profileSwitch = RelayV2ProfileSwitchStateMachine(
             profileStore = profiles,
             disconnectBarrier = barrier,
-            isolationBoundary = RelayProfileIsolationBoundary { previous ->
+            isolationBoundary = RelayProfileIsolationBoundary { receipt ->
                 isolationCalls += 1
+                isolationReceipts += receipt
                 events += "clear"
                 // Model the real boundary's credential deletion responsibility. If the state
                 // machine calls this for the same target, this deliberately removes that target.
                 profiles.activeV2
-                    ?.takeIf { it.identity == previous }
+                    ?.takeIf { it.identity == receipt.profile }
                     ?.let { credentials.clear(it.credentialReference) }
             },
             newId = idFactory,
@@ -523,7 +675,11 @@ class RelayV2ProfileRepositoryTest {
 
         override suspend fun activeRelayV2Profile(): RelayV2Profile? = activeV2
 
-        override suspend fun activateRelayV2Profile(profile: RelayV2Profile) {
+        override suspend fun activateRelayV2Profile(
+            expectedActiveProfile: RelayActiveProfileIdentity?,
+            profile: RelayV2Profile,
+        ): Boolean {
+            if (activeIdentity != expectedActiveProfile) return false
             activationCount += 1
             events += "activate"
             activeV2 = profile
@@ -542,6 +698,7 @@ class RelayV2ProfileRepositoryTest {
                 "credentialKind" to "twcap2_grant",
                 "offeredSubprotocol" to profile.offeredSubprotocol,
             )
+            return true
         }
 
         override suspend fun updateRelayV2CredentialVersion(
@@ -572,10 +729,15 @@ class RelayV2ProfileRepositoryTest {
     private class RecordingDisconnectBarrier(
         private val events: MutableList<String>,
         blocked: Boolean,
+        private val receiptFactory: ((
+            RelayActiveProfileIdentity,
+            String,
+        ) -> RelayProfileDisconnectReceipt)?,
     ) : RelayProfileDisconnectBarrier {
         val started = CompletableDeferred<Unit>()
         val release = CompletableDeferred<Unit>()
         var calls = 0
+        var returnedReceipt: RelayProfileDisconnectReceipt? = null
 
         init {
             if (!blocked) release.complete(Unit)
@@ -590,7 +752,10 @@ class RelayV2ProfileRepositoryTest {
             started.complete(Unit)
             release.await()
             events += "disconnect:end"
-            return RelayProfileDisconnectReceipt(profile, barrierId)
+            return (receiptFactory?.invoke(profile, barrierId)
+                ?: RelayProfileDisconnectReceipt(profile, barrierId)).also {
+                returnedReceipt = it
+            }
         }
     }
 
@@ -598,12 +763,21 @@ class RelayV2ProfileRepositoryTest {
         private val events: MutableList<String>,
     ) : RelayV2CredentialExchange {
         var redeemCalls = 0
+        private val deferredRedeems = linkedMapOf<String, DeferredRedeem>()
+
+        fun deferEnrollment(enrollmentId: String): DeferredRedeem = DeferredRedeem().also {
+            check(deferredRedeems.put(enrollmentId, it) == null)
+        }
 
         override suspend fun redeem(
             request: RelayV2EnrollmentExchangeRequest,
         ): RelayV2EnrollmentExchangeResponse {
             redeemCalls += 1
             events += "exchange"
+            deferredRedeems[request.enrollmentId]?.let { deferred ->
+                deferred.request.complete(request)
+                return deferred.response.await()
+            }
             return RelayV2EnrollmentExchangeResponse(
                 exchangeAttemptId = request.exchangeAttemptId,
                 principalId = "principal-1",
@@ -619,6 +793,11 @@ class RelayV2ProfileRepositoryTest {
 
         override suspend fun refresh(request: RelayV2RefreshRequest): RelayV2RefreshResponse =
             error("No production or fake refresh call is needed by these state-machine cases")
+    }
+
+    private class DeferredRedeem {
+        val request = CompletableDeferred<RelayV2EnrollmentExchangeRequest>()
+        val response = CompletableDeferred<RelayV2EnrollmentExchangeResponse>()
     }
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(
@@ -647,17 +826,35 @@ class RelayV2ProfileRepositoryTest {
             pendingSecretReference = pendingAttempt?.secretReference,
         )
 
-    private fun enrollmentDraft(): RelayV2EnrollmentReviewDraft =
+    private fun enrollmentDraft(
+        enrollmentId: String = "enrollment-1",
+        enrollmentCode: String = ENROLLMENT_CODE,
+    ): RelayV2EnrollmentReviewDraft =
         requireNotNull(
             RelayV2EnrollmentReviewParser.parse(
                 "tmuxworktree://enroll?v=2" +
                     "&issuerUrl=https%3A%2F%2Frelay.example.com" +
                     "&relayUrl=wss%3A%2F%2Frelay.example.com%2Fclient" +
                     "&hostId=mac-admin" +
-                    "&enrollmentId=enrollment-1" +
-                    "&enrollmentCode=$ENROLLMENT_CODE",
+                    "&enrollmentId=$enrollmentId" +
+                    "&enrollmentCode=$enrollmentCode",
             ),
         )
+
+    private fun enrollmentResponse(
+        request: RelayV2EnrollmentExchangeRequest,
+        identitySuffix: String,
+    ): RelayV2EnrollmentExchangeResponse = RelayV2EnrollmentExchangeResponse(
+        exchangeAttemptId = request.exchangeAttemptId,
+        principalId = "principal-$identitySuffix",
+        grantId = "grant-$identitySuffix",
+        hostId = "mac-admin",
+        relayUrl = "wss://relay.example.com/client",
+        accessToken = "twcap2.access-$identitySuffix",
+        accessExpiresAtMs = 2_000,
+        refreshToken = "twref2.refresh-$identitySuffix",
+        refreshExpiresAtMs = 3_000,
+    )
 
     private fun refreshResponse(
         prepared: RelayV2PreparedRefresh,

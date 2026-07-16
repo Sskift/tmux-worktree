@@ -281,10 +281,18 @@ class PreferencesStore(context: Context) {
 
     internal suspend fun activeRelayV2Profile(): RelayV2Profile? = relayV2Profile.first()
 
-    internal suspend fun activateRelayV2Profile(profile: RelayV2Profile) {
+    internal suspend fun activateRelayV2Profile(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        profile: RelayV2Profile,
+    ): Boolean {
+        var activated = false
         store.edit { preferences ->
-            RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, profile)
+            if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) == expectedActiveProfile) {
+                RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, profile)
+                activated = true
+            }
         }
+        return activated
     }
 
     internal suspend fun updateRelayV2CredentialVersion(
@@ -415,9 +423,10 @@ internal class PreferencesRelayV2ProfileStore(
     override suspend fun activeRelayV2Profile(): RelayV2Profile? =
         preferencesStore.activeRelayV2Profile()
 
-    override suspend fun activateRelayV2Profile(profile: RelayV2Profile) {
-        preferencesStore.activateRelayV2Profile(profile)
-    }
+    override suspend fun activateRelayV2Profile(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        profile: RelayV2Profile,
+    ): Boolean = preferencesStore.activateRelayV2Profile(expectedActiveProfile, profile)
 
     override suspend fun updateRelayV2CredentialVersion(
         profileId: String,

@@ -238,7 +238,12 @@ internal interface RelayV2CredentialStore {
 internal interface RelayV2ProfileStore {
     suspend fun activeProfileIdentity(): RelayActiveProfileIdentity?
     suspend fun activeRelayV2Profile(): RelayV2Profile?
-    suspend fun activateRelayV2Profile(profile: RelayV2Profile)
+
+    /** Atomically activates [profile] only while the exact previous identity is still active. */
+    suspend fun activateRelayV2Profile(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        profile: RelayV2Profile,
+    ): Boolean
 
     suspend fun updateRelayV2CredentialVersion(
         profileId: String,
@@ -263,7 +268,7 @@ internal data class RelayProfileDisconnectReceipt(
 
 /** Clears the old profile's Room cache, Outbox, drafts, terminal queue, and credential. */
 internal fun interface RelayProfileIsolationBoundary {
-    suspend fun clearAfterDisconnect(profile: RelayActiveProfileIdentity)
+    suspend fun clearAfterDisconnect(receipt: RelayProfileDisconnectReceipt)
 }
 
 internal data class RelayV2EnrollmentExchangeRequest(
