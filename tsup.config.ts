@@ -19,6 +19,7 @@ export default defineConfig({
     "src/relay/v2/token.ts",
     "src/relay/v2/issuer.ts",
     "src/relay/v2/auth.ts",
+    "src/relay/v2/continuityAnchor.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",
     "src/relay/v2/carrierPump.ts",
