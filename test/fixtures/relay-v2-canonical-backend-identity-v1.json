@@ -4,29 +4,29 @@
   "vectors": [
     {
       "name": "local bundled CLI",
-      "backendScope": {
+      "processTarget": {
         "kind": "local",
         "targetId": "bundled-local-cli"
       },
-      "rpcIncarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "incarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "expected": "twbk2.i7lUEzOSxoFJE-1-UTdcnZx_k6w3cak24brDgKg-NrU"
     },
     {
       "name": "SSH kind separates the same stable target ID",
-      "backendScope": {
+      "processTarget": {
         "kind": "ssh",
         "targetId": "bundled-local-cli"
       },
-      "rpcIncarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "incarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "expected": "twbk2.V3MrBuqmodoeYZIAOe15TX3Ue9AQsNtJrKCjU4FvjIY"
     },
     {
       "name": "configured SSH target identity",
-      "backendScope": {
+      "processTarget": {
         "kind": "ssh",
         "targetId": "configured-devbox"
       },
-      "rpcIncarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "incarnation": "twinc2.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
       "expected": "twbk2.cUTWli1fMPbza0jnsZBhkIXPA2DKlYa31NC5cUiat_I"
     }
   ]

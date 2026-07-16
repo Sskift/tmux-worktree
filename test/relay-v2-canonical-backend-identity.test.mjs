@@ -26,7 +26,7 @@ function terminalSession(vector, overrides = {}) {
     windows: 1,
     created: 1_783_700_010,
     activity: 1_783_700_020,
-    incarnation: vector.rpcIncarnation,
+    incarnation: vector.incarnation,
     lifecycleMarked: true,
     reservationCorrelation: null,
     ...overrides,
@@ -39,8 +39,8 @@ test("canonical backend identity fixture is shared by direct and discovery entry
   const keys = [];
   for (const vector of fixture.vectors) {
     const input = {
-      backendScope: vector.backendScope,
-      rpcIncarnation: vector.rpcIncarnation,
+      processTarget: vector.processTarget,
+      incarnation: vector.incarnation,
     };
     assert.equal(
       identity.issueRelayV2CanonicalBackendInstanceKey(input),
@@ -48,7 +48,7 @@ test("canonical backend identity fixture is shared by direct and discovery entry
       vector.name,
     );
     const projected = discovery.projectRelayV2CanonicalTwRpcDiscoveredSession({
-      backendScope: vector.backendScope,
+      processTarget: vector.processTarget,
       session: terminalSession(vector),
     });
     assert.equal(projected.backendIdentity, vector.expected, vector.name);
@@ -62,12 +62,12 @@ test("canonical backend identity fixture is shared by direct and discovery entry
 test("canonical backend identity and discovery inputs are closed and fail closed", () => {
   const vector = fixture.vectors[0];
   for (const malformed of [
-    { backendScope: vector.backendScope, rpcIncarnation: vector.rpcIncarnation, extra: true },
+    { processTarget: vector.processTarget, incarnation: vector.incarnation, extra: true },
     {
-      backendScope: { ...vector.backendScope, scopeId: "public-scope-must-not-participate" },
-      rpcIncarnation: vector.rpcIncarnation,
+      processTarget: { ...vector.processTarget, scopeId: "public-scope-must-not-participate" },
+      incarnation: vector.incarnation,
     },
-    { backendScope: vector.backendScope, rpcIncarnation: `twinc2.${"!".repeat(43)}` },
+    { processTarget: vector.processTarget, incarnation: `twinc2.${"!".repeat(43)}` },
   ]) {
     assert.throws(
       () => identity.issueRelayV2CanonicalBackendInstanceKey(malformed),
@@ -76,14 +76,14 @@ test("canonical backend identity and discovery inputs are closed and fail closed
   }
   assert.throws(
     () => discovery.projectRelayV2CanonicalTwRpcDiscoveredSession({
-      backendScope: vector.backendScope,
+      processTarget: vector.processTarget,
       session: terminalSession(vector, { label: null }),
     }),
     /persisted display label/,
   );
   assert.throws(
     () => discovery.projectRelayV2CanonicalTwRpcDiscoveredSession({
-      backendScope: vector.backendScope,
+      processTarget: vector.processTarget,
       session: terminalSession(vector, { repoPath: "/repo/demo" }),
     }),
     /worktree fields/,

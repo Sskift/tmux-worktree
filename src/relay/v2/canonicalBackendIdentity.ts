@@ -1,14 +1,12 @@
 import { createHash } from "node:crypto";
 
-export interface RelayV2CanonicalBackendScopeIdentity {
-  kind: "local" | "ssh";
-  /** Stable local process target or configured SSH target identity. */
-  targetId: string;
-}
-
-export interface RelayV2CanonicalBackendInstanceIdentity {
-  backendScope: RelayV2CanonicalBackendScopeIdentity;
-  rpcIncarnation: string;
+interface RelayV2CanonicalBackendInstanceIdentity {
+  processTarget: {
+    kind: "local" | "ssh";
+    /** Stable local process target or configured SSH target identity. */
+    targetId: string;
+  };
+  incarnation: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -50,21 +48,21 @@ export function issueRelayV2CanonicalBackendInstanceKey(
   value: RelayV2CanonicalBackendInstanceIdentity,
 ): string {
   if (!isRecord(value)
-    || !exactKeys(value, ["backendScope", "rpcIncarnation"])
-    || !isRecord(value.backendScope)
-    || !exactKeys(value.backendScope, ["kind", "targetId"])
-    || (value.backendScope.kind !== "local" && value.backendScope.kind !== "ssh")) {
+    || !exactKeys(value, ["processTarget", "incarnation"])
+    || !isRecord(value.processTarget)
+    || !exactKeys(value.processTarget, ["kind", "targetId"])
+    || (value.processTarget.kind !== "local" && value.processTarget.kind !== "ssh")) {
     throw new TypeError("canonical backend identity input is malformed");
   }
-  const targetId = boundedIdentity(value.backendScope.targetId, "targetId");
-  const rpcIncarnation = boundedIdentity(value.rpcIncarnation, "RPC incarnation");
+  const targetId = boundedIdentity(value.processTarget.targetId, "targetId");
+  const rpcIncarnation = boundedIdentity(value.incarnation, "RPC incarnation");
   if (!/^twinc2\.[A-Za-z0-9_-]{43}$/.test(rpcIncarnation)) {
     throw new TypeError("canonical backend RPC incarnation is invalid");
   }
   const digest = createHash("sha256").update(canonicalJson({
     domain: "tmux-worktree.relay-v2.backend-instance.v1",
     value: {
-      processTarget: { kind: value.backendScope.kind, targetId },
+      processTarget: { kind: value.processTarget.kind, targetId },
       rpcIncarnation,
     },
   }), "utf8").digest("base64url");

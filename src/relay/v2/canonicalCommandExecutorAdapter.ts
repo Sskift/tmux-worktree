@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { isAbsolute, normalize } from "node:path";
+import { basename, isAbsolute, normalize } from "node:path";
 import type {
   CanonicalAgentMessageResult,
   CanonicalTerminalLease,
@@ -20,7 +20,6 @@ import {
 import type { ManagedSessionReservationCorrelationV1 } from "../../state.js";
 import {
   issueRelayV2CanonicalBackendInstanceKey,
-  type RelayV2CanonicalBackendScopeIdentity,
 } from "./canonicalBackendIdentity.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
@@ -66,9 +65,9 @@ export interface RelayV2CanonicalResolverEvidence {
   observedAtMs: number;
 }
 
-export type RelayV2CanonicalProcessTarget = RelayV2CanonicalBackendScopeIdentity & {
-  scopeId: string;
-};
+export type RelayV2CanonicalProcessTarget =
+  | { kind: "local"; scopeId: string; targetId: string }
+  | { kind: "ssh"; scopeId: string; targetId: string };
 
 export interface RelayV2CanonicalProspectiveSession {
   kind: "worktree" | "terminal";
@@ -310,15 +309,18 @@ function resolverEvidence(value: unknown): RelayV2CanonicalResolverEvidence {
 }
 
 function notFoundCodeAllowed(
-  operation: RelayV2CommandOperation,
+  request: RelayV2CanonicalCommandRequest,
   code: unknown,
 ): boolean {
   if (code === "SCOPE_NOT_FOUND") return true;
-  if (code === "PROJECT_NOT_FOUND") return operation === "create_worktree";
-  if (code === "SESSION_NOT_FOUND") {
-    return operation === "send_agent_message" || operation === "kill_session";
+  if (code === "PROJECT_NOT_FOUND") {
+    return request.operation === "create_worktree"
+      && !Object.hasOwn(request.arguments, "path");
   }
-  return code === "PANE_NOT_FOUND" && operation === "send_agent_message";
+  if (code === "SESSION_NOT_FOUND") {
+    return request.operation === "send_agent_message" || request.operation === "kill_session";
+  }
+  return code === "PANE_NOT_FOUND" && request.operation === "send_agent_message";
 }
 
 function processTarget(value: unknown, scopeId: string): RelayV2CanonicalProcessTarget {
@@ -437,7 +439,10 @@ function acceptedCreateArguments(
   return accepted;
 }
 
-function terminalExecution(value: unknown): {
+function terminalExecution(
+  value: unknown,
+  accepted: RpcV2CreateTerminalRequest["arguments"],
+): {
   canonicalCwd: string;
   publicDisplayName: string;
 } {
@@ -449,9 +454,14 @@ function terminalExecution(value: unknown): {
   if (!isAbsolute(canonicalCwd) || normalize(canonicalCwd) !== canonicalCwd) {
     throw new TypeError("canonical terminal cwd is not a normalized absolute path");
   }
+  const publicDisplayName = boundedString(value.publicDisplayName);
+  const derivedDisplayName = (accepted.label ?? basename(canonicalCwd)) || "Terminal";
+  if (publicDisplayName !== derivedDisplayName) {
+    throw new TypeError("canonical terminal display is not derived from its frozen cwd");
+  }
   return {
     canonicalCwd,
-    publicDisplayName: boundedString(value.publicDisplayName),
+    publicDisplayName,
   };
 }
 
@@ -555,7 +565,7 @@ function resolvedTarget(
       };
     }
     const terminalArgs = args as RpcV2CreateTerminalRequest["arguments"];
-    const execution = terminalExecution(value.execution);
+    const execution = terminalExecution(value.execution, terminalArgs);
     if (displayName !== execution.publicDisplayName
       || (terminalArgs.label !== undefined && displayName !== terminalArgs.label)
       || session.displayName !== displayName
@@ -813,11 +823,11 @@ function sessionEvidence(
   return {
     schemaVersion: RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
     backendInstanceKey: issueRelayV2CanonicalBackendInstanceKey({
-      backendScope: {
+      processTarget: {
         kind: target.processTarget.kind,
         targetId: target.processTarget.targetId,
       },
-      rpcIncarnation: session.incarnation,
+      incarnation: session.incarnation,
     }),
     evidence,
   };
@@ -872,7 +882,7 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
   }
 
   async resolve(request: RelayV2CanonicalCommandRequest): Promise<RelayV2CommandAdmission> {
-    let raw: RelayV2CanonicalTargetResolution;
+    let raw: unknown;
     try {
       fingerprint(request.requestFingerprint);
       boundedString(request.commandId);
@@ -884,6 +894,12 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       };
     }
 
+    if (!isRecord(raw)) {
+      return {
+        kind: "transient_admission_failure",
+        error: transientError("INTERNAL", "Canonical target evidence is invalid"),
+      };
+    }
     let evidence: RelayV2CanonicalResolverEvidence;
     try {
       evidence = resolverEvidence(raw.evidence);
@@ -894,25 +910,26 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       };
     }
     if (raw.kind === "not_found") {
-      const validCoverage = raw.coverage === "complete"
+      const coverage = (raw.coverage === "complete"
         || raw.coverage === "partial"
-        || raw.coverage === "unreachable";
-      if (!isRecord(raw)
-        || !exactKeys(raw, ["kind", "coverage", "evidence", "code"])
-        || !validCoverage
-        || !notFoundCodeAllowed(request.operation, raw.code)) {
+        || raw.coverage === "unreachable")
+        ? raw.coverage as "complete" | "partial" | "unreachable"
+        : null;
+      if (!exactKeys(raw, ["kind", "coverage", "evidence", "code"])
+        || coverage === null
+        || !notFoundCodeAllowed(request, raw.code)) {
         return {
           kind: "transient_admission_failure",
           authorityEvidence: authorityEvidence(
             request,
-            validCoverage ? raw.coverage : "unreachable",
+            coverage ?? "unreachable",
             evidence,
           ),
           error: transientError("INTERNAL", "Canonical target evidence is invalid"),
         };
       }
-      const observed = authorityEvidence(request, raw.coverage, evidence);
-      if (raw.coverage !== "complete") {
+      const observed = authorityEvidence(request, coverage, evidence);
+      if (coverage !== "complete") {
         return {
           kind: "transient_admission_failure",
           authorityEvidence: observed,
@@ -926,7 +943,7 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         kind: "immutable_business_failure",
         authorityEvidence: observed,
         error: {
-          code: raw.code,
+          code: raw.code as string,
           message: "Canonical target does not exist in the complete authority view",
           retryable: false,
           commandDisposition: "completed",
@@ -935,27 +952,71 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       };
     }
     if (raw.kind === "unavailable") {
-      let retryAfterMs: number | null | undefined;
+      const validCoverage = raw.coverage === "partial" || raw.coverage === "unreachable";
+      const validCode = raw.code === "SCOPE_UNREACHABLE"
+        || raw.code === "BUSY"
+        || raw.code === "CAPABILITY_UNAVAILABLE";
+      const hasRetryAfterMs = Object.hasOwn(raw, "retryAfterMs");
+      let retryAfterMs: number | null | undefined = undefined;
       try {
-        retryAfterMs = raw.retryAfterMs === undefined || raw.retryAfterMs === null
-          ? raw.retryAfterMs
-          : safeInteger(raw.retryAfterMs);
+        if (!exactKeys(
+          raw,
+          hasRetryAfterMs
+            ? ["kind", "coverage", "evidence", "code", "retryAfterMs"]
+            : ["kind", "coverage", "evidence", "code"],
+        ) || !validCoverage || !validCode) {
+          throw new TypeError("canonical unavailable evidence is malformed");
+        }
+        retryAfterMs = hasRetryAfterMs
+          ? raw.retryAfterMs === null
+            ? null
+            : safeInteger(raw.retryAfterMs)
+          : undefined;
       } catch {
-        retryAfterMs = undefined;
+        return {
+          kind: "transient_admission_failure",
+          authorityEvidence: authorityEvidence(
+            request,
+            validCoverage ? raw.coverage as "partial" | "unreachable" : "unreachable",
+            evidence,
+          ),
+          error: transientError("INTERNAL", "Canonical target evidence is invalid"),
+        };
       }
       return {
         kind: "transient_admission_failure",
-        authorityEvidence: authorityEvidence(request, raw.coverage, evidence),
+        authorityEvidence: authorityEvidence(
+          request,
+          raw.coverage as "partial" | "unreachable",
+          evidence,
+        ),
         error: transientError(
-          raw.code,
+          raw.code as string,
           "Canonical target authority is incomplete or unreachable",
           retryAfterMs,
         ),
       };
     }
 
+    if (raw.kind !== "resolved") {
+      return {
+        kind: "transient_admission_failure",
+        error: transientError("INTERNAL", "Canonical target evidence is invalid"),
+      };
+    }
+    if (!exactKeys(raw, ["kind", "coverage", "evidence", "target"])
+      || raw.coverage !== "complete") {
+      const coverage = raw.coverage === "partial" || raw.coverage === "unreachable"
+        ? raw.coverage
+        : "unreachable";
+      return {
+        kind: "transient_admission_failure",
+        authorityEvidence: authorityEvidence(request, coverage, evidence),
+        error: transientError("INTERNAL", "Canonical target evidence is invalid"),
+      };
+    }
+
     try {
-      if (raw.coverage !== "complete") throw new TypeError("resolved target lacks complete coverage");
       const target = resolvedTarget(raw.target, request);
       const state = adapterState(request, evidence, target);
       if (target.operation === "create_worktree" || target.operation === "create_terminal") {
@@ -1074,11 +1135,11 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
           backendOutcome: {
             schemaVersion: RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
             backendInstanceKey: issueRelayV2CanonicalBackendInstanceKey({
-              backendScope: {
+              processTarget: {
                 kind: target.processTarget.kind,
                 targetId: target.processTarget.targetId,
               },
-              rpcIncarnation: response.incarnation,
+              incarnation: response.incarnation,
             }),
             evidence: { terminated: true },
           },

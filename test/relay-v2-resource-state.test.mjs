@@ -217,7 +217,7 @@ test("H2 materializes the canonical discovery key from the shared backend identi
   try {
     const vector = backendIdentityFixture.vectors[0];
     const discovered = canonicalDiscovery.projectRelayV2CanonicalTwRpcDiscoveredSession({
-      backendScope: vector.backendScope,
+      processTarget: vector.processTarget,
       session: {
         name: "raw-terminal-backend-7",
         kind: "terminal",
@@ -234,7 +234,7 @@ test("H2 materializes the canonical discovery key from the shared backend identi
         windows: 1,
         created: 1_783_700_010,
         activity: 1_783_700_020,
-        incarnation: vector.rpcIncarnation,
+        incarnation: vector.incarnation,
         lifecycleMarked: true,
         reservationCorrelation: null,
       },
@@ -242,9 +242,9 @@ test("H2 materializes the canonical discovery key from the shared backend identi
     h.discovery.push({
       coverage: "complete",
       scopes: [scope({
-        backendIdentity: vector.backendScope.targetId,
+        backendIdentity: vector.processTarget.targetId,
         displayName: "Local",
-        kind: vector.backendScope.kind,
+        kind: vector.processTarget.kind,
         sessions: [discovered],
       })],
     });

@@ -365,8 +365,8 @@ test("canonical executor translates all four operations to one exact authority c
   assert.equal(
     outcomes.create_terminal.backendOutcome.backendInstanceKey,
     backendIdentityFixture.vectors.find((vector) => (
-      vector.backendScope.kind === "ssh"
-      && vector.backendScope.targetId === "configured-devbox"
+      vector.processTarget.kind === "ssh"
+      && vector.processTarget.targetId === "configured-devbox"
     )).expected,
   );
   assert.notEqual(
@@ -449,7 +449,7 @@ test("resolver coverage alone controls immutable not-found admission", async () 
 
 test("complete not-found evidence is closed over each operation", async (t) => {
   const allowed = {
-    create_worktree: new Set(["SCOPE_NOT_FOUND", "PROJECT_NOT_FOUND"]),
+    create_worktree: new Set(["SCOPE_NOT_FOUND"]),
     create_terminal: new Set(["SCOPE_NOT_FOUND"]),
     send_agent_message: new Set(["SCOPE_NOT_FOUND", "SESSION_NOT_FOUND", "PANE_NOT_FOUND"]),
     kill_session: new Set(["SCOPE_NOT_FOUND", "SESSION_NOT_FOUND"]),
@@ -476,6 +476,75 @@ test("complete not-found evidence is closed over each operation", async (t) => {
         assert.equal(ports.calls.terminal.length, 0);
       });
     }
+  }
+});
+
+test("PROJECT_NOT_FOUND is final only for catalog lookup without an explicit path", async () => {
+  const ports = fakePorts({
+    resolve: () => ({
+      kind: "not_found",
+      ...evidence("complete"),
+      code: "PROJECT_NOT_FOUND",
+    }),
+  });
+  const executor = executorFor(ports);
+  const pathPresent = await executor.resolve(canonicalRequest("create_worktree"));
+  assert.equal(pathPresent.kind, "transient_admission_failure");
+  assert.equal(pathPresent.error.code, "INTERNAL");
+  assert.equal(pathPresent.error.commandDisposition, "not_accepted");
+
+  const catalogOnly = await executor.resolve(canonicalRequest("create_worktree", {
+    arguments: {
+      project: "demo",
+      name: "fix",
+      branch: "main",
+      aiCommand: "codex",
+    },
+  }));
+  assert.equal(catalogOnly.kind, "immutable_business_failure");
+  assert.equal(catalogOnly.error.code, "PROJECT_NOT_FOUND");
+  assert.equal(ports.calls.process.length, 0);
+  assert.equal(ports.calls.terminal.length, 0);
+});
+
+test("resolver runtime result variants are exact closed unions", async (t) => {
+  const request = canonicalRequest("create_terminal");
+  const resolved = resolvedFor(request);
+  const unavailable = {
+    kind: "unavailable",
+    ...evidence("partial"),
+    code: "BUSY",
+  };
+  const malformed = [
+    ["unknown kind", { ...resolved, kind: "future_resolved" }],
+    ["resolved extra field", { ...resolved, futureField: true }],
+    ["resolved illegal coverage", { ...resolved, coverage: "partial" }],
+    ["unavailable extra field", { ...unavailable, futureField: true }],
+    ["unavailable complete coverage", { ...unavailable, coverage: "complete" }],
+    ["unavailable unknown code", { ...unavailable, code: "FUTURE_BUSY" }],
+    ["unavailable negative retry", { ...unavailable, retryAfterMs: -1 }],
+    ["unavailable fractional retry", { ...unavailable, retryAfterMs: 1.5 }],
+    ["not-found extra field", {
+      kind: "not_found",
+      ...evidence("complete"),
+      code: "SCOPE_NOT_FOUND",
+      futureField: true,
+    }],
+    ["resolver evidence extra field", {
+      ...resolved,
+      evidence: { ...resolved.evidence, futureField: true },
+    }],
+  ];
+  for (const [name, result] of malformed) {
+    await t.test(name, async () => {
+      const ports = fakePorts({ resolve: () => structuredClone(result) });
+      const admission = await executorFor(ports).resolve(request);
+      assert.equal(admission.kind, "transient_admission_failure");
+      assert.equal(admission.error.code, "INTERNAL");
+      assert.equal(admission.error.commandDisposition, "not_accepted");
+      assert.equal(ports.calls.process.length, 0);
+      assert.equal(ports.calls.terminal.length, 0);
+    });
   }
 });
 
@@ -527,6 +596,80 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
     assert.equal((await executor.resolve(canonicalRequest("create_worktree"))).kind, "executable");
     assert.equal((await executor.resolve(canonicalRequest("create_terminal"))).kind, "executable");
     assert.equal(ports.calls.process.length, 0);
+  });
+
+  await t.test("path-only effective project is the canonical repo basename", async () => {
+    const request = canonicalRequest("create_worktree", {
+      arguments: { path: "/catalog/link", aiCommand: "codex" },
+    });
+    const invalidPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        answer.target.execution.effectiveProject = "resolver-choice";
+        answer.target.execution.publicDisplayName = "resolver-choice-1";
+        answer.target.execution.worktreePath = `/worktrees/resolver-choice/${WORKTREE_BRANCH}`;
+        answer.target.publicDisplayName = "resolver-choice-1";
+        answer.target.prospectiveSession.displayName = "resolver-choice-1";
+        answer.target.prospectiveSession.project = "resolver-choice";
+        answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
+        return answer;
+      },
+    });
+    const invalid = await executorFor(invalidPorts).resolve(request);
+    assert.equal(invalid.kind, "transient_admission_failure");
+    assert.equal(invalid.error.commandDisposition, "not_accepted");
+    assert.equal(invalidPorts.calls.process.length, 0);
+
+    const validPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        const project = "canonical-project";
+        answer.target.execution.canonicalRepoPath = `/real/${project}`;
+        answer.target.execution.effectiveProject = project;
+        answer.target.execution.publicDisplayName = `${project}-1`;
+        answer.target.execution.worktreePath = `/worktrees/${project}/${WORKTREE_BRANCH}`;
+        answer.target.publicDisplayName = `${project}-1`;
+        answer.target.prospectiveSession.displayName = `${project}-1`;
+        answer.target.prospectiveSession.project = project;
+        answer.target.prospectiveSession.cwd = answer.target.execution.worktreePath;
+        return answer;
+      },
+    });
+    assert.equal((await executorFor(validPorts).resolve(request)).kind, "executable");
+  });
+
+  await t.test("omitted terminal label is derived from canonical cwd", async () => {
+    const request = canonicalRequest("create_terminal", {
+      arguments: { cwd: "/input/link" },
+    });
+    const invalidPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        answer.target.execution.publicDisplayName = "resolver-choice";
+        answer.target.publicDisplayName = "resolver-choice";
+        answer.target.prospectiveSession.displayName = "resolver-choice";
+        answer.target.prospectiveSession.label = "resolver-choice";
+        return answer;
+      },
+    });
+    const invalid = await executorFor(invalidPorts).resolve(request);
+    assert.equal(invalid.kind, "transient_admission_failure");
+    assert.equal(invalid.error.commandDisposition, "not_accepted");
+    assert.equal(invalidPorts.calls.process.length, 0);
+
+    const rootPorts = fakePorts({
+      resolve: (accepted) => {
+        const answer = resolvedFor(accepted);
+        answer.target.execution.canonicalCwd = "/";
+        answer.target.execution.publicDisplayName = "Terminal";
+        answer.target.publicDisplayName = "Terminal";
+        answer.target.prospectiveSession.displayName = "Terminal";
+        answer.target.prospectiveSession.label = "Terminal";
+        answer.target.prospectiveSession.cwd = "/";
+        return answer;
+      },
+    });
+    assert.equal((await executorFor(rootPorts).resolve(request)).kind, "executable");
   });
 });
 

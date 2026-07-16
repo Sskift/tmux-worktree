@@ -1,7 +1,6 @@
 import type { RpcV2Session } from "../../rpcV2.js";
 import {
   issueRelayV2CanonicalBackendInstanceKey,
-  type RelayV2CanonicalBackendScopeIdentity,
 } from "./canonicalBackendIdentity.js";
 import type {
   RelayV2DiscoveredSession,
@@ -9,7 +8,10 @@ import type {
 } from "./resourceState.js";
 
 export interface RelayV2CanonicalTwRpcDiscoveryInput {
-  backendScope: RelayV2CanonicalBackendScopeIdentity;
+  processTarget: {
+    kind: "local" | "ssh";
+    targetId: string;
+  };
   session: RpcV2Session;
 }
 
@@ -72,8 +74,8 @@ export function projectRelayV2CanonicalTwRpcDiscoveredSession(
     : clone(session.reservationCorrelation) as RelayV2DiscoveredReservationCorrelation;
   return {
     backendIdentity: issueRelayV2CanonicalBackendInstanceKey({
-      backendScope: input.backendScope,
-      rpcIncarnation: session.incarnation,
+      processTarget: input.processTarget,
+      incarnation: session.incarnation,
     }),
     kind: session.kind,
     displayName,
