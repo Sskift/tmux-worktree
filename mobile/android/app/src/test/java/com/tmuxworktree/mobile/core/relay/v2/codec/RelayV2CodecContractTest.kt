@@ -154,6 +154,22 @@ class RelayV2CodecContractTest {
     }
 
     @Test
+    fun androidSnapshotReleaseAckRequiresExactlyOneAuthorityProof() {
+        listOf(true to true, false to false).forEach { (released, alreadyReleased) ->
+            val frame = fixture("state-snapshot-released")
+            frame.payload()["released"] = released
+            frame.payload()["alreadyReleased"] = alreadyReleased
+
+            val error = assertThrows(RelayV2CodecException::class.java) {
+                decodePublic(frame)
+            }
+
+            assertEquals("INVALID_ENVELOPE", error.code)
+            assertEquals("schema-mismatch", error.failureClass)
+        }
+    }
+
+    @Test
     fun androidDialectResolutionMatchesSharedNoFallbackMatrix() {
         fixtures.dialect.forEach { fixture ->
             val clientDialect = RelayV2ClientDialect.fromWireName(

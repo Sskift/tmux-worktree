@@ -933,8 +933,9 @@ private fun validateStateSnapshotReleasedFrame(frame: RelayV2JsonObject) {
     )
     jsonId(required(payload, "snapshotRequestId"))
     jsonId(required(payload, "snapshotId"))
-    jsonBoolean(required(payload, "released"))
-    jsonBoolean(required(payload, "alreadyReleased"))
+    val released = jsonBoolean(required(payload, "released"))
+    val alreadyReleased = jsonBoolean(required(payload, "alreadyReleased"))
+    if (released == alreadyReleased) schemaFailure("schema-mismatch")
     jsonInteger(required(payload, "releasedAtMs"))
 }
 

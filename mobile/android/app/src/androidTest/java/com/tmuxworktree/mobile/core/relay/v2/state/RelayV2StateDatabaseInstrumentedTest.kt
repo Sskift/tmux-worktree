@@ -60,10 +60,13 @@ class RelayV2StateDatabaseInstrumentedTest {
             RelayV2StateSyncResult.ResyncRequired(
                 namespace = base,
                 reason = RelayV2ResyncReason.FRESH,
-                release = RelayV2SnapshotReleaseDirective(
+                release = RelayV2SnapshotReleaseObligation(
                     namespace = base,
                     snapshotRequestId = "request-base",
                     snapshotId = SNAPSHOT_ID,
+                    durableCursorEventSeq = null,
+                    reason = RelayV2SnapshotReleaseReason.FRESH,
+                    phase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
                 ),
             ),
             result,

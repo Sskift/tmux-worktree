@@ -23,31 +23,48 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheck
  */
 internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
-) {
+) : RelayV2StateSyncAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
     )
 
-    suspend fun applyHelloUnderApplyLease(hello: RelayV2StateHello): RelayV2StateSyncResult =
+    override suspend fun applyHelloUnderApplyLease(
+        hello: RelayV2StateHello,
+    ): RelayV2StateSyncResult =
         core.applyHelloUnderApplyLease(hello)
 
-    suspend fun stageSnapshotChunkUnderApplyLease(
+    override suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult = core.stageSnapshotChunkUnderApplyLease(chunk)
 
-    suspend fun applyStateEventUnderApplyLease(
+    override suspend fun applyStateEventUnderApplyLease(
         event: RelayV2StateEvent,
     ): RelayV2StateSyncResult = core.applyStateEventUnderApplyLease(event)
 
-    suspend fun commitSnapshotUnderApplyLease(
+    override suspend fun commitSnapshotUnderApplyLease(
         namespace: RelayV2StateNamespace,
         snapshotId: String,
     ): RelayV2StateSyncResult = core.commitSnapshotUnderApplyLease(namespace, snapshotId)
 
     suspend fun discardSnapshotUnderApplyLease(
         namespace: RelayV2StateNamespace,
-    ): RelayV2SnapshotReleaseDirective? = core.discardSnapshotUnderApplyLease(namespace)
+    ): RelayV2SnapshotReleaseObligation? = core.discardSnapshotUnderApplyLease(namespace)
+
+    override suspend fun completeSnapshotReleaseUnderApplyLease(
+        expected: RelayV2SnapshotReleaseObligation,
+    ): RelayV2SnapshotReleaseObligation? =
+        core.completeSnapshotReleaseUnderApplyLease(expected)
+
+    override suspend fun expireSnapshotContinuationUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+        snapshotRequestId: String,
+        snapshotId: String,
+    ): RelayV2StateSyncResult = core.expireSnapshotContinuationUnderApplyLease(
+        namespace,
+        snapshotRequestId,
+        snapshotId,
+    )
 
     suspend fun loadOutbox(
         namespace: RelayV2OutboxAuthorityNamespace,
@@ -658,6 +675,7 @@ private fun RelayV2AuthorityEntity.toStored() = RelayV2StoredAuthority(
     phase = RelayV2StoredSyncPhase.valueOf(phase),
     cacheRecordCount = cacheRecordCount,
     cacheCanonicalBytes = cacheCanonicalBytes,
+    pendingRelease = pendingRelease(),
 )
 
 private fun RelayV2StoredAuthority.toEntity() = RelayV2AuthorityEntity(
@@ -672,7 +690,36 @@ private fun RelayV2StoredAuthority.toEntity() = RelayV2AuthorityEntity(
     phase = phase.name,
     cacheRecordCount = cacheRecordCount,
     cacheCanonicalBytes = cacheCanonicalBytes,
+    pendingReleaseSnapshotRequestId = pendingRelease?.snapshotRequestId,
+    pendingReleaseSnapshotId = pendingRelease?.snapshotId,
+    pendingReleaseCursorEventSeq = pendingRelease?.durableCursorEventSeq,
+    pendingReleaseReason = pendingRelease?.reason?.name,
+    pendingReleasePhase = pendingRelease?.phase?.name,
 )
+
+private fun RelayV2AuthorityEntity.pendingRelease(): RelayV2SnapshotReleaseObligation? {
+    val required = listOf(
+        pendingReleaseSnapshotRequestId,
+        pendingReleaseSnapshotId,
+        pendingReleaseReason,
+        pendingReleasePhase,
+    )
+    if (required.all { it == null }) {
+        check(pendingReleaseCursorEventSeq == null) {
+            "Relay v2 pending release cursor exists without an obligation"
+        }
+        return null
+    }
+    check(required.all { it != null }) { "Relay v2 pending release obligation is incomplete" }
+    return RelayV2SnapshotReleaseObligation(
+        namespace = namespace(),
+        snapshotRequestId = requireNotNull(pendingReleaseSnapshotRequestId),
+        snapshotId = requireNotNull(pendingReleaseSnapshotId),
+        durableCursorEventSeq = pendingReleaseCursorEventSeq,
+        reason = RelayV2SnapshotReleaseReason.valueOf(requireNotNull(pendingReleaseReason)),
+        phase = RelayV2PostReleasePhase.valueOf(requireNotNull(pendingReleasePhase)),
+    )
+}
 
 private fun RelayV2ScopeEntity.toStored() = RelayV2StoredScope(
     namespace = namespace(),

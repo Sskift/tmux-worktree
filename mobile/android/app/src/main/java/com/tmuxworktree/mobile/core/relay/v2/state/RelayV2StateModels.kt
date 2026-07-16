@@ -317,6 +317,80 @@ internal data class RelayV2SnapshotReleaseDirective(
     val snapshotId: String,
 )
 
+internal data class RelayV2StateSnapshotContinuation(
+    val snapshotRequestId: String,
+    val snapshotId: String,
+    val cursor: String,
+    val nextChunkIndex: Long,
+)
+
+internal enum class RelayV2SnapshotReleaseReason {
+    COMPLETED,
+    SNAPSHOT_RESTART_REQUIRED,
+    SNAPSHOT_IDENTITY_CONFLICT,
+    SNAPSHOT_ORDER_CONFLICT,
+    SNAPSHOT_LIMIT_EXCEEDED,
+    SNAPSHOT_INCOMPLETE,
+    SNAPSHOT_COUNT_MISMATCH,
+    SNAPSHOT_DIGEST_MISMATCH,
+    EVENT_GAP,
+    EVENT_REVISION_CONFLICT,
+    EVENT_BUFFER_OVERFLOW,
+    FRESH,
+}
+
+internal enum class RelayV2PostReleasePhase {
+    RESTART_SNAPSHOT,
+    QUERY_PENDING_COMMANDS,
+}
+
+/** Durable authority journal that must be cleared only by an exact host release proof. */
+internal data class RelayV2SnapshotReleaseObligation(
+    val namespace: RelayV2StateNamespace,
+    val snapshotRequestId: String,
+    val snapshotId: String,
+    val durableCursorEventSeq: String?,
+    val reason: RelayV2SnapshotReleaseReason,
+    val phase: RelayV2PostReleasePhase,
+) {
+    init {
+        require(snapshotRequestId.isNotBlank())
+        require(snapshotId.isNotBlank())
+        durableCursorEventSeq?.let(::requireRelayV2Counter)
+        require(
+            phase != RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS ||
+                durableCursorEventSeq != null
+        )
+    }
+
+    val wireReason: String
+        get() = if (reason == RelayV2SnapshotReleaseReason.COMPLETED) {
+            "completed"
+        } else {
+            "abandoned"
+        }
+
+    /** Opaque full-identity CAS token; it is recomputed from the durable row after reopen. */
+    val opaqueToken: String
+        get() {
+            val identity = listOf(
+                namespace.profileId,
+                namespace.principalId,
+                namespace.clientInstanceId,
+                namespace.hostId,
+                namespace.hostEpoch,
+                snapshotRequestId,
+                snapshotId,
+                durableCursorEventSeq ?: "",
+                reason.name,
+                phase.name,
+            ).joinToString("\u0000")
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(
+                MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8)),
+            )
+        }
+}
+
 internal enum class RelayV2ResyncReason {
     FRESH,
     CURSOR_BEHIND,
@@ -348,7 +422,14 @@ internal sealed interface RelayV2StateSyncResult {
     data class ResyncRequired(
         val namespace: RelayV2StateNamespace,
         val reason: RelayV2ResyncReason,
-        val release: RelayV2SnapshotReleaseDirective? = null,
+        val release: RelayV2SnapshotReleaseObligation? = null,
+        val durableCursorEventSeq: String? = release?.durableCursorEventSeq,
+        val continuation: RelayV2StateSnapshotContinuation? = null,
+    ) : RelayV2StateSyncResult
+
+    data class ReleasePending(
+        val namespace: RelayV2StateNamespace,
+        val release: RelayV2SnapshotReleaseObligation,
     ) : RelayV2StateSyncResult
 
     data class RotationRequired(
@@ -367,6 +448,14 @@ internal sealed interface RelayV2StateSyncResult {
     data class SnapshotCommitted(
         val namespace: RelayV2StateNamespace,
         val cursorEventSeq: String,
+        val release: RelayV2SnapshotReleaseObligation,
+    ) : RelayV2StateSyncResult
+
+    data class SnapshotExpired(
+        val namespace: RelayV2StateNamespace,
+        val snapshotRequestId: String,
+        val snapshotId: String,
+        val durableCursorEventSeq: String?,
     ) : RelayV2StateSyncResult
 
     data object DuplicateEvent : RelayV2StateSyncResult

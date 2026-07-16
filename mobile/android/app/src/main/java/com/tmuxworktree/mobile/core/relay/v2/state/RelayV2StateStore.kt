@@ -13,6 +13,7 @@ internal data class RelayV2StoredAuthority(
     val phase: RelayV2StoredSyncPhase,
     val cacheRecordCount: Long,
     val cacheCanonicalBytes: Long,
+    val pendingRelease: RelayV2SnapshotReleaseObligation? = null,
 )
 
 internal data class RelayV2StoredScope(
@@ -93,6 +94,27 @@ internal data class RelayV2StoredSessionStats(
  */
 internal interface RelayV2StateStore {
     suspend fun <T> transaction(block: RelayV2StateTransaction.() -> T): T
+}
+
+/** Durable state-sync authority consumed by the unwired Relay v2 recovery adapter. */
+internal interface RelayV2StateSyncAuthority {
+    suspend fun applyHelloUnderApplyLease(hello: RelayV2StateHello): RelayV2StateSyncResult
+    suspend fun stageSnapshotChunkUnderApplyLease(
+        chunk: RelayV2SnapshotChunk,
+    ): RelayV2StateSyncResult
+    suspend fun applyStateEventUnderApplyLease(event: RelayV2StateEvent): RelayV2StateSyncResult
+    suspend fun commitSnapshotUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+        snapshotId: String,
+    ): RelayV2StateSyncResult
+    suspend fun completeSnapshotReleaseUnderApplyLease(
+        expected: RelayV2SnapshotReleaseObligation,
+    ): RelayV2SnapshotReleaseObligation?
+    suspend fun expireSnapshotContinuationUnderApplyLease(
+        namespace: RelayV2StateNamespace,
+        snapshotRequestId: String,
+        snapshotId: String,
+    ): RelayV2StateSyncResult
 }
 
 internal interface RelayV2StateTransaction {

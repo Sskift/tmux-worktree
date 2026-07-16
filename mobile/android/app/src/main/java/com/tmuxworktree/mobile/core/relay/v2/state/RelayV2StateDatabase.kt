@@ -19,7 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2OutboxEntryEntity::class,
         RelayV2TerminalCheckpointEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
@@ -33,7 +33,7 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
             context.applicationContext,
             RelayV2StateDatabase::class.java,
             DATABASE_NAME,
-        ).addMigrations(MIGRATION_1_2).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
 
         /**
          * Additive storage-owner migration. Existing v2 state-sync rows remain byte-for-byte
@@ -117,6 +117,31 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                         )
                     )
                     """.trimIndent(),
+                )
+            }
+        }
+
+        val MIGRATION_2_3: Migration = object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE `relay_v2_authority` " +
+                        "ADD COLUMN `pendingReleaseSnapshotRequestId` TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE `relay_v2_authority` " +
+                        "ADD COLUMN `pendingReleaseSnapshotId` TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE `relay_v2_authority` " +
+                        "ADD COLUMN `pendingReleaseCursorEventSeq` TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE `relay_v2_authority` " +
+                        "ADD COLUMN `pendingReleaseReason` TEXT",
+                )
+                db.execSQL(
+                    "ALTER TABLE `relay_v2_authority` " +
+                        "ADD COLUMN `pendingReleasePhase` TEXT",
                 )
             }
         }

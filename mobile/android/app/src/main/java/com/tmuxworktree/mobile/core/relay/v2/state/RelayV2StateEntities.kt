@@ -19,6 +19,11 @@ internal data class RelayV2AuthorityEntity(
     val phase: String,
     val cacheRecordCount: Long,
     val cacheCanonicalBytes: Long,
+    val pendingReleaseSnapshotRequestId: String? = null,
+    val pendingReleaseSnapshotId: String? = null,
+    val pendingReleaseCursorEventSeq: String? = null,
+    val pendingReleaseReason: String? = null,
+    val pendingReleasePhase: String? = null,
 )
 
 @Entity(

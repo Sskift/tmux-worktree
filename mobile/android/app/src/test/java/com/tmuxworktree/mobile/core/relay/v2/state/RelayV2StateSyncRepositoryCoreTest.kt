@@ -111,10 +111,179 @@ class RelayV2StateSyncRepositoryCoreTest {
         assertNull(store.snapshot(namespace))
         assertEquals("at-3", store.session(namespace, "scope-a", "session-a")?.item?.displayName)
 
+        assertEquals(
+            reconnected.release,
+            repository.completeSnapshotReleaseUnderApplyLease(requireNotNull(reconnected.release)),
+        )
+
         commitCut(repository, namespace, "5", session("session-a", "at-5"), snapshotSuffix = "5")
         assertEquals("5", store.authority(namespace)?.cursorEventSeq)
         assertEquals("at-5", store.session(namespace, "scope-a", "session-a")?.item?.displayName)
     }
+
+    @Test
+    fun `durable release journal survives reopen and blocks a fresh cut until exact proof`() =
+        runBlocking {
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val namespace = namespace()
+            repository.applyHelloUnderApplyLease(
+                hello(namespace, "2", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            commitCut(repository, namespace, "2", session("session-a", "stable"))
+            repository.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "3",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            )
+            stageCut(repository, namespace, "3", session("session-a", "staged"))
+
+            repeat(16) { offset ->
+                repository.applyStateEventUnderApplyLease(
+                    event(
+                        namespace,
+                        seq = (4 + offset).toString(),
+                        revision = (2 + offset).toString(),
+                        RelayV2StateChange.SessionUpsert(session("session-a", "buffer-$offset")),
+                        rawUtf8Bytes = RelayV2StateLimits.MAX_PUBLIC_FRAME_BYTES,
+                    ),
+                )
+            }
+            val overflow = repository.applyStateEventUnderApplyLease(
+                event(
+                    namespace,
+                    seq = "20",
+                    revision = "18",
+                    RelayV2StateChange.SessionUpsert(session("session-a", "overflow")),
+                    rawUtf8Bytes = RelayV2StateLimits.MAX_PUBLIC_FRAME_BYTES,
+                ),
+            ) as RelayV2StateSyncResult.ResyncRequired
+            val pending = requireNotNull(overflow.release)
+            assertEquals(RelayV2ResyncReason.EVENT_BUFFER_OVERFLOW, overflow.reason)
+            assertEquals("snapshot-3", pending.snapshotId)
+            assertNull(store.snapshot(namespace))
+            assertTrue(store.events(namespace).isEmpty())
+
+            // Simulate socket/process loss by constructing a new repository over the same store.
+            val reopened = RelayV2StateSyncRepositoryCore(store)
+            val recovered = reopened.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "3",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            ) as RelayV2StateSyncResult.ReleasePending
+            assertEquals(pending, recovered.release)
+
+            val blocked = reopened.stageSnapshotChunkUnderApplyLease(
+                snapshotChunk(
+                    namespace,
+                    through = "3",
+                    snapshotSuffix = "fresh-3",
+                    session = session("session-a", "fresh"),
+                ),
+            )
+            assertEquals(pending, (blocked as RelayV2StateSyncResult.ReleasePending).release)
+            assertNull(
+                reopened.completeSnapshotReleaseUnderApplyLease(
+                    pending.copy(snapshotId = "different-cut-uuid"),
+                ),
+            )
+            assertEquals(
+                pending,
+                (reopened.applyHelloUnderApplyLease(
+                    hello(
+                        namespace,
+                        "3",
+                        RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                        RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                    ),
+                ) as RelayV2StateSyncResult.ReleasePending).release,
+            )
+
+            assertEquals(pending, reopened.completeSnapshotReleaseUnderApplyLease(pending))
+            assertResync(
+                reopened.applyHelloUnderApplyLease(
+                    hello(
+                        namespace,
+                        "3",
+                        RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                        RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                    ),
+                ),
+                RelayV2ResyncReason.CURSOR_BEHIND,
+            )
+            val fresh = reopened.stageSnapshotChunkUnderApplyLease(
+                snapshotChunk(
+                    namespace,
+                    through = "3",
+                    snapshotSuffix = "fresh-3",
+                    session = session("session-a", "fresh"),
+                ),
+            )
+            assertTrue(fresh is RelayV2StateSyncResult.SnapshotStaged)
+            assertEquals("snapshot-fresh-3", store.snapshot(namespace)?.snapshotId)
+        }
+
+    @Test
+    fun `pending completed release persists restart plan and cannot bypass watermark regression`() =
+        runBlocking {
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val namespace = namespace()
+            repository.applyHelloUnderApplyLease(
+                hello(namespace, "3", null, RelayV2StateHelloDisposition.FRESH),
+            )
+            stageCut(repository, namespace, "3", session("session-a", "committed"))
+            val committed = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
+                as RelayV2StateSyncResult.SnapshotCommitted
+            assertEquals(RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS, committed.release.phase)
+
+            val regressed = repository.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "2",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.MATCHED,
+                ),
+            )
+            assertRotation(regressed, RelayV2RotationReason.REQUIRED_WATERMARK_REGRESSED)
+            assertEquals(committed.release, store.authority(namespace)?.pendingRelease)
+
+            val behind = repository.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "4",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "3"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            ) as RelayV2StateSyncResult.ReleasePending
+            assertEquals(RelayV2PostReleasePhase.RESTART_SNAPSHOT, behind.release.phase)
+            assertEquals(RelayV2StoredSyncPhase.RESYNCING, store.authority(namespace)?.phase)
+
+            // Simulate release ACK after process restart. The exact transaction returns the
+            // durable post-release plan and leaves the authority ready to stage a fresh cut.
+            val reopened = RelayV2StateSyncRepositoryCore(store)
+            assertEquals(
+                behind.release,
+                reopened.completeSnapshotReleaseUnderApplyLease(behind.release),
+            )
+            assertEquals(RelayV2StoredSyncPhase.RESYNCING, store.authority(namespace)?.phase)
+            val fresh = snapshotChunk(
+                namespace,
+                through = "4",
+                snapshotSuffix = "after-release",
+                session = session("session-a", "fresh"),
+            )
+            assertTrue(
+                reopened.stageSnapshotChunkUnderApplyLease(fresh) is
+                    RelayV2StateSyncResult.SnapshotStaged,
+            )
+        }
 
     @Test
     fun `streamed complete cut and durable buffered event commit atomically`() = runBlocking {
@@ -221,8 +390,10 @@ class RelayV2StateSyncRepositoryCoreTest {
             ),
         )
         assertResync(wrongCursor, RelayV2ResyncReason.SNAPSHOT_IDENTITY_CONFLICT)
+        assertNotNull((wrongCursor as RelayV2StateSyncResult.ResyncRequired).release)
         assertNull(store.snapshot(namespace))
         assertEquals("stable", store.session(namespace, "scope-a", "session-a")?.item?.displayName)
+        completePendingRelease(repository, wrongCursor)
 
         val reversed = listOf(
             RelayV2SnapshotRecord.SessionsScope("scope-a", "1"),
@@ -243,6 +414,7 @@ class RelayV2StateSyncRepositoryCoreTest {
         assertResync(wrongOrder, RelayV2ResyncReason.SNAPSHOT_ORDER_CONFLICT)
         assertNull(store.snapshot(namespace))
         assertEquals("1", store.authority(namespace)?.cursorEventSeq)
+        completePendingRelease(repository, wrongOrder)
 
         val missingIntermediateSessionsScope = listOf(
             RelayV2SnapshotRecord.Scope(scope("a")),
@@ -302,6 +474,25 @@ class RelayV2StateSyncRepositoryCoreTest {
             repository.applyHelloUnderApplyLease(
                 hello(
                     namespace,
+                    "4",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            )
+            stageCut(repository, namespace, "3", session("session-a", "gap-cut"))
+            val gap = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
+                as RelayV2StateSyncResult.ResyncRequired
+            assertEquals(RelayV2ResyncReason.EVENT_GAP, gap.reason)
+            assertNotNull(gap.release)
+            assertNull(store.snapshot(namespace))
+            assertOldState(store, namespace)
+        }
+
+        run {
+            val (store, repository) = seeded()
+            repository.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
                     "3",
                     RelayV2AppliedCursor(namespace.hostEpoch, "2"),
                     RelayV2StateHelloDisposition.CURSOR_BEHIND,
@@ -342,6 +533,61 @@ class RelayV2StateSyncRepositoryCoreTest {
                     RelayV2StateHelloDisposition.CURSOR_BEHIND,
                 ),
             )
+            val (emptyBytes, emptyDigest) = canonicalSnapshotDigest(emptyList())
+            var cursor: String? = null
+            repeat(512) { index ->
+                val next = "cursor-${index + 1}"
+                val staged = repository.stageSnapshotChunkUnderApplyLease(
+                    chunk(
+                        namespace = namespace,
+                        through = "3",
+                        records = emptyList(),
+                        allRecordCount = 0,
+                        allCanonicalBytes = emptyBytes,
+                        digest = emptyDigest,
+                        chunkIndex = index.toLong(),
+                        requestedCursor = cursor,
+                        isLast = false,
+                        nextCursor = next,
+                        snapshotSuffix = "staging-overflow",
+                        rawUtf8Bytes = RelayV2StateLimits.MAX_PUBLIC_FRAME_BYTES,
+                    ),
+                )
+                assertTrue(staged is RelayV2StateSyncResult.SnapshotStaged)
+                cursor = next
+            }
+            val overflow = repository.stageSnapshotChunkUnderApplyLease(
+                chunk(
+                    namespace = namespace,
+                    through = "3",
+                    records = emptyList(),
+                    allRecordCount = 0,
+                    allCanonicalBytes = emptyBytes,
+                    digest = emptyDigest,
+                    chunkIndex = 512,
+                    requestedCursor = cursor,
+                    isLast = false,
+                    nextCursor = "cursor-513",
+                    snapshotSuffix = "staging-overflow",
+                    rawUtf8Bytes = RelayV2StateLimits.MAX_PUBLIC_FRAME_BYTES,
+                ),
+            ) as RelayV2StateSyncResult.ResyncRequired
+            assertEquals(RelayV2ResyncReason.SNAPSHOT_LIMIT_EXCEEDED, overflow.reason)
+            assertNotNull(overflow.release)
+            assertNull(store.snapshot(namespace))
+            assertOldState(store, namespace)
+        }
+
+        run {
+            val (store, repository) = seeded()
+            repository.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "3",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            )
             val records = records(session("session-a", "partial"))
             val (bytes, digest) = canonicalSnapshotDigest(records)
             repository.stageSnapshotChunkUnderApplyLease(
@@ -360,7 +606,7 @@ class RelayV2StateSyncRepositoryCoreTest {
             )
             val partial = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
             assertResync(partial, RelayV2ResyncReason.SNAPSHOT_INCOMPLETE)
-            assertNotNull(store.snapshot(namespace))
+            assertNull(store.snapshot(namespace))
             assertOldState(store, namespace)
         }
 
@@ -383,6 +629,7 @@ class RelayV2StateSyncRepositoryCoreTest {
             )
             val failed = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
             assertResync(failed, RelayV2ResyncReason.SNAPSHOT_DIGEST_MISMATCH)
+            assertNotNull((failed as RelayV2StateSyncResult.ResyncRequired).release)
             assertNull(store.snapshot(namespace))
             assertOldState(store, namespace)
         }
@@ -537,6 +784,8 @@ class RelayV2StateSyncRepositoryCoreTest {
         stageCut(repository, namespace, through, session, snapshotSuffix = snapshotSuffix)
         val committed = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-$snapshotSuffix")
         assertTrue(committed is RelayV2StateSyncResult.SnapshotCommitted)
+        val release = (committed as RelayV2StateSyncResult.SnapshotCommitted).release
+        assertEquals(release, repository.completeSnapshotReleaseUnderApplyLease(release))
     }
 
     private suspend fun stageCut(
@@ -563,6 +812,26 @@ class RelayV2StateSyncRepositoryCoreTest {
         )
     }
 
+    private fun snapshotChunk(
+        namespace: RelayV2StateNamespace,
+        through: String,
+        snapshotSuffix: String,
+        session: RelayV2SessionResource,
+    ): RelayV2SnapshotChunk {
+        val records = records(session)
+        val (bytes, digest) = canonicalSnapshotDigest(records)
+        return chunk(
+            namespace = namespace,
+            through = through,
+            records = records,
+            allRecordCount = records.size.toLong(),
+            allCanonicalBytes = bytes,
+            digest = digest,
+            isLast = true,
+            snapshotSuffix = snapshotSuffix,
+        )
+    }
+
     private fun chunk(
         namespace: RelayV2StateNamespace,
         through: String,
@@ -575,6 +844,7 @@ class RelayV2StateSyncRepositoryCoreTest {
         isLast: Boolean,
         nextCursor: String? = null,
         snapshotSuffix: String = through,
+        rawUtf8Bytes: Int = records.sumOf { it.canonicalJson().toByteArray().size } + 256,
     ) = RelayV2SnapshotChunk(
         namespace = namespace,
         snapshotRequestId = "request-$snapshotSuffix",
@@ -592,7 +862,7 @@ class RelayV2StateSyncRepositoryCoreTest {
         totalCanonicalBytes = allCanonicalBytes,
         cutDigest = digest,
         records = records,
-        rawUtf8Bytes = records.sumOf { it.canonicalJson().toByteArray().size } + 256,
+        rawUtf8Bytes = rawUtf8Bytes,
     )
 
     private fun records(
@@ -660,12 +930,20 @@ class RelayV2StateSyncRepositoryCoreTest {
         assertEquals(reason, (result as RelayV2StateSyncResult.ResyncRequired).reason)
     }
 
+    private suspend fun completePendingRelease(
+        repository: RelayV2StateSyncRepositoryCore,
+        result: RelayV2StateSyncResult,
+    ) {
+        val release = requireNotNull((result as RelayV2StateSyncResult.ResyncRequired).release)
+        assertEquals(release, repository.completeSnapshotReleaseUnderApplyLease(release))
+    }
+
     private fun assertRotation(result: RelayV2StateSyncResult, reason: RelayV2RotationReason) {
         assertEquals(reason, (result as RelayV2StateSyncResult.RotationRequired).reason)
     }
 }
 
-private class FakeStateStore(
+internal class FakeStateStore(
     val v1Sentinel: String = "",
 ) : RelayV2StateStore {
     private var state = FakeState()
