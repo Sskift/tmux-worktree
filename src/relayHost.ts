@@ -46,19 +46,22 @@ type RelayHostOptions = {
 
 type RelayHostConnectionState = "connecting" | "connected" | "retrying" | "stopping" | "stopped";
 
-type RelayDnsResolver = (hostname: string) => Promise<string[]>;
+type RelayDnsResolver = Pick<InstanceType<typeof dnsPromises.Resolver>, "resolve4" | "resolve6">;
 
 type RelayLookupDependencies = {
   lookup: LookupFunction;
   platform: NodeJS.Platform;
-  resolve4: RelayDnsResolver;
-  resolve6: RelayDnsResolver;
+  dnsServers: () => string[];
+  createResolver: (server?: string) => RelayDnsResolver;
 };
 
 function isQuickTunnelHostname(hostname: string): boolean {
   const normalized = hostname.toLowerCase().replace(/\.$/, "");
   const label = normalized.slice(0, -".trycloudflare.com".length);
-  return normalized.endsWith(".trycloudflare.com") && !!label && !label.includes(".");
+  return normalized.endsWith(".trycloudflare.com")
+    && label.length > 0
+    && label.length <= 63
+    && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(label);
 }
 
 function isRetryableSystemDnsError(error: NodeJS.ErrnoException): boolean {
@@ -75,9 +78,14 @@ async function resolveQuickTunnelAddresses(
     : family === 6 || family === "IPv6"
       ? [6]
       : [4, 6];
+  const configuredServers = [...new Set(dependencies.dnsServers())];
+  const servers = configuredServers.length > 0 ? configuredServers : [undefined];
   const settled = await Promise.allSettled(families.map(async (candidate) => ({
     family: candidate,
-    addresses: await (candidate === 4 ? dependencies.resolve4(hostname) : dependencies.resolve6(hostname)),
+    addresses: await Promise.any(servers.map(async (server) => {
+      const resolver = dependencies.createResolver(server);
+      return candidate === 4 ? resolver.resolve4(hostname) : resolver.resolve6(hostname);
+    })),
   })));
   return settled.flatMap((result) => result.status === "fulfilled"
     ? result.value.addresses.map((address) => ({ address, family: result.value.family }))
@@ -90,8 +98,12 @@ export function createRelayLookup(
   const dependencies: RelayLookupDependencies = {
     lookup: overrides.lookup ?? systemDnsLookup,
     platform: overrides.platform ?? process.platform,
-    resolve4: overrides.resolve4 ?? dnsPromises.resolve4,
-    resolve6: overrides.resolve6 ?? dnsPromises.resolve6,
+    dnsServers: overrides.dnsServers ?? dnsPromises.getServers,
+    createResolver: overrides.createResolver ?? ((server) => {
+      const resolver = new dnsPromises.Resolver();
+      if (server) resolver.setServers([server]);
+      return resolver;
+    }),
   };
   return (hostname, options, callback) => {
     dependencies.lookup(hostname, options, (error, address, family) => {

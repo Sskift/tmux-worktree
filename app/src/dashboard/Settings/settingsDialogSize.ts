@@ -9,8 +9,8 @@ export interface SettingsDialogViewport {
 }
 
 export const DEFAULT_SETTINGS_DIALOG_SIZE: SettingsDialogSize = {
-  width: 780,
-  height: 620,
+  width: 1060,
+  height: 740,
 };
 
 const MIN_SETTINGS_DIALOG_SIZE: SettingsDialogSize = {

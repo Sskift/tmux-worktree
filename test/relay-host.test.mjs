@@ -48,16 +48,25 @@ function invokeLookup(lookup, hostname, options) {
 test("Quick Tunnel DNS bypasses a stale system negative cache without changing fixed relay lookup", async () => {
   const negativeCacheError = Object.assign(new Error("stale system DNS result"), { code: "ENOTFOUND" });
   let directQueries = 0;
+  let resolverCreations = 0;
   const lookup = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
     platform: "darwin",
-    resolve4: async () => {
-      directQueries += 1;
-      return ["192.0.2.10"];
-    },
-    resolve6: async () => {
-      directQueries += 1;
-      return ["2001:db8::10"];
+    dnsServers: () => ["stale-dns", "fresh-dns"],
+    createResolver: (server) => {
+      resolverCreations += 1;
+      return {
+        resolve4: async () => {
+          directQueries += 1;
+          if (server === "stale-dns") throw negativeCacheError;
+          return ["192.0.2.10"];
+        },
+        resolve6: async () => {
+          directQueries += 1;
+          if (server === "stale-dns") throw negativeCacheError;
+          return ["2001:db8::10"];
+        },
+      };
     },
   });
 
@@ -71,7 +80,8 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
       family: undefined,
     },
   );
-  assert.equal(directQueries, 2);
+  assert.equal(directQueries, 4);
+  assert.equal(resolverCreations, 4);
 
   assert.deepEqual(
     await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: true, family: "IPv6" }),
@@ -80,39 +90,62 @@ test("Quick Tunnel DNS bypasses a stale system negative cache without changing f
       family: undefined,
     },
   );
-  assert.equal(directQueries, 3);
+  assert.equal(directQueries, 6);
+  assert.equal(resolverCreations, 6);
 
   assert.deepEqual(
     await invokeLookup(lookup, "fresh-tunnel.trycloudflare.com", { all: false, family: 4 }),
     { address: "192.0.2.10", family: 4 },
   );
-  assert.equal(directQueries, 4);
+  assert.equal(directQueries, 8);
+  assert.equal(resolverCreations, 8);
 
-  await assert.rejects(
-    invokeLookup(lookup, "relay.example.net", { all: false }),
-    (error) => error === negativeCacheError,
-  );
-  assert.equal(directQueries, 4);
+  for (const hostname of [
+    "relay.example.net",
+    "trycloudflare.com",
+    "nested.name.trycloudflare.com",
+    "-invalid.trycloudflare.com",
+    "invalid-.trycloudflare.com",
+    "fresh-tunnel.trycloudflare.com.example.net",
+  ]) {
+    await assert.rejects(
+      invokeLookup(lookup, hostname, { all: false }),
+      (error) => error === negativeCacheError,
+    );
+  }
+  assert.equal(directQueries, 8);
+  assert.equal(resolverCreations, 8);
 
   const linuxLookup = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
     platform: "linux",
-    resolve4: async () => {
-      directQueries += 1;
-      return ["192.0.2.20"];
+    dnsServers: () => ["unused-dns"],
+    createResolver: () => {
+      resolverCreations += 1;
+      return {
+        resolve4: async () => {
+          directQueries += 1;
+          return ["192.0.2.20"];
+        },
+        resolve6: async () => [],
+      };
     },
   });
   await assert.rejects(
     invokeLookup(linuxLookup, "fresh-tunnel.trycloudflare.com", { all: false }),
     (error) => error === negativeCacheError,
   );
-  assert.equal(directQueries, 4);
+  assert.equal(directQueries, 8);
+  assert.equal(resolverCreations, 8);
 
   const unavailableDirectDns = createRelayLookup({
     lookup: (_hostname, _options, callback) => callback(negativeCacheError, "", 0),
     platform: "darwin",
-    resolve4: async () => { throw new Error("no A response"); },
-    resolve6: async () => { throw new Error("no AAAA response"); },
+    dnsServers: () => ["unavailable-dns"],
+    createResolver: () => ({
+      resolve4: async () => { throw new Error("no A response"); },
+      resolve6: async () => { throw new Error("no AAAA response"); },
+    }),
   });
   await assert.rejects(
     invokeLookup(unavailableDirectDns, "fresh-tunnel.trycloudflare.com", { all: true }),
