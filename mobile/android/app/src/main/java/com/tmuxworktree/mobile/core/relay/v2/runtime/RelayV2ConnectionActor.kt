@@ -1354,8 +1354,8 @@ internal class RelayV2ConnectionActor(
         rawBytes: Int,
         profile: RelayV2Profile,
     ) {
+        val context = recoveryAttempt?.takeIf(::isRecoveryCurrent)?.context ?: onlineContext
         if (decoded.type() in STATE_CHANGE_INBOUND_TYPES) {
-            val context = recoveryAttempt?.takeIf(::isRecoveryCurrent)?.context ?: onlineContext
             if (context == null ||
                 decoded.frame["hostId"] != context.hostId ||
                 decoded.frame["hostEpoch"] != context.hostEpoch
@@ -1370,11 +1370,23 @@ internal class RelayV2ConnectionActor(
                 return
             }
         }
+        if (context == null) {
+            failConnection(
+                RelayV2FailureKind.SCHEMA,
+                "INVALID_ENVELOPE",
+                retryable = false,
+                closeCode = 4400,
+                rawBytes = rawBytes,
+            )
+            return
+        }
         emitEffect(
             RelayV2RuntimeEffect.DeliverPostHandshakeFrame(
-                decoded,
-                currentEffectGeneration(profile),
-                recoveryAttempt
+                context = context,
+                message = decoded,
+                rawUtf8Bytes = rawBytes,
+                generation = currentEffectGeneration(profile),
+                recovery = recoveryAttempt
                     ?.takeIf(::isRecoveryCurrent)
                     ?.currentBinding(),
             ),
@@ -1470,6 +1482,7 @@ internal class RelayV2ConnectionActor(
             RelayV2RuntimeEffect.ApplyStateSnapshotChunk(
                 context = recovery.context,
                 message = decoded,
+                rawUtf8Bytes = rawBytes,
                 snapshotRequestId = request.snapshotRequestId,
                 snapshotId = request.snapshotId,
                 requestedCursor = request.cursor,
@@ -1861,6 +1874,8 @@ internal class RelayV2ConnectionActor(
         val window = payload.objectValue("commandDedupeWindow")
         val context = RelayV2HandshakeContext(
             profile = profile.identity,
+            principalId = profile.principalId,
+            clientInstanceId = profile.clientInstanceId,
             hostId = profile.hostId,
             brokerEpoch = requireNotNull(brokerEpoch),
             hostEpoch = hostEpoch,

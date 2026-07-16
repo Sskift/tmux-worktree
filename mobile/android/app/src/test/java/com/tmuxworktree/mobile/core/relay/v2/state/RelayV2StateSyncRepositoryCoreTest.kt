@@ -166,13 +166,25 @@ class RelayV2StateSyncRepositoryCoreTest {
             assertEquals("snapshot-3", pending.snapshotId)
             assertNull(store.snapshot(namespace))
             assertTrue(store.events(namespace).isEmpty())
+            assertEquals("20", store.authority(namespace)?.requiredThroughEventSeq)
 
             // Simulate socket/process loss by constructing a new repository over the same store.
             val reopened = RelayV2StateSyncRepositoryCore(store)
+            assertRotation(
+                reopened.applyHelloUnderApplyLease(
+                    hello(
+                        namespace,
+                        "3",
+                        RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                        RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                    ),
+                ),
+                RelayV2RotationReason.REQUIRED_WATERMARK_REGRESSED,
+            )
             val recovered = reopened.applyHelloUnderApplyLease(
                 hello(
                     namespace,
-                    "3",
+                    "20",
                     RelayV2AppliedCursor(namespace.hostEpoch, "2"),
                     RelayV2StateHelloDisposition.CURSOR_BEHIND,
                 ),
@@ -198,7 +210,7 @@ class RelayV2StateSyncRepositoryCoreTest {
                 (reopened.applyHelloUnderApplyLease(
                     hello(
                         namespace,
-                        "3",
+                        "20",
                         RelayV2AppliedCursor(namespace.hostEpoch, "2"),
                         RelayV2StateHelloDisposition.CURSOR_BEHIND,
                     ),
@@ -210,7 +222,7 @@ class RelayV2StateSyncRepositoryCoreTest {
                 reopened.applyHelloUnderApplyLease(
                     hello(
                         namespace,
-                        "3",
+                        "20",
                         RelayV2AppliedCursor(namespace.hostEpoch, "2"),
                         RelayV2StateHelloDisposition.CURSOR_BEHIND,
                     ),
@@ -226,8 +238,75 @@ class RelayV2StateSyncRepositoryCoreTest {
                 ),
             )
             assertTrue(fresh is RelayV2StateSyncResult.SnapshotStaged)
-            assertEquals("snapshot-fresh-3", store.snapshot(namespace)?.snapshotId)
+            val insufficient = reopened.commitSnapshotUnderApplyLease(
+                namespace,
+                "snapshot-fresh-3",
+            ) as RelayV2StateSyncResult.ResyncRequired
+            assertEquals(RelayV2ResyncReason.EVENT_GAP, insufficient.reason)
+            assertNotNull(insufficient.release)
+            assertNull(store.snapshot(namespace))
         }
+
+    @Test
+    fun `conflicting seq20 survives reopen as a required recovery watermark`() = runBlocking {
+        val store = FakeStateStore()
+        val repository = RelayV2StateSyncRepositoryCore(store)
+        val namespace = namespace()
+        repository.applyHelloUnderApplyLease(
+            hello(namespace, "2", null, RelayV2StateHelloDisposition.FRESH),
+        )
+        commitCut(repository, namespace, "2", session("session-a", "stable"))
+        repository.applyHelloUnderApplyLease(
+            hello(
+                namespace,
+                "3",
+                RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                RelayV2StateHelloDisposition.CURSOR_BEHIND,
+            ),
+        )
+
+        assertResync(
+            repository.applyStateEventUnderApplyLease(
+                event(
+                    namespace,
+                    "20",
+                    "2",
+                    RelayV2StateChange.SessionUpsert(session("session-a", "first-20")),
+                ),
+            ),
+            RelayV2ResyncReason.EVENT_GAP,
+        )
+        val conflict = repository.applyStateEventUnderApplyLease(
+            event(
+                namespace,
+                "20",
+                "2",
+                RelayV2StateChange.SessionUpsert(session("session-a", "conflicting-20")),
+            ),
+        ) as RelayV2StateSyncResult.ResyncRequired
+        assertEquals(RelayV2ResyncReason.EVENT_REVISION_CONFLICT, conflict.reason)
+        assertEquals("20", store.authority(namespace)?.requiredThroughEventSeq)
+        assertTrue(store.events(namespace).isEmpty())
+
+        val reopened = RelayV2StateSyncRepositoryCore(store)
+        assertRotation(
+            reopened.applyHelloUnderApplyLease(
+                hello(
+                    namespace,
+                    "3",
+                    RelayV2AppliedCursor(namespace.hostEpoch, "2"),
+                    RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                ),
+            ),
+            RelayV2RotationReason.REQUIRED_WATERMARK_REGRESSED,
+        )
+        stageCut(reopened, namespace, "3", session("session-a", "insufficient"))
+        val insufficient = reopened.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
+            as RelayV2StateSyncResult.ResyncRequired
+        assertEquals(RelayV2ResyncReason.EVENT_GAP, insufficient.reason)
+        assertNotNull(insufficient.release)
+        assertNull(store.snapshot(namespace))
+    }
 
     @Test
     fun `pending completed release persists restart plan and cannot bypass watermark regression`() =
@@ -242,6 +321,16 @@ class RelayV2StateSyncRepositoryCoreTest {
             val committed = repository.commitSnapshotUnderApplyLease(namespace, "snapshot-3")
                 as RelayV2StateSyncResult.SnapshotCommitted
             assertEquals(RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS, committed.release.phase)
+            val pendingFromEvent = repository.applyStateEventUnderApplyLease(
+                event(
+                    namespace,
+                    "20",
+                    "2",
+                    RelayV2StateChange.SessionUpsert(session("session-a", "observed-20")),
+                ),
+            ) as RelayV2StateSyncResult.ReleasePending
+            assertEquals(RelayV2PostReleasePhase.RESTART_SNAPSHOT, pendingFromEvent.release.phase)
+            assertEquals("20", store.authority(namespace)?.requiredThroughEventSeq)
 
             val regressed = repository.applyHelloUnderApplyLease(
                 hello(
@@ -252,12 +341,23 @@ class RelayV2StateSyncRepositoryCoreTest {
                 ),
             )
             assertRotation(regressed, RelayV2RotationReason.REQUIRED_WATERMARK_REGRESSED)
-            assertEquals(committed.release, store.authority(namespace)?.pendingRelease)
+            assertEquals(pendingFromEvent.release, store.authority(namespace)?.pendingRelease)
 
+            assertRotation(
+                repository.applyHelloUnderApplyLease(
+                    hello(
+                        namespace,
+                        "4",
+                        RelayV2AppliedCursor(namespace.hostEpoch, "3"),
+                        RelayV2StateHelloDisposition.CURSOR_BEHIND,
+                    ),
+                ),
+                RelayV2RotationReason.REQUIRED_WATERMARK_REGRESSED,
+            )
             val behind = repository.applyHelloUnderApplyLease(
                 hello(
                     namespace,
-                    "4",
+                    "20",
                     RelayV2AppliedCursor(namespace.hostEpoch, "3"),
                     RelayV2StateHelloDisposition.CURSOR_BEHIND,
                 ),
@@ -283,6 +383,11 @@ class RelayV2StateSyncRepositoryCoreTest {
                 reopened.stageSnapshotChunkUnderApplyLease(fresh) is
                     RelayV2StateSyncResult.SnapshotStaged,
             )
+            val insufficient = reopened.commitSnapshotUnderApplyLease(
+                namespace,
+                "snapshot-after-release",
+            ) as RelayV2StateSyncResult.ResyncRequired
+            assertEquals(RelayV2ResyncReason.EVENT_GAP, insufficient.reason)
         }
 
     @Test

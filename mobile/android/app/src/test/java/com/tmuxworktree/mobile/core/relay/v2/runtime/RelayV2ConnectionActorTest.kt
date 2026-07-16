@@ -21,7 +21,6 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SessionResource
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotChunk
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotRecord
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateChange
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateEvent
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHelloDisposition
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
@@ -390,16 +389,34 @@ class RelayV2ConnectionActorTest {
                 val onlineProof = harness.actor.withEffectApplyLease(delivery) {
                     adapter.applyOnlineStateEvent(
                         delivery,
-                        RelayV2StateEvent(
-                            namespace,
-                            "93",
-                            "2",
-                            RelayV2StateChange.SessionUpsert(adapterSession("gap-online")),
-                            rawUtf8Bytes = 256,
-                        ),
                         emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
+                val storedEvent = store.events(namespace).single().event
+                assertEquals(
+                    RelayV2StrictJson.stringify(gapFrame).toByteArray(Charsets.UTF_8).size,
+                    delivery.rawUtf8Bytes,
+                )
+                assertEquals(delivery.rawUtf8Bytes, storedEvent.rawUtf8Bytes)
+                assertEquals("93", store.authority(namespace)?.requiredThroughEventSeq)
+                assertEquals("93", storedEvent.eventSeq)
+                assertEquals("2", storedEvent.resultingRevision)
+                assertEquals(
+                    RelayV2SessionResource(
+                        scopeId = "scope-a",
+                        sessionId = "ses_01JOPAQUE",
+                        kind = RelayV2SessionKind.WORKTREE,
+                        displayName = "demo",
+                        project = "demo",
+                        label = null,
+                        cwd = "/repo/demo",
+                        attached = false,
+                        windowCount = 1,
+                        createdAtMs = 1_783_700_000_000,
+                        activityAtMs = 1_783_700_000_000,
+                    ),
+                    (storedEvent.change as RelayV2StateChange.SessionUpsert).item,
+                )
                 assertTrue(harness.actor.submitOnlineResyncRequired(requireNotNull(onlineProof.value)))
 
                 val snapshot = transport.awaitSentFrame(1)
@@ -1200,35 +1217,26 @@ class RelayV2ConnectionActorTest {
                 chunkFrame["requestId"] = firstGet.stringValue("requestId")
                 chunkFrame.payload()["snapshotRequestId"] =
                     firstGet.payload().stringValue("snapshotRequestId")
-                firstTransport.sendFrame(chunkFrame)
-                val chunkEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
-                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
                 val records = adapterSnapshotRecords("invalid-before-crash")
                 val (bytes, _) = canonicalSnapshotDigest(records)
                 val invalidDigest = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+                chunkFrame.payload().apply {
+                    this["snapshotCreatedAtMs"] = 100L
+                    this["snapshotLeaseExpiresAtMs"] = 200L
+                    this["snapshotAbsoluteExpiresAtMs"] = 1_000L
+                    this["throughEventSeq"] = "91"
+                    this["scopesRevision"] = "1"
+                    this["totalRecords"] = records.size.toLong()
+                    this["totalCanonicalBytes"] = bytes
+                    this["cutDigest"] = invalidDigest
+                    this["records"] = records.map { it.toWireMapForActorTest() }
+                }
+                firstTransport.sendFrame(chunkFrame)
+                val chunkEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
                 val durableAbandon = harness.actor.withEffectApplyLease(chunkEffect) {
                     firstAdapter.applySnapshotChunk(
                         chunkEffect,
-                        RelayV2SnapshotChunk(
-                            namespace = namespace,
-                            snapshotRequestId = firstGet.payload()
-                                .stringValue("snapshotRequestId"),
-                            snapshotId = chunkFrame.payload().stringValue("snapshotId"),
-                            snapshotCreatedAtMs = 100,
-                            snapshotLeaseExpiresAtMs = 200,
-                            snapshotAbsoluteExpiresAtMs = 1_000,
-                            chunkIndex = 0,
-                            requestedCursor = null,
-                            isLast = true,
-                            nextCursor = null,
-                            throughEventSeq = "91",
-                            scopesRevision = "1",
-                            totalRecords = records.size.toLong(),
-                            totalCanonicalBytes = bytes,
-                            cutDigest = invalidDigest,
-                            records = records,
-                            rawUtf8Bytes = 512,
-                        ),
                         pendingCommands = emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
@@ -1288,34 +1296,25 @@ class RelayV2ConnectionActorTest {
                 freshChunkFrame["requestId"] = freshGet.stringValue("requestId")
                 freshChunkFrame.payload()["snapshotRequestId"] =
                     freshGet.payload().stringValue("snapshotRequestId")
+                val freshRecords = adapterSnapshotRecords("after-reopen")
+                val (freshBytes, freshDigest) = canonicalSnapshotDigest(freshRecords)
+                freshChunkFrame.payload().apply {
+                    this["snapshotCreatedAtMs"] = 100L
+                    this["snapshotLeaseExpiresAtMs"] = 200L
+                    this["snapshotAbsoluteExpiresAtMs"] = 1_000L
+                    this["throughEventSeq"] = "91"
+                    this["scopesRevision"] = "1"
+                    this["totalRecords"] = freshRecords.size.toLong()
+                    this["totalCanonicalBytes"] = freshBytes
+                    this["cutDigest"] = freshDigest
+                    this["records"] = freshRecords.map { it.toWireMapForActorTest() }
+                }
                 secondTransport.sendFrame(freshChunkFrame)
                 val freshChunkEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                     as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
-                val freshRecords = adapterSnapshotRecords("after-reopen")
-                val (freshBytes, freshDigest) = canonicalSnapshotDigest(freshRecords)
                 val freshCommitted = harness.actor.withEffectApplyLease(freshChunkEffect) {
                     reopenedAdapter.applySnapshotChunk(
                         freshChunkEffect,
-                        RelayV2SnapshotChunk(
-                            namespace = namespace,
-                            snapshotRequestId = freshGet.payload()
-                                .stringValue("snapshotRequestId"),
-                            snapshotId = freshChunkFrame.payload().stringValue("snapshotId"),
-                            snapshotCreatedAtMs = 100,
-                            snapshotLeaseExpiresAtMs = 200,
-                            snapshotAbsoluteExpiresAtMs = 1_000,
-                            chunkIndex = 0,
-                            requestedCursor = null,
-                            isLast = true,
-                            nextCursor = null,
-                            throughEventSeq = "91",
-                            scopesRevision = "1",
-                            totalRecords = freshRecords.size.toLong(),
-                            totalCanonicalBytes = freshBytes,
-                            cutDigest = freshDigest,
-                            records = freshRecords,
-                            rawUtf8Bytes = 512,
-                        ),
                         pendingCommands = emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
@@ -4116,15 +4115,7 @@ class RelayV2ConnectionActorTest {
     )
 
     private fun recoveryAdapter(repository: RelayV2StateSyncRepositoryCore) =
-        RelayV2RecoveryRepositoryAdapter(
-            repository,
-            RelayV2RecoveryRepositoryAdapter.Identity(
-                "profile-primary",
-                PRINCIPAL_ID,
-                "android-install-primary",
-                HOST_ID,
-            ),
-        )
+        RelayV2RecoveryRepositoryAdapter(repository)
 
     private fun adapterSession(displayName: String) = RelayV2SessionResource(
         scopeId = "scope-a",
@@ -4152,6 +4143,24 @@ class RelayV2ConnectionActorTest {
         RelayV2SnapshotRecord.SessionsScope("scope-a", "1"),
         RelayV2SnapshotRecord.Session("scope-a", adapterSession(displayName)),
     )
+
+    private fun RelayV2SnapshotRecord.toWireMapForActorTest(): Map<String, Any?> = when (this) {
+        is RelayV2SnapshotRecord.Scope -> linkedMapOf(
+            "recordType" to "scope",
+            "item" to item.wireMap(),
+        )
+        is RelayV2SnapshotRecord.SessionsScope -> linkedMapOf(
+            "recordType" to "sessions_scope",
+            "scopeId" to scopeId,
+            "revision" to revision,
+            "completeness" to "complete",
+        )
+        is RelayV2SnapshotRecord.Session -> linkedMapOf(
+            "recordType" to "session",
+            "scopeId" to scopeId,
+            "item" to item.wireMap(),
+        )
+    }
 
     private fun adapterSnapshotChunk(
         namespace: RelayV2StateNamespace,

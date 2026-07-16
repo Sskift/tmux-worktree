@@ -250,14 +250,40 @@ internal class RelayV2StateSyncRepositoryCore(
     override suspend fun applyStateEventUnderApplyLease(
         event: RelayV2StateEvent,
     ): RelayV2StateSyncResult = store.transaction {
-        val authority = authority(event.namespace)
+        val storedAuthority = authority(event.namespace)
             ?: return@transaction unknownEpoch(event.namespace)
-        authority.pendingRelease?.let { pending ->
-            return@transaction RelayV2StateSyncResult.ReleasePending(event.namespace, pending)
-        }
-        val cursor = authority.cursorEventSeq
+        val cursor = storedAuthority.cursorEventSeq
         if (cursor != null && compareRelayV2Counters(event.eventSeq, cursor) <= 0) {
             return@transaction RelayV2StateSyncResult.DuplicateEvent
+        }
+        val required = maxRelayV2Counter(
+            storedAuthority.requiredThroughEventSeq,
+            event.eventSeq,
+        )
+        val pending = storedAuthority.pendingRelease?.let { release ->
+            release.copy(
+                phase = if (release.phase == RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS &&
+                    release.durableCursorEventSeq != null &&
+                    compareRelayV2Counters(release.durableCursorEventSeq, required) >= 0
+                ) {
+                    RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS
+                } else {
+                    RelayV2PostReleasePhase.RESTART_SNAPSHOT
+                },
+            )
+        }
+        val authority = storedAuthority.copy(
+            requiredThroughEventSeq = required,
+            pendingRelease = pending,
+            phase = if (pending != null) {
+                RelayV2StoredSyncPhase.RESYNCING
+            } else {
+                storedAuthority.phase
+            },
+        )
+        putAuthority(authority)
+        if (pending != null) {
+            return@transaction RelayV2StateSyncResult.ReleasePending(event.namespace, pending)
         }
 
         if (authority.phase == RelayV2StoredSyncPhase.LIVE &&

@@ -132,6 +132,8 @@ internal data class RelayV2NegotiatedLimits(
 
 internal data class RelayV2HandshakeContext(
     val profile: RelayActiveProfileIdentity,
+    val principalId: String,
+    val clientInstanceId: String,
     val hostId: String,
     val brokerEpoch: String,
     val hostEpoch: String,
@@ -140,7 +142,13 @@ internal data class RelayV2HandshakeContext(
     val negotiatedCapabilities: Set<String>,
     val negotiatedLimits: RelayV2NegotiatedLimits,
     val commandDedupeWindow: RelayV2CommandDedupeWindow,
-)
+) {
+    init {
+        requireRelayV2RuntimeId(principalId, "Principal ID")
+        requireRelayV2RuntimeId(clientInstanceId, "Client instance ID")
+        require(profile.activationGeneration > 0) { "Profile activation must be positive" }
+    }
+}
 
 /** Exact actor-owned recovery step that a durable repository receipt must acknowledge. */
 internal data class RelayV2RecoveryBinding(
@@ -511,13 +519,18 @@ internal sealed interface RelayV2RuntimeEffect {
     data class ApplyStateSnapshotChunk(
         val context: RelayV2HandshakeContext,
         val message: RelayV2DecodedMessage,
+        val rawUtf8Bytes: Int,
         val snapshotRequestId: String,
         val snapshotId: String?,
         val requestedCursor: String?,
         val requestedChunkIndex: Long,
         val recovery: RelayV2RecoveryBinding,
         override val generation: RelayV2EffectGeneration = recovery.generation,
-    ) : GenerationScoped
+    ) : GenerationScoped {
+        init {
+            require(rawUtf8Bytes in 1..1_048_576)
+        }
+    }
 
     data class CompleteSnapshotRelease(
         val context: RelayV2HandshakeContext,
@@ -547,10 +560,16 @@ internal sealed interface RelayV2RuntimeEffect {
 
     /** Bounded handoff seam for repository-owned post-handshake protocol state. */
     data class DeliverPostHandshakeFrame(
+        val context: RelayV2HandshakeContext,
         val message: RelayV2DecodedMessage,
+        val rawUtf8Bytes: Int,
         override val generation: RelayV2EffectGeneration,
         val recovery: RelayV2RecoveryBinding? = null,
-    ) : GenerationScoped
+    ) : GenerationScoped {
+        init {
+            require(rawUtf8Bytes in 1..1_048_576)
+        }
+    }
 
     data class ConnectionFailed(
         val profile: RelayActiveProfileIdentity?,
