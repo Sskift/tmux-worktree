@@ -83,6 +83,62 @@ class AgentTranscriptLifecycleV1CodecContractTest {
     }
 
     @Test
+    fun correlatedExtensionErrorsDecodeToTheFrozenClosedCodeSet() {
+        val decodedCodes = fixtures.manifestExtensionErrorCodes.map { wireCode ->
+            val frame = correlatedErrorFrame(wireCode)
+            val bytes = RelayV2StrictJson.stringify(frame).toByteArray(StandardCharsets.UTF_8)
+            val decoded = codec.decodePublicFrame(bytes) as AgentTimelineErrorFrame
+
+            assertEquals("request-agent-timeline", decoded.requestId)
+            assertEquals("mac-admin", decoded.hostId)
+            assertEquals("host-epoch-1", decoded.hostEpoch)
+            assertEquals("scope-local", decoded.scopeId)
+            assertEquals("session-1", decoded.sessionId)
+            assertEquals(wireCode, decoded.error.code.wireValue)
+            assertEquals(
+                AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+                decoded.error.commandDisposition,
+            )
+            assertArrayEquals(bytes, codec.encodePublicFrame(decoded))
+            assertEquals(decoded, codec.decodePublicFrame(codec.encodePublicFrame(decoded)))
+            decoded.error.code.wireValue
+        }.toSet()
+
+        assertEquals(fixtures.manifestExtensionErrorCodes, decodedCodes)
+        assertEquals(
+            fixtures.manifestExtensionErrorCodes,
+            AgentTimelineErrorCode.entries.map { it.wireValue }.toSet(),
+        )
+
+        val retryable = correlatedErrorFrame(
+            code = "AGENT_TIMELINE_UNAVAILABLE",
+            retryAfterMs = 250L,
+        )
+        val decodedRetryable = decode(retryable) as AgentTimelineErrorFrame
+        assertEquals(true, decodedRetryable.error.retryable)
+        assertEquals(250L, decodedRetryable.error.retryAfterMs)
+
+        val baseErrorCode = correlatedErrorFrame("EVENT_CURSOR_AHEAD")
+        assertRejected(baseErrorCode, "schema-mismatch")
+
+        val machineDisposition = correlatedErrorFrame("AGENT_CURSOR_EXPIRED")
+        machineDisposition.structuredError()["commandDisposition"] = "gap_resync"
+        assertRejected(machineDisposition, "schema-mismatch")
+
+        val uncorrelated = correlatedErrorFrame("AGENT_CURSOR_AHEAD")
+        uncorrelated.remove("requestId")
+        assertRejected(uncorrelated, "missing-field")
+
+        val missingTarget = correlatedErrorFrame("AGENT_TIMELINE_EPOCH_MISMATCH")
+        missingTarget.remove("sessionId")
+        assertRejected(missingTarget, "missing-field")
+
+        val details = correlatedErrorFrame("AGENT_SNAPSHOT_EXPIRED")
+        details.structuredError()["details"] = linkedMapOf("text" to "must-not-pass")
+        assertRejected(details, "schema-mismatch")
+    }
+
+    @Test
     fun framingIsOneMiBStrictUtf8DuplicateSafeAndTextOnly() {
         assertRejected(
             ByteArray(AgentTranscriptLifecycleV1Codec.MAX_PUBLIC_FRAME_BYTES + 1),
@@ -130,6 +186,18 @@ class AgentTranscriptLifecycleV1CodecContractTest {
         val oversizedId = fixtures.frame("live-entry-redacted")
         oversizedId["hostId"] = "x".repeat(129)
         assertRejected(oversizedId, "id-byte-limit")
+
+        val exactCursor = "é".repeat(64)
+        assertEquals(128, exactCursor.toByteArray(StandardCharsets.UTF_8).size)
+        val cursorAtLimit = fixtures.frame("replay-get")
+        cursorAtLimit.payload()["cursor"] = exactCursor
+        decode(cursorAtLimit)
+
+        val oversizedCursor = exactCursor + "x"
+        assertEquals(129, oversizedCursor.toByteArray(StandardCharsets.UTF_8).size)
+        val cursorOverLimit = fixtures.frame("replay-get")
+        cursorOverLimit.payload()["cursor"] = oversizedCursor
+        assertRejected(cursorOverLimit, "id-byte-limit")
 
         val paddedId = fixtures.frame("live-entry-redacted")
         paddedId["hostId"] = " host"
@@ -247,6 +315,14 @@ class AgentTranscriptLifecycleV1CodecContractTest {
         agentCommand.replayEvents()[1].mutation().entry()["commandId"] = "command-claim"
         assertRejected(agentCommand, "agent-command-correlation")
 
+        val modifiedVisibleSnapshotEntry = fixtures.frame("snapshot-page-materialized")
+        modifiedVisibleSnapshotEntry.snapshotRecords()[1]["lastModifiedAgentSeq"] = "4"
+        assertRejected(modifiedVisibleSnapshotEntry, "entry-sequence-binding")
+
+        val unmodifiedRedactedSnapshotEntry = fixtures.frame("snapshot-page-materialized")
+        unmodifiedRedactedSnapshotEntry.snapshotRecords()[2]["lastModifiedAgentSeq"] = "5"
+        assertRejected(unmodifiedRedactedSnapshotEntry, "entry-sequence-binding")
+
         listOf("live-entry-redacted", "live-entry-deleted").forEach { fixtureName ->
             val bodyLeak = fixtures.frame(fixtureName)
             bodyLeak.payload().mutation()["text"] = "must-not-survive"
@@ -273,8 +349,33 @@ class AgentTranscriptLifecycleV1CodecContractTest {
         assertRejected(lifecycleMirrorConflict, "lifecycle-event-binding")
 
         val appendMirrorConflict = fixtures.frame("replay-page-lifecycle-and-entry")
-        appendMirrorConflict.replayEvents()[1].mutation().entry()["createdAgentSeq"] = "9"
+        appendMirrorConflict.replayEvents()[1].mutation().entry().apply {
+            this["createdAgentSeq"] = "9"
+            this["lastModifiedAgentSeq"] = "9"
+        }
         assertRejected(appendMirrorConflict, "entry-event-binding")
+    }
+
+    @Test
+    fun timelineResetReasonClosesTheNewEpochShape() {
+        val repeatedEpoch = fixtures.frame("timeline-deleted-reset")
+        repeatedEpoch.payload()["newTimelineEpoch"] =
+            repeatedEpoch.payload().getValue("previousTimelineEpoch")
+        assertRejected(repeatedEpoch, "reset-shape")
+
+        val emptyEpoch = fixtures.frame("timeline-deleted-reset")
+        emptyEpoch.payload()["newTimelineEpoch"] = ""
+        assertRejected(emptyEpoch, "invalid-argument")
+
+        val storeReset = codec.decodePublicFrame(
+            fixtures.wire("timeline-store-reset-unavailable"),
+        ) as AgentTimelineResetFrame
+        assertEquals(AgentTimelineResetReason.STORE_RESET, storeReset.reason)
+        assertEquals(null, storeReset.newTimelineEpoch)
+
+        val storeResetWithEpoch = fixtures.frame("timeline-store-reset-unavailable")
+        storeResetWithEpoch.payload()["newTimelineEpoch"] = "timeline-after-store-reset"
+        assertRejected(storeResetWithEpoch, "reset-shape")
     }
 
     @Test
@@ -357,6 +458,11 @@ private class AgentTranscriptLifecycleV1Fixtures {
         .map { it as? String ?: error("Manifest message type must be a string") }
         .toSet()
 
+    val manifestExtensionErrorCodes: Set<String> = manifest.map("wire")
+        .list("extensionErrorCodes")
+        .map { it as? String ?: error("Manifest extension error code must be a string") }
+        .toSet()
+
     val golden: List<AgentTranscriptLifecycleV1GoldenFixture> =
         readArray("$base/$goldenPath").map {
             AgentTranscriptLifecycleV1GoldenFixture(
@@ -436,6 +542,31 @@ private fun deletionEvent(sequence: String): LinkedHashMap<String, Any?> = linke
     ),
 )
 
+private fun correlatedErrorFrame(
+    code: String,
+    retryAfterMs: Long? = null,
+): LinkedHashMap<String, Any?> {
+    val error = linkedMapOf<String, Any?>(
+        "code" to code,
+        "message" to "Agent timeline request failed",
+        "retryable" to (retryAfterMs != null),
+    )
+    retryAfterMs?.let { error["retryAfterMs"] = it }
+    error["commandDisposition"] = "not_applicable"
+    return linkedMapOf(
+        "protocolVersion" to 2L,
+        "kind" to "response",
+        "type" to "error",
+        "requestId" to "request-agent-timeline",
+        "hostId" to "mac-admin",
+        "hostEpoch" to "host-epoch-1",
+        "scopeId" to "scope-local",
+        "sessionId" to "session-1",
+        "payload" to null,
+        "error" to error,
+    )
+}
+
 @Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.payload(): MutableMap<String, Any?> =
     getValue("payload") as MutableMap<String, Any?>
@@ -457,8 +588,16 @@ private fun MutableMap<String, Any?>.failure(): MutableMap<String, Any?> =
     getValue("failure") as MutableMap<String, Any?>
 
 @Suppress("UNCHECKED_CAST")
+private fun MutableMap<String, Any?>.structuredError(): MutableMap<String, Any?> =
+    getValue("error") as MutableMap<String, Any?>
+
+@Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.replayEvents(): MutableList<MutableMap<String, Any?>> =
     payload().getValue("events") as MutableList<MutableMap<String, Any?>>
+
+@Suppress("UNCHECKED_CAST")
+private fun MutableMap<String, Any?>.snapshotRecords(): MutableList<MutableMap<String, Any?>> =
+    payload().getValue("records") as MutableList<MutableMap<String, Any?>>
 
 private fun MutableMap<String, Any?>.lifecycleMutation(): MutableMap<String, Any?> =
     payload().mutation().lifecycle()

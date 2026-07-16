@@ -18,6 +18,41 @@ sealed interface AgentTranscriptLifecycleV1Frame {
     val type: String
 }
 
+enum class AgentTimelineErrorCode(val wireValue: String) {
+    AGENT_TIMELINE_UNAVAILABLE("AGENT_TIMELINE_UNAVAILABLE"),
+    AGENT_CURSOR_EXPIRED("AGENT_CURSOR_EXPIRED"),
+    AGENT_CURSOR_AHEAD("AGENT_CURSOR_AHEAD"),
+    AGENT_SNAPSHOT_EXPIRED("AGENT_SNAPSHOT_EXPIRED"),
+    AGENT_TIMELINE_EPOCH_MISMATCH("AGENT_TIMELINE_EPOCH_MISMATCH"),
+}
+
+enum class AgentTimelineErrorCommandDisposition(val wireValue: String) {
+    NOT_APPLICABLE("not_applicable"),
+}
+
+data class AgentTimelineStructuredError(
+    val code: AgentTimelineErrorCode,
+    val message: String,
+    val retryable: Boolean,
+    val retryAfterMs: Long? = null,
+    val commandDisposition: AgentTimelineErrorCommandDisposition =
+        AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+)
+
+/** Correlated base-v2 error envelope carrying only extension-owned error codes. */
+data class AgentTimelineErrorFrame(
+    val requestId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val error: AgentTimelineStructuredError,
+) : AgentTranscriptLifecycleV1Frame {
+    override val kind: AgentTranscriptLifecycleV1FrameKind =
+        AgentTranscriptLifecycleV1FrameKind.RESPONSE
+    override val type: String = "error"
+}
+
 data class AgentTimelineStatusGetFrame(
     val requestId: String,
     val hostId: String,

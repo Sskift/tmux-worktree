@@ -95,6 +95,7 @@ class AgentTranscriptLifecycleV1Codec {
     private fun decodeFrame(frame: RelayV2JsonObject): AgentTranscriptLifecycleV1Frame {
         val type = extensionString(required(frame, "type"), maxBytes = MAX_ID_BYTES)
         return when (type) {
+            "error" -> decodeError(frame)
             "agent.timeline.status.get" -> decodeStatusGet(frame)
             "agent.timeline.status" -> decodeStatus(frame)
             "agent.timeline.snapshot.get" -> decodeSnapshotGet(frame)
@@ -105,6 +106,62 @@ class AgentTranscriptLifecycleV1Codec {
             "agent.timeline.reset" -> decodeTimelineReset(frame)
             else -> schemaFailure("unknown-message-type")
         }
+    }
+
+    private fun decodeError(frame: RelayV2JsonObject): AgentTimelineErrorFrame {
+        errorRoot(frame)
+        jsonNull(required(frame, "payload"))
+        val error = jsonObject(required(frame, "error"))
+        exactKeys(
+            error,
+            required = listOf("code", "message", "retryable", "commandDisposition"),
+            optional = listOf("retryAfterMs", "details"),
+        )
+        val code = when (
+            jsonOneOf(
+                required(error, "code"),
+                AgentTimelineErrorCode.entries.map { it.wireValue }.toSet(),
+            )
+        ) {
+            "AGENT_TIMELINE_UNAVAILABLE" ->
+                AgentTimelineErrorCode.AGENT_TIMELINE_UNAVAILABLE
+            "AGENT_CURSOR_EXPIRED" -> AgentTimelineErrorCode.AGENT_CURSOR_EXPIRED
+            "AGENT_CURSOR_AHEAD" -> AgentTimelineErrorCode.AGENT_CURSOR_AHEAD
+            "AGENT_SNAPSHOT_EXPIRED" -> AgentTimelineErrorCode.AGENT_SNAPSHOT_EXPIRED
+            "AGENT_TIMELINE_EPOCH_MISMATCH" ->
+                AgentTimelineErrorCode.AGENT_TIMELINE_EPOCH_MISMATCH
+            else -> schemaFailure("schema-mismatch")
+        }
+        val commandDisposition = when (
+            jsonOneOf(required(error, "commandDisposition"), setOf("not_applicable"))
+        ) {
+            "not_applicable" -> AgentTimelineErrorCommandDisposition.NOT_APPLICABLE
+            else -> schemaFailure("schema-mismatch")
+        }
+        val retryAfterMs = if (error.containsKey("retryAfterMs")) {
+            error["retryAfterMs"]?.let { strictInteger(it) }
+        } else {
+            null
+        }
+        if (error.containsKey("details")) jsonNull(error["details"])
+        return AgentTimelineErrorFrame(
+            requestId = opaqueId(frame["requestId"]),
+            hostId = opaqueId(frame["hostId"]),
+            hostEpoch = opaqueId(frame["hostEpoch"]),
+            scopeId = opaqueId(frame["scopeId"]),
+            sessionId = opaqueId(frame["sessionId"]),
+            error = AgentTimelineStructuredError(
+                code = code,
+                message = extensionString(
+                    value = required(error, "message"),
+                    allowOuterWhitespace = true,
+                    maxBytes = MAX_ERROR_MESSAGE_UTF8_BYTES,
+                ),
+                retryable = jsonBoolean(required(error, "retryable")),
+                retryAfterMs = retryAfterMs,
+                commandDisposition = commandDisposition,
+            ),
+        )
     }
 
     private fun decodeStatusGet(frame: RelayV2JsonObject): AgentTimelineStatusGetFrame {
@@ -408,9 +465,11 @@ class AgentTranscriptLifecycleV1Codec {
             "store_reset" -> AgentTimelineResetReason.STORE_RESET
             else -> schemaFailure("schema-mismatch")
         }
+        val previousTimelineEpoch = opaqueId(required(payload, "previousTimelineEpoch"))
         val newTimelineEpoch = nullableOpaqueId(required(payload, "newTimelineEpoch"))
         if (
-            (reason == AgentTimelineResetReason.DELETED && newTimelineEpoch == null) ||
+            (reason == AgentTimelineResetReason.DELETED &&
+                (newTimelineEpoch == null || newTimelineEpoch == previousTimelineEpoch)) ||
             (reason == AgentTimelineResetReason.STORE_RESET && newTimelineEpoch != null)
         ) {
             schemaFailure("reset-shape")
@@ -420,7 +479,7 @@ class AgentTranscriptLifecycleV1Codec {
             hostEpoch = opaqueId(frame["hostEpoch"]),
             scopeId = opaqueId(frame["scopeId"]),
             sessionId = opaqueId(frame["sessionId"]),
-            previousTimelineEpoch = opaqueId(required(payload, "previousTimelineEpoch")),
+            previousTimelineEpoch = previousTimelineEpoch,
             newTimelineEpoch = newTimelineEpoch,
             reason = reason,
         )
@@ -467,8 +526,13 @@ class AgentTranscriptLifecycleV1Codec {
         }
         val createdAgentSeq = positiveCounter(required(record, "createdAgentSeq"))
         val lastModifiedAgentSeq = positiveCounter(required(record, "lastModifiedAgentSeq"))
-        if (compareCounters(lastModifiedAgentSeq, createdAgentSeq) < 0) {
-            schemaFailure("entry-sequence-order")
+        val state = jsonOneOf(required(record, "state"), setOf("visible", "redacted"))
+        val sequenceOrder = compareCounters(lastModifiedAgentSeq, createdAgentSeq)
+        if (
+            (state == "visible" && sequenceOrder != 0) ||
+            (state == "redacted" && sequenceOrder <= 0)
+        ) {
+            schemaFailure("entry-sequence-binding")
         }
         val metadata = AgentTimelineTextEntryMetadata(
             entryId = opaqueId(required(record, "entryId")),
@@ -480,9 +544,7 @@ class AgentTranscriptLifecycleV1Codec {
             createdAgentSeq = createdAgentSeq,
             lastModifiedAgentSeq = lastModifiedAgentSeq,
         )
-        return when (
-            jsonOneOf(required(record, "state"), setOf("visible", "redacted"))
-        ) {
+        return when (state) {
             "visible" -> {
                 jsonNull(required(record, "redactionReason"))
                 AgentTimelineVisibleTextEntryRecord(
@@ -754,6 +816,27 @@ class AgentTranscriptLifecycleV1Codec {
             .forEach { opaqueId(required(frame, it)) }
     }
 
+    private fun errorRoot(frame: RelayV2JsonObject) {
+        exactKeys(
+            frame,
+            required = listOf(
+                "protocolVersion",
+                "kind",
+                "type",
+                "requestId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "payload",
+                "error",
+            ),
+        )
+        fixedRoot(frame, AgentTranscriptLifecycleV1FrameKind.RESPONSE, "error")
+        listOf("requestId", "hostId", "hostEpoch", "scopeId", "sessionId")
+            .forEach { opaqueId(required(frame, it)) }
+    }
+
     private fun eventRoot(frame: RelayV2JsonObject, type: String) {
         exactKeys(
             frame,
@@ -892,7 +975,8 @@ class AgentTranscriptLifecycleV1Codec {
 
         private const val CAPABILITY = "agent.transcript-lifecycle.v1"
         private const val MAX_ID_BYTES = 128
-        private const val MAX_CURSOR_BYTES = 1_024
+        private const val MAX_CURSOR_BYTES = 128
+        private const val MAX_ERROR_MESSAGE_UTF8_BYTES = 4_096
         private const val MIN_EVENT_REPLAY_RETENTION_MS = 86_400_000L
 
         private val PAGED_MESSAGE_TYPES = setOf(
@@ -916,6 +1000,7 @@ class AgentTranscriptLifecycleV1Codec {
 
 private fun AgentTranscriptLifecycleV1Frame.toWireObject(): LinkedHashMap<String, Any?> =
     when (this) {
+        is AgentTimelineErrorFrame -> errorWire()
         is AgentTimelineStatusGetFrame -> requestWire(
             type = type,
             requestId = requestId,
@@ -998,6 +1083,31 @@ private fun AgentTranscriptLifecycleV1Frame.toWireObject(): LinkedHashMap<String
                 "reason" to reason.wireValue,
             ),
         )
+    }
+
+private fun AgentTimelineErrorFrame.errorWire(): LinkedHashMap<String, Any?> =
+    wireObject(
+        "protocolVersion" to 2L,
+        "kind" to "response",
+        "type" to type,
+        "requestId" to requestId,
+    ).apply {
+        put("hostId", hostId)
+        put("hostEpoch", hostEpoch)
+        put("scopeId", scopeId)
+        put("sessionId", sessionId)
+        put("payload", null)
+        put("error", error.toWireObject())
+    }
+
+private fun AgentTimelineStructuredError.toWireObject(): LinkedHashMap<String, Any?> =
+    wireObject(
+        "code" to code.wireValue,
+        "message" to message,
+        "retryable" to retryable,
+    ).apply {
+        retryAfterMs?.let { put("retryAfterMs", it) }
+        put("commandDisposition", commandDisposition.wireValue)
     }
 
 private fun AgentTimelineStatus.toWireObject(): LinkedHashMap<String, Any?> = when (this) {
