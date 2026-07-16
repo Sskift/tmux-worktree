@@ -644,6 +644,46 @@ test("operation IDs deduplicate exact retries and reject payload reuse", async (
   }
 });
 
+test("Dashboard and Relay share interactive input without fencing each other", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const dashboard = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("dashboard", "dashboard-window:pty-1"),
+    );
+    const relay = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("relay-v1", "connector:android-client:target"),
+    );
+
+    assert.equal(relay.lease.leaseId, dashboard.lease.leaseId);
+    assert.equal(relay.lease.fence, dashboard.lease.fence);
+    await authority.handle(rawRequest(dashboard.lease, "dashboard-input-1", "from-dashboard"));
+    await authority.handle(rawRequest(relay.lease, "relay-input-1", "from-apk"));
+
+    await authority.handle({
+      protocolVersion: 1,
+      requestId: "dashboard-release-with-relay-active",
+      type: "lease.release",
+      lease: dashboard.lease,
+    });
+    await authority.handle(rawRequest(relay.lease, "relay-input-2", "apk-still-writable"));
+
+    assert.deepEqual(backend.writes, [
+      { kind: "raw", value: { pane: "0", data: "from-dashboard" } },
+      { kind: "raw", value: { pane: "0", data: "from-apk" } },
+      { kind: "raw", value: { pane: "0", data: "apk-still-writable" } },
+    ]);
+  } finally {
+    temp.cleanup();
+  }
+});
+
 test("semantic tmux scroll is lease-fenced, atomic, and deduplicated", async () => {
   const temp = tempState();
   const backend = new FakeBackend();

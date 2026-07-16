@@ -1,6 +1,6 @@
 {
   "name": "@byted-codebase/tmux-worktree",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "type": "module",
   "description": "AI + tmux + git worktree workspace manager with a macOS Dashboard, local sessions, automations, and SSH remote TW-managed worktrees",
   "repository": {

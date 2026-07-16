@@ -431,6 +431,7 @@ if (command.includes("terminal-control") && command.includes("request")) {
   process.stdin.on("data", (chunk) => { input += chunk.toString("utf8"); });
   process.stdin.on("end", () => {
     const request = JSON.parse(input.trim());
+    appendFileSync(join(gateDir, "remote-control-requests.ndjson"), JSON.stringify(request) + "\\n");
     let state = existsSync(statePath)
       ? JSON.parse(readFileSync(statePath, "utf8"))
       : { epoch: "remote-epoch", leases: {} };
@@ -444,7 +445,9 @@ if (command.includes("terminal-control") && command.includes("request")) {
         leaseId: "remote-lease-" + request.controlTargetId,
         fence: "1",
         owner: request.owner,
-        expiresAt: "2099-01-01T00:00:00.000Z",
+        expiresAt: existsSync(join(gateDir, "remote-short-control-lease"))
+          ? new Date(Date.now() + 100).toISOString()
+          : "2099-01-01T00:00:00.000Z",
       };
       state.leases[request.controlTargetId] = lease;
       writeFileSync(statePath, JSON.stringify(state));
@@ -452,12 +455,43 @@ if (command.includes("terminal-control") && command.includes("request")) {
     } else if (request.type === "lease.renew") {
       const lease = state.leases[request.lease.controlTargetId];
       if (!lease) throw new Error("remote lease missing");
-      result = { lease };
+      if (Date.parse(lease.expiresAt) <= Date.now()) {
+        delete state.leases[request.lease.controlTargetId];
+        writeFileSync(statePath, JSON.stringify(state));
+        process.stdout.write(JSON.stringify({
+          protocolVersion: 1,
+          requestId: request.requestId,
+          ok: false,
+          error: {
+            code: "PERMISSION_DENIED",
+            message: "target has no current input owner",
+            retryable: false,
+          },
+        }) + "\\n");
+        process.exit(0);
+      }
+      const renewed = { ...lease, expiresAt: new Date(Date.now() + 60_000).toISOString() };
+      state.leases[request.lease.controlTargetId] = renewed;
+      writeFileSync(statePath, JSON.stringify(state));
+      result = { lease: renewed };
     } else if (request.type === "lease.release") {
       delete state.leases[request.lease.controlTargetId];
       writeFileSync(statePath, JSON.stringify(state));
       result = { state: "FREE" };
     } else if (request.type.startsWith("input.")) {
+      if (existsSync(join(gateDir, "fail-remote-stale-control-input"))) {
+        process.stdout.write(JSON.stringify({
+          protocolVersion: 1,
+          requestId: request.requestId,
+          ok: false,
+          error: {
+            code: "PERMISSION_DENIED",
+            message: "terminal input lease is fenced",
+            retryable: false,
+          },
+        }) + "\\n");
+        process.exit(0);
+      }
       if (existsSync(join(gateDir, "fail-remote-control-input"))) {
         process.stdout.write(JSON.stringify({
           protocolVersion: 1,
@@ -848,7 +882,7 @@ test("local bridge discards inherited query and fragment credentials", async (t)
   assert.equal(connection.requestUrl.includes("stale-fragment"), false);
 });
 
-test("Relay keeps controlled input on logical pane zero when the physical pane index starts at one", async (t) => {
+test("Relay keeps local resize attachment-only and controlled input on logical pane zero", async (t) => {
   const harness = await startHarness(t);
   const session = "pane-base-one";
   setPhysicalPaneIndex(harness, session, 1);
@@ -861,15 +895,15 @@ test("Relay keeps controlled input on logical pane zero when the physical pane i
 
   const before = harness.brokerMessages.length;
   sendToHost(harness, {
-    type: "terminal_input",
-    streamId: STREAM_ID,
-    data: "raw-on-logical-zero",
-  });
-  sendToHost(harness, {
     type: "resize",
     streamId: STREAM_ID,
     cols: 111,
     rows: 37,
+  });
+  sendToHost(harness, {
+    type: "terminal_input",
+    streamId: STREAM_ID,
+    data: "raw-on-logical-zero",
   });
   sendToHost(harness, {
     type: "send_agent_message",
@@ -882,16 +916,12 @@ test("Relay keeps controlled input on logical pane zero when the physical pane i
 
   await waitFor(
     () => {
-      const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
-        .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
       const input = existsSync(join(harness.gateDir, "tmux-inputs.ndjson"))
         ? readFileSync(join(harness.gateDir, "tmux-inputs.ndjson"), "utf8")
         : "";
       return input.includes("raw-on-logical-zero")
         && input.includes("agent-on-logical-zero")
-        && calls.some(({ args }) => (
-          args[0] === "resize-window" && args.includes("111") && args.includes("37")
-        ))
+        && connection.received.includes(JSON.stringify({ type: "attachment_resize", cols: 111, rows: 37 }))
         && harness.brokerMessages.some(({ message }) => (
           message.type === "agent_message_sent" && message.requestId === "pane-base-one-agent"
         ));
@@ -902,6 +932,9 @@ test("Relay keeps controlled input on logical pane zero when the physical pane i
     harness.brokerMessages.slice(before).some(({ message }) => message.type === "error"),
     false,
   );
+  const calls = readFileSync(join(harness.gateDir, "calls.ndjson"), "utf8")
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  assert.equal(calls.some(({ args }) => args[0] === "resize-window"), false);
 });
 
 test("local agent submit paces paste and submit while preserving exact normalized text", async (t) => {
@@ -1041,9 +1074,21 @@ test("Relay v1 stays read-only while Feishu owns input and never replays rejecte
         .map(({ message }) => message)
         .filter(({ type }) => type === "error");
       return errors.some(({ requestId }) => requestId === "owned-agent-message")
-        && errors.filter(({ streamId }) => streamId === STREAM_ID).length >= 2;
+        && errors.some(({ streamId }) => streamId === STREAM_ID)
+        && observer.received.includes(JSON.stringify({ type: "attachment_resize", cols: 120, rows: 40 }));
     },
     `ownership errors were not correlated on the frozen v1 wire; output:\n${harness.output()}`,
+  );
+  const ownershipErrors = harness.brokerMessages.slice(before)
+    .map(({ message }) => message)
+    .filter(({ type }) => type === "error");
+  assert.equal(
+    ownershipErrors.find(({ streamId }) => streamId === STREAM_ID)?.message,
+    "[input-ownership:PERMISSION_DENIED] terminal input is owned by feishu",
+  );
+  assert.equal(
+    ownershipErrors.find(({ requestId }) => requestId === "owned-agent-message")?.message,
+    "[input-ownership:PERMISSION_DENIED] terminal input is owned by feishu",
   );
   assert.equal(
     harness.brokerMessages.slice(before).some(({ message }) => (
@@ -1055,6 +1100,13 @@ test("Relay v1 stays read-only while Feishu owns input and never replays rejecte
     .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   assert.equal(callsBeforeRelease.some(({ args }) => args[0] === "load-buffer"), false);
   assert.equal(callsBeforeRelease.some(({ args }) => args[0] === "resize-window"), false);
+  assert.equal(
+    harness.brokerMessages.slice(before).filter(({ message }) => (
+      message.type === "error" && message.streamId === STREAM_ID
+    )).length,
+    1,
+    "attachment-only resize must not be rejected by Feishu input ownership",
+  );
 
   observer.socket.send("output-still-readable");
   await waitFor(
@@ -1717,7 +1769,86 @@ test("closing one observer route does not release another route's shared client 
   );
 });
 
-test("remote resize signals do not make the following terminal input look closed", async (t) => {
+test("Relay refreshes an expired cached lease before sending the next raw input", async (t) => {
+  const harness = await startHarness(t, { remotePtySuccess: true });
+  writeFileSync(join(harness.gateDir, "remote-short-control-lease"), "");
+  openScopedTerminalAs(harness, CLIENT_ID, "remote:expired-lease-input", STREAM_ID);
+  await waitFor(
+    () => harness.brokerMessages.some(({ message }) => (
+      message.type === "terminal_data"
+      && message.streamId === STREAM_ID
+      && message.data.includes("REMOTE_READY")
+    )),
+    "the remote observer stream did not open",
+  );
+
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "prime-short-lease" });
+  await waitFor(
+    () => existsSync(join(harness.gateDir, "remote-control-inputs.ndjson"))
+      && readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
+        .includes(Buffer.from("prime-short-lease", "utf8").toString("base64")),
+    "the priming input did not cache the short relay lease",
+  );
+  rmSync(join(harness.gateDir, "remote-short-control-lease"), { force: true });
+  await delay(150);
+
+  const before = harness.brokerMessages.length;
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "after-expiry-once" });
+  await waitFor(
+    () => readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
+      .includes(Buffer.from("after-expiry-once", "utf8").toString("base64")),
+    "raw input did not transparently reacquire before writing after lease expiry",
+  );
+
+  const requests = readFileSync(join(harness.gateDir, "remote-control-requests.ndjson"), "utf8")
+    .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const afterInputIndex = requests.findIndex(({ type, dataBase64 }) => (
+    type === "input.raw"
+    && Buffer.from(dataBase64, "base64").toString("utf8") === "after-expiry-once"
+  ));
+  assert.ok(afterInputIndex > 2);
+  assert.equal(requests[afterInputIndex - 3].type, "lease.renew");
+  assert.equal(requests[afterInputIndex - 2].type, "target.resolve");
+  assert.equal(requests[afterInputIndex - 1].type, "lease.acquire");
+  assert.equal(
+    requests.filter(({ type, dataBase64 }) => (
+      type === "input.raw"
+      && Buffer.from(dataBase64, "base64").toString("utf8") === "after-expiry-once"
+    )).length,
+    1,
+    "the raw input request must be issued exactly once",
+  );
+  assert.deepEqual(
+    harness.brokerMessages.slice(before).filter(({ message }) => (
+      message.streamId === STREAM_ID && (message.type === "error" || message.type === "terminal_exit")
+    )),
+    [],
+  );
+
+  writeFileSync(join(harness.gateDir, "fail-remote-stale-control-input"), "");
+  const staleBefore = harness.brokerMessages.length;
+  sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "must-not-replay-stale" });
+  const staleError = await waitFor(
+    () => harness.brokerMessages.slice(staleBefore).find(({ message }) => (
+      message.type === "error" && message.streamId === STREAM_ID
+    ))?.message,
+    "the stale lease error was not surfaced",
+  );
+  assert.equal(staleError.message, "terminal input lease is fenced");
+  assert.equal(staleError.message.includes("[input-ownership:"), false);
+  assert.equal(
+    readFileSync(join(harness.gateDir, "remote-control-requests.ndjson"), "utf8")
+      .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+      .filter(({ type, dataBase64 }) => (
+        type === "input.raw"
+        && Buffer.from(dataBase64, "base64").toString("utf8") === "must-not-replay-stale"
+      )).length,
+    1,
+    "a fenced input response must never cause the input request to be replayed",
+  );
+});
+
+test("remote resize stays attachment-only and leaves following controlled input writable", async (t) => {
   const harness = await startHarness(t, { remotePtySuccess: true });
   openScopedTerminalAs(harness, CLIENT_ID, "remote:resize-input", STREAM_ID);
   await waitFor(
@@ -1732,17 +1863,29 @@ test("remote resize signals do not make the following terminal input look closed
   sendToHost(harness, { type: "resize", streamId: STREAM_ID, cols: 120, rows: 40 });
   sendToHost(harness, { type: "terminal_input", streamId: STREAM_ID, data: "after-resize" });
   await waitFor(
-    () => existsSync(join(harness.gateDir, "remote-control-inputs.ndjson"))
-      && readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
-        .trim().split("\n").filter(Boolean).length >= 2,
-    "remote input and resize did not pass through terminal-control",
+    () => {
+      const path = join(harness.gateDir, "remote-control-inputs.ndjson");
+      if (!existsSync(path)) return false;
+      return readFileSync(path, "utf8")
+        .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        .some(({ type, dataBase64 }) => (
+          type === "input.raw" && Buffer.from(dataBase64, "base64").toString("utf8") === "after-resize"
+        ));
+    },
+    "remote input did not pass through terminal-control",
   );
   const controlled = readFileSync(join(harness.gateDir, "remote-control-inputs.ndjson"), "utf8")
     .trim().split("\n").map((line) => JSON.parse(line));
-  assert.ok(controlled.some(({ type, cols, rows }) => type === "input.resize" && cols === 120 && rows === 40));
+  assert.equal(controlled.some(({ type }) => type === "input.resize"), false);
   assert.ok(controlled.some(({ type, dataBase64 }) => (
     type === "input.raw" && Buffer.from(dataBase64, "base64").toString("utf8") === "after-resize"
   )));
+  const tmuxCallsPath = join(harness.gateDir, "calls.ndjson");
+  const tmuxCalls = existsSync(tmuxCallsPath)
+    ? readFileSync(tmuxCallsPath, "utf8")
+      .trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+    : [];
+  assert.equal(tmuxCalls.some(({ args }) => args[0] === "resize-window"), false);
   const lifecycleFailures = harness.brokerMessages
     .slice(beforeInput)
     .map(({ message }) => message)
@@ -1765,6 +1908,11 @@ test("remote resize signals do not make the following terminal input look closed
         && readFileSync(join(path, "process-group"), "utf8").trim() === String(sshPid)
       )),
     "the remote PTY wrapper did not publish its private process-group directory",
+  );
+  await waitFor(
+    () => existsSync(join(controlDir, "resize"))
+      && readFileSync(join(controlDir, "resize"), "utf8") === "120,40",
+    "remote resize did not reach the attachment PTY",
   );
   sendToHost(harness, { type: "close_terminal", streamId: STREAM_ID });
   await waitFor(

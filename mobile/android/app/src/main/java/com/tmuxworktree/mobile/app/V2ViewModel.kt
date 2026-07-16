@@ -596,7 +596,7 @@ class V2ViewModel(
         }
     }
 
-    fun openTerminal(session: RelaySession) {
+    fun openTerminal(session: RelaySession, attachmentId: String) {
         if (demoMode) {
             _uiState.update {
                 it.copy(
@@ -610,36 +610,41 @@ class V2ViewModel(
             emit(V2UiEffect.TerminalReset("Connected to ${session.title}\r\n"))
             emit(V2UiEffect.TerminalWrite("\u001b[32m${session.hostName}\u001b[0m:${session.cwd.ifBlank { "~" }}$ "))
         } else {
-            relay.openTerminal(session.hostId, session.name)
+            relay.openTerminal(
+                hostId = session.hostId,
+                sessionName = session.name,
+                attachmentId = attachmentId,
+            )
         }
     }
 
-    fun retryTerminalInput(session: RelaySession) {
+    fun retryTerminalInput(session: RelaySession, attachmentId: String) {
         if (demoMode) {
-            openTerminal(session)
+            openTerminal(session, attachmentId)
         } else {
             relay.openTerminal(
                 hostId = session.hostId,
                 sessionName = session.name,
                 resetDisplay = true,
+                attachmentId = attachmentId,
             )
         }
     }
 
-    fun closeTerminal() {
-        if (!demoMode) relay.closeTerminal()
+    fun closeTerminal(attachmentId: String) {
+        if (!demoMode) relay.closeTerminal(attachmentId)
     }
 
-    fun sendTerminalInput(data: String) {
+    fun sendTerminalInput(data: String, attachmentId: String) {
         if (demoMode) {
             emit(V2UiEffect.TerminalWrite(data))
         } else {
-            relay.sendTerminalInput(data)
+            relay.sendTerminalInput(data, attachmentId)
         }
     }
 
-    fun resizeTerminal(cols: Int, rows: Int) {
-        if (!demoMode) relay.resizeTerminal(cols, rows)
+    fun resizeTerminal(cols: Int, rows: Int, attachmentId: String) {
+        if (!demoMode) relay.resizeTerminal(cols, rows, attachmentId)
     }
 
     fun setNotificationPreference(kind: NotificationKind, enabled: Boolean) {

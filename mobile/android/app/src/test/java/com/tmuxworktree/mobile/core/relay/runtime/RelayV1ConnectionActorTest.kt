@@ -4,6 +4,7 @@ import com.tmuxworktree.mobile.core.model.TransportPhase
 import com.tmuxworktree.mobile.core.relay.v1.RelayV1Command
 import com.tmuxworktree.mobile.core.relay.v1.RelayV1Pane
 import com.tmuxworktree.mobile.core.relay.v1.TinyJson
+import com.tmuxworktree.mobile.core.relay.v1.int
 import com.tmuxworktree.mobile.core.relay.v1.string
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
@@ -179,7 +180,7 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
-    fun `ownership rejection stays read only until a fresh retry and never replays input`() = runBlocking {
+    fun `ownership rejection blocks raw input while resize still reaches relay`() = runBlocking {
         val terminalInputs = CopyOnWriteArrayList<String>()
         val openedStreams = CopyOnWriteArrayList<String>()
         val resizeCount = AtomicInteger(0)
@@ -239,7 +240,7 @@ class RelayV1ConnectionActorTest {
             actor.resizeTerminal(100, 40)
             delay(150)
             assertEquals(listOf("first"), terminalInputs.toList())
-            assertEquals(0, resizeCount.get())
+            assertEquals(1, resizeCount.get())
 
             val retriedStreamId = actor.openTerminal(
                 hostId = "mac-admin",
@@ -258,6 +259,7 @@ class RelayV1ConnectionActorTest {
             }
             assertEquals(2, openedStreams.distinct().size)
             assertFalse(actor.terminal.value.inputReadOnly)
+            waitUntil { resizeCount.get() == 2 }
 
             actor.sendTerminalInput("retry-attempt")
             withTimeout(5_000) {
@@ -267,6 +269,197 @@ class RelayV1ConnectionActorTest {
             delay(150)
             assertEquals(listOf("first", "retry-attempt"), terminalInputs.toList())
             assertTrue(actor.terminal.value.inputReadOnly)
+
+            actor.closeTerminal()
+            withTimeout(5_000) { actor.terminal.first { it.streamId == null } }
+            val reopenedAfterClose = actor.openTerminal("mac-admin", "local:owned")
+            withTimeout(5_000) {
+                actor.terminal.first {
+                    it.streamId == reopenedAfterClose &&
+                        it.status.name == "ONLINE" &&
+                        !it.inputReadOnly
+                }
+            }
+            delay(100)
+            assertEquals(2, resizeCount.get())
+        } finally {
+            actor.close()
+            scope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `ownership latch is scoped to one stream and ordinary stream errors stay writable`() = runBlocking {
+        val terminalInputs = CopyOnWriteArrayList<String>()
+        val openedStreams = CopyOnWriteArrayList<String>()
+        val socketRef = AtomicReference<WebSocket>()
+        val ownershipRejections = AtomicInteger(0)
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(object : WebSocketListener() {
+                override fun onOpen(webSocket: WebSocket, response: Response) {
+                    socketRef.set(webSocket)
+                    webSocket.send("{\"type\":\"ready\",\"clientId\":\"client-1\"}")
+                }
+
+                override fun onMessage(webSocket: WebSocket, text: String) {
+                    val payload = TinyJson.parseObject(text)
+                    when (payload.string("type")) {
+                        "open_terminal" -> {
+                            openedStreams += payload.string("streamId")
+                            webSocket.send(
+                                "{\"type\":\"terminal_data\",\"streamId\":\"${payload.string("streamId")}\",\"data\":\"ready\"}",
+                            )
+                        }
+                        "terminal_input" -> {
+                            terminalInputs += payload.string("data")
+                            if (ownershipRejections.getAndIncrement() == 0) {
+                                webSocket.send(
+                                    "{\"type\":\"error\",\"streamId\":\"${payload.string("streamId")}\",\"message\":\"[input-ownership:PERMISSION_DENIED] terminal input is owned by feishu\"}",
+                                )
+                            }
+                        }
+                        "resize" -> webSocket.send(
+                            "{\"type\":\"error\",\"streamId\":\"${payload.string("streamId")}\",\"message\":\"resize rejected by terminal\"}",
+                        )
+                    }
+                }
+            }),
+        )
+        server.start()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(scope)
+        try {
+            actor.connect(configFor(server))
+            withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.ONLINE } }
+            actor.openTerminal("mac-admin", "local:owned")
+            withTimeout(5_000) { actor.terminal.first { it.status.name == "ONLINE" } }
+            val firstStreamId = actor.terminal.value.streamId!!
+
+            val malformedMarker = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events.filterIsInstance<RelayClientEvent.Error>().first {
+                        it.message == "[input-ownership:] malformed"
+                    }
+                }
+            }
+            socketRef.get().send(
+                "{\"type\":\"error\",\"streamId\":\"$firstStreamId\",\"message\":\"[input-ownership:] malformed\"}",
+            )
+            malformedMarker.await()
+            assertFalse(actor.terminal.value.inputReadOnly)
+
+            val resizeError = async(start = CoroutineStart.UNDISPATCHED) {
+                withTimeout(5_000) {
+                    actor.events.filterIsInstance<RelayClientEvent.Error>().first {
+                        it.message == "resize rejected by terminal"
+                    }
+                }
+            }
+            actor.resizeTerminal(100, 40)
+            resizeError.await()
+            assertFalse(actor.terminal.value.inputReadOnly)
+
+            actor.sendTerminalInput("first")
+            withTimeout(5_000) { actor.terminal.first { it.inputReadOnly } }
+            actor.sendTerminalInput("must-not-replay")
+            delay(100)
+            assertEquals(listOf("first"), terminalInputs.toList())
+
+            socketRef.get().send(
+                "{\"type\":\"error\",\"streamId\":\"$firstStreamId\",\"message\":\"terminal stream is not open\"}",
+            )
+            waitUntil {
+                openedStreams.size >= 2 &&
+                    actor.terminal.value.streamId == openedStreams.last() &&
+                    actor.terminal.value.status.name == "ONLINE" &&
+                    !actor.terminal.value.inputReadOnly
+            }
+
+            actor.sendTerminalInput("after-reconnect")
+            waitUntil { terminalInputs.contains("after-reconnect") }
+            assertEquals(listOf("first", "after-reconnect"), terminalInputs.toList())
+            assertFalse(actor.terminal.value.inputReadOnly)
+        } finally {
+            actor.close()
+            scope.cancel()
+            server.shutdown()
+        }
+    }
+
+    @Test
+    fun `stale attachment actions cannot mutate a fresh attachment`() = runBlocking {
+        val commands = CopyOnWriteArrayList<String>()
+        val openedStreams = CopyOnWriteArrayList<String>()
+        val terminalInputs = CopyOnWriteArrayList<String>()
+        val terminalResizes = CopyOnWriteArrayList<String>()
+        val closedStreams = CopyOnWriteArrayList<String>()
+        val server = MockWebServer()
+        server.enqueue(
+            MockResponse().withWebSocketUpgrade(
+                snapshotListener(commands) { webSocket, payload ->
+                    val streamId = payload.string("streamId")
+                    openedStreams += streamId
+                    webSocket.send(
+                        "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"ready\"}",
+                    )
+                }.withCommandHandler { _, payload ->
+                    val streamId = payload.string("streamId")
+                    when (payload.string("type")) {
+                        "terminal_input" -> terminalInputs += "$streamId:${payload.string("data")}"
+                        "resize" -> terminalResizes += "$streamId:${payload.int("cols")}x${payload.int("rows")}"
+                        "close_terminal" -> closedStreams += streamId
+                    }
+                },
+            ),
+        )
+        server.start()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        val actor = RelayV1ConnectionActor(scope)
+        try {
+            actor.connect(configFor(server))
+            withTimeout(5_000) { actor.health.first { it.phase == TransportPhase.ONLINE } }
+
+            actor.resizeTerminal(90, 30, attachmentId = "attachment-old")
+            val oldStream = actor.openTerminal(
+                hostId = "mac-admin",
+                sessionName = "local:demo",
+                attachmentId = "attachment-old",
+            )
+            waitUntil {
+                actor.terminal.value.streamId == oldStream &&
+                    actor.terminal.value.status.name == "ONLINE" &&
+                    terminalResizes.contains("$oldStream:90x30")
+            }
+
+            actor.resizeTerminal(120, 50, attachmentId = "attachment-fresh")
+            val freshStream = actor.openTerminal(
+                hostId = "mac-admin",
+                sessionName = "local:demo",
+                attachmentId = "attachment-fresh",
+            )
+            withTimeout(5_000) {
+                actor.terminal.first {
+                    it.streamId == freshStream && it.status.name == "ONLINE"
+                }
+            }
+            waitUntil { terminalResizes.contains("$freshStream:120x50") }
+
+            actor.resizeTerminal(140, 60, attachmentId = "attachment-old")
+            actor.sendTerminalInput("stale", attachmentId = "attachment-old")
+            actor.closeTerminal(attachmentId = "attachment-old")
+            actor.sendTerminalInput("fresh", attachmentId = "attachment-fresh")
+            waitUntil { terminalInputs.contains("$freshStream:fresh") }
+
+            assertEquals(freshStream, actor.terminal.value.streamId)
+            assertEquals(
+                listOf("$oldStream:90x30", "$freshStream:120x50"),
+                terminalResizes.toList(),
+            )
+            assertEquals(listOf("$freshStream:fresh"), terminalInputs.toList())
+            assertEquals(listOf(oldStream), closedStreams.toList())
+            assertEquals(listOf(oldStream, freshStream), openedStreams.toList())
         } finally {
             actor.close()
             scope.cancel()
@@ -913,11 +1106,12 @@ class RelayV1ConnectionActorTest {
     }
 
     @Test
-    fun `same config reconnect and network pause preserve desired terminal while profile change clears it`() = runBlocking {
+    fun `network recovery preserves desired terminal size while profile change clears both`() = runBlocking {
         val commands = CopyOnWriteArrayList<String>()
         val openedStreams = CopyOnWriteArrayList<String>()
+        val resizedStreams = CopyOnWriteArrayList<String>()
         val server = MockWebServer()
-        repeat(3) {
+        repeat(4) {
             server.enqueue(
                 MockResponse().withWebSocketUpgrade(
                     snapshotListener(commands) { webSocket, payload ->
@@ -926,6 +1120,10 @@ class RelayV1ConnectionActorTest {
                         webSocket.send(
                             "{\"type\":\"terminal_data\",\"streamId\":\"$streamId\",\"data\":\"connected\"}",
                         )
+                    }.withCommandHandler { _, payload ->
+                        if (payload.string("type") == "resize") {
+                            resizedStreams += "${payload.string("streamId")}:${payload.int("cols")}x${payload.int("rows")}"
+                        }
                     },
                 ),
             )
@@ -937,14 +1135,31 @@ class RelayV1ConnectionActorTest {
         try {
             actor.connect(config)
             withTimeout(5_000) { actor.snapshots.first { it.sessions.isNotEmpty() } }
+            actor.resizeTerminal(111, 44)
+            actor.resizeTerminal(19, 44)
+            actor.resizeTerminal(111, 201)
             actor.openTerminal("mac-admin", "local:demo")
             withTimeout(5_000) { actor.terminal.first { it.status.name == "ONLINE" } }
+            waitUntil { resizedStreams.size == 1 }
             val firstGeneration = actor.terminal.value.generation
+            assertEquals("${openedStreams.single()}:111x44", resizedStreams.single())
+
+            actor.resizeTerminal(111, 44)
+            delay(100)
+            assertEquals(1, resizedStreams.size)
 
             actor.connect(config)
-            waitUntil { openedStreams.size >= 2 && actor.terminal.value.status.name == "ONLINE" }
+            waitUntil {
+                openedStreams.size >= 2 &&
+                    resizedStreams.size >= 2 &&
+                    actor.terminal.value.status.name == "ONLINE"
+            }
             assertTrue(actor.terminal.value.generation > firstGeneration)
             assertEquals(2, openedStreams.distinct().size)
+            assertEquals(
+                openedStreams.take(2).map { "$it:111x44" },
+                resizedStreams.take(2),
+            )
 
             actor.pauseForNetwork()
             withTimeout(5_000) {
@@ -952,10 +1167,23 @@ class RelayV1ConnectionActorTest {
             }
             assertEquals(com.tmuxworktree.mobile.core.model.ConnectionStatus.PAUSED, actor.terminal.value.status)
             assertNull(actor.terminal.value.streamId)
+            actor.resizeTerminal(112, 45)
 
             actor.connect(config)
-            waitUntil { openedStreams.size >= 3 && actor.terminal.value.status.name == "ONLINE" }
+            waitUntil {
+                openedStreams.size >= 3 &&
+                    resizedStreams.size >= 3 &&
+                    actor.terminal.value.status.name == "ONLINE"
+            }
             assertEquals(3, openedStreams.distinct().size)
+            assertEquals(
+                listOf(
+                    "${openedStreams[0]}:111x44",
+                    "${openedStreams[1]}:111x44",
+                    "${openedStreams[2]}:112x45",
+                ),
+                resizedStreams.take(3),
+            )
 
             actor.connect(
                 RelayV1ConnectionConfig(
@@ -968,6 +1196,18 @@ class RelayV1ConnectionActorTest {
             }
             assertEquals(com.tmuxworktree.mobile.core.model.ConnectionStatus.OFFLINE, actor.terminal.value.status)
             assertNull(actor.terminal.value.streamId)
+
+            actor.connect(config)
+            withTimeout(5_000) { actor.snapshots.first { it.sessions.isNotEmpty() } }
+            val afterProfileSwitch = actor.openTerminal("mac-admin", "local:demo")
+            waitUntil {
+                openedStreams.size >= 4 &&
+                    actor.terminal.value.streamId == afterProfileSwitch &&
+                    actor.terminal.value.status.name == "ONLINE"
+            }
+            assertEquals(4, openedStreams.size)
+            delay(100)
+            assertEquals(3, resizedStreams.size)
         } finally {
             actor.close()
             actorScope.cancel()

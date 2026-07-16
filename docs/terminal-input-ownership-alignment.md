@@ -55,7 +55,7 @@ Dashboard 的 Integrations 页面只持久化非敏感 `lark-cli` profile 名称
 ### 2.4 Relay v1/v2
 
 - Relay v1 保持 legacy-frozen wire，只在 relay-host 内部增加 controller adapter；不增加 status、takeover、error code 或 input ACK 字段。
-- managed single-pane 在 terminal-control 边界内只有逻辑 pane `"0"`。tmux 的物理 `pane_index`（可以因 `pane-base-index` 从 `1` 开始）只用于本地/SSH attach 选 pane，Relay adapter 不得把它作为 `input.raw`、`input.resize` 或 `input.agent-message` 的逻辑 pane。
+- managed single-pane 在 terminal-control 边界内只有逻辑 pane `"0"`。tmux 的物理 `pane_index`（可以因 `pane-base-index` 从 `1` 开始）只用于本地/SSH attach 选 pane；Relay raw/agent-message adapter 不得把它作为 `input.raw` 或 `input.agent-message` 的逻辑 pane，Relay v1 attachment resize不进入terminal-control。
 - Relay v2 继续拥有 twcap2、carrier、command ledger、snapshot/eventSeq、terminal stream generation、inputSeq、ring 和 detached lease。relay-host 在最终 backend write 前调用 controller，但 broker 永不感知或裁决本地 ownership。
 - Relay v2 public `sessionId` 和 terminal-control `controlTargetId` 是不同 namespace，只在 relay-host 内部映射。
 
@@ -230,8 +230,8 @@ Relay v1 wire不变：
 
 - list/session snapshot、terminal open和output继续可用。
 - `send_agent_message` 由relay-host先严格映射target，再调用controller。Feishu持有时返回现有v1 `error`，尽可能回显原requestId；不调用tmux，不产生`agent_message_sent`。
-- Feishu 独占时，`terminal_input`/resize在stream write前被controller拒绝，relay-host发送现有带streamId的v1 `error`；不得缓存、重开stream后重放或写backend，output仍可继续。Dashboard 或另一个 APK 已持有 interactive lease 时，Relay v1 复用同一 lease/fence并正常写入。
-- relay-host只在既有`error.message`内加稳定的`[input-ownership:<local-code>]`分类标记；不增加wire字段或message type。Android v1把该拒绝视为不可自动重试的只读结果，停止input/resize；锁定图标表示客户端的 fail-closed latch，不表示 APK 持有服务端 lease。用户可以用 `Retry input` 显式创建一个 fresh stream 并清除旧 latch，但旧按键永不重放；若 authority 仍拒绝，下一次新输入会再次进入只读。v1没有可提前查询owner或发起takeover的协议能力。
+- Feishu 独占时，`terminal_input`在stream write前被controller拒绝，relay-host发送现有带streamId的v1 `error`；不得缓存、重开stream后重放或写backend，output仍可继续。Dashboard 或另一个 APK 已持有 interactive lease 时，Relay v1 复用同一 lease/fence并正常写入。v1 `resize` 是 observation attachment 的私有 PTY 状态，不调用controller、不会改变共享 tmux window，Feishu 持有时也可继续使用。
+- relay-host只在既有`error.message`内加稳定的`[input-ownership:<local-code>]`分类标记；不增加wire字段或message type。`PERMISSION_DENIED` 只有在controller明确表示 input 由 Feishu 持有时才使用该 marker，过期、fenced 或没有 current owner 的 shared lease 错误不能伪装成 Feishu ownership。relay-host在新 input operation 构造前检查缓存 lease 的 freshness，必要时续租或重新 acquire；不会以重放 input request 的方式恢复。Android v1把格式完整的 marker 视为当前 stream 的只读结果，停止input但仍允许 attachment resize；锁定图标表示客户端的 fail-closed latch，不表示 APK 持有服务端 lease。显式 `Retry input` 或正常 stream/transport 恢复都会创建 fresh stream并清除旧 latch，但旧按键永不重放；若 authority 仍拒绝，下一次新输入会再次进入只读。v1没有可提前查询owner或发起takeover的协议能力。
 - socket/stream关闭不能把旧pending input交给新connection；Relay v1原有AMBIGUOUS语义保持不变。
 
 ### 9.2 Relay v2
@@ -252,7 +252,7 @@ Relay v1 wire不变：
 | Dashboard PTY | output可读；write/paste/resize禁用；Take over走handoff | mount只观察，首次input加入shared interactive lease；其他Dashboard/APK不使其只读；SSH target在目标机裁决 | inactive/detach只清除自己的lease view；不fence其他interactive producer |
 | 受控`tw attach` | 默认read-only/拒绝；`--take-over`走handoff | acquire后加入shared interactive lease | detach只释放自己的view |
 | raw tmux | privileged bypass，无产品保证 | 同左 | 文档和UI必须明确 |
-| Relay v1 | read/output可用；send/input/resize/kill拒绝 | adapter加入Dashboard/其他APK共用的interactive lease后写 | 不继承旧pending input；close不fence其他interactive producer |
+| Relay v1 | read/output和attachment resize可用；send/input/kill拒绝 | adapter加入Dashboard/其他APK共用的interactive lease后写；resize只调整自己的attachment PTY | 不继承旧pending input；fresh stream不继承旧read-only latch；close不fence其他interactive producer |
 | Relay v2 | open/output/replay可用；send/input/resize/kill拒绝 | v2 adapter加入shared interactive lease后写 | detached stream不单独保留或fence shared lease |
 
 ## 11. Storage、恢复和安全
@@ -273,7 +273,7 @@ Relay v1 wire不变：
 - 新增独立的local terminal-control contract、daemon、状态库和controller client。
 - 新增Feishu Bridge进程、binding/event/turn/reply persistence和Lark adapter。
 - 修改DashboardBackend、Tauri/fake/preview backend和UI以管理binding、只读状态和本地handoff。
-- 修改Dashboard PTY write/paste/resize、受控CLI attach和Relay v1 relay-host内部adapter，使其调用controller。
+- 修改Dashboard PTY write/paste/backend resize、受控CLI attach和Relay v1 relay-host的raw/agent-message adapter，使真实backend mutation调用controller；Relay v1 attachment resize保持在私有PTY内。
 - 按 `AGENTS.md` 的测试准入规则补充必要的 storage、安全、竞态或端到端证据；不要求每类都新建测试。
 
 ### Terminal-control / Feishu 侧不可修改
@@ -334,13 +334,13 @@ Relay v1 wire不变：
 | send message与raw input并发 | 同一single writer排序；正文和Enter之间不能插入其他producer bytes |
 | Graceful handoff遇到ACCEPTED命令 | 等命令收敛后transfer，不静默撤销或重放 |
 | Force handoff遇到RUNNING命令 | 无副作用则明确失败；边界不明进入IN_DOUBT |
-| route/socket重连 | 不恢复或重放旧pending input；interactive adapter可重新加入当前shared lease，Feishu独占不变 |
+| route/socket重连 | 不恢复或重放旧pending input；fresh stream清除旧客户端latch并重发一次当前WebView attachment的desired size；旧attachment token的input/resize/close被丢弃；interactive adapter可重新加入当前shared lease，Feishu独占不变 |
 | relay-host SUPERSEDED/重启 | 旧route/hostInstance不能写；global owner不被新进程猜测继承 |
 | controller重启/状态损坏 | controlEpoch变化且所有旧lease/fence失效；idle非Feishu lease复核target并重建capture后回FREE，Feishu/handoff/in-doubt仍RECOVERY_REQUIRED |
 | 显式force recovery | 先验证exact backend并确认旧operation可能已生效；推进fence且绝不重放旧operation |
 | target同名重建 | 新controlTargetId；Bridge 确认旧 lifecycle 已结束后清除旧 binding、发送失效原因卡片，且不自动重定向 |
 | target closure/kill竞态 | lease撤销、turn停止tail/post、observer不能用kill绕过handoff |
-| resize/close | observer不能改变backend resize；允许只关闭自己的observation attachment |
+| resize/close | observer resize只改变自己的attachment PTY、不能改变shared backend/tmux几何尺寸；允许只关闭自己的observation attachment |
 | Dashboard退出 | 不停止共享controller/Bridge，不释放Feishu lease，不暂停active binding；群事件继续由daemon处理 |
 | Feishu remote target未实现 | binding/admission明确拒绝；Dashboard/Relay只调用目标机controller，不以本地名称lease伪装支持 |
 | raw tmux privileged bypass | 产品文档/UI明确不保证，自动化验收不把它当受控路径 |
