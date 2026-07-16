@@ -207,11 +207,16 @@ internal data class RelayV2TransportOpenRequest(
         require(offeredSubprotocols == listOf(RelayV2Profile.RELAY_V2_SUBPROTOCOL)) {
             "Relay v2 transport must offer only tw-relay.v2"
         }
-        require(accessToken.startsWith("twcap2.")) { "Relay v2 access credential is invalid" }
+        require(accessToken.startsWith("twcap2.") &&
+            accessToken.length <= 8_192 &&
+            accessToken.all { it.code in 0x21..0x7e }
+        ) {
+            "Relay v2 access credential is invalid"
+        }
     }
 
     override fun toString(): String =
-        "RelayV2TransportOpenRequest(relayUrl=$relayUrl, " +
+        "RelayV2TransportOpenRequest(relayUrl=<redacted>, " +
             "offeredSubprotocols=$offeredSubprotocols, accessToken=<redacted>)"
 }
 
