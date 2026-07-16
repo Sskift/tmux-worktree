@@ -15,7 +15,6 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -242,57 +241,65 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
-    fun `late success from an older enrollment intent cannot replace the latest activation`() =
+    fun `newer confirmation immediately supersedes older activation in either response order`() =
         runBlocking {
-            val harness = Harness()
-            val firstGate = harness.exchange.deferEnrollment("enrollment-a")
-            val secondGate = harness.exchange.deferEnrollment("enrollment-b")
+            EnrollmentResponseOrder.entries.forEach { responseOrder ->
+                val firstResponseArrivesFirst = responseOrder == EnrollmentResponseOrder.A_FIRST
+                val harness = Harness()
+                val firstGate = harness.exchange.deferEnrollment("enrollment-a")
+                val secondGate = harness.exchange.deferEnrollment("enrollment-b")
+                val first = async {
+                    harness.repository.confirmEnrollment(
+                        enrollmentDraft("enrollment-a", "twenroll2.code-a")
+                            .confirm(deviceLabel = "Pixel A"),
+                    )
+                }
+                val firstRequest = firstGate.request.await()
+                val profileReadGate = if (firstResponseArrivesFirst) {
+                    harness.profiles.blockNextActiveProfileRead()
+                } else {
+                    null
+                }
+                val second = async {
+                    harness.repository.confirmEnrollment(
+                        enrollmentDraft("enrollment-b", "twenroll2.code-b")
+                            .confirm(deviceLabel = "Pixel B"),
+                    )
+                }
+                profileReadGate?.started?.await()
 
-            val first = async {
-                harness.repository.confirmEnrollment(
-                    enrollmentDraft(
-                        enrollmentId = "enrollment-a",
-                        enrollmentCode = "twenroll2.code-a",
-                    ).confirm(deviceLabel = "Pixel A"),
+                val (olderResult, winningProfile) = if (firstResponseArrivesFirst) {
+                    firstGate.response.complete(enrollmentResponse(firstRequest, "a"))
+                    val older = first.await()
+                    assertTrue(older is RelayV2EnrollmentResult.Superseded)
+                    assertEquals(0, harness.isolationCalls)
+                    assertEquals(0, harness.profiles.activationCount)
+                    requireNotNull(profileReadGate).release.complete(Unit)
+                    val secondRequest = secondGate.request.await()
+                    secondGate.response.complete(enrollmentResponse(secondRequest, "b"))
+                    older to (second.await() as RelayV2EnrollmentResult.Activated).profile
+                } else {
+                    val secondRequest = secondGate.request.await()
+                    secondGate.response.complete(enrollmentResponse(secondRequest, "b"))
+                    val winner = (second.await() as RelayV2EnrollmentResult.Activated).profile
+                    firstGate.response.complete(enrollmentResponse(firstRequest, "a"))
+                    first.await() to winner
+                }
+
+                assertTrue(olderResult is RelayV2EnrollmentResult.Superseded)
+                assertEquals(winningProfile, harness.profiles.activeV2)
+                assertEquals(1, harness.barrier.calls)
+                assertEquals(1, harness.isolationCalls)
+                assertEquals(1, harness.profiles.activationCount)
+                val winner = requireNotNull(
+                    harness.credentials.read(winningProfile.credentialReference),
                 )
+                assertEquals("twcap2.access-b", winner.accessToken)
+                assertEquals("twref2.refresh-b", winner.refreshToken)
+                val loser = harness.credentials.values().single { !it.hasCredentialMaterial }
+                assertEquals(0L, loser.credentialVersion)
+                assertNotNull(loser.pendingAttempt)
             }
-            val firstRequest = firstGate.request.await()
-            val second = async {
-                harness.repository.confirmEnrollment(
-                    enrollmentDraft(
-                        enrollmentId = "enrollment-b",
-                        enrollmentCode = "twenroll2.code-b",
-                    ).confirm(deviceLabel = "Pixel B"),
-                )
-            }
-            val secondRequest = secondGate.request.await()
-
-            secondGate.response.complete(enrollmentResponse(secondRequest, identitySuffix = "b"))
-            val secondResult = second.await() as RelayV2EnrollmentResult.Activated
-            val winningProfile = secondResult.profile
-            val isolationCallsAfterWinner = harness.isolationCalls
-            val activationCallsAfterWinner = harness.profiles.activationCount
-
-            firstGate.response.complete(enrollmentResponse(firstRequest, identitySuffix = "a"))
-            assertEquals(
-                RelayV2EnrollmentResult.Superseded(winningProfile.identity),
-                first.await(),
-            )
-
-            assertEquals(winningProfile, harness.profiles.activeV2)
-            assertEquals(isolationCallsAfterWinner, harness.isolationCalls)
-            assertEquals(activationCallsAfterWinner, harness.profiles.activationCount)
-            val winningCredential = requireNotNull(
-                harness.credentials.read(winningProfile.credentialReference),
-            )
-            assertEquals(1L, winningCredential.credentialVersion)
-            assertEquals("twcap2.access-b", winningCredential.accessToken)
-            assertEquals("twref2.refresh-b", winningCredential.refreshToken)
-            val losingCredential = harness.credentials.values().single { !it.hasCredentialMaterial }
-            assertEquals(0L, losingCredential.credentialVersion)
-            assertNotNull(losingCredential.pendingAttempt)
-            assertNull(losingCredential.accessToken)
-            assertNull(losingCredential.refreshToken)
 
             val switched = Harness()
             val switchedGate = switched.exchange.deferEnrollment("enrollment-switch")
@@ -343,6 +350,32 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(0, cancelled.isolationCalls)
             assertEquals(0, cancelled.profiles.activationCount)
             assertTrue(cancelled.credentials.values().single().hasCredentialMaterial.not())
+        }
+
+    @Test
+    fun `same reference and pending attempt exact replay has one credential and activation winner`() =
+        runBlocking {
+            val harness = Harness()
+            val gate = harness.exchange.deferEnrollment("enrollment-replay")
+            val confirmed = enrollmentDraft(
+                "enrollment-replay",
+                "twenroll2.code-replay",
+            ).confirm(deviceLabel = "Pixel")
+            val first = async { harness.repository.confirmEnrollment(confirmed) }
+            val firstRequest = gate.request.await()
+            val replay = async { harness.repository.confirmEnrollment(confirmed) }
+            val replayRequest = gate.replayRequest.await()
+
+            assertEquals(firstRequest, replayRequest)
+            gate.response.complete(enrollmentResponse(firstRequest, "replay"))
+            val results = listOf(first.await(), replay.await())
+
+            assertEquals(1, results.count { it is RelayV2EnrollmentResult.Activated })
+            assertEquals(1, results.count { it is RelayV2EnrollmentResult.StaleCredentialResponse })
+            assertFalse(results.any { it is RelayV2EnrollmentResult.Superseded })
+            assertEquals(2, harness.exchange.redeemCalls)
+            assertEquals(1, harness.profiles.activationCount)
+            assertEquals(1L, harness.credentials.values().single().credentialVersion)
         }
 
     @Test
@@ -670,8 +703,21 @@ class RelayV2ProfileRepositoryTest {
         var activationCount = 0
         var failNextCredentialVersionUpdate = false
         var persistedValues: Map<String, Any> = emptyMap()
+        private var nextActiveProfileReadGate: SuspensionGate? = null
 
-        override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? = activeIdentity
+        fun blockNextActiveProfileRead(): SuspensionGate = SuspensionGate().also {
+            check(nextActiveProfileReadGate == null)
+            nextActiveProfileReadGate = it
+        }
+
+        override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
+            nextActiveProfileReadGate?.also {
+                nextActiveProfileReadGate = null
+                it.started.complete(Unit)
+                it.release.await()
+            }
+            return activeIdentity
+        }
 
         override suspend fun activeRelayV2Profile(): RelayV2Profile? = activeV2
 
@@ -775,7 +821,7 @@ class RelayV2ProfileRepositoryTest {
             redeemCalls += 1
             events += "exchange"
             deferredRedeems[request.enrollmentId]?.let { deferred ->
-                deferred.request.complete(request)
+                deferred.record(request)
                 return deferred.response.await()
             }
             return RelayV2EnrollmentExchangeResponse(
@@ -797,7 +843,22 @@ class RelayV2ProfileRepositoryTest {
 
     private class DeferredRedeem {
         val request = CompletableDeferred<RelayV2EnrollmentExchangeRequest>()
+        val replayRequest = CompletableDeferred<RelayV2EnrollmentExchangeRequest>()
         val response = CompletableDeferred<RelayV2EnrollmentExchangeResponse>()
+
+        fun record(value: RelayV2EnrollmentExchangeRequest) {
+            if (!request.complete(value)) replayRequest.complete(value)
+        }
+    }
+
+    private class SuspensionGate {
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+    }
+
+    private enum class EnrollmentResponseOrder {
+        A_FIRST,
+        B_FIRST,
     }
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(

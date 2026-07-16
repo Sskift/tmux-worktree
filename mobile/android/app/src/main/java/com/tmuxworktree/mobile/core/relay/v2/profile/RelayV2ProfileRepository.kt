@@ -332,11 +332,10 @@ internal class RelayV2ProfileRepository(
     suspend fun confirmEnrollment(
         confirmed: RelayV2ConfirmedEnrollment,
     ): RelayV2EnrollmentResult {
+        val intent = beginEnrollmentIntent(credentialReference(confirmed.draft))
+            ?: return supersededEnrollment()
         val prepared = prepareEnrollment(confirmed)
-        val intent = registerEnrollmentIntent(
-            credentialReference = prepared.credentialReference,
-            expectedActiveProfile = profileStore.activeProfileIdentity(),
-        )
+        check(prepared.credentialReference == intent.credentialReference)
         val blob = when (prepared) {
             is PreparedEnrollment.Completed -> prepared.blob
             is PreparedEnrollment.Pending -> {
@@ -569,16 +568,27 @@ internal class RelayV2ProfileRepository(
         }
     }
 
-    private fun registerEnrollmentIntent(
+    private suspend fun beginEnrollmentIntent(
         credentialReference: RelayV2CredentialReference,
-        expectedActiveProfile: RelayActiveProfileIdentity?,
-    ): EnrollmentIntent = synchronized(enrollmentIntentLock) {
-        currentEnrollmentIntent
-            ?.takeIf { it.credentialReference == credentialReference }
-            ?: EnrollmentIntent(
-                credentialReference = credentialReference,
-                expectedActiveProfile = expectedActiveProfile,
-            ).also { currentEnrollmentIntent = it }
+    ): EnrollmentIntent? {
+        // Registration is deliberately the first action before the profile read can suspend.
+        val intent = synchronized(enrollmentIntentLock) {
+            currentEnrollmentIntent
+                ?.takeIf { it.credentialReference == credentialReference }
+                ?: EnrollmentIntent(credentialReference).also { currentEnrollmentIntent = it }
+        }
+        val observedActiveProfile = profileStore.activeProfileIdentity()
+        return synchronized(enrollmentIntentLock) {
+            if (currentEnrollmentIntent !== intent) return@synchronized null
+            if (!intent.expectedActiveProfileBound) {
+                intent.expectedActiveProfile = observedActiveProfile
+                intent.expectedActiveProfileBound = true
+            } else if (intent.expectedActiveProfile != observedActiveProfile) {
+                currentEnrollmentIntent = null
+                return@synchronized null
+            }
+            intent
+        }
     }
 
     private fun authorizeEnrollmentActivation(intent: EnrollmentIntent): Boolean =
@@ -747,8 +757,9 @@ internal class RelayV2ProfileRepository(
 
     private class EnrollmentIntent(
         val credentialReference: RelayV2CredentialReference,
-        val expectedActiveProfile: RelayActiveProfileIdentity?,
     ) {
+        var expectedActiveProfile: RelayActiveProfileIdentity? = null
+        var expectedActiveProfileBound: Boolean = false
         var activationCommitted: Boolean = false
     }
 }
