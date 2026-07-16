@@ -2,7 +2,6 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 
 import android.content.Context
 import androidx.room.Room
-import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
@@ -34,18 +33,41 @@ class RelayV2StateDatabaseInstrumentedTest {
 
     @Test
     fun completeNamespaceIdentityAllowsCoexistenceAndExactClear() = runBlocking {
-        val first = namespace("principal-one", "client-one")
-        val second = namespace("principal-two", "client-two")
-        putAllSixCategories(first, "one")
-        putAllSixCategories(second, "two")
+        val base = namespace("principal-base", "client-base")
+        val principalOnly = namespace("principal-other", "client-base")
+        val clientOnly = namespace("principal-base", "client-other")
+        putAllSixCategories(base, "base")
+        putAllSixCategories(principalOnly, "principal")
+        putAllSixCategories(clientOnly, "client")
 
-        assertNamespacePresent(first, "one")
-        assertNamespacePresent(second, "two")
+        assertNamespacePresent(base, "base")
+        assertNamespacePresent(principalOnly, "principal")
+        assertNamespacePresent(clientOnly, "client")
 
-        database.withTransaction { clearNamespace(first) }
+        val result = RelayV2StateRepository(database).applyHelloUnderApplyLease(
+            RelayV2StateHello(
+                namespace = base,
+                welcomeEventSeq = FRESH_REQUIRED_EVENT_SEQ,
+                resume = null,
+                disposition = RelayV2StateHelloDisposition.FRESH,
+            ),
+        )
 
-        assertNamespaceAbsent(first)
-        assertNamespacePresent(second, "two")
+        assertEquals(
+            RelayV2StateSyncResult.ResyncRequired(
+                namespace = base,
+                reason = RelayV2ResyncReason.FRESH,
+                release = RelayV2SnapshotReleaseDirective(
+                    namespace = base,
+                    snapshotRequestId = "request-base",
+                    snapshotId = SNAPSHOT_ID,
+                ),
+            ),
+            result,
+        )
+        assertNamespaceFreshReset(base)
+        assertNamespacePresent(principalOnly, "principal")
+        assertNamespacePresent(clientOnly, "client")
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
@@ -196,58 +218,28 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals("{\"event\":\"$suffix\"}", bufferedEvent(namespace)?.canonicalJson)
     }
 
-    private fun assertNamespaceAbsent(namespace: RelayV2StateNamespace) {
-        assertNull(authority(namespace))
+    private fun assertNamespaceFreshReset(namespace: RelayV2StateNamespace) {
+        assertEquals(
+            RelayV2AuthorityEntity(
+                profileId = namespace.profileId,
+                principalId = namespace.principalId,
+                clientInstanceId = namespace.clientInstanceId,
+                hostId = namespace.hostId,
+                hostEpoch = namespace.hostEpoch,
+                cursorEventSeq = null,
+                requiredThroughEventSeq = FRESH_REQUIRED_EVENT_SEQ,
+                scopesRevision = null,
+                phase = RelayV2StoredSyncPhase.RESYNCING.name,
+                cacheRecordCount = 0,
+                cacheCanonicalBytes = 2,
+            ),
+            authority(namespace),
+        )
         assertNull(scope(namespace))
         assertNull(session(namespace))
         assertNull(snapshot(namespace))
         assertEquals(emptyList<RelayV2SnapshotRecordEntity>(), snapshotRecords(namespace))
         assertNull(bufferedEvent(namespace))
-    }
-
-    private fun clearNamespace(namespace: RelayV2StateNamespace) {
-        dao.deleteBufferedEvents(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
-        dao.deleteSnapshotRecords(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
-        dao.deleteSnapshot(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
-        dao.deleteSessions(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
-        dao.deleteScopes(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
-        dao.deleteNamespaceAuthority(
-            namespace.profileId,
-            namespace.principalId,
-            namespace.clientInstanceId,
-            namespace.hostId,
-            namespace.hostEpoch,
-        )
     }
 
     private fun authority(namespace: RelayV2StateNamespace) = dao.authority(
@@ -318,5 +310,6 @@ class RelayV2StateDatabaseInstrumentedTest {
         const val SESSION_ID = "session"
         const val SNAPSHOT_ID = "snapshot"
         const val EVENT_SEQ = "1"
+        const val FRESH_REQUIRED_EVENT_SEQ = "7"
     }
 }
