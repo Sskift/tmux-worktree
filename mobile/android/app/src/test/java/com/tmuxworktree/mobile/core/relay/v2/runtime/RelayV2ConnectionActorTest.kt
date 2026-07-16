@@ -28,6 +28,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -879,6 +880,189 @@ class RelayV2ConnectionActorTest {
     }
 
     @Test
+    fun `source mismatch dominates ordinary terminal callbacks in either enqueue order`() =
+        runBlocking {
+            listOf("ordinary-first", "mismatch-first").forEach { order ->
+                val factory = FakeTransportFactory(blockFirstSend = true)
+                val harness = Harness(factory = factory)
+                try {
+                    assertTrue(order, harness.actor.connect(harness.profile, null))
+                    val committed = harness.awaitTransport(0)
+                    committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                    harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+                    committed.sendFixture("relay-welcome")
+                    assertTrue(factory.sendEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                    val mismatched = factory.createCallbackSource().apply {
+                        completeTerminationOnClose = false
+                    }
+                    if (order == "ordinary-first") {
+                        committed.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+                        mismatched.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                    } else {
+                        mismatched.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                        committed.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
+                    }
+                    factory.releaseSend.countDown()
+
+                    val failure = harness.actor.awaitFailure(RelayV2FailureKind.SECURITY).failure
+                    assertEquals(order, "TRANSPORT_SOURCE_MISMATCH", failure?.code)
+                    assertFalse(order, requireNotNull(failure).retryable)
+                    val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.ConnectionFailed
+                    assertEquals(order, failure, effect.failure)
+                    assertEquals(
+                        order,
+                        null,
+                        withTimeoutOrNull(50) { harness.actor.effects.first() },
+                    )
+
+                    assertTrue(order, harness.actor.connect(harness.profile, null))
+                    val receipt = async {
+                        harness.actor.disconnectAndDrain(
+                            harness.profile.identity,
+                            "terminal-precedence-$order",
+                        )
+                    }
+                    delay(25)
+                    assertFalse(order, receipt.isCompleted)
+                    assertEquals(order, 1, factory.requests.size)
+                    mismatched.completeTermination()
+                    assertEquals(
+                        order,
+                        "terminal-precedence-$order",
+                        withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+                    )
+                    assertTrue(order, committed.awaitTerminationCount.get() > 0)
+                    assertTrue(order, mismatched.awaitTerminationCount.get() > 0)
+                    assertEquals(order, 1, factory.requests.size)
+                } finally {
+                    factory.releaseSend.countDown()
+                    factory.transports.forEach { it.completeTermination() }
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `slow consumer intent dominates synchronous close callback`() = runBlocking {
+        val harness = Harness(actionByteCapacity = 64)
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0)
+            transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            transport.completeTerminationOnClose = false
+            transport.synchronousClosedOnClose = true
+            transport.throwOnSecondClose = true
+            transport.sendFixture("relay-welcome")
+
+            val failure = harness.actor.awaitFailure(RelayV2FailureKind.QUEUE_SATURATED).failure
+            assertEquals("SLOW_CONSUMER", failure?.code)
+            val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.ConnectionFailed
+            assertEquals(failure, effect.failure)
+            assertEquals(listOf(1013), transport.closeCodes)
+
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val receipt = async {
+                harness.actor.disconnectAndDrain(harness.profile.identity, "slow-consumer-sync-close")
+            }
+            delay(25)
+            assertFalse(receipt.isCompleted)
+            assertEquals(1, harness.factory.requests.size)
+            transport.completeTermination()
+            assertEquals(
+                "slow-consumer-sync-close",
+                withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+            )
+            assertEquals(listOf(1013), transport.closeCodes)
+            assertEquals(1, harness.factory.requests.size)
+        } finally {
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `completed retirement remains tombstoned through queued stale callback`() = runBlocking {
+        val factory = FakeTransportFactory(blockFirstSend = true)
+        val harness = Harness(factory = factory)
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val first = harness.awaitTransport(0)
+            first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            first.sendFixture("relay-welcome")
+            assertTrue(factory.sendEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            first.throwOnSecondClose = true
+
+            assertTrue(harness.actor.connect(harness.profile, null))
+            first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            factory.releaseSend.countDown()
+            val second = harness.awaitTransport(1)
+            delay(25)
+            assertEquals(listOf(1000), first.closeCodes)
+
+            val receipt = harness.actor.disconnectAndDrain(
+                harness.profile.identity,
+                "completed-retirement-tombstone",
+            )
+            assertEquals("completed-retirement-tombstone", receipt.barrierId)
+            assertEquals(2, factory.requests.size)
+            assertEquals(listOf(1000), first.closeCodes)
+            second.completeTermination()
+        } finally {
+            factory.releaseSend.countDown()
+            factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `multi source fence awaits every source before reporting any failure`() = runBlocking {
+        listOf(0, 1).forEach { falseIndex ->
+            val factory = FakeTransportFactory().apply { returnDifferentSource = true }
+            val harness = Harness(factory = factory)
+            try {
+                factory.onTransportCreated = { callbackSource ->
+                    factory.transports.forEach { it.completeTerminationOnClose = false }
+                    callbackSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                }
+                assertTrue(harness.actor.connect(harness.profile, null))
+                harness.actor.awaitFailure(RelayV2FailureKind.SECURITY)
+                val sources = listOf(harness.awaitTransport(0), harness.awaitTransport(1))
+                val pendingIndex = 1 - falseIndex
+                sources[falseIndex].completeTermination(terminated = false)
+                withTimeout(TIMEOUT_MS) {
+                    while (sources[pendingIndex].awaitTerminationCount.get() == 0) delay(1)
+                }
+
+                assertTrue(harness.actor.connect(harness.profile, null))
+                val barrier = async {
+                    runCatching {
+                        harness.actor.disconnectAndDrain(
+                            harness.profile.identity,
+                            "multi-source-$falseIndex",
+                        )
+                    }
+                }
+                delay(25)
+                assertFalse(falseIndex.toString(), barrier.isCompleted)
+                assertEquals(falseIndex.toString(), 1, factory.requests.size)
+                sources[pendingIndex].completeTermination()
+                val result = withTimeout(TIMEOUT_MS) { barrier.await() }
+                assertTrue(falseIndex.toString(), result.exceptionOrNull() is IllegalStateException)
+                assertTrue(sources[0].awaitTerminationCount.get() > 0)
+                assertTrue(sources[1].awaitTerminationCount.get() > 0)
+                assertEquals(falseIndex.toString(), 1, factory.requests.size)
+            } finally {
+                factory.transports.forEach { it.completeTermination() }
+                harness.close()
+            }
+        }
+    }
+
+    @Test
     fun `shutdown invalidates provisional callbacks after factory return before commit`() =
         runBlocking {
             val commitEntered = CompletableDeferred<Unit>()
@@ -1582,6 +1766,7 @@ class RelayV2ConnectionActorTest {
     ) : RelayV2Transport {
         val sent = CopyOnWriteArrayList<ByteArray>()
         val closeCodes = CopyOnWriteArrayList<Int>()
+        val awaitTerminationCount = AtomicInteger()
         @Volatile
         var cancelCount: Int = 0
             private set
@@ -1620,7 +1805,10 @@ class RelayV2ConnectionActorTest {
             termination.complete(true)
         }
 
-        override suspend fun awaitTermination(): Boolean = termination.await()
+        override suspend fun awaitTermination(): Boolean {
+            awaitTerminationCount.incrementAndGet()
+            return termination.await()
+        }
 
         fun completeTermination(terminated: Boolean = true) {
             termination.complete(terminated)
