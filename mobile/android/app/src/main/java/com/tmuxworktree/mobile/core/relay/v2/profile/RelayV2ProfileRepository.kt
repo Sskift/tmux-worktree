@@ -703,21 +703,29 @@ internal class RelayV2ProfileRepository(
             }
             return false
         }
-        val cancelled = enrollmentIntentMutex.withLock {
+        return enrollmentIntentMutex.withLock {
             if (currentEnrollmentIntent?.credentialReference != reference) return@withLock false
-            currentEnrollmentIntent = null
-            true
-        }
-        if (!cancelled) return false
-        activationOperationMutex.withLock {
-            val pending = profileStore.pendingRelayV2Activation()
-            if (pending?.targetCredentialReference == reference) {
-                rollbackExactPreparedActivationWithLease(pending) {
-                    currentEnrollmentIntent == null
+            val prepared = profileStore.pendingRelayV2Activation()?.let {
+                if (it.targetCredentialReference == reference) {
+                    if (activationCredentialState(it) != ActivationCredentialState.ExactPending) {
+                        return@withLock false
+                    }
+                    it
+                } else {
+                    null
                 }
             }
+            // The final activation authority must acquire this same mutex before credential CAS.
+            // Revoking first also makes the switch's lock-free barrier precheck fail as soon as
+            // possible; rollback remains atomically visible to the authoritative locked check.
+            currentEnrollmentIntent = null
+            prepared?.let {
+                check(profileStore.rollbackPreparedRelayV2Activation(it)) {
+                    "Prepared Relay v2 activation changed during cancellation"
+                }
+            }
+            true
         }
-        return true
     }
 
     /**
@@ -740,12 +748,8 @@ internal class RelayV2ProfileRepository(
         val profile = when (val state = activationCredentialState(journal)) {
             is ActivationCredentialState.ExactCompleted -> state.profile
             ActivationCredentialState.ExactPending -> {
-                check(
-                    rollbackExactPreparedActivationWithLease(journal) {
-                        currentEnrollmentIntent == null
-                    },
-                ) {
-                    "Prepared Relay v2 activation is owned by a live enrollment"
+                check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
+                    "Prepared Relay v2 activation changed during recovery"
                 }
                 return RelayV2ActivationRecoveryResult.ReenrollmentRequired(
                     journal.targetCredentialReference,
@@ -992,24 +996,13 @@ internal class RelayV2ProfileRepository(
     private suspend fun rollbackPreparedForSupersedingIntent(
         intent: EnrollmentIntent,
         journal: RelayV2ProfileActivationJournal,
-    ): Boolean = activationOperationMutex.withLock {
-        rollbackExactPreparedActivationWithLease(journal) {
-            currentEnrollmentIntent === intent
-        }
-    }
-
-    /** Requires [activationOperationMutex]; acquires intent authority before durable rollback. */
-    private suspend fun rollbackExactPreparedActivationWithLease(
-        journal: RelayV2ProfileActivationJournal,
-        hasIntentAuthority: () -> Boolean,
     ): Boolean = enrollmentIntentMutex.withLock {
-        if (!hasIntentAuthority()) return@withLock false
-        val current = profileStore.pendingRelayV2Activation()
-        if (current != journal ||
-            activationCredentialState(current) != ActivationCredentialState.ExactPending
+        if (currentEnrollmentIntent !== intent ||
+            profileStore.pendingRelayV2Activation() != journal ||
+            activationCredentialState(journal) != ActivationCredentialState.ExactPending
         ) return@withLock false
-        check(profileStore.rollbackPreparedRelayV2Activation(current)) {
-            "Exact prepared Relay v2 activation changed during rollback"
+        check(profileStore.rollbackPreparedRelayV2Activation(journal)) {
+            "Prepared Relay v2 activation changed during supersession"
         }
         true
     }

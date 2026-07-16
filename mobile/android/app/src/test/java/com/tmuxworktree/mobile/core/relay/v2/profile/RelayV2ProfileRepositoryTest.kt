@@ -700,6 +700,9 @@ class RelayV2ProfileRepositoryTest {
             val newerGate = harness.exchange.deferEnrollment("enrollment-disconnect-b")
             val older = async { harness.repository.confirmEnrollment(olderConfirmation) }
             harness.barrier.started.await()
+            val olderReference = requireNotNull(
+                harness.profiles.journal,
+            ).targetCredentialReference
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
 
             val newer = async {
@@ -710,18 +713,19 @@ class RelayV2ProfileRepositoryTest {
                     ).confirm(deviceLabel = "Pixel B"),
                 )
             }
-            yield()
-            assertFalse(newerGate.request.isCompleted)
+            val newerRequest = withTimeout(1_000) { newerGate.request.await() }
+            assertEquals(null, harness.profiles.journal)
+            assertEquals(0, harness.credentials.enrollmentCompletionCasCalls(olderReference))
             assertFalse(harness.credentials.values().single {
                 it.pendingAttempt?.enrollmentId == "enrollment-disconnect-a"
             }.hasCredentialMaterial)
             harness.barrier.release.complete(Unit)
 
             assertTrue(older.await() is RelayV2EnrollmentResult.Superseded)
-            val newerRequest = withTimeout(1_000) { newerGate.request.await() }
             assertEquals(0, harness.isolationCalls)
             assertEquals(0, harness.profiles.activationCount)
             assertEquals(null, harness.profiles.journal)
+            assertEquals(0, harness.credentials.enrollmentCompletionCasCalls(olderReference))
             assertFalse(harness.credentials.values().single {
                 it.pendingAttempt?.enrollmentId == "enrollment-disconnect-a"
             }.hasCredentialMaterial)
@@ -729,6 +733,11 @@ class RelayV2ProfileRepositoryTest {
             newerGate.response.complete(enrollmentResponse(newerRequest, "disconnect-b"))
             val winner = (newer.await() as RelayV2EnrollmentResult.Activated).profile
             assertEquals(winner, harness.profiles.activeV2)
+            assertEquals(0, harness.credentials.enrollmentCompletionCasCalls(olderReference))
+            assertEquals(
+                1,
+                harness.credentials.enrollmentCompletionCasCalls(winner.credentialReference),
+            )
             assertEquals(1, harness.isolationCalls)
             assertEquals(1, harness.profiles.activationCount)
             assertSameReferenceRetryRedeems(
@@ -749,20 +758,19 @@ class RelayV2ProfileRepositoryTest {
             ).confirm(deviceLabel = "Pixel A")
             val pending = async { harness.repository.confirmEnrollment(confirmed) }
             harness.barrier.started.await()
+            val reference = requireNotNull(harness.profiles.journal).targetCredentialReference
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
 
-            val cancellation = async {
-                harness.repository.cancelPendingEnrollment(confirmed)
-            }
-            yield()
-            assertFalse(cancellation.isCompleted)
+            assertTrue(harness.repository.cancelPendingEnrollment(confirmed))
+            assertEquals(null, harness.profiles.journal)
+            assertEquals(0, harness.credentials.enrollmentCompletionCasCalls(reference))
             harness.barrier.release.complete(Unit)
 
             assertTrue(pending.await() is RelayV2EnrollmentResult.Superseded)
-            assertTrue(cancellation.await())
             assertEquals(0, harness.isolationCalls)
             assertEquals(0, harness.profiles.activationCount)
             assertEquals(null, harness.profiles.journal)
+            assertEquals(0, harness.credentials.enrollmentCompletionCasCalls(reference))
             assertFalse(harness.credentials.values().single().hasCredentialMaterial)
             assertSameReferenceRetryRedeems(
                 harness = harness,
@@ -1680,6 +1688,8 @@ class RelayV2ProfileRepositoryTest {
         private val events: MutableList<String>,
     ) : RelayV2CredentialStore {
         private val blobs = linkedMapOf<RelayV2CredentialReference, RelayV2CredentialBlob>()
+        private val enrollmentCompletionCasCallsByReference =
+            linkedMapOf<RelayV2CredentialReference, Int>()
         var failNextCasBeforeWriteCount = 0
         var failNextCasAfterWrite = false
         var failNextCasAfterWriteWithHigherVersion = false
@@ -1722,6 +1732,13 @@ class RelayV2ProfileRepositoryTest {
                 ?: return RelayV2CredentialCasResult.Stale(null)
             if (!current.matchesExpectation(expectation)) {
                 return RelayV2CredentialCasResult.Stale(current.credentialVersion)
+            }
+            if (current.pendingAttempt?.kind ==
+                RelayV2CredentialAttemptKind.ENROLLMENT_EXCHANGE &&
+                replacement.hasCredentialMaterial
+            ) {
+                enrollmentCompletionCasCallsByReference[reference] =
+                    enrollmentCompletionCasCallsByReference.getOrDefault(reference, 0) + 1
             }
             if (failNextCasWithMissingBlob) {
                 failNextCasWithMissingBlob = false
@@ -1779,6 +1796,9 @@ class RelayV2ProfileRepositoryTest {
         }
 
         fun isEmpty(): Boolean = blobs.isEmpty()
+        @Synchronized
+        fun enrollmentCompletionCasCalls(reference: RelayV2CredentialReference): Int =
+            enrollmentCompletionCasCallsByReference.getOrDefault(reference, 0)
         @Synchronized
         fun values(): List<RelayV2CredentialBlob> = blobs.values.toList()
         @Synchronized
