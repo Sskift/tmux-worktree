@@ -1344,16 +1344,7 @@ internal class RelayV2ConnectionActor(
             403 -> failConnection(RelayV2FailureKind.AUTH, "PERMISSION_DENIED", false, null)
             426 -> failConnection(RelayV2FailureKind.DIALECT, "PROTOCOL_UNSUPPORTED", false, null)
             503 -> failConnection(RelayV2FailureKind.ROUTE, "HOST_OFFLINE", true, null)
-            else -> if (failure.kind == RelayV2TransportFailureKind.UPGRADE && status == 101) {
-                failConnection(
-                    RelayV2FailureKind.DIALECT,
-                    "PROTOCOL_UNSUPPORTED",
-                    retryable = false,
-                    closeCode = null,
-                )
-            } else {
-                failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
-            }
+            else -> failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
         }
     }
 

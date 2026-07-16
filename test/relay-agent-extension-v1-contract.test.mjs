@@ -109,12 +109,7 @@ test("Relay Agent extension v1 fixture set is internally complete and machine-re
     runtimeConsumers: "pending",
     nodeCodecConformance: false,
     androidCodecConformance: false,
-    hostAuthorityMachineConformance: false,
-    hostAuthorityMachineConformancePending: [
-      "durable-store-continuity",
-      "retention-and-pruning",
-      "public-codec-and-replay-runtime",
-    ],
+    hostAuthorityMachineConformance: true,
     androidConsumerMachineConformance: false,
     androidLifecycleReducerFixtureConformance: true,
     androidReducerRuntimeIntegrated: false,

@@ -2,7 +2,7 @@
 
 状态：**Frozen extension contract + 未接线的 Node host authority reducer 与 Android lifecycle/notification reducer foundations；生产 capability 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
 
-当前交付包含 contract/machine fixtures，以及直接消费 authority machine cases 的独立 Node 纯 reducer foundation。该 foundation 提供受信 adapter binding、显式 state restore/corruption boundary、结构化 source availability、持久索引 transition 和固定资源预算，但没有接入 relay-host 或任何 durable store。Node public codec、snapshot/replay/event log 和 retention pruning 仍为 pending，`hostAuthorityMachineConformance=false`。
+当前交付包含 contract/machine fixtures，以及完整直接消费 accepted authority machine cases 的独立 Node 纯 reducer foundation，因此该 reducer 的 fixture/machine conformance 为 true。该 foundation 提供受信 adapter binding、显式 state restore/corruption boundary、结构化 source availability、持久索引 transition 和固定资源预算，但不是 durable authority store，也没有接入 relay-host。Durable store continuity/retention、Node public codec、snapshot/replay/event log 和所有 runtime wiring 仍未交付；`runtimeConsumers=pending`、Node codec conformance、G4 与 production capability 仍为 false。
 
 Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。共享 fixture 的 `command_status` 步骤由测试中的 base-owner composition stub处理，生产 reducer不拥有基础 command ledger，因此尚不存在 production composition consumer，`androidConsumerMachineConformance` 仍为 false；单独的 reducer fixture conformance不构成 runtime conformance。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending，G4 尚未通过。
 

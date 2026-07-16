@@ -189,8 +189,6 @@ Android 的 profile/credential、codec/actor、Room state、Outbox、terminal和
 
 X 的 contract/authority spike 与基础 v2 并行，不阻塞 C/B/H/A。它使用独立 capability/manifest；基础六项完整实现也不能自动视为支持 X。
 
-当前 X 已有直接消费共享 authority machine cases 的未接线 Node 纯 reducer foundation，包含显式结构 restore、持久索引 transition、source availability和固定资源预算；durable continuity/retention store、public codec/replay runtime、relay-host adapter、Android consumer、G4 与 capability advertisement仍未交付。
-
 首个 extension slice 只覆盖结构化 user/agent text entry、turn/run lifecycle和由 lifecycle event驱动的通知。原始 terminal transcript、tool-call全文、附件和离线 push不是默认包含项。
 
 工作边界：

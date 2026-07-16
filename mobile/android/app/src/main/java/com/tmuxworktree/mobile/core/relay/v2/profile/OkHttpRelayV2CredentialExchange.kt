@@ -7,17 +7,22 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2HttpsSchema
 import java.io.IOException
 import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.suspendCancellableCoroutine
+import okhttp3.Authenticator
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.CookieJar
+import okhttp3.EventListener
 import okhttp3.HttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.RequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okio.Buffer
+import okio.BufferedSink
 
 internal enum class RelayV2CredentialExchangeFailureKind {
     CONFIGURATION,
@@ -48,11 +53,7 @@ internal class OkHttpRelayV2CredentialExchange(
     client: OkHttpClient = defaultClient(),
     private val codec: RelayV2Codec = RelayV2Codec(),
 ) : RelayV2CredentialExchange {
-    private val client = client.newBuilder()
-        .retryOnConnectionFailure(false)
-        .followRedirects(false)
-        .followSslRedirects(false)
-        .build()
+    private val client = singleAttemptClient(client)
 
     override suspend fun redeem(
         request: RelayV2EnrollmentExchangeRequest,
@@ -108,7 +109,7 @@ internal class OkHttpRelayV2CredentialExchange(
         }
         val httpRequest = Request.Builder()
             .url(url)
-            .post(encoded.toRequestBody(JSON_MEDIA_TYPE))
+            .post(SingleAttemptJsonRequestBody(encoded))
             .header("Cache-Control", "no-store")
             .header("Accept-Encoding", "identity")
             .build()
@@ -321,7 +322,30 @@ internal class OkHttpRelayV2CredentialExchange(
             .retryOnConnectionFailure(false)
             .followRedirects(false)
             .followSslRedirects(false)
+            .protocols(listOf(Protocol.HTTP_1_1))
             .build()
+
+        /**
+         * Retains only connection/TLS policy from an injected client. Credential-bearing calls do
+         * not inherit application hooks or any OkHttp follow-up authority. The one-shot request
+         * body is the final guard against status follow-ups such as 503 Retry-After: 0.
+         */
+        fun singleAttemptClient(source: OkHttpClient): OkHttpClient {
+            val builder = source.newBuilder()
+            builder.interceptors().clear()
+            builder.networkInterceptors().clear()
+            return builder
+                .authenticator(Authenticator.NONE)
+                .proxyAuthenticator(Authenticator.NONE)
+                .cookieJar(CookieJar.NO_COOKIES)
+                .eventListener(EventListener.NONE)
+                .cache(null)
+                .protocols(listOf(Protocol.HTTP_1_1))
+                .retryOnConnectionFailure(false)
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .build()
+        }
 
         fun failure(
             kind: RelayV2CredentialExchangeFailureKind,
@@ -336,6 +360,22 @@ internal class OkHttpRelayV2CredentialExchange(
             retryable = retryable,
             retryAfterMs = retryAfterMs,
         )
+    }
+
+    private class SingleAttemptJsonRequestBody(
+        private val bytes: ByteArray,
+    ) : RequestBody() {
+        override fun contentType() = JSON_MEDIA_TYPE
+
+        override fun contentLength(): Long = bytes.size.toLong()
+
+        override fun isOneShot(): Boolean = true
+
+        override fun writeTo(sink: BufferedSink) {
+            sink.write(bytes)
+        }
+
+        override fun toString(): String = "RelayV2CredentialRequestBody(<redacted>)"
     }
 }
 

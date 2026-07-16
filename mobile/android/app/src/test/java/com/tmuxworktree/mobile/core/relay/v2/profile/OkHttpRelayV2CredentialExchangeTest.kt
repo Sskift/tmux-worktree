@@ -4,9 +4,16 @@ import com.tmuxworktree.mobile.core.relay.v2.RelayV2TlsMockServer
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2HttpsSchema
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.runBlocking
+import okhttp3.Authenticator
+import okhttp3.Call
+import okhttp3.EventListener
+import okhttp3.Interceptor
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.RecordedRequest
+import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -122,6 +129,93 @@ class OkHttpRelayV2CredentialExchangeTest {
     }
 
     @Test
+    fun `each credential invocation performs one HTTP1 exchange without inherited observers`() =
+        runBlocking {
+            val scenarios = listOf<() -> MockResponse>(
+                {
+                    MockResponse()
+                        .setResponseCode(503)
+                        .addHeader("Retry-After", "0")
+                        .addHeader("Cache-Control", "no-store")
+                        .setBody(errorBody("BUSY", "Retry later"))
+                },
+                {
+                    MockResponse()
+                        .setResponseCode(401)
+                        .addHeader("WWW-Authenticate", "Basic realm=relay")
+                        .addHeader("Cache-Control", "no-store")
+                        .setBody(errorBody("AUTH_INVALID", "Credential is invalid"))
+                },
+                {
+                    MockResponse()
+                        .setResponseCode(421)
+                        .addHeader("Cache-Control", "no-store")
+                        .setBody(errorBody("INTERNAL", "Misdirected request"))
+                },
+            )
+
+            scenarios.forEachIndexed { index, response ->
+                RelayV2TlsMockServer().use { tls ->
+                    val authenticatorCalls = AtomicInteger()
+                    val applicationInterceptorCalls = AtomicInteger()
+                    val networkInterceptorCalls = AtomicInteger()
+                    val eventListenerCalls = AtomicInteger()
+                    val observedCredentialBody = AtomicReference<String?>()
+                    val injected = tls.client.newBuilder()
+                        .authenticator(Authenticator { _, challenge ->
+                            authenticatorCalls.incrementAndGet()
+                            observedCredentialBody.set(requestBody(challenge.request))
+                            if (authenticatorCalls.get() == 1) {
+                                challenge.request.newBuilder()
+                                    .header("Authorization", "Basic inherited")
+                                    .build()
+                            } else {
+                                null
+                            }
+                        })
+                        .addInterceptor(credentialReadingInterceptor(
+                            applicationInterceptorCalls,
+                            observedCredentialBody,
+                        ))
+                        .addNetworkInterceptor(credentialReadingInterceptor(
+                            networkInterceptorCalls,
+                            observedCredentialBody,
+                        ))
+                        .eventListener(object : EventListener() {
+                            override fun callStart(call: Call) {
+                                eventListenerCalls.incrementAndGet()
+                                observedCredentialBody.set(requestBody(call.request()))
+                            }
+                        })
+                        .build()
+                    tls.server.enqueue(response())
+                    // A second response keeps the regression bounded if OkHttp performs a follow-up.
+                    tls.server.enqueue(response())
+                    val exchange = OkHttpRelayV2CredentialExchange(injected)
+
+                    if (index == 1) {
+                        captureExchangeFailure {
+                            exchange.refresh(refreshRequest(tls.issuerUrl))
+                        }
+                    } else {
+                        captureExchangeFailure {
+                            exchange.redeem(enrollmentRequest(tls.issuerUrl))
+                        }
+                    }
+
+                    assertEquals("scenario $index request count", 1, tls.server.requestCount)
+                    val request = tls.recordedRequest()
+                    assertTrue(request.requestLine.endsWith(" HTTP/1.1"))
+                    assertEquals(0, authenticatorCalls.get())
+                    assertEquals(0, applicationInterceptorCalls.get())
+                    assertEquals(0, networkInterceptorCalls.get())
+                    assertEquals(0, eventListenerCalls.get())
+                    assertNull(observedCredentialBody.get())
+                }
+            }
+        }
+
+    @Test
     fun `malformed oversized and noncanonical Relay responses fail closed without secret echo`() =
         runBlocking {
             RelayV2TlsMockServer().use { tls ->
@@ -129,6 +223,13 @@ class OkHttpRelayV2CredentialExchangeTest {
                 tls.server.enqueue(jsonResponse(malformed))
                 tls.server.enqueue(
                     jsonResponse("x".repeat(RelayV2Codec.HTTPS_BODY_BYTES + 1)),
+                )
+                tls.server.enqueue(
+                    jsonResponse("")
+                        .setChunkedBody(
+                            "x".repeat(RelayV2Codec.HTTPS_BODY_BYTES + 1),
+                            1_024,
+                        ),
                 )
                 tls.server.enqueue(
                     jsonResponse(
@@ -141,7 +242,7 @@ class OkHttpRelayV2CredentialExchangeTest {
                 )
                 val exchange = OkHttpRelayV2CredentialExchange(tls.client)
 
-                repeat(3) {
+                repeat(4) {
                     val failure = captureExchangeFailure {
                         exchange.redeem(enrollmentRequest(tls.issuerUrl))
                     }
@@ -201,6 +302,22 @@ class OkHttpRelayV2CredentialExchangeTest {
         assertFalse(url.contains(ENROLLMENT_CODE))
         assertFalse(url.contains(ACCESS_TOKEN_1))
         assertFalse(url.contains(REFRESH_TOKEN_1))
+    }
+
+    private fun credentialReadingInterceptor(
+        calls: AtomicInteger,
+        observedBody: AtomicReference<String?>,
+    ): Interceptor = Interceptor { chain ->
+        calls.incrementAndGet()
+        observedBody.set(requestBody(chain.request()))
+        chain.proceed(chain.request())
+    }
+
+    private fun requestBody(request: okhttp3.Request): String? {
+        val body = request.body ?: return null
+        val sink = Buffer()
+        body.writeTo(sink)
+        return sink.readUtf8()
     }
 
     private fun RelayV2TlsMockServer.recordedRequest(): RecordedRequest =
