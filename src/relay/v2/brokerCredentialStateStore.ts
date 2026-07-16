@@ -742,14 +742,11 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
     let pending: unknown;
     try {
       pending = this.#runMethod.call(this.#receiver, nativeCallback);
-    } catch (error) {
-      if (callbackInvoked) {
-        this.terminalFence();
-        return Promise.reject(
-          new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID"),
-        );
-      }
-      return Promise.reject(nativeOperationError(error));
+    } catch {
+      this.terminalFence();
+      return Promise.reject(
+        new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID"),
+      );
     }
     return Promise.resolve(pending).then(
       () => {
@@ -760,12 +757,9 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
         if (!operationSucceeded) throw operationError;
         return operationValue;
       },
-      (error) => {
-        if (callbackInvoked || protocolViolation) {
-          this.terminalFence();
-          throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
-        }
-        throw nativeOperationError(error);
+      () => {
+        this.terminalFence();
+        throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
       },
     );
   }

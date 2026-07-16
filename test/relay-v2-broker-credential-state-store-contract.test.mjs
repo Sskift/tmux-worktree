@@ -670,6 +670,71 @@ test("runtime runExclusive requires exactly one settled callback without identit
     );
     await early.close();
   }
+
+  for (const settlement of ["reject-before-callback", "throw-before-callback"]) {
+    const release = deferred();
+    const entered = deferred();
+    const observed = deferred();
+    const rawBacking = { publicationAttempts: 0 };
+    const rawRevision = Object.freeze({});
+    const transaction = Object.freeze({
+      read: async () => ({ outcome: "missing", revision: rawRevision }),
+      compareAndPublish: async () => {
+        rawBacking.publicationAttempts += 1;
+        return { outcome: "uncertain" };
+      },
+    });
+    let delayedCallback;
+    const delayed = openRaw((callback) => {
+      delayedCallback = callback;
+      if (settlement === "reject-before-callback") {
+        return Promise.reject(rawFailure("STORE_BUSY"));
+      }
+      throw rawFailure("STORE_BUSY");
+    });
+    const running = delayed.runExclusive(async (wrappedTransaction) => {
+      entered.resolve();
+      await release.promise;
+      const readCode = await wrappedTransaction.read().then(
+        () => "resolved",
+        (error) => error.code,
+      );
+      const publishCode = await wrappedTransaction.compareAndPublish(
+        Object.freeze({}),
+        new Uint8Array([1]),
+      ).then(
+        () => "resolved",
+        (error) => error.code,
+      );
+      observed.resolve({ readCode, publishCode });
+    });
+    await assert.rejects(
+      running,
+      (error) => error.code === "NATIVE_INTERFACE_INVALID" && error.retryable === false,
+      `${settlement} never exposes retryable STORE_BUSY`,
+    );
+    await assert.rejects(
+      delayed.runExclusive(() => undefined),
+      (error) => error.code === "STORE_CLOSED",
+      `${settlement} fences new admission before the delayed callback runs`,
+    );
+
+    assert.equal(typeof delayedCallback, "function");
+    const callbackPending = delayedCallback(transaction);
+    await entered.promise;
+    release.resolve();
+    await callbackPending;
+    assert.deepEqual(await observed.promise, {
+      readCode: "STORE_CLOSED",
+      publishCode: "STORE_CLOSED",
+    });
+    assert.equal(
+      rawBacking.publicationAttempts,
+      0,
+      `${settlement} cannot publish from its delayed callback`,
+    );
+    await delayed.close();
+  }
 });
 
 registerRelayV2BrokerCredentialStateStoreConformance({

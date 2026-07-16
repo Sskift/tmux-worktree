@@ -191,7 +191,7 @@
           "uncertain-publish-outcome",
           "raw-callback-duplicate",
           "raw-run-settles-before-callback",
-          "raw-run-rejects-or-throws-after-callback-admission",
+          "raw-run-rejects-or-throws",
           "post-publish-malformed-result",
           "post-publish-error-without-proven-no-commit-code"
         ],
@@ -220,7 +220,7 @@
       "nativeCallbackContract": {
         "invocationCount": "exactly-one",
         "nativeSettlesAfterCallback": true,
-        "protocolViolation": "NATIVE_INTERFACE_INVALID-and-terminal-close-before-active-callback-can-continue",
+        "protocolViolation": "NATIVE_INTERFACE_INVALID-and-terminal-close-before-current-or-delayed-callback-can-operate",
         "operationResultOwner": "typescript-wrapper",
         "nativeIdentityEchoRequired": false,
         "businessExceptionRoundTripThroughNativeRequired": false
