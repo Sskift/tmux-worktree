@@ -31,6 +31,7 @@ internal enum class RelayV2ConnectionPhase {
     AWAITING_HOST_WELCOME,
     QUERYING,
     RESYNCING,
+    ONLINE,
     CONTINUITY_REJECTED,
     FAILED,
     DISCONNECTED,
@@ -141,6 +142,140 @@ internal data class RelayV2HandshakeContext(
     val commandDedupeWindow: RelayV2CommandDedupeWindow,
 )
 
+/** Exact actor-owned recovery step that a durable repository receipt must acknowledge. */
+internal data class RelayV2RecoveryBinding(
+    val generation: RelayV2EffectGeneration,
+    val step: Long,
+    val requestId: String,
+) {
+    init {
+        require(step > 0) { "Recovery step must be positive" }
+        requireRelayV2RuntimeId(requestId, "Recovery request ID")
+    }
+}
+
+internal data class RelayV2PendingCommand(
+    val commandId: String,
+    val dedupeWindowId: String,
+) {
+    init {
+        requireRelayV2RuntimeId(commandId, "Command ID")
+        requireRelayV2RuntimeId(dedupeWindowId, "Dedupe window ID")
+    }
+}
+
+/** Durable continuation proof for a pinned snapshot that survived a prior route. */
+internal data class RelayV2SnapshotContinuation(
+    val snapshotRequestId: String,
+    val snapshotId: String,
+    val cursor: String,
+    val nextChunkIndex: Long,
+) {
+    init {
+        requireRelayV2RuntimeId(snapshotRequestId, "Snapshot request ID")
+        requireRelayV2RuntimeId(snapshotId, "Snapshot ID")
+        require(cursor.isNotEmpty()) { "Snapshot cursor is required" }
+        require(cursor.toByteArray(Charsets.UTF_8).size <= 1_024) {
+            "Snapshot cursor is too long"
+        }
+        require(nextChunkIndex > 0) { "Snapshot continuation index must be positive" }
+    }
+}
+
+internal sealed interface RelayV2DurableSnapshotApplyResult {
+    val snapshotRequestId: String
+    val snapshotId: String
+
+    data class Continue(
+        override val snapshotRequestId: String,
+        override val snapshotId: String,
+        val nextChunkIndex: Long,
+        val nextCursor: String,
+    ) : RelayV2DurableSnapshotApplyResult {
+        init {
+            requireRelayV2RuntimeId(snapshotRequestId, "Snapshot request ID")
+            requireRelayV2RuntimeId(snapshotId, "Snapshot ID")
+            require(nextChunkIndex > 0) { "Snapshot continuation index must be positive" }
+            require(nextCursor.isNotEmpty()) { "Snapshot continuation cursor is required" }
+            require(nextCursor.toByteArray(Charsets.UTF_8).size <= 1_024) {
+                "Snapshot continuation cursor is too long"
+            }
+        }
+    }
+
+    data class Committed(
+        override val snapshotRequestId: String,
+        override val snapshotId: String,
+        val durableCursorEventSeq: String,
+    ) : RelayV2DurableSnapshotApplyResult {
+        init {
+            requireRelayV2RuntimeId(snapshotRequestId, "Snapshot request ID")
+            requireRelayV2RuntimeId(snapshotId, "Snapshot ID")
+            requireRelayV2RuntimeCounter(durableCursorEventSeq, "Durable snapshot cursor")
+        }
+    }
+}
+
+/**
+ * Proof returned only after an effect consumer commits its complete repository transaction under
+ * [RelayV2ConnectionActor.withEffectApplyLease]. The actor treats these values as opaque durable
+ * receipts and still rechecks generation, step, request, host and epoch before advancing.
+ */
+internal sealed interface RelayV2RecoveryReceipt {
+    val binding: RelayV2RecoveryBinding
+    val hostId: String
+    val hostEpoch: String
+
+    data class HelloApplied(
+        override val binding: RelayV2RecoveryBinding,
+        override val hostId: String,
+        override val hostEpoch: String,
+        val durableCursorEventSeq: String?,
+        val pendingCommands: List<RelayV2PendingCommand>,
+        val snapshotContinuation: RelayV2SnapshotContinuation? = null,
+    ) : RelayV2RecoveryReceipt {
+        init {
+            requireRelayV2RuntimeId(hostId, "Host ID")
+            requireRelayV2RuntimeId(hostEpoch, "Host epoch")
+            durableCursorEventSeq?.let {
+                requireRelayV2RuntimeCounter(it, "Durable hello cursor")
+            }
+            require(pendingCommands.size <= 4_096) { "Too many pending commands" }
+            require(pendingCommands.distinctBy { it.commandId }.size == pendingCommands.size) {
+                "Pending command IDs must be unique"
+            }
+        }
+    }
+
+    data class CommandStatusesApplied(
+        override val binding: RelayV2RecoveryBinding,
+        override val hostId: String,
+        override val hostEpoch: String,
+        val appliedCommands: List<RelayV2PendingCommand>,
+    ) : RelayV2RecoveryReceipt {
+        init {
+            requireRelayV2RuntimeId(hostId, "Host ID")
+            requireRelayV2RuntimeId(hostEpoch, "Host epoch")
+            require(appliedCommands.size in 1..32) { "Command status receipt batch is invalid" }
+            require(appliedCommands.distinctBy { it.commandId }.size == appliedCommands.size) {
+                "Applied command IDs must be unique"
+            }
+        }
+    }
+
+    data class SnapshotChunkApplied(
+        override val binding: RelayV2RecoveryBinding,
+        override val hostId: String,
+        override val hostEpoch: String,
+        val result: RelayV2DurableSnapshotApplyResult,
+    ) : RelayV2RecoveryReceipt {
+        init {
+            requireRelayV2RuntimeId(hostId, "Host ID")
+            requireRelayV2RuntimeId(hostEpoch, "Host epoch")
+        }
+    }
+}
+
 /** Explicit repository-facing consequences of the v2 hello barrier. */
 internal sealed interface RelayV2RuntimeEffect {
     sealed interface GenerationScoped : RelayV2RuntimeEffect {
@@ -150,6 +285,7 @@ internal sealed interface RelayV2RuntimeEffect {
     data class QueryPendingCommands(
         val context: RelayV2HandshakeContext,
         override val generation: RelayV2EffectGeneration,
+        val recovery: RelayV2RecoveryBinding,
         val outcome: RelayV2HelloOutcome = RelayV2HelloOutcome.MATCHED,
     ) : GenerationScoped
 
@@ -158,7 +294,27 @@ internal sealed interface RelayV2RuntimeEffect {
         override val generation: RelayV2EffectGeneration,
         val outcome: RelayV2HelloOutcome,
         val discardPriorResourceLineage: Boolean,
+        val recovery: RelayV2RecoveryBinding,
         val queryPendingCommandsAfterResync: Boolean = true,
+    ) : GenerationScoped
+
+    data class ApplyCommandStatuses(
+        val context: RelayV2HandshakeContext,
+        val message: RelayV2DecodedMessage,
+        val expectedCommands: List<RelayV2PendingCommand>,
+        val recovery: RelayV2RecoveryBinding,
+        override val generation: RelayV2EffectGeneration = recovery.generation,
+    ) : GenerationScoped
+
+    data class ApplyStateSnapshotChunk(
+        val context: RelayV2HandshakeContext,
+        val message: RelayV2DecodedMessage,
+        val snapshotRequestId: String,
+        val snapshotId: String?,
+        val requestedCursor: String?,
+        val requestedChunkIndex: Long,
+        val recovery: RelayV2RecoveryBinding,
+        override val generation: RelayV2EffectGeneration = recovery.generation,
     ) : GenerationScoped
 
     data class RejectContinuity(
@@ -259,3 +415,17 @@ internal fun interface RelayV2TransportFactory {
         listener: RelayV2TransportListener,
     ): RelayV2Transport
 }
+
+private fun requireRelayV2RuntimeId(value: String, label: String) {
+    require(value.isNotBlank()) { "$label is required" }
+    require(value.toByteArray(Charsets.UTF_8).size <= 128) { "$label is too long" }
+    require('\u0000' !in value) { "$label contains NUL" }
+}
+
+private fun requireRelayV2RuntimeCounter(value: String, label: String) {
+    require(RUNTIME_COUNTER_PATTERN.matches(value)) { "$label is not canonical" }
+    require(BigInteger(value) <= RUNTIME_UNSIGNED_COUNTER_MAX) { "$label is too large" }
+}
+
+private val RUNTIME_COUNTER_PATTERN = Regex("^(?:0|[1-9][0-9]*)$")
+private val RUNTIME_UNSIGNED_COUNTER_MAX = BigInteger("18446744073709551615")
