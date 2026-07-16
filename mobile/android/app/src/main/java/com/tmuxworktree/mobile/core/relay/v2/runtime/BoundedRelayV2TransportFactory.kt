@@ -9,6 +9,12 @@ import java.net.SocketTimeoutException
 import java.security.SecureRandom
 import java.security.cert.CertificateException
 import java.security.cert.CertPathValidatorException
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HostnameVerifier
@@ -89,9 +95,11 @@ private class BoundedRelayV2Transport(
     private val terminal = AtomicBoolean(false)
     private val protocolFailureInProgress = AtomicBoolean(false)
     private val resolution = AtomicReference<RelayV2AddressResolution?>()
+    private val wireSocket = AtomicReference<Socket?>()
     private val socket = AtomicReference<Socket?>()
     private val writer = AtomicReference<BoundedRfc6455Writer?>()
     private val connectionThread = AtomicReference<Thread?>()
+    private val closeDeadline = AtomicReference<RelayV2CloseDeadline?>()
     private val opened = AtomicBoolean(false)
 
     fun start() {
@@ -110,9 +118,24 @@ private class BoundedRelayV2Transport(
         if (terminal.get()) return
         if (currentWriter == null || !opened.get()) {
             terminateSilently()
-        } else {
-            if (!currentWriter.close(code, reason)) terminateSilently()
+            return
         }
+
+        val deadline = RelayV2CloseDeadlineScheduler.schedule(::terminateSilently)
+            ?: run {
+                terminateSilently()
+                return
+            }
+        if (!closeDeadline.compareAndSet(null, deadline)) {
+            deadline.cancel()
+            return
+        }
+        if (terminal.get()) {
+            closeDeadline.compareAndSet(deadline, null)
+            deadline.cancel()
+            return
+        }
+        if (!currentWriter.close(code, reason)) terminateSilently()
     }
 
     override fun cancel() {
@@ -145,7 +168,12 @@ private class BoundedRelayV2Transport(
                 endpointIdentificationAlgorithm = "HTTPS"
             }
             tls.startHandshake()
-            if (additionalHostnameVerifier?.verify(endpoint.host, tls.session) == false) {
+            val session = tls.session
+            if (!RelayV2StrictHostnameVerifier.verify(endpoint.host, session) ||
+                additionalHostnameVerifier?.let { verifier ->
+                    runCatching { verifier.verify(endpoint.host, session) }.getOrDefault(false)
+                } == false
+            ) {
                 throw RelayV2TlsValidationException()
             }
 
@@ -247,9 +275,14 @@ private class BoundedRelayV2Transport(
             candidate.closeQuietly()
             return false
         }
+        if (!wireSocket.compareAndSet(null, candidate)) {
+            candidate.closeQuietly()
+            return false
+        }
         val previous = socket.getAndSet(candidate)
         if (terminal.get()) {
             socket.compareAndSet(candidate, null)
+            wireSocket.compareAndSet(candidate, null)
             candidate.closeQuietly()
             previous?.closeQuietly()
             return false
@@ -318,7 +351,11 @@ private class BoundedRelayV2Transport(
 
     private fun closeResources() {
         opened.set(false)
+        closeDeadline.getAndSet(null)?.cancel()
         resolution.getAndSet(null)?.cancel()
+        // Close the connected raw socket before touching the TLS wrapper: some providers serialize
+        // SSLSocket.close() behind an in-flight write/flush. The raw close interrupts kernel I/O.
+        wireSocket.getAndSet(null)?.closeQuietly()
         writer.getAndSet(null)?.stop()
         socket.getAndSet(null)?.closeQuietly()
         connectionThread.get()?.takeUnless { it === Thread.currentThread() }?.interrupt()
@@ -331,6 +368,68 @@ private class BoundedRelayV2Transport(
     private companion object {
         const val CLOSE_REPLY_TIMEOUT_MS = 1_000L
         const val PROTOCOL_CLOSE_TIMEOUT_MS = 1_000L
+    }
+}
+
+private interface RelayV2CloseDeadline {
+    fun cancel()
+}
+
+/** One process-wide daemon and a hard admission cap; saturation fails closed immediately. */
+private object RelayV2CloseDeadlineScheduler {
+    private const val CLOSE_DEADLINE_MS = 1_000L
+    private const val MAX_PENDING_DEADLINES = 64
+
+    private val threadSequence = AtomicInteger()
+    private val permits = Semaphore(MAX_PENDING_DEADLINES)
+    private val executor = ScheduledThreadPoolExecutor(
+        1,
+        { runnable ->
+            Thread(
+                runnable,
+                "tw-relay-v2-close-deadline-${threadSequence.incrementAndGet()}",
+            ).apply { isDaemon = true }
+        },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy(),
+    ).apply {
+        removeOnCancelPolicy = true
+        setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
+    }
+
+    fun schedule(action: () -> Unit): RelayV2CloseDeadline? {
+        if (!permits.tryAcquire()) return null
+        val ticket = Ticket(action)
+        return try {
+            ticket.future = executor.schedule(ticket::run, CLOSE_DEADLINE_MS, TimeUnit.MILLISECONDS)
+            ticket
+        } catch (_: RejectedExecutionException) {
+            ticket.release()
+            null
+        }
+    }
+
+    private class Ticket(
+        private val action: () -> Unit,
+    ) : RelayV2CloseDeadline {
+        private val released = AtomicBoolean(false)
+        lateinit var future: ScheduledFuture<*>
+
+        fun run() {
+            try {
+                action()
+            } finally {
+                release()
+            }
+        }
+
+        override fun cancel() {
+            future.cancel(false)
+            release()
+        }
+
+        fun release() {
+            if (released.compareAndSet(false, true)) permits.release()
+        }
     }
 }
 

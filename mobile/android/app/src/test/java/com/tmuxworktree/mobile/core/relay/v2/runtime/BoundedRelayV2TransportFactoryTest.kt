@@ -555,6 +555,31 @@ class BoundedRelayV2TransportFactoryTest {
 
     @Test
     fun cancelInterruptsProductionTlsSocketWriteBeforeDeclaredPayloadCompletes() {
+        assertProductionWriteTeardown("cancel") { transport, socket ->
+            val startedAt = System.nanoTime()
+            transport.cancel()
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+            assertTrue("socket write cancel took ${elapsedMs}ms", elapsedMs < 500)
+            assertTrue(socket.closed.await(500, TimeUnit.MILLISECONDS))
+        }
+    }
+
+    @Test
+    fun closeDeadlineTerminatesBlockedProductionTlsSocketWriteWithoutLateCallback() {
+        assertProductionWriteTeardown("close deadline") { transport, socket ->
+            val startedAt = System.nanoTime()
+            transport.close(1000, "client disconnect")
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+            assertTrue("close call took ${elapsedMs}ms", elapsedMs < 500)
+            assertFalse("close skipped its best-effort window", socket.closed.await(250, TimeUnit.MILLISECONDS))
+            assertTrue("close deadline left the socket open", socket.closed.await(2, TimeUnit.SECONDS))
+        }
+    }
+
+    private fun assertProductionWriteTeardown(
+        description: String,
+        trigger: (RelayV2Transport, CloseObservingSocket) -> Unit,
+    ) {
         RawTlsWebSocketServer().use { server ->
             val firstFrameBytes = CountDownLatch(1)
             val releaseDrain = CountDownLatch(1)
@@ -579,31 +604,27 @@ class BoundedRelayV2TransportFactoryTest {
                         if (count > 0) receivedFrameBytes.addAndGet(count)
                     }
                 } catch (_: IOException) {
-                    // Abrupt transport cancel may end TLS without a close_notify.
+                    // Forced transport teardown may end TLS without a close_notify.
                 } finally {
                     drainFinished.countDown()
                 }
             }
 
             val listener = RecordingListener()
+            val rawSocket = CloseObservingSocket().apply { sendBufferSize = 1_024 }
             val transport = server.factory(
-                rawSocketFactory = {
-                    Socket().apply { sendBufferSize = 1_024 }
-                },
+                rawSocketFactory = { rawSocket },
             ).open(openRequest(server.url()), listener)
             assertTrue(listener.opened.await(3, TimeUnit.SECONDS))
             assertTrue(transport.send(ByteArray(MAX_MESSAGE_BYTES) { 'w'.code.toByte() }))
             assertTrue(firstFrameBytes.await(3, TimeUnit.SECONDS))
             Thread.sleep(100)
-            val startedAt = System.nanoTime()
-            transport.cancel()
-            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
-            assertTrue("socket write cancel took ${elapsedMs}ms", elapsedMs < 500)
+            trigger(transport, rawSocket)
             releaseDrain.countDown()
             assertTrue(drainFinished.await(5, TimeUnit.SECONDS))
             assertTrue(receivedFrameBytes.get() > 0)
             assertTrue(
-                "entire declared frame reached the peer before cancel",
+                "entire declared frame reached the peer before $description",
                 receivedFrameBytes.get() < CLIENT_ONE_MIB_FRAME_BYTES,
             )
             assertEquals(listOf("open"), listener.events)
@@ -975,6 +996,18 @@ private class BlockingConnectSocket : Socket() {
     override fun close() {
         closed.countDown()
         super.close()
+    }
+}
+
+private class CloseObservingSocket : Socket() {
+    val closed = CountDownLatch(1)
+
+    override fun close() {
+        try {
+            super.close()
+        } finally {
+            closed.countDown()
+        }
     }
 }
 
