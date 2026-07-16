@@ -114,6 +114,8 @@ export type RpcV2KillSessionResponse = {
   operation: "kill-session";
 } & ReturnType<typeof killManagedSessionV2>;
 
+export type RpcV2CreateOperation = "create-worktree" | "create-terminal";
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -217,6 +219,214 @@ export function parseRpcV2KillSessionRequest(value: unknown): RpcV2KillSessionRe
     throw new Error("invalid expectedIncarnation");
   }
   return { name: boundedString(value.name, "name", 128), expectedIncarnation };
+}
+
+function nullableBoundedString(
+  value: unknown,
+  label: string,
+  maxBytes: number,
+): string | null {
+  return value === null ? null : boundedString(value, label, maxBytes);
+}
+
+function nonNegativeSafeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new Error(`invalid ${label}`);
+  }
+  return value as number;
+}
+
+function parseRpcV2Session(value: unknown): RpcV2Session {
+  if (!isRecord(value) || !exactKeys(value, [
+    "name",
+    "kind",
+    "profile",
+    "project",
+    "label",
+    "repoPath",
+    "worktreePath",
+    "branch",
+    "baseBranch",
+    "cwd",
+    "createdAt",
+    "attached",
+    "windows",
+    "created",
+    "activity",
+    "incarnation",
+    "lifecycleMarked",
+    "reservationCorrelation",
+  ])) {
+    throw new Error("invalid RPC v2 Session response");
+  }
+  if ((value.kind !== "worktree" && value.kind !== "terminal")
+    || (value.profile !== "cli" && value.profile !== "dashboard")
+    || typeof value.attached !== "boolean"
+    || typeof value.lifecycleMarked !== "boolean") {
+    throw new Error("invalid RPC v2 Session response fields");
+  }
+  const createdAt = boundedString(value.createdAt, "createdAt", 64);
+  const createdAtMs = Date.parse(createdAt);
+  if (!Number.isFinite(createdAtMs) || new Date(createdAtMs).toISOString() !== createdAt) {
+    throw new Error("invalid RPC v2 Session createdAt");
+  }
+  const incarnation = boundedString(value.incarnation, "incarnation", 128);
+  if (!/^twinc2\.[A-Za-z0-9_-]{43}$/.test(incarnation)) {
+    throw new Error("invalid RPC v2 Session incarnation");
+  }
+  const reservationCorrelation = value.reservationCorrelation === null
+    ? null
+    : parseCorrelation(value.reservationCorrelation);
+  return {
+    name: boundedString(value.name, "name", 128),
+    kind: value.kind,
+    profile: value.profile,
+    project: nullableBoundedString(value.project, "project", 128),
+    label: nullableBoundedString(value.label, "label", 128),
+    repoPath: nullableBoundedString(value.repoPath, "repoPath", 4_096),
+    worktreePath: nullableBoundedString(value.worktreePath, "worktreePath", 4_096),
+    branch: nullableBoundedString(value.branch, "branch", 255),
+    baseBranch: nullableBoundedString(value.baseBranch, "baseBranch", 255),
+    cwd: boundedString(value.cwd, "cwd", 4_096),
+    createdAt,
+    attached: value.attached,
+    windows: nonNegativeSafeInteger(value.windows, "windows"),
+    created: nonNegativeSafeInteger(value.created, "created"),
+    activity: nonNegativeSafeInteger(value.activity, "activity"),
+    incarnation,
+    lifecycleMarked: value.lifecycleMarked,
+    reservationCorrelation,
+  };
+}
+
+export function parseRpcV2CreateResponse(
+  value: unknown,
+  expectedOperation: RpcV2CreateOperation,
+): RpcV2CreateResponse {
+  if (!isRecord(value)
+    || value.protocolVersion !== RPC_V2_PROTOCOL_VERSION
+    || value.operation !== expectedOperation
+    || (value.state !== "succeeded" && value.state !== "failed" && value.state !== "in_doubt")) {
+    throw new Error("invalid RPC v2 create response");
+  }
+  if (value.state === "succeeded") {
+    if (!exactKeys(value, ["protocolVersion", "operation", "state", "session"])) {
+      throw new Error("invalid RPC v2 create success response");
+    }
+    const session = parseRpcV2Session(value.session);
+    if (session.kind !== (expectedOperation === "create-worktree" ? "worktree" : "terminal")
+      || session.lifecycleMarked !== true
+      || session.reservationCorrelation === null) {
+      throw new Error("RPC v2 create response lacks lifecycle authority");
+    }
+    return {
+      protocolVersion: 2,
+      operation: expectedOperation,
+      state: "succeeded",
+      session,
+    };
+  }
+  if (!exactKeys(value, ["protocolVersion", "operation", "state", "error"],
+    value.state === "failed" ? ["sideEffect"] : [])) {
+    throw new Error("invalid RPC v2 create failure response");
+  }
+  if (!isRecord(value.error)
+    || !exactKeys(value.error, ["code", "message"])
+    || typeof value.error.message !== "string"
+    || value.error.message.length === 0
+    || value.error.message.includes("\0")
+    || Buffer.byteLength(value.error.message, "utf8") > 4_096) {
+    throw new Error("invalid RPC v2 create error");
+  }
+  if (value.state === "failed") {
+    if (value.sideEffect !== "not_applied" || value.error.code !== "CREATE_FAILED") {
+      throw new Error("RPC v2 create failure lacks no-side-effect proof");
+    }
+    return {
+      protocolVersion: 2,
+      operation: expectedOperation,
+      state: "failed",
+      sideEffect: "not_applied",
+      error: { code: "CREATE_FAILED", message: value.error.message },
+    };
+  }
+  if (value.error.code !== "IN_DOUBT") {
+    throw new Error("invalid RPC v2 create in-doubt response");
+  }
+  return {
+    protocolVersion: 2,
+    operation: expectedOperation,
+    state: "in_doubt",
+    error: { code: "IN_DOUBT", message: value.error.message },
+  };
+}
+
+export function parseRpcV2KillSessionResponse(value: unknown): RpcV2KillSessionResponse {
+  if (!isRecord(value)
+    || value.protocolVersion !== RPC_V2_PROTOCOL_VERSION
+    || value.operation !== "kill-session"
+    || (value.state !== "succeeded" && value.state !== "failed" && value.state !== "in_doubt")) {
+    throw new Error("invalid RPC v2 kill-session response");
+  }
+  if (value.state === "succeeded") {
+    if (!exactKeys(value, [
+      "protocolVersion", "operation", "state", "name", "kind", "incarnation", "terminated", "sessionId",
+    ])
+      || (value.kind !== "worktree" && value.kind !== "terminal")
+      || value.terminated !== true) {
+      throw new Error("invalid RPC v2 kill-session success response");
+    }
+    const incarnation = boundedString(value.incarnation, "incarnation", 128);
+    if (!/^twinc2\.[A-Za-z0-9_-]{43}$/.test(incarnation)) {
+      throw new Error("invalid RPC v2 kill-session incarnation");
+    }
+    const sessionId = boundedString(value.sessionId, "sessionId", 128);
+    if (!/^\$(?:0|[1-9][0-9]*)$/.test(sessionId)) {
+      throw new Error("invalid RPC v2 kill-session backend sessionId");
+    }
+    return {
+      protocolVersion: 2,
+      operation: "kill-session",
+      state: "succeeded",
+      name: boundedString(value.name, "name", 128),
+      kind: value.kind,
+      incarnation,
+      terminated: true,
+      sessionId,
+    };
+  }
+  if (!exactKeys(value, ["protocolVersion", "operation", "state", "code", "message"],
+    value.state === "failed" ? ["sideEffect"] : [])
+    || typeof value.message !== "string"
+    || value.message.length === 0
+    || value.message.includes("\0")
+    || Buffer.byteLength(value.message, "utf8") > 4_096) {
+    throw new Error("invalid RPC v2 kill-session failure response");
+  }
+  if (value.state === "failed") {
+    if (value.sideEffect !== "not_applied"
+      || (value.code !== "SESSION_NOT_FOUND" && value.code !== "INCARNATION_MISMATCH")) {
+      throw new Error("RPC v2 kill-session failure lacks no-side-effect proof");
+    }
+    return {
+      protocolVersion: 2,
+      operation: "kill-session",
+      state: "failed",
+      sideEffect: "not_applied",
+      code: value.code,
+      message: value.message,
+    };
+  }
+  if (value.code !== "IN_DOUBT") {
+    throw new Error("invalid RPC v2 kill-session in-doubt response");
+  }
+  return {
+    protocolVersion: 2,
+    operation: "kill-session",
+    state: "in_doubt",
+    code: "IN_DOUBT",
+    message: value.message,
+  };
 }
 
 export function buildRpcV2CapabilitiesResponse(): RpcV2CapabilitiesResponse {

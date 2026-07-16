@@ -59,6 +59,8 @@ export interface RelayV2CommandStructuredError {
 
 export interface RelayV2CanonicalCommandRequest {
   fingerprintSchemaVersion: typeof RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
   authority: "tw_rpc" | "terminal_control";
   operation: RelayV2CommandOperation;
   principalId: string;
@@ -1869,6 +1871,8 @@ export class RelayV2HostCommandPlane {
 
     const canonicalRequest: RelayV2CanonicalCommandRequest = {
       fingerprintSchemaVersion: RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION,
+      commandId: command.commandId,
+      requestFingerprint: cloneJson(fingerprint),
       authority: authorityFor(command.operation),
       operation: command.operation,
       principalId: auth.principalId,

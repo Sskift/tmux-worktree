@@ -131,6 +131,41 @@ test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
   assert.deepEqual(Object.keys(cases.wire.outcomes), [
     "createFailed", "createInDoubt", "killFailed", "killInDoubt",
   ]);
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(cases.wire.createWorktree.normalized, "create-worktree"),
+    cases.wire.createWorktree.normalized,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(cases.wire.createTerminal.normalized, "create-terminal"),
+    cases.wire.createTerminal.normalized,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(cases.wire.outcomes.createFailed, "create-terminal"),
+    cases.wire.outcomes.createFailed,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(cases.wire.outcomes.createInDoubt, "create-worktree"),
+    cases.wire.outcomes.createInDoubt,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2KillSessionResponse(cases.wire.killSession.normalized),
+    cases.wire.killSession.normalized,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2KillSessionResponse(cases.wire.outcomes.killFailed),
+    cases.wire.outcomes.killFailed,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2KillSessionResponse(cases.wire.outcomes.killInDoubt),
+    cases.wire.outcomes.killInDoubt,
+  );
+  assert.throws(
+    () => rpcV2.parseRpcV2CreateResponse({
+      ...cases.wire.createTerminal.normalized,
+      futureField: true,
+    }, "create-terminal"),
+    /invalid RPC v2 create success response/,
+  );
 });
 
 test("production execute mappers conform to frozen create and kill outcomes", () => {
