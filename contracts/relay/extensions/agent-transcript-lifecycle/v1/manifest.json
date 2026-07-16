@@ -163,6 +163,7 @@
   "requiredInvalidCategories": [
     "unknown-field",
     "noncanonical-counter",
+    "nonpositive-agent-event-sequence",
     "invalid-lifecycle-scope",
     "raw-terminal-transcript",
     "tool-call-body",

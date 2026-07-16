@@ -21,6 +21,34 @@
     "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"08\",\"eventId\":\"event-bad-3\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"entry.deleted\",\"entryId\":\"entry-1\",\"reason\":\"retention\"}}}"
   },
   {
+    "name": "live-delete-agent-sequence-zero",
+    "category": "nonpositive-agent-event-sequence",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"0\",\"eventId\":\"event-zero-delete\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"entry.deleted\",\"entryId\":\"entry-zero-delete\",\"reason\":\"retention\"}}}"
+  },
+  {
+    "name": "live-lifecycle-outer-and-record-sequence-zero",
+    "category": "nonpositive-agent-event-sequence",
+    "type": "agent.timeline.event",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"event\",\"type\":\"agent.timeline.event\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"agentEventSeq\":\"0\",\"eventId\":\"event-zero-lifecycle\",\"occurredAtMs\":1783700000000,\"mutation\":{\"mutationType\":\"lifecycle.changed\",\"lifecycle\":{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-zero-lifecycle\",\"sourceEpoch\":\"source-zero\",\"scope\":\"run\",\"runId\":\"run-zero\",\"turnId\":null,\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"0\"}}}}"
+  },
+  {
+    "name": "snapshot-lifecycle-record-sequence-zero",
+    "category": "nonpositive-agent-event-sequence",
+    "type": "agent.timeline.snapshot.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-lifecycle\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-lifecycle\",\"snapshotId\":\"cut-zero-lifecycle\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"0\",\"records\":[{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-zero-snapshot-lifecycle\",\"sourceEpoch\":\"source-zero\",\"scope\":\"run\",\"runId\":\"run-zero\",\"turnId\":null,\"state\":\"running\",\"failure\":null,\"occurredAtMs\":1783700000000,\"agentEventSeq\":\"0\"}]}}"
+  },
+  {
+    "name": "snapshot-text-record-sequences-zero",
+    "category": "nonpositive-agent-event-sequence",
+    "type": "agent.timeline.snapshot.page",
+    "expectedError": "INVALID_ENVELOPE",
+    "wire": "{\"protocolVersion\":2,\"kind\":\"response\",\"type\":\"agent.timeline.snapshot.page\",\"requestId\":\"bad-zero-snapshot-text\",\"hostId\":\"mac-admin\",\"hostEpoch\":\"host-epoch-1\",\"scopeId\":\"scope-local\",\"sessionId\":\"session-1\",\"payload\":{\"capability\":\"agent.transcript-lifecycle.v1\",\"timelineEpoch\":\"timeline-1\",\"snapshotRequestId\":\"logical-zero-text\",\"snapshotId\":\"cut-zero-text\",\"pageIndex\":0,\"isLast\":true,\"nextCursor\":null,\"throughAgentSeq\":\"1\",\"earliestRetainedSeq\":\"0\",\"records\":[{\"recordType\":\"text_entry\",\"entryId\":\"entry-zero-snapshot\",\"runId\":\"run-zero\",\"turnId\":\"turn-zero\",\"role\":\"agent\",\"state\":\"visible\",\"text\":\"invalid zero sequence\",\"redactionReason\":null,\"commandId\":null,\"createdAtMs\":1783700000000,\"createdAgentSeq\":\"0\",\"lastModifiedAgentSeq\":\"0\"}]}}"
+  },
+  {
     "name": "run-lifecycle-carries-turn-id",
     "category": "invalid-lifecycle-scope",
     "type": "agent.timeline.event",

@@ -248,6 +248,12 @@ function counter(value: RelayV2JsonValue): string {
   return value;
 }
 
+function positiveCounter(value: RelayV2JsonValue): string {
+  const parsed = counter(value);
+  if (parsed === "0") reject("invalid-argument");
+  return parsed;
+}
+
 function array(
   value: RelayV2JsonValue,
   validator: (item: RelayV2JsonValue, index: number) => void,
@@ -343,7 +349,7 @@ function validateLifecycleRecord(value: RelayV2JsonValue): RelayV2JsonObject {
   );
   validateFailure(field(record, "failure"), state);
   integer(field(record, "occurredAtMs"));
-  counter(field(record, "agentEventSeq"));
+  positiveCounter(field(record, "agentEventSeq"));
   return record;
 }
 
@@ -369,8 +375,8 @@ function validateTextEntryRecord(value: RelayV2JsonValue): RelayV2JsonObject {
   const commandId = nullable(field(record, "commandId"), id);
   if (role === "agent" && commandId !== null) reject("schema-mismatch");
   integer(field(record, "createdAtMs"));
-  const created = counter(field(record, "createdAgentSeq"));
-  const modified = counter(field(record, "lastModifiedAgentSeq"));
+  const created = positiveCounter(field(record, "createdAgentSeq"));
+  const modified = positiveCounter(field(record, "lastModifiedAgentSeq"));
   if (compareCounter(created, modified) > 0) reject("schema-mismatch");
   if (state === "visible" && created !== modified) reject("schema-mismatch");
   if (state === "redacted" && created === modified) reject("schema-mismatch");
@@ -434,7 +440,7 @@ function validateMutation(
 function validatePublicEventItem(value: RelayV2JsonValue): RelayV2JsonObject {
   const event = object(value);
   exact(event, ["agentEventSeq", "eventId", "occurredAtMs", "mutation"]);
-  const agentEventSeq = counter(field(event, "agentEventSeq"));
+  const agentEventSeq = positiveCounter(field(event, "agentEventSeq"));
   const eventId = id(field(event, "eventId"));
   const occurredAtMs = integer(field(event, "occurredAtMs"));
   validateMutation(field(event, "mutation"), { agentEventSeq, eventId, occurredAtMs });
@@ -633,7 +639,7 @@ export function validateRelayAgentTranscriptLifecycleFrame(
       ]);
       literal(field(payload, "capability"), RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY);
       id(field(payload, "timelineEpoch"));
-      const agentEventSeq = counter(field(payload, "agentEventSeq"));
+      const agentEventSeq = positiveCounter(field(payload, "agentEventSeq"));
       const eventId = id(field(payload, "eventId"));
       const occurredAtMs = integer(field(payload, "occurredAtMs"));
       validateMutation(field(payload, "mutation"), { agentEventSeq, eventId, occurredAtMs });
