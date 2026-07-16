@@ -17,6 +17,8 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.matchesCredentialBinding
 import java.io.Closeable
 import java.math.BigInteger
+import java.util.Collections
+import java.util.IdentityHashMap
 import java.util.UUID
 import java.util.concurrent.CancellationException
 import java.util.concurrent.Executors
@@ -42,8 +44,9 @@ import kotlinx.coroutines.launch
 /**
  * Serialized Relay v2 client runtime seam.
  *
- * The actor owns the active transport and all handshake state. Transport callbacks only enqueue
- * generation-tagged actions; this class has no dependency on the Relay v1 profile, actor, or codec.
+ * The actor owns transport identity and all handshake state. Callback entry atomically binds and
+ * fences its source before enqueueing generation-tagged actions; this class has no dependency on
+ * the Relay v1 profile, actor, or codec.
  */
 internal class RelayV2ConnectionActor(
     parentScope: CoroutineScope,
@@ -130,10 +133,13 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    // Actor-owned mutable state. Callback threads only retain immutable generation values.
+    // Actor state is serialized below; callback source binding/fences are guarded by lifecycleLock.
     private var connectionGeneration = 0L
     private var activeTransport: RelayV2Transport? = null
-    private var retiredTransport: RelayV2Transport? = null
+    private val transportFences: MutableSet<RelayV2Transport> =
+        Collections.newSetFromMap(IdentityHashMap())
+    private val transportRetirements: MutableSet<RelayV2Transport> =
+        Collections.newSetFromMap(IdentityHashMap())
     private var activeProfile: RelayV2Profile? = null
     private var requestedResume: RelayV2ResumeCursor? = null
     private var pendingHelloRequestId: String? = null
@@ -336,6 +342,8 @@ internal class RelayV2ConnectionActor(
 
         var credential: RelayV2CredentialBlob? = null
         var uncommittedTransport: RelayV2Transport? = null
+        var provisionalOwner: ProvisionalCallbackOwner? = null
+        var transportCommitted = false
         try {
             credential = runCatching { credentialStore.read(profile.credentialReference) }
                 .getOrNull()
@@ -365,7 +373,7 @@ internal class RelayV2ConnectionActor(
                 retainTransportFence(previous)
                 previous.close(1000, "v2 reconnect")
             }
-            val transportTerminated = awaitRetiredTransport()
+            val transportTerminated = awaitTransportFences()
             preparation.applyDrain.await()
             if (!isConnectTokenCurrent(token)) return
             if (!transportTerminated) {
@@ -387,7 +395,7 @@ internal class RelayV2ConnectionActor(
                 profileGeneration = profile.activationGeneration,
                 connectionGeneration = preparation.connectionGeneration,
             )
-            val provisionalOwner = synchronized(lifecycleLock) {
+            val owner = synchronized(lifecycleLock) {
                 if (!isConnectTokenCurrentLocked(token)) return@synchronized null
                 ProvisionalCallbackOwner(
                     connectToken = token,
@@ -395,7 +403,8 @@ internal class RelayV2ConnectionActor(
                     phase = CallbackOwnerPhase.OPENING,
                 ).also { provisionalCallbackOwner = it }
             } ?: return
-            val listener = listenerFor(provisionalOwner)
+            provisionalOwner = owner
+            val listener = listenerFor(owner)
             val request = runCatching {
                 RelayV2TransportOpenRequest(
                     relayUrl = profile.relayUrl,
@@ -417,23 +426,51 @@ internal class RelayV2ConnectionActor(
             }
             val opened = runCatching { transportFactory.open(request, listener) }
                 .getOrElse {
+                    val sourceMismatch = synchronized(lifecycleLock) { owner.sourceMismatch }
                     failConnectAttempt(
                         token,
                         profile,
-                        RelayV2ConnectionFailure(
-                            RelayV2FailureKind.TRANSPORT,
-                            "HOST_OFFLINE",
-                            retryable = true,
-                        ),
+                        if (sourceMismatch) {
+                            RelayV2ConnectionFailure(
+                                RelayV2FailureKind.SECURITY,
+                                "TRANSPORT_SOURCE_MISMATCH",
+                                retryable = false,
+                            )
+                        } else {
+                            RelayV2ConnectionFailure(
+                                RelayV2FailureKind.TRANSPORT,
+                                "HOST_OFFLINE",
+                                retryable = true,
+                            )
+                        },
                         closeCode = null,
                     )
                     return
                 }
             uncommittedTransport = opened
+            when (bindFactorySource(owner, opened)) {
+                FactorySourceBinding.MATCHED -> Unit
+                FactorySourceBinding.STALE -> return
+                FactorySourceBinding.MISMATCH -> {
+                    failConnectAttempt(
+                        token,
+                        profile,
+                        RelayV2ConnectionFailure(
+                            RelayV2FailureKind.SECURITY,
+                            "TRANSPORT_SOURCE_MISMATCH",
+                            retryable = false,
+                        ),
+                        closeCode = null,
+                    )
+                    return
+                }
+            }
             beforeTransportCommit()
             val committed = synchronized(lifecycleLock) {
                 if (!isConnectTokenCurrentLocked(token) ||
-                    provisionalCallbackOwner != provisionalOwner
+                    provisionalCallbackOwner !== owner ||
+                    owner.sourceMismatch ||
+                    owner.factorySource !== opened
                 ) {
                     return@synchronized false
                 }
@@ -456,15 +493,18 @@ internal class RelayV2ConnectionActor(
                 true
             }
             if (!committed) return
+            transportCommitted = true
             uncommittedTransport = null
         } finally {
             credential = null
-            uncommittedTransport?.let { stale ->
-                stale.close(1000, "stale v2 connect attempt")
-                if (!stale.awaitTermination()) {
-                    stale.cancel()
-                    retainTransportFence(stale)
+            if (!transportCommitted) {
+                val staleSources = identitySetOf<RelayV2Transport>().apply {
+                    uncommittedTransport?.let(::add)
+                    provisionalOwner?.callbackSource?.let(::add)
+                    provisionalOwner?.factorySource?.let(::add)
                 }
+                retireTransports(staleSources, "stale v2 connect attempt")
+                awaitTransportFences(staleSources)
             }
             releaseConnectToken(token)
         }
@@ -539,6 +579,91 @@ internal class RelayV2ConnectionActor(
             if (provisionalCallbackOwner?.connectToken == token) {
                 provisionalCallbackOwner = null
             }
+        }
+    }
+
+    private fun bindFactorySource(
+        owner: ProvisionalCallbackOwner,
+        source: RelayV2Transport,
+    ): FactorySourceBinding = synchronized(lifecycleLock) {
+        owner.factorySource = source
+        if (provisionalCallbackOwner !== owner || !isConnectTokenCurrentLocked(owner.connectToken)) {
+            return@synchronized FactorySourceBinding.STALE
+        }
+        val callbackSource = owner.callbackSource
+        if (owner.sourceMismatch || (callbackSource != null && callbackSource !== source)) {
+            owner.sourceMismatch = true
+            transportFences.add(source)
+            callbackSource?.let(transportFences::add)
+            FactorySourceBinding.MISMATCH
+        } else {
+            FactorySourceBinding.MATCHED
+        }
+    }
+
+    private fun registerCallbackSource(
+        owner: ProvisionalCallbackOwner,
+        source: RelayV2Transport,
+    ): CallbackSourceRegistration = synchronized(lifecycleLock) {
+        transportFences.add(source)
+        val callbackSource = owner.callbackSource
+        val factorySource = owner.factorySource
+        val mismatch = owner.sourceMismatch ||
+            (callbackSource != null && callbackSource !== source) ||
+            (factorySource != null && factorySource !== source)
+        if (mismatch) {
+            owner.sourceMismatch = true
+            val expected = committedCallbackOwner
+                ?.takeIf { it.key == owner.key }
+                ?.source
+                ?: callbackSource
+                ?: factorySource
+            val sources = identitySetOf<RelayV2Transport>().apply {
+                add(source)
+                callbackSource?.let(::add)
+                factorySource?.let(::add)
+            }
+            sources.forEach(transportFences::add)
+            CallbackSourceRegistration.Mismatch(expected, sources)
+        } else {
+            if (callbackSource == null) owner.callbackSource = source
+            val accepted = lifecycleState == LifecycleState.OPEN &&
+                ((provisionalCallbackOwner === owner &&
+                    isConnectTokenCurrentLocked(owner.connectToken)) ||
+                    (committedCallbackOwner?.key == owner.key &&
+                        committedCallbackOwner?.source === source))
+            if (accepted) {
+                CallbackSourceRegistration.Accepted
+            } else {
+                CallbackSourceRegistration.Stale
+            }
+        }
+    }
+
+    private fun acceptCallbackSource(
+        owner: ProvisionalCallbackOwner,
+        source: RelayV2Transport,
+    ): Boolean = when (val registration = registerCallbackSource(owner, source)) {
+        CallbackSourceRegistration.Accepted -> true
+        CallbackSourceRegistration.Stale -> {
+            retireTransports(listOf(source), "stale v2 transport callback")
+            false
+        }
+        is CallbackSourceRegistration.Mismatch -> {
+            retireTransports(
+                registration.sources,
+                "relay v2 transport source mismatch",
+            )
+            registration.expectedSource?.let { expected ->
+                enqueueTermination(
+                    owner.key,
+                    expected,
+                    TerminationCause.TransportFailed(
+                        RelayV2TransportFailure(RelayV2TransportFailureKind.PROTOCOL),
+                    ),
+                )
+            }
+            false
         }
     }
 
@@ -624,6 +749,7 @@ internal class RelayV2ConnectionActor(
     private fun listenerFor(owner: ProvisionalCallbackOwner): RelayV2TransportListener =
         object : RelayV2TransportListener {
             override fun onOpen(source: RelayV2Transport, selectedSubprotocol: String?) {
+                if (!acceptCallbackSource(owner, source)) return
                 enqueueCallback(
                     Action.TransportOpened(
                         owner.connectToken.id,
@@ -641,6 +767,7 @@ internal class RelayV2ConnectionActor(
                 bytes: ByteArray,
                 metadata: RelayV2FrameMetadata,
             ) {
+                if (!acceptCallbackSource(owner, source)) return
                 val action = if (bytes.size > RelayV2Codec.PUBLIC_FRAME_BYTES) {
                     Action.TransportFrameTooLarge(
                         owner.connectToken.id,
@@ -660,6 +787,7 @@ internal class RelayV2ConnectionActor(
             }
 
             override fun onClosed(source: RelayV2Transport, code: Int) {
+                if (!acceptCallbackSource(owner, source)) return
                 enqueueTermination(
                     owner.key,
                     source,
@@ -668,6 +796,7 @@ internal class RelayV2ConnectionActor(
             }
 
             override fun onFailure(source: RelayV2Transport, failure: RelayV2TransportFailure) {
+                if (!acceptCallbackSource(owner, source)) return
                 enqueueTermination(
                     owner.key,
                     source,
@@ -695,10 +824,10 @@ internal class RelayV2ConnectionActor(
             }
         }
         when (result) {
-            CallbackEnqueue.ENQUEUED,
-            CallbackEnqueue.STALE,
-            -> Unit
-            CallbackEnqueue.STOPPED -> source.cancel()
+            CallbackEnqueue.ENQUEUED -> Unit
+            CallbackEnqueue.STALE ->
+                retireTransports(listOf(source), "stale v2 transport callback")
+            CallbackEnqueue.STOPPED -> retireTransports(listOf(source), graceful = false)
             CallbackEnqueue.SATURATED -> signalQueueSaturation(owner, source)
             else -> error("Unexpected normal callback enqueue state")
         }
@@ -727,11 +856,14 @@ internal class RelayV2ConnectionActor(
         }
         when (result) {
             CallbackEnqueue.ENQUEUED,
-            CallbackEnqueue.STALE,
             CallbackEnqueue.COALESCED,
             -> return
+            CallbackEnqueue.STALE -> {
+                retireTransports(listOf(source), graceful = false)
+                return
+            }
             CallbackEnqueue.STOPPED -> {
-                source.cancel()
+                retireTransports(listOf(source), graceful = false)
                 return
             }
             CallbackEnqueue.RETRY -> Unit
@@ -1443,7 +1575,7 @@ internal class RelayV2ConnectionActor(
         updateState(_state.value.phase, current, _state.value.failure)
         disconnectedTransport?.let(::retainTransportFence)
         disconnectedTransport?.close(1000, "profile disconnect barrier")
-        val transportTerminated = awaitRetiredTransport()
+        val transportTerminated = awaitTransportFences()
         applyDrain.await()
         if (!transportTerminated) {
             if (isLifecycleOpen()) {
@@ -1485,21 +1617,51 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun retainTransportFence(source: RelayV2Transport) {
-        check(retiredTransport == null || retiredTransport === source) {
-            "Relay v2 transport ownership advanced before termination"
+        synchronized(lifecycleLock) {
+            transportFences.add(source)
         }
-        retiredTransport = source
     }
 
-    private suspend fun awaitRetiredTransport(): Boolean {
-        val source = retiredTransport ?: return true
-        val terminated = source.awaitTermination()
-        if (terminated) {
-            if (retiredTransport === source) retiredTransport = null
-        } else {
-            source.cancel()
+    private fun retireTransports(
+        sources: Collection<RelayV2Transport>,
+        reason: String = "",
+        graceful: Boolean = true,
+    ) {
+        val newlyRetired = synchronized(lifecycleLock) {
+            sources.filter { source ->
+                transportFences.add(source)
+                transportRetirements.add(source)
+            }
         }
-        return terminated
+        newlyRetired.forEach { source ->
+            if (graceful) source.close(1000, reason) else source.cancel()
+        }
+    }
+
+    private fun <T> identitySetOf(): MutableSet<T> =
+        Collections.newSetFromMap(IdentityHashMap())
+
+    private suspend fun awaitTransportFences(
+        requiredSources: Set<RelayV2Transport>? = null,
+    ): Boolean {
+        while (true) {
+            val sources = synchronized(lifecycleLock) {
+                val candidates = requiredSources ?: transportFences
+                candidates.filter { it in transportFences }
+            }
+            if (sources.isEmpty()) return true
+            for (source in sources) {
+                if (!source.awaitTermination()) {
+                    source.cancel()
+                    return false
+                }
+                synchronized(lifecycleLock) {
+                    transportFences.remove(source)
+                    transportRetirements.remove(source)
+                }
+            }
+            if (requiredSources != null) return true
+        }
     }
 
     private fun failConnection(
@@ -1619,7 +1781,9 @@ internal class RelayV2ConnectionActor(
         }
         val provisional = provisionalCallbackOwner
         return provisional?.key == owner &&
-            isConnectTokenCurrentLocked(provisional.connectToken)
+            isConnectTokenCurrentLocked(provisional.connectToken) &&
+            (source == null ||
+                (provisional.callbackSource ?: provisional.factorySource) === source)
     }
 
     private fun isCurrentCallback(
@@ -1665,7 +1829,7 @@ internal class RelayV2ConnectionActor(
         connectionGeneration += 1
         source?.let(::retainTransportFence)
         source?.cancel()
-        val transportTerminated = awaitRetiredTransport()
+        val transportTerminated = awaitTransportFences()
         applyDrain.await()
         if (!transportTerminated) {
             finishResources()
@@ -1826,12 +1990,15 @@ internal class RelayV2ConnectionActor(
         val effectGeneration: RelayV2EffectGeneration,
     )
 
-    private data class ProvisionalCallbackOwner(
+    private class ProvisionalCallbackOwner(
         val connectToken: ConnectToken,
         val effectGeneration: RelayV2EffectGeneration,
         val phase: CallbackOwnerPhase,
     ) {
         val key = CallbackOwnerKey(connectToken.id, effectGeneration)
+        var callbackSource: RelayV2Transport? = null
+        var factorySource: RelayV2Transport? = null
+        var sourceMismatch: Boolean = false
     }
 
     private data class CommittedCallbackOwner(
@@ -1843,6 +2010,16 @@ internal class RelayV2ConnectionActor(
     }
 
     private enum class CallbackOwnerPhase { OPENING }
+    private enum class FactorySourceBinding { MATCHED, MISMATCH, STALE }
+
+    private sealed interface CallbackSourceRegistration {
+        data object Accepted : CallbackSourceRegistration
+        data object Stale : CallbackSourceRegistration
+        data class Mismatch(
+            val expectedSource: RelayV2Transport?,
+            val sources: Set<RelayV2Transport>,
+        ) : CallbackSourceRegistration
+    }
 
     private enum class BarrierEnqueue { ENQUEUED, RETRY, STOPPED }
     private enum class ShutdownEnqueue { ENQUEUED, RETRY, STOPPED }
