@@ -311,10 +311,12 @@ class RelayV2ProfileRepositoryTest {
             }
             val switchedRequest = switchedGate.request.await()
             val replacement = relayV2Profile().copy(profileId = "replacement-profile")
-            assertTrue(
+            assertEquals(
+                replacement,
                 switched.profiles.activateRelayV2Profile(
                     switched.profiles.activeIdentity,
                     replacement,
+                    RelayV2ProfileActivationAuthority { activate -> activate() },
                 ),
             )
             switchedGate.response.complete(enrollmentResponse(switchedRequest, "switched-late"))
@@ -327,17 +329,16 @@ class RelayV2ProfileRepositoryTest {
 
             val cancelled = Harness()
             val cancelledGate = cancelled.exchange.deferEnrollment("enrollment-cancel")
+            val cancelledConfirmation = enrollmentDraft(
+                enrollmentId = "enrollment-cancel",
+                enrollmentCode = "twenroll2.code-cancel",
+            ).confirm(deviceLabel = "Pixel")
             val lateAfterCancel = async {
-                cancelled.repository.confirmEnrollment(
-                    enrollmentDraft(
-                        enrollmentId = "enrollment-cancel",
-                        enrollmentCode = "twenroll2.code-cancel",
-                    ).confirm(deviceLabel = "Pixel"),
-                )
+                cancelled.repository.confirmEnrollment(cancelledConfirmation)
             }
             val cancelledRequest = cancelledGate.request.await()
-            assertTrue(cancelled.repository.cancelPendingEnrollment())
-            assertFalse(cancelled.repository.cancelPendingEnrollment())
+            assertTrue(cancelled.repository.cancelPendingEnrollment(cancelledConfirmation))
+            assertFalse(cancelled.repository.cancelPendingEnrollment(cancelledConfirmation))
             cancelledGate.response.complete(
                 enrollmentResponse(cancelledRequest, identitySuffix = "cancelled-late"),
             )
@@ -351,6 +352,101 @@ class RelayV2ProfileRepositoryTest {
             assertEquals(0, cancelled.profiles.activationCount)
             assertTrue(cancelled.credentials.values().single().hasCredentialMaterial.not())
         }
+
+    @Test
+    fun `new confirmation supersedes response blocked in disconnect before isolation`() =
+        runBlocking {
+            val harness = Harness(blockDisconnect = true)
+            val olderConfirmation = enrollmentDraft(
+                "enrollment-disconnect-a",
+                "twenroll2.code-disconnect-a",
+            ).confirm(deviceLabel = "Pixel A")
+            val newerGate = harness.exchange.deferEnrollment("enrollment-disconnect-b")
+            val older = async { harness.repository.confirmEnrollment(olderConfirmation) }
+            harness.barrier.started.await()
+
+            val newer = async {
+                harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-disconnect-b",
+                        "twenroll2.code-disconnect-b",
+                    ).confirm(deviceLabel = "Pixel B"),
+                )
+            }
+            val newerRequest = newerGate.request.await()
+            harness.barrier.release.complete(Unit)
+
+            assertTrue(older.await() is RelayV2EnrollmentResult.Superseded)
+            assertEquals(0, harness.isolationCalls)
+            assertEquals(0, harness.profiles.activationCount)
+
+            newerGate.response.complete(enrollmentResponse(newerRequest, "disconnect-b"))
+            val winner = (newer.await() as RelayV2EnrollmentResult.Activated).profile
+            assertEquals(winner, harness.profiles.activeV2)
+            assertEquals(1, harness.isolationCalls)
+            assertEquals(1, harness.profiles.activationCount)
+        }
+
+    @Test
+    fun `intent change at credential CAS gate drops late credential material`() = runBlocking {
+        CredentialCasInterleaving.entries.forEach { interleaving ->
+            val harness = Harness()
+            val casGate = harness.credentials.blockNextAuthorizedCas()
+            val olderConfirmation = enrollmentDraft(
+                "enrollment-cas-a",
+                "twenroll2.code-cas-a",
+            ).confirm(deviceLabel = "Pixel A")
+            val older = async { harness.repository.confirmEnrollment(olderConfirmation) }
+            casGate.started.await()
+
+            val newer = when (interleaving) {
+                CredentialCasInterleaving.CONFIRM_NEWER -> {
+                    val newerGate = harness.exchange.deferEnrollment("enrollment-cas-b")
+                    val pending = async {
+                        harness.repository.confirmEnrollment(
+                            enrollmentDraft(
+                                "enrollment-cas-b",
+                                "twenroll2.code-cas-b",
+                            ).confirm(deviceLabel = "Pixel B"),
+                        )
+                    }
+                    val newerRequest = newerGate.request.await()
+                    assertFalse(harness.repository.cancelPendingEnrollment(olderConfirmation))
+                    Pair(pending, newerGate to newerRequest)
+                }
+                CredentialCasInterleaving.CANCEL_OLDER -> {
+                    assertTrue(harness.repository.cancelPendingEnrollment(olderConfirmation))
+                    assertFalse(harness.repository.cancelPendingEnrollment(olderConfirmation))
+                    null
+                }
+            }
+
+            casGate.release.complete(Unit)
+            assertTrue(older.await() is RelayV2EnrollmentResult.Superseded)
+            val olderBlob = harness.credentials.values().single {
+                it.pendingAttempt?.enrollmentId == "enrollment-cas-a"
+            }
+            assertEquals(0L, olderBlob.credentialVersion)
+            assertFalse(olderBlob.hasCredentialMaterial)
+            assertEquals(null, olderBlob.accessToken)
+            assertEquals(null, olderBlob.refreshToken)
+
+            if (newer != null) {
+                val (pending, exchange) = newer
+                val (newerGate, newerRequest) = exchange
+                newerGate.response.complete(enrollmentResponse(newerRequest, "cas-b"))
+                val winner = (pending.await() as RelayV2EnrollmentResult.Activated).profile
+                assertEquals(winner, harness.profiles.activeV2)
+                assertEquals(
+                    "twcap2.access-cas-b",
+                    harness.credentials.read(winner.credentialReference)?.accessToken,
+                )
+            } else {
+                assertEquals(RelayProfileDialect.V1, harness.profiles.activeIdentity?.dialect)
+                assertEquals(0, harness.profiles.activationCount)
+            }
+        }
+    }
 
     @Test
     fun `same reference and pending attempt exact replay has one credential and activation winner`() =
@@ -516,10 +612,12 @@ class RelayV2ProfileRepositoryTest {
                 oldActivation.profile.credentialReference,
                 replacement.credentialReference,
             )
-            assertTrue(
+            assertEquals(
+                replacement,
                 switched.profiles.activateRelayV2Profile(
                     expectedActiveProfile = oldActivation.profile.identity,
                     profile = replacement,
+                    authority = RelayV2ProfileActivationAuthority { activate -> activate() },
                 ),
             )
             val activationCountBeforeResponse = switched.profiles.activationCount
@@ -648,6 +746,13 @@ class RelayV2ProfileRepositoryTest {
 
     private class MemoryCredentialStore : RelayV2CredentialStore {
         private val blobs = linkedMapOf<RelayV2CredentialReference, RelayV2CredentialBlob>()
+        private var nextAuthorizedCasGate: SuspensionGate? = null
+
+        @Synchronized
+        fun blockNextAuthorizedCas(): SuspensionGate = SuspensionGate().also {
+            check(nextAuthorizedCasGate == null)
+            nextAuthorizedCasGate = it
+        }
 
         @Synchronized
         override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? =
@@ -668,13 +773,41 @@ class RelayV2ProfileRepositoryTest {
             reference: RelayV2CredentialReference,
             expectation: RelayV2CredentialCasExpectation,
             replacement: RelayV2CredentialBlob,
+        ): RelayV2CredentialCasResult = compareAndSetLocked(reference, expectation, replacement)
+
+        override suspend fun compareAndSetAuthorized(
+            reference: RelayV2CredentialReference,
+            expectation: RelayV2CredentialCasExpectation,
+            replacement: RelayV2CredentialBlob,
+            authority: RelayV2CredentialCasAuthority,
+        ): RelayV2CredentialCasResult? {
+            val gate = synchronized(this) {
+                val current = blobs[reference]
+                    ?: return RelayV2CredentialCasResult.Stale(null)
+                if (!current.matchesExpectation(expectation)) {
+                    return RelayV2CredentialCasResult.Stale(current.credentialVersion)
+                }
+                nextAuthorizedCasGate.also { nextAuthorizedCasGate = null }
+            }
+            gate?.let {
+                it.started.complete(Unit)
+                it.release.await()
+            }
+            return authority.commitIfCurrent {
+                synchronized(this) {
+                    compareAndSetLocked(reference, expectation, replacement)
+                }
+            }
+        }
+
+        private fun compareAndSetLocked(
+            reference: RelayV2CredentialReference,
+            expectation: RelayV2CredentialCasExpectation,
+            replacement: RelayV2CredentialBlob,
         ): RelayV2CredentialCasResult {
             val current = blobs[reference]
                 ?: return RelayV2CredentialCasResult.Stale(null)
-            if (current.credentialVersion != expectation.credentialVersion ||
-                current.pendingAttempt?.attemptId != expectation.pendingAttemptId ||
-                current.pendingAttempt?.secretReference != expectation.pendingSecretReference
-            ) {
+            if (!current.matchesExpectation(expectation)) {
                 return RelayV2CredentialCasResult.Stale(current.credentialVersion)
             }
             require(replacement.credentialVersion >= current.credentialVersion)
@@ -682,12 +815,19 @@ class RelayV2ProfileRepositoryTest {
             return RelayV2CredentialCasResult.Updated(replacement.credentialVersion)
         }
 
+        private fun RelayV2CredentialBlob.matchesExpectation(
+            expectation: RelayV2CredentialCasExpectation,
+        ): Boolean = credentialVersion == expectation.credentialVersion &&
+            pendingAttempt?.attemptId == expectation.pendingAttemptId &&
+            pendingAttempt?.secretReference == expectation.pendingSecretReference
+
         @Synchronized
         override fun clear(reference: RelayV2CredentialReference) {
             blobs.remove(reference)
         }
 
         fun isEmpty(): Boolean = blobs.isEmpty()
+        @Synchronized
         fun values(): List<RelayV2CredentialBlob> = blobs.values.toList()
     }
 
@@ -724,28 +864,62 @@ class RelayV2ProfileRepositoryTest {
         override suspend fun activateRelayV2Profile(
             expectedActiveProfile: RelayActiveProfileIdentity?,
             profile: RelayV2Profile,
-        ): Boolean {
-            if (activeIdentity != expectedActiveProfile) return false
-            activationCount += 1
-            events += "activate"
-            activeV2 = profile
-            activeIdentity = profile.identity
+            authority: RelayV2ProfileActivationAuthority,
+        ): RelayV2Profile? = authority.commitIfCurrent {
+            if (activeIdentity != expectedActiveProfile) return@commitIfCurrent null
+            val current = activeV2
+            val sameActivation = current?.identity == profile.identity &&
+                current.credentialReference == profile.credentialReference
+            if (current != null &&
+                sameActivation &&
+                profile.credentialVersion > current.credentialVersion &&
+                failNextCredentialVersionUpdate
+            ) {
+                failNextCredentialVersionUpdate = false
+                error("Relay v2 credential version update was rejected")
+            }
+            val resolved = if (sameActivation) {
+                requireNotNull(current).copy(
+                    credentialVersion = maxOf(
+                        current.credentialVersion,
+                        profile.credentialVersion,
+                    ),
+                )
+            } else {
+                profile
+            }
+            if (!sameActivation) {
+                activationCount += 1
+                events += "activate"
+            }
+            activeV2 = resolved
+            activeIdentity = resolved.identity
             persistedValues = mapOf(
-                "profileId" to profile.profileId,
-                "issuerUrl" to profile.issuerUrl,
-                "relayUrl" to profile.relayUrl,
-                "hostId" to profile.hostId,
-                "principalId" to profile.principalId,
-                "grantId" to profile.grantId,
-                "clientInstanceId" to profile.clientInstanceId,
-                "credentialReference" to profile.credentialReference.value,
-                "credentialVersion" to profile.credentialVersion,
-                "activationGeneration" to profile.activationGeneration,
+                "profileId" to resolved.profileId,
+                "issuerUrl" to resolved.issuerUrl,
+                "relayUrl" to resolved.relayUrl,
+                "hostId" to resolved.hostId,
+                "principalId" to resolved.principalId,
+                "grantId" to resolved.grantId,
+                "clientInstanceId" to resolved.clientInstanceId,
+                "credentialReference" to resolved.credentialReference.value,
+                "credentialVersion" to resolved.credentialVersion,
+                "activationGeneration" to resolved.activationGeneration,
                 "credentialKind" to "twcap2_grant",
-                "offeredSubprotocol" to profile.offeredSubprotocol,
+                "offeredSubprotocol" to resolved.offeredSubprotocol,
             )
-            return true
+            resolved
         }
+
+        override suspend fun <T> withActiveProfileIdentity(
+            expectedActiveProfile: RelayActiveProfileIdentity?,
+            block: suspend () -> T,
+        ): RelayV2ActiveProfileGuardResult<T> =
+            if (activeIdentity == expectedActiveProfile) {
+                RelayV2ActiveProfileGuardResult.Matched(block())
+            } else {
+                RelayV2ActiveProfileGuardResult.Mismatch(activeIdentity)
+            }
 
         override suspend fun updateRelayV2CredentialVersion(
             profileId: String,
@@ -859,6 +1033,11 @@ class RelayV2ProfileRepositoryTest {
     private enum class EnrollmentResponseOrder {
         A_FIRST,
         B_FIRST,
+    }
+
+    private enum class CredentialCasInterleaving {
+        CONFIRM_NEWER,
+        CANCEL_OLDER,
     }
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(

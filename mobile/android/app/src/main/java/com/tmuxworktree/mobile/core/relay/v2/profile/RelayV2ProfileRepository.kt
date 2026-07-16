@@ -39,10 +39,11 @@ internal class RelayV2ProfileSwitchStateMachine(
     suspend fun switchTo(
         profile: RelayV2Profile,
         expectedPrevious: RelayActiveProfileIdentity?,
-        authorizeActivation: () -> Boolean,
+        isStillCurrent: () -> Boolean,
+        activationAuthority: RelayV2ProfileActivationAuthority,
     ): RelayV2Profile? = mutex.withLock {
         val previous = profileStore.activeProfileIdentity()
-        if (previous != expectedPrevious || !authorizeActivation()) {
+        if (previous != expectedPrevious || !isStillCurrent()) {
             return@withLock null
         }
         val previousV2 = profileStore.activeRelayV2Profile()
@@ -58,38 +59,27 @@ internal class RelayV2ProfileSwitchStateMachine(
                 previousV2.clientInstanceId == profile.clientInstanceId
             ) { "Active Relay v2 profile binding conflicts with the target" }
             val restored = if (profile.credentialVersion > previousV2.credentialVersion) {
-                val updated = profileStore.updateRelayV2CredentialVersion(
-                    profileId = previousV2.profileId,
-                    credentialReference = previousV2.credentialReference,
-                    expectedActivationGeneration = previousV2.activationGeneration,
-                    expectedVersion = previousV2.credentialVersion,
-                    newVersion = profile.credentialVersion,
-                )
-                if (updated) previousV2.copy(credentialVersion = profile.credentialVersion) else {
-                    val concurrent = profileStore.activeRelayV2Profile()
-                        ?: error("Active Relay v2 profile disappeared during reconciliation")
-                    require(concurrent.profileId == profile.profileId &&
-                        concurrent.credentialReference == profile.credentialReference &&
-                        concurrent.activationGeneration == previousV2.activationGeneration &&
-                        concurrent.issuerUrl == profile.issuerUrl &&
-                        concurrent.relayUrl == profile.relayUrl &&
-                        concurrent.hostId == profile.hostId &&
-                        concurrent.principalId == profile.principalId &&
-                        concurrent.grantId == profile.grantId &&
-                        concurrent.clientInstanceId == profile.clientInstanceId
-                    ) { "Active Relay v2 profile changed during reconciliation" }
-                    check(concurrent.credentialVersion >= profile.credentialVersion) {
-                        "Active Relay v2 credential version did not reach the target"
-                    }
-                    concurrent
-                }
+                previousV2.copy(credentialVersion = profile.credentialVersion)
             } else {
                 previousV2
             }
             // Re-confirming the exact target is a recovery/no-op path. It must not invoke the
             // isolation boundary because that boundary owns deletion of the previous credential.
-            state = RelayV2ProfileSwitchState.Active(restored.identity)
-            return@withLock restored
+            if (!isStillCurrent()) {
+                state = RelayV2ProfileSwitchState.Idle
+                return@withLock null
+            }
+            val committed = profileStore.activateRelayV2Profile(
+                previous,
+                restored,
+                activationAuthority,
+            )
+            if (committed == null) {
+                state = RelayV2ProfileSwitchState.Idle
+                return@withLock null
+            }
+            state = RelayV2ProfileSwitchState.Active(committed.identity)
+            return@withLock committed
         }
         val nextGeneration = max(
             previous?.activationGeneration ?: 0,
@@ -104,17 +94,30 @@ internal class RelayV2ProfileSwitchStateMachine(
             check(receipt.profile == previous && receipt.barrierId == barrierId) {
                 "Disconnect barrier did not drain the expected profile"
             }
+            if (!isStillCurrent()) {
+                state = RelayV2ProfileSwitchState.Idle
+                return@withLock null
+            }
             state = RelayV2ProfileSwitchState.Isolating(receipt)
             isolationBoundary.clearAfterDisconnect(receipt)
+            if (!isStillCurrent()) {
+                state = RelayV2ProfileSwitchState.Idle
+                return@withLock null
+            }
         }
 
         state = RelayV2ProfileSwitchState.Activating(activated.profileId)
-        if (!profileStore.activateRelayV2Profile(previous, activated)) {
+        val committed = profileStore.activateRelayV2Profile(
+            previous,
+            activated,
+            activationAuthority,
+        )
+        if (committed == null) {
             state = RelayV2ProfileSwitchState.Idle
             return@withLock null
         }
-        state = RelayV2ProfileSwitchState.Active(activated.identity)
-        activated
+        state = RelayV2ProfileSwitchState.Active(committed.identity)
+        committed
     }
 
     fun accepts(callback: RelayProfileCallbackScope): Boolean {
@@ -322,7 +325,9 @@ internal class RelayV2ProfileRepository(
 ) {
     // The secure blob remains the durable attempt owner. This only linearizes live user
     // confirmations: the same reference joins its existing intent; a different reference fences it.
-    private val enrollmentIntentLock = Any()
+    private val enrollmentIntentMutex = Mutex()
+
+    @Volatile
     private var currentEnrollmentIntent: EnrollmentIntent? = null
 
     init {
@@ -341,11 +346,8 @@ internal class RelayV2ProfileRepository(
             is PreparedEnrollment.Pending -> {
                 val response = exchange.redeem(prepared.request)
                 enrollmentIntentResult(intent)?.let { return it }
-                if (profileStore.activeProfileIdentity() != intent.expectedActiveProfile) {
-                    retireEnrollmentIntent(intent)
-                    return supersededEnrollment()
-                }
-                when (val applied = applyEnrollmentResponse(prepared, response)) {
+                when (val applied = applyEnrollmentResponse(intent, prepared, response)) {
+                    null -> return enrollmentIntentResult(intent) ?: supersededEnrollment()
                     is RelayV2CredentialCasResult.Stale -> {
                         enrollmentIntentResult(intent)?.let { return it }
                         return RelayV2EnrollmentResult.StaleCredentialResponse(
@@ -368,15 +370,21 @@ internal class RelayV2ProfileRepository(
         val activated = profileSwitch.switchTo(
             profile = profile,
             expectedPrevious = intent.expectedActiveProfile,
-            authorizeActivation = { authorizeEnrollmentActivation(intent) },
-        ) ?: return enrollmentIntentResult(intent)
-            ?: supersededEnrollment()
+            isStillCurrent = { currentEnrollmentIntent === intent },
+            activationAuthority = enrollmentActivationAuthority(intent),
+        ) ?: run {
+            retireEnrollmentIntent(intent)
+            return enrollmentIntentResult(intent) ?: supersededEnrollment()
+        }
         return RelayV2EnrollmentResult.Activated(activated)
     }
 
     /** Fences a user-cancelled confirmation without consuming or rewriting its persisted attempt. */
-    fun cancelPendingEnrollment(): Boolean = synchronized(enrollmentIntentLock) {
-        if (currentEnrollmentIntent == null) return@synchronized false
+    suspend fun cancelPendingEnrollment(
+        confirmed: RelayV2ConfirmedEnrollment,
+    ): Boolean = enrollmentIntentMutex.withLock {
+        val reference = credentialReference(confirmed.draft)
+        if (currentEnrollmentIntent?.credentialReference != reference) return@withLock false
         currentEnrollmentIntent = null
         true
     }
@@ -572,41 +580,46 @@ internal class RelayV2ProfileRepository(
         credentialReference: RelayV2CredentialReference,
     ): EnrollmentIntent? {
         // Registration is deliberately the first action before the profile read can suspend.
-        val intent = synchronized(enrollmentIntentLock) {
+        val intent = enrollmentIntentMutex.withLock {
             currentEnrollmentIntent
                 ?.takeIf { it.credentialReference == credentialReference }
                 ?: EnrollmentIntent(credentialReference).also { currentEnrollmentIntent = it }
         }
         val observedActiveProfile = profileStore.activeProfileIdentity()
-        return synchronized(enrollmentIntentLock) {
-            if (currentEnrollmentIntent !== intent) return@synchronized null
+        return enrollmentIntentMutex.withLock {
+            if (currentEnrollmentIntent !== intent) return@withLock null
             if (!intent.expectedActiveProfileBound) {
                 intent.expectedActiveProfile = observedActiveProfile
                 intent.expectedActiveProfileBound = true
             } else if (intent.expectedActiveProfile != observedActiveProfile) {
                 currentEnrollmentIntent = null
-                return@synchronized null
+                return@withLock null
             }
             intent
         }
     }
 
-    private fun authorizeEnrollmentActivation(intent: EnrollmentIntent): Boolean =
-        synchronized(enrollmentIntentLock) {
-            if (currentEnrollmentIntent !== intent) return@synchronized false
+    private fun enrollmentActivationAuthority(
+        intent: EnrollmentIntent,
+    ): RelayV2ProfileActivationAuthority = RelayV2ProfileActivationAuthority { activate ->
+        enrollmentIntentMutex.withLock {
+            if (currentEnrollmentIntent !== intent) return@withLock null
+            val activated = activate() ?: return@withLock null
             intent.activationCommitted = true
             currentEnrollmentIntent = null
-            true
+            activated
         }
-
-    private fun retireEnrollmentIntent(intent: EnrollmentIntent) = synchronized(enrollmentIntentLock) {
-        if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
     }
+
+    private suspend fun retireEnrollmentIntent(intent: EnrollmentIntent) =
+        enrollmentIntentMutex.withLock {
+            if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
+        }
 
     private suspend fun enrollmentIntentResult(
         intent: EnrollmentIntent,
     ): RelayV2EnrollmentResult? {
-        val activationCommitted = synchronized(enrollmentIntentLock) {
+        val activationCommitted = enrollmentIntentMutex.withLock {
             when {
                 currentEnrollmentIntent === intent -> null
                 intent.activationCommitted -> true
@@ -625,10 +638,11 @@ internal class RelayV2ProfileRepository(
     private suspend fun supersededEnrollment(): RelayV2EnrollmentResult.Superseded =
         RelayV2EnrollmentResult.Superseded(profileStore.activeProfileIdentity())
 
-    private fun applyEnrollmentResponse(
+    private suspend fun applyEnrollmentResponse(
+        intent: EnrollmentIntent,
         prepared: PreparedEnrollment.Pending,
         response: RelayV2EnrollmentExchangeResponse,
-    ): RelayV2CredentialCasResult {
+    ): RelayV2CredentialCasResult? {
         val current = credentialStore.read(prepared.credentialReference)
             ?: return RelayV2CredentialCasResult.Stale(null)
         if (!current.matches(prepared.expectation)) {
@@ -654,11 +668,30 @@ internal class RelayV2ProfileRepository(
             refreshExpiresAtMs = response.refreshExpiresAtMs,
             pendingAttempt = null,
         )
-        return credentialStore.compareAndSet(
+        return credentialStore.compareAndSetAuthorized(
             prepared.credentialReference,
             prepared.expectation,
             replacement,
+            enrollmentCredentialCasAuthority(intent),
         )
+    }
+
+    private fun enrollmentCredentialCasAuthority(
+        intent: EnrollmentIntent,
+    ): RelayV2CredentialCasAuthority = RelayV2CredentialCasAuthority { commit ->
+        enrollmentIntentMutex.withLock {
+            if (currentEnrollmentIntent !== intent) return@withLock null
+            when (val guarded = profileStore.withActiveProfileIdentity(
+                expectedActiveProfile = intent.expectedActiveProfile,
+                block = { commit() },
+            )) {
+                is RelayV2ActiveProfileGuardResult.Matched -> guarded.value
+                is RelayV2ActiveProfileGuardResult.Mismatch -> {
+                    if (currentEnrollmentIntent === intent) currentEnrollmentIntent = null
+                    null
+                }
+            }
+        }
     }
 
     private fun preparedRefresh(

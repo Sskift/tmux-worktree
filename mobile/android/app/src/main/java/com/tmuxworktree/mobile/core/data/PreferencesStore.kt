@@ -13,7 +13,9 @@ import androidx.datastore.preferences.preferencesDataStore
 import com.tmuxworktree.mobile.core.model.RelayProfile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ActiveProfileGuardResult
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialReference
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationAuthority
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileStore
 import java.io.IOException
@@ -284,15 +286,51 @@ class PreferencesStore(context: Context) {
     internal suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-    ): Boolean {
-        var activated = false
+        authority: RelayV2ProfileActivationAuthority,
+    ): RelayV2Profile? = authority.commitIfCurrent {
+        var activated: RelayV2Profile? = null
         store.edit { preferences ->
             if (RelayProfilePreferencesCodec.activeProfileIdentity(preferences) == expectedActiveProfile) {
-                RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, profile)
-                activated = true
+                val current = RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
+                val resolved = if (current?.identity == profile.identity) {
+                    if (current.credentialReference != profile.credentialReference ||
+                        current.issuerUrl != profile.issuerUrl ||
+                        current.relayUrl != profile.relayUrl ||
+                        current.hostId != profile.hostId ||
+                        current.principalId != profile.principalId ||
+                        current.grantId != profile.grantId ||
+                        current.clientInstanceId != profile.clientInstanceId
+                    ) return@edit
+                    current.copy(
+                        credentialVersion = maxOf(
+                            current.credentialVersion,
+                            profile.credentialVersion,
+                        ),
+                    )
+                } else {
+                    profile
+                }
+                RelayProfilePreferencesCodec.activateRelayV2Profile(preferences, resolved)
+                activated = resolved
             }
         }
-        return activated
+        activated
+    }
+
+    internal suspend fun <T> withActiveProfileIdentity(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        block: suspend () -> T,
+    ): RelayV2ActiveProfileGuardResult<T> {
+        var result: RelayV2ActiveProfileGuardResult<T>? = null
+        store.edit { preferences ->
+            val activeProfile = RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
+            result = if (activeProfile == expectedActiveProfile) {
+                RelayV2ActiveProfileGuardResult.Matched(block())
+            } else {
+                RelayV2ActiveProfileGuardResult.Mismatch(activeProfile)
+            }
+        }
+        return checkNotNull(result)
     }
 
     internal suspend fun updateRelayV2CredentialVersion(
@@ -426,7 +464,20 @@ internal class PreferencesRelayV2ProfileStore(
     override suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-    ): Boolean = preferencesStore.activateRelayV2Profile(expectedActiveProfile, profile)
+        authority: RelayV2ProfileActivationAuthority,
+    ): RelayV2Profile? = preferencesStore.activateRelayV2Profile(
+        expectedActiveProfile,
+        profile,
+        authority,
+    )
+
+    override suspend fun <T> withActiveProfileIdentity(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        block: suspend () -> T,
+    ): RelayV2ActiveProfileGuardResult<T> = preferencesStore.withActiveProfileIdentity(
+        expectedActiveProfile,
+        block,
+    )
 
     override suspend fun updateRelayV2CredentialVersion(
         profileId: String,

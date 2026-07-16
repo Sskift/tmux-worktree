@@ -219,6 +219,12 @@ internal sealed interface RelayV2CredentialCasResult {
     data class Stale(val currentCredentialVersion: Long?) : RelayV2CredentialCasResult
 }
 
+internal fun interface RelayV2CredentialCasAuthority {
+    suspend fun commitIfCurrent(
+        commit: () -> RelayV2CredentialCasResult,
+    ): RelayV2CredentialCasResult?
+}
+
 internal interface RelayV2CredentialStore {
     fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob?
 
@@ -232,7 +238,30 @@ internal interface RelayV2CredentialStore {
         replacement: RelayV2CredentialBlob,
     ): RelayV2CredentialCasResult
 
+    /** Runs the actual replace only while the caller's exact live intent still owns authority. */
+    suspend fun compareAndSetAuthorized(
+        reference: RelayV2CredentialReference,
+        expectation: RelayV2CredentialCasExpectation,
+        replacement: RelayV2CredentialBlob,
+        authority: RelayV2CredentialCasAuthority,
+    ): RelayV2CredentialCasResult? = authority.commitIfCurrent {
+        compareAndSet(reference, expectation, replacement)
+    }
+
     fun clear(reference: RelayV2CredentialReference)
+}
+
+internal fun interface RelayV2ProfileActivationAuthority {
+    suspend fun commitIfCurrent(
+        activate: suspend () -> RelayV2Profile?,
+    ): RelayV2Profile?
+}
+
+internal sealed interface RelayV2ActiveProfileGuardResult<out T> {
+    data class Matched<T>(val value: T) : RelayV2ActiveProfileGuardResult<T>
+    data class Mismatch(
+        val activeProfile: RelayActiveProfileIdentity?,
+    ) : RelayV2ActiveProfileGuardResult<Nothing>
 }
 
 internal interface RelayV2ProfileStore {
@@ -243,7 +272,14 @@ internal interface RelayV2ProfileStore {
     suspend fun activateRelayV2Profile(
         expectedActiveProfile: RelayActiveProfileIdentity?,
         profile: RelayV2Profile,
-    ): Boolean
+        authority: RelayV2ProfileActivationAuthority,
+    ): RelayV2Profile?
+
+    /** Holds the active-profile storage transaction across [block]. */
+    suspend fun <T> withActiveProfileIdentity(
+        expectedActiveProfile: RelayActiveProfileIdentity?,
+        block: suspend () -> T,
+    ): RelayV2ActiveProfileGuardResult<T>
 
     suspend fun updateRelayV2CredentialVersion(
         profileId: String,
