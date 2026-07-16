@@ -1003,6 +1003,53 @@ class RelayV2ConnectionActorTest {
             harness.factory.transports.forEach { it.completeTermination() }
             harness.close()
         }
+
+        val sourceCreated = CountDownLatch(1)
+        val releaseFactoryReturn = CountDownLatch(1)
+        val blockedFactory = FakeTransportFactory()
+        val blockedHarness = Harness(factory = blockedFactory)
+        try {
+            blockedFactory.onTransportCreated = { source ->
+                source.completeTerminationOnCancel = false
+                source.completeTerminationOnClose = false
+                sourceCreated.countDown()
+                check(releaseFactoryReturn.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            }
+            assertTrue(blockedHarness.actor.connect(blockedHarness.profile, null))
+            assertTrue(sourceCreated.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            val source = blockedHarness.awaitTransport(0)
+            val receipt = async(start = CoroutineStart.UNDISPATCHED) {
+                blockedHarness.actor.disconnectAndDrain(
+                    blockedHarness.profile.identity,
+                    "created-before-return",
+                )
+            }
+
+            source.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            assertEquals(1, source.cancelCount)
+            assertTrue(source.closeCodes.isEmpty())
+            assertFalse(receipt.isCompleted)
+
+            releaseFactoryReturn.countDown()
+            withTimeout(TIMEOUT_MS) {
+                while (source.awaitTerminationCount.get() == 0) delay(1)
+            }
+            assertEquals(1, source.cancelCount)
+            assertTrue(source.closeCodes.isEmpty())
+            assertFalse(receipt.isCompleted)
+
+            source.completeTermination()
+            assertEquals(
+                "created-before-return",
+                withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+            )
+            assertEquals(1, source.cancelCount)
+            assertTrue(source.closeCodes.isEmpty())
+        } finally {
+            releaseFactoryReturn.countDown()
+            blockedFactory.transports.forEach { it.completeTermination() }
+            blockedHarness.close()
+        }
     }
 
     @Test
@@ -2368,6 +2415,9 @@ class RelayV2ConnectionActorTest {
         var completeTerminationOnClose: Boolean = true
 
         @Volatile
+        var completeTerminationOnCancel: Boolean = true
+
+        @Volatile
         var synchronousClosedOnClose: Boolean = false
 
         @Volatile
@@ -2393,7 +2443,7 @@ class RelayV2ConnectionActorTest {
 
         override fun cancel() {
             cancelCount += 1
-            termination.complete(true)
+            if (completeTerminationOnCancel) termination.complete(true)
         }
 
         override suspend fun awaitTermination(): Boolean {

@@ -443,6 +443,7 @@ internal class RelayV2ConnectionActor(
             }
             val opened = runCatching { transportFactory.open(request, listener) }
                 .getOrElse {
+                    synchronized(lifecycleLock) { owner.factorySourceResolved = true }
                     val sourceMismatch = synchronized(lifecycleLock) { owner.sourceMismatch }
                     failConnectAttempt(
                         token,
@@ -515,13 +516,24 @@ internal class RelayV2ConnectionActor(
         } finally {
             credential = null
             if (!transportCommitted) {
+                val cancelOnly = synchronized(lifecycleLock) {
+                    provisionalOwner?.postSealCallbackSeen == true
+                }
                 releaseConnectToken(token)
                 val staleSources = identitySetOf<RelayV2Transport>().apply {
                     uncommittedTransport?.let(::add)
                     provisionalOwner?.callbackSource?.let(::add)
                     provisionalOwner?.factorySource?.let(::add)
                 }
-                beginRetirement(staleSources, reason = "stale v2 connect attempt")
+                if (cancelOnly) {
+                    beginRetirement(
+                        staleSources,
+                        closeCode = null,
+                        forceCancel = true,
+                    )
+                } else {
+                    beginRetirement(staleSources, reason = "stale v2 connect attempt")
+                }
                 awaitTransportFences(staleSources)
             }
             releaseConnectToken(token)
@@ -607,6 +619,7 @@ internal class RelayV2ConnectionActor(
         source: RelayV2Transport,
     ): FactorySourceBinding = synchronized(lifecycleLock) {
         owner.factorySource = source
+        owner.factorySourceResolved = true
         addTransportFenceLocked(source)
         if (provisionalCallbackOwner !== owner || !isConnectTokenCurrentLocked(owner.connectToken)) {
             return@synchronized FactorySourceBinding.STALE
@@ -852,7 +865,7 @@ internal class RelayV2ConnectionActor(
     ) {
         val admission = callbackAdmissions.tryEnter(owner.key)
         if (admission == null) {
-            retirePostSealCallbackSource(source)
+            retirePostSealCallbackSource(owner, source)
             return
         }
         try {
@@ -864,20 +877,48 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private fun retirePostSealCallbackSource(source: RelayV2Transport) {
-        val alreadyOwned = synchronized(lifecycleLock) {
-            activeTransport === source ||
+    private fun retirePostSealCallbackSource(
+        owner: ProvisionalCallbackOwner,
+        source: RelayV2Transport,
+    ) {
+        var cancelUntrackedSource = false
+        val command = synchronized(lifecycleLock) {
+            val alreadyOwned = activeTransport === source ||
                 committedCallbackOwner?.source === source ||
                 provisionalCallbackOwner?.callbackSource === source ||
                 provisionalCallbackOwner?.factorySource === source ||
                 source in transportFences ||
                 source in transportRetirements ||
                 source in completedTransportRetirements
+            if (alreadyOwned) return@synchronized null
+
+            if (owner.factorySourceResolved) {
+                cancelUntrackedSource = true
+                return@synchronized null
+            }
+            owner.postSealCallbackSeen = true
+            val tracked = owner.postSealRetiredSource
+            when {
+                tracked == null -> {
+                    owner.postSealRetiredSource = source
+                    claimRetirementLocked(
+                        source,
+                        closeCode = null,
+                        forceCancel = true,
+                    )
+                }
+                tracked === source -> null
+                else -> {
+                    cancelUntrackedSource = true
+                    null
+                }
+            }
         }
-        // The owner seal prevents a new source from entering actor ownership. The transport's
-        // cancel operation is itself idempotent, so rejection needs no unbounded new identity
-        // tombstone; an already-owned source continues through its existing termination fence.
-        if (!alreadyOwned) source.cancel()
+        command?.execute()
+        // A sealed attempt retains one plausible factory source in its normal termination fence.
+        // Extra distinct callback sources are rejected through the transport's idempotent cancel
+        // without expanding actor-owned identity state.
+        if (cancelUntrackedSource) source.cancel()
     }
 
     private fun enqueueCallback(
@@ -2533,6 +2574,9 @@ internal class RelayV2ConnectionActor(
         var callbackSource: RelayV2Transport? = null
         var factorySource: RelayV2Transport? = null
         var sourceMismatch: Boolean = false
+        var factorySourceResolved: Boolean = false
+        var postSealCallbackSeen: Boolean = false
+        var postSealRetiredSource: RelayV2Transport? = null
     }
 
     private data class CommittedCallbackOwner(
