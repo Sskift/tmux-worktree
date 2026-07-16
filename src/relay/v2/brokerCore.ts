@@ -642,6 +642,7 @@ export class RelayV2BrokerCore {
   private readonly routes = new Map<string, RouteState>();
   private readonly clients = new Map<string, ClientState>();
   private readonly pendingLiveAuthFences: RelayV2LiveAuthFence[] = [];
+  private liveAuthCompositionLatched = false;
   private readonly now: () => number;
   private readonly authControlAuthority: RelayV2BrokerAuthControlAuthority | undefined;
   private readonly baseCapabilityReadiness: string[];
@@ -669,6 +670,9 @@ export class RelayV2BrokerCore {
 
   /** Attach only after dispatchRelayBrokerUpgrade accepted a role=host v2 Upgrade. */
   attachHostCarrier(transportId: string, authContext: RelayV2AuthContext): void {
+    if (this.liveAuthCompositionLatched) {
+      throw new Error("Relay v2 live-auth composition is latched fail-closed");
+    }
     if (!isIdentifier(transportId) || this.carriers.has(transportId)) {
       throw new Error("invalid or duplicate Relay v2 carrier transport ID");
     }
@@ -788,6 +792,16 @@ export class RelayV2BrokerCore {
         error: structuredError("PERMISSION_DENIED", "Client authorization is not valid"),
       };
     }
+    if (this.liveAuthCompositionLatched) {
+      return {
+        outcome: "reject",
+        status: 503,
+        error: structuredError(
+          "CAPABILITY_UNAVAILABLE",
+          "Live authorization composition is latched fail-closed",
+        ),
+      };
+    }
     const liveAuthFence = this.pendingLiveAuthFence(authContext);
     if (liveAuthFence) {
       return {
@@ -840,8 +854,11 @@ export class RelayV2BrokerCore {
    * Synchronous live-authorization commit hook for the persistent B-AUTH
    * owner. The fence is installed before commit is entered, so re-entrant
    * frame admission is denied; literal true is the only successful commit
-   * receipt. Any other result still closes matching live state fail-closed
-   * and reports that production composition is unavailable.
+   * receipt. Any other result still closes matching live state, consumes any
+   * eventual thenable settlement, and permanently latches this core instance
+   * fail-closed. The latch has deliberately no reset API: recovery requires a
+   * new core constructed only after B-AUTH has synchronously supplied its new
+   * verified authority state.
    *
    * This core deliberately does not retain revocation, expiry, kid, grant or
    * issuer state. New Upgrade authorization remains B-AUTH's responsibility.
@@ -854,14 +871,26 @@ export class RelayV2BrokerCore {
     this.validateLiveAuthFence(installedFence);
     this.pendingLiveAuthFences.push(installedFence);
     let committed = false;
+    let receipt: unknown;
     let actions: RelayV2BrokerAction[] = [];
     try {
-      committed = commit() === true;
+      receipt = commit();
+      committed = receipt === true;
     } catch {
       committed = false;
     }
+    if (!committed) {
+      // Install the bounded global latch before observing a thenable. Its
+      // getter or settlement may re-enter application code; neither can see
+      // an admission window or revive the old authority state.
+      this.liveAuthCompositionLatched = true;
+      this.consumeLiveAuthCommitSettlement(receipt);
+    }
     try {
       actions = this.applyLiveAuthFence(installedFence);
+    } catch (error) {
+      this.liveAuthCompositionLatched = true;
+      throw error;
     } finally {
       const index = this.pendingLiveAuthFences.indexOf(installedFence);
       if (index >= 0) this.pendingLiveAuthFences.splice(index, 1);
@@ -872,6 +901,11 @@ export class RelayV2BrokerCore {
       "Live authorization fence did not receive a synchronous commit receipt",
     );
     return { accepted: false, error, actions };
+  }
+
+  /** Process-lifetime state; there is intentionally no in-place reset. */
+  inspectLiveAuthCompositionLatch(): "open" | "latched_fail_closed" {
+    return this.liveAuthCompositionLatched ? "latched_fail_closed" : "open";
   }
 
   /**
@@ -1119,6 +1153,31 @@ export class RelayV2BrokerCore {
       || this.registeringCarriers.get(carrier.authContext.hostId) !== carrier
     ) {
       return this.failure("INVALID_ENVELOPE", "Host control delivery fence is stale");
+    }
+    const liveAuthFence = this.pendingLiveAuthFence(carrier.authContext);
+    if (this.liveAuthCompositionLatched || liveAuthFence) {
+      const closeCode = this.liveAuthCompositionLatched
+        ? 1013
+        : liveAuthFence?.reason === "access_expired"
+          ? 4401
+          : 4403;
+      this.cancelRegistration(carrier);
+      const error = structuredError(
+        this.liveAuthCompositionLatched ? "CAPABILITY_UNAVAILABLE" : "AUTH_INVALID",
+        "Host authorization cannot commit registration",
+      );
+      return {
+        accepted: false,
+        error,
+        actions: [{
+          kind: "close_host",
+          transportId,
+          closeCode,
+          reason: this.liveAuthCompositionLatched
+            ? "live_auth_composition_fail_closed"
+            : "host_authorization_fenced",
+        }],
+      };
     }
     const currentRevision = this.directory.get(carrier.authContext.hostId)?.revision ?? 0n;
     const previous = registration.previousTransportId === null
@@ -2016,6 +2075,20 @@ export class RelayV2BrokerCore {
     return [...RELAY_V2_REQUIRED_CAPABILITIES];
   }
 
+  private consumeLiveAuthCommitSettlement(receipt: unknown): void {
+    if (
+      receipt === null
+      || (typeof receipt !== "object" && typeof receipt !== "function")
+    ) return;
+    // Promise.resolve also assimilates foreign thenables. Both branches are
+    // consumed solely to prevent an unhandled settlement; neither owns or
+    // clears the process-lifetime fail-closed latch.
+    void Promise.resolve(receipt).then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+
   private validateLiveAuthFence(fence: RelayV2LiveAuthFence): void {
     if (fence.reason === "kid_removed") {
       if (!isIdentifier(fence.kid)
@@ -2050,7 +2123,8 @@ export class RelayV2BrokerCore {
   private isLiveAuthAdmissionBlocked(
     authContext: Readonly<RelayV2AuthContext>,
   ): boolean {
-    return this.pendingLiveAuthFence(authContext) !== undefined;
+    return this.liveAuthCompositionLatched
+      || this.pendingLiveAuthFence(authContext) !== undefined;
   }
 
   private pendingLiveAuthFence(

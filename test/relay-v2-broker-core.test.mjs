@@ -773,9 +773,14 @@ test("live-auth commit fence blocks re-entrant admission and fails closed withou
     return true;
   });
   assert.equal(expiryFence.accepted, true);
+  assert.equal(expiryRace.inspectLiveAuthCompositionLatch(), "open");
   assert.equal(expiryAdmission.accepted, false);
   assert.equal(expiryAdmission.actions[0].kind, "route_unavailable");
   assert.equal(expiryAdmission.actions[0].closeCode, 4401);
+  assert.equal(expiryRace.openClientRoute(
+    "client-after-sync-live-auth",
+    authContext("client", { jti: "client-after-sync-live-auth-jti" }),
+  ).accepted, true);
 
   const unsupported = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
   await registerHost(unsupported, "host-live-auth-async");
@@ -784,19 +789,59 @@ test("live-auth commit fence blocks re-entrant admission and fails closed withou
     "host-live-auth-async",
     "client-live-auth-async",
   );
+  let resolveAsyncCommit;
+  const pendingAsyncCommit = new Promise((resolve) => {
+    resolveAsyncCommit = resolve;
+  });
   const asyncCommit = unsupported.linearizeLiveAuthFence({
     reason: "access_expired",
     role: "client",
     hostId: HOST_ID,
     jti: "client-live-auth-async-jti",
-  }, () => Promise.resolve(true));
+  }, () => pendingAsyncCommit);
   assert.equal(asyncCommit.accepted, false);
   assert.equal(asyncCommit.error.code, "CAPABILITY_UNAVAILABLE");
+  assert.equal(unsupported.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
   assert.equal(asyncCommit.actions.some((action) => (
     action.kind === "close_client"
       && action.connectionId === asyncRoute.connectionId
       && action.closeCode === 4401
   )), true);
+  const pendingReopen = unsupported.openClientRoute(
+    "client-live-auth-async-pending-reopen",
+    authContext("client", { jti: "client-live-auth-async-jti" }),
+  );
+  assert.equal(pendingReopen.accepted, false);
+  assert.equal(pendingReopen.error.code, "CAPABILITY_UNAVAILABLE");
+  resolveAsyncCommit(true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(unsupported.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.equal(unsupported.openClientRoute(
+    "client-live-auth-async-resolved-reopen",
+    authContext("client", { jti: "client-live-auth-async-jti" }),
+  ).accepted, false);
+
+  const rejected = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
+  await registerHost(rejected, "host-live-auth-rejected");
+  let rejectAsyncCommit;
+  const rejectedAsyncCommit = new Promise((_resolve, reject) => {
+    rejectAsyncCommit = reject;
+  });
+  const rejectedResult = rejected.linearizeLiveAuthFence({
+    reason: "grant_revoked",
+    role: "client",
+    hostId: HOST_ID,
+    grantId: "client-grant",
+  }, () => rejectedAsyncCommit);
+  assert.equal(rejectedResult.accepted, false);
+  assert.equal(rejected.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  rejectAsyncCommit(new Error("authority commit failed"));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(rejected.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.equal(rejected.openClientRoute(
+    "client-live-auth-rejected-reopen",
+    authContext("client"),
+  ).accepted, false);
 
   const hostFence = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
   await registerHost(hostFence, "host-live-auth-kid");
