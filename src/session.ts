@@ -352,14 +352,50 @@ function lifecycleRecordWasCommitted(
   expected: ManagedSessionLifecycleExtensionV1,
   load: () => ManagedState,
 ): boolean {
+  const state = load();
+  assertManagedStateLifecycleV2Authority(state);
+  const record = state.sessions.find((candidate) => candidate.name === session);
+  const extension = record ? managedSessionLifecycleExtension(record) : undefined;
+  return extension?.incarnation === expected.incarnation;
+}
+
+function lifecycleV2InDoubtAfterTmuxMutation(
+  operation: "create-worktree" | "create-terminal",
+  session: string,
+  phase: string,
+  error: unknown,
+): ManagedSessionLifecycleV2InDoubtError {
+  if (error instanceof ManagedSessionLifecycleV2InDoubtError) return error;
+  return new ManagedSessionLifecycleV2InDoubtError(
+    `RPC v2 ${operation} ${phase} is uncertain for ${session}: ${errorDetail(error)}`,
+  );
+}
+
+function captureLifecycleV2AfterTmuxMutation(
+  operation: "create-worktree" | "create-terminal",
+  phase: string,
+  session: string,
+  prepared: PreparedLifecycleV2Create,
+  list: () => TmuxSessionLifecycleEntry[],
+): ReturnType<typeof captureLifecycleV2> {
   try {
-    const state = load();
-    assertManagedStateLifecycleV2Authority(state);
-    const record = state.sessions.find((candidate) => candidate.name === session);
-    const extension = record ? managedSessionLifecycleExtension(record) : undefined;
-    return extension?.incarnation === expected.incarnation;
-  } catch {
-    return false;
+    return captureLifecycleV2(session, prepared, list);
+  } catch (error) {
+    throw lifecycleV2InDoubtAfterTmuxMutation(operation, session, phase, error);
+  }
+}
+
+function lifecycleRecordWasCommittedAfterTmuxMutation(
+  operation: "create-worktree" | "create-terminal",
+  phase: string,
+  session: string,
+  expected: ManagedSessionLifecycleExtensionV1,
+  load: () => ManagedState,
+): boolean {
+  try {
+    return lifecycleRecordWasCommitted(session, expected, load);
+  } catch (error) {
+    throw lifecycleV2InDoubtAfterTmuxMutation(operation, session, phase, error);
   }
 }
 
@@ -519,7 +555,13 @@ export function createManagedWorktreeSession(
   } catch (err) {
     if (preparedLifecycle) {
       try {
-        capturedLifecycle = captureLifecycleV2(session, preparedLifecycle, listLifecycle);
+        capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+          "create-worktree",
+          "tmux start confirmation",
+          session,
+          preparedLifecycle,
+          listLifecycle,
+        );
       } catch {
         throw new ManagedSessionLifecycleV2InDoubtError(
           `RPC v2 create-worktree could not confirm whether tmux session ${session} was created: ${errorDetail(err)}`,
@@ -542,7 +584,13 @@ export function createManagedWorktreeSession(
   }
 
   if (preparedLifecycle && !capturedLifecycle) {
-    capturedLifecycle = captureLifecycleV2(session, preparedLifecycle, listLifecycle);
+    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+      "create-worktree",
+      "initial tmux identity capture",
+      session,
+      preparedLifecycle,
+      listLifecycle,
+    );
   }
 
   if (createdWorktree) {
@@ -564,7 +612,9 @@ export function createManagedWorktreeSession(
       persistManagedSession(record, deps);
     } catch (err) {
       if (capturedLifecycle) {
-        if (!lifecycleRecordWasCommitted(
+        if (!lifecycleRecordWasCommittedAfterTmuxMutation(
+          "create-worktree",
+          "state commit re-read",
           session,
           capturedLifecycle.extension,
           loadMutationState,
@@ -603,9 +653,21 @@ export function createManagedWorktreeSession(
   }
 
   if (capturedLifecycle) {
-    const confirmed = captureLifecycleV2(session, preparedLifecycle!, listLifecycle);
+    const confirmed = captureLifecycleV2AfterTmuxMutation(
+      "create-worktree",
+      "final tmux identity confirmation",
+      session,
+      preparedLifecycle!,
+      listLifecycle,
+    );
     if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
-      || !lifecycleRecordWasCommitted(session, capturedLifecycle.extension, loadMutationState)) {
+      || !lifecycleRecordWasCommittedAfterTmuxMutation(
+        "create-worktree",
+        "final state commit confirmation",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
       throw new ManagedSessionLifecycleV2InDoubtError(
         `RPC v2 create-worktree commit could not be confirmed for ${session}`,
       );
@@ -667,7 +729,13 @@ export function createManagedTerminalSession(
   } catch (error) {
     if (!preparedLifecycle) throw error;
     try {
-      capturedLifecycle = captureLifecycleV2(session, preparedLifecycle, listLifecycle);
+      capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+        "create-terminal",
+        "tmux start confirmation",
+        session,
+        preparedLifecycle,
+        listLifecycle,
+      );
     } catch {
       throw new ManagedSessionLifecycleV2InDoubtError(
         `RPC v2 create-terminal could not confirm whether tmux session ${session} was created: ${errorDetail(error)}`,
@@ -675,7 +743,13 @@ export function createManagedTerminalSession(
     }
   }
   if (preparedLifecycle && !capturedLifecycle) {
-    capturedLifecycle = captureLifecycleV2(session, preparedLifecycle, listLifecycle);
+    capturedLifecycle = captureLifecycleV2AfterTmuxMutation(
+      "create-terminal",
+      "initial tmux identity capture",
+      session,
+      preparedLifecycle,
+      listLifecycle,
+    );
   }
   const baseRecord: ManagedSession = {
     name: session,
@@ -691,7 +765,9 @@ export function createManagedTerminalSession(
     persistManagedSession(record, deps);
   } catch (error) {
     if (capturedLifecycle) {
-      if (!lifecycleRecordWasCommitted(
+      if (!lifecycleRecordWasCommittedAfterTmuxMutation(
+        "create-terminal",
+        "state commit re-read",
         session,
         capturedLifecycle.extension,
         loadMutationState,
@@ -713,9 +789,21 @@ export function createManagedTerminalSession(
     }
   }
   if (capturedLifecycle) {
-    const confirmed = captureLifecycleV2(session, preparedLifecycle!, listLifecycle);
+    const confirmed = captureLifecycleV2AfterTmuxMutation(
+      "create-terminal",
+      "final tmux identity confirmation",
+      session,
+      preparedLifecycle!,
+      listLifecycle,
+    );
     if (confirmed.extension.incarnation !== capturedLifecycle.extension.incarnation
-      || !lifecycleRecordWasCommitted(session, capturedLifecycle.extension, loadMutationState)) {
+      || !lifecycleRecordWasCommittedAfterTmuxMutation(
+        "create-terminal",
+        "final state commit confirmation",
+        session,
+        capturedLifecycle.extension,
+        loadMutationState,
+      )) {
       throw new ManagedSessionLifecycleV2InDoubtError(
         `RPC v2 create-terminal commit could not be confirmed for ${session}`,
       );

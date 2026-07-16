@@ -7,6 +7,7 @@ import {
   ManagedSessionLifecycleV2InDoubtError,
   observeManagedSessionIncarnation,
   SESSION_NAME_MAX_LEN,
+  type CreateManagedWorktreeSessionDeps,
 } from "./session";
 import {
   assertManagedStateLifecycleV2Authority,
@@ -326,6 +327,8 @@ interface RpcV2CreateExecutionDeps {
   createWorktree?: typeof createManagedWorktreeSession;
   createTerminal?: typeof createManagedTerminalSession;
   loadConfig?: typeof loadConfigFile;
+  worktreeSessionDeps?: CreateManagedWorktreeSessionDeps;
+  terminalSessionDeps?: CreateManagedWorktreeSessionDeps;
 }
 
 function committedCreateObservationFailure(
@@ -373,7 +376,7 @@ export function executeRpcV2CreateWorktree(
         reservationCorrelation: request.reservationCorrelation,
         displayLabel: null,
       },
-    });
+    }, deps.worktreeSessionDeps);
   } catch (error) {
     return createFailure("create-worktree", error);
   }
@@ -410,7 +413,7 @@ export function executeRpcV2CreateTerminal(
         reservationCorrelation: request.reservationCorrelation,
         displayLabel: label,
       },
-    });
+    }, deps.terminalSessionDeps);
   } catch (error) {
     return createFailure("create-terminal", error);
   }

@@ -441,6 +441,144 @@ test("a v2 worktree mutation error is IN_DOUBT rather than false no-side-effect 
   );
 });
 
+test("canonical create owners fence every post-start observation failure as IN_DOUBT", () => {
+  const worktreeIdentity = liveSession({
+    name: "demo-fix",
+    rawName: "demo-fix",
+    sessionId: "$9",
+  });
+  const worktreeConfig = () => ({
+    projects: { demo: { path: "/repo/demo", branch: "main" } },
+  });
+  const worktreeOwnerDeps = (overrides = {}) => ({
+    existsSync: () => true,
+    isGitRepo: () => true,
+    gitQuery: () => "",
+    exec: () => {},
+    mkdirSync: () => {},
+    tmuxBin: () => "tmux",
+    sessionExists: () => false,
+    randomId: () => "abc12",
+    randomBirthMarker: () => cases.incarnation.baseIdentity.birthMarker,
+    loadManagedStateForMutation: () => ({ version: 1, sessions: [] }),
+    recordManagedSession: () => {},
+    listTmuxSessionLifecycleEntries: () => [worktreeIdentity],
+    setupClipboardBindings: () => {},
+    now: () => new Date("2026-07-12T00:00:01.000Z"),
+    ...overrides,
+  });
+  const terminalOwnerDeps = (overrides = {}) => ({
+    existsSync: () => true,
+    exec: () => {},
+    tmuxBin: () => "tmux",
+    sessionExists: () => false,
+    randomId: () => "a1b2c",
+    randomBirthMarker: () => cases.incarnation.baseIdentity.birthMarker,
+    loadManagedStateForMutation: () => ({ version: 1, sessions: [] }),
+    recordManagedSession: () => {},
+    listTmuxSessionLifecycleEntries: () => [liveSession()],
+    setupClipboardBindings: () => {},
+    now: () => new Date("2026-07-12T00:00:01.000Z"),
+    ...overrides,
+  });
+  const assertInDoubtWithoutRetrySignal = (result, detail) => {
+    assert.equal(result.state, "in_doubt", detail);
+    assert.equal(Object.hasOwn(result, "sideEffect"), false, detail);
+    assert.equal(result.error.code, "IN_DOUBT", detail);
+    assert.match(result.error.message, detail);
+  };
+
+  let ownerTmuxStarted = false;
+  let rpcPostCreateListCalls = 0;
+  const initialCaptureFailed = rpcV2.executeRpcV2CreateWorktree(
+    cases.wire.createWorktree.request,
+    {
+      loadConfig: worktreeConfig,
+      worktreeSessionDeps: worktreeOwnerDeps({
+        exec: (bin) => { if (bin === "tmux") ownerTmuxStarted = true; },
+        listTmuxSessionLifecycleEntries: () => { throw new Error("tmux list timed out"); },
+      }),
+      currentList: () => {
+        rpcPostCreateListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assert.equal(ownerTmuxStarted, true);
+  assertInDoubtWithoutRetrySignal(
+    initialCaptureFailed,
+    /initial tmux identity capture.*tmux list timed out/,
+  );
+
+  let terminalStateReads = 0;
+  const commitRereadFailed = rpcV2.executeRpcV2CreateTerminal(
+    cases.wire.createTerminal.request,
+    {
+      terminalSessionDeps: terminalOwnerDeps({
+        loadManagedStateForMutation: () => {
+          terminalStateReads += 1;
+          if (terminalStateReads > 1) throw new Error("commit re-read timed out");
+          return { version: 1, sessions: [] };
+        },
+        recordManagedSession: () => { throw new Error("state rename result unknown"); },
+      }),
+      currentList: () => {
+        rpcPostCreateListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assertInDoubtWithoutRetrySignal(
+    commitRereadFailed,
+    /state commit re-read.*commit re-read timed out/,
+  );
+
+  let managedState = { version: 1, sessions: [] };
+  let worktreeStateReads = 0;
+  const finalConfirmationFailed = rpcV2.executeRpcV2CreateWorktree(
+    cases.wire.createWorktree.request,
+    {
+      loadConfig: worktreeConfig,
+      worktreeSessionDeps: worktreeOwnerDeps({
+        loadManagedStateForMutation: () => {
+          worktreeStateReads += 1;
+          if (worktreeStateReads > 1) throw new Error("final state read malformed");
+          return managedState;
+        },
+        recordManagedSession: (record) => {
+          managedState = state.upsertManagedSession(managedState, record);
+        },
+      }),
+      currentList: () => {
+        rpcPostCreateListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assertInDoubtWithoutRetrySignal(
+    finalConfirmationFailed,
+    /final state commit confirmation.*final state read malformed/,
+  );
+  assert.equal(rpcPostCreateListCalls, 0);
+
+  const failedBeforeMutation = rpcV2.executeRpcV2CreateTerminal(
+    cases.wire.createTerminal.request,
+    {
+      terminalSessionDeps: terminalOwnerDeps({
+        tmuxBin: () => { throw new Error("tmux unavailable before mutation"); },
+      }),
+      currentList: () => {
+        rpcPostCreateListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assert.equal(failedBeforeMutation.state, "failed");
+  assert.equal(failedBeforeMutation.sideEffect, "not_applied");
+  assert.equal(failedBeforeMutation.error.code, "CREATE_FAILED");
+  assert.equal(rpcPostCreateListCalls, 0);
+});
+
 test("legacy records stay readable without a synthesized marker and v1 list white-lists frozen fields", () => {
   const legacyLive = liveSession({
     name: storageCases.legacy.name,
