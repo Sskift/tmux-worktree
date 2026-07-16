@@ -2650,6 +2650,19 @@ class RelayV2TerminalCheckpointReducerTest {
             result.effects.filterIsInstance<RelayV2TerminalEffect.ResetRequired>().single().fence,
         )
 
+        val mismatchedConsumedAttempt = RelayV2TerminalCheckpointReducer.restorePreOpen(
+            RelayV2TerminalStoredCheckpoint.PreOpen(preOpen),
+            identity.target(),
+            firstAttempt.copy(fingerprint = "mismatched-consumed-fingerprint"),
+            delivery(),
+            PARSER_CONTINUITY,
+        )
+        assertNull(mismatchedConsumedAttempt.preOpenCheckpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.IDENTITY_CHANGED,
+            (mismatchedConsumedAttempt.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
         val restored = RelayV2TerminalCheckpointReducer.restorePreOpen(
             RelayV2TerminalStoredCheckpoint.PreOpen(preOpen),
             identity.target(),

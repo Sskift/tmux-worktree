@@ -148,9 +148,7 @@ internal object RelayV2TerminalCheckpointReducer {
                     !validPreOpenCheckpoint(checkpoint) ->
                         missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
                     checkpoint.target != expectedTarget ||
-                        checkpoint.pendingOpen?.openAttempt?.let {
-                            it != expectedOpenAttempt
-                        } == true ->
+                        authoritativePreOpenAttempt(checkpoint) != expectedOpenAttempt ->
                         missingReset(null, RelayV2TerminalResetReason.IDENTITY_CHANGED)
                     currentParserContinuityId.isNullOrBlank() ||
                         checkpoint.parserContinuityId != currentParserContinuityId ->
@@ -2710,6 +2708,13 @@ internal object RelayV2TerminalCheckpointReducer {
             issuedRequestIds = checkpoint.pendingOpen.issuedRequestIds.toList(),
         ),
     )
+
+    private fun authoritativePreOpenAttempt(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+    ): RelayV2TerminalOpenAttempt? = when (checkpoint.phase) {
+        RelayV2TerminalPreOpenPhase.PENDING_OPEN -> checkpoint.pendingOpen?.openAttempt
+        RelayV2TerminalPreOpenPhase.RESET_REQUIRED -> checkpoint.resetFence?.openAttempt
+    }
 
     /**
      * Rejects hostile storage shapes before any list is mapped or any terminal bytes are copied.
