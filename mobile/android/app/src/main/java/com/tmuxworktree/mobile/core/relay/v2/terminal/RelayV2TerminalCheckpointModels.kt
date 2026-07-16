@@ -4,7 +4,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
 
 /** Frozen and local bounds for the unwired Android terminal checkpoint core. */
 internal object RelayV2TerminalCheckpointLimits {
-    const val SCHEMA_VERSION = 6
+    const val SCHEMA_VERSION = 7
     const val IDENTITY_VERSION = 3
     const val MAX_ID_UTF8_BYTES = 128
     const val MAX_CREDENTIAL_REFERENCE_UTF8_BYTES = 256
@@ -455,6 +455,7 @@ internal data class RelayV2TerminalCheckpoint(
     val nextParserOperationSeq: String,
     val nextReplayRequestSeq: String,
     val replayRequestIds: List<String> = emptyList(),
+    val closeRequestIds: List<String> = emptyList(),
     val parserResetCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val parserInFlightCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val lastAppliedParserCallbackToken: RelayV2TerminalParserCallbackToken? = null,

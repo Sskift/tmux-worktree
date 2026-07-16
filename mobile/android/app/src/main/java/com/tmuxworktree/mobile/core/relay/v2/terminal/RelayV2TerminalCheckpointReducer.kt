@@ -1878,18 +1878,25 @@ internal object RelayV2TerminalCheckpointReducer {
         if (!validOperationId(action.requestId)) {
             return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
+        if (action.requestId in current.closeRequestIds) {
+            return reduction(
+                current,
+                RelayV2TerminalOutcome.Ignored(
+                    RelayV2TerminalIgnoredReason.NETWORK_REQUEST_ID_REUSED,
+                ),
+            )
+        }
         current.pendingClose?.let { pending ->
             if (pending.closeAttempt == action.closeAttempt) {
-                if (action.requestId in pending.issuedRequestIds) {
-                    return reduction(
-                        current,
-                        RelayV2TerminalOutcome.Ignored(
-                            RelayV2TerminalIgnoredReason.NETWORK_REQUEST_ID_REUSED,
-                        ),
-                    )
-                }
                 val issuedRequestIds = appendRequestId(
                     pending.issuedRequestIds,
+                    action.requestId,
+                ) ?: return reset(
+                    current,
+                    RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED,
+                )
+                val closeRequestIds = appendRequestId(
+                    current.closeRequestIds,
                     action.requestId,
                 ) ?: return reset(
                     current,
@@ -1901,6 +1908,7 @@ internal object RelayV2TerminalCheckpointReducer {
                 )
                 val candidate = current.copy(
                     pendingClose = retried,
+                    closeRequestIds = closeRequestIds,
                     activeControlDispatchLease = null,
                 )
                 return commit(
@@ -1918,6 +1926,8 @@ internal object RelayV2TerminalCheckpointReducer {
         if (current.closed != null) {
             return reduction(current, RelayV2TerminalOutcome.Applied)
         }
+        val closeRequestIds = appendRequestId(current.closeRequestIds, action.requestId)
+            ?: return reset(current, RelayV2TerminalResetReason.CHECKPOINT_LIMIT_EXCEEDED)
         val pending = RelayV2TerminalPendingClose(
             action.closeAttempt,
             action.requestId,
@@ -1927,6 +1937,7 @@ internal object RelayV2TerminalCheckpointReducer {
             current,
             current.copy(
                 pendingClose = pending,
+                closeRequestIds = closeRequestIds,
                 activeControlDispatchLease = null,
             ),
             RelayV2TerminalOutcome.Applied,
@@ -2649,6 +2660,7 @@ internal object RelayV2TerminalCheckpointReducer {
     ): RelayV2TerminalCheckpoint = checkpoint.copy(
         openRequestIds = checkpoint.openRequestIds.toList(),
         replayRequestIds = checkpoint.replayRequestIds.toList(),
+        closeRequestIds = checkpoint.closeRequestIds.toList(),
         pendingOutput = checkpoint.pendingOutput.map {
             it.copy(bytes = it.bytes.snapshot())
         },
@@ -2680,8 +2692,9 @@ internal object RelayV2TerminalCheckpointReducer {
         val resizeCount = checkpoint.pendingResizes.size
         val openRequestCount = checkpoint.openRequestIds.size
         val replayRequestCount = checkpoint.replayRequestIds.size
+        val closeRequestCount = checkpoint.closeRequestIds.size
         val pendingOpenRequestCount = checkpoint.pendingOpen?.issuedRequestIds?.size ?: 0
-        val closeRequestCount = checkpoint.pendingClose?.issuedRequestIds?.size ?: 0
+        val pendingCloseRequestCount = checkpoint.pendingClose?.issuedRequestIds?.size ?: 0
         if (outputCount > RelayV2TerminalCheckpointLimits.MAX_PENDING_OUTPUT_FRAMES ||
             pendingInputCount.toLong() + ambiguousInputCount.toLong() >
             RelayV2TerminalCheckpointLimits.MAX_INPUT_RECORDS.toLong() ||
@@ -2689,8 +2702,9 @@ internal object RelayV2TerminalCheckpointReducer {
             listOf(
                 openRequestCount,
                 replayRequestCount,
-                pendingOpenRequestCount,
                 closeRequestCount,
+                pendingOpenRequestCount,
+                pendingCloseRequestCount,
             ).any { it > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS }
         ) {
             return CheckpointValidity.LIMIT_EXCEEDED
@@ -2917,6 +2931,7 @@ internal object RelayV2TerminalCheckpointReducer {
         }
         if (!validRequestIdHistory(checkpoint.openRequestIds) ||
             !validRequestIdHistory(checkpoint.replayRequestIds, allowEmpty = true) ||
+            !validRequestIdHistory(checkpoint.closeRequestIds, allowEmpty = true) ||
             (checkpoint.openMode == RelayV2TerminalOpenMode.RESET &&
                 !resetResultAdvancesAuthority(
                     checkpoint.openRequestResume,
@@ -3101,10 +3116,16 @@ internal object RelayV2TerminalCheckpointReducer {
         checkpoint.pendingClose?.let {
             if (!validOperationId(it.requestId) ||
                 !validRequestIdHistory(it.issuedRequestIds, it.requestId) ||
+                it.issuedRequestIds != checkpoint.closeRequestIds ||
                 checkpoint.closed?.tombstone?.closeAttempt != null
             ) {
                 return CheckpointValidity.INVALID
             }
+        }
+        if (checkpoint.closeRequestIds.isNotEmpty() && checkpoint.pendingClose == null &&
+            checkpoint.closed?.tombstone?.closeAttempt == null
+        ) {
+            return CheckpointValidity.INVALID
         }
         checkpoint.closed?.let { closed ->
             val tombstone = closed.tombstone
@@ -3269,6 +3290,7 @@ internal object RelayV2TerminalCheckpointReducer {
         bytes += attemptSize(checkpoint.openAttempt)
         bytes += checkpoint.openRequestIds.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() }
         bytes += checkpoint.replayRequestIds.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() }
+        bytes += checkpoint.closeRequestIds.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() }
         bytes += checkpoint.openRequestResume?.let(::openResumeSize) ?: 0
         bytes += 96L + checkpoint.openResult.generation.length +
             checkpoint.openResult.hostInstanceId.length +
@@ -3725,7 +3747,7 @@ internal object RelayV2TerminalCheckpointReducer {
         return when (networkResponseCorrelation(
             requestId,
             pending?.requestId,
-            pending?.issuedRequestIds.orEmpty(),
+            checkpoint.closeRequestIds,
         )) {
             NetworkResponseCorrelation.ISSUED_OLD -> ClosedResponseCorrelation.Rejected(
                 reduction(

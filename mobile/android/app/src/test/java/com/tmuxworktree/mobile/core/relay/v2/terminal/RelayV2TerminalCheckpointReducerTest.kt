@@ -2132,6 +2132,66 @@ class RelayV2TerminalCheckpointReducerTest {
     }
 
     @Test
+    fun `consumed close keeps earlier issued request stale while parser drains`() {
+        var checkpoint = requireNotNull(output(open(), "0", "x").checkpoint)
+        val closeAttempt = closeAttempt("close-draining", "close-draining-fingerprint")
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.RequestClose(
+                    checkpoint.deliveryToken,
+                    closeAttempt,
+                    "close-draining-a",
+                ),
+            ).checkpoint,
+        )
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.RequestClose(
+                    checkpoint.deliveryToken,
+                    closeAttempt,
+                    "close-draining-b",
+                ),
+            ).checkpoint,
+        )
+
+        checkpoint = requireNotNull(
+            reduce(
+                checkpoint,
+                closedAction(
+                    checkpoint,
+                    finalOffset = "1",
+                    replayAvailable = false,
+                    bufferStartOffset = null,
+                    closeId = closeAttempt.closeId,
+                    requestId = "close-draining-b",
+                ),
+            ).checkpoint,
+        )
+        assertEquals(RelayV2TerminalPhase.CLOSED_WAITING_PARSER, checkpoint.phase)
+        assertNull(checkpoint.pendingClose)
+
+        val lateIssued = reduce(
+            checkpoint,
+            closedAction(
+                checkpoint,
+                finalOffset = "1",
+                replayAvailable = false,
+                bufferStartOffset = null,
+                closeId = closeAttempt.closeId,
+                requestId = "close-draining-a",
+            ),
+        )
+        assertEquals(
+            RelayV2TerminalIgnoredReason.STALE_CLOSE_RESPONSE,
+            (lateIssued.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
+        assertTrue(checkpoint === lateIssued.checkpoint)
+        assertTrue(lateIssued.effects.isEmpty())
+    }
+
+    @Test
     fun `restore snapshots collections and drops corrupt or oversized untrusted state`() {
         var checkpoint = open()
         checkpoint = requireNotNull(output(checkpoint, "0", "x").checkpoint)
