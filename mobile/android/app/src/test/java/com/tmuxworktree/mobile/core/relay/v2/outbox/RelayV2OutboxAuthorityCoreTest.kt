@@ -516,7 +516,7 @@ class RelayV2OutboxAuthorityCoreTest {
             replacement.requestFingerprint,
             firstLineageProof.replacementInitialTarget.requestFingerprint,
         )
-        val firstConfirmedHistory = confirmedReplacement.reissueConfirmedTargetHistory
+        val firstConfirmedHistory = confirmedReplacement.targetProvenance.confirmedHistory
         assertEquals(1, firstConfirmedHistory.size)
         val firstConfirmedTarget = firstConfirmedHistory.single()
         assertEquals(1L, firstConfirmedTarget.confirmationOrdinal)
@@ -557,7 +557,7 @@ class RelayV2OutboxAuthorityCoreTest {
         )
         assertEquals("epoch-revalidated-again", pendingAgain.expectedHostEpoch)
         assertEquals(firstLineageProof, pendingAgain.reissueLineageProof)
-        assertEquals(firstConfirmedHistory, pendingAgain.reissueConfirmedTargetHistory)
+        assertEquals(firstConfirmedHistory, pendingAgain.targetProvenance.confirmedHistory)
         assertEquals(
             firstConfirmedTarget.confirmedTarget,
             pendingAgain.targetRevalidation?.sourceConfirmedTarget,
@@ -675,7 +675,7 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals("epoch-revalidated-again", confirmedAgainReplacement.expectedHostEpoch)
         assertEquals(null, confirmedAgainReplacement.targetRevalidation)
         assertEquals(firstLineageProof, confirmedAgainReplacement.reissueLineageProof)
-        val confirmedTargetHistory = confirmedAgainReplacement.reissueConfirmedTargetHistory
+        val confirmedTargetHistory = confirmedAgainReplacement.targetProvenance.confirmedHistory
         assertEquals(2, confirmedTargetHistory.size)
         val latestConfirmedTarget = confirmedTargetHistory.last()
         assertEquals(2L, latestConfirmedTarget.confirmationOrdinal)
@@ -719,37 +719,49 @@ class RelayV2OutboxAuthorityCoreTest {
                 requestFingerprint = selfConsistentPriorTarget.requestFingerprint,
             ),
             confirmedAgainReplacement.copy(
-                reissueConfirmedTargetHistory = emptyList(),
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = emptyList(),
+                ),
             ),
             confirmedAgainReplacement.copy(
-                reissueConfirmedTargetHistory = listOf(latestConfirmedTarget),
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = listOf(latestConfirmedTarget),
+                ),
             ),
             confirmedAgainReplacement.copy(
-                reissueConfirmedTargetHistory = confirmedTargetHistory.map { step ->
-                    if (step.confirmationOrdinal == 2L) {
-                        step.copy(confirmationOrdinal = 3)
-                    } else {
-                        step
-                    }
-                },
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = confirmedTargetHistory.map { step ->
+                        if (step.confirmationOrdinal == 2L) {
+                            step.copy(confirmationOrdinal = 3)
+                        } else {
+                            step
+                        }
+                    },
+                ),
             ),
             confirmedAgainReplacement.copy(
-                reissueConfirmedTargetHistory = confirmedTargetHistory.map { step ->
-                    if (step.confirmationOrdinal == 2L) {
-                        step.copy(sourceTarget = arbitrarySelfConsistentSource)
-                    } else {
-                        step
-                    }
-                },
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = confirmedTargetHistory.map { step ->
+                        if (step.confirmationOrdinal == 2L) {
+                            step.copy(sourceTarget = arbitrarySelfConsistentSource)
+                        } else {
+                            step
+                        }
+                    },
+                ),
             ),
             confirmedAgainReplacement.copy(
-                reissueConfirmedTargetHistory = confirmedTargetHistory.reversed(),
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = confirmedTargetHistory.reversed(),
+                ),
             ),
             confirmedAgainReplacement.copy(
                 reissueLineageProof = firstLineageProof.copy(
                     replacementInitialTarget = latestConfirmedTarget.confirmedTarget,
                 ),
-                reissueConfirmedTargetHistory = emptyList(),
+                targetProvenance = confirmedAgainReplacement.targetProvenance.copy(
+                    confirmedHistory = emptyList(),
+                ),
             ),
         )
         corruptedReplacementTargets.forEach { corruptedReplacement ->
@@ -762,19 +774,23 @@ class RelayV2OutboxAuthorityCoreTest {
         }
 
         val oversizedHistory = MutableList(
-            RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS + 1,
+            RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_STEPS + 1,
         ) { firstConfirmedTarget }
         val historyOverflow = restoreFailure(
             confirmedAgain.state.entries.map { entry ->
                 if (entry.commandId == replacement.commandId) {
-                    entry.copy(reissueConfirmedTargetHistory = oversizedHistory)
+                    entry.copy(
+                        targetProvenance = entry.targetProvenance.copy(
+                            confirmedHistory = oversizedHistory,
+                        ),
+                    )
                 } else {
                     entry
                 }
             },
             confirmedAgain.state.nextCreationOrder,
         )
-        assertTrue(historyOverflow.message.orEmpty().contains("too many reissue confirmation"))
+        assertTrue(historyOverflow.message.orEmpty().contains("too many target provenance"))
 
         val oversizedSourceTarget = firstConfirmedTarget.sourceTarget.copy(
             expectedHostEpoch = "s".repeat(128),
@@ -789,7 +805,7 @@ class RelayV2OutboxAuthorityCoreTest {
             sessionId = "n".repeat(128),
         )
         val oversizedCanonicalHistory = List(
-            RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
+            RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_STEPS,
         ) {
             firstConfirmedTarget.copy(
                 sourceTarget = oversizedSourceTarget,
@@ -799,7 +815,11 @@ class RelayV2OutboxAuthorityCoreTest {
         val historyBytesOverflow = restoreFailure(
             confirmedAgain.state.entries.map { entry ->
                 if (entry.commandId == replacement.commandId) {
-                    entry.copy(reissueConfirmedTargetHistory = oversizedCanonicalHistory)
+                    entry.copy(
+                        targetProvenance = entry.targetProvenance.copy(
+                            confirmedHistory = oversizedCanonicalHistory,
+                        ),
+                    )
                 } else {
                     entry
                 }
@@ -817,7 +837,7 @@ class RelayV2OutboxAuthorityCoreTest {
         )
         val countCapacity = rejected(
             RelayV2OutboxAuthorityCore(
-                RelayV2OutboxCapacity(maxReissueConfirmationHistorySteps = 2),
+                RelayV2OutboxCapacity(maxTargetProvenanceSteps = 2),
             ).reduce(arbitraryPending.state, confirmArbitraryPending),
         )
         assertEquals(RelayV2OutboxRejection.CAPACITY_EXCEEDED, countCapacity.reason)
@@ -826,9 +846,9 @@ class RelayV2OutboxAuthorityCoreTest {
         val byteCapacity = rejected(
             RelayV2OutboxAuthorityCore(
                 RelayV2OutboxCapacity(
-                    maxReissueConfirmationHistoryCanonicalBytes =
+                    maxTargetProvenanceCanonicalBytes =
                         confirmedAgainReplacement
-                            .reissueConfirmedTargetHistoryCanonicalByteCount,
+                            .targetProvenanceCanonicalByteCount,
                 ),
             ).reduce(arbitraryPending.state, confirmArbitraryPending),
         )
@@ -841,7 +861,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val thirdConfirmedReplacement = thirdConfirmed.state.entries.single {
             it.commandId == replacement.commandId
         }
-        val threeStepHistory = thirdConfirmedReplacement.reissueConfirmedTargetHistory
+        val threeStepHistory = thirdConfirmedReplacement.targetProvenance.confirmedHistory
         assertEquals(listOf(1L, 2L, 3L), threeStepHistory.map { it.confirmationOrdinal })
         listOf(
             listOf(threeStepHistory[0], threeStepHistory[2]),
@@ -850,7 +870,11 @@ class RelayV2OutboxAuthorityCoreTest {
             restoreFailure(
                 thirdConfirmed.state.entries.map { entry ->
                     if (entry.commandId == replacement.commandId) {
-                        entry.copy(reissueConfirmedTargetHistory = corruptedHistory)
+                        entry.copy(
+                            targetProvenance = entry.targetProvenance.copy(
+                                confirmedHistory = corruptedHistory,
+                            ),
+                        )
                     } else {
                         entry
                     }
@@ -863,7 +887,11 @@ class RelayV2OutboxAuthorityCoreTest {
         val snapshotWithAliasedHistory = RelayV2OutboxState.restore(
             confirmedAgain.state.entries.map { entry ->
                 if (entry.commandId == replacement.commandId) {
-                    entry.copy(reissueConfirmedTargetHistory = aliasedHistory)
+                    entry.copy(
+                        targetProvenance = entry.targetProvenance.copy(
+                            confirmedHistory = aliasedHistory,
+                        ),
+                    )
                 } else {
                     entry
                 }
@@ -876,7 +904,7 @@ class RelayV2OutboxAuthorityCoreTest {
         val snapshottedCanonical = snapshottedReplacement.canonicalJson
         val snapshottedBytes = snapshotWithAliasedHistory.canonicalByteCount
         aliasedHistory.clear()
-        assertEquals(2, snapshottedReplacement.reissueConfirmedTargetHistory.size)
+        assertEquals(2, snapshottedReplacement.targetProvenance.confirmedHistory.size)
         assertEquals(snapshottedCanonical, snapshottedReplacement.canonicalJson)
         assertEquals(snapshottedBytes, snapshotWithAliasedHistory.canonicalByteCount)
 
@@ -996,6 +1024,231 @@ class RelayV2OutboxAuthorityCoreTest {
             ),
         )
         assertEquals(RelayV2OutboxRejection.INVALID_TRANSITION, repeated.reason)
+    }
+
+    @Test
+    fun `ordinary queued targets preserve complete provenance across epochs and restore`() {
+        val initial = enqueue(
+            RelayV2OutboxState.empty(),
+            draft(commandId = "ordinary-provenance"),
+            0,
+        ).state
+        val initialEntry = initial.entries.single()
+        assertEquals(
+            initialEntry.requestFingerprint,
+            initialEntry.targetProvenance.initialTarget.requestFingerprint,
+        )
+        assertTrue(initialEntry.targetProvenance.confirmedHistory.isEmpty())
+        val initialCheckpoint = RelayV2OutboxState.restore(
+            initial.entries,
+            initial.nextCreationOrder,
+        )
+        assertEquals(
+            RelayV2OutboxStateTag.SENDING,
+            dispatch(
+                initialCheckpoint,
+                mapOf(initialCheckpoint.entries.single().id to "ordinary-initial-dispatch"),
+            ).state.entries.single().state,
+        )
+
+        val epochTwoPending = applied(
+            core.reduce(
+                initial,
+                RelayV2OutboxAction.HostEpochChanged(
+                    profileId = initialEntry.profileId,
+                    principalId = initialEntry.principalId,
+                    hostId = initialEntry.hostId,
+                    previousHostEpoch = initialEntry.expectedHostEpoch,
+                    observedHostEpoch = "ordinary-epoch-2",
+                    currentDedupeWindowId = "ordinary-window-2",
+                    oldLineageAvailability = RelayV2OldLineageAvailability.LOST,
+                ),
+            ),
+        )
+        val pendingTwoCheckpoint = RelayV2OutboxState.restore(
+            epochTwoPending.state.entries,
+            epochTwoPending.state.nextCreationOrder,
+        )
+        val pendingTwo = pendingTwoCheckpoint.entries.single()
+        assertEquals(
+            pendingTwo.targetProvenance.initialTarget,
+            pendingTwo.targetRevalidation?.sourceConfirmedTarget,
+        )
+        assertEquals(1L, pendingTwo.targetRevalidation?.confirmationOrdinal)
+        val confirmedTwo = applied(
+            core.reduce(
+                pendingTwoCheckpoint,
+                RelayV2OutboxAction.ConfirmQueuedTarget(
+                    entryId = pendingTwo.id,
+                    observedHostEpoch = pendingTwo.expectedHostEpoch,
+                    currentDedupeWindowId = pendingTwo.dedupeWindowId,
+                    verifiedScopeId = pendingTwo.scopeId,
+                    verifiedSessionId = pendingTwo.sessionId,
+                ),
+            ),
+        )
+        val confirmedTwoCheckpoint = RelayV2OutboxState.restore(
+            confirmedTwo.state.entries,
+            confirmedTwo.state.nextCreationOrder,
+        )
+        val confirmedTwoEntry = confirmedTwoCheckpoint.entries.single()
+        val firstStep = confirmedTwoEntry.targetProvenance.confirmedHistory.single()
+        assertEquals(1L, firstStep.confirmationOrdinal)
+        assertEquals(confirmedTwoEntry.targetProvenance.initialTarget, firstStep.sourceTarget)
+
+        val epochThreePending = applied(
+            core.reduce(
+                confirmedTwoCheckpoint,
+                RelayV2OutboxAction.HostEpochChanged(
+                    profileId = confirmedTwoEntry.profileId,
+                    principalId = confirmedTwoEntry.principalId,
+                    hostId = confirmedTwoEntry.hostId,
+                    previousHostEpoch = confirmedTwoEntry.expectedHostEpoch,
+                    observedHostEpoch = "ordinary-epoch-3",
+                    currentDedupeWindowId = "ordinary-window-3",
+                    oldLineageAvailability = RelayV2OldLineageAvailability.LOST,
+                ),
+            ),
+        )
+        val pendingThreeCheckpoint = RelayV2OutboxState.restore(
+            epochThreePending.state.entries,
+            epochThreePending.state.nextCreationOrder,
+        )
+        val pendingThree = pendingThreeCheckpoint.entries.single()
+        val pendingThreeProof = pendingThree.targetRevalidation!!
+        assertEquals(firstStep.confirmedTarget, pendingThreeProof.sourceConfirmedTarget)
+        assertEquals(2L, pendingThreeProof.confirmationOrdinal)
+
+        fun selfConsistentTarget(
+            commandId: String,
+            scopeId: String,
+            sessionId: String?,
+        ): RelayV2ReissueTargetSnapshot {
+            val retargetedEntry = enqueue(
+                RelayV2OutboxState.empty(),
+                draft(
+                    commandId = commandId,
+                    expectedHostEpoch = pendingThree.expectedHostEpoch,
+                    dedupeWindowId = pendingThree.dedupeWindowId,
+                    scopeId = scopeId,
+                    sessionId = sessionId,
+                    arguments = pendingThree.canonicalRequestArguments.value,
+                ),
+                0,
+            ).state.entries.single()
+            return RelayV2ReissueTargetSnapshot(
+                expectedHostEpoch = retargetedEntry.expectedHostEpoch,
+                dedupeWindowId = retargetedEntry.dedupeWindowId,
+                scopeId = retargetedEntry.scopeId,
+                sessionId = retargetedEntry.sessionId,
+                requestFingerprint = retargetedEntry.requestFingerprint,
+            )
+        }
+        val retargetedTarget = selfConsistentTarget(
+            commandId = "ordinary-retargeted-fingerprint",
+            scopeId = "ordinary-retargeted-scope",
+            sessionId = "ordinary-retargeted-session",
+        )
+        val historyRetargetedTargets = listOf(
+            selfConsistentTarget(
+                commandId = "ordinary-history-retargeted-scope",
+                scopeId = "ordinary-history-retargeted-scope",
+                sessionId = pendingThree.sessionId,
+            ),
+            selfConsistentTarget(
+                commandId = "ordinary-history-retargeted-session",
+                scopeId = pendingThree.scopeId,
+                sessionId = "ordinary-history-retargeted-session",
+            ),
+        )
+        listOf(
+            pendingThree.copy(targetRevalidation = null),
+            pendingThree.copy(
+                scopeId = retargetedTarget.scopeId,
+                sessionId = retargetedTarget.sessionId,
+                requestFingerprint = retargetedTarget.requestFingerprint,
+                targetRevalidation = pendingThreeProof.copy(proposedTarget = retargetedTarget),
+            ),
+        ).forEach { corruptedPending ->
+            restoreFailure(listOf(corruptedPending), pendingThreeCheckpoint.nextCreationOrder)
+        }
+
+        val confirmedThree = applied(
+            core.reduce(
+                pendingThreeCheckpoint,
+                RelayV2OutboxAction.ConfirmQueuedTarget(
+                    entryId = pendingThree.id,
+                    observedHostEpoch = pendingThree.expectedHostEpoch,
+                    currentDedupeWindowId = pendingThree.dedupeWindowId,
+                    verifiedScopeId = pendingThree.scopeId,
+                    verifiedSessionId = pendingThree.sessionId,
+                ),
+            ),
+        )
+        val confirmedThreeEntry = confirmedThree.state.entries.single()
+        val completeHistory = confirmedThreeEntry.targetProvenance.confirmedHistory
+        assertEquals(listOf(1L, 2L), completeHistory.map { it.confirmationOrdinal })
+        assertTrue(
+            completeHistory.all { step ->
+                step.confirmedTarget.scopeId == step.sourceTarget.scopeId &&
+                    step.confirmedTarget.sessionId == step.sourceTarget.sessionId
+            },
+        )
+        listOf(
+            completeHistory.reversed(),
+            completeHistory.map { step ->
+                if (step.confirmationOrdinal == 2L) {
+                    step.copy(confirmationOrdinal = 3)
+                } else {
+                    step
+                }
+            },
+        ).forEach { corruptedHistory ->
+            restoreFailure(
+                listOf(
+                    confirmedThreeEntry.copy(
+                        targetProvenance = confirmedThreeEntry.targetProvenance.copy(
+                            confirmedHistory = corruptedHistory,
+                        ),
+                    ),
+                ),
+                confirmedThree.state.nextCreationOrder,
+            )
+        }
+        historyRetargetedTargets.forEach { historyRetargetedTarget ->
+            val retargetedHistory = completeHistory.dropLast(1) +
+                completeHistory.last().copy(confirmedTarget = historyRetargetedTarget)
+            restoreFailure(
+                listOf(
+                    confirmedThreeEntry.copy(
+                        scopeId = historyRetargetedTarget.scopeId,
+                        sessionId = historyRetargetedTarget.sessionId,
+                        requestFingerprint = historyRetargetedTarget.requestFingerprint,
+                        targetProvenance = confirmedThreeEntry.targetProvenance.copy(
+                            confirmedHistory = retargetedHistory,
+                        ),
+                    ),
+                ),
+                confirmedThree.state.nextCreationOrder,
+            )
+        }
+
+        val finalCheckpoint = RelayV2OutboxState.restore(
+            confirmedThree.state.entries,
+            confirmedThree.state.nextCreationOrder,
+        )
+        val secondFinalCheckpoint = RelayV2OutboxState.restore(
+            finalCheckpoint.entries,
+            finalCheckpoint.nextCreationOrder,
+        )
+        val finalEntry = secondFinalCheckpoint.entries.single()
+        assertEquals(
+            RelayV2OutboxStateTag.SENDING,
+            dispatch(
+                secondFinalCheckpoint,
+                mapOf(finalEntry.id to "ordinary-provenance-final-dispatch"),
+            ).state.entries.single().state,
+        )
     }
 
     @Test
@@ -1856,6 +2109,8 @@ class RelayV2OutboxAuthorityCoreTest {
             sourceEntry.canonicalRequestArguments,
             draft,
             sourceEntry,
+            sourceEntry.targetProvenance,
+            sourceEntry.targetProvenance.initialTarget,
             restored,
             redactedExpiredEvidence,
             RelayV2OutboxAction.ReconcileStatus(redactedExpiredEvidence),

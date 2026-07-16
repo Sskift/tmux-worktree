@@ -9,8 +9,8 @@ internal object RelayV2OutboxLimits {
     const val MAX_QUERY_ITEMS_PER_BATCH = 32
     const val MAX_QUERY_BATCHES =
         (MAX_ENTRIES + MAX_QUERY_ITEMS_PER_BATCH - 1) / MAX_QUERY_ITEMS_PER_BATCH
-    const val MAX_REISSUE_CONFIRMATION_HISTORY_STEPS = 64
-    const val MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES = 65_536
+    const val MAX_TARGET_PROVENANCE_STEPS = 64
+    const val MAX_TARGET_PROVENANCE_CANONICAL_BYTES = 65_536
     const val MAX_ARGUMENTS_CANONICAL_BYTES = 131_072
     const val MAX_ENTRY_CANONICAL_BYTES = 262_144
     const val MAX_STATE_CANONICAL_BYTES = 16_777_216
@@ -19,10 +19,9 @@ internal object RelayV2OutboxLimits {
 internal data class RelayV2OutboxCapacity(
     val maxEntries: Int = RelayV2OutboxLimits.MAX_ENTRIES,
     val maxAttemptsPerEntry: Int = RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
-    val maxReissueConfirmationHistorySteps: Int =
-        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
-    val maxReissueConfirmationHistoryCanonicalBytes: Int =
-        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
+    val maxTargetProvenanceSteps: Int = RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_STEPS,
+    val maxTargetProvenanceCanonicalBytes: Int =
+        RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_CANONICAL_BYTES,
     val maxArgumentsCanonicalBytes: Int = RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES,
     val maxEntryCanonicalBytes: Int = RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES,
     val maxStateCanonicalBytes: Int = RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES,
@@ -31,12 +30,11 @@ internal data class RelayV2OutboxCapacity(
         require(maxEntries in 1..RelayV2OutboxLimits.MAX_ENTRIES)
         require(maxAttemptsPerEntry in 1..RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY)
         require(
-            maxReissueConfirmationHistorySteps in
-                1..RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
+            maxTargetProvenanceSteps in 1..RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_STEPS,
         )
         require(
-            maxReissueConfirmationHistoryCanonicalBytes in
-                1..RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
+            maxTargetProvenanceCanonicalBytes in
+                1..RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_CANONICAL_BYTES,
         )
         require(maxArgumentsCanonicalBytes in 1..RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES)
         require(maxEntryCanonicalBytes in 1..RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES)
@@ -311,16 +309,15 @@ internal data class RelayV2QueuedTargetRevalidation(
     val observedHostEpoch: String,
     val dedupeWindowId: String,
     val proposedTarget: RelayV2ReissueTargetSnapshot,
-    val sourceConfirmedTarget: RelayV2ReissueTargetSnapshot? = null,
-    val confirmationOrdinal: Long? = null,
+    val sourceConfirmedTarget: RelayV2ReissueTargetSnapshot,
+    val confirmationOrdinal: Long,
 ) {
     init {
         requireOutboxId(observedHostEpoch)
         requireOutboxId(dedupeWindowId)
         require(proposedTarget.expectedHostEpoch == observedHostEpoch)
         require(proposedTarget.dedupeWindowId == dedupeWindowId)
-        require((sourceConfirmedTarget == null) == (confirmationOrdinal == null))
-        confirmationOrdinal?.let { require(it in 1..MAX_JSON_INTEGER) }
+        require(confirmationOrdinal in 1..MAX_JSON_INTEGER)
     }
 
     override fun toString(): String = "RelayV2QueuedTargetRevalidation(<redacted>)"
@@ -341,7 +338,7 @@ internal data class RelayV2ReissueTargetSnapshot(
     override fun toString(): String = "RelayV2ReissueTargetSnapshot(<redacted>)"
 }
 
-internal data class RelayV2ReissueConfirmedTargetStep(
+internal data class RelayV2ConfirmedTargetStep(
     val sourceTarget: RelayV2ReissueTargetSnapshot,
     val confirmedTarget: RelayV2ReissueTargetSnapshot,
     val confirmationOrdinal: Long,
@@ -351,7 +348,15 @@ internal data class RelayV2ReissueConfirmedTargetStep(
         require(confirmationOrdinal in 1..MAX_JSON_INTEGER)
     }
 
-    override fun toString(): String = "RelayV2ReissueConfirmedTargetStep(<redacted>)"
+    override fun toString(): String = "RelayV2ConfirmedTargetStep(<redacted>)"
+}
+
+internal data class RelayV2TargetProvenance(
+    val initialTarget: RelayV2ReissueTargetSnapshot,
+    val confirmedHistory: List<RelayV2ConfirmedTargetStep>,
+) {
+    override fun toString(): String =
+        "RelayV2TargetProvenance(steps=${confirmedHistory.size}, <redacted>)"
 }
 
 internal data class RelayV2ReissueLineageProof(
@@ -411,7 +416,7 @@ internal data class RelayV2OutboxEntry(
     val reissuedFromCommandId: String? = null,
     val targetRevalidation: RelayV2QueuedTargetRevalidation? = null,
     val reissueLineageProof: RelayV2ReissueLineageProof? = null,
-    val reissueConfirmedTargetHistory: List<RelayV2ReissueConfirmedTargetStep> = emptyList(),
+    val targetProvenance: RelayV2TargetProvenance,
 ) {
     val id: RelayV2OutboxEntryId = RelayV2OutboxEntryId(
         profileId,
@@ -433,11 +438,11 @@ internal data class RelayV2OutboxEntry(
     val canonicalByteCount: Int by lazy(LazyThreadSafetyMode.NONE) {
         canonicalJson.toByteArray(Charsets.UTF_8).size
     }
-    val reissueConfirmedTargetHistoryCanonicalByteCount: Int by lazy(
+    val targetProvenanceCanonicalByteCount: Int by lazy(
         LazyThreadSafetyMode.NONE,
     ) {
         RelayV2OutboxCanonicalJson.stringify(
-            reissueConfirmedTargetHistory.canonicalValue(),
+            targetProvenance.canonicalValue(),
         ).toByteArray(Charsets.UTF_8).size
     }
 
@@ -520,10 +525,7 @@ internal data class RelayV2OutboxEntry(
                 targetRevalidation.proposedTarget == reissueTargetSnapshot(),
         )
         require((reissuedFromCommandId == null) == (reissueLineageProof == null))
-        require(reissueConfirmedTargetHistory.isEmpty() || reissueLineageProof != null)
-        require(
-            reissueLineageProof != null || targetRevalidation?.sourceConfirmedTarget == null,
-        )
+        require(targetProvenance.isValidFor(this)) { "invalid target provenance" }
     }
 
     override fun toString(): String =
@@ -573,8 +575,7 @@ internal data class RelayV2OutboxEntry(
                     "replacementProfileId" to it.replacementProfileId,
                 )
             },
-            "reissueConfirmedTargetHistory" to
-                reissueConfirmedTargetHistory.canonicalValue(),
+            "targetProvenance" to targetProvenance.canonicalValue(),
             "replacementCommandId" to replacementCommandId,
             "requestFingerprint" to requestFingerprint.sha256Hex,
             "requestFingerprintSchemaVersion" to requestFingerprint.schemaVersion,
@@ -587,7 +588,7 @@ internal data class RelayV2OutboxEntry(
                     "dedupeWindowId" to it.dedupeWindowId,
                     "observedHostEpoch" to it.observedHostEpoch,
                     "proposedTarget" to it.proposedTarget.canonicalMap(),
-                    "sourceConfirmedTarget" to it.sourceConfirmedTarget?.canonicalMap(),
+                    "sourceConfirmedTarget" to it.sourceConfirmedTarget.canonicalMap(),
                 )
             },
         ),
@@ -620,9 +621,9 @@ internal class RelayV2OutboxState private constructor(
             var cheapStateLowerBound = 0L
             entries.forEach { entry ->
                 requireOutboxCapacity(
-                    entry.reissueConfirmedTargetHistory.size <=
-                        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
-                    "too many reissue confirmation history steps",
+                    entry.targetProvenance.confirmedHistory.size <=
+                        RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_STEPS,
+                    "too many target provenance steps",
                 )
                 requireOutboxCapacity(
                     entry.attempts.size <= RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
@@ -643,8 +644,10 @@ internal class RelayV2OutboxState private constructor(
             val snapshots = entries.map { entry ->
                 entry.copy(
                     attempts = immutableListSnapshot(entry.attempts),
-                    reissueConfirmedTargetHistory = immutableListSnapshot(
-                        entry.reissueConfirmedTargetHistory,
+                    targetProvenance = entry.targetProvenance.copy(
+                        confirmedHistory = immutableListSnapshot(
+                            entry.targetProvenance.confirmedHistory,
+                        ),
                     ),
                 )
             }
@@ -661,9 +664,9 @@ internal class RelayV2OutboxState private constructor(
             var canonicalEntriesBytes = 0L
             snapshots.forEachIndexed { index, entry ->
                 requireOutboxCapacity(
-                    entry.reissueConfirmedTargetHistoryCanonicalByteCount <=
-                        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
-                    "reissue confirmation history exceeds the canonical hard bound",
+                    entry.targetProvenanceCanonicalByteCount <=
+                        RelayV2OutboxLimits.MAX_TARGET_PROVENANCE_CANONICAL_BYTES,
+                    "target provenance exceeds the canonical hard bound",
                 )
                 entry.validateForRestore()
                 requireOutboxCapacity(
@@ -1581,7 +1584,7 @@ internal class RelayV2OutboxAuthorityCore(
                     replacementPrincipalId = replacementBase.principalId,
                     replacementHostId = replacementBase.hostId,
                     replacementCommandId = replacementBase.commandId,
-                    replacementInitialTarget = replacementBase.reissueTargetSnapshot(),
+                    replacementInitialTarget = replacementBase.targetProvenance.initialTarget,
                 ),
             )
             if (state.entry(replacement.id) != null) {
@@ -1624,17 +1627,12 @@ internal class RelayV2OutboxAuthorityCore(
         matching.forEach { entry ->
             when (entry.state) {
                 RelayV2OutboxStateTag.QUEUED -> {
-                    val lineageProof = entry.reissueLineageProof
                     val existingPending = entry.targetRevalidation
-                    val sourceConfirmedTarget = lineageProof?.let {
-                        existingPending?.sourceConfirmedTarget
-                            ?: entry.reissueConfirmedTargetHistory.lastOrNull()?.confirmedTarget
-                            ?: it.replacementInitialTarget
-                    }
-                    val confirmationOrdinal = lineageProof?.let {
-                        existingPending?.confirmationOrdinal
-                            ?: (entry.reissueConfirmedTargetHistory.size + 1).toLong()
-                    }
+                    val sourceConfirmedTarget = existingPending?.sourceConfirmedTarget
+                        ?: entry.targetProvenance.confirmedHistory.lastOrNull()?.confirmedTarget
+                        ?: entry.targetProvenance.initialTarget
+                    val confirmationOrdinal = existingPending?.confirmationOrdinal
+                        ?: (entry.targetProvenance.confirmedHistory.size + 1).toLong()
                     val proposedTarget = RelayV2ReissueTargetSnapshot(
                         expectedHostEpoch = action.observedHostEpoch,
                         dedupeWindowId = action.currentDedupeWindowId,
@@ -1730,29 +1728,26 @@ internal class RelayV2OutboxAuthorityCore(
         ) {
             return state.reject(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH)
         }
-        val confirmedTargetHistory = entry.reissueLineageProof?.let { lineageProof ->
-            val sourceTarget = pending.sourceConfirmedTarget
-                ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-            val ordinal = pending.confirmationOrdinal
-                ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-            val expectedSource = entry.reissueConfirmedTargetHistory.lastOrNull()?.confirmedTarget
-                ?: lineageProof.replacementInitialTarget
-            val expectedOrdinal = (entry.reissueConfirmedTargetHistory.size + 1).toLong()
-            if (sourceTarget != expectedSource || ordinal != expectedOrdinal) {
-                return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-            }
-            if (entry.reissueConfirmedTargetHistory.size >=
-                capacity.maxReissueConfirmationHistorySteps
-            ) {
-                return state.reject(RelayV2OutboxRejection.CAPACITY_EXCEEDED)
-            }
-            val step = RelayV2ReissueConfirmedTargetStep(
-                sourceTarget = sourceTarget,
-                confirmedTarget = confirmedTarget,
-                confirmationOrdinal = ordinal,
-            )
-            immutableListSnapshot(entry.reissueConfirmedTargetHistory + step)
+        val confirmedHistory = entry.targetProvenance.confirmedHistory
+        val expectedSource = confirmedHistory.lastOrNull()?.confirmedTarget
+            ?: entry.targetProvenance.initialTarget
+        val expectedOrdinal = (confirmedHistory.size + 1).toLong()
+        if (pending.sourceConfirmedTarget != expectedSource ||
+            pending.confirmationOrdinal != expectedOrdinal
+        ) {
+            return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
         }
+        if (confirmedHistory.size >= capacity.maxTargetProvenanceSteps) {
+            return state.reject(RelayV2OutboxRejection.CAPACITY_EXCEEDED)
+        }
+        val step = RelayV2ConfirmedTargetStep(
+            sourceTarget = pending.sourceConfirmedTarget,
+            confirmedTarget = confirmedTarget,
+            confirmationOrdinal = pending.confirmationOrdinal,
+        )
+        val updatedProvenance = entry.targetProvenance.copy(
+            confirmedHistory = immutableListSnapshot(confirmedHistory + step),
+        )
         val updated = entry.copy(
             expectedHostEpoch = confirmedTarget.expectedHostEpoch,
             dedupeWindowId = confirmedTarget.dedupeWindowId,
@@ -1760,8 +1755,7 @@ internal class RelayV2OutboxAuthorityCore(
             sessionId = confirmedTarget.sessionId,
             requestFingerprint = confirmedTarget.requestFingerprint,
             targetRevalidation = null,
-            reissueConfirmedTargetHistory = confirmedTargetHistory
-                ?: entry.reissueConfirmedTargetHistory,
+            targetProvenance = updatedProvenance,
         )
         if (state.entries.any { it.id == updated.id && it.id != entry.id }) {
             return state.reject(RelayV2OutboxRejection.DUPLICATE_COMMAND)
@@ -1834,10 +1828,10 @@ internal class RelayV2OutboxAuthorityCore(
             state.canonicalByteCount <= capacity.maxStateCanonicalBytes &&
             state.entries.all {
                 it.attempts.size <= capacity.maxAttemptsPerEntry &&
-                    it.reissueConfirmedTargetHistory.size <=
-                    capacity.maxReissueConfirmationHistorySteps &&
-                    it.reissueConfirmedTargetHistoryCanonicalByteCount <=
-                    capacity.maxReissueConfirmationHistoryCanonicalBytes &&
+                    it.targetProvenance.confirmedHistory.size <=
+                    capacity.maxTargetProvenanceSteps &&
+                    it.targetProvenanceCanonicalByteCount <=
+                    capacity.maxTargetProvenanceCanonicalBytes &&
                     it.canonicalRequestArguments.utf8ByteCount <=
                     capacity.maxArgumentsCanonicalBytes &&
                     it.canonicalByteCount <= capacity.maxEntryCanonicalBytes
@@ -1851,6 +1845,23 @@ private fun entryFromDraft(
     reissuedFromCommandId: String? = null,
 ): RelayV2OutboxEntry {
     val canonical = RelayV2CanonicalRequestArguments.from(draft.arguments)
+    val requestFingerprint = calculateRequestFingerprint(
+        draft.requestFingerprintSchemaVersion,
+        draft.operation,
+        draft.dedupeWindowId,
+        draft.expectedHostEpoch,
+        draft.hostId,
+        draft.scopeId,
+        draft.sessionId,
+        canonical,
+    )
+    val initialTarget = RelayV2ReissueTargetSnapshot(
+        expectedHostEpoch = draft.expectedHostEpoch,
+        dedupeWindowId = draft.dedupeWindowId,
+        scopeId = draft.scopeId,
+        sessionId = draft.sessionId,
+        requestFingerprint = requestFingerprint,
+    )
     return RelayV2OutboxEntry(
         profileId = draft.profileId,
         principalId = draft.principalId,
@@ -1862,22 +1873,14 @@ private fun entryFromDraft(
         scopeId = draft.scopeId,
         sessionId = draft.sessionId,
         canonicalRequestArguments = canonical,
-        requestFingerprint = calculateRequestFingerprint(
-            draft.requestFingerprintSchemaVersion,
-            draft.operation,
-            draft.dedupeWindowId,
-            draft.expectedHostEpoch,
-            draft.hostId,
-            draft.scopeId,
-            draft.sessionId,
-            canonical,
-        ),
+        requestFingerprint = requestFingerprint,
         state = RelayV2OutboxStateTag.QUEUED,
         acceptanceEvidence = RelayV2OutboxAcceptanceEvidence.NONE,
         attempts = emptyList(),
         createdOrder = createdOrder,
         createdAtMillis = createdAtMillis,
         reissuedFromCommandId = reissuedFromCommandId,
+        targetProvenance = RelayV2TargetProvenance(initialTarget, emptyList()),
     )
 }
 
@@ -1911,7 +1914,7 @@ private fun RelayV2ReissueTargetSnapshot.canonicalMap(): Map<String, Any?> = map
     "sessionId" to sessionId,
 )
 
-private fun List<RelayV2ReissueConfirmedTargetStep>.canonicalValue(): List<Map<String, Any?>> =
+private fun List<RelayV2ConfirmedTargetStep>.canonicalValue(): List<Map<String, Any?>> =
     map { step ->
         mapOf(
             "confirmationOrdinal" to step.confirmationOrdinal,
@@ -1919,6 +1922,11 @@ private fun List<RelayV2ReissueConfirmedTargetStep>.canonicalValue(): List<Map<S
             "sourceTarget" to step.sourceTarget.canonicalMap(),
         )
     }
+
+private fun RelayV2TargetProvenance.canonicalValue(): Map<String, Any?> = mapOf(
+    "confirmedHistory" to confirmedHistory.canonicalValue(),
+    "initialTarget" to initialTarget.canonicalMap(),
+)
 
 private fun RelayV2OutboxEntry.requiresTargetRevalidation(): Boolean =
     targetRevalidation != null
@@ -2160,7 +2168,8 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
         (reissueLineageProof?.replacementHostId?.length ?: 0) +
         (reissueLineageProof?.replacementCommandId?.length ?: 0) +
         (reissueLineageProof?.replacementInitialTarget?.cheapCanonicalLowerBound() ?: 0L) +
-        reissueConfirmedTargetHistory.sumOf { step ->
+        targetProvenance.initialTarget.cheapCanonicalLowerBound() +
+        targetProvenance.confirmedHistory.sumOf { step ->
             step.sourceTarget.cheapCanonicalLowerBound() +
                 step.confirmedTarget.cheapCanonicalLowerBound()
         } +
@@ -2319,6 +2328,39 @@ private fun RelayV2ReissueTargetSnapshot.matchesFingerprint(
     )
 }
 
+private fun RelayV2TargetProvenance.isValidFor(entry: RelayV2OutboxEntry): Boolean {
+    if (!initialTarget.matchesFingerprint(entry)) return false
+    var historyIsValid = true
+    var historyTail = initialTarget
+    confirmedHistory.forEachIndexed { index, step ->
+        if (step.confirmationOrdinal != (index + 1).toLong() ||
+            step.sourceTarget != historyTail ||
+            step.sourceTarget == step.confirmedTarget ||
+            step.confirmedTarget.scopeId != step.sourceTarget.scopeId ||
+            step.confirmedTarget.sessionId != step.sourceTarget.sessionId ||
+            !step.sourceTarget.matchesFingerprint(entry) ||
+            !step.confirmedTarget.matchesFingerprint(entry)
+        ) {
+            historyIsValid = false
+        }
+        historyTail = step.confirmedTarget
+    }
+    if (!historyIsValid) return false
+    val currentTarget = entry.reissueTargetSnapshot()
+    val pending = entry.targetRevalidation
+    return if (pending == null) {
+        currentTarget == historyTail
+    } else {
+        pending.proposedTarget == currentTarget &&
+            pending.sourceConfirmedTarget == historyTail &&
+            pending.confirmationOrdinal == (confirmedHistory.size + 1).toLong() &&
+            currentTarget.matchesFingerprint(entry) &&
+            currentTarget != historyTail &&
+            currentTarget.scopeId == historyTail.scopeId &&
+            currentTarget.sessionId == historyTail.sessionId
+    }
+}
+
 private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): Boolean {
     val lineageProof = other.reissueLineageProof ?: return false
     val lineageProofMatchesParent = lineageProof.parentProfileId == profileId &&
@@ -2340,48 +2382,15 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
             initialTarget.dedupeWindowId != dedupeWindowId &&
             initialTarget.scopeId == scopeId &&
             initialTarget.sessionId == sessionId &&
-            initialTarget.matchesFingerprint(other)
-    val currentTarget = other.reissueTargetSnapshot()
-    var confirmedHistoryIsValid = true
-    var confirmedHistoryTail = initialTarget
-    other.reissueConfirmedTargetHistory.forEachIndexed { index, step ->
-        if (step.confirmationOrdinal != (index + 1).toLong() ||
-            step.sourceTarget != confirmedHistoryTail ||
-            step.sourceTarget == step.confirmedTarget ||
-            !step.sourceTarget.matchesFingerprint(other) ||
-            !step.confirmedTarget.matchesFingerprint(other)
-        ) {
-            confirmedHistoryIsValid = false
-        }
-        confirmedHistoryTail = step.confirmedTarget
-    }
-    val pending = other.targetRevalidation
-    val currentTargetIsAuthorized = if (pending != null) {
-        val pendingSource = pending.sourceConfirmedTarget
-        val pendingOrdinal = pending.confirmationOrdinal
-        pendingSource != null &&
-            pendingOrdinal != null &&
-            pending.proposedTarget == currentTarget &&
-            pending.observedHostEpoch == currentTarget.expectedHostEpoch &&
-            pending.dedupeWindowId == currentTarget.dedupeWindowId &&
-            currentTarget.matchesFingerprint(other) &&
-            currentTarget != pendingSource &&
-            currentTarget.scopeId == pendingSource.scopeId &&
-            currentTarget.sessionId == pendingSource.sessionId &&
-            pendingSource == confirmedHistoryTail &&
-            pendingOrdinal == (other.reissueConfirmedTargetHistory.size + 1).toLong()
-    } else {
-        currentTarget == confirmedHistoryTail
-    }
+            initialTarget.matchesFingerprint(other) &&
+            initialTarget == other.targetProvenance.initialTarget
     return profileId == other.profileId &&
         principalId == other.principalId &&
         hostId == other.hostId &&
         operation == other.operation &&
         canonicalRequestArguments == other.canonicalRequestArguments &&
         lineageProofMatchesParent &&
-        lineageProofMatchesReplacement &&
-        confirmedHistoryIsValid &&
-        currentTargetIsAuthorized
+        lineageProofMatchesReplacement
 }
 
 private fun requireTargetShape(operation: RelayV2OutboxOperation, sessionId: String?) {
