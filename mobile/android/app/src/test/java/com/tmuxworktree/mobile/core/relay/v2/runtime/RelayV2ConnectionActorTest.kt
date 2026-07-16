@@ -881,6 +881,131 @@ class RelayV2ConnectionActorTest {
     }
 
     @Test
+    fun `direct failures share the terminal claim with higher callback causes`() = runBlocking {
+        val directClaimEntered = CountDownLatch(1)
+        val releaseDirectClaim = CountDownLatch(1)
+        val blockDirectClaim = AtomicBoolean(true)
+        val directHarness = Harness(
+            beforeTerminalClaim = {
+                if (blockDirectClaim.compareAndSet(true, false)) {
+                    directClaimEntered.countDown()
+                    check(releaseDirectClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                }
+            },
+        )
+        try {
+            assertTrue(directHarness.actor.connect(directHarness.profile, null))
+            val committed = directHarness.awaitTransport(0)
+            committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            directHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            committed.sendRaw(byteArrayOf('{'.code.toByte()))
+            assertTrue(directClaimEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            val mismatched = directHarness.factory.createCallbackSource()
+            mismatched.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            releaseDirectClaim.countDown()
+
+            val failure = directHarness.actor.awaitFailure(RelayV2FailureKind.SECURITY).failure
+            assertEquals("TRANSPORT_SOURCE_MISMATCH", failure?.code)
+            assertFalse(requireNotNull(failure).retryable)
+            val effect = withTimeout(TIMEOUT_MS) { directHarness.actor.effects.first() }
+                as RelayV2RuntimeEffect.ConnectionFailed
+            assertEquals(failure, effect.failure)
+            assertEquals(null, withTimeoutOrNull(50) { directHarness.actor.effects.first() })
+        } finally {
+            releaseDirectClaim.countDown()
+            directHarness.factory.transports.forEach { it.completeTermination() }
+            directHarness.close()
+        }
+
+        val queueClaimEntered = CountDownLatch(1)
+        val releaseQueueClaim = CountDownLatch(1)
+        val blockQueueClaim = AtomicBoolean(true)
+        val queueHarness = Harness(
+            effectByteCapacity = 64,
+            beforeTerminalClaim = {
+                if (blockQueueClaim.compareAndSet(true, false)) {
+                    queueClaimEntered.countDown()
+                    check(releaseQueueClaim.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+                }
+            },
+        )
+        try {
+            val hello = queueHarness.connectThroughRelayWelcome(null)
+            val transport = queueHarness.transport()
+            transport.sendFixture(
+                "host-welcome-snapshot-required",
+                hello.stringValue("requestId"),
+            )
+            assertTrue(queueClaimEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            transport.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION))
+            releaseQueueClaim.countDown()
+
+            val failure = queueHarness.actor.awaitFailure(RelayV2FailureKind.SECURITY).failure
+            assertEquals("TLS_VALIDATION_FAILED", failure?.code)
+            assertFalse(requireNotNull(failure).retryable)
+            val effect = withTimeout(TIMEOUT_MS) { queueHarness.actor.effects.first() }
+                as RelayV2RuntimeEffect.ConnectionFailed
+            assertEquals(failure, effect.failure)
+            assertEquals(1, transport.cancelCount)
+        } finally {
+            releaseQueueClaim.countDown()
+            queueHarness.factory.transports.forEach { it.completeTermination() }
+            queueHarness.close()
+        }
+    }
+
+    @Test
+    fun `disconnect recognizes committed source before its first callback`() = runBlocking {
+        val ownerSealed = CountDownLatch(1)
+        val releaseDisconnect = CountDownLatch(1)
+        val harness = Harness(
+            afterDisconnectOwnerSeal = {
+                ownerSealed.countDown()
+                check(releaseDisconnect.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            },
+        )
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0).apply {
+                completeTerminationOnClose = false
+            }
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.CONNECTING)
+            val receipt = async(start = CoroutineStart.UNDISPATCHED) {
+                harness.actor.disconnectAndDrain(
+                    harness.profile.identity,
+                    "pre-callback-source",
+                )
+            }
+            assertTrue(ownerSealed.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+
+            transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            assertEquals(0, transport.cancelCount)
+            assertTrue(transport.closeCodes.isEmpty())
+            assertFalse(receipt.isCompleted)
+
+            releaseDisconnect.countDown()
+            withTimeout(TIMEOUT_MS) {
+                while (transport.closeCodes.isEmpty()) delay(1)
+            }
+            assertEquals(listOf(1000), transport.closeCodes)
+            assertEquals(0, transport.cancelCount)
+            assertFalse(receipt.isCompleted)
+            transport.completeTermination()
+            assertEquals(
+                "pre-callback-source",
+                withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+            )
+            assertEquals(listOf(1000), transport.closeCodes)
+        } finally {
+            releaseDisconnect.countDown()
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
+
+    @Test
     fun `source mismatch dominates ordinary terminal callbacks in either enqueue order`() =
         runBlocking {
             listOf("ordinary-first", "mismatch-first").forEach { order ->
@@ -2085,6 +2210,7 @@ class RelayV2ConnectionActorTest {
         beforeTerminalClaim: () -> Unit = {},
         betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
         afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
+        afterDisconnectOwnerSeal: () -> Unit = {},
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -2101,6 +2227,7 @@ class RelayV2ConnectionActorTest {
             betweenTerminalCauseReadAndOwnerRevoke =
                 betweenTerminalCauseReadAndOwnerRevoke,
             afterCallbackAdmission = afterCallbackAdmission,
+            afterDisconnectOwnerSeal = afterDisconnectOwnerSeal,
             normalActionCapacity = normalActionCapacity,
             reservedActionCapacity = reservedActionCapacity,
             eventCapacity = eventCapacity,
