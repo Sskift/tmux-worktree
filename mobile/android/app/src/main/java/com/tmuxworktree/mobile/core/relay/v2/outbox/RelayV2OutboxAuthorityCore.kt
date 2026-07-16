@@ -1,7 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.v2.outbox
 
 import java.security.MessageDigest
-import java.util.Base64
 import java.util.Collections
 
 internal object RelayV2OutboxLimits {
@@ -69,6 +68,8 @@ internal sealed interface RelayV2OutboxArguments {
             branch?.let { put("branch", it) }
             put("aiCommand", aiCommand)
         }
+
+        override fun toString(): String = "CreateWorktree(<redacted>)"
     }
 
     data class CreateTerminal(
@@ -86,6 +87,8 @@ internal sealed interface RelayV2OutboxArguments {
             put("cwd", cwd)
             label?.let { put("label", it) }
         }
+
+        override fun toString(): String = "CreateTerminal(<redacted>)"
     }
 
     data class SendAgentMessage(
@@ -98,6 +101,7 @@ internal sealed interface RelayV2OutboxArguments {
         init {
             require(pane in 0..65_535) { "pane is out of range" }
             require(message == normalizeRelayV2Message(message)) { "message is not normalized" }
+            require(message.length <= 65_536) { "message is too large" }
             require(message.toByteArray(Charsets.UTF_8).size <= 65_536) { "message is too large" }
             require(message.isNotEmpty() || submit) { "empty message must submit" }
         }
@@ -107,6 +111,9 @@ internal sealed interface RelayV2OutboxArguments {
             "message" to message,
             "submit" to submit,
         )
+
+        override fun toString(): String =
+            "SendAgentMessage(pane=$pane, submit=$submit, message=<redacted>)"
     }
 
     data object KillSession : RelayV2OutboxArguments {
@@ -145,9 +152,20 @@ internal data class RelayV2CanonicalRequestArguments(
     val value: RelayV2OutboxArguments,
     val canonicalJson: String,
 ) {
-    val utf8ByteCount: Int = canonicalJson.toByteArray(Charsets.UTF_8).size
+    init {
+        require(canonicalJson.length <= RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES) {
+            "canonical arguments exceed the hard character bound"
+        }
+    }
+
+    val utf8ByteCount: Int by lazy(LazyThreadSafetyMode.NONE) {
+        canonicalJson.toByteArray(Charsets.UTF_8).size
+    }
 
     fun utf8Bytes(): ByteArray = canonicalJson.toByteArray(Charsets.UTF_8)
+
+    override fun toString(): String =
+        "RelayV2CanonicalRequestArguments(charCount=${canonicalJson.length}, <redacted>)"
 
     companion object {
         fun from(value: RelayV2OutboxArguments): RelayV2CanonicalRequestArguments =
@@ -160,18 +178,18 @@ internal data class RelayV2CanonicalRequestArguments(
 
 internal data class RelayV2RequestFingerprint(
     val schemaVersion: Int,
-    val sha256Base64Url: String,
+    val sha256Hex: String,
     val canonicalRequestByteCount: Int,
 ) {
     init {
         require(schemaVersion == SCHEMA_VERSION) { "unsupported request fingerprint schema" }
-        require(SHA256_BASE64URL.matches(sha256Base64Url)) { "invalid request fingerprint" }
+        require(SHA256_HEX.matches(sha256Hex)) { "invalid request fingerprint" }
         require(canonicalRequestByteCount > 0)
     }
 
     companion object {
         const val SCHEMA_VERSION = 1
-        private val SHA256_BASE64URL = Regex("^[A-Za-z0-9_-]{43}$")
+        private val SHA256_HEX = Regex("^[0-9a-f]{64}$")
     }
 }
 
@@ -236,6 +254,9 @@ internal data class RelayV2OutboxDraft(
         require(requestFingerprintSchemaVersion == RelayV2RequestFingerprint.SCHEMA_VERSION)
         requireTargetShape(operation, sessionId)
     }
+
+    override fun toString(): String =
+        "RelayV2OutboxDraft(commandId=$commandId, operation=$operation, <redacted>)"
 }
 
 internal enum class RelayV2OutboxStateTag(val persistedTag: Int) {
@@ -317,8 +338,10 @@ internal data class RelayV2OutboxEntry(
         sessionId = sessionId,
         createOperation = operation.takeIf { sessionId == null },
     )
-    val canonicalJson: String = canonicalEntryJson()
-    val canonicalByteCount: Int = canonicalJson.toByteArray(Charsets.UTF_8).size
+    val canonicalJson: String by lazy(LazyThreadSafetyMode.NONE) { canonicalEntryJson() }
+    val canonicalByteCount: Int by lazy(LazyThreadSafetyMode.NONE) {
+        canonicalJson.toByteArray(Charsets.UTF_8).size
+    }
 
     init {
         listOf(
@@ -334,6 +357,11 @@ internal data class RelayV2OutboxEntry(
         replacementCommandId?.let(::requireOutboxId)
         reissuedFromCommandId?.let(::requireOutboxId)
         requireTargetShape(operation, sessionId)
+        require(createdOrder >= 0)
+        require(createdAtMillis in 0..MAX_JSON_INTEGER)
+    }
+
+    internal fun validateForRestore() {
         require(canonicalRequestArguments.value.operation == operation)
         require(
             canonicalRequestArguments ==
@@ -351,8 +379,6 @@ internal data class RelayV2OutboxEntry(
                 canonicalRequestArguments,
             ),
         ) { "request fingerprint does not match the entry" }
-        require(createdOrder >= 0)
-        require(createdAtMillis in 0..MAX_JSON_INTEGER)
         require(attempts.map { it.requestId }.toSet().size == attempts.size)
         attempts.forEachIndexed { index, attempt -> require(attempt.ordinal == index + 1) }
         when (state) {
@@ -393,6 +419,9 @@ internal data class RelayV2OutboxEntry(
         require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
     }
 
+    override fun toString(): String =
+        "RelayV2OutboxEntry(id=$id, state=$state, attempts=${attempts.size}, <redacted>)"
+
     private fun canonicalEntryJson(): String = RelayV2OutboxCanonicalJson.stringify(
         mapOf(
             "acceptanceEvidence" to acceptanceEvidence.persistedTag,
@@ -415,7 +444,7 @@ internal data class RelayV2OutboxEntry(
             "profileId" to profileId,
             "reissuedFromCommandId" to reissuedFromCommandId,
             "replacementCommandId" to replacementCommandId,
-            "requestFingerprint" to requestFingerprint.sha256Base64Url,
+            "requestFingerprint" to requestFingerprint.sha256Hex,
             "requestFingerprintSchemaVersion" to requestFingerprint.schemaVersion,
             "scopeId" to scopeId,
             "sessionId" to sessionId,
@@ -431,38 +460,85 @@ internal data class RelayV2OutboxEntry(
 }
 
 internal class RelayV2OutboxState private constructor(
-    entries: List<RelayV2OutboxEntry>,
+    val entries: List<RelayV2OutboxEntry>,
     val nextCreationOrder: Long,
+    val canonicalByteCount: Int,
 ) {
-    val entries: List<RelayV2OutboxEntry> = Collections.unmodifiableList(
-        entries.sortedWith(compareBy<RelayV2OutboxEntry> { it.createdOrder }.thenBy { it.commandId }),
-    )
-    val canonicalByteCount: Int = stateCanonicalByteCount(this.entries, nextCreationOrder)
-
-    init {
-        require(nextCreationOrder >= 0)
-        require(this.entries.map { it.id }.toSet().size == this.entries.size)
-        require(this.entries.map { it.createdOrder }.toSet().size == this.entries.size)
-        require(this.entries.all { it.createdOrder < nextCreationOrder })
-        require(this.entries.size <= RelayV2OutboxLimits.MAX_ENTRIES)
-        require(this.entries.all {
-            it.attempts.size <= RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY &&
-                it.canonicalRequestArguments.utf8ByteCount <=
-                RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES &&
-                it.canonicalByteCount <= RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES
-        })
-        require(canonicalByteCount <= RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES)
-    }
-
     fun entry(id: RelayV2OutboxEntryId): RelayV2OutboxEntry? = entries.firstOrNull { it.id == id }
 
+    override fun toString(): String =
+        "RelayV2OutboxState(entries=${entries.size}, canonicalByteCount=$canonicalByteCount, <redacted>)"
+
     companion object {
-        fun empty(): RelayV2OutboxState = RelayV2OutboxState(emptyList(), 0)
+        fun empty(): RelayV2OutboxState = restore(emptyList(), 0)
 
         fun restore(
             entries: List<RelayV2OutboxEntry>,
             nextCreationOrder: Long,
-        ): RelayV2OutboxState = RelayV2OutboxState(entries.toList(), nextCreationOrder)
+        ): RelayV2OutboxState {
+            require(nextCreationOrder >= 0) { "invalid next creation order" }
+            require(entries.size <= RelayV2OutboxLimits.MAX_ENTRIES) { "too many Outbox entries" }
+
+            var cheapStateLowerBound = 0L
+            entries.forEach { entry ->
+                require(entry.attempts.size <= RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY) {
+                    "too many attempts"
+                }
+                require(
+                    entry.canonicalRequestArguments.canonicalJson.length <=
+                        RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES,
+                ) { "canonical arguments exceed the hard bound" }
+                cheapStateLowerBound += entry.cheapCanonicalLowerBound()
+                require(cheapStateLowerBound <= RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES) {
+                    "Outbox state exceeds the cheap hard bound"
+                }
+            }
+
+            val snapshots = entries.map { entry ->
+                entry.copy(attempts = immutableListSnapshot(entry.attempts))
+            }
+            require(snapshots.map { it.id }.toSet().size == snapshots.size) {
+                "duplicate command identity"
+            }
+            require(snapshots.map { it.createdOrder }.toSet().size == snapshots.size) {
+                "duplicate creation order"
+            }
+            require(snapshots.all { it.createdOrder < nextCreationOrder }) {
+                "invalid creation order"
+            }
+
+            var canonicalEntriesBytes = 0L
+            snapshots.forEachIndexed { index, entry ->
+                entry.validateForRestore()
+                require(
+                    entry.canonicalRequestArguments.utf8ByteCount <=
+                        RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES,
+                ) { "canonical arguments exceed the UTF-8 hard bound" }
+                require(entry.canonicalByteCount <= RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES) {
+                    "Outbox entry exceeds the canonical hard bound"
+                }
+                canonicalEntriesBytes += entry.canonicalByteCount
+                if (index > 0) canonicalEntriesBytes += 1
+                require(
+                    canonicalEntriesBytes + stateCanonicalFixedBytes(nextCreationOrder) <=
+                        RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES,
+                ) { "Outbox state exceeds the canonical hard bound" }
+            }
+            validateAttemptOwnership(snapshots)
+            validateReissueGraph(snapshots)
+
+            val sorted = snapshots.sortedWith(
+                compareBy<RelayV2OutboxEntry> { it.createdOrder }.thenBy { it.commandId },
+            )
+            val canonicalByteCount = (
+                stateCanonicalFixedBytes(nextCreationOrder) + canonicalEntriesBytes
+            ).toInt()
+            return RelayV2OutboxState(
+                entries = immutableListSnapshot(sorted),
+                nextCreationOrder = nextCreationOrder,
+                canonicalByteCount = canonicalByteCount,
+            )
+        }
     }
 }
 
@@ -484,13 +560,63 @@ internal enum class RelayV2CommandDisposition(val wireValue: String) {
     NOT_APPLICABLE("not_applicable"),
 }
 
+internal enum class RelayV2CommandStatusSource(val attemptKind: RelayV2OutboxAttemptKind?) {
+    EXECUTE_RESPONSE(RelayV2OutboxAttemptKind.EXECUTE),
+    QUERY_RESPONSE(RelayV2OutboxAttemptKind.QUERY),
+    RESULT_EVENT(null),
+}
+
+internal enum class RelayV2ResultSessionKind {
+    WORKTREE,
+    TERMINAL,
+}
+
+internal sealed interface RelayV2CommandResult {
+    data class CreatedSession(
+        val sessionId: String,
+        val scopeId: String,
+        val kind: RelayV2ResultSessionKind,
+    ) : RelayV2CommandResult {
+        init {
+            requireOutboxId(sessionId)
+            requireOutboxId(scopeId)
+        }
+    }
+
+    data class AgentMessage(
+        val pane: Int,
+        val submit: Boolean,
+        val messageUtf8Bytes: Int,
+    ) : RelayV2CommandResult {
+        init {
+            require(pane in 0..65_535)
+            require(messageUtf8Bytes in 0..65_536)
+        }
+    }
+
+    data class KilledSession(
+        val sessionId: String,
+        val terminated: Boolean,
+    ) : RelayV2CommandResult {
+        init {
+            requireOutboxId(sessionId)
+        }
+    }
+}
+
 /** Already schema-decoded authority evidence. Human-readable message is deliberately inert. */
 internal data class RelayV2CommandStatusEvidence(
     val entryId: RelayV2OutboxEntryId,
     val dedupeWindowId: String,
     val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String?,
+    val operation: RelayV2OutboxOperation,
+    val source: RelayV2CommandStatusSource,
+    val attemptKind: RelayV2OutboxAttemptKind?,
     val state: RelayV2CommandStatusState,
     val attemptRequestId: String? = null,
+    val result: RelayV2CommandResult? = null,
     val retryable: Boolean = false,
     val retryAfterMs: Long? = null,
     val reissueRequired: Boolean = false,
@@ -502,11 +628,19 @@ internal data class RelayV2CommandStatusEvidence(
     init {
         requireOutboxId(dedupeWindowId)
         requireOutboxId(hostEpoch)
+        requireOutboxId(scopeId)
+        sessionId?.let(::requireOutboxId)
         attemptRequestId?.let(::requireOutboxId)
         require(retryAfterMs == null || retryAfterMs in 0..MAX_JSON_INTEGER)
         errorCode?.let { requireOutboxString(it, 128) }
-        errorMessage?.let { require(it.toByteArray(Charsets.UTF_8).size <= 4_096) }
+        errorMessage?.let {
+            require(it.length <= 4_096)
+            require(it.toByteArray(Charsets.UTF_8).size <= 4_096)
+        }
     }
+
+    override fun toString(): String =
+        "RelayV2CommandStatusEvidence(entryId=$entryId, state=$state, source=$source, <redacted>)"
 }
 
 internal sealed interface RelayV2OutboxRecovery {
@@ -646,12 +780,17 @@ internal sealed interface RelayV2OutboxAction {
 }
 
 internal sealed interface RelayV2OutboxMutation {
-    data class Insert(val entry: RelayV2OutboxEntry) : RelayV2OutboxMutation
+    data class Insert(val entry: RelayV2OutboxEntry) : RelayV2OutboxMutation {
+        override fun toString(): String = "Insert(entryId=${entry.id}, <redacted>)"
+    }
 
     data class Replace(
         val previousId: RelayV2OutboxEntryId,
         val entry: RelayV2OutboxEntry,
-    ) : RelayV2OutboxMutation
+    ) : RelayV2OutboxMutation {
+        override fun toString(): String =
+            "Replace(previousId=$previousId, entryId=${entry.id}, <redacted>)"
+    }
 }
 
 internal sealed interface RelayV2OutboxTransactionPlan {
@@ -659,13 +798,16 @@ internal sealed interface RelayV2OutboxTransactionPlan {
 
     data class MutationSet(
         override val mutations: List<RelayV2OutboxMutation>,
-    ) : RelayV2OutboxTransactionPlan
+    ) : RelayV2OutboxTransactionPlan {
+        override fun toString(): String = "MutationSet(size=${mutations.size}, <redacted>)"
+    }
 
     data class AtomicReissue(
         val original: RelayV2OutboxMutation.Replace,
         val replacement: RelayV2OutboxMutation.Insert,
     ) : RelayV2OutboxTransactionPlan {
-        override val mutations: List<RelayV2OutboxMutation> = listOf(original, replacement)
+        override val mutations: List<RelayV2OutboxMutation> =
+            immutableListSnapshot(listOf(original, replacement))
 
         init {
             require(original.entry.id == original.previousId)
@@ -686,6 +828,10 @@ internal sealed interface RelayV2OutboxTransactionPlan {
                     replacement.entry.canonicalRequestArguments,
             )
         }
+
+        override fun toString(): String =
+            "AtomicReissue(original=${original.previousId}, " +
+                "replacement=${replacement.entry.id}, <redacted>)"
     }
 }
 
@@ -697,7 +843,10 @@ internal data class RelayV2OutboxCommand(
     val sessionId: String?,
     val canonicalRequestArguments: RelayV2CanonicalRequestArguments,
     val requestFingerprint: RelayV2RequestFingerprint,
-)
+) {
+    override fun toString(): String =
+        "RelayV2OutboxCommand(entryId=$entryId, operation=$operation, <redacted>)"
+}
 
 internal data class RelayV2OutboxQueryAuthority(
     val profileId: String,
@@ -724,7 +873,10 @@ internal sealed interface RelayV2OutboxEffect {
         val command: RelayV2OutboxCommand,
         val attempt: RelayV2OutboxAttempt,
         val retryAfterMs: Long? = null,
-    ) : RelayV2OutboxEffect
+    ) : RelayV2OutboxEffect {
+        override fun toString(): String =
+            "ExecuteCommand(entryId=${command.entryId}, attempt=${attempt.requestId}, <redacted>)"
+    }
 
     data class QueryCommands(
         val authority: RelayV2OutboxQueryAuthority,
@@ -742,6 +894,9 @@ internal sealed interface RelayV2OutboxEffect {
                     it.entryId.expectedHostEpoch == authority.expectedHostEpoch
             })
         }
+
+        override fun toString(): String =
+            "QueryCommands(authority=$authority, items=${items.size}, <redacted>)"
     }
 
     data class RevalidateOpaqueTarget(
@@ -750,7 +905,10 @@ internal sealed interface RelayV2OutboxEffect {
         val currentDedupeWindowId: String,
         val priorScopeId: String,
         val priorSessionId: String?,
-    ) : RelayV2OutboxEffect
+    ) : RelayV2OutboxEffect {
+        override fun toString(): String =
+            "RevalidateOpaqueTarget(entryId=$entryId, <redacted>)"
+    }
 
     data class ConfirmOldLineage(val entryId: RelayV2OutboxEntryId) : RelayV2OutboxEffect
 
@@ -780,12 +938,18 @@ internal sealed interface RelayV2OutboxResult {
         override val state: RelayV2OutboxState,
         val transaction: RelayV2OutboxTransactionPlan,
         val effects: List<RelayV2OutboxEffect>,
-    ) : RelayV2OutboxResult
+    ) : RelayV2OutboxResult {
+        override fun toString(): String =
+            "Applied(state=$state, mutations=${transaction.mutations.size}, " +
+                "effects=${effects.size}, <redacted>)"
+    }
 
     data class Rejected(
         override val state: RelayV2OutboxState,
         val reason: RelayV2OutboxRejection,
-    ) : RelayV2OutboxResult
+    ) : RelayV2OutboxResult {
+        override fun toString(): String = "Rejected(reason=$reason, state=$state, <redacted>)"
+    }
 }
 
 /** Pure, deterministic authority reducer. It performs no clock, UUID, Room, actor, or network IO. */
@@ -929,7 +1093,11 @@ internal class RelayV2OutboxAuthorityCore(
                 mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
                 RelayV2OutboxQueryItem(updated.id, updated.dedupeWindowId)
             }
-            effects += RelayV2OutboxEffect.QueryCommands(authority, requestId, items)
+            effects += RelayV2OutboxEffect.QueryCommands(
+                authority,
+                requestId,
+                immutableListSnapshot(items),
+            )
         }
         return apply(state, mutations, effects)
     }
@@ -975,9 +1143,10 @@ internal class RelayV2OutboxAuthorityCore(
             ?: return state.reject(RelayV2OutboxRejection.ENTRY_NOT_FOUND)
         if (evidence.hostEpoch != entry.expectedHostEpoch ||
             evidence.dedupeWindowId != entry.dedupeWindowId ||
-            evidence.attemptRequestId?.let { request ->
-                entry.attempts.none { it.requestId == request }
-            } == true
+            evidence.scopeId != entry.scopeId ||
+            evidence.sessionId != entry.sessionId ||
+            evidence.operation != entry.operation ||
+            !evidence.hasValidCorrelation(entry)
         ) {
             return state.reject(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH)
         }
@@ -1064,14 +1233,16 @@ internal class RelayV2OutboxAuthorityCore(
         finalState: RelayV2OutboxStateTag,
     ): RelayV2OutboxResult {
         val valid = when (evidence.state) {
-            RelayV2CommandStatusState.SUCCEEDED -> evidence.isNonFailureStatus()
+            RelayV2CommandStatusState.SUCCEEDED ->
+                evidence.hasNoErrorMetadata() && evidence.result.matches(entry)
             RelayV2CommandStatusState.FAILED ->
                 !evidence.retryable &&
                     evidence.retryAfterMs == null &&
                     !evidence.reissueRequired &&
-                    evidence.errorCode != null &&
+                    evidence.errorCode in FINAL_COMMAND_FAILURE_CODES &&
                     evidence.commandDisposition == RelayV2CommandDisposition.COMPLETED &&
-                    evidence.detailsReissueRequired == null
+                    evidence.detailsReissueRequired == null &&
+                    evidence.result == null
             else -> false
         }
         if (!valid) return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
@@ -1125,6 +1296,12 @@ internal class RelayV2OutboxAuthorityCore(
     ): RelayV2OutboxResult {
         if (entry.state == RelayV2OutboxStateTag.AMBIGUOUS ||
             entry.acceptanceEvidence != RelayV2OutboxAcceptanceEvidence.NONE
+        ) {
+            return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
+        }
+        if (evidence.source != RelayV2CommandStatusSource.EXECUTE_RESPONSE ||
+            evidence.attemptKind != RelayV2OutboxAttemptKind.EXECUTE ||
+            evidence.attemptRequestId == null
         ) {
             return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
         }
@@ -1315,14 +1492,14 @@ internal class RelayV2OutboxAuthorityCore(
         effects: List<RelayV2OutboxEffect> = emptyList(),
         nextCreationOrder: Long = state.nextCreationOrder,
         transactionPlan: RelayV2OutboxTransactionPlan =
-            RelayV2OutboxTransactionPlan.MutationSet(mutations.toList()),
+            RelayV2OutboxTransactionPlan.MutationSet(immutableListSnapshot(mutations)),
     ): RelayV2OutboxResult {
         require(transactionPlan.mutations == mutations)
         if (mutations.isEmpty()) {
             return RelayV2OutboxResult.Applied(
                 state,
                 transactionPlan,
-                effects.toList(),
+                immutableListSnapshot(effects),
             )
         }
         val entries = state.entries.toMutableList()
@@ -1358,7 +1535,7 @@ internal class RelayV2OutboxAuthorityCore(
         return RelayV2OutboxResult.Applied(
             state = candidate,
             transaction = transactionPlan,
-            effects = effects.toList(),
+            effects = immutableListSnapshot(effects),
         )
     }
 
@@ -1452,13 +1629,61 @@ private fun RelayV2OutboxState.hasReplacementFor(entry: RelayV2OutboxEntry): Boo
 private fun RelayV2OutboxState.reject(reason: RelayV2OutboxRejection) =
     RelayV2OutboxResult.Rejected(this, reason)
 
-private fun RelayV2CommandStatusEvidence.isNonFailureStatus(): Boolean =
+private fun RelayV2CommandStatusEvidence.hasNoErrorMetadata(): Boolean =
     !retryable &&
         retryAfterMs == null &&
         !reissueRequired &&
         errorCode == null &&
         commandDisposition == null &&
         detailsReissueRequired == null
+
+private fun RelayV2CommandStatusEvidence.isNonFailureStatus(): Boolean =
+    hasNoErrorMetadata() && result == null
+
+private fun RelayV2CommandStatusEvidence.hasValidCorrelation(entry: RelayV2OutboxEntry): Boolean =
+    when (source) {
+        RelayV2CommandStatusSource.RESULT_EVENT ->
+            attemptRequestId == null &&
+                attemptKind == null &&
+                state in setOf(
+                    RelayV2CommandStatusState.SUCCEEDED,
+                    RelayV2CommandStatusState.FAILED,
+                    RelayV2CommandStatusState.IN_DOUBT,
+                )
+        RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+        RelayV2CommandStatusSource.QUERY_RESPONSE,
+        -> {
+            val requestId = attemptRequestId ?: return false
+            val expectedKind = source.attemptKind ?: return false
+            attemptKind == expectedKind &&
+                entry.attempts.any { it.requestId == requestId && it.kind == expectedKind }
+        }
+    }
+
+private fun RelayV2CommandResult?.matches(entry: RelayV2OutboxEntry): Boolean =
+    when (entry.operation) {
+        RelayV2OutboxOperation.CREATE_WORKTREE ->
+            this is RelayV2CommandResult.CreatedSession &&
+                scopeId == entry.scopeId &&
+                kind == RelayV2ResultSessionKind.WORKTREE
+        RelayV2OutboxOperation.CREATE_TERMINAL ->
+            this is RelayV2CommandResult.CreatedSession &&
+                scopeId == entry.scopeId &&
+                kind == RelayV2ResultSessionKind.TERMINAL
+        RelayV2OutboxOperation.SEND_AGENT_MESSAGE -> {
+            val arguments = entry.canonicalRequestArguments.value as?
+                RelayV2OutboxArguments.SendAgentMessage
+            this is RelayV2CommandResult.AgentMessage &&
+                arguments != null &&
+                pane == arguments.pane &&
+                submit == arguments.submit &&
+                messageUtf8Bytes == arguments.message.toByteArray(Charsets.UTF_8).size
+        }
+        RelayV2OutboxOperation.KILL_SESSION ->
+            this is RelayV2CommandResult.KilledSession &&
+                sessionId == entry.sessionId &&
+                terminated
+    }
 
 private fun RelayV2CommandStatusEvidence.isFixedFailure(
     code: String,
@@ -1468,7 +1693,8 @@ private fun RelayV2CommandStatusEvidence.isFixedFailure(
     !reissueRequired &&
     errorCode == code &&
     commandDisposition == disposition &&
-    detailsReissueRequired == null
+    detailsReissueRequired == null &&
+    result == null
 
 private fun RelayV2CommandStatusEvidence.isRetryableNotAccepted(): Boolean =
     retryable &&
@@ -1476,7 +1702,8 @@ private fun RelayV2CommandStatusEvidence.isRetryableNotAccepted(): Boolean =
         !reissueRequired &&
         errorCode == "COMMAND_NOT_ACCEPTED" &&
         commandDisposition == RelayV2CommandDisposition.NOT_ACCEPTED &&
-        detailsReissueRequired == null
+        detailsReissueRequired == null &&
+        result == null
 
 private fun RelayV2CommandStatusEvidence.isReissueRequiredNotAccepted(): Boolean =
     !retryable &&
@@ -1484,7 +1711,8 @@ private fun RelayV2CommandStatusEvidence.isReissueRequiredNotAccepted(): Boolean
         reissueRequired &&
         errorCode == "COMMAND_WINDOW_EXPIRED" &&
         commandDisposition == RelayV2CommandDisposition.NOT_ACCEPTED &&
-        detailsReissueRequired == true
+        detailsReissueRequired == true &&
+        result == null
 
 private fun calculateRequestFingerprint(
     schemaVersion: Int,
@@ -1497,37 +1725,140 @@ private fun calculateRequestFingerprint(
     arguments: RelayV2CanonicalRequestArguments,
 ): RelayV2RequestFingerprint {
     require(schemaVersion == RelayV2RequestFingerprint.SCHEMA_VERSION)
-    val canonicalRequest = RelayV2OutboxCanonicalJson.stringify(
-        mapOf(
-            "arguments" to arguments.value.canonicalMap(),
-            "dedupeWindowId" to dedupeWindowId,
-            "hostEpoch" to hostEpoch,
-            "hostId" to hostId,
-            "operation" to operation.wireValue,
-            "schemaVersion" to schemaVersion,
-            "scopeId" to scopeId,
-            "sessionId" to sessionId,
-        ),
+    val canonicalRequest = canonicalRelayV2FingerprintRequest(
+        schemaVersion,
+        operation,
+        dedupeWindowId,
+        hostEpoch,
+        hostId,
+        scopeId,
+        sessionId,
+        arguments,
     )
     val bytes = canonicalRequest.toByteArray(Charsets.UTF_8)
     val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
     return RelayV2RequestFingerprint(
         schemaVersion,
-        Base64.getUrlEncoder().withoutPadding().encodeToString(digest),
+        digest.joinToString(separator = "") { byte ->
+            (byte.toInt() and 0xff).toString(16).padStart(2, '0')
+        },
         bytes.size,
     )
 }
 
-private fun stateCanonicalByteCount(
-    entries: List<RelayV2OutboxEntry>,
-    nextCreationOrder: Long,
-): Int {
-    val fixed = "{\"entries\":[".toByteArray().size +
-        "],\"nextCreationOrder\":$nextCreationOrder}".toByteArray().size
-    val entriesBytes = entries.sumOf { it.canonicalByteCount.toLong() } +
-        maxOf(0, entries.size - 1)
-    return (fixed + entriesBytes).toInt()
+internal fun canonicalRelayV2FingerprintRequest(
+    schemaVersion: Int,
+    operation: RelayV2OutboxOperation,
+    dedupeWindowId: String,
+    hostEpoch: String,
+    hostId: String,
+    scopeId: String,
+    sessionId: String?,
+    arguments: RelayV2CanonicalRequestArguments,
+): String = RelayV2OutboxCanonicalJson.stringify(
+    buildMap {
+        put("arguments", arguments.value.canonicalMap())
+        put("dedupeWindowId", dedupeWindowId)
+        put("hostEpoch", hostEpoch)
+        put("hostId", hostId)
+        put("operation", operation.wireValue)
+        put("schemaVersion", schemaVersion)
+        put("scopeId", scopeId)
+        sessionId?.let { put("sessionId", it) }
+    },
+)
+
+private fun stateCanonicalFixedBytes(nextCreationOrder: Long): Long =
+    "{\"entries\":[".toByteArray(Charsets.UTF_8).size.toLong() +
+        "],\"nextCreationOrder\":$nextCreationOrder}".toByteArray(Charsets.UTF_8).size
+
+private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
+    canonicalRequestArguments.canonicalJson.length.toLong() +
+        profileId.length +
+        principalId.length +
+        hostId.length +
+        expectedHostEpoch.length +
+        dedupeWindowId.length +
+        commandId.length +
+        scopeId.length +
+        (sessionId?.length ?: 0) +
+        attempts.sumOf { it.requestId.length.toLong() }
+
+private fun <T> immutableListSnapshot(values: List<T>): List<T> =
+    Collections.unmodifiableList(values.toList())
+
+private fun validateAttemptOwnership(entries: List<RelayV2OutboxEntry>) {
+    val ownership = mutableMapOf<String, MutableList<Pair<RelayV2OutboxEntry, RelayV2OutboxAttempt>>>()
+    entries.forEach { entry ->
+        entry.attempts.forEach { attempt ->
+            ownership.getOrPut(attempt.requestId) { mutableListOf() } += entry to attempt
+        }
+    }
+    ownership.forEach { (requestId, owners) ->
+        val kinds = owners.map { it.second.kind }.toSet()
+        require(kinds.size == 1) { "attempt requestId $requestId mixes EXECUTE and QUERY" }
+        when (kinds.single()) {
+            RelayV2OutboxAttemptKind.EXECUTE ->
+                require(owners.size == 1) { "EXECUTE requestId has multiple command owners" }
+            RelayV2OutboxAttemptKind.QUERY -> {
+                require(owners.size <= RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH) {
+                    "QUERY requestId exceeds its batch bound"
+                }
+                require(owners.map { it.first.queryAuthority() }.toSet().size == 1) {
+                    "QUERY requestId crosses authority"
+                }
+            }
+        }
+    }
 }
+
+private fun validateReissueGraph(entries: List<RelayV2OutboxEntry>) {
+    val byId = entries.associateBy { it.id }
+    entries.forEach { child ->
+        val parentCommandId = child.reissuedFromCommandId ?: return@forEach
+        val parent = byId[child.id.copy(commandId = parentCommandId)]
+            ?: error("reissue replacement is orphaned")
+        require(parent.state == RelayV2OutboxStateTag.REISSUED) {
+            "reissue parent is not REISSUED"
+        }
+        require(parent.replacementCommandId == child.commandId) {
+            "reissue reverse pointer mismatch"
+        }
+        require(parent.hasSameReissueIntent(child)) { "reissue intent or authority mismatch" }
+    }
+    entries.filter { it.state == RelayV2OutboxStateTag.REISSUED }.forEach { parent ->
+        val replacementId = parent.replacementCommandId
+            ?: error("REISSUED entry lacks replacement pointer")
+        val child = byId[parent.id.copy(commandId = replacementId)]
+            ?: error("REISSUED entry lacks replacement")
+        require(child.reissuedFromCommandId == parent.commandId) {
+            "reissue forward pointer mismatch"
+        }
+        require(parent.hasSameReissueIntent(child)) { "reissue intent or authority mismatch" }
+    }
+    entries.forEach { start ->
+        val visited = mutableSetOf<RelayV2OutboxEntryId>()
+        var current: RelayV2OutboxEntry? = start
+        while (current?.state == RelayV2OutboxStateTag.REISSUED) {
+            require(visited.add(current.id)) { "reissue graph contains a cycle" }
+            val replacement = current.replacementCommandId
+                ?: error("REISSUED entry lacks replacement pointer")
+            current = byId[current.id.copy(commandId = replacement)]
+                ?: error("REISSUED entry lacks replacement")
+        }
+    }
+}
+
+private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): Boolean =
+    profileId == other.profileId &&
+        principalId == other.principalId &&
+        hostId == other.hostId &&
+        expectedHostEpoch == other.expectedHostEpoch &&
+        operation == other.operation &&
+        scopeId == other.scopeId &&
+        sessionId == other.sessionId &&
+        canonicalRequestArguments == other.canonicalRequestArguments &&
+        dedupeWindowId != other.dedupeWindowId
 
 private fun requireTargetShape(operation: RelayV2OutboxOperation, sessionId: String?) {
     when (operation) {
@@ -1548,6 +1879,7 @@ private fun requireOutboxString(value: String, maxUtf8Bytes: Int) {
     require(value.isNotEmpty())
     require(value.trim() == value)
     require('\u0000' !in value)
+    require(value.length <= maxUtf8Bytes) { "string exceeds the hard character bound" }
     require(value.toByteArray(Charsets.UTF_8).size <= maxUtf8Bytes)
 }
 
@@ -1624,6 +1956,13 @@ private object RelayV2OutboxCanonicalJson {
 }
 
 private const val MAX_JSON_INTEGER = 9_007_199_254_740_991L
+private val FINAL_COMMAND_FAILURE_CODES = setOf(
+    "COMMAND_FAILED",
+    "SCOPE_NOT_FOUND",
+    "PROJECT_NOT_FOUND",
+    "SESSION_NOT_FOUND",
+    "PANE_NOT_FOUND",
+)
 private val QUERYABLE_STATES = setOf(
     RelayV2OutboxStateTag.SENDING,
     RelayV2OutboxStateTag.ACCEPTED,

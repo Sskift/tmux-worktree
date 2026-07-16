@@ -44,7 +44,7 @@ class RelayV2OutboxAuthorityCoreTest {
             first.canonicalRequestArguments.utf8Bytes().size,
         )
         assertEquals(1, first.requestFingerprint.schemaVersion)
-        assertEquals(43, first.requestFingerprint.sha256Base64Url.length)
+        assertEquals(64, first.requestFingerprint.sha256Hex.length)
         assertEquals("profile-a", first.profileId)
         assertEquals("principal-a", first.principalId)
         assertEquals("host-a", first.hostId)
@@ -68,8 +68,8 @@ class RelayV2OutboxAuthorityCoreTest {
             createdAtMillis = 0,
         ).state.entries.single()
         assertEquals(
-            first.requestFingerprint.sha256Base64Url,
-            sameIntentDifferentClientTime.requestFingerprint.sha256Base64Url,
+            first.requestFingerprint.sha256Hex,
+            sameIntentDifferentClientTime.requestFingerprint.sha256Hex,
         )
     }
 
@@ -217,6 +217,7 @@ class RelayV2OutboxAuthorityCoreTest {
                 "${entry.state} accepted illegal ${case.status}",
                 result.reason in setOf(
                     RelayV2OutboxRejection.INVALID_TRANSITION,
+                    RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH,
                     RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING,
                 ),
             )
@@ -353,8 +354,8 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals("window-b", replacement.dedupeWindowId)
         assertEquals(original.canonicalRequestArguments, replacement.canonicalRequestArguments)
         assertNotEquals(
-            original.requestFingerprint.sha256Base64Url,
-            replacement.requestFingerprint.sha256Base64Url,
+            original.requestFingerprint.sha256Hex,
+            replacement.requestFingerprint.sha256Hex,
         )
         assertEquals(2, result.transaction.mutations.size)
         assertTrue(result.transaction is RelayV2OutboxTransactionPlan.AtomicReissue)
@@ -463,6 +464,113 @@ class RelayV2OutboxAuthorityCoreTest {
             ),
         )
         assertEquals(RelayV2OutboxRejection.INVALID_TRANSITION, repeated.reason)
+    }
+
+    @Test
+    fun `status evidence rejects wrong target source attempt result and unlisted final failure`() {
+        val source = sourceState(RelayV2OutboxStateTag.SENDING)
+        val entry = source.entries.single()
+        val validFinal = terminalEvidence(entry, RelayV2CommandStatusState.SUCCEEDED)
+
+        listOf(
+            validFinal.copy(scopeId = "wrong-scope"),
+            validFinal.copy(sessionId = "wrong-session"),
+            validFinal.copy(operation = RelayV2OutboxOperation.KILL_SESSION),
+            validFinal.copy(attemptKind = RelayV2OutboxAttemptKind.QUERY),
+            validFinal.copy(
+                source = RelayV2CommandStatusSource.QUERY_RESPONSE,
+                attemptKind = RelayV2OutboxAttemptKind.QUERY,
+            ),
+        ).forEach { evidence ->
+            val rejected = rejected(
+                core.reduce(source, RelayV2OutboxAction.ReconcileStatus(evidence)),
+            )
+            assertEquals(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH, rejected.reason)
+            assertTrue(rejected.state === source)
+        }
+
+        listOf(
+            validFinal.copy(
+                result = RelayV2CommandResult.AgentMessage(
+                    pane = 1,
+                    submit = true,
+                    messageUtf8Bytes = 8,
+                ),
+            ),
+            validFinal.copy(
+                result = RelayV2CommandResult.KilledSession("session-a", true),
+            ),
+        ).forEach { evidence ->
+            val rejected = rejected(
+                core.reduce(source, RelayV2OutboxAction.ReconcileStatus(evidence)),
+            )
+            assertEquals(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING, rejected.reason)
+            assertTrue(rejected.state === source)
+        }
+
+        val arbitraryFailure = terminalEvidence(entry, RelayV2CommandStatusState.FAILED).copy(
+            errorCode = "ARBITRARY_COMPLETED_ERROR",
+        )
+        val failed = rejected(
+            core.reduce(source, RelayV2OutboxAction.ReconcileStatus(arbitraryFailure)),
+        )
+        assertEquals(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING, failed.reason)
+
+        val missingCorrelation = rejected(
+            core.reduce(
+                source,
+                RelayV2OutboxAction.ReconcileStatus(
+                    retryableNotAccepted(entry).copy(attemptRequestId = null),
+                    RelayV2OutboxRecovery.RetrySameCommand("retry-without-correlation"),
+                ),
+            ),
+        )
+        assertEquals(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH, missingCorrelation.reason)
+        assertTrue(missingCorrelation.state === source)
+
+        val missingReissueCorrelation = rejected(
+            core.reduce(
+                source,
+                RelayV2OutboxAction.ReconcileStatus(
+                    reissueRequiredNotAccepted(entry).copy(attemptRequestId = null),
+                    RelayV2OutboxRecovery.Reissue(
+                        "reissue-without-correlation",
+                        "reissue-without-correlation-window",
+                        0,
+                    ),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH,
+            missingReissueCorrelation.reason,
+        )
+        assertTrue(missingReissueCorrelation.state === source)
+
+        val queryState = applied(
+            core.reduce(
+                source,
+                RelayV2OutboxAction.BeginQueries(
+                    entryIds = listOf(entry.id),
+                    attemptRequestIds = listOf("query-not-accepted"),
+                ),
+            ),
+        ).state
+        val queriedEntry = queryState.entry(entry.id)!!
+        val queryPretendingToExecute = rejected(
+            core.reduce(
+                queryState,
+                RelayV2OutboxAction.ReconcileStatus(
+                    retryableNotAccepted(queriedEntry),
+                    RelayV2OutboxRecovery.RetrySameCommand("query-proof-retry"),
+                ),
+            ),
+        )
+        assertEquals(
+            RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING,
+            queryPretendingToExecute.reason,
+        )
+        assertTrue(queryPretendingToExecute.state === queryState)
     }
 
     @Test
@@ -578,8 +686,8 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals("opaque-session-b", revalidated.sessionId)
         assertEquals(null, revalidated.targetRevalidation)
         assertNotEquals(
-            queued.requestFingerprint.sha256Base64Url,
-            revalidated.requestFingerprint.sha256Base64Url,
+            queued.requestFingerprint.sha256Hex,
+            revalidated.requestFingerprint.sha256Hex,
         )
 
         val wrongLineage = rejected(
@@ -772,6 +880,235 @@ class RelayV2OutboxAuthorityCoreTest {
     }
 
     @Test
+    fun `restore rejects duplicate mixed oversized and cross authority attempt ownership`() {
+        var twoCommands = RelayV2OutboxState.empty()
+        twoCommands = enqueue(
+            twoCommands,
+            draft(commandId = "owner-a", sessionId = "owner-session-a"),
+            0,
+        ).state
+        twoCommands = enqueue(
+            twoCommands,
+            draft(commandId = "owner-b", sessionId = "owner-session-b"),
+            1,
+        ).state
+        val first = twoCommands.entries[0]
+        val second = twoCommands.entries[1]
+        val duplicateExecute = listOf(first, second).map { entry ->
+            entry.copy(
+                state = RelayV2OutboxStateTag.SENDING,
+                attempts = listOf(
+                    RelayV2OutboxAttempt(
+                        "duplicate-execute-request",
+                        RelayV2OutboxAttemptKind.EXECUTE,
+                        1,
+                    ),
+                ),
+            )
+        }
+        restoreFailure(duplicateExecute, twoCommands.nextCreationOrder)
+
+        val mixedKinds = listOf(
+            duplicateExecute[0],
+            second.copy(
+                state = RelayV2OutboxStateTag.CONFIRMING,
+                attempts = listOf(
+                    RelayV2OutboxAttempt(
+                        "duplicate-execute-request",
+                        RelayV2OutboxAttemptKind.QUERY,
+                        1,
+                    ),
+                ),
+            ),
+        )
+        restoreFailure(mixedKinds, twoCommands.nextCreationOrder)
+
+        val crossAuthorityQuery = listOf(
+            first.copy(
+                state = RelayV2OutboxStateTag.CONFIRMING,
+                attempts = listOf(RelayV2OutboxAttempt("cross-query", RelayV2OutboxAttemptKind.QUERY, 1)),
+            ),
+            second.copy(
+                principalId = "principal-b",
+                state = RelayV2OutboxStateTag.CONFIRMING,
+                attempts = listOf(RelayV2OutboxAttempt("cross-query", RelayV2OutboxAttemptKind.QUERY, 1)),
+            ),
+        )
+        restoreFailure(crossAuthorityQuery, twoCommands.nextCreationOrder)
+
+        var thirtyThree = RelayV2OutboxState.empty()
+        repeat(33) { index ->
+            thirtyThree = enqueue(
+                thirtyThree,
+                draft(commandId = "oversized-query-$index", sessionId = "oversized-session-$index"),
+                index.toLong(),
+            ).state
+        }
+        val oversizedQuery = thirtyThree.entries.map { entry ->
+            entry.copy(
+                state = RelayV2OutboxStateTag.CONFIRMING,
+                attempts = listOf(
+                    RelayV2OutboxAttempt("query-over-32", RelayV2OutboxAttemptKind.QUERY, 1),
+                ),
+            )
+        }
+        restoreFailure(oversizedQuery, thirtyThree.nextCreationOrder)
+    }
+
+    @Test
+    fun `restore rejects orphan mismatched cross authority and cyclic reissue graphs`() {
+        val valid = sourceState(RelayV2OutboxStateTag.REISSUED)
+        val parent = valid.entries.single { it.commandId == "command-a" }
+        val child = valid.entries.single { it.reissuedFromCommandId == parent.commandId }
+
+        restoreFailure(listOf(parent), valid.nextCreationOrder)
+        restoreFailure(
+            listOf(parent.copy(replacementCommandId = "missing-replacement"), child),
+            valid.nextCreationOrder,
+        )
+        restoreFailure(
+            listOf(parent, child.copy(principalId = "another-principal")),
+            valid.nextCreationOrder,
+        )
+
+        val cyclicParent = parent.copy(reissuedFromCommandId = child.commandId)
+        val cyclicChild = child.copy(
+            state = RelayV2OutboxStateTag.REISSUED,
+            attempts = listOf(
+                RelayV2OutboxAttempt("cycle-execute", RelayV2OutboxAttemptKind.EXECUTE, 1),
+            ),
+            replacementCommandId = parent.commandId,
+            reissuedFromCommandId = parent.commandId,
+        )
+        restoreFailure(listOf(cyclicParent, cyclicChild), valid.nextCreationOrder)
+    }
+
+    @Test
+    fun `create fingerprint bytes exactly match host canonical omission rules`() {
+        val state = enqueue(
+            RelayV2OutboxState.empty(),
+            draft(
+                commandId = "canonical-create",
+                sessionId = null,
+                arguments = RelayV2OutboxArguments.createWorktree(
+                    project = "demo",
+                    aiCommand = "codex",
+                ),
+            ),
+            0,
+        ).state
+        val entry = state.entries.single()
+        val canonical = canonicalRelayV2FingerprintRequest(
+            entry.requestFingerprint.schemaVersion,
+            entry.operation,
+            entry.dedupeWindowId,
+            entry.expectedHostEpoch,
+            entry.hostId,
+            entry.scopeId,
+            entry.sessionId,
+            entry.canonicalRequestArguments,
+        )
+        assertEquals(
+            "{\"arguments\":{\"aiCommand\":\"codex\",\"project\":\"demo\"}," +
+                "\"dedupeWindowId\":\"window-a\",\"hostEpoch\":\"epoch-a\"," +
+                "\"hostId\":\"host-a\",\"operation\":\"create_worktree\"," +
+                "\"schemaVersion\":1,\"scopeId\":\"scope-a\"}",
+            canonical,
+        )
+        assertFalse(canonical.contains("sessionId"))
+        assertEquals(188, entry.requestFingerprint.canonicalRequestByteCount)
+        assertEquals(
+            "deefc813581a3d185c32753e71cc131e9d585a8bcab69d8b30380d44b21b5ce7",
+            entry.requestFingerprint.sha256Hex,
+        )
+    }
+
+    @Test
+    fun `durable aggregate snapshots mutable inputs and redacts recursive string forms`() {
+        val secret = "TOP-SECRET-agent-payload"
+        val draft = draft(
+            commandId = "redacted-command",
+            arguments = RelayV2OutboxArguments.sendAgentMessage(0, secret, true),
+        )
+        val queued = enqueue(RelayV2OutboxState.empty(), draft, 0).state
+        val sent = dispatch(
+            queued,
+            mapOf(queued.entries.single().id to "redacted-execute-attempt"),
+        )
+        val sourceEntry = sent.state.entries.single()
+        val mutableAttempts = sourceEntry.attempts.toMutableList()
+        val mutableEntries = mutableListOf(sourceEntry.copy(attempts = mutableAttempts))
+        val restored = RelayV2OutboxState.restore(
+            mutableEntries,
+            sent.state.nextCreationOrder,
+        )
+        val canonicalBefore = restored.entries.single().canonicalJson
+        val bytesBefore = restored.canonicalByteCount
+
+        mutableAttempts += RelayV2OutboxAttempt(
+            "external-alias-attempt",
+            RelayV2OutboxAttemptKind.EXECUTE,
+            2,
+        )
+        mutableEntries.clear()
+        val exportedBytes = restored.entries.single().canonicalRequestArguments.utf8Bytes()
+        exportedBytes.fill(0)
+
+        assertEquals(1, restored.entries.size)
+        assertEquals(1, restored.entries.single().attempts.size)
+        assertTrue(restored.entries.single().canonicalJson == canonicalBefore)
+        assertEquals(bytesBefore, restored.canonicalByteCount)
+        assertTrue(
+            sourceEntry.canonicalRequestArguments.canonicalJson ==
+                restored.entries.single().canonicalRequestArguments.canonicalJson,
+        )
+
+        val recursiveValues = listOf(
+            draft.arguments,
+            sourceEntry.canonicalRequestArguments,
+            draft,
+            sourceEntry,
+            sent.transaction,
+            sent.transaction.mutations.single(),
+            sent.effects.single(),
+            sent,
+        )
+        recursiveValues.forEach { value ->
+            assertFalse(value.toString().contains(secret))
+            assertFalse(value.toString().contains("\"message\""))
+        }
+
+        val tooManyAttempts = (1..65).map { ordinal ->
+            RelayV2OutboxAttempt(
+                requestId = "oversized-attempt-$ordinal",
+                kind = RelayV2OutboxAttemptKind.EXECUTE,
+                ordinal = ordinal,
+            )
+        }
+        val poisonedCanonical = RelayV2CanonicalRequestArguments(
+            sourceEntry.canonicalRequestArguments.value,
+            "not-canonical",
+        )
+        val earlyAttemptFailure = restoreFailure(
+            listOf(
+                sourceEntry.copy(
+                    canonicalRequestArguments = poisonedCanonical,
+                    attempts = tooManyAttempts,
+                ),
+            ),
+            sent.state.nextCreationOrder,
+        )
+        assertTrue(earlyAttemptFailure.message.orEmpty().contains("too many attempts"))
+
+        val tooManyEntries = MutableList(RelayV2OutboxLimits.MAX_ENTRIES + 1) { sourceEntry }
+        val earlyEntryFailure = restoreFailure(
+            tooManyEntries,
+            (RelayV2OutboxLimits.MAX_ENTRIES + 1).toLong(),
+        )
+        assertTrue(earlyEntryFailure.message.orEmpty().contains("too many Outbox entries"))
+    }
+
+    @Test
     fun `capacity rejection preserves existing rows attempts and atomic reissue decision`() {
         val oneEntryCore = RelayV2OutboxAuthorityCore(
             RelayV2OutboxCapacity(maxEntries = 1),
@@ -957,19 +1294,34 @@ class RelayV2OutboxAuthorityCoreTest {
     private fun acceptedEvidence(
         entry: RelayV2OutboxEntry,
         state: RelayV2CommandStatusState,
-    ) = RelayV2CommandStatusEvidence(
-        entryId = entry.id,
-        dedupeWindowId = entry.dedupeWindowId,
-        hostEpoch = entry.expectedHostEpoch,
-        state = state,
-        attemptRequestId = entry.attempts.lastOrNull()?.requestId,
-    )
+    ): RelayV2CommandStatusEvidence {
+        val attempt = entry.attempts.lastOrNull()
+        val source = when (attempt?.kind) {
+            RelayV2OutboxAttemptKind.EXECUTE -> RelayV2CommandStatusSource.EXECUTE_RESPONSE
+            RelayV2OutboxAttemptKind.QUERY -> RelayV2CommandStatusSource.QUERY_RESPONSE
+            null -> RelayV2CommandStatusSource.RESULT_EVENT
+        }
+        return RelayV2CommandStatusEvidence(
+            entryId = entry.id,
+            dedupeWindowId = entry.dedupeWindowId,
+            hostEpoch = entry.expectedHostEpoch,
+            scopeId = entry.scopeId,
+            sessionId = entry.sessionId,
+            operation = entry.operation,
+            source = source,
+            attemptKind = attempt?.kind,
+            state = state,
+            attemptRequestId = attempt?.requestId,
+        )
+    }
 
     private fun terminalEvidence(
         entry: RelayV2OutboxEntry,
         state: RelayV2CommandStatusState,
     ): RelayV2CommandStatusEvidence = when (state) {
-        RelayV2CommandStatusState.SUCCEEDED -> acceptedEvidence(entry, state)
+        RelayV2CommandStatusState.SUCCEEDED -> acceptedEvidence(entry, state).copy(
+            result = successfulResult(entry),
+        )
         RelayV2CommandStatusState.FAILED -> acceptedEvidence(entry, state).copy(
             errorCode = "COMMAND_FAILED",
             commandDisposition = RelayV2CommandDisposition.COMPLETED,
@@ -988,6 +1340,33 @@ class RelayV2OutboxAuthorityCoreTest {
         )
         else -> acceptedEvidence(entry, state)
     }
+
+    private fun successfulResult(entry: RelayV2OutboxEntry): RelayV2CommandResult =
+        when (entry.operation) {
+            RelayV2OutboxOperation.CREATE_WORKTREE -> RelayV2CommandResult.CreatedSession(
+                sessionId = "created-worktree-session",
+                scopeId = entry.scopeId,
+                kind = RelayV2ResultSessionKind.WORKTREE,
+            )
+            RelayV2OutboxOperation.CREATE_TERMINAL -> RelayV2CommandResult.CreatedSession(
+                sessionId = "created-terminal-session",
+                scopeId = entry.scopeId,
+                kind = RelayV2ResultSessionKind.TERMINAL,
+            )
+            RelayV2OutboxOperation.SEND_AGENT_MESSAGE -> {
+                val arguments = entry.canonicalRequestArguments.value as
+                    RelayV2OutboxArguments.SendAgentMessage
+                RelayV2CommandResult.AgentMessage(
+                    pane = arguments.pane,
+                    submit = arguments.submit,
+                    messageUtf8Bytes = arguments.message.toByteArray(Charsets.UTF_8).size,
+                )
+            }
+            RelayV2OutboxOperation.KILL_SESSION -> RelayV2CommandResult.KilledSession(
+                sessionId = entry.sessionId!!,
+                terminated = true,
+            )
+        }
 
     private fun retryableNotAccepted(entry: RelayV2OutboxEntry) =
         acceptedEvidence(entry, RelayV2CommandStatusState.NOT_ACCEPTED).copy(
@@ -1040,13 +1419,24 @@ class RelayV2OutboxAuthorityCoreTest {
     )
 
     private fun applied(result: RelayV2OutboxResult): RelayV2OutboxResult.Applied {
-        assertTrue("Expected applied result but got $result", result is RelayV2OutboxResult.Applied)
+        assertTrue("Expected applied Outbox result", result is RelayV2OutboxResult.Applied)
         return result as RelayV2OutboxResult.Applied
     }
 
     private fun rejected(result: RelayV2OutboxResult): RelayV2OutboxResult.Rejected {
-        assertTrue("Expected rejected result but got $result", result is RelayV2OutboxResult.Rejected)
+        assertTrue("Expected rejected Outbox result", result is RelayV2OutboxResult.Rejected)
         return result as RelayV2OutboxResult.Rejected
+    }
+
+    private fun restoreFailure(
+        entries: List<RelayV2OutboxEntry>,
+        nextCreationOrder: Long,
+    ): Throwable {
+        val failure = runCatching {
+            RelayV2OutboxState.restore(entries, nextCreationOrder)
+        }.exceptionOrNull()
+        assertTrue("Expected corrupt Outbox restore to fail closed", failure != null)
+        return failure!!
     }
 
     private data class IllegalCase(
