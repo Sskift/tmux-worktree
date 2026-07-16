@@ -10,6 +10,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
+import packageMetadata from "../package.json";
 import { FeishuBridge, type CreateFeishuBindingInput } from "./feishuBridge.js";
 import { FeishuBridgeStore, feishuBridgePaths, type FeishuBridgePaths } from "./feishuBridgeStorage.js";
 import { LarkCliBridgeAdapter, type FeishuEventSubscription, type FeishuLarkAdapter } from "./larkCliBridge.js";
@@ -25,8 +26,14 @@ const PROTOCOL_VERSION = 1;
 const MAX_FRAME_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const INSTANCE_LOCK_STALE_MS = 30_000;
+export const FEISHU_BRIDGE_CAPABILITIES = [
+  "binding.lifecycle-notices.v1",
+  "binding.create.session-summary.v1",
+  "binding.target-reconciliation.v1",
+] as const;
 
 type FeishuBridgeOperation =
+  | "bridge.info"
   | "bridge.snapshot"
   | "bridge.shutdown"
   | "groups.list"
@@ -43,6 +50,12 @@ interface BridgeRequest {
   requestId: string;
   operation: FeishuBridgeOperation;
   params: Record<string, unknown>;
+}
+
+interface FeishuBridgeInfo {
+  daemonVersion: string;
+  larkProfile: string;
+  capabilities: string[];
 }
 
 type BridgeResponse =
@@ -109,7 +122,7 @@ function parseRequest(value: unknown): BridgeRequest {
   }
   text(value.requestId, "requestId");
   const operations: FeishuBridgeOperation[] = [
-    "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
+    "bridge.info", "bridge.snapshot", "bridge.shutdown", "groups.list", "binding.create", "binding.pause", "binding.resume", "binding.repair", "binding.remove",
     "binding.takeover", "binding.return",
   ];
   if (!operations.includes(value.operation as FeishuBridgeOperation)) throw new Error("unknown Feishu bridge operation");
@@ -120,9 +133,13 @@ async function dispatch(
   bridge: FeishuBridge,
   lark: FeishuLarkAdapter,
   request: BridgeRequest,
+  info: FeishuBridgeInfo,
 ): Promise<unknown> {
   const params = request.params;
   switch (request.operation) {
+    case "bridge.info":
+      if (!exactKeys(params, [])) throw new Error("invalid bridge.info params");
+      return structuredClone(info);
     case "bridge.snapshot":
       if (!exactKeys(params, [])) throw new Error("invalid snapshot params");
       return bridge.snapshot();
@@ -139,7 +156,7 @@ async function dispatch(
       return lark.listGroups();
     case "binding.create": {
       if (!exactKeys(params, ["chatId", "chatName", "sessionName", "createdBy"], [
-        "allowedSenderIds", "mentionOnly", "dashboardLease",
+        "sessionSummary", "allowedSenderIds", "mentionOnly", "dashboardLease",
       ])) throw new Error("invalid binding.create params");
       if (params.allowedSenderIds !== undefined
         && (!Array.isArray(params.allowedSenderIds)
@@ -157,6 +174,9 @@ async function dispatch(
         chatName: text(params.chatName, "chatName"),
         sessionName: text(params.sessionName, "sessionName"),
         createdBy: text(params.createdBy, "createdBy"),
+        ...(params.sessionSummary === undefined ? {} : {
+          sessionSummary: text(params.sessionSummary, "sessionSummary"),
+        }),
         ...(params.allowedSenderIds === undefined ? {} : {
           allowedSenderIds: params.allowedSenderIds.map((item) => text(item, "allowedSenderId")),
         }),
@@ -218,6 +238,7 @@ function responseError(requestId: string, error: unknown): BridgeResponse {
 function attachSocket(
   bridge: FeishuBridge,
   lark: FeishuLarkAdapter,
+  info: FeishuBridgeInfo,
   socket: Socket,
   onShutdown: () => void,
 ): void {
@@ -249,7 +270,7 @@ function attachSocket(
             protocolVersion: PROTOCOL_VERSION,
             requestId: request.requestId,
             ok: true,
-            result: await dispatch(bridge, lark, request),
+            result: await dispatch(bridge, lark, request, info),
           };
         } catch (error) {
           response = responseError(requestId, error);
@@ -314,6 +335,7 @@ export class FeishuBridgeServer {
   readonly paths: FeishuBridgePaths;
   readonly bridge: FeishuBridge;
   private readonly lark: FeishuLarkAdapter;
+  private readonly info: FeishuBridgeInfo;
   private readonly server: Server;
   private consumer?: FeishuEventSubscription;
   private pollTimer?: ReturnType<typeof setInterval>;
@@ -327,16 +349,19 @@ export class FeishuBridgeServer {
     paths: FeishuBridgePaths;
     bridge: FeishuBridge;
     lark: FeishuLarkAdapter;
+    info: FeishuBridgeInfo;
   }) {
     this.paths = options.paths;
     this.bridge = options.bridge;
     this.lark = options.lark;
+    this.info = options.info;
     this.stopped = new Promise<void>((resolve) => {
       this.resolveStopped = resolve;
     });
     this.server = createServer((socket) => attachSocket(
       this.bridge,
       this.lark,
+      this.info,
       socket,
       () => { void this.stop(); },
     ));
@@ -351,8 +376,9 @@ export class FeishuBridgeServer {
   } = {}): Promise<FeishuBridgeServer> {
     const paths = options.paths ?? feishuBridgePaths();
     const control = options.control ?? new CanonicalTerminalControlSocketClient();
+    const larkProfile = options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE ?? "";
     const lark = options.lark ?? new LarkCliBridgeAdapter({
-      profile: options.larkProfile ?? process.env.TW_FEISHU_LARK_PROFILE,
+      profile: larkProfile || undefined,
     });
     const bridge = new FeishuBridge({
       control,
@@ -361,7 +387,16 @@ export class FeishuBridgeServer {
       botOpenId: options.botOpenId ?? process.env.TW_FEISHU_BOT_OPEN_ID,
     });
     bridge.initializeAfterRestart();
-    return new FeishuBridgeServer({ paths, bridge, lark });
+    return new FeishuBridgeServer({
+      paths,
+      bridge,
+      lark,
+      info: {
+        daemonVersion: typeof packageMetadata.version === "string" ? packageMetadata.version : "unknown",
+        larkProfile,
+        capabilities: [...FEISHU_BRIDGE_CAPABILITIES],
+      },
+    });
   }
 
   async start(): Promise<void> {
@@ -375,6 +410,7 @@ export class FeishuBridgeServer {
         this.server.listen(this.paths.socket, () => resolve());
       });
       chmodSync(this.paths.socket, 0o600);
+      await this.bridge.reconcileBindingTargets();
       this.pollTimer = setInterval(() => {
         void this.bridge.pollTurns().then(
           () => this.bridge.reconcileHandoffs(),
@@ -384,7 +420,9 @@ export class FeishuBridgeServer {
       }, 500);
       this.pollTimer.unref();
       this.renewTimer = setInterval(() => {
-        void this.bridge.renewLeases().catch((error) => {
+        void this.bridge.renewLeases().then(
+          () => this.bridge.reconcileBindingTargets(),
+        ).catch((error) => {
           process.stderr.write(`[feishu-bridge] lease renewal failed: ${error instanceof Error ? error.message : String(error)}\n`);
         });
       }, 20_000);
@@ -531,6 +569,7 @@ export async function feishuBridgeCmd(args: string[]): Promise<void> {
         chatName: requiredFlag(args, "--chat-name"),
         sessionName: requiredFlag(args, "--session"),
         createdBy: requiredFlag(args, "--created-by"),
+        ...(flag(args, "--summary") ? { sessionSummary: flag(args, "--summary") } : {}),
         ...(args.includes("--no-mention-required") ? { mentionOnly: false } : {}),
         ...(flag(args, "--allow-senders") ? {
           allowedSenderIds: flag(args, "--allow-senders")!.split(",").filter(Boolean),

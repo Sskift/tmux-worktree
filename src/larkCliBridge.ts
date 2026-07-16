@@ -57,6 +57,7 @@ export interface FeishuEventSubscription {
 export interface FeishuLarkAdapter {
   subscribe(onEvent: (event: FeishuInboundEvent) => Promise<void>): FeishuEventSubscription;
   messageDetail(messageId: string): Promise<FeishuMessageDetail>;
+  sendCard(chatId: string, card: FeishuReplyCard, idempotencyKey: string): Promise<FeishuReplyResult>;
   replyCard(messageId: string, card: FeishuReplyCard, idempotencyKey: string): Promise<FeishuReplyResult>;
   addReaction(messageId: string, emojiType: FeishuReactionEmoji): Promise<FeishuReactionResult>;
   deleteReaction(messageId: string, reactionId: string): Promise<void>;
@@ -420,6 +421,23 @@ export class LarkCliBridgeAdapter implements FeishuLarkAdapter {
       "--msg-type", "interactive",
       "--content", JSON.stringify(card),
       "--reply-in-thread",
+      "--idempotency-key", idempotencyKey,
+      "--as", "bot",
+      "--json",
+    ]));
+    return { messageId: findReplyMessageId(raw), raw };
+  }
+
+  async sendCard(
+    chatId: string,
+    card: FeishuReplyCard,
+    idempotencyKey: string,
+  ): Promise<FeishuReplyResult> {
+    const raw = await this.runner(this.commandArgs([
+      "im", "+messages-send",
+      "--chat-id", chatId,
+      "--msg-type", "interactive",
+      "--content", JSON.stringify(card),
       "--idempotency-key", idempotencyKey,
       "--as", "bot",
       "--json",

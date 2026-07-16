@@ -11,6 +11,7 @@
     "closedSchemas": true
   },
   "operations": [
+    "bridge.info",
     "bridge.snapshot",
     "bridge.shutdown",
     "groups.list",
@@ -22,6 +23,22 @@
     "binding.takeover",
     "binding.return"
   ],
+  "capabilityNegotiation": {
+    "operation": "bridge.info",
+    "params": {},
+    "resultFields": [
+      "daemonVersion",
+      "larkProfile",
+      "capabilities"
+    ],
+    "currentCapabilities": [
+      "binding.lifecycle-notices.v1",
+      "binding.create.session-summary.v1",
+      "binding.target-reconciliation.v1"
+    ],
+    "rollingUpgrade": "a Dashboard may reuse a daemon only when the selected larkProfile and required capabilities match; an empty legacy daemon may be shut down and replaced; confirmed stale/pausing removal may migrate a legacy daemon only when it is the daemon's sole binding and no active turn would be disrupted",
+    "legacyCreate": "fail with FEISHU_BRIDGE_UPGRADE_REQUIRED; never send sessionSummary to an old closed binding.create parser"
+  },
   "eventSource": {
     "command": "lark-cli event consume im.message.receive_v1 --as bot --quiet",
     "framing": "ndjson",
@@ -52,6 +69,17 @@
     "idempotencyRequired": true,
     "unknownAcknowledgement": "recovery-required",
     "unterminatedMarker": "never-send"
+  },
+  "bindingLifecycleNotices": {
+    "command": "lark-cli im +messages-send --msg-type interactive --as bot",
+    "format": "Card JSON 2.0 top-level group card",
+    "onCreate": "sent after the exact binding and Feishu lease are durable",
+    "onManualRemove": "sent after a live Feishu lease is released, or authority proves the target is FREE, TARGET_GONE, or held by a controlled local owner, and the binding is durably removed; missing lease plus Feishu/recovery ownership fails closed",
+    "legacyManualRemove": "one-time removal of an active/paused binding through an already-running legacy daemon cannot emit this newer lifecycle card; Dashboard keeps that canonical legacy removal path to avoid interrupting its live authority, and later current-capability operations upgrade the empty daemon",
+    "onTargetGone": "all persisted bindings, including paused and stale bindings, are reconciled by exact controlTargetId; only certain ended/replaced lifecycles are removed and announced",
+    "sameNameRecreation": "never auto-retarget; announce replacement only after the old exact target is proven TARGET_GONE",
+    "uncertainTargetState": "recovery, transport failure, or a new controlTargetId caused only by unknown controller continuity remains fail-closed and is not announced as deletion or replacement",
+    "delivery": "best-effort ordered effect lane with deterministic idempotency; notification latency or failure never blocks lease renewal or rolls back terminal ownership or binding state"
   },
   "reactions": {
     "processing": "Typing",

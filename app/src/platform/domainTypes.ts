@@ -334,6 +334,7 @@ export type FeishuBindingInput = {
   chatId: string;
   chatName: string;
   sessionName: string;
+  sessionSummary?: string;
   createdBy: string;
   allowedSenderIds?: string[];
   mentionOnly?: boolean;

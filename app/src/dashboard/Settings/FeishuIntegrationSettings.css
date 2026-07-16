@@ -142,7 +142,7 @@
 
 .feishu-integration-settings__binding {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto auto;
   align-items: center;
   gap: 8px;
   min-height: 34px;
@@ -186,6 +186,11 @@
 
 .feishu-integration-settings__binding-status--stale {
   color: var(--shell-danger, #ff6b6b);
+}
+
+.feishu-integration-settings__binding-unlink {
+  min-height: 26px;
+  padding: 3px 8px;
 }
 
 .feishu-integration-settings__primary:not(:disabled) {
@@ -248,7 +253,7 @@
   }
 
   .feishu-integration-settings__binding {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto auto;
   }
 
   .feishu-integration-settings__binding-arrow {

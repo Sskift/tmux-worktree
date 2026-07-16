@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdtempSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -11,10 +13,14 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 
 const terminalControl = await import("../dist/terminalControl/index.js");
 const contractRoot = new URL("../contracts/terminal-control/v1/", import.meta.url);
+const isolatedTmuxWrapperRoot = mkdtempSync(join(tmpdir(), "tw-terminal-control-tmux-wrapper-"));
+const isolatedTmuxWrapper = join(isolatedTmuxWrapperRoot, "isolated-tmux");
+
+after(() => rmSync(isolatedTmuxWrapperRoot, { recursive: true, force: true }));
 
 function tempState() {
   const root = mkdtempSync(join(tmpdir(), "tw-terminal-control-"));
@@ -33,6 +39,166 @@ function deferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function regularFileBytes(root) {
+  if (!existsSync(root)) return 0;
+  let total = 0;
+  for (const entry of readdirSync(root, { withFileTypes: true })) {
+    const path = join(root, entry.name);
+    if (entry.isDirectory()) total += regularFileBytes(path);
+    else if (entry.isFile()) total += statSync(path).size;
+  }
+  return total;
+}
+
+function shellSingleQuote(value) {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function installFullLegacyCapture(harness, controlTargetId, outputGeneration, bytes) {
+  const targetDirectory = join(harness.outputRoot, sha256Hex(controlTargetId));
+  mkdirSync(targetDirectory, { recursive: true, mode: 0o700 });
+  writeFileSync(
+    join(targetDirectory, `${sha256Hex(outputGeneration)}.bin`),
+    Buffer.alloc(bytes, 0x78),
+    { mode: 0o600 },
+  );
+  const configured = spawnSync(
+    harness.wrapper,
+    ["set-option", "-t", harness.sessionName, "@tw_terminal_control_output_generation_v1", outputGeneration],
+    { encoding: "utf8" },
+  );
+  assert.equal(configured.status, 0, configured.stderr);
+  return targetDirectory;
+}
+
+async function persistedLegacyRecovery(harness, previousOwnerKind) {
+  const legacyBytes = 8 * 1024 * 1024;
+  const controlTargetId = randomUUID();
+  const outputGeneration = `legacy-recovery-${sha256Hex(harness.sessionName).slice(0, 16)}`;
+  const backend = new terminalControl.TmuxTerminalControlBackend();
+  const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
+  const state = terminalControl.emptyTerminalControlState();
+  state.targets.push({
+    controlTargetId,
+    lifecycle: "RECOVERY_REQUIRED",
+    managedSession: {
+      name: harness.sessionName,
+      kind: "terminal",
+      createdAt: harness.createdAt,
+    },
+    backend: {
+      kind: "tmux",
+      tmuxInstanceId: resolvedBackend.tmuxInstanceId,
+    },
+    outputGeneration,
+    ownership: { state: "FREE", fence: "7" },
+    revision: "2",
+    recovery: {
+      reason: "OUTPUT_CONTINUITY_UNCERTAIN",
+      since: harness.createdAt,
+      previousControlEpoch: "legacy-controller-epoch",
+      ...(previousOwnerKind === undefined ? {} : { previousOwnerKind }),
+    },
+    completedOperations: [],
+    updatedAt: harness.createdAt,
+  });
+  terminalControl.saveTerminalControlState(state, harness.temp.path);
+  const targetDirectory = installFullLegacyCapture(
+    harness,
+    controlTargetId,
+    outputGeneration,
+    legacyBytes,
+  );
+  return {
+    legacyBytes,
+    controlTargetId,
+    outputGeneration,
+    targetDirectory,
+    authority: new terminalControl.TerminalControlAuthority({
+      statePath: harness.temp.path,
+      backend,
+    }),
+  };
+}
+
+function isolatedManagedTmux(t, sessionName) {
+  const probe = spawnSync("tmux", ["-V"], { encoding: "utf8" });
+  if (probe.status !== 0) {
+    t.skip("tmux is unavailable");
+    return undefined;
+  }
+  const temp = tempState();
+  const home = join(temp.root, "home");
+  const twHome = join(home, ".tmux-worktree");
+  const outputRoot = join(twHome, "terminal-control-output-v1");
+  const wrapper = isolatedTmuxWrapper;
+  const socketName = `tw-terminal-control-ring-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const previous = {
+    HOME: process.env.HOME,
+    TW_TMUX: process.env.TW_TMUX,
+    TW_TERMINAL_CONTROL_OUTPUT_DIR: process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR,
+  };
+  mkdirSync(twHome, { recursive: true, mode: 0o700 });
+  writeFileSync(wrapper, `#!/bin/sh\nexec tmux -L ${socketName} -f /dev/null "$@"\n`, { mode: 0o700 });
+  process.env.HOME = home;
+  process.env.TW_TMUX = wrapper;
+  process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = outputRoot;
+  const createdAt = "2026-07-13T00:00:00.000Z";
+  const created = spawnSync(wrapper, ["new-session", "-d", "-s", sessionName, "-c", temp.root], {
+    encoding: "utf8",
+  });
+  if (created.status !== 0) {
+    restore();
+    temp.cleanup();
+    throw new Error(created.stderr || `could not create isolated tmux session: ${sessionName}`);
+  }
+  writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
+    version: 1,
+    sessions: [{
+      name: sessionName,
+      kind: "terminal",
+      profile: "dashboard",
+      cwd: temp.root,
+      createdAt,
+    }],
+  })}\n`, { mode: 0o600 });
+
+  function restore() {
+    if (previous.HOME === undefined) delete process.env.HOME;
+    else process.env.HOME = previous.HOME;
+    if (previous.TW_TMUX === undefined) delete process.env.TW_TMUX;
+    else process.env.TW_TMUX = previous.TW_TMUX;
+    if (previous.TW_TERMINAL_CONTROL_OUTPUT_DIR === undefined) delete process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR;
+    else process.env.TW_TERMINAL_CONTROL_OUTPUT_DIR = previous.TW_TERMINAL_CONTROL_OUTPUT_DIR;
+  }
+
+  return {
+    temp,
+    twHome,
+    outputRoot,
+    wrapper,
+    sessionName,
+    createdAt,
+    async cleanup() {
+      spawnSync(wrapper, ["kill-server"], { encoding: "utf8" });
+      restore();
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        try {
+          temp.cleanup();
+          return;
+        } catch (error) {
+          if (attempt === 19 || error.code !== "ENOTEMPTY") throw error;
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+      }
+    },
+  };
 }
 
 class FakeBackend {
@@ -1243,6 +1409,378 @@ test("an uncertain drain persists recovery and never transfers through FREE", as
   }
 });
 
+test("production backend fails closed when managed state has duplicate session identities", async () => {
+  const temp = tempState();
+  const home = join(temp.root, "home");
+  const twHome = join(home, ".tmux-worktree");
+  const previousHome = process.env.HOME;
+  mkdirSync(twHome, { recursive: true, mode: 0o700 });
+  writeFileSync(join(twHome, "state.json"), `${JSON.stringify({
+    version: 1,
+    sessions: [
+      {
+        name: "duplicate",
+        kind: "terminal",
+        profile: "dashboard",
+        cwd: temp.root,
+        createdAt: "2026-07-13T00:00:00.000Z",
+      },
+      {
+        name: "duplicate",
+        kind: "worktree",
+        profile: "cli",
+        project: "project",
+        repoPath: temp.root,
+        worktreePath: join(temp.root, "worktree"),
+        branch: "duplicate",
+        baseBranch: "master",
+        createdAt: "2026-07-14T00:00:00.000Z",
+      },
+    ],
+  })}\n`, { mode: 0o600 });
+  process.env.HOME = home;
+  try {
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    await assert.rejects(
+      backend.resolveManagedSession("duplicate"),
+      (error) => error.code === "RECOVERY_REQUIRED" && /ambiguous session identity/.test(error.message),
+    );
+  } finally {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    temp.cleanup();
+  }
+});
+
+test("production backend resumes a full legacy capture without explicit recovery", async (t) => {
+  const harness = isolatedManagedTmux(t, "legacy-capture");
+  if (!harness) return;
+  const legacyBytes = 8 * 1024 * 1024;
+  const controlTargetId = randomUUID();
+  const outputGeneration = "legacy-output-generation-1";
+  try {
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    const resolvedBackend = await backend.resolveManagedSession(harness.sessionName);
+    const state = terminalControl.emptyTerminalControlState();
+    state.targets.push({
+      controlTargetId,
+      lifecycle: "ACTIVE",
+      managedSession: {
+        name: harness.sessionName,
+        kind: "terminal",
+        createdAt: harness.createdAt,
+      },
+      backend: {
+        kind: "tmux",
+        tmuxInstanceId: resolvedBackend.tmuxInstanceId,
+      },
+      outputGeneration,
+      ownership: { state: "FREE", fence: "0" },
+      revision: "1",
+      completedOperations: [],
+      updatedAt: harness.createdAt,
+    });
+    terminalControl.saveTerminalControlState(state, harness.temp.path);
+
+    const targetDirectory = installFullLegacyCapture(
+      harness,
+      controlTargetId,
+      outputGeneration,
+      legacyBytes,
+    );
+
+    const authority = new terminalControl.TerminalControlAuthority({
+      statePath: harness.temp.path,
+      backend,
+    });
+    const opened = await authority.handle({
+      protocolVersion: 1,
+      requestId: "legacy-open",
+      type: "ownership.status",
+      controlTargetId,
+    });
+    assert.equal(opened.state, "FREE");
+    assert.notEqual(opened.outputGeneration, outputGeneration);
+    assert.equal(opened.outputCursor, 0);
+    const currentGeneration = opened.outputGeneration;
+
+    const dashboard = await acquired(
+      authority,
+      controlTargetId,
+      owner("dashboard", "legacy-open:pty-1"),
+    );
+    const marker = "TW_LEGACY_CAPTURE_CONTINUED";
+    const accepted = await authority.handle({
+      protocolVersion: 1,
+      requestId: "legacy-continue-input",
+      type: "input.agent-message",
+      lease: dashboard.lease,
+      operationId: "legacy-continue-input",
+      pane: "0",
+      message: `printf '${marker}\\n'`,
+      submit: true,
+    });
+    assert.equal(accepted.outputGeneration, currentGeneration);
+    let cursor = accepted.outputCursor;
+    let observed = "";
+    const deadline = Date.now() + 3_000;
+    while (!observed.includes(marker) && Date.now() < deadline) {
+      const chunk = await authority.handle({
+        protocolVersion: 1,
+        requestId: `legacy-continue-tail-${cursor}`,
+        type: "output.tail",
+        controlTargetId,
+        controlEpoch: accepted.controlEpoch,
+        outputGeneration: currentGeneration,
+        cursor,
+        maxBytes: 4096,
+      });
+      cursor = chunk.nextCursor;
+      observed += Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+      if (!chunk.dataBase64) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.match(observed, new RegExp(marker));
+    const healthy = await authority.handle({
+      protocolVersion: 1,
+      requestId: "legacy-open-health",
+      type: "ownership.status",
+      controlTargetId,
+    });
+    assert.equal(healthy.state, "HELD");
+    assert.equal(healthy.outputGeneration, currentGeneration);
+    assert.ok(regularFileBytes(targetDirectory) < legacyBytes / 2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("production backend auto-recovers a persisted full legacy capture with no previous owner", async (t) => {
+  const harness = isolatedManagedTmux(t, "legacy-ownerless-recovery");
+  if (!harness) return;
+  try {
+    const recovery = await persistedLegacyRecovery(harness, undefined);
+    const opened = await recovery.authority.handle({
+      protocolVersion: 1,
+      requestId: "legacy-ownerless-recovery-open",
+      type: "ownership.status",
+      controlTargetId: recovery.controlTargetId,
+    });
+    assert.equal(opened.state, "FREE");
+    assert.notEqual(opened.outputGeneration, recovery.outputGeneration);
+    assert.equal(opened.outputCursor, 0);
+    const persisted = terminalControl.loadTerminalControlState(harness.temp.path).targets[0];
+    assert.equal(persisted.lifecycle, "ACTIVE");
+    assert.equal(persisted.recovery, undefined);
+    assert.equal(persisted.outputGeneration, opened.outputGeneration);
+    assert.ok(regularFileBytes(recovery.targetDirectory) < recovery.legacyBytes / 2);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("production backend keeps a full legacy capture with a previous Feishu owner in recovery", async (t) => {
+  const harness = isolatedManagedTmux(t, "legacy-feishu-recovery");
+  if (!harness) return;
+  try {
+    const recovery = await persistedLegacyRecovery(harness, "feishu");
+    const opened = await recovery.authority.handle({
+      protocolVersion: 1,
+      requestId: "legacy-feishu-recovery-open",
+      type: "ownership.status",
+      controlTargetId: recovery.controlTargetId,
+    });
+    assert.equal(opened.state, "RECOVERY_REQUIRED");
+    assert.equal(opened.ownerKind, "feishu");
+    assert.equal(opened.outputGeneration, recovery.outputGeneration);
+    assert.equal(opened.outputCursor, 0);
+    const persisted = terminalControl.loadTerminalControlState(harness.temp.path).targets[0];
+    assert.equal(persisted.lifecycle, "RECOVERY_REQUIRED");
+    assert.equal(persisted.recovery.previousOwnerKind, "feishu");
+    assert.equal(persisted.outputGeneration, recovery.outputGeneration);
+    assert.equal(regularFileBytes(recovery.targetDirectory), recovery.legacyBytes);
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("production backend fails closed when a held capture pipe disappears", async (t) => {
+  const harness = isolatedManagedTmux(t, "missing-held-capture");
+  if (!harness) return;
+  try {
+    const authority = new terminalControl.TerminalControlAuthority({
+      statePath: harness.temp.path,
+      backend: new terminalControl.TmuxTerminalControlBackend(),
+    });
+    const target = await resolved(authority, harness.sessionName);
+    const feishu = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("feishu", "missing-capture:binding-1"),
+    );
+    const generation = feishu.ownership.outputGeneration;
+    const cursor = feishu.ownership.outputCursor;
+    const activePipe = spawnSync(
+      harness.wrapper,
+      ["display-message", "-p", "-t", harness.sessionName, "#{pane_pipe}"],
+      { encoding: "utf8" },
+    );
+    assert.equal(activePipe.stdout.trim(), "1");
+    const detached = spawnSync(
+      harness.wrapper,
+      ["pipe-pane", "-t", harness.sessionName],
+      { encoding: "utf8" },
+    );
+    assert.equal(detached.status, 0, detached.stderr);
+    const uncaptured = spawnSync(
+      harness.wrapper,
+      ["send-keys", "-t", harness.sessionName, "printf 'uncaptured-gap\\n'", "C-m"],
+      { encoding: "utf8" },
+    );
+    assert.equal(uncaptured.status, 0, uncaptured.stderr);
+
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "missing-held-capture-status",
+        type: "ownership.status",
+        controlTargetId: target.controlTargetId,
+      }),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+    const persisted = terminalControl.loadTerminalControlState(harness.temp.path).targets[0];
+    assert.equal(persisted.lifecycle, "RECOVERY_REQUIRED");
+    assert.equal(persisted.recovery.reason, "OUTPUT_CONTINUITY_UNCERTAIN");
+    const recovery = await authority.handle({
+      protocolVersion: 1,
+      requestId: "missing-held-capture-recovery-view",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(recovery.state, "RECOVERY_REQUIRED");
+    assert.equal(recovery.ownerKind, "feishu");
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "missing-held-capture-tail",
+        type: "output.tail",
+        controlTargetId: target.controlTargetId,
+        controlEpoch: target.controlEpoch,
+        outputGeneration: generation,
+        cursor,
+        maxBytes: 4096,
+      }),
+      (error) => error.code === "RECOVERY_REQUIRED",
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
+test("production capture rolls over with an absolute cursor and garbage-collects old generations", async (t) => {
+  const harness = isolatedManagedTmux(t, "rolling-capture");
+  if (!harness) return;
+  const retainedLimit = 8 * 1024 * 1024;
+  const emittedBytes = 9 * 1024 * 1024;
+  try {
+    const backend = new terminalControl.TmuxTerminalControlBackend();
+    const authority = new terminalControl.TerminalControlAuthority({
+      statePath: harness.temp.path,
+      backend,
+    });
+    const target = await resolved(authority, harness.sessionName);
+    const feishu = await acquired(
+      authority,
+      target.controlTargetId,
+      owner("feishu", "ring:binding-1"),
+    );
+    const marker = "TW_RING_CAPTURE_TAIL";
+    const script = `process.stdout.write("x".repeat(${emittedBytes}));process.stdout.write("\\n${marker}\\n")`;
+    const accepted = await authority.handle({
+      protocolVersion: 1,
+      requestId: "ring-output-input",
+      type: "input.agent-message",
+      lease: feishu.lease,
+      operationId: "ring-output-input",
+      pane: "0",
+      message: `${shellSingleQuote(process.execPath)} -e ${shellSingleQuote(script)}`,
+      submit: true,
+    });
+    const originalGeneration = accepted.outputGeneration;
+    const originalCursor = accepted.outputCursor;
+    let healthy;
+    let tail = "";
+    const deadline = Date.now() + 10_000;
+    while (!tail.includes(marker) && Date.now() < deadline) {
+      healthy = await authority.handle({
+        protocolVersion: 1,
+        requestId: `ring-health-${Date.now()}`,
+        type: "ownership.status",
+        controlTargetId: target.controlTargetId,
+      });
+      assert.equal(healthy.state, "HELD");
+      assert.equal(healthy.outputGeneration, originalGeneration);
+      const cursor = Math.max(originalCursor, healthy.outputCursor - 4096);
+      const chunk = await authority.handle({
+        protocolVersion: 1,
+        requestId: `ring-tail-${healthy.outputCursor}`,
+        type: "output.tail",
+        controlTargetId: target.controlTargetId,
+        controlEpoch: accepted.controlEpoch,
+        outputGeneration: originalGeneration,
+        cursor,
+        maxBytes: 4096,
+      });
+      tail = Buffer.from(chunk.dataBase64, "base64").toString("utf8");
+      if (!tail.includes(marker)) await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    assert.ok(healthy.outputCursor >= originalCursor + emittedBytes, String(healthy.outputCursor));
+    assert.equal(healthy.outputGeneration, originalGeneration);
+    assert.match(tail, new RegExp(marker));
+
+    await assert.rejects(
+      authority.handle({
+        protocolVersion: 1,
+        requestId: "ring-stale-retained-cursor",
+        type: "output.tail",
+        controlTargetId: target.controlTargetId,
+        controlEpoch: accepted.controlEpoch,
+        outputGeneration: originalGeneration,
+        cursor: originalCursor,
+        maxBytes: 4096,
+      }),
+      (error) => error.code === "STALE_OUTPUT_CURSOR",
+    );
+    const afterStale = await authority.handle({
+      protocolVersion: 1,
+      requestId: "ring-health-after-stale",
+      type: "ownership.status",
+      controlTargetId: target.controlTargetId,
+    });
+    assert.equal(afterStale.state, "HELD");
+    assert.equal(afterStale.outputGeneration, originalGeneration);
+
+    const targetDirectory = join(harness.outputRoot, sha256Hex(target.controlTargetId));
+    const retainedBytes = regularFileBytes(targetDirectory);
+    assert.ok(retainedBytes <= retainedLimit, `${retainedBytes} capture bytes remain`);
+
+    const released = await authority.handle({
+      protocolVersion: 1,
+      requestId: "ring-release",
+      type: "lease.release",
+      lease: feishu.lease,
+    });
+    assert.equal(released.state, "FREE");
+    assert.notEqual(released.outputGeneration, originalGeneration);
+    const afterGenerationReset = regularFileBytes(targetDirectory);
+    assert.ok(
+      afterGenerationReset < retainedBytes / 2,
+      `${afterGenerationReset} bytes remain after replacing ${retainedBytes} bytes of the old generation`,
+    );
+  } finally {
+    await harness.cleanup();
+  }
+});
+
 test("production tmux backend captures bounded correlated output on an isolated server", async (t) => {
   const probe = spawnSync("tmux", ["-V"], { encoding: "utf8" });
   if (probe.status !== 0) {
@@ -1252,7 +1790,7 @@ test("production tmux backend captures bounded correlated output on an isolated 
   const temp = tempState();
   const home = join(temp.root, "home");
   const twHome = join(home, ".tmux-worktree");
-  const wrapper = join(temp.root, "isolated-tmux");
+  const wrapper = isolatedTmuxWrapper;
   const socketName = `tw-terminal-control-test-${process.pid}-${Date.now()}`;
   const previous = {
     HOME: process.env.HOME,

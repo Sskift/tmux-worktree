@@ -26,7 +26,10 @@
     "input.scroll is the lease-fenced semantic tmux history path; controlled adapters MUST NOT send terminal mouse escape bytes directly to a pane.",
     "Feishu is the only exclusive owner class. Dashboard, Relay, controlled CLI, and tw-serve producers share one interactive lease and fence; an interactive release detaches only that producer, never fences remaining interactive writers, and returns the target to FREE when the last registered producer releases cleanly.",
     "Leases are liveness-bounded and must be renewed. An idle expired/restarted non-Feishu HELD lease is fenced, exact-target checked, output-capture reset, and safely abandoned to FREE; Feishu, DRAINING, and accepted/in-doubt operations remain RECOVERY_REQUIRED.",
-    "output.tail is a read-only observation capability. Its controlEpoch and outputGeneration fence late Feishu markers without granting input ownership.",
+    "output.tail is a read-only Feishu marker-correlation capability, not visible PTY output or tmux scrollback. Its controlEpoch and outputGeneration fence late markers without granting input ownership.",
+    "Within one outputGeneration, the capture uses two bounded 4 MiB segments and exposes a monotonically increasing absolute byte cursor while retaining approximately the newest 4-8 MiB. A cursor older than the retained base returns STALE_OUTPUT_CURSOR without changing target lifecycle or input ownership.",
+    "A Feishu marker consumer may resume a retention-stale cursor from the guaranteed 4 MiB retained window only after reproving the same lease, fence, controlEpoch, and outputGeneration; it must rebuild parser state without replaying input. Any authority change remains fail closed.",
+    "Old outputGeneration artifacts are garbage-collected only after the generation fence. A legacy output-only OUTPUT_CONTINUITY_UNCERTAIN state follows the existing idle non-Feishu repair rule: the exact backend must be current, ownership FREE, no operation or handoff uncertain, and the previous owner must not be Feishu; every other continuity uncertainty remains fail closed.",
     "handoff.commit is the durable transfer point and requires a persisted drain disposition."
   ]
 }

@@ -11,7 +11,11 @@ import {
 import { Terminal } from "../Terminal";
 import { MenuSelect } from "../MenuSelect";
 import type { Selection } from "./model/selection";
-import { terminalRawName, terminalSessionKey } from "./model/terminalIdentity";
+import {
+  sessionDisplayName,
+  terminalRawName,
+  terminalSessionKey,
+} from "./model/terminalIdentity";
 import { buildSshAttachArgs } from "../terminal/attach";
 
 export {
@@ -69,7 +73,11 @@ export function TerminalDeck({
   const [feishuSnapshot, setFeishuSnapshot] = useState<FeishuBridgeSnapshot | null>(null);
   const [feishuError, setFeishuError] = useState<string | null>(null);
   const [feishuBusy, setFeishuBusy] = useState(false);
-  const [bindingTarget, setBindingTarget] = useState<{ sessionName: string; ptyId: string } | null>(null);
+  const [bindingTarget, setBindingTarget] = useState<{
+    sessionName: string;
+    sessionSummary: string;
+    ptyId: string;
+  } | null>(null);
   const [groups, setGroups] = useState<FeishuChat[]>([]);
   const [groupsLoading, setGroupsLoading] = useState(false);
   const [groupsError, setGroupsError] = useState<string | null>(null);
@@ -135,8 +143,8 @@ export function TerminalDeck({
     }
   };
 
-  const openBinding = (sessionName: string, ptyId: string) => {
-    setBindingTarget({ sessionName, ptyId });
+  const openBinding = (sessionName: string, ptyId: string, sessionSummary: string) => {
+    setBindingTarget({ sessionName, ptyId, sessionSummary: sessionSummary.slice(0, 256) });
     setChatId("");
     setChatName("");
     setFeishuError(null);
@@ -156,6 +164,7 @@ export function TerminalDeck({
     sessionName: string,
     managed: boolean,
     ptyId?: string,
+    sessionSummary = sessionName,
   ) => {
     if (!managed) return null;
     const binding = bindingFor(sessionName);
@@ -178,7 +187,7 @@ export function TerminalDeck({
             <button
               type="button"
               disabled={feishuBusy || !ptyId}
-              onClick={() => ptyId && openBinding(sessionName, ptyId)}
+              onClick={() => ptyId && openBinding(sessionName, ptyId, sessionSummary)}
             >
               Link group
             </button>
@@ -310,7 +319,14 @@ export function TerminalDeck({
                 initialHistory={tmuxPreviews[name]}
                 onOpenFile={onOpenFile}
               />
-              {!isRemote && lockOverlay(rawName, controlled, ptyId)}
+              {!isRemote && lockOverlay(
+                rawName,
+                controlled,
+                ptyId,
+                session.project
+                  ? `${session.project} · ${sessionDisplayName(session)}`
+                  : sessionDisplayName(session),
+              )}
             </div>
           );
         })}
@@ -363,7 +379,7 @@ export function TerminalDeck({
                 initialHistory={tmuxPreviews[sessionKey]}
                 onOpenFile={onOpenFile}
               />
-              {!terminal.hostId && lockOverlay(rawName, controlled, ptyId)}
+              {!terminal.hostId && lockOverlay(rawName, controlled, ptyId, terminal.label)}
             </div>
           );
         })}
@@ -423,18 +439,32 @@ export function TerminalDeck({
                 Group name
                 <input value={chatName} onChange={(event) => setChatName(event.target.value)} />
               </label>
+              <label>
+                Session summary shown to the group
+                <input
+                  value={bindingTarget.sessionSummary}
+                  maxLength={256}
+                  onChange={(event) => setBindingTarget((current) => current
+                    ? { ...current, sessionSummary: event.target.value }
+                    : current)}
+                />
+              </label>
               {feishuError && <p className="terminal-feishu-dialog__error">{feishuError}</p>}
               <div className="terminal-feishu-dialog__actions">
                 <button type="button" disabled={feishuBusy} onClick={() => setBindingTarget(null)}>Cancel</button>
                 <button
                   type="button"
-                  disabled={feishuBusy || !chatId.trim() || !chatName.trim()}
+                  disabled={feishuBusy
+                    || !chatId.trim()
+                    || !chatName.trim()
+                    || !bindingTarget.sessionSummary.trim()}
                   onClick={() => void runFeishuAction(async () => {
                     const groupOwner = groups.find((group) => group.chatId === chatId.trim())?.ownerId?.trim();
                     await dashboardBackend.feishu.create({
                       chatId: chatId.trim(),
                       chatName: chatName.trim(),
                       sessionName: bindingTarget.sessionName,
+                      sessionSummary: bindingTarget.sessionSummary.trim(),
                       attachmentId: bindingTarget.ptyId,
                       createdBy: groupOwner || "local-dashboard",
                       allowedSenderIds: [],

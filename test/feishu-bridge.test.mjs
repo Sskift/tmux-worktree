@@ -13,6 +13,7 @@ const {
 } = await import("../dist/feishuBridgeStorage.js");
 const { FeishuBridgeClient, FeishuBridgeServer } = await import("../dist/feishuBridgeServer.js");
 const {
+  CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   CanonicalTerminalControlSocketClient,
   canonicalTerminalControlSocketPath,
 } = await import("../dist/canonicalTerminalControlClient.js");
@@ -25,8 +26,12 @@ const {
   parseFeishuMessageDetail,
   parseFeishuReactionId,
 } = await import("../dist/larkCliBridge.js");
-const { buildFeishuReplyCard } = await import("../dist/feishuReplyCard.js");
+const {
+  buildFeishuBindingLifecycleCard,
+  buildFeishuReplyCard,
+} = await import("../dist/feishuReplyCard.js");
 const terminalControl = await import("../dist/terminalControl/index.js");
+const packageVersion = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).version;
 
 class JointTerminalBackend {
   constructor() {
@@ -120,6 +125,8 @@ class FakeControlClient {
     this.tailFence = undefined;
     this.tailOwnerKind = undefined;
     this.tailChunkBytes = undefined;
+    this.retainedFloor = 0;
+    this.beforeRetainedStale = undefined;
     this.beforeInput = undefined;
     this.beforeCommit = undefined;
     this.failInputAfterCommit = false;
@@ -407,6 +414,12 @@ class FakeControlClient {
       error.code = "STALE_OUTPUT_CURSOR";
       throw error;
     }
+    if (input.cursor < this.retainedFloor) {
+      await this.beforeRetainedStale?.(input);
+      const error = new Error("output cursor precedes the retained window");
+      error.code = "STALE_OUTPUT_CURSOR";
+      throw error;
+    }
     const source = Buffer.from(this.output, "utf8");
     const maxBytes = Math.min(input.maxBytes, this.tailChunkBytes ?? input.maxBytes);
     const data = source.subarray(input.cursor, input.cursor + maxBytes);
@@ -427,13 +440,16 @@ class FakeLark {
   constructor() {
     this.details = new Map();
     this.replies = [];
+    this.groupCards = [];
     this.reactionCreates = [];
     this.reactionDeletes = [];
     this.failReply = false;
+    this.failGroupCard = false;
     this.failReactionCreateAcknowledgement = false;
     this.omitReactionId = false;
     this.failReactionDelete = false;
     this.reactionCreateBarrier = undefined;
+    this.beforeGroupCard = undefined;
   }
 
   subscribe() {
@@ -454,6 +470,14 @@ class FakeLark {
     this.replies.push({ messageId, text, card, idempotencyKey });
     if (this.failReply) throw new Error("reply acknowledgement lost");
     return { messageId: `reply-${this.replies.length}`, raw: {} };
+  }
+
+  async sendCard(chatId, card, idempotencyKey) {
+    const sent = { chatId, card, idempotencyKey };
+    this.groupCards.push(sent);
+    await this.beforeGroupCard?.(sent);
+    if (this.failGroupCard) throw new Error("group card acknowledgement lost");
+    return { messageId: `group-card-${this.groupCards.length}`, raw: {} };
   }
 
   async addReaction(messageId, emojiType) {
@@ -519,6 +543,32 @@ function marked(h, text) {
   const turn = currentTurn(h);
   const markers = feishuTurnMarkers(turn.markerNonce);
   return `${markers.open}${text}${markers.close}`;
+}
+
+function installRetainedMarkedOutput(h, text) {
+  const droppedBytes = 257;
+  const payload = marked(h, text);
+  const fillerBytes = CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES
+    - Buffer.byteLength(payload, "utf8");
+  assert.ok(fillerBytes > 0);
+  h.control.output = `${"d".repeat(droppedBytes)}${payload}${"r".repeat(fillerBytes)}`;
+  h.control.retainedFloor = droppedBytes;
+  assert.equal(
+    Buffer.byteLength(h.control.output, "utf8")
+      - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+    droppedBytes,
+  );
+  return droppedBytes;
+}
+
+function cardText(value) {
+  if (Array.isArray(value)) return value.map(cardText).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return typeof value === "string" ? value : "";
+  return Object.values(value).map(cardText).filter(Boolean).join("\n");
+}
+
+async function flushBestEffortEffects() {
+  await new Promise((resolve) => setImmediate(resolve));
 }
 
 test("canonical socket path matches Relay long-HOME fallback semantics", () => {
@@ -829,10 +879,11 @@ test("Lark CLI bridge collects every bot group page and keeps the group owner", 
   );
 });
 
-test("Lark CLI bridge sends validated Card JSON in-thread and manages bot reactions", async () => {
+test("Lark CLI bridge sends Card JSON to a group or source thread and manages bot reactions", async () => {
   const calls = [];
   const responses = [
     { data: { message_id: "om-card-reply" } },
+    { data: { message_id: "om-group-card" } },
     { data: { reaction_id: "reaction-typing" } },
     { data: { reaction_id: "reaction-typing" } },
   ];
@@ -846,6 +897,7 @@ test("Lark CLI bridge sends validated Card JSON in-thread and manages bot reacti
   const card = buildFeishuReplyCard("answer <at id=\"ou-surprise\"></at>");
 
   assert.equal((await adapter.replyCard("om-root", card, "tw-card-one")).messageId, "om-card-reply");
+  assert.equal((await adapter.sendCard("oc-one", card, "tw-card-two")).messageId, "om-group-card");
   assert.equal((await adapter.addReaction("om-root", "Typing")).reactionId, "reaction-typing");
   await adapter.deleteReaction("om-root", "reaction-typing");
 
@@ -863,12 +915,21 @@ test("Lark CLI bridge sends validated Card JSON in-thread and manages bot reacti
   assert.equal(card.config.streaming_mode, false);
   assert.equal(card.body.elements[0].content.includes("<at"), false, "card output must not create a real mention");
   assert.deepEqual(calls[1], [
+    "--profile", "bot", "im", "+messages-send",
+    "--chat-id", "oc-one",
+    "--msg-type", "interactive",
+    "--content", JSON.stringify(card),
+    "--idempotency-key", "tw-card-two",
+    "--as", "bot",
+    "--json",
+  ]);
+  assert.deepEqual(calls[2], [
     "--profile", "bot", "im", "reactions", "create",
     "--params", JSON.stringify({ message_id: "om-root" }),
     "--data", JSON.stringify({ reaction_type: { emoji_type: "Typing" } }),
     "--as", "bot", "--json",
   ]);
-  assert.deepEqual(calls[2], [
+  assert.deepEqual(calls[3], [
     "--profile", "bot", "im", "reactions", "delete",
     "--params", JSON.stringify({ message_id: "om-root", reaction_id: "reaction-typing" }),
     "--as", "bot", "--json",
@@ -899,6 +960,94 @@ test("Feishu event and message detail parsers keep the verified routing fields",
     reply: "public answer",
     complete: true,
   });
+});
+
+test("binding lifecycle cards keep dynamic session details in plain-text components", () => {
+  const card = buildFeishuBindingLifecycleCard({
+    kind: "linked",
+    sessionName: "managed-<at id='all'>",
+    sessionKind: "worktree",
+    sessionSummary: "release inspection <at id='all'>",
+    controlTargetId: "target-lifecycle-one",
+  });
+  assert.equal(card.schema, "2.0");
+  assert.equal(card.header.template, "green");
+  assert.match(cardText(card), /release inspection <at id='all'>/);
+  const dynamicTextNodes = card.body.elements
+    .filter((element) => element.tag === "div")
+    .flatMap((element) => [element.text, ...(element.fields ?? []).map((field) => field.text)]);
+  assert.ok(dynamicTextNodes.every((text) => text.tag === "plain_text"));
+});
+
+test("binding creation and manual unlink announce the committed lifecycle to the group", async () => {
+  const h = harness();
+  try {
+    const observedBindingCounts = [];
+    h.lark.beforeGroupCard = ({ card }) => {
+      if (card.header.template === "green" || card.header.template === "grey") {
+        observedBindingCounts.push(h.store.read().bindings.length);
+      }
+    };
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "tmux-worktree release verification",
+      createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].chatId, "oc-one");
+    assert.equal(h.lark.groupCards[0].card.header.template, "green");
+    assert.match(cardText(h.lark.groupCards[0].card), /tmux-worktree release verification/);
+    assert.match(cardText(h.lark.groupCards[0].card), /managed-one/);
+    assert.match(h.lark.groupCards[0].idempotencyKey, /^tw-[0-9a-f]{40}$/);
+
+    await h.bridge.removeBinding(binding.id);
+    await flushBestEffortEffects();
+    assert.equal(h.store.read().bindings.length, 0);
+    assert.equal(h.lark.groupCards.length, 2);
+    assert.equal(h.lark.groupCards[1].card.header.template, "grey");
+    assert.match(cardText(h.lark.groupCards[1].card), /用户主动解除绑定/);
+    assert.deepEqual(observedBindingCounts, [1, 0]);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("a delayed lifecycle card never blocks terminal lease renewal", async () => {
+  const h = harness();
+  let releaseCard = () => {};
+  const cardBarrier = new Promise((resolve) => { releaseCard = resolve; });
+  let markCardStarted = () => {};
+  const cardStarted = new Promise((resolve) => { markCardStarted = resolve; });
+  let createPromise;
+  try {
+    h.lark.beforeGroupCard = async () => {
+      markCardStarted();
+      await cardBarrier;
+    };
+    createPromise = h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await cardStarted;
+
+    const renewPromise = h.bridge.renewLeases();
+    await flushBestEffortEffects();
+    assert.equal(
+      h.control.requests.filter((request) => request.type === "lease.renew").length,
+      1,
+      "best-effort Feishu delivery must not occupy the terminal mutation lane",
+    );
+    releaseCard();
+    await Promise.all([createPromise, renewPromise]);
+  } finally {
+    releaseCard();
+    await createPromise?.catch(() => {});
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
 });
 
 test("one authorized mentioned message owns the target, writes once, and posts only marked output", async () => {
@@ -1001,6 +1150,82 @@ test("agent-message output correlation, not a pre-input inspect cursor, starts t
   }
 });
 
+test("a retention-stale cursor resyncs within the same Feishu authority and completes the turn", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await h.bridge.handleEvent(event());
+    const initialTurn = currentTurn(h);
+    assert.equal(initialTurn.cursor, 0);
+    const retainedCursor = installRetainedMarkedOutput(h, "answer after retained-window resync");
+
+    await h.bridge.pollTurns();
+    let state = h.store.read();
+    let turn = state.turns.at(-1);
+    assert.equal(turn.status, "awaiting");
+    assert.equal(turn.cursor, retainedCursor);
+    assert.equal(turn.output, "");
+    assert.equal(turn.outputRemainderBase64, undefined);
+    assert.equal(turn.markerSeenAt, undefined);
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.control.inputs.length, 1, "output resync must not replay terminal input");
+    assert.equal(h.lark.replies.length, 0);
+    const firstTail = h.control.requests.filter(({ type }) => type === "output.tail").at(-1);
+    assert.equal(firstTail.fields.cursor, 0);
+
+    await h.bridge.pollTurns();
+    state = h.store.read();
+    turn = state.turns.at(-1);
+    assert.equal(turn.status, "completed");
+    assert.equal(state.bindings[0].status, "active");
+    assert.equal(h.lark.replies.length, 1);
+    assert.equal(h.lark.replies[0].text, "answer after retained-window resync");
+    assert.equal(h.control.inputs.length, 1, "reply polling must not resend the accepted operation");
+    const successfulTail = h.control.requests.filter(({ type }) => type === "output.tail").at(-1);
+    assert.equal(successfulTail.fields.cursor, retainedCursor);
+    assert.equal(successfulTail.fields.outputGeneration, initialTurn.outputGeneration);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("retention resync still fails closed when generation or fence changes", async () => {
+  for (const scenario of [
+    {
+      name: "generation",
+      mutate: (control) => { control.target.outputGeneration = "out-after-retention-stale"; },
+    },
+    {
+      name: "fence",
+      mutate: (control) => { control.target.fence = (BigInt(control.target.fence) + 1n).toString(); },
+    },
+  ]) {
+    const h = harness();
+    try {
+      await h.bridge.createBinding({
+        chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      });
+      await h.bridge.handleEvent(event());
+      installRetainedMarkedOutput(h, `must stay private after ${scenario.name} change`);
+      h.control.beforeRetainedStale = () => scenario.mutate(h.control);
+
+      await h.bridge.pollTurns();
+      const state = h.store.read();
+      assert.equal(state.turns.at(-1).status, "recovery-required", scenario.name);
+      assert.equal(state.turns.at(-1).cursor, 0, scenario.name);
+      assert.equal(state.bindings[0].status, "stale", scenario.name);
+      assert.equal(h.lark.replies.length, 0, scenario.name);
+      assert.equal(h.control.inputs.length, 1, `${scenario.name} staleness must not replay input`);
+    } finally {
+      await h.bridge.close();
+      rmSync(h.root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("Dashboard binding creation atomically hands its lease to Feishu and requires a closed reply marker", async () => {
   const h = harness();
   try {
@@ -1088,6 +1313,234 @@ test("lease renewal carries the full canonical token and failure fences an activ
     assert.equal(state.turns.at(-1).status, "recovery-required");
     assert.equal(h.lark.replies.length, 0);
   } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("exact target deletion removes an active binding and announces the deletion once", async () => {
+  const h = harness();
+  const ended = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.ownershipStatus = async () => {
+      const error = new Error("target lifecycle ended");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    h.control.resolveTarget = async () => {
+      const error = new Error("managed session is absent");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+
+    await h.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.equal(h.lark.groupCards.length, 1);
+    assert.equal(h.lark.groupCards[0].card.header.template, "red");
+    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+    await h.bridge.reconcileBindingTargets();
+    assert.equal(h.lark.groupCards.length, 1, "a removed binding must not notify twice");
+
+    await ended.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    ended.lark.groupCards.length = 0;
+    ended.control.ownershipStatus = async () => {
+      const error = new Error("exact lifecycle ended");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    ended.control.resolveTarget = async () => {
+      const error = new Error("backend lookup is temporarily unavailable");
+      error.code = "CONTROLLER_UNAVAILABLE";
+      throw error;
+    };
+    await ended.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    const endedText = cardText(ended.lark.groupCards[0].card);
+    assert.match(endedText, /精确生命周期已结束/);
+    assert.doesNotMatch(endedText, /同名会话替换/);
+  } finally {
+    await h.bridge.close();
+    await ended.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+    rmSync(ended.root, { recursive: true, force: true });
+  }
+});
+
+test("paused bindings require proof of replacement while uncertain targets stay linked", async () => {
+  const replaced = harness();
+  const uncertain = harness();
+  const reset = harness();
+  try {
+    const binding = await replaced.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await replaced.bridge.pauseBinding(binding.id);
+    replaced.lark.groupCards.length = 0;
+    let replacementResolved = false;
+    replaced.control.ownershipStatus = async () => {
+      if (!replacementResolved) return replaced.control.ownership();
+      const error = new Error("old target was invalidated after backend identity changed");
+      error.code = "TARGET_GONE";
+      throw error;
+    };
+    replaced.control.resolveTarget = async () => {
+      replacementResolved = true;
+      return {
+        controlTargetId: "replacement-target",
+        controlEpoch: "replacement-epoch",
+        managedSession: {
+          name: "managed-one",
+          kind: "terminal",
+          createdAt: "2026-07-16T00:00:00.000Z",
+        },
+        ownership: replaced.control.ownership(),
+      };
+    };
+    await replaced.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(replaced.bridge.snapshot().bindings.length, 0);
+    assert.match(cardText(replaced.lark.groupCards[0].card), /同名会话替换/);
+    assert.match(cardText(replaced.lark.groupCards[0].card), /不会自动指向/);
+
+    const uncertainBinding = await uncertain.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await uncertain.bridge.pauseBinding(uncertainBinding.id);
+    uncertain.lark.groupCards.length = 0;
+    uncertain.control.ownershipStatus = async () => {
+      const error = new Error("controller requires recovery");
+      error.code = "RECOVERY_REQUIRED";
+      throw error;
+    };
+    await uncertain.bridge.reconcileBindingTargets();
+    assert.equal(uncertain.bridge.snapshot().bindings[0].status, "paused");
+    assert.equal(uncertain.lark.groupCards.length, 0);
+
+    const resetBinding = await reset.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    await reset.bridge.pauseBinding(resetBinding.id);
+    reset.lark.groupCards.length = 0;
+    reset.control.ownershipStatus = async () => {
+      const error = new Error("controller lineage was reset");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+    reset.control.resolveTarget = async () => ({
+      controlTargetId: "new-controller-target",
+      controlEpoch: "new-controller-epoch",
+      managedSession: {
+        name: "managed-one",
+        kind: "terminal",
+        createdAt: "2026-07-16T00:00:00.000Z",
+      },
+      ownership: reset.control.ownership(),
+    });
+    await reset.bridge.reconcileBindingTargets();
+    assert.equal(reset.bridge.snapshot().bindings[0].status, "paused");
+    assert.equal(reset.lark.groupCards.length, 0, "a new controller ID alone is not replacement proof");
+  } finally {
+    await replaced.bridge.close();
+    await uncertain.bridge.close();
+    await reset.bridge.close();
+    rmSync(replaced.root, { recursive: true, force: true });
+    rmSync(uncertain.root, { recursive: true, force: true });
+    rmSync(reset.root, { recursive: true, force: true });
+  }
+});
+
+test("a recovery-required stale binding still detects a certainly deleted session", async () => {
+  const h = harness();
+  try {
+    await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    await flushBestEffortEffects();
+    h.lark.groupCards.length = 0;
+    h.control.failRenew = true;
+    await h.bridge.renewLeases();
+    assert.equal(h.bridge.snapshot().bindings[0].status, "stale");
+    h.control.ownershipStatus = async () => {
+      const error = new Error("old Feishu ownership requires recovery");
+      error.code = "RECOVERY_REQUIRED";
+      throw error;
+    };
+    h.control.resolveTarget = async () => {
+      const error = new Error("managed session was deleted");
+      error.code = "TARGET_NOT_FOUND";
+      throw error;
+    };
+
+    await h.bridge.reconcileBindingTargets();
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.match(cardText(h.lark.groupCards[0].card), /已被删除/);
+  } finally {
+    await h.bridge.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("restart-stale unlink keeps the binding until Feishu ownership is recovered locally", async () => {
+  const h = harness();
+  const binding = await h.bridge.createBinding({
+    chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+  });
+  await flushBestEffortEffects();
+  const restarted = new FeishuBridge({
+    control: h.control,
+    lark: h.lark,
+    store: h.store,
+    instanceId: "daemon-after-restart",
+    botOpenId: "ou-bot",
+  });
+  try {
+    restarted.initializeAfterRestart();
+    await assert.rejects(
+      restarted.removeBinding(binding.id, true),
+      /recover terminal ownership locally/,
+    );
+    assert.equal(restarted.snapshot().bindings[0].status, "stale");
+
+    h.control.recoverLocally();
+    await restarted.removeBinding(binding.id, true);
+    await flushBestEffortEffects();
+    assert.equal(restarted.snapshot().bindings.length, 0);
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /用户主动解除绑定/);
+  } finally {
+    await restarted.close();
+    rmSync(h.root, { recursive: true, force: true });
+  }
+});
+
+test("group card delivery failure never rolls back binding ownership or unlink", async () => {
+  const h = harness();
+  try {
+    h.lark.failGroupCard = true;
+    const binding = await h.bridge.createBinding({
+      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+    });
+    assert.equal(h.bridge.snapshot().bindings[0].status, "active");
+    assert.equal(h.control.target.owner.kind, "feishu");
+    await h.bridge.removeBinding(binding.id);
+    await flushBestEffortEffects();
+    assert.equal(h.bridge.snapshot().bindings.length, 0);
+    assert.equal(h.control.target.state, "FREE");
+    assert.equal(h.lark.groupCards.length, 2);
+  } finally {
+    h.lark.failGroupCard = false;
     await h.bridge.close();
     rmSync(h.root, { recursive: true, force: true });
   }
@@ -1545,21 +1998,41 @@ test("Feishu bridge UDS is private and exposes closed management operations", as
     paths: h.paths,
     control: h.control,
     lark: h.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {
     await server.start();
     assert.equal(statSync(h.paths.socket).mode & 0o777, 0o600);
     const client = new FeishuBridgeClient(h.paths.socket);
+    assert.deepEqual(await client.request("bridge.info", {}), {
+      daemonVersion: packageVersion,
+      larkProfile: "bot",
+      capabilities: [
+        "binding.lifecycle-notices.v1",
+        "binding.create.session-summary.v1",
+        "binding.target-reconciliation.v1",
+      ],
+    });
+    await assert.rejects(
+      client.request("bridge.info", { extra: true }),
+      /invalid bridge.info params/,
+    );
     const snapshot = await client.request("bridge.snapshot", {});
     assert.deepEqual(snapshot.bindings, []);
     assert.deepEqual(await client.request("groups.list", {}), [
       { chatId: "oc-one", name: "bridge group" },
     ]);
     const binding = await client.request("binding.create", {
-      chatId: "oc-one", chatName: "bridge group", sessionName: "managed-one", createdBy: "ou-owner",
+      chatId: "oc-one",
+      chatName: "bridge group",
+      sessionName: "managed-one",
+      sessionSummary: "UDS lifecycle summary",
+      createdBy: "ou-owner",
     });
+    await flushBestEffortEffects();
     assert.equal(binding.status, "active");
+    assert.match(cardText(h.lark.groupCards.at(-1).card), /UDS lifecycle summary/);
     await assert.rejects(
       client.request("binding.pause", { bindingId: binding.id, unknown: true }),
       /invalid binding.pause params/,
@@ -1576,6 +2049,7 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
     paths: empty.paths,
     control: empty.control,
     lark: empty.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {
@@ -1594,6 +2068,7 @@ test("Feishu bridge allows a profile restart only while it has no bindings", asy
     paths: bound.paths,
     control: bound.control,
     lark: bound.lark,
+    larkProfile: "bot",
     botOpenId: "ou-bot",
   });
   try {

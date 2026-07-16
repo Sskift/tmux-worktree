@@ -20,12 +20,20 @@ use tauri::State;
 const PROTOCOL_VERSION: u32 = 1;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const START_ATTEMPTS: usize = 80;
+const STOP_ATTEMPTS: usize = 200;
 const START_RETRY_DELAY: Duration = Duration::from_millis(100);
 const MAX_LARK_PROFILE_OUTPUT_BYTES: usize = 1024 * 1024;
+const REQUIRED_BRIDGE_CAPABILITIES: [&str; 3] = [
+    "binding.lifecycle-notices.v1",
+    "binding.create.session-summary.v1",
+    "binding.target-reconciliation.v1",
+];
+const UNKNOWN_BRIDGE_INFO_ERROR: &str = "BRIDGE_ERROR: unknown Feishu bridge operation";
 
 #[derive(Default)]
 pub(crate) struct FeishuBridgeRuntimeState {
     process: Mutex<Option<Child>>,
+    transition: Mutex<()>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +42,7 @@ pub(crate) struct FeishuBindingInput {
     chat_id: String,
     chat_name: String,
     session_name: String,
+    session_summary: Option<String>,
     created_by: String,
     #[serde(default)]
     allowed_sender_ids: Vec<String>,
@@ -101,6 +110,33 @@ struct BridgeError {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BridgeInfo {
+    daemon_version: String,
+    lark_profile: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeProbeDisposition {
+    Current,
+    LegacyEmpty,
+    LegacyOccupied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyBindingRemoveAction {
+    UseLegacy,
+    UpgradeCurrent,
+    AlreadyRemoved,
+}
+
+struct BridgeProbe {
+    snapshot: Value,
+    disposition: BridgeProbeDisposition,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct FeishuBridgeInstanceLock {
     pid: u32,
     started_at: u64,
@@ -120,6 +156,11 @@ fn socket_path() -> Result<PathBuf, String> {
     Ok(std::env::temp_dir()
         .join(format!("tw-feishu-bridge-{suffix}"))
         .join("v1.sock"))
+}
+
+fn instance_lock_path() -> Result<PathBuf, String> {
+    let home = app_home_dir().ok_or("home dir not found")?;
+    Ok(home.join(".tmux-worktree").join("feishu-bridge-v1.lock"))
 }
 
 fn valid_profile_name(value: &str) -> bool {
@@ -519,10 +560,96 @@ fn runtime_command(runtime: &LocalTwRpcRuntime) -> Command {
     }
 }
 
-fn ensure_server(app: &tauri::AppHandle, state: &FeishuBridgeRuntimeState) -> Result<(), String> {
-    let (profile, _) = effective_profile()?;
-    let profile = profile
-        .ok_or("FEISHU_PROFILE_NOT_CONFIGURED: choose a bot profile in Settings > Integrations")?;
+fn bridge_snapshot_is_empty(snapshot: &Value) -> Result<bool, String> {
+    let object = snapshot
+        .as_object()
+        .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot is not an object")?;
+    let bindings = object
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot omitted bindings")?;
+    let active_turns = object
+        .get("activeTurns")
+        .and_then(Value::as_array)
+        .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot omitted activeTurns")?;
+    Ok(bindings.is_empty() && active_turns.is_empty())
+}
+
+fn classify_bridge_probe(
+    snapshot: &Value,
+    info_result: Result<Value, String>,
+    expected_profile: &str,
+) -> Result<BridgeProbeDisposition, String> {
+    let snapshot_is_empty = bridge_snapshot_is_empty(snapshot)?;
+    let info_value = match info_result {
+        Ok(value) => value,
+        Err(error) if error == UNKNOWN_BRIDGE_INFO_ERROR => {
+            return Ok(if snapshot_is_empty {
+                BridgeProbeDisposition::LegacyEmpty
+            } else {
+                BridgeProbeDisposition::LegacyOccupied
+            });
+        }
+        Err(error) => return Err(format!("FEISHU_BRIDGE_PROBE_FAILED: {error}")),
+    };
+    let info: BridgeInfo = serde_json::from_value(info_value)
+        .map_err(|error| format!("FEISHU_BRIDGE_INCOMPATIBLE: invalid bridge.info: {error}"))?;
+    if info.daemon_version.trim().is_empty()
+        || info.daemon_version.len() > 128
+        || info.daemon_version.chars().any(char::is_control)
+        || !valid_profile_name(&info.lark_profile)
+        || info.capabilities.iter().any(|capability| {
+            capability.is_empty()
+                || capability.len() > 128
+                || capability.chars().any(char::is_control)
+        })
+    {
+        return Err("FEISHU_BRIDGE_INCOMPATIBLE: bridge.info contains invalid fields".to_string());
+    }
+    if info.lark_profile != expected_profile {
+        return Err(
+            "FEISHU_BRIDGE_PROFILE_MISMATCH: the running daemon uses a different lark-cli profile"
+                .to_string(),
+        );
+    }
+    let missing = REQUIRED_BRIDGE_CAPABILITIES
+        .iter()
+        .filter(|required| {
+            !info
+                .capabilities
+                .iter()
+                .any(|capability| capability == **required)
+        })
+        .copied()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(format!(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: running daemon is missing required capabilities: {}",
+            missing.join(", ")
+        ));
+    }
+    Ok(BridgeProbeDisposition::Current)
+}
+
+fn probe_bridge(expected_profile: &str) -> Result<BridgeProbe, String> {
+    // Snapshot comes first so a legacy daemon can only be restarted after its
+    // durable work is known to be empty. bridge.info is additive, and the one
+    // exact unknown-operation response is the sole legacy signal.
+    let snapshot = request("bridge.snapshot", json!({}))?;
+    let info_result = request("bridge.info", json!({}));
+    let disposition = classify_bridge_probe(&snapshot, info_result, expected_profile)?;
+    Ok(BridgeProbe {
+        snapshot,
+        disposition,
+    })
+}
+
+fn start_server(
+    app: &tauri::AppHandle,
+    state: &FeishuBridgeRuntimeState,
+    profile: &str,
+    bundled_only: bool,
+) -> Result<(), String> {
     if UnixStream::connect(socket_path()?).is_ok() {
         return Ok(());
     }
@@ -538,9 +665,14 @@ fn ensure_server(app: &tauri::AppHandle, state: &FeishuBridgeRuntimeState) -> Re
     if process.is_none() {
         let home = app_home_dir().ok_or("home dir not found")?;
         let runtime = resolve_local_tw_rpc_runtime(app, &home)?;
+        if bundled_only && !matches!(&runtime, LocalTwRpcRuntime::Bundled { .. }) {
+            return Err(
+                "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled current TW CLI is unavailable".to_string(),
+            );
+        }
         let mut command = runtime_command(&runtime);
         command
-            .args(["feishu-bridge", "serve", "--lark-profile", &profile])
+            .args(["feishu-bridge", "serve", "--lark-profile", profile])
             .env("HOME", &home)
             .env("TW_DASHBOARD_HOME", &home)
             .stdin(Stdio::null())
@@ -569,28 +701,78 @@ fn ensure_server(app: &tauri::AppHandle, state: &FeishuBridgeRuntimeState) -> Re
     Err("FEISHU_BRIDGE_UNAVAILABLE: bridge did not become ready".to_string())
 }
 
-fn wait_for_bridge_stop(state: &FeishuBridgeRuntimeState) -> Result<(), String> {
-    for _ in 0..START_ATTEMPTS {
-        if !bridge_is_running() {
-            let mut process = state.process.lock().unwrap();
-            if process
-                .as_mut()
-                .and_then(|child| child.try_wait().ok())
-                .flatten()
-                .is_some()
-            {
-                *process = None;
-            }
-            return Ok(());
-        }
-        std::thread::sleep(START_RETRY_DELAY);
+fn validate_bridge_shutdown(result: &Value) -> Result<(), String> {
+    let object = result
+        .as_object()
+        .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.shutdown returned a non-object")?;
+    if object.len() != 1 || object.get("stopping").and_then(Value::as_bool) != Some(true) {
+        return Err(
+            "FEISHU_BRIDGE_INCOMPATIBLE: bridge.shutdown returned an invalid acknowledgement"
+                .to_string(),
+        );
     }
-    Err("FEISHU_BRIDGE_UNAVAILABLE: bridge did not stop after profile change".to_string())
+    Ok(())
 }
 
-fn stop_legacy_empty_bridge() -> Result<(), String> {
-    let home = app_home_dir().ok_or("home dir not found")?;
-    let path = home.join(".tmux-worktree").join("feishu-bridge-v1.lock");
+fn ensure_server(
+    app: &tauri::AppHandle,
+    state: &FeishuBridgeRuntimeState,
+) -> Result<BridgeProbe, String> {
+    let (profile, _) = effective_profile()?;
+    let profile = profile
+        .ok_or("FEISHU_PROFILE_NOT_CONFIGURED: choose a bot profile in Settings > Integrations")?;
+    let _transition = state
+        .transition
+        .lock()
+        .map_err(|_| "Feishu bridge transition lock poisoned".to_string())?;
+    if !bridge_is_running() {
+        start_server(app, state, &profile, false)?;
+    }
+    let probe = probe_bridge(&profile)?;
+    if probe.disposition != BridgeProbeDisposition::LegacyEmpty {
+        return Ok(probe);
+    }
+
+    let shutdown = request("bridge.shutdown", json!({}))?;
+    validate_bridge_shutdown(&shutdown)?;
+    wait_for_bridge_stop(state)?;
+    start_server(app, state, &profile, true)?;
+    let upgraded = probe_bridge(&profile)?;
+    if upgraded.disposition != BridgeProbeDisposition::Current {
+        return Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled daemon did not provide the current bridge capabilities"
+                .to_string(),
+        );
+    }
+    Ok(upgraded)
+}
+
+fn wait_for_bridge_stop(state: &FeishuBridgeRuntimeState) -> Result<(), String> {
+    let lock_path = instance_lock_path()?;
+    for _ in 0..STOP_ATTEMPTS {
+        let socket_running = bridge_is_running();
+        let mut process = state.process.lock().unwrap();
+        let process_exited = match process.as_mut() {
+            Some(child) => child
+                .try_wait()
+                .map_err(|error| format!("inspect Feishu bridge process: {error}"))?
+                .is_some(),
+            None => false,
+        };
+        if process_exited {
+            *process = None;
+        }
+        if !socket_running && process.is_none() && !lock_path.exists() {
+            return Ok(());
+        }
+        drop(process);
+        std::thread::sleep(START_RETRY_DELAY);
+    }
+    Err("FEISHU_BRIDGE_UNAVAILABLE: bridge did not stop cleanly".to_string())
+}
+
+fn stop_verified_legacy_bridge() -> Result<(), String> {
+    let path = instance_lock_path()?;
     let text = std::fs::read_to_string(&path)
         .map_err(|error| format!("read legacy Feishu bridge lock: {error}"))?;
     let owner: FeishuBridgeInstanceLock = serde_json::from_str(&text)
@@ -635,7 +817,7 @@ fn stop_empty_bridge_for_profile_change(state: &FeishuBridgeRuntimeState) -> Res
     }
     if let Err(error) = request("bridge.shutdown", json!({})) {
         if error.contains("unknown Feishu bridge operation") {
-            stop_legacy_empty_bridge()?;
+            stop_verified_legacy_bridge()?;
         } else {
             return Err(error);
         }
@@ -869,6 +1051,148 @@ fn binding_target(snapshot: &Value, binding_id: &str) -> Result<BindingTarget, S
     })
 }
 
+fn snapshot_binding<'a>(
+    snapshot: &'a Value,
+    binding_id: &str,
+) -> Result<Option<&'a Value>, String> {
+    let bindings = snapshot
+        .get("bindings")
+        .and_then(Value::as_array)
+        .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot omitted bindings")?;
+    let mut matches = bindings
+        .iter()
+        .filter(|binding| binding.get("id").and_then(Value::as_str) == Some(binding_id));
+    let binding = matches.next();
+    if matches.next().is_some() {
+        return Err("FEISHU_BRIDGE_INCOMPATIBLE: duplicate binding identities".to_string());
+    }
+    Ok(binding)
+}
+
+fn legacy_binding_remove_action(
+    snapshot: &Value,
+    binding_id: &str,
+    force: bool,
+) -> Result<LegacyBindingRemoveAction, String> {
+    let Some(binding) = snapshot_binding(snapshot, binding_id)? else {
+        return Ok(LegacyBindingRemoveAction::AlreadyRemoved);
+    };
+    match binding.get("status").and_then(Value::as_str) {
+        Some("active" | "paused") => Ok(LegacyBindingRemoveAction::UseLegacy),
+        Some("stale" | "pausing") if force => {
+            let active_turns = snapshot
+                .get("activeTurns")
+                .and_then(Value::as_array)
+                .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot omitted activeTurns")?;
+            if !active_turns.is_empty() {
+                return Err(
+                    "FEISHU_BRIDGE_UPGRADE_REQUIRED: wait for or cancel active Feishu turns before migrating this legacy binding"
+                        .to_string(),
+                );
+            }
+            let bindings = snapshot
+                .get("bindings")
+                .and_then(Value::as_array)
+                .ok_or("FEISHU_BRIDGE_INCOMPATIBLE: bridge.snapshot omitted bindings")?;
+            if bindings.len() != 1 {
+                return Err(
+                    "FEISHU_BRIDGE_UPGRADE_REQUIRED: unlink other Feishu groups before migrating this legacy binding"
+                        .to_string(),
+                );
+            }
+            Ok(LegacyBindingRemoveAction::UpgradeCurrent)
+        }
+        Some("stale" | "pausing") => Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: force confirmation is required to migrate and remove this uncertain legacy binding"
+                .to_string(),
+        ),
+        _ => Err(
+            "FEISHU_BRIDGE_INCOMPATIBLE: legacy binding has an unknown status".to_string(),
+        ),
+    }
+}
+
+fn request_binding_remove_confirming_absence(
+    binding_id: &str,
+    force: bool,
+) -> Result<Value, String> {
+    match request(
+        "binding.remove",
+        json!({ "bindingId": binding_id, "force": force }),
+    ) {
+        Ok(result) => Ok(result),
+        Err(error) => match request("bridge.snapshot", json!({})) {
+            Ok(snapshot) if matches!(snapshot_binding(&snapshot, binding_id), Ok(None)) => {
+                Ok(json!({ "removed": true }))
+            }
+            // An uncertain acknowledgement is never retried. Preserve the
+            // original remove error unless a fresh snapshot proves absence.
+            Ok(_) | Err(_) => Err(error),
+        },
+    }
+}
+
+fn remove_binding_after_legacy_migration(
+    app: &tauri::AppHandle,
+    state: &FeishuBridgeRuntimeState,
+    binding_id: &str,
+    force: bool,
+) -> Result<Value, String> {
+    if !force {
+        return Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: force confirmation is required before migrating an uncertain legacy binding"
+                .to_string(),
+        );
+    }
+    let (profile, _) = effective_profile()?;
+    let profile = profile
+        .ok_or("FEISHU_PROFILE_NOT_CONFIGURED: choose a bot profile in Settings > Integrations")?;
+    let _transition = state
+        .transition
+        .lock()
+        .map_err(|_| "Feishu bridge transition lock poisoned".to_string())?;
+    let probe = probe_bridge(&profile)?;
+    let current = match probe.disposition {
+        BridgeProbeDisposition::Current => probe,
+        BridgeProbeDisposition::LegacyEmpty => {
+            let shutdown = request("bridge.shutdown", json!({}))?;
+            validate_bridge_shutdown(&shutdown)?;
+            wait_for_bridge_stop(state)?;
+            start_server(app, state, &profile, true)?;
+            probe_bridge(&profile)?
+        }
+        BridgeProbeDisposition::LegacyOccupied => {
+            match legacy_binding_remove_action(&probe.snapshot, binding_id, force)? {
+                LegacyBindingRemoveAction::AlreadyRemoved => {
+                    return Ok(json!({ "removed": true }));
+                }
+                LegacyBindingRemoveAction::UseLegacy => {
+                    return request_binding_remove_confirming_absence(binding_id, force);
+                }
+                LegacyBindingRemoveAction::UpgradeCurrent => {
+                    // The user explicitly confirmed removal. SIGTERM is sent
+                    // only after the legacy lock PID and command identity have
+                    // been verified; the Node handler performs server.stop().
+                    stop_verified_legacy_bridge()?;
+                    wait_for_bridge_stop(state)?;
+                    start_server(app, state, &profile, true)?;
+                    probe_bridge(&profile)?
+                }
+            }
+        }
+    };
+    if current.disposition != BridgeProbeDisposition::Current {
+        return Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: bundled daemon did not provide the current bridge capabilities"
+                .to_string(),
+        );
+    }
+    if snapshot_binding(&current.snapshot, binding_id)?.is_none() {
+        return Ok(json!({ "removed": true }));
+    }
+    request_binding_remove_confirming_absence(binding_id, force)
+}
+
 fn ensure_binding_matches_pty(control: &PtyControl, target: &BindingTarget) -> Result<(), String> {
     control.ensure_local_transfer_target(&target.session_name)?;
     if control.control_target_id.as_deref() != Some(target.control_target_id.as_str()) {
@@ -892,12 +1216,9 @@ pub(crate) async fn feishu_bridge_status(
     state: State<'_, Arc<FeishuBridgeRuntimeState>>,
 ) -> Result<Value, String> {
     let state = Arc::clone(state.inner());
-    tauri::async_runtime::spawn_blocking(move || {
-        ensure_server(&app, state.as_ref())?;
-        request("bridge.snapshot", json!({}))
-    })
-    .await
-    .map_err(|error| format!("join Feishu bridge status: {error}"))?
+    tauri::async_runtime::spawn_blocking(move || Ok(ensure_server(&app, state.as_ref())?.snapshot))
+        .await
+        .map_err(|error| format!("join Feishu bridge status: {error}"))?
 }
 
 #[tauri::command]
@@ -922,8 +1243,14 @@ pub(crate) fn feishu_binding_create(
     control_state: State<'_, Arc<TerminalControlState>>,
     args: FeishuBindingInput,
 ) -> Result<Value, String> {
-    ensure_server(&app, state.inner().as_ref())?;
-    let params = json!({
+    let probe = ensure_server(&app, state.inner().as_ref())?;
+    if probe.disposition != BridgeProbeDisposition::Current {
+        return Err(
+            "FEISHU_BRIDGE_UPGRADE_REQUIRED: unlink existing groups and retry after the legacy bridge becomes idle"
+                .to_string(),
+        );
+    }
+    let mut params = json!({
         "chatId": args.chat_id,
         "chatName": args.chat_name,
         "sessionName": args.session_name,
@@ -931,6 +1258,12 @@ pub(crate) fn feishu_binding_create(
         "allowedSenderIds": args.allowed_sender_ids,
         "mentionOnly": args.mention_only,
     });
+    if let Some(session_summary) = args.session_summary.as_ref() {
+        params
+            .as_object_mut()
+            .ok_or("binding.create params are invalid")?
+            .insert("sessionSummary".to_string(), json!(session_summary));
+    }
     let pty_id = args
         .attachment_id
         .ok_or("Feishu Dashboard binding requires a controlled PTY attachment")?;
@@ -996,11 +1329,24 @@ pub(crate) fn feishu_binding_remove(
     binding_id: String,
     force: bool,
 ) -> Result<Value, String> {
-    ensure_server(&app, state.inner().as_ref())?;
-    request(
-        "binding.remove",
-        json!({ "bindingId": binding_id, "force": force }),
-    )
+    let probe = ensure_server(&app, state.inner().as_ref())?;
+    if probe.disposition == BridgeProbeDisposition::LegacyOccupied {
+        match legacy_binding_remove_action(&probe.snapshot, &binding_id, force)? {
+            LegacyBindingRemoveAction::AlreadyRemoved => {
+                return Ok(json!({ "removed": true }));
+            }
+            LegacyBindingRemoveAction::UpgradeCurrent => {
+                return remove_binding_after_legacy_migration(
+                    &app,
+                    state.inner().as_ref(),
+                    &binding_id,
+                    force,
+                );
+            }
+            LegacyBindingRemoveAction::UseLegacy => {}
+        }
+    }
+    request_binding_remove_confirming_absence(&binding_id, force)
 }
 
 #[tauri::command]
@@ -1071,10 +1417,13 @@ pub(crate) fn feishu_binding_return(
 #[cfg(test)]
 mod tests {
     use super::{
-        add_lark_profile_with_program, configured_profile_from_file, effective_profile,
-        empty_lark_profile_config, generated_lark_profile_name, lark_cli_error_message,
-        save_configured_profile, FeishuLarkProfile,
+        add_lark_profile_with_program, classify_bridge_probe, configured_profile_from_file,
+        effective_profile, empty_lark_profile_config, generated_lark_profile_name,
+        lark_cli_error_message, legacy_binding_remove_action, save_configured_profile,
+        validate_bridge_shutdown, BridgeProbeDisposition, FeishuLarkProfile,
+        LegacyBindingRemoveAction, REQUIRED_BRIDGE_CAPABILITIES, UNKNOWN_BRIDGE_INFO_ERROR,
     };
+    use serde_json::json;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1249,5 +1598,164 @@ mod tests {
         let detail = outcome.detail.expect("failure detail");
         assert!(detail.contains("[redacted]"));
         assert!(!detail.contains(secret));
+    }
+
+    #[test]
+    fn bridge_probe_requires_current_capabilities_and_matching_profile() {
+        let snapshot = json!({ "bindings": [], "activeTurns": [] });
+        let info = json!({
+            "daemonVersion": "1.0.7",
+            "larkProfile": "team-bot",
+            "capabilities": REQUIRED_BRIDGE_CAPABILITIES,
+        });
+        assert_eq!(
+            classify_bridge_probe(&snapshot, Ok(info.clone()), "team-bot").expect("current daemon"),
+            BridgeProbeDisposition::Current
+        );
+
+        let mut missing_capability = info.clone();
+        missing_capability["capabilities"] = json!([REQUIRED_BRIDGE_CAPABILITIES[0]]);
+        assert!(
+            classify_bridge_probe(&snapshot, Ok(missing_capability), "team-bot")
+                .expect_err("missing capability must fail closed")
+                .starts_with("FEISHU_BRIDGE_UPGRADE_REQUIRED:")
+        );
+
+        assert!(classify_bridge_probe(&snapshot, Ok(info), "other-bot")
+            .expect_err("profile mismatch must fail closed")
+            .starts_with("FEISHU_BRIDGE_PROFILE_MISMATCH:"));
+    }
+
+    #[test]
+    fn bridge_probe_only_marks_an_exact_unknown_info_operation_as_legacy() {
+        let empty = json!({ "bindings": [], "activeTurns": [] });
+        assert_eq!(
+            classify_bridge_probe(
+                &empty,
+                Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
+                "team-bot"
+            )
+            .expect("empty legacy daemon"),
+            BridgeProbeDisposition::LegacyEmpty
+        );
+
+        for occupied in [
+            json!({ "bindings": [{ "id": "binding-1" }], "activeTurns": [] }),
+            json!({ "bindings": [], "activeTurns": [{ "id": "turn-1" }] }),
+        ] {
+            assert_eq!(
+                classify_bridge_probe(
+                    &occupied,
+                    Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
+                    "team-bot"
+                )
+                .expect("occupied legacy daemon"),
+                BridgeProbeDisposition::LegacyOccupied
+            );
+        }
+
+        assert!(classify_bridge_probe(
+            &empty,
+            Err("FEISHU_BRIDGE_UNAVAILABLE: read timed out".to_string()),
+            "team-bot"
+        )
+        .expect_err("transport uncertainty must fail closed")
+        .starts_with("FEISHU_BRIDGE_PROBE_FAILED:"));
+    }
+
+    #[test]
+    fn bridge_upgrade_preconditions_reject_malformed_state_and_shutdown_ack() {
+        let malformed_snapshot = json!({ "bindings": [] });
+        assert!(classify_bridge_probe(
+            &malformed_snapshot,
+            Err(UNKNOWN_BRIDGE_INFO_ERROR.to_string()),
+            "team-bot"
+        )
+        .expect_err("missing active turns must block restart")
+        .contains("omitted activeTurns"));
+
+        let empty = json!({ "bindings": [], "activeTurns": [] });
+        assert!(classify_bridge_probe(
+            &empty,
+            Ok(json!({
+                "daemonVersion": "1.0.7",
+                "larkProfile": "team-bot",
+                "capabilities": REQUIRED_BRIDGE_CAPABILITIES,
+                "unexpected": true,
+            })),
+            "team-bot"
+        )
+        .expect_err("malformed bridge info must fail closed")
+        .starts_with("FEISHU_BRIDGE_INCOMPATIBLE:"));
+
+        validate_bridge_shutdown(&json!({ "stopping": true })).expect("shutdown ack");
+        assert!(validate_bridge_shutdown(&json!({ "stopping": false }))
+            .expect_err("false shutdown ack")
+            .contains("invalid acknowledgement"));
+        assert!(
+            validate_bridge_shutdown(&json!({ "stopping": true, "extra": true }))
+                .expect_err("open shutdown ack")
+                .contains("invalid acknowledgement")
+        );
+    }
+
+    #[test]
+    fn legacy_binding_removal_only_migrates_uncertain_status_after_force_confirmation() {
+        for status in ["active", "paused"] {
+            let snapshot = json!({
+                "bindings": [{ "id": "binding-1", "status": status }],
+                "activeTurns": [],
+            });
+            assert_eq!(
+                legacy_binding_remove_action(&snapshot, "binding-1", false)
+                    .expect("certain legacy status"),
+                LegacyBindingRemoveAction::UseLegacy
+            );
+        }
+
+        for status in ["stale", "pausing"] {
+            let snapshot = json!({
+                "bindings": [{ "id": "binding-1", "status": status }],
+                "activeTurns": [],
+            });
+            assert!(legacy_binding_remove_action(&snapshot, "binding-1", false)
+                .expect_err("uncertain legacy status requires confirmation")
+                .starts_with("FEISHU_BRIDGE_UPGRADE_REQUIRED:"));
+            assert_eq!(
+                legacy_binding_remove_action(&snapshot, "binding-1", true)
+                    .expect("confirmed uncertain legacy status"),
+                LegacyBindingRemoveAction::UpgradeCurrent
+            );
+        }
+
+        let active_turn = json!({
+            "bindings": [{ "id": "binding-1", "status": "stale" }],
+            "activeTurns": [{ "id": "turn-1" }],
+        });
+        assert!(
+            legacy_binding_remove_action(&active_turn, "binding-1", true)
+                .expect_err("active turn blocks daemon migration")
+                .contains("active Feishu turns")
+        );
+
+        for sibling_status in ["active", "paused", "pausing", "stale"] {
+            let sibling = json!({
+                "bindings": [
+                    { "id": "binding-1", "status": "stale" },
+                    { "id": "binding-2", "status": sibling_status },
+                ],
+                "activeTurns": [],
+            });
+            assert!(legacy_binding_remove_action(&sibling, "binding-1", true)
+                .expect_err("any sibling blocks whole-daemon migration")
+                .contains("other Feishu groups"));
+        }
+
+        let missing = json!({ "bindings": [], "activeTurns": [] });
+        assert_eq!(
+            legacy_binding_remove_action(&missing, "binding-1", true)
+                .expect("already removed binding"),
+            LegacyBindingRemoveAction::AlreadyRemoved
+        );
     }
 }

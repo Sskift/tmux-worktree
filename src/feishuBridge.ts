@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
   type CanonicalDrainRecord,
   type CanonicalHandoffResult,
   type CanonicalLeaseResult,
@@ -19,7 +20,11 @@ import {
   type FeishuInboundEvent,
   type FeishuLarkAdapter,
 } from "./larkCliBridge.js";
-import { buildFeishuReplyCard } from "./feishuReplyCard.js";
+import {
+  buildFeishuBindingLifecycleCard,
+  buildFeishuReplyCard,
+  type FeishuBindingLifecycleCardKind,
+} from "./feishuReplyCard.js";
 
 const TURN_TIMEOUT_MS = 10 * 60_000;
 const MAX_PROMPT_BYTES = 16 * 1024;
@@ -44,6 +49,7 @@ export interface CreateFeishuBindingInput {
   chatName: string;
   sessionName: string;
   createdBy: string;
+  sessionSummary?: string;
   allowedSenderIds?: string[];
   mentionOnly?: boolean;
   dashboardLease?: CanonicalTerminalLease;
@@ -166,6 +172,7 @@ export class FeishuBridge {
   private state: BridgeState;
   private mutation = Promise.resolve();
   private reactionMutation = Promise.resolve();
+  private lifecycleMutation = Promise.resolve();
 
   constructor(options: {
     control: CanonicalTerminalControlClient;
@@ -338,6 +345,10 @@ export class FeishuBridge {
           throw error;
         }
       }
+      this.queueBindingLifecycle(binding, "linked", {
+        sessionKind: target.managedSession.kind,
+        sessionSummary: input.sessionSummary?.trim(),
+      });
       return structuredClone(binding);
     });
   }
@@ -462,11 +473,14 @@ export class FeishuBridge {
           if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
           throw error;
         }
+      } else {
+        await this.assertUnleasedBindingCanBeRemoved(binding);
       }
       this.leases.delete(binding.id);
       this.state.bindings = this.state.bindings.filter((candidate) => candidate.id !== bindingId);
       this.persist();
       if (turn) this.queueProcessingReactionSettlement(turn.messageId, "cancelled");
+      this.queueBindingLifecycle(binding, "manual-unlink");
     });
   }
 
@@ -783,6 +797,32 @@ export class FeishuBridge {
     });
   }
 
+  /**
+   * Reconcile every persisted binding against its exact canonical target.
+   * This includes paused/stale bindings, which have no lease to renew. Only a
+   * certain ended/replaced lifecycle removes a binding; recovery and transport
+   * failures remain fail-closed for local inspection.
+   */
+  reconcileBindingTargets(): Promise<void> {
+    return this.serial(async () => {
+      for (const candidate of [...this.state.bindings]) {
+        const binding = this.state.bindings.find((item) => item.id === candidate.id);
+        if (!binding) continue;
+        let exactTargetEnded = false;
+        try {
+          const ownership = await this.control.ownershipStatus(binding.controlTargetId);
+          exactTargetEnded = ownership.state === "TARGET_GONE";
+        } catch (error) {
+          if (hasCode(error, "TARGET_GONE")) exactTargetEnded = true;
+        }
+
+        const reason = await this.bindingLifecycleEndReason(binding, exactTargetEnded);
+        if (!reason) continue;
+        await this.invalidateBinding(binding, reason);
+      }
+    });
+  }
+
   pollTurns(): Promise<void> {
     return this.serial(async () => {
       const turns = this.state.turns.filter((turn) => turn.status === "awaiting");
@@ -835,9 +875,10 @@ export class FeishuBridge {
       }
     });
     // Terminal authority is already persisted/released above. Drain the
-    // independent best-effort UX lane before a clean shutdown reports done so
-    // known Typing handles are not abandoned merely because the daemon stopped.
-    await this.reactionMutation;
+    // independent best-effort UX lanes before a clean shutdown reports done so
+    // known reactions and lifecycle notices are not abandoned merely because
+    // the daemon stopped.
+    await Promise.all([this.reactionMutation, this.lifecycleMutation]);
   }
 
   private async pollTurn(turn: FeishuTurn): Promise<void> {
@@ -866,13 +907,37 @@ export class FeishuBridge {
       }
       const target = await this.control.ownershipStatus(turn.controlTargetId);
       this.assertTurnAuthority(turn, lease, target);
-      const chunk = await this.control.tailOutput({
-        controlTargetId: turn.controlTargetId,
-        controlEpoch: turn.controlEpoch,
-        outputGeneration: turn.outputGeneration,
-        cursor: turn.cursor,
-        maxBytes: OUTPUT_TAIL_BYTES,
-      });
+      let chunk;
+      try {
+        chunk = await this.control.tailOutput({
+          controlTargetId: turn.controlTargetId,
+          controlEpoch: turn.controlEpoch,
+          outputGeneration: turn.outputGeneration,
+          cursor: turn.cursor,
+          maxBytes: OUTPUT_TAIL_BYTES,
+        });
+      } catch (error) {
+        if (!hasCode(error, "STALE_OUTPUT_CURSOR")) throw error;
+        const latest = await this.control.ownershipStatus(turn.controlTargetId);
+        this.assertTurnAuthority(turn, lease, latest);
+        const retainedCursor = Math.max(
+          0,
+          latest.outputCursor - CANONICAL_TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+        );
+        if (retainedCursor <= turn.cursor) throw error;
+        // A fast command can emit more than the bounded correlation window
+        // between Bridge polls. The current authority view proves the same
+        // Feishu lease/generation, so resume at the minimum guaranteed
+        // retained cursor and rebuild only the read-only marker parser. Input
+        // is never replayed, and generation/fence staleness still fails closed.
+        turn.cursor = retainedCursor;
+        turn.output = "";
+        delete turn.outputRemainderBase64;
+        delete turn.markerSeenAt;
+        delete turn.lastOutputAt;
+        this.persist();
+        return;
+      }
       if (chunk.controlEpoch !== turn.controlEpoch
         || chunk.controlTargetId !== turn.controlTargetId
         || chunk.fence !== turn.fence
@@ -1204,6 +1269,13 @@ export class FeishuBridge {
     if (input.sessionName.includes(":")) {
       throw new Error("remote Feishu targets are not supported in this version");
     }
+    if (input.sessionSummary !== undefined
+      && (typeof input.sessionSummary !== "string"
+        || !input.sessionSummary.trim()
+        || input.sessionSummary.includes("\0")
+        || Buffer.byteLength(input.sessionSummary, "utf8") > 1024)) {
+      throw new Error("invalid sessionSummary");
+    }
   }
 
   private async ensureBotOpenId(): Promise<string> {
@@ -1344,6 +1416,138 @@ export class FeishuBridge {
   private async bestEffortReleaseLease(lease: CanonicalTerminalLease): Promise<void> {
     try { await this.releaseLease(lease); } catch {
       // Rollback is best effort, but no caller treats this as proof that ownership is free.
+    }
+  }
+
+  private async bindingLifecycleEndReason(
+    binding: FeishuBinding,
+    exactTargetEnded: boolean,
+  ): Promise<"session-deleted" | "target-ended" | "target-replaced" | undefined> {
+    try {
+      const current = await this.control.resolveTarget(binding.sessionName);
+      if (current.controlTargetId !== binding.controlTargetId) {
+        if (exactTargetEnded) return "target-replaced";
+        try {
+          const oldTarget = await this.control.ownershipStatus(binding.controlTargetId);
+          if (oldTarget.state === "TARGET_GONE") return "target-replaced";
+        } catch (error) {
+          if (hasCode(error, "TARGET_GONE")) return "target-replaced";
+        }
+        // A controller state reset can mint a new controlTargetId for the same
+        // backend lifecycle. Without proof that the old target ended, retain
+        // the binding for controlled local inspection.
+        return undefined;
+      }
+      return exactTargetEnded ? "target-ended" : undefined;
+    } catch (error) {
+      if (hasCode(error, "TARGET_NOT_FOUND")) return "session-deleted";
+      return exactTargetEnded ? "target-ended" : undefined;
+    }
+  }
+
+  private async assertUnleasedBindingCanBeRemoved(binding: FeishuBinding): Promise<void> {
+    let ownership: CanonicalTerminalOwnership;
+    try {
+      ownership = await this.control.ownershipStatus(binding.controlTargetId);
+    } catch (error) {
+      if (hasCode(error, "TARGET_GONE")) return;
+      if (hasCode(error, "TARGET_NOT_FOUND")) {
+        try {
+          const current = await this.control.resolveTarget(binding.sessionName);
+          if (current.controlTargetId !== binding.controlTargetId) {
+            try {
+              const oldTarget = await this.control.ownershipStatus(binding.controlTargetId);
+              if (oldTarget.state === "TARGET_GONE") return;
+            } catch (oldTargetError) {
+              if (hasCode(oldTargetError, "TARGET_GONE")) return;
+            }
+          }
+        } catch (resolutionError) {
+          if (hasCode(resolutionError, "TARGET_NOT_FOUND")) return;
+        }
+      }
+      const unavailable = new Error(
+        "binding has no live Feishu lease; recover terminal ownership locally before unlinking",
+      );
+      Object.assign(unavailable, { code: "RECOVERY_REQUIRED" });
+      throw unavailable;
+    }
+    if (ownership.state === "FREE" || ownership.state === "TARGET_GONE") return;
+    if (ownership.state === "HELD"
+      && (ownership.ownerKind === "dashboard" || ownership.ownerKind === "local-cli")) return;
+    const unavailable = new Error(
+      "binding has no live Feishu lease; recover terminal ownership locally before unlinking",
+    );
+    Object.assign(unavailable, { code: "RECOVERY_REQUIRED" });
+    throw unavailable;
+  }
+
+  private async invalidateBinding(
+    binding: FeishuBinding,
+    reason: "session-deleted" | "target-ended" | "target-replaced",
+  ): Promise<void> {
+    const current = this.state.bindings.find((candidate) => candidate.id === binding.id);
+    if (!current || current.controlTargetId !== binding.controlTargetId) return;
+    const turn = this.activeTurn(binding.id);
+    if (turn) {
+      turn.status = "cancelled";
+      turn.completedAt = nowIso(this.now);
+      turn.error = reason === "session-deleted"
+        ? "the bound TW session was deleted"
+        : "the exact bound TW lifecycle no longer exists";
+    }
+    this.leases.delete(binding.id);
+    this.state.bindings = this.state.bindings.filter((candidate) => candidate.id !== binding.id);
+    this.persist();
+    if (turn) this.queueProcessingReactionSettlement(turn.messageId, "failure");
+    this.queueBindingLifecycle(binding, reason);
+  }
+
+  private queueBindingLifecycle(
+    binding: FeishuBinding,
+    kind: FeishuBindingLifecycleCardKind,
+    details: {
+      sessionKind?: "worktree" | "terminal";
+      sessionSummary?: string;
+    } = {},
+  ): void {
+    const snapshot = structuredClone(binding);
+    const snapshotDetails = structuredClone(details);
+    const effect = async () => {
+      await this.safeSendBindingLifecycle(snapshot, kind, snapshotDetails);
+    };
+    const result = this.lifecycleMutation.then(effect, effect);
+    this.lifecycleMutation = result.then(
+      () => undefined,
+      (error) => {
+        process.stderr.write(`[feishu-bridge] lifecycle effect failed: ${error instanceof Error ? error.message : String(error)}\n`);
+      },
+    );
+  }
+
+  private async safeSendBindingLifecycle(
+    binding: FeishuBinding,
+    kind: FeishuBindingLifecycleCardKind,
+    details: {
+      sessionKind?: "worktree" | "terminal";
+      sessionSummary?: string;
+    },
+  ): Promise<void> {
+    try {
+      await this.lark.sendCard(
+        binding.chatId,
+        buildFeishuBindingLifecycleCard({
+          kind,
+          sessionName: binding.sessionName,
+          controlTargetId: binding.controlTargetId,
+          ...details,
+        }),
+        `tw-${digest(`binding-lifecycle:${binding.id}:${kind}:${binding.controlTargetId}`).slice(0, 40)}`,
+      );
+    } catch (error) {
+      process.stderr.write(
+        `[feishu-bridge] ${kind} group card failed for ${binding.id}: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
     }
   }
 

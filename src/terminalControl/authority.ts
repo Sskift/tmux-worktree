@@ -29,6 +29,8 @@ import {
 } from "./store";
 
 const MAX_COMPLETED_OPERATIONS = 128;
+const OUTPUT_CAPTURE_LIMIT_MESSAGE = "terminal output generation exceeded its bounded capture limit";
+const LEGACY_CAPTURE_ROTATION_MESSAGE = "terminal output legacy capture requires bounded rotation";
 
 type AuthorityOptions = {
   statePath?: string;
@@ -111,6 +113,19 @@ function isAutoRecoverableNonFeishuState(target: TerminalControlTargetRecord): b
   if (target.lifecycle !== "RECOVERY_REQUIRED" || target.inFlight || !target.recovery) return false;
   if (target.recovery.previousOwnerKind === "feishu" || target.recovery.operationId) return false;
   return !["OPERATION_IN_DOUBT", "DRAIN_UNCERTAIN"].includes(target.recovery.reason);
+}
+
+function isOutputCapacityError(error: unknown): error is TerminalControlProtocolError {
+  return error instanceof TerminalControlProtocolError
+    && error.code === "RESOURCE_EXHAUSTED"
+    && error.message === OUTPUT_CAPTURE_LIMIT_MESSAGE;
+}
+
+function isOutputRotationError(error: unknown): error is TerminalControlProtocolError {
+  return isOutputCapacityError(error)
+    || (error instanceof TerminalControlProtocolError
+      && error.code === "RESOURCE_EXHAUSTED"
+      && error.message === LEGACY_CAPTURE_ROTATION_MESSAGE);
 }
 
 function appendOperation(
@@ -474,9 +489,11 @@ export class TerminalControlAuthority {
       // unavailable. Feishu and every draining/in-flight state remain strict.
       if (
         target.lifecycle === "ACTIVE"
-        && target.ownership.state === "HELD"
-        && target.ownership.owner.kind !== "feishu"
         && !target.inFlight
+        && (
+          (target.ownership.state === "FREE" && isOutputRotationError(error))
+          || (target.ownership.state === "HELD" && target.ownership.owner.kind !== "feishu")
+        )
       ) {
         try {
           await this.backend.assertCurrent(target.managedSession, target.backend.tmuxInstanceId);
@@ -805,6 +822,12 @@ export class TerminalControlAuthority {
         }
         if (detached.remaining) {
           const output = await this.prepareOutput(state, target);
+          if (target.ownership.state !== "HELD") {
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              "interactive ownership disappeared while another producer remained registered",
+            );
+          }
           if (!sameOwner(target.ownership.owner, detached.remaining)) {
             target.ownership.owner = detached.remaining;
             revision(target);

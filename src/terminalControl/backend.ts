@@ -4,23 +4,33 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readSync,
+  readdirSync,
+  rmdirSync,
   statSync,
+  unlinkSync,
 } from "node:fs";
+import type { Stats } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { managedStatePath, loadManagedStateForMutation, type ManagedSession } from "../state";
 import { tmuxBin } from "../tmux";
-import { TerminalControlProtocolError } from "./protocol";
+import {
+  TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES,
+  TerminalControlProtocolError,
+} from "./protocol";
 
 const TMUX_INSTANCE_OPTION = "@tw_terminal_control_instance_v1";
 const OUTPUT_GENERATION_OPTION = "@tw_terminal_control_output_generation_v1";
 const COMMAND_TIMEOUT_MS = 5_000;
 const MAX_COMMAND_OUTPUT_BYTES = 64 * 1024;
 const MAX_OUTPUT_FILE_BYTES = 8 * 1024 * 1024;
+const OUTPUT_SEGMENT_BYTES = TERMINAL_CONTROL_OUTPUT_RETAINED_MIN_BYTES;
+const MAX_OUTPUT_SEGMENTS = 2;
 const AGENT_MESSAGE_SUBMIT_PACE_MS = 100;
 
 // xterm emits client-terminal escape sequences for special keys. Pasting
@@ -361,12 +371,16 @@ function exactManagedSession(sessionName: string, home = homedir()): ManagedSess
     );
   }
   const matches = state.sessions.filter((session) => session.name === sessionName);
-  if (matches.length !== 1) {
+  if (matches.length === 0) {
     throw new TerminalControlProtocolError(
       "TARGET_NOT_FOUND",
-      matches.length === 0
-        ? `session is not TW-managed: ${sessionName}`
-        : `managed state contains ambiguous session identity: ${sessionName}`,
+      `session is not TW-managed: ${sessionName}`,
+    );
+  }
+  if (matches.length > 1) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      `managed state contains ambiguous session identity: ${sessionName}`,
     );
   }
   return matches[0];
@@ -487,6 +501,18 @@ function outputRoot(home = homedir()): string {
     || join(home, ".tmux-worktree", "terminal-control-output-v1");
 }
 
+type OutputCapturePaths = {
+  directory: string;
+  generationHash: string;
+  legacyPath: string;
+};
+
+type OutputSegment = {
+  path: string;
+  start: number;
+  size: number;
+};
+
 function privateDirectory(path: string): void {
   mkdirSync(path, { recursive: true, mode: 0o700 });
   const stat = lstatSync(path);
@@ -500,20 +526,45 @@ function privateDirectory(path: string): void {
   chmodSync(path, 0o700);
 }
 
-function outputPath(controlTargetId: string, generation: string): string {
+function outputCapturePaths(controlTargetId: string, generation: string): OutputCapturePaths {
   const target = createHash("sha256").update(controlTargetId, "utf8").digest("hex");
-  const output = createHash("sha256").update(generation, "utf8").digest("hex");
+  const generationHash = createHash("sha256").update(generation, "utf8").digest("hex");
   const directory = join(outputRoot(), target);
   privateDirectory(outputRoot());
   privateDirectory(directory);
-  return join(directory, `${output}.bin`);
+  return {
+    directory,
+    generationHash,
+    legacyPath: join(directory, `${generationHash}.bin`),
+  };
 }
 
-function ensureOutputFile(path: string): void {
-  if (!existsSync(path)) {
-    const fd = openSync(path, "wx", 0o600);
-    closeSync(fd);
+function segmentPath(paths: OutputCapturePaths, start: number): string {
+  return join(paths.legacyPath, `${paths.generationHash}.${start}.segment`);
+}
+
+function outputCaptureKind(paths: OutputCapturePaths): "missing" | "legacy" | "segmented" {
+  if (!existsSync(paths.legacyPath)) return "missing";
+  const stat = lstatSync(paths.legacyPath);
+  const uid = process.getuid?.();
+  if (stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid)) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output generation is not a private owned filesystem entry",
+    );
   }
+  if (stat.isFile()) return "legacy";
+  if (stat.isDirectory()) {
+    chmodSync(paths.legacyPath, 0o700);
+    return "segmented";
+  }
+  throw new TerminalControlProtocolError(
+    "RECOVERY_REQUIRED",
+    "terminal output generation has an unsupported filesystem type",
+  );
+}
+
+function assertPrivateOutputFile(path: string, maxBytes?: number): Stats {
   const stat = lstatSync(path);
   const uid = process.getuid?.();
   if (!stat.isFile() || stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid)) {
@@ -523,6 +574,21 @@ function ensureOutputFile(path: string): void {
     );
   }
   chmodSync(path, 0o600);
+  if (maxBytes !== undefined && stat.size > maxBytes) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture segment exceeded its bounded size",
+    );
+  }
+  return stat;
+}
+
+function ensureOutputFile(path: string): void {
+  if (!existsSync(path)) {
+    const fd = openSync(path, "wx", 0o600);
+    closeSync(fd);
+  }
+  const stat = assertPrivateOutputFile(path);
   if (stat.size >= MAX_OUTPUT_FILE_BYTES) {
     throw new TerminalControlProtocolError(
       "RESOURCE_EXHAUSTED",
@@ -531,33 +597,299 @@ function ensureOutputFile(path: string): void {
   }
 }
 
-const BOUNDED_CAPTURE_SCRIPT = [
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
+function scanOutputSegments(paths: OutputCapturePaths): OutputSegment[] {
+  if (outputCaptureKind(paths) !== "segmented") return [];
+  const pattern = new RegExp(`^${paths.generationHash}\\.([0-9]+)\\.segment$`);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const segments = readdirSync(paths.legacyPath)
+        .flatMap((name): OutputSegment[] => {
+          const match = pattern.exec(name);
+          if (!match) return [];
+          const start = Number(match[1]);
+          if (!Number.isSafeInteger(start) || start < 0) {
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              "terminal output capture segment cursor is invalid",
+            );
+          }
+          const path = join(paths.legacyPath, name);
+          const stat = assertPrivateOutputFile(path, OUTPUT_SEGMENT_BYTES);
+          return [{ path, start, size: stat.size }];
+        })
+        .sort((left, right) => left.start - right.start);
+      for (let index = 0; index < segments.length - 1; index += 1) {
+        const current = segments[index];
+        const next = segments[index + 1];
+        if (current.size !== OUTPUT_SEGMENT_BYTES || next.start !== current.start + current.size) {
+          throw new TerminalControlProtocolError(
+            "RECOVERY_REQUIRED",
+            "terminal output capture segments are not contiguous",
+          );
+        }
+      }
+      return segments;
+    } catch (error) {
+      if (attempt === 0 && isMissingFileError(error)) continue;
+      throw error;
+    }
+  }
+  return [];
+}
+
+function currentOutputSegments(paths: OutputCapturePaths): OutputSegment[] {
+  // The capture writer is the sole owner of current-generation retention.
+  // Readers may observe the brief create-before-unlink window and simply use
+  // the newest two contiguous segments; they never race the writer by
+  // unlinking a live segment themselves.
+  return scanOutputSegments(paths).slice(-MAX_OUTPUT_SEGMENTS);
+}
+
+function createInitialOutputSegment(paths: OutputCapturePaths): OutputSegment[] {
+  mkdirSync(paths.legacyPath, { mode: 0o700 });
+  if (outputCaptureKind(paths) !== "segmented") {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output generation directory could not be established",
+    );
+  }
+  const path = segmentPath(paths, 0);
+  const fd = openSync(path, "wx", 0o600);
+  closeSync(fd);
+  return [{ path, start: 0, size: 0 }];
+}
+
+function outputPositionFromSegments(
+  generation: string,
+  segments: OutputSegment[],
+): TerminalControlOutputPosition {
+  const current = segments.at(-1);
+  if (!current) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture has no retained segment",
+    );
+  }
+  const cursor = current.start + current.size;
+  if (!Number.isSafeInteger(cursor)) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output cursor exceeded the supported range",
+    );
+  }
+  return { generation, cursor };
+}
+
+function pruneObsoleteOutputFiles(paths: OutputCapturePaths): void {
+  const captureName = /^([0-9a-f]{64})\.bin$/;
+  const flatSegmentName = /^([0-9a-f]{64})\.[0-9]+\.segment$/;
+  for (const name of readdirSync(paths.directory)) {
+    const match = captureName.exec(name) ?? flatSegmentName.exec(name);
+    if (!match || match[1] === paths.generationHash) continue;
+    const path = join(paths.directory, name);
+    try {
+      const stat = lstatSync(path);
+      const uid = process.getuid?.();
+      if (stat.isSymbolicLink() || (uid !== undefined && stat.uid !== uid)) continue;
+      if (stat.isFile()) {
+        unlinkSync(path);
+        continue;
+      }
+      if (!stat.isDirectory() || !captureName.test(name)) continue;
+      const segmentPattern = new RegExp(`^${match[1]}\\.[0-9]+\\.segment$`);
+      const children = readdirSync(path);
+      const safeChildren = children.every((child) => {
+        if (!segmentPattern.test(child)) return false;
+        const childStat = lstatSync(join(path, child));
+        return childStat.isFile()
+          && !childStat.isSymbolicLink()
+          && (uid === undefined || childStat.uid === uid);
+      });
+      if (!safeChildren) continue;
+      for (const child of children) unlinkSync(join(path, child));
+      rmdirSync(path);
+    } catch (error) {
+      if (!isMissingFileError(error)) {
+        // Capture cleanup is bounded best effort. Unknown or concurrently
+        // changing entries must never weaken the current generation's fence.
+      }
+    }
+  }
+}
+
+const SEGMENTED_CAPTURE_SCRIPT = [
   "const fs=require('fs')",
-  "const path=process.argv[1]",
-  "const limit=Number(process.argv[2])",
-  "const fd=fs.openSync(path,'a',0o600)",
+  "const directory=process.argv[1]",
+  "const generation=process.argv[2]",
+  "let start=Number(process.argv[3])",
+  "const limit=Number(process.argv[4])",
+  "const retain=Number(process.argv[5])",
+  "if(!/^[0-9a-f]{64}$/.test(generation)||!Number.isSafeInteger(start)||start<0||!Number.isSafeInteger(limit)||limit<=0||!Number.isSafeInteger(retain)||retain<2){process.exit(2)}",
+  "const segmentPath=(cursor)=>directory+'/'+generation+'.'+cursor+'.segment'",
+  "let path=segmentPath(start)",
+  "let fd=fs.openSync(path,fs.constants.O_WRONLY|fs.constants.O_APPEND)",
   "let size=fs.fstatSync(fd).size",
+  "if(size>limit){process.exit(3)}",
+  "const cleanup=()=>{",
+  "const pattern=new RegExp('^'+generation+'\\\\.([0-9]+)\\\\.segment$')",
+  "const segments=fs.readdirSync(directory).map((name)=>{const match=pattern.exec(name);return match?{name,start:Number(match[1])}:null}).filter(Boolean).filter((entry)=>Number.isSafeInteger(entry.start)).sort((a,b)=>a.start-b.start)",
+  "for(const entry of segments.slice(0,-retain)){const candidate=directory+'/'+entry.name;try{const stat=fs.lstatSync(candidate);if(!stat.isFile()||stat.isSymbolicLink()){process.exit(4)}fs.unlinkSync(candidate)}catch(error){if(error.code!=='ENOENT'){throw error}}}",
+  "}",
+  "cleanup()",
+  "const rotate=()=>{",
+  "fs.closeSync(fd)",
+  "start+=size",
+  "if(!Number.isSafeInteger(start)){process.exit(5)}",
+  "path=segmentPath(start)",
+  "fd=fs.openSync(path,'wx',0o600)",
+  "size=0",
+  "cleanup()",
+  "}",
   "process.stdin.on('data',(chunk)=>{",
-  "const remaining=limit-size",
-  "if(remaining<=0){process.exit(0)}",
-  "const write=chunk.length>remaining?chunk.subarray(0,remaining):chunk",
   "let offset=0",
-  "while(offset<write.length){offset+=fs.writeSync(fd,write,offset,write.length-offset)}",
-  "size+=write.length",
-  "if(size>=limit){process.exit(0)}",
+  "while(offset<chunk.length){",
+  "if(size===limit){rotate()}",
+  "const length=Math.min(limit-size,chunk.length-offset)",
+  "let written=0",
+  "while(written<length){written+=fs.writeSync(fd,chunk,offset+written,length-written)}",
+  "offset+=length",
+  "size+=length",
+  "}",
   "})",
   "process.stdin.on('end',()=>{fs.closeSync(fd)})",
 ].join(";");
 
-function outputCaptureCommand(path: string): string {
+function outputCaptureCommand(paths: OutputCapturePaths, current: OutputSegment): string {
   return [
     "exec",
     shellQuote(process.execPath),
     "-e",
-    shellQuote(BOUNDED_CAPTURE_SCRIPT),
-    shellQuote(path),
-    String(MAX_OUTPUT_FILE_BYTES),
+    shellQuote(SEGMENTED_CAPTURE_SCRIPT),
+    shellQuote(paths.legacyPath),
+    paths.generationHash,
+    String(current.start),
+    String(OUTPUT_SEGMENT_BYTES),
+    String(MAX_OUTPUT_SEGMENTS),
   ].join(" ");
+}
+
+async function establishSegmentedOutputCapture(
+  sessionId: string,
+  paneTarget: string,
+  paths: OutputCapturePaths,
+  generation: string,
+): Promise<TerminalControlOutputPosition> {
+  if (outputCaptureKind(paths) !== "missing") {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "new terminal output generation already has capture data",
+    );
+  }
+  const current = createInitialOutputSegment(paths)[0];
+  await runTmux(["set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, generation]);
+  await runTmux(["pipe-pane", "-O", "-t", paneTarget, outputCaptureCommand(paths, current)]);
+  const confirmed = (await runTmux(
+    ["display-message", "-p", "-t", paneTarget, "#{pane_pipe}"],
+  )).stdout.trim() === "1";
+  if (!confirmed) {
+    throw new TerminalControlProtocolError(
+      "RECOVERY_REQUIRED",
+      "terminal output capture could not be established",
+    );
+  }
+  pruneObsoleteOutputFiles(paths);
+  return outputPositionFromSegments(generation, currentOutputSegments(paths));
+}
+
+function legacyCaptureRequiresRotation(path: string): never {
+  ensureOutputFile(path);
+  throw new TerminalControlProtocolError(
+    "RESOURCE_EXHAUSTED",
+    "terminal output legacy capture requires bounded rotation",
+  );
+}
+
+function readSegmentedOutput(
+  paths: OutputCapturePaths,
+  generation: string,
+  cursor: number,
+  maxBytes: number,
+): TerminalControlOutputChunk {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const segments = currentOutputSegments(paths);
+      const position = outputPositionFromSegments(generation, segments);
+      const floor = segments[0].start;
+      if (cursor < floor || cursor > position.cursor) {
+        throw new TerminalControlProtocolError("STALE_OUTPUT_CURSOR", "terminal output cursor is stale");
+      }
+      const length = Math.min(maxBytes, position.cursor - cursor);
+      const buffer = Buffer.alloc(length);
+      let nextCursor = cursor;
+      let outputOffset = 0;
+      for (const segment of segments) {
+        if (outputOffset >= length) break;
+        const segmentEnd = segment.start + segment.size;
+        if (nextCursor >= segmentEnd) continue;
+        if (nextCursor < segment.start) {
+          throw new TerminalControlProtocolError(
+            "RECOVERY_REQUIRED",
+            "terminal output capture contains a retained cursor gap",
+          );
+        }
+        let fd = -1;
+        try {
+          fd = openSync(segment.path, "r");
+          const stat = fstatSync(fd);
+          const uid = process.getuid?.();
+          if (!stat.isFile() || (uid !== undefined && stat.uid !== uid) || stat.size > OUTPUT_SEGMENT_BYTES) {
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              "terminal output capture segment is not a private bounded regular file",
+            );
+          }
+          const fileOffset = nextCursor - segment.start;
+          const available = Math.min(segment.size - fileOffset, length - outputOffset);
+          const read = available > 0
+            ? readSync(fd, buffer, outputOffset, available, fileOffset)
+            : 0;
+          outputOffset += read;
+          nextCursor += read;
+          if (read !== available) {
+            throw new TerminalControlProtocolError(
+              "RECOVERY_REQUIRED",
+              "terminal output capture changed during a retained read",
+            );
+          }
+        } finally {
+          if (fd >= 0) closeSync(fd);
+        }
+      }
+      if (outputOffset !== length) {
+        throw new TerminalControlProtocolError(
+          "RECOVERY_REQUIRED",
+          "terminal output capture could not satisfy a retained read",
+        );
+      }
+      return {
+        generation,
+        cursor,
+        dataBase64: buffer.toString("base64"),
+        nextCursor,
+      };
+    } catch (error) {
+      if (attempt === 0 && isMissingFileError(error)) continue;
+      throw error;
+    }
+  }
+  throw new TerminalControlProtocolError(
+    "RECOVERY_REQUIRED",
+    "terminal output capture changed repeatedly during a retained read",
+  );
 }
 
 export class TmuxTerminalControlBackend implements TerminalControlBackend {
@@ -640,15 +972,26 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     controlTargetId: string,
     generation: string,
   ): Promise<TerminalControlOutputPosition> {
-    const path = outputPath(controlTargetId, generation);
-    if (!existsSync(path)) {
+    const paths = outputCapturePaths(controlTargetId, generation);
+    const segments = currentOutputSegments(paths);
+    if (segments.length > 0) {
+      return outputPositionFromSegments(generation, segments);
+    }
+    const kind = outputCaptureKind(paths);
+    if (kind === "missing") {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
         "terminal output capture file is missing",
       );
     }
-    ensureOutputFile(path);
-    return { generation, cursor: statSync(path).size };
+    if (kind === "segmented") {
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output capture has no retained segment",
+      );
+    }
+    ensureOutputFile(paths.legacyPath);
+    return { generation, cursor: statSync(paths.legacyPath).size };
   }
 
   async writeRawFenced(
@@ -915,31 +1258,45 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
       ["display-message", "-p", "-t", target, "#{pane_pipe}"],
     )).stdout.trim() === "1";
     if (generation && pipeActive && configured === generation) {
-      const path = outputPath(controlTargetId, generation);
-      ensureOutputFile(path);
-      return { generation, cursor: statSync(path).size };
+      const paths = outputCapturePaths(controlTargetId, generation);
+      const segments = currentOutputSegments(paths);
+      if (segments.length > 0) {
+        pruneObsoleteOutputFiles(paths);
+        return outputPositionFromSegments(generation, segments);
+      }
+      if (outputCaptureKind(paths) === "legacy") legacyCaptureRequiresRotation(paths.legacyPath);
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output capture file is missing",
+      );
     }
-    if (pipeActive || (configured && configured !== generation)) {
+    if (!pipeActive && generation && configured === generation) {
+      const paths = outputCapturePaths(controlTargetId, generation);
+      if (outputCaptureKind(paths) === "legacy") legacyCaptureRequiresRotation(paths.legacyPath);
+      throw new TerminalControlProtocolError(
+        "RECOVERY_REQUIRED",
+        "terminal output capture stopped before the authority could prove continuity",
+      );
+    }
+    if (pipeActive || configured) {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
         "terminal output capture continuity is owned by another generation",
       );
     }
     const nextGeneration = generation || randomUUID();
-    const path = outputPath(controlTargetId, nextGeneration);
-    ensureOutputFile(path);
-    await runTmux(["set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, nextGeneration]);
-    await runTmux(["pipe-pane", "-O", "-t", target, outputCaptureCommand(path)]);
-    const confirmed = (await runTmux(
-      ["display-message", "-p", "-t", target, "#{pane_pipe}"],
-    )).stdout.trim() === "1";
-    if (!confirmed) {
+    const paths = outputCapturePaths(controlTargetId, nextGeneration);
+    const kind = outputCaptureKind(paths);
+    if (kind === "legacy") {
+      legacyCaptureRequiresRotation(paths.legacyPath);
+    }
+    if (kind === "segmented") {
       throw new TerminalControlProtocolError(
         "RECOVERY_REQUIRED",
-        "terminal output capture could not be established",
+        "terminal output capture data exists without an established generation",
       );
     }
-    return { generation: nextGeneration, cursor: statSync(path).size };
+    return establishSegmentedOutputCapture(sessionId, target, paths, nextGeneration);
   }
 
   async resetOutput(
@@ -964,8 +1321,12 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     )).stdout.trim() === "1";
     if (pipeActive) await runTmux(["pipe-pane", "-t", target]);
     const nextGeneration = randomUUID();
-    await runTmux(["set-option", "-t", sessionId, OUTPUT_GENERATION_OPTION, nextGeneration]);
-    return this.prepareOutput(controlTargetId, sessionName, pane, nextGeneration);
+    return establishSegmentedOutputCapture(
+      sessionId,
+      target,
+      outputCapturePaths(controlTargetId, nextGeneration),
+      nextGeneration,
+    );
   }
 
   async tailOutput(
@@ -980,20 +1341,11 @@ export class TmuxTerminalControlBackend implements TerminalControlBackend {
     if (cursor > position.cursor) {
       throw new TerminalControlProtocolError("STALE_OUTPUT_CURSOR", "terminal output cursor is stale");
     }
-    const length = Math.min(maxBytes, position.cursor - cursor);
-    const buffer = Buffer.alloc(length);
-    let fd = -1;
-    try {
-      fd = openSync(outputPath(controlTargetId, generation), "r");
-      const read = length > 0 ? readSync(fd, buffer, 0, length, cursor) : 0;
-      return {
-        generation,
-        cursor,
-        dataBase64: buffer.subarray(0, read).toString("base64"),
-        nextCursor: cursor + read,
-      };
-    } finally {
-      if (fd >= 0) closeSync(fd);
-    }
+    return readSegmentedOutput(
+      outputCapturePaths(controlTargetId, generation),
+      generation,
+      cursor,
+      maxBytes,
+    );
   }
 }

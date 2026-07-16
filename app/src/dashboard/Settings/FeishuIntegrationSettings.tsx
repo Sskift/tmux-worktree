@@ -6,6 +6,7 @@ import {
   useDashboardBackend,
 } from "../../platform";
 import { MenuSelect } from "../../MenuSelect";
+import { FeishuBindingList } from "./FeishuBindingList";
 import "./FeishuIntegrationSettings.css";
 
 function botName(profile: FeishuLarkProfile): string {
@@ -25,6 +26,7 @@ export function FeishuIntegrationSettings() {
   const [warning, setWarning] = useState<string | null>(null);
   const [bindings, setBindings] = useState<FeishuBinding[] | null>(null);
   const [bindingsError, setBindingsError] = useState<string | null>(null);
+  const [unlinkingBindingId, setUnlinkingBindingId] = useState<string | null>(null);
   const [addingProfile, setAddingProfile] = useState(false);
   const [newAppId, setNewAppId] = useState("");
   const [newAppSecret, setNewAppSecret] = useState("");
@@ -188,6 +190,36 @@ export function FeishuIntegrationSettings() {
         // Keep the deletion diagnostic; the next settings open retries status.
       }
     } finally {
+      setBusy(false);
+    }
+  };
+
+  const unlinkBinding = async (binding: FeishuBinding) => {
+    if (busy) return;
+    const confirmed = await dashboardBackend.dialog.confirm({
+      title: "Unlink Feishu group?",
+      message: `Unlink ${binding.chatName} from ${binding.sessionName}? Any in-progress Feishu turn will be cancelled. If terminal ownership is uncertain, unlinking stays blocked until local recovery confirms it.`,
+    });
+    if (!confirmed) return;
+
+    setBusy(true);
+    setUnlinkingBindingId(binding.id);
+    setError(null);
+    setNotice(null);
+    setWarning(null);
+    try {
+      await dashboardBackend.feishu.remove(binding.id, true);
+      await applyStatus(await dashboardBackend.feishu.integrationStatus());
+      setNotice(`Unlinked ${binding.chatName} from ${binding.sessionName}.`);
+    } catch (unlinkError) {
+      setError(unlinkError instanceof Error ? unlinkError.message : String(unlinkError));
+      try {
+        await applyStatus(await dashboardBackend.feishu.integrationStatus());
+      } catch {
+        // Keep the unlink diagnostic; reopening Settings retries both status views.
+      }
+    } finally {
+      setUnlinkingBindingId(null);
       setBusy(false);
     }
   };
@@ -358,22 +390,12 @@ export function FeishuIntegrationSettings() {
           </p>
         )}
         {bindings && bindings.length > 0 && (
-          <div className="feishu-integration-settings__binding-list" role="list">
-            {bindings.map((binding) => (
-              <div className="feishu-integration-settings__binding" role="listitem" key={binding.id}>
-                <span className="feishu-integration-settings__binding-session" title={binding.sessionName}>
-                  {binding.sessionName}
-                </span>
-                <span className="feishu-integration-settings__binding-arrow" aria-hidden="true">→</span>
-                <span className="feishu-integration-settings__binding-group" title={binding.chatName}>
-                  {binding.chatName}
-                </span>
-                <span className={`feishu-integration-settings__binding-status feishu-integration-settings__binding-status--${binding.status}`}>
-                  {binding.status}
-                </span>
-              </div>
-            ))}
-          </div>
+          <FeishuBindingList
+            bindings={bindings}
+            disabled={busy}
+            unlinkingBindingId={unlinkingBindingId}
+            onUnlink={(binding) => void unlinkBinding(binding)}
+          />
         )}
       </section>
 

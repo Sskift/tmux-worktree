@@ -29,11 +29,11 @@ terminal-control plane 负责：
 - 保存 Feishu/interactive ownership class、共享 leaseId、control epoch、单调 fence 和 handoff 状态；producer instance identity 只用于 operation 去重、审计和 adapter 生命周期，不把 interactive producer 彼此变成竞争 owner。
 - 签发有界 TTL 的 lease；producer 必须定期 `lease.renew`。任一 interactive acquire/renew 都延长同一共享 lease；某个 interactive producer release 只丢弃自己的 lease view，不推进 fence，也不影响仍登记的 producer；最后一个 producer 正常 release 时立即重建 output capture 并回到 `FREE`。若 producer 异常退出，无人续租且无 in-flight/handoff 的 interactive `HELD` lease 可在旧 lease 已 fencing、exact backend 已复核且 output capture 已换代重建后安全回到 `FREE`。Feishu、`DRAINING`、已接受/不确定 operation 的 lease 过期或 controller 重启仍进入 `RECOVERY_REQUIRED`。
 - 串行执行 terminal input、paste、Agent message body/submit 和会影响 backend 的 resize。
-- 在同一 daemon 内维护有界、只读的 output capture，并用 `controlEpoch + outputGeneration + cursor` 关联 input 之后的输出；该 observation 不授予 input ownership。
+- 在同一 daemon 内维护有界、只读的 output capture，并用 `controlEpoch + outputGeneration + cursor` 关联 input 之后的 Feishu marker 输出；该 capture 不是可见 PTY/tmux scrollback，该 observation 也不授予 input ownership。每个 generation 使用两个各 4 MiB 的 segment，cursor 是跨 segment 单调递增的绝对 byte offset，滚动后通常保留最近约 4–8 MiB。Bridge 落后于 retention floor 时，只有重新证明同一 Feishu lease/fence/control epoch/output generation 后，才能从保证保留的 4 MiB 起点清空并重建 marker parser；不得重放 input。
 - 使 lease 校验和 backend write 成为不可分割的控制层操作，禁止 adapter 采用“先查询、再自行写 tmux”的 TOCTOU 路径。
 - 在 target 消失、状态连续性不明或 Feishu/interactive class 冲突时 fail closed。
 
-当前实现使用单独版本化的 local contract、权限受保护的 Unix-domain socket、独立的 0600 状态库和有界的 0600 output generation 文件。Feishu turn adapter只持有已返回的 correlation tuple和解析进度，不另建 output authority；Dashboard/Relay 自己的 stream observation也不能提升为 input owner。binding、Relay credential、TW managed state 和 terminal-control state 不得相互冒充。
+当前实现使用单独版本化的 local contract、权限受保护的 Unix-domain socket、独立的 0600 状态库和有界的 0600 output generation 文件。Feishu turn adapter只持有已返回的 correlation tuple和解析进度，不另建 output authority；Dashboard/Relay 自己的 stream observation也不能提升为 input owner。cursor 落在已淘汰 segment 之前时，authority 返回 `STALE_OUTPUT_CURSOR`，而不是把 target 转成 `RECOVERY_REQUIRED`；该 observation 失败不锁 session，也不能被 adapter 当成授权重放输入的信号。binding、Relay credential、TW managed state 和 terminal-control state 不得相互冒充。
 
 ### 2.2 TW managed core
 
@@ -86,7 +86,7 @@ React 只能通过 `DashboardBackend` 使用 binding/ownership 能力；Tauri ad
 - 不等于 UI row ID、display name、tmux raw name、Relay v1 `hostId+name` 或 Relay v2 `sessionId`。
 - 在同一 controller authority lineage 内永不复用。
 - 内部至少映射 authority scope、managed identity、backend kind 和可证明一次具体 backend lifecycle 的 instance key/birth evidence。
-- 同名 tmux session 被删除后重建时产生新的 `controlTargetId`；旧 Feishu binding 进入 `stale`，不能按名称自动重定向。
+- 同名 tmux session 被删除后重建时产生新的 `controlTargetId`；Bridge 在确定旧 exact lifecycle 已结束后删除旧 Feishu binding 并发送失效原因卡片，不能按名称自动重定向。controller continuity 不明时仍保持 fail-closed/stale，不能误判为删除。
 - Relay v1 adapter 只可在严格解析当前 host/session/backend instance 后映射 target；未知、partial、unreachable 或 identity 不确定时拒绝写入。
 - Relay v2 relay-host 将 `(hostEpoch, scopeId, opaque sessionId)` 映射到 `controlTargetId`，但不把后者放进公共 v2 envelope。
 - target closure 进入 `TARGET_GONE` 并撤销 lease；名称随后复用不能复活旧 target。
@@ -146,9 +146,11 @@ any state
 - `HELD(feishu)`：只有精确 Feishu owner/leaseId/fence 可以提交，所有 interactive input 只读。
 - `DRAINING`：拒绝所有新业务输入，只允许在进入该状态前已经由 single writer 接受的原子 operation完成。
 - `RECOVERY_REQUIRED`：无法证明旧写入、handoff 或 Feishu lease continuity；所有新写入 fail closed。只有受控本地 owner 在外部持久化取消/人工确认记录，并显式承认旧 operation 可能已生效后，才能用 force recovery 验证 exact backend、推进 fence 且不重放旧 operation；无 operation/handoff 的非 Feishu陈旧 lease 会走上面的安全回收，不要求用户确认。
-- `TARGET_GONE`：exact backend lifecycle 已结束；binding stale且不能按名称恢复。
+- `TARGET_GONE`：exact backend lifecycle 已结束；Bridge 清除对应 binding 并通知群聊，且不能按名称恢复或自动指向同名新 session。
 
 Feishu binding active 时默认长期持有独占 lease，即使当前没有 awaiting turn。Dashboard 的 **Take over locally**、binding pause 和 force pause 是解除占用的受控入口：它们先让 Bridge drain 或取消 turn，再切回所有 App/APK 共用的 interactive 类。当前这些 graceful/force 操作只允许本机 Dashboard 或受控本地 CLI 发起；Relay v1/v2 手机端不能远程暂停 Feishu。
+
+Bridge 重启后不会伪造旧 lease token，原 active binding 因而进入 `stale`。此时手动 unlink 只有在 authority 已是 `FREE`/`TARGET_GONE`，或已经由受控 Dashboard/local CLI 持有时才能删除 binding；`HELD(feishu)`、`DRAINING` 和 `RECOVERY_REQUIRED` 必须保留记录并引导受控本地 recovery。生命周期群卡片走独立有序的 best-effort effect lane，不能占用 lease/turn mutation lane。Dashboard 迁移旧 Bridge 时只允许在 stale/pausing target 是 daemon 唯一 binding 且没有 active turn 的情况下停止整个 daemon；任何 sibling binding 都 fail closed，避免 snapshot 后 sibling 恢复所产生的 TOCTOU。已占用旧 daemon 的 active/paused binding 继续由旧 daemon canonical remove，这个一次性兼容路径无法补发新版生命周期卡。
 
 ## 7. Handoff commit point 和 fencing
 
@@ -257,7 +259,8 @@ Relay v1 wire不变：
 
 - controller状态使用独立version/schema、锁、原子替换、0600权限和fail-closed解析；不得从binding active或Relay stream猜测恢复。
 - controlEpoch/authority continuity无法证明时更换epoch并使所有旧lease/fence失效。
-- output capture与controller同属一个本地daemon，但仍是read-only capability；每个generation有硬字节上限，达到上限或pipe连续性不明时进入recovery，不能无限写盘或回退到未fence的inspect路径。
+- output capture与controller同属一个本地daemon，但仍是read-only Feishu marker-correlation capability，不是 Dashboard、`tw serve`、Relay/Android 或受控 CLI 展示的 terminal output。每个 generation 以两个各 4 MiB segment 形成有界 ring，使用绝对 cursor 并通常保留最近约 4–8 MiB；segment 淘汰只让过旧 cursor 收到 `STALE_OUTPUT_CURSOR`，不改变 target lifecycle/ownership。旧 generation 只有在 generation fence 后才回收，不能无限写盘或回退到未fence的inspect路径。
+- 升级前由旧单文件硬上限遗留的 `OUTPUT_CONTINUITY_UNCERTAIN` 沿用 idle non-Feishu observation repair：仅在 authority 能复核 exact backend、当前 ownership 为 `FREE`、没有 in-flight/operation/handoff uncertainty，且 previous owner 不是 Feishu 时自动换代 capture 并回到可用状态。identity、Feishu turn、handoff 或 operation disposition 不明继续 fail closed。
 - Feishu awaiting turn和outbound reply attempt必须持久记录，reply response丢失需要幂等查询/重试策略；只做inbound event dedup不够。
 - target gone、bot membership丢失或daemon冲突必须先阻止旧turn继续tail/post，再释放或fence lease，避免接管后的本地输出被发到群。
 - owner display信息按least disclosure返回。Relay可以展示通用`feishu`/`local` owner kind，不传chatId、群名、成员或credential。
@@ -321,6 +324,8 @@ Relay v1 wire不变：
 | Force takeover | cancel先持久、fence再前进；迟到marker/callback不发群回复 |
 | Reply已发送但ACK未知 | 不误报完成、不自动transfer；进入recovery或显式force policy |
 | Dashboard PTY write竞态 | lease/fence校验和writer.write不可被handoff插入 |
+| output capture rollover | 两个 4 MiB segment 保持 generation 内绝对 cursor；保留窗口内连续 tail，已淘汰 cursor 返回 `STALE_OUTPUT_CURSOR` 且 target 不进入 recovery；同一 Feishu authority 可从保证保留窗口重建 parser 且不重放 input，generation/fence 变化仍 fail closed；可见 PTY output 不受 capture ring 影响；旧 generation 被回收 |
+| legacy capture容量recovery | 走 idle non-Feishu observation repair：只有 exact target、`FREE`、无 operation/handoff uncertainty 且 previous owner 非 Feishu 时自动换代；其他 continuity 不确定性仍 fail closed |
 | Relay v1 send message | 回显requestId error、无tmux副作用、无`agent_message_sent`、无自动重发 |
 | Relay v1 raw input | error带streamId、无backend write/隐式reopen，output继续 |
 | Relay v2新command | `PERMISSION_DENIED/not_accepted`且无ledger/tombstone |
@@ -333,7 +338,7 @@ Relay v1 wire不变：
 | relay-host SUPERSEDED/重启 | 旧route/hostInstance不能写；global owner不被新进程猜测继承 |
 | controller重启/状态损坏 | controlEpoch变化且所有旧lease/fence失效；idle非Feishu lease复核target并重建capture后回FREE，Feishu/handoff/in-doubt仍RECOVERY_REQUIRED |
 | 显式force recovery | 先验证exact backend并确认旧operation可能已生效；推进fence且绝不重放旧operation |
-| target同名重建 | 新controlTargetId；旧binding stale且不自动重定向 |
+| target同名重建 | 新controlTargetId；Bridge 确认旧 lifecycle 已结束后清除旧 binding、发送失效原因卡片，且不自动重定向 |
 | target closure/kill竞态 | lease撤销、turn停止tail/post、observer不能用kill绕过handoff |
 | resize/close | observer不能改变backend resize；允许只关闭自己的observation attachment |
 | Dashboard退出 | 不停止共享controller/Bridge，不释放Feishu lease，不暂停active binding；群事件继续由daemon处理 |
