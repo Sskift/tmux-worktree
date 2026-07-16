@@ -20,7 +20,7 @@ internal sealed interface AgentLifecycleNotificationPresentation {
     data class Available(
         val runLifecycles: List<AgentLifecyclePresentation>,
         val turnLifecycles: List<AgentLifecyclePresentation>,
-        val authorizedNotificationIntents: List<AgentNotificationIntentPresentation>,
+        val preflightNotificationCandidates: List<AgentNotificationIntentPresentation>,
     ) : AgentLifecycleNotificationPresentation
 }
 
@@ -91,7 +91,7 @@ internal object AgentLifecycleNotificationPresentationMapper {
                     { it.lifecycleEventId },
                 ),
             )
-        val notificationIntents = extension.notificationLedger.entries
+        val preflightNotificationCandidates = extension.notificationLedger.entries
             .mapNotNull { (dedupeKey, ledgerEntry) ->
                 if (ledgerEntry.disposition != AgentNotificationDisposition.SHOWN) {
                     return@mapNotNull null
@@ -121,7 +121,7 @@ internal object AgentLifecycleNotificationPresentationMapper {
         return AgentLifecycleNotificationPresentation.Available(
             runLifecycles = runs,
             turnLifecycles = turns,
-            authorizedNotificationIntents = notificationIntents,
+            preflightNotificationCandidates = preflightNotificationCandidates,
         )
     }
 }

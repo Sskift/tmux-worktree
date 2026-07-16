@@ -68,15 +68,15 @@ class AgentTranscriptLifecyclePresentationTest {
                 .all(AgentLifecyclePresentation::isCurrentSource),
         )
 
-        val authorizedEventIds = available.authorizedNotificationIntents.map {
+        val preflightCandidateEventIds = available.preflightNotificationCandidates.map {
             it.systemIntent.dedupeKey.lifecycleEventId
         }
-        assertEquals(listOf("event-turn-a-waiting"), authorizedEventIds)
-        assertTrue(available.authorizedNotificationIntents.single()
+        assertEquals(listOf("event-turn-a-waiting"), preflightCandidateEventIds)
+        assertTrue(available.preflightNotificationCandidates.single()
             .systemIntent.isPreflightAuthorizedBy(state))
         assertFalse(
             "reducer suppression must not be restored after config changes",
-            "event-run-c-completed" in authorizedEventIds,
+            "event-run-c-completed" in preflightCandidateEventIds,
         )
 
         val interruptedState = state.copy(
@@ -89,7 +89,7 @@ class AgentTranscriptLifecyclePresentationTest {
             (interrupted.runLifecycles + interrupted.turnLifecycles)
                 .none(AgentLifecyclePresentation::isCurrentSource),
         )
-        assertTrue(interrupted.authorizedNotificationIntents.isEmpty())
+        assertTrue(interrupted.preflightNotificationCandidates.isEmpty())
     }
 }
 
