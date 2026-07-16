@@ -621,13 +621,31 @@ test("runtime runExclusive requires exactly one settled callback without identit
     });
     const running = early.runExclusive(async (wrappedTransaction) => {
       entered.resolve();
+      let expectedRevision;
+      let initialReadError;
+      try {
+        const initial = await wrappedTransaction.read();
+        expectedRevision = initial.revision;
+      } catch (error) {
+        initialReadError = error;
+      }
+      if (settlement === "throw") {
+        assert.equal(initialReadError?.code, "STORE_CLOSED");
+        assert.equal(expectedRevision, undefined);
+      } else {
+        assert.equal(initialReadError, undefined);
+        assert.notEqual(expectedRevision, undefined);
+      }
       await release.promise;
       await assert.rejects(
         wrappedTransaction.read(),
         (error) => error.code === "STORE_CLOSED",
       );
       await assert.rejects(
-        wrappedTransaction.compareAndPublish(Object.freeze({}), new Uint8Array([1])),
+        wrappedTransaction.compareAndPublish(
+          expectedRevision ?? Object.freeze({}),
+          new Uint8Array([1]),
+        ),
         (error) => error.code === "STORE_CLOSED",
       );
     });
