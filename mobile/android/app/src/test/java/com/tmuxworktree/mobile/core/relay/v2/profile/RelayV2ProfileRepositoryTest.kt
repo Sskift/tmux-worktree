@@ -1261,6 +1261,54 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
+    fun `same reference retry after recovery publish reuses the recovered activation`() =
+        runBlocking {
+            val harness = Harness()
+            val confirmedA = enrollmentDraft(
+                "enrollment-published-a",
+                "twenroll2.code-published-a",
+            ).confirm(deviceLabel = "Pixel A")
+            harness.profiles.failNextCredentialReadyBeforeWrite = true
+            assertTrue(runCatching { harness.repository.confirmEnrollment(confirmedA) }.isFailure)
+            val preparedA = requireNotNull(harness.profiles.journal)
+            val completedA = requireNotNull(
+                harness.credentials.read(preparedA.targetCredentialReference),
+            )
+            val redeemCalls = harness.exchange.redeemCalls
+            val completionCasCalls = harness.credentials.enrollmentCompletionCasCalls(
+                preparedA.targetCredentialReference,
+            )
+            harness.restartRepository()
+
+            val publishReturn = harness.profiles.blockNextProfilePublishReturn()
+            val firstA = async { harness.repository.confirmEnrollment(confirmedA) }
+            publishReturn.started.await()
+            assertEquals(null, harness.profiles.journal)
+            assertEquals(
+                preparedA.targetCredentialReference,
+                harness.profiles.activeV2?.credentialReference,
+            )
+            val joinedA = async { harness.repository.confirmEnrollment(confirmedA) }
+            yield()
+            assertFalse(joinedA.isCompleted)
+
+            publishReturn.release.complete(Unit)
+            val results = withTimeout(1_000) { listOf(firstA.await(), joinedA.await()) }
+            val profiles = results.map { (it as RelayV2EnrollmentResult.Activated).profile }
+            assertEquals(profiles.first(), profiles.last())
+            assertEquals(profiles.first(), harness.profiles.activeV2)
+            assertEquals(completedA, harness.credentials.read(preparedA.targetCredentialReference))
+            assertEquals(redeemCalls, harness.exchange.redeemCalls)
+            assertEquals(
+                completionCasCalls,
+                harness.credentials.enrollmentCompletionCasCalls(
+                    preparedA.targetCredentialReference,
+                ),
+            )
+            assertEquals(1, harness.profiles.activationCount)
+        }
+
+    @Test
     fun `completed A recovery cannot let B overwrite a newer C intent`() = runBlocking {
         val harness = Harness()
         harness.repository.confirmEnrollment(
@@ -1960,6 +2008,7 @@ class RelayV2ProfileRepositoryTest {
         private var nextActiveProfileReadGate: SuspensionGate? = null
         private var nextPendingActivationReadGate: SuspensionGate? = null
         private var nextPreparedRollbackGate: SuspensionGate? = null
+        private var nextProfilePublishReturnGate: SuspensionGate? = null
 
         fun blockNextActiveProfileRead(): SuspensionGate = SuspensionGate().also {
             check(nextActiveProfileReadGate == null)
@@ -1975,6 +2024,11 @@ class RelayV2ProfileRepositoryTest {
         fun blockNextPreparedRollback(): SuspensionGate = SuspensionGate().also {
             check(nextPreparedRollbackGate == null)
             nextPreparedRollbackGate = it
+        }
+
+        fun blockNextProfilePublishReturn(): SuspensionGate = SuspensionGate().also {
+            check(nextProfilePublishReturnGate == null)
+            nextProfilePublishReturnGate = it
         }
 
         override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
@@ -2101,6 +2155,11 @@ class RelayV2ProfileRepositoryTest {
             val resolved = resolveProfile(profile)
             publishProfile(resolved)
             this.journal = null
+            nextProfilePublishReturnGate?.also {
+                nextProfilePublishReturnGate = null
+                it.started.complete(Unit)
+                it.release.await()
+            }
             if (failNextProfilePublishAfterWrite) {
                 failNextProfilePublishAfterWrite = false
                 error("Relay v2 profile publish outcome is ambiguous")

@@ -542,7 +542,7 @@ internal class RelayV2ProfileRepository(
             if (durableActivation != null) {
                 when (val state = activationCredentialState(durableActivation)) {
                     is ActivationCredentialState.ExactCompleted -> {
-                        val recovery = recoverDurableActivation()
+                        val recovery = recoverDurableActivation(intent)
                         when (recovery) {
                             is RelayV2ActivationRecoveryResult.Activated -> {
                                 retireEnrollmentIntent(intent)
@@ -714,7 +714,7 @@ internal class RelayV2ProfileRepository(
         ) {
             val allowedIntent = enrollmentIntentMutex.withLock { currentEnrollmentIntent }
             if (allowedIntent?.credentialReference?.let { it != reference } == true) return false
-            val recovery = recoverDurableActivation()
+            val recovery = recoverDurableActivation(allowedIntent)
             if (recovery !is RelayV2ActivationRecoveryResult.Activated) return false
             enrollmentIntentMutex.withLock {
                 if (currentEnrollmentIntent === allowedIntent) currentEnrollmentIntent = null
@@ -756,14 +756,18 @@ internal class RelayV2ProfileRepository(
      * Production v2 composition remains disabled and does not currently construct this owner.
      */
     suspend fun recoverPendingActivation(): RelayV2ActivationRecoveryResult =
-        recoverDurableActivation()
+        recoverDurableActivation(allowedIntent = null)
 
-    private suspend fun recoverDurableActivation(): RelayV2ActivationRecoveryResult =
+    private suspend fun recoverDurableActivation(
+        allowedIntent: EnrollmentIntent?,
+    ): RelayV2ActivationRecoveryResult =
         activationOperationMutex.withLock {
-            recoverDurableActivationWithLease()
+            recoverDurableActivationWithLease(allowedIntent)
         }
 
-    private suspend fun recoverDurableActivationWithLease(): RelayV2ActivationRecoveryResult {
+    private suspend fun recoverDurableActivationWithLease(
+        allowedIntent: EnrollmentIntent?,
+    ): RelayV2ActivationRecoveryResult {
         val journal = profileStore.pendingRelayV2Activation()
             ?: return RelayV2ActivationRecoveryResult.NoPendingActivation
         val profile = when (val state = activationCredentialState(journal)) {
@@ -801,6 +805,7 @@ internal class RelayV2ProfileRepository(
             isStillCurrent = { true },
             activationAuthority = recoveryActivationAuthority(
                 operationId = journal.operationId,
+                allowedIntent = allowedIntent,
             ),
         ) ?: error("Durable Relay v2 activation lost recovery authority")
         return RelayV2ActivationRecoveryResult.Activated(recovered)
@@ -1091,12 +1096,13 @@ internal class RelayV2ProfileRepository(
 
     private fun recoveryActivationAuthority(
         operationId: String,
+        allowedIntent: EnrollmentIntent?,
     ): RelayV2ProfileActivationAuthority = RelayV2ProfileActivationAuthority { activate ->
         enrollmentIntentMutex.withLock {
             val currentJournal = profileStore.pendingRelayV2Activation()
                 ?.takeIf { it.operationId == operationId }
                 ?: return@withLock null
-            credentialMutationMutex.withLock {
+            val activated = credentialMutationMutex.withLock {
                 activate(
                     RelayV2ProfileActivationCommit { journal, profile ->
                         if (journal.operationId != currentJournal.operationId) {
@@ -1108,6 +1114,12 @@ internal class RelayV2ProfileRepository(
                     },
                 )
             }
+            if (activated != null && allowedIntent != null &&
+                currentEnrollmentIntent === allowedIntent
+            ) {
+                currentEnrollmentIntent = null
+            }
+            activated
         }
     }
 
