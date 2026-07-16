@@ -1,9 +1,11 @@
 package com.tmuxworktree.mobile.core.relay.v2.terminal
 
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
+
 /** Frozen and local bounds for the unwired Android terminal checkpoint core. */
 internal object RelayV2TerminalCheckpointLimits {
-    const val SCHEMA_VERSION = 1
-    const val IDENTITY_VERSION = 1
+    const val SCHEMA_VERSION = 2
+    const val IDENTITY_VERSION = 2
     const val MAX_ID_UTF8_BYTES = 128
     const val MAX_CREDENTIAL_REFERENCE_UTF8_BYTES = 256
     const val MAX_FRAME_BYTES = 65_536
@@ -59,8 +61,6 @@ internal data class RelayV2TerminalIdentity(
     val sessionId: String,
     val streamId: String,
     val generation: String,
-    val openId: String,
-    val closeId: String,
     val resumeTokenCredentialReference: String,
     val pane: Int = 0,
 ) {
@@ -78,8 +78,6 @@ internal data class RelayV2TerminalIdentity(
             sessionId,
             streamId,
             generation,
-            openId,
-            closeId,
         ).forEach(::requireTerminalId)
         require(resumeTokenCredentialReference.isNotBlank())
         require(
@@ -93,22 +91,44 @@ internal data class RelayV2TerminalIdentity(
 }
 
 /**
- * Ephemeral socket/effect-delivery fence. It is deliberately not part of terminal timeline
- * identity: a retained generation may explicitly rebind to a newer route without changing bytes.
+ * One logical terminal.open attempt. The fingerprint binds all locally validated fields from that
+ * attempt, while [openId] remains the public protocol correlation identifier.
  */
-internal data class RelayV2TerminalDeliveryToken(
-    val profileActivationGeneration: Long,
-    val connectionGeneration: Long,
-    val deliverySequence: Long,
-    val routeId: String,
-    val routeFence: String,
+internal data class RelayV2TerminalOpenAttempt(
+    val openId: String,
+    val fingerprint: String,
 ) {
     init {
-        require(profileActivationGeneration > 0)
-        require(connectionGeneration > 0)
-        require(deliverySequence > 0)
-        requireTerminalId(routeId)
-        requireTerminalId(routeFence)
+        requireTerminalId(openId)
+        requireTerminalId(fingerprint)
+    }
+}
+
+/** One logical terminal.close attempt, retained until its exact correlated response arrives. */
+internal data class RelayV2TerminalCloseAttempt(
+    val closeId: String,
+    val fingerprint: String,
+) {
+    init {
+        requireTerminalId(closeId)
+        requireTerminalId(fingerprint)
+    }
+}
+
+/**
+ * Client-local effect-delivery fence. Actor generation is owned by RelayV2ConnectionActor; the
+ * local token distinguishes callback dispatches after a rebind within that actor generation.
+ * Carrier route identifiers never enter the Android public envelope or this checkpoint.
+ */
+internal data class RelayV2TerminalDeliveryToken(
+    val actorGeneration: RelayV2EffectGeneration,
+    val localDispatchToken: Long,
+) {
+    init {
+        requireTerminalId(actorGeneration.profileId)
+        require(actorGeneration.profileGeneration > 0)
+        require(actorGeneration.connectionGeneration > 0)
+        require(localDispatchToken > 0)
     }
 }
 
@@ -126,11 +146,17 @@ internal data class RelayV2TerminalBinding(
 internal data class RelayV2TerminalActionFence(
     val binding: RelayV2TerminalBinding,
     val deliveryToken: RelayV2TerminalDeliveryToken,
-)
+    val openId: String,
+) {
+    init {
+        requireTerminalId(openId)
+    }
+}
 
 internal data class RelayV2TerminalEffectFence(
     val identity: RelayV2TerminalIdentity,
     val deliveryToken: RelayV2TerminalDeliveryToken,
+    val openAttempt: RelayV2TerminalOpenAttempt,
 )
 
 /** Exact callback authority for one parser write or reset operation. */
@@ -148,6 +174,7 @@ internal enum class RelayV2TerminalPhase {
     REPLAY_REQUESTED,
     RESETTING_PARSER,
     CLOSED_WAITING_PARSER,
+    CLOSED_WAITING_CLOSE,
     FINALIZED,
     RESET_REQUIRED,
 }
@@ -222,19 +249,39 @@ internal data class RelayV2AmbiguousInput(
     val bytes: RelayV2TerminalBytes,
 )
 
-internal data class RelayV2TerminalClosedWatermark(
+internal data class RelayV2TerminalClosedTombstone(
     val finalOffset: String,
-    val replayAvailable: Boolean,
-    val bufferStartOffset: String?,
     val reason: RelayV2TerminalCloseReason,
     val exitCode: Int?,
-    val closeId: String?,
+    val closeAttempt: RelayV2TerminalCloseAttempt?,
+    val generation: String,
+    val openId: String,
+)
+
+internal data class RelayV2TerminalRetainedBuffer(
+    val replayAvailable: Boolean,
+    val bufferStartOffset: String?,
+)
+
+internal data class RelayV2TerminalClosedState(
+    val tombstone: RelayV2TerminalClosedTombstone,
+    val retainedBuffer: RelayV2TerminalRetainedBuffer,
 )
 
 internal data class RelayV2TerminalPendingReplay(
     val requestId: String,
     val fence: RelayV2TerminalEffectFence,
     val fromOffset: String,
+)
+
+internal data class RelayV2TerminalPendingOpen(
+    val requestId: String,
+    val deliveryToken: RelayV2TerminalDeliveryToken,
+    val openAttempt: RelayV2TerminalOpenAttempt,
+)
+
+internal data class RelayV2TerminalPendingClose(
+    val closeAttempt: RelayV2TerminalCloseAttempt,
 )
 
 /**
@@ -244,6 +291,7 @@ internal data class RelayV2TerminalPendingReplay(
 internal data class RelayV2TerminalCheckpoint(
     val schemaVersion: Int = RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
     val identity: RelayV2TerminalIdentity,
+    val openAttempt: RelayV2TerminalOpenAttempt,
     val deliveryToken: RelayV2TerminalDeliveryToken,
     val parserContinuityId: String,
     val phase: RelayV2TerminalPhase,
@@ -257,6 +305,7 @@ internal data class RelayV2TerminalCheckpoint(
     val parserInFlightCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val lastAppliedParserCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val pendingOutput: List<RelayV2PendingParserWrite> = emptyList(),
+    val pendingOpen: RelayV2TerminalPendingOpen? = null,
     val pendingReplay: RelayV2TerminalPendingReplay? = null,
     val replayTargetOffset: String? = null,
     val nextInputSeq: String = "1",
@@ -266,8 +315,8 @@ internal data class RelayV2TerminalCheckpoint(
     val ackedThroughResizeSeq: String = "0",
     val pendingResizes: List<RelayV2PendingResize> = emptyList(),
     val ambiguousInputs: List<RelayV2AmbiguousInput> = emptyList(),
-    val closeRequested: Boolean = false,
-    val closed: RelayV2TerminalClosedWatermark? = null,
+    val pendingClose: RelayV2TerminalPendingClose? = null,
+    val closed: RelayV2TerminalClosedState? = null,
     val resetReason: RelayV2TerminalResetReason? = null,
 )
 
@@ -291,8 +340,17 @@ internal sealed interface RelayV2TerminalStoredCheckpoint {
 }
 
 internal sealed interface RelayV2TerminalAction {
+    /** Owner-only entry authorizing one subsequent open response. */
+    data class BeginOpenAttempt(
+        val deliveryToken: RelayV2TerminalDeliveryToken,
+        val requestId: String,
+        val openAttempt: RelayV2TerminalOpenAttempt,
+    ) : RelayV2TerminalAction
+
     data class Opened(
         val identity: RelayV2TerminalIdentity,
+        val requestId: String,
+        val openAttempt: RelayV2TerminalOpenAttempt,
         val deliveryToken: RelayV2TerminalDeliveryToken,
         val parserContinuityId: String,
         val disposition: RelayV2TerminalOpenDisposition,
@@ -323,6 +381,7 @@ internal sealed interface RelayV2TerminalAction {
 
     data class ReplayStarted(
         val identity: RelayV2TerminalIdentity,
+        val openId: String,
         val deliveryToken: RelayV2TerminalDeliveryToken,
         val requestId: String,
         val fromOffset: String,
@@ -392,6 +451,7 @@ internal sealed interface RelayV2TerminalAction {
 
     data class RequestClose(
         val deliveryToken: RelayV2TerminalDeliveryToken,
+        val closeAttempt: RelayV2TerminalCloseAttempt,
     ) : RelayV2TerminalAction
 
     data class Closed(
@@ -404,13 +464,30 @@ internal sealed interface RelayV2TerminalAction {
         val closeId: String?,
     ) : RelayV2TerminalAction
 
-    data class HostResetRequired(
+    data class CorrelatedResetRequired(
         val fence: RelayV2TerminalActionFence,
+        val origin: RelayV2TerminalResetOrigin,
+        val requestId: String,
+        val openAttempt: RelayV2TerminalOpenAttempt? = null,
         val reason: RelayV2TerminalResetReason,
         val requestedOffset: String?,
         val bufferStartOffset: String?,
         val tailOffset: String?,
     ) : RelayV2TerminalAction
+
+    data class AsyncResetRequired(
+        val fence: RelayV2TerminalActionFence,
+        val correlationProofId: String,
+        val reason: RelayV2TerminalResetReason,
+        val requestedOffset: String?,
+        val bufferStartOffset: String?,
+        val tailOffset: String?,
+    ) : RelayV2TerminalAction
+}
+
+internal enum class RelayV2TerminalResetOrigin {
+    OPEN,
+    REPLAY,
 }
 
 internal enum class RelayV2TerminalEffectPriority {
@@ -466,7 +543,6 @@ internal sealed interface RelayV2TerminalEffect {
         val resizeSeq: String,
         val cols: Int,
         val rows: Int,
-        val replacesQueued: Boolean = false,
         override val priority: RelayV2TerminalEffectPriority = RelayV2TerminalEffectPriority.CONTROL,
     ) : RelayV2TerminalEffect
 
@@ -518,6 +594,9 @@ internal enum class RelayV2TerminalIgnoredReason {
     OUT_OF_ORDER_PARSER_CALLBACK,
     DUPLICATE_ACK,
     DUPLICATE_CLOSED,
+    STALE_OPEN_RESPONSE,
+    STALE_RESET_RESPONSE,
+    STALE_CLOSE_RESPONSE,
 }
 
 internal enum class RelayV2TerminalControlRejectionReason {
