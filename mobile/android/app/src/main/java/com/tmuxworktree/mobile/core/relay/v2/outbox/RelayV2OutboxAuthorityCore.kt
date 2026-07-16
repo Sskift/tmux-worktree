@@ -9,6 +9,8 @@ internal object RelayV2OutboxLimits {
     const val MAX_QUERY_ITEMS_PER_BATCH = 32
     const val MAX_QUERY_BATCHES =
         (MAX_ENTRIES + MAX_QUERY_ITEMS_PER_BATCH - 1) / MAX_QUERY_ITEMS_PER_BATCH
+    const val MAX_REISSUE_CONFIRMATION_HISTORY_STEPS = 64
+    const val MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES = 65_536
     const val MAX_ARGUMENTS_CANONICAL_BYTES = 131_072
     const val MAX_ENTRY_CANONICAL_BYTES = 262_144
     const val MAX_STATE_CANONICAL_BYTES = 16_777_216
@@ -17,6 +19,10 @@ internal object RelayV2OutboxLimits {
 internal data class RelayV2OutboxCapacity(
     val maxEntries: Int = RelayV2OutboxLimits.MAX_ENTRIES,
     val maxAttemptsPerEntry: Int = RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
+    val maxReissueConfirmationHistorySteps: Int =
+        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
+    val maxReissueConfirmationHistoryCanonicalBytes: Int =
+        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
     val maxArgumentsCanonicalBytes: Int = RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES,
     val maxEntryCanonicalBytes: Int = RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES,
     val maxStateCanonicalBytes: Int = RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES,
@@ -24,6 +30,14 @@ internal data class RelayV2OutboxCapacity(
     init {
         require(maxEntries in 1..RelayV2OutboxLimits.MAX_ENTRIES)
         require(maxAttemptsPerEntry in 1..RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY)
+        require(
+            maxReissueConfirmationHistorySteps in
+                1..RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
+        )
+        require(
+            maxReissueConfirmationHistoryCanonicalBytes in
+                1..RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
+        )
         require(maxArgumentsCanonicalBytes in 1..RelayV2OutboxLimits.MAX_ARGUMENTS_CANONICAL_BYTES)
         require(maxEntryCanonicalBytes in 1..RelayV2OutboxLimits.MAX_ENTRY_CANONICAL_BYTES)
         require(maxStateCanonicalBytes in 1..RelayV2OutboxLimits.MAX_STATE_CANONICAL_BYTES)
@@ -324,7 +338,7 @@ internal data class RelayV2ReissueTargetSnapshot(
     override fun toString(): String = "RelayV2ReissueTargetSnapshot(<redacted>)"
 }
 
-internal data class RelayV2ReissueLatestConfirmedTargetProof(
+internal data class RelayV2ReissueConfirmedTargetStep(
     val sourceTarget: RelayV2ReissueTargetSnapshot,
     val confirmedTarget: RelayV2ReissueTargetSnapshot,
     val confirmationOrdinal: Long,
@@ -334,7 +348,7 @@ internal data class RelayV2ReissueLatestConfirmedTargetProof(
         require(confirmationOrdinal in 1..MAX_JSON_INTEGER)
     }
 
-    override fun toString(): String = "RelayV2ReissueLatestConfirmedTargetProof(<redacted>)"
+    override fun toString(): String = "RelayV2ReissueConfirmedTargetStep(<redacted>)"
 }
 
 internal data class RelayV2ReissueLineageProof(
@@ -394,7 +408,7 @@ internal data class RelayV2OutboxEntry(
     val reissuedFromCommandId: String? = null,
     val targetRevalidation: RelayV2QueuedTargetRevalidation? = null,
     val reissueLineageProof: RelayV2ReissueLineageProof? = null,
-    val reissueLatestConfirmedTargetProof: RelayV2ReissueLatestConfirmedTargetProof? = null,
+    val reissueConfirmedTargetHistory: List<RelayV2ReissueConfirmedTargetStep> = emptyList(),
 ) {
     val id: RelayV2OutboxEntryId = RelayV2OutboxEntryId(
         profileId,
@@ -415,6 +429,13 @@ internal data class RelayV2OutboxEntry(
     val canonicalJson: String by lazy(LazyThreadSafetyMode.NONE) { canonicalEntryJson() }
     val canonicalByteCount: Int by lazy(LazyThreadSafetyMode.NONE) {
         canonicalJson.toByteArray(Charsets.UTF_8).size
+    }
+    val reissueConfirmedTargetHistoryCanonicalByteCount: Int by lazy(
+        LazyThreadSafetyMode.NONE,
+    ) {
+        RelayV2OutboxCanonicalJson.stringify(
+            reissueConfirmedTargetHistory.canonicalValue(),
+        ).toByteArray(Charsets.UTF_8).size
     }
 
     init {
@@ -492,7 +513,7 @@ internal data class RelayV2OutboxEntry(
         }
         require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
         require((reissuedFromCommandId == null) == (reissueLineageProof == null))
-        require(reissueLatestConfirmedTargetProof == null || reissueLineageProof != null)
+        require(reissueConfirmedTargetHistory.isEmpty() || reissueLineageProof != null)
         require(
             reissueLineageProof != null || targetRevalidation?.sourceConfirmedTarget == null,
         )
@@ -545,14 +566,8 @@ internal data class RelayV2OutboxEntry(
                     "replacementProfileId" to it.replacementProfileId,
                 )
             },
-            "reissueLatestConfirmedTargetProof" to
-                reissueLatestConfirmedTargetProof?.let {
-                    mapOf(
-                        "confirmationOrdinal" to it.confirmationOrdinal,
-                        "confirmedTarget" to it.confirmedTarget.canonicalMap(),
-                        "sourceTarget" to it.sourceTarget.canonicalMap(),
-                    )
-                },
+            "reissueConfirmedTargetHistory" to
+                reissueConfirmedTargetHistory.canonicalValue(),
             "replacementCommandId" to replacementCommandId,
             "requestFingerprint" to requestFingerprint.sha256Hex,
             "requestFingerprintSchemaVersion" to requestFingerprint.schemaVersion,
@@ -597,6 +612,11 @@ internal class RelayV2OutboxState private constructor(
             var cheapStateLowerBound = 0L
             entries.forEach { entry ->
                 requireOutboxCapacity(
+                    entry.reissueConfirmedTargetHistory.size <=
+                        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_STEPS,
+                    "too many reissue confirmation history steps",
+                )
+                requireOutboxCapacity(
                     entry.attempts.size <= RelayV2OutboxLimits.MAX_ATTEMPTS_PER_ENTRY,
                     "too many attempts",
                 )
@@ -613,7 +633,12 @@ internal class RelayV2OutboxState private constructor(
             }
 
             val snapshots = entries.map { entry ->
-                entry.copy(attempts = immutableListSnapshot(entry.attempts))
+                entry.copy(
+                    attempts = immutableListSnapshot(entry.attempts),
+                    reissueConfirmedTargetHistory = immutableListSnapshot(
+                        entry.reissueConfirmedTargetHistory,
+                    ),
+                )
             }
             require(snapshots.map { it.id }.toSet().size == snapshots.size) {
                 "duplicate command identity"
@@ -627,6 +652,11 @@ internal class RelayV2OutboxState private constructor(
 
             var canonicalEntriesBytes = 0L
             snapshots.forEachIndexed { index, entry ->
+                requireOutboxCapacity(
+                    entry.reissueConfirmedTargetHistoryCanonicalByteCount <=
+                        RelayV2OutboxLimits.MAX_REISSUE_CONFIRMATION_HISTORY_CANONICAL_BYTES,
+                    "reissue confirmation history exceeds the canonical hard bound",
+                )
                 entry.validateForRestore()
                 requireOutboxCapacity(
                     entry.canonicalRequestArguments.utf8ByteCount <=
@@ -1590,20 +1620,12 @@ internal class RelayV2OutboxAuthorityCore(
                     val existingPending = entry.targetRevalidation
                     val sourceConfirmedTarget = lineageProof?.let {
                         existingPending?.sourceConfirmedTarget
-                            ?: entry.reissueLatestConfirmedTargetProof?.confirmedTarget
+                            ?: entry.reissueConfirmedTargetHistory.lastOrNull()?.confirmedTarget
                             ?: it.replacementInitialTarget
                     }
                     val confirmationOrdinal = lineageProof?.let {
                         existingPending?.confirmationOrdinal
-                            ?: entry.reissueLatestConfirmedTargetProof?.let { latest ->
-                                if (latest.confirmationOrdinal >= MAX_JSON_INTEGER) {
-                                    return state.reject(
-                                        RelayV2OutboxRejection.INVARIANT_VIOLATION,
-                                    )
-                                }
-                                latest.confirmationOrdinal + 1
-                            }
-                            ?: 1L
+                            ?: (entry.reissueConfirmedTargetHistory.size + 1).toLong()
                     }
                     val revalidation = RelayV2QueuedTargetRevalidation(
                         action.observedHostEpoch,
@@ -1703,29 +1725,28 @@ internal class RelayV2OutboxAuthorityCore(
             sessionId = action.verifiedSessionId,
             requestFingerprint = updatedFingerprint,
         )
-        val latestConfirmedTargetProof = entry.reissueLineageProof?.let { lineageProof ->
+        val confirmedTargetHistory = entry.reissueLineageProof?.let { lineageProof ->
             val sourceTarget = pending.sourceConfirmedTarget
                 ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
             val ordinal = pending.confirmationOrdinal
                 ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-            val previous = entry.reissueLatestConfirmedTargetProof
-            if (previous == null) {
-                if (sourceTarget != lineageProof.replacementInitialTarget || ordinal != 1L) {
-                    return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-                }
-            } else {
-                if (previous.confirmedTarget != sourceTarget ||
-                    previous.confirmationOrdinal >= MAX_JSON_INTEGER ||
-                    ordinal != previous.confirmationOrdinal + 1
-                ) {
-                    return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
-                }
+            val expectedSource = entry.reissueConfirmedTargetHistory.lastOrNull()?.confirmedTarget
+                ?: lineageProof.replacementInitialTarget
+            val expectedOrdinal = (entry.reissueConfirmedTargetHistory.size + 1).toLong()
+            if (sourceTarget != expectedSource || ordinal != expectedOrdinal) {
+                return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
             }
-            RelayV2ReissueLatestConfirmedTargetProof(
+            if (entry.reissueConfirmedTargetHistory.size >=
+                capacity.maxReissueConfirmationHistorySteps
+            ) {
+                return state.reject(RelayV2OutboxRejection.CAPACITY_EXCEEDED)
+            }
+            val step = RelayV2ReissueConfirmedTargetStep(
                 sourceTarget = sourceTarget,
                 confirmedTarget = confirmedTarget,
                 confirmationOrdinal = ordinal,
             )
+            immutableListSnapshot(entry.reissueConfirmedTargetHistory + step)
         }
         val updated = entry.copy(
             expectedHostEpoch = action.observedHostEpoch,
@@ -1734,7 +1755,8 @@ internal class RelayV2OutboxAuthorityCore(
             sessionId = action.verifiedSessionId,
             requestFingerprint = updatedFingerprint,
             targetRevalidation = null,
-            reissueLatestConfirmedTargetProof = latestConfirmedTargetProof,
+            reissueConfirmedTargetHistory = confirmedTargetHistory
+                ?: entry.reissueConfirmedTargetHistory,
         )
         if (state.entries.any { it.id == updated.id && it.id != entry.id }) {
             return state.reject(RelayV2OutboxRejection.DUPLICATE_COMMAND)
@@ -1807,6 +1829,10 @@ internal class RelayV2OutboxAuthorityCore(
             state.canonicalByteCount <= capacity.maxStateCanonicalBytes &&
             state.entries.all {
                 it.attempts.size <= capacity.maxAttemptsPerEntry &&
+                    it.reissueConfirmedTargetHistory.size <=
+                    capacity.maxReissueConfirmationHistorySteps &&
+                    it.reissueConfirmedTargetHistoryCanonicalByteCount <=
+                    capacity.maxReissueConfirmationHistoryCanonicalBytes &&
                     it.canonicalRequestArguments.utf8ByteCount <=
                     capacity.maxArgumentsCanonicalBytes &&
                     it.canonicalByteCount <= capacity.maxEntryCanonicalBytes
@@ -1879,6 +1905,15 @@ private fun RelayV2ReissueTargetSnapshot.canonicalMap(): Map<String, Any?> = map
     "scopeId" to scopeId,
     "sessionId" to sessionId,
 )
+
+private fun List<RelayV2ReissueConfirmedTargetStep>.canonicalValue(): List<Map<String, Any?>> =
+    map { step ->
+        mapOf(
+            "confirmationOrdinal" to step.confirmationOrdinal,
+            "confirmedTarget" to step.confirmedTarget.canonicalMap(),
+            "sourceTarget" to step.sourceTarget.canonicalMap(),
+        )
+    }
 
 private fun RelayV2OutboxEntry.requiresTargetRevalidation(): Boolean =
     targetRevalidation != null
@@ -2120,8 +2155,10 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
         (reissueLineageProof?.replacementHostId?.length ?: 0) +
         (reissueLineageProof?.replacementCommandId?.length ?: 0) +
         (reissueLineageProof?.replacementInitialTarget?.cheapCanonicalLowerBound() ?: 0L) +
-        (reissueLatestConfirmedTargetProof?.sourceTarget?.cheapCanonicalLowerBound() ?: 0L) +
-        (reissueLatestConfirmedTargetProof?.confirmedTarget?.cheapCanonicalLowerBound() ?: 0L) +
+        reissueConfirmedTargetHistory.sumOf { step ->
+            step.sourceTarget.cheapCanonicalLowerBound() +
+                step.confirmedTarget.cheapCanonicalLowerBound()
+        } +
         (targetRevalidation?.sourceConfirmedTarget?.cheapCanonicalLowerBound() ?: 0L) +
         attempts.sumOf { it.requestId.length.toLong() }
 
@@ -2299,19 +2336,19 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
             initialTarget.sessionId == sessionId &&
             initialTarget.matchesFingerprint(other)
     val currentTarget = other.reissueTargetSnapshot()
-    val latestConfirmed = other.reissueLatestConfirmedTargetProof
-    val latestConfirmedIsValid = latestConfirmed == null ||
-        (
-            latestConfirmed.sourceTarget.matchesFingerprint(other) &&
-            latestConfirmed.confirmedTarget.matchesFingerprint(other) &&
-            (
-                if (latestConfirmed.confirmationOrdinal == 1L) {
-                    latestConfirmed.sourceTarget == initialTarget
-                } else {
-                    latestConfirmed.sourceTarget != initialTarget
-                }
-            )
-        )
+    var confirmedHistoryIsValid = true
+    var confirmedHistoryTail = initialTarget
+    other.reissueConfirmedTargetHistory.forEachIndexed { index, step ->
+        if (step.confirmationOrdinal != (index + 1).toLong() ||
+            step.sourceTarget != confirmedHistoryTail ||
+            step.sourceTarget == step.confirmedTarget ||
+            !step.sourceTarget.matchesFingerprint(other) ||
+            !step.confirmedTarget.matchesFingerprint(other)
+        ) {
+            confirmedHistoryIsValid = false
+        }
+        confirmedHistoryTail = step.confirmedTarget
+    }
     val pending = other.targetRevalidation
     val currentTargetIsAuthorized = if (pending != null) {
         val pendingSource = pending.sourceConfirmedTarget
@@ -2322,22 +2359,10 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
             pending.dedupeWindowId == currentTarget.dedupeWindowId &&
             currentTarget.matchesFingerprint(other) &&
             currentTarget != pendingSource &&
-            (
-                if (latestConfirmed == null) {
-                    pendingSource == initialTarget && pendingOrdinal == 1L
-                } else {
-                    latestConfirmedIsValid &&
-                        latestConfirmed.confirmationOrdinal < MAX_JSON_INTEGER &&
-                        pendingSource == latestConfirmed.confirmedTarget &&
-                        pendingOrdinal == latestConfirmed.confirmationOrdinal + 1
-                }
-            )
-    } else if (latestConfirmed == null) {
-        currentTarget == initialTarget
+            pendingSource == confirmedHistoryTail &&
+            pendingOrdinal == (other.reissueConfirmedTargetHistory.size + 1).toLong()
     } else {
-        latestConfirmedIsValid &&
-            currentTarget != initialTarget &&
-            latestConfirmed.confirmedTarget == currentTarget
+        currentTarget == confirmedHistoryTail
     }
     return profileId == other.profileId &&
         principalId == other.principalId &&
@@ -2346,6 +2371,7 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
         canonicalRequestArguments == other.canonicalRequestArguments &&
         lineageProofMatchesParent &&
         lineageProofMatchesReplacement &&
+        confirmedHistoryIsValid &&
         currentTargetIsAuthorized
 }
 
