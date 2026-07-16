@@ -261,7 +261,7 @@ internal fun interface RelayV2ProfileActivationCommit {
     suspend fun installCredential(
         journal: RelayV2ProfileActivationJournal,
         profile: RelayV2Profile,
-    ): RelayV2CredentialBlob?
+    ): RelayV2CompletedCredentialProof?
 }
 
 internal fun interface RelayV2ProfileActivationAuthority {
@@ -281,19 +281,20 @@ internal interface RelayV2ProfileStore {
         profile: RelayV2Profile,
         targetBindingDigest: String,
         targetCredentialAttemptId: String,
+        targetCredentialSecretReference: String,
         barrierId: String?,
         previousCredentialReference: RelayV2CredentialReference?,
     ): RelayV2ProfileActivationJournal?
 
-    suspend fun fenceRelayV2Activation(
-        operationId: String,
-        receipt: RelayProfileDisconnectReceipt?,
-    ): RelayV2ProfileActivationJournal?
-
     suspend fun markRelayV2CredentialReady(
         operationId: String,
-        credentialVersion: Long,
+        proof: RelayV2CompletedCredentialProof,
     ): RelayV2ProfileActivationJournal?
+
+    /** Clears only an exact reversible PREPARED operation, preserving its usable old profile. */
+    suspend fun rollbackPreparedRelayV2Activation(
+        journal: RelayV2ProfileActivationJournal,
+    ): Boolean
 
     /** Publishes [profile] and removes its exact durable activation journal in one DataStore edit. */
     suspend fun activateRelayV2Profile(
@@ -324,8 +325,25 @@ internal data class RelayProfileDisconnectReceipt(
 
 internal enum class RelayV2ProfileActivationPhase {
     PREPARED,
-    OLD_FENCED,
     CREDENTIAL_READY,
+}
+
+/** Non-sensitive proof that an exact enrollment result is durable in secure storage. */
+internal data class RelayV2CompletedCredentialProof(
+    val credentialReference: RelayV2CredentialReference,
+    val credentialVersion: Long,
+    val bindingDigest: String,
+    val completedAttemptId: String,
+    val completedSecretReference: String,
+) {
+    init {
+        require(credentialVersion > 0) { "Completed credential version must be positive" }
+        require(bindingDigest.isNotBlank()) { "Completed credential binding is required" }
+        require(completedAttemptId.isNotBlank()) { "Completed credential attempt is required" }
+        require(completedSecretReference.isNotBlank()) {
+            "Completed credential secret reference is required"
+        }
+    }
 }
 
 /** Non-sensitive durable recovery record; credential material remains Keystore-only. */
@@ -339,6 +357,7 @@ internal data class RelayV2ProfileActivationJournal(
     val targetCredentialVersion: Long,
     val targetBindingDigest: String,
     val targetCredentialAttemptId: String,
+    val targetCredentialSecretReference: String,
     val targetActivationGeneration: Long,
     val phase: RelayV2ProfileActivationPhase,
 ) {
@@ -360,6 +379,9 @@ internal data class RelayV2ProfileActivationJournal(
         require(targetCredentialAttemptId.isNotBlank()) {
             "Target credential attempt ID is required"
         }
+        require(targetCredentialSecretReference.isNotBlank()) {
+            "Target credential secret reference is required"
+        }
         require(targetActivationGeneration >= 0) {
             "Target activation generation cannot be negative"
         }
@@ -380,16 +402,12 @@ internal data class RelayV2ProfileActivationJournal(
             targetCredentialVersion == profile.credentialVersion &&
             targetActivationGeneration == profile.activationGeneration
 
-    fun targetsCredential(blob: RelayV2CredentialBlob): Boolean =
-        blob.credentialVersion >= targetCredentialVersion &&
-            targetCredentialAttemptId == blob.completedAttemptId
-
-    fun validatedReceipt(): RelayProfileDisconnectReceipt? {
-        check(phase != RelayV2ProfileActivationPhase.PREPARED) {
-            "Prepared activation has no validated disconnect receipt"
-        }
-        return barrierId?.let { RelayProfileDisconnectReceipt(requireNotNull(previousProfile), it) }
-    }
+    fun targetsCredential(proof: RelayV2CompletedCredentialProof): Boolean =
+        proof.credentialReference == targetCredentialReference &&
+            proof.credentialVersion >= targetCredentialVersion &&
+            proof.bindingDigest == targetBindingDigest &&
+            proof.completedAttemptId == targetCredentialAttemptId &&
+            proof.completedSecretReference == targetCredentialSecretReference
 }
 
 /** Clears the old profile's Room cache, Outbox, drafts, terminal queue, and credential. */
