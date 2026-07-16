@@ -73,6 +73,8 @@ export interface RelayV2CanonicalCommandRequest {
 
 interface RelayV2CanonicalExecutionPlanBase {
   schemaVersion: typeof RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION;
+  commandId: string;
+  requestFingerprint: RelayV2CommandRequestFingerprint;
   operation: RelayV2CommandOperation;
   principalId: string;
   hostId: string;
@@ -264,6 +266,7 @@ export type RelayV2CommandAdmission =
 type RelayV2ExecutionFailureOutcome =
   | {
       state: "failed";
+      sideEffect: "not_applied";
       error: RelayV2CommandStructuredError;
     }
   | {
@@ -919,6 +922,8 @@ function parseAuthorityEvidence(
 function parseExecutionPlan(
   value: unknown,
   expected: {
+    commandId: string;
+    fingerprint: StoredFingerprint;
     operation: RelayV2CommandOperation;
     principalId: string;
     hostId: string;
@@ -931,6 +936,8 @@ function parseExecutionPlan(
   if (!isRecord(value)
     || !hasExactKeys(value, [
       "schemaVersion",
+      "commandId",
+      "requestFingerprint",
       "authority",
       "operation",
       "principalId",
@@ -943,6 +950,7 @@ function parseExecutionPlan(
       "resourceReservation",
     ])
     || value.schemaVersion !== RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION
+    || value.commandId !== expected.commandId
     || !isCommandOperation(value.operation)
     || (value.authority !== "tw_rpc" && value.authority !== "terminal_control")
     || value.authority !== authorityFor(value.operation)
@@ -960,6 +968,12 @@ function parseExecutionPlan(
   }
   assertJson(value.arguments);
   assertJson(value.adapterState);
+  const requestFingerprint = parseFingerprint(value.requestFingerprint);
+  if (!fingerprintsEqual(requestFingerprint, expected.fingerprint)) {
+    throw new RelayV2HostCommandPlaneStateError(
+      "Relay v2 command execution plan fingerprint does not match ledger",
+    );
+  }
   if (value.resourceReservation !== null) {
     parseResourceReservationBinding(value.resourceReservation);
   }
@@ -1089,6 +1103,8 @@ function parseStoredCommand(value: RelayV2HostJson): StoredCommand {
     throw new RelayV2HostCommandPlaneStateError("Relay v2 command fingerprint does not match ledger");
   }
   const expected = {
+    commandId: value.commandId,
+    fingerprint,
     operation: value.operation,
     principalId: value.principalId,
     hostId: value.hostId,
@@ -1252,11 +1268,14 @@ function fingerprintsEqual(left: StoredFingerprint, right: StoredFingerprint): b
 function planFor(
   auth: RelayV2CommandAuthContext,
   command: NormalizedCommand,
+  fingerprint: StoredFingerprint,
   adapterState: RelayV2HostJson,
   resourceReservation: RelayV2CommandResourceReservationBinding | null,
 ): RelayV2CanonicalExecutionPlan {
   const base = {
     schemaVersion: RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION,
+    commandId: command.commandId,
+    requestFingerprint: cloneJson(fingerprint),
     operation: command.operation,
     principalId: auth.principalId,
     hostId: command.hostId,
@@ -1325,7 +1344,7 @@ function createFinalFailureRecord(
       auth,
       command,
       fingerprint,
-      planFor(auth, command, null, null),
+      planFor(auth, command, fingerprint, null, null),
       now,
     ),
     executionPlan: null,
@@ -1676,7 +1695,20 @@ function validateFailureOutcome(
   record: StoredCommandRecord,
   outcome: RelayV2ExecutionFailureOutcome,
 ): RelayV2ExecutionFailureOutcome {
-  if (outcome.state === "in_doubt") return outcome;
+  if (!isRecord(outcome)) {
+    throw new TypeError("canonical executor returned a malformed failure outcome");
+  }
+  if (outcome.state === "in_doubt") {
+    if (!hasExactKeys(outcome, ["state"])) {
+      throw new TypeError("canonical executor returned a malformed in-doubt outcome");
+    }
+    return { state: "in_doubt" };
+  }
+  if (outcome.state !== "failed"
+    || !hasExactKeys(outcome, ["state", "sideEffect", "error"])
+    || outcome.sideEffect !== "not_applied") {
+    throw new TypeError("canonical executor failure lacks exact no-side-effect proof");
+  }
   const error = normalizeError(outcome.error);
   if (error.retryable || error.commandDisposition !== "completed") {
     throw new TypeError("canonical executor returned a retryable final failure");
@@ -1702,7 +1734,7 @@ function validateFailureOutcome(
   };
   if (record.sessionId !== null) probe.sessionId = record.sessionId;
   checkedFrame(probe);
-  return { state: "failed", error };
+  return { state: "failed", sideEffect: "not_applied", error };
 }
 
 function validateSucceededResult(
@@ -2013,7 +2045,13 @@ export class RelayV2HostCommandPlane {
                   auth,
                   command,
                   fingerprint,
-                  planFor(auth, command, admission.adapterState, resourceReservation),
+                  planFor(
+                    auth,
+                    command,
+                    fingerprint,
+                    admission.adapterState,
+                    resourceReservation,
+                  ),
                   now,
                 );
             transaction.putCommandRecord(

@@ -238,6 +238,8 @@ async function executionPlan(executor, request, reservationId = "reservation-sta
   assert.equal(admission.kind, "executable");
   return {
     schemaVersion: 1,
+    commandId: request.commandId,
+    requestFingerprint: structuredClone(request.requestFingerprint),
     authority: request.authority,
     operation: request.operation,
     principalId: request.principalId,
@@ -507,6 +509,23 @@ test("TW RPC maps only explicit no-side-effect failure and strict correlated suc
     assert.equal(ports.calls.process.length, 0);
   });
 
+  for (const [name, mutate] of [
+    ["adapter command identity mismatch", (plan) => { plan.adapterState.commandId = "cmd-other"; }],
+    ["adapter fingerprint identity mismatch", (plan) => {
+      plan.adapterState.requestFingerprint = fingerprint("d");
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const ports = fakePorts();
+      const executor = executorFor(ports);
+      const plan = await executionPlan(executor, canonicalRequest("create_terminal"));
+      mutate(plan);
+      assert.equal((await executor.executeTwRpc(plan)).state, "in_doubt");
+      assert.equal(ports.calls.process.length, 0, "identity mismatch must fail before process I/O");
+      assert.equal(ports.calls.terminal.length, 0);
+    });
+  }
+
   await t.test("kill explicit not-applied", async () => {
     const ports = fakePorts({
       process: () => exitedJson({
@@ -539,6 +558,33 @@ test("terminal-control requires exact success correlation or explicit not-applie
       },
       expected: "failed",
     },
+    {
+      name: "failed without proof",
+      response: {
+        state: "failed",
+        error: { code: "PERMISSION_DENIED", message: "outcome lacks side-effect proof" },
+      },
+      expected: "in_doubt",
+    },
+    {
+      name: "failed with ambiguous proof",
+      response: {
+        state: "failed",
+        sideEffect: "unknown",
+        error: { code: "PERMISSION_DENIED", message: "input may have been applied" },
+      },
+      expected: "in_doubt",
+    },
+    {
+      name: "failed with extra field",
+      response: {
+        state: "failed",
+        sideEffect: "not_applied",
+        error: { code: "PERMISSION_DENIED", message: "fence rejected before write" },
+        futureField: true,
+      },
+      expected: "in_doubt",
+    },
     { name: "ambiguous", response: { state: "ambiguous" }, expected: "in_doubt" },
     { name: "in-doubt", response: { state: "in_doubt" }, expected: "in_doubt" },
   ];
@@ -549,6 +595,7 @@ test("terminal-control requires exact success correlation or explicit not-applie
       const plan = await executionPlan(executor, canonicalRequest("send_agent_message"));
       const outcome = await executor.executeTerminalControl(plan);
       assert.equal(outcome.state, scenario.expected);
+      if (scenario.expected === "failed") assert.equal(outcome.sideEffect, "not_applied");
       assert.equal(ports.calls.terminal.length, 1);
       assert.equal(ports.calls.process.length, 0);
     });

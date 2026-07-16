@@ -552,8 +552,8 @@ function parseAdapterState(
   }
   const request: RelayV2CanonicalCommandRequest = {
     fingerprintSchemaVersion: 1,
-    commandId: boundedString(value.commandId),
-    requestFingerprint: fingerprint(value.requestFingerprint),
+    commandId: boundedString(plan.commandId),
+    requestFingerprint: fingerprint(plan.requestFingerprint),
     authority: plan.authority,
     operation: plan.operation,
     principalId: plan.principalId,
@@ -563,6 +563,12 @@ function parseAdapterState(
     sessionId: plan.sessionId,
     arguments: clone(plan.arguments),
   };
+  const storedCommandId = boundedString(value.commandId);
+  const storedFingerprint = fingerprint(value.requestFingerprint);
+  if (storedCommandId !== request.commandId
+    || canonicalJson(storedFingerprint) !== canonicalJson(request.requestFingerprint)) {
+    throw new TypeError("canonical adapter state identity does not match its execution plan");
+  }
   const state: StoredAdapterState = {
     schemaVersion: RELAY_V2_CANONICAL_ADAPTER_STATE_SCHEMA_VERSION,
     commandId: request.commandId,
@@ -832,8 +838,8 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
           return { state: "in_doubt" };
         }
         expectedCorrelation = correlation({
-          commandId: state.commandId,
-          requestFingerprint: state.requestFingerprint,
+          commandId: plan.commandId,
+          requestFingerprint: plan.requestFingerprint,
           hostEpoch: plan.hostEpoch,
           principalId: plan.principalId,
           hostId: plan.hostId,
@@ -941,7 +947,7 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         || state.target.operation !== "send_agent_message") {
         return { state: "in_doubt" };
       }
-      const operationId = `relay-v2:${state.commandId}`;
+      const operationId = `relay-v2:${plan.commandId}`;
       const input = {
         scopeId: plan.scopeId,
         lease: clone(state.target.lease),
@@ -960,7 +966,9 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         return { state: "in_doubt" };
       }
       if (response.state === "failed") {
-        if (response.sideEffect !== "not_applied"
+        if (!isRecord(response)
+          || !exactKeys(response, ["state", "sideEffect", "error"])
+          || response.sideEffect !== "not_applied"
           || !isRecord(response.error)
           || !exactKeys(response.error, ["code", "message"])
           || typeof response.error.code !== "string"
@@ -975,6 +983,7 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         }
         return {
           state: "failed",
+          sideEffect: "not_applied",
           error: finalFailure("Canonical terminal-control proved the input was not applied"),
         };
       }

@@ -347,7 +347,8 @@ test("Relay v2 command fixtures persist RUNNING before routing each fixed operat
         const snapshot = await store.read();
         const records = Object.values(snapshot.commands);
         assert.ok(records.some((record) => (
-          record.commandId === plan.adapterState.commandId
+          record.commandId === plan.commandId
+          && record.fingerprint.digest === plan.requestFingerprint.digest
           && record.state === "running"
         )), `${plan.operation} must be durably RUNNING before TW RPC`);
         return successFor(plan);
@@ -356,7 +357,8 @@ test("Relay v2 command fixtures persist RUNNING before routing each fixed operat
         const snapshot = await store.read();
         const records = Object.values(snapshot.commands);
         assert.ok(records.some((record) => (
-          record.commandId === plan.adapterState.commandId
+          record.commandId === plan.commandId
+          && record.fingerprint.digest === plan.requestFingerprint.digest
           && record.state === "running"
         )), "send_agent_message must be durably RUNNING before terminal-control");
         return successFor(plan);
@@ -915,6 +917,26 @@ test("recovery revalidates closed plans, command semantics, results, and errors 
         }),
       },
       {
+        name: "execution plan command identity mismatch",
+        mutate: (record) => ({
+          ...record,
+          executionPlan: { ...record.executionPlan, commandId: "cmd-other" },
+        }),
+      },
+      {
+        name: "execution plan fingerprint identity mismatch",
+        mutate: (record) => ({
+          ...record,
+          executionPlan: {
+            ...record.executionPlan,
+            requestFingerprint: {
+              ...record.executionPlan.requestFingerprint,
+              digest: "d".repeat(64),
+            },
+          },
+        }),
+      },
+      {
         name: "self-consistent operation arguments",
         mutate: (record) => {
           record.arguments.pane = "0";
@@ -1048,6 +1070,64 @@ test("an exception after the RUNNING boundary becomes durable in_doubt and is ne
     assert.equal(queryResponse.payload.items[0].error.code, "COMMAND_IN_DOUBT");
   } finally {
     h.cleanup();
+  }
+});
+
+test("terminal-control final failure requires exact not-applied proof", async (t) => {
+  const finalError = {
+    code: "COMMAND_FAILED",
+    message: "Canonical terminal-control rejected the input",
+    retryable: false,
+    commandDisposition: "completed",
+    details: null,
+  };
+  const cases = [
+    {
+      name: "exact proof",
+      outcome: { state: "failed", sideEffect: "not_applied", error: finalError },
+      expected: "failed",
+    },
+    {
+      name: "missing proof",
+      outcome: { state: "failed", error: finalError },
+      expected: "in_doubt",
+    },
+    {
+      name: "ambiguous proof",
+      outcome: { state: "failed", sideEffect: "unknown", error: finalError },
+      expected: "in_doubt",
+    },
+    {
+      name: "malformed extra field",
+      outcome: {
+        state: "failed",
+        sideEffect: "not_applied",
+        error: finalError,
+        futureField: true,
+      },
+      expected: "in_doubt",
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const h = harness();
+      try {
+        const fake = fakeExecutor({
+          executeTerminalControl: async () => structuredClone(entry.outcome),
+        });
+        const configured = await setup(h, fake.executor);
+        const frame = commandFrame(
+          "command-execute-send-agent-message",
+          configured.snapshot.hostEpoch,
+          configured.window.windowId,
+        );
+        const response = await configured.plane.execute(auth(), frame);
+        assert.equal(response.payload.state, entry.expected);
+        assert.equal(fake.calls.terminalControl.length, 1);
+      } finally {
+        h.cleanup();
+      }
+    });
   }
 });
 
