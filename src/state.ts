@@ -77,6 +77,11 @@ export interface ManagedStateLock {
   owner: string;
 }
 
+export interface RecordManagedSessionDeps {
+  loadManagedStateForMutation?: (path: string) => ManagedState;
+  saveManagedState?: (state: ManagedState, path: string) => void;
+}
+
 interface ManagedStateLockOwnerRecord {
   owner: string;
   createdAt: number;
@@ -478,13 +483,26 @@ function withManagedStateLock<T>(path: string, operation: () => T): T {
 export function recordManagedSession(
   session: ManagedSession,
   path = managedStatePath(),
+  deps: RecordManagedSessionDeps = {},
 ): ManagedState {
   if (!isManagedSession(session)) {
     throw new Error("refusing to record a malformed managed session");
   }
   return withManagedStateLock(path, () => {
-    const next = upsertManagedSession(loadManagedStateForMutation(path), session);
-    saveManagedState(next, path);
+    const load = deps.loadManagedStateForMutation ?? loadManagedStateForMutation;
+    const save = deps.saveManagedState ?? saveManagedState;
+    const current = load(path);
+    const candidateState = { version: MANAGED_STATE_VERSION, sessions: [session] };
+    assertManagedStateLifecycleV2Authority(candidateState);
+    const lifecycle = managedSessionLifecycleExtension(session);
+    if (lifecycle) {
+      assertManagedStateLifecycleV2Authority(current);
+    }
+    const next = upsertManagedSession(current, session);
+    if (lifecycle) {
+      assertManagedStateLifecycleV2Authority(next);
+    }
+    save(next, path);
     return next;
   });
 }

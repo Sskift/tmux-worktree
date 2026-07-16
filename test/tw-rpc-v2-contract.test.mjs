@@ -607,6 +607,91 @@ test("canonical create owners fence every post-start observation failure as IN_D
   assert.equal(rpcPostCreateListCalls, 0);
 });
 
+test("lifecycle-marked commits reject raced or candidate authority corruption inside the state lock", () => {
+  const malformed = structuredClone(storageCases.extended);
+  malformed.extensions["tw.rpc-v2.lifecycle.v1"].tmux.birthMarker = "wrong-marker";
+  const duplicate = [
+    storageCases.extended,
+    structuredClone(storageCases.extended),
+  ];
+
+  for (const scenario of [
+    { id: "malformed", sessions: [malformed] },
+    { id: "duplicate", sessions: duplicate },
+  ]) {
+    withTempDir(`tw-rpc-v2-create-race-${scenario.id}-`, (root) => {
+      const path = join(root, "state.json");
+      writeState(path, []);
+      const racedBytes = `${JSON.stringify({ version: 1, sessions: scenario.sessions }, null, 2)}\n`;
+      let stateReads = 0;
+      let saveCalls = 0;
+      let tmuxStartCalls = 0;
+      let currentListCalls = 0;
+      const result = rpcV2.executeRpcV2CreateTerminal(
+        cases.wire.createTerminal.request,
+        {
+          terminalSessionDeps: {
+            existsSync: () => true,
+            exec: () => { tmuxStartCalls += 1; },
+            tmuxBin: () => "tmux",
+            sessionExists: () => false,
+            randomId: () => "a1b2c",
+            randomBirthMarker: () => cases.incarnation.baseIdentity.birthMarker,
+            loadManagedStateForMutation: () => {
+              stateReads += 1;
+              if (stateReads === 1) {
+                const validPreflight = state.loadManagedStateForMutation(path);
+                writeFileSync(path, racedBytes);
+                return validPreflight;
+              }
+              return state.loadManagedStateForMutation(path);
+            },
+            recordManagedSession: (record) => state.recordManagedSession(record, path, {
+              saveManagedState: () => { saveCalls += 1; },
+            }),
+            listTmuxSessionLifecycleEntries: () => [liveSession()],
+            setupClipboardBindings: () => {},
+            now: () => new Date("2026-07-12T00:00:01.000Z"),
+          },
+          currentList: () => {
+            currentListCalls += 1;
+            return { protocolVersion: 2, sessions: [] };
+          },
+        },
+      );
+      assert.equal(tmuxStartCalls, 1, scenario.id);
+      assert.equal(result.state, "in_doubt", scenario.id);
+      assert.equal(Object.hasOwn(result, "sideEffect"), false, scenario.id);
+      assert.equal(result.error.code, "IN_DOUBT", scenario.id);
+      assert.equal(saveCalls, 0, scenario.id);
+      assert.equal(currentListCalls, 0, scenario.id);
+      assert.equal(readFileSync(path, "utf8"), racedBytes, scenario.id);
+    });
+  }
+
+  withTempDir("tw-rpc-v2-candidate-authority-", (root) => {
+    const path = join(root, "state.json");
+    writeState(path, []);
+    const originalBytes = readFileSync(path, "utf8");
+    let loadSawLock = false;
+    let saveCalls = 0;
+    assert.throws(
+      () => state.recordManagedSession(malformed, path, {
+        loadManagedStateForMutation: (lockedPath) => {
+          loadSawLock = existsSync(`${lockedPath}.lock`);
+          return state.loadManagedStateForMutation(lockedPath);
+        },
+        saveManagedState: () => { saveCalls += 1; },
+      }),
+      /invalid tmux incarnation identity/,
+    );
+    assert.equal(loadSawLock, true);
+    assert.equal(saveCalls, 0);
+    assert.equal(readFileSync(path, "utf8"), originalBytes);
+    assert.equal(existsSync(`${path}.lock`), false);
+  });
+});
+
 test("legacy records stay readable without a synthesized marker and v1 list white-lists frozen fields", () => {
   const legacyLive = liveSession({
     name: storageCases.legacy.name,
