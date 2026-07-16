@@ -256,6 +256,32 @@ class RelayV2OutboxAuthorityCoreTest {
             retried.attempts.map { it.kind },
         )
 
+        val staleAttemptProofs = listOf(
+            retryableNotAccepted(retried).copy(
+                attemptRequestId = entry.attempts.single().requestId,
+            ) to RelayV2OutboxRecovery.RetrySameCommand("stale-attempt-retry"),
+            reissueRequiredNotAccepted(retried).copy(
+                attemptRequestId = entry.attempts.single().requestId,
+            ) to RelayV2OutboxRecovery.Reissue(
+                replacementCommandId = "stale-attempt-replacement",
+                newDedupeWindowId = "stale-attempt-window",
+                replacementCreatedAtMillis = 0,
+            ),
+        )
+        staleAttemptProofs.forEach { (staleEvidence, recovery) ->
+            val rejected = rejected(
+                core.reduce(
+                    result.state,
+                    RelayV2OutboxAction.ReconcileStatus(staleEvidence, recovery),
+                ),
+            )
+            assertEquals(
+                RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING,
+                rejected.reason,
+            )
+            assertTrue(rejected.state === result.state)
+        }
+
         val oldAttemptFinal = applied(
             core.reduce(
                 result.state,

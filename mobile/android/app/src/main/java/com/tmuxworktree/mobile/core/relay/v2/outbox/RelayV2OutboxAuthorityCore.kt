@@ -1305,6 +1305,12 @@ internal class RelayV2OutboxAuthorityCore(
         ) {
             return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
         }
+        val activeExecuteAttempt = entry.attempts.lastOrNull {
+            it.kind == RelayV2OutboxAttemptKind.EXECUTE
+        }
+        if (activeExecuteAttempt?.requestId != evidence.attemptRequestId) {
+            return state.reject(RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING)
+        }
         if (evidence.isRetryableNotAccepted()) {
             val retry = recovery as? RelayV2OutboxRecovery.RetrySameCommand
                 ?: return state.reject(RelayV2OutboxRejection.RECOVERY_INPUT_MISMATCH)
