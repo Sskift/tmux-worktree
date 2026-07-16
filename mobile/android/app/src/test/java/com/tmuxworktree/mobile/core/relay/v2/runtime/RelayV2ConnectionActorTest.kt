@@ -738,52 +738,145 @@ class RelayV2ConnectionActorTest {
                 }
             }
 
-            val mismatchedFactory = FakeTransportFactory().apply {
-                returnDifferentSource = true
+        }
+
+    @Test
+    fun `source mismatch is typed and fenced across factory timing windows`() = runBlocking {
+        MismatchTiming.entries.forEach { timing ->
+            val commitEntered = CompletableDeferred<Unit>()
+            val releaseCommit = CompletableDeferred<Unit>()
+            val factory = FakeTransportFactory().apply {
+                returnDifferentSource = timing == MismatchTiming.BEFORE_FACTORY_RETURN
             }
-            val mismatchedHarness = Harness(factory = mismatchedFactory)
-            try {
-                mismatchedFactory.onTransportCreated = { callbackSource ->
-                    mismatchedFactory.transports.forEach {
-                        it.completeTerminationOnClose = false
+            val harness = Harness(
+                factory = factory,
+                beforeTransportCommit = if (timing == MismatchTiming.BEFORE_COMMIT) {
+                    {
+                        commitEntered.complete(Unit)
+                        releaseCommit.await()
                     }
-                    callbackSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                } else {
+                    {}
+                },
+            )
+            try {
+                if (timing == MismatchTiming.BEFORE_FACTORY_RETURN) {
+                    factory.onTransportCreated = { callbackSource ->
+                        factory.transports.forEach { it.completeTerminationOnClose = false }
+                        callbackSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                    }
                 }
-                assertTrue(mismatchedHarness.actor.connect(mismatchedHarness.profile, null))
-                val failure = mismatchedHarness.actor.awaitFailure(RelayV2FailureKind.SECURITY)
-                assertEquals("TRANSPORT_SOURCE_MISMATCH", failure.failure?.code)
-                val callbackSource = mismatchedHarness.awaitTransport(0)
-                val returnedSource = mismatchedHarness.awaitTransport(1)
-                withTimeout(TIMEOUT_MS) {
-                    while (callbackSource.closeCodes.isEmpty() || returnedSource.closeCodes.isEmpty()) {
-                        delay(1)
+                assertTrue(timing.name, harness.actor.connect(harness.profile, null))
+
+                val sources = when (timing) {
+                    MismatchTiming.BEFORE_FACTORY_RETURN -> listOf(
+                        harness.awaitTransport(0),
+                        harness.awaitTransport(1),
+                    )
+                    MismatchTiming.BEFORE_COMMIT -> {
+                        withTimeout(TIMEOUT_MS) { commitEntered.await() }
+                        val returned = harness.awaitTransport(0).apply {
+                            completeTerminationOnClose = false
+                        }
+                        val callbackSource = factory.createCallbackSource().apply {
+                            completeTerminationOnClose = false
+                            open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                        }
+                        releaseCommit.complete(Unit)
+                        listOf(returned, callbackSource)
+                    }
+                    MismatchTiming.AFTER_COMMIT -> {
+                        val returned = harness.awaitTransport(0).apply {
+                            completeTerminationOnClose = false
+                        }
+                        harness.actor.awaitPhase(RelayV2ConnectionPhase.CONNECTING)
+                        val callbackSource = factory.createCallbackSource().apply {
+                            completeTerminationOnClose = false
+                            open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                        }
+                        listOf(returned, callbackSource)
                     }
                 }
 
-                assertTrue(mismatchedHarness.actor.connect(mismatchedHarness.profile, null))
+                val failure = harness.actor.awaitFailure(RelayV2FailureKind.SECURITY).failure
+                assertEquals(timing.name, "TRANSPORT_SOURCE_MISMATCH", failure?.code)
+                assertFalse(timing.name, requireNotNull(failure).retryable)
+                val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ConnectionFailed
+                assertEquals(timing.name, harness.profile.identity, effect.profile)
+                assertEquals(timing.name, failure, effect.failure)
+                withTimeout(TIMEOUT_MS) {
+                    while (sources.any { it.closeCodes.isEmpty() }) delay(1)
+                }
+                sources.forEach { source ->
+                    assertEquals(timing.name, listOf(1000), source.closeCodes)
+                }
+
+                assertTrue(timing.name, harness.actor.connect(harness.profile, null))
                 val receipt = async {
-                    mismatchedHarness.actor.disconnectAndDrain(
-                        mismatchedHarness.profile.identity,
-                        "source-mismatch",
+                    harness.actor.disconnectAndDrain(
+                        harness.profile.identity,
+                        "mismatch-${timing.name}",
                     )
                 }
                 delay(25)
-                assertFalse(receipt.isCompleted)
-                assertEquals(1, mismatchedFactory.requests.size)
-                callbackSource.completeTermination()
+                assertFalse(timing.name, receipt.isCompleted)
+                assertEquals(timing.name, 1, factory.requests.size)
+                sources.first().completeTermination()
                 delay(25)
-                assertFalse(receipt.isCompleted)
-                returnedSource.completeTermination()
+                assertFalse(timing.name, receipt.isCompleted)
+                sources.last().completeTermination()
                 assertEquals(
-                    "source-mismatch",
+                    timing.name,
+                    "mismatch-${timing.name}",
                     withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
                 )
-                assertEquals(1, mismatchedFactory.requests.size)
+                assertEquals(timing.name, 1, factory.requests.size)
             } finally {
-                mismatchedFactory.transports.forEach { it.completeTermination() }
-                mismatchedHarness.close()
+                releaseCommit.complete(Unit)
+                factory.transports.forEach { it.completeTermination() }
+                harness.close()
             }
         }
+    }
+
+    @Test
+    fun `synchronous close callback cannot recursively close a retiring source`() = runBlocking {
+        val harness = Harness()
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0)
+            transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            transport.completeTerminationOnClose = false
+            transport.synchronousClosedOnClose = true
+            transport.throwOnSecondClose = true
+
+            val receipt = async {
+                harness.actor.disconnectAndDrain(harness.profile.identity, "synchronous-close")
+            }
+            withTimeout(TIMEOUT_MS) {
+                while (transport.closeCodes.isEmpty()) delay(1)
+            }
+            assertEquals(listOf(1000), transport.closeCodes)
+            assertFalse(receipt.isCompleted)
+
+            transport.completeTermination()
+            assertEquals(
+                "synchronous-close",
+                withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+            )
+            assertEquals(listOf(1000), transport.closeCodes)
+
+            val reactivated = harness.profile.copy(activationGeneration = 2)
+            assertTrue(harness.actor.connect(reactivated, null))
+            harness.awaitTransport(1)
+            assertEquals(2, harness.factory.transports.size)
+        } finally {
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
 
     @Test
     fun `shutdown invalidates provisional callbacks after factory return before commit`() =
@@ -967,7 +1060,8 @@ class RelayV2ConnectionActorTest {
 
             val failed = eventHarness.actor.awaitFailure(RelayV2FailureKind.QUEUE_SATURATED)
             assertEquals("SLOW_CONSUMER", failed.failure?.code)
-            assertTrue(second.cancelCount > 0)
+            assertEquals(listOf(1013), second.closeCodes)
+            assertEquals(0, second.cancelCount)
         } finally {
             eventHarness.close()
         }
@@ -982,8 +1076,8 @@ class RelayV2ConnectionActorTest {
 
             val failed = actionByteHarness.actor.awaitFailure(RelayV2FailureKind.QUEUE_SATURATED)
             assertEquals("SLOW_CONSUMER", failed.failure?.code)
-            assertTrue(transport.cancelCount > 0)
-            assertTrue(transport.closeCodes.contains(1013))
+            assertEquals(listOf(1013), transport.closeCodes)
+            assertEquals(0, transport.cancelCount)
         } finally {
             actionByteHarness.close()
         }
@@ -998,7 +1092,8 @@ class RelayV2ConnectionActorTest {
 
             val failed = effectByteHarness.actor.awaitFailure(RelayV2FailureKind.QUEUE_SATURATED)
             assertEquals("SLOW_CONSUMER", failed.failure?.code)
-            assertTrue(effectByteHarness.transport().cancelCount > 0)
+            assertEquals(listOf(1013), effectByteHarness.transport().closeCodes)
+            assertEquals(0, effectByteHarness.transport().cancelCount)
         } finally {
             effectByteHarness.close()
         }
@@ -1440,6 +1535,7 @@ class RelayV2ConnectionActorTest {
     ) : RelayV2TransportFactory {
         val requests = CopyOnWriteArrayList<RelayV2TransportOpenRequest>()
         val transports = CopyOnWriteArrayList<FakeTransport>()
+        private val listeners = CopyOnWriteArrayList<RelayV2TransportListener>()
         val openEntered = CountDownLatch(if (blockFirstOpen) 1 else 0)
         val releaseOpen = CountDownLatch(if (blockFirstOpen) 1 else 0)
         val sendEntered = CountDownLatch(if (blockFirstSend) 1 else 0)
@@ -1453,6 +1549,7 @@ class RelayV2ConnectionActorTest {
             listener: RelayV2TransportListener,
         ): RelayV2Transport {
             requests += request
+            listeners += listener
             if (blockFirstOpen && requests.size == 1) {
                 openEntered.countDown()
                 check(releaseOpen.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
@@ -1472,6 +1569,9 @@ class RelayV2ConnectionActorTest {
             failureAfterCreate?.let { throw it }
             return returnedTransport
         }
+
+        fun createCallbackSource(attemptIndex: Int = 0): FakeTransport =
+            FakeTransport(listeners[attemptIndex]).also(transports::add)
     }
 
     private inner class FakeTransport(
@@ -1491,6 +1591,12 @@ class RelayV2ConnectionActorTest {
         @Volatile
         var completeTerminationOnClose: Boolean = true
 
+        @Volatile
+        var synchronousClosedOnClose: Boolean = false
+
+        @Volatile
+        var throwOnSecondClose: Boolean = false
+
         override fun send(bytes: ByteArray): Boolean {
             if (blockFirstSend && sendCount++ == 0) {
                 sendEntered.countDown()
@@ -1502,6 +1608,10 @@ class RelayV2ConnectionActorTest {
 
         override fun close(code: Int, reason: String) {
             closeCodes += code
+            if (throwOnSecondClose && closeCodes.size > 1) {
+                error("transport close called more than once")
+            }
+            if (synchronousClosedOnClose) listener.onClosed(this, code)
             if (completeTerminationOnClose) termination.complete(true)
         }
 
@@ -1648,6 +1758,12 @@ class RelayV2ConnectionActorTest {
         val expectedKind: RelayV2FailureKind,
         val trigger: suspend (Harness, FakeTransport) -> Unit,
     )
+
+    private enum class MismatchTiming {
+        BEFORE_FACTORY_RETURN,
+        BEFORE_COMMIT,
+        AFTER_COMMIT,
+    }
 
     private companion object {
         const val TIMEOUT_MS = 5_000L
