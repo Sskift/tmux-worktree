@@ -41,6 +41,79 @@ internal data class RelayV2AppliedCursor(
     }
 }
 
+internal data class RelayV2StateConnectIdentity(
+    val profileId: String,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+) {
+    init {
+        listOf(profileId, principalId, clientInstanceId, hostId).forEach(::requireRelayV2Id)
+    }
+}
+
+internal enum class RelayV2StateConnectRecovery {
+    EMPTY,
+    LIVE,
+    RESYNCING,
+    RELEASE_PENDING,
+}
+
+/** Room-owned unique durable resume selection for one activated profile/host authority. */
+internal data class RelayV2StateConnectPlan(
+    val identity: RelayV2StateConnectIdentity,
+    val resume: RelayV2AppliedCursor?,
+    val recovery: RelayV2StateConnectRecovery,
+    val durableHostEpoch: String?,
+    val requiredThroughEventSeq: String?,
+    val snapshotRequestId: String? = null,
+    val snapshotId: String? = null,
+    val snapshotNextCursor: String? = null,
+    val snapshotNextChunkIndex: Long? = null,
+    val snapshotComplete: Boolean? = null,
+    val releaseObligationToken: String? = null,
+) {
+    init {
+        durableHostEpoch?.let(::requireRelayV2Id)
+        requiredThroughEventSeq?.let(::requireRelayV2Counter)
+        snapshotRequestId?.let(::requireRelayV2Id)
+        snapshotId?.let(::requireRelayV2Id)
+        snapshotNextCursor?.let {
+            require(it.toByteArray(Charsets.UTF_8).size <= RelayV2StateLimits.MAX_CURSOR_UTF8_BYTES)
+        }
+        snapshotNextChunkIndex?.let { require(it in 1..MAX_JSON_INTEGER) }
+        when (recovery) {
+            RelayV2StateConnectRecovery.EMPTY -> require(
+                resume == null && durableHostEpoch == null &&
+                    requiredThroughEventSeq == null && snapshotRequestId == null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2StateConnectRecovery.LIVE -> require(
+                resume != null && durableHostEpoch == resume.hostEpoch &&
+                    requiredThroughEventSeq != null && snapshotRequestId == null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2StateConnectRecovery.RESYNCING -> require(
+                durableHostEpoch != null && requiredThroughEventSeq != null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2StateConnectRecovery.RELEASE_PENDING -> require(
+                durableHostEpoch != null && requiredThroughEventSeq != null &&
+                    releaseObligationToken != null && snapshotRequestId == null,
+            )
+        }
+        require(resume == null || resume.hostEpoch == durableHostEpoch)
+        val hasSnapshot = snapshotRequestId != null
+        require((snapshotId != null) == hasSnapshot)
+        require((snapshotNextChunkIndex != null) == hasSnapshot)
+        require((snapshotComplete != null) == hasSnapshot)
+        require(!hasSnapshot || recovery == RelayV2StateConnectRecovery.RESYNCING)
+        require(!hasSnapshot || (snapshotComplete == true) == (snapshotNextCursor == null))
+        require(snapshotNextCursor == null || snapshotNextCursor.isNotEmpty())
+        require(hasSnapshot || snapshotNextCursor == null)
+    }
+}
+
 internal enum class RelayV2StateHelloDisposition {
     FRESH,
     MATCHED,
@@ -351,16 +424,11 @@ internal data class RelayV2SnapshotReleaseObligation(
     val snapshotId: String,
     val durableCursorEventSeq: String?,
     val reason: RelayV2SnapshotReleaseReason,
-    val phase: RelayV2PostReleasePhase,
 ) {
     init {
         require(snapshotRequestId.isNotBlank())
         require(snapshotId.isNotBlank())
         durableCursorEventSeq?.let(::requireRelayV2Counter)
-        require(
-            phase != RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS ||
-                durableCursorEventSeq != null
-        )
     }
 
     val wireReason: String
@@ -383,13 +451,18 @@ internal data class RelayV2SnapshotReleaseObligation(
                 snapshotId,
                 durableCursorEventSeq ?: "",
                 reason.name,
-                phase.name,
             ).joinToString("\u0000")
             return Base64.getUrlEncoder().withoutPadding().encodeToString(
                 MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8)),
             )
         }
 }
+
+/** Exact release CAS result paired with the latest mutable plan observed in that transaction. */
+internal data class RelayV2SnapshotReleaseCompletion(
+    val release: RelayV2SnapshotReleaseObligation,
+    val afterReleasePhase: RelayV2PostReleasePhase,
+)
 
 internal enum class RelayV2ResyncReason {
     FRESH,
@@ -405,6 +478,11 @@ internal enum class RelayV2ResyncReason {
     SNAPSHOT_INCOMPLETE,
     SNAPSHOT_COUNT_MISMATCH,
     SNAPSHOT_DIGEST_MISMATCH,
+}
+
+internal enum class RelayV2BufferedRecoveryAction {
+    CONTINUE_CURRENT,
+    SUPERSEDE_QUERY_COMPLETION,
 }
 
 internal enum class RelayV2RotationReason {
@@ -423,13 +501,47 @@ internal sealed interface RelayV2StateSyncResult {
         val namespace: RelayV2StateNamespace,
         val reason: RelayV2ResyncReason,
         val release: RelayV2SnapshotReleaseObligation? = null,
+        val afterReleasePhase: RelayV2PostReleasePhase? = null,
         val durableCursorEventSeq: String? = release?.durableCursorEventSeq,
+        val requiredThroughEventSeq: String? = null,
         val continuation: RelayV2StateSnapshotContinuation? = null,
-    ) : RelayV2StateSyncResult
+        val supersedesQueryCompletion: Boolean = false,
+    ) : RelayV2StateSyncResult {
+        init {
+            require((release == null) == (afterReleasePhase == null))
+            requiredThroughEventSeq?.let(::requireRelayV2Counter)
+            if (supersedesQueryCompletion) {
+                val required = requireNotNull(requiredThroughEventSeq) {
+                    "A query completion can only be superseded by a durable watermark"
+                }
+                require(
+                    durableCursorEventSeq == null ||
+                        compareRelayV2Counters(required, durableCursorEventSeq) > 0
+                ) { "The superseding watermark must be later than the durable cursor" }
+            }
+        }
+    }
+
+    /** A gap event was durably retained while the existing recovery cut remains authoritative. */
+    data class EventBuffered(
+        val namespace: RelayV2StateNamespace,
+        val eventSeq: String,
+        val durableCursorEventSeq: String?,
+        val requiredThroughEventSeq: String,
+        val recoveryAction: RelayV2BufferedRecoveryAction,
+    ) : RelayV2StateSyncResult {
+        init {
+            requireRelayV2Counter(eventSeq)
+            durableCursorEventSeq?.let(::requireRelayV2Counter)
+            requireRelayV2Counter(requiredThroughEventSeq)
+            require(compareRelayV2Counters(requiredThroughEventSeq, eventSeq) >= 0)
+        }
+    }
 
     data class ReleasePending(
         val namespace: RelayV2StateNamespace,
         val release: RelayV2SnapshotReleaseObligation,
+        val afterReleasePhase: RelayV2PostReleasePhase,
     ) : RelayV2StateSyncResult
 
     data class RotationRequired(
@@ -449,6 +561,7 @@ internal sealed interface RelayV2StateSyncResult {
         val namespace: RelayV2StateNamespace,
         val cursorEventSeq: String,
         val release: RelayV2SnapshotReleaseObligation,
+        val afterReleasePhase: RelayV2PostReleasePhase,
     ) : RelayV2StateSyncResult
 
     data class SnapshotExpired(

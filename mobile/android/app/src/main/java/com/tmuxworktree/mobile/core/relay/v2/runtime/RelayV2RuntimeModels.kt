@@ -6,6 +6,8 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.math.BigInteger
+import java.security.MessageDigest
+import java.util.Base64
 
 internal data class RelayV2ResumeCursor(
     val hostEpoch: String,
@@ -22,6 +24,73 @@ internal data class RelayV2ResumeCursor(
         val COUNTER_PATTERN = Regex("^(?:0|[1-9][0-9]*)$")
         val UNSIGNED_COUNTER_MAX = BigInteger("18446744073709551615")
     }
+}
+
+internal enum class RelayV2ConnectRecovery {
+    EMPTY,
+    LIVE,
+    RESYNCING,
+    RELEASE_PENDING,
+}
+
+internal data class RelayV2ConnectPlan(
+    val profileId: String,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val requestedResume: RelayV2ResumeCursor?,
+    val recovery: RelayV2ConnectRecovery,
+    val durableHostEpoch: String?,
+    val requiredThroughEventSeq: String?,
+    val snapshotRequestId: String? = null,
+    val snapshotId: String? = null,
+    val snapshotNextCursor: String? = null,
+    val snapshotNextChunkIndex: Long? = null,
+    val snapshotComplete: Boolean? = null,
+    val releaseObligationToken: String? = null,
+) {
+    fun requireMatches(profile: RelayV2Profile) {
+        require(profileId == profile.profileId)
+        require(principalId == profile.principalId)
+        require(clientInstanceId == profile.clientInstanceId)
+        require(hostId == profile.hostId)
+        requiredThroughEventSeq?.let { requireRelayV2RuntimeCounter(it, "Required event sequence") }
+        durableHostEpoch?.let { requireRelayV2RuntimeId(it, "Durable host epoch") }
+        when (recovery) {
+            RelayV2ConnectRecovery.EMPTY -> require(
+                requestedResume == null && durableHostEpoch == null &&
+                    requiredThroughEventSeq == null && snapshotRequestId == null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2ConnectRecovery.LIVE -> require(
+                requestedResume != null && durableHostEpoch == requestedResume.hostEpoch &&
+                    requiredThroughEventSeq != null && snapshotRequestId == null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2ConnectRecovery.RESYNCING -> require(
+                durableHostEpoch != null && requiredThroughEventSeq != null &&
+                    releaseObligationToken == null,
+            )
+            RelayV2ConnectRecovery.RELEASE_PENDING -> require(
+                durableHostEpoch != null && requiredThroughEventSeq != null &&
+                    releaseObligationToken != null && snapshotRequestId == null,
+            )
+        }
+        require(requestedResume == null || requestedResume.hostEpoch == durableHostEpoch)
+        val hasSnapshot = snapshotRequestId != null
+        require((snapshotId != null) == hasSnapshot)
+        require((snapshotNextChunkIndex != null) == hasSnapshot)
+        require((snapshotComplete != null) == hasSnapshot)
+        require(!hasSnapshot || recovery == RelayV2ConnectRecovery.RESYNCING)
+        require(!hasSnapshot || requireNotNull(snapshotNextChunkIndex) > 0)
+        require(!hasSnapshot || (snapshotComplete == true) == (snapshotNextCursor == null))
+        require(snapshotNextCursor == null || snapshotNextCursor.isNotEmpty())
+        require(hasSnapshot || snapshotNextCursor == null)
+    }
+}
+
+internal fun interface RelayV2ConnectPlanSource {
+    suspend fun load(profile: RelayV2Profile): RelayV2ConnectPlan
 }
 
 internal enum class RelayV2ConnectionPhase {
@@ -150,6 +219,38 @@ internal data class RelayV2HandshakeContext(
     }
 }
 
+/** Exact namespace authority frozen by the actor for one repository-visible effect. */
+internal data class RelayV2RepositoryEffectAuthority(
+    val generation: RelayV2EffectGeneration,
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+) {
+    init {
+        require(profileId == generation.profileId)
+        require(profileActivationGeneration == generation.profileGeneration)
+        requireRelayV2RuntimeId(principalId, "Principal ID")
+        requireRelayV2RuntimeId(clientInstanceId, "Client instance ID")
+        requireRelayV2RuntimeId(hostId, "Host ID")
+        requireRelayV2RuntimeId(hostEpoch, "Host epoch")
+    }
+}
+
+internal fun RelayV2HandshakeContext.repositoryEffectAuthority(
+    generation: RelayV2EffectGeneration,
+): RelayV2RepositoryEffectAuthority = RelayV2RepositoryEffectAuthority(
+    generation = generation,
+    profileId = profile.profileId,
+    profileActivationGeneration = profile.activationGeneration,
+    principalId = principalId,
+    clientInstanceId = clientInstanceId,
+    hostId = hostId,
+    hostEpoch = hostEpoch,
+)
+
 /** Exact actor-owned recovery step that a durable repository receipt must acknowledge. */
 internal data class RelayV2RecoveryBinding(
     val generation: RelayV2EffectGeneration,
@@ -159,6 +260,16 @@ internal data class RelayV2RecoveryBinding(
     init {
         require(step > 0) { "Recovery step must be positive" }
         requireRelayV2RuntimeId(requestId, "Recovery request ID")
+    }
+}
+
+/** Stable actor lineage for one bounded command-query readiness window. */
+internal data class RelayV2QueryRecoveryLineage(
+    val generation: RelayV2EffectGeneration,
+    val recoveryId: String,
+) {
+    init {
+        requireRelayV2RuntimeId(recoveryId, "Query recovery ID")
     }
 }
 
@@ -191,8 +302,8 @@ internal data class RelayV2SnapshotContinuation(
 }
 
 /** Exact pinned cut that durable state-sync has discarded and the actor must release. */
-internal data class RelayV2RecoveryReleaseDirective(
-    val obligationToken: String,
+@ConsistentCopyVisibility
+internal data class RelayV2RecoveryReleaseDirective private constructor(
     val profileId: String,
     val principalId: String,
     val clientInstanceId: String,
@@ -201,12 +312,9 @@ internal data class RelayV2RecoveryReleaseDirective(
     val snapshotRequestId: String,
     val snapshotId: String,
     val durableCursorEventSeq: String?,
-    val reason: RelayV2RecoveryReleaseReason,
-    val durableReason: String,
-    val restart: RelayV2RecoveryRestartDirective,
+    val durableReason: RelayV2RecoveryDurableReleaseReason,
 ) {
     init {
-        requireRelayV2RuntimeId(obligationToken, "Release obligation token")
         requireRelayV2RuntimeId(profileId, "Release profile ID")
         requireRelayV2RuntimeId(principalId, "Release principal ID")
         requireRelayV2RuntimeId(clientInstanceId, "Release client instance ID")
@@ -217,12 +325,94 @@ internal data class RelayV2RecoveryReleaseDirective(
         durableCursorEventSeq?.let {
             requireRelayV2RuntimeCounter(it, "Release durable cursor")
         }
-        requireRelayV2RuntimeId(durableReason, "Release durable reason")
-        require(
-            restart != RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ||
-                durableCursorEventSeq != null
-        ) { "Release command query requires a durable cursor" }
     }
+
+    val reason: RelayV2RecoveryReleaseReason
+        get() = if (durableReason == RelayV2RecoveryDurableReleaseReason.COMPLETED) {
+            RelayV2RecoveryReleaseReason.COMPLETED
+        } else {
+            RelayV2RecoveryReleaseReason.ABANDONED
+        }
+
+    val obligationToken: String
+        get() = releaseObligationToken(
+            profileId,
+            principalId,
+            clientInstanceId,
+            hostId,
+            hostEpoch,
+            snapshotRequestId,
+            snapshotId,
+            durableCursorEventSeq,
+            durableReason,
+        )
+
+    companion object {
+        fun fromDurable(
+            profileId: String,
+            principalId: String,
+            clientInstanceId: String,
+            hostId: String,
+            hostEpoch: String,
+            snapshotRequestId: String,
+            snapshotId: String,
+            durableCursorEventSeq: String?,
+            durableReason: RelayV2RecoveryDurableReleaseReason,
+        ): RelayV2RecoveryReleaseDirective = RelayV2RecoveryReleaseDirective(
+            profileId,
+            principalId,
+            clientInstanceId,
+            hostId,
+            hostEpoch,
+            snapshotRequestId,
+            snapshotId,
+            durableCursorEventSeq,
+            durableReason,
+        )
+
+    }
+}
+
+internal enum class RelayV2RecoveryDurableReleaseReason {
+    COMPLETED,
+    SNAPSHOT_RESTART_REQUIRED,
+    SNAPSHOT_IDENTITY_CONFLICT,
+    SNAPSHOT_ORDER_CONFLICT,
+    SNAPSHOT_LIMIT_EXCEEDED,
+    SNAPSHOT_INCOMPLETE,
+    SNAPSHOT_COUNT_MISMATCH,
+    SNAPSHOT_DIGEST_MISMATCH,
+    EVENT_GAP,
+    EVENT_REVISION_CONFLICT,
+    EVENT_BUFFER_OVERFLOW,
+    FRESH,
+}
+
+private fun releaseObligationToken(
+    profileId: String,
+    principalId: String,
+    clientInstanceId: String,
+    hostId: String,
+    hostEpoch: String,
+    snapshotRequestId: String,
+    snapshotId: String,
+    durableCursorEventSeq: String?,
+    durableReason: RelayV2RecoveryDurableReleaseReason,
+): String {
+    val identity = listOf(
+        profileId,
+        principalId,
+        clientInstanceId,
+        hostId,
+        hostEpoch,
+        snapshotRequestId,
+        snapshotId,
+        durableCursorEventSeq ?: "",
+        durableReason.name,
+    ).joinToString("\u0000")
+    return Base64.getUrlEncoder().withoutPadding().encodeToString(
+        MessageDigest.getInstance("SHA-256").digest(identity.toByteArray(Charsets.UTF_8)),
+    )
 }
 
 internal enum class RelayV2RecoveryReleaseReason(val wireValue: String) {
@@ -289,7 +479,6 @@ internal sealed interface RelayV2DurableSnapshotApplyResult {
             require(release.snapshotRequestId == snapshotRequestId)
             require(release.snapshotId == snapshotId)
             require(release.reason == RelayV2RecoveryReleaseReason.COMPLETED)
-            require(release.restart == RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS)
         }
     }
 }
@@ -385,7 +574,10 @@ internal sealed interface RelayV2RecoveryReceipt {
                 "Abandoned recovery requires an abandoned release obligation"
             }
             require(release.hostId == hostId && release.hostEpoch == hostEpoch)
-            require(release.restart == restart)
+            require(
+                restart != RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ||
+                    release.durableCursorEventSeq != null
+            )
         }
     }
 
@@ -416,6 +608,43 @@ internal sealed interface RelayV2RecoveryReceipt {
         }
     }
 
+    /** Durable continuity loss that must outlive any in-flight query completion to ONLINE. */
+    data class QueryRecoverySuperseded(
+        override val binding: RelayV2RecoveryBinding,
+        val queryLineage: RelayV2QueryRecoveryLineage,
+        val completedReleaseBinding: RelayV2RecoveryBinding?,
+        override val hostId: String,
+        override val hostEpoch: String,
+        val reason: RelayV2RecoveryAbandonReason,
+        val durableCursorEventSeq: String?,
+        val requiredThroughEventSeq: String,
+        val pendingCommands: List<RelayV2PendingCommand>,
+    ) : RelayV2RecoveryReceipt {
+        init {
+            require(queryLineage.generation == binding.generation)
+            completedReleaseBinding?.let { require(it.generation == binding.generation) }
+            requireRelayV2RuntimeId(hostId, "Host ID")
+            requireRelayV2RuntimeId(hostEpoch, "Host epoch")
+            durableCursorEventSeq?.let {
+                requireRelayV2RuntimeCounter(it, "Durable recovery cursor")
+            }
+            requireRelayV2RuntimeCounter(
+                requiredThroughEventSeq,
+                "Required recovery watermark",
+            )
+            require(
+                durableCursorEventSeq == null ||
+                    BigInteger(requiredThroughEventSeq) > BigInteger(durableCursorEventSeq)
+            ) { "The superseding watermark must be later than the durable cursor" }
+            require(reason == RelayV2RecoveryAbandonReason.EVENT_GAP ||
+                reason == RelayV2RecoveryAbandonReason.EVENT_REVISION_CONFLICT ||
+                reason == RelayV2RecoveryAbandonReason.EVENT_BUFFER_OVERFLOW
+            ) { "Query completion can only be superseded by durable state continuity loss" }
+            require(pendingCommands.size <= 4_096)
+            require(pendingCommands.distinctBy { it.commandId }.size == pendingCommands.size)
+        }
+    }
+
     data class ReleaseObligationRecovered(
         override val binding: RelayV2RecoveryBinding,
         override val hostId: String,
@@ -440,7 +669,6 @@ internal sealed interface RelayV2RecoveryReceipt {
                 restart != RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ||
                     durableCursorEventSeq != null
             ) { "Command query restart requires a durable cursor" }
-            require(release.restart == restart)
         }
     }
 
@@ -449,11 +677,16 @@ internal sealed interface RelayV2RecoveryReceipt {
         override val hostId: String,
         override val hostEpoch: String,
         val release: RelayV2RecoveryReleaseDirective,
+        val restart: RelayV2RecoveryRestartDirective,
     ) : RelayV2RecoveryReceipt {
         init {
             requireRelayV2RuntimeId(hostId, "Host ID")
             requireRelayV2RuntimeId(hostEpoch, "Host epoch")
             require(release.hostId == hostId && release.hostEpoch == hostEpoch)
+            require(
+                restart != RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ||
+                    release.durableCursorEventSeq != null
+            )
         }
     }
 }
@@ -481,7 +714,6 @@ internal data class RelayV2OnlineResyncRequired(
         }
         release?.let {
             require(it.hostId == hostId && it.hostEpoch == hostEpoch)
-            require(it.restart == restart)
         }
     }
 }
@@ -492,12 +724,22 @@ internal sealed interface RelayV2RuntimeEffect {
         val generation: RelayV2EffectGeneration
     }
 
+    sealed interface RepositoryScoped : GenerationScoped {
+        val repositoryAuthority: RelayV2RepositoryEffectAuthority
+    }
+
     data class QueryPendingCommands(
         val context: RelayV2HandshakeContext,
         override val generation: RelayV2EffectGeneration,
         val recovery: RelayV2RecoveryBinding,
+        val connectPlan: RelayV2ConnectPlan,
         val outcome: RelayV2HelloOutcome = RelayV2HelloOutcome.MATCHED,
-    ) : GenerationScoped
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
+        val requestedResume: RelayV2ResumeCursor?
+            get() = connectPlan.requestedResume
+    }
 
     data class BeginStateResync(
         val context: RelayV2HandshakeContext,
@@ -505,8 +747,14 @@ internal sealed interface RelayV2RuntimeEffect {
         val outcome: RelayV2HelloOutcome,
         val discardPriorResourceLineage: Boolean,
         val recovery: RelayV2RecoveryBinding,
+        val connectPlan: RelayV2ConnectPlan,
         val queryPendingCommandsAfterResync: Boolean = true,
-    ) : GenerationScoped
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
+        val requestedResume: RelayV2ResumeCursor?
+            get() = connectPlan.requestedResume
+    }
 
     data class ApplyCommandStatuses(
         val context: RelayV2HandshakeContext,
@@ -514,7 +762,9 @@ internal sealed interface RelayV2RuntimeEffect {
         val expectedCommands: List<RelayV2PendingCommand>,
         val recovery: RelayV2RecoveryBinding,
         override val generation: RelayV2EffectGeneration = recovery.generation,
-    ) : GenerationScoped
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped
 
     data class ApplyStateSnapshotChunk(
         val context: RelayV2HandshakeContext,
@@ -526,7 +776,9 @@ internal sealed interface RelayV2RuntimeEffect {
         val requestedChunkIndex: Long,
         val recovery: RelayV2RecoveryBinding,
         override val generation: RelayV2EffectGeneration = recovery.generation,
-    ) : GenerationScoped {
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
         init {
             require(rawUtf8Bytes in 1..1_048_576)
         }
@@ -536,9 +788,12 @@ internal sealed interface RelayV2RuntimeEffect {
         val context: RelayV2HandshakeContext,
         val release: RelayV2RecoveryReleaseDirective,
         val proof: RelayV2ReleaseAuthorityProof,
+        val expectedRestart: RelayV2RecoveryRestartDirective,
         val recovery: RelayV2RecoveryBinding,
         override val generation: RelayV2EffectGeneration = recovery.generation,
-    ) : GenerationScoped
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped
 
     data class ExpireSnapshotContinuation(
         val context: RelayV2HandshakeContext,
@@ -546,7 +801,9 @@ internal sealed interface RelayV2RuntimeEffect {
         val snapshotId: String,
         val recovery: RelayV2RecoveryBinding,
         override val generation: RelayV2EffectGeneration = recovery.generation,
-    ) : GenerationScoped
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped
 
     data class RejectContinuity(
         val profile: RelayActiveProfileIdentity,
@@ -565,9 +822,18 @@ internal sealed interface RelayV2RuntimeEffect {
         val rawUtf8Bytes: Int,
         override val generation: RelayV2EffectGeneration,
         val recovery: RelayV2RecoveryBinding? = null,
-    ) : GenerationScoped {
+        val queryLineage: RelayV2QueryRecoveryLineage? = null,
+        val completedReleaseBinding: RelayV2RecoveryBinding? = null,
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
         init {
             require(rawUtf8Bytes in 1..1_048_576)
+            recovery?.let { require(it.generation == generation) }
+            queryLineage?.let { require(recovery != null && it.generation == generation) }
+            completedReleaseBinding?.let {
+                require(queryLineage != null && it.generation == generation)
+            }
         }
     }
 
@@ -661,9 +927,12 @@ private fun requireRelayV2RuntimeId(value: String, label: String) {
 }
 
 private fun requireRelayV2RuntimeCounter(value: String, label: String) {
-    require(RUNTIME_COUNTER_PATTERN.matches(value)) { "$label is not canonical" }
-    require(BigInteger(value) <= RUNTIME_UNSIGNED_COUNTER_MAX) { "$label is too large" }
+    require(isCanonicalRelayV2RuntimeCounter(value)) { "$label is not canonical or is too large" }
 }
+
+internal fun isCanonicalRelayV2RuntimeCounter(value: String): Boolean =
+    RUNTIME_COUNTER_PATTERN.matches(value) &&
+        BigInteger(value) <= RUNTIME_UNSIGNED_COUNTER_MAX
 
 private val RUNTIME_COUNTER_PATTERN = Regex("^(?:0|[1-9][0-9]*)$")
 private val RUNTIME_UNSIGNED_COUNTER_MAX = BigInteger("18446744073709551615")

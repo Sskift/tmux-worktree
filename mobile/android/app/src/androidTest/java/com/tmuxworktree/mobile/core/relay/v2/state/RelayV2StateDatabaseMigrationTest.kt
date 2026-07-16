@@ -210,7 +210,15 @@ class RelayV2StateDatabaseMigrationTest {
             try {
                 val failure = runCatching {
                     runBlocking(Dispatchers.IO) {
-                        RelayV2StateRepository(reopened).applyHelloUnderApplyLease(
+                        val repository = RelayV2StateRepository(reopened)
+                        val identity = RelayV2StateConnectIdentity(
+                            "profile-v2",
+                            "principal-v2",
+                            "android-install-v2",
+                            "host-a",
+                        )
+                        repository.applyHelloUnderApplyLease(
+                            repository.loadConnectPlan(identity),
                             RelayV2StateHello(
                                 RelayV2StateNamespace(
                                     "profile-v2",

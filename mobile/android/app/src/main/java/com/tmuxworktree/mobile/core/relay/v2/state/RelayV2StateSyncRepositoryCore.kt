@@ -17,7 +17,59 @@ import kotlin.math.max
 internal class RelayV2StateSyncRepositoryCore(
     private val store: RelayV2StateStore,
 ) : RelayV2StateSyncAuthority {
+    override suspend fun loadConnectPlan(
+        identity: RelayV2StateConnectIdentity,
+    ): RelayV2StateConnectPlan = store.transaction {
+        val matches = authorities(identity)
+        check(matches.size <= 1) {
+            "Relay v2 durable resume is ambiguous across host epochs"
+        }
+        val authority = matches.singleOrNull()
+            ?: return@transaction RelayV2StateConnectPlan(
+                identity,
+                resume = null,
+                recovery = RelayV2StateConnectRecovery.EMPTY,
+                durableHostEpoch = null,
+                requiredThroughEventSeq = null,
+            )
+        val pendingRelease = authority.validatedPendingRelease()
+        check(authority.namespace.profileId == identity.profileId &&
+            authority.namespace.principalId == identity.principalId &&
+            authority.namespace.clientInstanceId == identity.clientInstanceId &&
+            authority.namespace.hostId == identity.hostId
+        ) { "Relay v2 durable resume crossed profile authority" }
+        if (authority.phase == RelayV2StoredSyncPhase.LIVE) {
+            check(authority.cursorEventSeq != null && pendingRelease == null) {
+                "Relay v2 LIVE authority has no usable durable cursor"
+            }
+        }
+        val staged = snapshot(authority.namespace)
+        check(authority.phase == RelayV2StoredSyncPhase.RESYNCING || staged == null) {
+            "Relay v2 LIVE authority retained snapshot staging"
+        }
+        RelayV2StateConnectPlan(
+            identity = identity,
+            resume = authority.cursorEventSeq?.let {
+                RelayV2AppliedCursor(authority.namespace.hostEpoch, it)
+            },
+            recovery = when {
+                authority.pendingRelease != null -> RelayV2StateConnectRecovery.RELEASE_PENDING
+                authority.phase == RelayV2StoredSyncPhase.LIVE -> RelayV2StateConnectRecovery.LIVE
+                else -> RelayV2StateConnectRecovery.RESYNCING
+            },
+            durableHostEpoch = authority.namespace.hostEpoch,
+            requiredThroughEventSeq = authority.requiredThroughEventSeq,
+            snapshotRequestId = staged?.snapshotRequestId,
+            snapshotId = staged?.snapshotId,
+            snapshotNextCursor = staged?.nextCursor,
+            snapshotNextChunkIndex = staged?.nextChunkIndex,
+            snapshotComplete = staged?.complete,
+            releaseObligationToken = pendingRelease?.opaqueToken,
+        )
+    }
+
     override suspend fun applyHelloUnderApplyLease(
+        connectPlan: RelayV2StateConnectPlan,
         hello: RelayV2StateHello,
     ): RelayV2StateSyncResult =
         store.transaction {
@@ -29,6 +81,10 @@ internal class RelayV2StateSyncRepositoryCore(
                     RelayV2RotationReason.EVENT_CURSOR_AHEAD,
                 )
             }
+            check(connectPlan.identity == namespace.connectIdentity() &&
+                connectPlan.resume == hello.resume
+            ) { "Relay v2 hello crossed its frozen durable connect plan" }
+            validateConnectPlan(this, connectPlan)
             if (current != null &&
                 compareRelayV2Counters(
                     hello.welcomeEventSeq,
@@ -46,7 +102,8 @@ internal class RelayV2StateSyncRepositoryCore(
                     hello.welcomeEventSeq,
                 )
                 val afterRelease = if (
-                    pending.phase == RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS &&
+                    current.afterReleasePhase ==
+                    RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS &&
                     hello.disposition != RelayV2StateHelloDisposition.FRESH &&
                     hello.disposition != RelayV2StateHelloDisposition.HOST_EPOCH_CHANGED &&
                     pending.durableCursorEventSeq != null &&
@@ -56,20 +113,28 @@ internal class RelayV2StateSyncRepositoryCore(
                 } else {
                     RelayV2PostReleasePhase.RESTART_SNAPSHOT
                 }
-                val updatedPending = pending.copy(phase = afterRelease)
                 putAuthority(current.copy(
                     requiredThroughEventSeq = required,
                     phase = RelayV2StoredSyncPhase.RESYNCING,
-                    pendingRelease = updatedPending,
+                    afterReleasePhase = afterRelease,
                 ))
                 return@transaction RelayV2StateSyncResult.ReleasePending(
                     namespace,
-                    updatedPending,
+                    pending,
+                    afterRelease,
                 )
             }
 
             when (hello.disposition) {
                 RelayV2StateHelloDisposition.FRESH -> {
+                    if (connectPlan.recovery == RelayV2StateConnectRecovery.RESYNCING &&
+                        connectPlan.durableHostEpoch == namespace.hostEpoch
+                    ) {
+                        return@transaction applySameEpochWelcome(this, current, hello)
+                    }
+                    connectPlan.durableHostEpoch
+                        ?.takeIf { it != namespace.hostEpoch }
+                        ?.let { deleteNamespaceState(namespace.copy(hostEpoch = it)) }
                     val staged = current?.let { snapshot(it.namespace) }
                     deleteNamespaceState(namespace)
                     val authority = newAuthority(namespace, hello.welcomeEventSeq)
@@ -77,14 +142,20 @@ internal class RelayV2StateSyncRepositoryCore(
                         authority.releaseObligation(
                             it.releaseDirective(),
                             RelayV2SnapshotReleaseReason.FRESH,
-                            RelayV2PostReleasePhase.RESTART_SNAPSHOT,
                         )
                     }
-                    putAuthority(authority.copy(pendingRelease = release))
+                    val afterRelease = release?.let {
+                        RelayV2PostReleasePhase.RESTART_SNAPSHOT
+                    }
+                    putAuthority(authority.copy(
+                        pendingRelease = release,
+                        afterReleasePhase = afterRelease,
+                    ))
                     RelayV2StateSyncResult.ResyncRequired(
                         namespace,
                         RelayV2ResyncReason.FRESH,
                         release,
+                        afterRelease,
                     )
                 }
                 RelayV2StateHelloDisposition.HOST_EPOCH_CHANGED -> {
@@ -104,13 +175,51 @@ internal class RelayV2StateSyncRepositoryCore(
             }
         }
 
+    private fun validateConnectPlan(
+        transaction: RelayV2StateTransaction,
+        plan: RelayV2StateConnectPlan,
+    ) = with(transaction) {
+        val matches = authorities(plan.identity)
+        if (plan.recovery == RelayV2StateConnectRecovery.EMPTY) {
+            check(matches.isEmpty()) { "Relay v2 EMPTY connect plan became stale" }
+            return@with
+        }
+        check(matches.size == 1) { "Relay v2 durable connect plan is no longer unique" }
+        val authority = matches.single()
+        check(authority.namespace.hostEpoch == plan.durableHostEpoch) {
+            "Relay v2 durable connect epoch changed after the connection barrier"
+        }
+        val pending = authority.validatedPendingRelease()
+        val actualRecovery = when {
+            pending != null -> RelayV2StateConnectRecovery.RELEASE_PENDING
+            authority.phase == RelayV2StoredSyncPhase.LIVE -> RelayV2StateConnectRecovery.LIVE
+            else -> RelayV2StateConnectRecovery.RESYNCING
+        }
+        check(actualRecovery == plan.recovery &&
+            authority.cursorEventSeq == plan.resume?.eventSeq &&
+            authority.requiredThroughEventSeq == plan.requiredThroughEventSeq &&
+            pending?.opaqueToken == plan.releaseObligationToken
+        ) { "Relay v2 durable connect plan changed after the connection barrier" }
+        val staged = snapshot(authority.namespace)
+        check(staged?.snapshotRequestId == plan.snapshotRequestId &&
+            staged?.snapshotId == plan.snapshotId &&
+            staged?.nextCursor == plan.snapshotNextCursor &&
+            staged?.nextChunkIndex == plan.snapshotNextChunkIndex &&
+            staged?.complete == plan.snapshotComplete
+        ) { "Relay v2 snapshot continuation changed after the connection barrier" }
+    }
+
     override suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult = store.transaction {
         val authority = authority(chunk.namespace)
             ?: return@transaction unknownEpoch(chunk.namespace)
         authority.pendingRelease?.let { pending ->
-            return@transaction RelayV2StateSyncResult.ReleasePending(chunk.namespace, pending)
+            return@transaction RelayV2StateSyncResult.ReleasePending(
+                chunk.namespace,
+                pending,
+                requireNotNull(authority.afterReleasePhase),
+            )
         }
         if (authority.phase != RelayV2StoredSyncPhase.RESYNCING) {
             return@transaction RelayV2StateSyncResult.ResyncRequired(
@@ -125,15 +234,20 @@ internal class RelayV2StateSyncRepositoryCore(
             val obligation = authority.releaseObligation(
                 release,
                 RelayV2SnapshotReleaseReason.valueOf(reason.name),
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = obligation,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(chunk.namespace)
             deleteBufferedEvents(chunk.namespace)
-            return RelayV2StateSyncResult.ResyncRequired(chunk.namespace, reason, obligation)
+            return RelayV2StateSyncResult.ResyncRequired(
+                chunk.namespace,
+                reason,
+                obligation,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
+            )
         }
 
         val canonicalRecords = chunk.records.map { record ->
@@ -204,9 +318,12 @@ internal class RelayV2StateSyncRepositoryCore(
         val newRecordBytes = base.receivedRecordCanonicalBytes + canonicalRecords.sumOf {
             it.second.toByteArray(Charsets.UTF_8).size.toLong()
         }
+        val newCanonicalArrayBytes = canonicalArrayBytes(newRecordCount, newRecordBytes)
         val newRawBytes = base.receivedRawUtf8Bytes + chunk.rawUtf8Bytes
         if (newRecordCount > base.totalRecords ||
             newRecordCount > RelayV2StateLimits.MAX_SNAPSHOT_RECORDS ||
+            newCanonicalArrayBytes > base.totalCanonicalBytes ||
+            newCanonicalArrayBytes > RelayV2StateLimits.MAX_SNAPSHOT_CANONICAL_BYTES ||
             newRawBytes > RelayV2StateLimits.MAX_STAGED_RAW_UTF8_BYTES
         ) {
             return@transaction reject(RelayV2ResyncReason.SNAPSHOT_LIMIT_EXCEEDED)
@@ -260,21 +377,21 @@ internal class RelayV2StateSyncRepositoryCore(
             storedAuthority.requiredThroughEventSeq,
             event.eventSeq,
         )
-        val pending = storedAuthority.pendingRelease?.let { release ->
-            release.copy(
-                phase = if (release.phase == RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS &&
-                    release.durableCursorEventSeq != null &&
-                    compareRelayV2Counters(release.durableCursorEventSeq, required) >= 0
-                ) {
-                    RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS
-                } else {
-                    RelayV2PostReleasePhase.RESTART_SNAPSHOT
-                },
-            )
+        val pending = storedAuthority.pendingRelease
+        val afterRelease = pending?.let {
+            if (storedAuthority.afterReleasePhase ==
+                RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS &&
+                it.durableCursorEventSeq != null &&
+                compareRelayV2Counters(it.durableCursorEventSeq, required) >= 0
+            ) {
+                RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS
+            } else {
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT
+            }
         }
         val authority = storedAuthority.copy(
             requiredThroughEventSeq = required,
-            pendingRelease = pending,
+            afterReleasePhase = afterRelease,
             phase = if (pending != null) {
                 RelayV2StoredSyncPhase.RESYNCING
             } else {
@@ -283,7 +400,11 @@ internal class RelayV2StateSyncRepositoryCore(
         )
         putAuthority(authority)
         if (pending != null) {
-            return@transaction RelayV2StateSyncResult.ReleasePending(event.namespace, pending)
+            return@transaction bufferEventWhileReleasePending(
+                transaction = this,
+                authority = authority,
+                event = event,
+            )
         }
 
         if (authority.phase == RelayV2StoredSyncPhase.LIVE &&
@@ -321,7 +442,11 @@ internal class RelayV2StateSyncRepositoryCore(
     ): RelayV2StateSyncResult = store.transaction {
         val authority = authority(namespace) ?: return@transaction unknownEpoch(namespace)
         authority.pendingRelease?.let { pending ->
-            return@transaction RelayV2StateSyncResult.ReleasePending(namespace, pending)
+            return@transaction RelayV2StateSyncResult.ReleasePending(
+                namespace,
+                pending,
+                requireNotNull(authority.afterReleasePhase),
+            )
         }
         val staged = snapshot(namespace)
             ?: return@transaction RelayV2StateSyncResult.ResyncRequired(
@@ -333,11 +458,11 @@ internal class RelayV2StateSyncRepositoryCore(
             val release = authority.releaseObligation(
                 staged.releaseDirective(),
                 RelayV2SnapshotReleaseReason.SNAPSHOT_IDENTITY_CONFLICT,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
@@ -345,17 +470,18 @@ internal class RelayV2StateSyncRepositoryCore(
                 namespace,
                 RelayV2ResyncReason.SNAPSHOT_IDENTITY_CONFLICT,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
         if (!staged.complete) {
             val release = authority.releaseObligation(
                 staged.releaseDirective(),
                 RelayV2SnapshotReleaseReason.SNAPSHOT_INCOMPLETE,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
@@ -363,6 +489,7 @@ internal class RelayV2StateSyncRepositoryCore(
                 namespace,
                 RelayV2ResyncReason.SNAPSHOT_INCOMPLETE,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
 
@@ -373,11 +500,11 @@ internal class RelayV2StateSyncRepositoryCore(
             val release = authority.releaseObligation(
                 staged.releaseDirective(),
                 RelayV2SnapshotReleaseReason.SNAPSHOT_COUNT_MISMATCH,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
@@ -385,17 +512,18 @@ internal class RelayV2StateSyncRepositoryCore(
                 namespace,
                 RelayV2ResyncReason.SNAPSHOT_COUNT_MISMATCH,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
         if (actual.digest != staged.cutDigest) {
             val release = authority.releaseObligation(
                 staged.releaseDirective(),
                 RelayV2SnapshotReleaseReason.SNAPSHOT_DIGEST_MISMATCH,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
@@ -403,6 +531,7 @@ internal class RelayV2StateSyncRepositoryCore(
                 namespace,
                 RelayV2ResyncReason.SNAPSHOT_DIGEST_MISMATCH,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
 
@@ -416,11 +545,11 @@ internal class RelayV2StateSyncRepositoryCore(
             val release = authority.releaseObligation(
                 staged.releaseDirective(),
                 RelayV2SnapshotReleaseReason.valueOf(reason.name),
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
@@ -428,6 +557,7 @@ internal class RelayV2StateSyncRepositoryCore(
                 namespace,
                 reason,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
 
@@ -472,11 +602,11 @@ internal class RelayV2StateSyncRepositoryCore(
         val release = committedAuthority.releaseObligation(
             staged.releaseDirective(),
             RelayV2SnapshotReleaseReason.COMPLETED,
-            RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
         )
         committedAuthority = committedAuthority.copy(
             phase = RelayV2StoredSyncPhase.RESYNCING,
             pendingRelease = release,
+            afterReleasePhase = RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
         )
         putAuthority(committedAuthority)
         deleteSnapshot(namespace)
@@ -485,6 +615,7 @@ internal class RelayV2StateSyncRepositoryCore(
             namespace,
             requireNotNull(committedAuthority.cursorEventSeq),
             release,
+            RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
         )
     }
 
@@ -497,13 +628,13 @@ internal class RelayV2StateSyncRepositoryCore(
             authority.releaseObligation(
                 directive,
                 RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
         if (release != null) {
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ))
         }
         deleteSnapshot(namespace)
@@ -513,17 +644,20 @@ internal class RelayV2StateSyncRepositoryCore(
 
     override suspend fun completeSnapshotReleaseUnderApplyLease(
         expected: RelayV2SnapshotReleaseObligation,
-    ): RelayV2SnapshotReleaseObligation? = store.transaction {
+    ): RelayV2SnapshotReleaseCompletion? = store.transaction {
         val authority = authority(expected.namespace) ?: return@transaction null
-        if (authority.pendingRelease != expected) return@transaction null
+        val pending = authority.validatedPendingRelease()
+        if (pending != expected) return@transaction null
+        val afterRelease = requireNotNull(authority.afterReleasePhase)
         putAuthority(authority.copy(
             pendingRelease = null,
-            phase = when (expected.phase) {
+            afterReleasePhase = null,
+            phase = when (afterRelease) {
                 RelayV2PostReleasePhase.RESTART_SNAPSHOT -> RelayV2StoredSyncPhase.RESYNCING
                 RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS -> RelayV2StoredSyncPhase.LIVE
             },
         ))
-        expected
+        RelayV2SnapshotReleaseCompletion(expected, afterRelease)
     }
 
     override suspend fun expireSnapshotContinuationUnderApplyLease(
@@ -533,7 +667,11 @@ internal class RelayV2StateSyncRepositoryCore(
     ): RelayV2StateSyncResult = store.transaction {
         val authority = authority(namespace) ?: return@transaction unknownEpoch(namespace)
         authority.pendingRelease?.let { pending ->
-            return@transaction RelayV2StateSyncResult.ReleasePending(namespace, pending)
+            return@transaction RelayV2StateSyncResult.ReleasePending(
+                namespace,
+                pending,
+                requireNotNull(authority.afterReleasePhase),
+            )
         }
         val staged = snapshot(namespace)
             ?: return@transaction RelayV2StateSyncResult.ResyncRequired(
@@ -603,15 +741,19 @@ internal class RelayV2StateSyncRepositoryCore(
                 val release = updated.releaseObligation(
                     staged.releaseDirective(),
                     RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED,
-                    RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
                 )
                 putAuthority(updated.copy(
                     phase = RelayV2StoredSyncPhase.RESYNCING,
                     pendingRelease = release,
+                    afterReleasePhase = RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
                 ))
                 deleteSnapshot(namespace)
                 deleteBufferedEvents(namespace)
-                return RelayV2StateSyncResult.ReleasePending(namespace, release)
+                return RelayV2StateSyncResult.ReleasePending(
+                    namespace,
+                    release,
+                    RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS,
+                )
             }
             putAuthority(updated)
             deleteSnapshot(namespace)
@@ -625,22 +767,27 @@ internal class RelayV2StateSyncRepositoryCore(
         )
         putAuthority(updated)
         val staged = snapshot(namespace)
-        if (staged != null &&
-            compareRelayV2Counters(staged.throughEventSeq, required) < 0 &&
-            !bufferCovers(this, namespace, staged.throughEventSeq, required)
+        if (staged?.complete == true ||
+            (staged != null &&
+                compareRelayV2Counters(staged.throughEventSeq, required) < 0 &&
+                !bufferCovers(this, namespace, staged.throughEventSeq, required))
         ) {
+            val pinned = requireNotNull(staged)
             val release = updated.releaseObligation(
-                staged.releaseDirective(),
+                pinned.releaseDirective(),
                 RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED,
-                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
-            putAuthority(updated.copy(pendingRelease = release))
+            putAuthority(updated.copy(
+                pendingRelease = release,
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
+            ))
             deleteSnapshot(namespace)
             deleteBufferedEvents(namespace)
             return RelayV2StateSyncResult.ResyncRequired(
                 namespace,
                 RelayV2ResyncReason.SNAPSHOT_RESTART_REQUIRED,
                 release,
+                RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             )
         }
         val continuation = staged?.takeIf { !it.complete && it.nextCursor != null }?.let {
@@ -659,6 +806,50 @@ internal class RelayV2StateSyncRepositoryCore(
         )
     }
 
+    private fun bufferEventWhileReleasePending(
+        transaction: RelayV2StateTransaction,
+        authority: RelayV2StoredAuthority,
+        event: RelayV2StateEvent,
+    ): RelayV2StateSyncResult = with(transaction) {
+        val release = authority.validatedPendingRelease()
+            ?: error("Release-pending event lost its durable obligation")
+        val restart = RelayV2PostReleasePhase.RESTART_SNAPSHOT
+        val updated = authority.copy(
+            phase = RelayV2StoredSyncPhase.RESYNCING,
+            afterReleasePhase = restart,
+        )
+        putAuthority(updated)
+        val canonical = event.canonicalJson()
+        val existing = bufferedEvent(event.namespace, event.eventSeq)
+        if (existing != null) {
+            if (existing.canonicalJson == canonical) return RelayV2StateSyncResult.DuplicateEvent
+            deleteBufferedEvents(event.namespace)
+            return RelayV2StateSyncResult.ReleasePending(event.namespace, release, restart)
+        }
+        if (bufferedEventCount(event.namespace) + 1 >
+            RelayV2StateLimits.MAX_BUFFERED_STATE_EVENTS ||
+            bufferedEventRawBytes(event.namespace) + event.rawUtf8Bytes >
+            RelayV2StateLimits.MAX_BUFFERED_STATE_EVENT_BYTES
+        ) {
+            deleteBufferedEvents(event.namespace)
+            return RelayV2StateSyncResult.ReleasePending(event.namespace, release, restart)
+        }
+        putBufferedEvent(
+            RelayV2StoredEvent(
+                event = event,
+                eventSeqOrder = relayV2CounterOrder(event.eventSeq),
+                canonicalJson = canonical,
+            ),
+        )
+        RelayV2StateSyncResult.EventBuffered(
+            namespace = event.namespace,
+            eventSeq = event.eventSeq,
+            durableCursorEventSeq = updated.cursorEventSeq,
+            requiredThroughEventSeq = updated.requiredThroughEventSeq,
+            recoveryAction = RelayV2BufferedRecoveryAction.CONTINUE_CURRENT,
+        )
+    }
+
     private fun bufferEventOrRestart(
         transaction: RelayV2StateTransaction,
         authority: RelayV2StoredAuthority,
@@ -673,13 +864,13 @@ internal class RelayV2StateSyncRepositoryCore(
                 authority.releaseObligation(
                     directive,
                     RelayV2SnapshotReleaseReason.EVENT_REVISION_CONFLICT,
-                    RelayV2PostReleasePhase.RESTART_SNAPSHOT,
                 )
             }
             if (release != null) {
                 putAuthority(authority.copy(
                     phase = RelayV2StoredSyncPhase.RESYNCING,
                     pendingRelease = release,
+                    afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
                 ))
             }
             deleteSnapshot(event.namespace)
@@ -688,7 +879,11 @@ internal class RelayV2StateSyncRepositoryCore(
                 event.namespace,
                 RelayV2ResyncReason.EVENT_REVISION_CONFLICT,
                 release,
-                authority.cursorEventSeq,
+                release?.let { RelayV2PostReleasePhase.RESTART_SNAPSHOT },
+                durableCursorEventSeq = authority.cursorEventSeq,
+                requiredThroughEventSeq = authority.requiredThroughEventSeq,
+                supersedesQueryCompletion =
+                    authority.phase == RelayV2StoredSyncPhase.LIVE,
             )
         }
         if (bufferedEventCount(event.namespace) + 1 > RelayV2StateLimits.MAX_BUFFERED_STATE_EVENTS ||
@@ -699,7 +894,6 @@ internal class RelayV2StateSyncRepositoryCore(
                 authority.releaseObligation(
                     directive,
                     RelayV2SnapshotReleaseReason.EVENT_BUFFER_OVERFLOW,
-                    RelayV2PostReleasePhase.RESTART_SNAPSHOT,
                 )
             }
             deleteSnapshot(event.namespace)
@@ -707,12 +901,18 @@ internal class RelayV2StateSyncRepositoryCore(
             putAuthority(authority.copy(
                 phase = RelayV2StoredSyncPhase.RESYNCING,
                 pendingRelease = release,
+                afterReleasePhase =
+                    release?.let { RelayV2PostReleasePhase.RESTART_SNAPSHOT },
             ))
             return RelayV2StateSyncResult.ResyncRequired(
                 event.namespace,
                 RelayV2ResyncReason.EVENT_BUFFER_OVERFLOW,
                 release,
-                authority.cursorEventSeq,
+                release?.let { RelayV2PostReleasePhase.RESTART_SNAPSHOT },
+                durableCursorEventSeq = authority.cursorEventSeq,
+                requiredThroughEventSeq = authority.requiredThroughEventSeq,
+                supersedesQueryCompletion =
+                    authority.phase == RelayV2StoredSyncPhase.LIVE,
             )
         }
         putBufferedEvent(
@@ -722,11 +922,25 @@ internal class RelayV2StateSyncRepositoryCore(
                 canonicalJson = canonical,
             ),
         )
-        return RelayV2StateSyncResult.ResyncRequired(
-            event.namespace,
-            reason,
-            durableCursorEventSeq = authority.cursorEventSeq,
-        )
+        return if (reason == RelayV2ResyncReason.EVENT_GAP) {
+            RelayV2StateSyncResult.EventBuffered(
+                namespace = event.namespace,
+                eventSeq = event.eventSeq,
+                durableCursorEventSeq = authority.cursorEventSeq,
+                requiredThroughEventSeq = authority.requiredThroughEventSeq,
+                recoveryAction = if (authority.phase == RelayV2StoredSyncPhase.LIVE) {
+                    RelayV2BufferedRecoveryAction.SUPERSEDE_QUERY_COMPLETION
+                } else {
+                    RelayV2BufferedRecoveryAction.CONTINUE_CURRENT
+                },
+            )
+        } else {
+            RelayV2StateSyncResult.ResyncRequired(
+                event.namespace,
+                reason,
+                durableCursorEventSeq = authority.cursorEventSeq,
+            )
+        }
     }
 
     private fun applyLiveEvent(
@@ -1062,7 +1276,6 @@ private fun RelayV2SnapshotChunk.releaseDirective() = RelayV2SnapshotReleaseDire
 private fun RelayV2StoredAuthority.releaseObligation(
     directive: RelayV2SnapshotReleaseDirective,
     reason: RelayV2SnapshotReleaseReason,
-    phase: RelayV2PostReleasePhase,
 ): RelayV2SnapshotReleaseObligation {
     check(namespace == directive.namespace) { "Snapshot release crossed authority namespace" }
     check(pendingRelease == null) { "Snapshot release obligation is already pending" }
@@ -1072,7 +1285,6 @@ private fun RelayV2StoredAuthority.releaseObligation(
         snapshotId = directive.snapshotId,
         durableCursorEventSeq = cursorEventSeq,
         reason = reason,
-        phase = phase,
     )
 }
 
@@ -1132,6 +1344,13 @@ private fun bufferCovers(
 
 private fun maxRelayV2Counter(left: String, right: String): String =
     if (compareRelayV2Counters(left, right) >= 0) left else right
+
+private fun RelayV2StateNamespace.connectIdentity() = RelayV2StateConnectIdentity(
+    profileId,
+    principalId,
+    clientInstanceId,
+    hostId,
+)
 
 private fun canonicalArrayBytes(canonicalRecords: List<String>): Long =
     2L + canonicalRecords.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() } +

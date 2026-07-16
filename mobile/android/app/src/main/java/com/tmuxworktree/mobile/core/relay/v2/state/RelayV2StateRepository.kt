@@ -29,10 +29,15 @@ internal class RelayV2StateRepository(
         RoomRelayV2DurableStateStore(database),
     )
 
+    override suspend fun loadConnectPlan(
+        identity: RelayV2StateConnectIdentity,
+    ): RelayV2StateConnectPlan = core.loadConnectPlan(identity)
+
     override suspend fun applyHelloUnderApplyLease(
+        connectPlan: RelayV2StateConnectPlan,
         hello: RelayV2StateHello,
     ): RelayV2StateSyncResult =
-        core.applyHelloUnderApplyLease(hello)
+        core.applyHelloUnderApplyLease(connectPlan, hello)
 
     override suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
@@ -53,7 +58,7 @@ internal class RelayV2StateRepository(
 
     override suspend fun completeSnapshotReleaseUnderApplyLease(
         expected: RelayV2SnapshotReleaseObligation,
-    ): RelayV2SnapshotReleaseObligation? =
+    ): RelayV2SnapshotReleaseCompletion? =
         core.completeSnapshotReleaseUnderApplyLease(expected)
 
     override suspend fun expireSnapshotContinuationUnderApplyLease(
@@ -325,6 +330,15 @@ private class RoomTransaction(
             namespace.hostId,
             namespace.hostEpoch,
         )?.toStored()
+
+    override fun authorities(
+        identity: RelayV2StateConnectIdentity,
+    ): List<RelayV2StoredAuthority> = dao.authorities(
+        identity.profileId,
+        identity.principalId,
+        identity.clientInstanceId,
+        identity.hostId,
+    ).map { it.toStored() }
 
     override fun putAuthority(authority: RelayV2StoredAuthority) {
         dao.putAuthority(authority.toEntity())
@@ -667,37 +681,49 @@ private class RoomTransaction(
     }
 }
 
-private fun RelayV2AuthorityEntity.toStored() = RelayV2StoredAuthority(
-    namespace = namespace(),
-    cursorEventSeq = cursorEventSeq,
-    requiredThroughEventSeq = requiredThroughEventSeq,
-    scopesRevision = scopesRevision,
-    phase = RelayV2StoredSyncPhase.valueOf(phase),
-    cacheRecordCount = cacheRecordCount,
-    cacheCanonicalBytes = cacheCanonicalBytes,
-    pendingRelease = pendingRelease(),
+private fun RelayV2AuthorityEntity.toStored(): RelayV2StoredAuthority {
+    val releaseJournal = pendingRelease()
+    return RelayV2StoredAuthority(
+        namespace = namespace(),
+        cursorEventSeq = cursorEventSeq,
+        requiredThroughEventSeq = requiredThroughEventSeq,
+        scopesRevision = scopesRevision,
+        phase = RelayV2StoredSyncPhase.valueOf(phase),
+        cacheRecordCount = cacheRecordCount,
+        cacheCanonicalBytes = cacheCanonicalBytes,
+        pendingRelease = releaseJournal?.release,
+        afterReleasePhase = releaseJournal?.afterReleasePhase,
+    ).also { it.validatedPendingRelease() }
+}
+
+private fun RelayV2StoredAuthority.toEntity(): RelayV2AuthorityEntity {
+    validatedPendingRelease()
+    return RelayV2AuthorityEntity(
+        profileId = namespace.profileId,
+        principalId = namespace.principalId,
+        clientInstanceId = namespace.clientInstanceId,
+        hostId = namespace.hostId,
+        hostEpoch = namespace.hostEpoch,
+        cursorEventSeq = cursorEventSeq,
+        requiredThroughEventSeq = requiredThroughEventSeq,
+        scopesRevision = scopesRevision,
+        phase = phase.name,
+        cacheRecordCount = cacheRecordCount,
+        cacheCanonicalBytes = cacheCanonicalBytes,
+        pendingReleaseSnapshotRequestId = pendingRelease?.snapshotRequestId,
+        pendingReleaseSnapshotId = pendingRelease?.snapshotId,
+        pendingReleaseCursorEventSeq = pendingRelease?.durableCursorEventSeq,
+        pendingReleaseReason = pendingRelease?.reason?.name,
+        pendingReleasePhase = afterReleasePhase?.name,
+    )
+}
+
+private data class StoredReleaseJournal(
+    val release: RelayV2SnapshotReleaseObligation,
+    val afterReleasePhase: RelayV2PostReleasePhase,
 )
 
-private fun RelayV2StoredAuthority.toEntity() = RelayV2AuthorityEntity(
-    profileId = namespace.profileId,
-    principalId = namespace.principalId,
-    clientInstanceId = namespace.clientInstanceId,
-    hostId = namespace.hostId,
-    hostEpoch = namespace.hostEpoch,
-    cursorEventSeq = cursorEventSeq,
-    requiredThroughEventSeq = requiredThroughEventSeq,
-    scopesRevision = scopesRevision,
-    phase = phase.name,
-    cacheRecordCount = cacheRecordCount,
-    cacheCanonicalBytes = cacheCanonicalBytes,
-    pendingReleaseSnapshotRequestId = pendingRelease?.snapshotRequestId,
-    pendingReleaseSnapshotId = pendingRelease?.snapshotId,
-    pendingReleaseCursorEventSeq = pendingRelease?.durableCursorEventSeq,
-    pendingReleaseReason = pendingRelease?.reason?.name,
-    pendingReleasePhase = pendingRelease?.phase?.name,
-)
-
-private fun RelayV2AuthorityEntity.pendingRelease(): RelayV2SnapshotReleaseObligation? {
+private fun RelayV2AuthorityEntity.pendingRelease(): StoredReleaseJournal? {
     val required = listOf(
         pendingReleaseSnapshotRequestId,
         pendingReleaseSnapshotId,
@@ -711,13 +737,17 @@ private fun RelayV2AuthorityEntity.pendingRelease(): RelayV2SnapshotReleaseOblig
         return null
     }
     check(required.all { it != null }) { "Relay v2 pending release obligation is incomplete" }
-    return RelayV2SnapshotReleaseObligation(
-        namespace = namespace(),
-        snapshotRequestId = requireNotNull(pendingReleaseSnapshotRequestId),
-        snapshotId = requireNotNull(pendingReleaseSnapshotId),
-        durableCursorEventSeq = pendingReleaseCursorEventSeq,
-        reason = RelayV2SnapshotReleaseReason.valueOf(requireNotNull(pendingReleaseReason)),
-        phase = RelayV2PostReleasePhase.valueOf(requireNotNull(pendingReleasePhase)),
+    return StoredReleaseJournal(
+        release = RelayV2SnapshotReleaseObligation(
+            namespace = namespace(),
+            snapshotRequestId = requireNotNull(pendingReleaseSnapshotRequestId),
+            snapshotId = requireNotNull(pendingReleaseSnapshotId),
+            durableCursorEventSeq = pendingReleaseCursorEventSeq,
+            reason = RelayV2SnapshotReleaseReason.valueOf(requireNotNull(pendingReleaseReason)),
+        ),
+        afterReleasePhase = RelayV2PostReleasePhase.valueOf(
+            requireNotNull(pendingReleasePhase),
+        ),
     )
 }
 

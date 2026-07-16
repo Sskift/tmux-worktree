@@ -25,6 +25,18 @@ internal interface RelayV2StateDao {
         hostEpoch: String,
     ): RelayV2AuthorityEntity?
 
+    @Query(
+        "SELECT * FROM relay_v2_authority WHERE profileId = :profileId " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId ORDER BY hostEpoch",
+    )
+    fun authorities(
+        profileId: String,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+    ): List<RelayV2AuthorityEntity>
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     fun putAuthority(authority: RelayV2AuthorityEntity)
 

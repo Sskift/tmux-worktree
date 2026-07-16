@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AppliedCursor
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2BufferedRecoveryAction
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2PostReleasePhase
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ResyncReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2ScopeKind
@@ -15,6 +16,9 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotRecord
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseObligation
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2SnapshotReleaseReason
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateChange
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectIdentity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectPlan
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectRecovery
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateEvent
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHelloDisposition
@@ -30,10 +34,38 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult
  */
 internal class RelayV2RecoveryRepositoryAdapter(
     private val state: RelayV2StateSyncAuthority,
-) {
+) : RelayV2ConnectPlanSource {
+    override suspend fun load(profile: com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile):
+        RelayV2ConnectPlan {
+        val identity = RelayV2StateConnectIdentity(
+            profile.profileId,
+            profile.principalId,
+            profile.clientInstanceId,
+            profile.hostId,
+        )
+        val plan = state.loadConnectPlan(identity)
+        return RelayV2ConnectPlan(
+            profileId = identity.profileId,
+            principalId = identity.principalId,
+            clientInstanceId = identity.clientInstanceId,
+            hostId = identity.hostId,
+            requestedResume = plan.resume?.let {
+                RelayV2ResumeCursor(it.hostEpoch, it.eventSeq)
+            },
+            recovery = RelayV2ConnectRecovery.valueOf(plan.recovery.name),
+            durableHostEpoch = plan.durableHostEpoch,
+            requiredThroughEventSeq = plan.requiredThroughEventSeq,
+            snapshotRequestId = plan.snapshotRequestId,
+            snapshotId = plan.snapshotId,
+            snapshotNextCursor = plan.snapshotNextCursor,
+            snapshotNextChunkIndex = plan.snapshotNextChunkIndex,
+            snapshotComplete = plan.snapshotComplete,
+            releaseObligationToken = plan.releaseObligationToken,
+        )
+    }
+
     suspend fun applyHello(
         effect: RelayV2RuntimeEffect.GenerationScoped,
-        resume: RelayV2AppliedCursor?,
         pendingCommands: List<RelayV2PendingCommand>,
     ): RelayV2RecoveryReceipt {
         val helloEffect = when (effect) {
@@ -42,19 +74,32 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 effect.generation,
                 effect.recovery,
                 effect.outcome,
+                effect.connectPlan,
+                effect.repositoryAuthority,
             )
             is RelayV2RuntimeEffect.BeginStateResync -> HelloEffect(
                 effect.context,
                 effect.generation,
                 effect.recovery,
                 effect.outcome,
+                effect.connectPlan,
+                effect.repositoryAuthority,
             )
             else -> error("Effect is not a Relay v2 hello apply")
         }
-        requireIdentity(helloEffect.context, helloEffect.generation)
+        requireIdentity(
+            helloEffect.context,
+            helloEffect.generation,
+            helloEffect.repositoryAuthority,
+        )
         require(helloEffect.binding.generation == helloEffect.generation)
+        val resume = helloEffect.connectPlan.requestedResume?.let {
+            RelayV2AppliedCursor(it.hostEpoch, it.lastEventSeq)
+        }
         val namespace = helloEffect.context.namespace()
+        val stateConnectPlan = helloEffect.connectPlan.toStateConnectPlan()
         val result = state.applyHelloUnderApplyLease(
+            stateConnectPlan,
             RelayV2StateHello(
                 namespace = namespace,
                 welcomeEventSeq = helloEffect.context.eventSeq,
@@ -71,7 +116,12 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 pendingCommands,
             )
             is RelayV2StateSyncResult.ResyncRequired -> result.release?.let { release ->
-                recoveredRelease(helloEffect.binding, release, pendingCommands)
+                recoveredRelease(
+                    helloEffect.binding,
+                    release,
+                    requireNotNull(result.afterReleasePhase),
+                    pendingCommands,
+                )
             } ?: RelayV2RecoveryReceipt.HelloApplied(
                 helloEffect.binding,
                 namespace.hostId,
@@ -88,7 +138,12 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 },
             )
             is RelayV2StateSyncResult.ReleasePending ->
-                recoveredRelease(helloEffect.binding, result.release, pendingCommands)
+                recoveredRelease(
+                    helloEffect.binding,
+                    result.release,
+                    result.afterReleasePhase,
+                    pendingCommands,
+                )
             is RelayV2StateSyncResult.RotationRequired ->
                 error("Durable Relay v2 continuity rejected: ${result.reason}")
             else -> error("Unexpected hello repository result: $result")
@@ -112,18 +167,19 @@ internal class RelayV2RecoveryRepositoryAdapter(
     suspend fun completeRelease(
         effect: RelayV2RuntimeEffect.CompleteSnapshotRelease,
     ): RelayV2RecoveryReceipt.SnapshotReleaseCompleted? {
-        requireIdentity(effect.context, effect.generation)
+        requireIdentity(effect.context, effect.generation, effect.repositoryAuthority)
         require(effect.recovery.generation == effect.generation)
         val expected = effect.release.toStateObligation()
         require(expected.namespace == effect.context.namespace())
         require(expected.opaqueToken == effect.release.obligationToken)
         val completed = state.completeSnapshotReleaseUnderApplyLease(expected) ?: return null
-        check(completed.opaqueToken == effect.release.obligationToken)
+        check(completed.release.opaqueToken == effect.release.obligationToken)
         return RelayV2RecoveryReceipt.SnapshotReleaseCompleted(
             effect.recovery,
             effect.context.hostId,
             effect.context.hostEpoch,
-            completed.toRuntimeObligation(),
+            completed.release.toRuntimeObligation(),
+            completed.afterReleasePhase.toRuntimeRestart(),
         )
     }
 
@@ -131,7 +187,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
         effect: RelayV2RuntimeEffect.ExpireSnapshotContinuation,
         pendingCommands: List<RelayV2PendingCommand>,
     ): RelayV2RecoveryReceipt.RecoveryRestartRequired? {
-        requireIdentity(effect.context, effect.generation)
+        requireIdentity(effect.context, effect.generation, effect.repositoryAuthority)
         require(effect.recovery.generation == effect.generation)
         val result = state.expireSnapshotContinuationUnderApplyLease(
             effect.context.namespace(),
@@ -171,6 +227,14 @@ internal class RelayV2RecoveryRepositoryAdapter(
             RelayV2StateSyncResult.DuplicateEvent,
             is RelayV2StateSyncResult.Live,
             -> null
+            is RelayV2StateSyncResult.EventBuffered -> RelayV2OnlineResyncRequired(
+                effect.generation,
+                event.namespace.hostId,
+                event.namespace.hostEpoch,
+                result.durableCursorEventSeq,
+                pendingCommands,
+                release = null,
+            )
             is RelayV2StateSyncResult.ResyncRequired -> RelayV2OnlineResyncRequired(
                 effect.generation,
                 event.namespace.hostId,
@@ -178,6 +242,8 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 result.durableCursorEventSeq,
                 pendingCommands,
                 result.release?.toRuntimeObligation(),
+                result.afterReleasePhase?.toRuntimeRestart()
+                    ?: RelayV2RecoveryRestartDirective.SNAPSHOT,
             )
             is RelayV2StateSyncResult.ReleasePending -> RelayV2OnlineResyncRequired(
                 effect.generation,
@@ -186,6 +252,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 result.release.durableCursorEventSeq,
                 pendingCommands,
                 result.release.toRuntimeObligation(),
+                result.afterReleasePhase.toRuntimeRestart(),
             )
             else -> error("Unexpected ONLINE state repository result: $result")
         }
@@ -203,7 +270,36 @@ internal class RelayV2RecoveryRepositoryAdapter(
             RelayV2StateSyncResult.DuplicateEvent,
             is RelayV2StateSyncResult.Live,
             -> null
-            is RelayV2StateSyncResult.ResyncRequired -> result.release?.let { release ->
+            is RelayV2StateSyncResult.EventBuffered -> when (result.recoveryAction) {
+                RelayV2BufferedRecoveryAction.CONTINUE_CURRENT -> null
+                RelayV2BufferedRecoveryAction.SUPERSEDE_QUERY_COMPLETION ->
+                    RelayV2RecoveryReceipt.QueryRecoverySuperseded(
+                        binding,
+                        requireNotNull(effect.queryLineage),
+                        effect.completedReleaseBinding,
+                        event.namespace.hostId,
+                        event.namespace.hostEpoch,
+                        RelayV2RecoveryAbandonReason.EVENT_GAP,
+                        result.durableCursorEventSeq,
+                        result.requiredThroughEventSeq,
+                        pendingCommands,
+                    )
+            }
+            is RelayV2StateSyncResult.ResyncRequired -> if (
+                result.supersedesQueryCompletion
+            ) {
+                RelayV2RecoveryReceipt.QueryRecoverySuperseded(
+                    binding,
+                    requireNotNull(effect.queryLineage),
+                    effect.completedReleaseBinding,
+                    event.namespace.hostId,
+                    event.namespace.hostEpoch,
+                    result.reason.toRuntimeReason(),
+                    result.durableCursorEventSeq,
+                    requireNotNull(result.requiredThroughEventSeq),
+                    pendingCommands,
+                )
+            } else result.release?.let { release ->
                 RelayV2RecoveryReceipt.RecoveryAbandoned(
                     binding,
                     event.namespace.hostId,
@@ -212,7 +308,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
                     release.durableCursorEventSeq,
                     pendingCommands,
                     release.toRuntimeObligation(),
-                    release.phase.toRuntimeRestart(),
+                    requireNotNull(result.afterReleasePhase).toRuntimeRestart(),
                 )
             } ?: RelayV2RecoveryReceipt.RecoveryRestartRequired(
                 binding,
@@ -223,8 +319,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 pendingCommands,
                 RelayV2RecoveryRestartDirective.SNAPSHOT,
             )
-            is RelayV2StateSyncResult.ReleasePending ->
-                recoveredRelease(binding, result.release, pendingCommands)
+            is RelayV2StateSyncResult.ReleasePending -> null
             else -> error("Unexpected recovery state repository result: $result")
         }
     }
@@ -266,7 +361,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
                 release.durableCursorEventSeq,
                 pendingCommands,
                 release.toRuntimeObligation(),
-                release.phase.toRuntimeRestart(),
+                requireNotNull(result.afterReleasePhase).toRuntimeRestart(),
             )
         } ?: RelayV2RecoveryReceipt.RecoveryRestartRequired(
             effect.recovery,
@@ -278,13 +373,19 @@ internal class RelayV2RecoveryRepositoryAdapter(
             RelayV2RecoveryRestartDirective.SNAPSHOT,
         )
         is RelayV2StateSyncResult.ReleasePending ->
-            recoveredRelease(effect.recovery, result.release, pendingCommands)
+            recoveredRelease(
+                effect.recovery,
+                result.release,
+                result.afterReleasePhase,
+                pendingCommands,
+            )
         else -> error("Unexpected snapshot repository result: $result")
     }
 
     private fun recoveredRelease(
         binding: RelayV2RecoveryBinding,
         release: RelayV2SnapshotReleaseObligation,
+        afterReleasePhase: RelayV2PostReleasePhase,
         pendingCommands: List<RelayV2PendingCommand>,
     ) = RelayV2RecoveryReceipt.ReleaseObligationRecovered(
         binding,
@@ -293,13 +394,16 @@ internal class RelayV2RecoveryRepositoryAdapter(
         release.durableCursorEventSeq,
         pendingCommands,
         release.toRuntimeObligation(),
-        release.phase.toRuntimeRestart(),
+        afterReleasePhase.toRuntimeRestart(),
     )
 
     private fun requireIdentity(
         context: RelayV2HandshakeContext,
         generation: RelayV2EffectGeneration,
+        repositoryAuthority: RelayV2RepositoryEffectAuthority,
     ) {
+        require(repositoryAuthority == context.repositoryEffectAuthority(generation))
+        require(repositoryAuthority.generation == generation)
         require(generation.profileId == context.profile.profileId)
         require(generation.profileGeneration == context.profile.activationGeneration)
         require(generation.connectionGeneration > 0)
@@ -311,7 +415,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
 
     private fun RelayV2RuntimeEffect.ApplyStateSnapshotChunk.toStateSnapshotChunk():
         RelayV2SnapshotChunk {
-        requireIdentity(context, generation)
+        requireIdentity(context, generation, repositoryAuthority)
         require(recovery.generation == generation)
         val frame = message.closedFrame()
         require(frame["requestId"] == recovery.requestId)
@@ -346,7 +450,7 @@ internal class RelayV2RecoveryRepositoryAdapter(
     }
 
     private fun RelayV2RuntimeEffect.DeliverPostHandshakeFrame.toStateEvent(): RelayV2StateEvent {
-        requireIdentity(context, generation)
+        requireIdentity(context, generation, repositoryAuthority)
         recovery?.let { require(it.generation == generation) }
         val frame = message.closedFrame()
         require(frame["hostId"] == context.hostId)
@@ -444,8 +548,24 @@ internal class RelayV2RecoveryRepositoryAdapter(
         val generation: RelayV2EffectGeneration,
         val binding: RelayV2RecoveryBinding,
         val outcome: RelayV2HelloOutcome,
+        val connectPlan: RelayV2ConnectPlan,
+        val repositoryAuthority: RelayV2RepositoryEffectAuthority,
     )
 }
+
+private fun RelayV2ConnectPlan.toStateConnectPlan() = RelayV2StateConnectPlan(
+    identity = RelayV2StateConnectIdentity(profileId, principalId, clientInstanceId, hostId),
+    resume = requestedResume?.let { RelayV2AppliedCursor(it.hostEpoch, it.lastEventSeq) },
+    recovery = RelayV2StateConnectRecovery.valueOf(recovery.name),
+    durableHostEpoch = durableHostEpoch,
+    requiredThroughEventSeq = requiredThroughEventSeq,
+    snapshotRequestId = snapshotRequestId,
+    snapshotId = snapshotId,
+    snapshotNextCursor = snapshotNextCursor,
+    snapshotNextChunkIndex = snapshotNextChunkIndex,
+    snapshotComplete = snapshotComplete,
+    releaseObligationToken = releaseObligationToken,
+)
 
 private fun RelayV2SnapshotChunk.toResponseFrame(requestId: String): Map<String, Any?> =
     linkedMapOf(
@@ -563,8 +683,7 @@ private fun RelayV2PostReleasePhase.toRuntimeRestart() = when (this) {
 }
 
 private fun RelayV2SnapshotReleaseObligation.toRuntimeObligation() =
-    RelayV2RecoveryReleaseDirective(
-        obligationToken = opaqueToken,
+    RelayV2RecoveryReleaseDirective.fromDurable(
         profileId = namespace.profileId,
         principalId = namespace.principalId,
         clientInstanceId = namespace.clientInstanceId,
@@ -573,14 +692,8 @@ private fun RelayV2SnapshotReleaseObligation.toRuntimeObligation() =
         snapshotRequestId = snapshotRequestId,
         snapshotId = snapshotId,
         durableCursorEventSeq = durableCursorEventSeq,
-        reason = if (reason == RelayV2SnapshotReleaseReason.COMPLETED) {
-            RelayV2RecoveryReleaseReason.COMPLETED
-        } else {
-            RelayV2RecoveryReleaseReason.ABANDONED
-        },
-        durableReason = reason.name,
-        restart = phase.toRuntimeRestart(),
-    )
+        durableReason = RelayV2RecoveryDurableReleaseReason.valueOf(reason.name),
+    ).also { check(it.obligationToken == opaqueToken) }
 
 private fun RelayV2RecoveryReleaseDirective.toStateObligation() =
     RelayV2SnapshotReleaseObligation(
@@ -594,10 +707,5 @@ private fun RelayV2RecoveryReleaseDirective.toStateObligation() =
         snapshotRequestId = snapshotRequestId,
         snapshotId = snapshotId,
         durableCursorEventSeq = durableCursorEventSeq,
-        reason = RelayV2SnapshotReleaseReason.valueOf(durableReason),
-        phase = when (restart) {
-            RelayV2RecoveryRestartDirective.SNAPSHOT -> RelayV2PostReleasePhase.RESTART_SNAPSHOT
-            RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ->
-                RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS
-        },
+        reason = RelayV2SnapshotReleaseReason.valueOf(durableReason.name),
     )

@@ -775,11 +775,12 @@ class BoundedRelayV2TransportFactoryTest {
                     parentScope = parent,
                     transportFactory = server.factory(),
                     credentialStore = ReadOnlyCredentialStore(credentialReference, credential),
+                    connectPlanSource = emptyConnectPlanSource(),
                     codec = RelayV2Codec(),
                     clock = { 1_000_000 },
                 )
                 try {
-                    assertTrue(actor.connect(profile, resume = null))
+                    assertTrue(actor.connect(profile))
                     val failed = withTimeout(5_000) {
                         actor.state.first { it.phase == RelayV2ConnectionPhase.FAILED }
                     }
@@ -857,11 +858,12 @@ class BoundedRelayV2TransportFactoryTest {
                 parentScope = parent,
                 transportFactory = capturingFactory,
                 credentialStore = ReadOnlyCredentialStore(credentialReference, credential),
+                connectPlanSource = emptyConnectPlanSource(),
                 codec = RelayV2Codec(),
                 clock = { 1_000_000 },
             )
             try {
-                assertTrue(actor.connect(profile, null))
+                assertTrue(actor.connect(profile))
                 withTimeout(5_000) {
                     actor.state.first {
                         it.phase == RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME
@@ -1379,6 +1381,19 @@ private fun webSocketAccept(key: String): String {
         (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").toByteArray(StandardCharsets.US_ASCII),
     )
     return Base64.getEncoder().encodeToString(digest)
+}
+
+private fun emptyConnectPlanSource() = RelayV2ConnectPlanSource { profile ->
+    RelayV2ConnectPlan(
+        profile.profileId,
+        profile.principalId,
+        profile.clientInstanceId,
+        profile.hostId,
+        requestedResume = null,
+        recovery = RelayV2ConnectRecovery.EMPTY,
+        durableHostEpoch = null,
+        requiredThroughEventSeq = null,
+    )
 }
 
 private fun OutputStream.writeAscii(value: String) {

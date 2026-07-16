@@ -54,6 +54,7 @@ internal class RelayV2ConnectionActor(
     parentScope: CoroutineScope,
     private val transportFactory: RelayV2TransportFactory,
     private val credentialStore: RelayV2CredentialStore,
+    private val connectPlanSource: RelayV2ConnectPlanSource,
     private val codec: RelayV2Codec = RelayV2Codec(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val attemptId: () -> String = { UUID.randomUUID().toString() },
@@ -137,7 +138,10 @@ internal class RelayV2ConnectionActor(
         effect: RelayV2RuntimeEffect.GenerationScoped,
         block: suspend () -> T,
     ): RelayV2EffectApplyResult<T> {
-        val lease = effectApplyGate.begin(effect.generation)
+        val lease = effectApplyGate.begin(
+            effect.generation,
+            (effect as? RelayV2RuntimeEffect.RepositoryScoped)?.repositoryAuthority,
+        )
             ?: return RelayV2EffectApplyResult.Stale
         return try {
             RelayV2EffectApplyResult.Applied(block())
@@ -165,6 +169,7 @@ internal class RelayV2ConnectionActor(
         >()
     private var activeProfile: RelayV2Profile? = null
     private var requestedResume: RelayV2ResumeCursor? = null
+    private var activeConnectPlan: RelayV2ConnectPlan? = null
     private var pendingHelloRequestId: String? = null
     private var brokerEpoch: String? = null
     private var brokerCapabilities: Set<String> = emptySet()
@@ -173,6 +178,7 @@ internal class RelayV2ConnectionActor(
     private var hostWelcomeWatchdog: Job? = null
     private var recoveryStepWatchdog: Job? = null
     private var recoveryAttempt: RecoveryAttempt? = null
+    private var onlineQueryWindow: OnlineQueryWindow? = null
     private var onlineContext: RelayV2HandshakeContext? = null
     private val recentIssuedIds = LinkedHashSet<String>()
     private val completedRecoveryResponses = LinkedHashSet<CompletedRecoveryResponse>()
@@ -212,12 +218,12 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    fun connect(profile: RelayV2Profile, resume: RelayV2ResumeCursor?): Boolean {
+    fun connect(profile: RelayV2Profile): Boolean {
         val overloadOwner = synchronized(lifecycleLock) {
             if (lifecycleState != LifecycleState.OPEN || isActivationFencedLocked(profile.identity)) {
                 return false
             }
-            if (actions.trySendNormal(Action.Connect(profile, resume))) return true
+            if (actions.trySendNormal(Action.Connect(profile))) return true
             currentCallbackOwnerKeyLocked()
         }
         signalQueueSaturation(overloadOwner, source = null)
@@ -369,7 +375,7 @@ internal class RelayV2ConnectionActor(
 
     private suspend fun handle(action: Action) {
         when (action) {
-            is Action.Connect -> connectNow(action.profile, action.resume)
+            is Action.Connect -> connectNow(action.profile)
             is Action.Disconnect -> disconnectNow(action)
             is Action.TransportOpened -> transportOpened(action)
             is Action.TransportFrame -> transportFrame(action)
@@ -387,7 +393,7 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private suspend fun connectNow(profile: RelayV2Profile, resume: RelayV2ResumeCursor?) {
+    private suspend fun connectNow(profile: RelayV2Profile) {
         val token = claimConnectToken(profile) ?: run {
             if (isLifecycleOpen()) {
                 emitEffect(
@@ -444,6 +450,7 @@ internal class RelayV2ConnectionActor(
                 clearRecoveryAttempt()
                 recentIssuedIds.clear()
                 completedRecoveryResponses.clear()
+                onlineQueryWindow = null
                 ConnectPreparation(
                     previousTransport = previous,
                     connectionGeneration = connectionGeneration,
@@ -470,6 +477,25 @@ internal class RelayV2ConnectionActor(
                 )
                 return
             }
+
+            // The plan read is intentionally after the old generation apply-lease drain. It is
+            // the only resume/recovery fact frozen into this connection attempt.
+            val connectPlan = runCatching {
+                connectPlanSource.load(profile).also { it.requireMatches(profile) }
+            }.getOrElse {
+                failConnectAttempt(
+                    token,
+                    profile,
+                    RelayV2ConnectionFailure(
+                        RelayV2FailureKind.CONFIGURATION,
+                        "DURABLE_CONNECT_PLAN_INVALID",
+                        retryable = false,
+                    ),
+                    closeCode = null,
+                )
+                return
+            }
+            val resume = connectPlan.requestedResume
 
             val effectGeneration = RelayV2EffectGeneration(
                 profileId = profile.profileId,
@@ -549,6 +575,7 @@ internal class RelayV2ConnectionActor(
                     else -> {
                         activeProfile = profile
                         requestedResume = resume
+                        activeConnectPlan = connectPlan
                         pendingHelloRequestId = null
                         brokerEpoch = null
                         brokerCapabilities = emptySet()
@@ -1380,15 +1407,17 @@ internal class RelayV2ConnectionActor(
             )
             return
         }
+        val activeRecovery = recoveryAttempt?.takeIf(::isRecoveryCurrent)
         emitEffect(
             RelayV2RuntimeEffect.DeliverPostHandshakeFrame(
                 context = context,
                 message = decoded,
                 rawUtf8Bytes = rawBytes,
                 generation = currentEffectGeneration(profile),
-                recovery = recoveryAttempt
-                    ?.takeIf(::isRecoveryCurrent)
-                    ?.currentBinding(),
+                recovery = activeRecovery?.currentBinding(),
+                queryLineage = activeRecovery?.queryWindowLineage,
+                completedReleaseBinding =
+                    activeRecovery?.completedReleaseBindingForStateEvent(),
             ),
             rawBytes,
         )
@@ -1608,11 +1637,20 @@ internal class RelayV2ConnectionActor(
         rawBytes: Int,
     ) {
         recovery.stage = RecoveryStage.AWAITING_RELEASE_RECEIPT
+        val expectedRestart = when (val followUp = requireNotNull(recovery.releaseFollowUp)) {
+            ReleaseFollowUp.QueryPendingCommands ->
+                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS
+            is ReleaseFollowUp.RestartAfterAbandon -> followUp.directive
+        }
+        if (expectedRestart == RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS) {
+            recovery.armQueryWindow(request.binding)
+        }
         if (emitEffect(
             RelayV2RuntimeEffect.CompleteSnapshotRelease(
                 context = recovery.context,
                 release = request.release,
                 proof = proof,
+                expectedRestart = expectedRestart,
                 recovery = request.binding,
             ),
             rawBytes,
@@ -1896,7 +1934,13 @@ internal class RelayV2ConnectionActor(
         val helloRequestId = requireNotNull(pendingHelloRequestId)
         pendingHelloRequestId = null
         val effectGeneration = currentEffectGeneration(profile)
-        if (!activateEffectGenerationIfCurrent(effectGeneration)) return
+        if (!activateEffectGenerationIfCurrent(
+                effectGeneration,
+                context.repositoryEffectAuthority(effectGeneration),
+            )
+        ) {
+            return
+        }
         val recovery = RelayV2RecoveryBinding(
             generation = effectGeneration,
             step = 1,
@@ -1905,11 +1949,15 @@ internal class RelayV2ConnectionActor(
         recoveryAttempt = RecoveryAttempt(
             context = context,
             outcome = outcome,
+            connectPlan = requireNotNull(activeConnectPlan),
             generation = effectGeneration,
             helloRequestId = helloRequestId,
             step = recovery.step,
             stage = RecoveryStage.AWAITING_HELLO_RECEIPT,
         )
+        if (outcome == RelayV2HelloOutcome.MATCHED) {
+            requireNotNull(recoveryAttempt).armQueryWindow(recovery)
+        }
         when (outcome) {
             RelayV2HelloOutcome.MATCHED -> {
                 updateState(RelayV2ConnectionPhase.QUERYING, profile)
@@ -1918,6 +1966,7 @@ internal class RelayV2ConnectionActor(
                         context,
                         effectGeneration,
                         recovery,
+                        requireNotNull(activeConnectPlan),
                     ),
                     rawBytes,
                 )) {
@@ -1941,6 +1990,7 @@ internal class RelayV2ConnectionActor(
                         discardPriorResourceLineage =
                             outcome == RelayV2HelloOutcome.HOST_EPOCH_CHANGED,
                         recovery = recovery,
+                        connectPlan = requireNotNull(activeConnectPlan),
                     ),
                     rawBytes,
                 )) {
@@ -1956,6 +2006,10 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun handleRecoveryReceipt(receipt: RelayV2RecoveryReceipt) {
+        if (receipt is RelayV2RecoveryReceipt.QueryRecoverySuperseded) {
+            applyQueryRecoverySuperseded(receipt)
+            return
+        }
         val recovery = recoveryAttempt ?: return
         if (!isRecoveryCurrent(recovery) ||
             receipt.binding.generation != recovery.generation ||
@@ -1975,6 +2029,8 @@ internal class RelayV2ConnectionActor(
                 applyRecoveryAbandonedReceipt(recovery, receipt)
             is RelayV2RecoveryReceipt.RecoveryRestartRequired ->
                 applyRecoveryRestartRequiredReceipt(recovery, receipt)
+            is RelayV2RecoveryReceipt.QueryRecoverySuperseded ->
+                error("Handled before current recovery lookup")
             is RelayV2RecoveryReceipt.ReleaseObligationRecovered ->
                 applyRecoveredReleaseReceipt(recovery, receipt)
             is RelayV2RecoveryReceipt.SnapshotReleaseCompleted ->
@@ -2003,11 +2059,13 @@ internal class RelayV2ConnectionActor(
         val recovery = RecoveryAttempt(
             context = context,
             outcome = RelayV2HelloOutcome.CURSOR_BEHIND,
+            connectPlan = requireNotNull(activeConnectPlan),
             generation = receipt.generation,
             helloRequestId = lineageId,
             step = 1,
             stage = RecoveryStage.AWAITING_HELLO_RECEIPT,
         )
+        onlineQueryWindow = null
         recoveryAttempt = recovery
         recovery.pendingCommands = receipt.pendingCommands
         recovery.nextCommandIndex = 0
@@ -2044,25 +2102,48 @@ internal class RelayV2ConnectionActor(
             return
         }
         val matched = recovery.outcome == RelayV2HelloOutcome.MATCHED
+        val continuation = receipt.snapshotContinuation
         if (matched) {
             val cursor = receipt.durableCursorEventSeq ?: return
             if (BigInteger(cursor) < BigInteger(recovery.context.eventSeq) ||
-                receipt.snapshotContinuation != null
+                continuation != null
             ) {
+                failConnection(
+                    RelayV2FailureKind.SCHEMA,
+                    "DURABLE_RECOVERY_RECEIPT_INVALID",
+                    retryable = false,
+                    closeCode = 4400,
+                )
                 return
             }
-        } else if (receipt.snapshotContinuation != null &&
-            recovery.outcome != RelayV2HelloOutcome.CURSOR_BEHIND
-        ) {
-            return
+        } else if (continuation != null) {
+            val plan = recovery.connectPlan
+            val authorized = plan.recovery == RelayV2ConnectRecovery.RESYNCING &&
+                plan.durableHostEpoch == recovery.context.hostEpoch &&
+                plan.snapshotComplete == false &&
+                plan.snapshotRequestId == continuation.snapshotRequestId &&
+                plan.snapshotId == continuation.snapshotId &&
+                plan.snapshotNextCursor == continuation.cursor &&
+                plan.snapshotNextChunkIndex == continuation.nextChunkIndex &&
+                (recovery.outcome == RelayV2HelloOutcome.CURSOR_BEHIND ||
+                    recovery.outcome == RelayV2HelloOutcome.FRESH)
+            if (!authorized) {
+                failConnection(
+                    RelayV2FailureKind.SCHEMA,
+                    "DURABLE_RECOVERY_RECEIPT_INVALID",
+                    retryable = false,
+                    closeCode = 4400,
+                )
+                return
+            }
         }
         recovery.pendingCommands = receipt.pendingCommands
         recovery.nextCommandIndex = 0
         recovery.step += 1
         if (matched) {
-            beginCommandQueries(recovery)
+            beginCommandQueries(recovery, receipt.binding)
         } else {
-            beginStateSnapshot(recovery, receipt.snapshotContinuation)
+            beginStateSnapshot(recovery, continuation)
         }
     }
 
@@ -2189,7 +2270,11 @@ internal class RelayV2ConnectionActor(
         recovery.releaseRequest = null
         recovery.releaseFollowUp = null
         recovery.step += 1
-        continueAfterAbandon(recovery, ReleaseFollowUp.RestartAfterAbandon(receipt.restart))
+        continueAfterAbandon(
+            recovery,
+            ReleaseFollowUp.RestartAfterAbandon(receipt.restart),
+            receipt.binding,
+        )
     }
 
     private fun applyRecoveredReleaseReceipt(
@@ -2222,15 +2307,84 @@ internal class RelayV2ConnectionActor(
     ) {
         if (recovery.stage != RecoveryStage.AWAITING_RELEASE_RECEIPT) return
         val request = recovery.releaseRequest ?: return
-        val followUp = recovery.releaseFollowUp ?: return
+        recovery.releaseFollowUp ?: return
         if (receipt.binding != request.binding || receipt.release != request.release) return
         recovery.step += 1
         recovery.releaseRequest = null
         recovery.releaseFollowUp = null
-        when (followUp) {
-            ReleaseFollowUp.QueryPendingCommands -> beginCommandQueries(recovery)
-            is ReleaseFollowUp.RestartAfterAbandon -> continueAfterAbandon(recovery, followUp)
+        when (receipt.restart) {
+            RelayV2RecoveryRestartDirective.SNAPSHOT -> {
+                beginStateSnapshot(recovery, continuation = null)
+            }
+            RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS -> {
+                recovery.sourceCompletedReleaseBinding = receipt.binding
+                beginCommandQueries(recovery, receipt.binding)
+            }
         }
+    }
+
+    private fun applyQueryRecoverySuperseded(
+        receipt: RelayV2RecoveryReceipt.QueryRecoverySuperseded,
+    ) {
+        val profile = activeProfile ?: return
+        val context = onlineContext ?: return
+        if (receipt.binding.generation != currentEffectGeneration(profile) ||
+            receipt.hostId != context.hostId || receipt.hostEpoch != context.hostEpoch
+        ) {
+            return
+        }
+        if (!isCanonicalRelayV2RuntimeCounter(receipt.requiredThroughEventSeq) ||
+            receipt.durableCursorEventSeq?.let {
+                !isCanonicalRelayV2RuntimeCounter(it) ||
+                    BigInteger(receipt.requiredThroughEventSeq) <= BigInteger(it)
+            } == true
+        ) {
+            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            return
+        }
+        val recovery = recoveryAttempt
+        val activeWindowMatches = recovery?.let {
+            isRecoveryCurrent(it) &&
+                it.queryWindowLineage == receipt.queryLineage &&
+                receipt.binding in it.queryWindowEffectBindings &&
+                it.completedReleaseBindingForStateEvent() ==
+                receipt.completedReleaseBinding
+        } == true
+        val onlineWindowMatches = recovery == null &&
+            _state.value.phase == RelayV2ConnectionPhase.ONLINE &&
+            onlineQueryWindow?.let {
+                it.lineage == receipt.queryLineage &&
+                    receipt.binding in it.effectBindings &&
+                    it.completedReleaseBinding == receipt.completedReleaseBinding
+            } == true
+        if (!activeWindowMatches && !onlineWindowMatches) {
+            return
+        }
+        onlineQueryWindow = null
+
+        val activeRecovery = recovery ?: run {
+            if (_state.value.phase != RelayV2ConnectionPhase.ONLINE) return
+            val lineageId = issueId() ?: return
+            RecoveryAttempt(
+                context = context,
+                outcome = RelayV2HelloOutcome.CURSOR_BEHIND,
+                connectPlan = requireNotNull(activeConnectPlan),
+                generation = receipt.binding.generation,
+                helloRequestId = lineageId,
+                step = 1,
+                stage = RecoveryStage.AWAITING_HELLO_RECEIPT,
+            ).also { recoveryAttempt = it }
+        }
+        activeRecovery.pendingCommands = receipt.pendingCommands
+        activeRecovery.nextCommandIndex = 0
+        activeRecovery.commandRequest = null
+        activeRecovery.snapshotRequest = null
+        activeRecovery.snapshotChunkResponse = null
+        activeRecovery.releaseRequest = null
+        activeRecovery.releaseFollowUp = null
+        activeRecovery.clearQueryWindow()
+        activeRecovery.step += 1
+        beginStateSnapshot(activeRecovery, continuation = null)
     }
 
     private fun restartReceiptCanAdvance(
@@ -2248,12 +2402,13 @@ internal class RelayV2ConnectionActor(
     private fun continueAfterAbandon(
         recovery: RecoveryAttempt,
         restart: ReleaseFollowUp.RestartAfterAbandon,
+        originBinding: RelayV2RecoveryBinding,
     ) {
         when (restart.directive) {
             RelayV2RecoveryRestartDirective.SNAPSHOT ->
                 beginStateSnapshot(recovery, continuation = null)
             RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS ->
-                beginCommandQueries(recovery)
+                beginCommandQueries(recovery, originBinding)
         }
     }
 
@@ -2261,6 +2416,9 @@ internal class RelayV2ConnectionActor(
         recovery: RecoveryAttempt,
         continuation: RelayV2SnapshotContinuation?,
     ) {
+        if (!isRecoveryCurrent(recovery)) return
+        recovery.clearQueryWindow()
+        onlineQueryWindow = null
         updateState(RelayV2ConnectionPhase.RESYNCING, activeProfile)
         if (continuation == null) {
             val snapshotRequestId = issueId() ?: return
@@ -2325,14 +2483,11 @@ internal class RelayV2ConnectionActor(
         followUp: ReleaseFollowUp,
     ) {
         if (!isRecoveryCurrent(recovery)) return
-        val expectedRestart = when (followUp) {
-            ReleaseFollowUp.QueryPendingCommands ->
-                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS
-            is ReleaseFollowUp.RestartAfterAbandon -> followUp.directive
-        }
-        if (!releaseMatchesContext(release, recovery.context) ||
-            release.restart != expectedRestart
-        ) {
+        // A release flow replaces any earlier hello/query readiness lineage. If it later resumes
+        // querying, the exact release binding becomes that new window's origin.
+        recovery.clearQueryWindow()
+        onlineQueryWindow = null
+        if (!releaseMatchesContext(release, recovery.context)) {
             failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
             return
         }
@@ -2363,8 +2518,12 @@ internal class RelayV2ConnectionActor(
         }
     }
 
-    private fun beginCommandQueries(recovery: RecoveryAttempt) {
+    private fun beginCommandQueries(
+        recovery: RecoveryAttempt,
+        originBinding: RelayV2RecoveryBinding,
+    ) {
         if (!isRecoveryCurrent(recovery)) return
+        recovery.armQueryWindow(originBinding)
         updateState(RelayV2ConnectionPhase.QUERYING, activeProfile)
         sendNextCommandQuery(recovery)
     }
@@ -2372,6 +2531,14 @@ internal class RelayV2ConnectionActor(
     private fun sendNextCommandQuery(recovery: RecoveryAttempt) {
         if (!isRecoveryCurrent(recovery)) return
         if (recovery.nextCommandIndex >= recovery.pendingCommands.size) {
+            onlineQueryWindow = recovery.queryWindowLineage?.let {
+                OnlineQueryWindow(
+                    it,
+                    recovery.queryWindowEffectBindings.toSet(),
+                    recovery.sourceCompletedReleaseBinding,
+                )
+            }
+            recovery.clearQueryWindow()
             clearRecoveryAttempt()
             updateState(RelayV2ConnectionPhase.ONLINE, activeProfile)
             return
@@ -2386,6 +2553,7 @@ internal class RelayV2ConnectionActor(
         ).toList()
         val requestId = issueId() ?: return
         val binding = RelayV2RecoveryBinding(recovery.generation, recovery.step, requestId)
+        recovery.armQueryWindow(binding)
         recovery.commandRequest = CommandQueryRequest(binding, commands)
         recovery.stage = RecoveryStage.AWAITING_COMMAND_RESPONSE
         val frame = linkedMapOf<String, Any?>(
@@ -3103,6 +3271,8 @@ internal class RelayV2ConnectionActor(
         }
         activeProfile = null
         requestedResume = null
+        activeConnectPlan = null
+        onlineQueryWindow = null
         pendingHelloRequestId = null
         clearRecoveryAttempt()
         brokerEpoch = null
@@ -3412,6 +3582,7 @@ internal class RelayV2ConnectionActor(
 
     private fun activateEffectGenerationIfCurrent(
         generation: RelayV2EffectGeneration,
+        repositoryAuthority: RelayV2RepositoryEffectAuthority? = null,
     ): Boolean = synchronized(lifecycleLock) {
         val committed = committedCallbackOwner
         if (lifecycleState != LifecycleState.OPEN ||
@@ -3420,7 +3591,7 @@ internal class RelayV2ConnectionActor(
         ) {
             return@synchronized false
         }
-        effectApplyGate.activate(generation)
+        effectApplyGate.activate(generation, repositoryAuthority)
         true
     }
 
@@ -3441,6 +3612,7 @@ internal class RelayV2ConnectionActor(
             return
         }
         activeProfile = null
+        onlineQueryWindow = null
         updateState(RelayV2ConnectionPhase.CLOSED, null)
         drainQueuedEffects()
         completeShutdownDrain()
@@ -3494,7 +3666,6 @@ internal class RelayV2ConnectionActor(
 
         data class Connect(
             val profile: RelayV2Profile,
-            val resume: RelayV2ResumeCursor?,
         ) : Action
 
         data class Disconnect(
@@ -3683,6 +3854,7 @@ internal class RelayV2ConnectionActor(
     private class RecoveryAttempt(
         val context: RelayV2HandshakeContext,
         val outcome: RelayV2HelloOutcome,
+        val connectPlan: RelayV2ConnectPlan,
         val generation: RelayV2EffectGeneration,
         val helloRequestId: String,
         var step: Long,
@@ -3695,6 +3867,9 @@ internal class RelayV2ConnectionActor(
         var snapshotChunkResponse: SnapshotChunkResponse? = null
         var releaseRequest: SnapshotReleaseRequest? = null
         var releaseFollowUp: ReleaseFollowUp? = null
+        var sourceCompletedReleaseBinding: RelayV2RecoveryBinding? = null
+        var queryWindowLineage: RelayV2QueryRecoveryLineage? = null
+        val queryWindowEffectBindings = linkedSetOf<RelayV2RecoveryBinding>()
 
         val pendingRequestId: String?
             get() = commandRequest?.binding?.requestId
@@ -3714,7 +3889,35 @@ internal class RelayV2ConnectionActor(
             RecoveryStage.AWAITING_RELEASE_RECEIPT,
             -> releaseRequest?.binding
         }
+
+        fun completedReleaseBindingForStateEvent(): RelayV2RecoveryBinding? =
+            sourceCompletedReleaseBinding ?: if (stage == RecoveryStage.AWAITING_RELEASE_RECEIPT) {
+                releaseRequest?.binding
+            } else {
+                null
+            }
+
+        fun armQueryWindow(originBinding: RelayV2RecoveryBinding) {
+            require(originBinding.generation == generation)
+            if (queryWindowLineage == null) {
+                queryWindowLineage = RelayV2QueryRecoveryLineage(generation, helloRequestId)
+            }
+            queryWindowEffectBindings += originBinding
+            check(queryWindowEffectBindings.size <= MAX_QUERY_WINDOW_BINDINGS)
+        }
+
+        fun clearQueryWindow() {
+            queryWindowLineage = null
+            queryWindowEffectBindings.clear()
+            sourceCompletedReleaseBinding = null
+        }
     }
+
+    private data class OnlineQueryWindow(
+        val lineage: RelayV2QueryRecoveryLineage,
+        val effectBindings: Set<RelayV2RecoveryBinding>,
+        val completedReleaseBinding: RelayV2RecoveryBinding?,
+    )
 
     private data class CommandQueryRequest(
         val binding: RelayV2RecoveryBinding,
@@ -3906,32 +4109,53 @@ internal class RelayV2ConnectionActor(
     private class EffectApplyGate {
         private val lock = Any()
         private var acceptingGeneration: RelayV2EffectGeneration? = null
+        private var acceptingAuthority: RelayV2RepositoryEffectAuthority? = null
         private var leasedGeneration: RelayV2EffectGeneration? = null
+        private var leasedAuthority: RelayV2RepositoryEffectAuthority? = null
         private var activeLeaseCount = 0
         private var drainWaiter: CompletableDeferred<Unit>? = null
 
-        fun activate(generation: RelayV2EffectGeneration) = synchronized(lock) {
+        fun activate(
+            generation: RelayV2EffectGeneration,
+            repositoryAuthority: RelayV2RepositoryEffectAuthority? = null,
+        ) = synchronized(lock) {
             check(activeLeaseCount == 0) {
                 "Cannot activate a Relay v2 generation while an older apply lease is active"
             }
             check(acceptingGeneration == null || acceptingGeneration == generation) {
                 "Relay v2 apply generation changed without a drain barrier"
             }
+            check(acceptingAuthority == null || acceptingAuthority == repositoryAuthority) {
+                "Relay v2 repository authority changed without a drain barrier"
+            }
             acceptingGeneration = generation
+            acceptingAuthority = repositoryAuthority
         }
 
-        fun begin(generation: RelayV2EffectGeneration): ApplyLease? = synchronized(lock) {
-            if (acceptingGeneration != generation) return@synchronized null
+        fun begin(
+            generation: RelayV2EffectGeneration,
+            repositoryAuthority: RelayV2RepositoryEffectAuthority?,
+        ): ApplyLease? = synchronized(lock) {
+            if (acceptingGeneration != generation ||
+                acceptingAuthority != repositoryAuthority
+            ) {
+                return@synchronized null
+            }
             check(leasedGeneration == null || leasedGeneration == generation) {
                 "Relay v2 apply leases crossed generations"
             }
+            check(leasedAuthority == null || leasedAuthority == repositoryAuthority) {
+                "Relay v2 apply leases crossed repository authorities"
+            }
             leasedGeneration = generation
+            leasedAuthority = repositoryAuthority
             activeLeaseCount += 1
             ApplyLease(this)
         }
 
         fun invalidateAndDrain(): CompletableDeferred<Unit> = synchronized(lock) {
             acceptingGeneration = null
+            acceptingAuthority = null
             if (activeLeaseCount == 0) {
                 CompletableDeferred(Unit)
             } else {
@@ -3950,6 +4174,7 @@ internal class RelayV2ConnectionActor(
                 return@synchronized null
             }
             acceptingGeneration = null
+            acceptingAuthority = null
             if (activeLeaseCount == 0) {
                 CompletableDeferred(Unit)
             } else {
@@ -3963,6 +4188,7 @@ internal class RelayV2ConnectionActor(
                 activeLeaseCount -= 1
                 if (activeLeaseCount == 0) {
                     leasedGeneration = null
+                    leasedAuthority = null
                     drainWaiter.also { drainWaiter = null }
                 } else {
                     null
@@ -4004,6 +4230,7 @@ internal class RelayV2ConnectionActor(
         private const val CONTROL_ENQUEUE_RETRY_MS = 1L
         private const val MAX_RECENT_ISSUED_IDS = 1_024
         private const val MAX_COMPLETED_RECOVERY_RESPONSES = 128
+        private const val MAX_QUERY_WINDOW_BINDINGS = 129
 
         private val UUID_PATTERN = Regex(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" +
@@ -4139,6 +4366,13 @@ private fun RelayV2RecoveryReceipt.estimatedRawBytes(): Int {
             (durableCursorEventSeq?.bytes() ?: 0L) +
                 pendingCommands.sumOf { it.bytes() } +
                 32L
+        is RelayV2RecoveryReceipt.QueryRecoverySuperseded ->
+            (durableCursorEventSeq?.bytes() ?: 0L) +
+                requiredThroughEventSeq.bytes() +
+                queryLineage.recoveryId.bytes() +
+                (completedReleaseBinding?.requestId?.bytes() ?: 0L) +
+                pendingCommands.sumOf { it.bytes() } +
+                32L
         is RelayV2RecoveryReceipt.ReleaseObligationRecovered ->
                 (durableCursorEventSeq?.bytes() ?: 0L) +
                 pendingCommands.sumOf { it.bytes() } +
@@ -4171,6 +4405,6 @@ private fun RelayV2RecoveryReleaseDirective.estimatedRawBytes(): Long {
         snapshotRequestId.bytes() +
         snapshotId.bytes() +
         (durableCursorEventSeq?.bytes() ?: 0L) +
-        durableReason.bytes() +
+        durableReason.name.bytes() +
         32L
 }

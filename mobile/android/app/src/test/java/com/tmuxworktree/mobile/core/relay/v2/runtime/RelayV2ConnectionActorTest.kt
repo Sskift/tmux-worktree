@@ -25,6 +25,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHello
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateHelloDisposition
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncRepositoryCore
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StoredSyncPhase
 import com.tmuxworktree.mobile.core.relay.v2.state.canonicalSnapshotDigest
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArrayList
@@ -336,7 +337,7 @@ class RelayV2ConnectionActorTest {
             val repository = RelayV2StateSyncRepositoryCore(store)
             val records = adapterSnapshotRecords("seed-online")
             val (bytes, digest) = canonicalSnapshotDigest(records)
-            repository.applyHelloUnderApplyLease(
+            repository.applyHelloForActorTest(
                 RelayV2StateHello(
                     namespace,
                     "91",
@@ -353,10 +354,10 @@ class RelayV2ConnectionActorTest {
             ) as com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult.SnapshotCommitted
             assertEquals(
                 committed.release,
-                repository.completeSnapshotReleaseUnderApplyLease(committed.release),
+                repository.completeSnapshotReleaseUnderApplyLease(committed.release)?.release,
             )
             val adapter = recoveryAdapter(repository)
-            val harness = Harness()
+            val harness = Harness(durableConnectPlanSource = adapter)
             try {
                 val hello = harness.connectThroughRelayWelcome(
                     RelayV2ResumeCursor(HOST_EPOCH, "91"),
@@ -365,10 +366,13 @@ class RelayV2ConnectionActorTest {
                 transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
                 val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                     as RelayV2RuntimeEffect.QueryPendingCommands
+                assertEquals(
+                    helloEffect.context.repositoryEffectAuthority(helloEffect.generation),
+                    helloEffect.repositoryAuthority,
+                )
                 val helloReceipt = harness.actor.withEffectApplyLease(helloEffect) {
                     adapter.applyHello(
                         helloEffect,
-                        RelayV2AppliedCursor(HOST_EPOCH, "91"),
                         emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
@@ -423,8 +427,731 @@ class RelayV2ConnectionActorTest {
                 assertEquals("state.snapshot.get", snapshot.stringValue("type"))
                 assertEquals(null, snapshot.payload()["snapshotId"])
                 assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+
+                val bufferedFrame = deepClone(gapFrame)
+                bufferedFrame["eventSeq"] = "94"
+                bufferedFrame.payload()["resultingRevision"] = "3"
+                transport.sendFrame(bufferedFrame)
+                val buffered = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                val bufferedReceipt = harness.actor.withEffectApplyLease(buffered) {
+                    adapter.applyRecoveryStateEvent(buffered, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertNull(bufferedReceipt.value)
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                assertEquals(listOf("93", "94"), store.events(namespace).map {
+                    it.event.eventSeq
+                })
+
+                val chunk = fixture("state-snapshot-chunk")
+                chunk["requestId"] = snapshot.stringValue("requestId")
+                chunk.payload()["snapshotRequestId"] =
+                    snapshot.payload().stringValue("snapshotRequestId")
+                transport.sendFrame(chunk)
+                val chunkEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                assertEquals(
+                    snapshot.payload().stringValue("snapshotRequestId"),
+                    chunkEffect.snapshotRequestId,
+                )
             } finally {
                 harness.close()
+            }
+        }
+
+    @Test
+    fun `repository apply lease rejects a forged principal namespace`() = runBlocking {
+        val store = FakeStateStore()
+        val adapter = recoveryAdapter(RelayV2StateSyncRepositoryCore(store))
+        val harness = Harness()
+        try {
+            val hello = harness.connectThroughRelayWelcome(null)
+            val transport = harness.transport()
+            transport.sendFixture(
+                "host-welcome-snapshot-required",
+                hello.stringValue("requestId"),
+            )
+            val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.BeginStateResync
+            val foreignContext = effect.context.copy(principalId = "principal-foreign")
+            val contextOnlyForgery = effect.copy(context = foreignContext)
+            assertTrue(
+                runCatching {
+                    harness.actor.withEffectApplyLease(contextOnlyForgery) {
+                        adapter.applyHello(contextOnlyForgery, emptyList())
+                    }
+                }.exceptionOrNull() != null,
+            )
+
+            val fullyForged = contextOnlyForgery.copy(
+                repositoryAuthority =
+                    foreignContext.repositoryEffectAuthority(effect.generation),
+            )
+            var forgedLeaseEntered = false
+            assertEquals(
+                RelayV2EffectApplyResult.Stale,
+                harness.actor.withEffectApplyLease(fullyForged) {
+                    forgedLeaseEntered = true
+                    adapter.applyHello(fullyForged, emptyList())
+                },
+            )
+            assertFalse(forgedLeaseEntered)
+            assertNull(
+                store.authority(
+                    RelayV2StateNamespace(
+                        "profile-primary",
+                        "principal-foreign",
+                        "android-install-primary",
+                        HOST_ID,
+                        HOST_EPOCH,
+                    ),
+                ),
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `reconnect reads durable plan only after the prior apply lease drains`() = runBlocking {
+        val harness = Harness()
+        try {
+            val firstHello = harness.connectThroughRelayWelcome(null)
+            val firstTransport = harness.transport()
+            firstTransport.sendFixture(
+                "host-welcome-snapshot-required",
+                firstHello.stringValue("requestId"),
+            )
+            val priorEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.BeginStateResync
+            val leaseEntered = CompletableDeferred<Unit>()
+            val releaseLease = CompletableDeferred<Unit>()
+            val postLeasePlan = RelayV2ConnectPlan(
+                harness.profile.profileId,
+                harness.profile.principalId,
+                harness.profile.clientInstanceId,
+                harness.profile.hostId,
+                requestedResume = RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                recovery = RelayV2ConnectRecovery.LIVE,
+                durableHostEpoch = HOST_EPOCH,
+                requiredThroughEventSeq = "91",
+            )
+            val applying = async(Dispatchers.Default) {
+                harness.actor.withEffectApplyLease(priorEffect) {
+                    leaseEntered.complete(Unit)
+                    releaseLease.await()
+                    harness.publishConnectPlan(postLeasePlan)
+                }
+            }
+            leaseEntered.await()
+            val leaseReleased = AtomicBoolean(false)
+            val prematureLoad = AtomicBoolean(false)
+            harness.guardConnectPlanLoad {
+                if (!leaseReleased.get()) {
+                    prematureLoad.set(true)
+                    error("Durable plan loaded before the prior apply lease drained")
+                }
+            }
+            val loadsBeforeReconnect = harness.connectPlanLoadCount()
+            assertTrue(harness.actor.connect(harness.profile))
+            withTimeout(TIMEOUT_MS) {
+                while (firstTransport.closeCodes.isEmpty()) delay(1)
+            }
+            assertEquals(loadsBeforeReconnect, harness.connectPlanLoadCount())
+
+            leaseReleased.set(true)
+            releaseLease.complete(Unit)
+            applying.await()
+            val secondTransport = harness.awaitTransport(1)
+            secondTransport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+            harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
+            secondTransport.sendFixture("relay-welcome")
+            val secondHello = secondTransport.awaitSentFrame()
+            assertFalse(prematureLoad.get())
+            assertEquals(loadsBeforeReconnect + 1, harness.connectPlanLoadCount())
+            val resume = secondHello.payload().mutableObject("resume")
+            assertEquals(HOST_EPOCH, resume.stringValue("hostEpoch"))
+            assertEquals("91", resume.stringValue("lastEventSeq"))
+        } finally {
+            harness.factory.transports.forEach { it.completeTermination() }
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `cursorless reconnect resumes the same durable partial cut after an ordinary close`() =
+        runBlocking {
+            val namespace = RelayV2StateNamespace(
+                "profile-primary",
+                PRINCIPAL_ID,
+                "android-install-primary",
+                HOST_ID,
+                HOST_EPOCH,
+            )
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val adapter = recoveryAdapter(repository)
+            val harness = Harness(durableConnectPlanSource = adapter)
+            try {
+                val firstHello = harness.connectThroughRelayWelcome(null)
+                val firstTransport = harness.transport()
+                firstTransport.sendFixture(
+                    "host-welcome-snapshot-required",
+                    firstHello.stringValue("requestId"),
+                )
+                val firstHelloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                val firstHelloReceipt = harness.actor.withEffectApplyLease(firstHelloEffect) {
+                    adapter.applyHello(firstHelloEffect, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(firstHelloReceipt.value))
+
+                val firstGet = firstTransport.awaitSentFrame(1)
+                val partial = adapterSnapshotChunkFrame(firstGet, "partial-91", "91")
+                partial.payload()["isLast"] = false
+                partial.payload()["nextCursor"] = "cursor-partial-1"
+                partial.payload()["records"] = listOf(
+                    adapterSnapshotRecords("partial-91").first().toWireMapForActorTest(),
+                )
+                firstTransport.sendFrame(partial)
+                val partialEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                val partialReceipt = harness.actor.withEffectApplyLease(partialEffect) {
+                    adapter.applySnapshotChunk(partialEffect, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(partialReceipt.value))
+                firstTransport.awaitSentFrame(2)
+
+                firstTransport.closed(1000)
+                harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+                assertTrue(
+                    withTimeout(TIMEOUT_MS) { harness.actor.effects.first() } is
+                        RelayV2RuntimeEffect.ConnectionFailed,
+                )
+
+                val secondHello = harness.connectThroughRelayWelcome(resume = null)
+                val secondTransport = harness.transport()
+                secondTransport.sendFixture(
+                    "host-welcome-snapshot-required",
+                    secondHello.stringValue("requestId"),
+                )
+                val resumedHelloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                val resumedHelloReceipt = harness.actor.withEffectApplyLease(resumedHelloEffect) {
+                    adapter.applyHello(resumedHelloEffect, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(resumedHelloReceipt.value))
+
+                val resumedGet = secondTransport.awaitSentFrame(1)
+                assertEquals(
+                    firstGet.payload().stringValue("snapshotRequestId"),
+                    resumedGet.payload().stringValue("snapshotRequestId"),
+                )
+                assertEquals(
+                    partial.payload().stringValue("snapshotId"),
+                    resumedGet.payload().stringValue("snapshotId"),
+                )
+                assertEquals("cursor-partial-1", resumedGet.payload().stringValue("cursor"))
+                assertEquals(1L, (resumedGet.payload()["nextChunkIndex"] as Number).toLong())
+                assertEquals("91", store.authority(namespace)?.requiredThroughEventSeq)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `reopened complete staging releases the old cut before any new snapshot id`() =
+        runBlocking {
+            val namespace = RelayV2StateNamespace(
+                "profile-primary",
+                PRINCIPAL_ID,
+                "android-install-primary",
+                HOST_ID,
+                HOST_EPOCH,
+            )
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            repository.applyHelloForActorTest(
+                RelayV2StateHello(
+                    namespace,
+                    "91",
+                    null,
+                    RelayV2StateHelloDisposition.FRESH,
+                ),
+            )
+            val records = adapterSnapshotRecords("complete-before-crash")
+            val (bytes, digest) = canonicalSnapshotDigest(records)
+            val oldRequestId = "request-complete-before-crash"
+            val oldSnapshotId = "snapshot-complete-before-crash"
+            val staged = repository.stageSnapshotChunkUnderApplyLease(
+                adapterSnapshotChunk(
+                    namespace,
+                    "complete-before-crash",
+                    "91",
+                    records,
+                    bytes,
+                    digest,
+                ),
+            )
+            assertTrue(
+                staged is com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult.SnapshotStaged &&
+                    staged.complete,
+            )
+
+            val reopenedAdapter = recoveryAdapter(RelayV2StateSyncRepositoryCore(store))
+            val harness = Harness(durableConnectPlanSource = reopenedAdapter)
+            try {
+                val hello = harness.connectThroughRelayWelcome(null)
+                val transport = harness.transport()
+                transport.sendFixture(
+                    "host-welcome-snapshot-required",
+                    hello.stringValue("requestId"),
+                )
+                val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                val receipt = harness.actor.withEffectApplyLease(effect) {
+                    reopenedAdapter.applyHello(effect, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(receipt.value))
+
+                val release = transport.awaitSentFrame(1)
+                assertEquals("state.snapshot.release", release.stringValue("type"))
+                assertEquals(oldRequestId, release.payload().stringValue("snapshotRequestId"))
+                assertEquals(oldSnapshotId, release.payload().stringValue("snapshotId"))
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                assertEquals(2, transport.sent.size)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `events during release and durable completion keep one request and force catchup`(): Unit =
+        runBlocking {
+            val namespace = RelayV2StateNamespace(
+                "profile-primary",
+                PRINCIPAL_ID,
+                "android-install-primary",
+                HOST_ID,
+                HOST_EPOCH,
+            )
+            val store = FakeStateStore()
+            val repository = RelayV2StateSyncRepositoryCore(store)
+            val adapter = recoveryAdapter(repository)
+            val harness = Harness(durableConnectPlanSource = adapter)
+            try {
+                val hello = harness.connectThroughRelayWelcome(null)
+                val transport = harness.transport()
+                transport.sendFixture(
+                    "host-welcome-snapshot-required",
+                    hello.stringValue("requestId"),
+                )
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                val helloReceipt = harness.actor.withEffectApplyLease(helloEffect) {
+                    adapter.applyHello(helloEffect, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(helloReceipt.value))
+
+                val firstGet = transport.awaitSentFrame(1)
+                transport.sendFrame(adapterSnapshotChunkFrame(firstGet, "base-91", "91"))
+                val firstChunk = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                val firstCommitted = harness.actor.withEffectApplyLease(firstChunk) {
+                    adapter.applySnapshotChunk(firstChunk, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(firstCommitted.value))
+                val releaseA = transport.awaitSentFrame(2)
+                val durableRelease = requireNotNull(store.authority(namespace)?.pendingRelease)
+                val releaseToken = durableRelease.opaqueToken
+
+                suspend fun bufferEvent(eventSeq: String, revision: String) {
+                    val frame = fixture("sessions-changed-upsert")
+                    frame["eventSeq"] = eventSeq
+                    frame["scopeId"] = "scope-a"
+                    frame.payload()["resourceKey"] = "scope-a"
+                    frame.payload()["resultingRevision"] = revision
+                    frame.payload().mutableObject("change").mutableObject("item")["scopeId"] =
+                        "scope-a"
+                    transport.sendFrame(frame)
+                    val delivery = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                    val receipt = harness.actor.withEffectApplyLease(delivery) {
+                        adapter.applyRecoveryStateEvent(delivery, emptyList())
+                    } as RelayV2EffectApplyResult.Applied
+                    assertNull(receipt.value)
+                    assertEquals(releaseToken, store.authority(namespace)
+                        ?.pendingRelease?.opaqueToken)
+                }
+
+                bufferEvent("92", "2")
+                assertEquals(3, transport.sent.size)
+
+                val releasedA = fixture("state-snapshot-released")
+                releasedA["requestId"] = releaseA.stringValue("requestId")
+                releasedA.payload()["snapshotRequestId"] =
+                    releaseA.payload().stringValue("snapshotRequestId")
+                releasedA.payload()["snapshotId"] = releaseA.payload().stringValue("snapshotId")
+                transport.sendFrame(releasedA)
+                val completeA = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.CompleteSnapshotRelease
+
+                // The immutable ACK remains valid while a later event transaction changes only
+                // the durable after-release plan.
+                bufferEvent("93", "3")
+                assertEquals(3, transport.sent.size)
+                val completedA = harness.actor.withEffectApplyLease(completeA) {
+                    requireNotNull(adapter.completeRelease(completeA))
+                } as RelayV2EffectApplyResult.Applied
+                assertEquals(
+                    RelayV2RecoveryRestartDirective.SNAPSHOT,
+                    completedA.value.restart,
+                )
+                assertTrue(harness.actor.submitRecoveryReceipt(completedA.value))
+                val secondGet = transport.awaitSentFrame(3)
+                assertEquals("state.snapshot.get", secondGet.stringValue("type"))
+                assertTrue(
+                    secondGet.payload().stringValue("snapshotRequestId") !=
+                        firstGet.payload().stringValue("snapshotRequestId"),
+                )
+                assertTrue(harness.actor.state.value.phase != RelayV2ConnectionPhase.ONLINE)
+
+                transport.sendFrame(adapterSnapshotChunkFrame(secondGet, "base-retry", "91"))
+                val retryChunk = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                val retryCommitted = harness.actor.withEffectApplyLease(retryChunk) {
+                    adapter.applySnapshotChunk(retryChunk, emptyList())
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(retryCommitted.value))
+                assertEquals("93", store.authority(namespace)?.cursorEventSeq)
+
+                val releaseB = transport.awaitSentFrame(4)
+                assertEquals("state.snapshot.release", releaseB.stringValue("type"))
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `durable gap supersedes release and lease-bound query receipts in either action order`() =
+        runBlocking {
+            ActionOrder.entries.forEach { actionOrder ->
+                val pending = listOf(
+                    RelayV2PendingCommand("post-release-race", "window-race"),
+                )
+                val race = prepareReleaseCompletionRace(pending)
+                try {
+                    val supersede = race.durablyApplyGap("93", "2", pending)
+                    val baselineCount = race.transport.sent.size
+                    var delayedQueryReceipt: RelayV2RecoveryReceipt.CommandStatusesApplied? = null
+                    val freshFrameIndex = when (actionOrder) {
+                        ActionOrder.COMPLETION_FIRST -> {
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(race.oldCompletion),
+                            )
+                            val staleQuery = race.transport.awaitSentFrame(baselineCount)
+                            assertEquals("command.query", staleQuery.stringValue("type"))
+                            race.transport.sendCommandStatuses(
+                                staleQuery.stringValue("requestId"),
+                                pending,
+                            )
+                            val staleApply = withTimeout(TIMEOUT_MS) {
+                                race.harness.actor.effects.first()
+                            } as RelayV2RuntimeEffect.ApplyCommandStatuses
+                            // There is no command-status repository adapter in this foundation.
+                            // This lease-bound receipt proves only actor queue ordering; the Room
+                            // watermark asserted below is the durable supersede proof.
+                            val applied = race.harness.actor.withEffectApplyLease(staleApply) {
+                                RelayV2RecoveryReceipt.CommandStatusesApplied(
+                                    staleApply.recovery,
+                                    HOST_ID,
+                                    HOST_EPOCH,
+                                    pending,
+                                )
+                            } as RelayV2EffectApplyResult.Applied
+                            delayedQueryReceipt = applied.value
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(supersede),
+                            )
+                            baselineCount + 1
+                        }
+                        ActionOrder.SUPERSEDE_FIRST -> {
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(supersede),
+                            )
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(race.oldCompletion),
+                            )
+                            baselineCount
+                        }
+                    }
+
+                    val freshGet = race.transport.awaitSentFrame(freshFrameIndex)
+                    assertEquals("state.snapshot.get", freshGet.stringValue("type"))
+                    assertTrue(
+                        freshGet.stringValue("requestId") !=
+                            race.originalGet.stringValue("requestId"),
+                    )
+                    assertTrue(
+                        freshGet.objectValue("payload").stringValue("snapshotRequestId") !=
+                            race.originalGet.objectValue("payload")
+                                .stringValue("snapshotRequestId"),
+                    )
+                    delayedQueryReceipt?.let {
+                        assertTrue(race.harness.actor.submitRecoveryReceipt(it))
+                    }
+
+                    // The fresh response is a FIFO barrier behind every stale action above.
+                    race.transport.sendFrame(
+                        adapterSnapshotChunkFrame(
+                            freshGet,
+                            "race-fresh-${actionOrder.name.lowercase()}",
+                            "93",
+                        ),
+                    )
+                    val freshChunk = withTimeout(TIMEOUT_MS) {
+                        race.harness.actor.effects.first()
+                    } as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                    assertEquals(
+                        freshGet.stringValue("requestId"),
+                        freshChunk.recovery.requestId,
+                    )
+                    assertEquals(
+                        freshGet.objectValue("payload").stringValue("snapshotRequestId"),
+                        freshChunk.snapshotRequestId,
+                    )
+                    assertEquals(
+                        RelayV2StoredSyncPhase.RESYNCING,
+                        race.store.authority(race.namespace)?.phase,
+                    )
+                    assertEquals("91", race.store.authority(race.namespace)?.cursorEventSeq)
+                    assertEquals(
+                        "93",
+                        race.store.authority(race.namespace)?.requiredThroughEventSeq,
+                    )
+                    assertEquals(
+                        listOf("93"),
+                        race.store.events(race.namespace).map { it.event.eventSeq },
+                    )
+                    assertEquals(
+                        RelayV2ConnectionPhase.RESYNCING,
+                        race.harness.actor.state.value.phase,
+                    )
+                } finally {
+                    race.harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `late query-bound gap supersedes ONLINE through its completed release lineage`() =
+        runBlocking {
+            val pending = listOf(
+                RelayV2PendingCommand("query-window-race", "window-race"),
+            )
+            val race = prepareReleaseCompletionRace(pending)
+            try {
+                val queryFrameIndex = race.transport.sent.size
+                assertTrue(race.harness.actor.submitRecoveryReceipt(race.oldCompletion))
+                val query = race.transport.awaitSentFrame(queryFrameIndex)
+                race.transport.sendCommandStatuses(query.stringValue("requestId"), pending)
+                val commandApply = withTimeout(TIMEOUT_MS) {
+                    race.harness.actor.effects.first()
+                } as RelayV2RuntimeEffect.ApplyCommandStatuses
+                val commandReceipt = race.harness.actor.withEffectApplyLease(commandApply) {
+                    RelayV2RecoveryReceipt.CommandStatusesApplied(
+                        commandApply.recovery,
+                        HOST_ID,
+                        HOST_EPOCH,
+                        pending,
+                    )
+                } as RelayV2EffectApplyResult.Applied
+
+                val supersede = race.durablyApplyGap("93", "2", pending)
+                assertEquals(commandApply.recovery, supersede.binding)
+                assertEquals(race.oldCompletion.binding, supersede.completedReleaseBinding)
+                val freshFrameIndex = race.transport.sent.size
+                assertTrue(race.harness.actor.submitRecoveryReceipt(commandReceipt.value))
+                race.harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                assertTrue(race.harness.actor.submitRecoveryReceipt(supersede))
+
+                val freshGet = race.transport.awaitSentFrame(freshFrameIndex)
+                assertEquals("state.snapshot.get", freshGet.stringValue("type"))
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, race.harness.actor.state.value.phase)
+                assertEquals("93", race.store.authority(race.namespace)?.requiredThroughEventSeq)
+                assertEquals(listOf("93"), race.store.events(race.namespace).map {
+                    it.event.eventSeq
+                })
+            } finally {
+                race.harness.close()
+            }
+        }
+
+    @Test
+    fun `matched query window retains gap proof across hello and command receipt timing`() =
+        runBlocking {
+            MatchedGapTiming.entries.forEach { timing ->
+                val pending = if (timing == MatchedGapTiming.DURING_COMMAND_RECEIPT) {
+                    listOf(RelayV2PendingCommand("matched-gap", "matched-window"))
+                } else {
+                    emptyList()
+                }
+                val race = prepareMatchedQueryRace(pending)
+                try {
+                    val gap = when (timing) {
+                        MatchedGapTiming.BEFORE_HELLO_RECEIPT ->
+                            race.durablyApplyGap("93", "2", pending)
+                                .also { assertEquals(race.helloReceipt.binding, it.binding) }
+                        MatchedGapTiming.DURING_COMMAND_RECEIPT -> {
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(race.helloReceipt),
+                            )
+                            val query = race.transport.awaitSentFrame(1)
+                            race.transport.sendCommandStatuses(
+                                query.stringValue("requestId"),
+                                pending,
+                            )
+                            val commandApply = withTimeout(TIMEOUT_MS) {
+                                race.harness.actor.effects.first()
+                            } as RelayV2RuntimeEffect.ApplyCommandStatuses
+                            val commandReceipt = race.harness.actor.withEffectApplyLease(
+                                commandApply,
+                            ) {
+                                RelayV2RecoveryReceipt.CommandStatusesApplied(
+                                    commandApply.recovery,
+                                    HOST_ID,
+                                    HOST_EPOCH,
+                                    pending,
+                                )
+                            } as RelayV2EffectApplyResult.Applied
+                            val proof = race.durablyApplyGap("93", "2", pending)
+                            assertEquals(commandApply.recovery, proof.binding)
+                            assertTrue(
+                                race.harness.actor.submitRecoveryReceipt(commandReceipt.value),
+                            )
+                            proof
+                        }
+                    }
+                    if (timing == MatchedGapTiming.BEFORE_HELLO_RECEIPT) {
+                        assertTrue(
+                            race.harness.actor.submitRecoveryReceipt(race.helloReceipt),
+                        )
+                    }
+                    race.harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                    val freshFrameIndex = race.transport.sent.size
+                    assertTrue(race.harness.actor.submitRecoveryReceipt(gap))
+
+                    val freshGet = race.transport.awaitSentFrame(freshFrameIndex)
+                    assertEquals("state.snapshot.get", freshGet.stringValue("type"))
+                    assertEquals(RelayV2ConnectionPhase.RESYNCING, race.harness.actor.state.value.phase)
+                    assertEquals("93", race.store.authority(race.namespace)?.requiredThroughEventSeq)
+                    assertEquals(listOf("93"), race.store.events(race.namespace).map {
+                        it.event.eventSeq
+                    })
+                } finally {
+                    race.harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `release replacement keeps the maximum command query window bounded`(): Unit =
+        runBlocking {
+            val pending = (1..4_096).map {
+                RelayV2PendingCommand("bounded-command-$it", "bounded-window")
+            }
+            // Reopen the real pending release left by a committed cut whose ACK was not applied.
+            val seeded = seedSnapshotState("bounded-query", completeRelease = false)
+            val adapter = recoveryAdapter(seeded.repository)
+            val harness = Harness(durableConnectPlanSource = adapter)
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "91"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.QueryPendingCommands
+                val releaseReceipt = harness.actor.withEffectApplyLease(helloEffect) {
+                    adapter.applyHello(helloEffect, pending)
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(releaseReceipt.value))
+
+                val release = transport.awaitSentFrame(1)
+                val released = fixture("state-snapshot-released")
+                released["requestId"] = release.stringValue("requestId")
+                released.payload()["snapshotRequestId"] =
+                    release.payload().stringValue("snapshotRequestId")
+                released.payload()["snapshotId"] = release.payload().stringValue("snapshotId")
+                transport.sendFrame(released)
+                val completeEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.CompleteSnapshotRelease
+                val completed = harness.actor.withEffectApplyLease(completeEffect) {
+                    requireNotNull(adapter.completeRelease(completeEffect))
+                } as RelayV2EffectApplyResult.Applied
+                assertTrue(harness.actor.submitRecoveryReceipt(completed.value))
+
+                repeat(128) { batchIndex ->
+                    val query = transport.awaitSentFrame(batchIndex + 2)
+                    val commands = query.payload().commandItems()
+                    assertEquals(32, commands.size)
+                    transport.sendCommandStatuses(query.stringValue("requestId"), commands)
+                    val apply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.ApplyCommandStatuses
+                    assertTrue(
+                        harness.actor.commitRecoveryReceipt(
+                            apply,
+                            RelayV2RecoveryReceipt.CommandStatusesApplied(
+                                apply.recovery,
+                                HOST_ID,
+                                HOST_EPOCH,
+                                commands,
+                            ),
+                        ),
+                    )
+                }
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `late completed release supersede cannot orphan a newer snapshot recovery`() =
+        runBlocking {
+            val race = prepareReleaseCompletionRace(emptyList())
+            try {
+                val supersede = race.durablyApplyGap("93", "2", emptyList())
+                assertTrue(race.harness.actor.submitRecoveryReceipt(race.oldCompletion))
+                race.harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+
+                race.transport.sendFrame(sessionUpsertFrame("94", "3"))
+                val newerEvent = withTimeout(TIMEOUT_MS) { race.harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                val newerProof = race.harness.actor.withEffectApplyLease(newerEvent) {
+                    requireNotNull(
+                        race.adapter.applyOnlineStateEvent(newerEvent, emptyList()),
+                    )
+                } as RelayV2EffectApplyResult.Applied
+                val newerBaselineCount = race.transport.sent.size
+                assertTrue(race.harness.actor.submitOnlineResyncRequired(newerProof.value))
+                val newerGet = race.transport.awaitSentFrame(newerBaselineCount)
+                assertEquals("state.snapshot.get", newerGet.stringValue("type"))
+
+                assertTrue(race.harness.actor.submitRecoveryReceipt(supersede))
+                race.transport.sendFrame(
+                    adapterSnapshotChunkFrame(newerGet, "newer-recovery", "94"),
+                )
+                val accepted = withTimeout(TIMEOUT_MS) { race.harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                assertEquals(newerGet.stringValue("requestId"), accepted.recovery.requestId)
+                assertEquals(
+                    newerGet.objectValue("payload").stringValue("snapshotRequestId"),
+                    accepted.snapshotRequestId,
+                )
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, race.harness.actor.state.value.phase)
+            } finally {
+                race.harness.close()
             }
         }
 
@@ -484,7 +1211,6 @@ class RelayV2ConnectionActorTest {
                     "00000000-0000-0000-0000-00000000e001",
                     "00000000-0000-0000-0000-00000000e002",
                     RelayV2RecoveryReleaseReason.ABANDONED,
-                    RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
                     durableCursorEventSeq = "91",
                 )
                 assertTrue(
@@ -562,7 +1288,6 @@ class RelayV2ConnectionActorTest {
                     get.payload().stringValue("snapshotRequestId"),
                     chunk.payload().stringValue("snapshotId"),
                     RelayV2RecoveryReleaseReason.COMPLETED,
-                    RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
                     durableCursorEventSeq = "91",
                 )
                 assertTrue(
@@ -699,7 +1424,6 @@ class RelayV2ConnectionActorTest {
                                 snapshotRequestId,
                                 snapshotId,
                                 RelayV2RecoveryReleaseReason.COMPLETED,
-                                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
                                 durableCursorEventSeq = "90",
                             ),
                         ),
@@ -725,7 +1449,6 @@ class RelayV2ConnectionActorTest {
                                 snapshotRequestId,
                                 snapshotId,
                                 RelayV2RecoveryReleaseReason.COMPLETED,
-                                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
                                 durableCursorEventSeq = "91",
                             ),
                         ),
@@ -949,7 +1672,6 @@ class RelayV2ConnectionActorTest {
                                 get.payload().stringValue("snapshotRequestId"),
                                 chunk.payload().stringValue("snapshotId"),
                                 RelayV2RecoveryReleaseReason.ABANDONED,
-                                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
                                 durableCursorEventSeq = "91",
                             ),
                             restart = RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
@@ -1097,7 +1819,7 @@ class RelayV2ConnectionActorTest {
             val repository = RelayV2StateSyncRepositoryCore(store)
             val seed = adapterSnapshotRecords("cursor-90")
             val (seedBytes, seedDigest) = canonicalSnapshotDigest(seed)
-            repository.applyHelloUnderApplyLease(
+            repository.applyHelloForActorTest(
                 RelayV2StateHello(namespace, "90", null, RelayV2StateHelloDisposition.FRESH),
             )
             repository.stageSnapshotChunkUnderApplyLease(
@@ -1108,7 +1830,7 @@ class RelayV2ConnectionActorTest {
                 "snapshot-cursor-90",
             ) as com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult.SnapshotCommitted
             repository.completeSnapshotReleaseUnderApplyLease(committed.release)
-            repository.applyHelloUnderApplyLease(
+            repository.applyHelloForActorTest(
                 RelayV2StateHello(
                     namespace,
                     "91",
@@ -1140,7 +1862,7 @@ class RelayV2ConnectionActorTest {
                 ),
             )
             val adapter = recoveryAdapter(repository)
-            val harness = Harness()
+            val harness = Harness(durableConnectPlanSource = adapter)
             try {
                 val hello = harness.connectThroughRelayWelcome(
                     RelayV2ResumeCursor(HOST_EPOCH, "90"),
@@ -1152,7 +1874,6 @@ class RelayV2ConnectionActorTest {
                 val helloReceipt = harness.actor.withEffectApplyLease(helloEffect) {
                     adapter.applyHello(
                         helloEffect,
-                        RelayV2AppliedCursor(HOST_EPOCH, "90"),
                         emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
@@ -1198,7 +1919,7 @@ class RelayV2ConnectionActorTest {
             val store = FakeStateStore()
             val firstRepository = RelayV2StateSyncRepositoryCore(store)
             val firstAdapter = recoveryAdapter(firstRepository)
-            val harness = Harness()
+            val harness = Harness(durableConnectPlanSource = firstAdapter)
             try {
                 val firstHello = harness.connectThroughRelayWelcome(null)
                 val firstTransport = harness.transport()
@@ -1209,7 +1930,7 @@ class RelayV2ConnectionActorTest {
                 val firstEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
                     as RelayV2RuntimeEffect.BeginStateResync
                 val helloApplied = harness.actor.withEffectApplyLease(firstEffect) {
-                    firstAdapter.applyHello(firstEffect, resume = null, pendingCommands = emptyList())
+                    firstAdapter.applyHello(firstEffect, pendingCommands = emptyList())
                 } as RelayV2EffectApplyResult.Applied
                 assertTrue(harness.actor.submitRecoveryReceipt(helloApplied.value))
                 val firstGet = firstTransport.awaitSentFrame(1)
@@ -1262,7 +1983,6 @@ class RelayV2ConnectionActorTest {
                 val recovered = harness.actor.withEffectApplyLease(secondEffect) {
                     reopenedAdapter.applyHello(
                         secondEffect,
-                        resume = null,
                         pendingCommands = emptyList(),
                     )
                 } as RelayV2EffectApplyResult.Applied
@@ -1613,9 +2333,9 @@ class RelayV2ConnectionActorTest {
     fun `replaced transport callbacks are fenced by connection generation`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, resume = null))
+            assertTrue(harness.actor.connect(harness.profile))
             val first = harness.awaitTransport(0)
-            assertTrue(harness.actor.connect(harness.profile, resume = null))
+            assertTrue(harness.actor.connect(harness.profile))
             val second = harness.awaitTransport(1)
 
             first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
@@ -1638,7 +2358,7 @@ class RelayV2ConnectionActorTest {
             )
             assertTrue(first.closeCodes.contains(1000))
 
-            assertTrue(harness.actor.connect(harness.profile, resume = null))
+            assertTrue(harness.actor.connect(harness.profile))
             val third = harness.awaitTransport(2)
             assertFalse(
                 harness.actor.commitRecoveryReceipt(
@@ -1663,11 +2383,11 @@ class RelayV2ConnectionActorTest {
         runBlocking {
             val harness = Harness()
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val first = harness.awaitTransport(0)
                 first.completeTerminationOnClose = false
 
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 delay(25)
                 assertEquals(1, harness.factory.transports.size)
                 first.completeTermination()
@@ -1696,7 +2416,7 @@ class RelayV2ConnectionActorTest {
     fun `termination timeout is bounded fails closed and does not issue a receipt`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.completeTerminationOnClose = false
             transport.completeTermination(terminated = false)
@@ -1722,7 +2442,7 @@ class RelayV2ConnectionActorTest {
         runBlocking {
             val harness = Harness()
             try {
-                assertTrue(harness.actor.connect(harness.profile, resume = null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val first = harness.awaitTransport(0)
                 first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -1743,7 +2463,7 @@ class RelayV2ConnectionActorTest {
                 )
 
                 val replacement = harness.installProfile("replacement", activationGeneration = 2)
-                assertTrue(harness.actor.connect(replacement, resume = null))
+                assertTrue(harness.actor.connect(replacement))
                 val second = harness.awaitTransport(1)
 
                 first.fail(
@@ -1826,7 +2546,7 @@ class RelayV2ConnectionActorTest {
             withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
             commits += "old-profile-cleared"
             val replacement = harness.installProfile("replacement", activationGeneration = 2)
-            assertTrue(harness.actor.connect(replacement, null))
+            assertTrue(harness.actor.connect(replacement))
             val second = harness.awaitTransport(1)
             second.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -1883,17 +2603,17 @@ class RelayV2ConnectionActorTest {
             }
             assertFalse(barrier.isCompleted)
 
-            assertFalse(harness.actor.connect(harness.profile, null))
+            assertFalse(harness.actor.connect(harness.profile))
             assertEquals(readsBeforeFence, harness.credentialReadCount())
             releaseApply.complete(Unit)
             withTimeout(TIMEOUT_MS) { applying.await() }
             assertEquals("activation-fence", withTimeout(TIMEOUT_MS) { barrier.await() }.barrierId)
             withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
 
-            assertFalse(harness.actor.connect(harness.profile, null))
+            assertFalse(harness.actor.connect(harness.profile))
             assertEquals(readsBeforeFence, harness.credentialReadCount())
             val reactivated = harness.profile.copy(activationGeneration = 2)
-            assertTrue(harness.actor.connect(reactivated, null))
+            assertTrue(harness.actor.connect(reactivated))
             val replacement = harness.awaitTransport(1)
             replacement.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             val awaiting = harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -1981,7 +2701,7 @@ class RelayV2ConnectionActorTest {
                 reservedActionCapacity = 1,
             )
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 assertTrue(factory.openEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
                 val queued = async {
                     harness.actor.disconnectAndDrain(harness.profile.identity, "queued-cancel")
@@ -2019,7 +2739,7 @@ class RelayV2ConnectionActorTest {
                 reservedActionCapacity = 1,
             )
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val transport = harness.awaitTransport(0)
                 transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2056,7 +2776,7 @@ class RelayV2ConnectionActorTest {
             val blockedFactory = FakeTransportFactory(blockFirstOpen = true)
             val blockedHarness = Harness(factory = blockedFactory)
             try {
-                assertTrue(blockedHarness.actor.connect(blockedHarness.profile, null))
+                assertTrue(blockedHarness.actor.connect(blockedHarness.profile))
                 assertTrue(blockedFactory.openEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
                 blockedHarness.actor.close()
                 val barrier = async {
@@ -2086,7 +2806,7 @@ class RelayV2ConnectionActorTest {
             val createdHarness = Harness(factory = createdFactory)
             try {
                 createdFactory.onTransportCreated = { createdHarness.actor.close() }
-                assertTrue(createdHarness.actor.connect(createdHarness.profile, null))
+                assertTrue(createdHarness.actor.connect(createdHarness.profile))
                 val opened = createdHarness.awaitTransport(0)
                 val receipt = withTimeout(TIMEOUT_MS) {
                     createdHarness.actor.disconnectAndDrain(
@@ -2114,7 +2834,7 @@ class RelayV2ConnectionActorTest {
                 openedFactory.onTransportCreated = {
                     it.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 }
-                assertTrue(openedHarness.actor.connect(openedHarness.profile, null))
+                assertTrue(openedHarness.actor.connect(openedHarness.profile))
                 openedHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
                 assertTrue(openedHarness.transport().closeCodes.isEmpty())
             } finally {
@@ -2127,7 +2847,7 @@ class RelayV2ConnectionActorTest {
                 failedFactory.onTransportCreated = {
                     it.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
                 }
-                assertTrue(failedHarness.actor.connect(failedHarness.profile, null))
+                assertTrue(failedHarness.actor.connect(failedHarness.profile))
                 val failure = failedHarness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
                 assertEquals("HOST_OFFLINE", failure.failure?.code)
                 assertEquals(1, failedFactory.requests.size)
@@ -2150,7 +2870,7 @@ class RelayV2ConnectionActorTest {
                     }
                     assertTrue(
                         callbackName,
-                        throwingHarness.actor.connect(throwingHarness.profile, null),
+                        throwingHarness.actor.connect(throwingHarness.profile),
                     )
                     throwingHarness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
                     val transport = throwingHarness.awaitTransport(0)
@@ -2161,7 +2881,7 @@ class RelayV2ConnectionActorTest {
                     throwingFactory.failureAfterCreate = null
                     assertTrue(
                         callbackName,
-                        throwingHarness.actor.connect(throwingHarness.profile, null),
+                        throwingHarness.actor.connect(throwingHarness.profile),
                     )
                     transport.sendRaw(byteArrayOf('{'.code.toByte()))
                     val receipt = async {
@@ -2215,7 +2935,7 @@ class RelayV2ConnectionActorTest {
                         callbackSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                     }
                 }
-                assertTrue(timing.name, harness.actor.connect(harness.profile, null))
+                assertTrue(timing.name, harness.actor.connect(harness.profile))
 
                 val sources = when (timing) {
                     MismatchTiming.BEFORE_FACTORY_RETURN -> listOf(
@@ -2261,7 +2981,7 @@ class RelayV2ConnectionActorTest {
                     assertEquals(timing.name, listOf(1000), source.closeCodes)
                 }
 
-                assertTrue(timing.name, harness.actor.connect(harness.profile, null))
+                assertTrue(timing.name, harness.actor.connect(harness.profile))
                 val receipt = async {
                     harness.actor.disconnectAndDrain(
                         harness.profile.identity,
@@ -2293,7 +3013,7 @@ class RelayV2ConnectionActorTest {
     fun `synchronous close callback cannot recursively close a retiring source`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2318,7 +3038,7 @@ class RelayV2ConnectionActorTest {
             assertEquals(listOf(1000), transport.closeCodes)
 
             val reactivated = harness.profile.copy(activationGeneration = 2)
-            assertTrue(harness.actor.connect(reactivated, null))
+            assertTrue(harness.actor.connect(reactivated))
             harness.awaitTransport(1)
             assertEquals(2, harness.factory.transports.size)
         } finally {
@@ -2341,7 +3061,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(directHarness.actor.connect(directHarness.profile, null))
+            assertTrue(directHarness.actor.connect(directHarness.profile))
             val committed = directHarness.awaitTransport(0)
             committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             directHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2414,7 +3134,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0).apply {
                 completeTerminationOnClose = false
             }
@@ -2462,7 +3182,7 @@ class RelayV2ConnectionActorTest {
                 sourceCreated.countDown()
                 check(releaseFactoryReturn.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
             }
-            assertTrue(blockedHarness.actor.connect(blockedHarness.profile, null))
+            assertTrue(blockedHarness.actor.connect(blockedHarness.profile))
             assertTrue(sourceCreated.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
             val source = blockedHarness.awaitTransport(0)
             val receipt = async(start = CoroutineStart.UNDISPATCHED) {
@@ -2506,7 +3226,7 @@ class RelayV2ConnectionActorTest {
                 val factory = FakeTransportFactory(blockFirstSend = true)
                 val harness = Harness(factory = factory)
                 try {
-                    assertTrue(order, harness.actor.connect(harness.profile, null))
+                    assertTrue(order, harness.actor.connect(harness.profile))
                     val committed = harness.awaitTransport(0)
                     committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                     harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2536,7 +3256,7 @@ class RelayV2ConnectionActorTest {
                         withTimeoutOrNull(50) { harness.actor.effects.first() },
                     )
 
-                    assertTrue(order, harness.actor.connect(harness.profile, null))
+                    assertTrue(order, harness.actor.connect(harness.profile))
                     val receipt = async {
                         harness.actor.disconnectAndDrain(
                             harness.profile.identity,
@@ -2574,7 +3294,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val committed = harness.awaitTransport(0)
             committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2612,7 +3332,7 @@ class RelayV2ConnectionActorTest {
     fun `slow consumer intent dominates synchronous close callback`() = runBlocking {
         val harness = Harness(actionByteCapacity = 64)
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2628,7 +3348,7 @@ class RelayV2ConnectionActorTest {
             assertEquals(failure, effect.failure)
             assertEquals(listOf(1013), transport.closeCodes)
 
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val receipt = async {
                 harness.actor.disconnectAndDrain(harness.profile.identity, "slow-consumer-sync-close")
             }
@@ -2758,7 +3478,7 @@ class RelayV2ConnectionActorTest {
                     },
                 )
                 try {
-                    assertTrue("${scenario.name}:$order", harness.actor.connect(harness.profile, null))
+                    assertTrue("${scenario.name}:$order", harness.actor.connect(harness.profile))
                     withTimeout(TIMEOUT_MS) { commitEntered.await() }
                     val transport = harness.awaitTransport(0)
                     val saturate = { transport.sendRaw(ByteArray(65)) }
@@ -2806,7 +3526,7 @@ class RelayV2ConnectionActorTest {
                     },
                 )
                 try {
-                    assertTrue("$name:$order", harness.actor.connect(harness.profile, null))
+                    assertTrue("$name:$order", harness.actor.connect(harness.profile))
                     withTimeout(TIMEOUT_MS) { commitEntered.await() }
                     val transport = harness.awaitTransport(0)
                     val saturate = { transport.sendRaw(ByteArray(65)) }
@@ -2839,7 +3559,7 @@ class RelayV2ConnectionActorTest {
         val factory = FakeTransportFactory(blockFirstSend = true)
         val harness = Harness(factory = factory)
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val first = harness.awaitTransport(0)
             first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2847,7 +3567,7 @@ class RelayV2ConnectionActorTest {
             assertTrue(factory.sendEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
             first.throwOnSecondClose = true
 
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             first.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             factory.releaseSend.countDown()
             val second = harness.awaitTransport(1)
@@ -2887,7 +3607,7 @@ class RelayV2ConnectionActorTest {
                 },
             )
             try {
-                assertTrue(scenario, harness.actor.connect(harness.profile, null))
+                assertTrue(scenario, harness.actor.connect(harness.profile))
                 val committed = harness.awaitTransport(0)
                 committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -2898,7 +3618,7 @@ class RelayV2ConnectionActorTest {
                     check(releaseSecond.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
                 }
 
-                assertTrue(scenario, harness.actor.connect(harness.profile, null))
+                assertTrue(scenario, harness.actor.connect(harness.profile))
                 val retiredSources = if (scenario == "source-mismatch") {
                     committed.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK))
                     val mismatched = factory.createCallbackSource()
@@ -2958,7 +3678,7 @@ class RelayV2ConnectionActorTest {
                     factory.transports.forEach { it.completeTerminationOnClose = false }
                     callbackSource.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 }
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 harness.actor.awaitFailure(RelayV2FailureKind.SECURITY)
                 val sources = listOf(harness.awaitTransport(0), harness.awaitTransport(1))
                 val pendingIndex = 1 - falseIndex
@@ -2974,7 +3694,7 @@ class RelayV2ConnectionActorTest {
                 assertEquals(1, lateSource.cancelCount)
                 assertTrue(lateSource.closeCodes.isEmpty())
 
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val barrier = async {
                     runCatching {
                         harness.actor.disconnectAndDrain(
@@ -3012,7 +3732,7 @@ class RelayV2ConnectionActorTest {
                 },
             )
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 withTimeout(TIMEOUT_MS) { commitEntered.await() }
                 val transport = harness.awaitTransport(0)
                 transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
@@ -3050,7 +3770,7 @@ class RelayV2ConnectionActorTest {
             val relayWatchdog = ManualWatchdog()
             val relayHarness = Harness(watchdogDelay = relayWatchdog::await)
             try {
-                assertTrue(relayHarness.actor.connect(relayHarness.profile, null))
+                assertTrue(relayHarness.actor.connect(relayHarness.profile))
                 val transport = relayHarness.awaitTransport(0)
                 transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 relayHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3100,7 +3820,7 @@ class RelayV2ConnectionActorTest {
             )
             try {
                 assertTrue(
-                    raceHarness.actor.connect(
+                    raceHarness.connect(
                         raceHarness.profile,
                         RelayV2ResumeCursor(HOST_EPOCH, "91"),
                     ),
@@ -3140,7 +3860,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(tlsHarness.actor.connect(tlsHarness.profile, null))
+            assertTrue(tlsHarness.actor.connect(tlsHarness.profile))
             val transport = tlsHarness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             tlsHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3174,7 +3894,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(mismatchHarness.actor.connect(mismatchHarness.profile, null))
+            assertTrue(mismatchHarness.actor.connect(mismatchHarness.profile))
             val committed = mismatchHarness.awaitTransport(0)
             committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             mismatchHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3216,7 +3936,7 @@ class RelayV2ConnectionActorTest {
             },
         )
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val committed = harness.awaitTransport(0)
             committed.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3272,10 +3992,10 @@ class RelayV2ConnectionActorTest {
             eventCapacity = 4,
         )
         try {
-            assertTrue(actionHarness.actor.connect(actionHarness.profile, null))
+            assertTrue(actionHarness.actor.connect(actionHarness.profile))
             assertTrue(blockingFactory.openEntered.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
-            assertTrue(actionHarness.actor.connect(actionHarness.profile, null))
-            assertFalse(actionHarness.actor.connect(actionHarness.profile, null))
+            assertTrue(actionHarness.actor.connect(actionHarness.profile))
+            assertFalse(actionHarness.actor.connect(actionHarness.profile))
             blockingFactory.releaseOpen.countDown()
 
             val replacementTransport = actionHarness.awaitTransport(1)
@@ -3303,7 +4023,7 @@ class RelayV2ConnectionActorTest {
             eventHarness.actor.awaitPhase(RelayV2ConnectionPhase.QUERYING)
 
             assertTrue(
-                eventHarness.actor.connect(
+                eventHarness.connect(
                     eventHarness.profile,
                     RelayV2ResumeCursor(HOST_EPOCH, "91"),
                 ),
@@ -3328,7 +4048,7 @@ class RelayV2ConnectionActorTest {
 
         val actionByteHarness = Harness(actionByteCapacity = 64)
         try {
-            assertTrue(actionByteHarness.actor.connect(actionByteHarness.profile, null))
+            assertTrue(actionByteHarness.actor.connect(actionByteHarness.profile))
             val transport = actionByteHarness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             actionByteHarness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3407,7 +4127,7 @@ class RelayV2ConnectionActorTest {
             reservedActionCapacity = 1,
         )
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3442,7 +4162,7 @@ class RelayV2ConnectionActorTest {
     fun `protocol close 4400 fails closed without retry or fallback`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3463,7 +4183,7 @@ class RelayV2ConnectionActorTest {
         runBlocking {
             val harness = Harness()
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val transport = harness.awaitTransport(0)
                 transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
                 harness.actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3634,7 +4354,7 @@ class RelayV2ConnectionActorTest {
         scenarios.forEach { scenario ->
             val harness = Harness()
             try {
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
                 val transport = harness.awaitTransport(0)
                 scenario.trigger(harness, transport)
                 val failed = harness.actor.awaitFailure(scenario.expectedKind)
@@ -3663,7 +4383,7 @@ class RelayV2ConnectionActorTest {
     fun `legacy upgrade 101 classification is non retryable invalid envelope`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.fail(
                 RelayV2TransportFailure(
@@ -3685,7 +4405,7 @@ class RelayV2ConnectionActorTest {
     fun `TLS validation failure is non retryable security failure`() = runBlocking {
         val harness = Harness()
         try {
-            assertTrue(harness.actor.connect(harness.profile, null))
+            assertTrue(harness.actor.connect(harness.profile))
             val transport = harness.awaitTransport(0)
             transport.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION))
 
@@ -3709,7 +4429,7 @@ class RelayV2ConnectionActorTest {
             val harness = Harness()
             try {
                 harness.servePersistedAccessToken(token)
-                assertTrue(harness.actor.connect(harness.profile, null))
+                assertTrue(harness.actor.connect(harness.profile))
 
                 val failed = harness.actor.awaitFailure(RelayV2FailureKind.AUTH)
                 val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
@@ -3722,7 +4442,7 @@ class RelayV2ConnectionActorTest {
                 harness.servePersistedAccessToken(null)
                 harness.actor.disconnectAndDrain(harness.profile.identity, "credential-recovery")
                 val recovered = harness.profile.copy(activationGeneration = 2)
-                assertTrue(harness.actor.connect(recovered, null))
+                assertTrue(harness.actor.connect(recovered))
                 harness.awaitTransport(0)
                 assertEquals(1, harness.factory.requests.size)
             } finally {
@@ -3749,14 +4469,17 @@ class RelayV2ConnectionActorTest {
         betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
         afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
         afterDisconnectOwnerSeal: () -> Unit = {},
+        durableConnectPlanSource: RelayV2ConnectPlanSource? = null,
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
+        private val connectPlans = MutableConnectPlanSource()
         val profile = installProfile("primary", activationGeneration = 1)
         val actor = RelayV2ConnectionActor(
             parentScope = parent,
             transportFactory = factory,
             credentialStore = credentials,
+            connectPlanSource = durableConnectPlanSource ?: connectPlans,
             codec = codec,
             clock = { NOW_MS },
             watchdogDelay = watchdogDelay,
@@ -3809,6 +4532,7 @@ class RelayV2ConnectionActorTest {
                     ),
                 ),
             )
+            connectPlans.set(profile, resume = null)
             return profile
         }
 
@@ -3817,7 +4541,7 @@ class RelayV2ConnectionActorTest {
             connectingProfile: RelayV2Profile = profile,
         ): MutableMap<String, Any?> {
             val transportIndex = factory.transports.size
-            assertTrue(actor.connect(connectingProfile, resume))
+            assertTrue(connect(connectingProfile, resume))
             val transport = awaitTransport(transportIndex)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
@@ -3825,6 +4549,14 @@ class RelayV2ConnectionActorTest {
             val hello = transport.awaitSentFrame()
             actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_HOST_WELCOME)
             return hello
+        }
+
+        fun connect(
+            connectingProfile: RelayV2Profile,
+            resume: RelayV2ResumeCursor?,
+        ): Boolean {
+            connectPlans.set(connectingProfile, resume)
+            return actor.connect(connectingProfile)
         }
 
         suspend fun awaitTransport(index: Int): FakeTransport = withTimeout(TIMEOUT_MS) {
@@ -3843,10 +4575,21 @@ class RelayV2ConnectionActorTest {
                 hostId = HOST_ID,
                 hostEpoch = HOST_EPOCH,
                 release = effect.release,
+                restart = effect.expectedRestart,
             ),
         )
 
         fun credentialReadCount(): Int = credentials.readCount.get()
+
+        fun publishConnectPlan(plan: RelayV2ConnectPlan) {
+            connectPlans.publish(profile, plan)
+        }
+
+        fun guardConnectPlanLoad(guard: () -> Unit) {
+            connectPlans.beforeLoad = guard
+        }
+
+        fun connectPlanLoadCount(): Int = connectPlans.loadCount.get()
 
         fun servePersistedAccessToken(accessToken: String?) {
             credentials.readTransform = accessToken?.let { candidate ->
@@ -3857,6 +4600,43 @@ class RelayV2ConnectionActorTest {
         fun close() {
             actor.close()
             parent.cancel()
+        }
+    }
+
+    private class MutableConnectPlanSource : RelayV2ConnectPlanSource {
+        private val plans = linkedMapOf<String, RelayV2ConnectPlan>()
+        val loadCount = AtomicInteger()
+        @Volatile
+        var beforeLoad: (() -> Unit)? = null
+
+        fun set(
+            profile: RelayV2Profile,
+            resume: RelayV2ResumeCursor?,
+        ) {
+            plans[profile.profileId] = RelayV2ConnectPlan(
+                profile.profileId,
+                profile.principalId,
+                profile.clientInstanceId,
+                profile.hostId,
+                requestedResume = resume,
+                recovery = if (resume == null) {
+                    RelayV2ConnectRecovery.EMPTY
+                } else {
+                    RelayV2ConnectRecovery.LIVE
+                },
+                durableHostEpoch = resume?.hostEpoch,
+                requiredThroughEventSeq = resume?.lastEventSeq,
+            )
+        }
+
+        fun publish(profile: RelayV2Profile, plan: RelayV2ConnectPlan) {
+            plans[profile.profileId] = plan
+        }
+
+        override suspend fun load(profile: RelayV2Profile): RelayV2ConnectPlan {
+            loadCount.incrementAndGet()
+            beforeLoad?.invoke()
+            return requireNotNull(plans[profile.profileId])
         }
     }
 
@@ -4089,14 +4869,23 @@ class RelayV2ConnectionActorTest {
         fixtures.golden.single { it.name == name }.frame,
     )
 
+    private fun sessionUpsertFrame(
+        eventSeq: String,
+        resultingRevision: String,
+    ): MutableMap<String, Any?> = fixture("sessions-changed-upsert").apply {
+        this["eventSeq"] = eventSeq
+        this["scopeId"] = "scope-a"
+        payload()["resourceKey"] = "scope-a"
+        payload()["resultingRevision"] = resultingRevision
+        payload().mutableObject("change").mutableObject("item")["scopeId"] = "scope-a"
+    }
+
     private fun releaseObligation(
         snapshotRequestId: String,
         snapshotId: String,
         reason: RelayV2RecoveryReleaseReason,
-        restart: RelayV2RecoveryRestartDirective = RelayV2RecoveryRestartDirective.SNAPSHOT,
         durableCursorEventSeq: String? = null,
-    ) = RelayV2RecoveryReleaseDirective(
-        obligationToken = "release-obligation-${snapshotRequestId.takeLast(8)}",
+    ) = RelayV2RecoveryReleaseDirective.fromDurable(
         profileId = "profile-primary",
         principalId = PRINCIPAL_ID,
         clientInstanceId = "android-install-primary",
@@ -4105,17 +4894,226 @@ class RelayV2ConnectionActorTest {
         snapshotRequestId = snapshotRequestId,
         snapshotId = snapshotId,
         durableCursorEventSeq = durableCursorEventSeq,
-        reason = reason,
         durableReason = if (reason == RelayV2RecoveryReleaseReason.COMPLETED) {
-            "COMPLETED"
+            RelayV2RecoveryDurableReleaseReason.COMPLETED
         } else {
-            "SNAPSHOT_RESTART_REQUIRED"
+            RelayV2RecoveryDurableReleaseReason.SNAPSHOT_RESTART_REQUIRED
         },
-        restart = restart,
     )
 
     private fun recoveryAdapter(repository: RelayV2StateSyncRepositoryCore) =
         RelayV2RecoveryRepositoryAdapter(repository)
+
+    private suspend fun prepareReleaseCompletionRace(
+        pending: List<RelayV2PendingCommand>,
+    ): ReleaseCompletionRace {
+        val namespace = RelayV2StateNamespace(
+            "profile-primary",
+            PRINCIPAL_ID,
+            "android-install-primary",
+            HOST_ID,
+            HOST_EPOCH,
+        )
+        val store = FakeStateStore()
+        val adapter = recoveryAdapter(RelayV2StateSyncRepositoryCore(store))
+        val harness = Harness(durableConnectPlanSource = adapter)
+        try {
+            val hello = harness.connectThroughRelayWelcome(null)
+            val transport = harness.transport()
+            transport.sendFixture(
+                "host-welcome-snapshot-required",
+                hello.stringValue("requestId"),
+            )
+            val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.BeginStateResync
+            val helloReceipt = harness.actor.withEffectApplyLease(helloEffect) {
+                adapter.applyHello(helloEffect, pending)
+            } as RelayV2EffectApplyResult.Applied
+            assertTrue(harness.actor.submitRecoveryReceipt(helloReceipt.value))
+
+            val get = transport.awaitSentFrame(1)
+            transport.sendFrame(adapterSnapshotChunkFrame(get, "race-91", "91"))
+            val chunkEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+            val committed = harness.actor.withEffectApplyLease(chunkEffect) {
+                adapter.applySnapshotChunk(chunkEffect, pending)
+            } as RelayV2EffectApplyResult.Applied
+            assertTrue(harness.actor.submitRecoveryReceipt(committed.value))
+            val release = transport.awaitSentFrame(2)
+
+            val released = fixture("state-snapshot-released")
+            released["requestId"] = release.stringValue("requestId")
+            released.payload()["snapshotRequestId"] =
+                release.payload().stringValue("snapshotRequestId")
+            released.payload()["snapshotId"] = release.payload().stringValue("snapshotId")
+            transport.sendFrame(released)
+            val completeEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.CompleteSnapshotRelease
+            val oldCompletion = harness.actor.withEffectApplyLease(completeEffect) {
+                requireNotNull(adapter.completeRelease(completeEffect))
+            } as RelayV2EffectApplyResult.Applied
+            assertEquals(
+                RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
+                oldCompletion.value.restart,
+            )
+            return ReleaseCompletionRace(
+                namespace,
+                store,
+                adapter,
+                harness,
+                transport,
+                get,
+                oldCompletion.value,
+            )
+        } catch (failure: Throwable) {
+            harness.close()
+            throw failure
+        }
+    }
+
+    private suspend fun ReleaseCompletionRace.durablyApplyGap(
+        eventSeq: String,
+        resultingRevision: String,
+        pending: List<RelayV2PendingCommand>,
+    ): RelayV2RecoveryReceipt.QueryRecoverySuperseded {
+        return durablyApplyQueryGap(
+            harness,
+            transport,
+            adapter,
+            eventSeq,
+            resultingRevision,
+            pending,
+        ).also {
+            assertEquals(oldCompletion.binding, it.completedReleaseBinding)
+            assertEquals("91", it.durableCursorEventSeq)
+        }
+    }
+
+    private suspend fun prepareMatchedQueryRace(
+        pending: List<RelayV2PendingCommand>,
+    ): MatchedQueryRace {
+        val seeded = seedSnapshotState("matched-race", completeRelease = true)
+        val adapter = recoveryAdapter(seeded.repository)
+        val harness = Harness(durableConnectPlanSource = adapter)
+        try {
+            val hello = harness.connectThroughRelayWelcome(
+                RelayV2ResumeCursor(HOST_EPOCH, "91"),
+            )
+            val transport = harness.transport()
+            transport.sendFixture("host-welcome-caught-up", hello.stringValue("requestId"))
+            val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.QueryPendingCommands
+            val applied = harness.actor.withEffectApplyLease(helloEffect) {
+                adapter.applyHello(helloEffect, pending)
+            } as RelayV2EffectApplyResult.Applied
+            return MatchedQueryRace(
+                seeded.namespace,
+                seeded.store,
+                adapter,
+                harness,
+                transport,
+                applied.value as RelayV2RecoveryReceipt.HelloApplied,
+            )
+        } catch (failure: Throwable) {
+            harness.close()
+            throw failure
+        }
+    }
+
+    private suspend fun seedSnapshotState(
+        suffix: String,
+        completeRelease: Boolean,
+    ): SeededSnapshotState {
+        val namespace = RelayV2StateNamespace(
+            "profile-primary",
+            PRINCIPAL_ID,
+            "android-install-primary",
+            HOST_ID,
+            HOST_EPOCH,
+        )
+        val store = FakeStateStore()
+        val repository = RelayV2StateSyncRepositoryCore(store)
+        val records = adapterSnapshotRecords(suffix)
+        val (bytes, digest) = canonicalSnapshotDigest(records)
+        repository.applyHelloForActorTest(
+            RelayV2StateHello(
+                namespace,
+                "91",
+                null,
+                RelayV2StateHelloDisposition.FRESH,
+            ),
+        )
+        repository.stageSnapshotChunkUnderApplyLease(
+            adapterSnapshotChunk(
+                namespace,
+                suffix,
+                "91",
+                records,
+                bytes,
+                digest,
+            ),
+        )
+        val committed = repository.commitSnapshotUnderApplyLease(
+            namespace,
+            "snapshot-$suffix",
+        ) as com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncResult.SnapshotCommitted
+        if (completeRelease) {
+            requireNotNull(repository.completeSnapshotReleaseUnderApplyLease(committed.release))
+        }
+        return SeededSnapshotState(namespace, store, repository)
+    }
+
+    private suspend fun MatchedQueryRace.durablyApplyGap(
+        eventSeq: String,
+        resultingRevision: String,
+        pending: List<RelayV2PendingCommand>,
+    ): RelayV2RecoveryReceipt.QueryRecoverySuperseded = durablyApplyQueryGap(
+        harness,
+        transport,
+        adapter,
+        eventSeq,
+        resultingRevision,
+        pending,
+    ).also {
+        assertNull(it.completedReleaseBinding)
+        assertEquals("91", it.durableCursorEventSeq)
+    }
+
+    private suspend fun durablyApplyQueryGap(
+        harness: Harness,
+        transport: FakeTransport,
+        adapter: RelayV2RecoveryRepositoryAdapter,
+        eventSeq: String,
+        resultingRevision: String,
+        pending: List<RelayV2PendingCommand>,
+    ): RelayV2RecoveryReceipt.QueryRecoverySuperseded {
+        transport.sendFrame(sessionUpsertFrame(eventSeq, resultingRevision))
+        val eventEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+            as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+        val applied = harness.actor.withEffectApplyLease(eventEffect) {
+            requireNotNull(adapter.applyRecoveryStateEvent(eventEffect, pending))
+        } as RelayV2EffectApplyResult.Applied
+        return (applied.value as RelayV2RecoveryReceipt.QueryRecoverySuperseded).also {
+            assertEquals(eventEffect.recovery, it.binding)
+            assertEquals(eventEffect.queryLineage, it.queryLineage)
+            assertEquals(eventEffect.completedReleaseBinding, it.completedReleaseBinding)
+            assertEquals(eventSeq, it.requiredThroughEventSeq)
+        }
+    }
+
+    private suspend fun RelayV2StateSyncRepositoryCore.applyHelloForActorTest(
+        hello: RelayV2StateHello,
+    ) = applyHelloUnderApplyLease(
+        loadConnectPlan(
+            com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateConnectIdentity(
+                hello.namespace.profileId,
+                hello.namespace.principalId,
+                hello.namespace.clientInstanceId,
+                hello.namespace.hostId,
+            ),
+        ),
+        hello,
+    )
 
     private fun adapterSession(displayName: String) = RelayV2SessionResource(
         scopeId = "scope-a",
@@ -4143,6 +5141,34 @@ class RelayV2ConnectionActorTest {
         RelayV2SnapshotRecord.SessionsScope("scope-a", "1"),
         RelayV2SnapshotRecord.Session("scope-a", adapterSession(displayName)),
     )
+
+    private fun adapterSnapshotChunkFrame(
+        request: Map<String, Any?>,
+        displayName: String,
+        throughEventSeq: String,
+    ): MutableMap<String, Any?> {
+        val frame = fixture("state-snapshot-chunk")
+        val records = adapterSnapshotRecords(displayName)
+        val (bytes, digest) = canonicalSnapshotDigest(records)
+        @Suppress("UNCHECKED_CAST")
+        val requestPayload = request.getValue("payload") as Map<String, Any?>
+        frame["requestId"] = request.stringValue("requestId")
+        frame.payload().apply {
+            this["snapshotRequestId"] = requestPayload.stringValue("snapshotRequestId")
+            this["snapshotId"] =
+                "snapshot-${requestPayload.stringValue("snapshotRequestId").takeLast(12)}"
+            this["snapshotCreatedAtMs"] = 100L
+            this["snapshotLeaseExpiresAtMs"] = 200L
+            this["snapshotAbsoluteExpiresAtMs"] = 1_000L
+            this["throughEventSeq"] = throughEventSeq
+            this["scopesRevision"] = "1"
+            this["totalRecords"] = records.size.toLong()
+            this["totalCanonicalBytes"] = bytes
+            this["cutDigest"] = digest
+            this["records"] = records.map { it.toWireMapForActorTest() }
+        }
+        return frame
+    }
 
     private fun RelayV2SnapshotRecord.toWireMapForActorTest(): Map<String, Any?> = when (this) {
         is RelayV2SnapshotRecord.Scope -> linkedMapOf(
@@ -4258,6 +5284,41 @@ class RelayV2ConnectionActorTest {
         val trigger: suspend (Harness, FakeTransport) -> Unit,
     )
 
+    private data class ReleaseCompletionRace(
+        val namespace: RelayV2StateNamespace,
+        val store: FakeStateStore,
+        val adapter: RelayV2RecoveryRepositoryAdapter,
+        val harness: Harness,
+        val transport: FakeTransport,
+        val originalGet: Map<String, Any?>,
+        val oldCompletion: RelayV2RecoveryReceipt.SnapshotReleaseCompleted,
+    )
+
+    private data class MatchedQueryRace(
+        val namespace: RelayV2StateNamespace,
+        val store: FakeStateStore,
+        val adapter: RelayV2RecoveryRepositoryAdapter,
+        val harness: Harness,
+        val transport: FakeTransport,
+        val helloReceipt: RelayV2RecoveryReceipt.HelloApplied,
+    )
+
+    private data class SeededSnapshotState(
+        val namespace: RelayV2StateNamespace,
+        val store: FakeStateStore,
+        val repository: RelayV2StateSyncRepositoryCore,
+    )
+
+    private enum class ActionOrder {
+        SUPERSEDE_FIRST,
+        COMPLETION_FIRST,
+    }
+
+    private enum class MatchedGapTiming {
+        BEFORE_HELLO_RECEIPT,
+        DURING_COMMAND_RECEIPT,
+    }
+
     private enum class MismatchTiming {
         BEFORE_FACTORY_RETURN,
         BEFORE_COMMIT,
@@ -4299,6 +5360,10 @@ private fun MutableMap<String, Any?>.mutableObject(name: String): MutableMap<Str
     getValue(name) as MutableMap<String, Any?>
 
 private fun Map<String, Any?>.stringValue(name: String): String = getValue(name) as String
+
+@Suppress("UNCHECKED_CAST")
+private fun Map<String, Any?>.objectValue(name: String): Map<String, Any?> =
+    getValue(name) as Map<String, Any?>
 
 private fun Map<String, Any?>.stringList(name: String): List<String> =
     (getValue(name) as List<*>).map { it as String }

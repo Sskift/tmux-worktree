@@ -14,7 +14,49 @@ internal data class RelayV2StoredAuthority(
     val cacheRecordCount: Long,
     val cacheCanonicalBytes: Long,
     val pendingRelease: RelayV2SnapshotReleaseObligation? = null,
+    val afterReleasePhase: RelayV2PostReleasePhase? = null,
 )
+
+/**
+ * Validates the release journal as one durable authority fact, rather than five independent
+ * nullable columns. Callers use this on Room load/write and immediately before the exact CAS.
+ */
+internal fun RelayV2StoredAuthority.validatedPendingRelease():
+    RelayV2SnapshotReleaseObligation? {
+    val pending = pendingRelease
+    if (pending == null) {
+        check(afterReleasePhase == null) {
+            "Relay v2 after-release plan exists without an obligation"
+        }
+        return null
+    }
+    val plan = checkNotNull(afterReleasePhase) {
+        "Relay v2 pending release has no after-release plan"
+    }
+    check(pending.namespace == namespace) {
+        "Relay v2 pending release crossed authority namespace"
+    }
+    check(phase == RelayV2StoredSyncPhase.RESYNCING) {
+        "Relay v2 pending release exists outside RESYNCING authority"
+    }
+    check(pending.durableCursorEventSeq == cursorEventSeq) {
+        "Relay v2 pending release cursor disagrees with authority cursor"
+    }
+    if (plan == RelayV2PostReleasePhase.QUERY_PENDING_COMMANDS) {
+        val cursor = checkNotNull(cursorEventSeq) {
+            "Relay v2 query-after-release has no durable cursor"
+        }
+        check(compareRelayV2Counters(cursor, requiredThroughEventSeq) >= 0) {
+            "Relay v2 query-after-release cursor is below the required watermark"
+        }
+        check(pending.reason == RelayV2SnapshotReleaseReason.COMPLETED ||
+            pending.reason == RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED
+        ) {
+            "Relay v2 release reason cannot transition directly to command query"
+        }
+    }
+    return pending
+}
 
 internal data class RelayV2StoredScope(
     val namespace: RelayV2StateNamespace,
@@ -98,7 +140,11 @@ internal interface RelayV2StateStore {
 
 /** Durable state-sync authority consumed by the unwired Relay v2 recovery adapter. */
 internal interface RelayV2StateSyncAuthority {
-    suspend fun applyHelloUnderApplyLease(hello: RelayV2StateHello): RelayV2StateSyncResult
+    suspend fun loadConnectPlan(identity: RelayV2StateConnectIdentity): RelayV2StateConnectPlan
+    suspend fun applyHelloUnderApplyLease(
+        connectPlan: RelayV2StateConnectPlan,
+        hello: RelayV2StateHello,
+    ): RelayV2StateSyncResult
     suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult
@@ -109,7 +155,7 @@ internal interface RelayV2StateSyncAuthority {
     ): RelayV2StateSyncResult
     suspend fun completeSnapshotReleaseUnderApplyLease(
         expected: RelayV2SnapshotReleaseObligation,
-    ): RelayV2SnapshotReleaseObligation?
+    ): RelayV2SnapshotReleaseCompletion?
     suspend fun expireSnapshotContinuationUnderApplyLease(
         namespace: RelayV2StateNamespace,
         snapshotRequestId: String,
@@ -119,6 +165,7 @@ internal interface RelayV2StateSyncAuthority {
 
 internal interface RelayV2StateTransaction {
     fun authority(namespace: RelayV2StateNamespace): RelayV2StoredAuthority?
+    fun authorities(identity: RelayV2StateConnectIdentity): List<RelayV2StoredAuthority>
     fun putAuthority(authority: RelayV2StoredAuthority)
 
     /** Deletes all six v2 state categories for this exact namespace, never v1 or credentials. */

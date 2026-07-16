@@ -47,7 +47,17 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertNamespacePresent(principalOnly, "principal")
         assertNamespacePresent(clientOnly, "client")
 
-        val result = RelayV2StateRepository(database).applyHelloUnderApplyLease(
+        val repository = RelayV2StateRepository(database)
+        val connectPlan = repository.loadConnectPlan(
+            RelayV2StateConnectIdentity(
+                base.profileId,
+                base.principalId,
+                base.clientInstanceId,
+                base.hostId,
+            ),
+        )
+        val result = repository.applyHelloUnderApplyLease(
+            connectPlan,
             RelayV2StateHello(
                 namespace = base,
                 welcomeEventSeq = FRESH_REQUIRED_EVENT_SEQ,
@@ -59,15 +69,15 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals(
             RelayV2StateSyncResult.ResyncRequired(
                 namespace = base,
-                reason = RelayV2ResyncReason.FRESH,
+                reason = RelayV2ResyncReason.SNAPSHOT_RESTART_REQUIRED,
                 release = RelayV2SnapshotReleaseObligation(
                     namespace = base,
                     snapshotRequestId = "request-base",
                     snapshotId = SNAPSHOT_ID,
                     durableCursorEventSeq = null,
-                    reason = RelayV2SnapshotReleaseReason.FRESH,
-                    phase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
+                    reason = RelayV2SnapshotReleaseReason.SNAPSHOT_RESTART_REQUIRED,
                 ),
+                afterReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT,
             ),
             result,
         )
@@ -113,6 +123,14 @@ class RelayV2StateDatabaseInstrumentedTest {
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
+        val scopeRecord = partialSnapshotScopeRecord(suffix)
+        val scopeCanonical = scopeRecord.canonicalJson()
+        val (totalCanonicalBytes, cutDigest) = canonicalSnapshotDigest(
+            listOf(
+                scopeRecord,
+                RelayV2SnapshotRecord.SessionsScope(SCOPE_ID, "1"),
+            ),
+        )
         dao.putAuthority(
             RelayV2AuthorityEntity(
                 profileId = namespace.profileId,
@@ -179,16 +197,17 @@ class RelayV2StateDatabaseInstrumentedTest {
                 snapshotAbsoluteExpiresAtMs = 3,
                 throughEventSeq = "1",
                 scopesRevision = "1",
-                totalRecords = 1,
-                totalCanonicalBytes = 2,
-                cutDigest = "digest-$suffix",
-                nextChunkIndex = 0,
-                nextCursor = null,
-                receivedRecords = 0,
-                receivedRecordCanonicalBytes = 0,
-                receivedRawUtf8Bytes = 0,
-                lastScopeId = null,
-                lastRecordKind = null,
+                totalRecords = 2,
+                totalCanonicalBytes = totalCanonicalBytes,
+                cutDigest = cutDigest,
+                nextChunkIndex = 1,
+                nextCursor = "cursor-$suffix",
+                receivedRecords = 1,
+                receivedRecordCanonicalBytes = scopeCanonical.toByteArray(Charsets.UTF_8)
+                    .size.toLong(),
+                receivedRawUtf8Bytes = scopeCanonical.toByteArray(Charsets.UTF_8).size + 256L,
+                lastScopeId = SCOPE_ID,
+                lastRecordKind = "scope",
                 lastSessionId = null,
                 complete = false,
             ),
@@ -218,7 +237,7 @@ class RelayV2StateDatabaseInstrumentedTest {
                     windowCount = null,
                     createdAtMs = null,
                     activityAtMs = null,
-                    canonicalJson = "{\"record\":\"$suffix\"}",
+                    canonicalJson = scopeCanonical,
                 ),
             ),
         )
@@ -317,9 +336,21 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals("scope-$suffix", scope(namespace)?.displayName)
         assertEquals("session-$suffix", session(namespace)?.displayName)
         assertEquals("request-$suffix", snapshot(namespace)?.snapshotRequestId)
-        assertEquals("{\"record\":\"$suffix\"}", snapshotRecords(namespace).single().canonicalJson)
+        assertEquals(
+            partialSnapshotScopeRecord(suffix).canonicalJson(),
+            snapshotRecords(namespace).single().canonicalJson,
+        )
         assertEquals("{\"event\":\"$suffix\"}", bufferedEvent(namespace)?.canonicalJson)
     }
+
+    private fun partialSnapshotScopeRecord(suffix: String) = RelayV2SnapshotRecord.Scope(
+        RelayV2ScopeResource(
+            scopeId = SCOPE_ID,
+            displayName = "scope-$suffix",
+            kind = RelayV2ScopeKind.LOCAL,
+            reachability = RelayV2ScopeReachability.ONLINE,
+        ),
+    )
 
     private fun assertDurablePayloadByteCounts(namespace: RelayV2OutboxAuthorityNamespace) {
         val meta = requireNotNull(outboxMeta(namespace))
@@ -353,6 +384,12 @@ class RelayV2StateDatabaseInstrumentedTest {
                 phase = RelayV2StoredSyncPhase.RESYNCING.name,
                 cacheRecordCount = 0,
                 cacheCanonicalBytes = 2,
+                pendingReleaseSnapshotRequestId = "request-base",
+                pendingReleaseSnapshotId = SNAPSHOT_ID,
+                pendingReleaseCursorEventSeq = null,
+                pendingReleaseReason = RelayV2SnapshotReleaseReason
+                    .SNAPSHOT_RESTART_REQUIRED.name,
+                pendingReleasePhase = RelayV2PostReleasePhase.RESTART_SNAPSHOT.name,
             ),
             authority(namespace),
         )
