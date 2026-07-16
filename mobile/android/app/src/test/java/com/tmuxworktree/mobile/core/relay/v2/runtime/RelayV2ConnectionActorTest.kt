@@ -221,6 +221,65 @@ class RelayV2ConnectionActorTest {
     }
 
     @Test
+    fun `reconnect and disconnect receipt wait for the same transport termination fence`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                assertTrue(harness.actor.connect(harness.profile, null))
+                val first = harness.awaitTransport(0)
+                first.completeTerminationOnClose = false
+
+                assertTrue(harness.actor.connect(harness.profile, null))
+                delay(25)
+                assertEquals(1, harness.factory.transports.size)
+                first.completeTermination()
+                val second = harness.awaitTransport(1)
+
+                second.completeTerminationOnClose = false
+                val receipt = async {
+                    harness.actor.disconnectAndDrain(harness.profile.identity, "resource-fence")
+                }
+                delay(25)
+                assertFalse(receipt.isCompleted)
+                second.completeTermination()
+                assertEquals(
+                    "resource-fence",
+                    withTimeout(TIMEOUT_MS) { receipt.await() }.barrierId,
+                )
+                assertEquals(listOf(1000), first.closeCodes)
+                assertEquals(listOf(1000), second.closeCodes)
+            } finally {
+                harness.factory.transports.forEach { it.completeTermination() }
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `termination timeout is bounded fails closed and does not issue a receipt`() = runBlocking {
+        val harness = Harness()
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0)
+            transport.completeTerminationOnClose = false
+            transport.completeTermination(terminated = false)
+
+            val result = runCatching {
+                withTimeout(TIMEOUT_MS) {
+                    harness.actor.disconnectAndDrain(harness.profile.identity, "timeout-fence")
+                }
+            }
+            assertTrue(result.exceptionOrNull() is IllegalStateException)
+            val failed = harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+            assertEquals("TRANSPORT_TERMINATION_TIMEOUT", failed.failure?.code)
+            assertFalse(requireNotNull(failed.failure).retryable)
+            assertEquals(listOf(1000), transport.closeCodes)
+            assertEquals(1, transport.cancelCount)
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
     fun `disconnect barrier drains queued callback and fences late callbacks from next profile`() =
         runBlocking {
             val harness = Harness()
@@ -1173,6 +1232,39 @@ class RelayV2ConnectionActorTest {
         }
     }
 
+    @Test
+    fun `malformed persisted access token is typed redacted and recoverable`() = runBlocking {
+        val invalidTokens = listOf(
+            "twcap2.contains space",
+            "twcap2.contains\rcontrol",
+            "twcap2.${"x".repeat(8_192)}",
+        )
+        invalidTokens.forEach { token ->
+            val harness = Harness()
+            try {
+                harness.servePersistedAccessToken(token)
+                assertTrue(harness.actor.connect(harness.profile, null))
+
+                val failed = harness.actor.awaitFailure(RelayV2FailureKind.AUTH)
+                val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ConnectionFailed
+                assertEquals("AUTH_INVALID", failed.failure?.code)
+                assertFalse(requireNotNull(failed.failure).retryable)
+                assertTrue(harness.factory.requests.isEmpty())
+                assertFalse("$failed $effect".contains("twcap2."))
+
+                harness.servePersistedAccessToken(null)
+                harness.actor.disconnectAndDrain(harness.profile.identity, "credential-recovery")
+                val recovered = harness.profile.copy(activationGeneration = 2)
+                assertTrue(harness.actor.connect(recovered, null))
+                harness.awaitTransport(0)
+                assertEquals(1, harness.factory.requests.size)
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
     private inner class Harness(
         val factory: FakeTransportFactory = FakeTransportFactory(),
         normalActionCapacity: Int = RelayV2ConnectionActor.DEFAULT_ACTION_CAPACITY,
@@ -1258,6 +1350,12 @@ class RelayV2ConnectionActorTest {
 
         fun credentialReadCount(): Int = credentials.readCount.get()
 
+        fun servePersistedAccessToken(accessToken: String?) {
+            credentials.readTransform = accessToken?.let { candidate ->
+                { blob -> blob.copy(accessToken = candidate) }
+            }
+        }
+
         fun close() {
             actor.close()
             parent.cancel()
@@ -1310,6 +1408,10 @@ class RelayV2ConnectionActorTest {
         var cancelCount: Int = 0
             private set
         private var sendCount = 0
+        private val termination = CompletableDeferred<Boolean>()
+
+        @Volatile
+        var completeTerminationOnClose: Boolean = true
 
         override fun send(bytes: ByteArray): Boolean {
             if (blockFirstSend && sendCount++ == 0) {
@@ -1322,10 +1424,18 @@ class RelayV2ConnectionActorTest {
 
         override fun close(code: Int, reason: String) {
             closeCodes += code
+            if (completeTerminationOnClose) termination.complete(true)
         }
 
         override fun cancel() {
             cancelCount += 1
+            termination.complete(true)
+        }
+
+        override suspend fun awaitTermination(): Boolean = termination.await()
+
+        fun completeTermination(terminated: Boolean = true) {
+            termination.complete(terminated)
         }
 
         fun open(selectedSubprotocol: String?) = listener.onOpen(this, selectedSubprotocol)
@@ -1344,9 +1454,15 @@ class RelayV2ConnectionActorTest {
             listener.onFrame(this, bytes, RelayV2FrameMetadata())
         }
 
-        fun fail(failure: RelayV2TransportFailure) = listener.onFailure(this, failure)
+        fun fail(failure: RelayV2TransportFailure) {
+            termination.complete(true)
+            listener.onFailure(this, failure)
+        }
 
-        fun closed(code: Int) = listener.onClosed(this, code)
+        fun closed(code: Int) {
+            termination.complete(true)
+            listener.onClosed(this, code)
+        }
 
         suspend fun awaitSentFrame(index: Int = 0): MutableMap<String, Any?> =
             withTimeout(TIMEOUT_MS) {
@@ -1363,11 +1479,12 @@ class RelayV2ConnectionActorTest {
     private class MemoryCredentialStore : RelayV2CredentialStore {
         private val values = linkedMapOf<RelayV2CredentialReference, RelayV2CredentialBlob>()
         val readCount = AtomicInteger()
+        var readTransform: ((RelayV2CredentialBlob) -> RelayV2CredentialBlob)? = null
 
         override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? =
             synchronized(values) {
                 readCount.incrementAndGet()
-                values[reference]
+                values[reference]?.let { readTransform?.invoke(it) ?: it }
             }
 
         override fun create(

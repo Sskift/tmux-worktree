@@ -24,6 +24,8 @@ import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.concurrent.thread
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * Unwired, bounded RFC6455 transport foundation for the existing Relay v2 actor seam.
@@ -101,11 +103,22 @@ private class BoundedRelayV2Transport(
     private val connectionThread = AtomicReference<Thread?>()
     private val closeDeadline = AtomicReference<RelayV2CloseDeadline?>()
     private val opened = AtomicBoolean(false)
+    private val resourcesFenced = AtomicBoolean(false)
+    private val readerStopped = AtomicBoolean(false)
+    private val writerStarted = AtomicBoolean(false)
+    private val writerStopped = AtomicBoolean(false)
+    private val deadlineTasks = AtomicInteger()
+    private val termination = CompletableDeferred<Unit>()
 
     fun start() {
         connectionThread.set(
             thread(name = "tw-relay-v2-ws-reader", isDaemon = true) {
-                connectAndRead()
+                try {
+                    connectAndRead()
+                } finally {
+                    readerStopped.set(true)
+                    completeTerminationIfFenced()
+                }
             },
         )
     }
@@ -121,8 +134,16 @@ private class BoundedRelayV2Transport(
             return
         }
 
-        val deadline = RelayV2CloseDeadlineScheduler.schedule(::terminateSilently)
+        deadlineTasks.incrementAndGet()
+        val deadline = RelayV2CloseDeadlineScheduler.schedule(
+            action = ::terminateSilently,
+            onFinished = {
+                deadlineTasks.decrementAndGet()
+                completeTerminationIfFenced()
+            },
+        )
             ?: run {
+                deadlineTasks.decrementAndGet()
                 terminateSilently()
                 return
             }
@@ -141,6 +162,12 @@ private class BoundedRelayV2Transport(
     override fun cancel() {
         terminateSilently()
     }
+
+    override suspend fun awaitTermination(): Boolean =
+        withTimeoutOrNull(TERMINATION_FENCE_TIMEOUT_MS) {
+            termination.await()
+            true
+        } ?: false
 
     override fun toString(): String = "BoundedRelayV2Transport(<redacted>)"
 
@@ -195,7 +222,12 @@ private class BoundedRelayV2Transport(
                     }
                 },
                 onLocalCloseComplete = ::terminateSilently,
+                onStopped = {
+                    writerStopped.set(true)
+                    completeTerminationIfFenced()
+                },
             )
+            writerStarted.set(true)
             if (!writer.compareAndSet(null, frameWriter) || terminal.get()) {
                 frameWriter.stop()
                 return
@@ -359,6 +391,16 @@ private class BoundedRelayV2Transport(
         writer.getAndSet(null)?.stop()
         socket.getAndSet(null)?.closeQuietly()
         connectionThread.get()?.takeUnless { it === Thread.currentThread() }?.interrupt()
+        resourcesFenced.set(true)
+        completeTerminationIfFenced()
+    }
+
+    private fun completeTerminationIfFenced() {
+        if (terminal.get() && resourcesFenced.get() && readerStopped.get() &&
+            (!writerStarted.get() || writerStopped.get()) && deadlineTasks.get() == 0
+        ) {
+            termination.complete(Unit)
+        }
     }
 
     private fun Socket.closeQuietly() {
@@ -368,6 +410,7 @@ private class BoundedRelayV2Transport(
     private companion object {
         const val CLOSE_REPLY_TIMEOUT_MS = 1_000L
         const val PROTOCOL_CLOSE_TIMEOUT_MS = 1_000L
+        const val TERMINATION_FENCE_TIMEOUT_MS = 2_000L
     }
 }
 
@@ -396,39 +439,42 @@ private object RelayV2CloseDeadlineScheduler {
         setExecuteExistingDelayedTasksAfterShutdownPolicy(false)
     }
 
-    fun schedule(action: () -> Unit): RelayV2CloseDeadline? {
+    fun schedule(action: () -> Unit, onFinished: () -> Unit): RelayV2CloseDeadline? {
         if (!permits.tryAcquire()) return null
-        val ticket = Ticket(action)
+        val ticket = Ticket(action, onFinished)
         return try {
             ticket.future = executor.schedule(ticket::run, CLOSE_DEADLINE_MS, TimeUnit.MILLISECONDS)
             ticket
         } catch (_: RejectedExecutionException) {
-            ticket.release()
+            permits.release()
             null
         }
     }
 
     private class Ticket(
         private val action: () -> Unit,
+        private val onFinished: () -> Unit,
     ) : RelayV2CloseDeadline {
-        private val released = AtomicBoolean(false)
+        private val finished = AtomicBoolean(false)
         lateinit var future: ScheduledFuture<*>
 
         fun run() {
             try {
                 action()
             } finally {
-                release()
+                finish()
             }
         }
 
         override fun cancel() {
-            future.cancel(false)
-            release()
+            if (future.cancel(false)) finish()
         }
 
-        fun release() {
-            if (released.compareAndSet(false, true)) permits.release()
+        fun finish() {
+            if (finished.compareAndSet(false, true)) {
+                permits.release()
+                onFinished()
+            }
         }
     }
 }

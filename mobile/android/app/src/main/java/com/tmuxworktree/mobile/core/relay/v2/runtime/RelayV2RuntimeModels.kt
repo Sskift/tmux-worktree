@@ -3,6 +3,7 @@ package com.tmuxworktree.mobile.core.relay.v2.runtime
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import java.math.BigInteger
 
@@ -208,10 +209,7 @@ internal data class RelayV2TransportOpenRequest(
         require(offeredSubprotocols == listOf(RelayV2Profile.RELAY_V2_SUBPROTOCOL)) {
             "Relay v2 transport must offer only tw-relay.v2"
         }
-        require(accessToken.startsWith("twcap2.") &&
-            accessToken.length <= 8_192 &&
-            accessToken.all { it.code in 0x21..0x7e }
-        ) {
+        require(RelayV2CredentialSecretValidator.isAccessToken(accessToken)) {
             "Relay v2 access credential is invalid"
         }
     }
@@ -237,6 +235,9 @@ internal interface RelayV2Transport {
     fun send(bytes: ByteArray): Boolean
     fun close(code: Int, reason: String)
     fun cancel()
+
+    /** Returns only after resources are fenced, or false at the transport-owned hard deadline. */
+    suspend fun awaitTermination(): Boolean
 }
 
 internal interface RelayV2TransportListener {

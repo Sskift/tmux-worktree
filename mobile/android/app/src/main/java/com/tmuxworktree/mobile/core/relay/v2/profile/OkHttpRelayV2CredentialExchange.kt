@@ -272,8 +272,8 @@ internal class OkHttpRelayV2CredentialExchange(
         val accessToken = frame.string("accessToken")
         val refreshToken = frame.string("refreshToken")
         if (!RelayV2EndpointValidator.isRelayUrl(relayUrl) ||
-            !isSafeSecret(accessToken, "twcap2.") ||
-            !isSafeSecret(refreshToken, "twref2.")
+            !RelayV2CredentialSecretValidator.isAccessToken(accessToken) ||
+            !RelayV2CredentialSecretValidator.isRefreshToken(refreshToken)
         ) {
             throw failure(RelayV2CredentialExchangeFailureKind.SCHEMA)
         }
@@ -289,10 +289,6 @@ internal class OkHttpRelayV2CredentialExchange(
         )
     }
 
-    private fun isSafeSecret(value: String, prefix: String): Boolean =
-        value.startsWith(prefix) && value.length <= MAX_SECRET_BYTES &&
-            value.all { it.code in VISIBLE_ASCII_RANGE }
-
     private data class CredentialResponseFields(
         val principalId: String,
         val grantId: String,
@@ -307,8 +303,6 @@ internal class OkHttpRelayV2CredentialExchange(
     private companion object {
         const val ENROLLMENT_REDEEM_PATH = "/v2/enrollments/redeem"
         const val CLIENT_REFRESH_PATH = "/v2/tokens/refresh"
-        const val MAX_SECRET_BYTES = 8_192
-        val VISIBLE_ASCII_RANGE = 0x21..0x7E
         val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         val AUTH_ERROR_CODES = setOf(
             "AUTH_REQUIRED",

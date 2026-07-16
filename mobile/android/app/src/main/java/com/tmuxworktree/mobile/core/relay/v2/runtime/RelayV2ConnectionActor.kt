@@ -11,6 +11,7 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectBarrier
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialBlob
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialSecretValidator
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2CredentialStore
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.matchesCredentialBinding
@@ -132,6 +133,7 @@ internal class RelayV2ConnectionActor(
     // Actor-owned mutable state. Callback threads only retain immutable generation values.
     private var connectionGeneration = 0L
     private var activeTransport: RelayV2Transport? = null
+    private var retiredTransport: RelayV2Transport? = null
     private var activeProfile: RelayV2Profile? = null
     private var requestedResume: RelayV2ResumeCursor? = null
     private var pendingHelloRequestId: String? = null
@@ -359,9 +361,26 @@ internal class RelayV2ConnectionActor(
                 )
             } ?: return
             cancelHandshakeWatchdogs()
-            preparation.previousTransport?.close(1000, "v2 reconnect")
+            preparation.previousTransport?.let { previous ->
+                retainTransportFence(previous)
+                previous.close(1000, "v2 reconnect")
+            }
+            val transportTerminated = awaitRetiredTransport()
             preparation.applyDrain.await()
             if (!isConnectTokenCurrent(token)) return
+            if (!transportTerminated) {
+                failConnectAttempt(
+                    token,
+                    profile,
+                    RelayV2ConnectionFailure(
+                        RelayV2FailureKind.TRANSPORT,
+                        "TRANSPORT_TERMINATION_TIMEOUT",
+                        retryable = false,
+                    ),
+                    closeCode = null,
+                )
+                return
+            }
 
             val effectGeneration = RelayV2EffectGeneration(
                 profileId = profile.profileId,
@@ -377,11 +396,25 @@ internal class RelayV2ConnectionActor(
                 ).also { provisionalCallbackOwner = it }
             } ?: return
             val listener = listenerFor(provisionalOwner)
-            val request = RelayV2TransportOpenRequest(
-                relayUrl = profile.relayUrl,
-                offeredSubprotocols = listOf(profile.offeredSubprotocol),
-                accessToken = requireNotNull(credential).accessToken!!,
-            )
+            val request = runCatching {
+                RelayV2TransportOpenRequest(
+                    relayUrl = profile.relayUrl,
+                    offeredSubprotocols = listOf(profile.offeredSubprotocol),
+                    accessToken = requireNotNull(credential).accessToken!!,
+                )
+            }.getOrElse {
+                failConnectAttempt(
+                    token,
+                    profile,
+                    RelayV2ConnectionFailure(
+                        RelayV2FailureKind.SECURITY,
+                        "AUTH_INVALID",
+                        retryable = false,
+                    ),
+                    closeCode = null,
+                )
+                return
+            }
             val opened = runCatching { transportFactory.open(request, listener) }
                 .getOrElse {
                     failConnectAttempt(
@@ -426,7 +459,13 @@ internal class RelayV2ConnectionActor(
             uncommittedTransport = null
         } finally {
             credential = null
-            uncommittedTransport?.close(1000, "stale v2 connect attempt")
+            uncommittedTransport?.let { stale ->
+                stale.close(1000, "stale v2 connect attempt")
+                if (!stale.awaitTermination()) {
+                    stale.cancel()
+                    retainTransportFence(stale)
+                }
+            }
             releaseConnectToken(token)
         }
     }
@@ -445,7 +484,8 @@ internal class RelayV2ConnectionActor(
         if (credential == null ||
             !profile.matchesCredentialBinding(credential) ||
             credential.pendingAttempt != null ||
-            credential.credentialVersion != profile.credentialVersion
+            credential.credentialVersion != profile.credentialVersion ||
+            !RelayV2CredentialSecretValidator.isAccessToken(credential.accessToken!!)
         ) {
             return RelayV2ConnectionFailure(
                 RelayV2FailureKind.AUTH,
@@ -556,8 +596,10 @@ internal class RelayV2ConnectionActor(
         }
         cancelHandshakeWatchdogs()
         if (closeCode != null) {
+            failed?.let(::retainTransportFence)
             failed?.close(closeCode, "relay v2 ${failure.code}")
         } else {
+            failed?.let(::retainTransportFence)
             failed?.cancel()
         }
         emitEffect(
@@ -1089,6 +1131,7 @@ internal class RelayV2ConnectionActor(
             publishedEffectGeneration.set(null)
             activeTransport.also { activeTransport = null }
         }
+        source?.let(::retainTransportFence)
         source?.close(4400, "event cursor ahead")
         pendingHelloRequestId = null
         updateState(RelayV2ConnectionPhase.CONTINUITY_REJECTED, profile)
@@ -1308,12 +1351,12 @@ internal class RelayV2ConnectionActor(
     private fun terminateConnection(action: Action.TerminateConnection) {
         if (!isCurrentCallback(action.owner, action.source)) return
         when (val cause = action.cause) {
-            is TerminationCause.TransportClosed -> transportClosed(cause.code)
+            is TerminationCause.TransportClosed -> transportClosed(action.source, cause.code)
             is TerminationCause.TransportFailed -> transportFailed(cause.failure)
         }
     }
 
-    private fun transportClosed(closeCode: Int) {
+    private fun transportClosed(source: RelayV2Transport, closeCode: Int) {
         cancelHandshakeWatchdogs()
         val (kind, code, retryable) = when (closeCode) {
             4400 -> Triple(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false)
@@ -1326,6 +1369,7 @@ internal class RelayV2ConnectionActor(
         val generation = activeProfile?.let(::currentEffectGeneration)
         invalidateConnectionOwnershipAndDrain()
         activeTransport = null
+        retainTransportFence(source)
         val failure = RelayV2ConnectionFailure(kind, code, retryable)
         updateState(RelayV2ConnectionPhase.FAILED, activeProfile, failure)
         emitEffect(
@@ -1396,7 +1440,25 @@ internal class RelayV2ConnectionActor(
         val disconnectedTransport = activeTransport
         activeTransport = null
         connectionGeneration += 1
+        updateState(_state.value.phase, current, _state.value.failure)
+        disconnectedTransport?.let(::retainTransportFence)
         disconnectedTransport?.close(1000, "profile disconnect barrier")
+        val transportTerminated = awaitRetiredTransport()
+        applyDrain.await()
+        if (!transportTerminated) {
+            if (isLifecycleOpen()) {
+                val failure = RelayV2ConnectionFailure(
+                    RelayV2FailureKind.TRANSPORT,
+                    "TRANSPORT_TERMINATION_TIMEOUT",
+                    retryable = false,
+                )
+                updateState(RelayV2ConnectionPhase.FAILED, current, failure)
+                action.completion.completeExceptionally(
+                    IllegalStateException("Relay v2 transport termination timed out"),
+                )
+            }
+            return
+        }
         activeProfile = null
         requestedResume = null
         pendingHelloRequestId = null
@@ -1405,7 +1467,6 @@ internal class RelayV2ConnectionActor(
         brokerLimits = null
         updateState(RelayV2ConnectionPhase.DISCONNECTED, null)
         drainQueuedEffects()
-        applyDrain.await()
         if (!isLifecycleOpen()) return
         val receipt = RelayProfileDisconnectReceipt(action.profile, action.barrierId)
         emitEffect(
@@ -1423,6 +1484,24 @@ internal class RelayV2ConnectionActor(
         }
     }
 
+    private fun retainTransportFence(source: RelayV2Transport) {
+        check(retiredTransport == null || retiredTransport === source) {
+            "Relay v2 transport ownership advanced before termination"
+        }
+        retiredTransport = source
+    }
+
+    private suspend fun awaitRetiredTransport(): Boolean {
+        val source = retiredTransport ?: return true
+        val terminated = source.awaitTermination()
+        if (terminated) {
+            if (retiredTransport === source) retiredTransport = null
+        } else {
+            source.cancel()
+        }
+        return terminated
+    }
+
     private fun failConnection(
         kind: RelayV2FailureKind,
         code: String,
@@ -1436,6 +1515,7 @@ internal class RelayV2ConnectionActor(
         invalidateConnectionOwnershipAndDrain()
         val source = activeTransport
         activeTransport = null
+        source?.let(::retainTransportFence)
         if (closeCode != null) source?.close(closeCode, "relay v2 $code") else source?.cancel()
         pendingHelloRequestId = null
         val failure = RelayV2ConnectionFailure(kind, code, retryable)
@@ -1464,6 +1544,7 @@ internal class RelayV2ConnectionActor(
             invalidateConnectionOwnershipAndDrain()
             val source = activeTransport
             activeTransport = null
+            source?.let(::retainTransportFence)
             source?.cancel()
             cancelHandshakeWatchdogs()
             val failure = RelayV2ConnectionFailure(
@@ -1582,8 +1663,14 @@ internal class RelayV2ConnectionActor(
         val source = activeTransport
         activeTransport = null
         connectionGeneration += 1
+        source?.let(::retainTransportFence)
         source?.cancel()
+        val transportTerminated = awaitRetiredTransport()
         applyDrain.await()
+        if (!transportTerminated) {
+            finishResources()
+            return
+        }
         activeProfile = null
         updateState(RelayV2ConnectionPhase.CLOSED, null)
         drainQueuedEffects()

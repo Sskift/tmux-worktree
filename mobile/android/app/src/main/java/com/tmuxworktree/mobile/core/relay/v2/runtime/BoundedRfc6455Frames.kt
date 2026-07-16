@@ -12,6 +12,7 @@ import java.security.SecureRandom
 import java.util.ArrayDeque
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.math.max
 
@@ -172,6 +173,7 @@ internal class BoundedRfc6455Writer(
     private val random: SecureRandom,
     private val onFailure: (IOException) -> Unit,
     private val onLocalCloseComplete: () -> Unit,
+    private val onStopped: () -> Unit = {},
 ) {
     private val lock = Object()
     private val controls = ArrayDeque<OutboundFrame>()
@@ -182,12 +184,25 @@ internal class BoundedRfc6455Writer(
     private var acceptingMessages = true
     private var stopped = false
     private var worker: Thread? = null
+    private val stoppedNotified = AtomicBoolean(false)
 
     fun start() {
-        synchronized(lock) {
+        val notifyStopped = synchronized(lock) {
             check(worker == null)
-            worker = thread(name = "tw-relay-v2-ws-writer", isDaemon = true) { writeLoop() }
+            if (stopped) {
+                true
+            } else {
+                worker = thread(name = "tw-relay-v2-ws-writer", isDaemon = true) {
+                    try {
+                        writeLoop()
+                    } finally {
+                        notifyStopped()
+                    }
+                }
+                false
+            }
         }
+        if (notifyStopped) notifyStopped()
     }
 
     fun enqueueText(bytes: ByteArray): Boolean {
@@ -248,7 +263,11 @@ internal class BoundedRfc6455Writer(
             lock.notifyAll()
             worker
         }
-        if (thread !== Thread.currentThread()) thread?.interrupt()
+        if (thread == null) {
+            notifyStopped()
+        } else if (thread !== Thread.currentThread()) {
+            thread.interrupt()
+        }
     }
 
     internal fun reservedMessageBytesForTest(): Long = synchronized(lock) { reservedMessageBytes }
@@ -351,6 +370,10 @@ internal class BoundedRfc6455Writer(
             reservedMessageBytes -= removed.payload.size
             reservedMessageCount -= 1
         }
+    }
+
+    private fun notifyStopped() {
+        if (stoppedNotified.compareAndSet(false, true)) onStopped()
     }
 
     private data class OutboundFrame(

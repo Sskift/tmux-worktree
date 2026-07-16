@@ -29,6 +29,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
@@ -37,7 +38,9 @@ import okhttp3.tls.HeldCertificate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -554,31 +557,35 @@ class BoundedRelayV2TransportFactoryTest {
     }
 
     @Test
-    fun cancelInterruptsProductionTlsSocketWriteBeforeDeclaredPayloadCompletes() {
+    fun cancelInterruptsProductionTlsSocketWriteBeforeDeclaredPayloadCompletes() = runBlocking {
         assertProductionWriteTeardown("cancel") { transport, socket ->
             val startedAt = System.nanoTime()
             transport.cancel()
             val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
             assertTrue("socket write cancel took ${elapsedMs}ms", elapsedMs < 500)
             assertTrue(socket.closed.await(500, TimeUnit.MILLISECONDS))
+            assertTrue(transport.awaitTermination())
         }
     }
 
     @Test
-    fun closeDeadlineTerminatesBlockedProductionTlsSocketWriteWithoutLateCallback() {
+    fun closeDeadlineTerminatesBlockedProductionTlsSocketWriteWithoutLateCallback() = runBlocking {
         assertProductionWriteTeardown("close deadline") { transport, socket ->
+            val termination = async { transport.awaitTermination() }
             val startedAt = System.nanoTime()
             transport.close(1000, "client disconnect")
             val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
             assertTrue("close call took ${elapsedMs}ms", elapsedMs < 500)
             assertFalse("close skipped its best-effort window", socket.closed.await(250, TimeUnit.MILLISECONDS))
+            assertFalse("termination fence completed with an open socket", termination.isCompleted)
             assertTrue("close deadline left the socket open", socket.closed.await(2, TimeUnit.SECONDS))
+            assertTrue(termination.await())
         }
     }
 
-    private fun assertProductionWriteTeardown(
+    private suspend fun assertProductionWriteTeardown(
         description: String,
-        trigger: (RelayV2Transport, CloseObservingSocket) -> Unit,
+        trigger: suspend (RelayV2Transport, CloseObservingSocket) -> Unit,
     ) {
         RawTlsWebSocketServer().use { server ->
             val firstFrameBytes = CountDownLatch(1)
@@ -793,6 +800,101 @@ class BoundedRelayV2TransportFactoryTest {
         }
 
     @Test
+    fun productionBlockedWriteIsFencedBeforeDisconnectReceipt() = runBlocking {
+        RawTlsWebSocketServer().use { server ->
+            val firstFrameBytes = CountDownLatch(1)
+            val releaseDrain = CountDownLatch(1)
+            val drainFinished = CountDownLatch(1)
+            server.start { socket ->
+                socket.receiveBufferSize = 1_024
+                val request = server.readRequest(socket)
+                server.writeValidUpgrade(socket, request)
+                try {
+                    if (socket.inputStream.read(ByteArray(512)) > 0) firstFrameBytes.countDown()
+                    releaseDrain.await(5, TimeUnit.SECONDS)
+                    while (socket.inputStream.read(ByteArray(512)) != -1) Unit
+                } catch (_: IOException) {
+                    // The close deadline interrupts the blocked production write.
+                } finally {
+                    drainFinished.countDown()
+                }
+            }
+
+            val credentialReference = RelayV2CredentialReference("credential-disconnect-fence")
+            val profile = RelayV2Profile(
+                profileId = "profile-disconnect-fence",
+                issuerUrl = "https://issuer.example.com",
+                relayUrl = server.url(),
+                hostId = "host-disconnect-fence",
+                principalId = "principal-disconnect-fence",
+                grantId = "grant-disconnect-fence",
+                clientInstanceId = "client-disconnect-fence",
+                credentialReference = credentialReference,
+                credentialVersion = 1,
+                activationGeneration = 1,
+            )
+            val credential = RelayV2CredentialBlob(
+                credentialVersion = 1,
+                issuerUrl = profile.issuerUrl,
+                relayUrl = profile.relayUrl,
+                hostId = profile.hostId,
+                clientInstanceId = profile.clientInstanceId,
+                principalId = profile.principalId,
+                grantId = profile.grantId,
+                accessToken = TOKEN,
+                accessExpiresAtMs = 2_000_000,
+                refreshToken = "twref2.disconnect-fence",
+                refreshExpiresAtMs = 3_000_000,
+            )
+            val rawSocket = CloseObservingSocket().apply { sendBufferSize = 1_024 }
+            val openedTransport = AtomicReference<RelayV2Transport?>()
+            val delegate = server.factory(rawSocketFactory = { rawSocket })
+            val capturingFactory = RelayV2TransportFactory { request, listener ->
+                delegate.open(request, listener).also(openedTransport::set)
+            }
+            val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            val actor = RelayV2ConnectionActor(
+                parentScope = parent,
+                transportFactory = capturingFactory,
+                credentialStore = ReadOnlyCredentialStore(credentialReference, credential),
+                codec = RelayV2Codec(),
+                clock = { 1_000_000 },
+            )
+            try {
+                assertTrue(actor.connect(profile, null))
+                withTimeout(5_000) {
+                    actor.state.first {
+                        it.phase == RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME
+                    }
+                }
+                val transport = requireNotNull(openedTransport.get())
+                assertTrue(transport.send(ByteArray(MAX_MESSAGE_BYTES) { 'w'.code.toByte() }))
+                assertTrue(firstFrameBytes.await(3, TimeUnit.SECONDS))
+
+                val receipt = async {
+                    actor.disconnectAndDrain(profile.identity, "production-resource-fence")
+                }
+                delay(250)
+                assertFalse(receipt.isCompleted)
+                assertEquals(1L, rawSocket.closed.count)
+                assertTrue(rawSocket.closed.await(2, TimeUnit.SECONDS))
+                val resourceClosedAt = rawSocket.closedAtNanos.get()
+                val completed = withTimeout(5_000) { receipt.await() }
+                val receiptAt = System.nanoTime()
+                assertEquals("production-resource-fence", completed.barrierId)
+                assertTrue(resourceClosedAt > 0L && resourceClosedAt <= receiptAt)
+                val effect = withTimeout(5_000) { actor.effects.first() }
+                assertTrue(effect is RelayV2RuntimeEffect.Disconnected)
+            } finally {
+                releaseDrain.countDown()
+                assertTrue(drainFinished.await(5, TimeUnit.SECONDS))
+                actor.close()
+                parent.cancel()
+            }
+        }
+    }
+
+    @Test
     fun boundedResolverCancelFencesLateResultAndCapsWorkersAndQueuedTasks() {
         RawTlsWebSocketServer().use { server ->
             val lookupEntered = CountDownLatch(1)
@@ -1001,11 +1103,13 @@ private class BlockingConnectSocket : Socket() {
 
 private class CloseObservingSocket : Socket() {
     val closed = CountDownLatch(1)
+    val closedAtNanos = AtomicLong()
 
     override fun close() {
         try {
             super.close()
         } finally {
+            closedAtNanos.compareAndSet(0L, System.nanoTime())
             closed.countDown()
         }
     }

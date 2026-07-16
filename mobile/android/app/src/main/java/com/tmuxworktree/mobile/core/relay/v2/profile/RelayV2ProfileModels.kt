@@ -161,8 +161,12 @@ internal data class RelayV2CredentialBlob(
         }
         if (hasCredentialMaterial) {
             require(credentialVersion > 0) { "Completed credentials require a positive version" }
-            require(accessToken!!.startsWith("twcap2.")) { "Unexpected access credential kind" }
-            require(refreshToken!!.startsWith("twref2.")) { "Unexpected refresh credential kind" }
+            require(RelayV2CredentialSecretValidator.isAccessToken(accessToken!!)) {
+                "Relay v2 access credential is invalid"
+            }
+            require(RelayV2CredentialSecretValidator.isRefreshToken(refreshToken!!)) {
+                "Relay v2 refresh credential is invalid"
+            }
             require(accessExpiresAtMs!! >= 0 && refreshExpiresAtMs!! >= 0) {
                 "Credential expiry cannot be negative"
             }
@@ -189,6 +193,19 @@ internal data class RelayV2CredentialBlob(
     companion object {
         const val SCHEMA_VERSION = 1
     }
+}
+
+internal object RelayV2CredentialSecretValidator {
+    fun isAccessToken(value: String): Boolean = isSafeSecret(value, "twcap2.")
+
+    fun isRefreshToken(value: String): Boolean = isSafeSecret(value, "twref2.")
+
+    private fun isSafeSecret(value: String, prefix: String): Boolean =
+        value.startsWith(prefix) && value.length <= MAX_SECRET_BYTES &&
+            value.all { it.code in VISIBLE_ASCII_RANGE }
+
+    private const val MAX_SECRET_BYTES = 8_192
+    private val VISIBLE_ASCII_RANGE = 0x21..0x7e
 }
 
 internal data class RelayV2CredentialCasExpectation(
