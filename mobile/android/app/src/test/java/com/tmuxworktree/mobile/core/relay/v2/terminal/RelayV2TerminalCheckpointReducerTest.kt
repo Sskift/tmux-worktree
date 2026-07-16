@@ -2210,6 +2210,25 @@ class RelayV2TerminalCheckpointReducerTest {
         assertNull(checkpoint.pendingClose)
 
         val parserOperation = requireNotNull(checkpoint.parserInFlightCallbackToken)
+        val missingCloseHistory = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(
+                checkpoint.copy(closeRequestIds = emptyList()),
+            ),
+            checkpoint.identity,
+            checkpoint.openAttempt,
+            checkpoint.deliveryToken,
+            checkpoint.parserContinuityId,
+            parserProof(
+                parserOperation,
+                parserAppliedNextOffset = "0",
+                status = RelayV2TerminalParserOperationStatus.NOT_APPLIED,
+            ),
+        )
+        assertNull(missingCloseHistory.checkpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (missingCloseHistory.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
         checkpoint = requireNotNull(
             RelayV2TerminalCheckpointReducer.restore(
                 RelayV2TerminalStoredCheckpoint.Present(checkpoint),
@@ -3294,6 +3313,77 @@ class RelayV2TerminalCheckpointReducerTest {
     @Test
     fun `restore preflights hostile queues proves parser operations and fences current authority`() {
         val initial = open()
+        var replayPending = requireNotNull(output(initial, "1", "x").checkpoint)
+        val supersededReplayRequest = requireNotNull(replayPending.pendingReplay).requestId
+        replayPending = requireNotNull(
+            reduce(
+                replayPending,
+                RelayV2TerminalAction.RetryReplay(
+                    replayPending.deliveryToken,
+                    requestId = "replay-storage-current",
+                ),
+            ).checkpoint,
+        )
+        val restoredSupersededReplay = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(
+                replayPending.copy(
+                    pendingReplay = requireNotNull(replayPending.pendingReplay).copy(
+                        requestId = supersededReplayRequest,
+                    ),
+                ),
+            ),
+            replayPending.identity,
+            replayPending.openAttempt,
+            replayPending.deliveryToken,
+            replayPending.parserContinuityId,
+        )
+        assertNull(restoredSupersededReplay.checkpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (restoredSupersededReplay.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
+        val preOpenAttempt = openAttempt("preflight-open", "preflight-open-fingerprint")
+        val preOpenAction = RelayV2TerminalAction.BeginOpenAttempt(
+            deliveryToken = delivery(),
+            requestId = "preflight-open-request",
+            openAttempt = preOpenAttempt,
+            mode = RelayV2TerminalOpenMode.NEW,
+            cols = 120,
+            rows = 36,
+            target = initial.identity.target(),
+            parserContinuityId = PARSER_CONTINUITY,
+            resume = null,
+        )
+        val preOpen = requireNotNull(
+            RelayV2TerminalCheckpointReducer.reduce(null, preOpenAction).preOpenCheckpoint,
+        )
+        var preOpenHistoryReads = 0
+        val preOpenHistoryGuard = object : AbstractList<String>() {
+            override val size: Int
+                get() = RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS + 1
+
+            override fun get(index: Int): String {
+                preOpenHistoryReads += 1
+                error("pre-open preflight must reject count before reading elements")
+            }
+        }
+        val oversizedPreOpen = RelayV2TerminalCheckpointReducer.restorePreOpen(
+            RelayV2TerminalStoredCheckpoint.PreOpen(
+                preOpen.copy(openRequestIds = preOpenHistoryGuard),
+            ),
+            initial.identity.target(),
+            preOpenAttempt,
+            preOpen.deliveryToken,
+            preOpen.parserContinuityId,
+        )
+        assertNull(oversizedPreOpen.preOpenCheckpoint)
+        assertEquals(0, preOpenHistoryReads)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (oversizedPreOpen.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
         val countGuard = object : AbstractList<RelayV2PendingParserWrite>() {
             override val size: Int
                 get() = RelayV2TerminalCheckpointLimits.MAX_PENDING_OUTPUT_FRAMES + 1

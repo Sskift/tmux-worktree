@@ -139,85 +139,87 @@ internal object RelayV2TerminalCheckpointReducer {
         is RelayV2TerminalStoredCheckpoint.Present,
         -> missingReset(null, RelayV2TerminalResetReason.MISSING_CHECKPOINT)
         is RelayV2TerminalStoredCheckpoint.PreOpen -> {
-            val checkpoint = stored.checkpoint.copy(
-                openRequestIds = stored.checkpoint.openRequestIds.toList(),
-                pendingOpen = stored.checkpoint.pendingOpen?.copy(
-                    issuedRequestIds = stored.checkpoint.pendingOpen.issuedRequestIds.toList(),
-                ),
-            )
-            when {
-                !validPreOpenCheckpoint(checkpoint) ->
-                    missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
-                checkpoint.target != expectedTarget ||
-                    checkpoint.pendingOpen?.openAttempt?.let { it != expectedOpenAttempt } == true ->
-                    missingReset(null, RelayV2TerminalResetReason.IDENTITY_CHANGED)
-                currentParserContinuityId.isNullOrBlank() ||
-                    checkpoint.parserContinuityId != currentParserContinuityId ->
-                    missingReset(null, RelayV2TerminalResetReason.PARSER_CONTINUITY_LOST)
-                checkpoint.deliveryToken != currentDeliveryToken -> {
-                    if (!deliveryIsStrictlyFresher(
-                            checkpoint.deliveryToken,
-                            currentDeliveryToken,
-                        )
-                    ) {
+            val untrusted = stored.checkpoint
+            if (!preflightPreOpenCheckpoint(untrusted)) {
+                missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
+            } else {
+                val checkpoint = snapshotPreOpenCheckpoint(untrusted)
+                when {
+                    !validPreOpenCheckpoint(checkpoint) ->
+                        missingReset(null, RelayV2TerminalResetReason.CHECKPOINT_INVALID)
+                    checkpoint.target != expectedTarget ||
+                        checkpoint.pendingOpen?.openAttempt?.let {
+                            it != expectedOpenAttempt
+                        } == true ->
                         missingReset(null, RelayV2TerminalResetReason.IDENTITY_CHANGED)
-                    } else {
-                        if (checkpoint.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED) {
-                            val reason = checkpoint.resetReason
-                                ?: RelayV2TerminalResetReason.CHECKPOINT_INVALID
-                            preOpenReduction(
-                                checkpoint.copy(
-                                    deliveryToken = currentDeliveryToken,
-                                    resetFence = checkpoint.resetFence?.copy(
+                    currentParserContinuityId.isNullOrBlank() ||
+                        checkpoint.parserContinuityId != currentParserContinuityId ->
+                        missingReset(null, RelayV2TerminalResetReason.PARSER_CONTINUITY_LOST)
+                    checkpoint.deliveryToken != currentDeliveryToken -> {
+                        if (!deliveryIsStrictlyFresher(
+                                checkpoint.deliveryToken,
+                                currentDeliveryToken,
+                            )
+                        ) {
+                            missingReset(null, RelayV2TerminalResetReason.IDENTITY_CHANGED)
+                        } else {
+                            if (checkpoint.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED) {
+                                val reason = checkpoint.resetReason
+                                    ?: RelayV2TerminalResetReason.CHECKPOINT_INVALID
+                                preOpenReduction(
+                                    checkpoint.copy(
                                         deliveryToken = currentDeliveryToken,
-                                    ),
-                                ),
-                                RelayV2TerminalOutcome.ResetRequired(reason),
-                                listOf(
-                                    RelayV2TerminalEffect.ResetRequired(
-                                        checkpoint.resetFence?.copy(
+                                        resetFence = checkpoint.resetFence?.copy(
                                             deliveryToken = currentDeliveryToken,
                                         ),
-                                        reason,
-                                        null,
                                     ),
-                                ),
-                            )
-                        } else {
-                            val reboundPending = requireNotNull(checkpoint.pendingOpen).copy(
-                                deliveryToken = currentDeliveryToken,
-                            )
-                            val rebound = checkpoint.copy(
-                                deliveryToken = currentDeliveryToken,
-                                pendingOpen = reboundPending,
-                            )
-                            preOpenReduction(
-                                rebound,
-                                RelayV2TerminalOutcome.Restored,
-                            )
+                                    RelayV2TerminalOutcome.ResetRequired(reason),
+                                    listOf(
+                                        RelayV2TerminalEffect.ResetRequired(
+                                            checkpoint.resetFence?.copy(
+                                                deliveryToken = currentDeliveryToken,
+                                            ),
+                                            reason,
+                                            null,
+                                        ),
+                                    ),
+                                )
+                            } else {
+                                val reboundPending = requireNotNull(checkpoint.pendingOpen).copy(
+                                    deliveryToken = currentDeliveryToken,
+                                )
+                                val rebound = checkpoint.copy(
+                                    deliveryToken = currentDeliveryToken,
+                                    pendingOpen = reboundPending,
+                                )
+                                preOpenReduction(
+                                    rebound,
+                                    RelayV2TerminalOutcome.Restored,
+                                )
+                            }
                         }
                     }
-                }
-                checkpoint.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED ->
-                    preOpenReduction(
-                        checkpoint,
-                        RelayV2TerminalOutcome.ResetRequired(
-                            checkpoint.resetReason
-                                ?: RelayV2TerminalResetReason.CHECKPOINT_INVALID,
-                        ),
-                        listOf(
-                            RelayV2TerminalEffect.ResetRequired(
-                                checkpoint.resetFence,
+                    checkpoint.phase == RelayV2TerminalPreOpenPhase.RESET_REQUIRED ->
+                        preOpenReduction(
+                            checkpoint,
+                            RelayV2TerminalOutcome.ResetRequired(
                                 checkpoint.resetReason
                                     ?: RelayV2TerminalResetReason.CHECKPOINT_INVALID,
-                                null,
                             ),
-                        ),
+                            listOf(
+                                RelayV2TerminalEffect.ResetRequired(
+                                    checkpoint.resetFence,
+                                    checkpoint.resetReason
+                                        ?: RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+                                    null,
+                                ),
+                            ),
+                        )
+                    else -> preOpenReduction(
+                        checkpoint,
+                        RelayV2TerminalOutcome.Restored,
                     )
-                else -> preOpenReduction(
-                    checkpoint,
-                    RelayV2TerminalOutcome.Restored,
-                )
+                }
             }
         }
     }
@@ -2700,6 +2702,15 @@ internal object RelayV2TerminalCheckpointReducer {
         ),
     )
 
+    private fun snapshotPreOpenCheckpoint(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+    ): RelayV2TerminalPreOpenCheckpoint = checkpoint.copy(
+        openRequestIds = checkpoint.openRequestIds.toList(),
+        pendingOpen = checkpoint.pendingOpen?.copy(
+            issuedRequestIds = checkpoint.pendingOpen.issuedRequestIds.toList(),
+        ),
+    )
+
     /**
      * Rejects hostile storage shapes before any list is mapped or any terminal bytes are copied.
      * Once the O(1) counts pass, every traversal is bounded by the persisted hard count limits.
@@ -2906,7 +2917,7 @@ internal object RelayV2TerminalCheckpointReducer {
                             pending.issuedRequestIds,
                             pending.requestId,
                         ) &&
-                        pending.requestId in checkpoint.openRequestIds &&
+                        pending.requestId == checkpoint.openRequestIds.lastOrNull() &&
                         (pending.issuedRequestIds.size == 1 ||
                             pending.requiresDeduplicatedResponse) &&
                         pending.deliveryToken == checkpoint.deliveryToken &&
@@ -2926,6 +2937,19 @@ internal object RelayV2TerminalCheckpointReducer {
                             fence.cols in 1..1000 && fence.rows in 1..500
                     } == true
         }
+    }
+
+    private fun preflightPreOpenCheckpoint(
+        checkpoint: RelayV2TerminalPreOpenCheckpoint,
+    ): Boolean {
+        val openRequestCount = checkpoint.openRequestIds.size
+        val pendingOpenRequestCount = checkpoint.pendingOpen?.issuedRequestIds?.size ?: 0
+        if (openRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS ||
+            pendingOpenRequestCount > RelayV2TerminalCheckpointLimits.MAX_NETWORK_REQUEST_IDS
+        ) {
+            return false
+        }
+        return validPreOpenCheckpoint(checkpoint)
     }
 
     private fun validateCheckpoint(checkpoint: RelayV2TerminalCheckpoint): CheckpointValidity {
@@ -2964,6 +2988,7 @@ internal object RelayV2TerminalCheckpointReducer {
         checkpoint.pendingOpen?.let {
             if (!validOperationId(it.requestId) || it.deliveryToken != checkpoint.deliveryToken ||
                 !validRequestIdHistory(it.issuedRequestIds, it.requestId) ||
+                it.requestId != checkpoint.openRequestIds.lastOrNull() ||
                 (it.issuedRequestIds.size > 1 && !it.requiresDeduplicatedResponse) ||
                 it.target != checkpoint.identity.target() ||
                 !validParserContinuity(it.parserContinuityId) ||
@@ -3093,7 +3118,8 @@ internal object RelayV2TerminalCheckpointReducer {
             if (checkpoint.phase != RelayV2TerminalPhase.REPLAY_REQUESTED ||
                 it.fence != effectFence(checkpoint) ||
                 parseCounter(it.fromOffset) != received ||
-                !validOperationId(it.requestId) || it.requestId !in checkpoint.replayRequestIds
+                !validOperationId(it.requestId) ||
+                it.requestId != checkpoint.replayRequestIds.lastOrNull()
             ) {
                 return CheckpointValidity.INVALID
             }
@@ -3143,8 +3169,9 @@ internal object RelayV2TerminalCheckpointReducer {
                 return CheckpointValidity.INVALID
             }
         }
-        if (checkpoint.closeRequestIds.isNotEmpty() && checkpoint.pendingClose == null &&
-            checkpoint.closed?.tombstone?.closeAttempt == null
+        if (checkpoint.pendingClose == null &&
+            (checkpoint.closeRequestIds.isNotEmpty() !=
+                (checkpoint.closed?.tombstone?.closeAttempt != null))
         ) {
             return CheckpointValidity.INVALID
         }
