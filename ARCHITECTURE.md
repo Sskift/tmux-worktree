@@ -330,7 +330,7 @@ Android 使用自己的 Gradle wrapper、依赖图、测试和 Lint。根 npm bu
 | `docs/android-v2-architecture.md` | 当前 Android 专题 | Compose/Room/actor/Outbox 的详细产品和实现约束 |
 | `docs/remote-relay-android.md` | 运维手册 | broker、Mac connector、TLS、配对和 Android 验证流程 |
 | `docs/terminal-input-ownership-alignment.md` | 跨产品实现 companion | terminal-control、Feishu、Dashboard、CLI 与 Relay 的 lease、handoff、拒绝行为和测试矩阵 |
-| `docs/relay-v2-contract.md` | 冻结契约 | codec conformance 与未接线的 H0/H1/H2 spool/H3、Android actor/Room/HTTPS/bounded RFC6455 WSS foundations 已落地；另有独立 native broker credential store frozen contract 与未接线纯 Rust core，但无 N-API/platform adapter/injection；WSS foundation 尚未接 production composition，且无真实 TLS/device 互操作证据；跨端 runtime/capability 均未交付，不能据此宣告 capability 或生成 v2 credential |
+| `docs/relay-v2-contract.md` | 冻结契约 | codec conformance 与未接线的 H0/H1/H2 spool/H3、Android actor/Room/HTTPS/bounded RFC6455 WSS foundations 已落地；另有独立 native broker credential store frozen contract、未接线纯 Rust core/optional loader/credential authority source，但无 N-API/platform adapter、host bootstrap 或 production injection；WSS foundation 尚未接 production composition，且无真实 TLS/device 互操作证据；跨端 runtime/capability 均未交付，不能据此宣告 capability 或生成 v2 credential |
 | `docs/relay-v2-implementation-plan.md` | 非规范性实施协调 | 按 owner 拆分可并行工作、硬依赖和验收 Gate；不描述当前完成状态，也不修改冻结契约 |
 | `contracts/` | 机器契约 | Relay v1/v2、TW RPC v1 和共享 storage fixture；协议/存储变更必须同步生产实现和 contract tests |
 | `.codex/skills/` | Agent 操作规程 | 固化跨机器等易误操作流程，不属于产品 runtime |
