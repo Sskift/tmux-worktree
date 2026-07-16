@@ -456,6 +456,330 @@ class RelayV2ConnectionActorTest {
     }
 
     @Test
+    fun `durable repository abandon results release the invalid cut and restart with fresh ids`() =
+        runBlocking {
+            val cases = listOf(
+                RelayV2RecoveryAbandonReason.SNAPSHOT_IDENTITY_CONFLICT to false,
+                RelayV2RecoveryAbandonReason.SNAPSHOT_ORDER_CONFLICT to false,
+                RelayV2RecoveryAbandonReason.SNAPSHOT_DIGEST_MISMATCH to false,
+                RelayV2RecoveryAbandonReason.SNAPSHOT_LIMIT_EXCEEDED to false,
+                RelayV2RecoveryAbandonReason.EVENT_GAP to true,
+                RelayV2RecoveryAbandonReason.EVENT_BUFFER_OVERFLOW to true,
+            )
+            cases.forEach { (reason, fromStateEvent) ->
+                val harness = Harness()
+                try {
+                    val hello = harness.connectThroughRelayWelcome(null)
+                    val transport = harness.transport()
+                    transport.sendFixture(
+                        "host-welcome-snapshot-required",
+                        hello.stringValue("requestId"),
+                    )
+                    val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.BeginStateResync
+                    val pending = listOf(
+                        RelayV2PendingCommand("pending-${reason.name}", "window-${reason.name}"),
+                    )
+                    assertTrue(
+                        harness.actor.commitRecoveryReceipt(
+                            helloEffect,
+                            RelayV2RecoveryReceipt.HelloApplied(
+                                binding = helloEffect.recovery,
+                                hostId = HOST_ID,
+                                hostEpoch = HOST_EPOCH,
+                                durableCursorEventSeq = null,
+                                pendingCommands = pending,
+                            ),
+                        ),
+                    )
+
+                    val firstGet = transport.awaitSentFrame(1)
+                    val abandonedSnapshotRequestId =
+                        firstGet.payload().stringValue("snapshotRequestId")
+                    val abandonedSnapshotId = "cut-${reason.name}"
+                    val sourceEffect: RelayV2RuntimeEffect.GenerationScoped = if (fromStateEvent) {
+                        transport.sendFixture("sessions-changed-upsert")
+                        val delivered = withTimeout(TIMEOUT_MS) {
+                            harness.actor.effects.first()
+                        } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                        assertEquals(
+                            firstGet.stringValue("requestId"),
+                            delivered.recovery?.requestId,
+                        )
+                        delivered
+                    } else {
+                        val chunk = fixture("state-snapshot-chunk")
+                        chunk["requestId"] = firstGet.stringValue("requestId")
+                        chunk.payload()["snapshotRequestId"] = abandonedSnapshotRequestId
+                        chunk.payload()["snapshotId"] = abandonedSnapshotId
+                        transport.sendFrame(chunk)
+                        withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                            as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                    }
+                    val binding = when (sourceEffect) {
+                        is RelayV2RuntimeEffect.ApplyStateSnapshotChunk -> sourceEffect.recovery
+                        is RelayV2RuntimeEffect.DeliverPostHandshakeFrame ->
+                            requireNotNull(sourceEffect.recovery)
+                        else -> error("Unexpected abandon source: $sourceEffect")
+                    }
+                    val abandoned = RelayV2RecoveryReceipt.RecoveryAbandoned(
+                        binding = binding,
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        reason = reason,
+                        durableCursorEventSeq = "90",
+                        pendingCommands = pending,
+                        release = RelayV2RecoveryReleaseDirective(
+                            abandonedSnapshotRequestId,
+                            abandonedSnapshotId,
+                        ),
+                        restart = RelayV2RecoveryRestartDirective.SNAPSHOT,
+                    )
+                    assertTrue(harness.actor.commitRecoveryReceipt(sourceEffect, abandoned))
+
+                    val release = transport.awaitSentFrame(2)
+                    assertEquals("state.snapshot.release", release.stringValue("type"))
+                    assertEquals("abandoned", release.payload()["reason"])
+                    assertEquals(abandonedSnapshotRequestId, release.payload()["snapshotRequestId"])
+                    assertEquals(abandonedSnapshotId, release.payload()["snapshotId"])
+
+                    val wrongRelease = fixture("state-snapshot-released")
+                    wrongRelease["requestId"] = "00000000-0000-0000-0000-000000000097"
+                    wrongRelease.payload()["snapshotRequestId"] = abandonedSnapshotRequestId
+                    wrongRelease.payload()["snapshotId"] = abandonedSnapshotId
+                    transport.sendFrame(wrongRelease)
+                    delay(25)
+                    assertEquals(3, transport.sent.size)
+
+                    val released = fixture("state-snapshot-released")
+                    released["requestId"] = release.stringValue("requestId")
+                    released.payload()["snapshotRequestId"] = abandonedSnapshotRequestId
+                    released.payload()["snapshotId"] = abandonedSnapshotId
+                    transport.sendFrame(released)
+
+                    val restarted = transport.awaitSentFrame(3)
+                    assertEquals("state.snapshot.get", restarted.stringValue("type"))
+                    assertTrue(
+                        restarted.stringValue("requestId") != firstGet.stringValue("requestId"),
+                    )
+                    assertTrue(
+                        restarted.payload().stringValue("snapshotRequestId") !=
+                            abandonedSnapshotRequestId,
+                    )
+                    assertEquals(null, restarted.payload()["snapshotId"])
+                    assertEquals(null, restarted.payload()["cursor"])
+                    assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+
+                    // The old durable result can still enter the current generation queue, but its
+                    // retired step/request cannot release again, restart again, or reach ONLINE.
+                    assertTrue(harness.actor.commitRecoveryReceipt(sourceEffect, abandoned))
+                    delay(25)
+                    assertEquals(4, transport.sent.size)
+                    assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                } finally {
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `abandon proof can query only after release and a durable cursor reaches welcome`() =
+        runBlocking {
+            val harness = Harness()
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    RelayV2ResumeCursor(HOST_EPOCH, "90"),
+                )
+                val transport = harness.transport()
+                transport.sendFixture(
+                    "host-welcome-cursor-behind",
+                    hello.stringValue("requestId"),
+                )
+                val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+                val pending = listOf(RelayV2PendingCommand("pending-after-abandon", "window-after"))
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        helloEffect,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            helloEffect.recovery,
+                            HOST_ID,
+                            HOST_EPOCH,
+                            durableCursorEventSeq = "90",
+                            pendingCommands = pending,
+                        ),
+                    ),
+                )
+                val get = transport.awaitSentFrame(1)
+                val chunk = fixture("state-snapshot-chunk")
+                chunk["requestId"] = get.stringValue("requestId")
+                chunk.payload()["snapshotRequestId"] =
+                    get.payload().stringValue("snapshotRequestId")
+                transport.sendFrame(chunk)
+                val apply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        apply,
+                        RelayV2RecoveryReceipt.RecoveryAbandoned(
+                            binding = apply.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            reason = RelayV2RecoveryAbandonReason.SNAPSHOT_DIGEST_MISMATCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = pending,
+                            release = RelayV2RecoveryReleaseDirective(
+                                get.payload().stringValue("snapshotRequestId"),
+                                chunk.payload().stringValue("snapshotId"),
+                            ),
+                            restart = RelayV2RecoveryRestartDirective.QUERY_PENDING_COMMANDS,
+                        ),
+                    ),
+                )
+                val release = transport.awaitSentFrame(2)
+                assertEquals("state.snapshot.release", release.stringValue("type"))
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+
+                val released = fixture("state-snapshot-released")
+                released["requestId"] = release.stringValue("requestId")
+                released.payload()["snapshotRequestId"] = release.payload()["snapshotRequestId"]
+                released.payload()["snapshotId"] = release.payload()["snapshotId"]
+                transport.sendFrame(released)
+
+                val query = transport.awaitSentFrame(3)
+                assertEquals("command.query", query.stringValue("type"))
+                assertEquals(pending, query.payload().commandItems())
+                transport.sendCommandStatuses(query.stringValue("requestId"), pending)
+                val commandApply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.ApplyCommandStatuses
+                assertTrue(
+                    harness.actor.commitRecoveryReceipt(
+                        commandApply,
+                        RelayV2RecoveryReceipt.CommandStatusesApplied(
+                            commandApply.recovery,
+                            HOST_ID,
+                            HOST_EPOCH,
+                            pending,
+                        ),
+                    ),
+                )
+                harness.actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+                assertEquals(4, transport.sent.size)
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `lost durable receipts and abandoned release responses fail closed on recovery deadline`() =
+        runBlocking {
+            suspend fun awaitDeadline(
+                deadlines: CopyOnWriteArrayList<CompletableDeferred<Unit>>,
+                count: Int,
+            ): CompletableDeferred<Unit> = withTimeout(TIMEOUT_MS) {
+                while (deadlines.size < count) delay(1)
+                deadlines[count - 1]
+            }
+
+            run {
+                val deadlines = CopyOnWriteArrayList<CompletableDeferred<Unit>>()
+                val harness = Harness(
+                    recoveryWatchdogDelay = {
+                        CompletableDeferred<Unit>().also(deadlines::add).await()
+                    },
+                )
+                try {
+                    val hello = harness.connectThroughRelayWelcome(null)
+                    val transport = harness.transport()
+                    transport.sendFixture(
+                        "host-welcome-snapshot-required",
+                        hello.stringValue("requestId"),
+                    )
+                    withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    awaitDeadline(deadlines, 1).complete(Unit)
+
+                    val failed = harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+                    assertEquals("RECOVERY_TIMEOUT", failed.failure?.code)
+                    assertEquals(listOf(1013), transport.closeCodes)
+                    assertTrue(harness.actor.state.value.phase != RelayV2ConnectionPhase.ONLINE)
+                } finally {
+                    harness.close()
+                }
+            }
+
+            run {
+                val deadlines = CopyOnWriteArrayList<CompletableDeferred<Unit>>()
+                val harness = Harness(
+                    recoveryWatchdogDelay = {
+                        CompletableDeferred<Unit>().also(deadlines::add).await()
+                    },
+                )
+                try {
+                    val hello = harness.connectThroughRelayWelcome(null)
+                    val transport = harness.transport()
+                    transport.sendFixture(
+                        "host-welcome-snapshot-required",
+                        hello.stringValue("requestId"),
+                    )
+                    val helloEffect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.BeginStateResync
+                    assertTrue(
+                        harness.actor.commitRecoveryReceipt(
+                            helloEffect,
+                            RelayV2RecoveryReceipt.HelloApplied(
+                                helloEffect.recovery,
+                                HOST_ID,
+                                HOST_EPOCH,
+                                durableCursorEventSeq = null,
+                                pendingCommands = emptyList(),
+                            ),
+                        ),
+                    )
+                    val get = transport.awaitSentFrame(1)
+                    val chunk = fixture("state-snapshot-chunk")
+                    chunk["requestId"] = get.stringValue("requestId")
+                    chunk.payload()["snapshotRequestId"] =
+                        get.payload().stringValue("snapshotRequestId")
+                    transport.sendFrame(chunk)
+                    val apply = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.ApplyStateSnapshotChunk
+                    assertTrue(
+                        harness.actor.commitRecoveryReceipt(
+                            apply,
+                            RelayV2RecoveryReceipt.RecoveryAbandoned(
+                                apply.recovery,
+                                HOST_ID,
+                                HOST_EPOCH,
+                                RelayV2RecoveryAbandonReason.SNAPSHOT_DIGEST_MISMATCH,
+                                durableCursorEventSeq = null,
+                                pendingCommands = emptyList(),
+                                release = RelayV2RecoveryReleaseDirective(
+                                    get.payload().stringValue("snapshotRequestId"),
+                                    chunk.payload().stringValue("snapshotId"),
+                                ),
+                                restart = RelayV2RecoveryRestartDirective.SNAPSHOT,
+                            ),
+                        ),
+                    )
+                    transport.awaitSentFrame(2)
+                    val releaseDeadline = withTimeout(TIMEOUT_MS) {
+                        while (deadlines.size < 4) delay(1)
+                        deadlines.last()
+                    }
+                    releaseDeadline.complete(Unit)
+
+                    val failed = harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+                    assertEquals("RECOVERY_TIMEOUT", failed.failure?.code)
+                    assertEquals(listOf(1013), transport.closeCodes)
+                    assertEquals(3, transport.sent.size)
+                    assertTrue(harness.actor.state.value.phase != RelayV2ConnectionPhase.ONLINE)
+                } finally {
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
     fun `current continuity rejection can apply while its fenced generation cannot`() = runBlocking {
         val harness = Harness()
         try {
@@ -2624,6 +2948,7 @@ class RelayV2ConnectionActorTest {
         actionByteCapacity: Long = RelayV2ConnectionActor.DEFAULT_ACTION_BYTE_CAPACITY,
         effectByteCapacity: Long = RelayV2ConnectionActor.DEFAULT_EFFECT_BYTE_CAPACITY,
         watchdogDelay: suspend (Long) -> Unit = { delay(it) },
+        recoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
         beforeTransportCommit: suspend () -> Unit = {},
         beforeTerminalClaim: () -> Unit = {},
         betweenTerminalCauseReadAndOwnerRevoke: () -> Unit = {},
@@ -2640,6 +2965,7 @@ class RelayV2ConnectionActorTest {
             codec = codec,
             clock = { NOW_MS },
             watchdogDelay = watchdogDelay,
+            recoveryWatchdogDelay = recoveryWatchdogDelay,
             beforeTransportCommit = beforeTransportCommit,
             beforeTerminalClaim = beforeTerminalClaim,
             betweenTerminalCauseReadAndOwnerRevoke =
