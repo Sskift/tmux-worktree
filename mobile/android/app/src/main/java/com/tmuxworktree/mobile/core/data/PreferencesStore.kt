@@ -19,10 +19,8 @@ import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2Profile
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationJournal
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileActivationPhase
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayV2ProfileStore
-import java.io.IOException
 import java.util.UUID
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
@@ -318,16 +316,13 @@ class PreferencesStore internal constructor(
 ) {
     constructor(context: Context) : this(context.applicationContext.twPreferencesDataStore)
 
-    private val authoritativeData: Flow<Preferences> = store.data
+    /** Raw authority is reserved for owner-side saga validation and mutation. */
+    private val rawData: Flow<Preferences> = store.data
 
-    private val readableData: Flow<Preferences> = authoritativeData
-        .catch { error ->
-            if (error is IOException) emit(androidx.datastore.preferences.core.emptyPreferences()) else throw error
-        }
+    /** Connection-visible preferences; a fenced profile is never exposed as reconnectable. */
+    val values: Flow<AppPreferences> = rawData.map(::toConnectionVisibleAppPreferences)
 
-    val values: Flow<AppPreferences> = readableData.map(::toAppPreferences)
-
-    val profile: Flow<RelayProfile> = authoritativeData.map { stored ->
+    val profile: Flow<RelayProfile> = rawData.map { stored ->
         if (activeProfileIsUsable(stored)) {
             toAppPreferences(stored).let { preferences ->
                 RelayProfile(
@@ -344,7 +339,7 @@ class PreferencesStore internal constructor(
 
     /** Independent non-sensitive Relay v2 profile namespace. Tokens are not representable here. */
     internal val relayV2Profile: Flow<RelayV2Profile?> =
-        authoritativeData.map { preferences ->
+        rawData.map { preferences ->
             if (activeProfileIsUsable(preferences)) {
                 RelayProfilePreferencesCodec.toRelayV2Profile(preferences)
             } else {
@@ -353,7 +348,7 @@ class PreferencesStore internal constructor(
         }
 
     internal suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
-        val preferences = authoritativeData.first()
+        val preferences = rawData.first()
         return if (activeProfileIsUsable(preferences)) {
             RelayProfilePreferencesCodec.activeProfileIdentity(preferences)
         } else {
@@ -364,7 +359,7 @@ class PreferencesStore internal constructor(
     internal suspend fun activeRelayV2Profile(): RelayV2Profile? = relayV2Profile.first()
 
     internal suspend fun pendingRelayV2Activation(): RelayV2ProfileActivationJournal? =
-        activationJournal(authoritativeData.first())
+        activationJournal(rawData.first())
 
     internal suspend fun prepareRelayV2Activation(
         expectedActiveProfile: RelayActiveProfileIdentity?,
@@ -789,6 +784,21 @@ class PreferencesStore internal constructor(
         completedNotifications = preferences[Keys.completedNotifications] ?: false,
         darkThemeEnabled = preferences[Keys.darkThemeEnabled] ?: true,
     )
+
+    private fun toConnectionVisibleAppPreferences(
+        preferences: Preferences,
+    ): AppPreferences = toAppPreferences(preferences).let { stored ->
+        if (activeProfileIsUsable(preferences)) {
+            stored
+        } else {
+            stored.copy(
+                relayUrl = "",
+                preferredHostId = "",
+                preferredScopeId = "local",
+                autoConnect = false,
+            )
+        }
+    }
 
 }
 

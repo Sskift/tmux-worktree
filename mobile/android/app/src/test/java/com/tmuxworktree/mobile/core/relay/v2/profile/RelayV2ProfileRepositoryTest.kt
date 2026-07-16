@@ -23,7 +23,10 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.take
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
@@ -233,6 +236,15 @@ class RelayV2ProfileRepositoryTest {
                 val store = PreferencesRelayV2ProfileStore(preferences)
                 assertEquals(prepared, store.pendingRelayV2Activation())
                 assertEquals(prepared.previousProfile, store.activeProfileIdentity())
+                val connectionWatcher = async { preferences.values.take(2).toList() }
+                yield()
+                assertV1ProfileMutationsRejected(preferences)
+                assertEquals(
+                    "wss://legacy.example.com/client",
+                    preferences.values.first().relayUrl,
+                )
+                assertEquals("legacy-host", preferences.values.first().preferredHostId)
+                assertTrue(preferences.values.first().autoConnect)
                 val proof = RelayV2CompletedCredentialProof(
                     credentialReference = target.credentialReference,
                     credentialVersion = target.credentialVersion + 1,
@@ -256,8 +268,18 @@ class RelayV2ProfileRepositoryTest {
                 ready = requireNotNull(
                     store.markRelayV2CredentialReady(prepared.operationId, proof),
                 )
+                val observed = withTimeout(1_000) { connectionWatcher.await() }
+                assertEquals("wss://legacy.example.com/client", observed.first().relayUrl)
+                assertEquals("legacy-host", observed.first().preferredHostId)
+                assertTrue(observed.first().autoConnect)
+                assertEquals("", observed.last().relayUrl)
+                assertEquals("", observed.last().preferredHostId)
+                assertEquals("local", observed.last().preferredScopeId)
+                assertFalse(observed.last().autoConnect)
                 assertEquals(RelayV2ProfileActivationPhase.CREDENTIAL_READY, ready.phase)
                 assertEquals(null, store.activeProfileIdentity())
+                assertEquals("", preferences.profile.first().relayUrl)
+                assertV1ProfileMutationsRejected(preferences)
             }
 
             withPreferencesStore(file) { preferences ->
@@ -293,6 +315,10 @@ class RelayV2ProfileRepositoryTest {
             assertSame(
                 ioFailure,
                 runCatching { failingPreferences.activeProfileIdentity() }.exceptionOrNull(),
+            )
+            assertSame(
+                ioFailure,
+                runCatching { failingPreferences.values.first() }.exceptionOrNull(),
             )
             directory.toFile().deleteRecursively()
             Unit
@@ -1888,6 +1914,31 @@ class RelayV2ProfileRepositoryTest {
             block(PreferencesStore(dataStore))
         } finally {
             job.cancelAndJoin()
+        }
+    }
+
+    private suspend fun assertV1ProfileMutationsRejected(preferences: PreferencesStore) {
+        val mutations = listOf<suspend () -> Unit>(
+            {
+                preferences.saveProfile(
+                    relayUrl = "wss://write-through.example.com/client",
+                    hostId = "write-through-host",
+                    autoConnect = true,
+                )
+            },
+            { preferences.setPreferredHost("write-through-host") },
+            {
+                preferences.setPreferredHostAndScope(
+                    "write-through-host",
+                    "write-through-scope",
+                )
+            },
+            { preferences.setPreferredScope("write-through-scope") },
+            { preferences.setAutoConnect(true) },
+            { preferences.clearProfile() },
+        )
+        mutations.forEach { mutate ->
+            assertTrue(runCatching { mutate() }.isFailure)
         }
     }
 
