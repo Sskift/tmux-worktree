@@ -1350,13 +1350,22 @@ class RelayV2TerminalCheckpointReducerTest {
         )
 
         val hostResetAttempt = openAttempt("open-host-reset", "host-reset-fingerprint")
-        val pendingHostReset = beginOpen(initial, hostResetAttempt, "host-reset-request")
+        val firstPendingHostReset = beginOpen(
+            initial,
+            hostResetAttempt,
+            "host-reset-request-a",
+        )
+        val pendingHostReset = beginOpen(
+            firstPendingHostReset,
+            hostResetAttempt,
+            "host-reset-request-b",
+        )
         val staleHostReset = reduce(
             pendingHostReset,
             RelayV2TerminalAction.CorrelatedResetRequired(
                 actionFence(pendingHostReset),
                 origin = RelayV2TerminalResetOrigin.OPEN,
-                requestId = "old-open-request",
+                requestId = "host-reset-request-a",
                 openAttempt = hostResetAttempt,
                 reason = RelayV2TerminalResetReason.STREAM_LOST,
                 requestedOffset = null,
@@ -1368,12 +1377,40 @@ class RelayV2TerminalCheckpointReducerTest {
             RelayV2TerminalIgnoredReason.STALE_RESET_RESPONSE,
             (staleHostReset.outcome as RelayV2TerminalOutcome.Ignored).reason,
         )
+        listOf(
+            RelayV2TerminalAction.CorrelatedResetRequired(
+                actionFence(pendingHostReset),
+                origin = RelayV2TerminalResetOrigin.OPEN,
+                requestId = "host-reset-request-unknown",
+                openAttempt = hostResetAttempt,
+                reason = RelayV2TerminalResetReason.STREAM_LOST,
+                requestedOffset = null,
+                bufferStartOffset = null,
+                tailOffset = null,
+            ),
+            RelayV2TerminalAction.CorrelatedResetRequired(
+                actionFence(pendingHostReset),
+                origin = RelayV2TerminalResetOrigin.OPEN,
+                requestId = "host-reset-request-b",
+                openAttempt = hostResetAttempt.copy(fingerprint = "tampered-reset-fingerprint"),
+                reason = RelayV2TerminalResetReason.STREAM_LOST,
+                requestedOffset = null,
+                bufferStartOffset = null,
+                tailOffset = null,
+            ),
+        ).forEach { conflictingReset ->
+            val rejected = reduce(pendingHostReset, conflictingReset)
+            assertEquals(
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+                (rejected.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+            )
+        }
         val exactHostReset = reduce(
             pendingHostReset,
             RelayV2TerminalAction.CorrelatedResetRequired(
                 actionFence(pendingHostReset),
                 origin = RelayV2TerminalResetOrigin.OPEN,
-                requestId = "host-reset-request",
+                requestId = "host-reset-request-b",
                 openAttempt = hostResetAttempt,
                 reason = RelayV2TerminalResetReason.STREAM_LOST,
                 requestedOffset = null,
@@ -2171,6 +2208,22 @@ class RelayV2TerminalCheckpointReducerTest {
         )
         assertEquals(RelayV2TerminalPhase.CLOSED_WAITING_PARSER, checkpoint.phase)
         assertNull(checkpoint.pendingClose)
+
+        val parserOperation = requireNotNull(checkpoint.parserInFlightCallbackToken)
+        checkpoint = requireNotNull(
+            RelayV2TerminalCheckpointReducer.restore(
+                RelayV2TerminalStoredCheckpoint.Present(checkpoint),
+                checkpoint.identity,
+                checkpoint.openAttempt,
+                checkpoint.deliveryToken,
+                checkpoint.parserContinuityId,
+                parserProof(
+                    parserOperation,
+                    parserAppliedNextOffset = "0",
+                    status = RelayV2TerminalParserOperationStatus.NOT_APPLIED,
+                ),
+            ).checkpoint,
+        )
 
         val lateIssued = reduce(
             checkpoint,

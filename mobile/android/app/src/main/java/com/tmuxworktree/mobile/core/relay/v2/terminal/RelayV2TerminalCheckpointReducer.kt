@@ -2070,20 +2070,41 @@ internal object RelayV2TerminalCheckpointReducer {
         current: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction.CorrelatedResetRequired,
     ): RelayV2TerminalReduction {
-        val matchesPending = when (action.origin) {
-            RelayV2TerminalResetOrigin.OPEN -> current.pendingOpen?.let {
-                it.requestId == action.requestId && it.deliveryToken == action.fence.deliveryToken &&
-                    it.openAttempt == action.openAttempt
-            } == true
-            RelayV2TerminalResetOrigin.REPLAY -> current.pendingReplay?.let {
-                it.requestId == action.requestId && it.fence == effectFence(current)
-            } == true && action.openAttempt == null
+        val correlation = when (action.origin) {
+            RelayV2TerminalResetOrigin.OPEN -> networkResponseCorrelation(
+                action.requestId,
+                current.pendingOpen?.requestId,
+                current.openRequestIds,
+            )
+            RelayV2TerminalResetOrigin.REPLAY -> networkResponseCorrelation(
+                action.requestId,
+                current.pendingReplay?.requestId,
+                current.replayRequestIds,
+            )
         }
-        if (!matchesPending) {
-            return reduction(
+        when (correlation) {
+            NetworkResponseCorrelation.ISSUED_OLD -> return reduction(
                 current,
                 RelayV2TerminalOutcome.Ignored(RelayV2TerminalIgnoredReason.STALE_RESET_RESPONSE),
             )
+            NetworkResponseCorrelation.UNKNOWN -> return reset(
+                current,
+                RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT,
+            )
+            NetworkResponseCorrelation.CURRENT -> Unit
+        }
+        val matchesCurrentAuthority = action.fence == actionFence(current) &&
+            when (action.origin) {
+                RelayV2TerminalResetOrigin.OPEN -> current.pendingOpen?.let {
+                    it.deliveryToken == action.fence.deliveryToken &&
+                        it.openAttempt == action.openAttempt
+                } == true
+                RelayV2TerminalResetOrigin.REPLAY -> current.pendingReplay?.let {
+                    it.fence == effectFence(current)
+                } == true && action.openAttempt == null
+            }
+        if (!matchesCurrentAuthority) {
+            return reset(current, RelayV2TerminalResetReason.PROTOCOL_ORDER_CONFLICT)
         }
         return applyHostReset(current, action.reason, action.requestedOffset,
             action.bufferStartOffset, action.tailOffset)
@@ -2406,7 +2427,7 @@ internal object RelayV2TerminalCheckpointReducer {
         is RelayV2TerminalAction.RetryReplay -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.RequestClose -> deliveryGuard(current, action.deliveryToken)
         is RelayV2TerminalAction.Closed -> null
-        is RelayV2TerminalAction.CorrelatedResetRequired -> fenceGuard(current, action.fence)
+        is RelayV2TerminalAction.CorrelatedResetRequired -> null
         is RelayV2TerminalAction.AsyncResetRequired -> fenceGuard(current, action.fence)
     }
 
