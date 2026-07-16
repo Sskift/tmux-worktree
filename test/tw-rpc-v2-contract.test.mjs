@@ -561,11 +561,15 @@ test("canonical create owners fence every post-start observation failure as IN_D
   );
   assert.equal(rpcPostCreateListCalls, 0);
 
-  const failedBeforeMutation = rpcV2.executeRpcV2CreateTerminal(
-    cases.wire.createTerminal.request,
+  let worktreeMutationCalls = 0;
+  const worktreeClockFailed = rpcV2.executeRpcV2CreateWorktree(
+    cases.wire.createWorktree.request,
     {
-      terminalSessionDeps: terminalOwnerDeps({
-        tmuxBin: () => { throw new Error("tmux unavailable before mutation"); },
+      loadConfig: worktreeConfig,
+      worktreeSessionDeps: worktreeOwnerDeps({
+        now: () => { throw new Error("worktree clock unavailable"); },
+        exec: () => { worktreeMutationCalls += 1; },
+        mkdirSync: () => { worktreeMutationCalls += 1; },
       }),
       currentList: () => {
         rpcPostCreateListCalls += 1;
@@ -573,9 +577,33 @@ test("canonical create owners fence every post-start observation failure as IN_D
       },
     },
   );
-  assert.equal(failedBeforeMutation.state, "failed");
-  assert.equal(failedBeforeMutation.sideEffect, "not_applied");
-  assert.equal(failedBeforeMutation.error.code, "CREATE_FAILED");
+  assert.equal(worktreeClockFailed.state, "failed");
+  assert.equal(worktreeClockFailed.sideEffect, "not_applied");
+  assert.equal(worktreeClockFailed.error.code, "CREATE_FAILED");
+  assert.match(worktreeClockFailed.error.message, /worktree clock unavailable/);
+  assert.equal(worktreeMutationCalls, 0);
+
+  let terminalStartCalls = 0;
+  const terminalClockFailed = rpcV2.executeRpcV2CreateTerminal(
+    cases.wire.createTerminal.request,
+    {
+      terminalSessionDeps: terminalOwnerDeps({
+        now: () => ({
+          toISOString: () => { throw new Error("terminal timestamp conversion failed"); },
+        }),
+        exec: () => { terminalStartCalls += 1; },
+      }),
+      currentList: () => {
+        rpcPostCreateListCalls += 1;
+        return { protocolVersion: 2, sessions: [] };
+      },
+    },
+  );
+  assert.equal(terminalClockFailed.state, "failed");
+  assert.equal(terminalClockFailed.sideEffect, "not_applied");
+  assert.equal(terminalClockFailed.error.code, "CREATE_FAILED");
+  assert.match(terminalClockFailed.error.message, /terminal timestamp conversion failed/);
+  assert.equal(terminalStartCalls, 0);
   assert.equal(rpcPostCreateListCalls, 0);
 });
 

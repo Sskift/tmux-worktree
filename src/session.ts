@@ -231,6 +231,15 @@ function errorDetail(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function managedSessionCreatedAt(now: () => Date): string {
+  const createdAt = now().toISOString();
+  const parsed = new Date(createdAt);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString() !== createdAt) {
+    throw new CliError("invalid managed session creation timestamp");
+  }
+  return createdAt;
+}
+
 function appendRollbackFailures(error: unknown, failures: string[]): CliError {
   const detail = errorDetail(error);
   if (failures.length === 0) {
@@ -455,6 +464,7 @@ export function createManagedWorktreeSession(
   const sessionExists = deps.sessionExists ?? defaultSessionExists;
   const randomId = deps.randomId ?? randomHexId;
   const now = deps.now ?? (() => new Date());
+  const profile = params.profile;
   const setupBindings = deps.setupClipboardBindings ?? setupClipboardBindings;
   const cleanupWorktree = deps.removeWorktree ?? removeWorktree;
   const cleanupBranch = deps.deleteBranch ?? deleteBranch;
@@ -482,6 +492,7 @@ export function createManagedWorktreeSession(
   const tmux = tmuxBin();
   let workDir = params.projectDir;
   let createdWorktree: CreatedManagedWorktree | null = null;
+  let createdAt: string;
 
   if (params.useWorktree) {
     if (!isGitRepo(params.projectDir)) {
@@ -491,6 +502,7 @@ export function createManagedWorktreeSession(
     const label = params.projectKey ?? session;
     log(`📦 项目: ${label} (${params.projectDir})`);
     const targetBranch = detectTargetBranch(params.projectDir, params.branch, gitQuery);
+    createdAt = managedSessionCreatedAt(now);
 
     log(`🔄 正在从远程拉取最新代码 (${targetBranch})...`);
     exec("git", ["-C", params.projectDir, "fetch", "origin", targetBranch, "--quiet"]);
@@ -532,6 +544,7 @@ export function createManagedWorktreeSession(
     };
     workDir = worktreeDir;
   } else {
+    createdAt = managedSessionCreatedAt(now);
     log(`📂 使用自定义目录 (跳过 git worktree):`);
     log(`   路径: ${params.projectDir}`);
   }
@@ -597,13 +610,13 @@ export function createManagedWorktreeSession(
     const baseRecord: ManagedSession = {
       name: session,
       kind: "worktree",
-      profile: params.profile,
+      profile,
       project: createdWorktree.project,
       repoPath: createdWorktree.repoDir,
       worktreePath: createdWorktree.path,
       branch: createdWorktree.branch,
       baseBranch: createdWorktree.baseBranch,
-      createdAt: now().toISOString(),
+      createdAt,
     };
     const record = capturedLifecycle
       ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
@@ -694,6 +707,7 @@ export function createManagedTerminalSession(
   const sessionExists = deps.sessionExists ?? defaultSessionExists;
   const randomId = deps.randomId ?? randomHexId;
   const now = deps.now ?? (() => new Date());
+  const profile = params.profile;
   const setupBindings = deps.setupClipboardBindings ?? setupClipboardBindings;
   const loadMutationState = deps.loadManagedStateForMutation ?? defaultLoadManagedStateForMutation;
   const listLifecycle = deps.listTmuxSessionLifecycleEntries
@@ -714,6 +728,7 @@ export function createManagedTerminalSession(
   do {
     session = `tw-term-${randomId()}`;
   } while (sessionExists(session));
+  const createdAt = managedSessionCreatedAt(now);
 
   let capturedLifecycle: ReturnType<typeof captureLifecycleV2> | undefined;
   try {
@@ -754,9 +769,9 @@ export function createManagedTerminalSession(
   const baseRecord: ManagedSession = {
     name: session,
     kind: "terminal",
-    profile: params.profile,
+    profile,
     cwd,
-    createdAt: now().toISOString(),
+    createdAt,
   };
   const record = capturedLifecycle
     ? withManagedSessionLifecycleExtension(baseRecord, capturedLifecycle.extension)
