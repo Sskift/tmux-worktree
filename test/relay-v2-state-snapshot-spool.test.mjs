@@ -33,6 +33,7 @@ function spawnSnapshotSpoolChild(root, options = {}) {
   const child = fork(snapshotSpoolChild, [], {
     env: {
       ...process.env,
+      ...options.environment,
       HOME: dirname(root),
       SNAPSHOT_SPOOL_ROOT: root,
       SNAPSHOT_SPOOL_CHILD_MODE: options.mode ?? "worker",
@@ -1066,6 +1067,90 @@ test("PID reuse cannot keep a stale metadata lock or spool owner live", async ()
       testHooks: { processIncarnationForPid: () => "incarnation-new" },
     });
     await afterStaleLock.close();
+  } finally {
+    h.cleanup();
+  }
+});
+
+test(
+  "production process witness keeps a live metadata lock fenced across caller locale and timezone",
+  { skip: !["darwin", "linux"].includes(process.platform) },
+  async () => {
+    const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-snapshot-process-witness-"));
+    const root = join(home, "spool");
+    const holder = spawnSnapshotSpoolChild(root, {
+      owner: "process-witness-holder",
+      holdFirst: true,
+      environment: {
+        LC_ALL: "C",
+        LANG: "C",
+        TZ: "Pacific/Honolulu",
+      },
+    });
+    const children = [holder];
+    try {
+      await holder.message("lock-enter");
+      const contender = spawnSnapshotSpoolChild(root, {
+        owner: "process-witness-contender",
+        environment: {
+          LC_ALL: "en_US.UTF-8",
+          LANG: "en_US.UTF-8",
+          TZ: "Asia/Tokyo",
+        },
+      });
+      children.push(contender);
+      const rejected = await contender.message("open-error");
+      assert.equal(rejected.code, "BUSY");
+      assert.equal(
+        readdirSync(join(root, ".metadata-lock-quarantine-v1")).length,
+        0,
+        "a live lock must not be quarantined under a different caller environment",
+      );
+      contender.send({ type: "exit" });
+      await contender.exit();
+
+      holder.send({ type: "release-acquire" });
+      await holder.message("lock-exit");
+      await holder.message("opened");
+      holder.send({ type: "close" });
+      assert.equal((await holder.message("close-result")).ok, true);
+    } finally {
+      for (const child of children) {
+        if (child.child.exitCode === null) child.send({ type: "exit" });
+      }
+      await Promise.all(children.map(async (child) => {
+        if (child.child.exitCode === null) await child.exit();
+      }));
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test("boot-session changes fence the same pid and production process-start witness", async () => {
+  const firstBoot = "00000000-0000-4000-8000-000000000001";
+  const secondBoot = "00000000-0000-4000-8000-000000000002";
+  const h = await fakeSpool({
+    options: {
+      ownerInstanceId: "boot-session-old-owner",
+      testHooks: { bootSessionIdentity: () => firstBoot },
+    },
+  });
+  try {
+    const previousOwner = JSON.parse(readFileSync(h.spool.paths.owner, "utf8"));
+    assert.equal(previousOwner.pid, process.pid);
+
+    const replacement = await snapshotSpool.RelayV2StateSnapshotSpool.open({
+      hostId: "mac-admin",
+      cutSource: h.fake.source,
+      root: h.spool.paths.root,
+      ownerInstanceId: "boot-session-new-owner",
+      testHooks: { bootSessionIdentity: () => secondBoot },
+    });
+    const currentOwner = JSON.parse(readFileSync(replacement.paths.owner, "utf8"));
+    assert.equal(currentOwner.pid, previousOwner.pid);
+    assert.notEqual(currentOwner.processIncarnation, previousOwner.processIncarnation);
+    await assert.rejects(h.spool.cleanupExpired(), assertSpoolError("INTERNAL"));
+    await replacement.close();
   } finally {
     h.cleanup();
   }

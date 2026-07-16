@@ -10,6 +10,7 @@ import {
   openSync,
   opendirSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -109,6 +110,8 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
   processIncarnationForPid?: (pid: number) => string | null | undefined;
   afterRecoveryExpiredFencePersisted?: (snapshotId: string) => void;
   afterReservationPersisted?: (snapshotId: string) => void;
+  /** Narrow seam for boot-bound process-witness behavior; production must omit it. */
+  bootSessionIdentity?: (platform: NodeJS.Platform) => string | undefined;
   afterTombstonePersisted?: (
     snapshotId: string,
     disposition: "released" | "expired",
@@ -1117,35 +1120,208 @@ function parseLockHolder(value: unknown): PersistedLockHolder {
   };
 }
 
-function processIncarnationForPid(pid: number): string | null | undefined {
+type ProcessPresence = "present" | "absent" | "indeterminate";
+
+const PROCESS_INCARNATION_WITNESS_VERSION = 2;
+const MAX_BOOT_SESSION_ID_BYTES = 128;
+const MAX_LINUX_PROCESS_STAT_BYTES = 4_096;
+const MAX_PROCESS_START_OUTPUT_BYTES = 256;
+const MAX_UNSIGNED_64 = 18_446_744_073_709_551_615n;
+const BOOT_SESSION_UUID_PATTERN = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\r?\n)?$/i;
+const MACOS_PROCESS_START_PATTERN = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) +([1-9]|[12][0-9]|3[01]) ([01][0-9]|2[0-3]):([0-5][0-9]):([0-5][0-9]) ([0-9]{4})$/;
+const MACOS_MONTHS = new Map([
+  ["Jan", 0], ["Feb", 1], ["Mar", 2], ["Apr", 3], ["May", 4], ["Jun", 5],
+  ["Jul", 6], ["Aug", 7], ["Sep", 8], ["Oct", 9], ["Nov", 10], ["Dec", 11],
+]);
+const MACOS_WEEKDAYS = new Map([
+  ["Sun", 0], ["Mon", 1], ["Tue", 2], ["Wed", 3],
+  ["Thu", 4], ["Fri", 5], ["Sat", 6],
+]);
+const PROCESS_WITNESS_ENV = Object.freeze({
+  LC_ALL: "C",
+  LANG: "C",
+  TZ: "UTC0",
+});
+
+function processPresence(pid: number): ProcessPresence {
   try {
     process.kill(pid, 0);
+    return "present";
   } catch (error) {
-    if (isRecord(error) && error.code === "ESRCH") return null;
-    if (!isRecord(error) || error.code !== "EPERM") return undefined;
+    if (isRecord(error) && error.code === "ESRCH") return "absent";
+    return "indeterminate";
   }
+}
+
+function readBoundedUtf8File(path: string, maxBytes: number): string | undefined {
+  const descriptor = openSync(path, "r");
   try {
-    let witness: string;
-    if (process.platform === "linux") {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-      const startTicks = fields[19];
-      if (!startTicks || !/^[0-9]+$/.test(startTicks)) return undefined;
-      witness = `linux:${pid}:${startTicks}`;
-    } else {
-      const startedAt = execFileSync(
-        "/bin/ps",
-        ["-o", "lstart=", "-p", String(pid)],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      ).trim();
-      if (startedAt.length === 0) return null;
-      witness = `${process.platform}:${pid}:${startedAt}`;
+    const contents = Buffer.alloc(maxBytes + 1);
+    let total = 0;
+    while (total <= maxBytes) {
+      const bytesRead = readSync(
+        descriptor,
+        contents,
+        total,
+        maxBytes + 1 - total,
+        null,
+      );
+      if (bytesRead === 0) return contents.subarray(0, total).toString("utf8");
+      total += bytesRead;
     }
-    return createHash("sha256").update(witness, "utf8").digest("base64url");
-  } catch (error) {
-    if (isRecord(error) && (error.code === "ENOENT" || error.code === "ESRCH")) {
-      return null;
-    }
+    return undefined;
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function canonicalBootSessionIdentity(raw: string | undefined): string | undefined {
+  if (raw === undefined
+    || Buffer.byteLength(raw, "utf8") > MAX_BOOT_SESSION_ID_BYTES) return undefined;
+  const match = BOOT_SESSION_UUID_PATTERN.exec(raw);
+  return match?.[1]?.toLowerCase();
+}
+
+function productionBootSessionIdentity(platform: NodeJS.Platform): string | undefined {
+  if (platform === "linux") {
+    return readBoundedUtf8File(
+      "/proc/sys/kernel/random/boot_id",
+      MAX_BOOT_SESSION_ID_BYTES,
+    );
+  }
+  if (platform === "darwin") {
+    return execFileSync(
+      "/usr/sbin/sysctl",
+      ["-n", "kern.bootsessionuuid"],
+      {
+        encoding: "utf8",
+        env: PROCESS_WITNESS_ENV,
+        maxBuffer: MAX_BOOT_SESSION_ID_BYTES,
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 1_000,
+      },
+    );
+  }
+  return undefined;
+}
+
+function linuxProcessStartTicks(pid: number): string | undefined {
+  const stat = readBoundedUtf8File(`/proc/${pid}/stat`, MAX_LINUX_PROCESS_STAT_BYTES);
+  if (stat === undefined) return undefined;
+  const normalized = stat.endsWith("\n") ? stat.slice(0, -1) : stat;
+  if (normalized.includes("\n") || normalized.includes("\r")) return undefined;
+  const opening = normalized.indexOf("(");
+  const closing = normalized.lastIndexOf(")");
+  if (opening <= 0
+    || normalized.slice(0, opening).trim() !== String(pid)
+    || closing <= opening
+    || normalized.slice(closing, closing + 2) !== ") ") return undefined;
+  const fields = normalized.slice(closing + 2).split(" ");
+  const startTicks = fields[19];
+  if (fields.length < 20
+    || fields.some((field) => field.length === 0)
+    || startTicks === undefined
+    || !/^(?:0|[1-9][0-9]{0,19})$/.test(startTicks)) return undefined;
+  const numeric = BigInt(startTicks);
+  if (numeric === 0n || numeric > MAX_UNSIGNED_64) return undefined;
+  return startTicks;
+}
+
+function macosProcessStart(pid: number): string | undefined {
+  const raw = execFileSync(
+    "/bin/ps",
+    ["-o", "lstart=", "-p", String(pid)],
+    {
+      encoding: "utf8",
+      env: PROCESS_WITNESS_ENV,
+      maxBuffer: MAX_PROCESS_START_OUTPUT_BYTES,
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 1_000,
+    },
+  );
+  if (Buffer.byteLength(raw, "utf8") > MAX_PROCESS_START_OUTPUT_BYTES) return undefined;
+  const match = MACOS_PROCESS_START_PATTERN.exec(raw.trim());
+  if (!match) return undefined;
+  const [, weekdayName, monthName, dayText, hourText, minuteText, secondText, yearText] = match;
+  const month = MACOS_MONTHS.get(monthName!);
+  const weekday = MACOS_WEEKDAYS.get(weekdayName!);
+  if (month === undefined || weekday === undefined) return undefined;
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const year = Number(yearText);
+  if (!Number.isSafeInteger(year) || year < 1970 || year > 9_999) return undefined;
+  const timestamp = new Date(Date.UTC(year, month, day, hour, minute, second));
+  if (timestamp.getUTCFullYear() !== year
+    || timestamp.getUTCMonth() !== month
+    || timestamp.getUTCDate() !== day
+    || timestamp.getUTCHours() !== hour
+    || timestamp.getUTCMinutes() !== minute
+    || timestamp.getUTCSeconds() !== second
+    || timestamp.getUTCDay() !== weekday) return undefined;
+  return timestamp.toISOString();
+}
+
+function hashProcessIncarnation(
+  platform: "linux" | "darwin",
+  bootSessionIdentity: string,
+  pid: number,
+  processStartKind: "proc-start-ticks" | "ps-lstart-utc",
+  processStart: string,
+): string {
+  const canonical = [
+    `version=${PROCESS_INCARNATION_WITNESS_VERSION}`,
+    `platform=${platform}`,
+    `bootSessionIdentity=${bootSessionIdentity}`,
+    `pid=${pid}`,
+    `processStartKind=${processStartKind}`,
+    `processStart=${processStart}`,
+    "",
+  ].join("\n");
+  return createHash("sha256").update(canonical, "utf8").digest("base64url");
+}
+
+function processIncarnationForPid(
+  pid: number,
+  bootSessionIdentity: (platform: NodeJS.Platform) => string | undefined =
+    productionBootSessionIdentity,
+): string | null | undefined {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  const initialPresence = processPresence(pid);
+  if (initialPresence === "absent") return null;
+  if (initialPresence === "indeterminate") return undefined;
+  try {
+    if (process.platform !== "linux" && process.platform !== "darwin") return undefined;
+    const bootBefore = canonicalBootSessionIdentity(bootSessionIdentity(process.platform));
+    if (bootBefore === undefined) return undefined;
+    const startBefore = process.platform === "linux"
+      ? linuxProcessStartTicks(pid)
+      : macosProcessStart(pid);
+    if (startBefore === undefined) return undefined;
+    const middlePresence = processPresence(pid);
+    if (middlePresence === "absent") return null;
+    if (middlePresence === "indeterminate") return undefined;
+    const startAfter = process.platform === "linux"
+      ? linuxProcessStartTicks(pid)
+      : macosProcessStart(pid);
+    const bootAfter = canonicalBootSessionIdentity(bootSessionIdentity(process.platform));
+    if (startAfter === undefined
+      || bootAfter === undefined
+      || startBefore !== startAfter
+      || bootBefore !== bootAfter) return undefined;
+    const finalPresence = processPresence(pid);
+    if (finalPresence === "absent") return null;
+    if (finalPresence === "indeterminate") return undefined;
+    return hashProcessIncarnation(
+      process.platform,
+      bootBefore,
+      pid,
+      process.platform === "linux" ? "proc-start-ticks" : "ps-lstart-utc",
+      startBefore,
+    );
+  } catch {
+    if (processPresence(pid) === "absent") return null;
     return undefined;
   }
 }
@@ -1208,7 +1384,10 @@ export class RelayV2StateSnapshotSpool {
     this.now = options.now ?? Date.now;
     this.testHooks = options.testHooks;
     this.processIncarnationProbe = options.testHooks?.processIncarnationForPid
-      ?? processIncarnationForPid;
+      ?? ((pid) => processIncarnationForPid(
+        pid,
+        options.testHooks?.bootSessionIdentity ?? productionBootSessionIdentity,
+      ));
     const incarnation = this.processIncarnationProbe(process.pid);
     if (incarnation === null || incarnation === undefined) {
       throw new RelayV2StateSnapshotSpoolError(

@@ -110,6 +110,7 @@ try {
 }
 
 process.on("message", async (message) => {
+  if (message?.type === "exit") process.exit(0);
   if (!spool) return;
   if (message?.type === "cleanup") {
     try {
@@ -127,7 +128,6 @@ process.on("message", async (message) => {
       process.send({ type: "close-result", ok: false, code: error?.code ?? null });
     }
   }
-  if (message?.type === "exit") process.exit(0);
 });
 
 if (spool) {
