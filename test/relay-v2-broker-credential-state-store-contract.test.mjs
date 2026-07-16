@@ -210,6 +210,10 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
   );
   assert.equal(manifest.nativeInterface.openArguments[0].exactKeys.join(","),
     "trustedHome,maxStateBytes");
+  assert.equal(manifest.nativeInterface.openArguments[0].trustedHome.accountHomeRootOnly, true);
+  assert.equal(manifest.nativeInterface.openArguments[0].trustedHome.descendantPathAllowed, false);
+  assert.equal(manifest.nativeInterface.openArguments[0].maxStateBytes.mustEqualFrozenValue, true);
+  assert.equal(manifest.nativeInterface.openArguments[0].maxStateBytes.callerConfigurable, false);
   assert.equal(manifest.openUnion.pathConfigurationAllowed, false);
   assert.equal(manifest.openUnion.implicitHomeLookupAllowed, false);
   assert.deepEqual(manifest.nativeInterface.storeMethods, ["runExclusive", "close"]);
@@ -217,6 +221,7 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
   assert.deepEqual(manifest.port.runExclusive.compareAndPublishOutcomes.uncertain, ["outcome"]);
   assert.equal(manifest.port.close.admittedTransactionsRemainUsableDuringOrdinaryClose, true);
   assert.equal(manifest.binaryStorage.container.fileLengthBytes, 134217984);
+  assert.equal(manifest.binaryStorage.container.layoutAlignmentBytes, 128);
   assert.deepEqual(
     manifest.binaryStorage.container.regions.map(({ name, offset, capacity }) => ({ name, offset, capacity })),
     [
@@ -230,6 +235,16 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
   assert.deepEqual(checksum.covers, { offset: 0, length: 96 });
   assert.deepEqual(manifest.binaryStorage.container.positionalIoOnly, ["pwrite", "write_at"]);
   assert.equal(manifest.binaryStorage.container.sharedCursorOrWriteAllowed, false);
+  assert.equal(manifest.binaryStorage.container.namedReplaceAllowed, false);
+  assert.equal(manifest.binaryStorage.container.renameAllowed, false);
+  assert.equal(
+    manifest.binaryStorage.container.missingInitialization.initialPayloads,
+    "both-67108864-byte-regions-logically-all-zero",
+  );
+  assert.deepEqual(
+    manifest.port.runExclusive.postPublishFailure.provenNoCommitCodes,
+    ["INVALID_ARGUMENT", "INVALID_REVISION", "STATE_TOO_LARGE", "GENERATION_EXHAUSTED"],
+  );
   assert.equal(
     manifest.binaryStorage.container.locking.primitive,
     "process-wide-exclusive-kernel-lock-on-the-same-container-descriptor",
@@ -484,46 +499,159 @@ test("runtime store wrapper closes raw operation shapes and legal error codes", 
   await changingBytes.store.close();
 });
 
-test("runtime runExclusive requires exactly one settled callback without identity echo", async () => {
-  const rawRevision = Object.freeze({});
-  const transaction = Object.freeze({
-    read: async () => ({ outcome: "missing", revision: rawRevision }),
-    compareAndPublish: async () => ({ outcome: "uncertain" }),
+test("post-publish malformed results and unstructured failures terminal-close the store", async () => {
+  const openRaw = (rawPublish) => {
+    const rawRevision = Object.freeze({});
+    let publicationAttempts = 0;
+    const transaction = Object.freeze({
+      read: async () => ({ outcome: "missing", revision: rawRevision }),
+      compareAndPublish: async (...args) => {
+        publicationAttempts += 1;
+        return rawPublish(...args);
+      },
+    });
+    const opened = stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult({
+      status: "opened",
+      selfCheck: "passed",
+      store: Object.freeze({
+        runExclusive: async (callback) => { await callback(transaction); },
+        close: async () => undefined,
+      }),
+    });
+    return { store: opened.store, publicationAttempts: () => publicationAttempts };
+  };
+
+  const cases = [
+    ["malformed closed-union result", async () => ({ outcome: "swapped" }), "NATIVE_INTERFACE_INVALID"],
+    ["unstructured raw failure", async () => { throw new Error("raw post-publish failure"); }, "NATIVE_INTERFACE_INVALID"],
+    ["exact error without no-commit proof", async () => { throw rawFailure("STORE_IO"); }, "STORE_IO"],
+  ];
+  for (const [name, rawPublish, expectedCode] of cases) {
+    const context = openRaw(rawPublish);
+    await context.store.runExclusive(async (transaction) => {
+      const current = await transaction.read();
+      await assert.rejects(
+        transaction.compareAndPublish(current.revision, new Uint8Array([1])),
+        (error) => error.code === expectedCode,
+        name,
+      );
+      await assert.rejects(
+        transaction.read(),
+        (error) => error.code === "STORE_CLOSED",
+        `${name} fences the active transaction`,
+      );
+    });
+    assert.equal(context.publicationAttempts(), 1, `${name} crossed the raw publish boundary`);
+    await assert.rejects(
+      context.store.runExclusive(() => undefined),
+      (error) => error.code === "STORE_CLOSED",
+      `${name} fences new admission`,
+    );
+    assert.equal(context.publicationAttempts(), 1, `${name} is never resent`);
+    await context.store.close();
+  }
+
+  const provenNoCommit = openRaw(async () => { throw rawFailure("GENERATION_EXHAUSTED"); });
+  await provenNoCommit.store.runExclusive(async (transaction) => {
+    const current = await transaction.read();
+    await assert.rejects(
+      transaction.compareAndPublish(current.revision, new Uint8Array([1])),
+      (error) => error.code === "GENERATION_EXHAUSTED",
+    );
+    assert.equal((await transaction.read()).outcome, "missing");
   });
+  await provenNoCommit.store.runExclusive(async (transaction) => {
+    assert.equal((await transaction.read()).outcome, "missing");
+  });
+  await provenNoCommit.store.close();
+});
+
+test("runtime runExclusive requires exactly one settled callback without identity echo", async () => {
   const openRaw = (runExclusive) => stateStore.parseRelayV2BrokerCredentialStateStoreOpenResult({
     status: "opened",
     selfCheck: "passed",
     store: Object.freeze({ runExclusive, close: async () => undefined }),
   }).store;
 
+  const inertTransaction = Object.freeze({
+    read: async () => ({ outcome: "missing", revision: Object.freeze({}) }),
+    compareAndPublish: async () => ({ outcome: "uncertain" }),
+  });
+
   const noEcho = openRaw(async (callback) => {
-    await callback(transaction);
+    await callback(inertTransaction);
     return "unrelated-native-result";
   });
   assert.equal(await noEcho.runExclusive(() => "wrapper-result"), "wrapper-result");
   await noEcho.close();
 
   const duplicate = openRaw(async (callback) => {
-    await callback(transaction);
-    try { await callback(transaction); } catch {}
+    await callback(inertTransaction);
+    try { await callback(inertTransaction); } catch {}
   });
   await assert.rejects(
     duplicate.runExclusive(() => undefined),
     (error) => error.code === "NATIVE_INTERFACE_INVALID",
   );
+  await assert.rejects(
+    duplicate.runExclusive(() => undefined),
+    (error) => error.code === "STORE_CLOSED",
+  );
   await duplicate.close();
 
-  const release = deferred();
-  const early = openRaw((callback) => {
-    void callback(transaction);
-    return undefined;
-  });
-  await assert.rejects(
-    early.runExclusive(async () => { await release.promise; }),
-    (error) => error.code === "NATIVE_INTERFACE_INVALID",
-  );
-  release.resolve();
-  await early.close();
+  for (const settlement of ["resolve", "reject", "throw"]) {
+    const release = deferred();
+    const entered = deferred();
+    const callbackDone = deferred();
+    const rawRevision = Object.freeze({});
+    const rawBacking = { publicationAttempts: 0 };
+    const transaction = Object.freeze({
+      read: async () => ({ outcome: "missing", revision: rawRevision }),
+      compareAndPublish: async () => {
+        rawBacking.publicationAttempts += 1;
+        return { outcome: "uncertain" };
+      },
+    });
+    const early = openRaw((callback) => {
+      const pendingCallback = callback(transaction);
+      void pendingCallback.then(callbackDone.resolve, callbackDone.resolve);
+      if (settlement === "resolve") return undefined;
+      if (settlement === "reject") return Promise.reject(rawFailure("STORE_BUSY"));
+      throw rawFailure("STORE_BUSY");
+    });
+    const running = early.runExclusive(async (wrappedTransaction) => {
+      entered.resolve();
+      await release.promise;
+      await assert.rejects(
+        wrappedTransaction.read(),
+        (error) => error.code === "STORE_CLOSED",
+      );
+      await assert.rejects(
+        wrappedTransaction.compareAndPublish(Object.freeze({}), new Uint8Array([1])),
+        (error) => error.code === "STORE_CLOSED",
+      );
+    });
+    const rejected = assert.rejects(
+      running,
+      (error) => error.code === "NATIVE_INTERFACE_INVALID",
+      `raw early ${settlement} is closed`,
+    );
+    await entered.promise;
+    await rejected;
+    await assert.rejects(
+      early.runExclusive(() => undefined),
+      (error) => error.code === "STORE_CLOSED",
+      `raw early ${settlement} fences new admission`,
+    );
+    release.resolve();
+    await callbackDone.promise;
+    assert.equal(
+      rawBacking.publicationAttempts,
+      0,
+      `raw early ${settlement} cannot publish from its background callback`,
+    );
+    await early.close();
+  }
 });
 
 registerRelayV2BrokerCredentialStateStoreConformance({

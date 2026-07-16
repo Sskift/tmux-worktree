@@ -139,8 +139,9 @@ export interface RelayV2BrokerCredentialStateStore {
 }
 
 /**
- * The caller supplies the already-trusted account home. Native open must
- * verify caller ownership and must not consult HOME or derive input paths.
+ * The caller supplies the already-trusted absolute account-home root itself,
+ * never a descendant path. Native open re-verifies root ownership, must not
+ * consult HOME or derive input paths, and enforces the exact frozen limit.
  */
 export interface RelayV2BrokerCredentialStateStoreOpenOptions {
   trustedHome: string;
@@ -197,6 +198,19 @@ const UNSUPPORTED_REASONS = new Set<RelayV2BrokerCredentialStateStoreUnsupported
 const ERROR_CODES = new Set<RelayV2BrokerCredentialStateStoreErrorCode>(
   Object.keys(ERROR_MESSAGES) as RelayV2BrokerCredentialStateStoreErrorCode[],
 );
+
+/**
+ * Once the raw publish method has been invoked, only these exact native errors
+ * prove that publication never began. Every other failure terminal-fences the
+ * wrapper because the native boundary can no longer prove that no bytes were
+ * committed.
+ */
+const PUBLISH_PROVEN_NO_COMMIT_CODES = new Set<RelayV2BrokerCredentialStateStoreErrorCode>([
+  "INVALID_ARGUMENT",
+  "INVALID_REVISION",
+  "STATE_TOO_LARGE",
+  "GENERATION_EXHAUSTED",
+]);
 
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
   const actual = Reflect.ownKeys(value);
@@ -599,7 +613,7 @@ implements RelayV2BrokerCredentialStateTransaction<TransactionScope> {
     try {
       pending = this.#publishMethod.call(this.#receiver, rawExpected, copiedNext.bytes);
     } catch (error) {
-      return Promise.reject(nativeOperationError(error));
+      return Promise.reject(this.#store.mapPostPublishFailure(error));
     }
     return Promise.resolve(pending).then(
       (value): RelayV2BrokerCredentialStatePublish<TransactionScope> => {
@@ -613,7 +627,7 @@ implements RelayV2BrokerCredentialStateTransaction<TransactionScope> {
             if (!hasExactKeys(snapshot, ["outcome"])) {
               throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
             }
-            this.#store.poisonUncertain();
+            this.#store.terminalFence();
             return Object.freeze({ outcome: "uncertain" });
           }
           if (
@@ -630,10 +644,11 @@ implements RelayV2BrokerCredentialStateTransaction<TransactionScope> {
           return Object.freeze({ outcome: snapshot.outcome, current }) as
             RelayV2BrokerCredentialStatePublish<TransactionScope>;
         } catch (error) {
+          this.#store.terminalFence();
           throw nativeOperationError(error);
         }
       },
-      (error) => { throw nativeOperationError(error); },
+      (error) => { throw this.#store.mapPostPublishFailure(error); },
     );
   }
 }
@@ -666,9 +681,23 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
     return this.#terminalPoisoned;
   }
 
-  poisonUncertain(): void {
+  terminalFence(): void {
     this.#terminalPoisoned = true;
     this.#admissionClosed = true;
+  }
+
+  mapPostPublishFailure(error: unknown): RelayV2BrokerCredentialStateStoreError {
+    const mapped = nativeOperationError(error);
+    const code = snapshotOwnDataField(mapped, "code");
+    if (
+      typeof code !== "string"
+      || !PUBLISH_PROVEN_NO_COMMIT_CODES.has(
+        code as RelayV2BrokerCredentialStateStoreErrorCode,
+      )
+    ) {
+      this.terminalFence();
+    }
+    return mapped;
   }
 
   runExclusive<Result>(
@@ -688,6 +717,7 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
     const nativeCallback = async (rawTransaction: unknown): Promise<unknown> => {
       if (callbackInvoked) {
         protocolViolation = true;
+        this.terminalFence();
         throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
       }
       callbackInvoked = true;
@@ -695,6 +725,7 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
       try {
         transaction = new NativeTransactionAdapter(this, rawTransaction);
       } catch (error) {
+        this.terminalFence();
         throw nativeOperationError(error);
       }
       try {
@@ -712,17 +743,28 @@ class NativeStoreAdapter implements RelayV2BrokerCredentialStateStore {
     try {
       pending = this.#runMethod.call(this.#receiver, nativeCallback);
     } catch (error) {
+      if (callbackInvoked) {
+        this.terminalFence();
+        return Promise.reject(
+          new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID"),
+        );
+      }
       return Promise.reject(nativeOperationError(error));
     }
     return Promise.resolve(pending).then(
       () => {
         if (!callbackInvoked || !callbackSettled || protocolViolation) {
+          this.terminalFence();
           throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
         }
         if (!operationSucceeded) throw operationError;
         return operationValue;
       },
       (error) => {
+        if (callbackInvoked || protocolViolation) {
+          this.terminalFence();
+          throw new RelayV2BrokerCredentialStateStoreError("NATIVE_INTERFACE_INVALID");
+        }
         throw nativeOperationError(error);
       },
     );

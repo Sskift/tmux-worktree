@@ -20,11 +20,16 @@
         "trustedHome": {
           "type": "absolute-path",
           "authority": "caller-supplied-account-owned-root",
-          "implicitHomeLookupAllowed": false
+          "implicitHomeLookupAllowed": false,
+          "accountHomeRootOnly": true,
+          "descendantPathAllowed": false,
+          "nativeOwnerAndRootVerificationRequired": true
         },
         "maxStateBytes": {
           "type": "integer",
           "value": 67108864,
+          "mustEqualFrozenValue": true,
+          "callerConfigurable": false,
           "enforcedAsAdmissionLimit": true
         }
       }
@@ -45,6 +50,7 @@
       "getterThrow": "NATIVE_INTERFACE_INVALID",
       "rawExactErrorCode": "copy-and-rewrap-local-store-error",
       "unstructuredRawThrow": "NATIVE_INTERFACE_INVALID",
+      "postPublishUnprovenFailure": "mapped-error-and-terminal-close-store-instance",
       "rawStoreEscapesToBusinessOwner": false,
       "rawTransactionEscapesToBusinessOwner": false,
       "rawRevisionEscapesToBusinessOwner": false,
@@ -180,6 +186,32 @@
         "automaticRetryAllowed": false,
         "recovery": "close-then-explicit-open-self-check-and-authority-continuity"
       },
+      "terminalFence": {
+        "triggers": [
+          "uncertain-publish-outcome",
+          "raw-callback-duplicate",
+          "raw-run-settles-before-callback",
+          "raw-run-rejects-or-throws-after-callback-admission",
+          "post-publish-malformed-result",
+          "post-publish-error-without-proven-no-commit-code"
+        ],
+        "currentTransactionFurtherOperations": "STORE_CLOSED",
+        "futureRunExclusiveOnSameStore": "STORE_CLOSED",
+        "automaticRetryAllowed": false,
+        "recovery": "close-then-explicit-open-self-check-and-authority-continuity"
+      },
+      "postPublishFailure": {
+        "rawInvocationIsPublicationBoundary": true,
+        "provenNoCommitCodes": [
+          "INVALID_ARGUMENT",
+          "INVALID_REVISION",
+          "STATE_TOO_LARGE",
+          "GENERATION_EXHAUSTED"
+        ],
+        "malformedOrUnstructuredResult": "NATIVE_INTERFACE_INVALID-and-terminal-close-store-instance",
+        "allOtherThrownOrRejectedErrors": "mapped-closed-error-and-terminal-close-store-instance",
+        "automaticRetryAllowed": false
+      },
       "byteOwnership": {
         "read": "fresh-native-copy-per-result-caller-mutation-never-aliases-store",
         "definitiveCurrent": "fresh-native-copy-caller-mutation-never-aliases-store",
@@ -188,6 +220,7 @@
       "nativeCallbackContract": {
         "invocationCount": "exactly-one",
         "nativeSettlesAfterCallback": true,
+        "protocolViolation": "NATIVE_INTERFACE_INVALID-and-terminal-close-before-active-callback-can-continue",
         "operationResultOwner": "typescript-wrapper",
         "nativeIdentityEchoRequired": false,
         "businessExceptionRoundTripThroughNativeRequired": false
@@ -198,7 +231,8 @@
       "rejectsNewTransactionsAtBarrierStart": true,
       "waitsForAdmittedTransactions": true,
       "admittedTransactionsRemainUsableDuringOrdinaryClose": true,
-      "onlyUncertainPoisonsAdmittedTransactions": true,
+      "ordinaryClosePoisonsAdmittedTransactions": false,
+      "terminalFencePoisonsAdmittedTransactions": true,
       "resolvesAfterNativeResourcesClose": true,
       "requiredBeforeReopenAfterUncertain": true
     }
@@ -208,6 +242,8 @@
     "container": {
       "kind": "single-descriptor-backed-fixed-length",
       "fileLengthBytes": 134217984,
+      "layoutAlignmentBytes": 128,
+      "alignmentRule": "every-region-offset-capacity-and-file-length-is-a-multiple-of-128",
       "descriptorOnlyAfterOpen": true,
       "positionalIoOnly": ["pwrite", "write_at"],
       "sharedCursorOrWriteAllowed": false,
@@ -222,6 +258,7 @@
       "missingInitialization": {
         "absentContainer": "securely-create-one-owner-only-container-at-exact-file-length",
         "initialHeaders": "both-128-byte-regions-all-zero",
+        "initialPayloads": "both-67108864-byte-regions-logically-all-zero",
         "durabilityRequiredBeforeOpened": true,
         "existingWrongLength": "STORE_CORRUPT",
         "existingUnsafeObject": "preserve-and-return-invalid"
@@ -326,6 +363,7 @@
     "missing-native-is-unsupported-and-never-a-v2-or-v1-fallback-signal",
     "existing-invalid-state-is-preserved-and-never-reclassified-as-missing",
     "uncertain-terminal-closes-the-store-until-close-explicit-open-self-check-and-continuity",
+    "raw-callback-protocol-and-unproven-post-publish-failures-terminal-fence-the-store",
     "prototype-json-lock-temp-artifacts-remain-untouched",
     "relay-v2-production-capability-remains-disabled"
   ]
