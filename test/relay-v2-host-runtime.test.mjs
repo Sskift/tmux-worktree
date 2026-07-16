@@ -1975,6 +1975,37 @@ test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol 
       assert.equal(JSON.stringify(response).includes(secret), false);
       assert.equal(h.state.closes.some(({ code: closeCode }) => closeCode === 1011), false);
     }
+
+    for (const [kind, makeFailure] of [
+      ["error", (secret) => Object.assign(new Error(secret), {
+        name: "RelayV2StateSnapshotSpoolError",
+        code: "SNAPSHOT_EXPIRED",
+        details: null,
+      })],
+      ["object", (secret) => ({
+        name: "RelayV2StateSnapshotSpoolError",
+        code: "SNAPSHOT_EXPIRED",
+        details: null,
+        message: secret,
+      })],
+    ]) {
+      const secret = `unbranded-${kind}-spool-secret`;
+      const h = createHarness({
+        stateSnapshotGet: async () => { throw makeFailure(secret); },
+      });
+      const routeBinding = await ready(h);
+      const request = fixture("state-snapshot-get-first");
+      request.requestId = `unbranded-spool-${kind}`;
+      request.expectedHostEpoch = HOST_EPOCH;
+      send(h.runtime, routeBinding, request);
+      await settle(8);
+
+      assert.equal(h.state.sent.some(({ frame }) => frame.requestId === request.requestId), false);
+      assert.equal(h.state.sent.some(({ frame }) => frame.error?.code === "SNAPSHOT_EXPIRED"), false);
+      assert.equal(JSON.stringify(h.state.sent).includes(secret), false);
+      assert.equal(h.state.closes.at(-1).code, 1011);
+      assert.equal(h.state.closes.at(-1).reason, "authority_failure");
+    }
   });
 });
 

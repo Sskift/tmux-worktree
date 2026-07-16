@@ -219,15 +219,22 @@ export class RelayV2StateSnapshotSpoolError extends Error {
 export function isRelayV2StateSnapshotSpoolError(
   error: unknown,
 ): error is RelayV2StateSnapshotSpoolError {
-  if (!(error instanceof Error)
-    || error.name !== "RelayV2StateSnapshotSpoolError"
-    || (error as Record<PropertyKey, unknown>)[RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR] !== true
-    || !RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR_CODES.has(
-      (error as { code?: unknown }).code as string,
-    )) return false;
-  const details = (error as { details?: unknown }).details;
+  if (!(error instanceof Error)) return false;
+  const candidate = error as unknown as Record<PropertyKey, unknown>;
+  if (!Object.hasOwn(candidate, RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR)
+    || candidate[RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR] !== true
+    || !Object.hasOwn(candidate, "name")
+    || candidate.name !== "RelayV2StateSnapshotSpoolError"
+    || !Object.hasOwn(candidate, "code")
+    || typeof candidate.code !== "string"
+    || !RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR_CODES.has(candidate.code)
+    || !Object.hasOwn(candidate, "details")) return false;
+  const details = candidate.details;
   return details === null
-    || (!!details && typeof details === "object" && !Array.isArray(details));
+    || (!!details
+      && typeof details === "object"
+      && !Array.isArray(details)
+      && Object.getPrototypeOf(details) === Object.prototype);
 }
 
 interface SnapshotBinding {
@@ -810,7 +817,7 @@ function expiredError(): RelayV2StateSnapshotSpoolError {
 }
 
 function structuredSpoolError(error: unknown): RelayV2StateSnapshotSpoolError {
-  if (isRelayV2StateSnapshotSpoolError(error)) return error;
+  if (error instanceof RelayV2StateSnapshotSpoolError) return error;
   return new RelayV2StateSnapshotSpoolError(
     "INTERNAL",
     "snapshot spool persistence failed closed",
@@ -1748,7 +1755,7 @@ export class RelayV2StateSnapshotSpool {
         return result;
       });
     } catch (error) {
-      if (!isRelayV2StateSnapshotSpoolError(error)) {
+      if (!(error instanceof RelayV2StateSnapshotSpoolError)) {
         this.fatalUnavailable = true;
       }
       throw structuredSpoolError(error);
