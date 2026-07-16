@@ -115,7 +115,7 @@ test("TW RPC v2 manifest and capability golden are explicit and parallel to froz
   }
 });
 
-test("TW RPC v2 fixtures freeze list, correlated create, fenced kill, and outcome unions", () => {
+test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
   assert.deepEqual(
     rpcV2.parseRpcV2CreateWorktreeRequest(cases.wire.createWorktree.request),
     cases.wire.createWorktree.request,
@@ -128,20 +128,166 @@ test("TW RPC v2 fixtures freeze list, correlated create, fenced kill, and outcom
     rpcV2.parseRpcV2KillSessionRequest(cases.wire.killSession.request),
     cases.wire.killSession.request,
   );
-  for (const normalized of [
-    cases.wire.list.normalized,
-    cases.wire.createWorktree.normalized,
-    cases.wire.createTerminal.normalized,
-    cases.wire.killSession.normalized,
-    ...Object.values(cases.wire.outcomes),
-  ]) {
-    const line = `${JSON.stringify(normalized)}\n`;
-    assert.equal(line.trim().split("\n").length, 1);
-    assert.deepEqual(JSON.parse(line), normalized);
-  }
   assert.deepEqual(Object.keys(cases.wire.outcomes), [
     "createFailed", "createInDoubt", "killFailed", "killInDoubt",
   ]);
+});
+
+test("production execute mappers conform to frozen create and kill outcomes", () => {
+  const terminalList = () => rpcV2.buildRpcV2ListResponse(
+    { version: 1, sessions: [storageCases.extended] },
+    [liveSession()],
+  );
+  const committedTerminal = () => ({
+    session: "tw-term-a1b2c",
+    cwd: "/repo/demo",
+    lifecycleV2: {
+      incarnation: cases.incarnation.base,
+      reservationCorrelation: cases.reservationCorrelation,
+    },
+  });
+
+  const worktreeIdentity = {
+    ...cases.incarnation.baseIdentity,
+    sessionId: "$9",
+    rawName: "demo-fix",
+    sessionCreated: "1783700012",
+  };
+  const worktreeExtension = state.buildManagedSessionLifecycleExtension(
+    worktreeIdentity,
+    cases.reservationCorrelation,
+    null,
+  );
+  const worktreeManaged = state.withManagedSessionLifecycleExtension({
+    name: "demo-fix",
+    kind: "worktree",
+    profile: "dashboard",
+    project: "demo",
+    repoPath: "/repo/demo",
+    worktreePath: "/worktrees/demo/demo-fix-abc12",
+    branch: "demo-fix-abc12",
+    baseBranch: "main",
+    createdAt: "2026-07-12T00:00:01.000Z",
+  }, worktreeExtension);
+  const worktreeList = () => rpcV2.buildRpcV2ListResponse(
+    { version: 1, sessions: [worktreeManaged] },
+    [liveSession({
+      name: "demo-fix",
+      rawName: "demo-fix",
+      sessionId: "$9",
+      sessionCreated: "1783700012",
+      created: 1783700012,
+      activity: 1783700020,
+      cwd: "/worktrees/demo/demo-fix-abc12",
+    })],
+  );
+  const committedWorktree = () => ({
+    session: "demo-fix",
+    workDir: "/worktrees/demo/demo-fix-abc12",
+    worktree: null,
+    lifecycleV2: worktreeExtension,
+  });
+  const worktreeDeps = {
+    loadConfig: () => ({ projects: { demo: { path: "/repo/demo", branch: "main" } } }),
+    createWorktree: committedWorktree,
+  };
+
+  let postCreateListCalls = 0;
+  const mappings = [
+    {
+      id: "create-terminal-success",
+      expected: cases.wire.createTerminal.normalized,
+      execute: () => rpcV2.executeRpcV2CreateTerminal(cases.wire.createTerminal.request, {
+        createTerminal: committedTerminal,
+        currentList: terminalList,
+      }),
+    },
+    {
+      id: "create-worktree-success",
+      expected: cases.wire.createWorktree.normalized,
+      execute: () => rpcV2.executeRpcV2CreateWorktree(cases.wire.createWorktree.request, {
+        ...worktreeDeps,
+        currentList: worktreeList,
+      }),
+    },
+    {
+      id: "create-failed-before-commit",
+      expected: cases.wire.outcomes.createFailed,
+      execute: () => rpcV2.executeRpcV2CreateTerminal(cases.wire.createTerminal.request, {
+        createTerminal: () => { throw new Error("canonical preflight rejected the request"); },
+        currentList: () => {
+          postCreateListCalls += 1;
+          return terminalList();
+        },
+      }),
+    },
+    {
+      id: "create-in-doubt-after-commit",
+      expected: cases.wire.outcomes.createInDoubt,
+      execute: () => rpcV2.executeRpcV2CreateWorktree(cases.wire.createWorktree.request, {
+        ...worktreeDeps,
+        currentList: () => { throw new Error("canonical create result is uncertain"); },
+      }),
+    },
+    {
+      id: "kill-failed",
+      expected: cases.wire.outcomes.killFailed,
+      execute: () => withTempDir("tw-rpc-v2-mapper-kill-failed-", (root) => {
+        const path = join(root, "state.json");
+        writeState(path, [storageCases.extended]);
+        return rpcV2.executeRpcV2KillSession(cases.wire.killSession.request, {
+          statePath: path,
+          listTmuxSessionLifecycleEntries: () => [liveSession({ serverPid: "4201" })],
+          killTmuxSessionByLifecycleIdentity: () => {
+            throw new Error("mismatched incarnation must not reach kill");
+          },
+        });
+      }),
+    },
+    {
+      id: "kill-in-doubt",
+      expected: cases.wire.outcomes.killInDoubt,
+      execute: () => withTempDir("tw-rpc-v2-mapper-kill-uncertain-", (root) => {
+        const path = join(root, "state.json");
+        writeState(path, [storageCases.extended]);
+        return rpcV2.executeRpcV2KillSession(cases.wire.killSession.request, {
+          statePath: path,
+          listTmuxSessionLifecycleEntries: () => [liveSession()],
+          killTmuxSessionByLifecycleIdentity: () => "in_doubt",
+        });
+      }),
+    },
+  ];
+  for (const mapping of mappings) {
+    assert.deepEqual(mapping.execute(), mapping.expected, mapping.id);
+  }
+  assert.equal(postCreateListCalls, 0);
+
+  const missingAfterCommit = rpcV2.executeRpcV2CreateTerminal(
+    cases.wire.createTerminal.request,
+    {
+      createTerminal: committedTerminal,
+      currentList: () => ({ protocolVersion: 2, sessions: [] }),
+    },
+  );
+  assert.equal(missingAfterCommit.state, "in_doubt");
+  assert.equal(Object.hasOwn(missingAfterCommit, "sideEffect"), false);
+  assert.match(missingAfterCommit.error.message, /committed.*not visible/);
+
+  let validationCreateCalls = 0;
+  let validationListCalls = 0;
+  const validationFailed = rpcV2.executeRpcV2CreateWorktree(
+    cases.wire.createWorktree.request,
+    {
+      loadConfig: () => null,
+      createWorktree: () => { validationCreateCalls += 1; return committedWorktree(); },
+      currentList: () => { validationListCalls += 1; return worktreeList(); },
+    },
+  );
+  assert.equal(validationFailed.state, "failed");
+  assert.equal(validationFailed.sideEffect, "not_applied");
+  assert.equal(validationCreateCalls, 0);
+  assert.equal(validationListCalls, 0);
 });
 
 test("opaque incarnation binds server birth, session ID, raw name, creation, and birth marker", () => {
@@ -209,12 +355,6 @@ test("correlated create metadata is written to tmux and state, then projected co
 
   const listed = rpcV2.buildRpcV2ListResponse(managedState, [live]);
   assert.deepEqual(listed, cases.wire.list.normalized);
-  assert.deepEqual({
-    protocolVersion: 2,
-    operation: "create-terminal",
-    state: "succeeded",
-    session: listed.sessions[0],
-  }, cases.wire.createTerminal.normalized);
   assert.equal(listed.sessions[0].incarnation, created.lifecycleV2.incarnation);
   assert.deepEqual(listed.sessions[0].reservationCorrelation, cases.reservationCorrelation);
   assert.equal(listed.sessions[0].label, "demo");

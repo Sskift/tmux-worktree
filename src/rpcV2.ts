@@ -321,11 +321,31 @@ function createFailure(
   };
 }
 
+interface RpcV2CreateExecutionDeps {
+  currentList?: () => RpcV2ListResponse;
+  createWorktree?: typeof createManagedWorktreeSession;
+  createTerminal?: typeof createManagedTerminalSession;
+  loadConfig?: typeof loadConfigFile;
+}
+
+function committedCreateObservationFailure(
+  operation: "create-worktree" | "create-terminal",
+  session: string,
+  error: unknown,
+): RpcV2CreateResponse {
+  const detail = error instanceof Error ? error.message : String(error);
+  return createFailure(operation, new ManagedSessionLifecycleV2InDoubtError(
+    `created ${operation === "create-worktree" ? "worktree" : "terminal"} ${session} committed but post-commit observation is uncertain: ${detail}`,
+  ));
+}
+
 export function executeRpcV2CreateWorktree(
   request: RpcV2CreateWorktreeRequest,
+  deps: RpcV2CreateExecutionDeps = {},
 ): RpcV2CreateResponse {
+  let created: ReturnType<typeof createManagedWorktreeSession>;
   try {
-    const config = loadConfigFile();
+    const config = (deps.loadConfig ?? loadConfigFile)();
     const configuredProject = request.arguments.project
       ? config?.projects[request.arguments.project]
       : undefined;
@@ -339,7 +359,7 @@ export function executeRpcV2CreateWorktree(
     const project = request.arguments.project || basename(projectDir) || "project";
     const title = request.arguments.name;
     const sessionName = (title ? `${project}-${title}` : project).slice(0, SESSION_NAME_MAX_LEN);
-    const created = createManagedWorktreeSession({
+    created = (deps.createWorktree ?? createManagedWorktreeSession)({
       aiCmd: request.arguments.aiCommand,
       projectDir,
       sessionName,
@@ -354,7 +374,12 @@ export function executeRpcV2CreateWorktree(
         displayLabel: null,
       },
     });
-    const session = currentRpcV2List().sessions.find((item) => (
+  } catch (error) {
+    return createFailure("create-worktree", error);
+  }
+
+  try {
+    const session = (deps.currentList ?? currentRpcV2List)().sessions.find((item) => (
       item.name === created.session
       && item.incarnation === created.lifecycleV2?.incarnation
     ));
@@ -365,17 +390,19 @@ export function executeRpcV2CreateWorktree(
     }
     return { protocolVersion: 2, operation: "create-worktree", state: "succeeded", session };
   } catch (error) {
-    return createFailure("create-worktree", error);
+    return committedCreateObservationFailure("create-worktree", created.session, error);
   }
 }
 
 export function executeRpcV2CreateTerminal(
   request: RpcV2CreateTerminalRequest,
+  deps: RpcV2CreateExecutionDeps = {},
 ): RpcV2CreateResponse {
+  let created: ReturnType<typeof createManagedTerminalSession>;
   try {
     const cwd = expandHomePath(request.arguments.cwd);
     const label = request.arguments.label ?? (basename(cwd) || "Terminal");
-    const created = createManagedTerminalSession({
+    created = (deps.createTerminal ?? createManagedTerminalSession)({
       cwd,
       profile: "dashboard",
       quiet: true,
@@ -384,7 +411,12 @@ export function executeRpcV2CreateTerminal(
         displayLabel: label,
       },
     });
-    const session = currentRpcV2List().sessions.find((item) => (
+  } catch (error) {
+    return createFailure("create-terminal", error);
+  }
+
+  try {
+    const session = (deps.currentList ?? currentRpcV2List)().sessions.find((item) => (
       item.name === created.session
       && item.incarnation === created.lifecycleV2?.incarnation
     ));
@@ -395,17 +427,18 @@ export function executeRpcV2CreateTerminal(
     }
     return { protocolVersion: 2, operation: "create-terminal", state: "succeeded", session };
   } catch (error) {
-    return createFailure("create-terminal", error);
+    return committedCreateObservationFailure("create-terminal", created.session, error);
   }
 }
 
 export function executeRpcV2KillSession(
   request: RpcV2KillSessionRequest,
+  deps: Parameters<typeof killManagedSessionV2>[1] = {},
 ): RpcV2KillSessionResponse {
   return {
     protocolVersion: 2,
     operation: "kill-session",
-    ...killManagedSessionV2(request),
+    ...killManagedSessionV2(request, deps),
   };
 }
 

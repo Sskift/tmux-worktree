@@ -202,11 +202,11 @@
       },
       "createInDoubt": {
         "protocolVersion": 2,
-        "operation": "create-terminal",
+        "operation": "create-worktree",
         "state": "in_doubt",
         "error": {
           "code": "IN_DOUBT",
-          "message": "canonical create result is uncertain"
+          "message": "created worktree demo-fix committed but post-commit observation is uncertain: canonical create result is uncertain"
         }
       },
       "killFailed": {
@@ -215,14 +215,14 @@
         "state": "failed",
         "sideEffect": "not_applied",
         "code": "INCARNATION_MISMATCH",
-        "message": "managed session incarnation changed"
+        "message": "managed session incarnation changed: tw-term-a1b2c"
       },
       "killInDoubt": {
         "protocolVersion": 2,
         "operation": "kill-session",
         "state": "in_doubt",
         "code": "IN_DOUBT",
-        "message": "exact tmux kill result is uncertain"
+        "message": "exact tmux kill result is uncertain: tw-term-a1b2c"
       }
     }
   },
