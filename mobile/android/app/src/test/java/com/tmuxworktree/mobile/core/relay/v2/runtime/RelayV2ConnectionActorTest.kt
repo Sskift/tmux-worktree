@@ -1156,6 +1156,23 @@ class RelayV2ConnectionActorTest {
         }
     }
 
+    @Test
+    fun `TLS validation failure is non retryable security failure`() = runBlocking {
+        val harness = Harness()
+        try {
+            assertTrue(harness.actor.connect(harness.profile, null))
+            val transport = harness.awaitTransport(0)
+            transport.fail(RelayV2TransportFailure(RelayV2TransportFailureKind.TLS_VALIDATION))
+
+            val failed = harness.actor.awaitFailure(RelayV2FailureKind.SECURITY)
+            assertEquals("TLS_VALIDATION_FAILED", failed.failure?.code)
+            assertFalse(requireNotNull(failed.failure).retryable)
+            assertEquals(1, transport.cancelCount)
+        } finally {
+            harness.close()
+        }
+    }
+
     private inner class Harness(
         val factory: FakeTransportFactory = FakeTransportFactory(),
         normalActionCapacity: Int = RelayV2ConnectionActor.DEFAULT_ACTION_CAPACITY,

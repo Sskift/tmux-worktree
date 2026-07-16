@@ -1341,6 +1341,8 @@ internal class RelayV2ConnectionActor(
         when (failure.kind) {
             RelayV2TransportFailureKind.PROTOCOL ->
                 failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, null)
+            RelayV2TransportFailureKind.TLS_VALIDATION ->
+                failConnection(RelayV2FailureKind.SECURITY, "TLS_VALIDATION_FAILED", false, null)
             RelayV2TransportFailureKind.NETWORK ->
                 failConnection(RelayV2FailureKind.TRANSPORT, "HOST_OFFLINE", true, null)
             RelayV2TransportFailureKind.UPGRADE -> when (failure.httpStatus) {

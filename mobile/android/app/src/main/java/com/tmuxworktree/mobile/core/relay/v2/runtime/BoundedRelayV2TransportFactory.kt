@@ -7,10 +7,14 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.security.SecureRandom
+import java.security.cert.CertificateException
+import java.security.cert.CertPathValidatorException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLHandshakeException
+import javax.net.ssl.SSLPeerUnverifiedException
 import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import kotlin.concurrent.thread
@@ -26,6 +30,7 @@ internal class BoundedRelayV2TransportFactory(
     private val sslSocketFactory: SSLSocketFactory = systemTrustSocketFactory(),
     private val additionalHostnameVerifier: HostnameVerifier? = null,
     private val addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
+    private val rawSocketFactory: () -> Socket = ::Socket,
     private val randomFactory: () -> SecureRandom = ::SecureRandom,
     private val resolveTimeoutMs: Int = DEFAULT_RESOLVE_TIMEOUT_MS,
     private val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
@@ -49,6 +54,7 @@ internal class BoundedRelayV2TransportFactory(
             sslSocketFactory = sslSocketFactory,
             additionalHostnameVerifier = additionalHostnameVerifier,
             addressResolver = addressResolver,
+            rawSocketFactory = rawSocketFactory,
             random = randomFactory(),
             resolveTimeoutMs = resolveTimeoutMs,
             connectTimeoutMs = connectTimeoutMs,
@@ -73,6 +79,7 @@ private class BoundedRelayV2Transport(
     private val sslSocketFactory: SSLSocketFactory,
     private val additionalHostnameVerifier: HostnameVerifier?,
     private val addressResolver: RelayV2AddressResolver,
+    private val rawSocketFactory: () -> Socket,
     private val random: SecureRandom,
     private val resolveTimeoutMs: Int,
     private val connectTimeoutMs: Int,
@@ -119,7 +126,7 @@ private class BoundedRelayV2Transport(
         try {
             val address = resolveAddress() ?: return
             if (terminal.get()) return
-            raw = Socket()
+            raw = rawSocketFactory()
             if (!registerSocket(raw)) return
             raw.connect(InetSocketAddress(address, endpoint.port), connectTimeoutMs)
             if (terminal.get()) return
@@ -139,7 +146,7 @@ private class BoundedRelayV2Transport(
             }
             tls.startHandshake()
             if (additionalHostnameVerifier?.verify(endpoint.host, tls.session) == false) {
-                throw IOException("Relay v2 TLS hostname verification failed")
+                throw RelayV2TlsValidationException()
             }
 
             val selected = BoundedRfc6455Handshake.perform(
@@ -189,6 +196,17 @@ private class BoundedRelayV2Transport(
             completeFailure(RelayV2TransportFailureKind.UPGRADE, failure.httpStatus)
         } catch (_: RelayV2WebSocketProtocolException) {
             completeProtocolFailure()
+        } catch (_: RelayV2TlsValidationException) {
+            completeFailure(RelayV2TransportFailureKind.TLS_VALIDATION)
+        } catch (failure: SSLHandshakeException) {
+            val kind = if (failure.isCertificateValidationFailure()) {
+                RelayV2TransportFailureKind.TLS_VALIDATION
+            } else {
+                RelayV2TransportFailureKind.NETWORK
+            }
+            completeFailure(kind)
+        } catch (_: SSLPeerUnverifiedException) {
+            completeFailure(RelayV2TransportFailureKind.TLS_VALIDATION)
         } catch (_: SocketTimeoutException) {
             completeFailure(RelayV2TransportFailureKind.NETWORK)
         } catch (_: IOException) {
@@ -314,4 +332,17 @@ private class BoundedRelayV2Transport(
         const val CLOSE_REPLY_TIMEOUT_MS = 1_000L
         const val PROTOCOL_CLOSE_TIMEOUT_MS = 1_000L
     }
+}
+
+private class RelayV2TlsValidationException : IOException("Relay v2 TLS validation failed")
+
+private fun SSLHandshakeException.isCertificateValidationFailure(): Boolean {
+    var current: Throwable? = this
+    while (current != null) {
+        if (current is CertificateException || current is CertPathValidatorException) return true
+        val next = current.cause
+        if (next === current) return false
+        current = next
+    }
+    return false
 }

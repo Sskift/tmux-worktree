@@ -38,6 +38,7 @@ internal enum class RelayV2ConnectionPhase {
 
 internal enum class RelayV2FailureKind {
     CONFIGURATION,
+    SECURITY,
     AUTH,
     DIALECT,
     SCHEMA,
@@ -224,6 +225,7 @@ internal enum class RelayV2TransportFailureKind {
     NETWORK,
     UPGRADE,
     PROTOCOL,
+    TLS_VALIDATION,
 }
 
 internal data class RelayV2TransportFailure(

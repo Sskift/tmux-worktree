@@ -16,6 +16,9 @@ import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
+import java.net.Socket
+import java.net.SocketAddress
+import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -372,7 +375,8 @@ class BoundedRelayV2TransportFactoryTest {
             val listener = RecordingListener()
             val transport = server.factory().open(openRequest(server.url("127.0.0.1")), listener)
             assertTrue(listener.terminal.await(3, TimeUnit.SECONDS))
-            assertEquals(RelayV2TransportFailureKind.NETWORK, listener.failure?.kind)
+            assertEquals(RelayV2TransportFailureKind.TLS_VALIDATION, listener.failure?.kind)
+            assertNull(listener.failure?.httpStatus)
             assertEquals(0, server.requests.size)
             assertSameTransportForEveryCallback(transport, listener)
         }
@@ -385,7 +389,8 @@ class BoundedRelayV2TransportFactoryTest {
                 listener,
             )
             assertTrue(listener.terminal.await(3, TimeUnit.SECONDS))
-            assertEquals(RelayV2TransportFailureKind.NETWORK, listener.failure?.kind)
+            assertEquals(RelayV2TransportFailureKind.TLS_VALIDATION, listener.failure?.kind)
+            assertNull(listener.failure?.httpStatus)
             assertEquals(0, server.requests.size)
             assertSameTransportForEveryCallback(transport, listener)
         }
@@ -521,6 +526,86 @@ class BoundedRelayV2TransportFactoryTest {
             transport.cancel()
             releaseServer.countDown()
             Thread.sleep(100)
+            assertEquals(listOf("open"), listener.events)
+            assertEquals(0, listener.terminalCount.get())
+            assertSameTransportForEveryCallback(transport, listener)
+        }
+    }
+
+    @Test
+    fun cancelDuringConnectClosesRegisteredProductionTransportSocketWithoutCallback() {
+        val blockingSocket = BlockingConnectSocket()
+        val listener = RecordingListener()
+        val factory = BoundedRelayV2TransportFactory(
+            addressResolver = ImmediateAddressResolver(InetAddress.getLoopbackAddress()),
+            rawSocketFactory = { blockingSocket },
+            connectTimeoutMs = 5_000,
+        )
+        val transport = factory.open(openRequest("wss://localhost/client"), listener)
+        assertTrue(blockingSocket.connectEntered.await(3, TimeUnit.SECONDS))
+        val startedAt = System.nanoTime()
+        transport.cancel()
+        val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+        assertTrue("connect cancel took ${elapsedMs}ms", elapsedMs < 500)
+        assertTrue(blockingSocket.connectExited.await(3, TimeUnit.SECONDS))
+        Thread.sleep(100)
+        assertTrue(listener.events.isEmpty())
+        assertEquals(0, listener.terminalCount.get())
+    }
+
+    @Test
+    fun cancelInterruptsProductionTlsSocketWriteBeforeDeclaredPayloadCompletes() {
+        RawTlsWebSocketServer().use { server ->
+            val firstFrameBytes = CountDownLatch(1)
+            val releaseDrain = CountDownLatch(1)
+            val drainFinished = CountDownLatch(1)
+            val receivedFrameBytes = AtomicInteger()
+            server.start { socket ->
+                socket.receiveBufferSize = 1_024
+                val request = server.readRequest(socket)
+                server.writeValidUpgrade(socket, request)
+                val input = socket.inputStream
+                val buffer = ByteArray(512)
+                try {
+                    val first = input.read(buffer)
+                    if (first > 0) {
+                        receivedFrameBytes.addAndGet(first)
+                        firstFrameBytes.countDown()
+                    }
+                    releaseDrain.await(3, TimeUnit.SECONDS)
+                    while (true) {
+                        val count = input.read(buffer)
+                        if (count == -1) break
+                        if (count > 0) receivedFrameBytes.addAndGet(count)
+                    }
+                } catch (_: IOException) {
+                    // Abrupt transport cancel may end TLS without a close_notify.
+                } finally {
+                    drainFinished.countDown()
+                }
+            }
+
+            val listener = RecordingListener()
+            val transport = server.factory(
+                rawSocketFactory = {
+                    Socket().apply { sendBufferSize = 1_024 }
+                },
+            ).open(openRequest(server.url()), listener)
+            assertTrue(listener.opened.await(3, TimeUnit.SECONDS))
+            assertTrue(transport.send(ByteArray(MAX_MESSAGE_BYTES) { 'w'.code.toByte() }))
+            assertTrue(firstFrameBytes.await(3, TimeUnit.SECONDS))
+            Thread.sleep(100)
+            val startedAt = System.nanoTime()
+            transport.cancel()
+            val elapsedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+            assertTrue("socket write cancel took ${elapsedMs}ms", elapsedMs < 500)
+            releaseDrain.countDown()
+            assertTrue(drainFinished.await(5, TimeUnit.SECONDS))
+            assertTrue(receivedFrameBytes.get() > 0)
+            assertTrue(
+                "entire declared frame reached the peer before cancel",
+                receivedFrameBytes.get() < CLIENT_ONE_MIB_FRAME_BYTES,
+            )
             assertEquals(listOf("open"), listener.events)
             assertEquals(0, listener.terminalCount.get())
             assertSameTransportForEveryCallback(transport, listener)
@@ -787,6 +872,7 @@ class BoundedRelayV2TransportFactoryTest {
         const val OPCODE_CLOSE = 0x8
         const val OPCODE_PING = 0x9
         const val OPCODE_PONG = 0xa
+        const val CLIENT_ONE_MIB_FRAME_BYTES = MAX_MESSAGE_BYTES + 14
     }
 }
 
@@ -858,6 +944,40 @@ private class ReadOnlyCredentialStore(
     override fun clear(reference: RelayV2CredentialReference) = Unit
 }
 
+private class ImmediateAddressResolver(
+    private val address: InetAddress,
+) : RelayV2AddressResolver {
+    override fun resolve(host: String): RelayV2AddressResolution =
+        object : RelayV2AddressResolution {
+            override fun await(timeoutMs: Int): List<InetAddress> = listOf(address)
+
+            override fun cancel() = Unit
+        }
+}
+
+private class BlockingConnectSocket : Socket() {
+    val connectEntered = CountDownLatch(1)
+    val connectExited = CountDownLatch(1)
+    private val closed = CountDownLatch(1)
+
+    override fun connect(endpoint: SocketAddress, timeout: Int) {
+        connectEntered.countDown()
+        try {
+            closed.await()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            connectExited.countDown()
+        }
+        throw SocketException("test socket was closed")
+    }
+
+    override fun close() {
+        closed.countDown()
+        super.close()
+    }
+}
+
 private class RawTlsWebSocketServer(
     certificateHostname: String = "localhost",
 ) : Closeable {
@@ -914,9 +1034,11 @@ private class RawTlsWebSocketServer(
     fun factory(
         addressResolver: RelayV2AddressResolver = RelayV2SystemAddressResolver,
         resolveTimeoutMs: Int = 2_000,
+        rawSocketFactory: () -> Socket = ::Socket,
     ): BoundedRelayV2TransportFactory = BoundedRelayV2TransportFactory(
         sslSocketFactory = clientCertificates.sslSocketFactory(),
         addressResolver = addressResolver,
+        rawSocketFactory = rawSocketFactory,
         resolveTimeoutMs = resolveTimeoutMs,
         connectTimeoutMs = 2_000,
         handshakeTimeoutMs = 2_000,
