@@ -296,11 +296,45 @@ internal data class RelayV2OutboxAttempt(
 internal data class RelayV2QueuedTargetRevalidation(
     val observedHostEpoch: String,
     val dedupeWindowId: String,
+    val sourceConfirmedTarget: RelayV2ReissueTargetSnapshot? = null,
+    val confirmationOrdinal: Long? = null,
 ) {
     init {
         requireOutboxId(observedHostEpoch)
         requireOutboxId(dedupeWindowId)
+        require((sourceConfirmedTarget == null) == (confirmationOrdinal == null))
+        confirmationOrdinal?.let { require(it in 1..MAX_JSON_INTEGER) }
     }
+
+    override fun toString(): String = "RelayV2QueuedTargetRevalidation(<redacted>)"
+}
+
+internal data class RelayV2ReissueTargetSnapshot(
+    val expectedHostEpoch: String,
+    val dedupeWindowId: String,
+    val scopeId: String,
+    val sessionId: String?,
+    val requestFingerprint: RelayV2RequestFingerprint,
+) {
+    init {
+        listOf(expectedHostEpoch, dedupeWindowId, scopeId).forEach(::requireOutboxId)
+        sessionId?.let(::requireOutboxId)
+    }
+
+    override fun toString(): String = "RelayV2ReissueTargetSnapshot(<redacted>)"
+}
+
+internal data class RelayV2ReissueLatestConfirmedTargetProof(
+    val sourceTarget: RelayV2ReissueTargetSnapshot,
+    val confirmedTarget: RelayV2ReissueTargetSnapshot,
+    val confirmationOrdinal: Long,
+) {
+    init {
+        require(sourceTarget.expectedHostEpoch != confirmedTarget.expectedHostEpoch)
+        require(confirmationOrdinal in 1..MAX_JSON_INTEGER)
+    }
+
+    override fun toString(): String = "RelayV2ReissueLatestConfirmedTargetProof(<redacted>)"
 }
 
 internal data class RelayV2ReissueLineageProof(
@@ -313,7 +347,11 @@ internal data class RelayV2ReissueLineageProof(
     val parentScopeId: String,
     val parentSessionId: String?,
     val parentRequestFingerprint: RelayV2RequestFingerprint,
-    val firstConfirmedHostEpoch: String?,
+    val replacementProfileId: String,
+    val replacementPrincipalId: String,
+    val replacementHostId: String,
+    val replacementCommandId: String,
+    val replacementInitialTarget: RelayV2ReissueTargetSnapshot,
 ) {
     init {
         listOf(
@@ -324,12 +362,12 @@ internal data class RelayV2ReissueLineageProof(
             parentExpectedHostEpoch,
             parentDedupeWindowId,
             parentScopeId,
+            replacementProfileId,
+            replacementPrincipalId,
+            replacementHostId,
+            replacementCommandId,
         ).forEach(::requireOutboxId)
         parentSessionId?.let(::requireOutboxId)
-        firstConfirmedHostEpoch?.let {
-            requireOutboxId(it)
-            require(parentExpectedHostEpoch != it)
-        }
     }
 
     override fun toString(): String = "RelayV2ReissueLineageProof(<redacted>)"
@@ -356,6 +394,7 @@ internal data class RelayV2OutboxEntry(
     val reissuedFromCommandId: String? = null,
     val targetRevalidation: RelayV2QueuedTargetRevalidation? = null,
     val reissueLineageProof: RelayV2ReissueLineageProof? = null,
+    val reissueLatestConfirmedTargetProof: RelayV2ReissueLatestConfirmedTargetProof? = null,
 ) {
     val id: RelayV2OutboxEntryId = RelayV2OutboxEntryId(
         profileId,
@@ -453,6 +492,10 @@ internal data class RelayV2OutboxEntry(
         }
         require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
         require((reissuedFromCommandId == null) == (reissueLineageProof == null))
+        require(reissueLatestConfirmedTargetProof == null || reissueLineageProof != null)
+        require(
+            reissueLineageProof != null || targetRevalidation?.sourceConfirmedTarget == null,
+        )
     }
 
     override fun toString(): String =
@@ -481,7 +524,6 @@ internal data class RelayV2OutboxEntry(
             "reissuedFromCommandId" to reissuedFromCommandId,
             "reissueLineageProof" to reissueLineageProof?.let {
                 mapOf(
-                    "firstConfirmedHostEpoch" to it.firstConfirmedHostEpoch,
                     "parentCommandId" to it.parentCommandId,
                     "parentDedupeWindowId" to it.parentDedupeWindowId,
                     "parentExpectedHostEpoch" to it.parentExpectedHostEpoch,
@@ -496,8 +538,21 @@ internal data class RelayV2OutboxEntry(
                     ),
                     "parentScopeId" to it.parentScopeId,
                     "parentSessionId" to it.parentSessionId,
+                    "replacementCommandId" to it.replacementCommandId,
+                    "replacementHostId" to it.replacementHostId,
+                    "replacementInitialTarget" to it.replacementInitialTarget.canonicalMap(),
+                    "replacementPrincipalId" to it.replacementPrincipalId,
+                    "replacementProfileId" to it.replacementProfileId,
                 )
             },
+            "reissueLatestConfirmedTargetProof" to
+                reissueLatestConfirmedTargetProof?.let {
+                    mapOf(
+                        "confirmationOrdinal" to it.confirmationOrdinal,
+                        "confirmedTarget" to it.confirmedTarget.canonicalMap(),
+                        "sourceTarget" to it.sourceTarget.canonicalMap(),
+                    )
+                },
             "replacementCommandId" to replacementCommandId,
             "requestFingerprint" to requestFingerprint.sha256Hex,
             "requestFingerprintSchemaVersion" to requestFingerprint.schemaVersion,
@@ -506,8 +561,10 @@ internal data class RelayV2OutboxEntry(
             "state" to state.persistedTag,
             "targetRevalidation" to targetRevalidation?.let {
                 mapOf(
+                    "confirmationOrdinal" to it.confirmationOrdinal,
                     "dedupeWindowId" to it.dedupeWindowId,
                     "observedHostEpoch" to it.observedHostEpoch,
+                    "sourceConfirmedTarget" to it.sourceConfirmedTarget?.canonicalMap(),
                 )
             },
         ),
@@ -1465,12 +1522,13 @@ internal class RelayV2OutboxAuthorityCore(
                 arguments = entry.canonicalRequestArguments.value,
                 requestFingerprintSchemaVersion = entry.requestFingerprint.schemaVersion,
             )
-            val replacement = entryFromDraft(
+            val replacementBase = entryFromDraft(
                 replacementDraft,
                 createdOrder = state.nextCreationOrder,
                 createdAtMillis = reissue.replacementCreatedAtMillis,
                 reissuedFromCommandId = entry.commandId,
-            ).copy(
+            )
+            val replacement = replacementBase.copy(
                 reissueLineageProof = RelayV2ReissueLineageProof(
                     parentProfileId = entry.profileId,
                     parentPrincipalId = entry.principalId,
@@ -1481,7 +1539,11 @@ internal class RelayV2OutboxAuthorityCore(
                     parentScopeId = entry.scopeId,
                     parentSessionId = entry.sessionId,
                     parentRequestFingerprint = entry.requestFingerprint,
-                    firstConfirmedHostEpoch = null,
+                    replacementProfileId = replacementBase.profileId,
+                    replacementPrincipalId = replacementBase.principalId,
+                    replacementHostId = replacementBase.hostId,
+                    replacementCommandId = replacementBase.commandId,
+                    replacementInitialTarget = replacementBase.reissueTargetSnapshot(),
                 ),
             )
             if (state.entry(replacement.id) != null) {
@@ -1524,14 +1586,49 @@ internal class RelayV2OutboxAuthorityCore(
         matching.forEach { entry ->
             when (entry.state) {
                 RelayV2OutboxStateTag.QUEUED -> {
+                    val lineageProof = entry.reissueLineageProof
+                    val existingPending = entry.targetRevalidation
+                    val sourceConfirmedTarget = lineageProof?.let {
+                        existingPending?.sourceConfirmedTarget
+                            ?: entry.reissueLatestConfirmedTargetProof?.confirmedTarget
+                            ?: it.replacementInitialTarget
+                    }
+                    val confirmationOrdinal = lineageProof?.let {
+                        existingPending?.confirmationOrdinal
+                            ?: entry.reissueLatestConfirmedTargetProof?.let { latest ->
+                                if (latest.confirmationOrdinal >= MAX_JSON_INTEGER) {
+                                    return state.reject(
+                                        RelayV2OutboxRejection.INVARIANT_VIOLATION,
+                                    )
+                                }
+                                latest.confirmationOrdinal + 1
+                            }
+                            ?: 1L
+                    }
                     val revalidation = RelayV2QueuedTargetRevalidation(
                         action.observedHostEpoch,
                         action.currentDedupeWindowId,
+                        sourceConfirmedTarget,
+                        confirmationOrdinal,
                     )
-                    val updated = entry.copy(targetRevalidation = revalidation)
+                    val updated = entry.copy(
+                        expectedHostEpoch = action.observedHostEpoch,
+                        dedupeWindowId = action.currentDedupeWindowId,
+                        requestFingerprint = calculateRequestFingerprint(
+                            entry.requestFingerprint.schemaVersion,
+                            entry.operation,
+                            action.currentDedupeWindowId,
+                            action.observedHostEpoch,
+                            entry.hostId,
+                            entry.scopeId,
+                            entry.sessionId,
+                            entry.canonicalRequestArguments,
+                        ),
+                        targetRevalidation = revalidation,
+                    )
                     mutations += RelayV2OutboxMutation.Replace(entry.id, updated)
                     effects += RelayV2OutboxEffect.RevalidateOpaqueTarget(
-                        entry.id,
+                        updated.id,
                         action.observedHostEpoch,
                         action.currentDedupeWindowId,
                         entry.scopeId,
@@ -1576,7 +1673,9 @@ internal class RelayV2OutboxAuthorityCore(
             ?: return state.reject(RelayV2OutboxRejection.TARGET_REVALIDATION_REQUIRED)
         if (entry.state != RelayV2OutboxStateTag.QUEUED ||
             pending.observedHostEpoch != action.observedHostEpoch ||
-            pending.dedupeWindowId != action.currentDedupeWindowId
+            pending.dedupeWindowId != action.currentDedupeWindowId ||
+            entry.expectedHostEpoch != action.observedHostEpoch ||
+            entry.dedupeWindowId != action.currentDedupeWindowId
         ) {
             return state.reject(RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH)
         }
@@ -1587,30 +1686,55 @@ internal class RelayV2OutboxAuthorityCore(
         if (entry.reissuedFromCommandId != null && entry.reissueLineageProof == null) {
             return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
         }
-        val reissueLineageProof = entry.reissueLineageProof?.let { proof ->
-            if (proof.firstConfirmedHostEpoch == null) {
-                proof.copy(firstConfirmedHostEpoch = action.observedHostEpoch)
+        val updatedFingerprint = calculateRequestFingerprint(
+            entry.requestFingerprint.schemaVersion,
+            entry.operation,
+            action.currentDedupeWindowId,
+            action.observedHostEpoch,
+            entry.hostId,
+            action.verifiedScopeId,
+            action.verifiedSessionId,
+            canonical,
+        )
+        val confirmedTarget = RelayV2ReissueTargetSnapshot(
+            expectedHostEpoch = action.observedHostEpoch,
+            dedupeWindowId = action.currentDedupeWindowId,
+            scopeId = action.verifiedScopeId,
+            sessionId = action.verifiedSessionId,
+            requestFingerprint = updatedFingerprint,
+        )
+        val latestConfirmedTargetProof = entry.reissueLineageProof?.let { lineageProof ->
+            val sourceTarget = pending.sourceConfirmedTarget
+                ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
+            val ordinal = pending.confirmationOrdinal
+                ?: return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
+            val previous = entry.reissueLatestConfirmedTargetProof
+            if (previous == null) {
+                if (sourceTarget != lineageProof.replacementInitialTarget || ordinal != 1L) {
+                    return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
+                }
             } else {
-                proof
+                if (previous.confirmedTarget != sourceTarget ||
+                    previous.confirmationOrdinal >= MAX_JSON_INTEGER ||
+                    ordinal != previous.confirmationOrdinal + 1
+                ) {
+                    return state.reject(RelayV2OutboxRejection.INVARIANT_VIOLATION)
+                }
             }
+            RelayV2ReissueLatestConfirmedTargetProof(
+                sourceTarget = sourceTarget,
+                confirmedTarget = confirmedTarget,
+                confirmationOrdinal = ordinal,
+            )
         }
         val updated = entry.copy(
             expectedHostEpoch = action.observedHostEpoch,
             dedupeWindowId = action.currentDedupeWindowId,
             scopeId = action.verifiedScopeId,
             sessionId = action.verifiedSessionId,
-            requestFingerprint = calculateRequestFingerprint(
-                entry.requestFingerprint.schemaVersion,
-                entry.operation,
-                action.currentDedupeWindowId,
-                action.observedHostEpoch,
-                entry.hostId,
-                action.verifiedScopeId,
-                action.verifiedSessionId,
-                canonical,
-            ),
+            requestFingerprint = updatedFingerprint,
             targetRevalidation = null,
-            reissueLineageProof = reissueLineageProof,
+            reissueLatestConfirmedTargetProof = latestConfirmedTargetProof,
         )
         if (state.entries.any { it.id == updated.id && it.id != entry.id }) {
             return state.reject(RelayV2OutboxRejection.DUPLICATE_COMMAND)
@@ -1733,6 +1857,27 @@ private fun RelayV2OutboxEntry.appendAttempt(
 ): RelayV2OutboxEntry = copy(
     attempts = attempts + RelayV2OutboxAttempt(requestId, kind, attempts.size + 1),
     state = nextState,
+)
+
+private fun RelayV2OutboxEntry.reissueTargetSnapshot(): RelayV2ReissueTargetSnapshot =
+    RelayV2ReissueTargetSnapshot(
+        expectedHostEpoch = expectedHostEpoch,
+        dedupeWindowId = dedupeWindowId,
+        scopeId = scopeId,
+        sessionId = sessionId,
+        requestFingerprint = requestFingerprint,
+    )
+
+private fun RelayV2ReissueTargetSnapshot.canonicalMap(): Map<String, Any?> = mapOf(
+    "dedupeWindowId" to dedupeWindowId,
+    "expectedHostEpoch" to expectedHostEpoch,
+    "requestFingerprint" to mapOf(
+        "canonicalRequestByteCount" to requestFingerprint.canonicalRequestByteCount,
+        "schemaVersion" to requestFingerprint.schemaVersion,
+        "sha256Hex" to requestFingerprint.sha256Hex,
+    ),
+    "scopeId" to scopeId,
+    "sessionId" to sessionId,
 )
 
 private fun RelayV2OutboxEntry.requiresTargetRevalidation(): Boolean =
@@ -1942,6 +2087,13 @@ private fun requireOutboxCapacity(condition: Boolean, message: String) {
     if (!condition) throw RelayV2OutboxCapacityExceededException(message)
 }
 
+private fun RelayV2ReissueTargetSnapshot.cheapCanonicalLowerBound(): Long =
+    expectedHostEpoch.length.toLong() +
+        dedupeWindowId.length +
+        scopeId.length +
+        (sessionId?.length ?: 0) +
+        requestFingerprint.sha256Hex.length
+
 private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
     canonicalRequestArguments.canonicalJson.length.toLong() +
         profileId.length +
@@ -1963,7 +2115,14 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
         (reissueLineageProof?.parentScopeId?.length ?: 0) +
         (reissueLineageProof?.parentSessionId?.length ?: 0) +
         (reissueLineageProof?.parentRequestFingerprint?.sha256Hex?.length ?: 0) +
-        (reissueLineageProof?.firstConfirmedHostEpoch?.length ?: 0) +
+        (reissueLineageProof?.replacementProfileId?.length ?: 0) +
+        (reissueLineageProof?.replacementPrincipalId?.length ?: 0) +
+        (reissueLineageProof?.replacementHostId?.length ?: 0) +
+        (reissueLineageProof?.replacementCommandId?.length ?: 0) +
+        (reissueLineageProof?.replacementInitialTarget?.cheapCanonicalLowerBound() ?: 0L) +
+        (reissueLatestConfirmedTargetProof?.sourceTarget?.cheapCanonicalLowerBound() ?: 0L) +
+        (reissueLatestConfirmedTargetProof?.confirmedTarget?.cheapCanonicalLowerBound() ?: 0L) +
+        (targetRevalidation?.sourceConfirmedTarget?.cheapCanonicalLowerBound() ?: 0L) +
         attempts.sumOf { it.requestId.length.toLong() }
 
 private fun <T> immutableListSnapshot(values: List<T>): List<T> =
@@ -2101,11 +2260,24 @@ private fun validateReissueGraph(entries: List<RelayV2OutboxEntry>) {
 private const val REISSUE_GRAPH_VISITING = 1
 private const val REISSUE_GRAPH_DONE = 2
 
+private fun RelayV2ReissueTargetSnapshot.matchesFingerprint(
+    entry: RelayV2OutboxEntry,
+): Boolean {
+    if (runCatching { requireTargetShape(entry.operation, sessionId) }.isFailure) return false
+    return requestFingerprint == calculateRequestFingerprint(
+        requestFingerprint.schemaVersion,
+        entry.operation,
+        dedupeWindowId,
+        expectedHostEpoch,
+        entry.hostId,
+        scopeId,
+        sessionId,
+        entry.canonicalRequestArguments,
+    )
+}
+
 private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): Boolean {
     val lineageProof = other.reissueLineageProof ?: return false
-    val sameHistoricalTarget = expectedHostEpoch == other.expectedHostEpoch &&
-        scopeId == other.scopeId &&
-        sessionId == other.sessionId
     val lineageProofMatchesParent = lineageProof.parentProfileId == profileId &&
         lineageProof.parentPrincipalId == principalId &&
         lineageProof.parentHostId == hostId &&
@@ -2115,19 +2287,66 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
         lineageProof.parentScopeId == scopeId &&
         lineageProof.parentSessionId == sessionId &&
         lineageProof.parentRequestFingerprint == requestFingerprint
-    val targetLineageMatchesProof = if (sameHistoricalTarget) {
-        lineageProof.firstConfirmedHostEpoch == null
+    val initialTarget = lineageProof.replacementInitialTarget
+    val lineageProofMatchesReplacement =
+        lineageProof.replacementProfileId == other.profileId &&
+            lineageProof.replacementPrincipalId == other.principalId &&
+            lineageProof.replacementHostId == other.hostId &&
+            lineageProof.replacementCommandId == other.commandId &&
+            initialTarget.expectedHostEpoch == expectedHostEpoch &&
+            initialTarget.dedupeWindowId != dedupeWindowId &&
+            initialTarget.scopeId == scopeId &&
+            initialTarget.sessionId == sessionId &&
+            initialTarget.matchesFingerprint(other)
+    val currentTarget = other.reissueTargetSnapshot()
+    val latestConfirmed = other.reissueLatestConfirmedTargetProof
+    val latestConfirmedIsValid = latestConfirmed == null ||
+        (
+            latestConfirmed.sourceTarget.matchesFingerprint(other) &&
+            latestConfirmed.confirmedTarget.matchesFingerprint(other) &&
+            (
+                if (latestConfirmed.confirmationOrdinal == 1L) {
+                    latestConfirmed.sourceTarget == initialTarget
+                } else {
+                    latestConfirmed.sourceTarget != initialTarget
+                }
+            )
+        )
+    val pending = other.targetRevalidation
+    val currentTargetIsAuthorized = if (pending != null) {
+        val pendingSource = pending.sourceConfirmedTarget
+        val pendingOrdinal = pending.confirmationOrdinal
+        pendingSource != null &&
+            pendingOrdinal != null &&
+            pending.observedHostEpoch == currentTarget.expectedHostEpoch &&
+            pending.dedupeWindowId == currentTarget.dedupeWindowId &&
+            currentTarget.matchesFingerprint(other) &&
+            currentTarget != pendingSource &&
+            (
+                if (latestConfirmed == null) {
+                    pendingSource == initialTarget && pendingOrdinal == 1L
+                } else {
+                    latestConfirmedIsValid &&
+                        latestConfirmed.confirmationOrdinal < MAX_JSON_INTEGER &&
+                        pendingSource == latestConfirmed.confirmedTarget &&
+                        pendingOrdinal == latestConfirmed.confirmationOrdinal + 1
+                }
+            )
+    } else if (latestConfirmed == null) {
+        currentTarget == initialTarget
     } else {
-        lineageProof.firstConfirmedHostEpoch != null
+        latestConfirmedIsValid &&
+            currentTarget != initialTarget &&
+            latestConfirmed.confirmedTarget == currentTarget
     }
     return profileId == other.profileId &&
         principalId == other.principalId &&
         hostId == other.hostId &&
         operation == other.operation &&
         canonicalRequestArguments == other.canonicalRequestArguments &&
-        dedupeWindowId != other.dedupeWindowId &&
         lineageProofMatchesParent &&
-        targetLineageMatchesProof
+        lineageProofMatchesReplacement &&
+        currentTargetIsAuthorized
 }
 
 private fun requireTargetShape(operation: RelayV2OutboxOperation, sessionId: String?) {

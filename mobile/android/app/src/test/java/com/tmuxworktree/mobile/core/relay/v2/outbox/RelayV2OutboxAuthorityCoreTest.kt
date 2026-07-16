@@ -482,7 +482,13 @@ class RelayV2OutboxAuthorityCoreTest {
             original.expectedHostEpoch,
             epochChanged.state.entry(original.id)?.expectedHostEpoch,
         )
+        assertEquals("epoch-revalidated", pendingReplacement.expectedHostEpoch)
         assertEquals("epoch-revalidated", pendingReplacement.targetRevalidation?.observedHostEpoch)
+        assertEquals(
+            pendingReplacement.reissueLineageProof?.replacementInitialTarget,
+            pendingReplacement.targetRevalidation?.sourceConfirmedTarget,
+        )
+        assertEquals(1L, pendingReplacement.targetRevalidation?.confirmationOrdinal)
 
         val confirmed = applied(
             core.reduce(
@@ -506,7 +512,17 @@ class RelayV2OutboxAuthorityCoreTest {
         val firstLineageProof = confirmedReplacement.reissueLineageProof!!
         assertEquals(original.expectedHostEpoch, firstLineageProof.parentExpectedHostEpoch)
         assertEquals(original.dedupeWindowId, firstLineageProof.parentDedupeWindowId)
-        assertEquals("epoch-revalidated", firstLineageProof.firstConfirmedHostEpoch)
+        assertEquals(
+            replacement.requestFingerprint,
+            firstLineageProof.replacementInitialTarget.requestFingerprint,
+        )
+        val firstConfirmedTarget = confirmedReplacement.reissueLatestConfirmedTargetProof!!
+        assertEquals(1L, firstConfirmedTarget.confirmationOrdinal)
+        assertEquals(
+            firstLineageProof.replacementInitialTarget,
+            firstConfirmedTarget.sourceTarget,
+        )
+        assertEquals("epoch-revalidated", firstConfirmedTarget.confirmedTarget.expectedHostEpoch)
         assertNotEquals(
             replacement.requestFingerprint.sha256Hex,
             confirmedReplacement.requestFingerprint.sha256Hex,
@@ -537,7 +553,25 @@ class RelayV2OutboxAuthorityCoreTest {
             "epoch-revalidated-again",
             pendingAgain.targetRevalidation?.observedHostEpoch,
         )
+        assertEquals("epoch-revalidated-again", pendingAgain.expectedHostEpoch)
         assertEquals(firstLineageProof, pendingAgain.reissueLineageProof)
+        assertEquals(firstConfirmedTarget, pendingAgain.reissueLatestConfirmedTargetProof)
+        assertEquals(
+            firstConfirmedTarget.confirmedTarget,
+            pendingAgain.targetRevalidation?.sourceConfirmedTarget,
+        )
+        assertEquals(2L, pendingAgain.targetRevalidation?.confirmationOrdinal)
+        val pendingDispatch = rejected(
+            core.reduce(
+                secondEpochPending.state,
+                RelayV2OutboxAction.DispatchEligible(
+                    mapOf(pendingAgain.id to "must-not-dispatch-pending-target"),
+                    effectBudget = 1,
+                ),
+            ),
+        )
+        assertEquals(RelayV2OutboxRejection.INVALID_TRANSITION, pendingDispatch.reason)
+        assertTrue(pendingDispatch.state === secondEpochPending.state)
 
         val pendingCheckpoint = RelayV2OutboxState.restore(
             secondEpochPending.state.entries,
@@ -564,6 +598,49 @@ class RelayV2OutboxAuthorityCoreTest {
         assertEquals("epoch-revalidated-again", confirmedAgainReplacement.expectedHostEpoch)
         assertEquals(null, confirmedAgainReplacement.targetRevalidation)
         assertEquals(firstLineageProof, confirmedAgainReplacement.reissueLineageProof)
+        val latestConfirmedTarget = confirmedAgainReplacement.reissueLatestConfirmedTargetProof!!
+        assertEquals(2L, latestConfirmedTarget.confirmationOrdinal)
+        assertEquals(firstConfirmedTarget.confirmedTarget, latestConfirmedTarget.sourceTarget)
+        assertEquals(
+            "epoch-revalidated-again",
+            latestConfirmedTarget.confirmedTarget.expectedHostEpoch,
+        )
+
+        val selfConsistentPriorTarget = firstConfirmedTarget.confirmedTarget
+        val corruptedReplacementTargets = listOf(
+            confirmedAgainReplacement.copy(
+                expectedHostEpoch = selfConsistentPriorTarget.expectedHostEpoch,
+                dedupeWindowId = selfConsistentPriorTarget.dedupeWindowId,
+                scopeId = selfConsistentPriorTarget.scopeId,
+                sessionId = selfConsistentPriorTarget.sessionId,
+                requestFingerprint = selfConsistentPriorTarget.requestFingerprint,
+            ),
+            confirmedAgainReplacement.copy(
+                reissueLatestConfirmedTargetProof = null,
+            ),
+            confirmedAgainReplacement.copy(
+                reissueLatestConfirmedTargetProof = firstConfirmedTarget,
+            ),
+            confirmedAgainReplacement.copy(
+                reissueLatestConfirmedTargetProof = latestConfirmedTarget.copy(
+                    confirmationOrdinal = 1,
+                ),
+            ),
+            confirmedAgainReplacement.copy(
+                reissueLineageProof = firstLineageProof.copy(
+                    replacementInitialTarget = latestConfirmedTarget.confirmedTarget,
+                ),
+                reissueLatestConfirmedTargetProof = null,
+            ),
+        )
+        corruptedReplacementTargets.forEach { corruptedReplacement ->
+            restoreFailure(
+                confirmedAgain.state.entries.map { entry ->
+                    if (entry.commandId == replacement.commandId) corruptedReplacement else entry
+                },
+                confirmedAgain.state.nextCreationOrder,
+            )
+        }
 
         val finalCheckpoint = RelayV2OutboxState.restore(
             confirmedAgain.state.entries,
@@ -1314,7 +1391,12 @@ class RelayV2OutboxAuthorityCoreTest {
             lineageProof.copy(parentCommandId = "wrong-parent-command"),
             lineageProof.copy(parentPrincipalId = "wrong-parent-principal"),
             lineageProof.copy(parentScopeId = "wrong-parent-scope"),
-            lineageProof.copy(firstConfirmedHostEpoch = "wrong-confirmed-epoch"),
+            lineageProof.copy(replacementCommandId = "wrong-replacement-command"),
+            lineageProof.copy(
+                replacementInitialTarget = lineageProof.replacementInitialTarget.copy(
+                    scopeId = "wrong-initial-scope",
+                ),
+            ),
             lineageProof.copy(
                 parentRequestFingerprint = lineageProof.parentRequestFingerprint.copy(
                     sha256Hex = "0".repeat(64),
@@ -1339,7 +1421,17 @@ class RelayV2OutboxAuthorityCoreTest {
                 parentScopeId = child.scopeId,
                 parentSessionId = child.sessionId,
                 parentRequestFingerprint = child.requestFingerprint,
-                firstConfirmedHostEpoch = null,
+                replacementProfileId = parent.profileId,
+                replacementPrincipalId = parent.principalId,
+                replacementHostId = parent.hostId,
+                replacementCommandId = parent.commandId,
+                replacementInitialTarget = RelayV2ReissueTargetSnapshot(
+                    expectedHostEpoch = parent.expectedHostEpoch,
+                    dedupeWindowId = parent.dedupeWindowId,
+                    scopeId = parent.scopeId,
+                    sessionId = parent.sessionId,
+                    requestFingerprint = parent.requestFingerprint,
+                ),
             ),
         )
         val cyclicChild = child.copy(
@@ -1401,7 +1493,17 @@ class RelayV2OutboxAuthorityCoreTest {
                         parentScopeId = parentTemplate.scopeId,
                         parentSessionId = parentTemplate.sessionId,
                         parentRequestFingerprint = parentTemplate.requestFingerprint,
-                        firstConfirmedHostEpoch = null,
+                        replacementProfileId = template.profileId,
+                        replacementPrincipalId = template.principalId,
+                        replacementHostId = template.hostId,
+                        replacementCommandId = commandId,
+                        replacementInitialTarget = RelayV2ReissueTargetSnapshot(
+                            expectedHostEpoch = template.expectedHostEpoch,
+                            dedupeWindowId = template.dedupeWindowId,
+                            scopeId = template.scopeId,
+                            sessionId = template.sessionId,
+                            requestFingerprint = template.requestFingerprint,
+                        ),
                     )
                 },
             )
