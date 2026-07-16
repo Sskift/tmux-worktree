@@ -51,23 +51,44 @@ private class RoomRelayV2StateStore(
 private class RoomTransaction(
     private val dao: RelayV2StateDao,
 ) : RelayV2StateTransaction {
-    override fun currentAuthority(profileId: String, hostId: String): RelayV2StoredAuthority? =
-        dao.currentAuthority(profileId, hostId)?.toStored()
-
     override fun authority(namespace: RelayV2StateNamespace): RelayV2StoredAuthority? =
-        dao.authority(namespace.profileId, namespace.hostId, namespace.hostEpoch)?.toStored()
+        dao.authority(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )?.toStored()
 
     override fun putAuthority(authority: RelayV2StoredAuthority) {
         dao.putAuthority(authority.toEntity())
     }
 
-    override fun deleteHostState(profileId: String, hostId: String) {
-        dao.deleteHostEvents(profileId, hostId)
-        dao.deleteHostSnapshotRecords(profileId, hostId)
-        dao.deleteHostSnapshots(profileId, hostId)
-        dao.deleteHostSessions(profileId, hostId)
-        dao.deleteHostScopes(profileId, hostId)
-        dao.deleteHostAuthorities(profileId, hostId)
+    override fun deleteNamespaceState(namespace: RelayV2StateNamespace) {
+        deleteBufferedEvents(namespace)
+        dao.deleteSnapshotRecords(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
+        dao.deleteSnapshot(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
+        deleteSessions(namespace)
+        deleteScopes(namespace)
+        dao.deleteNamespaceAuthority(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
     }
 
     override fun deleteProfileState(profileId: String) {
@@ -80,18 +101,38 @@ private class RoomTransaction(
     }
 
     override fun scope(namespace: RelayV2StateNamespace, scopeId: String): RelayV2StoredScope? =
-        dao.scope(namespace.profileId, namespace.hostId, namespace.hostEpoch, scopeId)?.toStored()
+        dao.scope(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+            scopeId,
+        )?.toStored()
 
     override fun putScope(scope: RelayV2StoredScope) {
         dao.putScope(scope.toEntity())
     }
 
     override fun deleteScope(namespace: RelayV2StateNamespace, scopeId: String) {
-        dao.deleteScope(namespace.profileId, namespace.hostId, namespace.hostEpoch, scopeId)
+        dao.deleteScope(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+            scopeId,
+        )
     }
 
     override fun deleteScopes(namespace: RelayV2StateNamespace) {
-        dao.deleteScopes(namespace.profileId, namespace.hostId, namespace.hostEpoch)
+        dao.deleteScopes(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
     }
 
     override fun session(
@@ -100,6 +141,8 @@ private class RoomTransaction(
         sessionId: String,
     ): RelayV2StoredSession? = dao.session(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         scopeId,
@@ -117,6 +160,8 @@ private class RoomTransaction(
     ) {
         dao.deleteSession(
             namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
             namespace.hostId,
             namespace.hostEpoch,
             scopeId,
@@ -129,6 +174,8 @@ private class RoomTransaction(
         scopeId: String,
     ): RelayV2StoredSessionStats = dao.sessionStats(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         scopeId,
@@ -137,6 +184,8 @@ private class RoomTransaction(
     override fun deleteSessionsForScope(namespace: RelayV2StateNamespace, scopeId: String) {
         dao.deleteSessionsForScope(
             namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
             namespace.hostId,
             namespace.hostEpoch,
             scopeId,
@@ -144,19 +193,43 @@ private class RoomTransaction(
     }
 
     override fun deleteSessions(namespace: RelayV2StateNamespace) {
-        dao.deleteSessions(namespace.profileId, namespace.hostId, namespace.hostEpoch)
+        dao.deleteSessions(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
     }
 
     override fun snapshot(namespace: RelayV2StateNamespace): RelayV2StoredSnapshot? =
-        dao.snapshot(namespace.profileId, namespace.hostId, namespace.hostEpoch)?.toStored()
+        dao.snapshot(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )?.toStored()
 
     override fun putSnapshot(snapshot: RelayV2StoredSnapshot) {
         dao.putSnapshot(snapshot.toEntity())
     }
 
     override fun deleteSnapshot(namespace: RelayV2StateNamespace) {
-        dao.deleteSnapshotRecords(namespace.profileId, namespace.hostId, namespace.hostEpoch)
-        dao.deleteSnapshot(namespace.profileId, namespace.hostId, namespace.hostEpoch)
+        dao.deleteSnapshotRecords(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
+        dao.deleteSnapshot(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
     }
 
     override fun putSnapshotRecords(records: List<RelayV2StoredSnapshotRecord>) {
@@ -172,6 +245,8 @@ private class RoomTransaction(
         do {
             val page = dao.snapshotRecordPage(
                 namespace.profileId,
+                namespace.principalId,
+                namespace.clientInstanceId,
                 namespace.hostId,
                 namespace.hostEpoch,
                 snapshotId,
@@ -190,6 +265,8 @@ private class RoomTransaction(
     ): RelayV2StoredScope? {
         val scope = dao.stagedRecord(
             namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
             namespace.hostId,
             namespace.hostEpoch,
             snapshotId,
@@ -198,6 +275,8 @@ private class RoomTransaction(
         ) ?: return null
         val sessionsScope = dao.stagedRecord(
             namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
             namespace.hostId,
             namespace.hostEpoch,
             snapshotId,
@@ -220,6 +299,8 @@ private class RoomTransaction(
         sessionId: String,
     ): RelayV2StoredSession? = dao.stagedSessionRecord(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         snapshotId,
@@ -235,6 +316,8 @@ private class RoomTransaction(
         scopeId: String,
     ): RelayV2StoredSessionStats = dao.stagedSessionStats(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         snapshotId,
@@ -247,6 +330,8 @@ private class RoomTransaction(
         scopeId: String,
     ): String? = dao.stagedRecord(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         snapshotId,
@@ -259,6 +344,8 @@ private class RoomTransaction(
         eventSeq: String,
     ): RelayV2StoredEvent? = dao.bufferedEvent(
         namespace.profileId,
+        namespace.principalId,
+        namespace.clientInstanceId,
         namespace.hostId,
         namespace.hostEpoch,
         eventSeq,
@@ -269,17 +356,41 @@ private class RoomTransaction(
     }
 
     override fun bufferedEvents(namespace: RelayV2StateNamespace): List<RelayV2StoredEvent> =
-        dao.bufferedEvents(namespace.profileId, namespace.hostId, namespace.hostEpoch)
+        dao.bufferedEvents(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
             .map { it.toStored(namespace) }
 
     override fun bufferedEventCount(namespace: RelayV2StateNamespace): Long =
-        dao.bufferedEventStats(namespace.profileId, namespace.hostId, namespace.hostEpoch).itemCount
+        dao.bufferedEventStats(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        ).itemCount
 
     override fun bufferedEventRawBytes(namespace: RelayV2StateNamespace): Long =
-        dao.bufferedEventStats(namespace.profileId, namespace.hostId, namespace.hostEpoch).byteCount
+        dao.bufferedEventStats(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        ).byteCount
 
     override fun deleteBufferedEvents(namespace: RelayV2StateNamespace) {
-        dao.deleteBufferedEvents(namespace.profileId, namespace.hostId, namespace.hostEpoch)
+        dao.deleteBufferedEvents(
+            namespace.profileId,
+            namespace.principalId,
+            namespace.clientInstanceId,
+            namespace.hostId,
+            namespace.hostEpoch,
+        )
     }
 
     private companion object {

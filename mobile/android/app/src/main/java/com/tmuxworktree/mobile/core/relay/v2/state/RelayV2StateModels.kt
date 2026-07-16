@@ -337,7 +337,6 @@ internal enum class RelayV2RotationReason {
     EVENT_CURSOR_AHEAD,
     REQUIRED_WATERMARK_REGRESSED,
     UNKNOWN_HOST_EPOCH,
-    PROFILE_BINDING_CONFLICT,
 }
 
 internal sealed interface RelayV2StateSyncResult {

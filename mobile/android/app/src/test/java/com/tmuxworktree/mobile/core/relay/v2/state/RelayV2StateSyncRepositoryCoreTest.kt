@@ -175,7 +175,7 @@ class RelayV2StateSyncRepositoryCoreTest {
     }
 
     @Test
-    fun `continuation cursor and record order conflicts discard staging without touching cache`() = runBlocking {
+    fun `cursor and incomplete scope ordering conflicts roll back staging without touching cache`() = runBlocking {
         val store = FakeStateStore()
         val repository = RelayV2StateSyncRepositoryCore(store)
         val namespace = namespace()
@@ -243,6 +243,30 @@ class RelayV2StateSyncRepositoryCoreTest {
         assertResync(wrongOrder, RelayV2ResyncReason.SNAPSHOT_ORDER_CONFLICT)
         assertNull(store.snapshot(namespace))
         assertEquals("1", store.authority(namespace)?.cursorEventSeq)
+
+        val missingIntermediateSessionsScope = listOf(
+            RelayV2SnapshotRecord.Scope(scope("a")),
+            RelayV2SnapshotRecord.Scope(scope("b")),
+            RelayV2SnapshotRecord.SessionsScope("b", "0"),
+        )
+        val (missingBytes, missingDigest) = canonicalSnapshotDigest(missingIntermediateSessionsScope)
+        val missingIntermediate = repository.stageSnapshotChunkUnderApplyLease(
+            chunk(
+                namespace,
+                "2",
+                missingIntermediateSessionsScope,
+                missingIntermediateSessionsScope.size.toLong(),
+                missingBytes,
+                missingDigest,
+                isLast = true,
+            ),
+        )
+        assertResync(missingIntermediate, RelayV2ResyncReason.SNAPSHOT_ORDER_CONFLICT)
+        assertNull(store.snapshot(namespace))
+        assertEquals(0, store.recordCount(namespace))
+        assertEquals("1", store.authority(namespace)?.cursorEventSeq)
+        assertEquals("stable", store.session(namespace, "scope-a", "session-a")?.item?.displayName)
+        assertNull(store.scope(namespace, "b"))
     }
 
     @Test
@@ -584,8 +608,8 @@ class RelayV2StateSyncRepositoryCoreTest {
         hostEpoch,
     )
 
-    private fun scope() = RelayV2ScopeResource(
-        "scope-a",
+    private fun scope(scopeId: String = "scope-a") = RelayV2ScopeResource(
+        scopeId,
         "Local",
         RelayV2ScopeKind.LOCAL,
         RelayV2ScopeReachability.ONLINE,
@@ -679,26 +703,19 @@ private class FakeTransaction(
     private val state: FakeState,
     private val beforeSessionWrite: () -> Unit,
 ) : RelayV2StateTransaction {
-    override fun currentAuthority(profileId: String, hostId: String) = state.authorities.values
-        .singleOrNull { it.namespace.profileId == profileId && it.namespace.hostId == hostId }
-
     override fun authority(namespace: RelayV2StateNamespace) = state.authorities[namespace]
 
     override fun putAuthority(authority: RelayV2StoredAuthority) {
-        state.authorities.keys.removeAll {
-            it.profileId == authority.namespace.profileId && it.hostId == authority.namespace.hostId
-        }
         state.authorities[authority.namespace] = authority
     }
 
-    override fun deleteHostState(profileId: String, hostId: String) {
-        fun RelayV2StateNamespace.matches() = this.profileId == profileId && this.hostId == hostId
-        state.authorities.keys.removeAll { it.matches() }
-        state.scopes.keys.removeAll { it.first.matches() }
-        state.sessions.keys.removeAll { it.namespace.matches() }
-        state.snapshots.keys.removeAll { it.matches() }
-        state.records.keys.removeAll { it.matches() }
-        state.events.keys.removeAll { it.first.matches() }
+    override fun deleteNamespaceState(namespace: RelayV2StateNamespace) {
+        state.authorities.remove(namespace)
+        state.scopes.keys.removeAll { it.first == namespace }
+        state.sessions.keys.removeAll { it.namespace == namespace }
+        state.snapshots.remove(namespace)
+        state.records.remove(namespace)
+        state.events.keys.removeAll { it.first == namespace }
     }
 
     override fun deleteProfileState(profileId: String) {

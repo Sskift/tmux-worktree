@@ -5,8 +5,7 @@ import androidx.room.Index
 
 @Entity(
     tableName = "relay_v2_authority",
-    primaryKeys = ["profileId", "hostId", "hostEpoch"],
-    indices = [Index(value = ["profileId", "hostId"], unique = true)],
+    primaryKeys = ["profileId", "principalId", "clientInstanceId", "hostId", "hostEpoch"],
 )
 internal data class RelayV2AuthorityEntity(
     val profileId: String,
@@ -24,8 +23,17 @@ internal data class RelayV2AuthorityEntity(
 
 @Entity(
     tableName = "relay_v2_scopes",
-    primaryKeys = ["profileId", "hostId", "hostEpoch", "scopeId"],
-    indices = [Index(value = ["profileId", "hostId", "hostEpoch"])],
+    primaryKeys = [
+        "profileId",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+    ],
+    indices = [
+        Index(value = ["profileId", "principalId", "clientInstanceId", "hostId", "hostEpoch"]),
+    ],
 )
 internal data class RelayV2ScopeEntity(
     val profileId: String,
@@ -44,10 +52,27 @@ internal data class RelayV2ScopeEntity(
 
 @Entity(
     tableName = "relay_v2_sessions",
-    primaryKeys = ["profileId", "hostId", "hostEpoch", "scopeId", "sessionId"],
+    primaryKeys = [
+        "profileId",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+    ],
     indices = [
-        Index(value = ["profileId", "hostId", "hostEpoch"]),
-        Index(value = ["profileId", "hostId", "hostEpoch", "scopeId"]),
+        Index(value = ["profileId", "principalId", "clientInstanceId", "hostId", "hostEpoch"]),
+        Index(
+            value = [
+                "profileId",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+            ],
+        ),
     ],
 )
 internal data class RelayV2SessionEntity(
@@ -72,8 +97,20 @@ internal data class RelayV2SessionEntity(
 
 @Entity(
     tableName = "relay_v2_snapshot_staging",
-    primaryKeys = ["profileId", "hostId", "hostEpoch", "snapshotId"],
-    indices = [Index(value = ["profileId", "hostId", "hostEpoch"], unique = true)],
+    primaryKeys = [
+        "profileId",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "snapshotId",
+    ],
+    indices = [
+        Index(
+            value = ["profileId", "principalId", "clientInstanceId", "hostId", "hostEpoch"],
+            unique = true,
+        ),
+    ],
 )
 internal data class RelayV2SnapshotStagingEntity(
     val profileId: String,
@@ -104,11 +141,51 @@ internal data class RelayV2SnapshotStagingEntity(
 
 @Entity(
     tableName = "relay_v2_snapshot_records",
-    primaryKeys = ["profileId", "hostId", "hostEpoch", "snapshotId", "recordIndex"],
+    primaryKeys = [
+        "profileId",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "snapshotId",
+        "recordIndex",
+    ],
     indices = [
-        Index(value = ["profileId", "hostId", "hostEpoch", "snapshotId", "chunkIndex"]),
-        Index(value = ["profileId", "hostId", "hostEpoch", "snapshotId", "scopeId", "recordType"]),
-        Index(value = ["profileId", "hostId", "hostEpoch", "snapshotId", "scopeId", "sessionId"]),
+        Index(
+            value = [
+                "profileId",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "snapshotId",
+                "chunkIndex",
+            ],
+        ),
+        Index(
+            value = [
+                "profileId",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "snapshotId",
+                "scopeId",
+                "recordType",
+            ],
+        ),
+        Index(
+            value = [
+                "profileId",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "snapshotId",
+                "scopeId",
+                "sessionId",
+            ],
+        ),
     ],
 )
 internal data class RelayV2SnapshotRecordEntity(
@@ -139,9 +216,25 @@ internal data class RelayV2SnapshotRecordEntity(
 
 @Entity(
     tableName = "relay_v2_state_event_buffer",
-    primaryKeys = ["profileId", "hostId", "hostEpoch", "eventSeq"],
+    primaryKeys = [
+        "profileId",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "eventSeq",
+    ],
     indices = [
-        Index(value = ["profileId", "hostId", "hostEpoch", "eventSeqOrder"]),
+        Index(
+            value = [
+                "profileId",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "eventSeqOrder",
+            ],
+        ),
     ],
 )
 internal data class RelayV2StateEventEntity(

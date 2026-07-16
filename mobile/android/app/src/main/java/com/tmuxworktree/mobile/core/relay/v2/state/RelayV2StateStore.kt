@@ -96,12 +96,11 @@ internal interface RelayV2StateStore {
 }
 
 internal interface RelayV2StateTransaction {
-    fun currentAuthority(profileId: String, hostId: String): RelayV2StoredAuthority?
     fun authority(namespace: RelayV2StateNamespace): RelayV2StoredAuthority?
     fun putAuthority(authority: RelayV2StoredAuthority)
 
-    /** Deletes all six v2 state categories for this profile/host, never v1 or credentials. */
-    fun deleteHostState(profileId: String, hostId: String)
+    /** Deletes all six v2 state categories for this exact namespace, never v1 or credentials. */
+    fun deleteNamespaceState(namespace: RelayV2StateNamespace)
 
     /** Deletes all six v2 state categories for this profile, never v1 or credentials. */
     fun deleteProfileState(profileId: String)

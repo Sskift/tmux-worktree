@@ -2,11 +2,11 @@
   "formatVersion": 1,
   "database": {
     "version": 1,
-    "identityHash": "daf669b045df48d3be057d3165bc2729",
+    "identityHash": "58e1a17904a413ab49f86b703fb438f3",
     "entities": [
       {
         "tableName": "relay_v2_authority",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `cursorEventSeq` TEXT, `requiredThroughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT, `phase` TEXT NOT NULL, `cacheRecordCount` INTEGER NOT NULL, `cacheCanonicalBytes` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `cursorEventSeq` TEXT, `requiredThroughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT, `phase` TEXT NOT NULL, `cacheRecordCount` INTEGER NOT NULL, `cacheCanonicalBytes` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -77,26 +77,16 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch"
           ]
-        },
-        "indices": [
-          {
-            "name": "index_relay_v2_authority_profileId_hostId",
-            "unique": true,
-            "columnNames": [
-              "profileId",
-              "hostId"
-            ],
-            "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_authority_profileId_hostId` ON `${TABLE_NAME}` (`profileId`, `hostId`)"
-          }
-        ]
+        }
       },
       {
         "tableName": "relay_v2_scopes",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `displayName` TEXT NOT NULL, `kind` TEXT NOT NULL, `reachability` TEXT NOT NULL, `sessionsRevision` TEXT NOT NULL, `scopeRecordCanonicalJson` TEXT NOT NULL, `sessionsScopeRecordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`, `scopeId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `displayName` TEXT NOT NULL, `kind` TEXT NOT NULL, `reachability` TEXT NOT NULL, `sessionsRevision` TEXT NOT NULL, `scopeRecordCanonicalJson` TEXT NOT NULL, `sessionsScopeRecordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -175,6 +165,8 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch",
             "scopeId"
@@ -182,21 +174,23 @@
         },
         "indices": [
           {
-            "name": "index_relay_v2_scopes_profileId_hostId_hostEpoch",
+            "name": "index_relay_v2_scopes_profileId_principalId_clientInstanceId_hostId_hostEpoch",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_scopes_profileId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_scopes_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
           }
         ]
       },
       {
         "tableName": "relay_v2_sessions",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `kind` TEXT NOT NULL, `displayName` TEXT NOT NULL, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER NOT NULL, `windowCount` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `activityAtMs` INTEGER NOT NULL, `recordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `kind` TEXT NOT NULL, `displayName` TEXT NOT NULL, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER NOT NULL, `windowCount` INTEGER NOT NULL, `createdAtMs` INTEGER NOT NULL, `activityAtMs` INTEGER NOT NULL, `recordCanonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -302,6 +296,8 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch",
             "scopeId",
@@ -310,33 +306,37 @@
         },
         "indices": [
           {
-            "name": "index_relay_v2_sessions_profileId_hostId_hostEpoch",
+            "name": "index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
           },
           {
-            "name": "index_relay_v2_sessions_profileId_hostId_hostEpoch_scopeId",
+            "name": "index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch_scopeId",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch",
               "scopeId"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_hostId_hostEpoch_scopeId` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`, `scopeId`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_sessions_profileId_principalId_clientInstanceId_hostId_hostEpoch_scopeId` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`)"
           }
         ]
       },
       {
         "tableName": "relay_v2_snapshot_staging",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotRequestId` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `snapshotCreatedAtMs` INTEGER NOT NULL, `snapshotLeaseExpiresAtMs` INTEGER NOT NULL, `snapshotAbsoluteExpiresAtMs` INTEGER NOT NULL, `throughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT NOT NULL, `totalRecords` INTEGER NOT NULL, `totalCanonicalBytes` INTEGER NOT NULL, `cutDigest` TEXT NOT NULL, `nextChunkIndex` INTEGER NOT NULL, `nextCursor` TEXT, `receivedRecords` INTEGER NOT NULL, `receivedRecordCanonicalBytes` INTEGER NOT NULL, `receivedRawUtf8Bytes` INTEGER NOT NULL, `lastScopeId` TEXT, `lastRecordKind` TEXT, `lastSessionId` TEXT, `complete` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`, `snapshotId`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotRequestId` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `snapshotCreatedAtMs` INTEGER NOT NULL, `snapshotLeaseExpiresAtMs` INTEGER NOT NULL, `snapshotAbsoluteExpiresAtMs` INTEGER NOT NULL, `throughEventSeq` TEXT NOT NULL, `scopesRevision` TEXT NOT NULL, `totalRecords` INTEGER NOT NULL, `totalCanonicalBytes` INTEGER NOT NULL, `cutDigest` TEXT NOT NULL, `nextChunkIndex` INTEGER NOT NULL, `nextCursor` TEXT, `receivedRecords` INTEGER NOT NULL, `receivedRecordCanonicalBytes` INTEGER NOT NULL, `receivedRawUtf8Bytes` INTEGER NOT NULL, `lastScopeId` TEXT, `lastRecordKind` TEXT, `lastSessionId` TEXT, `complete` INTEGER NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -483,6 +483,8 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch",
             "snapshotId"
@@ -490,21 +492,23 @@
         },
         "indices": [
           {
-            "name": "index_relay_v2_snapshot_staging_profileId_hostId_hostEpoch",
+            "name": "index_relay_v2_snapshot_staging_profileId_principalId_clientInstanceId_hostId_hostEpoch",
             "unique": true,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch"
             ],
             "orders": [],
-            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_snapshot_staging_profileId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`)"
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_snapshot_staging_profileId_principalId_clientInstanceId_hostId_hostEpoch` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`)"
           }
         ]
       },
       {
         "tableName": "relay_v2_snapshot_records",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `recordIndex` INTEGER NOT NULL, `chunkIndex` INTEGER NOT NULL, `recordType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `revision` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`, `snapshotId`, `recordIndex`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `snapshotId` TEXT NOT NULL, `recordIndex` INTEGER NOT NULL, `chunkIndex` INTEGER NOT NULL, `recordType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `revision` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `recordIndex`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -637,6 +641,8 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch",
             "snapshotId",
@@ -645,23 +651,27 @@
         },
         "indices": [
           {
-            "name": "index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_chunkIndex",
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_chunkIndex",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch",
               "snapshotId",
               "chunkIndex"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_chunkIndex` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`, `snapshotId`, `chunkIndex`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_chunkIndex` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `chunkIndex`)"
           },
           {
-            "name": "index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_scopeId_recordType",
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_recordType",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch",
               "snapshotId",
@@ -669,13 +679,15 @@
               "recordType"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_scopeId_recordType` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `recordType`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_recordType` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `recordType`)"
           },
           {
-            "name": "index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_scopeId_sessionId",
+            "name": "index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_sessionId",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch",
               "snapshotId",
@@ -683,13 +695,13 @@
               "sessionId"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_hostId_hostEpoch_snapshotId_scopeId_sessionId` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `sessionId`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_snapshot_records_profileId_principalId_clientInstanceId_hostId_hostEpoch_snapshotId_scopeId_sessionId` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `snapshotId`, `scopeId`, `sessionId`)"
           }
         ]
       },
       {
         "tableName": "relay_v2_state_event_buffer",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `eventSeq` TEXT NOT NULL, `eventSeqOrder` TEXT NOT NULL, `resultingRevision` TEXT NOT NULL, `changeType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `rawUtf8Bytes` INTEGER NOT NULL, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `hostId`, `hostEpoch`, `eventSeq`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `eventSeq` TEXT NOT NULL, `eventSeqOrder` TEXT NOT NULL, `resultingRevision` TEXT NOT NULL, `changeType` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT, `displayName` TEXT, `kind` TEXT, `reachability` TEXT, `project` TEXT, `label` TEXT, `cwd` TEXT, `attached` INTEGER, `windowCount` INTEGER, `createdAtMs` INTEGER, `activityAtMs` INTEGER, `rawUtf8Bytes` INTEGER NOT NULL, `canonicalJson` TEXT NOT NULL, PRIMARY KEY(`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `eventSeq`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -823,6 +835,8 @@
           "autoGenerate": false,
           "columnNames": [
             "profileId",
+            "principalId",
+            "clientInstanceId",
             "hostId",
             "hostEpoch",
             "eventSeq"
@@ -830,23 +844,25 @@
         },
         "indices": [
           {
-            "name": "index_relay_v2_state_event_buffer_profileId_hostId_hostEpoch_eventSeqOrder",
+            "name": "index_relay_v2_state_event_buffer_profileId_principalId_clientInstanceId_hostId_hostEpoch_eventSeqOrder",
             "unique": false,
             "columnNames": [
               "profileId",
+              "principalId",
+              "clientInstanceId",
               "hostId",
               "hostEpoch",
               "eventSeqOrder"
             ],
             "orders": [],
-            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_state_event_buffer_profileId_hostId_hostEpoch_eventSeqOrder` ON `${TABLE_NAME}` (`profileId`, `hostId`, `hostEpoch`, `eventSeqOrder`)"
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_relay_v2_state_event_buffer_profileId_principalId_clientInstanceId_hostId_hostEpoch_eventSeqOrder` ON `${TABLE_NAME}` (`profileId`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `eventSeqOrder`)"
           }
         ]
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'daf669b045df48d3be057d3165bc2729')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '58e1a17904a413ab49f86b703fb438f3')"
     ]
   }
 }

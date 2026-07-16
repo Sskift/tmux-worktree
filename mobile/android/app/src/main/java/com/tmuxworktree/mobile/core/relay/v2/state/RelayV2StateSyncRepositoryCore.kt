@@ -20,13 +20,7 @@ internal class RelayV2StateSyncRepositoryCore(
     suspend fun applyHelloUnderApplyLease(hello: RelayV2StateHello): RelayV2StateSyncResult =
         store.transaction {
             val namespace = hello.namespace
-            val current = currentAuthority(namespace.profileId, namespace.hostId)
-            if (current != null && !current.namespace.sameProfileBinding(namespace)) {
-                return@transaction RelayV2StateSyncResult.RotationRequired(
-                    namespace,
-                    RelayV2RotationReason.PROFILE_BINDING_CONFLICT,
-                )
-            }
+            val current = authority(namespace)
             if (hello.disposition == RelayV2StateHelloDisposition.EVENT_CURSOR_AHEAD) {
                 return@transaction RelayV2StateSyncResult.RotationRequired(
                     namespace,
@@ -37,7 +31,7 @@ internal class RelayV2StateSyncRepositoryCore(
             when (hello.disposition) {
                 RelayV2StateHelloDisposition.FRESH -> {
                     val release = current?.let { snapshot(it.namespace)?.releaseDirective() }
-                    deleteHostState(namespace.profileId, namespace.hostId)
+                    deleteNamespaceState(namespace)
                     putAuthority(newAuthority(namespace, hello.welcomeEventSeq))
                     RelayV2StateSyncResult.ResyncRequired(
                         namespace,
@@ -46,7 +40,9 @@ internal class RelayV2StateSyncRepositoryCore(
                     )
                 }
                 RelayV2StateHelloDisposition.HOST_EPOCH_CHANGED -> {
-                    deleteHostState(namespace.profileId, namespace.hostId)
+                    val priorNamespace = namespace.copy(hostEpoch = requireNotNull(hello.resume).hostEpoch)
+                    deleteNamespaceState(priorNamespace)
+                    deleteNamespaceState(namespace)
                     putAuthority(newAuthority(namespace, hello.welcomeEventSeq))
                     RelayV2StateSyncResult.ResyncRequired(
                         namespace,
@@ -63,7 +59,7 @@ internal class RelayV2StateSyncRepositoryCore(
     suspend fun stageSnapshotChunkUnderApplyLease(
         chunk: RelayV2SnapshotChunk,
     ): RelayV2StateSyncResult = store.transaction {
-        val authority = currentExactAuthority(chunk.namespace)
+        val authority = authority(chunk.namespace)
             ?: return@transaction unknownEpoch(chunk.namespace)
         if (authority.phase != RelayV2StoredSyncPhase.RESYNCING) {
             return@transaction RelayV2StateSyncResult.ResyncRequired(
@@ -194,7 +190,7 @@ internal class RelayV2StateSyncRepositoryCore(
     suspend fun applyStateEventUnderApplyLease(
         event: RelayV2StateEvent,
     ): RelayV2StateSyncResult = store.transaction {
-        val authority = currentExactAuthority(event.namespace)
+        val authority = authority(event.namespace)
             ?: return@transaction unknownEpoch(event.namespace)
         val cursor = authority.cursorEventSeq
         if (cursor != null && compareRelayV2Counters(event.eventSeq, cursor) <= 0) {
@@ -234,7 +230,7 @@ internal class RelayV2StateSyncRepositoryCore(
         namespace: RelayV2StateNamespace,
         snapshotId: String,
     ): RelayV2StateSyncResult = store.transaction {
-        val authority = currentExactAuthority(namespace) ?: return@transaction unknownEpoch(namespace)
+        val authority = authority(namespace) ?: return@transaction unknownEpoch(namespace)
         val staged = snapshot(namespace)
             ?: return@transaction RelayV2StateSyncResult.ResyncRequired(
                 namespace,
@@ -297,20 +293,29 @@ internal class RelayV2StateSyncRepositoryCore(
 
         deleteSessions(namespace)
         deleteScopes(namespace)
+        var pendingScope: RelayV2SnapshotRecord.Scope? = null
         visitSnapshotRecords(namespace, snapshotId) { record ->
             when (val value = record.record) {
-                is RelayV2SnapshotRecord.Scope -> putScope(
-                    storedScope(namespace, value.item, sessionsRevision = "0"),
-                )
+                is RelayV2SnapshotRecord.Scope -> {
+                    check(pendingScope == null) { "Snapshot scope is missing sessions_scope" }
+                    pendingScope = value
+                }
                 is RelayV2SnapshotRecord.SessionsScope -> {
-                    val current = requireNotNull(scope(namespace, value.scopeId))
-                    putScope(storedScope(namespace, current.item, value.revision))
+                    val scopeRecord = requireNotNull(pendingScope) {
+                        "Snapshot sessions_scope has no matching scope"
+                    }
+                    check(scopeRecord.item.scopeId == value.scopeId) {
+                        "Snapshot sessions_scope does not match scope"
+                    }
+                    putScope(storedScope(namespace, scopeRecord.item, value.revision))
+                    pendingScope = null
                 }
                 is RelayV2SnapshotRecord.Session -> putSession(
                     storedSession(namespace, value.item),
                 )
             }
         }
+        check(pendingScope == null) { "Snapshot scope is missing sessions_scope" }
 
         var committedAuthority = authority.copy(
             cursorEventSeq = staged.throughEventSeq,
@@ -714,8 +719,13 @@ internal class RelayV2StateSyncRepositoryCore(
     ) {
         fun advance(record: RelayV2SnapshotRecord): SnapshotOrder? = when (record) {
             is RelayV2SnapshotRecord.Scope -> {
-                if (scopeId != null && compareUtf8(record.item.scopeId, scopeId) <= 0) null
-                else SnapshotOrder(record.item.scopeId, "scope", null)
+                if (scopeId != null &&
+                    (recordKind == "scope" || compareUtf8(record.item.scopeId, scopeId) <= 0)
+                ) {
+                    null
+                } else {
+                    SnapshotOrder(record.item.scopeId, "scope", null)
+                }
             }
             is RelayV2SnapshotRecord.SessionsScope -> {
                 if (scopeId != record.scopeId || recordKind != "scope") null
@@ -764,17 +774,6 @@ private fun newAuthority(
     cacheRecordCount = 0,
     cacheCanonicalBytes = 2,
 )
-
-private fun RelayV2StateTransaction.currentExactAuthority(
-    namespace: RelayV2StateNamespace,
-): RelayV2StoredAuthority? = currentAuthority(namespace.profileId, namespace.hostId)
-    ?.takeIf { it.namespace == namespace }
-
-private fun RelayV2StateNamespace.sameProfileBinding(other: RelayV2StateNamespace): Boolean =
-    profileId == other.profileId &&
-        principalId == other.principalId &&
-        clientInstanceId == other.clientInstanceId &&
-        hostId == other.hostId
 
 private fun unknownEpoch(namespace: RelayV2StateNamespace) =
     RelayV2StateSyncResult.RotationRequired(
