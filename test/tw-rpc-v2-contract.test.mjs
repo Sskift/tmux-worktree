@@ -77,6 +77,7 @@ test("TW RPC v2 manifest and capability golden are explicit and parallel to froz
       "capabilities",
       "list",
       "create-worktree",
+      "create-worktree-resolved",
       "create-terminal",
       "kill-session",
     ],
@@ -121,6 +122,10 @@ test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
     cases.wire.createWorktree.request,
   );
   assert.deepEqual(
+    rpcV2.parseRpcV2CreateResolvedWorktreeRequest(cases.wire.createResolvedWorktree.request),
+    cases.wire.createResolvedWorktree.request,
+  );
+  assert.deepEqual(
     rpcV2.parseRpcV2CreateTerminalRequest(cases.wire.createTerminal.request),
     cases.wire.createTerminal.request,
   );
@@ -134,6 +139,13 @@ test("TW RPC v2 fixtures freeze closed requests and response unions", () => {
   assert.deepEqual(
     rpcV2.parseRpcV2CreateResponse(cases.wire.createWorktree.normalized, "create-worktree"),
     cases.wire.createWorktree.normalized,
+  );
+  assert.deepEqual(
+    rpcV2.parseRpcV2CreateResponse(
+      cases.wire.createResolvedWorktree.normalized,
+      "create-worktree-resolved",
+    ),
+    cases.wire.createResolvedWorktree.normalized,
   );
   assert.deepEqual(
     rpcV2.parseRpcV2CreateResponse(cases.wire.createTerminal.normalized, "create-terminal"),
@@ -226,6 +238,46 @@ test("production execute mappers conform to frozen create and kill outcomes", ()
     loadConfig: () => ({ projects: { demo: { path: "/repo/demo", branch: "main" } } }),
     createWorktree: committedWorktree,
   };
+  const resolvedIdentity = {
+    ...cases.incarnation.baseIdentity,
+    sessionId: "$10",
+    rawName: "demo-fix-1",
+    sessionCreated: "1783700012",
+  };
+  const resolvedExtension = state.buildManagedSessionLifecycleExtension(
+    resolvedIdentity,
+    cases.reservationCorrelation,
+    "fix-1",
+  );
+  const resolvedManaged = state.withManagedSessionLifecycleExtension({
+    name: "demo-fix-1",
+    kind: "worktree",
+    profile: "dashboard",
+    project: "demo",
+    repoPath: "/repo/demo",
+    worktreePath: "/worktrees/demo/demo-fix-abc12",
+    branch: "demo-fix-abc12",
+    baseBranch: "main",
+    createdAt: "2026-07-12T00:00:01.000Z",
+  }, resolvedExtension);
+  const resolvedList = () => rpcV2.buildRpcV2ListResponse(
+    { version: 1, sessions: [resolvedManaged] },
+    [liveSession({
+      name: "demo-fix-1",
+      rawName: "demo-fix-1",
+      sessionId: "$10",
+      sessionCreated: "1783700012",
+      created: 1783700012,
+      activity: 1783700020,
+      cwd: "/worktrees/demo/demo-fix-abc12",
+    })],
+  );
+  const committedResolvedWorktree = () => ({
+    session: "demo-fix-1",
+    workDir: "/worktrees/demo/demo-fix-abc12",
+    worktree: null,
+    lifecycleV2: resolvedExtension,
+  });
 
   let postCreateListCalls = 0;
   const mappings = [
@@ -244,6 +296,18 @@ test("production execute mappers conform to frozen create and kill outcomes", ()
         ...worktreeDeps,
         currentList: worktreeList,
       }),
+    },
+    {
+      id: "create-resolved-worktree-success",
+      expected: cases.wire.createResolvedWorktree.normalized,
+      execute: () => rpcV2.executeRpcV2CreateResolvedWorktree(
+        cases.wire.createResolvedWorktree.request,
+        {
+          loadConfig: () => { throw new Error("resolved execution must not read config"); },
+          createWorktree: committedResolvedWorktree,
+          currentList: resolvedList,
+        },
+      ),
     },
     {
       id: "create-failed-before-commit",
@@ -323,6 +387,83 @@ test("production execute mappers conform to frozen create and kill outcomes", ()
   assert.equal(validationFailed.sideEffect, "not_applied");
   assert.equal(validationCreateCalls, 0);
   assert.equal(validationListCalls, 0);
+});
+
+test("resolved worktree producer does not reread create defaults after admission", () => {
+  let configReads = 0;
+  const captured = [];
+  let externalDefaults = {
+    catalogPath: "/catalog/demo",
+    originHead: "main",
+    worktreeBase: "/old/default",
+  };
+  const execute = () => rpcV2.executeRpcV2CreateResolvedWorktree(
+    cases.wire.createResolvedWorktree.request,
+    {
+      loadConfig: () => {
+        configReads += 1;
+        return externalDefaults;
+      },
+      createWorktree: (params) => {
+        captured.push(structuredClone(params));
+        return {
+          session: "demo-fix-1",
+          workDir: "/worktrees/demo/demo-fix-abc12",
+          worktree: null,
+          lifecycleV2: {
+            incarnation: cases.wire.createResolvedWorktree.normalized.session.incarnation,
+            reservationCorrelation: cases.reservationCorrelation,
+          },
+        };
+      },
+      currentList: () => ({
+        protocolVersion: 2,
+        sessions: [structuredClone(cases.wire.createResolvedWorktree.normalized.session)],
+      }),
+    },
+  );
+
+  assert.deepEqual(execute(), cases.wire.createResolvedWorktree.normalized);
+  externalDefaults = {
+    catalogPath: "/drifted/catalog",
+    originHead: "release/drifted",
+    worktreeBase: "/drifted/default",
+  };
+  assert.deepEqual(execute(), cases.wire.createResolvedWorktree.normalized);
+  assert.equal(configReads, 0);
+  assert.deepEqual(captured[0], captured[1]);
+  assert.deepEqual(captured[0], {
+    aiCmd: "codex",
+    projectDir: "/repo/demo",
+    sessionName: "demo-fix-1",
+    useWorktree: true,
+    worktreeBase: "/worktrees",
+    projectKey: "demo",
+    branch: "main",
+    profile: "dashboard",
+    quiet: true,
+    lifecycleV2: {
+      reservationCorrelation: cases.reservationCorrelation,
+      displayLabel: "fix-1",
+    },
+    resolvedV2: {
+      baseBranch: "main",
+      worktreeBranch: "demo-fix-abc12",
+      worktreePath: "/worktrees/demo/demo-fix-abc12",
+    },
+  });
+
+  const omittedOptionalNameAndBranch = structuredClone(cases.wire.createResolvedWorktree.request);
+  delete omittedOptionalNameAndBranch.arguments.name;
+  delete omittedOptionalNameAndBranch.arguments.branch;
+  omittedOptionalNameAndBranch.execution.publicDisplayName = "demo-2";
+  assert.equal(
+    rpcV2.parseRpcV2CreateResolvedWorktreeRequest(
+      omittedOptionalNameAndBranch,
+    ).execution.effectiveBaseBranch,
+    "main",
+  );
+  assert.equal(Object.hasOwn(omittedOptionalNameAndBranch.arguments, "name"), false);
 });
 
 test("opaque incarnation binds server birth, session ID, raw name, creation, and birth marker", () => {
@@ -440,6 +581,78 @@ test("create-worktree uses the same canonical lifecycle extension without inferr
     state.managedSessionLifecycleExtension(managedState.sessions[0]).reservationCorrelation,
     cases.reservationCorrelation,
   );
+});
+
+test("resolved worktree lifecycle uses only the frozen branch, placement, raw target, and display label", () => {
+  let managedState = { version: 1, sessions: [] };
+  const execCalls = [];
+  let sessionExistsCalls = 0;
+  const identity = liveSession({
+    name: "demo-fix-1",
+    rawName: "demo-fix-1",
+    sessionId: "$10",
+    sessionCreated: "1783700012",
+    created: 1783700012,
+    activity: 1783700020,
+    cwd: "/worktrees/demo/demo-fix-abc12",
+  });
+  const result = session.createManagedWorktreeSession({
+    aiCmd: "codex",
+    projectDir: "/repo/demo",
+    sessionName: "demo-fix-1",
+    useWorktree: true,
+    worktreeBase: "/worktrees",
+    projectKey: "demo",
+    branch: "main",
+    profile: "dashboard",
+    quiet: true,
+    lifecycleV2: {
+      reservationCorrelation: cases.reservationCorrelation,
+      displayLabel: "fix-1",
+    },
+    resolvedV2: {
+      baseBranch: "main",
+      worktreeBranch: "demo-fix-abc12",
+      worktreePath: "/worktrees/demo/demo-fix-abc12",
+    },
+  }, {
+    existsSync: () => true,
+    isGitRepo: () => true,
+    gitQuery: () => { throw new Error("resolved execution must not query origin HEAD"); },
+    exec: (bin, args) => { execCalls.push([bin, structuredClone(args)]); },
+    mkdirSync: () => {},
+    tmuxBin: () => "tmux",
+    sessionExists: () => { sessionExistsCalls += 1; return false; },
+    randomId: () => { throw new Error("resolved execution must not allocate placement"); },
+    randomBirthMarker: () => cases.incarnation.baseIdentity.birthMarker,
+    loadManagedStateForMutation: () => managedState,
+    recordManagedSession: (record) => {
+      managedState = state.upsertManagedSession(managedState, record);
+    },
+    listTmuxSessionLifecycleEntries: () => [identity],
+    setupClipboardBindings: () => {},
+    now: () => new Date("2026-07-12T00:00:01.000Z"),
+  });
+
+  assert.equal(sessionExistsCalls, 1);
+  assert.equal(result.session, "demo-fix-1");
+  assert.deepEqual(result.worktree, {
+    repoDir: "/repo/demo",
+    path: "/worktrees/demo/demo-fix-abc12",
+    branch: "demo-fix-abc12",
+    project: "demo",
+    baseBranch: "main",
+  });
+  assert.deepEqual(execCalls.find(([bin, args]) => bin === "git" && args.includes("worktree")), [
+    "git",
+    [
+      "-C", "/repo/demo", "worktree", "add", "-b", "demo-fix-abc12",
+      "/worktrees/demo/demo-fix-abc12", "origin/main", "--quiet",
+    ],
+  ]);
+  const extension = state.managedSessionLifecycleExtension(managedState.sessions[0]);
+  assert.equal(extension.displayLabel, "fix-1");
+  assert.equal(extension.incarnation, cases.wire.createResolvedWorktree.normalized.session.incarnation);
 });
 
 test("a v2 worktree mutation error is IN_DOUBT rather than false no-side-effect evidence", () => {

@@ -1,4 +1,4 @@
-import { basename } from "node:path";
+import { basename, isAbsolute, join, normalize } from "node:path";
 import { expandHomePath, loadConfigFile, resolveWorktreeBase } from "./config";
 import {
   createManagedTerminalSession,
@@ -27,6 +27,7 @@ export const RPC_V2_CAPABILITIES = Object.freeze([
   "incarnation-list.v1",
   "reservation-correlation.v1",
   "correlated-create-worktree.v1",
+  "resolved-create-worktree.v1",
   "correlated-create-terminal.v1",
   "expected-incarnation-kill-session.v1",
   "hard-timeout.v1",
@@ -83,6 +84,21 @@ export interface RpcV2CreateTerminalRequest {
   reservationCorrelation: ManagedSessionReservationCorrelationV1;
 }
 
+export interface RpcV2CreateResolvedWorktreeRequest {
+  arguments: RpcV2CreateWorktreeRequest["arguments"];
+  execution: {
+    canonicalRepoPath: string;
+    effectiveProject: string;
+    effectiveBaseBranch: string;
+    rawSessionName: string;
+    publicDisplayName: string;
+    worktreeBase: string;
+    worktreePath: string;
+    worktreeBranch: string;
+  };
+  reservationCorrelation: ManagedSessionReservationCorrelationV1;
+}
+
 export interface RpcV2KillSessionRequest {
   name: string;
   expectedIncarnation: string;
@@ -91,20 +107,20 @@ export interface RpcV2KillSessionRequest {
 export type RpcV2CreateResponse =
   | {
       protocolVersion: 2;
-      operation: "create-worktree" | "create-terminal";
+      operation: "create-worktree" | "create-worktree-resolved" | "create-terminal";
       state: "succeeded";
       session: RpcV2Session;
     }
   | {
       protocolVersion: 2;
-      operation: "create-worktree" | "create-terminal";
+      operation: "create-worktree" | "create-worktree-resolved" | "create-terminal";
       state: "failed";
       sideEffect: "not_applied";
       error: { code: "CREATE_FAILED"; message: string };
     }
   | {
       protocolVersion: 2;
-      operation: "create-worktree" | "create-terminal";
+      operation: "create-worktree" | "create-worktree-resolved" | "create-terminal";
       state: "in_doubt";
       error: { code: "IN_DOUBT"; message: string };
     };
@@ -114,7 +130,7 @@ export type RpcV2KillSessionResponse = {
   operation: "kill-session";
 } & ReturnType<typeof killManagedSessionV2>;
 
-export type RpcV2CreateOperation = "create-worktree" | "create-terminal";
+export type RpcV2CreateOperation = "create-worktree" | "create-worktree-resolved" | "create-terminal";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -203,6 +219,81 @@ export function parseRpcV2CreateTerminalRequest(value: unknown): RpcV2CreateTerm
   return {
     arguments: { cwd, ...(label ? { label } : {}) },
     reservationCorrelation: parseCorrelation(value.reservationCorrelation),
+  };
+}
+
+function normalizedAbsolutePath(value: unknown, label: string): string {
+  const parsed = boundedString(value, label, 4_096);
+  if (!isAbsolute(parsed) || normalize(parsed) !== parsed) {
+    throw new Error(`invalid ${label}`);
+  }
+  return parsed;
+}
+
+function publicDisplayMatches(base: string, actual: string): boolean {
+  if (actual === base) return true;
+  if (!actual.startsWith(`${base}-`)) return false;
+  return /^[1-9][0-9]*$/.test(actual.slice(base.length + 1));
+}
+
+export function parseRpcV2CreateResolvedWorktreeRequest(
+  value: unknown,
+): RpcV2CreateResolvedWorktreeRequest {
+  if (!isRecord(value)
+    || !exactKeys(value, ["arguments", "execution", "reservationCorrelation"])
+    || !isRecord(value.execution)
+    || !exactKeys(value.execution, [
+      "canonicalRepoPath", "effectiveProject", "effectiveBaseBranch", "rawSessionName",
+      "publicDisplayName", "worktreeBase", "worktreePath", "worktreeBranch",
+    ])) {
+    throw new Error("invalid RPC v2 resolved create-worktree request");
+  }
+  const reservationCorrelation = parseCorrelation(value.reservationCorrelation);
+  const args = parseRpcV2CreateWorktreeRequest({
+    arguments: value.arguments,
+    reservationCorrelation,
+  }).arguments;
+  const canonicalRepoPath = normalizedAbsolutePath(
+    value.execution.canonicalRepoPath,
+    "canonicalRepoPath",
+  );
+  const effectiveProject = boundedString(value.execution.effectiveProject, "effectiveProject", 128);
+  const effectiveBaseBranch = boundedString(
+    value.execution.effectiveBaseBranch,
+    "effectiveBaseBranch",
+    255,
+  );
+  const rawSessionName = boundedString(value.execution.rawSessionName, "rawSessionName", 128);
+  if (Array.from(rawSessionName).length > SESSION_NAME_MAX_LEN) {
+    throw new Error(`rawSessionName exceeds ${SESSION_NAME_MAX_LEN} characters`);
+  }
+  const publicDisplayName = boundedString(
+    value.execution.publicDisplayName,
+    "publicDisplayName",
+    128,
+  );
+  const worktreeBase = normalizedAbsolutePath(value.execution.worktreeBase, "worktreeBase");
+  const worktreePath = normalizedAbsolutePath(value.execution.worktreePath, "worktreePath");
+  const worktreeBranch = boundedString(value.execution.worktreeBranch, "worktreeBranch", 255);
+  if ((args.project !== undefined && args.project !== effectiveProject)
+    || (args.branch !== undefined && args.branch !== effectiveBaseBranch)
+    || !publicDisplayMatches(args.name ?? effectiveProject, publicDisplayName)
+    || worktreePath !== join(worktreeBase, effectiveProject, worktreeBranch)) {
+    throw new Error("resolved create-worktree execution is not bound to accepted arguments");
+  }
+  return {
+    arguments: args,
+    execution: {
+      canonicalRepoPath,
+      effectiveProject,
+      effectiveBaseBranch,
+      rawSessionName,
+      publicDisplayName,
+      worktreeBase,
+      worktreePath,
+      worktreeBranch,
+    },
+    reservationCorrelation,
   };
 }
 
@@ -314,7 +405,7 @@ export function parseRpcV2CreateResponse(
       throw new Error("invalid RPC v2 create success response");
     }
     const session = parseRpcV2Session(value.session);
-    if (session.kind !== (expectedOperation === "create-worktree" ? "worktree" : "terminal")
+    if (session.kind !== (expectedOperation === "create-terminal" ? "terminal" : "worktree")
       || session.lifecycleMarked !== true
       || session.reservationCorrelation === null) {
       throw new Error("RPC v2 create response lacks lifecycle authority");
@@ -511,7 +602,7 @@ function currentRpcV2List(): RpcV2ListResponse {
 }
 
 function createFailure(
-  operation: "create-worktree" | "create-terminal",
+  operation: RpcV2CreateOperation,
   error: unknown,
 ): RpcV2CreateResponse {
   const message = error instanceof Error ? error.message : String(error);
@@ -542,13 +633,13 @@ interface RpcV2CreateExecutionDeps {
 }
 
 function committedCreateObservationFailure(
-  operation: "create-worktree" | "create-terminal",
+  operation: RpcV2CreateOperation,
   session: string,
   error: unknown,
 ): RpcV2CreateResponse {
   const detail = error instanceof Error ? error.message : String(error);
   return createFailure(operation, new ManagedSessionLifecycleV2InDoubtError(
-    `created ${operation === "create-worktree" ? "worktree" : "terminal"} ${session} committed but post-commit observation is uncertain: ${detail}`,
+    `created ${operation === "create-terminal" ? "terminal" : "worktree"} ${session} committed but post-commit observation is uncertain: ${detail}`,
   ));
 }
 
@@ -604,6 +695,66 @@ export function executeRpcV2CreateWorktree(
     return { protocolVersion: 2, operation: "create-worktree", state: "succeeded", session };
   } catch (error) {
     return committedCreateObservationFailure("create-worktree", created.session, error);
+  }
+}
+
+export function executeRpcV2CreateResolvedWorktree(
+  request: RpcV2CreateResolvedWorktreeRequest,
+  deps: RpcV2CreateExecutionDeps = {},
+): RpcV2CreateResponse {
+  let created: ReturnType<typeof createManagedWorktreeSession>;
+  const execution = request.execution;
+  try {
+    created = (deps.createWorktree ?? createManagedWorktreeSession)({
+      aiCmd: request.arguments.aiCommand,
+      projectDir: execution.canonicalRepoPath,
+      sessionName: execution.rawSessionName,
+      useWorktree: true,
+      worktreeBase: execution.worktreeBase,
+      projectKey: execution.effectiveProject,
+      branch: execution.effectiveBaseBranch,
+      profile: "dashboard",
+      quiet: true,
+      lifecycleV2: {
+        reservationCorrelation: request.reservationCorrelation,
+        displayLabel: execution.publicDisplayName,
+      },
+      resolvedV2: {
+        baseBranch: execution.effectiveBaseBranch,
+        worktreeBranch: execution.worktreeBranch,
+        worktreePath: execution.worktreePath,
+      },
+    }, deps.worktreeSessionDeps);
+  } catch (error) {
+    return createFailure("create-worktree-resolved", error);
+  }
+
+  try {
+    const session = (deps.currentList ?? currentRpcV2List)().sessions.find((item) => (
+      item.name === created.session
+      && item.incarnation === created.lifecycleV2?.incarnation
+    ));
+    if (!session
+      || session.name !== execution.rawSessionName
+      || session.project !== execution.effectiveProject
+      || session.label !== execution.publicDisplayName
+      || session.repoPath !== execution.canonicalRepoPath
+      || session.worktreePath !== execution.worktreePath
+      || session.branch !== execution.worktreeBranch
+      || session.baseBranch !== execution.effectiveBaseBranch
+      || session.cwd !== execution.worktreePath) {
+      throw new ManagedSessionLifecycleV2InDoubtError(
+        `created resolved worktree ${created.session} does not match its frozen execution target`,
+      );
+    }
+    return {
+      protocolVersion: 2,
+      operation: "create-worktree-resolved",
+      state: "succeeded",
+      session,
+    };
+  } catch (error) {
+    return committedCreateObservationFailure("create-worktree-resolved", created.session, error);
   }
 }
 
@@ -669,6 +820,11 @@ export async function rpcV2Cmd(args: string[]): Promise<void> {
     case "create-worktree":
       console.log(JSON.stringify(executeRpcV2CreateWorktree(
         parseRpcV2CreateWorktreeRequest(parseRequestJsonArg(args.slice(1))),
+      )));
+      return;
+    case "create-worktree-resolved":
+      console.log(JSON.stringify(executeRpcV2CreateResolvedWorktree(
+        parseRpcV2CreateResolvedWorktreeRequest(parseRequestJsonArg(args.slice(1))),
       )));
       return;
     case "create-terminal":

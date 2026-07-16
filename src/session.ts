@@ -55,6 +55,12 @@ export interface CreateManagedWorktreeSessionParams {
   profile: ManagedSessionProfile;
   quiet?: boolean;
   lifecycleV2?: ManagedSessionLifecycleV2Create;
+  /** Fully materialized RPC v2 placement; bypasses all branch/name/path defaults. */
+  resolvedV2?: {
+    baseBranch: string;
+    worktreeBranch: string;
+    worktreePath: string;
+  };
 }
 
 export interface CreatedManagedWorktree {
@@ -488,7 +494,12 @@ export function createManagedWorktreeSession(
     throw new CliError(`目录不存在: ${params.projectDir}`);
   }
 
-  const session = resolveSessionName(params.sessionName, sessionExists);
+  const session = params.resolvedV2
+    ? params.sessionName
+    : resolveSessionName(params.sessionName, sessionExists);
+  if (params.resolvedV2 && sessionExists(session)) {
+    throw new CliError(`resolved RPC v2 tmux session target already exists: ${session}`);
+  }
   const tmux = tmuxBin();
   let workDir = params.projectDir;
   let createdWorktree: CreatedManagedWorktree | null = null;
@@ -501,15 +512,19 @@ export function createManagedWorktreeSession(
 
     const label = params.projectKey ?? session;
     log(`📦 项目: ${label} (${params.projectDir})`);
-    const targetBranch = detectTargetBranch(params.projectDir, params.branch, gitQuery);
+    const targetBranch = params.resolvedV2?.baseBranch
+      ?? detectTargetBranch(params.projectDir, params.branch, gitQuery);
     createdAt = managedSessionCreatedAt(now);
 
     log(`🔄 正在从远程拉取最新代码 (${targetBranch})...`);
     exec("git", ["-C", params.projectDir, "fetch", "origin", targetBranch, "--quiet"]);
 
-    const branchName = `${session}-${randomId()}`;
+    const branchName = params.resolvedV2?.worktreeBranch ?? `${session}-${randomId()}`;
     const projectWorktreeRoot = join(params.worktreeBase, label);
-    const worktreeDir = join(projectWorktreeRoot, branchName);
+    const worktreeDir = params.resolvedV2?.worktreePath ?? join(projectWorktreeRoot, branchName);
+    if (params.resolvedV2 && worktreeDir !== join(projectWorktreeRoot, branchName)) {
+      throw new CliError("resolved RPC v2 worktree placement is inconsistent");
+    }
     mkdirSync(projectWorktreeRoot, { recursive: true });
 
     log(`🌿 创建 worktree 分支: ${branchName}`);

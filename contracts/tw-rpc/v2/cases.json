@@ -1,7 +1,7 @@
 {
   "capabilities": {
     "argv": ["rpc-v2", "capabilities"],
-    "stdout": "{\"protocolVersion\":2,\"app\":\"tmux-worktree\",\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\"]}\n",
+    "stdout": "{\"protocolVersion\":2,\"app\":\"tmux-worktree\",\"capabilities\":[\"incarnation-list.v1\",\"reservation-correlation.v1\",\"correlated-create-worktree.v1\",\"resolved-create-worktree.v1\",\"correlated-create-terminal.v1\",\"expected-incarnation-kill-session.v1\",\"hard-timeout.v1\"]}\n",
     "normalized": {
       "protocolVersion": 2,
       "app": "tmux-worktree",
@@ -9,6 +9,7 @@
         "incarnation-list.v1",
         "reservation-correlation.v1",
         "correlated-create-worktree.v1",
+        "resolved-create-worktree.v1",
         "correlated-create-terminal.v1",
         "expected-incarnation-kill-session.v1",
         "hard-timeout.v1"
@@ -98,6 +99,76 @@
           "created": 1783700012,
           "activity": 1783700020,
           "incarnation": "twinc2.o3_VQ1gGehiOD7Kria-v61EKe1-VMUrkkgQdIosbTC0",
+          "lifecycleMarked": true,
+          "reservationCorrelation": {
+            "schemaVersion": 1,
+            "reservationId": "res_opaque_1",
+            "hostEpoch": "host-epoch-1",
+            "principalId": "principal-1",
+            "hostId": "mac-admin",
+            "commandId": "command-1",
+            "requestFingerprint": {
+              "schemaVersion": 1,
+              "algorithm": "sha256-rfc8785",
+              "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+            }
+          }
+        }
+      }
+    },
+    "createResolvedWorktree": {
+      "request": {
+        "arguments": {
+          "project": "demo",
+          "name": "fix",
+          "branch": "main",
+          "aiCommand": "codex"
+        },
+        "execution": {
+          "canonicalRepoPath": "/repo/demo",
+          "effectiveProject": "demo",
+          "effectiveBaseBranch": "main",
+          "rawSessionName": "demo-fix-1",
+          "publicDisplayName": "fix-1",
+          "worktreeBase": "/worktrees",
+          "worktreePath": "/worktrees/demo/demo-fix-abc12",
+          "worktreeBranch": "demo-fix-abc12"
+        },
+        "reservationCorrelation": {
+          "schemaVersion": 1,
+          "reservationId": "res_opaque_1",
+          "hostEpoch": "host-epoch-1",
+          "principalId": "principal-1",
+          "hostId": "mac-admin",
+          "commandId": "command-1",
+          "requestFingerprint": {
+            "schemaVersion": 1,
+            "algorithm": "sha256-rfc8785",
+            "digest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          }
+        }
+      },
+      "normalized": {
+        "protocolVersion": 2,
+        "operation": "create-worktree-resolved",
+        "state": "succeeded",
+        "session": {
+          "name": "demo-fix-1",
+          "kind": "worktree",
+          "profile": "dashboard",
+          "project": "demo",
+          "label": "fix-1",
+          "repoPath": "/repo/demo",
+          "worktreePath": "/worktrees/demo/demo-fix-abc12",
+          "branch": "demo-fix-abc12",
+          "baseBranch": "main",
+          "cwd": "/worktrees/demo/demo-fix-abc12",
+          "createdAt": "2026-07-12T00:00:01.000Z",
+          "attached": false,
+          "windows": 1,
+          "created": 1783700012,
+          "activity": 1783700020,
+          "incarnation": "twinc2.F8iPdnz8FfBLoU-RvsDVLq37vOjko-9uQ2Gp3hhhMug",
           "lifecycleMarked": true,
           "reservationCorrelation": {
             "schemaVersion": 1,

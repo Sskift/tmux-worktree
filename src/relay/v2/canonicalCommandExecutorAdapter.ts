@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute, normalize } from "node:path";
 import type {
   CanonicalAgentMessageResult,
   CanonicalTerminalLease,
@@ -6,11 +7,13 @@ import type {
 import {
   RPC_V2_CAPABILITIES,
   parseRpcV2CreateResponse,
+  parseRpcV2CreateResolvedWorktreeRequest,
   parseRpcV2CreateTerminalRequest,
   parseRpcV2CreateWorktreeRequest,
   parseRpcV2KillSessionRequest,
   parseRpcV2KillSessionResponse,
   type RpcV2CreateTerminalRequest,
+  type RpcV2CreateResolvedWorktreeRequest,
   type RpcV2CreateWorktreeRequest,
   type RpcV2Session,
 } from "../../rpcV2.js";
@@ -83,6 +86,7 @@ export type RelayV2CanonicalResolvedTarget =
       processTarget: RelayV2CanonicalProcessTarget;
       capabilities: readonly string[];
       arguments: RpcV2CreateWorktreeRequest["arguments"];
+      execution: RpcV2CreateResolvedWorktreeRequest["execution"];
       publicDisplayName: string;
       prospectiveSession: RelayV2CanonicalProspectiveSession;
     }
@@ -92,6 +96,10 @@ export type RelayV2CanonicalResolvedTarget =
       processTarget: RelayV2CanonicalProcessTarget;
       capabilities: readonly string[];
       arguments: RpcV2CreateTerminalRequest["arguments"];
+      execution: {
+        canonicalCwd: string;
+        publicDisplayName: string;
+      };
       publicDisplayName: string;
       prospectiveSession: RelayV2CanonicalProspectiveSession;
     }
@@ -275,6 +283,7 @@ function terminalOperationId(plan: RelayV2TerminalControlExecutionPlan): string 
     principalId: plan.principalId,
     hostId: plan.hostId,
     commandId: plan.commandId,
+    requestFingerprint: fingerprint(plan.requestFingerprint),
   });
   if (Buffer.byteLength(operationId, "utf8") > 192) {
     throw new TypeError("canonical terminal-control operation identity exceeds its hard limit");
@@ -304,6 +313,18 @@ function resolverEvidence(value: unknown): RelayV2CanonicalResolverEvidence {
     revision: boundedString(value.revision),
     observedAtMs: safeInteger(value.observedAtMs),
   };
+}
+
+function notFoundCodeAllowed(
+  operation: RelayV2CommandOperation,
+  code: unknown,
+): boolean {
+  if (code === "SCOPE_NOT_FOUND") return true;
+  if (code === "PROJECT_NOT_FOUND") return operation === "create_worktree";
+  if (code === "SESSION_NOT_FOUND") {
+    return operation === "send_agent_message" || operation === "kill_session";
+  }
+  return code === "PANE_NOT_FOUND" && operation === "send_agent_message";
 }
 
 function processTarget(value: unknown, scopeId: string): RelayV2CanonicalProcessTarget {
@@ -388,7 +409,7 @@ function correlation(
   };
 }
 
-function createArguments(
+function acceptedCreateArguments(
   operation: "create_worktree" | "create_terminal",
   value: unknown,
   request: RelayV2CanonicalCommandRequest,
@@ -403,17 +424,10 @@ function createArguments(
         arguments: value,
         reservationCorrelation: probeCorrelation,
       }).arguments;
-    if (resolved.aiCommand !== accepted.aiCommand
-      || (accepted.project !== undefined && resolved.project !== accepted.project)
-      || (accepted.name !== undefined && resolved.name !== accepted.name)
-      || resolved.project === undefined
-      || resolved.path === undefined
-      || resolved.name === undefined
-      || Object.hasOwn(resolved, "branch") !== Object.hasOwn(accepted, "branch")
-      || resolved.branch !== accepted.branch) {
+    if (canonicalJson(resolved) !== canonicalJson(accepted)) {
       throw new TypeError("canonical resolver changed accepted create-worktree arguments");
     }
-    return resolved;
+    return accepted;
   }
   const accepted = parseRpcV2CreateTerminalRequest({
     arguments: request.arguments,
@@ -423,11 +437,28 @@ function createArguments(
     arguments: value,
     reservationCorrelation: probeCorrelation,
   }).arguments;
-  if ((accepted.label !== undefined && resolved.label !== accepted.label)
-    || resolved.label === undefined) {
+  if (canonicalJson(resolved) !== canonicalJson(accepted)) {
     throw new TypeError("canonical resolver changed accepted create-terminal arguments");
   }
-  return resolved;
+  return accepted;
+}
+
+function terminalExecution(value: unknown): {
+  canonicalCwd: string;
+  publicDisplayName: string;
+} {
+  if (!isRecord(value)
+    || !exactKeys(value, ["canonicalCwd", "publicDisplayName"])) {
+    throw new TypeError("canonical terminal execution target is malformed");
+  }
+  const canonicalCwd = boundedString(value.canonicalCwd, 4_096);
+  if (!isAbsolute(canonicalCwd) || normalize(canonicalCwd) !== canonicalCwd) {
+    throw new TypeError("canonical terminal cwd is not a normalized absolute path");
+  }
+  return {
+    canonicalCwd,
+    publicDisplayName: boundedString(value.publicDisplayName),
+  };
 }
 
 function managedTarget(value: unknown): {
@@ -495,11 +526,11 @@ function resolvedTarget(
   if (request.operation === "create_worktree" || request.operation === "create_terminal") {
     if (!exactKeys(value, [
       "authority", "operation", "processTarget", "capabilities", "arguments",
-      "publicDisplayName", "prospectiveSession",
+      "execution", "publicDisplayName", "prospectiveSession",
     ])) {
       throw new TypeError("canonical create target is malformed");
     }
-    const args = createArguments(request.operation, value.arguments, request);
+    const args = acceptedCreateArguments(request.operation, value.arguments, request);
     const displayName = boundedString(value.publicDisplayName);
     const session = prospectiveSession(value.prospectiveSession, request.operation);
     const base = {
@@ -511,21 +542,39 @@ function resolvedTarget(
     };
     if (request.operation === "create_worktree") {
       const worktreeArgs = args as RpcV2CreateWorktreeRequest["arguments"];
-      if (displayName !== worktreeArgs.name
+      const execution = parseRpcV2CreateResolvedWorktreeRequest({
+        arguments: worktreeArgs,
+        execution: value.execution,
+        reservationCorrelation: correlation(request, "resolver-reservation"),
+      }).execution;
+      if (displayName !== execution.publicDisplayName
         || session.displayName !== displayName
-        || session.project !== worktreeArgs.project) {
+        || session.project !== execution.effectiveProject
+        || session.cwd !== execution.worktreePath) {
         throw new TypeError("canonical worktree display evidence is not bound to accepted arguments");
       }
-      return { ...base, operation: request.operation, arguments: worktreeArgs };
+      return {
+        ...base,
+        operation: request.operation,
+        arguments: worktreeArgs,
+        execution,
+      };
     }
     const terminalArgs = args as RpcV2CreateTerminalRequest["arguments"];
-    if (displayName !== terminalArgs.label
+    const execution = terminalExecution(value.execution);
+    if (displayName !== execution.publicDisplayName
+      || (terminalArgs.label !== undefined && displayName !== terminalArgs.label)
       || session.displayName !== displayName
       || session.label !== displayName
-      || session.cwd !== terminalArgs.cwd) {
+      || session.cwd !== execution.canonicalCwd) {
       throw new TypeError("canonical terminal display evidence is not bound to accepted arguments");
     }
-    return { ...base, operation: request.operation, arguments: terminalArgs };
+    return {
+      ...base,
+      operation: request.operation,
+      arguments: terminalArgs,
+      execution,
+    };
   }
   if (request.operation === "kill_session") {
     if (!exactKeys(value, [
@@ -656,8 +705,10 @@ function parseAdapterState(
   return state;
 }
 
-function rpcOperation(operation: RelayV2CommandOperation): "create-worktree" | "create-terminal" | "kill-session" {
-  if (operation === "create_worktree") return "create-worktree";
+function rpcOperation(
+  operation: RelayV2CommandOperation,
+): "create-worktree-resolved" | "create-terminal" | "kill-session" {
+  if (operation === "create_worktree") return "create-worktree-resolved";
   if (operation === "create_terminal") return "create-terminal";
   return "kill-session";
 }
@@ -729,10 +780,10 @@ function sessionEvidence(
   const evidence = {
     session: {
       kind: session.kind,
-      displayName: target.publicDisplayName,
+      displayName: session.label,
       state: "running",
       project: session.project,
-      label: session.kind === "terminal" ? target.publicDisplayName : null,
+      label: session.kind === "terminal" ? session.label : null,
       cwd: session.cwd,
       attached: session.attached,
       windowCount: session.windows,
@@ -740,13 +791,28 @@ function sessionEvidence(
       activityAtMs,
     },
   } as RelayV2JsonObject;
-  if ((session.kind === "worktree" && (session.project === null || session.label !== null))
+  if ((session.kind === "worktree" && (session.project === null || session.label === null))
     || (session.kind === "terminal" && (session.project !== null || session.label === null))
     || session.kind !== (target.operation === "create_worktree" ? "worktree" : "terminal")
-    || (target.operation === "create_worktree"
-      && session.project !== target.prospectiveSession.project)
+    || session.label !== target.publicDisplayName
+    || (target.operation === "create_worktree" && (
+      session.name !== target.execution.rawSessionName
+      || session.project !== target.execution.effectiveProject
+      || session.repoPath !== target.execution.canonicalRepoPath
+      || session.worktreePath === null
+      || session.worktreePath !== target.execution.worktreePath
+      || session.branch === null
+      || session.branch !== target.execution.worktreeBranch
+      || session.baseBranch !== target.execution.effectiveBaseBranch
+      || session.cwd !== session.worktreePath
+    ))
     || (target.operation === "create_terminal" && (
-      session.label !== target.publicDisplayName || session.cwd !== target.arguments.cwd
+      session.project !== null
+      || session.repoPath !== null
+      || session.worktreePath !== null
+      || session.branch !== null
+      || session.baseBranch !== null
+      || session.cwd !== target.execution.canonicalCwd
     ))) {
     throw new TypeError("canonical RPC v2 Session kind fields are inconsistent");
   }
@@ -828,6 +894,23 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       };
     }
     if (raw.kind === "not_found") {
+      const validCoverage = raw.coverage === "complete"
+        || raw.coverage === "partial"
+        || raw.coverage === "unreachable";
+      if (!isRecord(raw)
+        || !exactKeys(raw, ["kind", "coverage", "evidence", "code"])
+        || !validCoverage
+        || !notFoundCodeAllowed(request.operation, raw.code)) {
+        return {
+          kind: "transient_admission_failure",
+          authorityEvidence: authorityEvidence(
+            request,
+            validCoverage ? raw.coverage : "unreachable",
+            evidence,
+          ),
+          error: transientError("INTERNAL", "Canonical target evidence is invalid"),
+        };
+      }
       const observed = authorityEvidence(request, raw.coverage, evidence);
       if (raw.coverage !== "complete") {
         return {
@@ -929,15 +1012,23 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
           principalId: plan.principalId,
           hostId: plan.hostId,
         }, plan.resourceReservation.reservationId);
-        request = plan.operation === "create_worktree"
-          ? parseRpcV2CreateWorktreeRequest({
-              arguments: target.arguments,
-              reservationCorrelation: expectedCorrelation,
-            }) as unknown as RelayV2JsonObject
-          : parseRpcV2CreateTerminalRequest({
-              arguments: target.arguments,
-              reservationCorrelation: expectedCorrelation,
-            }) as unknown as RelayV2JsonObject;
+        if (plan.operation === "create_worktree") {
+          if (target.operation !== "create_worktree") return { state: "in_doubt" };
+          request = parseRpcV2CreateResolvedWorktreeRequest({
+            arguments: target.arguments,
+            execution: target.execution,
+            reservationCorrelation: expectedCorrelation,
+          }) as unknown as RelayV2JsonObject;
+        } else {
+          if (target.operation !== "create_terminal") return { state: "in_doubt" };
+          request = parseRpcV2CreateTerminalRequest({
+            arguments: {
+              cwd: target.execution.canonicalCwd,
+              label: target.execution.publicDisplayName,
+            },
+            reservationCorrelation: expectedCorrelation,
+          }) as unknown as RelayV2JsonObject;
+        }
       } else {
         if (target.operation !== "kill_session" || plan.resourceReservation !== null) {
           return { state: "in_doubt" };
@@ -997,7 +1088,7 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       }
       const response = parseRpcV2CreateResponse(
         frame,
-        plan.operation === "create_worktree" ? "create-worktree" : "create-terminal",
+        plan.operation === "create_worktree" ? "create-worktree-resolved" : "create-terminal",
       );
       if (response.state === "in_doubt") return { state: "in_doubt" };
       if (response.state === "failed") {

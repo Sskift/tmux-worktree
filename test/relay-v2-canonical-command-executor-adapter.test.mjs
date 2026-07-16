@@ -11,7 +11,10 @@ const SCOPE_ID = "scope-local";
 const INCARNATION = `twinc2.${"A".repeat(43)}`;
 const OTHER_INCARNATION = `twinc2.${"B".repeat(43)}`;
 const CREATED_AT = "2026-07-12T00:00:01.000Z";
-const RAW_WORKTREE_NAME = "tw-demo-fix-backend-a1b2c";
+const RAW_WORKTREE_NAME = "demo-fix-backend-1";
+const WORKTREE_BRANCH = "demo-fix-7f3";
+const WORKTREE_PATH = `/worktrees/demo/${WORKTREE_BRANCH}`;
+const WORKTREE_DISPLAY = "fix-1";
 
 function fingerprint(seed = "a") {
   return {
@@ -63,15 +66,15 @@ function evidence(coverage = "complete") {
   };
 }
 
-function prospectiveSession(operation, args) {
+function prospectiveSession(operation, execution) {
   const terminal = operation === "create_terminal";
   return {
     kind: terminal ? "terminal" : "worktree",
-    displayName: terminal ? args.label : args.name,
+    displayName: execution.publicDisplayName,
     state: "running",
-    project: terminal ? null : args.project,
-    label: terminal ? args.label : null,
-    cwd: terminal ? args.cwd : "/worktrees/demo/demo-fix",
+    project: terminal ? null : execution.effectiveProject,
+    label: terminal ? execution.publicDisplayName : null,
+    cwd: terminal ? execution.canonicalCwd : execution.worktreePath,
     attached: false,
     windowCount: 1,
     createdAtMs: 1_783_700_001_000,
@@ -83,6 +86,21 @@ function resolvedFor(request) {
   const base = { kind: "resolved", ...evidence() };
   if (request.operation === "create_worktree" || request.operation === "create_terminal") {
     const args = structuredClone(request.arguments);
+    const execution = request.operation === "create_worktree"
+      ? {
+          canonicalRepoPath: "/repo/demo",
+          effectiveProject: args.project ?? "demo",
+          effectiveBaseBranch: args.branch ?? "main",
+          rawSessionName: RAW_WORKTREE_NAME,
+          publicDisplayName: args.name ? `${args.name}-1` : `${args.project ?? "demo"}-1`,
+          worktreeBase: "/worktrees",
+          worktreePath: WORKTREE_PATH,
+          worktreeBranch: WORKTREE_BRANCH,
+        }
+      : {
+          canonicalCwd: "/repo/demo",
+          publicDisplayName: args.label ?? "demo",
+        };
     return {
       ...base,
       target: {
@@ -95,8 +113,9 @@ function resolvedFor(request) {
         },
         capabilities: [...rpcV2.RPC_V2_CAPABILITIES],
         arguments: args,
-        publicDisplayName: request.operation === "create_terminal" ? args.label : args.name,
-        prospectiveSession: prospectiveSession(request.operation, args),
+        execution,
+        publicDisplayName: execution.publicDisplayName,
+        prospectiveSession: prospectiveSession(request.operation, execution),
       },
     };
   }
@@ -147,19 +166,20 @@ function exitedJson(value, overrides = {}) {
   };
 }
 
-function createSession(operation, reservationCorrelation) {
+function createSession(operation, request) {
   const terminal = operation === "create-terminal";
+  const execution = terminal ? null : request.execution;
   return {
-    name: terminal ? "tw-term-a1b2c" : RAW_WORKTREE_NAME,
+    name: terminal ? "tw-term-a1b2c" : execution.rawSessionName,
     kind: terminal ? "terminal" : "worktree",
     profile: "dashboard",
-    project: terminal ? null : "demo",
-    label: terminal ? "demo" : null,
-    repoPath: terminal ? null : "/repo/demo",
-    worktreePath: terminal ? null : "/worktrees/demo/demo-fix",
-    branch: terminal ? null : "demo-fix",
-    baseBranch: terminal ? null : "main",
-    cwd: terminal ? "/repo/demo" : "/worktrees/demo/demo-fix",
+    project: terminal ? null : execution.effectiveProject,
+    label: terminal ? request.arguments.label : execution.publicDisplayName,
+    repoPath: terminal ? null : execution.canonicalRepoPath,
+    worktreePath: terminal ? null : execution.worktreePath,
+    branch: terminal ? null : execution.worktreeBranch,
+    baseBranch: terminal ? null : execution.effectiveBaseBranch,
+    cwd: terminal ? request.arguments.cwd : execution.worktreePath,
     createdAt: CREATED_AT,
     attached: false,
     windows: 1,
@@ -167,7 +187,7 @@ function createSession(operation, reservationCorrelation) {
     activity: 1_783_700_020,
     incarnation: terminal ? INCARNATION : OTHER_INCARNATION,
     lifecycleMarked: true,
-    reservationCorrelation: structuredClone(reservationCorrelation),
+    reservationCorrelation: structuredClone(request.reservationCorrelation),
   };
 }
 
@@ -190,7 +210,7 @@ function successResponseForProcessCall(call) {
     protocolVersion: 2,
     operation,
     state: "succeeded",
-    session: createSession(operation, request.reservationCorrelation),
+    session: createSession(operation, request),
   };
 }
 
@@ -297,7 +317,7 @@ test("canonical executor translates all four operations to one exact authority c
   assert.deepEqual(
     ports.calls.process.map((call) => [call.target.kind, call.argv.slice(0, 3)]),
     [
-      ["local", ["rpc-v2", "create-worktree", "--request-json"]],
+      ["local", ["rpc-v2", "create-worktree-resolved", "--request-json"]],
       ["ssh", ["rpc-v2", "create-terminal", "--request-json"]],
       ["local", ["rpc-v2", "kill-session", "--request-json"]],
     ],
@@ -316,6 +336,10 @@ test("canonical executor translates all four operations to one exact authority c
   assert.equal(worktreeRequest.reservationCorrelation.reservationId, "reservation-create_worktree");
   assert.equal(worktreeRequest.reservationCorrelation.commandId, "cmd-create_worktree");
   assert.deepEqual(worktreeRequest.reservationCorrelation.requestFingerprint, fingerprint("a"));
+  assert.deepEqual(worktreeRequest.arguments, canonicalRequest("create_worktree").arguments);
+  assert.deepEqual(worktreeRequest.execution, resolvedFor(
+    canonicalRequest("create_worktree"),
+  ).target.execution);
   const terminalRequest = JSON.parse(ports.calls.process[1].argv[3]);
   assert.equal(terminalRequest.reservationCorrelation.reservationId, "reservation-create_terminal");
   const killRequest = JSON.parse(ports.calls.process[2].argv[3]);
@@ -337,7 +361,7 @@ test("canonical executor translates all four operations to one exact authority c
     outcomes.create_terminal.backendOutcome.backendInstanceKey,
     outcomes.kill_session.backendOutcome.backendInstanceKey,
   );
-  assert.equal(outcomes.create_worktree.backendOutcome.evidence.session.displayName, "fix");
+  assert.equal(outcomes.create_worktree.backendOutcome.evidence.session.displayName, WORKTREE_DISPLAY);
   assert.equal(JSON.stringify(outcomes.create_worktree.backendOutcome.evidence).includes(RAW_WORKTREE_NAME), false);
   assert.equal(outcomes.create_terminal.backendOutcome.evidence.session.displayName, "demo");
   assert.equal(outcomes.create_terminal.backendOutcome.evidence.session.label, "demo");
@@ -411,6 +435,38 @@ test("resolver coverage alone controls immutable not-found admission", async () 
   assert.equal(unavailable.error.commandDisposition, "not_accepted");
 });
 
+test("complete not-found evidence is closed over each operation", async (t) => {
+  const allowed = {
+    create_worktree: new Set(["SCOPE_NOT_FOUND", "PROJECT_NOT_FOUND"]),
+    create_terminal: new Set(["SCOPE_NOT_FOUND"]),
+    send_agent_message: new Set(["SCOPE_NOT_FOUND", "SESSION_NOT_FOUND", "PANE_NOT_FOUND"]),
+    kill_session: new Set(["SCOPE_NOT_FOUND", "SESSION_NOT_FOUND"]),
+  };
+  const codes = [
+    "SCOPE_NOT_FOUND", "PROJECT_NOT_FOUND", "SESSION_NOT_FOUND", "PANE_NOT_FOUND",
+  ];
+  for (const [operation, operationCodes] of Object.entries(allowed)) {
+    for (const code of codes) {
+      await t.test(`${operation}/${code}`, async () => {
+        const ports = fakePorts({
+          resolve: () => ({ kind: "not_found", ...evidence("complete"), code }),
+        });
+        const admission = await executorFor(ports).resolve(canonicalRequest(operation));
+        if (operationCodes.has(code)) {
+          assert.equal(admission.kind, "immutable_business_failure");
+          assert.equal(admission.error.code, code);
+        } else {
+          assert.equal(admission.kind, "transient_admission_failure");
+          assert.equal(admission.error.code, "INTERNAL");
+          assert.equal(admission.error.commandDisposition, "not_accepted");
+        }
+        assert.equal(ports.calls.process.length, 0);
+        assert.equal(ports.calls.terminal.length, 0);
+      });
+    }
+  }
+});
+
 test("resolver cannot rewrite accepted pure create arguments", async (t) => {
   const cases = [
     ["aiCommand", "create_worktree", (target) => { target.arguments.aiCommand = "other-agent"; }],
@@ -420,8 +476,10 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
     ["public display", "create_worktree", (target) => {
       target.publicDisplayName = "other-display";
       target.prospectiveSession.displayName = "other-display";
+      target.execution.publicDisplayName = "other-display";
     }],
     ["label", "create_terminal", (target) => { target.arguments.label = "other-label"; }],
+    ["cwd", "create_terminal", (target) => { target.arguments.cwd = "/other/user-input"; }],
   ];
   for (const [name, operation, mutate] of cases) {
     await t.test(name, async () => {
@@ -445,9 +503,9 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
       resolve: (request) => {
         const resolved = resolvedFor(request);
         if (request.operation === "create_worktree") {
-          resolved.target.arguments.path = "/canonical/repo/demo";
+          resolved.target.execution.canonicalRepoPath = "/canonical/repo/demo";
         } else {
-          resolved.target.arguments.cwd = "/canonical/repo/demo";
+          resolved.target.execution.canonicalCwd = "/canonical/repo/demo";
           resolved.target.prospectiveSession.cwd = "/canonical/repo/demo";
         }
         return resolved;
@@ -457,6 +515,61 @@ test("resolver cannot rewrite accepted pure create arguments", async (t) => {
     assert.equal((await executor.resolve(canonicalRequest("create_worktree"))).kind, "executable");
     assert.equal((await executor.resolve(canonicalRequest("create_terminal"))).kind, "executable");
     assert.equal(ports.calls.process.length, 0);
+  });
+});
+
+test("resolved worktree freezes omitted defaults without synthesizing public arguments", async () => {
+  const request = canonicalRequest("create_worktree", {
+    arguments: {
+      project: "demo",
+      path: "/catalog/demo",
+      aiCommand: "codex --resume exact",
+    },
+  });
+  const externalAuthority = {
+    canonicalRepoPath: "/real/demo",
+    effectiveBaseBranch: "release/2026",
+    worktreeBase: "/frozen/worktrees",
+    worktreeBranch: "demo-release-91a",
+    publicDisplayName: "demo-2",
+  };
+  const ports = fakePorts({
+    resolve: (accepted) => {
+      const resolved = resolvedFor(accepted);
+      Object.assign(resolved.target.execution, externalAuthority, {
+        worktreePath: `${externalAuthority.worktreeBase}/demo/${externalAuthority.worktreeBranch}`,
+      });
+      resolved.target.publicDisplayName = externalAuthority.publicDisplayName;
+      resolved.target.prospectiveSession.displayName = externalAuthority.publicDisplayName;
+      resolved.target.prospectiveSession.cwd = resolved.target.execution.worktreePath;
+      return resolved;
+    },
+  });
+  const executor = executorFor(ports);
+  const plan = await executionPlan(executor, request);
+  Object.assign(externalAuthority, {
+    canonicalRepoPath: "/drifted/catalog/repo",
+    effectiveBaseBranch: "drifted-origin-head",
+    worktreeBase: "/drifted/config/worktrees",
+    worktreeBranch: "drifted-branch",
+    publicDisplayName: "drifted-label",
+  });
+
+  assert.equal((await executor.executeTwRpc(plan)).state, "succeeded");
+  assert.equal(ports.calls.process.length, 1);
+  const sent = JSON.parse(ports.calls.process[0].argv[3]);
+  assert.deepEqual(sent.arguments, request.arguments);
+  assert.equal(Object.hasOwn(sent.arguments, "name"), false);
+  assert.equal(Object.hasOwn(sent.arguments, "branch"), false);
+  assert.deepEqual(sent.execution, {
+    canonicalRepoPath: "/real/demo",
+    effectiveProject: "demo",
+    effectiveBaseBranch: "release/2026",
+    rawSessionName: RAW_WORKTREE_NAME,
+    publicDisplayName: "demo-2",
+    worktreeBase: "/frozen/worktrees",
+    worktreePath: "/frozen/worktrees/demo/demo-release-91a",
+    worktreeBranch: "demo-release-91a",
   });
 });
 
@@ -511,6 +624,10 @@ test("terminal operation identity binds the full trusted ledger tuple", async ()
       commandId: "cmd-shared",
       hostId: "mac-admin-two",
     }),
+    canonicalRequest("send_agent_message", {
+      commandId: "cmd-shared",
+      requestFingerprint: fingerprint("d"),
+    }),
     canonicalRequest("send_agent_message", { commandId: "cmd-shared" }),
   ];
   for (const request of requests) {
@@ -519,7 +636,7 @@ test("terminal operation identity binds the full trusted ledger tuple", async ()
     )).state, "succeeded");
   }
   const operationIds = ports.calls.terminal.map((call) => call.operationId);
-  assert.equal(operationIds[0], operationIds[4]);
+  assert.equal(operationIds[0], operationIds[5]);
   assert.equal(new Set(operationIds).size, requests.length - 1);
   assert.ok(operationIds.every((value) => Buffer.byteLength(value, "utf8") <= 192));
 });
@@ -627,6 +744,43 @@ test("TW RPC maps only explicit no-side-effect failure and strict correlated suc
     assert.equal((await executor.executeTwRpc(plan)).state, "in_doubt");
     assert.equal(ports.calls.process.length, 1);
   });
+
+  for (const [name, operation, mutate] of [
+    ["worktree repo drift", "create_worktree", (session) => { session.repoPath = "/other/repo"; }],
+    ["worktree base drift", "create_worktree", (session) => { session.baseBranch = "other"; }],
+    ["worktree path drift", "create_worktree", (session) => {
+      session.worktreePath = "/other/worktree";
+      session.cwd = "/other/worktree";
+    }],
+    ["worktree branch missing", "create_worktree", (session) => { session.branch = null; }],
+    ["worktree cwd drift", "create_worktree", (session) => { session.cwd = "/other/cwd"; }],
+    ["worktree raw label leak", "create_worktree", (session) => {
+      session.label = RAW_WORKTREE_NAME;
+    }],
+    ["terminal worktree fields present", "create_terminal", (session) => {
+      session.repoPath = "/repo/demo";
+      session.worktreePath = "/worktrees/demo/unexpected";
+      session.branch = "unexpected";
+      session.baseBranch = "main";
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const ports = fakePorts({
+        process: (call) => {
+          const response = successResponseForProcessCall(call);
+          mutate(response.session);
+          return exitedJson(response);
+        },
+      });
+      const executor = executorFor(ports);
+      const outcome = await executor.executeTwRpc(await executionPlan(
+        executor,
+        canonicalRequest(operation),
+      ));
+      assert.equal(outcome.state, "in_doubt");
+      assert.equal(ports.calls.process.length, 1);
+    });
+  }
 
   await t.test("persisted capability uncertainty", async () => {
     const ports = fakePorts();

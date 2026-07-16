@@ -8,6 +8,7 @@
     "capabilities",
     "list",
     "create-worktree",
+    "create-worktree-resolved",
     "create-terminal",
     "kill-session"
   ],
