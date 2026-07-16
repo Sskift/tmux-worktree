@@ -221,12 +221,30 @@ class RelayV2ProfileRepositoryTest {
             val target = relayV2Profile()
             lateinit var prepared: RelayV2ProfileActivationJournal
             withPreferencesStore(file) { preferences ->
+                val store = PreferencesRelayV2ProfileStore(preferences)
+                assertEquals(
+                    null,
+                    store.prepareRelayV2Activation(
+                        expectedActiveProfile = RelayActiveProfileIdentity(
+                            profileId = "vanished-before-prepare",
+                            dialect = RelayProfileDialect.V1,
+                            activationGeneration = 3,
+                        ),
+                        operationId = "activation-active-cas-race",
+                        profile = target,
+                        targetBindingDigest = "binding-active-cas-race",
+                        targetCredentialAttemptId = "attempt-active-cas-race",
+                        targetCredentialSecretReference = "secret-active-cas-race",
+                        barrierId = "barrier-active-cas-race",
+                        previousCredentialReference = null,
+                    ),
+                )
+                assertEquals(null, store.pendingRelayV2Activation())
                 preferences.saveProfile(
                     relayUrl = "wss://legacy.example.com/client",
                     hostId = "legacy-host",
                     autoConnect = true,
                 )
-                val store = PreferencesRelayV2ProfileStore(preferences)
                 val previous = requireNotNull(store.activeProfileIdentity())
                 prepared = requireNotNull(
                     store.prepareRelayV2Activation(
@@ -487,6 +505,41 @@ class RelayV2ProfileRepositoryTest {
             val secureBlob = harness.credentials.read(profile.credentialReference)
             assertEquals(ACCESS_TOKEN_1, secureBlob?.accessToken)
             assertEquals(REFRESH_TOKEN_1, secureBlob?.refreshToken)
+        }
+
+    @Test
+    fun `startup recovery cannot roll back a live switch blocked in disconnect`() =
+        runBlocking {
+            val harness = Harness(blockDisconnect = true)
+            val confirmed = enrollmentDraft(
+                "enrollment-live-recovery",
+                "twenroll2.code-live-recovery",
+            ).confirm(deviceLabel = "Pixel")
+            val activation = async { harness.repository.confirmEnrollment(confirmed) }
+            harness.barrier.started.await()
+
+            val prepared = requireNotNull(harness.profiles.journal)
+            assertEquals(RelayV2ProfileActivationPhase.PREPARED, prepared.phase)
+            assertFalse(
+                requireNotNull(harness.credentials.read(prepared.targetCredentialReference))
+                    .hasCredentialMaterial,
+            )
+            val recovery = async { harness.repository.recoverPendingActivation() }
+            yield()
+            assertFalse(recovery.isCompleted)
+
+            harness.barrier.release.complete(Unit)
+            val activated = (activation.await() as RelayV2EnrollmentResult.Activated).profile
+            assertEquals(
+                RelayV2ActivationRecoveryResult.NoPendingActivation,
+                recovery.await(),
+            )
+            assertEquals(activated, harness.profiles.activeV2)
+            assertEquals(null, harness.profiles.journal)
+            assertTrue(
+                requireNotNull(harness.credentials.read(activated.credentialReference))
+                    .hasCredentialMaterial,
+            )
         }
 
     @Test
@@ -1065,6 +1118,107 @@ class RelayV2ProfileRepositoryTest {
                 assertEquals(null, harness.profiles.journal)
             }
         }
+
+    @Test
+    fun `completed A recovery cannot let B overwrite a newer C intent`() = runBlocking {
+        val harness = Harness()
+        harness.repository.confirmEnrollment(
+            enrollmentDraft(
+                "enrollment-abc-old",
+                "twenroll2.code-abc-old",
+            ).confirm(deviceLabel = "Old Pixel"),
+        ) as RelayV2EnrollmentResult.Activated
+        val confirmedA = enrollmentDraft(
+            "enrollment-abc-a",
+            "twenroll2.code-abc-a",
+        ).confirm(deviceLabel = "Pixel A")
+        harness.profiles.failNextCredentialReadyBeforeWrite = true
+        assertTrue(runCatching { harness.repository.confirmEnrollment(confirmedA) }.isFailure)
+        val preparedA = requireNotNull(harness.profiles.journal)
+        assertTrue(
+            requireNotNull(harness.credentials.read(preparedA.targetCredentialReference))
+                .hasCredentialMaterial,
+        )
+        harness.restartRepository()
+
+        val recoveryBarrier = harness.barrier.blockNextDisconnect()
+        val gateB = harness.exchange.deferEnrollment("enrollment-abc-b")
+        val confirmationB = enrollmentDraft(
+            "enrollment-abc-b",
+            "twenroll2.code-abc-b",
+        ).confirm(deviceLabel = "Pixel B")
+        val activationB = async { harness.repository.confirmEnrollment(confirmationB) }
+        recoveryBarrier.started.await()
+
+        val cActiveRead = harness.profiles.blockNextActiveProfileRead()
+        val gateC = harness.exchange.deferEnrollment("enrollment-abc-c")
+        val confirmationC = enrollmentDraft(
+            "enrollment-abc-c",
+            "twenroll2.code-abc-c",
+        ).confirm(deviceLabel = "Pixel C")
+        val activationC = async { harness.repository.confirmEnrollment(confirmationC) }
+        cActiveRead.started.await()
+
+        recoveryBarrier.release.complete(Unit)
+        assertTrue(
+            withTimeout(1_000) { activationB.await() } is RelayV2EnrollmentResult.Superseded,
+        )
+        assertFalse(gateB.request.isCompleted)
+        assertEquals(
+            preparedA.targetCredentialReference,
+            harness.profiles.activeV2?.credentialReference,
+        )
+        assertEquals(null, harness.profiles.journal)
+
+        cActiveRead.release.complete(Unit)
+        val requestC = withTimeout(1_000) { gateC.request.await() }
+        gateC.response.complete(enrollmentResponse(requestC, "abc-c"))
+        val committedC = (activationC.await() as RelayV2EnrollmentResult.Activated).profile
+        assertEquals(committedC, harness.profiles.activeV2)
+        assertEquals(3, harness.profiles.activationCount)
+        assertEquals(null, harness.credentials.read(preparedA.targetCredentialReference))
+    }
+
+    @Test
+    fun `completed activation with a pending refresh resumes after reopen`() = runBlocking {
+        val harness = Harness()
+        val confirmed = enrollmentDraft(
+            "enrollment-refresh-reopen",
+            "twenroll2.code-refresh-reopen",
+        ).confirm(deviceLabel = "Pixel")
+        harness.profiles.failNextCredentialReadyBeforeWrite = true
+        assertTrue(runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure)
+        val journal = requireNotNull(harness.profiles.journal)
+        val completed = requireNotNull(
+            harness.credentials.read(journal.targetCredentialReference),
+        )
+        val refreshAttempt = RelayV2PendingCredentialAttempt(
+            kind = RelayV2CredentialAttemptKind.REFRESH,
+            attemptId = "refresh-during-reopen",
+            oldCredentialVersion = completed.credentialVersion,
+            secretReference = "refresh-secret-during-reopen",
+            secret = requireNotNull(completed.refreshToken),
+        )
+        val refreshing = completed.copy(pendingAttempt = refreshAttempt)
+        assertEquals(
+            RelayV2CredentialCasResult.Updated(completed.credentialVersion),
+            harness.credentials.compareAndSet(
+                journal.targetCredentialReference,
+                completed.expectation(),
+                refreshing,
+            ),
+        )
+        val redeemCalls = harness.exchange.redeemCalls
+        harness.restartRepository()
+
+        val recovered = harness.repository.recoverPendingActivation()
+            as RelayV2ActivationRecoveryResult.Activated
+        assertEquals(journal.targetCredentialReference, recovered.profile.credentialReference)
+        assertEquals(recovered.profile, harness.profiles.activeV2)
+        assertEquals(null, harness.profiles.journal)
+        assertEquals(refreshing, harness.credentials.read(journal.targetCredentialReference))
+        assertEquals(redeemCalls, harness.exchange.redeemCalls)
+    }
 
     @Test
     fun `post-commit IO ambiguity rolls forward without repeating one-time enrollment`() =
@@ -1684,6 +1838,7 @@ class RelayV2ProfileRepositoryTest {
                 failNextPrepareBeforeWrite = false
                 error("Relay v2 activation prepare failed before write")
             }
+            if (storedActiveIdentity != expectedActiveProfile) return null
             val current = journal
             val prepared = RelayV2ProfileActivationJournal(
                 operationId = operationId,
@@ -1699,7 +1854,6 @@ class RelayV2ProfileRepositoryTest {
                 targetActivationGeneration = profile.activationGeneration,
                 phase = RelayV2ProfileActivationPhase.PREPARED,
             )
-            if (storedActiveIdentity != expectedActiveProfile) return null
             when {
                 current == null -> journal = prepared
                 current == prepared -> Unit
@@ -1877,9 +2031,15 @@ class RelayV2ProfileRepositoryTest {
         val release = CompletableDeferred<Unit>()
         var calls = 0
         var returnedReceipt: RelayProfileDisconnectReceipt? = null
+        private var nextGate: SuspensionGate? = null
 
         init {
             if (!blocked) release.complete(Unit)
+        }
+
+        fun blockNextDisconnect(): SuspensionGate = SuspensionGate().also {
+            check(nextGate == null)
+            nextGate = it
         }
 
         override suspend fun disconnectAndDrain(
@@ -1890,6 +2050,11 @@ class RelayV2ProfileRepositoryTest {
             events += "disconnect:start"
             started.complete(Unit)
             release.await()
+            nextGate?.also { gate ->
+                nextGate = null
+                gate.started.complete(Unit)
+                gate.release.await()
+            }
             events += "disconnect:end"
             return (receiptFactory?.invoke(profile, barrierId)
                 ?: RelayProfileDisconnectReceipt(profile, barrierId)).also {
