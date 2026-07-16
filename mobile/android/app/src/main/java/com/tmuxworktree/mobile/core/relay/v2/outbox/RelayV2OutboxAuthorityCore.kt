@@ -304,14 +304,23 @@ internal data class RelayV2QueuedTargetRevalidation(
 }
 
 internal data class RelayV2ReissueLineageProof(
+    val parentProfileId: String,
+    val parentPrincipalId: String,
+    val parentHostId: String,
+    val parentCommandId: String,
     val parentExpectedHostEpoch: String,
     val parentDedupeWindowId: String,
     val parentScopeId: String,
     val parentSessionId: String?,
+    val parentRequestFingerprint: RelayV2RequestFingerprint,
     val firstConfirmedHostEpoch: String?,
 ) {
     init {
         listOf(
+            parentProfileId,
+            parentPrincipalId,
+            parentHostId,
+            parentCommandId,
             parentExpectedHostEpoch,
             parentDedupeWindowId,
             parentScopeId,
@@ -443,7 +452,7 @@ internal data class RelayV2OutboxEntry(
             }
         }
         require(targetRevalidation == null || state == RelayV2OutboxStateTag.QUEUED)
-        require(reissueLineageProof == null || reissuedFromCommandId != null)
+        require((reissuedFromCommandId == null) == (reissueLineageProof == null))
     }
 
     override fun toString(): String =
@@ -473,8 +482,18 @@ internal data class RelayV2OutboxEntry(
             "reissueLineageProof" to reissueLineageProof?.let {
                 mapOf(
                     "firstConfirmedHostEpoch" to it.firstConfirmedHostEpoch,
+                    "parentCommandId" to it.parentCommandId,
                     "parentDedupeWindowId" to it.parentDedupeWindowId,
                     "parentExpectedHostEpoch" to it.parentExpectedHostEpoch,
+                    "parentHostId" to it.parentHostId,
+                    "parentPrincipalId" to it.parentPrincipalId,
+                    "parentProfileId" to it.parentProfileId,
+                    "parentRequestFingerprint" to mapOf(
+                        "canonicalRequestByteCount" to
+                            it.parentRequestFingerprint.canonicalRequestByteCount,
+                        "schemaVersion" to it.parentRequestFingerprint.schemaVersion,
+                        "sha256Hex" to it.parentRequestFingerprint.sha256Hex,
+                    ),
                     "parentScopeId" to it.parentScopeId,
                     "parentSessionId" to it.parentSessionId,
                 )
@@ -1453,10 +1472,15 @@ internal class RelayV2OutboxAuthorityCore(
                 reissuedFromCommandId = entry.commandId,
             ).copy(
                 reissueLineageProof = RelayV2ReissueLineageProof(
+                    parentProfileId = entry.profileId,
+                    parentPrincipalId = entry.principalId,
+                    parentHostId = entry.hostId,
+                    parentCommandId = entry.commandId,
                     parentExpectedHostEpoch = entry.expectedHostEpoch,
                     parentDedupeWindowId = entry.dedupeWindowId,
                     parentScopeId = entry.scopeId,
                     parentSessionId = entry.sessionId,
+                    parentRequestFingerprint = entry.requestFingerprint,
                     firstConfirmedHostEpoch = null,
                 ),
             )
@@ -1930,10 +1954,15 @@ private fun RelayV2OutboxEntry.cheapCanonicalLowerBound(): Long =
         (sessionId?.length ?: 0) +
         (targetRevalidation?.observedHostEpoch?.length ?: 0) +
         (targetRevalidation?.dedupeWindowId?.length ?: 0) +
+        (reissueLineageProof?.parentProfileId?.length ?: 0) +
+        (reissueLineageProof?.parentPrincipalId?.length ?: 0) +
+        (reissueLineageProof?.parentHostId?.length ?: 0) +
+        (reissueLineageProof?.parentCommandId?.length ?: 0) +
         (reissueLineageProof?.parentExpectedHostEpoch?.length ?: 0) +
         (reissueLineageProof?.parentDedupeWindowId?.length ?: 0) +
         (reissueLineageProof?.parentScopeId?.length ?: 0) +
         (reissueLineageProof?.parentSessionId?.length ?: 0) +
+        (reissueLineageProof?.parentRequestFingerprint?.sha256Hex?.length ?: 0) +
         (reissueLineageProof?.firstConfirmedHostEpoch?.length ?: 0) +
         attempts.sumOf { it.requestId.length.toLong() }
 
@@ -2073,17 +2102,24 @@ private const val REISSUE_GRAPH_VISITING = 1
 private const val REISSUE_GRAPH_DONE = 2
 
 private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): Boolean {
+    val lineageProof = other.reissueLineageProof ?: return false
     val sameHistoricalTarget = expectedHostEpoch == other.expectedHostEpoch &&
         scopeId == other.scopeId &&
         sessionId == other.sessionId
-    val lineageProofMatchesParent = other.reissueLineageProof?.let { proof ->
-        proof.parentExpectedHostEpoch == expectedHostEpoch &&
-            proof.parentDedupeWindowId == dedupeWindowId &&
-            proof.parentScopeId == scopeId &&
-            proof.parentSessionId == sessionId
-    } ?: true
-    val explicitlyRevalidatedTarget = lineageProofMatchesParent &&
-        other.reissueLineageProof?.firstConfirmedHostEpoch != null
+    val lineageProofMatchesParent = lineageProof.parentProfileId == profileId &&
+        lineageProof.parentPrincipalId == principalId &&
+        lineageProof.parentHostId == hostId &&
+        lineageProof.parentCommandId == commandId &&
+        lineageProof.parentExpectedHostEpoch == expectedHostEpoch &&
+        lineageProof.parentDedupeWindowId == dedupeWindowId &&
+        lineageProof.parentScopeId == scopeId &&
+        lineageProof.parentSessionId == sessionId &&
+        lineageProof.parentRequestFingerprint == requestFingerprint
+    val targetLineageMatchesProof = if (sameHistoricalTarget) {
+        lineageProof.firstConfirmedHostEpoch == null
+    } else {
+        lineageProof.firstConfirmedHostEpoch != null
+    }
     return profileId == other.profileId &&
         principalId == other.principalId &&
         hostId == other.hostId &&
@@ -2091,7 +2127,7 @@ private fun RelayV2OutboxEntry.hasSameReissueIntent(other: RelayV2OutboxEntry): 
         canonicalRequestArguments == other.canonicalRequestArguments &&
         dedupeWindowId != other.dedupeWindowId &&
         lineageProofMatchesParent &&
-        (sameHistoricalTarget || explicitlyRevalidatedTarget)
+        targetLineageMatchesProof
 }
 
 private fun requireTargetShape(operation: RelayV2OutboxOperation, sessionId: String?) {

@@ -1305,8 +1305,43 @@ class RelayV2OutboxAuthorityCoreTest {
             listOf(parent, child.copy(principalId = "another-principal")),
             valid.nextCreationOrder,
         )
+        restoreFailure(
+            listOf(parent, child.copy(reissueLineageProof = null)),
+            valid.nextCreationOrder,
+        )
+        val lineageProof = child.reissueLineageProof!!
+        listOf(
+            lineageProof.copy(parentCommandId = "wrong-parent-command"),
+            lineageProof.copy(parentPrincipalId = "wrong-parent-principal"),
+            lineageProof.copy(parentScopeId = "wrong-parent-scope"),
+            lineageProof.copy(firstConfirmedHostEpoch = "wrong-confirmed-epoch"),
+            lineageProof.copy(
+                parentRequestFingerprint = lineageProof.parentRequestFingerprint.copy(
+                    sha256Hex = "0".repeat(64),
+                ),
+            ),
+        ).forEach { corruptedProof ->
+            restoreFailure(
+                listOf(parent, child.copy(reissueLineageProof = corruptedProof)),
+                valid.nextCreationOrder,
+            )
+        }
 
-        val cyclicParent = parent.copy(reissuedFromCommandId = child.commandId)
+        val cyclicParent = parent.copy(
+            reissuedFromCommandId = child.commandId,
+            reissueLineageProof = RelayV2ReissueLineageProof(
+                parentProfileId = child.profileId,
+                parentPrincipalId = child.principalId,
+                parentHostId = child.hostId,
+                parentCommandId = child.commandId,
+                parentExpectedHostEpoch = child.expectedHostEpoch,
+                parentDedupeWindowId = child.dedupeWindowId,
+                parentScopeId = child.scopeId,
+                parentSessionId = child.sessionId,
+                parentRequestFingerprint = child.requestFingerprint,
+                firstConfirmedHostEpoch = null,
+            ),
+        )
         val cyclicChild = child.copy(
             state = RelayV2OutboxStateTag.REISSUED,
             attempts = listOf(
@@ -1357,10 +1392,15 @@ class RelayV2OutboxAuthorityCoreTest {
                     null
                 } else {
                     RelayV2ReissueLineageProof(
+                        parentProfileId = parentTemplate.profileId,
+                        parentPrincipalId = parentTemplate.principalId,
+                        parentHostId = parentTemplate.hostId,
+                        parentCommandId = "bounded-chain-${index - 1}",
                         parentExpectedHostEpoch = parentTemplate.expectedHostEpoch,
                         parentDedupeWindowId = parentTemplate.dedupeWindowId,
                         parentScopeId = parentTemplate.scopeId,
                         parentSessionId = parentTemplate.sessionId,
+                        parentRequestFingerprint = parentTemplate.requestFingerprint,
                         firstConfirmedHostEpoch = null,
                     )
                 },
