@@ -1951,6 +1951,31 @@ test("owner failures are redacted and EVENT_CURSOR_AHEAD retains exact protocol 
     assert.equal(JSON.stringify(response).includes("oversized authority message"), false);
     assert.equal(h.state.closes.some(({ code }) => code === 4406), false);
   });
+
+  await t.test("independently bundled snapshot spool errors keep their typed semantics", async () => {
+    for (const code of ["SNAPSHOT_EXPIRED", "BUSY"]) {
+      const secret = `independent-spool-${code}-must-not-leak`;
+      const h = createHarness({
+        stateSnapshotGet: async () => {
+          throw new snapshotSpool.RelayV2StateSnapshotSpoolError(code, secret);
+        },
+      });
+      const routeBinding = await ready(h);
+      const request = fixture("state-snapshot-get-first");
+      request.requestId = `independent-spool-${code.toLowerCase()}`;
+      request.expectedHostEpoch = HOST_EPOCH;
+      send(h.runtime, routeBinding, request);
+      await settle(8);
+
+      const response = h.state.sent.find(({ frame }) => frame.requestId === request.requestId)?.frame;
+      assert.equal(response.type, "error");
+      assert.equal(response.error.code, code);
+      assert.equal(response.error.retryable, code === "BUSY");
+      assert.equal(response.error.commandDisposition, "not_applicable");
+      assert.equal(JSON.stringify(response).includes(secret), false);
+      assert.equal(h.state.closes.some(({ code: closeCode }) => closeCode === 1011), false);
+    }
+  });
 });
 
 test("typed H3 negative outcomes become correlated redacted not_applicable errors", async (t) => {

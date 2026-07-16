@@ -29,7 +29,7 @@ import type {
   RelayV2WelcomeCut,
 } from "./resourceState.js";
 import {
-  RelayV2StateSnapshotSpoolError,
+  isRelayV2StateSnapshotSpoolError,
 } from "./stateSnapshotSpool.js";
 import type {
   RelayV2StateSnapshotChunk,
@@ -674,7 +674,7 @@ function structuredAuthorityError(error: unknown): {
 } | null {
   if (error instanceof RelayV2HostRuntimeAuthorityError
     || isRelayV2MaterializedStateError(error)
-    || error instanceof RelayV2StateSnapshotSpoolError
+    || isRelayV2StateSnapshotSpoolError(error)
     || isRelayV2TerminalManagerError(error)) {
     const code = error.code as RelayV2HostRuntimeAuthorityErrorCode;
     if (!Object.hasOwn(AUTHORITY_ERROR_MESSAGES, code)) return null;

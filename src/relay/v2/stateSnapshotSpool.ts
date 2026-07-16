@@ -189,7 +189,22 @@ export type RelayV2StateSnapshotSpoolErrorCode =
   | "INVALID_ARGUMENT"
   | "SNAPSHOT_EXPIRED";
 
+const RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR = Symbol.for(
+  "tmux-worktree.relay-v2.state-snapshot-spool-error",
+);
+
+const RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR_CODES: ReadonlySet<string> = new Set([
+  "BUSY",
+  "CAPABILITY_UNAVAILABLE",
+  "HOST_EPOCH_MISMATCH",
+  "INTERNAL",
+  "INVALID_ARGUMENT",
+  "SNAPSHOT_EXPIRED",
+]);
+
 export class RelayV2StateSnapshotSpoolError extends Error {
+  readonly [RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR] = true;
+
   constructor(
     readonly code: RelayV2StateSnapshotSpoolErrorCode,
     message: string,
@@ -198,6 +213,21 @@ export class RelayV2StateSnapshotSpoolError extends Error {
     super(message);
     this.name = "RelayV2StateSnapshotSpoolError";
   }
+}
+
+/** Recognizes only spool-owned errors across independently bundled entries. */
+export function isRelayV2StateSnapshotSpoolError(
+  error: unknown,
+): error is RelayV2StateSnapshotSpoolError {
+  if (!(error instanceof Error)
+    || error.name !== "RelayV2StateSnapshotSpoolError"
+    || (error as Record<PropertyKey, unknown>)[RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR] !== true
+    || !RELAY_V2_STATE_SNAPSHOT_SPOOL_ERROR_CODES.has(
+      (error as { code?: unknown }).code as string,
+    )) return false;
+  const details = (error as { details?: unknown }).details;
+  return details === null
+    || (!!details && typeof details === "object" && !Array.isArray(details));
 }
 
 interface SnapshotBinding {
@@ -780,7 +810,7 @@ function expiredError(): RelayV2StateSnapshotSpoolError {
 }
 
 function structuredSpoolError(error: unknown): RelayV2StateSnapshotSpoolError {
-  if (error instanceof RelayV2StateSnapshotSpoolError) return error;
+  if (isRelayV2StateSnapshotSpoolError(error)) return error;
   return new RelayV2StateSnapshotSpoolError(
     "INTERNAL",
     "snapshot spool persistence failed closed",
@@ -1718,7 +1748,7 @@ export class RelayV2StateSnapshotSpool {
         return result;
       });
     } catch (error) {
-      if (!(error instanceof RelayV2StateSnapshotSpoolError)) {
+      if (!isRelayV2StateSnapshotSpoolError(error)) {
         this.fatalUnavailable = true;
       }
       throw structuredSpoolError(error);
