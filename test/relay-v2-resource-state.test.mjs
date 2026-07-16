@@ -9,7 +9,12 @@ const hostState = await import("../dist/relay/v2/hostState.js");
 const resourceState = await import("../dist/relay/v2/resourceState.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const codec = await import("../dist/relay/v2/codec.js");
+const canonicalDiscovery = await import("../dist/relay/v2/canonicalTwRpcDiscovery.js");
 const relayV2Corpus = loadRelayV2FixtureCorpus();
+const backendIdentityFixture = JSON.parse(readFileSync(
+  new URL("./fixtures/relay-v2-canonical-backend-identity-v1.json", import.meta.url),
+  "utf8",
+));
 
 const handshakeFixture = JSON.parse(readFileSync(
   new URL("../contracts/relay/v2/golden-public-handshake.json", import.meta.url),
@@ -206,6 +211,54 @@ function assertMaterializedError(code) {
     return true;
   };
 }
+
+test("H2 materializes the canonical discovery key from the shared backend identity fixture", async () => {
+  const h = await harness();
+  try {
+    const vector = backendIdentityFixture.vectors[0];
+    const discovered = canonicalDiscovery.projectRelayV2CanonicalTwRpcDiscoveredSession({
+      backendScope: vector.backendScope,
+      session: {
+        name: "raw-terminal-backend-7",
+        kind: "terminal",
+        profile: "dashboard",
+        project: null,
+        label: "Public terminal-2",
+        repoPath: null,
+        worktreePath: null,
+        branch: null,
+        baseBranch: null,
+        cwd: "/repo/demo",
+        createdAt: "2026-07-12T00:00:01.000Z",
+        attached: false,
+        windows: 1,
+        created: 1_783_700_010,
+        activity: 1_783_700_020,
+        incarnation: vector.rpcIncarnation,
+        lifecycleMarked: true,
+        reservationCorrelation: null,
+      },
+    });
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: vector.backendScope.targetId,
+        displayName: "Local",
+        kind: vector.backendScope.kind,
+        sessions: [discovered],
+      })],
+    });
+
+    const reconciled = await h.foundation.reconcile();
+    const persisted = materializedRoot(reconciled.snapshot).scopes[0].sessions[0];
+    assert.equal(discovered.backendIdentity, vector.expected);
+    assert.equal(persisted.backendIdentity, vector.expected);
+    assert.equal(persisted.item.displayName, "Public terminal-2");
+    assert.equal(JSON.stringify(persisted).includes("raw-terminal-backend-7"), false);
+  } finally {
+    h.cleanup();
+  }
+});
 
 test("materialized reconciliation persists opaque identities and only complete coverage deletes", async () => {
   const h = await harness();

@@ -18,6 +18,10 @@ import {
   type RpcV2Session,
 } from "../../rpcV2.js";
 import type { ManagedSessionReservationCorrelationV1 } from "../../state.js";
+import {
+  issueRelayV2CanonicalBackendInstanceKey,
+  type RelayV2CanonicalBackendScopeIdentity,
+} from "./canonicalBackendIdentity.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
   RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
@@ -62,9 +66,9 @@ export interface RelayV2CanonicalResolverEvidence {
   observedAtMs: number;
 }
 
-export type RelayV2CanonicalProcessTarget =
-  | { kind: "local"; scopeId: string; targetId: string }
-  | { kind: "ssh"; scopeId: string; targetId: string };
+export type RelayV2CanonicalProcessTarget = RelayV2CanonicalBackendScopeIdentity & {
+  scopeId: string;
+};
 
 export interface RelayV2CanonicalProspectiveSession {
   kind: "worktree" | "terminal";
@@ -265,16 +269,6 @@ function canonicalJson(value: unknown): string {
 function domainHash(prefix: string, domain: string, value: Record<string, unknown>): string {
   const digest = createHash("sha256").update(canonicalJson({ domain, value }), "utf8").digest("base64url");
   return `${prefix}.${digest}`;
-}
-
-function backendInstanceKey(
-  target: RelayV2CanonicalProcessTarget,
-  incarnation: string,
-): string {
-  return domainHash("twbk2", "tmux-worktree.relay-v2.backend-instance.v1", {
-    processTarget: { kind: target.kind, targetId: target.targetId },
-    rpcIncarnation: incarnation,
-  });
 }
 
 function terminalOperationId(plan: RelayV2TerminalControlExecutionPlan): string {
@@ -818,7 +812,13 @@ function sessionEvidence(
   }
   return {
     schemaVersion: RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
-    backendInstanceKey: backendInstanceKey(target.processTarget, session.incarnation),
+    backendInstanceKey: issueRelayV2CanonicalBackendInstanceKey({
+      backendScope: {
+        kind: target.processTarget.kind,
+        targetId: target.processTarget.targetId,
+      },
+      rpcIncarnation: session.incarnation,
+    }),
     evidence,
   };
 }
@@ -1073,7 +1073,13 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
           state: "succeeded",
           backendOutcome: {
             schemaVersion: RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
-            backendInstanceKey: backendInstanceKey(target.processTarget, response.incarnation),
+            backendInstanceKey: issueRelayV2CanonicalBackendInstanceKey({
+              backendScope: {
+                kind: target.processTarget.kind,
+                targetId: target.processTarget.targetId,
+              },
+              rpcIncarnation: response.incarnation,
+            }),
             evidence: { terminated: true },
           },
           commitIntent: {

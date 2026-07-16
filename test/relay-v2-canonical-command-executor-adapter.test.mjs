@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 const adapterModule = await import("../dist/relay/v2/canonicalCommandExecutorAdapter.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const rpcV2 = await import("../dist/rpcV2.js");
+const backendIdentityFixture = JSON.parse(readFileSync(
+  new URL("./fixtures/relay-v2-canonical-backend-identity-v1.json", import.meta.url),
+  "utf8",
+));
 
 const HOST_ID = "mac-admin";
 const HOST_EPOCH = "host-epoch-1";
@@ -357,6 +362,13 @@ test("canonical executor translates all four operations to one exact authority c
   }
   assert.notEqual(outcomes.create_worktree.backendOutcome.backendInstanceKey, OTHER_INCARNATION);
   assert.notEqual(outcomes.create_terminal.backendOutcome.backendInstanceKey, INCARNATION);
+  assert.equal(
+    outcomes.create_terminal.backendOutcome.backendInstanceKey,
+    backendIdentityFixture.vectors.find((vector) => (
+      vector.backendScope.kind === "ssh"
+      && vector.backendScope.targetId === "configured-devbox"
+    )).expected,
+  );
   assert.notEqual(
     outcomes.create_terminal.backendOutcome.backendInstanceKey,
     outcomes.kill_session.backendOutcome.backendInstanceKey,
