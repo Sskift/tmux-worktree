@@ -128,6 +128,8 @@ test("manifest freezes the existing owner chain and production NO-GO", () => {
   ]));
   assert.equal(manifest.scope.v1OrBauFallbackAllowed, false);
   assert.equal(manifest.scope.enrollmentOrCapabilityEffect, "none");
+  assert.ok(manifest.newNormativeChoices.includes("existing-continuity-success-shapes-with-untrusted-result-handoff"));
+  assert.ok(manifest.newNormativeChoices.includes("namespace-scoped-broker-versus-agent-failure-fencing"));
 });
 
 test("closed config and wire schemas are sufficient for a bounded decoder", () => {
@@ -141,7 +143,7 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   ], "typed port");
   exactKeys(manifest.transport, [
     "futureAdapterSeam", "backendGuarantee", "status", "authenticationModes", "operations", "namespaces",
-    "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed", "objectSchemaExactKeys",
+    "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed", "secretPolicy", "objectSchemaExactKeys",
     "configSchema", "namespaceBindingSchema", "namespaceBindingsRules",
     "wireObjectSchemas", "wireUnionRules", "operationTimeoutMs",
     "maxPendingOperations", "newNumericChoices",
@@ -171,8 +173,8 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
 
   const objectKeys = manifest.transport.objectSchemaExactKeys;
   exactKeys(manifest.transport.wireObjectSchemas, [
-    "checkpoint", "snapshot", "requestEnvelope", "readPayload", "casPayload",
-    "casResult", "externalError", "responseEnvelope",
+    "checkpoint", "uninitializedSnapshot", "committedSnapshot", "requestEnvelope",
+    "readPayload", "casPayload", "casResult", "externalError", "responseEnvelope",
   ], "wire object schemas");
   for (const [name, schema] of Object.entries(manifest.transport.wireObjectSchemas)) {
     exactKeys(schema, objectKeys, `wire schema ${name}`);
@@ -195,19 +197,36 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   });
   assert.match(manifest.transport.configSchema.fields.credentialReference, /opaque-resolver-key-not-secret-not-path$/);
   assert.match(manifest.transport.configSchema.fields.tlsTrustReference, /opaque-resolver-key-not-secret-not-path$/);
+  exactKeys(manifest.transport.secretPolicy, [
+    "authenticationSecretKinds", "allowedLocation", "forbiddenLocations",
+    "credentialAndTrustReferences", "casTokenClassification", "casTokenAllowedLocations",
+    "casTokenForbiddenLocations",
+  ], "secret policy");
+  assert.deepEqual(manifest.transport.secretPolicy.authenticationSecretKinds, [
+    "resolved-auth-secret", "private-key", "bearer-credential",
+  ]);
+  assert.ok(["config", "log", "error", "fixture", "record"].every(
+    (location) => manifest.transport.secretPolicy.forbiddenLocations.includes(location),
+  ));
+  assert.equal(manifest.transport.secretPolicy.casTokenClassification, "non-sensitive-comparison-token");
+  assert.ok(manifest.transport.secretPolicy.casTokenAllowedLocations.includes("normative-fixture"));
+  assert.ok(manifest.transport.secretPolicy.casTokenForbiddenLocations.includes("cross-security-domain-response"));
 
   const wire = manifest.transport.wireObjectSchemas;
-  assert.deepEqual(wire.snapshot.exactKeys, ["status", "checkpoint", "casToken"]);
-  assert.equal(manifest.transport.wireUnionRules.snapshot.uninitialized.checkpoint, null);
+  assert.deepEqual(wire.uninitializedSnapshot.exactKeys, ["protocolVersion", "status", "anchorId", "casToken"]);
+  assert.deepEqual(wire.committedSnapshot.exactKeys, ["protocolVersion", "status", "anchorId", "casToken", "checkpoint"]);
+  assert.equal(manifest.transport.wireUnionRules.snapshot.uninitialized.checkpointKey, "forbidden");
   assert.match(manifest.transport.wireUnionRules.snapshot.committed.checkpoint, /anchorId-equals-request$/);
   assert.deepEqual(wire.requestEnvelope.exactKeys, ["contractVersion", "operationId", "securityDomainId", "namespace", "anchorId", "operation", "payload"]);
   assert.deepEqual(wire.responseEnvelope.exactKeys, ["contractVersion", "operationId", "ok", "result", "error"]);
-  assert.deepEqual(wire.casResult.exactKeys, ["outcome", "current"]);
-  assert.equal(wire.casResult.fields.current, "object:snapshot");
-  exactKeys(manifest.transport.wireUnionRules, ["snapshot", "request", "casResult", "response", "typedPortTranslation"], "wire unions");
+  assert.deepEqual(wire.casResult.exactKeys, ["protocolVersion", "outcome", "current"]);
+  assert.equal(wire.casResult.fields.current, "object:uninitializedSnapshot-or-committedSnapshot");
+  assert.deepEqual(wire.externalError.exactKeys, ["code", "message", "retryable", "retryAfterMs", "commitDisposition"]);
+  assert.equal(wire.externalError.fields.message, "null:backend-message-must-be-discarded");
+  exactKeys(manifest.transport.wireUnionRules, ["snapshot", "request", "casResult", "response", "successHandoff"], "wire unions");
   exactKeys(manifest.transport.wireUnionRules.snapshot, ["uninitialized", "committed"], "snapshot union");
-  exactKeys(manifest.transport.wireUnionRules.snapshot.uninitialized, ["status", "checkpoint", "casToken"], "uninitialized union");
-  exactKeys(manifest.transport.wireUnionRules.snapshot.committed, ["status", "checkpoint", "casToken"], "committed union");
+  exactKeys(manifest.transport.wireUnionRules.snapshot.uninitialized, ["schema", "checkpointKey", "anchorId"], "uninitialized union");
+  exactKeys(manifest.transport.wireUnionRules.snapshot.committed, ["schema", "checkpoint", "anchorId"], "committed union");
   exactKeys(manifest.transport.wireUnionRules.request, ["read", "compareAndSwap"], "request union");
   exactKeys(manifest.transport.wireUnionRules.request.read, ["operation", "payload"], "read request union");
   exactKeys(manifest.transport.wireUnionRules.request.compareAndSwap, ["operation", "payload", "expectedAnchor", "nextAnchor"], "CAS request union");
@@ -219,13 +238,23 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   exactKeys(manifest.transport.wireUnionRules.response.readSuccess, ["requestOperation", "ok", "result", "error"], "read response union");
   exactKeys(manifest.transport.wireUnionRules.response.casSuccess, ["requestOperation", "ok", "result", "error"], "CAS response union");
   exactKeys(manifest.transport.wireUnionRules.response.error, ["requestOperation", "ok", "result", "error", "codeOperation", "commitDisposition"], "error response union");
-  exactKeys(manifest.transport.wireUnionRules.typedPortTranslation, ["common", "uninitialized", "committed", "cas"], "translation union");
+  exactKeys(manifest.transport.wireUnionRules.successHandoff, [
+    "futureAdapterSeam", "backendSuccessGuarantee", "continuityAnchor", "forbiddenAdapterBehavior",
+  ], "success handoff");
+  assert.match(manifest.transport.wireUnionRules.successHandoff.futureAdapterSeam, /outer-envelope-and-error-only/);
+  assert.match(manifest.transport.wireUnionRules.successHandoff.continuityAnchor, /^sole-checkpoint-snapshot/);
+  assert.deepEqual(manifest.transport.wireUnionRules.successHandoff.forbiddenAdapterBehavior, [
+    "add-protocolVersion", "add-anchorId", "decode-checkpoint", "synthesize-authority-field",
+  ]);
   assert.deepEqual(manifest.transport.wireUnionRules.response.readSuccess, {
-    requestOperation: "read", ok: true, result: "exact-snapshot", error: null,
+    requestOperation: "read", ok: true,
+    result: "untrusted-unknown-backend-guarantees-exact-RelayV2ContinuityAnchorSnapshot",
+    error: null,
   });
   assert.deepEqual(manifest.transport.wireUnionRules.response.casSuccess, {
     requestOperation: "compare_and_swap", ok: true,
-    result: "exact-casResult-current-snapshot", error: null,
+    result: "untrusted-unknown-backend-guarantees-exact-RelayV2ContinuityAnchorCasResult",
+    error: null,
   });
   assert.deepEqual(manifest.transport.wireUnionRules.response.error, {
     requestOperation: "read-or-compare_and_swap", ok: false, result: null,
@@ -237,11 +266,12 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
 test("external errors have operation-dependent dispositions and existing upper mappings", () => {
   exactKeys(manifest.errors, [
     "namespace", "futureAdapterSeam", "backendGuarantee", "status", "choiceRationale", "exactKeys",
-    "codeDefinitionExactKeys", "operationVocabulary", "retryAfterMsValues",
+    "messagePolicy", "codeDefinitionExactKeys", "operationVocabulary", "retryAfterMsValues",
     "commitDispositions", "recordOrSecretDetailsAllowed", "codes",
     "operationDispositionRules", "upperClosedMapping",
   ], "errors");
-  assert.deepEqual(manifest.errors.exactKeys, ["code", "retryable", "retryAfterMs", "commitDisposition"]);
+  assert.deepEqual(manifest.errors.exactKeys, ["code", "message", "retryable", "retryAfterMs", "commitDisposition"]);
+  assert.equal(manifest.errors.messagePolicy, "always-null-and-discard-any-backend-origin-message");
   exactKeys(manifest.errors.operationDispositionRules, ["read", "compareAndSwap", "provisioning"], "disposition rules");
   exactKeys(manifest.errors.operationDispositionRules.read, ["allowedCodes", "commitDisposition"], "read disposition");
   exactKeys(manifest.errors.operationDispositionRules.compareAndSwap, ["allowedCodes", "commitDisposition", "allowedDispositions"], "CAS disposition");
@@ -277,7 +307,9 @@ test("external errors have operation-dependent dispositions and existing upper m
       }
     }
   }
-  assert.equal(manifest.errors.upperClosedMapping.backendReadError, "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE");
+  assert.equal(manifest.errors.upperClosedMapping.readExternalErrorTransportOrOuterEnvelopeError, "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE");
+  assert.equal(manifest.errors.upperClosedMapping.readMalformedSuccessResult, "RelayV2ContinuityAnchor.INVALID_AUTHORITY_RESPONSE");
+  assert.equal(manifest.errors.upperClosedMapping.casTransportOuterEnvelopeOrSuccessResultError, "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN");
   assert.equal(manifest.errors.upperClosedMapping.backendCasErrorIncludingDefiniteRejection, "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN");
   assert.equal(caseNamed("capacity-before-cas-linearization").expect.externalCommitDisposition, "proven_no_commit");
   assert.equal(caseNamed("capacity-before-cas-linearization").expect.continuityError, "ANCHOR_COMMIT_UNCERTAIN");
@@ -377,6 +409,13 @@ test("machine deltas retain independent continuity and lifecycle fault signals",
     assert.equal(value.expect.continuityError, "ANCHOR_COMMIT_UNCERTAIN");
     assert.equal(value.expect.nextAction, "linearizable-read-reconcile");
   }
+  assert.equal(caseNamed("read-malformed-outer-envelope-is-unavailable").expect.continuityError, "ANCHOR_UNAVAILABLE");
+  assert.equal(caseNamed("read-malformed-success-snapshot-is-invalid").expect.continuityError, "INVALID_AUTHORITY_RESPONSE");
+  for (const name of ["cas-malformed-outer-envelope-is-uncertain", "cas-malformed-success-result-is-uncertain"]) {
+    const value = caseNamed(name);
+    assert.equal(value.expect.continuityError, "ANCHOR_COMMIT_UNCERTAIN");
+    assert.equal(value.expect.nextAction, "linearizable-read-reconcile");
+  }
   assert.equal(caseNamed("stale-read-is-not-continuity-evidence").expect.connectionFence, "synchronous-then-bounded-close");
   assert.equal(caseNamed("state-before-anchor-exact-successor-only").expect.outcomes[0], "recovered-successor");
   assert.equal(caseNamed("non-immediate-successor-fails-closed").expect.continuityError, "ROLLBACK_DETECTED");
@@ -394,10 +433,20 @@ test("machine deltas retain independent continuity and lifecycle fault signals",
 
 test("ready loss has separate credential, production composition, and BrokerCore owners", () => {
   exactKeys(manifest.readinessFence, [
-    "trigger", "credentialAuthority", "productionBrokerComposition", "brokerCore",
+    "trigger", "namespaceFailureIsolation", "credentialAuthority", "productionBrokerComposition", "brokerCore",
     "transportCloseCode", "transportCloseDeadlineMs", "sameAuthorityInstanceMayReturnReady",
     "recoveryRequires",
   ], "readiness fence");
+  exactKeys(manifest.readinessFence.namespaceFailureIsolation, ["brokerCredential", "agentTranscriptLifecycle"], "namespace failure isolation");
+  exactKeys(manifest.readinessFence.namespaceFailureIsolation.brokerCredential, [
+    "namespace", "credentialAuthority", "owningProductionComposition",
+  ], "broker credential failure scope");
+  exactKeys(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle, [
+    "namespace", "extensionDisposition", "baseV2CredentialRouteCommandTerminal", "globalConnectionFenceAllowed",
+  ], "Agent extension failure scope");
+  assert.equal(manifest.readinessFence.namespaceFailureIsolation.brokerCredential.namespace, "broker-credential.v1");
+  assert.equal(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle.namespace, "agent-transcript-lifecycle.v1");
+  assert.equal(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle.globalConnectionFenceAllowed, false);
   assert.equal(manifest.readinessFence.credentialAuthority.owner, "RelayV2BrokerCredentialAuthority");
   assert.match(manifest.readinessFence.credentialAuthority.readyAndAdmissionWithdrawal, /^synchronous/);
   assert.equal(manifest.readinessFence.productionBrokerComposition.owner, "owningProductionComposition");
@@ -415,6 +464,15 @@ test("ready loss has separate credential, production composition, and BrokerCore
     assert.equal(value.expect.admission, "blocked");
     assert.equal(value.expect.connectionFence, "synchronous-then-bounded-close");
   }
+  const agentLoss = caseNamed("agent-namespace-loss-is-extension-only");
+  assert.equal(agentLoss.binding, "agent-a");
+  assert.equal(agentLoss.initial.activeConnections, true);
+  assert.ok(agentLoss.expect.outcomes.includes("extension-unavailable"));
+  assert.equal(agentLoss.expect.credentialError, null);
+  assert.equal(agentLoss.expect.ready, true);
+  assert.equal(agentLoss.expect.admission, "open");
+  assert.equal(agentLoss.expect.connectionFence, "none");
+  assert.equal(agentLoss.expect.nextAction, "reset-agent-extension-authority-only");
   const qualification = caseNamed("missing-backend-rpo0-dr-evidence-blocks-composition");
   assert.equal(qualification.action.operation, "qualify_backend");
   assert.equal(qualification.action.fault, "backend_rpo0_dr_evidence_missing");

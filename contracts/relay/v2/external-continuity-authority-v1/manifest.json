@@ -106,13 +106,22 @@
     "tombstoneRetention": "permanent"
   },
   "transport": {
-    "futureAdapterSeam": "closed-config-auth-secret-resolution-request-encoding-response-decoding-and-upper-mapping",
+    "futureAdapterSeam": "closed-config-auth-secret-resolution-request-encoding-outer-envelope-and-error-decoding-and-upper-mapping",
     "backendGuarantee": "authenticated-linearizable-read-cas-exact-closed-response-and-idempotent-decision-replay",
     "status": "new-normative-v1-choice",
     "authenticationModes": ["mutual_tls", "workload_identity"],
     "operations": ["read", "compare_and_swap"],
     "namespaces": ["broker-credential.v1", "agent-transcript-lifecycle.v1"],
     "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed": false,
+    "secretPolicy": {
+      "authenticationSecretKinds": ["resolved-auth-secret", "private-key", "bearer-credential"],
+      "allowedLocation": "in-process-auth-provider-only",
+      "forbiddenLocations": ["config", "url", "log", "error", "trace", "fixture", "record"],
+      "credentialAndTrustReferences": "non-secret-opaque-resolver-keys",
+      "casTokenClassification": "non-sensitive-comparison-token",
+      "casTokenAllowedLocations": ["backend-record", "transport-success-result", "normative-fixture"],
+      "casTokenForbiddenLocations": ["external-error", "cross-security-domain-response", "log"]
+    },
     "objectSchemaExactKeys": ["exactKeys", "fields"],
     "configSchema": {
       "exactKeys": ["configVersion", "endpoint", "securityDomainId", "authenticationMode", "credentialReference", "tlsTrustReference", "operationTimeoutMs", "maxPendingOperations", "namespaceBindings"],
@@ -151,9 +160,13 @@
         "exactKeys": ["protocolVersion", "anchorId", "sequence", "commitId", "parentCommitId", "stateDigest"],
         "fields": {"protocolVersion": "integer-const-1", "anchorId": "scalar:identifier-equals-request-anchorId", "sequence": "scalar:canonicalUint64", "commitId": "scalar:identifier", "parentCommitId": "scalar:identifier-or-null-by-sequence", "stateDigest": "scalar:stateDigest"}
       },
-      "snapshot": {
-        "exactKeys": ["status", "checkpoint", "casToken"],
-        "fields": {"status": "enum:uninitialized|committed", "checkpoint": "object:checkpoint-or-null-by-status", "casToken": "scalar:casToken"}
+      "uninitializedSnapshot": {
+        "exactKeys": ["protocolVersion", "status", "anchorId", "casToken"],
+        "fields": {"protocolVersion": "integer-const-1", "status": "const:uninitialized", "anchorId": "scalar:identifier-equals-request-anchorId", "casToken": "scalar:casToken"}
+      },
+      "committedSnapshot": {
+        "exactKeys": ["protocolVersion", "status", "anchorId", "casToken", "checkpoint"],
+        "fields": {"protocolVersion": "integer-const-1", "status": "const:committed", "anchorId": "scalar:identifier-equals-request-anchorId", "casToken": "scalar:casToken", "checkpoint": "object:checkpoint"}
       },
       "requestEnvelope": {
         "exactKeys": ["contractVersion", "operationId", "securityDomainId", "namespace", "anchorId", "operation", "payload"],
@@ -162,25 +175,25 @@
       "readPayload": {"exactKeys": [], "fields": {}},
       "casPayload": {
         "exactKeys": ["expected", "next"],
-        "fields": {"expected": "object:snapshot", "next": "object:checkpoint"}
+        "fields": {"expected": "object:uninitializedSnapshot-or-committedSnapshot", "next": "object:checkpoint"}
       },
       "casResult": {
-        "exactKeys": ["outcome", "current"],
-        "fields": {"outcome": "enum:swapped|conflict", "current": "object:snapshot"}
+        "exactKeys": ["protocolVersion", "outcome", "current"],
+        "fields": {"protocolVersion": "integer-const-1", "outcome": "enum:swapped|conflict", "current": "object:uninitializedSnapshot-or-committedSnapshot"}
       },
       "externalError": {
-        "exactKeys": ["code", "retryable", "retryAfterMs", "commitDisposition"],
-        "fields": {"code": "enum:errorCodes", "retryable": "boolean:exact-code-definition", "retryAfterMs": "scalar:retryAfterMs-exact-code-definition", "commitDisposition": "enum:operationDispositionRule"}
+        "exactKeys": ["code", "message", "retryable", "retryAfterMs", "commitDisposition"],
+        "fields": {"code": "enum:errorCodes", "message": "null:backend-message-must-be-discarded", "retryable": "boolean:exact-code-definition", "retryAfterMs": "scalar:retryAfterMs-exact-code-definition", "commitDisposition": "enum:operationDispositionRule"}
       },
       "responseEnvelope": {
         "exactKeys": ["contractVersion", "operationId", "ok", "result", "error"],
-        "fields": {"contractVersion": "integer-const-1", "operationId": "scalar:operationId-exact-request-match", "ok": "boolean", "result": "object:snapshot-or-casResult-or-null-by-ok-and-request-operation", "error": "object:externalError-or-null-by-ok"}
+        "fields": {"contractVersion": "integer-const-1", "operationId": "scalar:operationId-exact-request-match", "ok": "boolean", "result": "untrusted-json-value-or-null-by-ok", "error": "object:externalError-or-null-by-ok"}
       }
     },
     "wireUnionRules": {
       "snapshot": {
-        "uninitialized": {"status": "uninitialized", "checkpoint": null, "casToken": "required-valid"},
-        "committed": {"status": "committed", "checkpoint": "required-valid-and-anchorId-equals-request", "casToken": "required-valid"}
+        "uninitialized": {"schema": "exact-uninitializedSnapshot", "checkpointKey": "forbidden", "anchorId": "equals-request-anchorId"},
+        "committed": {"schema": "exact-committedSnapshot", "checkpoint": "required-valid-and-anchorId-equals-request", "anchorId": "equals-request-anchorId"}
       },
       "request": {
         "read": {"operation": "read", "payload": "exact-readPayload"},
@@ -191,15 +204,15 @@
         "conflict": {"outcome": "conflict", "current": "authoritative-valid-snapshot", "casToken": "must-differ-from-expected"}
       },
       "response": {
-        "readSuccess": {"requestOperation": "read", "ok": true, "result": "exact-snapshot", "error": null},
-        "casSuccess": {"requestOperation": "compare_and_swap", "ok": true, "result": "exact-casResult-current-snapshot", "error": null},
+        "readSuccess": {"requestOperation": "read", "ok": true, "result": "untrusted-unknown-backend-guarantees-exact-RelayV2ContinuityAnchorSnapshot", "error": null},
+        "casSuccess": {"requestOperation": "compare_and_swap", "ok": true, "result": "untrusted-unknown-backend-guarantees-exact-RelayV2ContinuityAnchorCasResult", "error": null},
         "error": {"requestOperation": "read-or-compare_and_swap", "ok": false, "result": null, "error": "exact-externalError", "codeOperation": "definition-must-contain-request-operation", "commitDisposition": "errors.operationDispositionRules-for-request-operation"}
       },
-      "typedPortTranslation": {
-        "common": "adapter-adds-protocolVersion-and-request-anchorId",
-        "uninitialized": "external-checkpoint-null-becomes-typed-port-snapshot-without-checkpoint-key",
-        "committed": "external-checkpoint-object-becomes-typed-port-checkpoint-key",
-        "cas": "external-casResult-current-translates-by-same-snapshot-rule"
+      "successHandoff": {
+        "futureAdapterSeam": "closed-decode-outer-envelope-and-error-only-then-pass-result-as-untrusted-unknown",
+        "backendSuccessGuarantee": "result-is-exact-existing-RelayV2ContinuityAnchorSnapshot-or-CasResult-shape",
+        "continuityAnchor": "sole-checkpoint-snapshot-and-cas-result-decoder-and-authority-field-validator",
+        "forbiddenAdapterBehavior": ["add-protocolVersion", "add-anchorId", "decode-checkpoint", "synthesize-authority-field"]
       }
     },
     "operationTimeoutMs": {
@@ -246,7 +259,8 @@
     "backendGuarantee": "emit-only-allowed-code-operation-disposition-and-retryAfter-combinations",
     "status": "new-normative-v1-choice",
     "choiceRationale": "closed-redacted-operational-classification-needed-to-map-an-untrusted-backend-into-the-existing-continuity-and-credential-errors-without-creating-relay-wire-errors",
-    "exactKeys": ["code", "retryable", "retryAfterMs", "commitDisposition"],
+    "exactKeys": ["code", "message", "retryable", "retryAfterMs", "commitDisposition"],
+    "messagePolicy": "always-null-and-discard-any-backend-origin-message",
     "codeDefinitionExactKeys": ["code", "operations", "retryable", "retryAfterMsPolicy", "casCommitDisposition"],
     "operationVocabulary": ["read", "compare_and_swap", "provisioning"],
     "retryAfterMsValues": "null-or-scalar-retryAfterMs-as-required-by-code-definition",
@@ -274,8 +288,10 @@
       "provisioning": {"allowedCodes": "definitions-whose-operations-contain-provisioning", "commitDisposition": "not_applicable"}
     },
     "upperClosedMapping": {
-      "backendReadError": "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE",
-      "malformedReadSuccess": "RelayV2ContinuityAnchor.INVALID_AUTHORITY_RESPONSE",
+      "readExternalErrorTransportOrOuterEnvelopeError": "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE",
+      "readWellFormedSuccessResultHandoff": "pass-untrusted-unknown-to-RelayV2ContinuityAnchor",
+      "readMalformedSuccessResult": "RelayV2ContinuityAnchor.INVALID_AUTHORITY_RESPONSE",
+      "casTransportOuterEnvelopeOrSuccessResultError": "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN",
       "backendCasErrorIncludingDefiniteRejection": "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN",
       "reasonDefiniteCasRejectionStillMapsUncertain": "typed-port-handoff-does-not-expose-a-proven-pre-linearization-error-union",
       "validCasConflict": "RelayV2ContinuityAnchor.CAS_CONFLICT-only-when-current-is-not-requested-successor",
@@ -283,7 +299,8 @@
       "credentialMalformedRollbackOrUnknown": "RelayV2BrokerCredentialAuthority.EXTERNAL_CONTINUITY_INVALID",
       "credentialCasUncertain": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_UNCERTAIN",
       "credentialCasConflict": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_CONFLICT",
-      "fatalPostReadyResult": "credential-authority-synchronous-withdrawal-and-close-barrier"
+      "brokerCredentialFatalPostReadyResult": "credential-authority-synchronous-withdrawal-and-owning-composition-global-v2-fence",
+      "agentExtensionFatalResult": "extension-authority-store-only-unavailable-or-reset-with-base-v2-unchanged"
     }
   },
   "recovery": {
@@ -298,7 +315,20 @@
     "casAckLossOrLateAck": "uncertain-then-linearizable-read-reconcile"
   },
   "readinessFence": {
-    "trigger": "any-fatal-external-read-cas-or-response-after-ready",
+    "trigger": "fatal-broker-credential.v1-external-read-cas-or-response-after-ready",
+    "namespaceFailureIsolation": {
+      "brokerCredential": {
+        "namespace": "broker-credential.v1",
+        "credentialAuthority": "withdraw-ready-and-admission-and-initiate-close-barrier",
+        "owningProductionComposition": "synchronously-fence-all-v2-upgrade-route-and-active-data-then-bounded-close"
+      },
+      "agentTranscriptLifecycle": {
+        "namespace": "agent-transcript-lifecycle.v1",
+        "extensionDisposition": "extension-authority-store-fail-closed-unavailable-or-reset-required",
+        "baseV2CredentialRouteCommandTerminal": "remain-ready-and-operational",
+        "globalConnectionFenceAllowed": false
+      }
+    },
     "credentialAuthority": {
       "owner": "RelayV2BrokerCredentialAuthority",
       "readyAndAdmissionWithdrawal": "synchronous-before-failure-escapes",
@@ -354,7 +384,10 @@
     "collision-resistant-operationId-and-exact-replay",
     "https-with-mutual-tls-or-workload-identity-and-reference-only-secrets",
     "closed-bounded-config-and-wire-schema-including-2048-byte-endpoint",
-    "operation-dependent-external-error-commitDisposition"
+    "operation-dependent-external-error-commitDisposition",
+    "null-only-external-error-message-and-backend-message-discard",
+    "existing-continuity-success-shapes-with-untrusted-result-handoff",
+    "namespace-scoped-broker-versus-agent-failure-fencing"
   ],
   "requiredProductionChoices": [
     "select-and-qualify-a-compatible-backend-with-independent-administration-and-backup-domain",
@@ -363,7 +396,7 @@
     "choose-concrete-opaque-broker-ownerBinding-without-inferring-credential-fields",
     "set-deployment-quota-rate-and-capacity-values",
     "freeze-public-transport-close-code-and-bounded-close-deadline-in-owning-broker-contract",
-    "exercise-restart-old-backup-failover-and-ready-loss-fence",
+    "exercise-restart-old-backup-failover-broker-ready-loss-and-agent-extension-isolation",
     "package-native-store-and-inject-authority-before-broker-composition"
   ]
 }
