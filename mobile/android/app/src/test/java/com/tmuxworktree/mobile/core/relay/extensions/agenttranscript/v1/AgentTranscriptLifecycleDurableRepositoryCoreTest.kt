@@ -118,6 +118,10 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         val corruptions = listOf<(RelayV2EncodedPayload, AgentTranscriptLifecycleDurableConsumerIdentity) -> RelayV2EncodedPayload>(
             { payload, _ -> payload.copy(sha256 = "0".repeat(64)) },
             { payload, _ -> payload.copy(codecVersion = AgentTranscriptLifecycleDurableStateCodec.CODEC_VERSION + 1) },
+            { payload, _ -> payload.withActivationGeneration("07") },
+            { payload, _ -> payload.withActivationGeneration("+7") },
+            { payload, _ -> payload.withActivationGeneration("0") },
+            { payload, _ -> payload.withActivationGeneration("9223372036854775808") },
             { _, consumer ->
                 val wrongConsumer = consumer.copy(principalId = "principal-wrong")
                 val wrongState = richState(wrongConsumer, "timeline-a")
@@ -624,5 +628,25 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)),
             ),
         )
+
+        fun RelayV2EncodedPayload.withActivationGeneration(
+            encodedGeneration: String,
+        ): RelayV2EncodedPayload {
+            val original = "\"profileActivationGeneration\":\"7\""
+            check(original in canonicalJson)
+            check(canonicalJson.indexOf(original) == canonicalJson.lastIndexOf(original))
+            val tamperedJson = canonicalJson.replace(
+                original,
+                "\"profileActivationGeneration\":\"$encodedGeneration\"",
+            )
+            val bytes = tamperedJson.toByteArray(Charsets.UTF_8)
+            return copy(
+                payloadUtf8Bytes = bytes.size,
+                canonicalJson = tamperedJson,
+                sha256 = MessageDigest.getInstance("SHA-256")
+                    .digest(bytes)
+                    .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) },
+            )
+        }
     }
 }

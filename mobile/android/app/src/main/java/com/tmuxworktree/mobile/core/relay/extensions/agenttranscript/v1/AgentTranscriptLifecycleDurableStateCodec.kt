@@ -224,8 +224,12 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             "sessionId",
             "timelineEpoch",
         )
-        val activation = RelayV2StorageJson.string(value, "profileActivationGeneration")
-            .toLongOrNull()?.takeIf { it > 0 } ?: malformed()
+        val encodedActivation = RelayV2StorageJson.string(
+            value,
+            "profileActivationGeneration",
+        )
+        if (!CANONICAL_POSITIVE_DECIMAL.matches(encodedActivation)) malformed()
+        val activation = encodedActivation.toLongOrNull() ?: malformed()
         return AgentTranscriptLifecycleDurableNamespace(
             AgentTranscriptLifecycleDurableConsumerIdentity(
                 profileId = RelayV2StorageJson.string(value, "profileId"),
@@ -566,6 +570,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
     private const val MAX_EVER_TURN_MARKERS = 2_048
     private const val MAX_NOTIFICATION_LEDGER_ENTRIES = 4_096
     private const val MAX_RETIRED_TIMELINES = 256
+    private val CANONICAL_POSITIVE_DECIMAL = Regex("^[1-9][0-9]*$")
 
     private val JSON_LIMITS = RelayV2JsonLimits(
         maxDepth = 16,
