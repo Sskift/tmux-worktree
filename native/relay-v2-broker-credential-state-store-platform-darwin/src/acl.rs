@@ -39,7 +39,9 @@ pub(crate) fn validate_acl(
             let newly_allowed = entry.permissions & !state.denied;
             state.allowed |= newly_allowed;
             if entry.flags & INHERITANCE_FLAGS != 0 {
-                state.inheritable_allowed |= newly_allowed;
+                // Any non-owner inheritable ALLOW is forbidden even when an
+                // earlier DENY masks its permissions on the current object.
+                state.inheritable_allowed |= entry.permissions;
             }
         } else {
             state.denied |= entry.permissions;
@@ -116,10 +118,16 @@ mod tests {
             permissions: ACL_READ_DATA,
             flags: ACL_ENTRY_FILE_INHERIT,
         };
+        let deny_other_read = AclEntry {
+            allow: false,
+            principal: AclPrincipal::User(777),
+            permissions: ACL_READ_DATA,
+            flags: 0,
+        };
         assert_eq!(
             validate_acl(
                 &metadata(u32::from(libc::S_IFDIR) | 0o755),
-                &[inherited_other_read]
+                &[deny_other_read, inherited_other_read]
             ),
             Err(PlatformStoreFailure::PermissionInvalid)
         );
