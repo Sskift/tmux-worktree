@@ -8,22 +8,22 @@
     "operations": ["access", "backend_failover", "compare_and_swap", "decommission", "delete", "provision", "qualify_backend", "read", "reconcile", "reset", "restore_backup", "service_restart"],
     "requestIdentities": ["not-applicable", "same-conflicting", "same-exact", "reuse-after-timeout-forbidden", "unique"],
     "faults": ["none", "concurrent_competitor", "ack_lost", "late_ack_after_timeout", "stale_read", "state_before_anchor_crash", "non_immediate_successor", "paired_rollback", "divergent_same_sequence", "service_restart", "old_backup", "backend_failover", "returned_uninitialized_after_commit", "authentication_failed", "permission_denied", "quota_exceeded", "capacity_before_linearization", "rate_limit_before_linearization", "timeout", "malformed_request", "malformed_outer_response", "malformed_success_snapshot", "malformed_success_cas_result", "unknown_error_enum", "namespace_collision", "cross_security_domain", "reset_requested", "decommission_requested", "tombstone_reuse", "physical_payload_delete", "backend_rpo0_dr_evidence_missing", "unavailable", "result_uncertain", "agent_namespace_unavailable"],
-    "outcomes": ["swapped", "conflict", "idempotent-replay", "uncertain", "error", "recovered-successor", "preserved", "refused-serving", "tombstoned", "provisioned-new-anchor", "decommissioned", "preserved-terminal-marker", "isolated-from-other-namespace", "extension-unavailable", "extension-commit-uncertain", "extension-corrupt", "fenced", "configuration-blocked"],
+    "outcomes": ["swapped", "conflict", "idempotent-replay", "uncertain", "error", "recovered-successor", "preserved", "refused-serving", "tombstoned", "provisioned-new-anchor", "decommissioned", "preserved-terminal-marker", "isolated-from-other-namespace", "extension-unavailable", "extension-lineage-preserved", "extension-commit-uncertain", "extension-corrupt", "extension-new-epoch-required", "fenced", "configuration-blocked"],
     "externalErrors": [null, "AUTHENTICATION_FAILED", "PERMISSION_DENIED", "MALFORMED_REQUEST", "IDEMPOTENCY_CONFLICT", "QUOTA_EXCEEDED", "CAPACITY_EXHAUSTED", "RATE_LIMITED", "TIMEOUT", "UNAVAILABLE", "RESULT_UNCERTAIN", "STALE_READ", "RECOVERY_ROLLBACK", "NAMESPACE_COLLISION", "ANCHOR_RETIRED"],
     "externalCommitDispositions": [null, "not_applicable", "proven_no_commit", "uncertain"],
     "continuityErrors": [null, "ANCHOR_UNAVAILABLE", "INVALID_AUTHORITY_RESPONSE", "ANCHOR_COMMIT_UNCERTAIN", "CAS_CONFLICT", "ROLLBACK_DETECTED"],
     "credentialErrors": [null, "EXTERNAL_CONTINUITY_UNAVAILABLE", "EXTERNAL_CONTINUITY_INVALID", "EXTERNAL_ANCHOR_UNCERTAIN", "EXTERNAL_ANCHOR_CONFLICT"],
-    "agentStoreErrors": [null, "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE", "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN", "AGENT_AUTHORITY_STORE_CORRUPT"],
+    "agentAuthorityErrors": [null, "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE", "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN", "AGENT_AUTHORITY_STORE_CORRUPT"],
     "checkpointRefs": [null, "broker-0", "broker-1-left", "broker-1-right", "broker-2", "agent-0", "agent-1", "broker-reset-0", "unchanged", "one-of-candidates", "candidate-or-initial", "redacted", "broker-2-terminal-marker", "broker-2-tombstone-plus-new-anchor-uninitialized"],
     "casTokenRefs": [null, "cas-1", "cas-2", "cas-3", "agent-cas-1", "terminal", "unchanged", "advanced-once", "advanced-or-unchanged", "same-or-new-nonrepeating", "old-terminal-new-independent", "redacted"],
     "admissions": ["blocked", "open"],
     "connectionFences": ["none", "synchronous-then-bounded-close"],
-    "nextActions": ["none", "loser-accept-winner-current", "linearizable-read-reconcile", "operator-repair", "operator-repair-with-durable-high-water", "new-anchor-required", "reconcile-new-anchor", "restore-agent-extension-authority-only", "reconcile-agent-extension-authority-only", "reset-agent-extension-authority-only", "new-authority-instance-required", "qualify-backend-rpo0-and-dr-evidence"]
+    "nextActions": ["none", "loser-accept-winner-current", "linearizable-read-reconcile", "operator-repair", "operator-repair-with-durable-high-water", "new-anchor-required", "reconcile-new-anchor", "repair/reopen-new-agent-authority", "reconcile-agent-extension-authority-only", "reset-agent-extension-and-start-new-timeline-epoch", "new-authority-instance-required", "qualify-backend-rpo0-and-dr-evidence"]
   },
   "defaults": {
     "initial": {"lifecycle": "active", "externalCheckpoint": "broker-0", "externalCasToken": "cas-1", "localCheckpoint": "broker-0", "ready": false, "activeConnections": false},
     "action": {"operation": "read", "actors": 1, "candidateCheckpoints": [], "expectedCasToken": null, "requestIdentity": "unique", "fault": "none", "accessBinding": "same-binding"},
-    "expect": {"outcomes": ["error"], "externalErrors": [], "externalCommitDisposition": null, "continuityError": null, "credentialError": null, "agentStoreError": null, "externalCheckpoint": "unchanged", "externalCasToken": "unchanged", "localCheckpoint": "unchanged", "ready": false, "admission": "blocked", "connectionFence": "none", "nextAction": "none"}
+    "expect": {"outcomes": ["error"], "externalErrors": [], "externalCommitDisposition": null, "continuityError": null, "credentialError": null, "agentAuthorityError": null, "externalCheckpoint": "unchanged", "externalCasToken": "unchanged", "localCheckpoint": "unchanged", "ready": false, "admission": "blocked", "connectionFence": "none", "nextAction": "none"}
   },
   "bindings": [
     {"id": "broker-a", "securityDomainId": "domain-a", "namespace": "broker-credential.v1", "ownerBinding": "broker-owner-a", "anchorId": "anchor-broker-a"},
@@ -212,19 +212,19 @@
       "name": "agent-namespace-loss-is-extension-only", "category": "ready-loss", "binding": "agent-a",
       "initial": {"externalCheckpoint": "agent-1", "externalCasToken": "agent-cas-1", "localCheckpoint": "agent-1", "ready": true, "activeConnections": true},
       "action": {"fault": "agent_namespace_unavailable"},
-      "expect": {"outcomes": ["error", "extension-unavailable"], "externalErrors": ["UNAVAILABLE"], "externalCommitDisposition": "not_applicable", "continuityError": "ANCHOR_UNAVAILABLE", "agentStoreError": "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "restore-agent-extension-authority-only"}
+      "expect": {"outcomes": ["error", "extension-unavailable", "extension-lineage-preserved"], "externalErrors": ["UNAVAILABLE"], "externalCommitDisposition": "not_applicable", "continuityError": "ANCHOR_UNAVAILABLE", "agentAuthorityError": "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE", "localCheckpoint": "agent-1", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "repair/reopen-new-agent-authority"}
     },
     {
       "name": "agent-namespace-commit-uncertain-is-extension-only", "category": "ready-loss", "binding": "agent-a",
       "initial": {"externalCheckpoint": "agent-0", "externalCasToken": "agent-cas-1", "localCheckpoint": "agent-1", "ready": true, "activeConnections": true},
       "action": {"operation": "compare_and_swap", "candidateCheckpoints": ["agent-1"], "expectedCasToken": "agent-cas-1", "fault": "result_uncertain"},
-      "expect": {"outcomes": ["uncertain", "extension-commit-uncertain"], "externalErrors": ["RESULT_UNCERTAIN"], "externalCommitDisposition": "uncertain", "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "agentStoreError": "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN", "externalCheckpoint": "candidate-or-initial", "externalCasToken": "advanced-or-unchanged", "localCheckpoint": "agent-1", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "reconcile-agent-extension-authority-only"}
+      "expect": {"outcomes": ["uncertain", "extension-commit-uncertain"], "externalErrors": ["RESULT_UNCERTAIN"], "externalCommitDisposition": "uncertain", "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "agentAuthorityError": "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN", "externalCheckpoint": "candidate-or-initial", "externalCasToken": "advanced-or-unchanged", "localCheckpoint": "agent-1", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "reconcile-agent-extension-authority-only"}
     },
     {
-      "name": "agent-namespace-invalid-is-extension-only", "category": "ready-loss", "binding": "agent-a",
+      "name": "agent-namespace-corrupt-resets-extension-epoch-only", "category": "ready-loss", "binding": "agent-a",
       "initial": {"externalCheckpoint": "agent-1", "externalCasToken": "agent-cas-1", "localCheckpoint": "agent-1", "ready": true, "activeConnections": true},
       "action": {"fault": "malformed_success_snapshot"},
-      "expect": {"outcomes": ["error", "extension-corrupt"], "continuityError": "INVALID_AUTHORITY_RESPONSE", "agentStoreError": "AGENT_AUTHORITY_STORE_CORRUPT", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "reset-agent-extension-authority-only"}
+      "expect": {"outcomes": ["error", "extension-corrupt", "extension-new-epoch-required"], "continuityError": "INVALID_AUTHORITY_RESPONSE", "agentAuthorityError": "AGENT_AUTHORITY_STORE_CORRUPT", "ready": true, "admission": "open", "connectionFence": "none", "nextAction": "reset-agent-extension-and-start-new-timeline-epoch"}
     },
     {
       "name": "post-ready-read-unavailable-fences", "category": "ready-loss", "binding": "broker-a",

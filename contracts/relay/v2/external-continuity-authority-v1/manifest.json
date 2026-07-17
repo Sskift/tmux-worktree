@@ -352,6 +352,9 @@
           "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN": ["STATE_COMMIT_UNCERTAIN", "ANCHOR_COMMIT_UNCERTAIN", "RECONCILIATION_REQUIRED"],
           "AGENT_AUTHORITY_STORE_CORRUPT": ["INVALID_CHECKPOINT", "INVALID_AUTHORITY_RESPONSE", "LOCAL_STATE_CONFLICT", "CAS_CONFLICT", "ROLLBACK_DETECTED"]
         },
+        "unavailableLineagePolicy": "extension-unavailable-preserve-proven-timeline-and-cache-lineage-no-reset-or-new-epoch",
+        "commitUncertainLineagePolicy": "extension-only-reconcile-preserve-lineage-until-corruption-is-proven",
+        "corruptLineagePolicy": "extension-only-explicit-reset-and-new-timeline-epoch-required",
         "baseV2CredentialRouteCommandTerminal": "remain-ready-and-operational",
         "globalConnectionFenceAllowed": false
       }
