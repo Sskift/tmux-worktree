@@ -1,6 +1,8 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2EncodedPayload
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 
 /** Stable consumer slot before the host-issued Agent timeline lineage is selected. */
 internal data class AgentTranscriptLifecycleDurableConsumerIdentity(
@@ -15,13 +17,13 @@ internal data class AgentTranscriptLifecycleDurableConsumerIdentity(
 ) {
     init {
         require(profileActivationGeneration > 0) { "Profile activation generation must be positive" }
-        requireOpaqueId(profileId, "Profile ID")
-        requireOpaqueId(principalId, "Principal ID")
-        requireOpaqueId(clientInstanceId, "Client instance ID")
-        requireOpaqueId(hostId, "Host ID")
-        requireOpaqueId(hostEpoch, "Host epoch")
-        requireOpaqueId(scopeId, "Scope ID")
-        requireOpaqueId(sessionId, "Session ID")
+        requireStorageOpaqueIdentity(profileId, "Profile ID")
+        requireStorageOpaqueIdentity(principalId, "Principal ID")
+        requireStorageOpaqueIdentity(clientInstanceId, "Client instance ID")
+        requireStorageOpaqueIdentity(hostId, "Host ID")
+        requireStorageOpaqueIdentity(hostEpoch, "Host epoch")
+        requireStorageOpaqueIdentity(scopeId, "Scope ID")
+        requireStorageOpaqueIdentity(sessionId, "Session ID")
     }
 
     val sessionIdentity: AgentExtensionSessionIdentity
@@ -34,7 +36,7 @@ internal data class AgentTranscriptLifecycleDurableNamespace(
     val timelineEpoch: String?,
 ) {
     init {
-        timelineEpoch?.let { AgentTimelineLineage(consumer.sessionIdentity, it) }
+        timelineEpoch?.let { requireStorageOpaqueIdentity(it, "Timeline epoch") }
     }
 
     val timelineEpochKey: String
@@ -74,8 +76,8 @@ internal data class AgentTranscriptLifecycleNotificationClaimKey(
     val lifecycleState: AgentLifecycleState,
 ) {
     init {
-        AgentTimelineLineage(consumer.sessionIdentity, timelineEpoch)
-        requireOpaqueId(lifecycleEventId, "Lifecycle event ID")
+        requireStorageOpaqueIdentity(timelineEpoch, "Timeline epoch")
+        requireStorageOpaqueIdentity(lifecycleEventId, "Lifecycle event ID")
     }
 
     val dedupeKey: AgentNotificationDedupeKey
@@ -363,4 +365,20 @@ private sealed interface NotificationClaimTransactionResult {
     data class NotExecutable(
         val reason: AgentTranscriptLifecycleNotificationNotExecutableReason,
     ) : NotificationClaimTransactionResult
+}
+
+private const val MAX_STORAGE_OPAQUE_ID_UTF8_BYTES = 128
+
+/** Storage-boundary copy of the frozen opaque-ID constraints; it does not widen reducer APIs. */
+private fun requireStorageOpaqueIdentity(value: String?, label: String) {
+    require(!value.isNullOrBlank()) { "$label is required" }
+    require(value == value.trim()) { "$label cannot contain outer whitespace" }
+    require(!value.contains('\u0000')) { "$label contains NUL" }
+    val encoder = StandardCharsets.UTF_8.newEncoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    require(encoder.canEncode(value)) { "$label is not well-formed Unicode" }
+    require(value.toByteArray(StandardCharsets.UTF_8).size <= MAX_STORAGE_OPAQUE_ID_UTF8_BYTES) {
+        "$label exceeds $MAX_STORAGE_OPAQUE_ID_UTF8_BYTES UTF-8 bytes"
+    }
 }

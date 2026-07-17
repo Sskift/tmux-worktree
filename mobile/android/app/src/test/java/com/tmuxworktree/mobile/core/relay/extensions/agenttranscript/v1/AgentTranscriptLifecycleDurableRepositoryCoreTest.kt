@@ -11,6 +11,28 @@ import org.junit.Test
 
 class AgentTranscriptLifecycleDurableRepositoryCoreTest {
     @Test
+    fun `storage identity boundary rejects malformed and oversized UTF8`() {
+        val invalid = listOf(
+            "",
+            " profile",
+            "profile ",
+            "profile\u0000id",
+            "\uD800",
+            "a".repeat(129),
+            "界".repeat(43),
+        )
+        invalid.forEach { profileId ->
+            assertTrue(
+                runCatching { consumer(profileId = profileId) }.exceptionOrNull() is
+                    IllegalArgumentException,
+            )
+        }
+
+        assertEquals("a".repeat(128), consumer(profileId = "a".repeat(128)).profileId)
+        assertEquals("界".repeat(42), consumer(profileId = "界".repeat(42)).profileId)
+    }
+
+    @Test
     fun `complete namespaces coexist and retain reducer continuity evidence`() = runBlocking {
         val store = MemoryStore()
         val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)

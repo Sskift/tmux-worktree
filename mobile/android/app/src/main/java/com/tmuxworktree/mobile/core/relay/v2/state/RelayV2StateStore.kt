@@ -172,9 +172,8 @@ internal interface RelayV2StateTransaction {
     fun deleteNamespaceState(namespace: RelayV2StateNamespace)
 
     /**
-     * Deletes all six state-sync categories plus every activation-scoped Outbox, terminal, and
-     * optional Agent transcript/lifecycle consumer and claim rows for this profile, never v1 or
-     * credentials.
+     * Deletes all six state-sync categories plus every activation-scoped Outbox and terminal row
+     * for this profile, never v1 rows or credentials.
      */
     fun deleteProfileState(profileId: String)
 
