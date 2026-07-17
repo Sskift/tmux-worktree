@@ -3,6 +3,22 @@ use relay_v2_broker_credential_state_store_platform_common::NativeStoreErrorCode
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JsEncodingBoundary {
+    Read,
+    PostPublish,
+}
+
+pub(crate) fn record_js_encoding_failure(
+    boundary: JsEncodingBoundary,
+    terminal: &AtomicBool,
+) -> NativeStoreErrorCode {
+    if matches!(boundary, JsEncodingBoundary::PostPublish) {
+        terminal.store(true, Ordering::Release);
+    }
+    NativeStoreErrorCode::NativeInterfaceInvalid
+}
+
 pub(crate) struct AdmissionState {
     port: Option<Box<dyn AdmissionPort>>,
 }
@@ -519,6 +535,62 @@ mod tests {
                 .unwrap_err(),
             NativeStoreErrorCode::StoreClosed
         );
+        assert_eq!(store.admit().err(), Some(NativeStoreErrorCode::StoreClosed));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn read_and_post_publish_encoding_failures_have_distinct_terminal_precedence() {
+        let (store, _) = process_store();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let transaction = AdmissionState::new(store.admit().unwrap())
+            .enter(Arc::clone(&terminal))
+            .unwrap();
+        let mut completion = NativeCompletion::new(transaction);
+
+        assert_eq!(
+            record_js_encoding_failure(JsEncodingBoundary::Read, &terminal),
+            NativeStoreErrorCode::NativeInterfaceInvalid
+        );
+        assert!(!terminal.load(Ordering::Acquire));
+        let revision = completion
+            .transaction_mut()
+            .unwrap()
+            .read()
+            .unwrap()
+            .revision;
+        assert!(matches!(
+            completion
+                .transaction_mut()
+                .unwrap()
+                .compare_and_publish(revision, &[1, 3, 5])
+                .unwrap(),
+            PortPublishOutcome::Swapped(_)
+        ));
+
+        assert_eq!(
+            record_js_encoding_failure(JsEncodingBoundary::PostPublish, &terminal),
+            NativeStoreErrorCode::NativeInterfaceInvalid
+        );
+        assert!(terminal.load(Ordering::Acquire));
+        assert_eq!(
+            completion
+                .transaction_mut()
+                .and_then(TransactionState::read)
+                .unwrap_err(),
+            NativeStoreErrorCode::StoreClosed
+        );
+        assert_eq!(
+            completion.finish(None),
+            NativeCompletionResult::Settled(Ok(()))
+        );
+        assert_eq!(
+            completion
+                .transaction_mut()
+                .and_then(TransactionState::read)
+                .unwrap_err(),
+            NativeStoreErrorCode::StoreClosed
+        );
         store.close().unwrap();
     }
 
@@ -526,18 +598,39 @@ mod tests {
     fn callback_completion_settles_one_real_process_bound_transaction_exactly_once() {
         for callback_error in [None, Some(NativeStoreErrorCode::NativeInterfaceInvalid)] {
             let (store, descriptor) = process_store();
+            let terminal = Arc::new(AtomicBool::new(false));
             let transaction = AdmissionState::new(store.admit().unwrap())
-                .enter(Arc::new(AtomicBool::new(false)))
+                .enter(Arc::clone(&terminal))
                 .unwrap();
             let mut completion = NativeCompletion::new(transaction);
-            assert_eq!(
-                completion.finish(callback_error),
-                NativeCompletionResult::Settled(callback_error.map_or(Ok(()), Err))
-            );
             if callback_error.is_none() {
+                let next = AdmissionState::new(store.admit().unwrap());
+                let (entered_tx, entered_rx) = mpsc::channel();
+                let enter_worker = thread::Builder::new()
+                    .name("relay-v2-test-callback-settlement".to_owned())
+                    .spawn(move || entered_tx.send(next.enter(terminal)).unwrap())
+                    .unwrap();
+                assert!(entered_rx.recv_timeout(Duration::from_millis(40)).is_err());
+                assert_eq!(
+                    completion.finish(callback_error),
+                    NativeCompletionResult::Settled(Ok(()))
+                );
+                let mut next_transaction = entered_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(
                     completion.transaction_mut().err(),
                     Some(NativeStoreErrorCode::InvalidRevision)
+                );
+                next_transaction.settle().unwrap();
+                enter_worker.join().unwrap();
+            } else {
+                assert_eq!(
+                    completion.finish(callback_error),
+                    NativeCompletionResult::Settled(Err(
+                        NativeStoreErrorCode::NativeInterfaceInvalid
+                    ))
                 );
             }
             assert_eq!(

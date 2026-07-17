@@ -5,8 +5,8 @@ mod state;
 
 use crate::port::{erase_process_store, PortPublishOutcome, PortSnapshot, StorePort};
 use crate::state::{
-    same_transaction, AdmissionState, NativeCompletion, NativeCompletionResult,
-    TransactionIdentity, TransactionState,
+    record_js_encoding_failure, same_transaction, AdmissionState, JsEncodingBoundary,
+    NativeCompletion, NativeCompletionResult, TransactionIdentity, TransactionState,
 };
 use napi::bindgen_prelude::{
     Array, FnArgs, FromNapiValue, Function, FunctionCallContext, FunctionRef, JsObjectValue,
@@ -301,9 +301,44 @@ fn define_own_data<T: ToNapiValue>(
     object.define_properties(&[property])
 }
 
+#[cfg(test)]
+const BINDING_ERROR_UNION: [NativeStoreErrorCode; 13] = [
+    NativeStoreErrorCode::NativeInterfaceInvalid,
+    NativeStoreErrorCode::StoreBusy,
+    NativeStoreErrorCode::StoreClosed,
+    NativeStoreErrorCode::StoreCorrupt,
+    NativeStoreErrorCode::StoreFormatUnsupported,
+    NativeStoreErrorCode::StoreIdentityUncertain,
+    NativeStoreErrorCode::StoreIo,
+    NativeStoreErrorCode::StorePermissionInvalid,
+    NativeStoreErrorCode::DurabilityUnsupported,
+    NativeStoreErrorCode::InvalidArgument,
+    NativeStoreErrorCode::InvalidRevision,
+    NativeStoreErrorCode::StateTooLarge,
+    NativeStoreErrorCode::GenerationExhausted,
+];
+
+fn closed_binding_error_code(code: NativeStoreErrorCode) -> &'static str {
+    match code {
+        NativeStoreErrorCode::NativeInterfaceInvalid
+        | NativeStoreErrorCode::StoreBusy
+        | NativeStoreErrorCode::StoreClosed
+        | NativeStoreErrorCode::StoreCorrupt
+        | NativeStoreErrorCode::StoreFormatUnsupported
+        | NativeStoreErrorCode::StoreIdentityUncertain
+        | NativeStoreErrorCode::StoreIo
+        | NativeStoreErrorCode::StorePermissionInvalid
+        | NativeStoreErrorCode::DurabilityUnsupported
+        | NativeStoreErrorCode::InvalidArgument
+        | NativeStoreErrorCode::InvalidRevision
+        | NativeStoreErrorCode::StateTooLarge
+        | NativeStoreErrorCode::GenerationExhausted => code.as_contract_code(),
+    }
+}
+
 fn create_error_object<'env>(env: &'env Env, code: NativeStoreErrorCode) -> Result<Object<'env>> {
     let mut error = Object::new(env)?;
-    define_own_data(env, &mut error, "code", code.as_contract_code())?;
+    define_own_data(env, &mut error, "code", closed_binding_error_code(code))?;
     Ok(error)
 }
 
@@ -857,15 +892,17 @@ fn is_proven_no_commit(code: NativeStoreErrorCode) -> bool {
     )
 }
 
-fn encode_read_failure(env: &Env) -> Result<RawValue> {
+fn encode_read_failure(env: &Env, store: &Arc<NapiStoreState>) -> Result<RawValue> {
+    let code = record_js_encoding_failure(JsEncodingBoundary::Read, &store.terminal);
     clear_pending_exception(env);
-    rejected_promise(env, NativeStoreErrorCode::NativeInterfaceInvalid)
+    rejected_promise(env, code)
 }
 
 fn encode_failure_after_publication(env: &Env, store: &Arc<NapiStoreState>) -> Result<RawValue> {
-    terminal_fence(store);
+    let code = record_js_encoding_failure(JsEncodingBoundary::PostPublish, &store.terminal);
+    request_close(store, None, false);
     clear_pending_exception(env);
-    rejected_promise(env, NativeStoreErrorCode::NativeInterfaceInvalid)
+    rejected_promise(env, code)
 }
 
 fn create_transaction_object<'env>(
@@ -897,7 +934,7 @@ fn create_transaction_object<'env>(
                         // Read has no publication ambiguity. JS encoding or
                         // promise completion failure rejects exactly but does
                         // not permanently close an otherwise usable store.
-                        Err(_) => encode_read_failure(context.env),
+                        Err(_) => encode_read_failure(context.env, &read_completion.store),
                     }
                 }
                 // Read is not a publication boundary; preserve the native
@@ -1449,6 +1486,7 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     fn eager_lifecycle_failure_is_closed_invalid() {
@@ -1458,6 +1496,18 @@ mod tests {
             capability_decision(true, &failed),
             CapabilityDecision::Invalid(NativeStoreErrorCode::StoreClosed)
         );
+    }
+
+    #[test]
+    fn binding_error_union_exhaustively_consumes_common_codes() {
+        let mapped = BINDING_ERROR_UNION
+            .map(closed_binding_error_code)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mapped.len(), BINDING_ERROR_UNION.len());
+        for code in BINDING_ERROR_UNION {
+            assert_eq!(closed_binding_error_code(code), code.as_contract_code());
+        }
     }
 
     #[test]
