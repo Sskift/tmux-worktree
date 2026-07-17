@@ -1682,7 +1682,10 @@ mod tests {
         assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
         assert_eq!(fallback_count.load(Ordering::Relaxed), 1);
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
 
+    #[test]
+    fn main_thread_task_run_panic_contains_cleanup_fallback_ack_and_drop_panic() {
         let (task, dispatch_count, fallback_count, drop_count, ack) = panicking_cleanup_task();
         finish_main_thread_task_no_unwind(task, |_| panic!("synthetic run panic"), true);
         ack.recv_timeout(Duration::from_secs(1)).unwrap();
