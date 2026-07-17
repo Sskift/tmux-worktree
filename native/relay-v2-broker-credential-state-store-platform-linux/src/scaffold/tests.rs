@@ -2,6 +2,7 @@ use super::*;
 use relay_v2_broker_credential_state_store_platform_common::{
     initialize_process_lifecycle, ProcessBoundPublishOutcome,
 };
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -42,9 +43,14 @@ enum Call {
         parent: Role,
         component: OsString,
     },
-    Acl {
+    AclSize {
         role: Role,
         kind: AclXattrKind,
+    },
+    AclRead {
+        role: Role,
+        kind: AclXattrKind,
+        requested: usize,
     },
     Probe(Role),
     Fchmod {
@@ -82,11 +88,14 @@ struct FakeState {
     home: Metadata,
     private: Option<Metadata>,
     container: Option<Metadata>,
+    home_open_error: Option<SysError>,
     private_open_error: Option<SysError>,
     cloexec: bool,
     lock_error: Option<SysError>,
     access_acl: HashMap<Role, Vec<u8>>,
     default_acl: HashMap<Role, Vec<u8>>,
+    acl_size_errors: HashMap<(Role, AclXattrKind), SysError>,
+    acl_read_errors: HashMap<(Role, AclXattrKind), SysError>,
     bytes: BTreeMap<u64, u8>,
     write_steps: VecDeque<WriteStep>,
     fsync_steps: VecDeque<Result<(), SysError>>,
@@ -111,11 +120,14 @@ impl FakeSyscalls {
                     home_inode + 2,
                     container_spec().file_length(),
                 )),
+                home_open_error: None,
                 private_open_error: None,
                 cloexec: true,
                 lock_error: None,
                 access_acl: HashMap::new(),
                 default_acl: HashMap::new(),
+                acl_size_errors: HashMap::new(),
+                acl_read_errors: HashMap::new(),
                 bytes: BTreeMap::new(),
                 write_steps: VecDeque::new(),
                 fsync_steps: VecDeque::new(),
@@ -144,6 +156,11 @@ impl FakeSyscalls {
 
     fn mutate(&self, change: impl FnOnce(&mut FakeState)) {
         change(&mut self.state.lock().expect("fake state"));
+    }
+
+    fn allocate_role_fd(&self, role: Role) -> i32 {
+        let mut state = self.state.lock().expect("fake state");
+        Self::allocate_fd(&mut state, role)
     }
 
     fn allocate_fd(state: &mut FakeState, role: Role) -> i32 {
@@ -228,7 +245,12 @@ impl LinuxSyscalls for FakeSyscalls {
             flags,
         });
         let role = match (parent_role, component) {
-            (Role::Root, value) if value == OsStr::new("account") => Role::Home,
+            (Role::Root, value) if value == OsStr::new("account") => {
+                if let Some(error) = state.home_open_error {
+                    return Err(error);
+                }
+                Role::Home
+            }
             (Role::Home, value)
                 if value == OsStr::new(container_spec().relative_components()[0]) =>
             {
@@ -330,14 +352,43 @@ impl LinuxSyscalls for FakeSyscalls {
         }
     }
 
-    fn acl_xattr(&self, fd: i32, kind: AclXattrKind) -> Result<Option<Vec<u8>>, SysError> {
+    fn acl_xattr_size(&self, fd: i32, kind: AclXattrKind) -> Result<Option<usize>, SysError> {
         let mut state = self.state.lock().expect("fake state");
         let role = Self::role(&state, fd)?;
-        state.calls.push(Call::Acl { role, kind });
+        state.calls.push(Call::AclSize { role, kind });
+        if let Some(error) = state.acl_size_errors.get(&(role, kind)).copied() {
+            return Err(error);
+        }
         Ok(match kind {
-            AclXattrKind::Access => state.access_acl.get(&role).cloned(),
-            AclXattrKind::Default => state.default_acl.get(&role).cloned(),
+            AclXattrKind::Access => state.access_acl.get(&role).map(Vec::len),
+            AclXattrKind::Default => state.default_acl.get(&role).map(Vec::len),
         })
+    }
+
+    fn acl_xattr_read(
+        &self,
+        fd: i32,
+        kind: AclXattrKind,
+        output: &mut [u8],
+    ) -> Result<usize, SysError> {
+        let mut state = self.state.lock().expect("fake state");
+        let role = Self::role(&state, fd)?;
+        state.calls.push(Call::AclRead {
+            role,
+            kind,
+            requested: output.len(),
+        });
+        if let Some(error) = state.acl_read_errors.get(&(role, kind)).copied() {
+            return Err(error);
+        }
+        let value = match kind {
+            AclXattrKind::Access => state.access_acl.get(&role),
+            AclXattrKind::Default => state.default_acl.get(&role),
+        }
+        .ok_or(SysError::NoData)?;
+        let count = value.len().min(output.len());
+        output[..count].copy_from_slice(&value[..count]);
+        Ok(count)
     }
 
     fn durability_probe(&self, fd: i32) -> Result<DurabilityEvidence, SysError> {
@@ -542,6 +593,131 @@ fn empty_allowlist_returns_before_registry_and_every_mutation() {
     syscalls.clear_calls();
     let store = open_qualified(Arc::clone(&syscalls)).expect("test-only qualified reopen");
     store.close().expect("close qualified fake store");
+}
+
+#[test]
+fn account_home_traversal_enoent_is_identity_uncertain() {
+    let syscalls = FakeSyscalls::existing();
+    syscalls.mutate(|state| state.home_open_error = Some(SysError::NotFound));
+    assert!(matches!(
+        open_qualified(syscalls),
+        Err(NativeStoreErrorCode::StoreIdentityUncertain)
+    ));
+}
+
+#[test]
+fn acl_cannot_prove_is_permission_invalid_but_explicit_io_remains_store_io() {
+    // Linux ENOTSUP and EOPNOTSUPP share errno 95.
+    assert_eq!(classify_acl_xattr_errno(13), SysError::AclUnprovable);
+    assert_eq!(classify_acl_xattr_errno(95), SysError::AclUnprovable);
+    assert_eq!(classify_acl_xattr_errno(12_345), SysError::AclUnprovable);
+    assert_eq!(classify_acl_xattr_errno(5), SysError::AclIo);
+
+    for error in [SysError::Access, SysError::AclUnprovable, SysError::Other] {
+        let syscalls = FakeSyscalls::existing();
+        syscalls.mutate(|state| {
+            state
+                .acl_size_errors
+                .insert((Role::Home, AclXattrKind::Access), error);
+        });
+        assert!(matches!(
+            open_qualified(syscalls),
+            Err(NativeStoreErrorCode::StorePermissionInvalid)
+        ));
+    }
+
+    let io = FakeSyscalls::existing();
+    io.mutate(|state| {
+        state.access_acl.insert(Role::Home, access_acl(0o755, None));
+        state
+            .acl_read_errors
+            .insert((Role::Home, AclXattrKind::Access), SysError::AclIo);
+    });
+    assert!(matches!(
+        open_qualified(io),
+        Err(NativeStoreErrorCode::StoreIo)
+    ));
+}
+
+#[test]
+fn descriptor_acl_checks_before_every_size_read_and_retry_syscall() {
+    let access = access_acl(CONTAINER_MODE, None);
+    let access_length = access.len();
+    for (deny_at, interrupted_size, expected) in [
+        (1, false, vec![]),
+        (
+            2,
+            false,
+            vec![Call::AclSize {
+                role: Role::Container,
+                kind: AclXattrKind::Access,
+            }],
+        ),
+        (
+            3,
+            false,
+            vec![
+                Call::AclSize {
+                    role: Role::Container,
+                    kind: AclXattrKind::Access,
+                },
+                Call::AclRead {
+                    role: Role::Container,
+                    kind: AclXattrKind::Access,
+                    requested: access_length,
+                },
+            ],
+        ),
+        (
+            2,
+            true,
+            vec![Call::AclSize {
+                role: Role::Container,
+                kind: AclXattrKind::Access,
+            }],
+        ),
+    ] {
+        let syscalls = FakeSyscalls::existing();
+        let fd = syscalls.allocate_role_fd(Role::Container);
+        syscalls.mutate(|state| {
+            state.access_acl.insert(Role::Container, access.clone());
+            if interrupted_size {
+                state.acl_size_errors.insert(
+                    (Role::Container, AclXattrKind::Access),
+                    SysError::Interrupted,
+                );
+            }
+        });
+        let checks = Cell::new(0_usize);
+        // Injected `Closed` models a common fence observing registry poison.
+        // Each denial must happen before the corresponding fake syscall.
+        let result = validate_acl_with_syscall_check(
+            syscalls.as_ref(),
+            fd,
+            container_metadata(99, container_spec().file_length()),
+            false,
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                if next == deny_at {
+                    Err(PlatformStoreFailure::Closed.into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(OpenFailure::Platform(PlatformStoreFailure::Closed))
+        ));
+        assert_eq!(checks.get(), deny_at);
+        let actual: Vec<_> = syscalls
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::AclSize { .. } | Call::AclRead { .. }))
+            .collect();
+        assert_eq!(actual, expected);
+    }
 }
 
 #[test]

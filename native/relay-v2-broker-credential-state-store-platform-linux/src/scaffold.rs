@@ -31,6 +31,14 @@ const ACL_GROUP: u16 = 0x0008;
 const ACL_MASK: u16 = 0x0010;
 const ACL_OTHER: u16 = 0x0020;
 const ACL_WRITE: u8 = 0b010;
+const MAX_ACL_XATTR: usize = 64 * 1024;
+
+const LINUX_EINTR: i32 = 4;
+const LINUX_EIO: i32 = 5;
+const LINUX_EACCES: i32 = 13;
+const LINUX_ERANGE: i32 = 34;
+const LINUX_ENODATA: i32 = 61;
+const LINUX_ENOTSUP_OR_EOPNOTSUPP: i32 = 95;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Credentials {
@@ -81,11 +89,13 @@ pub(crate) enum SysError {
     Again,
     Interrupted,
     NoData,
+    AclSizeChanged,
     AclUnprovable,
+    AclIo,
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AclXattrKind {
     Access,
     Default,
@@ -130,7 +140,15 @@ pub(crate) trait LinuxSyscalls: Send + Sync + 'static {
 
     fn fstat(&self, fd: i32) -> Result<Metadata, SysError>;
     fn fstatat_nofollow(&self, parent: i32, component: &OsStr) -> Result<Metadata, SysError>;
-    fn acl_xattr(&self, fd: i32, kind: AclXattrKind) -> Result<Option<Vec<u8>>, SysError>;
+    /// Executes exactly one size-query `fgetxattr` syscall.
+    fn acl_xattr_size(&self, fd: i32, kind: AclXattrKind) -> Result<Option<usize>, SysError>;
+    /// Executes exactly one value-read `fgetxattr` syscall.
+    fn acl_xattr_read(
+        &self,
+        fd: i32,
+        kind: AclXattrKind,
+        output: &mut [u8],
+    ) -> Result<usize, SysError>;
     fn durability_probe(&self, fd: i32) -> Result<DurabilityEvidence, SysError>;
 
     fn fchmod(&self, fd: i32, mode: u32) -> Result<(), SysError>;
@@ -869,8 +887,10 @@ fn validate_acl_for_descriptor<S: LinuxSyscalls>(
     metadata: Metadata,
     directory: bool,
 ) -> Result<(), PlatformStoreFailure> {
-    fence.check()?;
-    validate_acl(syscalls, fd, metadata, directory).map_err(|error| match error {
+    validate_acl_with_syscall_check(syscalls, fd, metadata, directory, || {
+        fence.check().map_err(OpenFailure::from)
+    })
+    .map_err(|error| match error {
         OpenFailure::Platform(error) => error,
         OpenFailure::Corrupt => PlatformStoreFailure::PermissionInvalid,
     })
@@ -882,16 +902,22 @@ fn validate_acl<S: LinuxSyscalls>(
     metadata: Metadata,
     directory: bool,
 ) -> Result<(), OpenFailure> {
-    let access = syscalls
-        .acl_xattr(fd, AclXattrKind::Access)
-        .map_err(map_acl_error)?;
+    validate_acl_with_syscall_check(syscalls, fd, metadata, directory, || Ok(()))
+}
+
+fn validate_acl_with_syscall_check<S: LinuxSyscalls>(
+    syscalls: &S,
+    fd: i32,
+    metadata: Metadata,
+    directory: bool,
+    mut before_syscall: impl FnMut() -> Result<(), OpenFailure>,
+) -> Result<(), OpenFailure> {
+    let access = read_acl_xattr(syscalls, fd, AclXattrKind::Access, &mut before_syscall)?;
     if let Some(bytes) = access {
         let acl = ParsedAcl::parse(&bytes)?;
         acl.prove_access_mode(metadata.mode)?;
     }
-    let default = syscalls
-        .acl_xattr(fd, AclXattrKind::Default)
-        .map_err(map_acl_error)?;
+    let default = read_acl_xattr(syscalls, fd, AclXattrKind::Default, &mut before_syscall)?;
     if let Some(bytes) = default {
         if !directory {
             return Err(PlatformStoreFailure::PermissionInvalid.into());
@@ -899,6 +925,44 @@ fn validate_acl<S: LinuxSyscalls>(
         ParsedAcl::parse(&bytes)?.prove_default_does_not_relax_descendants()?;
     }
     Ok(())
+}
+
+fn read_acl_xattr<S: LinuxSyscalls>(
+    syscalls: &S,
+    fd: i32,
+    kind: AclXattrKind,
+    before_syscall: &mut impl FnMut() -> Result<(), OpenFailure>,
+) -> Result<Option<Vec<u8>>, OpenFailure> {
+    for _ in 0..3 {
+        before_syscall()?;
+        let size = match syscalls.acl_xattr_size(fd, kind) {
+            Ok(None) | Err(SysError::NoData) => return Ok(None),
+            Ok(Some(size)) if size <= MAX_ACL_XATTR => size,
+            Ok(Some(_)) => return Err(PlatformStoreFailure::PermissionInvalid.into()),
+            Err(SysError::Interrupted | SysError::AclSizeChanged) => continue,
+            Err(error) => return Err(map_acl_error(error)),
+        };
+        let mut value = vec![0_u8; size];
+        before_syscall()?;
+        match syscalls.acl_xattr_read(fd, kind, &mut value) {
+            Ok(read) if read == value.len() => return Ok(Some(value)),
+            Ok(_) | Err(SysError::Interrupted | SysError::AclSizeChanged) => continue,
+            Err(SysError::NoData) => return Ok(None),
+            Err(error) => return Err(map_acl_error(error)),
+        }
+    }
+    Err(PlatformStoreFailure::PermissionInvalid.into())
+}
+
+pub(crate) fn classify_acl_xattr_errno(errno: i32) -> SysError {
+    match errno {
+        LINUX_EINTR => SysError::Interrupted,
+        LINUX_ENODATA => SysError::NoData,
+        LINUX_ERANGE => SysError::AclSizeChanged,
+        LINUX_EIO => SysError::AclIo,
+        LINUX_EACCES | LINUX_ENOTSUP_OR_EOPNOTSUPP => SysError::AclUnprovable,
+        _ => SysError::AclUnprovable,
+    }
 }
 
 #[derive(Default)]
@@ -1018,7 +1082,7 @@ fn map_account_error(error: SysError) -> OpenFailure {
 
 fn map_path_open_error(error: SysError) -> OpenFailure {
     match error {
-        SysError::Symlink => PlatformStoreFailure::IdentityUncertain.into(),
+        SysError::NotFound | SysError::Symlink => PlatformStoreFailure::IdentityUncertain.into(),
         SysError::Access | SysError::AclUnprovable => {
             PlatformStoreFailure::PermissionInvalid.into()
         }
@@ -1065,8 +1129,8 @@ fn map_container_open_error(error: SysError) -> OpenFailure {
 
 fn map_acl_error(error: SysError) -> OpenFailure {
     match error {
-        SysError::AclUnprovable => PlatformStoreFailure::PermissionInvalid.into(),
-        _ => PlatformStoreFailure::Io.into(),
+        SysError::AclIo => PlatformStoreFailure::Io.into(),
+        _ => PlatformStoreFailure::PermissionInvalid.into(),
     }
 }
 

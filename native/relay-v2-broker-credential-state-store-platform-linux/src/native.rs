@@ -1,6 +1,7 @@
 use crate::scaffold::{
-    open_with_policy, AclXattrKind, Credentials, DurabilityEvidence, EmptyQualificationAllowlist,
-    FileKind, LinuxContainerCore, LinuxSyscalls, Metadata, SysError, TraditionalRecordLock,
+    classify_acl_xattr_errno, open_with_policy, AclXattrKind, Credentials, DurabilityEvidence,
+    EmptyQualificationAllowlist, FileKind, LinuxContainerCore, LinuxSyscalls, Metadata, SysError,
+    TraditionalRecordLock,
 };
 use relay_v2_broker_credential_state_store_platform_common::{
     ContainerSpec, DescriptorOperationFence, FinalCloseOperationFence, NativeStoreErrorCode,
@@ -34,7 +35,6 @@ const ERANGE: i32 = 34;
 const ELOOP: i32 = 40;
 const ENODATA: i32 = 61;
 const MAX_ACCOUNT_BUFFER: usize = 1024 * 1024;
-const MAX_ACL_XATTR: usize = 64 * 1024;
 
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
@@ -344,12 +344,34 @@ impl LinuxSyscalls for NativeLinuxSyscalls {
         metadata_from_stat(unsafe { value.assume_init() })
     }
 
-    fn acl_xattr(&self, fd: i32, kind: AclXattrKind) -> Result<Option<Vec<u8>>, SysError> {
-        let name = match kind {
-            AclXattrKind::Access => c"system.posix_acl_access",
-            AclXattrKind::Default => c"system.posix_acl_default",
-        };
-        read_xattr(fd, name)
+    fn acl_xattr_size(&self, fd: i32, kind: AclXattrKind) -> Result<Option<usize>, SysError> {
+        let name = acl_xattr_name(kind);
+        let size = unsafe { c_fgetxattr(fd, name.as_ptr(), ptr::null_mut(), 0) };
+        if size < 0 {
+            return match classify_acl_xattr_errno(last_errno()) {
+                SysError::NoData => Ok(None),
+                error => Err(error),
+            };
+        }
+        usize::try_from(size)
+            .map(Some)
+            .map_err(|_| SysError::AclUnprovable)
+    }
+
+    fn acl_xattr_read(
+        &self,
+        fd: i32,
+        kind: AclXattrKind,
+        output: &mut [u8],
+    ) -> Result<usize, SysError> {
+        let name = acl_xattr_name(kind);
+        let read =
+            unsafe { c_fgetxattr(fd, name.as_ptr(), output.as_mut_ptr().cast(), output.len()) };
+        if read < 0 {
+            Err(classify_acl_xattr_errno(last_errno()))
+        } else {
+            usize::try_from(read).map_err(|_| SysError::AclUnprovable)
+        }
     }
 
     fn durability_probe(&self, fd: i32) -> Result<DurabilityEvidence, SysError> {
@@ -445,36 +467,11 @@ fn metadata_from_stat(value: LinuxStat) -> Result<Metadata, SysError> {
     })
 }
 
-fn read_xattr(fd: i32, name: &CStr) -> Result<Option<Vec<u8>>, SysError> {
-    for _ in 0..3 {
-        let size = unsafe { c_fgetxattr(fd, name.as_ptr(), ptr::null_mut(), 0) };
-        if size < 0 {
-            return match last_errno() {
-                ENODATA => Ok(None),
-                EINTR => continue,
-                errno => Err(errno_to_sys(errno)),
-            };
-        }
-        let size = usize::try_from(size).map_err(|_| SysError::AclUnprovable)?;
-        if size > MAX_ACL_XATTR {
-            return Err(SysError::AclUnprovable);
-        }
-        let mut value = vec![0_u8; size];
-        let read =
-            unsafe { c_fgetxattr(fd, name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
-        if read < 0 {
-            match last_errno() {
-                ENODATA => return Ok(None),
-                EINTR | ERANGE => continue,
-                errno => return Err(errno_to_sys(errno)),
-            }
-        }
-        if usize::try_from(read).ok() != Some(value.len()) {
-            continue;
-        }
-        return Ok(Some(value));
+fn acl_xattr_name(kind: AclXattrKind) -> &'static CStr {
+    match kind {
+        AclXattrKind::Access => c"system.posix_acl_access",
+        AclXattrKind::Default => c"system.posix_acl_default",
     }
-    Err(SysError::AclUnprovable)
 }
 
 fn cvt_fd(value: c_int) -> Result<i32, SysError> {
