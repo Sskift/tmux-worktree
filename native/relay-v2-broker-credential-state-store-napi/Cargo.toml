@@ -1,0 +1,22 @@
+[package]
+name = "relay-v2-broker-credential-state-store-napi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "3.10.5", default-features = false, features = ["napi9"] }
+napi-derive = { version = "3.5.7", default-features = false }
+relay-v2-broker-credential-state-store-platform-common = { path = "../relay-v2-broker-credential-state-store-platform-common" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+relay-v2-broker-credential-state-store-platform-darwin = { path = "../relay-v2-broker-credential-state-store-platform-darwin" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+relay-v2-broker-credential-state-store-platform-linux = { path = "../relay-v2-broker-credential-state-store-platform-linux" }
+
+[build-dependencies]
+napi-build = "2.3.2"
