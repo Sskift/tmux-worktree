@@ -21,6 +21,14 @@ const CAPABILITY_KEYS = [
   "status",
   "storageFormatVersion",
 ];
+const CAPABILITY_FEATURES = [
+  "process_wide_kernel_lock_v1",
+  "exclusive_transaction_v1",
+  "opaque_transaction_revision_v1",
+  "compare_and_publish_v1",
+  "close_barrier_v1",
+  "dual_slot_binary_v1",
+];
 const POISONED_NAMES = [
   ...EXPORT_KEYS,
   ...CAPABILITY_KEYS,
@@ -87,10 +95,49 @@ test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and clo
     assert.equal(typeof binding.relayV2BrokerCredentialStateCapability, "function");
     assert.equal(typeof binding.openRelayV2BrokerCredentialStateStore, "function");
 
+    const previousObjectZero = Object.getOwnPropertyDescriptor(Object.prototype, "0");
+    const previousArrayZero = Object.getOwnPropertyDescriptor(Array.prototype, "0");
+    let numericSetterCalls = 0;
+    Object.defineProperty(Object.prototype, "0", {
+      configurable: true,
+      set() { numericSetterCalls += 1; },
+    });
+    Object.defineProperty(Array.prototype, "0", {
+      configurable: true,
+      set() { numericSetterCalls += 1; },
+    });
+
     const beforeCapability = setterCalls;
-    const rawCapability = binding.relayV2BrokerCredentialStateCapability();
+    let rawCapability;
+    try {
+      rawCapability = binding.relayV2BrokerCredentialStateCapability();
+      assert.equal(numericSetterCalls, 0, "capability feature indices bypass prototype setters");
+    } finally {
+      if (previousArrayZero === undefined) delete Array.prototype["0"];
+      else Object.defineProperty(Array.prototype, "0", previousArrayZero);
+      if (previousObjectZero === undefined) delete Object.prototype["0"];
+      else Object.defineProperty(Object.prototype, "0", previousObjectZero);
+    }
     assert.equal(setterCalls, beforeCapability, "capability fields bypass prototype setters");
     assert.deepEqual(exactOwnDataKeys(rawCapability), CAPABILITY_KEYS);
+    assert.equal(Array.isArray(rawCapability.features), true);
+    assert.deepEqual([...rawCapability.features], CAPABILITY_FEATURES);
+    const featureDescriptors = Object.getOwnPropertyDescriptors(rawCapability.features);
+    assert.deepEqual(Reflect.ownKeys(featureDescriptors), ["0", "1", "2", "3", "4", "5", "length"]);
+    for (const [index, feature] of CAPABILITY_FEATURES.entries()) {
+      assert.deepEqual(featureDescriptors[String(index)], {
+        value: feature,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
+    }
+    assert.deepEqual(featureDescriptors.length, {
+      value: CAPABILITY_FEATURES.length,
+      writable: true,
+      enumerable: false,
+      configurable: false,
+    });
     const capability = stateStore.readRelayV2BrokerCredentialStateStoreNativeCapability(binding);
     assert.equal(capability.status, "supported");
     assert.equal(capability.nativeAbi, "napi");

@@ -301,6 +301,28 @@ fn define_own_data<T: ToNapiValue>(
     object.define_properties(&[property])
 }
 
+fn create_own_data_string_array<'env>(env: &'env Env, values: &[&str]) -> Result<Object<'env>> {
+    let mut raw_array = ptr::null_mut();
+    let status =
+        unsafe { sys::napi_create_array_with_length(env.raw(), values.len(), &mut raw_array) };
+    if status != sys::Status::napi_ok {
+        return Err(napi_failure("failed to create own-data array"));
+    }
+
+    let mut array = unsafe { Object::from_napi_value(env.raw(), raw_array)? };
+    let properties = values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            Property::new()
+                .with_utf8_name(&index.to_string())?
+                .with_napi_value(env, *value)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    array.define_properties(&properties)?;
+    Ok(array)
+}
+
 #[cfg(test)]
 const BINDING_ERROR_UNION: [NativeStoreErrorCode; 13] = [
     NativeStoreErrorCode::NativeInterfaceInvalid,
@@ -376,7 +398,7 @@ fn create_capability<'env>(env: &'env Env) -> Result<Object<'env>> {
                 env,
                 &mut capability,
                 "features",
-                Array::from_ref_vec_string(env, &FEATURES.map(str::to_owned))?,
+                create_own_data_string_array(env, &FEATURES)?,
             )?;
             define_own_data(
                 env,
