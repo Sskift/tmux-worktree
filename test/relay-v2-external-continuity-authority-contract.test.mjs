@@ -195,7 +195,8 @@ test("closed config, outer HTTPS, and wire schemas are sufficient for a bounded 
   exactKeys(outer, [
     "limitsSource", "httpsBodyBytes", "httpsJsonMaxDepth", "httpsJsonMaxTotalKeys",
     "method", "endpoint", "tlsPeerVerification", "redirectPolicy", "workloadCredentialScope", "requestContentType",
-    "responseContentType", "requestAcceptEncoding", "contentEncoding", "compressionAllowed",
+    "requestAccept", "requestCacheControl", "responseEnvelopeHttpStatus", "responseContentType", "responseCacheControl",
+    "requestAcceptEncoding", "contentEncoding", "compressionAllowed", "responseEnvelopeDecodeRule", "rejectedResponseBodyRule",
     "bodyWriteRule", "bodyReadRule", "jsonDecodeRule", "boundaryFailureMapping",
   ], "outer HTTPS boundary");
   assert.deepEqual(
@@ -213,10 +214,22 @@ test("closed config, outer HTTPS, and wire schemas are sufficient for a bounded 
   assert.match(outer.redirectPolicy, /^reject-all-redirects-before-follow-or-credential-forwarding$/);
   assert.equal(outer.workloadCredentialScope, "initial-exact-configured-https-endpoint-only");
   assert.equal(outer.requestContentType, "application/json");
+  assert.equal(outer.requestAccept, "application/json");
+  assert.equal(outer.requestCacheControl, "no-store");
+  assert.equal(outer.responseEnvelopeHttpStatus, 200);
   assert.equal(outer.responseContentType, "application/json");
+  assert.equal(outer.responseCacheControl, "no-store");
   assert.equal(outer.requestAcceptEncoding, "identity");
   assert.equal(outer.contentEncoding, "absent-or-identity-only");
   assert.equal(outer.compressionAllowed, false);
+  assert.equal(
+    outer.responseEnvelopeDecodeRule,
+    "only-status-200-with-exact-content-type-application-json-cache-control-no-store-and-allowed-content-encoding-enters-bounded-response-envelope-decoder",
+  );
+  assert.equal(
+    outer.rejectedResponseBodyRule,
+    "non-200-or-required-response-header-mismatch-is-boundary-failure-before-body-read-without-parse-log-reflect-or-proxy-body",
+  );
   assert.equal(outer.bodyWriteRule, "encode-complete-body-within-limit-before-send");
   assert.match(outer.bodyReadRule, /counting-reader-stops-at-limit-plus-one/);
   assert.match(outer.jsonDecodeRule, /strict-utf8-exactly-one-object-reject-duplicate-key-trailing-json/);
