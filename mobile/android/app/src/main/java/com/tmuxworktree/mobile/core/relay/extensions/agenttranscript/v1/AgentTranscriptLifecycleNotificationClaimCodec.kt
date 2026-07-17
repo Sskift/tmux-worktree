@@ -78,8 +78,12 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
             "scopeId",
             "sessionId",
         )
-        val activation = RelayV2StorageJson.string(value, "profileActivationGeneration")
-            .toLongOrNull()?.takeIf { it > 0 } ?: malformed()
+        val encodedActivation = RelayV2StorageJson.string(
+            value,
+            "profileActivationGeneration",
+        )
+        if (!CANONICAL_POSITIVE_DECIMAL.matches(encodedActivation)) malformed()
+        val activation = encodedActivation.toLongOrNull() ?: malformed()
         return AgentTranscriptLifecycleDurableConsumerIdentity(
             RelayV2StorageJson.string(value, "profileId"),
             activation,
@@ -159,6 +163,7 @@ internal object AgentTranscriptLifecycleNotificationClaimCodec {
         throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
 
     private const val PAYLOAD_KIND = "agent_transcript_lifecycle_notification_claim"
+    private val CANONICAL_POSITIVE_DECIMAL = Regex("^[1-9][0-9]*$")
     private val JSON_LIMITS = RelayV2JsonLimits(
         maxDepth = 6,
         maxDirectKeys = 16,

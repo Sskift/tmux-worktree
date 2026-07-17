@@ -115,37 +115,121 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
 
     @Test
     fun `integrity codec and identity corruption fail closed without repair writes`() = runBlocking {
-        val corruptions = listOf<(RelayV2EncodedPayload, AgentTranscriptLifecycleDurableConsumerIdentity) -> RelayV2EncodedPayload>(
-            { payload, _ -> payload.copy(sha256 = "0".repeat(64)) },
-            { payload, _ -> payload.copy(codecVersion = AgentTranscriptLifecycleDurableStateCodec.CODEC_VERSION + 1) },
-            { payload, _ -> payload.withActivationGeneration("07") },
-            { payload, _ -> payload.withActivationGeneration("+7") },
-            { payload, _ -> payload.withActivationGeneration("0") },
-            { payload, _ -> payload.withActivationGeneration("9223372036854775808") },
-            { _, consumer ->
+        data class Corruption(
+            val label: String,
+            val expectedFailure: Class<out Throwable> = RelayV2StorageException::class.java,
+            val apply: (MemoryStore, AgentTranscriptLifecycleDurableConsumerIdentity) -> Unit,
+        )
+
+        val corruptions = listOf(
+            Corruption("hash") { store, consumer ->
+                store.mutatePayload(consumer) { it.copy(sha256 = "0".repeat(64)) }
+            },
+            Corruption("codec version") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.copy(
+                        codecVersion = AgentTranscriptLifecycleDurableStateCodec.CODEC_VERSION + 1,
+                    )
+                }
+            },
+            Corruption("declared byte count") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.copy(payloadUtf8Bytes = it.payloadUtf8Bytes + 1)
+                }
+            },
+            Corruption("noncanonical JSON") { store, consumer ->
+                store.mutatePayload(consumer) { it.withCanonicalJson(" ${it.canonicalJson}") }
+            },
+            Corruption("payload oversize") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.copy(
+                        payloadUtf8Bytes =
+                            AgentTranscriptLifecycleDurableStateCodec.MAX_PAYLOAD_UTF8_BYTES + 1,
+                    )
+                }
+            },
+            Corruption("direct key limit") { store, consumer ->
+                store.mutatePayload(consumer) { payload ->
+                    payload.withRootMembers(
+                        (0 until 62).joinToString(",") { index ->
+                            "\"overflow$index\":null"
+                        },
+                    )
+                }
+            },
+            Corruption("node limit") { store, consumer ->
+                store.mutatePayload(consumer) { payload ->
+                    payload.withRootMembers("\"overflow\":${nullArray(400_001)}")
+                }
+            },
+            Corruption("noncanonical activation 07") { store, consumer ->
+                store.mutatePayload(consumer) { it.withActivationGeneration("07") }
+            },
+            Corruption("noncanonical activation +7") { store, consumer ->
+                store.mutatePayload(consumer) { it.withActivationGeneration("+7") }
+            },
+            Corruption("zero activation") { store, consumer ->
+                store.mutatePayload(consumer) { it.withActivationGeneration("0") }
+            },
+            Corruption("overflow activation") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.withActivationGeneration("9223372036854775808")
+                }
+            },
+            Corruption("lifecycle graph") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.replaceCanonicalJson(
+                        "\"identity\":{\"scope\":\"RUN\",\"runId\":\"run-a\"," +
+                            "\"turnId\":null},\"state\":\"RUNNING\"",
+                        "\"identity\":{\"scope\":\"RUN\",\"runId\":\"run-a\"," +
+                            "\"turnId\":null},\"state\":\"COMPLETED\"",
+                    )
+                }
+            },
+            Corruption("lifecycle event index") { store, consumer ->
+                store.mutatePayload(consumer) {
+                    it.replaceCanonicalJson(
+                        "\"lifecycleEventId\":\"event-turn\",\"sourceEpoch\":\"source-a\"",
+                        "\"lifecycleEventId\":\"event-run\",\"sourceEpoch\":\"source-a\"",
+                    )
+                }
+            },
+            Corruption("namespace identity") { store, consumer ->
                 val wrongConsumer = consumer.copy(principalId = "principal-wrong")
                 val wrongState = richState(wrongConsumer, "timeline-a")
-                AgentTranscriptLifecycleDurableStateCodec.encode(
-                    namespace(wrongConsumer, wrongState),
-                    wrongState,
-                )
+                store.mutatePayload(consumer) {
+                    AgentTranscriptLifecycleDurableStateCodec.encode(
+                        namespace(wrongConsumer, wrongState),
+                        wrongState,
+                    )
+                }
+            },
+            Corruption(
+                "duplicate consumer row",
+                AgentTranscriptLifecyclePersistenceConflictException::class.java,
+            ) { store, consumer ->
+                store.duplicateConsumerRow(consumer)
             },
         )
 
-        corruptions.forEach { corrupt ->
+        corruptions.forEach { corruption ->
             val store = MemoryStore()
             val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
             val consumer = consumer()
             val state = richState(consumer, "timeline-a")
             repository.initializeUnderApplyLease(namespace(consumer, state), state)
-            store.mutatePayload(consumer) { corrupt(it, consumer) }
+            corruption.apply(store, consumer)
             val writesBeforeLoad = store.writeCount
+            val rowsBeforeLoad = store.rowCount
 
             val failure = runCatching { repository.load(consumer) }.exceptionOrNull()
 
-            assertTrue(failure is RelayV2StorageException)
-            assertEquals(writesBeforeLoad, store.writeCount)
-            assertEquals(1, store.rowCount)
+            assertTrue(
+                corruption.label,
+                corruption.expectedFailure.isInstance(failure),
+            )
+            assertEquals(corruption.label, writesBeforeLoad, store.writeCount)
+            assertEquals(corruption.label, rowsBeforeLoad, store.rowCount)
         }
     }
 
@@ -214,28 +298,35 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
     }
 
     @Test
-    fun `corrupt claim codec hash and identity fail closed without overwrite`() = runBlocking {
+    fun `corrupt claim payload hash and identity fail closed without overwrite`() = runBlocking {
         val consumer = consumer()
         val state = richState(consumer, "timeline-a")
         val namespace = namespace(consumer, state)
         val intent = notificationIntent(state)
         val key = claimKey(namespace, intent)
-        val corruptions = listOf<(RelayV2EncodedPayload) -> RelayV2EncodedPayload>(
-            { it.copy(sha256 = "0".repeat(64)) },
-            {
+        val corruptions = listOf<Pair<String, (RelayV2EncodedPayload) -> RelayV2EncodedPayload>>(
+            "payload" to { it.withCanonicalJson("{}") },
+            "declared byte count" to {
+                it.copy(payloadUtf8Bytes = it.payloadUtf8Bytes + 1)
+            },
+            "hash" to { it.copy(sha256 = "0".repeat(64)) },
+            "codec version" to {
                 it.copy(
                     codecVersion = AgentTranscriptLifecycleNotificationClaimCodec.CODEC_VERSION + 1,
                 )
             },
-            {
+            "identity" to {
                 val wrongKey = key.copy(
                     consumer = key.consumer.copy(principalId = "principal-wrong"),
                 )
                 AgentTranscriptLifecycleNotificationClaimCodec.encode(wrongKey, intent)
             },
+            "noncanonical activation identity" to {
+                it.withActivationGeneration("07")
+            },
         )
 
-        corruptions.forEach { corrupt ->
+        corruptions.forEach { (label, corrupt) ->
             val store = MemoryStore()
             val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
             repository.initializeUnderApplyLease(namespace, state)
@@ -250,9 +341,9 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 repository.claimNotificationUnderApplyLease(namespace, intent)
             }.exceptionOrNull()
 
-            assertTrue(failure is RelayV2StorageException)
-            assertEquals(writesBeforeRead, store.writeCount)
-            assertEquals(1, store.claimCount)
+            assertTrue(label, failure is RelayV2StorageException)
+            assertEquals(label, writesBeforeRead, store.writeCount)
+            assertEquals(label, 1, store.claimCount)
         }
     }
 
@@ -451,6 +542,13 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             val claim = requireNotNull(claims[key])
             claims[key] = claim.copy(payload = mutate(claim.payload))
         }
+
+        fun duplicateConsumerRow(
+            consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+        ) {
+            val row = rows.single { it.namespace.consumer == consumer }
+            rows += row.copy()
+        }
     }
 
     private companion object {
@@ -631,14 +729,30 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
 
         fun RelayV2EncodedPayload.withActivationGeneration(
             encodedGeneration: String,
+        ): RelayV2EncodedPayload = replaceCanonicalJson(
+            "\"profileActivationGeneration\":\"7\"",
+            "\"profileActivationGeneration\":\"$encodedGeneration\"",
+        )
+
+        fun RelayV2EncodedPayload.withRootMembers(
+            members: String,
         ): RelayV2EncodedPayload {
-            val original = "\"profileActivationGeneration\":\"7\""
+            check(canonicalJson.endsWith('}'))
+            return withCanonicalJson(canonicalJson.dropLast(1) + ",$members}")
+        }
+
+        fun RelayV2EncodedPayload.replaceCanonicalJson(
+            original: String,
+            replacement: String,
+        ): RelayV2EncodedPayload {
             check(original in canonicalJson)
             check(canonicalJson.indexOf(original) == canonicalJson.lastIndexOf(original))
-            val tamperedJson = canonicalJson.replace(
-                original,
-                "\"profileActivationGeneration\":\"$encodedGeneration\"",
-            )
+            return withCanonicalJson(canonicalJson.replace(original, replacement))
+        }
+
+        fun RelayV2EncodedPayload.withCanonicalJson(
+            tamperedJson: String,
+        ): RelayV2EncodedPayload {
             val bytes = tamperedJson.toByteArray(Charsets.UTF_8)
             return copy(
                 payloadUtf8Bytes = bytes.size,
@@ -647,6 +761,15 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                     .digest(bytes)
                     .joinToString("") { byte -> "%02x".format(byte.toInt() and 0xff) },
             )
+        }
+
+        fun nullArray(size: Int): String = buildString(size * 5 + 2) {
+            append('[')
+            repeat(size) { index ->
+                if (index > 0) append(',')
+                append("null")
+            }
+            append(']')
         }
     }
 }
