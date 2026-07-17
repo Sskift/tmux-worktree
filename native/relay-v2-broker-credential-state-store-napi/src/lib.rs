@@ -12,7 +12,7 @@ use napi::bindgen_prelude::{
     Array, FnArgs, FromNapiValue, Function, FunctionCallContext, FunctionRef, JsObjectValue,
     Object, ToNapiValue, TypeName, Uint8Array, Unknown,
 };
-use napi::{sys, Env, Error, JsDeferred, JsValue, Property, Result, Status, ValueType};
+use napi::{sys, Env, Error, JsValue, Property, Result, Status, ValueType};
 use napi_derive::napi;
 use relay_v2_broker_credential_state_store_platform_common::{
     initialize_process_lifecycle, NativeStoreErrorCode, ProcessLifecycleToken,
@@ -20,7 +20,8 @@ use relay_v2_broker_credential_state_store_platform_common::{
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+use std::thread;
 
 const MAX_STATE_BYTES: usize = 67_108_864;
 const FEATURES: [&str; 6] = [
@@ -63,8 +64,112 @@ impl TypeName for RawValue {
 
 type RawFunctionRef = FunctionRef<RawValue, RawValue>;
 type RawThenRef = FunctionRef<FnArgs<(RawValue, RawValue)>, RawValue>;
-type DeferredResolver = Box<dyn FnOnce(Env) -> Result<RawValue> + Send>;
-type BindingDeferred = JsDeferred<RawValue, DeferredResolver>;
+
+trait MainThreadTask: Send {
+    fn run(&mut self, env: Env);
+    fn dispatch_failed(&mut self);
+}
+
+struct MainThreadDispatcher {
+    raw: sys::napi_threadsafe_function,
+}
+
+unsafe impl Send for MainThreadDispatcher {}
+
+impl MainThreadDispatcher {
+    fn new(env: &Env) -> Result<Self> {
+        let mut resource_name = ptr::null_mut();
+        let name = b"relay_v2_broker_credential_state_store_dispatch";
+        let status = unsafe {
+            sys::napi_create_string_utf8(
+                env.raw(),
+                name.as_ptr().cast(),
+                name.len() as isize,
+                &mut resource_name,
+            )
+        };
+        if status != sys::Status::napi_ok {
+            return Err(napi_failure("failed to create dispatch resource name"));
+        }
+
+        let mut raw = ptr::null_mut();
+        let status = unsafe {
+            sys::napi_create_threadsafe_function(
+                env.raw(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                resource_name,
+                0,
+                1,
+                ptr::null_mut(),
+                None,
+                ptr::null_mut(),
+                Some(run_main_thread_task),
+                &mut raw,
+            )
+        };
+        if status != sys::Status::napi_ok {
+            return Err(napi_failure("failed to create main-thread dispatcher"));
+        }
+        Ok(Self { raw })
+    }
+
+    fn dispatch(self, task: Box<dyn MainThreadTask>) -> bool {
+        let task = Box::into_raw(Box::new(task));
+        let status = unsafe {
+            sys::napi_call_threadsafe_function(
+                self.raw,
+                task.cast(),
+                sys::ThreadsafeFunctionCallMode::blocking,
+            )
+        };
+        if status == sys::Status::napi_ok {
+            true
+        } else {
+            let mut task = unsafe { *Box::from_raw(task) };
+            task.dispatch_failed();
+            false
+        }
+    }
+}
+
+impl Drop for MainThreadDispatcher {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            sys::napi_release_threadsafe_function(
+                self.raw,
+                sys::ThreadsafeFunctionReleaseMode::release,
+            )
+        };
+    }
+}
+
+unsafe extern "C" fn run_main_thread_task(
+    raw_env: sys::napi_env,
+    _callback: sys::napi_value,
+    _context: *mut std::ffi::c_void,
+    data: *mut std::ffi::c_void,
+) {
+    if data.is_null() {
+        return;
+    }
+    let mut task = *Box::<Box<dyn MainThreadTask>>::from_raw(data.cast());
+    if raw_env.is_null() {
+        task.dispatch_failed();
+        return;
+    }
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        task.run(Env::from_raw(raw_env));
+    }));
+    if outcome.is_err() {
+        task.dispatch_failed();
+    }
+}
+
+struct BindingDeferred {
+    raw: usize,
+    dispatcher: MainThreadDispatcher,
+}
 
 struct Intrinsics {
     own_keys: RawFunctionRef,
@@ -300,18 +405,64 @@ fn resolved_promise(env: &Env, value: RawValue) -> Result<RawValue> {
 }
 
 fn create_binding_deferred(env: &Env) -> Result<(BindingDeferred, RawValue)> {
-    let (deferred, promise) = env.create_deferred::<RawValue, DeferredResolver>()?;
-    Ok((deferred, RawValue(promise.raw())))
+    let mut deferred = ptr::null_mut();
+    let mut promise = ptr::null_mut();
+    let status = unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) };
+    if status != sys::Status::napi_ok {
+        return Err(napi_failure("failed to create binding promise"));
+    }
+    Ok((
+        BindingDeferred {
+            raw: deferred as usize,
+            dispatcher: MainThreadDispatcher::new(env)?,
+        },
+        RawValue(promise),
+    ))
+}
+
+struct CompleteDeferredTask {
+    deferred: usize,
+    outcome: std::result::Result<(), NativeStoreErrorCode>,
+}
+
+impl MainThreadTask for CompleteDeferredTask {
+    fn run(&mut self, env: Env) {
+        let deferred = self.deferred as sys::napi_deferred;
+        let status = match self.outcome {
+            Ok(()) => raw_undefined(&env).and_then(|value| {
+                let status = unsafe { sys::napi_resolve_deferred(env.raw(), deferred, value.0) };
+                if status == sys::Status::napi_ok {
+                    Ok(())
+                } else {
+                    Err(napi_failure("failed to resolve binding promise"))
+                }
+            }),
+            Err(code) => create_error_object(&env, code).and_then(|error| {
+                let status = unsafe { sys::napi_reject_deferred(env.raw(), deferred, error.raw()) };
+                if status == sys::Status::napi_ok {
+                    Ok(())
+                } else {
+                    Err(napi_failure("failed to reject binding promise"))
+                }
+            }),
+        };
+        if status.is_err() {
+            clear_pending_exception(&env);
+        }
+    }
+
+    fn dispatch_failed(&mut self) {}
 }
 
 fn complete_deferred(
     deferred: BindingDeferred,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
-) {
-    deferred.resolve(Box::new(move |env| match outcome {
-        Ok(()) => raw_undefined(&env),
-        Err(code) => rejected_promise(&env, code),
-    }));
+) -> bool {
+    let task = CompleteDeferredTask {
+        deferred: deferred.raw,
+        outcome,
+    };
+    deferred.dispatcher.dispatch(Box::new(task))
 }
 
 fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
@@ -463,37 +614,73 @@ impl<W> BindingState<W> {
 }
 
 struct RunCommand {
+    store: Arc<NapiStoreState>,
     admission: AdmissionState,
     callback: FunctionRef<RawValue, RawValue>,
     outer: BindingDeferred,
-    dispatch: BindingDeferred,
+    dispatch: MainThreadDispatcher,
+}
+
+enum StoreWorkerCommand {
+    Run(RunCommand),
+    CloseAfterWorkerFailure(Arc<NapiStoreState>),
 }
 
 struct NapiStoreState {
     port: Arc<dyn StorePort>,
     terminal: Arc<AtomicBool>,
     state: Mutex<BindingState<BindingDeferred>>,
-    run_sender: mpsc::Sender<RunCommand>,
+    run_sender: mpsc::Sender<StoreWorkerCommand>,
+    close_sender: mpsc::Sender<Arc<NapiStoreState>>,
     intrinsics: Arc<Intrinsics>,
+}
+
+struct CreatedStore<'env> {
+    object: Object<'env>,
+    state: Arc<NapiStoreState>,
 }
 
 fn finish_native_close(
     store: &Arc<NapiStoreState>,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
 ) {
+    if outcome.is_err() {
+        store.terminal.store(true, Ordering::Release);
+    }
     let waiters = { lock_recover(&store.state).finish_close(outcome) };
     for waiter in waiters {
-        complete_deferred(waiter, outcome);
+        let _ = complete_deferred(waiter, outcome);
     }
 }
 
-fn start_native_close_worker(store: Arc<NapiStoreState>) {
-    let port = Arc::clone(&store.port);
-    std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| port.close()))
-            .unwrap_or(Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+fn close_port_safely(store: &Arc<NapiStoreState>) -> std::result::Result<(), NativeStoreErrorCode> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.port.close()))
+        .unwrap_or(Err(NativeStoreErrorCode::NativeInterfaceInvalid))
+}
+
+fn run_close_worker(receiver: mpsc::Receiver<Arc<NapiStoreState>>) {
+    while let Ok(store) = receiver.recv() {
+        let outcome = close_port_safely(&store);
         finish_native_close(&store, outcome);
-    });
+    }
+}
+
+fn finish_failed_close_dispatch(store: Arc<NapiStoreState>) {
+    store.terminal.store(true, Ordering::Release);
+    finish_native_close(&store, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+    let cleanup = StoreWorkerCommand::CloseAfterWorkerFailure(Arc::clone(&store));
+    if store.run_sender.send(cleanup).is_err() {
+        // A disconnected serial worker cannot own an entered transaction. The
+        // synchronous fallback is therefore safe and still releases the common
+        // ProcessBound descriptor after both worker channels have failed.
+        let _ = close_port_safely(&store);
+    }
+}
+
+fn start_native_close(store: Arc<NapiStoreState>) {
+    if let Err(error) = store.close_sender.send(Arc::clone(&store)) {
+        finish_failed_close_dispatch(error.0);
+    }
 }
 
 fn request_close(store: &Arc<NapiStoreState>, waiter: Option<BindingDeferred>, terminal: bool) {
@@ -505,10 +692,10 @@ fn request_close(store: &Arc<NapiStoreState>, waiter: Option<BindingDeferred>, t
         state.begin_close(waiter)
     };
     if let Some((waiter, outcome)) = cached {
-        complete_deferred(waiter, outcome);
+        let _ = complete_deferred(waiter, outcome);
     }
     if start {
-        start_native_close_worker(Arc::clone(store));
+        start_native_close(Arc::clone(store));
     }
 }
 
@@ -529,11 +716,26 @@ struct CallbackCompletion {
 }
 
 impl CallbackCompletion {
-    fn finish(&self, callback_error: Option<NativeStoreErrorCode>) {
+    fn finish(&self, protocol_violation: bool) {
+        let callback_error =
+            protocol_violation.then_some(NativeStoreErrorCode::NativeInterfaceInvalid);
+        // Callback/protocol failures close admission before authoritative
+        // settlement. If settlement also fails, the raw callback rejection
+        // remains the frozen NATIVE_INTERFACE_INVALID code.
+        if protocol_violation {
+            terminal_fence(&self.store);
+        }
         let outcome = match lock_recover(&self.native).finish(callback_error) {
             NativeCompletionResult::Settled(outcome) => outcome,
             NativeCompletionResult::Duplicate => {
                 terminal_fence(&self.store);
+                if let Some(outer) = lock_recover(&self.outer).take() {
+                    let _ =
+                        complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+                }
+                if let Some(ack) = lock_recover(&self.worker_ack).take() {
+                    let _ = ack.send(());
+                }
                 return;
             }
         };
@@ -541,10 +743,14 @@ impl CallbackCompletion {
             terminal_fence(&self.store);
         }
         if let Some(outer) = lock_recover(&self.outer).take() {
-            complete_deferred(outer, outcome);
+            if !complete_deferred(outer, outcome) {
+                terminal_fence(&self.store);
+            }
         }
         if let Some(ack) = lock_recover(&self.worker_ack).take() {
-            let _ = ack.send(());
+            if ack.send(()).is_err() {
+                terminal_fence(&self.store);
+            }
         }
     }
 }
@@ -643,7 +849,12 @@ fn is_proven_no_commit(code: NativeStoreErrorCode) -> bool {
     )
 }
 
-fn encode_failure_after_operation(env: &Env, store: &Arc<NapiStoreState>) -> Result<RawValue> {
+fn encode_read_failure(env: &Env) -> Result<RawValue> {
+    clear_pending_exception(env);
+    rejected_promise(env, NativeStoreErrorCode::NativeInterfaceInvalid)
+}
+
+fn encode_failure_after_publication(env: &Env, store: &Arc<NapiStoreState>) -> Result<RawValue> {
     terminal_fence(store);
     clear_pending_exception(env);
     rejected_promise(env, NativeStoreErrorCode::NativeInterfaceInvalid)
@@ -672,9 +883,10 @@ fn create_transaction_object<'env>(
                         .and_then(|value| resolved_promise(context.env, RawValue(value.raw())))
                     {
                         Ok(promise) => Ok(promise),
-                        Err(_) => {
-                            encode_failure_after_operation(context.env, &read_completion.store)
-                        }
+                        // Read has no publication ambiguity. JS encoding or
+                        // promise completion failure rejects exactly but does
+                        // not permanently close an otherwise usable store.
+                        Err(_) => encode_read_failure(context.env),
                     }
                 }
                 // Read is not a publication boundary; preserve the native
@@ -754,7 +966,7 @@ fn create_transaction_object<'env>(
                 Ok(promise) => Ok(promise),
                 // Native publication already returned. Encoding/completion
                 // failure is unproven-to-JS and therefore terminal.
-                Err(_) => encode_failure_after_operation(context.env, &publish_completion.store),
+                Err(_) => encode_failure_after_publication(context.env, &publish_completion.store),
             }
         },
     )?;
@@ -779,14 +991,14 @@ fn start_callback(
     let transaction_object = match create_transaction_object(env, Arc::clone(&completion)) {
         Ok(value) => value,
         Err(_) => {
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
     let callback = match callback.borrow_back(env) {
         Ok(callback) => callback,
         Err(_) => {
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
@@ -794,7 +1006,7 @@ fn start_callback(
         Ok(value) => value,
         Err(_) => {
             clear_pending_exception(env);
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
@@ -802,7 +1014,7 @@ fn start_callback(
         Ok(promise) => promise,
         Err(_) => {
             clear_pending_exception(env);
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
@@ -811,13 +1023,13 @@ fn start_callback(
     let fulfilled = match env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
         "relayV2NativeCallbackFulfilled",
         move |context: FunctionCallContext<'_>| {
-            fulfilled_completion.finish(None);
+            fulfilled_completion.finish(false);
             raw_undefined(context.env)
         },
     ) {
         Ok(value) => value,
         Err(_) => {
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
@@ -825,13 +1037,13 @@ fn start_callback(
     let rejected = match env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
         "relayV2NativeCallbackRejected",
         move |context: FunctionCallContext<'_>| {
-            rejected_completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            rejected_completion.finish(true);
             raw_undefined(context.env)
         },
     ) {
         Ok(value) => value,
         Err(_) => {
-            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+            completion.finish(true);
             return;
         }
     };
@@ -849,57 +1061,142 @@ fn start_callback(
         .is_err()
     {
         clear_pending_exception(env);
-        completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid));
+        completion.finish(true);
     }
 }
 
-fn reject_unstarted(command: RunCommand, code: NativeStoreErrorCode) {
-    complete_deferred(command.outer, Err(code));
-    complete_deferred(command.dispatch, Ok(()));
+struct RunCallbackTask {
+    store: Arc<NapiStoreState>,
+    transaction: Option<TransactionState>,
+    callback: Option<FunctionRef<RawValue, RawValue>>,
+    outer: Option<BindingDeferred>,
+    worker_ack: Option<mpsc::Sender<()>>,
 }
 
-fn run_store_worker(store: Weak<NapiStoreState>, receiver: mpsc::Receiver<RunCommand>) {
-    while let Ok(command) = receiver.recv() {
-        let Some(store) = store.upgrade() else {
-            reject_unstarted(command, NativeStoreErrorCode::StoreClosed);
-            break;
+impl MainThreadTask for RunCallbackTask {
+    fn run(&mut self, env: Env) {
+        let Some(transaction) = self.transaction.take() else {
+            self.dispatch_failed();
+            return;
         };
+        let Some(callback) = self.callback.take() else {
+            self.transaction = Some(transaction);
+            self.dispatch_failed();
+            return;
+        };
+        let Some(outer) = self.outer.take() else {
+            self.transaction = Some(transaction);
+            self.callback = Some(callback);
+            self.dispatch_failed();
+            return;
+        };
+        let Some(worker_ack) = self.worker_ack.take() else {
+            self.transaction = Some(transaction);
+            self.callback = Some(callback);
+            self.outer = Some(outer);
+            self.dispatch_failed();
+            return;
+        };
+        start_callback(
+            &env,
+            Arc::clone(&self.store),
+            transaction,
+            callback,
+            outer,
+            worker_ack,
+        );
+    }
+
+    fn dispatch_failed(&mut self) {
+        terminal_fence(&self.store);
+        if let Some(mut transaction) = self.transaction.take() {
+            let _ = transaction.settle();
+        }
+        if let Some(outer) = self.outer.take() {
+            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+        }
+        if let Some(ack) = self.worker_ack.take() {
+            let _ = ack.send(());
+        }
+        self.callback.take();
+    }
+}
+
+fn reject_unstarted(command: RunCommand, code: NativeStoreErrorCode) -> bool {
+    complete_deferred(command.outer, Err(code))
+}
+
+fn drain_store_worker(receiver: &mpsc::Receiver<StoreWorkerCommand>) {
+    while let Ok(command) = receiver.try_recv() {
+        match command {
+            StoreWorkerCommand::Run(command) => {
+                let _ = reject_unstarted(command, NativeStoreErrorCode::StoreClosed);
+            }
+            StoreWorkerCommand::CloseAfterWorkerFailure(store) => {
+                let _ = close_port_safely(&store);
+            }
+        }
+    }
+}
+
+fn run_store_worker(receiver: mpsc::Receiver<StoreWorkerCommand>) {
+    while let Ok(worker_command) = receiver.recv() {
+        let command = match worker_command {
+            StoreWorkerCommand::Run(command) => command,
+            StoreWorkerCommand::CloseAfterWorkerFailure(store) => {
+                let _ = close_port_safely(&store);
+                continue;
+            }
+        };
+        let store = Arc::clone(&command.store);
         if store.terminal.load(Ordering::Acquire) {
-            reject_unstarted(command, NativeStoreErrorCode::StoreClosed);
+            if !reject_unstarted(command, NativeStoreErrorCode::StoreClosed) {
+                drain_store_worker(&receiver);
+                return;
+            }
             continue;
         }
+
+        let RunCommand {
+            store: command_store,
+            admission,
+            callback,
+            outer,
+            dispatch,
+        } = command;
         let transaction = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            command.admission.enter(Arc::clone(&store.terminal))
+            admission.enter(Arc::clone(&store.terminal))
         }))
         .unwrap_or(Err(NativeStoreErrorCode::NativeInterfaceInvalid))
         {
             Ok(transaction) => transaction,
             Err(code) => {
                 terminal_fence(&store);
-                complete_deferred(command.outer, Err(code));
-                complete_deferred(command.dispatch, Ok(()));
-                continue;
+                let _ = complete_deferred(outer, Err(code));
+                drop((callback, dispatch, command_store));
+                drain_store_worker(&receiver);
+                return;
             }
         };
 
         let (ack_sender, ack_receiver) = mpsc::channel();
-        let callback_store = Arc::clone(&store);
-        command.dispatch.resolve(Box::new(move |env| {
-            start_callback(
-                &env,
-                callback_store,
-                transaction,
-                command.callback,
-                command.outer,
-                ack_sender,
-            );
-            raw_undefined(&env)
-        }));
+        let task = RunCallbackTask {
+            store: command_store,
+            transaction: Some(transaction),
+            callback: Some(callback),
+            outer: Some(outer),
+            worker_ack: Some(ack_sender),
+        };
+        if !dispatch.dispatch(Box::new(task)) {
+            drain_store_worker(&receiver);
+            return;
+        }
         // Exactly one transaction can be entered or waiting on its callback per
         // store. Queued admissions consume no libuv worker threads.
         if ack_receiver.recv().is_err() {
             terminal_fence(&store);
-            break;
+            drain_store_worker(&receiver);
+            return;
         }
     }
 }
@@ -910,14 +1207,19 @@ fn run_exclusive(
     callback_value: Unknown<'_>,
 ) -> Result<RawValue> {
     let (outer, promise) = create_binding_deferred(env)?;
-    let (dispatch, _dispatch_promise) = create_binding_deferred(env)?;
+    let dispatch = match MainThreadDispatcher::new(env) {
+        Ok(dispatch) => dispatch,
+        Err(_) => {
+            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            return Ok(promise);
+        }
+    };
     let callback = match Function::<RawValue, RawValue>::from_unknown(callback_value)
         .and_then(|callback| callback.create_ref())
     {
         Ok(callback) => callback,
         Err(_) => {
-            complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
-            complete_deferred(dispatch, Ok(()));
+            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
             return Ok(promise);
         }
     };
@@ -925,8 +1227,7 @@ fn run_exclusive(
     let state = lock_recover(&store.state);
     if state.admission_closed {
         drop(state);
-        complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed));
-        complete_deferred(dispatch, Ok(()));
+        let _ = complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed));
         return Ok(promise);
     }
     let admission = match store.port.admit() {
@@ -934,21 +1235,23 @@ fn run_exclusive(
         Err(code) => {
             drop(state);
             terminal_fence(&store);
-            complete_deferred(outer, Err(code));
-            complete_deferred(dispatch, Ok(()));
+            let _ = complete_deferred(outer, Err(code));
             return Ok(promise);
         }
     };
     let command = RunCommand {
+        store: Arc::clone(&store),
         admission,
         callback,
         outer,
         dispatch,
     };
-    if let Err(error) = store.run_sender.send(command) {
+    if let Err(error) = store.run_sender.send(StoreWorkerCommand::Run(command)) {
         drop(state);
         terminal_fence(&store);
-        reject_unstarted(error.0, NativeStoreErrorCode::NativeInterfaceInvalid);
+        if let StoreWorkerCommand::Run(command) = error.0 {
+            let _ = reject_unstarted(command, NativeStoreErrorCode::NativeInterfaceInvalid);
+        }
     }
     Ok(promise)
 }
@@ -963,8 +1266,9 @@ fn create_store_object<'env>(
     env: &'env Env,
     port: Box<dyn StorePort>,
     intrinsics: Arc<Intrinsics>,
-) -> Result<Object<'env>> {
+) -> Result<Option<CreatedStore<'env>>> {
     let (run_sender, run_receiver) = mpsc::channel();
+    let (close_sender, close_receiver) = mpsc::channel();
     let store = Arc::new(NapiStoreState {
         port: Arc::from(port),
         terminal: Arc::new(AtomicBool::new(false)),
@@ -973,39 +1277,71 @@ fn create_store_object<'env>(
             close: ClosePhase::Open,
         }),
         run_sender,
+        close_sender,
         intrinsics,
     });
-    let worker_store = Arc::downgrade(&store);
-    std::thread::spawn(move || run_store_worker(worker_store, run_receiver));
+    if thread::Builder::new()
+        .name("relay-v2-state-store-serial".to_owned())
+        .spawn(move || run_store_worker(run_receiver))
+        .is_err()
+    {
+        store.terminal.store(true, Ordering::Release);
+        lock_recover(&store.state).begin_close(None);
+        let _ = close_port_safely(&store);
+        finish_native_close(&store, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+        return Ok(None);
+    }
+    if thread::Builder::new()
+        .name("relay-v2-state-store-close".to_owned())
+        .spawn(move || run_close_worker(close_receiver))
+        .is_err()
+    {
+        store.terminal.store(true, Ordering::Release);
+        lock_recover(&store.state).begin_close(None);
+        let _ = close_port_safely(&store);
+        finish_native_close(&store, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+        return Ok(None);
+    }
 
-    let mut object = Object::new(env)?;
-    let run_store = Arc::clone(&store);
-    let run = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
-        "runExclusive",
-        move |context: FunctionCallContext<'_>| {
-            let callback = match context.get::<Unknown<'_>>(0) {
-                Ok(value) => value,
-                Err(_) => {
-                    return rejected_promise(
-                        context.env,
-                        NativeStoreErrorCode::NativeInterfaceInvalid,
-                    );
-                }
-            };
-            run_exclusive(context.env, Arc::clone(&run_store), callback)
-        },
-    )?;
-    define_own_data(env, &mut object, "runExclusive", run)?;
+    let result = (|| -> Result<Object<'env>> {
+        let mut object = Object::new(env)?;
+        let run_store = Arc::clone(&store);
+        let run = env.create_function_from_closure::<(Unknown<'_>,), RawValue, _>(
+            "runExclusive",
+            move |context: FunctionCallContext<'_>| {
+                let callback = match context.get::<Unknown<'_>>(0) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return rejected_promise(
+                            context.env,
+                            NativeStoreErrorCode::NativeInterfaceInvalid,
+                        );
+                    }
+                };
+                run_exclusive(context.env, Arc::clone(&run_store), callback)
+            },
+        )?;
+        define_own_data(env, &mut object, "runExclusive", run)?;
 
-    let close_store_state = Arc::clone(&store);
-    let close = env.create_function_from_closure::<(), RawValue, _>(
-        "close",
-        move |context: FunctionCallContext<'_>| {
-            close_store(context.env, Arc::clone(&close_store_state))
-        },
-    )?;
-    define_own_data(env, &mut object, "close", close)?;
-    Ok(object)
+        let close_store_state = Arc::clone(&store);
+        let close = env.create_function_from_closure::<(), RawValue, _>(
+            "close",
+            move |context: FunctionCallContext<'_>| {
+                close_store(context.env, Arc::clone(&close_store_state))
+            },
+        )?;
+        define_own_data(env, &mut object, "close", close)?;
+        Ok(object)
+    })();
+    if result.is_err() {
+        terminal_fence(&store);
+    }
+    result.map(|object| {
+        Some(CreatedStore {
+            object,
+            state: store,
+        })
+    })
 }
 
 fn open_binding<'env>(
@@ -1026,16 +1362,24 @@ fn open_binding<'env>(
     };
     match open_platform_store(lifecycle, &trusted_home) {
         Ok(port) => {
-            let mut result = Object::new(env)?;
-            define_own_data(env, &mut result, "status", "opened")?;
-            define_own_data(env, &mut result, "selfCheck", "passed")?;
-            define_own_data(
-                env,
-                &mut result,
-                "store",
-                create_store_object(env, port, intrinsics)?,
-            )?;
-            Ok(result)
+            let created = match create_store_object(env, port, intrinsics)? {
+                Some(store) => store,
+                None => {
+                    return create_invalid_open(env, NativeStoreErrorCode::NativeInterfaceInvalid);
+                }
+            };
+            let state = Arc::clone(&created.state);
+            let result = (|| -> Result<Object<'env>> {
+                let mut result = Object::new(env)?;
+                define_own_data(env, &mut result, "status", "opened")?;
+                define_own_data(env, &mut result, "selfCheck", "passed")?;
+                define_own_data(env, &mut result, "store", created.object)?;
+                Ok(result)
+            })();
+            if result.is_err() {
+                terminal_fence(&state);
+            }
+            result
         }
         Err(code) => create_invalid_open(env, code),
     }

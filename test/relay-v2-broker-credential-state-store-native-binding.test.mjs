@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import test from "node:test";
 
 const stateStore = await import("../dist/relay/v2/brokerCredentialStateStore.js");
+const nativeArtifact = process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT;
 
 const EXPORT_KEYS = [
   "openRelayV2BrokerCredentialStateStore",
@@ -48,10 +49,14 @@ function exactOwnDataKeys(value) {
   return Reflect.ownKeys(descriptors).sort();
 }
 
-test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and closed before store observation", async () => {
+test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and closed before store observation", {
+  skip: nativeArtifact === undefined
+    ? "RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT is required for the focused native run"
+    : false,
+}, async () => {
   assert.equal(process.platform, "darwin");
   assert.match(process.arch, /^(arm64|x64)$/);
-  const artifact = process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT;
+  const artifact = nativeArtifact;
   assert.equal(typeof artifact, "string");
   assert.equal(resolve(artifact), artifact);
   assert.equal(existsSync(artifact), true);

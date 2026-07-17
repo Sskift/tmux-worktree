@@ -78,6 +78,13 @@ impl TransactionState {
             .settle()
     }
 
+    #[cfg(test)]
+    pub(crate) fn exhaust_revision_tokens_for_test(&mut self) {
+        if let Some(port) = self.port.as_mut() {
+            port.exhaust_revision_tokens_for_test();
+        }
+    }
+
     fn assert_usable(&self) -> Result<(), NativeStoreErrorCode> {
         if self.terminal.load(Ordering::Acquire) {
             return Err(NativeStoreErrorCode::StoreClosed);
@@ -129,7 +136,7 @@ impl NativeCompletion {
             .transaction
             .take()
             .and_then(|mut transaction| transaction.settle().err());
-        NativeCompletionResult::Settled(settle_error.or(callback_error).map_or(Ok(()), Err))
+        NativeCompletionResult::Settled(callback_error.or(settle_error).map_or(Ok(()), Err))
     }
 
     pub(crate) fn transaction_mut(
@@ -159,6 +166,7 @@ mod tests {
 
     #[derive(Default)]
     struct DescriptorState {
+        read_count: usize,
         writes: Vec<(u64, Vec<u8>)>,
         final_close_count: usize,
     }
@@ -166,6 +174,28 @@ mod tests {
     struct MemoryContainer {
         state: Arc<Mutex<DescriptorState>>,
         descriptor_live: bool,
+    }
+
+    struct SettleFailurePort;
+
+    impl TransactionPort for SettleFailurePort {
+        fn read(&mut self) -> Result<PortSnapshot, NativeStoreErrorCode> {
+            unreachable!()
+        }
+
+        fn compare_and_publish(
+            &mut self,
+            _expected: u64,
+            _next: &[u8],
+        ) -> Result<PortPublishOutcome, NativeStoreErrorCode> {
+            unreachable!()
+        }
+
+        fn settle(self: Box<Self>) -> Result<(), NativeStoreErrorCode> {
+            Err(NativeStoreErrorCode::StoreIo)
+        }
+
+        fn exhaust_revision_tokens_for_test(&mut self) {}
     }
 
     impl SoleContainer for MemoryContainer {
@@ -198,7 +228,9 @@ mod tests {
             let output_end = absolute_offset
                 .checked_add(output.len() as u64)
                 .ok_or(PlatformStoreFailure::Io)?;
-            for (write_offset, bytes) in &self.state.lock().unwrap().writes {
+            let mut state = self.state.lock().unwrap();
+            state.read_count += 1;
+            for (write_offset, bytes) in &state.writes {
                 let write_end = write_offset + bytes.len() as u64;
                 let start = absolute_offset.max(*write_offset);
                 let end = output_end.min(write_end);
@@ -294,15 +326,18 @@ mod tests {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
 
-        let admission_worker = thread::spawn(move || {
-            let first_transaction = first.enter(Arc::clone(&terminal)).unwrap();
-            entered_tx.send((1_u8, first_transaction)).unwrap();
-            ack_rx.recv().unwrap();
+        let admission_worker = thread::Builder::new()
+            .name("relay-v2-test-admission".to_owned())
+            .spawn(move || {
+                let first_transaction = first.enter(Arc::clone(&terminal)).unwrap();
+                entered_tx.send((1_u8, first_transaction)).unwrap();
+                ack_rx.recv().unwrap();
 
-            let second_transaction = second.enter(terminal).unwrap();
-            entered_tx.send((2_u8, second_transaction)).unwrap();
-            ack_rx.recv().unwrap();
-        });
+                let second_transaction = second.enter(terminal).unwrap();
+                entered_tx.send((2_u8, second_transaction)).unwrap();
+                ack_rx.recv().unwrap();
+            })
+            .unwrap();
 
         let (first_id, mut first_transaction) =
             entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
@@ -311,7 +346,10 @@ mod tests {
 
         let (close_tx, close_rx) = mpsc::channel();
         let close_store = Arc::clone(&store);
-        let close_worker = thread::spawn(move || close_tx.send(close_store.close()).unwrap());
+        let close_worker = thread::Builder::new()
+            .name("relay-v2-test-close".to_owned())
+            .spawn(move || close_tx.send(close_store.close()).unwrap())
+            .unwrap();
         assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
 
         first_transaction.settle().unwrap();
@@ -399,6 +437,38 @@ mod tests {
     }
 
     #[test]
+    fn revision_exhaustion_precedes_real_process_bound_read_and_publish() {
+        let (store, descriptor) = process_store();
+        let mut transaction = AdmissionState::new(store.admit().unwrap())
+            .enter(Arc::new(AtomicBool::new(false)))
+            .unwrap();
+        let revision = transaction.read().unwrap().revision;
+        transaction.exhaust_revision_tokens_for_test();
+        let (reads_before, writes_before) = {
+            let state = descriptor.lock().unwrap();
+            (state.read_count, state.writes.len())
+        };
+
+        assert_eq!(
+            transaction
+                .compare_and_publish(revision, &[9, 8, 7])
+                .unwrap_err(),
+            NativeStoreErrorCode::GenerationExhausted
+        );
+        assert_eq!(
+            transaction.read().unwrap_err(),
+            NativeStoreErrorCode::GenerationExhausted
+        );
+        let state = descriptor.lock().unwrap();
+        assert_eq!(state.read_count, reads_before);
+        assert_eq!(state.writes.len(), writes_before);
+        drop(state);
+
+        transaction.settle().unwrap();
+        store.close().unwrap();
+    }
+
+    #[test]
     fn callback_completion_settles_one_real_process_bound_transaction_exactly_once() {
         for callback_error in [None, Some(NativeStoreErrorCode::NativeInterfaceInvalid)] {
             let (store, descriptor) = process_store();
@@ -417,5 +487,19 @@ mod tests {
             store.close().unwrap();
             assert_eq!(descriptor.lock().unwrap().final_close_count, 1);
         }
+    }
+
+    #[test]
+    fn callback_protocol_error_precedes_simultaneous_settle_failure() {
+        let transaction = TransactionState {
+            port: Some(Box::new(SettleFailurePort)),
+            identity: Arc::new(TransactionIdentity(())),
+            terminal: Arc::new(AtomicBool::new(false)),
+        };
+        let mut completion = NativeCompletion::new(transaction);
+        assert_eq!(
+            completion.finish(Some(NativeStoreErrorCode::NativeInterfaceInvalid)),
+            NativeCompletionResult::Settled(Err(NativeStoreErrorCode::NativeInterfaceInvalid))
+        );
     }
 }

@@ -37,6 +37,9 @@ pub(crate) trait TransactionPort: Send {
     ) -> Result<PortPublishOutcome, NativeStoreErrorCode>;
 
     fn settle(self: Box<Self>) -> Result<(), NativeStoreErrorCode>;
+
+    #[cfg(test)]
+    fn exhaust_revision_tokens_for_test(&mut self);
 }
 
 pub(crate) fn erase_process_store<C>(store: ProcessBoundStateStore<C>) -> Box<dyn StorePort>
@@ -89,17 +92,22 @@ struct ProcessTransactionPort<C: SoleContainer> {
 }
 
 impl<C: SoleContainer> ProcessTransactionPort<C> {
-    fn snapshot(
-        &mut self,
-        snapshot: ProcessBoundSnapshot,
-    ) -> Result<PortSnapshot, NativeStoreErrorCode> {
-        let bytes = snapshot.bytes()?.map(<[u8]>::to_vec);
-        let revision = snapshot.revision()?;
+    fn reserve_revision_token(&mut self) -> Result<u64, NativeStoreErrorCode> {
         let token = self.next_revision;
         self.next_revision = self
             .next_revision
             .checked_add(1)
             .ok_or(NativeStoreErrorCode::GenerationExhausted)?;
+        Ok(token)
+    }
+
+    fn snapshot_with_reserved_token(
+        &mut self,
+        token: u64,
+        snapshot: ProcessBoundSnapshot,
+    ) -> Result<PortSnapshot, NativeStoreErrorCode> {
+        let bytes = snapshot.bytes()?.map(<[u8]>::to_vec);
+        let revision = snapshot.revision()?;
         self.revisions.insert(token, revision);
         Ok(PortSnapshot {
             revision: token,
@@ -110,12 +118,15 @@ impl<C: SoleContainer> ProcessTransactionPort<C> {
 
 impl<C: SoleContainer> TransactionPort for ProcessTransactionPort<C> {
     fn read(&mut self) -> Result<PortSnapshot, NativeStoreErrorCode> {
+        // Reserve before touching the authoritative transaction so exhaustion
+        // cannot hide a successful native operation.
+        let token = self.reserve_revision_token()?;
         let snapshot = self
             .inner
             .as_mut()
             .ok_or(NativeStoreErrorCode::InvalidRevision)?
             .read()?;
-        self.snapshot(snapshot)
+        self.snapshot_with_reserved_token(token, snapshot)
     }
 
     fn compare_and_publish(
@@ -123,6 +134,13 @@ impl<C: SoleContainer> TransactionPort for ProcessTransactionPort<C> {
         expected: u64,
         next: &[u8],
     ) -> Result<PortPublishOutcome, NativeStoreErrorCode> {
+        if !self.revisions.contains_key(&expected) {
+            return Err(NativeStoreErrorCode::InvalidRevision);
+        }
+        // Every committed/non-committed snapshot outcome needs a new opaque
+        // token. Exhaustion is proven before compare-and-publish reaches the
+        // ProcessBound owner, never after a possible Swapped result.
+        let token = self.reserve_revision_token()?;
         let revision = self
             .revisions
             .get(&expected)
@@ -133,15 +151,15 @@ impl<C: SoleContainer> TransactionPort for ProcessTransactionPort<C> {
             .ok_or(NativeStoreErrorCode::InvalidRevision)?
             .compare_and_publish(revision, next)?;
         match outcome {
-            ProcessBoundPublishOutcome::Swapped(snapshot) => {
-                self.snapshot(snapshot).map(PortPublishOutcome::Swapped)
-            }
-            ProcessBoundPublishOutcome::AlreadySame(snapshot) => {
-                self.snapshot(snapshot).map(PortPublishOutcome::AlreadySame)
-            }
-            ProcessBoundPublishOutcome::Conflict(snapshot) => {
-                self.snapshot(snapshot).map(PortPublishOutcome::Conflict)
-            }
+            ProcessBoundPublishOutcome::Swapped(snapshot) => self
+                .snapshot_with_reserved_token(token, snapshot)
+                .map(PortPublishOutcome::Swapped),
+            ProcessBoundPublishOutcome::AlreadySame(snapshot) => self
+                .snapshot_with_reserved_token(token, snapshot)
+                .map(PortPublishOutcome::AlreadySame),
+            ProcessBoundPublishOutcome::Conflict(snapshot) => self
+                .snapshot_with_reserved_token(token, snapshot)
+                .map(PortPublishOutcome::Conflict),
             ProcessBoundPublishOutcome::Uncertain => Ok(PortPublishOutcome::Uncertain),
         }
     }
@@ -152,5 +170,10 @@ impl<C: SoleContainer> TransactionPort for ProcessTransactionPort<C> {
             .take()
             .ok_or(NativeStoreErrorCode::InvalidRevision)?
             .settle()
+    }
+
+    #[cfg(test)]
+    fn exhaust_revision_tokens_for_test(&mut self) {
+        self.next_revision = u64::MAX;
     }
 }
