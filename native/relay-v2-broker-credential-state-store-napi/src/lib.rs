@@ -17,6 +17,7 @@ use napi_derive::napi;
 use relay_v2_broker_credential_state_store_platform_common::{
     initialize_process_lifecycle, NativeStoreErrorCode, ProcessLifecycleToken,
 };
+use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -68,6 +69,39 @@ type RawThenRef = FunctionRef<FnArgs<(RawValue, RawValue)>, RawValue>;
 trait MainThreadTask: Send {
     fn run(&mut self, env: Env);
     fn dispatch_failed(&mut self);
+    fn panic_fallback(&mut self) {}
+}
+
+fn finish_main_thread_task_no_unwind<F>(
+    task: Box<dyn MainThreadTask>,
+    action: F,
+    recover_run_failure: bool,
+) where
+    F: FnOnce(&mut dyn MainThreadTask),
+{
+    // Do not let a run panic start dropping task fields while unwinding. Some
+    // fields own napi refs whose Drop can itself panic on a failed custom-GC
+    // TSFN. Run/failure cleanup and Drop are therefore separate catch domains.
+    let mut task = ManuallyDrop::new(task);
+    {
+        let task = &mut **task;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| action(task)));
+        if outcome.is_err() {
+            let cleanup_failed = if recover_run_failure {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task.dispatch_failed()))
+                    .is_err()
+            } else {
+                true
+            };
+            if cleanup_failed {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    task.panic_fallback();
+                }));
+            }
+        }
+    }
+    let task = unsafe { ManuallyDrop::take(&mut task) };
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(task)));
 }
 
 struct MainThreadDispatcher {
@@ -126,8 +160,12 @@ impl MainThreadDispatcher {
         if status == sys::Status::napi_ok {
             true
         } else {
-            let mut task = unsafe { *Box::from_raw(task) };
-            task.dispatch_failed();
+            // Reconstruction, failure cleanup, and task Drop are all contained;
+            // a FunctionRef/custom-GC panic must not kill the serial worker.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let task = unsafe { *Box::from_raw(task) };
+                finish_main_thread_task_no_unwind(task, |task| task.dispatch_failed(), false);
+            }));
             false
         }
     }
@@ -153,17 +191,17 @@ unsafe extern "C" fn run_main_thread_task(
     if data.is_null() {
         return;
     }
-    let mut task = *Box::<Box<dyn MainThreadTask>>::from_raw(data.cast());
-    if raw_env.is_null() {
-        task.dispatch_failed();
-        return;
-    }
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        task.run(Env::from_raw(raw_env));
+    // The catch starts before raw reconstruction and ends after task Drop. No
+    // Rust panic from run, cleanup, or napi-ref destruction may cross extern C.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let task = unsafe { *Box::<Box<dyn MainThreadTask>>::from_raw(data.cast()) };
+        if raw_env.is_null() {
+            finish_main_thread_task_no_unwind(task, |task| task.dispatch_failed(), false);
+        } else {
+            let env = Env::from_raw(raw_env);
+            finish_main_thread_task_no_unwind(task, |task| task.run(env), true);
+        }
     }));
-    if outcome.is_err() {
-        task.dispatch_failed();
-    }
 }
 
 struct BindingDeferred {
@@ -1207,22 +1245,42 @@ impl MainThreadTask for RunCallbackTask {
     }
 
     fn dispatch_failed(&mut self) {
-        terminal_fence(&self.store);
+        self.panic_fallback();
+    }
+
+    fn panic_fallback(&mut self) {
+        // This fallback is intentionally decomposed into independent catch
+        // domains. In particular, worker ack is still attempted if terminal,
+        // settlement, outer completion, or napi-ref Drop panics.
+        self.store.terminal.store(true, Ordering::Release);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            terminal_fence(&self.store);
+        }));
         if let Some(mut transaction) = self.transaction.take() {
-            let _ = transaction.settle();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = transaction.settle();
+            }));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(transaction)));
         }
         if let Some(outer) = self.outer.take() {
-            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            }));
         }
         if let Some(ack) = self.worker_ack.take() {
             let _ = ack.send(());
         }
-        self.callback.take();
+        if let Some(callback) = self.callback.take() {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(callback)));
+        }
     }
 }
 
 fn reject_unstarted(command: RunCommand, code: NativeStoreErrorCode) -> bool {
-    complete_deferred(command.outer, Err(code))
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        complete_deferred(command.outer, Err(code))
+    }))
+    .unwrap_or(false)
 }
 
 fn drain_store_worker(receiver: &mpsc::Receiver<StoreWorkerCommand>) {
@@ -1559,6 +1617,97 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    struct PanickingCleanupTask {
+        dispatch_count: Arc<AtomicUsize>,
+        fallback_count: Arc<AtomicUsize>,
+        drop_count: Arc<AtomicUsize>,
+        ack: Option<mpsc::Sender<()>>,
+    }
+
+    impl MainThreadTask for PanickingCleanupTask {
+        fn run(&mut self, _env: Env) {
+            panic!("synthetic run panic");
+        }
+
+        fn dispatch_failed(&mut self) {
+            self.dispatch_count.fetch_add(1, Ordering::Relaxed);
+            panic!("synthetic failure-cleanup panic");
+        }
+
+        fn panic_fallback(&mut self) {
+            self.fallback_count.fetch_add(1, Ordering::Relaxed);
+            if let Some(ack) = self.ack.take() {
+                let _ = ack.send(());
+            }
+        }
+    }
+
+    impl Drop for PanickingCleanupTask {
+        fn drop(&mut self) {
+            self.drop_count.fetch_add(1, Ordering::Relaxed);
+            panic!("synthetic task drop panic");
+        }
+    }
+
+    fn panicking_cleanup_task() -> (
+        Box<dyn MainThreadTask>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        mpsc::Receiver<()>,
+    ) {
+        let dispatch_count = Arc::new(AtomicUsize::new(0));
+        let fallback_count = Arc::new(AtomicUsize::new(0));
+        let drop_count = Arc::new(AtomicUsize::new(0));
+        let (ack, ack_receiver) = mpsc::channel();
+        (
+            Box::new(PanickingCleanupTask {
+                dispatch_count: Arc::clone(&dispatch_count),
+                fallback_count: Arc::clone(&fallback_count),
+                drop_count: Arc::clone(&drop_count),
+                ack: Some(ack),
+            }),
+            dispatch_count,
+            fallback_count,
+            drop_count,
+            ack_receiver,
+        )
+    }
+
+    #[test]
+    fn main_thread_task_failure_cleanup_and_drop_never_unwind_or_lose_fallback_ack() {
+        let (task, dispatch_count, fallback_count, drop_count, ack) = panicking_cleanup_task();
+        let raw_task = Box::into_raw(Box::new(task));
+        unsafe {
+            run_main_thread_task(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                raw_task.cast(),
+            );
+        }
+        ack.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+
+        let (task, dispatch_count, fallback_count, drop_count, ack) = panicking_cleanup_task();
+        finish_main_thread_task_no_unwind(task, |task| task.dispatch_failed(), false);
+        ack.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+
+        let (task, dispatch_count, fallback_count, drop_count, ack) = panicking_cleanup_task();
+        finish_main_thread_task_no_unwind(task, |_| panic!("synthetic run panic"), true);
+        ack.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
+        assert_eq!(fallback_count.load(Ordering::Relaxed), 1);
+        assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
 
     #[test]
     fn eager_lifecycle_failure_is_closed_invalid() {
