@@ -877,6 +877,9 @@ fn create_transaction_object<'env>(
     let read = env.create_function_from_closure::<(), RawValue, _>(
         "read",
         move |context: FunctionCallContext<'_>| {
+            if read_completion.store.terminal.load(Ordering::Acquire) {
+                return rejected_promise(context.env, NativeStoreErrorCode::StoreClosed);
+            }
             let result = {
                 let mut native = lock_recover(&read_completion.native);
                 let transaction = native.transaction_mut();
@@ -909,6 +912,9 @@ fn create_transaction_object<'env>(
     let publish = env.create_function_from_closure::<(Unknown<'_>, Unknown<'_>), RawValue, _>(
         "compareAndPublish",
         move |context: FunctionCallContext<'_>| {
+            if publish_completion.store.terminal.load(Ordering::Acquire) {
+                return rejected_promise(context.env, NativeStoreErrorCode::StoreClosed);
+            }
             let prepared = (|| -> std::result::Result<_, NativeStoreErrorCode> {
                 let expected = context
                     .get::<Unknown<'_>>(0)

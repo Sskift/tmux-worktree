@@ -113,12 +113,14 @@ pub(crate) enum NativeCompletionResult {
 
 pub(crate) struct NativeCompletion {
     transaction: Option<TransactionState>,
+    terminal: Arc<AtomicBool>,
     completed: bool,
 }
 
 impl NativeCompletion {
     pub(crate) fn new(transaction: TransactionState) -> Self {
         Self {
+            terminal: Arc::clone(&transaction.terminal),
             transaction: Some(transaction),
             completed: false,
         }
@@ -142,9 +144,14 @@ impl NativeCompletion {
     pub(crate) fn transaction_mut(
         &mut self,
     ) -> Result<&mut TransactionState, NativeStoreErrorCode> {
-        self.transaction
-            .as_mut()
-            .ok_or(NativeStoreErrorCode::InvalidRevision)
+        if self.terminal.load(Ordering::Acquire) {
+            return Err(NativeStoreErrorCode::StoreClosed);
+        }
+        match self.transaction.as_mut() {
+            Some(transaction) => Ok(transaction),
+            None if self.terminal.load(Ordering::Acquire) => Err(NativeStoreErrorCode::StoreClosed),
+            None => Err(NativeStoreErrorCode::InvalidRevision),
+        }
     }
 }
 
@@ -168,6 +175,7 @@ mod tests {
     struct DescriptorState {
         read_count: usize,
         writes: Vec<(u64, Vec<u8>)>,
+        fail_payload_barrier: bool,
         final_close_count: usize,
     }
 
@@ -264,7 +272,14 @@ mod tests {
             &mut self,
             fence: &DescriptorOperationFence,
         ) -> Result<(), PlatformStoreFailure> {
-            fence.check()
+            fence.check()?;
+            let mut state = self.state.lock().unwrap();
+            if state.fail_payload_barrier {
+                state.fail_payload_barrier = false;
+                Err(PlatformStoreFailure::Io)
+            } else {
+                Ok(())
+            }
         }
 
         fn header_and_container_durability_barrier(
@@ -469,6 +484,45 @@ mod tests {
     }
 
     #[test]
+    fn uncertain_terminal_precedes_settled_revision_state() {
+        let (store, descriptor) = process_store();
+        let terminal = Arc::new(AtomicBool::new(false));
+        let transaction = AdmissionState::new(store.admit().unwrap())
+            .enter(Arc::clone(&terminal))
+            .unwrap();
+        let mut completion = NativeCompletion::new(transaction);
+        let revision = completion
+            .transaction_mut()
+            .unwrap()
+            .read()
+            .unwrap()
+            .revision;
+        descriptor.lock().unwrap().fail_payload_barrier = true;
+
+        assert!(matches!(
+            completion
+                .transaction_mut()
+                .unwrap()
+                .compare_and_publish(revision, &[4, 5, 6])
+                .unwrap(),
+            PortPublishOutcome::Uncertain
+        ));
+        terminal.store(true, Ordering::Release);
+        assert_eq!(
+            completion.finish(None),
+            NativeCompletionResult::Settled(Ok(()))
+        );
+        assert_eq!(
+            completion
+                .transaction_mut()
+                .and_then(TransactionState::read)
+                .unwrap_err(),
+            NativeStoreErrorCode::StoreClosed
+        );
+        store.close().unwrap();
+    }
+
+    #[test]
     fn callback_completion_settles_one_real_process_bound_transaction_exactly_once() {
         for callback_error in [None, Some(NativeStoreErrorCode::NativeInterfaceInvalid)] {
             let (store, descriptor) = process_store();
@@ -480,6 +534,12 @@ mod tests {
                 completion.finish(callback_error),
                 NativeCompletionResult::Settled(callback_error.map_or(Ok(()), Err))
             );
+            if callback_error.is_none() {
+                assert_eq!(
+                    completion.transaction_mut().err(),
+                    Some(NativeStoreErrorCode::InvalidRevision)
+                );
+            }
             assert_eq!(
                 completion.finish(Some(NativeStoreErrorCode::StoreIo)),
                 NativeCompletionResult::Duplicate
