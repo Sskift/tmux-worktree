@@ -53,6 +53,19 @@ kapt {
     }
 }
 
+// Room 2.8.4's migration schema codecs are built against serialization 1.8.1.
+// Override only the instrumentation runtime because AGP's consistent resolution
+// otherwise constrains these modules to the tested app's 1.7.3 runtime ABI.
+configurations.matching { it.name == "debugAndroidTestRuntimeClasspath" }.configureEach {
+    resolutionStrategy.force(
+        "org.jetbrains.kotlinx:kotlinx-serialization-bom:1.8.1",
+        "org.jetbrains.kotlinx:kotlinx-serialization-core:1.8.1",
+        "org.jetbrains.kotlinx:kotlinx-serialization-core-jvm:1.8.1",
+        "org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.1",
+        "org.jetbrains.kotlinx:kotlinx-serialization-json-jvm:1.8.1",
+    )
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2026.06.00")
     val cameraXVersion = "1.6.1"
