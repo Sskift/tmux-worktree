@@ -157,12 +157,12 @@
     {
       "name": "cas-malformed-outer-envelope-is-uncertain", "category": "uncertainty", "binding": "broker-a", "initial": {"localCheckpoint": "broker-1-left"},
       "action": {"operation": "compare_and_swap", "candidateCheckpoints": ["broker-1-left"], "expectedCasToken": "cas-1", "fault": "malformed_outer_response"},
-      "expect": {"outcomes": ["uncertain"], "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "credentialError": "EXTERNAL_ANCHOR_UNCERTAIN", "localCheckpoint": "broker-1-left", "nextAction": "linearizable-read-reconcile"}
+      "expect": {"outcomes": ["uncertain"], "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "credentialError": "EXTERNAL_ANCHOR_UNCERTAIN", "localCheckpoint": "broker-1-left", "externalCheckpoint": "candidate-or-initial", "externalCasToken": "advanced-or-unchanged", "nextAction": "linearizable-read-reconcile"}
     },
     {
       "name": "cas-malformed-success-result-is-uncertain", "category": "uncertainty", "binding": "broker-a", "initial": {"localCheckpoint": "broker-1-left"},
       "action": {"operation": "compare_and_swap", "candidateCheckpoints": ["broker-1-left"], "expectedCasToken": "cas-1", "fault": "malformed_success_cas_result"},
-      "expect": {"outcomes": ["uncertain"], "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "credentialError": "EXTERNAL_ANCHOR_UNCERTAIN", "localCheckpoint": "broker-1-left", "nextAction": "linearizable-read-reconcile"}
+      "expect": {"outcomes": ["uncertain"], "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "credentialError": "EXTERNAL_ANCHOR_UNCERTAIN", "localCheckpoint": "broker-1-left", "externalCheckpoint": "candidate-or-initial", "externalCasToken": "advanced-or-unchanged", "nextAction": "linearizable-read-reconcile"}
     },
     {
       "name": "unknown-error-enum", "category": "closed-errors", "binding": "broker-a", "initial": {"ready": true, "activeConnections": true}, "action": {"fault": "unknown_error_enum"},

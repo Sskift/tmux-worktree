@@ -468,6 +468,8 @@ test("machine deltas retain independent continuity and lifecycle fault signals",
   for (const name of ["cas-malformed-outer-envelope-is-uncertain", "cas-malformed-success-result-is-uncertain"]) {
     const value = caseNamed(name);
     assert.equal(value.expect.continuityError, "ANCHOR_COMMIT_UNCERTAIN");
+    assert.equal(value.expect.externalCheckpoint, "candidate-or-initial");
+    assert.equal(value.expect.externalCasToken, "advanced-or-unchanged");
     assert.equal(value.expect.nextAction, "linearizable-read-reconcile");
   }
   assert.equal(caseNamed("stale-read-is-not-continuity-evidence").expect.connectionFence, "synchronous-then-bounded-close");
