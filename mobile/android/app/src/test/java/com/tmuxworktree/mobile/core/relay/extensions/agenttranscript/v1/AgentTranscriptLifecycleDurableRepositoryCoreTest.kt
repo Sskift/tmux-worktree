@@ -428,7 +428,7 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         }
 
     @Test
-    fun `corrupt state and failed claim CAS cannot emit or persist a ticket`() = runBlocking {
+    fun `corrupt state and failed claim commit cannot emit or persist a ticket`() = runBlocking {
         val consumer = consumer()
         val state = richState(consumer, "timeline-a")
         val namespace = namespace(consumer, state)
@@ -454,6 +454,23 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         assertTrue(failedCas is IllegalStateException)
         assertEquals(0, failingStore.claimCount)
         assertEquals(state, failingRepository.load(consumer)?.state)
+
+        val commitStore = MemoryStore()
+        val commitRepository = AgentTranscriptLifecycleDurableRepositoryCore(commitStore)
+        commitRepository.initializeUnderApplyLease(namespace, state)
+        val writesBeforeCommit = commitStore.writeCount
+        commitStore.failCommitAfterBlock = true
+
+        val failedCommit = runCatching {
+            commitRepository.claimNotificationUnderApplyLease(namespace, intent)
+        }
+
+        assertTrue(failedCommit.exceptionOrNull() is IllegalStateException)
+        assertTrue(failedCommit.getOrNull() == null)
+        assertEquals(1, commitStore.claimCountBeforeFailedCommit)
+        assertEquals(0, commitStore.claimCount)
+        assertEquals(writesBeforeCommit, commitStore.writeCount)
+        assertEquals(state, commitRepository.load(consumer)?.state)
     }
 
     private class MemoryStore :
@@ -466,6 +483,9 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             >()
         var failNextInsert = false
         var failNextClaimInsert = false
+        var failCommitAfterBlock = false
+        var claimCountBeforeFailedCommit: Int? = null
+            private set
         var writeCount = 0
             private set
         val rowCount: Int
@@ -480,7 +500,13 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             val claimsBefore = LinkedHashMap(claims)
             val writesBefore = writeCount
             return try {
-                block(this)
+                val result = block(this)
+                if (failCommitAfterBlock) {
+                    failCommitAfterBlock = false
+                    claimCountBeforeFailedCommit = claims.size
+                    error("injected commit failure after transaction block")
+                }
+                result
             } catch (failure: Throwable) {
                 rows = rowsBefore
                 claims = claimsBefore
