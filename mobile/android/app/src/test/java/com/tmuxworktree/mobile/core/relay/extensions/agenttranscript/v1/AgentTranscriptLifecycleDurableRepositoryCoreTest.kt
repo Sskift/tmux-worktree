@@ -356,8 +356,17 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 )
                 AgentTranscriptLifecycleNotificationClaimCodec.encode(wrongKey, intent)
             },
-            "noncanonical activation identity" to {
+            "noncanonical activation identity 07" to {
                 it.withActivationGeneration("07")
+            },
+            "noncanonical activation identity +7" to {
+                it.withActivationGeneration("+7")
+            },
+            "zero activation identity" to {
+                it.withActivationGeneration("0")
+            },
+            "overflow activation identity" to {
+                it.withActivationGeneration("9223372036854775808")
             },
         )
 
