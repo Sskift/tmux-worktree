@@ -21,14 +21,6 @@ const CAPABILITY_KEYS = [
   "status",
   "storageFormatVersion",
 ];
-const CAPABILITY_FEATURES = [
-  "process_wide_kernel_lock_v1",
-  "exclusive_transaction_v1",
-  "opaque_transaction_revision_v1",
-  "compare_and_publish_v1",
-  "close_barrier_v1",
-  "dual_slot_binary_v1",
-];
 const POISONED_NAMES = [
   ...EXPORT_KEYS,
   ...CAPABILITY_KEYS,
@@ -121,10 +113,14 @@ test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and clo
     assert.equal(setterCalls, beforeCapability, "capability fields bypass prototype setters");
     assert.deepEqual(exactOwnDataKeys(rawCapability), CAPABILITY_KEYS);
     assert.equal(Array.isArray(rawCapability.features), true);
-    assert.deepEqual([...rawCapability.features], CAPABILITY_FEATURES);
+    const canonicalFeatures = stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_STORE_FEATURES;
+    assert.deepEqual([...rawCapability.features], canonicalFeatures);
     const featureDescriptors = Object.getOwnPropertyDescriptors(rawCapability.features);
-    assert.deepEqual(Reflect.ownKeys(featureDescriptors), ["0", "1", "2", "3", "4", "5", "length"]);
-    for (const [index, feature] of CAPABILITY_FEATURES.entries()) {
+    assert.deepEqual(Reflect.ownKeys(featureDescriptors), [
+      ...canonicalFeatures.map((_, index) => String(index)),
+      "length",
+    ]);
+    for (const [index, feature] of canonicalFeatures.entries()) {
       assert.deepEqual(featureDescriptors[String(index)], {
         value: feature,
         writable: true,
@@ -133,7 +129,7 @@ test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and clo
       });
     }
     assert.deepEqual(featureDescriptors.length, {
-      value: CAPABILITY_FEATURES.length,
+      value: canonicalFeatures.length,
       writable: true,
       enumerable: false,
       configurable: false,
