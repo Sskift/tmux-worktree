@@ -356,15 +356,16 @@ mod tests {
         let second = AdmissionState::new(store.admit().unwrap());
         let (entered_tx, entered_rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel();
+        let admission_terminal = Arc::clone(&terminal);
 
         let admission_worker = thread::Builder::new()
             .name("relay-v2-test-admission".to_owned())
             .spawn(move || {
-                let first_transaction = first.enter(Arc::clone(&terminal)).unwrap();
+                let first_transaction = first.enter(Arc::clone(&admission_terminal)).unwrap();
                 entered_tx.send((1_u8, first_transaction)).unwrap();
                 ack_rx.recv().unwrap();
 
-                let second_transaction = second.enter(terminal).unwrap();
+                let second_transaction = second.enter(admission_terminal).unwrap();
                 entered_tx.send((2_u8, second_transaction)).unwrap();
                 ack_rx.recv().unwrap();
             })
@@ -379,8 +380,24 @@ mod tests {
         let close_store = Arc::clone(&store);
         let close_worker = thread::Builder::new()
             .name("relay-v2-test-close".to_owned())
-            .spawn(move || close_tx.send(close_store.close()).unwrap())
+            .spawn(move || {
+                close_tx
+                    .send(crate::close_port_safely(close_store.as_ref()))
+                    .unwrap()
+            })
             .unwrap();
+        assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(!terminal.load(Ordering::Acquire));
+
+        let first_snapshot = first_transaction.read().unwrap();
+        assert!(first_snapshot.bytes.is_none());
+        let PortPublishOutcome::Swapped(first_published) = first_transaction
+            .compare_and_publish(first_snapshot.revision, &[4, 5, 6])
+            .unwrap()
+        else {
+            panic!("expected ordinary-close transaction publish to swap");
+        };
+        assert_eq!(first_published.bytes, Some(vec![4, 5, 6]));
         assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
 
         first_transaction.settle().unwrap();
@@ -388,6 +405,10 @@ mod tests {
         let (second_id, mut second_transaction) =
             entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(second_id, 2);
+        assert_eq!(
+            second_transaction.read().unwrap().bytes,
+            Some(vec![4, 5, 6])
+        );
         assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
         second_transaction.settle().unwrap();
         ack_tx.send(()).unwrap();
