@@ -6,6 +6,7 @@ const root = new URL("../contracts/relay/v2/external-continuity-authority-v1/", 
 const load = async (name) => JSON.parse(await readFile(new URL(name, root), "utf8"));
 const manifest = await load("manifest.json");
 const machine = await load("machine-cases.json");
+const relayV2Manifest = await load("../manifest.json");
 
 const sorted = (values) => [...values].sort();
 const exactKeys = (value, expected, label) =>
@@ -133,7 +134,7 @@ test("manifest freezes the existing owner chain and production NO-GO", () => {
   assert.ok(manifest.newNormativeChoices.includes("namespace-scoped-broker-versus-agent-failure-fencing"));
 });
 
-test("closed config and wire schemas are sufficient for a bounded decoder", () => {
+test("closed config, outer HTTPS, and wire schemas are sufficient for a bounded decoder", () => {
   exactKeys(manifest.interface, [
     "protocolVersion", "recordKey", "typedPort", "checkpointExactKeys",
     "scalarSchemaExactKeys", "scalarSchemas", "monotonicRule", "concurrentCasRule",
@@ -144,7 +145,8 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   ], "typed port");
   exactKeys(manifest.transport, [
     "futureAdapterSeam", "backendGuarantee", "status", "authenticationModes", "operations", "namespaces",
-    "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed", "secretPolicy", "objectSchemaExactKeys",
+    "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed", "secretPolicy", "outerHttpsBoundary",
+    "objectSchemaExactKeys",
     "configSchema", "namespaceBindingSchema", "namespaceBindingsRules",
     "wireObjectSchemas", "wireUnionRules", "operationTimeoutMs",
     "maxPendingOperations", "newNumericChoices",
@@ -167,10 +169,61 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   assert.equal(manifest.transport.newNumericChoices[0].field, "endpoint.maximumUtf8Bytes");
   exactKeys(manifest.transport.newNumericChoices[0], ["field", "value", "appliesAt", "rationale"], "endpoint numeric choice");
   exactKeys(manifest.requestIdentity, [
-    "futureAdapterSeam", "backendGuarantee", "status", "operationId", "fingerprintCovers",
+    "futureAdapterSeam", "backendGuarantee", "status", "operationId", "fingerprintDefinition",
     "sameIdSameFingerprint", "sameIdDifferentFingerprint", "adapterReplayLimit",
     "casAfterTimeoutOrUncertain", "lateResultAfterDeadline",
   ], "request identity");
+  exactKeys(manifest.requestIdentity.fingerprintDefinition, [
+    "readTuple", "compareAndSwapTuple", "comparison", "jsonObjectKeyOrderSignificant",
+    "canonicalSerializationOrHashRequired", "coercionOrUnicodeNormalizationAllowed",
+  ], "request fingerprint");
+  assert.deepEqual(manifest.requestIdentity.fingerprintDefinition.readTuple, [
+    "contractVersion", "operation", "securityDomainId", "namespace", "anchorId",
+  ]);
+  assert.deepEqual(manifest.requestIdentity.fingerprintDefinition.compareAndSwapTuple, [
+    "contractVersion", "operation", "securityDomainId", "namespace", "anchorId", "expected", "next",
+  ]);
+  assert.equal(
+    manifest.requestIdentity.fingerprintDefinition.comparison,
+    "field-by-field-exact-type-and-value-equality-after-closed-decode",
+  );
+  assert.equal(manifest.requestIdentity.fingerprintDefinition.jsonObjectKeyOrderSignificant, false);
+  assert.equal(manifest.requestIdentity.fingerprintDefinition.canonicalSerializationOrHashRequired, false);
+  assert.equal(manifest.requestIdentity.fingerprintDefinition.coercionOrUnicodeNormalizationAllowed, false);
+
+  const outer = manifest.transport.outerHttpsBoundary;
+  exactKeys(outer, [
+    "limitsSource", "httpsBodyBytes", "httpsJsonMaxDepth", "httpsJsonMaxTotalKeys",
+    "method", "endpoint", "tlsPeerVerification", "redirectPolicy", "workloadCredentialScope", "requestContentType",
+    "responseContentType", "requestAcceptEncoding", "contentEncoding", "compressionAllowed",
+    "bodyWriteRule", "bodyReadRule", "jsonDecodeRule", "boundaryFailureMapping",
+  ], "outer HTTPS boundary");
+  assert.deepEqual(
+    [outer.httpsBodyBytes, outer.httpsJsonMaxDepth, outer.httpsJsonMaxTotalKeys],
+    [
+      relayV2Manifest.limits.httpsBodyBytes,
+      relayV2Manifest.limits.httpsJsonMaxDepth,
+      relayV2Manifest.limits.httpsJsonMaxTotalKeys,
+    ],
+  );
+  assert.equal(outer.limitsSource, "contracts/relay/v2/manifest.json#limits");
+  assert.equal(outer.method, "POST");
+  assert.equal(outer.endpoint, "exact-configured-https-endpoint-no-derived-url");
+  assert.match(outer.tlsPeerVerification, /tlsTrustReference-and-exact-endpoint-identity-before-authentication$/);
+  assert.match(outer.redirectPolicy, /^reject-all-redirects-before-follow-or-credential-forwarding$/);
+  assert.equal(outer.workloadCredentialScope, "initial-exact-configured-https-endpoint-only");
+  assert.equal(outer.requestContentType, "application/json");
+  assert.equal(outer.responseContentType, "application/json");
+  assert.equal(outer.requestAcceptEncoding, "identity");
+  assert.equal(outer.contentEncoding, "absent-or-identity-only");
+  assert.equal(outer.compressionAllowed, false);
+  assert.equal(outer.bodyWriteRule, "encode-complete-body-within-limit-before-send");
+  assert.match(outer.bodyReadRule, /counting-reader-stops-at-limit-plus-one/);
+  assert.match(outer.jsonDecodeRule, /strict-utf8-exactly-one-object-reject-duplicate-key-trailing-json/);
+  assert.deepEqual(outer.boundaryFailureMapping, {
+    read: "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE",
+    compareAndSwap: "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN",
+  });
 
   const objectKeys = manifest.transport.objectSchemaExactKeys;
   exactKeys(manifest.transport.wireObjectSchemas, [

@@ -122,6 +122,29 @@
       "casTokenAllowedLocations": ["backend-record", "transport-success-result", "normative-fixture"],
       "casTokenForbiddenLocations": ["external-error", "cross-security-domain-response", "log"]
     },
+    "outerHttpsBoundary": {
+      "limitsSource": "contracts/relay/v2/manifest.json#limits",
+      "httpsBodyBytes": 16384,
+      "httpsJsonMaxDepth": 8,
+      "httpsJsonMaxTotalKeys": 32,
+      "method": "POST",
+      "endpoint": "exact-configured-https-endpoint-no-derived-url",
+      "tlsPeerVerification": "required-against-configured-tlsTrustReference-and-exact-endpoint-identity-before-authentication",
+      "redirectPolicy": "reject-all-redirects-before-follow-or-credential-forwarding",
+      "workloadCredentialScope": "initial-exact-configured-https-endpoint-only",
+      "requestContentType": "application/json",
+      "responseContentType": "application/json",
+      "requestAcceptEncoding": "identity",
+      "contentEncoding": "absent-or-identity-only",
+      "compressionAllowed": false,
+      "bodyWriteRule": "encode-complete-body-within-limit-before-send",
+      "bodyReadRule": "content-length-over-limit-reject-before-read-otherwise-counting-reader-stops-at-limit-plus-one-without-unbounded-aggregation",
+      "jsonDecodeRule": "strict-utf8-exactly-one-object-reject-duplicate-key-trailing-json-and-closed-schema-violation",
+      "boundaryFailureMapping": {
+        "read": "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE",
+        "compareAndSwap": "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN"
+      }
+    },
     "objectSchemaExactKeys": ["exactKeys", "fields"],
     "configSchema": {
       "exactKeys": ["configVersion", "endpoint", "securityDomainId", "authenticationMode", "credentialReference", "tlsTrustReference", "operationTimeoutMs", "maxPendingOperations", "namespaceBindings"],
@@ -238,15 +261,14 @@
     "backendGuarantee": "same-id-same-fingerprint-exact-decision-replay-and-different-fingerprint-rejection",
     "status": "new-normative-v1-choice",
     "operationId": "new-v1-choice-collision-resistant-csprng-opaque-id",
-    "fingerprintCovers": [
-      "contractVersion",
-      "operation",
-      "securityDomainId",
-      "namespace",
-      "anchorId",
-      "expected",
-      "next"
-    ],
+    "fingerprintDefinition": {
+      "readTuple": ["contractVersion", "operation", "securityDomainId", "namespace", "anchorId"],
+      "compareAndSwapTuple": ["contractVersion", "operation", "securityDomainId", "namespace", "anchorId", "expected", "next"],
+      "comparison": "field-by-field-exact-type-and-value-equality-after-closed-decode",
+      "jsonObjectKeyOrderSignificant": false,
+      "canonicalSerializationOrHashRequired": false,
+      "coercionOrUnicodeNormalizationAllowed": false
+    },
     "sameIdSameFingerprint": "exact-decision-replay",
     "sameIdDifferentFingerprint": "IDEMPOTENCY_CONFLICT",
     "adapterReplayLimit": "same-operationId-and-fingerprint-before-original-deadline-only",
@@ -389,6 +411,8 @@
     "collision-resistant-operationId-and-exact-replay",
     "https-with-mutual-tls-or-workload-identity-and-reference-only-secrets",
     "closed-bounded-config-and-wire-schema-including-2048-byte-endpoint",
+    "bounded-exact-endpoint-post-with-no-redirect-or-compression-reusing-relay-v2-https-json-limits",
+    "decoded-closed-tuple-request-fingerprint-without-key-order-or-canonical-hash-dependency",
     "operation-dependent-external-error-commitDisposition",
     "null-only-external-error-message-and-backend-message-discard",
     "existing-continuity-success-shapes-with-untrusted-result-handoff",
