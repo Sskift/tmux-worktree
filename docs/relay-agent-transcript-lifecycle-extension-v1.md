@@ -6,6 +6,8 @@
 
 Node store 已把唯一 durable commit 路径接到共享 Relay v2 monotonic/CAS continuity anchor。composition 必须显式注入 rollback-independent authority 与绑定 `(hostId, hostEpoch)` 的 `anchorId`，没有默认实现；anchor checkpoint 的 `stateDigest` 从通过读取侧同等 strict inspection 的 exact durable bytes重算。本地 publish在既有跨进程 store lock内执行 expected-current CAS，只有 exact successor可报告 `swapped`/`already_same`；之后才提交外部 anchor并 ACK。外部 authority缺失、超时、回滚、冲突或要求 reconcile时 foundation fail closed，不能回退本地 witness。state-before-anchor的一代 crash cut可通过外部 anchor恢复，成对回滚旧 state+witness会被外部单调 checkpoint拒绝。因此 manifest 的 foundation事实为 `nodeContinuityAnchorIntegrated=true`、`pairedRollbackClosedAtFoundationBoundary=true`。为兼容现有 consumer保留的 `pairedRollbackClosed=false` 由 `pairedRollbackClosedScope=production-end-to-end` 明确限定；它与 `productionMonotonicAuthorityAdapterIntegrated=false`、`nodeDurabilitySecurityReviewPassed=false`、`nodeRuntimeIntegrated=false` 和 production/G4/capability advertisement 全部为 false共同表示生产接入仍未交付，不能把专项 fake authority证据描述为 production durability交付。
 
+future external authority 的互操作/安全边界另由 frozen [`external-continuity-authority-v1`](../contracts/relay/v2/external-continuity-authority-v1/README.md) 冻结；它不提供 backend或adapter。extension固定使用独立 `agent-transcript-lifecycle.v1` namespace、独立anchorId/ACL/reset/decommission/tombstone history，owner binding沿用本extension既有exact `(hostId, hostEpoch)`。它不能覆盖、复用或迁移`broker-credential.v1` record；reset/delete/decommission也不能让旧anchorId回到uninitialized或新history。external internal error不能成为extension public frame error，仍只能经共享continuity port fail closed。
+
 这些 Node 模块仍没有接入基础 `HostRuntime`、`relayHost` 或 broker，也没有进入任何 production composition/adapter、capability intersection或 advertisement；`runtimeConsumers=pending`、`nodeRuntimeIntegrated=false`、G4 与 production capability 仍为 false。它们只能称为**可接线的 host authority foundation**，不能称为远端 Agent reply/lifecycle 已上线。
 
 Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。共享 fixture 的 `command_status` 步骤由测试中的 base-owner composition stub处理，生产 reducer不拥有基础 command ledger，因此尚不存在 production composition consumer，`androidConsumerMachineConformance` 仍为 false；单独的 reducer fixture conformance不构成 runtime conformance。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending，G4 尚未通过。
@@ -371,6 +373,7 @@ Android 必须在尝试系统通知前持久化该 key 与 disposition：`shown|
 实现 owner 限于 `src/relay/extensions/agentTranscriptLifecycle/v1`：
 
 - authority key 固定为 `(hostId, hostEpoch, scopeId, sessionId, timelineEpoch)`；冻结的唯一 ingestion 写路径是 trusted adapter binding → store transaction → reducer → 同事务 authority snapshot/source cursor+dedupe/public event+replay log → exact state durable commit → shared monotonic/CAS anchor commit → ACK。store已接入该 required typed port，并在既有 store lock内做本地 expected-current CAS；但没有 production authority adapter、trusted source adapter或 composition调用它，所以当前仍不是 production ACK 路径；
+- external anchor provisioning固定使用`agent-transcript-lifecycle.v1` namespace与owner-bound `(hostId, hostEpoch)`，并与broker credential anchor的anchorId、ACL和terminal lifecycle完全隔离；当前只有future contract与fixture，没有真实provisioning/backend/transport或灾备实现；
 - store 默认把 0600 state 放在 `~/.tmux-worktree/relay-agent-transcript-lifecycle-v1/`，并写一个 0600 本地 continuity witness；相关目录/锁为 0700，逐层创建目录时 fsync每个 parent，写入使用同目录 temp、file fsync、rename和directory fsync。本地 witness只用于 crash cut，不是独立 rollback anchor；
 - replay只读取 committed public log。首次请求持久化 `replayThroughAgentSeq`，continuation cursor按 principal、client和完整 authority lineage解析；floor、ahead、epoch与 snapshot expiry返回冻结的 extension error；
 - runtime为独立 typed composition foundation，只标记内部 `LIVE`/`REPLAY` provenance并生成冻结 public frame；它不注册到 production route、不改变基础六项 capability、不持有 broker状态，也不接 Android/UI。
@@ -379,7 +382,7 @@ Android 必须在尝试系统通知前持久化该 key 与 disposition：`shown|
 
 本 contract slice 本身只冻结互操作语义。生产接入至少还需要：
 
-1. 为共享 Relay v2 continuity port交付真正 rollback-independent的 production monotonic/CAS authority与稳定 `anchorId` provisioning；G3 后在真实 relay-host composition显式注入，并交付结构化 SDK/adapter认证、disconnect barrier与 production capability intersection/advertisement；
+1. 按 external continuity authority v1 contract交付真正 rollback-independent、linearizable、已确认CAS RPO=0的production backend/adapter与稳定`anchorId` provisioning/ACL；使用独立`agent-transcript-lifecycle.v1` namespace和`(hostId, hostEpoch)` owner binding，验证restart/旧备份拒绝serving/failover high-water/reset/decommission/tombstone，且不复用`broker-credential.v1` anchor；G3后才可在真实relay-host composition显式注入，并交付结构化SDK/adapter认证、disconnect barrier与production capability intersection/advertisement；
 2. 完成 Android 独立 public codec并与 Node共同消费 extension fixture，且未协商时双方不发送 agent frame；
 3. 把现有独立 Android reducer foundation 接入独立 Room namespace、public codec/actor、unsupported UI，以及 durable notification claim/permission/lock-screen/profile隔离；
 4. 重复、source gap、公开 event gap、断线 replay、Agent重启、旧 source迟到终态、redaction/delete和store reset的跨端故障注入；

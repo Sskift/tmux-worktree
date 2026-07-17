@@ -1,0 +1,364 @@
+{
+  "contract": "tmux-worktree-relay-v2-external-continuity-authority",
+  "contractVersion": 1,
+  "fixtureFormatVersion": 1,
+  "status": "frozen-future-contract-production-no-go",
+  "normativeDocument": "README.md",
+  "files": ["README.md", "manifest.json", "machine-cases.json"],
+  "delivery": {
+    "productionBackendImplemented": false,
+    "productionAdapterImplemented": false,
+    "productionCompositionImplemented": false,
+    "nativeStorePackagingImplemented": false,
+    "authorityInjectionImplemented": false,
+    "brokerV2CompositionImplemented": false,
+    "productionReadinessDelivered": false,
+    "capabilityAdvertisementAllowed": false
+  },
+  "ownership": {
+    "externalBackend": "durable-monotonic-linearizable-record-and-terminal-lifecycle-by-anchorId-only",
+    "continuityAnchor": "local-state-before-anchor-ordering-single-crash-window-reconcile-bounded-timeout",
+    "credentialAuthority": "credential-checkpoint-business-state-ready-withdrawal-and-closed-error-mapping",
+    "brokerCore": "auth-control-authority-consumer-only",
+    "productionCompositionOrder": [
+      "native-store-open-and-self-check",
+      "inject-external-monotonic-authority",
+      "credential-authority-open-and-reconcile",
+      "install-synchronous-admission-and-connection-fence",
+      "inject-auth-control-authority-into-broker"
+    ]
+  },
+  "scope": {
+    "relayPublicWireChanged": false,
+    "relayV1Changed": false,
+    "v1OrBauFallbackAllowed": false,
+    "readinessShortcutAllowed": false,
+    "enrollmentOrCapabilityEffect": "none"
+  },
+  "interface": {
+    "protocolVersion": 1,
+    "recordKey": "anchorId",
+    "typedPort": {
+      "readRequestExactKeys": ["protocolVersion", "anchorId", "signal"],
+      "casRequestExactKeys": ["protocolVersion", "anchorId", "expected", "next", "signal"],
+      "snapshotStatuses": ["uninitialized", "committed"],
+      "casOutcomes": ["swapped", "conflict"]
+    },
+    "checkpointExactKeys": [
+      "protocolVersion",
+      "anchorId",
+      "sequence",
+      "commitId",
+      "parentCommitId",
+      "stateDigest"
+    ],
+    "scalarSchemaExactKeys": ["jsonType", "nullable", "boundUnit", "minimum", "maximum", "rule", "source"],
+    "scalarSchemas": {
+      "identifier": {"jsonType": "string", "nullable": false, "boundUnit": "utf8-bytes", "minimum": 1, "maximum": 128, "rule": "ascii-regexp-^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$", "source": "existing-continuity-anchor-bound"},
+      "operationId": {"jsonType": "string", "nullable": false, "boundUnit": "utf8-bytes", "minimum": 1, "maximum": 128, "rule": "identifier-plus-collision-resistant-csprng-generation", "source": "new-normative-v1-choice-reusing-identifier-bound"},
+      "casToken": {"jsonType": "string", "nullable": false, "boundUnit": "utf8-bytes", "minimum": 1, "maximum": 512, "rule": "opaque-printable-ascii-0x21-through-0x7e", "source": "existing-continuity-anchor-bound"},
+      "canonicalUint64": {"jsonType": "string", "nullable": false, "boundUnit": "decimal-digits", "minimum": 1, "maximum": 20, "rule": "canonical-decimal-0-through-18446744073709551615", "source": "existing-continuity-anchor-bound"},
+      "stateDigest": {"jsonType": "string", "nullable": false, "boundUnit": "ascii-characters", "minimum": 64, "maximum": 64, "rule": "lowercase-hex-sha256", "source": "existing-continuity-anchor-bound"},
+      "endpoint": {"jsonType": "string", "nullable": false, "boundUnit": "utf8-bytes", "minimum": 1, "maximum": 2048, "rule": "absolute-https-url-without-userinfo-query-or-fragment", "source": "new-normative-v1-choice"},
+      "retryAfterMs": {"jsonType": "integer", "nullable": true, "boundUnit": "milliseconds", "minimum": 0, "maximum": 9007199254740991, "rule": "null-or-json-safe-non-negative-integer-as-required-by-code", "source": "existing-relay-v2-json-safe-integer-model"}
+    },
+    "monotonicRule": "genesis-sequence-zero-then-exact-immediate-successor",
+    "concurrentCasRule": "same-expected-different-successors-exactly-one-swapped-rest-conflict-with-winner",
+    "initializedNeverUninitializedAgain": true,
+    "casTokenNonRepeating": true
+  },
+  "failureDomain": {
+    "owner": "external-backend-operator-and-recovery-control-plane",
+    "independentFrom": [
+      "node-local-state",
+      "local-continuity-witness",
+      "native-broker-credential-store",
+      "relay-agent-extension-store",
+      "their-backup-and-restore-domain"
+    ],
+    "linearizableReadAndCasRequired": true,
+    "acknowledgedCasRpo": 0,
+    "ackAfterDurabilityAndRecoveryEvidence": true,
+    "serviceRestartAndServingFailoverPreserveHighWater": true,
+    "oldBackupCannotServe": true,
+    "availabilityOrRtoGuaranteed": false,
+    "unprovenRecoveryDisposition": "unavailable"
+  },
+  "provisioning": {
+    "owner": "external-authority-provisioning-control-plane-not-runtime-data-plane",
+    "status": "new-normative-v1-choice",
+    "bindingExactKeys": ["securityDomainId", "namespace", "ownerBinding", "anchorId"],
+    "securityDomainIdMeaning": "new-external-authority-tenant-isolation-key-not-a-relay-wire-or-credential-claim",
+    "ownerBindingMeaning": "opaque-stable-provisioning-identity-never-inferred-from-display-name-or-credential-field",
+    "bindingImmutable": true,
+    "sameBindingRetry": "idempotent",
+    "differentBindingSameAnchorId": "NAMESPACE_COLLISION",
+    "aclDefault": "deny",
+    "runtimePermission": "exact-read-cas-only",
+    "runtimeProvisionPermission": false,
+    "crossSecurityDomainVisibility": "none",
+    "resetRequiresNewAnchorId": true,
+    "resetPreservesExactSecurityDomainNamespaceOwnerBinding": true,
+    "decommissionTerminal": true,
+    "physicalPayloadDeletionMayRemoveReservation": false,
+    "tombstoneRetention": "permanent"
+  },
+  "transport": {
+    "owner": "external-adapter-configuration-and-backend-transport-boundary",
+    "status": "new-normative-v1-choice",
+    "authenticationModes": ["mutual_tls", "workload_identity"],
+    "operations": ["read", "compare_and_swap"],
+    "namespaces": ["broker-credential.v1", "agent-transcript-lifecycle.v1"],
+    "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed": false,
+    "objectSchemaExactKeys": ["exactKeys", "fields"],
+    "configSchema": {
+      "exactKeys": ["configVersion", "endpoint", "securityDomainId", "authenticationMode", "credentialReference", "tlsTrustReference", "operationTimeoutMs", "maxPendingOperations", "namespaceBindings"],
+      "fields": {
+        "configVersion": "integer-const-1",
+        "endpoint": "scalar:endpoint",
+        "securityDomainId": "scalar:identifier",
+        "authenticationMode": "enum:authenticationModes",
+        "credentialReference": "scalar:identifier-opaque-resolver-key-not-secret-not-path",
+        "tlsTrustReference": "scalar:identifier-opaque-resolver-key-not-secret-not-path",
+        "operationTimeoutMs": "integer:operationTimeoutMs",
+        "maxPendingOperations": "integer:maxPendingOperations",
+        "namespaceBindings": "array:namespaceBinding"
+      }
+    },
+    "namespaceBindingSchema": {
+      "exactKeys": ["namespace", "ownerBinding", "anchorId"],
+      "fields": {
+        "namespace": "enum:namespaces",
+        "ownerBinding": "scalar:identifier",
+        "anchorId": "scalar:identifier"
+      }
+    },
+    "namespaceBindingsRules": {
+      "minimumItems": 1,
+      "maximumItems": 2,
+      "maximumSource": "derived-from-two-frozen-v1-namespaces",
+      "uniqueBy": ["namespace", "anchorId"],
+      "sameNamespaceDuplicateAllowed": false,
+      "sameAnchorIdDuplicateAllowed": false,
+      "securityDomainSource": "enclosing-config-securityDomainId",
+      "bindingMustMatchProvisionedExactTuple": true
+    },
+    "wireObjectSchemas": {
+      "checkpoint": {
+        "exactKeys": ["protocolVersion", "anchorId", "sequence", "commitId", "parentCommitId", "stateDigest"],
+        "fields": {"protocolVersion": "integer-const-1", "anchorId": "scalar:identifier-equals-request-anchorId", "sequence": "scalar:canonicalUint64", "commitId": "scalar:identifier", "parentCommitId": "scalar:identifier-or-null-by-sequence", "stateDigest": "scalar:stateDigest"}
+      },
+      "snapshot": {
+        "exactKeys": ["status", "checkpoint", "casToken"],
+        "fields": {"status": "enum:uninitialized|committed", "checkpoint": "object:checkpoint-or-null-by-status", "casToken": "scalar:casToken"}
+      },
+      "requestEnvelope": {
+        "exactKeys": ["contractVersion", "operationId", "securityDomainId", "namespace", "anchorId", "operation", "payload"],
+        "fields": {"contractVersion": "integer-const-1", "operationId": "scalar:operationId", "securityDomainId": "scalar:identifier", "namespace": "enum:namespaces", "anchorId": "scalar:identifier", "operation": "enum:operations", "payload": "object:readPayload-or-casPayload-by-operation"}
+      },
+      "readPayload": {"exactKeys": [], "fields": {}},
+      "casPayload": {
+        "exactKeys": ["expected", "next"],
+        "fields": {"expected": "object:snapshot", "next": "object:checkpoint"}
+      },
+      "casResult": {
+        "exactKeys": ["outcome", "current"],
+        "fields": {"outcome": "enum:swapped|conflict", "current": "object:snapshot"}
+      },
+      "externalError": {
+        "exactKeys": ["code", "retryable", "retryAfterMs", "commitDisposition"],
+        "fields": {"code": "enum:errorCodes", "retryable": "boolean:exact-code-definition", "retryAfterMs": "scalar:retryAfterMs-exact-code-definition", "commitDisposition": "enum:operationDispositionRule"}
+      },
+      "responseEnvelope": {
+        "exactKeys": ["contractVersion", "operationId", "ok", "result", "error"],
+        "fields": {"contractVersion": "integer-const-1", "operationId": "scalar:operationId-exact-request-match", "ok": "boolean", "result": "object:snapshot-or-casResult-or-null-by-ok-and-request-operation", "error": "object:externalError-or-null-by-ok"}
+      }
+    },
+    "wireUnionRules": {
+      "snapshot": {
+        "uninitialized": {"status": "uninitialized", "checkpoint": null, "casToken": "required-valid"},
+        "committed": {"status": "committed", "checkpoint": "required-valid-and-anchorId-equals-request", "casToken": "required-valid"}
+      },
+      "request": {
+        "read": {"operation": "read", "payload": "exact-readPayload"},
+        "compareAndSwap": {"operation": "compare_and_swap", "payload": "exact-casPayload", "expectedAnchor": "checkpoint-if-present-equals-envelope-anchorId", "nextAnchor": "equals-envelope-anchorId"}
+      },
+      "casResult": {
+        "swapped": {"outcome": "swapped", "current": "committed-snapshot-with-checkpoint-exactly-next", "casToken": "must-differ-from-expected"},
+        "conflict": {"outcome": "conflict", "current": "authoritative-valid-snapshot", "casToken": "must-differ-from-expected"}
+      },
+      "response": {
+        "readSuccess": {"requestOperation": "read", "ok": true, "result": "exact-snapshot", "error": null},
+        "casSuccess": {"requestOperation": "compare_and_swap", "ok": true, "result": "exact-casResult-current-snapshot", "error": null},
+        "error": {"requestOperation": "read-or-compare_and_swap", "ok": false, "result": null, "error": "exact-externalError", "codeOperation": "definition-must-contain-request-operation", "commitDisposition": "errors.operationDispositionRules-for-request-operation"}
+      },
+      "typedPortTranslation": {
+        "common": "adapter-adds-protocolVersion-and-request-anchorId",
+        "uninitialized": "external-checkpoint-null-becomes-typed-port-snapshot-without-checkpoint-key",
+        "committed": "external-checkpoint-object-becomes-typed-port-checkpoint-key",
+        "cas": "external-casResult-current-translates-by-same-snapshot-rule"
+      }
+    },
+    "operationTimeoutMs": {
+      "owner": "RelayV2ContinuityAnchor",
+      "source": "existing-frozen-continuity-foundation",
+      "minimum": 1,
+      "default": 5000,
+      "maximum": 30000
+    },
+    "maxPendingOperations": {
+      "owner": "RelayV2ContinuityAnchor",
+      "source": "existing-frozen-continuity-foundation",
+      "minimum": 1,
+      "default": 64,
+      "maximum": 1024
+    },
+    "newNumericChoices": [
+      {"field": "endpoint.maximumUtf8Bytes", "value": 2048, "owner": "external-adapter-configuration-boundary", "rationale": "finite-pre-URL-parse-allocation-bound-for-a-single-origin-without-query-or-fragment"}
+    ]
+  },
+  "requestIdentity": {
+    "owner": "external-adapter-and-backend-idempotency-boundary",
+    "status": "new-normative-v1-choice",
+    "operationId": "new-v1-choice-collision-resistant-csprng-opaque-id",
+    "fingerprintCovers": [
+      "contractVersion",
+      "operation",
+      "securityDomainId",
+      "namespace",
+      "anchorId",
+      "expected",
+      "next"
+    ],
+    "sameIdSameFingerprint": "exact-decision-replay",
+    "sameIdDifferentFingerprint": "IDEMPOTENCY_CONFLICT",
+    "adapterReplayLimit": "same-operationId-and-fingerprint-before-original-deadline-only",
+    "casAfterTimeoutOrUncertain": "no-retry-linearizable-read-reconcile-required",
+    "lateResultAfterDeadline": "ignored-for-original-call"
+  },
+  "errors": {
+    "namespace": "external-continuity-authority.v1-internal-not-relay-wire",
+    "owner": "external-backend-and-adapter-boundary",
+    "status": "new-normative-v1-choice",
+    "choiceRationale": "closed-redacted-operational-classification-needed-to-map-an-untrusted-backend-into-the-existing-continuity-and-credential-errors-without-creating-relay-wire-errors",
+    "exactKeys": ["code", "retryable", "retryAfterMs", "commitDisposition"],
+    "codeDefinitionExactKeys": ["code", "operations", "retryable", "retryAfterMsPolicy", "casCommitDisposition"],
+    "operationVocabulary": ["read", "compare_and_swap", "provisioning"],
+    "retryAfterMsValues": "null-or-scalar-retryAfterMs-as-required-by-code-definition",
+    "commitDispositions": ["not_applicable", "proven_no_commit", "uncertain"],
+    "recordOrSecretDetailsAllowed": false,
+    "codes": [
+      {"code": "AUTHENTICATION_FAILED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "PERMISSION_DENIED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "MALFORMED_REQUEST", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "IDEMPOTENCY_CONFLICT", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "QUOTA_EXCEEDED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "CAPACITY_EXHAUSTED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": true, "retryAfterMsPolicy": "required-scalar-retryAfterMs", "casCommitDisposition": "proven_no_commit"},
+      {"code": "RATE_LIMITED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": true, "retryAfterMsPolicy": "required-scalar-retryAfterMs", "casCommitDisposition": "proven_no_commit"},
+      {"code": "TIMEOUT", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "uncertain"},
+      {"code": "UNAVAILABLE", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "uncertain"},
+      {"code": "RESULT_UNCERTAIN", "operations": ["compare_and_swap"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "uncertain"},
+      {"code": "STALE_READ", "operations": ["read"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "not_applicable"},
+      {"code": "RECOVERY_ROLLBACK", "operations": ["read", "compare_and_swap"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"},
+      {"code": "NAMESPACE_COLLISION", "operations": ["provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "not_applicable"},
+      {"code": "ANCHOR_RETIRED", "operations": ["read", "compare_and_swap", "provisioning"], "retryable": false, "retryAfterMsPolicy": "null", "casCommitDisposition": "proven_no_commit"}
+    ],
+    "operationDispositionRules": {
+      "read": {"allowedCodes": "definitions-whose-operations-contain-read", "commitDisposition": "not_applicable"},
+      "compareAndSwap": {"allowedCodes": "definitions-whose-operations-contain-compare_and_swap", "commitDisposition": "exact-code-definition-casCommitDisposition", "allowedDispositions": ["proven_no_commit", "uncertain"]},
+      "provisioning": {"allowedCodes": "definitions-whose-operations-contain-provisioning", "commitDisposition": "not_applicable"}
+    },
+    "upperClosedMapping": {
+      "backendReadError": "RelayV2ContinuityAnchor.ANCHOR_UNAVAILABLE",
+      "malformedReadSuccess": "RelayV2ContinuityAnchor.INVALID_AUTHORITY_RESPONSE",
+      "backendCasErrorIncludingDefiniteRejection": "RelayV2ContinuityAnchor.ANCHOR_COMMIT_UNCERTAIN",
+      "reasonDefiniteCasRejectionStillMapsUncertain": "typed-port-handoff-does-not-expose-a-proven-pre-linearization-error-union",
+      "validCasConflict": "RelayV2ContinuityAnchor.CAS_CONFLICT-only-when-current-is-not-requested-successor",
+      "credentialReadUnavailable": "RelayV2BrokerCredentialAuthority.EXTERNAL_CONTINUITY_UNAVAILABLE",
+      "credentialMalformedRollbackOrUnknown": "RelayV2BrokerCredentialAuthority.EXTERNAL_CONTINUITY_INVALID",
+      "credentialCasUncertain": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_UNCERTAIN",
+      "credentialCasConflict": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_CONFLICT",
+      "fatalPostReadyResult": "credential-authority-synchronous-withdrawal-and-close-barrier"
+    }
+  },
+  "recovery": {
+    "singleAllowedCrashWindow": "local-exact-immediate-successor-before-anchor",
+    "singleCrashWindowAction": "one-cas-of-local-successor-after-linearizable-read",
+    "pairedRollback": "fail-closed",
+    "sameSequenceDivergence": "fail-closed",
+    "nonImmediateSuccessor": "fail-closed",
+    "serviceRestart": "read-same-or-newer-record-never-uninitialized",
+    "oldBackupRestore": "refuse-serving-until-durable-high-water-restored",
+    "backendFailover": "read-same-or-newer-record",
+    "casAckLossOrLateAck": "uncertain-then-linearizable-read-reconcile"
+  },
+  "readinessFence": {
+    "trigger": "any-fatal-external-read-cas-or-response-after-ready",
+    "credentialAuthority": {
+      "owner": "RelayV2BrokerCredentialAuthority",
+      "readyAndAdmissionWithdrawal": "synchronous-before-failure-escapes",
+      "closeBarrierInitiation": "synchronous-with-withdrawal"
+    },
+    "productionBrokerComposition": {
+      "owner": "future-production-broker-composition",
+      "upgradeRouteAndActiveDataFence": "synchronous-before-transport-close-delivery",
+      "transportCloseRequirement": "bounded-and-mandatory"
+    },
+    "brokerCore": {
+      "owner": "RelayV2BrokerCore",
+      "role": "auth-control-authority-consumer-only-no-external-readiness-or-transport-close-ownership"
+    },
+    "transportCloseCode": "required-production-choice-not-frozen-by-this-external-adapter-contract",
+    "transportCloseDeadlineMs": "required-production-choice-before-adapter-implementation",
+    "sameAuthorityInstanceMayReturnReady": false,
+    "recoveryRequires": [
+      "new-authority-instance",
+      "native-store-open-and-self-check",
+      "external-linearizable-reconcile",
+      "fresh-production-fence-installation"
+    ]
+  },
+  "namespaces": [
+    {
+      "name": "broker-credential.v1",
+      "status": "new-normative-v1-choice",
+      "ownerBinding": "opaque-stable-broker-credential-authority-owner-binding-required-from-provisioning",
+      "mustNotInferFrom": ["issuer-field", "security-domain-field", "display-name", "credential-payload"],
+      "reset": "tombstone-old-and-provision-new-anchorId"
+    },
+    {
+      "name": "agent-transcript-lifecycle.v1",
+      "status": "new-normative-v1-choice",
+      "ownerBinding": "existing-extension-owner-hostId-plus-hostEpoch",
+      "mustNotInferFrom": ["timeline-display-name", "session-display-name", "credential-payload"],
+      "reset": "continue-same-history-or-tombstone-old-and-provision-new-anchorId"
+    }
+  ],
+  "schemaPolicy": {
+    "objectsClosed": true,
+    "enumsClosed": true,
+    "unknownFieldsOrEnums": "reject-and-map-through-upper-closed-mapping",
+    "missingRequiredFieldsOrTypeCoercion": "reject",
+    "secretOrRecordDetailInError": "reject"
+  },
+  "newNormativeChoices": [
+    "external-internal-error-namespace-and-codes",
+    "securityDomainId-as-external-tenant-isolation-key",
+    "opaque-ownerBinding-provisioning-field",
+    "two-independent-anchor-namespace-names",
+    "collision-resistant-operationId-and-exact-replay",
+    "https-with-mutual-tls-or-workload-identity-and-reference-only-secrets",
+    "closed-bounded-config-and-wire-schema-including-2048-byte-endpoint",
+    "operation-dependent-external-error-commitDisposition"
+  ],
+  "requiredProductionChoices": [
+    "select-and-qualify-a-compatible-backend-with-independent-administration-and-backup-domain",
+    "prove-linearizability-and-rpo-zero-for-acknowledged-cas",
+    "implement-stable-provisioning-acl-and-permanent-tombstones",
+    "choose-concrete-opaque-broker-ownerBinding-without-inferring-credential-fields",
+    "set-deployment-quota-rate-and-capacity-values",
+    "freeze-public-transport-close-code-and-bounded-close-deadline-in-owning-broker-contract",
+    "exercise-restart-old-backup-failover-and-ready-loss-fence",
+    "package-native-store-and-inject-authority-before-broker-composition"
+  ]
+}
