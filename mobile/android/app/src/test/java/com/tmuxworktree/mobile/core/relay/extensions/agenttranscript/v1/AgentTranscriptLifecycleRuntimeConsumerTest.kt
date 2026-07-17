@@ -8,7 +8,6 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAppl
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
@@ -30,12 +29,12 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         )
 
         assertEquals(AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionNotNegotiated, result)
-        assertEquals(0, harness.lease.admittedCount)
+        assertEquals(0, harness.lease.blockCount)
         assertEquals(before, harness.repository.load(harness.consumer))
     }
 
     @Test
-    fun `correlated unavailable commits inside the actor lease before disconnect drains`() =
+    fun `correlated unavailable waits for commit inside the controlled lease block`() =
         runBlocking {
             val harness = Harness(sessionId = "session-shell", statusRequestId = "agent-status-2")
             val commit = harness.store.blockNextCommit()
@@ -47,17 +46,13 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             }
             commit.entered.await()
             assertFalse(applying.isCompleted)
-
-            val disconnecting = async(start = CoroutineStart.UNDISPATCHED) {
-                harness.lease.disconnectAndDrain()
-            }
-            assertFalse(disconnecting.isCompleted)
+            assertTrue(harness.lease.insideBlock)
             commit.release.complete(Unit)
 
             val result = applying.await()
             assertTrue(result is AgentTranscriptLifecycleRuntimeConsumeResult.Applied)
-            disconnecting.await()
-            assertEquals(1, harness.lease.admittedCount)
+            assertFalse(harness.lease.insideBlock)
+            assertEquals(1, harness.lease.blockCount)
             val restored = requireNotNull(harness.repository.load(harness.consumer)).state
             assertEquals(AgentExtensionSupport.UNAVAILABLE, restored.extensionLane.support)
             assertEquals(
@@ -68,7 +63,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         }
 
     @Test
-    fun `cursor bearing closed inputs never lease reduce or emit a base action`() = runBlocking {
+    fun `cursor bearing inputs close without lease or reduce`() = runBlocking {
         val harness = Harness(
             sessionId = "session-1",
             statusRequestId = "agent-status-1",
@@ -107,7 +102,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             )
         }
 
-        assertEquals(0, harness.lease.admittedCount)
+        assertEquals(0, harness.lease.blockCount)
         assertEquals(before, harness.repository.load(harness.consumer))
         assertEquals("8", requireNotNull(before).state.extensionLane.lastAgentSeq)
     }
@@ -144,7 +139,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         )
         val store = SingleRowStore()
         val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
-        val lease = FakeActorApplyLease(authority)
+        val lease = RecordingApplyLease(authority)
         val runtime = AgentTranscriptLifecycleRuntimeConsumer(lease, repository)
         private val namespace: AgentTranscriptLifecycleDurableNamespace
 
@@ -192,47 +187,27 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
     }
 }
 
-private class FakeActorApplyLease(
-    initialAuthority: RelayV2RepositoryEffectAuthority,
+private class RecordingApplyLease(
+    private val expectedAuthority: RelayV2RepositoryEffectAuthority,
 ) : RelayV2RepositoryEffectApplyLeasePort {
-    private val lock = Any()
-    private var accepting: RelayV2RepositoryEffectAuthority? = initialAuthority
-    private var active = 0
-    private var drain: CompletableDeferred<Unit>? = null
-    var admittedCount: Int = 0
+    var blockCount: Int = 0
+        private set
+    var insideBlock: Boolean = false
         private set
 
     override suspend fun <T> withEffectApplyLease(
         authority: RelayV2RepositoryEffectAuthority,
         block: suspend () -> T,
     ): RelayV2EffectApplyResult<T> {
-        val admitted = synchronized(lock) {
-            if (accepting != authority) false else {
-                active += 1
-                admittedCount += 1
-                true
-            }
-        }
-        if (!admitted) return RelayV2EffectApplyResult.Stale
+        check(authority == expectedAuthority)
+        check(!insideBlock)
+        blockCount += 1
+        insideBlock = true
         return try {
             RelayV2EffectApplyResult.Applied(block())
         } finally {
-            val completed = synchronized(lock) {
-                active -= 1
-                if (active == 0) drain.also { drain = null } else null
-            }
-            completed?.complete(Unit)
+            insideBlock = false
         }
-    }
-
-    suspend fun disconnectAndDrain() {
-        val pending = synchronized(lock) {
-            accepting = null
-            if (active == 0) CompletableDeferred(Unit) else {
-                drain ?: CompletableDeferred<Unit>().also { drain = it }
-            }
-        }
-        pending.await()
     }
 }
 

@@ -15,7 +15,6 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectApplyResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectApplyLeasePort
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
-import java.util.concurrent.CancellationException
 
 /** Trusted call-site provenance. It is deliberately absent from the public frame. */
 internal sealed interface AgentTranscriptLifecycleTrustedIngress {
@@ -40,7 +39,6 @@ internal enum class AgentTranscriptLifecycleRuntimeUnavailableReason {
     EXACT_FENCE_MISMATCH,
     COMPLETE_CONSUMER_NOT_READY,
     STALE_GENERATION,
-    DURABLE_REPOSITORY_UNAVAILABLE,
 }
 
 internal sealed interface AgentTranscriptLifecycleRuntimeConsumeResult {
@@ -106,16 +104,8 @@ internal class AgentTranscriptLifecycleRuntimeConsumer(
             requestFence = ingress.requestFence,
             reason = status.reason.toReducerReason(),
         )
-        val result = try {
-            applyLease.withEffectApplyLease(fence.authority) {
-                durableRepository.reduceUnderApplyLease(fence.expectedNamespace, input)
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            return unavailable(
-                AgentTranscriptLifecycleRuntimeUnavailableReason.DURABLE_REPOSITORY_UNAVAILABLE,
-            )
+        val result = applyLease.withEffectApplyLease(fence.authority) {
+            durableRepository.reduceUnderApplyLease(fence.expectedNamespace, input)
         }
         return when (result) {
             RelayV2EffectApplyResult.Stale -> unavailable(
