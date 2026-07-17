@@ -33,6 +33,7 @@ const ACL_OTHER: u16 = 0x0020;
 const ACL_WRITE: u8 = 0b010;
 const MAX_ACL_XATTR: usize = 64 * 1024;
 
+const LINUX_EPERM: i32 = 1;
 const LINUX_EINTR: i32 = 4;
 const LINUX_EIO: i32 = 5;
 const LINUX_EACCES: i32 = 13;
@@ -960,8 +961,8 @@ pub(crate) fn classify_acl_xattr_errno(errno: i32) -> SysError {
         LINUX_ENODATA => SysError::NoData,
         LINUX_ERANGE => SysError::AclSizeChanged,
         LINUX_EIO => SysError::AclIo,
-        LINUX_EACCES | LINUX_ENOTSUP_OR_EOPNOTSUPP => SysError::AclUnprovable,
-        _ => SysError::AclUnprovable,
+        LINUX_EPERM | LINUX_EACCES | LINUX_ENOTSUP_OR_EOPNOTSUPP => SysError::AclUnprovable,
+        _ => SysError::AclIo,
     }
 }
 
@@ -1129,8 +1130,10 @@ fn map_container_open_error(error: SysError) -> OpenFailure {
 
 fn map_acl_error(error: SysError) -> OpenFailure {
     match error {
-        SysError::AclIo => PlatformStoreFailure::Io.into(),
-        _ => PlatformStoreFailure::PermissionInvalid.into(),
+        SysError::Access | SysError::AclUnprovable => {
+            PlatformStoreFailure::PermissionInvalid.into()
+        }
+        _ => PlatformStoreFailure::Io.into(),
     }
 }
 

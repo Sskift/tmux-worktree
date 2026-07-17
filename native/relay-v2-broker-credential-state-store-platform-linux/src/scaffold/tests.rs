@@ -608,12 +608,19 @@ fn account_home_traversal_enoent_is_identity_uncertain() {
 #[test]
 fn acl_cannot_prove_is_permission_invalid_but_explicit_io_remains_store_io() {
     // Linux ENOTSUP and EOPNOTSUPP share errno 95.
+    assert_eq!(classify_acl_xattr_errno(1), SysError::AclUnprovable);
     assert_eq!(classify_acl_xattr_errno(13), SysError::AclUnprovable);
     assert_eq!(classify_acl_xattr_errno(95), SysError::AclUnprovable);
-    assert_eq!(classify_acl_xattr_errno(12_345), SysError::AclUnprovable);
+    assert_eq!(classify_acl_xattr_errno(4), SysError::Interrupted);
+    assert_eq!(classify_acl_xattr_errno(34), SysError::AclSizeChanged);
+    assert_eq!(classify_acl_xattr_errno(61), SysError::NoData);
     assert_eq!(classify_acl_xattr_errno(5), SysError::AclIo);
+    // EBADF, ENOMEM, and an unknown errno remain real syscall/implementation I/O.
+    assert_eq!(classify_acl_xattr_errno(9), SysError::AclIo);
+    assert_eq!(classify_acl_xattr_errno(12), SysError::AclIo);
+    assert_eq!(classify_acl_xattr_errno(12_345), SysError::AclIo);
 
-    for error in [SysError::Access, SysError::AclUnprovable, SysError::Other] {
+    for error in [SysError::Access, SysError::AclUnprovable] {
         let syscalls = FakeSyscalls::existing();
         syscalls.mutate(|state| {
             state
@@ -626,17 +633,19 @@ fn acl_cannot_prove_is_permission_invalid_but_explicit_io_remains_store_io() {
         ));
     }
 
-    let io = FakeSyscalls::existing();
-    io.mutate(|state| {
-        state.access_acl.insert(Role::Home, access_acl(0o755, None));
-        state
-            .acl_read_errors
-            .insert((Role::Home, AclXattrKind::Access), SysError::AclIo);
-    });
-    assert!(matches!(
-        open_qualified(io),
-        Err(NativeStoreErrorCode::StoreIo)
-    ));
+    for error in [SysError::AclIo, SysError::Other] {
+        let io = FakeSyscalls::existing();
+        io.mutate(|state| {
+            state.access_acl.insert(Role::Home, access_acl(0o755, None));
+            state
+                .acl_read_errors
+                .insert((Role::Home, AclXattrKind::Access), error);
+        });
+        assert!(matches!(
+            open_qualified(io),
+            Err(NativeStoreErrorCode::StoreIo)
+        ));
+    }
 }
 
 #[test]
