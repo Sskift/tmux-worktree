@@ -402,6 +402,23 @@ mod tests {
     }
 
     #[test]
+    fn unpublished_encoding_failure_completes_real_process_bound_close_before_return() {
+        let (store, descriptor) = process_store();
+        let terminal = AtomicBool::new(false);
+
+        assert_eq!(
+            crate::close_unpublished_port_safely(store.as_ref(), &terminal),
+            Ok(())
+        );
+        assert!(terminal.load(Ordering::Acquire));
+        assert_eq!(descriptor.lock().unwrap().final_close_count, 1);
+        assert!(matches!(
+            store.admit(),
+            Err(NativeStoreErrorCode::StoreClosed)
+        ));
+    }
+
+    #[test]
     fn real_process_bound_tokens_are_transaction_identity_scoped_and_expire_on_settle() {
         let (store, _) = process_store();
         let terminal = Arc::new(AtomicBool::new(false));

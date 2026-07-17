@@ -462,6 +462,9 @@ fn resolved_promise(env: &Env, value: RawValue) -> Result<RawValue> {
 }
 
 fn create_binding_deferred(env: &Env) -> Result<(BindingDeferred, RawValue)> {
+    // Capture the dispatcher before allocating a Promise so a TSFN failure
+    // cannot strand a deferred that the binding can no longer complete.
+    let dispatcher = MainThreadDispatcher::new(env)?;
     let mut deferred = ptr::null_mut();
     let mut promise = ptr::null_mut();
     let status = unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) };
@@ -471,7 +474,7 @@ fn create_binding_deferred(env: &Env) -> Result<(BindingDeferred, RawValue)> {
     Ok((
         BindingDeferred {
             raw: deferred as usize,
-            dispatcher: MainThreadDispatcher::new(env)?,
+            dispatcher,
         },
         RawValue(promise),
     ))
@@ -705,6 +708,12 @@ struct CreatedStore<'env> {
     state: Arc<NapiStoreState>,
 }
 
+enum StoreObjectCreation<'env> {
+    Created(CreatedStore<'env>),
+    ClosedInvalid,
+    EncodingFailed(Arc<NapiStoreState>),
+}
+
 fn finish_native_close(
     store: &Arc<NapiStoreState>,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
@@ -718,14 +727,31 @@ fn finish_native_close(
     }
 }
 
-fn close_port_safely(store: &Arc<NapiStoreState>) -> std::result::Result<(), NativeStoreErrorCode> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.port.close()))
+fn close_port_safely(port: &dyn StorePort) -> std::result::Result<(), NativeStoreErrorCode> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| port.close()))
         .unwrap_or(Err(NativeStoreErrorCode::NativeInterfaceInvalid))
+}
+
+fn close_unpublished_port_safely(
+    port: &dyn StorePort,
+    terminal: &AtomicBool,
+) -> std::result::Result<(), NativeStoreErrorCode> {
+    terminal.store(true, Ordering::Release);
+    close_port_safely(port)
+}
+
+fn close_unpublished_store_safely(store: &Arc<NapiStoreState>) {
+    {
+        let mut state = lock_recover(&store.state);
+        state.admission_closed = true;
+    }
+    let outcome = close_unpublished_port_safely(store.port.as_ref(), store.terminal.as_ref());
+    finish_native_close(store, outcome);
 }
 
 fn run_close_worker(receiver: mpsc::Receiver<Arc<NapiStoreState>>) {
     while let Ok(store) = receiver.recv() {
-        let outcome = close_port_safely(&store);
+        let outcome = close_port_safely(store.port.as_ref());
         finish_native_close(&store, outcome);
     }
 }
@@ -738,7 +764,7 @@ fn finish_failed_close_dispatch(store: Arc<NapiStoreState>) {
         // A disconnected serial worker cannot own an entered transaction. The
         // synchronous fallback is therefore safe and still releases the common
         // ProcessBound descriptor after both worker channels have failed.
-        let _ = close_port_safely(&store);
+        let _ = close_port_safely(store.port.as_ref());
     }
 }
 
@@ -1206,7 +1232,7 @@ fn drain_store_worker(receiver: &mpsc::Receiver<StoreWorkerCommand>) {
                 let _ = reject_unstarted(command, NativeStoreErrorCode::StoreClosed);
             }
             StoreWorkerCommand::CloseAfterWorkerFailure(store) => {
-                let _ = close_port_safely(&store);
+                let _ = close_port_safely(store.port.as_ref());
             }
         }
     }
@@ -1217,7 +1243,7 @@ fn run_store_worker(receiver: mpsc::Receiver<StoreWorkerCommand>) {
         let command = match worker_command {
             StoreWorkerCommand::Run(command) => command,
             StoreWorkerCommand::CloseAfterWorkerFailure(store) => {
-                let _ = close_port_safely(&store);
+                let _ = close_port_safely(store.port.as_ref());
                 continue;
             }
         };
@@ -1279,19 +1305,37 @@ fn run_exclusive(
     store: Arc<NapiStoreState>,
     callback_value: Unknown<'_>,
 ) -> Result<RawValue> {
-    let (outer, promise) = create_binding_deferred(env)?;
+    let (outer, promise) = match create_binding_deferred(env) {
+        Ok(value) => value,
+        Err(_) => {
+            clear_pending_exception(env);
+            terminal_fence(&store);
+            return rejected_promise(env, NativeStoreErrorCode::NativeInterfaceInvalid);
+        }
+    };
     let dispatch = match MainThreadDispatcher::new(env) {
         Ok(dispatch) => dispatch,
         Err(_) => {
+            clear_pending_exception(env);
+            terminal_fence(&store);
             let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
             return Ok(promise);
         }
     };
-    let callback = match Function::<RawValue, RawValue>::from_unknown(callback_value)
-        .and_then(|callback| callback.create_ref())
-    {
+    let callback = match Function::<RawValue, RawValue>::from_unknown(callback_value) {
         Ok(callback) => callback,
         Err(_) => {
+            if !complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid)) {
+                terminal_fence(&store);
+            }
+            return Ok(promise);
+        }
+    };
+    let callback = match callback.create_ref() {
+        Ok(callback) => callback,
+        Err(_) => {
+            clear_pending_exception(env);
+            terminal_fence(&store);
             let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
             return Ok(promise);
         }
@@ -1300,7 +1344,9 @@ fn run_exclusive(
     let state = lock_recover(&store.state);
     if state.admission_closed {
         drop(state);
-        let _ = complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed));
+        if !complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed)) {
+            terminal_fence(&store);
+        }
         return Ok(promise);
     }
     let admission = match store.port.admit() {
@@ -1339,7 +1385,7 @@ fn create_store_object<'env>(
     env: &'env Env,
     port: Box<dyn StorePort>,
     intrinsics: Arc<Intrinsics>,
-) -> Result<Option<CreatedStore<'env>>> {
+) -> StoreObjectCreation<'env> {
     let (run_sender, run_receiver) = mpsc::channel();
     let (close_sender, close_receiver) = mpsc::channel();
     let store = Arc::new(NapiStoreState {
@@ -1358,22 +1404,16 @@ fn create_store_object<'env>(
         .spawn(move || run_store_worker(run_receiver))
         .is_err()
     {
-        store.terminal.store(true, Ordering::Release);
-        lock_recover(&store.state).begin_close(None);
-        let _ = close_port_safely(&store);
-        finish_native_close(&store, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
-        return Ok(None);
+        close_unpublished_store_safely(&store);
+        return StoreObjectCreation::ClosedInvalid;
     }
     if thread::Builder::new()
         .name("relay-v2-state-store-close".to_owned())
         .spawn(move || run_close_worker(close_receiver))
         .is_err()
     {
-        store.terminal.store(true, Ordering::Release);
-        lock_recover(&store.state).begin_close(None);
-        let _ = close_port_safely(&store);
-        finish_native_close(&store, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
-        return Ok(None);
+        close_unpublished_store_safely(&store);
+        return StoreObjectCreation::ClosedInvalid;
     }
 
     let result = (|| -> Result<Object<'env>> {
@@ -1406,15 +1446,13 @@ fn create_store_object<'env>(
         define_own_data(env, &mut object, "close", close)?;
         Ok(object)
     })();
-    if result.is_err() {
-        terminal_fence(&store);
-    }
-    result.map(|object| {
-        Some(CreatedStore {
+    match result {
+        Ok(object) => StoreObjectCreation::Created(CreatedStore {
             object,
             state: store,
-        })
-    })
+        }),
+        Err(_) => StoreObjectCreation::EncodingFailed(store),
+    }
 }
 
 fn open_binding<'env>(
@@ -1437,12 +1475,20 @@ fn open_binding<'env>(
             return create_invalid_open(env, NativeStoreErrorCode::NativeInterfaceInvalid);
         }
     };
+    // Allocate the exact fallback before platform open. Once native authority
+    // has been obtained, no JS encoding failure needs to allocate or can
+    // dynamically throw before the authoritative close barrier completes.
+    let native_interface_invalid =
+        create_invalid_open(env, NativeStoreErrorCode::NativeInterfaceInvalid)?;
     match open_platform_store(lifecycle, &trusted_home) {
         Ok(port) => {
-            let created = match create_store_object(env, port, intrinsics)? {
-                Some(store) => store,
-                None => {
-                    return create_invalid_open(env, NativeStoreErrorCode::NativeInterfaceInvalid);
+            let created = match create_store_object(env, port, intrinsics) {
+                StoreObjectCreation::Created(store) => store,
+                StoreObjectCreation::ClosedInvalid => return Ok(native_interface_invalid),
+                StoreObjectCreation::EncodingFailed(store) => {
+                    clear_pending_exception(env);
+                    close_unpublished_store_safely(&store);
+                    return Ok(native_interface_invalid);
                 }
             };
             let state = Arc::clone(&created.state);
@@ -1453,10 +1499,14 @@ fn open_binding<'env>(
                 define_own_data(env, &mut result, "store", created.object)?;
                 Ok(result)
             })();
-            if result.is_err() {
-                terminal_fence(&state);
+            match result {
+                Ok(result) => Ok(result),
+                Err(_) => {
+                    clear_pending_exception(env);
+                    close_unpublished_store_safely(&state);
+                    Ok(native_interface_invalid)
+                }
             }
-            result
         }
         Err(code) => create_invalid_open(env, code),
     }
