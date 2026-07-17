@@ -31,6 +31,8 @@ const ENOENT: i32 = 2;
 const EACCES: i32 = 13;
 const EAGAIN: i32 = 11;
 const EEXIST: i32 = 17;
+const ENOTDIR: i32 = 20;
+const EISDIR: i32 = 21;
 const ERANGE: i32 = 34;
 const ELOOP: i32 = 40;
 const ENODATA: i32 = 61;
@@ -511,6 +513,7 @@ fn errno_to_sys(errno: i32) -> SysError {
         ENOENT => SysError::NotFound,
         EEXIST => SysError::AlreadyExists,
         ELOOP => SysError::Symlink,
+        ENOTDIR | EISDIR => SysError::WrongType,
         EACCES => SysError::Access,
         EAGAIN => SysError::Again,
         EINTR => SysError::Interrupted,

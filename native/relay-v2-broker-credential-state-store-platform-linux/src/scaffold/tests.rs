@@ -90,6 +90,9 @@ struct FakeState {
     container: Option<Metadata>,
     home_open_error: Option<SysError>,
     private_open_error: Option<SysError>,
+    container_open_error: Option<SysError>,
+    home_fstat_steps: VecDeque<Result<Metadata, SysError>>,
+    home_close_error: Option<SysError>,
     cloexec: bool,
     lock_error: Option<SysError>,
     access_acl: HashMap<Role, Vec<u8>>,
@@ -122,6 +125,9 @@ impl FakeSyscalls {
                 )),
                 home_open_error: None,
                 private_open_error: None,
+                container_open_error: None,
+                home_fstat_steps: VecDeque::new(),
+                home_close_error: None,
                 cloexec: true,
                 lock_error: None,
                 access_acl: HashMap::new(),
@@ -296,6 +302,9 @@ impl LinuxSyscalls for FakeSyscalls {
             return Err(SysError::NotFound);
         }
         state.calls.push(Call::OpenFile { flags, mode });
+        if let Some(error) = state.container_open_error {
+            return Err(error);
+        }
         if flags & O_CREAT != 0 {
             if state.container.is_some() {
                 return Err(SysError::AlreadyExists);
@@ -323,7 +332,10 @@ impl LinuxSyscalls for FakeSyscalls {
                 links: 1,
                 size: 0,
             }),
-            Role::Home => Ok(state.home),
+            Role::Home => match state.home_fstat_steps.pop_front() {
+                Some(result) => result,
+                None => Ok(state.home),
+            },
             Role::Private => state.private.ok_or(SysError::NotFound),
             Role::Container => state.container.ok_or(SysError::NotFound),
         }
@@ -503,6 +515,11 @@ impl LinuxSyscalls for FakeSyscalls {
         let role = Self::role(&state, fd)?;
         state.calls.push(Call::Close(role));
         state.roles.remove(&fd);
+        if role == Role::Home {
+            if let Some(error) = state.home_close_error.take() {
+                return Err(error);
+            }
+        }
         if role == Role::Container {
             if let Some(error) = state.container_close_error.take() {
                 return Err(error);
@@ -558,6 +575,14 @@ fn acl_bytes(entries: &[(u16, u8, u32)]) -> Vec<u8> {
     bytes
 }
 
+fn close_count(syscalls: &FakeSyscalls, role: Role) -> usize {
+    syscalls
+        .calls()
+        .iter()
+        .filter(|call| matches!(call, Call::Close(actual) if *actual == role))
+        .count()
+}
+
 #[test]
 fn empty_allowlist_returns_before_registry_and_every_mutation() {
     let syscalls = FakeSyscalls::existing();
@@ -601,6 +626,68 @@ fn account_home_traversal_enoent_is_identity_uncertain() {
     syscalls.mutate(|state| state.home_open_error = Some(SysError::NotFound));
     assert!(matches!(
         open_qualified(syscalls),
+        Err(NativeStoreErrorCode::StoreIdentityUncertain)
+    ));
+}
+
+#[test]
+fn verify_account_home_final_failures_close_once_and_preserve_primary() {
+    let fstat_failure = FakeSyscalls::existing();
+    fstat_failure.mutate(|state| {
+        let home = state.home;
+        state.home_fstat_steps = VecDeque::from([Ok(home), Ok(home), Err(SysError::Other)]);
+    });
+    assert!(matches!(
+        open_qualified(Arc::clone(&fstat_failure)),
+        Err(NativeStoreErrorCode::StoreIo)
+    ));
+    assert_eq!(close_count(&fstat_failure, Role::Home), 1);
+
+    let metadata_failure = FakeSyscalls::existing();
+    metadata_failure.mutate(|state| {
+        state.home.mode = 0o777;
+        state.home_close_error = Some(SysError::Interrupted);
+    });
+    assert!(matches!(
+        open_qualified(Arc::clone(&metadata_failure)),
+        Err(NativeStoreErrorCode::StorePermissionInvalid)
+    ));
+    assert_eq!(close_count(&metadata_failure, Role::Home), 1);
+
+    let acl_failure = FakeSyscalls::existing();
+    acl_failure.mutate(|state| {
+        state
+            .access_acl
+            .insert(Role::Home, access_acl(0o755, Some((ACL_WRITE, 0b111))));
+        state.home_close_error = Some(SysError::Interrupted);
+    });
+    assert!(matches!(
+        open_qualified(Arc::clone(&acl_failure)),
+        Err(NativeStoreErrorCode::StorePermissionInvalid)
+    ));
+    assert_eq!(close_count(&acl_failure, Role::Home), 1);
+}
+
+#[test]
+fn wrong_type_path_and_container_open_races_are_identity_uncertain() {
+    let account_home = FakeSyscalls::existing();
+    account_home.mutate(|state| state.home_open_error = Some(SysError::WrongType));
+    assert!(matches!(
+        open_qualified(account_home),
+        Err(NativeStoreErrorCode::StoreIdentityUncertain)
+    ));
+
+    let private = FakeSyscalls::existing();
+    private.mutate(|state| state.private_open_error = Some(SysError::WrongType));
+    assert!(matches!(
+        open_qualified(private),
+        Err(NativeStoreErrorCode::StoreIdentityUncertain)
+    ));
+
+    let container = FakeSyscalls::existing();
+    container.mutate(|state| state.container_open_error = Some(SysError::WrongType));
+    assert!(matches!(
+        open_qualified(container),
         Err(NativeStoreErrorCode::StoreIdentityUncertain)
     ));
 }

@@ -86,6 +86,7 @@ pub(crate) enum SysError {
     NotFound,
     AlreadyExists,
     Symlink,
+    WrongType,
     Access,
     Again,
     Interrupted,
@@ -463,8 +464,7 @@ fn verify_account_home<S: LinuxSyscalls>(
         }) {
             Ok(fd) => fd,
             Err(error) => {
-                let _ = syscalls.close(current);
-                return Err(map_path_open_error(error));
+                return fail_pre_registry_directory(&syscalls, current, map_path_open_error(error));
             }
         };
         let stable = stable_directory_entry(syscalls.as_ref(), current, component, child);
@@ -479,23 +479,39 @@ fn verify_account_home<S: LinuxSyscalls>(
         }
         current = child;
     }
-    let metadata = syscalls.fstat(current).map_err(map_io)?;
+    let metadata = match syscalls.fstat(current) {
+        Ok(metadata) => metadata,
+        Err(error) => return fail_pre_registry_directory(&syscalls, current, map_io(error)),
+    };
     if metadata.kind != FileKind::Directory
         || metadata.uid != credentials.effective_uid
         || metadata.mode & 0o022 != 0
     {
-        let _ = syscalls.close(current);
-        return Err(PlatformStoreFailure::PermissionInvalid.into());
+        return fail_pre_registry_directory(
+            &syscalls,
+            current,
+            PlatformStoreFailure::PermissionInvalid.into(),
+        );
     }
     if let Err(error) = validate_acl(syscalls.as_ref(), current, metadata, true) {
-        let _ = syscalls.close(current);
-        return Err(error);
+        return fail_pre_registry_directory(&syscalls, current, error);
     }
     Ok(VerifiedHome {
         syscalls,
         fd: current,
         metadata,
     })
+}
+
+fn fail_pre_registry_directory<S: LinuxSyscalls, T>(
+    syscalls: &Arc<S>,
+    fd: i32,
+    primary: OpenFailure,
+) -> Result<T, OpenFailure> {
+    // Pre-registry cleanup gets one raw close attempt with no EINTR retry.
+    // The already-observed primary failure retains precedence over cleanup.
+    let _ = syscalls.close(fd);
+    Err(primary)
 }
 
 fn stable_directory_entry<S: LinuxSyscalls>(
@@ -1083,7 +1099,9 @@ fn map_account_error(error: SysError) -> OpenFailure {
 
 fn map_path_open_error(error: SysError) -> OpenFailure {
     match error {
-        SysError::NotFound | SysError::Symlink => PlatformStoreFailure::IdentityUncertain.into(),
+        SysError::NotFound | SysError::Symlink | SysError::WrongType => {
+            PlatformStoreFailure::IdentityUncertain.into()
+        }
         SysError::Access | SysError::AclUnprovable => {
             PlatformStoreFailure::PermissionInvalid.into()
         }
@@ -1120,7 +1138,7 @@ fn map_preflight_error(error: SysError) -> OpenFailure {
 
 fn map_container_open_error(error: SysError) -> OpenFailure {
     match error {
-        SysError::NotFound | SysError::AlreadyExists | SysError::Symlink => {
+        SysError::NotFound | SysError::AlreadyExists | SysError::Symlink | SysError::WrongType => {
             PlatformStoreFailure::IdentityUncertain.into()
         }
         SysError::Access => PlatformStoreFailure::PermissionInvalid.into(),
