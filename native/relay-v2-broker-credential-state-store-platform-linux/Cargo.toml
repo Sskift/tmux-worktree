@@ -1,0 +1,8 @@
+[package]
+name = "relay-v2-broker-credential-state-store-platform-linux"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+relay-v2-broker-credential-state-store-platform-common = { path = "../relay-v2-broker-credential-state-store-platform-common" }
