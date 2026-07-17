@@ -488,10 +488,10 @@ fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
     Ok(found == expected)
 }
 
-fn data_descriptor_value<'env, T: FromNapiValue>(
+fn data_descriptor_value<'env>(
     descriptors: &Object<'env>,
     name: &str,
-) -> Result<Option<T>> {
+) -> Result<Option<Unknown<'env>>> {
     let Some(descriptor) = descriptors.get::<Object<'env>>(name)? else {
         return Ok(None);
     };
@@ -516,12 +516,20 @@ fn decode_open_options(
     if !exact_string_keys(&keys, &["trustedHome", "maxStateBytes"])? {
         return Ok(None);
     }
-    let Some(trusted_home) = data_descriptor_value::<String>(&descriptors, "trustedHome")? else {
+    let Some(trusted_home) = data_descriptor_value(&descriptors, "trustedHome")? else {
         return Ok(None);
     };
-    let Some(max_state_bytes) = data_descriptor_value::<f64>(&descriptors, "maxStateBytes")? else {
+    if trusted_home.get_type()? != ValueType::String {
+        return Ok(None);
+    }
+    let trusted_home = String::from_unknown(trusted_home)?;
+    let Some(max_state_bytes) = data_descriptor_value(&descriptors, "maxStateBytes")? else {
         return Ok(None);
     };
+    if max_state_bytes.get_type()? != ValueType::Number {
+        return Ok(None);
+    }
+    let max_state_bytes = f64::from_unknown(max_state_bytes)?;
     if trusted_home.is_empty()
         || trusted_home.as_bytes().contains(&0)
         || !Path::new(&trusted_home).is_absolute()
@@ -1356,9 +1364,13 @@ fn open_binding<'env>(
         Ok(lifecycle) => lifecycle,
         Err(code) => return create_invalid_open(env, *code),
     };
-    let trusted_home = match decode_open_options(env, &intrinsics, input)? {
-        Some(value) => value,
-        None => return create_invalid_open(env, NativeStoreErrorCode::InvalidArgument),
+    let trusted_home = match decode_open_options(env, &intrinsics, input) {
+        Ok(Some(value)) => value,
+        Ok(None) => return create_invalid_open(env, NativeStoreErrorCode::InvalidArgument),
+        Err(_) => {
+            clear_pending_exception(env);
+            return create_invalid_open(env, NativeStoreErrorCode::NativeInterfaceInvalid);
+        }
     };
     match open_platform_store(lifecycle, &trusted_home) {
         Ok(port) => {

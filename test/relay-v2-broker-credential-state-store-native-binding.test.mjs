@@ -96,6 +96,47 @@ test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and clo
     assert.equal(capability.nativeAbi, "napi");
     assert.equal(capability.interfaceVersion, 1);
 
+    const wrongTypeOpen = binding.openRelayV2BrokerCredentialStateStore(Object.freeze({
+      trustedHome: 7,
+      maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
+    }));
+    assert.deepEqual(exactOwnDataKeys(wrongTypeOpen), ["error", "status"]);
+    assert.deepEqual(exactOwnDataKeys(wrongTypeOpen.error), ["code"]);
+    assert.deepEqual(wrongTypeOpen, {
+      status: "invalid",
+      error: { code: "INVALID_ARGUMENT" },
+    });
+
+    const hostileOptions = [
+      ["ownKeys trap", new Proxy({}, {
+        ownKeys() { throw new Error("must not escape"); },
+      })],
+      ["getOwnPropertyDescriptor trap", new Proxy({}, {
+        ownKeys() { return ["trustedHome", "maxStateBytes"]; },
+        getOwnPropertyDescriptor() { throw new Error("must not escape"); },
+      })],
+      ["invalid descriptor conversion", new Proxy({}, {
+        ownKeys() { return ["trustedHome", "maxStateBytes"]; },
+        getOwnPropertyDescriptor() {
+          return { configurable: true, enumerable: true, get: 1 };
+        },
+      })],
+    ];
+    for (const [label, hostile] of hostileOptions) {
+      const beforeHostileOpen = setterCalls;
+      let hostileResult;
+      assert.doesNotThrow(() => {
+        hostileResult = binding.openRelayV2BrokerCredentialStateStore(hostile);
+      }, label);
+      assert.equal(setterCalls, beforeHostileOpen, `${label} result bypasses prototype setters`);
+      assert.deepEqual(exactOwnDataKeys(hostileResult), ["error", "status"]);
+      assert.deepEqual(exactOwnDataKeys(hostileResult.error), ["code"]);
+      assert.deepEqual(hostileResult, {
+        status: "invalid",
+        error: { code: "NATIVE_INTERFACE_INVALID" },
+      });
+    }
+
     const options = Object.freeze({
       trustedHome: nonAccountHome,
       maxStateBytes: stateStore.RELAY_V2_BROKER_CREDENTIAL_STATE_MAX_BYTES,
