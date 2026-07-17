@@ -514,7 +514,6 @@ impl LinuxSyscalls for FakeSyscalls {
         let mut state = self.state.lock().expect("fake state");
         let role = Self::role(&state, fd)?;
         state.calls.push(Call::Close(role));
-        state.roles.remove(&fd);
         if role == Role::Home {
             if let Some(error) = state.home_close_error.take() {
                 return Err(error);
@@ -525,6 +524,7 @@ impl LinuxSyscalls for FakeSyscalls {
                 return Err(error);
             }
         }
+        state.roles.remove(&fd);
         Ok(())
     }
 }
