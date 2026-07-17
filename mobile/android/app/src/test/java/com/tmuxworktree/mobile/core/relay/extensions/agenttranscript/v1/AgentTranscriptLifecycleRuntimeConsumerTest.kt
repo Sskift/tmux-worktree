@@ -70,6 +70,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             timelineEpoch = "timeline-1",
         )
         val before = harness.repository.load(harness.consumer)
+        val statusAvailable = fixtureWire("status-available")
         val cases = listOf(
             CursorCase(
                 "status-available",
@@ -102,6 +103,49 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             )
         }
 
+        val fenceMismatches = listOf(
+            FenceMismatchCase(
+                "public session identity",
+                statusAvailable.replaceSingleField(
+                    "\"sessionId\":\"session-1\"",
+                    "\"sessionId\":\"session-other\"",
+                ),
+                harness.fence(),
+            ),
+            FenceMismatchCase(
+                "actor principal authority",
+                statusAvailable,
+                harness.fence(
+                    authority = harness.authority.copy(principalId = "principal-other"),
+                ),
+            ),
+            FenceMismatchCase(
+                "trusted ingress",
+                statusAvailable,
+                harness.fence(ingress = AgentTranscriptLifecycleTrustedIngress.Live),
+            ),
+            FenceMismatchCase(
+                "timeline lineage",
+                fixtureWire("live-entry-redacted").replaceSingleField(
+                    "\"timelineEpoch\":\"timeline-1\"",
+                    "\"timelineEpoch\":\"timeline-other\"",
+                ),
+                harness.fence(ingress = AgentTranscriptLifecycleTrustedIngress.Live),
+            ),
+        )
+        fenceMismatches.forEach { case ->
+            val result = harness.runtime.consume(case.wire, case.fence)
+            assertEquals(
+                case.name,
+                AgentTranscriptLifecycleRuntimeConsumeResult.Unavailable(
+                    AgentTranscriptLifecycleRuntimeUnavailableReason.EXACT_FENCE_MISMATCH,
+                ),
+                result,
+            )
+            assertEquals(case.name, 0, harness.lease.blockCount)
+            assertEquals(case.name, before, harness.repository.load(harness.consumer))
+        }
+
         assertEquals(0, harness.lease.blockCount)
         assertEquals(before, harness.repository.load(harness.consumer))
         assertEquals("8", requireNotNull(before).state.extensionLane.lastAgentSeq)
@@ -110,6 +154,12 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
     private data class CursorCase(
         val fixture: String,
         val ingress: AgentTranscriptLifecycleTrustedIngress,
+    )
+
+    private data class FenceMismatchCase(
+        val name: String,
+        val wire: ByteArray,
+        val fence: AgentTranscriptLifecycleRuntimeFence,
     )
 
     private class Harness(
@@ -128,7 +178,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             sessionId = sessionId,
         )
         private val generation = RelayV2EffectGeneration("profile-1", 7, 11)
-        private val authority = RelayV2RepositoryEffectAuthority(
+        val authority = RelayV2RepositoryEffectAuthority(
             generation = generation,
             profileId = "profile-1",
             profileActivationGeneration = 7,
@@ -170,6 +220,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
 
         fun fence(
             negotiated: Boolean = true,
+            authority: RelayV2RepositoryEffectAuthority = this.authority,
             ingress: AgentTranscriptLifecycleTrustedIngress =
                 AgentTranscriptLifecycleTrustedIngress.CorrelatedStatus(
                     AgentLocalRequestFence("1", statusRequestId),
@@ -291,4 +342,18 @@ private fun fixtureWire(name: String): ByteArray {
     val fixture = fixtures.filterIsInstance<Map<String, Any?>>()
         .single { it["name"] == name }
     return (fixture["wire"] as String).toByteArray(StandardCharsets.UTF_8)
+}
+
+private fun ByteArray.replaceSingleField(
+    original: String,
+    replacement: String,
+): ByteArray {
+    val source = toString(StandardCharsets.UTF_8)
+    val first = source.indexOf(original)
+    assertTrue("fixture must contain $original", first >= 0)
+    assertEquals("fixture field must be unique", first, source.lastIndexOf(original))
+    val changed = source.replace(original, replacement)
+    assertFalse("fixture bytes must change", source == changed)
+    assertTrue("fixture must contain $replacement", replacement in changed)
+    return changed.toByteArray(StandardCharsets.UTF_8)
 }
