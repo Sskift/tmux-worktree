@@ -1,3 +1,8 @@
 <resources>
     <string name="app_name">tw mobile</string>
+    <string name="agent_lifecycle_notification_channel_name">Agent lifecycle</string>
+    <string name="agent_lifecycle_notification_channel_description">Agent waiting, failed, and completed status</string>
+    <string name="agent_lifecycle_notification_waiting_title">Agent is waiting for you</string>
+    <string name="agent_lifecycle_notification_failed_title">Agent failed</string>
+    <string name="agent_lifecycle_notification_completed_title">Agent completed</string>
 </resources>
