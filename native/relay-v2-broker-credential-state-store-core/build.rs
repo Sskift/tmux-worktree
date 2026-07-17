@@ -62,15 +62,13 @@ fn main() {
         member(&manifest, "contract"),
         "tmux-worktree-relay-v2-broker-credential-state-store"
     );
-    assert_eq!(
-        unsigned(member(&manifest, "contractVersion"), "contractVersion"),
-        1
-    );
     assert_eq!(member(&manifest, "status"), "frozen");
 
-    // N1 consumes only the frozen binary/publication section. Native interface,
-    // N-API, loader capability, secure-open, and platform error unions are not
-    // inputs to this crate and deliberately never enter its generated API.
+    // N1 consumes only the independently versioned frozen binary/publication
+    // section. Top-level contract revisions may tighten platform secure-open,
+    // locking, or durability qualification without changing N1's format.
+    // Native interface, N-API, loader capability, and platform error unions are
+    // not inputs to this crate and deliberately never enter its generated API.
     let binary = member(&manifest, "binaryStorage");
     let container = member(binary, "container");
     let regions = member(container, "regions");

@@ -1,0 +1,12 @@
+[package]
+name = "relay-v2-broker-credential-state-store-platform-common"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[dependencies]
+relay-v2-broker-credential-state-store-core = { path = "../relay-v2-broker-credential-state-store-core" }
+
+[build-dependencies]
+serde_json = "1"

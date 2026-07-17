@@ -1,8 +1,10 @@
 # Relay v2 Broker Credential State Store v1
 
-状态：**Frozen native storage contract；已有独立未接线的纯 Rust binary/publication core、TypeScript closed decoder/wrapper、未接线 optional loader 与 credential authority source foundation，没有 N-API binary、Darwin/Linux platform adapter、production authority injection、ready capability 或 production wiring。**
+状态：**Frozen native storage contract revision 2；interface/storage/binary/fixture 仍为 v1。已有独立未接线的纯 Rust binary/publication core、未接线 platform-common lifecycle owner、TypeScript closed decoder/wrapper、未接线 optional loader 与 credential authority source foundation；仍没有 N-API binary、Darwin/Linux platform adapter、production authority injection、ready capability 或 production wiring。**
 
 本目录冻结 Relay v2 broker credential 状态的唯一 native storage seam。它不修改 Relay v2 public wire，不启用 enrollment，不重新引入已被拒绝且未纳入当前交付源码的 unsafe BAU path/JSON 设计，也不改变 Relay v1。机器常量和 fixture 以 [`manifest.json`](manifest.json) 为准。
+
+顶层 `contractVersion=2` 只表示 secure-open、同进程 registry/fork/close lifecycle 与 deny-by-default durability qualification 语义已经被显式冻结。它没有升级 N-API `interfaceVersion=1`、capability `storageFormatVersion=1`、`binaryStorage.formatVersion=1`、header format 1、`privateLocation.derivationVersion=1` 或 `fixtureFormatVersion=1`；artifact 名、magic、offset、length、fixture 和 TypeScript ABI 均保持不变。N1 因而只消费独立版本化的 binary/publication section，不把顶层 contract revision 当作 binary format version。
 
 ## Owner 与 deep port
 
@@ -35,6 +37,8 @@ Interface 不接受或暴露 state/lock/temp path、fd、directory handle、devi
 ```
 
 `trustedHome` 不能由 binding 隐式读取 `HOME`，也不能替换为 derived state/lock/temp path。它必须是 caller 已信任的 account home **root 本身**；任何 descendant/subpath 都不是合法 `trustedHome`。TypeScript 边界先在一个 `try` 内取得 exact own **data descriptor** snapshot；accessor 被拒绝，hostile getter 不执行，每个 data value 只捕获一次。Native open 必须重新验证该绝对路径确为 caller-owned account home root。`maxStateBytes` 必须精确等于冻结值 `67,108,864`，caller 不可调小或调大；它同时是 native read/publish 的实际 admission upper limit，不是 advisory metadata。
+
+未接线的 [`native/relay-v2-broker-credential-state-store-platform-common`](../../../../native/relay-v2-broker-credential-state-store-platform-common/) 是未来 N2/N3/N-API 对 N1 的唯一 production consumer。其 build script 是 `privateLocation` 的唯一 native consumer并生成 private-field、无 public constructor 的 immutable container spec；runtime要求 composition先执行显式 `initialize_process_lifecycle()`并把opaque token传给reserve，以 `(verifiedHome dev, ino, RelayV2BrokerCredentialStateStoreV1)`在任何container fd前进入 `OpenReservation → DescriptorOpenAdmission → OpenedContainer` typestate。Common拥有PID/descriptor fence、panic-aware permanent poison、common-owned exactly-once final close、private N1 adapter bridge，以及不暴露 raw N1 store/ticket/lease/revision/snapshot 的 process-bound wrappers。Platform通过public `SoleContainer`提供read/write/barrier/final-close primitive，但该trait不出现N1 `PublicationAction`；attach后sole container由common持有，N2/N3/N-API不得直接依赖N1或复制registry/PID/close状态机。N1 self-check失败保留primary并受控close；ordinary close先关闭registry admission再drain已admitted work；publication boundary的`Uncertain`不被same-PID registry poison改写。该owner仍不接收`trustedHome`、不构造`PathBuf`，也不实现secure path、真实fd/syscall/filesystem/durability、kernel lock或N-API。Future N-API必须在任何可能fork前eager initialize；父从未load/init就fork的ancestry无法观察，当前也没有真实OS fork证据。
 
 ## Raw N-API 与 TypeScript 边界
 
@@ -82,9 +86,29 @@ Capability/open 都是 exact `supported|unsupported|invalid` closed union。`sup
 
 它们绝不能伪装成 `missing` 后重建。Error seam 只传 `{code}`，不传动态 message、path、errno detail 或 cleanup object。只有 `STORE_BUSY` retryable；任何 unsupported/invalid 都不授权 v1 fallback、prototype fallback、v2 capability 或 alternate store。
 
+## Secure open、registry、fork 与 close
+
+Contract revision 2 把 platform open 冻结为一条顺序唯一、mutation 前 fail-closed 的路径：
+
+1. 在任何 path 观察前 snapshot native real/effective uid 与 gid；要求 real uid 等于 effective uid、real gid 等于 effective gid，且 real/effective uid 都不是 0。gid=0 本身不等同 root，也不单独拒绝。Credential/root规则不满足统一是 `STORE_PERMISSION_INVALID`。
+2. 从 native account database 取得 effective uid 的 home root，要求 caller `trustedHome` 与其绝对 component sequence 精确相等，并用 read-only no-follow traversal证明 owner、mode 与 ACL。Account entry不存在或 caller/account home不匹配是 `STORE_PERMISSION_INVALID`；account DB真实 system/I/O failure是 `STORE_IO`。Home 不可 group/other write，ACL 不得授予非 owner namespace mutation；path/entry observation race或无法证明 identity是 `STORE_IDENTITY_UNCERTAIN`。
+3. Existing private directory 必须 owner uid/gid匹配且 exact `0700`；container 必须 regular、owner uid/gid匹配、exact `0600`、`nlink=1`。Existing object 不允许通过 `chmod` 修复。共享 ACL 规则是不允许 ACL 给 non-owner 扩张 mode bit 之外的权限，也不允许 default/inheritable ACL 放宽后代；Darwin 按 NFSv4 effective ALLOW、Linux 按 POSIX ACL+mask 证明。无法证明是 `STORE_PERMISSION_INVALID`，真实 ACL read I/O failure 是 `STORE_IO`。
+4. 在 private directory 已存在时对它、否则对 verified home 做只读 filesystem/storage probe并采集 qualification evidence。必须在 process registry、`mkdir/create/chmod/truncate/write` 之前精确命中 release-baked qualified record；随后才 reserve registry，并在 mutation 前重验 target fingerprint。
+5. 按 manifest 的 exact component 做 private directory traversal/create。Existing leaf在任何 container open前先用 `fstatat(parentFd, leaf, AT_SYMLINK_NOFOLLOW)` 证明 regular/owner uid+gid/exact `0600`/`nlink=1`/exact length；该 preflight不能打开另一个 container fd，symlink、special、link或无法证明 type/identity必须 preserve并 `STORE_IDENTITY_UNCERTAIN`。Existing随后只能 `openat(parentFd, leaf, O_RDWR|O_NOFOLLOW|O_CLOEXEC, 0600)`；create只能 `openat(..., O_RDWR|O_NOFOLLOW|O_CLOEXEC|O_CREAT|O_EXCL, 0600)`，禁止 `O_TRUNC`/`O_EXLOCK`，并用 `F_GETFD`证明 `FD_CLOEXEC`。Existing绝不 `fchmod`修复；new object只可在 qualification之后 `fchmod`收敛 exact `0600`。取得进程内唯一 container fd后才取 lock并完成初始身份/安全证明。Existing container 在 open 时就必须是 exact `134,217,984` bytes；new container 完成 initialization 后必须达到该 exact length。Existing self-check或 new initialization及 creation durability完成后，执行 final A/B/C proof并关闭所有 directory fd，再以 by-value handoff 一步转换为只剩 sole container descriptor 的 N1 store。
+
+Final stable proof 固定为 `A=fstat(fd)`、`B=fstatat(parent, leaf, AT_SYMLINK_NOFOLLOW)`、`C=fstat(fd)`；A/B/C 的 device+inode必须一致，file type、uid、gid、mode、link count和 size保持稳定，且 existing/open 与 new/init 后的 final size都必须是 `134,217,984`。完成该 named proof 后不再做 named lookup；final proof + directory-fd close之后的 by-value handoff就是 descriptor-only转换点，handoff 后只能剩 container fd。观测到 race 必须 `STORE_IDENTITY_UNCERTAIN`。同 uid 的任意外部 direct open 或 namespace mutation不在 trusted runtime threat model 内，但这不允许忽略已经观测到的 race。
+
+跨 Darwin/Linux 的锁只允许同一 fd 上 nonblocking traditional process-owned whole-file POSIX record lock：`fcntl(F_SETLK, {F_WRLCK, SEEK_SET, start=0, len=0})`。只有 `EACCES`/`EAGAIN` 映射 `STORE_BUSY`；禁止 `flock`、`F_SETLKW` 和 Linux `F_OFD_*`。锁持有到 sole container fd 的 final close，禁止显式 unlock、dup、reopen、clone、辅助 container fd、descriptor lending或由其他 library 再 open container。
+
+Traditional POSIX lock 是 process-owned，因此 platform-common 必须在任何 container fd 前以 `(verifiedHome dev, verifiedHome ino, RelayV2BrokerCredentialStateStoreV1)` reserve唯一 registry entry。状态只有 `Opening/Open/Closing/CloseUncertain`：与 active `Opening/Open/Closing` 碰撞必须在打开 fd 前返回 retryable `STORE_BUSY`，而 `CloseUncertain` 是永久 tombstone，后续 reserve/open只返回 non-retryable `STORE_CLOSED`。只有能证明从未产生 container fd 的失败才能删除 reservation；产生 fd 后 entry 保留到 final close。Close exactly once、不得 retry或显式 unlock：成功才删除 entry；首次实际 `EINTR`/`EIO`/不确定 close返回 `STORE_IO` 并永久进入 `CloseUncertain`，后续 close只返回缓存结果、不再执行 native close，后续 open返回 `STORE_CLOSED`。Registry mutex poison同样永久 fail closed为 non-retryable `STORE_CLOSED`。
+
+Platform-common 还必须保存 opener PID，并在取得 registry mutex、进入 N1 mutex/condition variable或任何 descriptor 操作前先做 lock-free process-origin check。可保证的 fork 前提是发起线程当时不在 common/N1/platform method或 `Drop` 内；child 继承的 store 一律返回 public `Closed -> STORE_CLOSED`（private reason可为 `ForkedChild`），不得修改 parent registry，且 pre-exec只应 `exec`/`_exit`、不得 fresh open。`vfork` child执行 Rust/common、signal/raw fork后继续已经进入的 store调用栈都不支持并位于 threat model外；`pthread_atfork` 不作为正确性依赖。Exec 后才是新进程。该 registry/PID/fork wrapper现由未接线的 platform-common唯一实现，不得由 N2/N3各自实现；当前证据仍只来自fake PID/registry transition，不构成真实OS fork验收。
+
 ## Single descriptor binary storage v1
 
 Native store 私有地拥有一个固定长度 `134,217,984` bytes 的 descriptor-backed container。打开后所有选择、read 与 publication 只使用该 descriptor。四个固定 range 是 format role，不是 interface path：
+
+`binaryStorage.container.privateLocation` 冻结唯一 canonical private location：以已验证的 `trustedHome` 为 base，依次使用 relative component `.tmux-worktree` 与 `relay-v2-broker-credential-state-store-v1.bin`，即展示为 `${trustedHome}/.tmux-worktree/relay-v2-broker-credential-state-store-v1.bin`。Darwin 与 Linux native adapter 必须共同消费 manifest 中这一份定义，从已验证的 account-home root 开始逐 component 做 native traversal，并对每一层执行 no-link 与 owner/mode/stable-identity 检查；不得把展示字符串当作 caller 可配置 path。Caller 不能覆盖 base 或任一 relative component，也不能提供 alternate candidate。Native implementation 不得在其他位置查找候选或 prototype artifact，更不得读取、导入、迁移、删除或清理任何 alternate/prototype state、lock、temp 或 container artifact。
 
 | Range | Absolute offset | Capacity |
 | --- | ---: | ---: |
@@ -97,7 +121,7 @@ Layout alignment 冻结为 128 bytes：四个 absolute offset、四个 capacity 
 
 Container 不存在时，native 才能安全创建 owner-only 单文件、设定 exact length、把两个 header range 初始化为全零，并证明文件 metadata 与目录 entry durable 后返回 `opened`。Existing object 长度错误、ownership/identity 不安全或部分初始化必须 invalid 并原样保留，不能 truncate/recreate。
 
-Open 必须在同一 container descriptor 上 **nonblocking** 取得 process-wide exclusive kernel lock，然后才做 identity 与完整 self-check。锁贯穿 store lifetime、所有 transaction、idle 和任意 terminal-fenced 状态；竞争返回 `STORE_BUSY`。不得创建 lock file，不得在 transaction 结束时释放。`close()` 等 admitted callback 后，以释放该 lock/descriptor 作为最后 native barrier 动作。
+Open 必须按上一节在进程内 sole container descriptor 上取得 traditional `F_SETLK` whole-file record lock，然后才完成 identity 与完整 self-check。锁贯穿 store lifetime、所有 transaction、idle 和任意 terminal-fenced 状态；竞争返回 `STORE_BUSY`。不得创建 lock file，不得在 transaction 结束时释放。`close()` 等 admitted callback 后，以 sole fd 的 exactly-once close 作为最后 native barrier 动作。
 
 每个 header 固定 128 bytes，integer 为 little-endian：
 
@@ -136,7 +160,13 @@ Publication 只能使用 explicit-offset positional `pwrite` / `write_at` 等价
 4. 通过 header durability barrier及任何必要的 container metadata barrier；
 5. 全部可证明后才返回 `swapped(fresh current snapshot)`。
 
-Durability 名称冻结为语义 `payload_then_header_durable_v1`，不把某个 syscall 名当跨平台契约。Darwin 与 Linux adapter 都必须证明此前 range 及所需 allocation/descriptor metadata 已到 stable storage、可承受 power loss，ordinary cache flush 不足。创建 container 时还要证明 exact length 与目录 entry durable。目标 filesystem/device 无法提供该保证时必须 `invalid/DURABILITY_UNSUPPORTED`，existing state 保留。
+Durability qualification policy 是 v1，publication protocol仍精确是 `payload_then_header_durable_v1`。它采用 release-baked exact match；本 revision 的 `qualifiedRecords` 精确为空、没有 item schema、template、example或 wildcard，第一条 record 必须通过新的 contract revision引入。因此所有真实 N2/N3 open都必须在 process registry和任何 mutation前返回 `invalid/DURABILITY_UNSUPPORTED`。Caller/environment不能 override；runtime probe或 syscall success只能采集/核对证据，不能创造 qualification。测试注入只能存在于 production不可达的 `cfg(test)`。
+
+未来 revision 的最小准入证据必须同时绑定 exact native artifact/source revision、target triple、OS build、filesystem implementation/features/mount+superblock options与 forbidden layers、按顺序描述的 storage topology/controller/driver/device/firmware/transport/cache/flush/FUA/PLP、exact primitive sequence，以及 immutable controlled power-cut procedure/report ID/SHA-256/tested scope。任何未知或不可观察字段都必须 `DURABILITY_UNSUPPORTED`，不能凭一次 flush成功推断 power-loss guarantee。
+
+Qualified Darwin profile 的 publication payload/header各执行 `fcntl(containerFd, F_FULLFSYNC)`；new-object creation顺序精确为 `F_FULLFSYNC(container)` → `fsync(container parent dir)` → 若本次创建 private dir则 `fsync(trustedHome)` → `fsync_volume_np(container, SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT)`，且 `fsync_volume_np` 任意 nonzero return本身就是 error code。Qualified Linux profile 的 payload/header各 `fsync(container)`；creation为 `fsync(container)` → `fsync(container parent dir)` → 若新建 private dir再 `fsync(trustedHome)`。
+
+任一 barrier失败都不能 unlink、rebuild或把已观察对象重新归类为 missing；已创建对象保留。能证明 primitive/guarantee不受支持时返回 `DURABILITY_UNSUPPORTED`，实际 I/O failure返回 `STORE_IO`；publication action一旦越过 N1 commit boundary仍遵守既有 `Uncertain` terminal semantics，不能据错误码自动重发。
 
 ## Legacy、conformance 与 production 边界
 
@@ -144,4 +174,4 @@ Durability 名称冻结为语义 `payload_then_header_durable_v1`，不把某个
 
 [`test/support/relayV2BrokerCredentialStateStoreConformance.mjs`](../../../../test/support/relayV2BrokerCredentialStateStoreConformance.mjs) 是未来 Rust/Darwin/Linux adapter 可复用的 authority-facing conformance harness。当前 in-memory raw adapter 只证明 TypeScript wrapper/port contract，**不是 native、device、filesystem、kernel-lock 或 power-loss durability 证据**。
 
-独立未接线的纯 Rust binary/publication core、未接 production composition 的 optional loader 与 credential authority source foundation 已实现。loader 只做显式 target、最低 N-API、固定 artifact selection，固定一次 raw binding identity，并把 capability/open 原样交给本 contract 的 TypeScript wrapper；只有固定目标 artifact 本身在 resolve 阶段确实缺失才映射 `native_artifact_missing`。Darwin/Linux adapter、N-API binary、production authority injection、packaging 和 production Gate 均未实现；authority 仍无 host bootstrap、成功 credential 流或 live revoke/kid fence。core、Port、manifest、fixture、self-check contract、loader 与 authority source 的存在不表示 native 已 open，更不表示 continuity 或 ready；production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。
+独立未接线的纯 Rust binary/publication core、platform-common lifecycle owner、未接 production composition 的 optional loader 与 credential authority source foundation 已实现。loader 只做显式 target、最低 N-API、固定 artifact selection，固定一次 raw binding identity，并把 capability/open 原样交给本 contract 的 TypeScript wrapper；只有固定目标 artifact 本身在 resolve 阶段确实缺失才映射 `native_artifact_missing`。Darwin/Linux adapter、N-API binary、production authority injection、packaging 和 production Gate 均未实现；authority 仍无 host bootstrap、成功 credential 流或 live revoke/kid fence。即使未来先实现 adapter scaffold，空 qualification allowlist也要求所有真实 open在 mutation前 fail closed。Core、common lifecycle owner、Port、manifest、fixture、self-check contract、loader 与 authority source 的存在不表示 native 已 open，更不表示 continuity 或 ready；production Relay v2 保持 disabled，Relay v1 继续独立构建和运行。

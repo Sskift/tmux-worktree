@@ -186,7 +186,8 @@ class MemoryAdapterContext {
 test("manifest and fixtures freeze one deep descriptor-backed seam without production readiness", () => {
   const { manifest } = corpus;
   assert.equal(manifest.contract, "tmux-worktree-relay-v2-broker-credential-state-store");
-  assert.equal(manifest.contractVersion, 1);
+  assert.equal(manifest.contractVersion, 2);
+  assert.equal(manifest.fixtureFormatVersion, 1);
   assert.equal(manifest.fixtureFormatVersion, corpus.goldenFixtureFormatVersion);
   assert.equal(manifest.fixtureFormatVersion, corpus.corruptFile.fixtureFormatVersion);
   assert.equal(manifest.fixtureFormatVersion, corpus.nativeInterface.fixtureFormatVersion);
@@ -195,6 +196,15 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
   assert.equal(manifest.scope, "native-storage-seam-only");
   assert.equal(manifest.productionCapabilityEffect, "none");
   assert.equal(manifest.businessOwner, "RelayV2BrokerCredentialAuthority");
+  assert.equal(manifest.nativeInterface.abi, "napi");
+  assert.equal(manifest.nativeInterface.minimumNapiVersion, 9);
+  assert.deepEqual(manifest.nativeInterface.exports, {
+    capability: "relayV2BrokerCredentialStateCapability",
+    open: "openRelayV2BrokerCredentialStateStore",
+  });
+  assert.equal(manifest.capability.supported.interfaceVersion, 1);
+  assert.equal(manifest.capability.supported.storageFormatVersion, 1);
+  assert.equal(manifest.binaryStorage.formatVersion, 1);
   assert.equal(manifest.capability.supportedMeansReady, false);
   assert.equal(
     manifest.capability.supported.maxStateBytes,
@@ -220,6 +230,18 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
   assert.deepEqual(manifest.nativeInterface.transactionMethods, ["read", "compareAndPublish"]);
   assert.deepEqual(manifest.port.runExclusive.compareAndPublishOutcomes.uncertain, ["outcome"]);
   assert.equal(manifest.port.close.admittedTransactionsRemainUsableDuringOrdinaryClose, true);
+  assert.deepEqual(manifest.binaryStorage.container.privateLocation, {
+    derivationVersion: 1,
+    base: "trustedHome",
+    relativeComponents: [
+      ".tmux-worktree",
+      "relay-v2-broker-credential-state-store-v1.bin",
+    ],
+    platformInvariant: true,
+    callerOverrideAllowed: false,
+    alternateCandidateLookupAllowed: false,
+  });
+  assert.equal(manifest.binaryStorage.container.privateLocation.derivationVersion, 1);
   assert.equal(manifest.binaryStorage.container.fileLengthBytes, 134217984);
   assert.equal(manifest.binaryStorage.container.layoutAlignmentBytes, 128);
   assert.deepEqual(
@@ -232,6 +254,10 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
     ],
   );
   const checksum = manifest.binaryStorage.headerLayout.find(({ name }) => name === "headerChecksum");
+  const formatVersion = manifest.binaryStorage.headerLayout.find(({ name }) => name === "formatVersion");
+  const magic = manifest.binaryStorage.headerLayout.find(({ name }) => name === "magic");
+  assert.equal(formatVersion.value, 1);
+  assert.equal(magic.valueAscii, "TWV2BCS1");
   assert.deepEqual(checksum.covers, { offset: 0, length: 96 });
   assert.deepEqual(manifest.binaryStorage.container.positionalIoOnly, ["pwrite", "write_at"]);
   assert.equal(manifest.binaryStorage.container.sharedCursorOrWriteAllowed, false);
@@ -245,13 +271,304 @@ test("manifest and fixtures freeze one deep descriptor-backed seam without produ
     manifest.port.runExclusive.postPublishFailure.provenNoCommitCodes,
     ["INVALID_ARGUMENT", "INVALID_REVISION", "STATE_TOO_LARGE", "GENERATION_EXHAUSTED"],
   );
-  assert.equal(
-    manifest.binaryStorage.container.locking.primitive,
-    "process-wide-exclusive-kernel-lock-on-the-same-container-descriptor",
-  );
-  assert.equal(manifest.binaryStorage.container.locking.contention, "STORE_BUSY");
-  assert.equal(manifest.binaryStorage.container.locking.perTransactionReleaseAllowed, false);
-  assert.equal(manifest.binaryStorage.container.locking.lockFileAllowed, false);
+  assert.deepEqual(manifest.binaryStorage.container.secureOpenPolicy, {
+    policyVersion: 1,
+    failureCodes: {
+      credentialOrRootRuleViolation: "STORE_PERMISSION_INVALID",
+      nativeAccountEntryMissing: "STORE_PERMISSION_INVALID",
+      callerHomeAccountHomeMismatch: "STORE_PERMISSION_INVALID",
+      nativeAccountDatabaseIo: "STORE_IO",
+      permissionOrUnprovableAcl: "STORE_PERMISSION_INVALID",
+      identityRaceOrUnprovableIdentity: "STORE_IDENTITY_UNCERTAIN",
+      pathOrEntryObservationRace: "STORE_IDENTITY_UNCERTAIN",
+      existingSymlinkSpecialOrUnprovableType: "STORE_IDENTITY_UNCERTAIN",
+      securityObservationIo: "STORE_IO",
+    },
+    credentialSnapshot: {
+      beforeAnyPathObservation: true,
+      nativeValues: ["real-uid", "effective-uid", "real-gid", "effective-gid"],
+      requirements: {
+        realUidEqualsEffectiveUid: true,
+        realGidEqualsEffectiveGid: true,
+        realUidNonRoot: true,
+        effectiveUidNonRoot: true,
+        gidZeroAloneIsRoot: false,
+      },
+    },
+    trustedHome: {
+      source: "native-account-database-home-for-effective-uid",
+      callerValueMustEqualExactAbsoluteComponentSequence: true,
+      readOnlyNoFollowTraversal: true,
+      ownerUid: "effective-uid",
+      groupWriteAllowed: false,
+      otherWriteAllowed: false,
+      nonOwnerNamespaceMutationAclAllowed: false,
+    },
+    privateDirectory: {
+      ownerUid: "effective-uid",
+      ownerGid: "effective-gid",
+      exactModeOctal: "0700",
+      existingPermissionRepairAllowed: false,
+    },
+    containerObject: {
+      fileType: "regular",
+      ownerUid: "effective-uid",
+      ownerGid: "effective-gid",
+      exactModeOctal: "0600",
+      exactLinkCount: 1,
+      existingPermissionRepairAllowed: false,
+    },
+    containerOpen: {
+      existingPreflight: {
+        primitive: "fstatat(container-parent-descriptor,container-leaf,AT_SYMLINK_NOFOLLOW)",
+        beforeOpeningContainerDescriptor: true,
+        opensContainerDescriptor: false,
+        mustProve: [
+          "regular-file",
+          "owner-uid-equals-effective-uid",
+          "owner-gid-equals-effective-gid",
+          "exact-mode-0600",
+          "link-count-one",
+          "exact-size-134217984",
+        ],
+        onlyEnoentSelectsCreate: true,
+        failureMapping: {
+          symlinkSpecialLinkOrUnprovableType: "preserve-and-STORE_IDENTITY_UNCERTAIN",
+          wrongOwnerModeOrAcl: "preserve-and-STORE_PERMISSION_INVALID",
+          wrongLength: "preserve-and-STORE_CORRUPT",
+          observationIo: "preserve-and-STORE_IO",
+        },
+      },
+      existingOpen: {
+        primitive: "openat",
+        directory: "container-parent-descriptor",
+        leaf: "container-leaf",
+        flags: ["O_RDWR", "O_NOFOLLOW", "O_CLOEXEC"],
+        modeOctal: "0600",
+      },
+      createOpen: {
+        primitive: "openat",
+        directory: "container-parent-descriptor",
+        leaf: "container-leaf",
+        flags: ["O_RDWR", "O_NOFOLLOW", "O_CLOEXEC", "O_CREAT", "O_EXCL"],
+        modeOctal: "0600",
+      },
+      forbiddenFlags: ["O_TRUNC", "O_EXLOCK"],
+      verifyDescriptorFlag: "fcntl(container-descriptor,F_GETFD)-contains-FD_CLOEXEC",
+      existingFchmodAllowed: false,
+      newFchmodExact0600AllowedOnlyAfterQualification: true,
+      preflightAuxiliaryContainerDescriptorAllowed: false,
+    },
+    aclProof: {
+      sharedRule: "no-acl-may-grant-a-non-owner-permission-beyond-the-mode-bits",
+      defaultOrInheritableAclMayRelaxDescendants: false,
+      darwin: "evaluate-effective-allow-under-nfsv4-acl-semantics",
+      linux: "evaluate-posix-access-acl-with-mask-and-default-acl",
+      cannotProve: "STORE_PERMISSION_INVALID",
+      aclReadIoFailure: "STORE_IO",
+    },
+    qualificationProbe: {
+      existingPrivateDirectoryTarget: "verified-existing-private-directory",
+      missingPrivateDirectoryTarget: "verified-trusted-home",
+      readOnly: true,
+      collectFilesystemAndOrderedStorageEvidence: true,
+      exactQualifiedRecordMatchRequired: true,
+      forbiddenBeforeExactMatch: [
+        "process-registry-reservation",
+        "mkdir",
+        "create",
+        "chmod",
+        "truncate",
+        "write",
+      ],
+      targetFingerprintRevalidationAfterRegistryReservation: true,
+      targetFingerprintMismatch: "STORE_IDENTITY_UNCERTAIN",
+    },
+    openOrder: [
+      "credential-and-trusted-home-proof",
+      "read-only-existing-private-directory-target-probe-or-verified-home-fallback",
+      "collect-durability-qualification-evidence",
+      "exact-qualified-record-match",
+      "process-registry-reservation",
+      "revalidate-qualified-target-fingerprint",
+      "private-directory-no-follow-traverse-or-secure-create",
+      "existing-container-fstatat-preflight-or-proven-absent",
+      "sole-container-descriptor-exact-openat-existing-or-O_CREAT-O_EXCL-create",
+      "new-container-fchmod-exact-0600-if-created",
+      "verify-FD_CLOEXEC",
+      "traditional-F_SETLK-record-lock",
+      "initial-security-and-identity-proof",
+      "existing-container-self-check-or-new-container-initialization",
+      "new-object-creation-durability",
+      "final-A-B-C-stable-proof-and-close-directory-descriptors",
+      "by-value-core-handoff-to-descriptor-only-store",
+    ],
+    stableDescriptorProof: {
+      sequence: [
+        "A=fstat(container-descriptor)",
+        "B=fstatat(container-parent-descriptor,container-leaf,AT_SYMLINK_NOFOLLOW)",
+        "C=fstat(container-descriptor)",
+      ],
+      aBAndCDeviceAndInodeMustMatch: true,
+      stableSecurityFields: ["file-type", "owner-uid", "owner-gid", "mode", "link-count", "size"],
+      existingContainerSizeAtOpenAndFinalProof: 134217984,
+      newContainerSizeAfterInitializationAndAtFinalProof: 134217984,
+      namedLookupAfterProofAllowed: false,
+      observedRace: "STORE_IDENTITY_UNCERTAIN",
+    },
+    descriptorOnlyBoundary: {
+      conversionPoint: "final-A-B-C-proof-and-directory-descriptor-close-then-by-value-core-handoff",
+      directoryDescriptorsClosedBeforeHandoff: true,
+      onlyContainerDescriptorAfterHandoff: true,
+      namedLookupAfterBoundaryAllowed: false,
+    },
+    threatModel: {
+      sameUidArbitraryDirectContainerOpen: "outside-trusted-runtime-threat-model",
+      sameUidArbitraryNamespaceMutation: "outside-trusted-runtime-threat-model",
+      observedRaceStillFailsClosed: true,
+    },
+  });
+  assert.deepEqual(manifest.binaryStorage.container.locking, {
+    primitive: "traditional-process-owned-whole-file-posix-record-lock",
+    fcntlCommand: "F_SETLK",
+    recordLockFields: { type: "F_WRLCK", whence: "SEEK_SET", start: 0, length: 0 },
+    blocking: false,
+    forbiddenPrimitives: ["flock", "F_SETLKW", "F_OFD_GETLK", "F_OFD_SETLK", "F_OFD_SETLKW"],
+    busyErrnos: ["EACCES", "EAGAIN"],
+    allOtherLockFailures: "STORE_IO",
+    acquisition: "nonblocking-on-the-sole-container-descriptor-before-self-check",
+    contention: "STORE_BUSY",
+    heldAcross: [
+      "self-check",
+      "all-runExclusive-callbacks",
+      "ordinary-idle-time",
+      "uncertain-terminal-state",
+    ],
+    release: "sole-container-descriptor-close-is-the-final-close-barrier-native-action-after-admitted-callbacks-drain",
+    explicitUnlockAllowed: false,
+    perTransactionReleaseAllowed: false,
+    lockFileAllowed: false,
+    descriptorDiscipline: {
+      containerDescriptorCountPerProcessStore: 1,
+      dupAllowed: false,
+      reopenAllowed: false,
+      cloneAllowed: false,
+      auxiliaryContainerDescriptorAllowed: false,
+      descriptorLendingAllowed: false,
+      otherLibraryContainerOpenAllowed: false,
+    },
+    processRegistry: {
+      owner: "relay-v2-broker-credential-state-store-platform-common",
+      key: {
+        verifiedHomeIdentity: ["device", "inode"],
+        logicalStoreKind: "RelayV2BrokerCredentialStateStoreV1",
+      },
+      reservationBeforeAnyContainerDescriptor: true,
+      states: ["Opening", "Open", "Closing", "CloseUncertain"],
+      collisionResult: {
+        Opening: "STORE_BUSY-before-opening-a-container-descriptor",
+        Open: "STORE_BUSY-before-opening-a-container-descriptor",
+        Closing: "STORE_BUSY-before-opening-a-container-descriptor",
+        CloseUncertain: "STORE_CLOSED-permanent-nonretryable",
+      },
+      closingBlocksNewOpen: true,
+      preDescriptorProvenFailure: "remove-reservation",
+      postDescriptorFailure: "retain-entry-until-proven-final-close",
+      mutexPoison: "permanent-fail-closed-STORE_CLOSED",
+      mutexPoisonRetryable: false,
+    },
+    processOrigin: {
+      openerPidCaptured: true,
+      lockFreePidCheckBefore: [
+        "process-registry-mutex",
+        "n1-mutex-or-condition-variable",
+        "container-descriptor-operation",
+      ],
+      forkBoundary: {
+        guaranteePrecondition: "fork-initiating-thread-is-not-inside-common-n1-platform-method-or-Drop",
+        inheritedStorePublicFailure: "STORE_CLOSED",
+        publicPlatformFailureVariant: "Closed",
+        privateFailureReasonMayBe: "ForkedChild",
+        childMayMutateParentRegistry: false,
+        childPreExecAllowedActions: ["exec", "_exit"],
+        childFreshUseOrOpenBeforeExecAllowed: false,
+        vforkChildExecutingRustOrCommon: "unsupported-outside-threat-model",
+        signalOrRawForkAfterStoreCallEntry: "unsupported-outside-threat-model",
+        pthreadAtforkCorrectnessDependency: false,
+        execStartsNewProcess: true,
+      },
+    },
+    finalClose: {
+      closeCount: "exactly-once",
+      closeRetryAllowed: false,
+      successfulCloseRegistryAction: "remove-entry",
+      eintrEioOrUncertainCloseRegistryAction: "permanent-CloseUncertain-tombstone",
+      firstActualCloseFailure: "STORE_IO-and-permanent-CloseUncertain-tombstone",
+      subsequentClose: "return-cached-first-close-result-without-native-close",
+      subsequentOpenAfterCloseUncertain: "STORE_CLOSED-nonretryable",
+      reopenAfterCloseUncertainAllowed: false,
+    },
+  });
+  assert.deepEqual(manifest.binaryStorage.durabilityQualification, {
+    policyVersion: 1,
+    publicationProtocol: "payload_then_header_durable_v1",
+    match: "exact",
+    qualifiedRecords: [],
+    firstQualifiedRecordRequiresContractRevision: true,
+    qualifiedRecordItemSchemaDefinedInThisRevision: false,
+    templateExampleOrWildcardAllowed: false,
+    unknownOrUnobservable: "invalid/DURABILITY_UNSUPPORTED",
+    callerOverrideAllowed: false,
+    environmentOverrideAllowed: false,
+    runtimeProbeMayCreateQualification: false,
+    runtimeSyscallSuccessMayCreateQualification: false,
+    testInjection: { allowedOnlyUnder: "cfg(test)", productionReachable: false },
+    productionOpenWhenQualifiedRecordsEmpty: "invalid/DURABILITY_UNSUPPORTED-before-registry-or-mutation",
+    nextRevisionEvidenceMinimum: [
+      "exact-native-artifact-and-source-revision",
+      "exact-target-triple",
+      "exact-os-build",
+      "exact-filesystem-implementation-features-mount-options-superblock-options-and-forbidden-layers",
+      "ordered-storage-topology-controller-driver-device-firmware-transport-cache-flush-fua-and-power-loss-protection",
+      "exact-ordered-durability-primitive-sequence",
+      "immutable-controlled-power-cut-procedure-report-id-sha256-and-tested-scope",
+    ],
+    platformPrimitiveProfiles: {
+      darwin: {
+        publicationPayloadBarrier: "fcntl(container-descriptor,F_FULLFSYNC)",
+        publicationHeaderBarrier: "fcntl(container-descriptor,F_FULLFSYNC)",
+        creationSequence: [
+          "fcntl(container-descriptor,F_FULLFSYNC)",
+          "fsync(container-parent-directory-descriptor)",
+          "if-private-directory-created-fsync(trusted-home-directory-descriptor)",
+          "fsync_volume_np(container-descriptor,SYNC_VOLUME_FULLSYNC|SYNC_VOLUME_WAIT)",
+        ],
+        fsyncVolumeNpFailure: "any-nonzero-return-is-the-error-code",
+        ordinaryFsyncIsPublicationProof: false,
+      },
+      linux: {
+        publicationPayloadBarrier: "fsync(container-descriptor)",
+        publicationHeaderBarrier: "fsync(container-descriptor)",
+        creationSequence: [
+          "fsync(container-descriptor)",
+          "fsync(container-parent-directory-descriptor)",
+          "if-private-directory-created-fsync(trusted-home-directory-descriptor)",
+        ],
+      },
+    },
+    barrierFailure: {
+      unlinkRebuildOrReclassifyMissingAllowed: false,
+      provenUnsupported: "invalid/DURABILITY_UNSUPPORTED",
+      actualIoFailure: "STORE_IO",
+      createdObjectsPreserved: true,
+    },
+  });
+  assert.deepEqual(manifest.files, [
+    { role: "specification", path: "README.md" },
+    { role: "golden-binary", path: "golden-binary.json" },
+    { role: "corrupt-binary", path: "corrupt-binary.json" },
+    { role: "native-interface", path: "native-interface-cases.json" },
+  ]);
   assert.equal(manifest.binaryStorage.legacyPrototypeArtifacts,
     "never-read-imported-migrated-renamed-unlinked-or-cleaned");
 });
