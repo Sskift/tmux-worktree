@@ -108,6 +108,24 @@ test("manifest freezes the existing owner chain and production NO-GO", () => {
   assert.equal(manifest.ownership.continuityAnchor, "local-state-before-anchor-ordering-single-crash-window-reconcile-bounded-timeout");
   assert.equal(manifest.ownership.credentialAuthority, "credential-checkpoint-business-state-ready-withdrawal-and-closed-error-mapping");
   assert.equal(manifest.ownership.brokerCore, "auth-control-authority-consumer-only");
+  assert.equal(manifest.ownership.productionComposition, "synchronous-upgrade-route-and-active-data-fence-plus-bounded-transport-close");
+  assert.equal(manifest.failureDomain.owner, "externalBackend");
+  assert.equal(manifest.provisioning.owner, "externalBackend");
+  assert.equal(manifest.provisioning.responsibilityLayer, "control-plane-provisioning-not-runtime-data-plane");
+  const ownerValues = [];
+  const collectOwners = (value) => {
+    if (Array.isArray(value)) return value.forEach(collectOwners);
+    if (value === null || typeof value !== "object") return;
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "owner") ownerValues.push(child);
+      collectOwners(child);
+    }
+  };
+  collectOwners(manifest);
+  assert.deepEqual(sorted(new Set(ownerValues)), sorted([
+    "externalBackend", "RelayV2ContinuityAnchor", "RelayV2BrokerCredentialAuthority",
+    "RelayV2BrokerCore", "owningProductionComposition",
+  ]));
   assert.equal(manifest.scope.v1OrBauFallbackAllowed, false);
   assert.equal(manifest.scope.enrollmentOrCapabilityEffect, "none");
 });
@@ -122,7 +140,7 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
     "readRequestExactKeys", "casRequestExactKeys", "snapshotStatuses", "casOutcomes",
   ], "typed port");
   exactKeys(manifest.transport, [
-    "owner", "status", "authenticationModes", "operations", "namespaces",
+    "futureAdapterSeam", "backendGuarantee", "status", "authenticationModes", "operations", "namespaces",
     "secretMaterialInConfigUrlLogsErrorsTracesFixturesAllowed", "objectSchemaExactKeys",
     "configSchema", "namespaceBindingSchema", "namespaceBindingsRules",
     "wireObjectSchemas", "wireUnionRules", "operationTimeoutMs",
@@ -144,6 +162,12 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
   assert.equal(manifest.interface.scalarSchemas.endpoint.maximum, 2048);
   assert.match(manifest.interface.scalarSchemas.identifier.rule, /\{0,127\}/);
   assert.equal(manifest.transport.newNumericChoices[0].field, "endpoint.maximumUtf8Bytes");
+  exactKeys(manifest.transport.newNumericChoices[0], ["field", "value", "appliesAt", "rationale"], "endpoint numeric choice");
+  exactKeys(manifest.requestIdentity, [
+    "futureAdapterSeam", "backendGuarantee", "status", "operationId", "fingerprintCovers",
+    "sameIdSameFingerprint", "sameIdDifferentFingerprint", "adapterReplayLimit",
+    "casAfterTimeoutOrUncertain", "lateResultAfterDeadline",
+  ], "request identity");
 
   const objectKeys = manifest.transport.objectSchemaExactKeys;
   exactKeys(manifest.transport.wireObjectSchemas, [
@@ -212,7 +236,7 @@ test("closed config and wire schemas are sufficient for a bounded decoder", () =
 
 test("external errors have operation-dependent dispositions and existing upper mappings", () => {
   exactKeys(manifest.errors, [
-    "namespace", "owner", "status", "choiceRationale", "exactKeys",
+    "namespace", "futureAdapterSeam", "backendGuarantee", "status", "choiceRationale", "exactKeys",
     "codeDefinitionExactKeys", "operationVocabulary", "retryAfterMsValues",
     "commitDispositions", "recordOrSecretDetailsAllowed", "codes",
     "operationDispositionRules", "upperClosedMapping",
@@ -376,7 +400,7 @@ test("ready loss has separate credential, production composition, and BrokerCore
   ], "readiness fence");
   assert.equal(manifest.readinessFence.credentialAuthority.owner, "RelayV2BrokerCredentialAuthority");
   assert.match(manifest.readinessFence.credentialAuthority.readyAndAdmissionWithdrawal, /^synchronous/);
-  assert.equal(manifest.readinessFence.productionBrokerComposition.owner, "future-production-broker-composition");
+  assert.equal(manifest.readinessFence.productionBrokerComposition.owner, "owningProductionComposition");
   assert.match(manifest.readinessFence.productionBrokerComposition.upgradeRouteAndActiveDataFence, /^synchronous/);
   assert.equal(manifest.readinessFence.brokerCore.owner, "RelayV2BrokerCore");
   assert.match(manifest.readinessFence.brokerCore.role, /consumer-only/);
@@ -391,5 +415,9 @@ test("ready loss has separate credential, production composition, and BrokerCore
     assert.equal(value.expect.admission, "blocked");
     assert.equal(value.expect.connectionFence, "synchronous-then-bounded-close");
   }
-  assert.equal(caseNamed("missing-durability-evidence-blocks-composition").expect.outcomes[0], "configuration-blocked");
+  const qualification = caseNamed("missing-backend-rpo0-dr-evidence-blocks-composition");
+  assert.equal(qualification.action.operation, "qualify_backend");
+  assert.equal(qualification.action.fault, "backend_rpo0_dr_evidence_missing");
+  assert.equal(qualification.expect.outcomes[0], "configuration-blocked");
+  assert.equal(qualification.expect.nextAction, "qualify-backend-rpo0-and-dr-evidence");
 });

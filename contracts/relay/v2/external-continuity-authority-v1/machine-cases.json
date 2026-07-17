@@ -5,9 +5,9 @@
   "vocabulary": {
     "categories": ["linearizability", "request-identity", "uncertainty", "reconciliation", "rollback", "recovery", "closed-errors", "namespace-lifecycle", "ready-loss"],
     "lifecycles": ["unprovisioned", "active", "tombstoned", "decommissioned"],
-    "operations": ["access", "backend_failover", "compare_and_swap", "decommission", "delete", "provision", "read", "reconcile", "reset", "restore_backup", "service_restart"],
+    "operations": ["access", "backend_failover", "compare_and_swap", "decommission", "delete", "provision", "qualify_backend", "read", "reconcile", "reset", "restore_backup", "service_restart"],
     "requestIdentities": ["not-applicable", "same-conflicting", "same-exact", "reuse-after-timeout-forbidden", "unique"],
-    "faults": ["none", "concurrent_competitor", "ack_lost", "late_ack_after_timeout", "stale_read", "state_before_anchor_crash", "non_immediate_successor", "paired_rollback", "divergent_same_sequence", "service_restart", "old_backup", "backend_failover", "returned_uninitialized_after_commit", "authentication_failed", "permission_denied", "quota_exceeded", "capacity_before_linearization", "rate_limit_before_linearization", "timeout", "malformed_request", "unknown_error_enum", "namespace_collision", "cross_security_domain", "reset_requested", "decommission_requested", "tombstone_reuse", "physical_payload_delete", "durability_evidence_missing", "unavailable", "result_uncertain"],
+    "faults": ["none", "concurrent_competitor", "ack_lost", "late_ack_after_timeout", "stale_read", "state_before_anchor_crash", "non_immediate_successor", "paired_rollback", "divergent_same_sequence", "service_restart", "old_backup", "backend_failover", "returned_uninitialized_after_commit", "authentication_failed", "permission_denied", "quota_exceeded", "capacity_before_linearization", "rate_limit_before_linearization", "timeout", "malformed_request", "unknown_error_enum", "namespace_collision", "cross_security_domain", "reset_requested", "decommission_requested", "tombstone_reuse", "physical_payload_delete", "backend_rpo0_dr_evidence_missing", "unavailable", "result_uncertain"],
     "outcomes": ["swapped", "conflict", "idempotent-replay", "uncertain", "error", "recovered-successor", "preserved", "refused-serving", "tombstoned", "provisioned-new-anchor", "decommissioned", "preserved-terminal-marker", "isolated-from-other-namespace", "fenced", "configuration-blocked"],
     "externalErrors": [null, "AUTHENTICATION_FAILED", "PERMISSION_DENIED", "MALFORMED_REQUEST", "IDEMPOTENCY_CONFLICT", "QUOTA_EXCEEDED", "CAPACITY_EXHAUSTED", "RATE_LIMITED", "TIMEOUT", "UNAVAILABLE", "RESULT_UNCERTAIN", "STALE_READ", "RECOVERY_ROLLBACK", "NAMESPACE_COLLISION", "ANCHOR_RETIRED"],
     "externalCommitDispositions": [null, "not_applicable", "proven_no_commit", "uncertain"],
@@ -17,7 +17,7 @@
     "casTokenRefs": [null, "cas-1", "cas-2", "cas-3", "agent-cas-1", "terminal", "unchanged", "advanced-once", "advanced-or-unchanged", "same-or-new-nonrepeating", "old-terminal-new-independent", "redacted"],
     "admissions": ["blocked", "open"],
     "connectionFences": ["none", "synchronous-then-bounded-close"],
-    "nextActions": ["none", "loser-accept-winner-current", "linearizable-read-reconcile", "operator-repair", "operator-repair-with-durable-high-water", "new-anchor-required", "reconcile-new-anchor", "new-authority-instance-required", "freeze-owning-broker-close-policy-before-adapter"]
+    "nextActions": ["none", "loser-accept-winner-current", "linearizable-read-reconcile", "operator-repair", "operator-repair-with-durable-high-water", "new-anchor-required", "reconcile-new-anchor", "new-authority-instance-required", "qualify-backend-rpo0-and-dr-evidence"]
   },
   "defaults": {
     "initial": {"lifecycle": "active", "externalCheckpoint": "broker-0", "externalCasToken": "cas-1", "localCheckpoint": "broker-0", "ready": false, "activeConnections": false},
@@ -202,9 +202,9 @@
       "expect": {"outcomes": ["uncertain", "fenced"], "externalErrors": ["RESULT_UNCERTAIN"], "externalCommitDisposition": "uncertain", "continuityError": "ANCHOR_COMMIT_UNCERTAIN", "credentialError": "EXTERNAL_ANCHOR_UNCERTAIN", "externalCheckpoint": "candidate-or-initial", "externalCasToken": "advanced-or-unchanged", "localCheckpoint": "broker-1-left", "connectionFence": "synchronous-then-bounded-close", "nextAction": "new-authority-instance-required"}
     },
     {
-      "name": "missing-durability-evidence-blocks-composition", "category": "ready-loss", "binding": "broker-a", "initial": {},
-      "action": {"fault": "durability_evidence_missing"},
-      "expect": {"outcomes": ["configuration-blocked"], "nextAction": "freeze-owning-broker-close-policy-before-adapter"}
+      "name": "missing-backend-rpo0-dr-evidence-blocks-composition", "category": "recovery", "binding": "broker-a", "initial": {},
+      "action": {"operation": "qualify_backend", "requestIdentity": "not-applicable", "fault": "backend_rpo0_dr_evidence_missing"},
+      "expect": {"outcomes": ["configuration-blocked"], "nextAction": "qualify-backend-rpo0-and-dr-evidence"}
     }
   ]
 }

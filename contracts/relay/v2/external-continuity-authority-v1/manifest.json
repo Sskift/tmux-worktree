@@ -20,6 +20,7 @@
     "continuityAnchor": "local-state-before-anchor-ordering-single-crash-window-reconcile-bounded-timeout",
     "credentialAuthority": "credential-checkpoint-business-state-ready-withdrawal-and-closed-error-mapping",
     "brokerCore": "auth-control-authority-consumer-only",
+    "productionComposition": "synchronous-upgrade-route-and-active-data-fence-plus-bounded-transport-close",
     "productionCompositionOrder": [
       "native-store-open-and-self-check",
       "inject-external-monotonic-authority",
@@ -68,7 +69,7 @@
     "casTokenNonRepeating": true
   },
   "failureDomain": {
-    "owner": "external-backend-operator-and-recovery-control-plane",
+    "owner": "externalBackend",
     "independentFrom": [
       "node-local-state",
       "local-continuity-witness",
@@ -85,7 +86,8 @@
     "unprovenRecoveryDisposition": "unavailable"
   },
   "provisioning": {
-    "owner": "external-authority-provisioning-control-plane-not-runtime-data-plane",
+    "owner": "externalBackend",
+    "responsibilityLayer": "control-plane-provisioning-not-runtime-data-plane",
     "status": "new-normative-v1-choice",
     "bindingExactKeys": ["securityDomainId", "namespace", "ownerBinding", "anchorId"],
     "securityDomainIdMeaning": "new-external-authority-tenant-isolation-key-not-a-relay-wire-or-credential-claim",
@@ -104,7 +106,8 @@
     "tombstoneRetention": "permanent"
   },
   "transport": {
-    "owner": "external-adapter-configuration-and-backend-transport-boundary",
+    "futureAdapterSeam": "closed-config-auth-secret-resolution-request-encoding-response-decoding-and-upper-mapping",
+    "backendGuarantee": "authenticated-linearizable-read-cas-exact-closed-response-and-idempotent-decision-replay",
     "status": "new-normative-v1-choice",
     "authenticationModes": ["mutual_tls", "workload_identity"],
     "operations": ["read", "compare_and_swap"],
@@ -214,11 +217,12 @@
       "maximum": 1024
     },
     "newNumericChoices": [
-      {"field": "endpoint.maximumUtf8Bytes", "value": 2048, "owner": "external-adapter-configuration-boundary", "rationale": "finite-pre-URL-parse-allocation-bound-for-a-single-origin-without-query-or-fragment"}
+      {"field": "endpoint.maximumUtf8Bytes", "value": 2048, "appliesAt": "future-adapter-seam", "rationale": "finite-pre-URL-parse-allocation-bound-for-a-single-origin-without-query-or-fragment"}
     ]
   },
   "requestIdentity": {
-    "owner": "external-adapter-and-backend-idempotency-boundary",
+    "futureAdapterSeam": "generate-one-operationId-and-preserve-exact-fingerprint-through-original-deadline",
+    "backendGuarantee": "same-id-same-fingerprint-exact-decision-replay-and-different-fingerprint-rejection",
     "status": "new-normative-v1-choice",
     "operationId": "new-v1-choice-collision-resistant-csprng-opaque-id",
     "fingerprintCovers": [
@@ -238,7 +242,8 @@
   },
   "errors": {
     "namespace": "external-continuity-authority.v1-internal-not-relay-wire",
-    "owner": "external-backend-and-adapter-boundary",
+    "futureAdapterSeam": "closed-decode-redact-and-map-to-existing-continuity-port-errors",
+    "backendGuarantee": "emit-only-allowed-code-operation-disposition-and-retryAfter-combinations",
     "status": "new-normative-v1-choice",
     "choiceRationale": "closed-redacted-operational-classification-needed-to-map-an-untrusted-backend-into-the-existing-continuity-and-credential-errors-without-creating-relay-wire-errors",
     "exactKeys": ["code", "retryable", "retryAfterMs", "commitDisposition"],
@@ -300,7 +305,7 @@
       "closeBarrierInitiation": "synchronous-with-withdrawal"
     },
     "productionBrokerComposition": {
-      "owner": "future-production-broker-composition",
+      "owner": "owningProductionComposition",
       "upgradeRouteAndActiveDataFence": "synchronous-before-transport-close-delivery",
       "transportCloseRequirement": "bounded-and-mandatory"
     },
