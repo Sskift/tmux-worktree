@@ -100,6 +100,9 @@ struct FakeState {
     home_final_failure: Option<HomeFinalFailure>,
     home_stat_calls: usize,
     home_acl_calls: usize,
+    open_at_error: Option<(RawFd, Vec<u8>, i32)>,
+    leaf_stat_at_calls: usize,
+    leaf_stat_at_error_on_call: Option<(usize, i32)>,
 }
 
 struct FakeSyscalls {
@@ -143,6 +146,9 @@ impl FakeSyscalls {
                 home_final_failure: None,
                 home_stat_calls: 0,
                 home_acl_calls: 0,
+                open_at_error: None,
+                leaf_stat_at_calls: 0,
+                leaf_stat_at_error_on_call: None,
             }),
         })
     }
@@ -210,6 +216,18 @@ impl FakeSyscalls {
 
     fn fail_home_final_with(&self, failure: HomeFinalFailure) {
         self.state.lock().expect("fake state").home_final_failure = Some(failure);
+    }
+
+    fn fail_open_at(&self, parent: RawFd, component: &[u8], errno: i32) {
+        self.state.lock().expect("fake state").open_at_error =
+            Some((parent, component.to_vec(), errno));
+    }
+
+    fn fail_leaf_stat_at_on_call(&self, call: usize, errno: i32) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .leaf_stat_at_error_on_call = Some((call, errno));
     }
 
     fn make_existing_valid(&self) {
@@ -300,6 +318,11 @@ impl DarwinSyscalls for FakeSyscalls {
             flags,
             mode,
         });
+        if let Some((error_parent, error_component, errno)) = &state.open_at_error {
+            if *error_parent == parent && error_component == &component {
+                return Err(SyscallError(*errno));
+            }
+        }
         match (parent, component.as_slice()) {
             (ROOT_FD, b"Users") => Ok(USERS_FD),
             (USERS_FD, b"alice") => Ok(HOME_FD),
@@ -412,6 +435,12 @@ impl DarwinSyscalls for FakeSyscalls {
                 }
             }
             (PRIVATE_FD, value) if value == Self::leaf_component() => {
+                state.leaf_stat_at_calls += 1;
+                if let Some((call, errno)) = state.leaf_stat_at_error_on_call {
+                    if call == state.leaf_stat_at_calls {
+                        return Err(SyscallError(errno));
+                    }
+                }
                 if state.container_exists {
                     Ok(match state.container_preflight {
                         ContainerPreflight::Metadata(metadata)
@@ -897,6 +926,77 @@ fn home_traversal_failures_close_each_owned_fd_once() {
         assert_eq!(close_count(&events, HOME_FD), 1);
         assert_eq!(close_count(&events, PRIVATE_FD), 0);
         assert_eq!(close_count(&events, CONTAINER_FD), 0);
+    }
+}
+
+#[test]
+fn named_path_errno_mapping_separates_identity_permission_and_io() {
+    let cases = [
+        (libc::ENOENT, PlatformStoreFailure::IdentityUncertain),
+        (libc::ESTALE, PlatformStoreFailure::IdentityUncertain),
+        (libc::ELOOP, PlatformStoreFailure::IdentityUncertain),
+        (libc::ENOTDIR, PlatformStoreFailure::IdentityUncertain),
+        (libc::EISDIR, PlatformStoreFailure::IdentityUncertain),
+        (libc::EEXIST, PlatformStoreFailure::IdentityUncertain),
+        (libc::EACCES, PlatformStoreFailure::PermissionInvalid),
+        (libc::EPERM, PlatformStoreFailure::PermissionInvalid),
+        (libc::EIO, PlatformStoreFailure::Io),
+        (libc::EMFILE, PlatformStoreFailure::Io),
+        (libc::ENFILE, PlatformStoreFailure::Io),
+    ];
+    for (errno, expected) in cases {
+        assert_eq!(
+            map_named_path_observation_error(SyscallError(errno)),
+            expected
+        );
+    }
+}
+
+#[test]
+fn home_openat_reports_resource_and_permission_failures_without_identity_masking() {
+    let cases = [
+        (libc::EIO, NativeStoreErrorCode::StoreIo),
+        (libc::EMFILE, NativeStoreErrorCode::StoreIo),
+        (libc::ELOOP, NativeStoreErrorCode::StoreIdentityUncertain),
+        (libc::EACCES, NativeStoreErrorCode::StorePermissionInvalid),
+    ];
+    for (errno, expected) in cases {
+        let fake = FakeSyscalls::new(false, ContainerPreflight::Missing);
+        fake.fail_open_at(ROOT_FD, b"Users", errno);
+        assert_eq!(open_test_store(Arc::clone(&fake)).err(), Some(expected));
+        let events = fake.events();
+        assert_eq!(close_count(&events, ROOT_FD), 1);
+        assert_eq!(close_count(&events, USERS_FD), 0);
+        assert_eq!(close_count(&events, HOME_FD), 0);
+    }
+}
+
+#[test]
+fn final_named_proof_preserves_statat_error_classification() {
+    let cases = [
+        (libc::EIO, NativeStoreErrorCode::StoreIo),
+        (libc::ESTALE, NativeStoreErrorCode::StoreIdentityUncertain),
+        (libc::EACCES, NativeStoreErrorCode::StorePermissionInvalid),
+    ];
+    for (errno, expected) in cases {
+        let fake = FakeSyscalls::new(false, ContainerPreflight::Missing);
+        fake.fail_leaf_stat_at_on_call(2, errno);
+        assert_eq!(open_test_store(Arc::clone(&fake)).err(), Some(expected));
+        let events = fake.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    Event::StatAt { parent: PRIVATE_FD, component }
+                        if component == &FakeSyscalls::leaf_component()
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(close_count(&events, PRIVATE_FD), 1);
+        assert_eq!(close_count(&events, HOME_FD), 1);
+        assert_eq!(close_count(&events, CONTAINER_FD), 1);
     }
 }
 

@@ -163,13 +163,9 @@ fn open_with<S: DarwinSyscalls, Q: QualificationPolicy>(
             }
         }
         Err(error) if error.is(libc::ENOENT) => None,
-        Err(error) if error.is(libc::ELOOP) || error.is(libc::ENOTDIR) => {
+        Err(error) => {
             let _ = admission.release_proven_no_descriptor();
-            return Err(NativeStoreErrorCode::StoreIdentityUncertain);
-        }
-        Err(_) => {
-            let _ = admission.release_proven_no_descriptor();
-            return Err(NativeStoreErrorCode::StoreIo);
+            return Err(map_named_path_observation_error(error).into());
         }
     };
     let created = preflight.is_none();
@@ -183,7 +179,7 @@ fn open_with<S: DarwinSyscalls, Q: QualificationPolicy>(
         Ok(fd) => fd,
         Err(error) => {
             let _ = admission.release_proven_no_descriptor();
-            return Err(map_open_error(error, created));
+            return Err(map_container_open_error(error));
         }
     };
 
@@ -350,7 +346,7 @@ fn verify_home<S: DarwinSyscalls>(
 ) -> Result<PreOpenContext<S>, PlatformStoreFailure> {
     let root = sys
         .open_root(DIRECTORY_OPEN_FLAGS)
-        .map_err(|_| PlatformStoreFailure::Io)?;
+        .map_err(map_named_path_observation_error)?;
     let mut current = OwnedDirectoryFd::new(&sys, root);
     let root_metadata = sys
         .stat(current.fd())
@@ -359,13 +355,13 @@ fn verify_home<S: DarwinSyscalls>(
     for component in components {
         let before = sys
             .stat_at(current.fd(), component, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+            .map_err(map_named_path_observation_error)?;
         if before.file_type() != u32::from(libc::S_IFDIR) {
             return Err(PlatformStoreFailure::IdentityUncertain);
         }
         let next_fd = sys
             .open_at(current.fd(), component, DIRECTORY_OPEN_FLAGS, 0)
-            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+            .map_err(map_named_path_observation_error)?;
         let next = OwnedDirectoryFd::new(&sys, next_fd);
         let after = sys.stat(next.fd()).map_err(|_| PlatformStoreFailure::Io)?;
         if !stable_path_security(before, after) {
@@ -415,13 +411,13 @@ fn inspect_private_path<S: DarwinSyscalls>(
                     context.first_missing_private = Some(index);
                     return Ok(());
                 }
-                Err(_) => return Err(PlatformStoreFailure::Io),
+                Err(error) => return Err(map_named_path_observation_error(error)),
             };
         validate_private_directory(before, context.effective_uid, context.effective_gid)?;
         let next = context
             .sys
             .open_at(context.parent_fd, component, DIRECTORY_OPEN_FLAGS, 0)
-            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+            .map_err(map_named_path_observation_error)?;
         let pending = OwnedDirectoryFd::new(&context.sys, next);
         let after = context
             .sys
@@ -490,9 +486,17 @@ fn validate_created_directory_before_chmod(
     Ok(())
 }
 
-fn map_created_named_observation_error(error: SyscallError) -> PlatformStoreFailure {
-    if error.is(libc::ENOENT) || error.is(libc::ELOOP) || error.is(libc::ENOTDIR) {
+fn map_named_path_observation_error(error: SyscallError) -> PlatformStoreFailure {
+    if error.is(libc::ENOENT)
+        || error.is(libc::ESTALE)
+        || error.is(libc::ELOOP)
+        || error.is(libc::ENOTDIR)
+        || error.is(libc::EISDIR)
+        || error.is(libc::EEXIST)
+    {
         PlatformStoreFailure::IdentityUncertain
+    } else if error.is(libc::EACCES) || error.is(libc::EPERM) {
+        PlatformStoreFailure::PermissionInvalid
     } else {
         PlatformStoreFailure::Io
     }
@@ -507,18 +511,12 @@ fn create_missing_private_path<S: DarwinSyscalls>(
         context
             .sys
             .mkdir_at(context.parent_fd, component, 0o700)
-            .map_err(|error| {
-                if error.is(libc::EEXIST) {
-                    PlatformStoreFailure::IdentityUncertain
-                } else {
-                    PlatformStoreFailure::Io
-                }
-            })?;
+            .map_err(map_named_path_observation_error)?;
         context.created_private_directory = true;
         let named_first = context
             .sys
             .stat_at(context.parent_fd, component, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(map_created_named_observation_error)?;
+            .map_err(map_named_path_observation_error)?;
         validate_created_directory_before_chmod(
             named_first,
             context.effective_uid,
@@ -527,7 +525,7 @@ fn create_missing_private_path<S: DarwinSyscalls>(
         let next = context
             .sys
             .open_at(context.parent_fd, component, DIRECTORY_OPEN_FLAGS, 0)
-            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+            .map_err(map_named_path_observation_error)?;
         let pending = OwnedDirectoryFd::new(&context.sys, next);
         let opened = context
             .sys
@@ -536,7 +534,7 @@ fn create_missing_private_path<S: DarwinSyscalls>(
         let named_second = context
             .sys
             .stat_at(context.parent_fd, component, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(map_created_named_observation_error)?;
+            .map_err(map_named_path_observation_error)?;
         if !stable_path_security(named_first, opened) || !stable_path_security(opened, named_second)
         {
             return Err(PlatformStoreFailure::IdentityUncertain);
@@ -581,14 +579,8 @@ fn validate_existing_container_preflight(
     Ok(())
 }
 
-fn map_open_error(error: SyscallError, creating: bool) -> NativeStoreErrorCode {
-    if error.is(libc::ELOOP) || error.is(libc::EEXIST) || (!creating && error.is(libc::ENOENT)) {
-        NativeStoreErrorCode::StoreIdentityUncertain
-    } else if error.is(libc::EACCES) || error.is(libc::EPERM) {
-        NativeStoreErrorCode::StorePermissionInvalid
-    } else {
-        NativeStoreErrorCode::StoreIo
-    }
+fn map_container_open_error(error: SyscallError) -> NativeStoreErrorCode {
+    map_named_path_observation_error(error).into()
 }
 
 fn stable_identity(left: FileMetadata, right: FileMetadata) -> bool {
@@ -733,7 +725,7 @@ impl<S: DarwinSyscalls> DarwinContainer<S> {
         fence.check()?;
         let named = sys
             .stat_at(context.parent_fd, &context.leaf, libc::AT_SYMLINK_NOFOLLOW)
-            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+            .map_err(map_named_path_observation_error)?;
         let second = descriptor_call(sys, fd, fence, |sys, fd| sys.stat(fd))?;
         if !stable_security(first, named)
             || !stable_security(named, second)
