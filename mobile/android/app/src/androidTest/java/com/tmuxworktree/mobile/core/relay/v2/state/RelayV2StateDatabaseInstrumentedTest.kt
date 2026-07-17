@@ -160,6 +160,35 @@ class RelayV2StateDatabaseInstrumentedTest {
         }
     }
 
+    @Test
+    fun unknownNotificationClaimLifecycleStateFailsClosedWithoutOverwrite() = runBlocking {
+        val namespace = durableNamespace("profile", activation = 1)
+        putAgentConsumer(namespace)
+        val committed = requireNotNull(agentClaim(namespace))
+        val unknownState = "UNKNOWN_PERSISTED_LIFECYCLE_STATE"
+        dao.deleteProfileAgentTranscriptLifecycleNotificationClaims(namespace.profileId)
+        dao.insertAgentTranscriptLifecycleNotificationClaim(
+            committed.copy(lifecycleState = unknownState),
+        )
+        val fixture = agentClaimFixture(namespace)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+
+        val failure = runCatching {
+            repository.claimNotificationUnderApplyLease(
+                fixture.namespace,
+                fixture.intent,
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is RelayV2StorageException)
+        assertEquals(
+            RelayV2StorageFailure.SCHEMA_INCOMPATIBLE,
+            (failure as RelayV2StorageException).failure,
+        )
+        assertTrue(unknownState !in failure.toString())
+        assertEquals(listOf(unknownState), agentClaims(namespace).map { it.lifecycleState })
+    }
+
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
         val scopeRecord = partialSnapshotScopeRecord(suffix)
         val scopeCanonical = scopeRecord.canonicalJson()
@@ -569,6 +598,12 @@ class RelayV2StateDatabaseInstrumentedTest {
 
     private fun agentClaim(namespace: RelayV2OutboxAuthorityNamespace):
         RelayV2AgentTranscriptLifecycleNotificationClaimEntity? {
+        return agentClaims(namespace).singleOrNull()
+    }
+
+    private fun agentClaims(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2AgentTranscriptLifecycleNotificationClaimEntity> {
         val fixture = agentClaimFixture(namespace)
         val key = fixture.intent.dedupeKey
         val consumer = fixture.namespace.consumer
@@ -583,7 +618,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             consumer.sessionId,
             key.timelineEpoch,
             key.lifecycleEventId,
-        ).singleOrNull()
+        )
     }
 
     private fun agentClaimFixture(namespace: RelayV2OutboxAuthorityNamespace): AgentClaimFixture {

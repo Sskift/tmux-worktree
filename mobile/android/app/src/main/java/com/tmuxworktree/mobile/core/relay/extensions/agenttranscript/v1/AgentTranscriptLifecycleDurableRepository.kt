@@ -173,7 +173,7 @@ private fun RelayV2AgentTranscriptLifecycleNotificationClaimEntity.toPersisted()
                 ),
                 timelineEpoch,
                 lifecycleEventId,
-                AgentLifecycleState.valueOf(lifecycleState),
+                decodeLifecycleState(lifecycleState),
             ),
             claimedLocalGeneration,
             RelayV2EncodedPayload(
@@ -190,6 +190,10 @@ private fun RelayV2AgentTranscriptLifecycleNotificationClaimEntity.toPersisted()
     } catch (_: IllegalStateException) {
         throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
     }
+
+private fun decodeLifecycleState(value: String): AgentLifecycleState =
+    AgentLifecycleState.entries.singleOrNull { it.name == value }
+        ?: throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
 
 private fun AgentTranscriptLifecyclePersistedNotificationClaim.toEntity():
     RelayV2AgentTranscriptLifecycleNotificationClaimEntity {
