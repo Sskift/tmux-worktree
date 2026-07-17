@@ -761,10 +761,18 @@ internal class RelayV2StateSyncRepositoryCore(
             return RelayV2StateSyncResult.Live(namespace, requireNotNull(updated.cursorEventSeq))
         }
 
-        val updated = current.copy(
-            requiredThroughEventSeq = required,
-            phase = RelayV2StoredSyncPhase.RESYNCING,
-        )
+        val updated = if (hello.disposition == RelayV2StateHelloDisposition.FRESH) {
+            // A fresh hello has no durable materialized cursor. Preserve staging long enough to
+            // continue or release its pinned host cut below, but reset the exact local cache now.
+            deleteSessions(namespace)
+            deleteScopes(namespace)
+            newAuthority(namespace, required)
+        } else {
+            current.copy(
+                requiredThroughEventSeq = required,
+                phase = RelayV2StoredSyncPhase.RESYNCING,
+            )
+        }
         putAuthority(updated)
         val staged = snapshot(namespace)
         if (staged?.complete == true ||
