@@ -30,7 +30,7 @@ const actionKeys = [
 ];
 const expectKeys = [
   "outcomes", "externalErrors", "externalCommitDisposition", "continuityError",
-  "credentialError", "externalCheckpoint", "externalCasToken", "localCheckpoint",
+  "credentialError", "agentStoreError", "externalCheckpoint", "externalCasToken", "localCheckpoint",
   "ready", "admission", "connectionFence", "nextAction",
 ];
 const bindingById = new Map(machine.bindings.map((value) => [value.id, value]));
@@ -77,6 +77,7 @@ function validateCase(raw) {
   assert.equal(expect.externalErrors.length === 0, expect.externalCommitDisposition === null);
   member(expect.continuityError, machine.vocabulary.continuityErrors, `${value.name}.continuityError`);
   member(expect.credentialError, machine.vocabulary.credentialErrors, `${value.name}.credentialError`);
+  member(expect.agentStoreError, machine.vocabulary.agentStoreErrors, `${value.name}.agentStoreError`);
   member(expect.externalCheckpoint, machine.vocabulary.checkpointRefs, `${value.name}.expectedCheckpoint`);
   member(expect.externalCasToken, machine.vocabulary.casTokenRefs, `${value.name}.expectedCasToken`);
   member(expect.localCheckpoint, machine.vocabulary.checkpointRefs, `${value.name}.expectedLocal`);
@@ -326,7 +327,7 @@ test("fixture schema, identifiers, references, and binding anchors are closed", 
   exactKeys(machine.vocabulary, [
     "categories", "lifecycles", "operations", "requestIdentities", "faults", "outcomes",
     "externalErrors", "externalCommitDispositions", "continuityErrors", "credentialErrors",
-    "checkpointRefs", "casTokenRefs", "admissions", "connectionFences", "nextActions",
+    "agentStoreErrors", "checkpointRefs", "casTokenRefs", "admissions", "connectionFences", "nextActions",
   ], "vocabulary");
   for (const [name, values] of Object.entries(machine.vocabulary)) unique(values, `vocabulary.${name}`);
   assert.deepEqual(sorted(machine.vocabulary.externalErrors.filter(Boolean)), sorted(errorByCode.keys()));
@@ -442,11 +443,25 @@ test("ready loss has separate credential, production composition, and BrokerCore
     "namespace", "credentialAuthority", "owningProductionComposition",
   ], "broker credential failure scope");
   exactKeys(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle, [
-    "namespace", "extensionDisposition", "baseV2CredentialRouteCommandTerminal", "globalConnectionFenceAllowed",
+    "namespace", "extensionDisposition", "existingStoreErrorMapping",
+    "baseV2CredentialRouteCommandTerminal", "globalConnectionFenceAllowed",
   ], "Agent extension failure scope");
   assert.equal(manifest.readinessFence.namespaceFailureIsolation.brokerCredential.namespace, "broker-credential.v1");
   assert.equal(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle.namespace, "agent-transcript-lifecycle.v1");
   assert.equal(manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle.globalConnectionFenceAllowed, false);
+  assert.deepEqual(
+    manifest.readinessFence.namespaceFailureIsolation.agentTranscriptLifecycle.existingStoreErrorMapping,
+    {
+      AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE: ["ANCHOR_UNAVAILABLE", "BUSY"],
+      AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN: [
+        "STATE_COMMIT_UNCERTAIN", "ANCHOR_COMMIT_UNCERTAIN", "RECONCILIATION_REQUIRED",
+      ],
+      AGENT_AUTHORITY_STORE_CORRUPT: [
+        "INVALID_CHECKPOINT", "INVALID_AUTHORITY_RESPONSE", "LOCAL_STATE_CONFLICT",
+        "CAS_CONFLICT", "ROLLBACK_DETECTED",
+      ],
+    },
+  );
   assert.equal(manifest.readinessFence.credentialAuthority.owner, "RelayV2BrokerCredentialAuthority");
   assert.match(manifest.readinessFence.credentialAuthority.readyAndAdmissionWithdrawal, /^synchronous/);
   assert.equal(manifest.readinessFence.productionBrokerComposition.owner, "owningProductionComposition");
@@ -464,15 +479,22 @@ test("ready loss has separate credential, production composition, and BrokerCore
     assert.equal(value.expect.admission, "blocked");
     assert.equal(value.expect.connectionFence, "synchronous-then-bounded-close");
   }
-  const agentLoss = caseNamed("agent-namespace-loss-is-extension-only");
-  assert.equal(agentLoss.binding, "agent-a");
-  assert.equal(agentLoss.initial.activeConnections, true);
-  assert.ok(agentLoss.expect.outcomes.includes("extension-unavailable"));
-  assert.equal(agentLoss.expect.credentialError, null);
-  assert.equal(agentLoss.expect.ready, true);
-  assert.equal(agentLoss.expect.admission, "open");
-  assert.equal(agentLoss.expect.connectionFence, "none");
-  assert.equal(agentLoss.expect.nextAction, "reset-agent-extension-authority-only");
+  const agentCases = [
+    ["agent-namespace-loss-is-extension-only", "ANCHOR_UNAVAILABLE", "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE"],
+    ["agent-namespace-commit-uncertain-is-extension-only", "ANCHOR_COMMIT_UNCERTAIN", "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN"],
+    ["agent-namespace-invalid-is-extension-only", "INVALID_AUTHORITY_RESPONSE", "AGENT_AUTHORITY_STORE_CORRUPT"],
+  ];
+  for (const [name, continuityError, agentStoreError] of agentCases) {
+    const value = caseNamed(name);
+    assert.equal(value.binding, "agent-a");
+    assert.equal(value.initial.activeConnections, true);
+    assert.equal(value.expect.continuityError, continuityError);
+    assert.equal(value.expect.agentStoreError, agentStoreError);
+    assert.equal(value.expect.credentialError, null);
+    assert.equal(value.expect.ready, true);
+    assert.equal(value.expect.admission, "open");
+    assert.equal(value.expect.connectionFence, "none");
+  }
   const qualification = caseNamed("missing-backend-rpo0-dr-evidence-blocks-composition");
   assert.equal(qualification.action.operation, "qualify_backend");
   assert.equal(qualification.action.fault, "backend_rpo0_dr_evidence_missing");

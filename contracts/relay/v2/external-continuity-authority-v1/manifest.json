@@ -300,7 +300,7 @@
       "credentialCasUncertain": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_UNCERTAIN",
       "credentialCasConflict": "RelayV2BrokerCredentialAuthority.EXTERNAL_ANCHOR_CONFLICT",
       "brokerCredentialFatalPostReadyResult": "credential-authority-synchronous-withdrawal-and-owning-composition-global-v2-fence",
-      "agentExtensionFatalResult": "extension-authority-store-only-unavailable-or-reset-with-base-v2-unchanged"
+      "agentExtensionFatalResult": "map-through-existing-agent-authority-store-errors-and-isolate-extension-only"
     }
   },
   "recovery": {
@@ -324,7 +324,12 @@
       },
       "agentTranscriptLifecycle": {
         "namespace": "agent-transcript-lifecycle.v1",
-        "extensionDisposition": "extension-authority-store-fail-closed-unavailable-or-reset-required",
+        "extensionDisposition": "map-through-existing-store-errors-and-fail-closed-within-extension",
+        "existingStoreErrorMapping": {
+          "AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE": ["ANCHOR_UNAVAILABLE", "BUSY"],
+          "AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN": ["STATE_COMMIT_UNCERTAIN", "ANCHOR_COMMIT_UNCERTAIN", "RECONCILIATION_REQUIRED"],
+          "AGENT_AUTHORITY_STORE_CORRUPT": ["INVALID_CHECKPOINT", "INVALID_AUTHORITY_RESPONSE", "LOCAL_STATE_CONFLICT", "CAS_CONFLICT", "ROLLBACK_DETECTED"]
+        },
         "baseV2CredentialRouteCommandTerminal": "remain-ready-and-operational",
         "globalConnectionFenceAllowed": false
       }
