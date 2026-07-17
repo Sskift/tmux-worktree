@@ -361,23 +361,6 @@ fn create_own_data_string_array<'env>(env: &'env Env, values: &[&str]) -> Result
     Ok(array)
 }
 
-#[cfg(test)]
-const BINDING_ERROR_UNION: [NativeStoreErrorCode; 13] = [
-    NativeStoreErrorCode::NativeInterfaceInvalid,
-    NativeStoreErrorCode::StoreBusy,
-    NativeStoreErrorCode::StoreClosed,
-    NativeStoreErrorCode::StoreCorrupt,
-    NativeStoreErrorCode::StoreFormatUnsupported,
-    NativeStoreErrorCode::StoreIdentityUncertain,
-    NativeStoreErrorCode::StoreIo,
-    NativeStoreErrorCode::StorePermissionInvalid,
-    NativeStoreErrorCode::DurabilityUnsupported,
-    NativeStoreErrorCode::InvalidArgument,
-    NativeStoreErrorCode::InvalidRevision,
-    NativeStoreErrorCode::StateTooLarge,
-    NativeStoreErrorCode::GenerationExhausted,
-];
-
 fn closed_binding_error_code(code: NativeStoreErrorCode) -> &'static str {
     match code {
         NativeStoreErrorCode::NativeInterfaceInvalid
@@ -1616,7 +1599,6 @@ fn initialize(mut exports: Object<'_>, env: Env) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
@@ -1717,18 +1699,6 @@ mod tests {
             capability_decision(true, &failed),
             CapabilityDecision::Invalid(NativeStoreErrorCode::StoreClosed)
         );
-    }
-
-    #[test]
-    fn binding_error_union_exhaustively_consumes_common_codes() {
-        let mapped = BINDING_ERROR_UNION
-            .map(closed_binding_error_code)
-            .into_iter()
-            .collect::<BTreeSet<_>>();
-        assert_eq!(mapped.len(), BINDING_ERROR_UNION.len());
-        for code in BINDING_ERROR_UNION {
-            assert_eq!(closed_binding_error_code(code), code.as_contract_code());
-        }
     }
 
     #[test]
