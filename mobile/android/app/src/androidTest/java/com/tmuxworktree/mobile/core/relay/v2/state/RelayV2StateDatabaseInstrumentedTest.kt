@@ -138,18 +138,26 @@ class RelayV2StateDatabaseInstrumentedTest {
         val namespace = durableNamespace("profile", activation = 1)
         putAgentConsumer(namespace)
         val committed = requireNotNull(agentClaim(namespace))
+        val conflicts = listOf(
+            committed.copy(
+                claimedLocalGeneration = "2",
+                payloadSha256 = "0".repeat(64),
+            ),
+            committed.copy(
+                lifecycleState = AgentLifecycleState.COMPLETED.name,
+                claimedLocalGeneration = "2",
+                payloadSha256 = "f".repeat(64),
+            ),
+        )
 
-        val failure = runCatching {
-            dao.insertAgentTranscriptLifecycleNotificationClaim(
-                committed.copy(
-                    claimedLocalGeneration = "2",
-                    payloadSha256 = "0".repeat(64),
-                ),
-            )
-        }.exceptionOrNull()
+        conflicts.forEach { conflict ->
+            val failure = runCatching {
+                dao.insertAgentTranscriptLifecycleNotificationClaim(conflict)
+            }.exceptionOrNull()
 
-        assertTrue(failure != null)
-        assertEquals(committed, agentClaim(namespace))
+            assertTrue(failure != null)
+            assertEquals(committed, agentClaim(namespace))
+        }
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
@@ -564,7 +572,7 @@ class RelayV2StateDatabaseInstrumentedTest {
         val fixture = agentClaimFixture(namespace)
         val key = fixture.intent.dedupeKey
         val consumer = fixture.namespace.consumer
-        return dao.agentTranscriptLifecycleNotificationClaim(
+        return dao.agentTranscriptLifecycleNotificationClaims(
             consumer.profileId,
             consumer.profileActivationGeneration,
             consumer.principalId,
@@ -575,8 +583,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             consumer.sessionId,
             key.timelineEpoch,
             key.lifecycleEventId,
-            key.state.name,
-        )
+        ).singleOrNull()
     }
 
     private fun agentClaimFixture(namespace: RelayV2OutboxAuthorityNamespace): AgentClaimFixture {

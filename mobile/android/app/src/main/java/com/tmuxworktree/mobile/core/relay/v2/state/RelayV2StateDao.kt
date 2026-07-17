@@ -468,9 +468,9 @@ internal interface RelayV2StateDao {
             "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
             "AND scopeId = :scopeId AND sessionId = :sessionId " +
             "AND timelineEpoch = :timelineEpoch " +
-            "AND lifecycleEventId = :lifecycleEventId AND lifecycleState = :lifecycleState",
+            "AND lifecycleEventId = :lifecycleEventId",
     )
-    fun agentTranscriptLifecycleNotificationClaim(
+    fun agentTranscriptLifecycleNotificationClaims(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -481,8 +481,7 @@ internal interface RelayV2StateDao {
         sessionId: String,
         timelineEpoch: String,
         lifecycleEventId: String,
-        lifecycleState: String,
-    ): RelayV2AgentTranscriptLifecycleNotificationClaimEntity?
+    ): List<RelayV2AgentTranscriptLifecycleNotificationClaimEntity>
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptLifecycleNotificationClaim(

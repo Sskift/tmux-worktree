@@ -86,22 +86,23 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         dao.insertAgentTranscriptLifecycleState(state.toEntity())
     }
 
-    override fun notificationClaim(
-        key: AgentTranscriptLifecycleNotificationClaimKey,
-    ): AgentTranscriptLifecyclePersistedNotificationClaim? =
-        dao.agentTranscriptLifecycleNotificationClaim(
-            key.consumer.profileId,
-            key.consumer.profileActivationGeneration,
-            key.consumer.principalId,
-            key.consumer.clientInstanceId,
-            key.consumer.hostId,
-            key.consumer.hostEpoch,
-            key.consumer.scopeId,
-            key.consumer.sessionId,
-            key.timelineEpoch,
-            key.lifecycleEventId,
-            key.lifecycleState.name,
-        )?.toPersisted()
+    override fun notificationClaims(
+        eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
+    ): List<AgentTranscriptLifecyclePersistedNotificationClaim> {
+        val consumer = eventIdentity.consumer
+        return dao.agentTranscriptLifecycleNotificationClaims(
+            consumer.profileId,
+            consumer.profileActivationGeneration,
+            consumer.principalId,
+            consumer.clientInstanceId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+            eventIdentity.timelineEpoch,
+            eventIdentity.lifecycleEventId,
+        ).map(RelayV2AgentTranscriptLifecycleNotificationClaimEntity::toPersisted)
+    }
 
     override fun insertNotificationClaim(
         claim: AgentTranscriptLifecyclePersistedNotificationClaim,

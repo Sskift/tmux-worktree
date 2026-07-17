@@ -442,7 +442,6 @@ internal data class RelayV2AgentTranscriptLifecycleStateEntity(
         "sessionId",
         "timelineEpoch",
         "lifecycleEventId",
-        "lifecycleState",
     ],
 )
 internal data class RelayV2AgentTranscriptLifecycleNotificationClaimEntity(

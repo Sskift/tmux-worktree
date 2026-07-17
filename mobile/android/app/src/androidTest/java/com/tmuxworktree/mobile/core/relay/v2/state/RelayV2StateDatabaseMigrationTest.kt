@@ -217,6 +217,33 @@ class RelayV2StateDatabaseMigrationTest {
                 0,
                 migrated.count("relay_v2_agent_transcript_lifecycle_notification_claims"),
             )
+            val claimPrimaryKey = mutableListOf<Pair<Int, String>>()
+            migrated.query(
+                "PRAGMA table_info(`relay_v2_agent_transcript_lifecycle_notification_claims`)",
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val primaryKeyOrder = cursor.getInt(cursor.getColumnIndexOrThrow("pk"))
+                    if (primaryKeyOrder > 0) {
+                        claimPrimaryKey += primaryKeyOrder to
+                            cursor.getString(cursor.getColumnIndexOrThrow("name"))
+                    }
+                }
+            }
+            assertEquals(
+                listOf(
+                    "profileId",
+                    "profileActivationGeneration",
+                    "principalId",
+                    "clientInstanceId",
+                    "hostId",
+                    "hostEpoch",
+                    "scopeId",
+                    "sessionId",
+                    "timelineEpoch",
+                    "lifecycleEventId",
+                ),
+                claimPrimaryKey.sortedBy { it.first }.map { it.second },
+            )
             migrated.query(
                 "SELECT nextCreationOrder, payloadSha256 FROM relay_v2_outbox_meta",
             ).use { cursor ->

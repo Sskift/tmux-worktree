@@ -298,6 +298,41 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
     }
 
     @Test
+    fun `alternate state and multiple event claims fail closed without overwrite`() = runBlocking {
+        val consumer = consumer()
+        val state = richState(consumer, "timeline-a")
+        val namespace = namespace(consumer, state)
+        val intent = notificationIntent(state)
+        val exactKey = claimKey(namespace, intent)
+        val alternateIntent = intent.copy(
+            dedupeKey = intent.dedupeKey.copy(state = AgentLifecycleState.COMPLETED),
+        )
+        val alternateKey = claimKey(namespace, alternateIntent)
+        val exactClaim = persistedClaim(exactKey, intent)
+        val alternateClaim = persistedClaim(alternateKey, alternateIntent)
+        val cases = listOf(
+            "alternate-state" to listOf(alternateClaim),
+            "multiple-rows" to listOf(exactClaim, alternateClaim),
+        )
+
+        cases.forEach { (label, existingClaims) ->
+            val store = MemoryStore()
+            val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+            repository.initializeUnderApplyLease(namespace, state)
+            existingClaims.forEach(store::putClaimUnchecked)
+            val writesBeforeClaim = store.writeCount
+
+            val failure = runCatching {
+                repository.claimNotificationUnderApplyLease(namespace, intent)
+            }.exceptionOrNull()
+
+            assertTrue(label, failure is AgentTranscriptLifecyclePersistenceConflictException)
+            assertEquals(label, writesBeforeClaim, store.writeCount)
+            assertEquals(label, existingClaims.size, store.claimCount)
+        }
+    }
+
+    @Test
     fun `corrupt claim payload hash and identity fail closed without overwrite`() = runBlocking {
         val consumer = consumer()
         val state = richState(consumer, "timeline-a")
@@ -536,9 +571,11 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             writeCount += 1
         }
 
-        override fun notificationClaim(
-            key: AgentTranscriptLifecycleNotificationClaimKey,
-        ): AgentTranscriptLifecyclePersistedNotificationClaim? = claims[key]
+        override fun notificationClaims(
+            eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
+        ): List<AgentTranscriptLifecyclePersistedNotificationClaim> = claims.values.filter {
+            it.key.eventIdentity == eventIdentity
+        }
 
         override fun insertNotificationClaim(
             claim: AgentTranscriptLifecyclePersistedNotificationClaim,
@@ -547,9 +584,15 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 failNextClaimInsert = false
                 error("injected claim insert failure")
             }
-            check(claim.key !in claims)
+            check(claims.values.none { it.key.eventIdentity == claim.key.eventIdentity })
             claims[claim.key] = claim
             writeCount += 1
+        }
+
+        fun putClaimUnchecked(
+            claim: AgentTranscriptLifecyclePersistedNotificationClaim,
+        ) {
+            claims[claim.key] = claim
         }
 
         fun mutatePayload(
@@ -615,6 +658,15 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             intent: AgentSystemNotificationIntent,
         ) = requireNotNull(
             AgentTranscriptLifecycleNotificationClaimKey.exactOrNull(namespace, intent),
+        )
+
+        fun persistedClaim(
+            key: AgentTranscriptLifecycleNotificationClaimKey,
+            intent: AgentSystemNotificationIntent,
+        ) = AgentTranscriptLifecyclePersistedNotificationClaim(
+            key,
+            intent.localGeneration,
+            AgentTranscriptLifecycleNotificationClaimCodec.encode(key, intent),
         )
 
         fun withLedgerDisposition(

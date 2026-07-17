@@ -92,6 +92,13 @@ internal data class AgentTranscriptLifecycleNotificationClaimKey(
             lifecycleState,
         )
 
+    val eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity
+        get() = AgentTranscriptLifecycleNotificationClaimEventIdentity(
+            consumer,
+            timelineEpoch,
+            lifecycleEventId,
+        )
+
     companion object {
         fun exactOrNull(
             namespace: AgentTranscriptLifecycleDurableNamespace,
@@ -114,6 +121,18 @@ internal data class AgentTranscriptLifecycleNotificationClaimKey(
                 key.state,
             )
         }
+    }
+}
+
+/** One-shot storage identity; lifecycle state remains evidence and cannot create another claim. */
+internal data class AgentTranscriptLifecycleNotificationClaimEventIdentity(
+    val consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    val timelineEpoch: String,
+    val lifecycleEventId: String,
+) {
+    init {
+        requireStorageOpaqueIdentity(timelineEpoch, "Timeline epoch")
+        requireStorageOpaqueIdentity(lifecycleEventId, "Lifecycle event ID")
     }
 }
 
@@ -177,9 +196,9 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
 
     fun insertState(state: AgentTranscriptLifecyclePersistedState)
 
-    fun notificationClaim(
-        key: AgentTranscriptLifecycleNotificationClaimKey,
-    ): AgentTranscriptLifecyclePersistedNotificationClaim?
+    fun notificationClaims(
+        eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
+    ): List<AgentTranscriptLifecyclePersistedNotificationClaim>
 
     /** Must use INSERT ABORT or an equivalent no-overwrite compare-and-set. */
     fun insertNotificationClaim(claim: AgentTranscriptLifecyclePersistedNotificationClaim)
@@ -278,17 +297,30 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
             )
 
+            val existingClaims = notificationClaims(key.eventIdentity).onEach { existing ->
+                AgentTranscriptLifecycleNotificationClaimCodec.decode(
+                    existing.key,
+                    existing.claimedLocalGeneration,
+                    existing.payload,
+                )
+                if (existing.key.eventIdentity != key.eventIdentity) {
+                    throw AgentTranscriptLifecyclePersistenceConflictException()
+                }
+            }
+            if (existingClaims.size > 1) {
+                throw AgentTranscriptLifecyclePersistenceConflictException()
+            }
+            val existing = existingClaims.singleOrNull()
+            if (existing != null && existing.key != key) {
+                throw AgentTranscriptLifecyclePersistenceConflictException()
+            }
+
             if (!intent.isPreflightAuthorizedBy(current.state)) {
                 return@transaction NotificationClaimTransactionResult.NotExecutable(
                     AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
                 )
             }
-            notificationClaim(key)?.let { existing ->
-                AgentTranscriptLifecycleNotificationClaimCodec.decode(
-                    key,
-                    existing.claimedLocalGeneration,
-                    existing.payload,
-                )
+            if (existing != null) {
                 return@transaction NotificationClaimTransactionResult.NotExecutable(
                     AgentTranscriptLifecycleNotificationNotExecutableReason.ALREADY_CLAIMED,
                 )

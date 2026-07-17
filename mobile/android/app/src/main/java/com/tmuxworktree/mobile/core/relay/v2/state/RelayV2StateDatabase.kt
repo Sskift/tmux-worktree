@@ -208,7 +208,7 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                         PRIMARY KEY(
                             `profileId`, `profileActivationGeneration`, `principalId`,
                             `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
-                            `timelineEpoch`, `lifecycleEventId`, `lifecycleState`
+                            `timelineEpoch`, `lifecycleEventId`
                         )
                     )
                     """.trimIndent(),

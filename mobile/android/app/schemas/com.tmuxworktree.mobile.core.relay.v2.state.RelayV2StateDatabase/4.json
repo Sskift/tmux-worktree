@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 4,
-    "identityHash": "65acc268d1d8666559a4b63925925cf3",
+    "identityHash": "bc7b04b5ac394217d4844ec6acb6e30b",
     "entities": [
       {
         "tableName": "relay_v2_authority",
@@ -1287,7 +1287,7 @@
       },
       {
         "tableName": "relay_v2_agent_transcript_lifecycle_notification_claims",
-        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `claimedLocalGeneration` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `lifecycleState`))",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `claimedLocalGeneration` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`))",
         "fields": [
           {
             "fieldPath": "profileId",
@@ -1398,15 +1398,14 @@
             "scopeId",
             "sessionId",
             "timelineEpoch",
-            "lifecycleEventId",
-            "lifecycleState"
+            "lifecycleEventId"
           ]
         }
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '65acc268d1d8666559a4b63925925cf3')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, 'bc7b04b5ac394217d4844ec6acb6e30b')"
     ]
   }
 }
