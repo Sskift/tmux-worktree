@@ -292,15 +292,16 @@ impl<S: DarwinSyscalls> PreOpenContext<S> {
     }
 }
 
-/// Owns a newly opened directory descriptor until `PreOpenContext` has
-/// successfully accepted it. Every early return closes the pending descriptor
-/// exactly once; after transfer, only the context owns it.
-struct PendingDirectoryFd<S: DarwinSyscalls> {
+/// Exactly-once owner for a directory descriptor before it is transferred to
+/// `PreOpenContext`. Every early return makes one close attempt; explicit close
+/// makes the guard inert before the syscall so an uncertain failure is never
+/// retried.
+struct OwnedDirectoryFd<S: DarwinSyscalls> {
     sys: Arc<S>,
     fd: Option<RawFd>,
 }
 
-impl<S: DarwinSyscalls> PendingDirectoryFd<S> {
+impl<S: DarwinSyscalls> OwnedDirectoryFd<S> {
     fn new(sys: &Arc<S>, fd: RawFd) -> Self {
         Self {
             sys: Arc::clone(sys),
@@ -309,15 +310,20 @@ impl<S: DarwinSyscalls> PendingDirectoryFd<S> {
     }
 
     fn fd(&self) -> RawFd {
-        self.fd.expect("pending directory descriptor")
+        self.fd.expect("owned directory descriptor")
     }
 
-    fn disarm(mut self) {
-        self.fd = None;
+    fn close(mut self) -> Result<(), PlatformStoreFailure> {
+        let fd = self.fd.take().expect("owned directory descriptor");
+        self.sys.close(fd).map_err(|_| PlatformStoreFailure::Io)
+    }
+
+    fn disarm(mut self) -> RawFd {
+        self.fd.take().expect("owned directory descriptor")
     }
 }
 
-impl<S: DarwinSyscalls> Drop for PendingDirectoryFd<S> {
+impl<S: DarwinSyscalls> Drop for OwnedDirectoryFd<S> {
     fn drop(&mut self) {
         if let Some(fd) = self.fd.take() {
             let _ = self.sys.close(fd);
@@ -342,92 +348,50 @@ fn verify_home<S: DarwinSyscalls>(
     effective_uid: u32,
     effective_gid: u32,
 ) -> Result<PreOpenContext<S>, PlatformStoreFailure> {
-    let mut current = sys
+    let root = sys
         .open_root(DIRECTORY_OPEN_FLAGS)
         .map_err(|_| PlatformStoreFailure::Io)?;
-    let root_metadata = match sys.stat(current) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let _ = sys.close(current);
-            return Err(PlatformStoreFailure::Io);
-        }
-    };
-    if let Err(error) = validate_namespace_directory(&sys, current, root_metadata, effective_uid) {
-        let _ = sys.close(current);
-        return Err(error);
-    }
+    let mut current = OwnedDirectoryFd::new(&sys, root);
+    let root_metadata = sys
+        .stat(current.fd())
+        .map_err(|_| PlatformStoreFailure::Io)?;
+    validate_namespace_directory(&sys, current.fd(), root_metadata, effective_uid)?;
     for component in components {
-        let before = match sys.stat_at(current, component, libc::AT_SYMLINK_NOFOLLOW) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                let _ = sys.close(current);
-                return Err(PlatformStoreFailure::IdentityUncertain);
-            }
-        };
+        let before = sys
+            .stat_at(current.fd(), component, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
         if before.file_type() != u32::from(libc::S_IFDIR) {
-            let _ = sys.close(current);
             return Err(PlatformStoreFailure::IdentityUncertain);
         }
-        let next = match sys.open_at(current, component, DIRECTORY_OPEN_FLAGS, 0) {
-            Ok(fd) => fd,
-            Err(_) => {
-                let _ = sys.close(current);
-                return Err(PlatformStoreFailure::IdentityUncertain);
-            }
-        };
-        let after = match sys.stat(next) {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                let _ = sys.close(next);
-                let _ = sys.close(current);
-                return Err(PlatformStoreFailure::Io);
-            }
-        };
-        let close_result = sys.close(current);
+        let next_fd = sys
+            .open_at(current.fd(), component, DIRECTORY_OPEN_FLAGS, 0)
+            .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
+        let next = OwnedDirectoryFd::new(&sys, next_fd);
+        let after = sys.stat(next.fd()).map_err(|_| PlatformStoreFailure::Io)?;
         if !stable_path_security(before, after) {
-            let _ = sys.close(next);
             return Err(PlatformStoreFailure::IdentityUncertain);
         }
-        if close_result.is_err() {
-            let _ = sys.close(next);
-            return Err(PlatformStoreFailure::Io);
-        }
-        if let Err(error) = validate_namespace_directory(&sys, next, after, effective_uid) {
-            let _ = sys.close(next);
-            return Err(error);
-        }
+        validate_namespace_directory(&sys, next.fd(), after, effective_uid)?;
+        current.close()?;
         current = next;
     }
 
-    let metadata = match sys.stat(current) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let _ = sys.close(current);
-            return Err(PlatformStoreFailure::Io);
-        }
-    };
+    let metadata = sys
+        .stat(current.fd())
+        .map_err(|_| PlatformStoreFailure::Io)?;
     if metadata.file_type() != u32::from(libc::S_IFDIR)
         || metadata.uid != effective_uid
         || metadata.permission_mode() & 0o022 != 0
     {
-        let _ = sys.close(current);
         return Err(PlatformStoreFailure::PermissionInvalid);
     }
-    let acl = match sys.acl(current) {
-        Ok(acl) => acl,
-        Err(error) => {
-            let _ = sys.close(current);
-            return Err(error);
-        }
-    };
-    if let Err(error) = validate_acl(&metadata, &acl) {
-        let _ = sys.close(current);
-        return Err(error);
-    }
+    let acl = sys.acl(current.fd())?;
+    validate_acl(&metadata, &acl)?;
+    let home_fd = current.disarm();
     Ok(PreOpenContext {
         sys,
-        home_fd: current,
-        parent_fd: current,
+        home_fd,
+        parent_fd: home_fd,
         home_metadata: metadata,
         effective_uid,
         effective_gid,
@@ -458,7 +422,7 @@ fn inspect_private_path<S: DarwinSyscalls>(
             .sys
             .open_at(context.parent_fd, component, DIRECTORY_OPEN_FLAGS, 0)
             .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
-        let pending = PendingDirectoryFd::new(&context.sys, next);
+        let pending = OwnedDirectoryFd::new(&context.sys, next);
         let after = context
             .sys
             .stat(pending.fd())
@@ -469,7 +433,7 @@ fn inspect_private_path<S: DarwinSyscalls>(
         let acl = context.sys.acl(pending.fd())?;
         validate_acl(&after, &acl)?;
         context.replace_parent(pending.fd())?;
-        pending.disarm();
+        let _ = pending.disarm();
     }
     Ok(())
 }
@@ -509,6 +473,31 @@ fn validate_private_directory(
     Ok(())
 }
 
+fn validate_created_directory_before_chmod(
+    metadata: FileMetadata,
+    effective_uid: u32,
+    effective_gid: u32,
+) -> Result<(), PlatformStoreFailure> {
+    if metadata.file_type() != u32::from(libc::S_IFDIR) {
+        return Err(PlatformStoreFailure::IdentityUncertain);
+    }
+    if metadata.uid != effective_uid
+        || metadata.gid != effective_gid
+        || metadata.permission_mode() & !0o700 != 0
+    {
+        return Err(PlatformStoreFailure::PermissionInvalid);
+    }
+    Ok(())
+}
+
+fn map_created_named_observation_error(error: SyscallError) -> PlatformStoreFailure {
+    if error.is(libc::ENOENT) || error.is(libc::ELOOP) || error.is(libc::ENOTDIR) {
+        PlatformStoreFailure::IdentityUncertain
+    } else {
+        PlatformStoreFailure::Io
+    }
+}
+
 fn create_missing_private_path<S: DarwinSyscalls>(
     context: &mut PreOpenContext<S>,
     components: &[CString],
@@ -526,11 +515,32 @@ fn create_missing_private_path<S: DarwinSyscalls>(
                 }
             })?;
         context.created_private_directory = true;
+        let named_first = context
+            .sys
+            .stat_at(context.parent_fd, component, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(map_created_named_observation_error)?;
+        validate_created_directory_before_chmod(
+            named_first,
+            context.effective_uid,
+            context.effective_gid,
+        )?;
         let next = context
             .sys
             .open_at(context.parent_fd, component, DIRECTORY_OPEN_FLAGS, 0)
             .map_err(|_| PlatformStoreFailure::IdentityUncertain)?;
-        let pending = PendingDirectoryFd::new(&context.sys, next);
+        let pending = OwnedDirectoryFd::new(&context.sys, next);
+        let opened = context
+            .sys
+            .stat(pending.fd())
+            .map_err(|_| PlatformStoreFailure::Io)?;
+        let named_second = context
+            .sys
+            .stat_at(context.parent_fd, component, libc::AT_SYMLINK_NOFOLLOW)
+            .map_err(map_created_named_observation_error)?;
+        if !stable_path_security(named_first, opened) || !stable_path_security(opened, named_second)
+        {
+            return Err(PlatformStoreFailure::IdentityUncertain);
+        }
         if let Err(error) = context.sys.chmod(pending.fd(), 0o700) {
             return Err(if error.is(libc::EPERM) || error.is(libc::EACCES) {
                 PlatformStoreFailure::PermissionInvalid
@@ -546,7 +556,7 @@ fn create_missing_private_path<S: DarwinSyscalls>(
         let acl = context.sys.acl(pending.fd())?;
         validate_acl(&metadata, &acl)?;
         context.replace_parent(pending.fd())?;
-        pending.disarm();
+        let _ = pending.disarm();
     }
     Ok(())
 }

@@ -64,6 +64,14 @@ enum ContainerPreflight {
     Metadata(FileMetadata),
 }
 
+#[derive(Clone, Copy)]
+enum HomeFinalFailure {
+    Stat,
+    Metadata,
+    AclRead,
+    AclValidation,
+}
+
 struct FakeState {
     events: Vec<Event>,
     credentials: Credentials,
@@ -84,7 +92,14 @@ struct FakeState {
     fail_stat_fd: Option<RawFd>,
     fail_acl_fd: Option<RawFd>,
     invalid_acl_fd: Option<RawFd>,
-    forced_private_mode: Option<u32>,
+    private_mode: u32,
+    private_mode_after_chmod: Option<u32>,
+    replace_private_on_named_recheck: bool,
+    private_named_observations: usize,
+    fail_close_fd: Option<RawFd>,
+    home_final_failure: Option<HomeFinalFailure>,
+    home_stat_calls: usize,
+    home_acl_calls: usize,
 }
 
 struct FakeSyscalls {
@@ -120,7 +135,14 @@ impl FakeSyscalls {
                 fail_stat_fd: None,
                 fail_acl_fd: None,
                 invalid_acl_fd: None,
-                forced_private_mode: None,
+                private_mode: 0o700,
+                private_mode_after_chmod: None,
+                replace_private_on_named_recheck: false,
+                private_named_observations: 0,
+                fail_close_fd: None,
+                home_final_failure: None,
+                home_stat_calls: 0,
+                home_acl_calls: 0,
             }),
         })
     }
@@ -168,8 +190,26 @@ impl FakeSyscalls {
         self.state.lock().expect("fake state").invalid_acl_fd = Some(fd);
     }
 
-    fn force_private_mode(&self, mode: u32) {
-        self.state.lock().expect("fake state").forced_private_mode = Some(mode);
+    fn force_private_mode_after_chmod(&self, mode: u32) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .private_mode_after_chmod = Some(mode);
+    }
+
+    fn replace_private_on_named_recheck(&self) {
+        self.state
+            .lock()
+            .expect("fake state")
+            .replace_private_on_named_recheck = true;
+    }
+
+    fn fail_close_for(&self, fd: RawFd) {
+        self.state.lock().expect("fake state").fail_close_fd = Some(fd);
+    }
+
+    fn fail_home_final_with(&self, failure: HomeFinalFailure) {
+        self.state.lock().expect("fake state").home_final_failure = Some(failure);
     }
 
     fn make_existing_valid(&self) {
@@ -213,7 +253,7 @@ impl FakeSyscalls {
                 1,
                 state.home_inode + 1,
                 libc::S_IFDIR,
-                state.forced_private_mode.unwrap_or(0o700),
+                state.private_mode,
                 501,
                 20,
                 0,
@@ -309,6 +349,20 @@ impl DarwinSyscalls for FakeSyscalls {
     fn stat(&self, fd: RawFd) -> Result<FileMetadata, SyscallError> {
         let mut state = self.state.lock().expect("fake state");
         state.events.push(Event::Stat(fd));
+        if fd == HOME_FD {
+            state.home_stat_calls += 1;
+            if state.home_stat_calls == 2 {
+                match state.home_final_failure {
+                    Some(HomeFinalFailure::Stat) => return Err(SyscallError(libc::EIO)),
+                    Some(HomeFinalFailure::Metadata) => {
+                        let mut metadata = Self::directory_metadata(fd, &state);
+                        metadata.mode = u32::from(libc::S_IFDIR) | 0o777;
+                        return Ok(metadata);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if state.fail_stat_fd == Some(fd) {
             return Err(SyscallError(libc::EIO));
         }
@@ -345,7 +399,14 @@ impl DarwinSyscalls for FakeSyscalls {
             (USERS_FD, b"alice") => Ok(Self::directory_metadata(HOME_FD, &state)),
             (HOME_FD, value) if value == Self::private_component() => {
                 if state.private_exists {
-                    Ok(Self::directory_metadata(PRIVATE_FD, &state))
+                    state.private_named_observations += 1;
+                    let mut metadata = Self::directory_metadata(PRIVATE_FD, &state);
+                    if state.replace_private_on_named_recheck
+                        && state.private_named_observations == 2
+                    {
+                        metadata.inode += 1_000;
+                    }
+                    Ok(metadata)
                 } else {
                     Err(SyscallError(libc::ENOENT))
                 }
@@ -377,7 +438,24 @@ impl DarwinSyscalls for FakeSyscalls {
     }
 
     fn acl(&self, fd: RawFd) -> Result<Vec<AclEntry>, PlatformStoreFailure> {
-        let state = self.state.lock().expect("fake state");
+        let mut state = self.state.lock().expect("fake state");
+        if fd == HOME_FD {
+            state.home_acl_calls += 1;
+            if state.home_acl_calls == 2 {
+                match state.home_final_failure {
+                    Some(HomeFinalFailure::AclRead) => return Err(PlatformStoreFailure::Io),
+                    Some(HomeFinalFailure::AclValidation) => {
+                        return Ok(vec![AclEntry {
+                            allow: true,
+                            principal: AclPrincipal::Unknown,
+                            permissions: 1 << 2,
+                            flags: 0,
+                        }]);
+                    }
+                    _ => {}
+                }
+            }
+        }
         if state.fail_acl_fd == Some(fd) {
             return Err(PlatformStoreFailure::Io);
         }
@@ -410,6 +488,8 @@ impl DarwinSyscalls for FakeSyscalls {
         state.events.push(Event::Chmod(fd, mode));
         if fd == CONTAINER_FD {
             state.container_mode = u32::from(libc::S_IFREG) | mode;
+        } else if fd == PRIVATE_FD {
+            state.private_mode = state.private_mode_after_chmod.unwrap_or(mode);
         }
         Ok(())
     }
@@ -521,12 +601,13 @@ impl DarwinSyscalls for FakeSyscalls {
     }
 
     fn close(&self, fd: RawFd) -> Result<(), SyscallError> {
-        self.state
-            .lock()
-            .expect("fake state")
-            .events
-            .push(Event::Close(fd));
-        Ok(())
+        let mut state = self.state.lock().expect("fake state");
+        state.events.push(Event::Close(fd));
+        if state.fail_close_fd == Some(fd) {
+            Err(SyscallError(libc::EIO))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -587,6 +668,13 @@ fn assert_no_store_mutation(events: &[Event]) {
         Event::OpenAt { flags, .. } => flags & (libc::O_CREAT | libc::O_RDWR) != 0,
         _ => false,
     }));
+}
+
+fn close_count(events: &[Event], fd: RawFd) -> usize {
+    events
+        .iter()
+        .filter(|event| **event == Event::Close(fd))
+        .count()
 }
 
 #[test]
@@ -715,7 +803,7 @@ fn private_directory_failures_close_the_untransferred_fd_exactly_once() {
         let fake = FakeSyscalls::new(private_exists, ContainerPreflight::Missing);
         match failure {
             Failure::InspectStat | Failure::CreateStat => fake.fail_stat_for(PRIVATE_FD),
-            Failure::CreateMetadata => fake.force_private_mode(0o755),
+            Failure::CreateMetadata => fake.force_private_mode_after_chmod(0o755),
             Failure::InspectAclRead | Failure::CreateAclRead => fake.fail_acl_for(PRIVATE_FD),
             Failure::InspectAclValidation | Failure::CreateAclValidation => {
                 fake.invalidate_acl_for(PRIVATE_FD)
@@ -741,6 +829,74 @@ fn private_directory_failures_close_the_untransferred_fd_exactly_once() {
         assert!(!events
             .iter()
             .any(|event| *event == Event::Close(CONTAINER_FD)));
+    }
+}
+
+#[test]
+fn created_private_directory_named_replacement_fails_before_chmod() {
+    let fake = FakeSyscalls::new(false, ContainerPreflight::Missing);
+    fake.replace_private_on_named_recheck();
+
+    assert!(matches!(
+        open_test_store(Arc::clone(&fake)),
+        Err(NativeStoreErrorCode::StoreIdentityUncertain)
+    ));
+    let events = fake.events();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::StatAt { parent: HOME_FD, component }
+                    if component == &FakeSyscalls::private_component()
+            ))
+            .count(),
+        3,
+        "initial absence plus named A/C observations are required"
+    );
+    assert!(!events
+        .iter()
+        .any(|event| *event == Event::Chmod(PRIVATE_FD, 0o700)));
+    assert_eq!(close_count(&events, PRIVATE_FD), 1);
+    assert_eq!(close_count(&events, HOME_FD), 1);
+    assert_eq!(close_count(&events, CONTAINER_FD), 0);
+}
+
+#[test]
+fn home_traversal_failures_close_each_owned_fd_once() {
+    let close_failure = FakeSyscalls::new(false, ContainerPreflight::Missing);
+    close_failure.fail_close_for(ROOT_FD);
+    assert!(matches!(
+        open_test_store(Arc::clone(&close_failure)),
+        Err(NativeStoreErrorCode::StoreIo)
+    ));
+    let events = close_failure.events();
+    assert_eq!(close_count(&events, ROOT_FD), 1);
+    assert_eq!(close_count(&events, USERS_FD), 1);
+    assert_eq!(close_count(&events, HOME_FD), 0);
+
+    let final_failures = [
+        (HomeFinalFailure::Stat, NativeStoreErrorCode::StoreIo),
+        (
+            HomeFinalFailure::Metadata,
+            NativeStoreErrorCode::StorePermissionInvalid,
+        ),
+        (HomeFinalFailure::AclRead, NativeStoreErrorCode::StoreIo),
+        (
+            HomeFinalFailure::AclValidation,
+            NativeStoreErrorCode::StorePermissionInvalid,
+        ),
+    ];
+    for (failure, expected) in final_failures {
+        let fake = FakeSyscalls::new(false, ContainerPreflight::Missing);
+        fake.fail_home_final_with(failure);
+        assert_eq!(open_test_store(Arc::clone(&fake)).err(), Some(expected));
+        let events = fake.events();
+        assert_eq!(close_count(&events, ROOT_FD), 1);
+        assert_eq!(close_count(&events, USERS_FD), 1);
+        assert_eq!(close_count(&events, HOME_FD), 1);
+        assert_eq!(close_count(&events, PRIVATE_FD), 0);
+        assert_eq!(close_count(&events, CONTAINER_FD), 0);
     }
 }
 
@@ -801,6 +957,33 @@ fn exact_container_flags_lock_creation_and_publication_barrier_order_are_preserv
     let fake = FakeSyscalls::new(false, ContainerPreflight::Missing);
     let store = open_test_store(Arc::clone(&fake)).expect("open created store");
     let events = fake.events();
+    let private_creation = [
+        Event::MkdirAt {
+            parent: HOME_FD,
+            component: FakeSyscalls::private_component(),
+            mode: 0o700,
+        },
+        Event::StatAt {
+            parent: HOME_FD,
+            component: FakeSyscalls::private_component(),
+        },
+        Event::OpenAt {
+            parent: HOME_FD,
+            component: FakeSyscalls::private_component(),
+            flags: DIRECTORY_OPEN_FLAGS,
+            mode: 0,
+        },
+        Event::Stat(PRIVATE_FD),
+        Event::StatAt {
+            parent: HOME_FD,
+            component: FakeSyscalls::private_component(),
+        },
+        Event::Chmod(PRIVATE_FD, 0o700),
+        Event::Stat(PRIVATE_FD),
+    ];
+    assert!(events
+        .windows(private_creation.len())
+        .any(|window| window == private_creation));
     let container_open = events
         .iter()
         .find_map(|event| match event {
