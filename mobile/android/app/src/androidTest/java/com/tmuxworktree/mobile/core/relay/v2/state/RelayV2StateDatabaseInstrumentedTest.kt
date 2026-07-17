@@ -4,6 +4,11 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentExtensionSessionIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
@@ -94,7 +99,9 @@ class RelayV2StateDatabaseInstrumentedTest {
         val second = durableNamespace("profile", activation = 2)
         val retained = durableNamespace("other-profile", activation = 1)
         listOf(first, second, retained).forEach(::putDurableAuthorities)
+        listOf(first, second, retained).forEach { putAgentConsumer(it) }
         listOf(first, second, retained).forEach(::assertDurablePayloadByteCounts)
+        listOf(first, second, retained).forEach { assertEquals(1, agentRows(it).size) }
 
         RelayV2StateRepository(database).clearProfileAfterDisconnect(
             RelayProfileDisconnectReceipt(
@@ -113,6 +120,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertNull(outboxMeta(cleared))
             assertEquals(emptyList<RelayV2OutboxEntryEntity>(), outboxEntries(cleared))
             assertNull(terminalCheckpoint(cleared))
+            assertEquals(emptyList<RelayV2AgentTranscriptLifecycleStateEntity>(), agentRows(cleared))
         }
         assertEquals(1L, outboxMeta(retained)?.nextCreationOrder)
         assertEquals(1, outboxEntries(retained).size)
@@ -120,6 +128,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             RelayV2TerminalCheckpointKind.PRE_OPEN.name,
             terminalCheckpoint(retained)?.checkpointKind,
         )
+        assertEquals(1, agentRows(retained).size)
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
@@ -331,6 +340,23 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
     }
 
+    private suspend fun putAgentConsumer(namespace: RelayV2OutboxAuthorityNamespace) {
+        val consumer = agentConsumer(namespace)
+        val state = AgentTranscriptLifecycleClientState(
+            identity = AgentExtensionSessionIdentity(
+                consumer.profileId,
+                consumer.hostId,
+                consumer.hostEpoch,
+                consumer.scopeId,
+                consumer.sessionId,
+            ),
+        )
+        AgentTranscriptLifecycleDurableRepository(database).initializeUnderApplyLease(
+            AgentTranscriptLifecycleDurableNamespace.from(consumer, state),
+            state,
+        )
+    }
+
     private fun assertNamespacePresent(namespace: RelayV2StateNamespace, suffix: String) {
         assertEquals(namespace.principalId, authority(namespace)?.principalId)
         assertEquals("scope-$suffix", scope(namespace)?.displayName)
@@ -500,6 +526,32 @@ class RelayV2StateDatabaseInstrumentedTest {
             "stream-${namespace.profileActivationGeneration}",
             0,
         )
+
+    private fun agentRows(namespace: RelayV2OutboxAuthorityNamespace) = agentConsumer(namespace).let {
+        dao.agentTranscriptLifecycleStates(
+            it.profileId,
+            it.profileActivationGeneration,
+            it.principalId,
+            it.clientInstanceId,
+            it.hostId,
+            it.hostEpoch,
+            it.scopeId,
+            it.sessionId,
+        )
+    }
+
+    private fun agentConsumer(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ) = AgentTranscriptLifecycleDurableConsumerIdentity(
+        namespace.profileId,
+        namespace.profileActivationGeneration,
+        namespace.principalId,
+        namespace.clientInstanceId,
+        "host",
+        "epoch",
+        SCOPE_ID,
+        SESSION_ID,
+    )
 
     private companion object {
         const val SCOPE_ID = "scope"

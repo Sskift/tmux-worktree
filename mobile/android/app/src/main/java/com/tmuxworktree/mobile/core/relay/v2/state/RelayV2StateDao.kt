@@ -413,6 +413,54 @@ internal interface RelayV2StateDao {
     fun deleteProfileTerminalCheckpoints(profileId: String)
 
     @Query(
+        "SELECT * FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND scopeId = :scopeId AND sessionId = :sessionId ORDER BY timelineEpochKey",
+    )
+    fun agentTranscriptLifecycleStates(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+    ): List<RelayV2AgentTranscriptLifecycleStateEntity>
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptLifecycleState(
+        state: RelayV2AgentTranscriptLifecycleStateEntity,
+    )
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND scopeId = :scopeId AND sessionId = :sessionId",
+    )
+    fun deleteAgentTranscriptLifecycleConsumer(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+    )
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_lifecycle_states WHERE profileId = :profileId",
+    )
+    fun deleteProfileAgentTranscriptLifecycleStates(profileId: String)
+
+    @Query(
         "DELETE FROM relay_v2_authority WHERE profileId = :profileId " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch",

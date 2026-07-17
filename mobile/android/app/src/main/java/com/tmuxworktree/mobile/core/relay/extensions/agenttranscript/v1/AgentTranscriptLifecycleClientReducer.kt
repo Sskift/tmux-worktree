@@ -1491,7 +1491,7 @@ private const val PRODUCTION_MAX_NOTIFICATION_DECISIONS_PER_REDUCTION = 64
 private const val PRODUCTION_MAX_RETIRED_TIMELINE_EPOCHS = 256
 private const val MAX_OPAQUE_ID_UTF8_BYTES = 128
 
-private fun requireOpaqueId(value: String?, label: String) {
+internal fun requireOpaqueId(value: String?, label: String) {
     require(!value.isNullOrBlank()) { "$label is required" }
     require(value == value.trim()) { "$label cannot contain outer whitespace" }
     require(!value.contains('\u0000')) { "$label contains NUL" }

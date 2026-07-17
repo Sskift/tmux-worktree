@@ -170,6 +170,67 @@ class RelayV2StateDatabaseMigrationTest {
     }
 
     @Test
+    fun migration3To4PreservesExistingV2RowsAndAddsEmptyAgentConsumerTable() {
+        migration.createDatabase(DATABASE_NAME, 3).apply {
+            insertLegacyAuthority()
+            execSQL(
+                """
+                INSERT INTO relay_v2_outbox_meta (
+                    profileId, profileActivationGeneration, principalId, clientInstanceId,
+                    nextCreationOrder, codecVersion, payloadUtf8Bytes,
+                    payloadCanonicalJson, payloadSha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "profile-v2", 7, "principal-v2", "android-install-v2",
+                    3, 1, 2, "{}", "outbox-digest-before-v4",
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO relay_v2_terminal_checkpoints (
+                    profileId, profileActivationGeneration, principalId, clientInstanceId,
+                    hostId, hostEpoch, scopeId, sessionId, streamId, pane, checkpointKind,
+                    codecVersion, payloadUtf8Bytes, payloadCanonicalJson, payloadSha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "profile-v2", 7, "principal-v2", "android-install-v2",
+                    "host-a", "epoch-a", "scope-a", "session-a", "stream-a", 0,
+                    "PRE_OPEN", 1, 2, "{}", "terminal-digest-before-v4",
+                ),
+            )
+            close()
+        }
+
+        migration.runMigrationsAndValidate(
+            DATABASE_NAME,
+            4,
+            true,
+            RelayV2StateDatabase.MIGRATION_3_4,
+        ).use { migrated ->
+            assertEquals(1, migrated.count("relay_v2_authority"))
+            assertEquals(1, migrated.count("relay_v2_outbox_meta"))
+            assertEquals(1, migrated.count("relay_v2_terminal_checkpoints"))
+            assertEquals(0, migrated.count("relay_v2_agent_transcript_lifecycle_states"))
+            migrated.query(
+                "SELECT nextCreationOrder, payloadSha256 FROM relay_v2_outbox_meta",
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(3, cursor.getInt(0))
+                assertEquals("outbox-digest-before-v4", cursor.getString(1))
+            }
+            migrated.query(
+                "SELECT checkpointKind, payloadSha256 FROM relay_v2_terminal_checkpoints",
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("PRE_OPEN", cursor.getString(0))
+                assertEquals("terminal-digest-before-v4", cursor.getString(1))
+            }
+        }
+    }
+
+    @Test
     fun migratedReleaseJournalCorruptionFailsClosedOnReopen() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         migration.createDatabase(DATABASE_NAME, 2).apply {
@@ -189,6 +250,7 @@ class RelayV2StateDatabaseMigrationTest {
         ).addMigrations(
             RelayV2StateDatabase.MIGRATION_1_2,
             RelayV2StateDatabase.MIGRATION_2_3,
+            RelayV2StateDatabase.MIGRATION_3_4,
         ).build()
         val corruptions = listOf(
             "pendingReleaseSnapshotRequestId='request-only'",

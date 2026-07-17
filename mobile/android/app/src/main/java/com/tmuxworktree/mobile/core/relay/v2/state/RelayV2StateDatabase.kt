@@ -18,8 +18,9 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2OutboxMetaEntity::class,
         RelayV2OutboxEntryEntity::class,
         RelayV2TerminalCheckpointEntity::class,
+        RelayV2AgentTranscriptLifecycleStateEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
@@ -33,7 +34,7 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
             context.applicationContext,
             RelayV2StateDatabase::class.java,
             DATABASE_NAME,
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build()
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
 
         /**
          * Additive storage-owner migration. Existing v2 state-sync rows remain byte-for-byte
@@ -142,6 +143,46 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                 db.execSQL(
                     "ALTER TABLE `relay_v2_authority` " +
                         "ADD COLUMN `pendingReleasePhase` TEXT",
+                )
+            }
+        }
+
+        /** Adds the isolated optional Agent extension consumer without reading or lifting v1. */
+        val MIGRATION_3_4: Migration = object : Migration(3, 4) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_transcript_lifecycle_states` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpochKey` TEXT NOT NULL,
+                        `codecVersion` INTEGER NOT NULL,
+                        `payloadUtf8Bytes` INTEGER NOT NULL,
+                        `payloadCanonicalJson` TEXT NOT NULL,
+                        `payloadSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        )
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_relay_v2_agent_transcript_lifecycle_states_profileId_profileActivationGeneration_principalId_clientInstanceId_hostId_hostEpoch_scopeId_sessionId`
+                    ON `relay_v2_agent_transcript_lifecycle_states` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`
+                    )
+                    """.trimIndent(),
                 )
             }
         }

@@ -374,3 +374,56 @@ internal data class RelayV2TerminalCheckpointEntity(
     val payloadCanonicalJson: String,
     val payloadSha256: String,
 )
+
+/**
+ * One durable optional Agent transcript/lifecycle consumer state.
+ *
+ * The primary key carries the complete profile activation, authenticated client, host, opaque
+ * Session, and timeline lineage. [timelineEpochKey] is the empty string only when the reducer has
+ * no current timeline; public timeline IDs themselves cannot be empty. The unique consumer index
+ * prevents two current lineages from being selected for one consumer slot.
+ */
+@Entity(
+    tableName = "relay_v2_agent_transcript_lifecycle_states",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpochKey",
+    ],
+    indices = [
+        Index(
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+            ],
+            unique = true,
+        ),
+    ],
+)
+internal data class RelayV2AgentTranscriptLifecycleStateEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpochKey: String,
+    val codecVersion: Int,
+    val payloadUtf8Bytes: Int,
+    val payloadCanonicalJson: String,
+    val payloadSha256: String,
+)
