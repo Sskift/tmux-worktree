@@ -18,6 +18,14 @@ sealed interface AgentTranscriptLifecycleV1Frame {
     val type: String
 }
 
+/** Strictly decoded server-to-client frame bound to one host session identity. */
+sealed interface AgentTranscriptLifecycleV1InboundFrame : AgentTranscriptLifecycleV1Frame {
+    val hostId: String
+    val hostEpoch: String
+    val scopeId: String
+    val sessionId: String
+}
+
 enum class AgentTimelineErrorCode(val wireValue: String) {
     AGENT_TIMELINE_UNAVAILABLE("AGENT_TIMELINE_UNAVAILABLE"),
     AGENT_CURSOR_EXPIRED("AGENT_CURSOR_EXPIRED"),
@@ -42,12 +50,12 @@ data class AgentTimelineStructuredError(
 /** Correlated base-v2 error envelope carrying only extension-owned error codes. */
 data class AgentTimelineErrorFrame(
     val requestId: String,
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val error: AgentTimelineStructuredError,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.RESPONSE
     override val type: String = "error"
@@ -67,12 +75,12 @@ data class AgentTimelineStatusGetFrame(
 
 data class AgentTimelineStatusFrame(
     val requestId: String,
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val status: AgentTimelineStatus,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.RESPONSE
     override val type: String = "agent.timeline.status"
@@ -134,12 +142,12 @@ data class AgentTimelineSnapshotRequest(
 
 data class AgentTimelineSnapshotPageFrame(
     val requestId: String,
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val page: AgentTimelineSnapshotPage,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.RESPONSE
     override val type: String = "agent.timeline.snapshot.page"
@@ -179,12 +187,12 @@ data class AgentTimelineReplayRequest(
 
 data class AgentTimelineReplayPageFrame(
     val requestId: String,
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val page: AgentTimelineReplayPage,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.RESPONSE
     override val type: String = "agent.timeline.replay.page"
@@ -200,13 +208,13 @@ data class AgentTimelineReplayPage(
 )
 
 data class AgentTimelineEventFrame(
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val timelineEpoch: String,
     val event: AgentTimelineEventRecord,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.EVENT
     override val type: String = "agent.timeline.event"
@@ -328,14 +336,14 @@ enum class AgentTimelineResetReason(val wireValue: String) {
 }
 
 data class AgentTimelineResetFrame(
-    val hostId: String,
-    val hostEpoch: String,
-    val scopeId: String,
-    val sessionId: String,
+    override val hostId: String,
+    override val hostEpoch: String,
+    override val scopeId: String,
+    override val sessionId: String,
     val previousTimelineEpoch: String,
     val newTimelineEpoch: String?,
     val reason: AgentTimelineResetReason,
-) : AgentTranscriptLifecycleV1Frame {
+) : AgentTranscriptLifecycleV1InboundFrame {
     override val kind: AgentTranscriptLifecycleV1FrameKind =
         AgentTranscriptLifecycleV1FrameKind.EVENT
     override val type: String = "agent.timeline.reset"

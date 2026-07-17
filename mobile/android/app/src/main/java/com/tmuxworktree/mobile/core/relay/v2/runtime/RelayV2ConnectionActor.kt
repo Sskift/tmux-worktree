@@ -77,7 +77,7 @@ internal class RelayV2ConnectionActor(
     eventCapacity: Int = DEFAULT_EVENT_CAPACITY,
     private val actionByteCapacity: Long = DEFAULT_ACTION_BYTE_CAPACITY,
     private val effectByteCapacity: Long = DEFAULT_EFFECT_BYTE_CAPACITY,
-) : RelayProfileDisconnectBarrier, Closeable {
+) : RelayProfileDisconnectBarrier, RelayV2RepositoryEffectApplyLeasePort, Closeable {
     private val actorDispatcher: ExecutorCoroutineDispatcher = Executors
         .newSingleThreadExecutor { runnable ->
             Thread(runnable, "tw-relay-v2-actor").apply { isDaemon = true }
@@ -137,10 +137,30 @@ internal class RelayV2ConnectionActor(
     suspend fun <T> withEffectApplyLease(
         effect: RelayV2RuntimeEffect.GenerationScoped,
         block: suspend () -> T,
+    ): RelayV2EffectApplyResult<T> = withEffectApplyLease(
+        generation = effect.generation,
+        repositoryAuthority =
+            (effect as? RelayV2RuntimeEffect.RepositoryScoped)?.repositoryAuthority,
+        block = block,
+    )
+
+    override suspend fun <T> withEffectApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        block: suspend () -> T,
+    ): RelayV2EffectApplyResult<T> = withEffectApplyLease(
+        generation = authority.generation,
+        repositoryAuthority = authority,
+        block = block,
+    )
+
+    private suspend fun <T> withEffectApplyLease(
+        generation: RelayV2EffectGeneration,
+        repositoryAuthority: RelayV2RepositoryEffectAuthority?,
+        block: suspend () -> T,
     ): RelayV2EffectApplyResult<T> {
         val lease = effectApplyGate.begin(
-            effect.generation,
-            (effect as? RelayV2RuntimeEffect.RepositoryScoped)?.repositoryAuthority,
+            generation,
+            repositoryAuthority,
         )
             ?: return RelayV2EffectApplyResult.Stale
         return try {

@@ -204,6 +204,15 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
     fun insertNotificationClaim(claim: AgentTranscriptLifecyclePersistedNotificationClaim)
 }
 
+/** Existing durable reducer owner as consumed by the runtime adapter and focused memory tests. */
+internal interface AgentTranscriptLifecycleDurableReductionPort {
+    suspend fun reduceUnderApplyLease(
+        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+        input: AgentTranscriptLifecycleClientInput,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleClientReduction
+}
+
 /**
  * Atomic persistence owner for the optional Agent reducer.
  *
@@ -212,7 +221,7 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
  */
 internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val store: AgentTranscriptLifecycleDurableStore,
-) {
+) : AgentTranscriptLifecycleDurableReductionPort {
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = store.transaction {
@@ -245,10 +254,10 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         )
     }
 
-    suspend fun reduceUnderApplyLease(
+    override suspend fun reduceUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         input: AgentTranscriptLifecycleClientInput,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleClientReduction = store.transaction {
         val current = loadSingle(expectedNamespace.consumer)
             ?: throw AgentTranscriptLifecyclePersistenceMissingException()

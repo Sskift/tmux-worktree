@@ -164,6 +164,20 @@ internal sealed interface RelayV2EffectApplyResult<out T> {
     data object Stale : RelayV2EffectApplyResult<Nothing>
 }
 
+/**
+ * Typed access to the actor-owned repository apply gate.
+ *
+ * Implementations must withdraw admission before a disconnect/profile-switch barrier and wait for
+ * every admitted [block] to finish. Observing a matching generation outside this port never grants
+ * repository mutation authority.
+ */
+internal interface RelayV2RepositoryEffectApplyLeasePort {
+    suspend fun <T> withEffectApplyLease(
+        authority: RelayV2RepositoryEffectAuthority,
+        block: suspend () -> T,
+    ): RelayV2EffectApplyResult<T>
+}
+
 internal enum class RelayV2HelloOutcome {
     FRESH,
     MATCHED,
