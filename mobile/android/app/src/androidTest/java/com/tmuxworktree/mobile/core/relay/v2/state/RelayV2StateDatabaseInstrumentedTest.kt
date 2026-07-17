@@ -4,18 +4,17 @@ import android.content.Context
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentExtensionSessionIdentity
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleClientState
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableConsumerIdentity
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableNamespace
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRepository
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.*
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
+import java.security.MessageDigest
+import java.util.Base64
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -102,6 +101,7 @@ class RelayV2StateDatabaseInstrumentedTest {
         listOf(first, second, retained).forEach { putAgentConsumer(it) }
         listOf(first, second, retained).forEach(::assertDurablePayloadByteCounts)
         listOf(first, second, retained).forEach { assertEquals(1, agentRows(it).size) }
+        listOf(first, second, retained).forEach { assertTrue(agentClaim(it) != null) }
 
         RelayV2StateRepository(database).clearProfileAfterDisconnect(
             RelayProfileDisconnectReceipt(
@@ -121,6 +121,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertEquals(emptyList<RelayV2OutboxEntryEntity>(), outboxEntries(cleared))
             assertNull(terminalCheckpoint(cleared))
             assertEquals(emptyList<RelayV2AgentTranscriptLifecycleStateEntity>(), agentRows(cleared))
+            assertNull(agentClaim(cleared))
         }
         assertEquals(1L, outboxMeta(retained)?.nextCreationOrder)
         assertEquals(1, outboxEntries(retained).size)
@@ -129,6 +130,26 @@ class RelayV2StateDatabaseInstrumentedTest {
             terminalCheckpoint(retained)?.checkpointKind,
         )
         assertEquals(1, agentRows(retained).size)
+        assertTrue(agentClaim(retained) != null)
+    }
+
+    @Test
+    fun notificationClaimInsertAbortNeverOverwritesCommittedEvidence() = runBlocking {
+        val namespace = durableNamespace("profile", activation = 1)
+        putAgentConsumer(namespace)
+        val committed = requireNotNull(agentClaim(namespace))
+
+        val failure = runCatching {
+            dao.insertAgentTranscriptLifecycleNotificationClaim(
+                committed.copy(
+                    claimedLocalGeneration = "2",
+                    payloadSha256 = "0".repeat(64),
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure != null)
+        assertEquals(committed, agentClaim(namespace))
     }
 
     private fun putAllSixCategories(namespace: RelayV2StateNamespace, suffix: String) {
@@ -341,19 +362,17 @@ class RelayV2StateDatabaseInstrumentedTest {
     }
 
     private suspend fun putAgentConsumer(namespace: RelayV2OutboxAuthorityNamespace) {
-        val consumer = agentConsumer(namespace)
-        val state = AgentTranscriptLifecycleClientState(
-            identity = AgentExtensionSessionIdentity(
-                consumer.profileId,
-                consumer.hostId,
-                consumer.hostEpoch,
-                consumer.scopeId,
-                consumer.sessionId,
-            ),
+        val fixture = agentClaimFixture(namespace)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        repository.initializeUnderApplyLease(
+            fixture.namespace,
+            fixture.state,
         )
-        AgentTranscriptLifecycleDurableRepository(database).initializeUnderApplyLease(
-            AgentTranscriptLifecycleDurableNamespace.from(consumer, state),
-            state,
+        assertTrue(
+            repository.claimNotificationUnderApplyLease(
+                fixture.namespace,
+                fixture.intent,
+            ) is AgentTranscriptLifecycleNotificationClaimResult.Claimed,
         )
     }
 
@@ -540,6 +559,104 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
     }
 
+    private fun agentClaim(namespace: RelayV2OutboxAuthorityNamespace):
+        RelayV2AgentTranscriptLifecycleNotificationClaimEntity? {
+        val fixture = agentClaimFixture(namespace)
+        val key = fixture.intent.dedupeKey
+        val consumer = fixture.namespace.consumer
+        return dao.agentTranscriptLifecycleNotificationClaim(
+            consumer.profileId,
+            consumer.profileActivationGeneration,
+            consumer.principalId,
+            consumer.clientInstanceId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+            key.timelineEpoch,
+            key.lifecycleEventId,
+            key.state.name,
+        )
+    }
+
+    private fun agentClaimFixture(namespace: RelayV2OutboxAuthorityNamespace): AgentClaimFixture {
+        val consumer = agentConsumer(namespace)
+        val lifecycleIdentity = AgentLifecycleIdentity(
+            AgentLifecycleScope.TURN,
+            "run-${namespace.profileActivationGeneration}",
+            "turn-${namespace.profileActivationGeneration}",
+        )
+        val record = AgentLifecycleRecord(
+            "event-${namespace.profileActivationGeneration}",
+            "source",
+            lifecycleIdentity,
+            AgentLifecycleState.WAITING_FOR_USER,
+            "1",
+        )
+        val closedDigest = digest("claim-${namespace.profileId}-${namespace.profileActivationGeneration}")
+        val witness = AgentLifecycleEventIdentityWitness(
+            record.lifecycleEventId,
+            record.agentEventSeq,
+            lifecycleIdentity,
+            record.sourceEpoch,
+            record.state,
+            closedDigest,
+        )
+        val dedupeKey = AgentNotificationDedupeKey(
+            consumer.profileId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+            "timeline",
+            record.lifecycleEventId,
+            record.state,
+        )
+        val state = AgentTranscriptLifecycleClientState(
+            identity = consumer.sessionIdentity,
+            extensionLane = AgentTranscriptLifecycleExtensionState(
+                localGeneration = "1",
+                support = AgentExtensionSupport.AVAILABLE,
+                unavailableReason = null,
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = record.sourceEpoch,
+                timelineEpoch = dedupeKey.timelineEpoch,
+                lastAgentSeq = "1",
+                notificationBaselineAgentSeq = "0",
+                lifecycleByIdentity = mapOf(lifecycleIdentity to record),
+                currentLifecycleIdentityByEventId = mapOf(
+                    record.lifecycleEventId to lifecycleIdentity,
+                ),
+                runsWithTurnRecords = setOf(lifecycleIdentity.runId),
+                appliedEventsBySeq = mapOf(
+                    "1" to AgentAppliedEventEvidence(record.lifecycleEventId, closedDigest),
+                ),
+                eventWitnessById = mapOf(record.lifecycleEventId to witness),
+                eventIdBySeq = mapOf("1" to record.lifecycleEventId),
+                notificationLedger = mapOf(
+                    dedupeKey to AgentNotificationLedgerEntry(
+                        AgentNotificationDisposition.SHOWN,
+                        witness,
+                        "1",
+                    ),
+                ),
+                notificationKeyByLifecycleEventId = mapOf(
+                    record.lifecycleEventId to dedupeKey,
+                ),
+            ),
+            notificationConfig = AgentNotificationConfig(
+                permission = AgentNotificationPermission.GRANTED,
+                profileActive = true,
+                policy = AgentNotificationPolicy.ALLOW,
+            ),
+        )
+        return AgentClaimFixture(
+            AgentTranscriptLifecycleDurableNamespace.from(consumer, state),
+            state,
+            AgentSystemNotificationIntent(dedupeKey, "1"),
+        )
+    }
+
     private fun agentConsumer(
         namespace: RelayV2OutboxAuthorityNamespace,
     ) = AgentTranscriptLifecycleDurableConsumerIdentity(
@@ -551,6 +668,18 @@ class RelayV2StateDatabaseInstrumentedTest {
         "epoch",
         SCOPE_ID,
         SESSION_ID,
+    )
+
+    private fun digest(value: String): AgentClosedEventDigest = AgentClosedEventDigest(
+        Base64.getUrlEncoder().withoutPadding().encodeToString(
+            MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)),
+        ),
+    )
+
+    private data class AgentClaimFixture(
+        val namespace: AgentTranscriptLifecycleDurableNamespace,
+        val state: AgentTranscriptLifecycleClientState,
+        val intent: AgentSystemNotificationIntent,
     )
 
     private companion object {

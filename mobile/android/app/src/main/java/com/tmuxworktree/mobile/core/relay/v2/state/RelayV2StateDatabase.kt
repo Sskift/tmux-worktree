@@ -19,6 +19,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2OutboxEntryEntity::class,
         RelayV2TerminalCheckpointEntity::class,
         RelayV2AgentTranscriptLifecycleStateEntity::class,
+        RelayV2AgentTranscriptLifecycleNotificationClaimEntity::class,
     ],
     version = 4,
     exportSchema = true,
@@ -181,6 +182,34 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                     ON `relay_v2_agent_transcript_lifecycle_states` (
                         `profileId`, `profileActivationGeneration`, `principalId`,
                         `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS
+                        `relay_v2_agent_transcript_lifecycle_notification_claims` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `lifecycleEventId` TEXT NOT NULL,
+                        `lifecycleState` TEXT NOT NULL,
+                        `claimedLocalGeneration` TEXT NOT NULL,
+                        `codecVersion` INTEGER NOT NULL,
+                        `payloadUtf8Bytes` INTEGER NOT NULL,
+                        `payloadCanonicalJson` TEXT NOT NULL,
+                        `payloadSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `lifecycleEventId`, `lifecycleState`
+                        )
                     )
                     """.trimIndent(),
                 )

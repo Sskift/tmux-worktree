@@ -159,25 +159,214 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             assertEquals(1, restored.extensionLane.notificationLedger.size)
         }
 
+    @Test
+    fun `notification claim is one shot and returns only post commit authority`() = runBlocking {
+        val store = MemoryStore()
+        val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+        val consumer = consumer()
+        val state = richState(consumer, "timeline-a")
+        val namespace = namespace(consumer, state)
+        val intent = notificationIntent(state)
+        repository.initializeUnderApplyLease(namespace, state)
+
+        val claimed = repository.claimNotificationUnderApplyLease(namespace, intent)
+            as AgentTranscriptLifecycleNotificationClaimResult.Claimed
+
+        assertEquals(namespace, claimed.ticket.namespace)
+        assertEquals(intent, claimed.ticket.intent)
+        assertEquals(64, claimed.ticket.claimId.length)
+        assertEquals(1, store.claimCount)
+        val writesAfterClaim = store.writeCount
+        assertEquals(
+            AgentTranscriptLifecycleNotificationClaimResult.NotExecutable(
+                AgentTranscriptLifecycleNotificationNotExecutableReason.ALREADY_CLAIMED,
+            ),
+            repository.claimNotificationUnderApplyLease(namespace, intent),
+        )
+        assertEquals(writesAfterClaim, store.writeCount)
+        assertEquals(1, store.claimCount)
+    }
+
+    @Test
+    fun `corrupt claim codec hash and identity fail closed without overwrite`() = runBlocking {
+        val consumer = consumer()
+        val state = richState(consumer, "timeline-a")
+        val namespace = namespace(consumer, state)
+        val intent = notificationIntent(state)
+        val key = claimKey(namespace, intent)
+        val corruptions = listOf<(RelayV2EncodedPayload) -> RelayV2EncodedPayload>(
+            { it.copy(sha256 = "0".repeat(64)) },
+            {
+                it.copy(
+                    codecVersion = AgentTranscriptLifecycleNotificationClaimCodec.CODEC_VERSION + 1,
+                )
+            },
+            {
+                val wrongKey = key.copy(
+                    consumer = key.consumer.copy(principalId = "principal-wrong"),
+                )
+                AgentTranscriptLifecycleNotificationClaimCodec.encode(wrongKey, intent)
+            },
+        )
+
+        corruptions.forEach { corrupt ->
+            val store = MemoryStore()
+            val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+            repository.initializeUnderApplyLease(namespace, state)
+            assertTrue(
+                repository.claimNotificationUnderApplyLease(namespace, intent) is
+                    AgentTranscriptLifecycleNotificationClaimResult.Claimed,
+            )
+            store.mutateClaimPayload(key, corrupt)
+            val writesBeforeRead = store.writeCount
+
+            val failure = runCatching {
+                repository.claimNotificationUnderApplyLease(namespace, intent)
+            }.exceptionOrNull()
+
+            assertTrue(failure is RelayV2StorageException)
+            assertEquals(writesBeforeRead, store.writeCount)
+            assertEquals(1, store.claimCount)
+        }
+    }
+
+    @Test
+    fun `stale lineage generation source and notification config never create claims`() =
+        runBlocking {
+            val consumer = consumer()
+            val base = richState(consumer, "timeline-a")
+            val baseIntent = notificationIntent(base)
+            val cases = listOf(
+                "old-generation" to (base to baseIntent.copy(localGeneration = "2")),
+                "old-timeline" to (
+                    base to baseIntent.copy(
+                        dedupeKey = baseIntent.dedupeKey.copy(timelineEpoch = "timeline-old"),
+                    )
+                    ),
+                "inactive-profile" to (
+                    base.copy(notificationConfig = base.notificationConfig.copy(profileActive = false))
+                        to baseIntent
+                    ),
+                "permission-denied" to (
+                    base.copy(
+                        notificationConfig = base.notificationConfig.copy(
+                            permission = AgentNotificationPermission.DENIED,
+                        ),
+                    ) to baseIntent
+                    ),
+                "policy-suppress" to (
+                    base.copy(
+                        notificationConfig = base.notificationConfig.copy(
+                            policy = AgentNotificationPolicy.SUPPRESS,
+                        ),
+                    ) to baseIntent
+                    ),
+                "source-interrupted" to (
+                    base.copy(
+                        extensionLane = base.extensionLane.copy(
+                            liveSource = AgentLiveSourceState.INTERRUPTED,
+                        ),
+                    ) to baseIntent
+                    ),
+                "not-shown" to (withLedgerDisposition(
+                    base,
+                    AgentNotificationDisposition.SUPPRESSED_POLICY,
+                ) to baseIntent),
+            )
+
+            cases.forEach { (label, stateAndIntent) ->
+                val (state, intent) = stateAndIntent
+                val store = MemoryStore()
+                val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+                val namespace = namespace(consumer, state)
+                repository.initializeUnderApplyLease(namespace, state)
+
+                assertEquals(
+                    label,
+                    AgentTranscriptLifecycleNotificationClaimResult.NotExecutable(
+                        AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
+                    ),
+                    repository.claimNotificationUnderApplyLease(namespace, intent),
+                )
+                assertEquals(label, 0, store.claimCount)
+            }
+
+            val activationStore = MemoryStore()
+            val activationRepository = AgentTranscriptLifecycleDurableRepositoryCore(activationStore)
+            val namespace = namespace(consumer, base)
+            activationRepository.initializeUnderApplyLease(namespace, base)
+            val wrongActivation = namespace.copy(
+                consumer = consumer.copy(profileActivationGeneration = 8),
+            )
+            assertEquals(
+                AgentTranscriptLifecycleNotificationClaimResult.NotExecutable(
+                    AgentTranscriptLifecycleNotificationNotExecutableReason.STATE_MISSING,
+                ),
+                activationRepository.claimNotificationUnderApplyLease(
+                    wrongActivation,
+                    baseIntent,
+                ),
+            )
+            assertEquals(0, activationStore.claimCount)
+        }
+
+    @Test
+    fun `corrupt state and failed claim CAS cannot emit or persist a ticket`() = runBlocking {
+        val consumer = consumer()
+        val state = richState(consumer, "timeline-a")
+        val namespace = namespace(consumer, state)
+        val intent = notificationIntent(state)
+
+        val corruptStore = MemoryStore()
+        val corruptRepository = AgentTranscriptLifecycleDurableRepositoryCore(corruptStore)
+        corruptRepository.initializeUnderApplyLease(namespace, state)
+        corruptStore.mutatePayload(consumer) { it.copy(sha256 = "0".repeat(64)) }
+        val corrupt = runCatching {
+            corruptRepository.claimNotificationUnderApplyLease(namespace, intent)
+        }.exceptionOrNull()
+        assertTrue(corrupt is RelayV2StorageException)
+        assertEquals(0, corruptStore.claimCount)
+
+        val failingStore = MemoryStore()
+        val failingRepository = AgentTranscriptLifecycleDurableRepositoryCore(failingStore)
+        failingRepository.initializeUnderApplyLease(namespace, state)
+        failingStore.failNextClaimInsert = true
+        val failedCas = runCatching {
+            failingRepository.claimNotificationUnderApplyLease(namespace, intent)
+        }.exceptionOrNull()
+        assertTrue(failedCas is IllegalStateException)
+        assertEquals(0, failingStore.claimCount)
+        assertEquals(state, failingRepository.load(consumer)?.state)
+    }
+
     private class MemoryStore :
         AgentTranscriptLifecycleDurableStore,
         AgentTranscriptLifecycleDurableTransaction {
         private var rows = mutableListOf<AgentTranscriptLifecyclePersistedState>()
+        private var claims = linkedMapOf<
+            AgentTranscriptLifecycleNotificationClaimKey,
+            AgentTranscriptLifecyclePersistedNotificationClaim
+            >()
         var failNextInsert = false
+        var failNextClaimInsert = false
         var writeCount = 0
             private set
         val rowCount: Int
             get() = rows.size
+        val claimCount: Int
+            get() = claims.size
 
         override suspend fun <T> transaction(
             block: AgentTranscriptLifecycleDurableTransaction.() -> T,
         ): T {
             val rowsBefore = rows.toMutableList()
+            val claimsBefore = LinkedHashMap(claims)
             val writesBefore = writeCount
             return try {
                 block(this)
             } catch (failure: Throwable) {
                 rows = rowsBefore
+                claims = claimsBefore
                 writeCount = writesBefore
                 throw failure
             }
@@ -204,6 +393,22 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             writeCount += 1
         }
 
+        override fun notificationClaim(
+            key: AgentTranscriptLifecycleNotificationClaimKey,
+        ): AgentTranscriptLifecyclePersistedNotificationClaim? = claims[key]
+
+        override fun insertNotificationClaim(
+            claim: AgentTranscriptLifecyclePersistedNotificationClaim,
+        ) {
+            if (failNextClaimInsert) {
+                failNextClaimInsert = false
+                error("injected claim insert failure")
+            }
+            check(claim.key !in claims)
+            claims[claim.key] = claim
+            writeCount += 1
+        }
+
         fun mutatePayload(
             consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
             mutate: (RelayV2EncodedPayload) -> RelayV2EncodedPayload,
@@ -211,6 +416,14 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             val index = rows.indexOfFirst { it.namespace.consumer == consumer }
             check(index >= 0)
             rows[index] = rows[index].copy(payload = mutate(rows[index].payload))
+        }
+
+        fun mutateClaimPayload(
+            key: AgentTranscriptLifecycleNotificationClaimKey,
+            mutate: (RelayV2EncodedPayload) -> RelayV2EncodedPayload,
+        ) {
+            val claim = requireNotNull(claims[key])
+            claims[key] = claim.copy(payload = mutate(claim.payload))
         }
     }
 
@@ -239,6 +452,32 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
             state: AgentTranscriptLifecycleClientState,
         ) = AgentTranscriptLifecycleDurableNamespace.from(consumer, state)
+
+        fun notificationIntent(
+            state: AgentTranscriptLifecycleClientState,
+        ): AgentSystemNotificationIntent {
+            val (key, entry) = state.extensionLane.notificationLedger.entries.single()
+            return AgentSystemNotificationIntent(key, entry.localGeneration)
+        }
+
+        fun claimKey(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+            intent: AgentSystemNotificationIntent,
+        ) = requireNotNull(
+            AgentTranscriptLifecycleNotificationClaimKey.exactOrNull(namespace, intent),
+        )
+
+        fun withLedgerDisposition(
+            state: AgentTranscriptLifecycleClientState,
+            disposition: AgentNotificationDisposition,
+        ): AgentTranscriptLifecycleClientState {
+            val (key, entry) = state.extensionLane.notificationLedger.entries.single()
+            return state.copy(
+                extensionLane = state.extensionLane.copy(
+                    notificationLedger = mapOf(key to entry.copy(disposition = disposition)),
+                ),
+            )
+        }
 
         fun richState(
             consumer: AgentTranscriptLifecycleDurableConsumerIdentity,

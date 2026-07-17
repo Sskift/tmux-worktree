@@ -173,7 +173,8 @@ internal interface RelayV2StateTransaction {
 
     /**
      * Deletes all six state-sync categories plus every activation-scoped Outbox, terminal, and
-     * optional Agent transcript/lifecycle consumer row for this profile, never v1 or credentials.
+     * optional Agent transcript/lifecycle consumer and claim rows for this profile, never v1 or
+     * credentials.
      */
     fun deleteProfileState(profileId: String)
 

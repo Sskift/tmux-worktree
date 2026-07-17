@@ -170,7 +170,7 @@ class RelayV2StateDatabaseMigrationTest {
     }
 
     @Test
-    fun migration3To4PreservesExistingV2RowsAndAddsEmptyAgentConsumerTable() {
+    fun migration3To4PreservesExistingV2RowsAndAddsEmptyAgentDurableTables() {
         migration.createDatabase(DATABASE_NAME, 3).apply {
             insertLegacyAuthority()
             execSQL(
@@ -213,6 +213,10 @@ class RelayV2StateDatabaseMigrationTest {
             assertEquals(1, migrated.count("relay_v2_outbox_meta"))
             assertEquals(1, migrated.count("relay_v2_terminal_checkpoints"))
             assertEquals(0, migrated.count("relay_v2_agent_transcript_lifecycle_states"))
+            assertEquals(
+                0,
+                migrated.count("relay_v2_agent_transcript_lifecycle_notification_claims"),
+            )
             migrated.query(
                 "SELECT nextCreationOrder, payloadSha256 FROM relay_v2_outbox_meta",
             ).use { cursor ->

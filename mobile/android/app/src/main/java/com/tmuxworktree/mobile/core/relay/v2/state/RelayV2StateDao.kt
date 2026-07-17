@@ -461,6 +461,41 @@ internal interface RelayV2StateDao {
     fun deleteProfileAgentTranscriptLifecycleStates(profileId: String)
 
     @Query(
+        "SELECT * FROM relay_v2_agent_transcript_lifecycle_notification_claims " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND scopeId = :scopeId AND sessionId = :sessionId " +
+            "AND timelineEpoch = :timelineEpoch " +
+            "AND lifecycleEventId = :lifecycleEventId AND lifecycleState = :lifecycleState",
+    )
+    fun agentTranscriptLifecycleNotificationClaim(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        lifecycleEventId: String,
+        lifecycleState: String,
+    ): RelayV2AgentTranscriptLifecycleNotificationClaimEntity?
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptLifecycleNotificationClaim(
+        claim: RelayV2AgentTranscriptLifecycleNotificationClaimEntity,
+    )
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_lifecycle_notification_claims " +
+            "WHERE profileId = :profileId",
+    )
+    fun deleteProfileAgentTranscriptLifecycleNotificationClaims(profileId: String)
+
+    @Query(
         "DELETE FROM relay_v2_authority WHERE profileId = :profileId " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch",

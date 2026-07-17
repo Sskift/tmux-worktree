@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "database": {
     "version": 4,
-    "identityHash": "76934fca675c520190ffa64d22c41ecd",
+    "identityHash": "65acc268d1d8666559a4b63925925cf3",
     "entities": [
       {
         "tableName": "relay_v2_authority",
@@ -1284,11 +1284,129 @@
             "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_relay_v2_agent_transcript_lifecycle_states_profileId_profileActivationGeneration_principalId_clientInstanceId_hostId_hostEpoch_scopeId_sessionId` ON `${TABLE_NAME}` (`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`)"
           }
         ]
+      },
+      {
+        "tableName": "relay_v2_agent_transcript_lifecycle_notification_claims",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`profileId` TEXT NOT NULL, `profileActivationGeneration` INTEGER NOT NULL, `principalId` TEXT NOT NULL, `clientInstanceId` TEXT NOT NULL, `hostId` TEXT NOT NULL, `hostEpoch` TEXT NOT NULL, `scopeId` TEXT NOT NULL, `sessionId` TEXT NOT NULL, `timelineEpoch` TEXT NOT NULL, `lifecycleEventId` TEXT NOT NULL, `lifecycleState` TEXT NOT NULL, `claimedLocalGeneration` TEXT NOT NULL, `codecVersion` INTEGER NOT NULL, `payloadUtf8Bytes` INTEGER NOT NULL, `payloadCanonicalJson` TEXT NOT NULL, `payloadSha256` TEXT NOT NULL, PRIMARY KEY(`profileId`, `profileActivationGeneration`, `principalId`, `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`, `timelineEpoch`, `lifecycleEventId`, `lifecycleState`))",
+        "fields": [
+          {
+            "fieldPath": "profileId",
+            "columnName": "profileId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "profileActivationGeneration",
+            "columnName": "profileActivationGeneration",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "principalId",
+            "columnName": "principalId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "clientInstanceId",
+            "columnName": "clientInstanceId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostId",
+            "columnName": "hostId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "hostEpoch",
+            "columnName": "hostEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "scopeId",
+            "columnName": "scopeId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "sessionId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timelineEpoch",
+            "columnName": "timelineEpoch",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleEventId",
+            "columnName": "lifecycleEventId",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "lifecycleState",
+            "columnName": "lifecycleState",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "claimedLocalGeneration",
+            "columnName": "claimedLocalGeneration",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "codecVersion",
+            "columnName": "codecVersion",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadUtf8Bytes",
+            "columnName": "payloadUtf8Bytes",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadCanonicalJson",
+            "columnName": "payloadCanonicalJson",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "payloadSha256",
+            "columnName": "payloadSha256",
+            "affinity": "TEXT",
+            "notNull": true
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "profileId",
+            "profileActivationGeneration",
+            "principalId",
+            "clientInstanceId",
+            "hostId",
+            "hostEpoch",
+            "scopeId",
+            "sessionId",
+            "timelineEpoch",
+            "lifecycleEventId",
+            "lifecycleState"
+          ]
+        }
       }
     ],
     "setupQueries": [
       "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
-      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '76934fca675c520190ffa64d22c41ecd')"
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '65acc268d1d8666559a4b63925925cf3')"
     ]
   }
 }

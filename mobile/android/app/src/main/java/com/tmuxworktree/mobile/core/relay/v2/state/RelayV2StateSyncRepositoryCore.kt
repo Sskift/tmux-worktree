@@ -700,7 +700,7 @@ internal class RelayV2StateSyncRepositoryCore(
      * The receipt is the authority to clear after the actor has fenced and drained the profile.
      * The Room adapter clears every v2 category in the independent state database in this same
      * transaction, including durable Outbox, terminal checkpoints, and optional Agent consumer
-     * rows.
+     * state/claim rows.
      */
     suspend fun clearProfileAfterDisconnect(receipt: RelayProfileDisconnectReceipt) {
         require(receipt.profile.dialect == RelayProfileDialect.V2)

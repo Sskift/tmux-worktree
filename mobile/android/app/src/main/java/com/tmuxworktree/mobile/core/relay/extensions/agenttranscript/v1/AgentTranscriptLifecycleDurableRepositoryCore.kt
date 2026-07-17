@@ -66,6 +66,85 @@ internal data class AgentTranscriptLifecycleDurableRecord(
     val state: AgentTranscriptLifecycleClientState,
 )
 
+/** Immutable one-shot key. Local generation is evidence, not a way to reclaim the same event. */
+internal data class AgentTranscriptLifecycleNotificationClaimKey(
+    val consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    val timelineEpoch: String,
+    val lifecycleEventId: String,
+    val lifecycleState: AgentLifecycleState,
+) {
+    init {
+        AgentTimelineLineage(consumer.sessionIdentity, timelineEpoch)
+        requireOpaqueId(lifecycleEventId, "Lifecycle event ID")
+    }
+
+    val dedupeKey: AgentNotificationDedupeKey
+        get() = AgentNotificationDedupeKey(
+            consumer.profileId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+            timelineEpoch,
+            lifecycleEventId,
+            lifecycleState,
+        )
+
+    companion object {
+        fun exactOrNull(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+            intent: AgentSystemNotificationIntent,
+        ): AgentTranscriptLifecycleNotificationClaimKey? {
+            val timelineEpoch = namespace.timelineEpoch ?: return null
+            val key = intent.dedupeKey
+            val consumer = namespace.consumer
+            if (key.profileId != consumer.profileId ||
+                key.hostId != consumer.hostId ||
+                key.hostEpoch != consumer.hostEpoch ||
+                key.scopeId != consumer.scopeId ||
+                key.sessionId != consumer.sessionId ||
+                key.timelineEpoch != timelineEpoch
+            ) return null
+            return AgentTranscriptLifecycleNotificationClaimKey(
+                consumer,
+                timelineEpoch,
+                key.lifecycleEventId,
+                key.state,
+            )
+        }
+    }
+}
+
+internal data class AgentTranscriptLifecyclePersistedNotificationClaim(
+    val key: AgentTranscriptLifecycleNotificationClaimKey,
+    val claimedLocalGeneration: String,
+    val payload: RelayV2EncodedPayload,
+)
+
+/** Content-free authority emitted only after the immutable claim transaction commits. */
+internal data class AgentTranscriptLifecycleNotificationExecutionTicket(
+    val claimId: String,
+    val namespace: AgentTranscriptLifecycleDurableNamespace,
+    val intent: AgentSystemNotificationIntent,
+)
+
+internal enum class AgentTranscriptLifecycleNotificationNotExecutableReason {
+    STATE_MISSING,
+    NAMESPACE_CHANGED,
+    INTENT_NOT_CURRENT,
+    ALREADY_CLAIMED,
+}
+
+internal sealed interface AgentTranscriptLifecycleNotificationClaimResult {
+    data class Claimed(
+        val ticket: AgentTranscriptLifecycleNotificationExecutionTicket,
+    ) : AgentTranscriptLifecycleNotificationClaimResult
+
+    data class NotExecutable(
+        val reason: AgentTranscriptLifecycleNotificationNotExecutableReason,
+    ) : AgentTranscriptLifecycleNotificationClaimResult
+}
+
 internal enum class AgentTranscriptLifecycleInitializeDisposition {
     CREATED,
     UNCHANGED,
@@ -95,6 +174,13 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
     fun deleteConsumer(consumer: AgentTranscriptLifecycleDurableConsumerIdentity)
 
     fun insertState(state: AgentTranscriptLifecyclePersistedState)
+
+    fun notificationClaim(
+        key: AgentTranscriptLifecycleNotificationClaimKey,
+    ): AgentTranscriptLifecyclePersistedNotificationClaim?
+
+    /** Must use INSERT ABORT or an equivalent no-overwrite compare-and-set. */
+    fun insertNotificationClaim(claim: AgentTranscriptLifecyclePersistedNotificationClaim)
 }
 
 /**
@@ -169,6 +255,78 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         reduction
     }
 
+    suspend fun claimNotificationUnderApplyLease(
+        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+        intent: AgentSystemNotificationIntent,
+    ): AgentTranscriptLifecycleNotificationClaimResult {
+        val transactionResult = store.transaction {
+            val current = loadSingle(expectedNamespace.consumer)
+                ?: return@transaction NotificationClaimTransactionResult.NotExecutable(
+                    AgentTranscriptLifecycleNotificationNotExecutableReason.STATE_MISSING,
+                )
+            if (current.namespace != expectedNamespace) {
+                return@transaction NotificationClaimTransactionResult.NotExecutable(
+                    AgentTranscriptLifecycleNotificationNotExecutableReason.NAMESPACE_CHANGED,
+                )
+            }
+            val key = AgentTranscriptLifecycleNotificationClaimKey.exactOrNull(
+                expectedNamespace,
+                intent,
+            ) ?: return@transaction NotificationClaimTransactionResult.NotExecutable(
+                AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
+            )
+
+            if (!intent.isPreflightAuthorizedBy(current.state)) {
+                return@transaction NotificationClaimTransactionResult.NotExecutable(
+                    AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
+                )
+            }
+            notificationClaim(key)?.let { existing ->
+                AgentTranscriptLifecycleNotificationClaimCodec.decode(
+                    key,
+                    existing.claimedLocalGeneration,
+                    existing.payload,
+                )
+                return@transaction NotificationClaimTransactionResult.NotExecutable(
+                    AgentTranscriptLifecycleNotificationNotExecutableReason.ALREADY_CLAIMED,
+                )
+            }
+
+            val payload = AgentTranscriptLifecycleNotificationClaimCodec.encode(key, intent)
+            insertNotificationClaim(
+                AgentTranscriptLifecyclePersistedNotificationClaim(
+                    key,
+                    intent.localGeneration,
+                    payload,
+                ),
+            )
+            NotificationClaimTransactionResult.Committed(
+                key,
+                intent,
+                payload.sha256,
+            )
+        }
+
+        // Room withTransaction returns only after commit. No execution authority escapes earlier.
+        return when (transactionResult) {
+            is NotificationClaimTransactionResult.Committed ->
+                AgentTranscriptLifecycleNotificationClaimResult.Claimed(
+                    AgentTranscriptLifecycleNotificationExecutionTicket(
+                        transactionResult.claimId,
+                        AgentTranscriptLifecycleDurableNamespace(
+                            transactionResult.key.consumer,
+                            transactionResult.key.timelineEpoch,
+                        ),
+                        transactionResult.intent,
+                    ),
+                )
+            is NotificationClaimTransactionResult.NotExecutable ->
+                AgentTranscriptLifecycleNotificationClaimResult.NotExecutable(
+                    transactionResult.reason,
+                )
+        }
+    }
+
     private fun AgentTranscriptLifecycleDurableTransaction.loadSingle(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? {
@@ -193,4 +351,16 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             throw AgentTranscriptLifecyclePersistenceConflictException()
         }
     }
+}
+
+private sealed interface NotificationClaimTransactionResult {
+    data class Committed(
+        val key: AgentTranscriptLifecycleNotificationClaimKey,
+        val intent: AgentSystemNotificationIntent,
+        val claimId: String,
+    ) : NotificationClaimTransactionResult
+
+    data class NotExecutable(
+        val reason: AgentTranscriptLifecycleNotificationNotExecutableReason,
+    ) : NotificationClaimTransactionResult
 }

@@ -372,6 +372,7 @@ private class RoomTransaction(
     }
 
     override fun deleteProfileState(profileId: String) {
+        dao.deleteProfileAgentTranscriptLifecycleNotificationClaims(profileId)
         dao.deleteProfileAgentTranscriptLifecycleStates(profileId)
         dao.deleteProfileTerminalCheckpoints(profileId)
         dao.deleteProfileOutboxEntries(profileId)

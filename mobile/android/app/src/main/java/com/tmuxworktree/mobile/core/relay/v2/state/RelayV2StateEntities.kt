@@ -427,3 +427,39 @@ internal data class RelayV2AgentTranscriptLifecycleStateEntity(
     val payloadCanonicalJson: String,
     val payloadSha256: String,
 )
+
+/** Immutable one-shot notification claim; it contains identities and evidence, never body text. */
+@Entity(
+    tableName = "relay_v2_agent_transcript_lifecycle_notification_claims",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpoch",
+        "lifecycleEventId",
+        "lifecycleState",
+    ],
+)
+internal data class RelayV2AgentTranscriptLifecycleNotificationClaimEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpoch: String,
+    val lifecycleEventId: String,
+    val lifecycleState: String,
+    val claimedLocalGeneration: String,
+    val codecVersion: Int,
+    val payloadUtf8Bytes: Int,
+    val payloadCanonicalJson: String,
+    val payloadSha256: String,
+)
