@@ -34,6 +34,15 @@ pub(crate) fn validate_acl(
 ) -> Result<(), PlatformStoreFailure> {
     let mut effective = BTreeMap::<AclPrincipal, EffectivePermissions>::new();
     for entry in entries {
+        if entry.principal == AclPrincipal::Unknown
+            && entry.allow
+            && (entry.permissions != 0 || entry.flags & INHERITANCE_FLAGS != 0)
+        {
+            // Unknown identities are not a shared principal. Reject before
+            // aggregation so one unresolved identity's DENY cannot mask a
+            // different unresolved identity's ALLOW.
+            return Err(PlatformStoreFailure::PermissionInvalid);
+        }
         let state = effective.entry(entry.principal).or_default();
         if entry.allow {
             let newly_allowed = entry.permissions & !state.denied;
@@ -128,6 +137,43 @@ mod tests {
             validate_acl(
                 &metadata(u32::from(libc::S_IFDIR) | 0o755),
                 &[deny_other_read, inherited_other_read]
+            ),
+            Err(PlatformStoreFailure::PermissionInvalid)
+        );
+    }
+
+    #[test]
+    fn unknown_allow_cannot_be_masked_by_another_unknown_deny() {
+        let unknown_deny = AclEntry {
+            allow: false,
+            principal: AclPrincipal::Unknown,
+            permissions: ACL_WRITE_DATA,
+            flags: 0,
+        };
+        let different_unknown_allow = AclEntry {
+            allow: true,
+            principal: AclPrincipal::Unknown,
+            permissions: ACL_WRITE_DATA,
+            flags: 0,
+        };
+        assert_eq!(
+            validate_acl(
+                &metadata(u32::from(libc::S_IFDIR) | 0o777),
+                &[unknown_deny, different_unknown_allow]
+            ),
+            Err(PlatformStoreFailure::PermissionInvalid)
+        );
+
+        let empty_inheritable_unknown_allow = AclEntry {
+            allow: true,
+            principal: AclPrincipal::Unknown,
+            permissions: 0,
+            flags: ACL_ENTRY_FILE_INHERIT,
+        };
+        assert_eq!(
+            validate_acl(
+                &metadata(u32::from(libc::S_IFDIR) | 0o777),
+                &[empty_inheritable_unknown_allow]
             ),
             Err(PlatformStoreFailure::PermissionInvalid)
         );
