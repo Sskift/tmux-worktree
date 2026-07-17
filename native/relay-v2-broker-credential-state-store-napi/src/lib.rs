@@ -110,6 +110,27 @@ struct MainThreadDispatcher {
 
 unsafe impl Send for MainThreadDispatcher {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainThreadDispatchOutcome {
+    Enqueued,
+    Closing,
+}
+
+fn finish_failed_main_thread_dispatch(task: *mut Box<dyn MainThreadTask>) {
+    // Reconstruction, failure cleanup, and task Drop are all contained; a
+    // FunctionRef/custom-GC panic must not kill the serial worker.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let task = unsafe { *Box::from_raw(task) };
+        finish_main_thread_task_no_unwind(task, |task| task.dispatch_failed(), false);
+    }));
+}
+
+fn fail_stop_unexpected_main_thread_dispatch(_status: sys::napi_status) -> ! {
+    // This branch can run on the serial worker. It must not call N-API from a
+    // disallowed thread; an unexpected live-environment TSFN failure is fatal.
+    std::process::abort()
+}
+
 impl MainThreadDispatcher {
     fn new(env: &Env) -> Result<Self> {
         let mut resource_name = ptr::null_mut();
@@ -148,7 +169,7 @@ impl MainThreadDispatcher {
         Ok(Self { raw })
     }
 
-    fn dispatch(self, task: Box<dyn MainThreadTask>) -> bool {
+    fn dispatch(self, task: Box<dyn MainThreadTask>) -> MainThreadDispatchOutcome {
         let task = Box::into_raw(Box::new(task));
         let status = unsafe {
             sys::napi_call_threadsafe_function(
@@ -157,16 +178,16 @@ impl MainThreadDispatcher {
                 sys::ThreadsafeFunctionCallMode::blocking,
             )
         };
-        if status == sys::Status::napi_ok {
-            true
-        } else {
-            // Reconstruction, failure cleanup, and task Drop are all contained;
-            // a FunctionRef/custom-GC panic must not kill the serial worker.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let task = unsafe { *Box::from_raw(task) };
-                finish_main_thread_task_no_unwind(task, |task| task.dispatch_failed(), false);
-            }));
-            false
+        match status {
+            sys::Status::napi_ok => MainThreadDispatchOutcome::Enqueued,
+            sys::Status::napi_closing => {
+                finish_failed_main_thread_dispatch(task);
+                MainThreadDispatchOutcome::Closing
+            }
+            unexpected => {
+                finish_failed_main_thread_dispatch(task);
+                fail_stop_unexpected_main_thread_dispatch(unexpected)
+            }
         }
     }
 }
@@ -208,6 +229,7 @@ struct BindingDeferred {
     raw: usize,
     dispatcher: MainThreadDispatcher,
     fallback: ObjectRef<false>,
+    fallback_backup: ObjectRef<false>,
     store: Weak<NapiStoreState>,
 }
 
@@ -491,13 +513,21 @@ fn create_binding_deferred(
     // Capture the dispatcher before allocating a Promise so a TSFN failure
     // cannot strand a deferred that the binding can no longer complete.
     let dispatcher = MainThreadDispatcher::new(env)?;
-    let fallback = create_error_object(env, NativeStoreErrorCode::NativeInterfaceInvalid)?
-        .create_ref::<false>()?;
+    let fallback_object = create_error_object(env, NativeStoreErrorCode::NativeInterfaceInvalid)?;
+    let fallback = fallback_object.create_ref::<false>()?;
+    let fallback_backup = match fallback_object.create_ref::<false>() {
+        Ok(fallback_backup) => fallback_backup,
+        Err(error) => {
+            let _ = fallback.unref(env);
+            return Err(error);
+        }
+    };
     let mut deferred = ptr::null_mut();
     let mut promise = ptr::null_mut();
     let status = unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) };
     if status != sys::Status::napi_ok {
         let _ = fallback.unref(env);
+        let _ = fallback_backup.unref(env);
         return Err(napi_failure("failed to create binding promise"));
     }
     Ok((
@@ -505,6 +535,7 @@ fn create_binding_deferred(
             raw: deferred as usize,
             dispatcher,
             fallback,
+            fallback_backup,
             store: Arc::downgrade(store),
         },
         RawValue(promise),
@@ -518,17 +549,19 @@ enum DeferredSettlementOutcome {
     Failed,
 }
 
-fn settle_deferred_with_fallback<P, T, F>(
+fn settle_deferred_with_fallback<C, P, T, F>(
+    cleanup: C,
     primary: P,
     terminal: T,
     fallback: F,
 ) -> DeferredSettlementOutcome
 where
+    C: FnOnce() -> bool,
     P: FnOnce() -> bool,
     T: FnOnce(),
     F: FnOnce() -> bool,
 {
-    if primary() {
+    if cleanup() && primary() {
         return DeferredSettlementOutcome::Primary;
     }
     terminal();
@@ -565,17 +598,54 @@ struct CompleteDeferredTask {
     deferred: usize,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
     fallback: Option<ObjectRef<false>>,
+    fallback_backup: Option<ObjectRef<false>>,
     store: Option<Arc<NapiStoreState>>,
 }
 
 impl MainThreadTask for CompleteDeferredTask {
     fn run(&mut self, env: Env) {
         let deferred = self.deferred as sys::napi_deferred;
-        let Some(fallback) = self.fallback.as_ref() else {
+        let Some(fallback) = self.fallback.take() else {
             terminal_deferred_store(&self.store);
             fatal_unsettled_binding_promise();
         };
+        let Some(fallback_backup) = self.fallback_backup.take() else {
+            let _ = fallback.unref(&env);
+            terminal_deferred_store(&self.store);
+            fatal_unsettled_binding_promise();
+        };
+        let (fallback_value, fallback_lookup_ok) = match fallback.get_value(&env) {
+            Ok(value) => (value, true),
+            Err(_) => {
+                clear_pending_exception(&env);
+                match fallback_backup.get_value(&env) {
+                    Ok(value) => (value, false),
+                    Err(_) => {
+                        clear_pending_exception(&env);
+                        let _ = fallback.unref(&env);
+                        let _ = fallback_backup.unref(&env);
+                        terminal_deferred_store(&self.store);
+                        fatal_unsettled_binding_promise();
+                    }
+                }
+            }
+        };
         let settlement = settle_deferred_with_fallback(
+            || {
+                // Both references are deleted before the deferred becomes
+                // observable. Any lookup/delete anomaly therefore selects the
+                // already acquired fixed rejection after terminal fencing.
+                let mut cleanup_ok = fallback_lookup_ok;
+                if fallback.unref(&env).is_err() {
+                    clear_pending_exception(&env);
+                    cleanup_ok = false;
+                }
+                if fallback_backup.unref(&env).is_err() {
+                    clear_pending_exception(&env);
+                    cleanup_ok = false;
+                }
+                cleanup_ok
+            },
             || {
                 let status = match self.outcome {
                     Ok(()) => raw_undefined(&env).and_then(|value| {
@@ -606,15 +676,8 @@ impl MainThreadTask for CompleteDeferredTask {
             },
             || terminal_deferred_store(&self.store),
             || {
-                let fallback = match fallback.get_value(&env) {
-                    Ok(fallback) => fallback,
-                    Err(_) => {
-                        clear_pending_exception(&env);
-                        return false;
-                    }
-                };
                 let status =
-                    unsafe { sys::napi_reject_deferred(env.raw(), deferred, fallback.raw()) };
+                    unsafe { sys::napi_reject_deferred(env.raw(), deferred, fallback_value.raw()) };
                 if status == sys::Status::napi_ok {
                     true
                 } else {
@@ -625,12 +688,6 @@ impl MainThreadTask for CompleteDeferredTask {
         );
         if settlement == DeferredSettlementOutcome::Failed {
             fatal_unsettled_binding_promise();
-        }
-        if let Some(fallback) = self.fallback.take() {
-            if fallback.unref(&env).is_err() {
-                clear_pending_exception(&env);
-                terminal_deferred_store(&self.store);
-            }
         }
     }
 
@@ -646,17 +703,19 @@ impl MainThreadTask for CompleteDeferredTask {
 fn complete_deferred(
     deferred: BindingDeferred,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
-) -> bool {
+) -> MainThreadDispatchOutcome {
     let BindingDeferred {
         raw,
         dispatcher,
         fallback,
+        fallback_backup,
         store,
     } = deferred;
     let task = CompleteDeferredTask {
         deferred: raw,
         outcome,
         fallback: Some(fallback),
+        fallback_backup: Some(fallback_backup),
         store: store.upgrade(),
     };
     dispatcher.dispatch(Box::new(task))
@@ -860,7 +919,7 @@ fn finish_native_close(
     }
     let waiters = { lock_recover(&store.state).finish_close(outcome) };
     for waiter in waiters {
-        let _ = complete_deferred(waiter, outcome);
+        observe_deferred_dispatch(store, complete_deferred(waiter, outcome));
     }
 }
 
@@ -920,7 +979,7 @@ fn request_close(store: &Arc<NapiStoreState>, waiter: Option<BindingDeferred>, t
         state.begin_close(waiter)
     };
     if let Some((waiter, outcome)) = cached {
-        let _ = complete_deferred(waiter, outcome);
+        observe_deferred_dispatch(store, complete_deferred(waiter, outcome));
     }
     if start {
         start_native_close(Arc::clone(store));
@@ -929,6 +988,18 @@ fn request_close(store: &Arc<NapiStoreState>, waiter: Option<BindingDeferred>, t
 
 fn terminal_fence(store: &Arc<NapiStoreState>) {
     request_close(store, None, true);
+}
+
+fn observe_deferred_dispatch(store: &Arc<NapiStoreState>, outcome: MainThreadDispatchOutcome) {
+    match outcome {
+        MainThreadDispatchOutcome::Enqueued => {}
+        MainThreadDispatchOutcome::Closing => {
+            // CompleteDeferredTask::dispatch_failed already requested the
+            // terminal close. Preserve the explicit teardown outcome at every
+            // caller while avoiding any off-thread N-API fallback.
+            store.terminal.store(true, Ordering::Release);
+        }
+    }
 }
 
 struct RevisionHandle {
@@ -958,8 +1029,9 @@ impl CallbackCompletion {
             NativeCompletionResult::Duplicate => {
                 terminal_fence(&self.store);
                 if let Some(outer) = lock_recover(&self.outer).take() {
-                    let _ =
+                    let dispatch =
                         complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+                    observe_deferred_dispatch(&self.store, dispatch);
                 }
                 if let Some(ack) = lock_recover(&self.worker_ack).take() {
                     let _ = ack.send(());
@@ -971,9 +1043,8 @@ impl CallbackCompletion {
             terminal_fence(&self.store);
         }
         if let Some(outer) = lock_recover(&self.outer).take() {
-            if !complete_deferred(outer, outcome) {
-                terminal_fence(&self.store);
-            }
+            let dispatch = complete_deferred(outer, outcome);
+            observe_deferred_dispatch(&self.store, dispatch);
         }
         if let Some(ack) = lock_recover(&self.worker_ack).take() {
             if ack.send(()).is_err() {
@@ -1363,7 +1434,9 @@ impl MainThreadTask for RunCallbackTask {
         }
         if let Some(outer) = self.outer.take() {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+                let dispatch =
+                    complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+                observe_deferred_dispatch(&self.store, dispatch);
             }));
         }
         if let Some(ack) = self.worker_ack.take() {
@@ -1375,18 +1448,25 @@ impl MainThreadTask for RunCallbackTask {
     }
 }
 
-fn reject_unstarted(command: RunCommand, code: NativeStoreErrorCode) -> bool {
+fn reject_unstarted(
+    command: RunCommand,
+    code: NativeStoreErrorCode,
+) -> std::result::Result<MainThreadDispatchOutcome, ()> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         complete_deferred(command.outer, Err(code))
     }))
-    .unwrap_or(false)
+    .map_err(|_| ())
 }
 
 fn drain_store_worker(receiver: &mpsc::Receiver<StoreWorkerCommand>) {
     while let Ok(command) = receiver.try_recv() {
         match command {
             StoreWorkerCommand::Run(command) => {
-                let _ = reject_unstarted(command, NativeStoreErrorCode::StoreClosed);
+                match reject_unstarted(command, NativeStoreErrorCode::StoreClosed) {
+                    Ok(MainThreadDispatchOutcome::Enqueued)
+                    | Ok(MainThreadDispatchOutcome::Closing)
+                    | Err(()) => {}
+                }
             }
             StoreWorkerCommand::CloseAfterWorkerFailure(store) => {
                 let _ = close_port_safely(store.port.as_ref());
@@ -1406,11 +1486,13 @@ fn run_store_worker(receiver: mpsc::Receiver<StoreWorkerCommand>) {
         };
         let store = Arc::clone(&command.store);
         if store.terminal.load(Ordering::Acquire) {
-            if !reject_unstarted(command, NativeStoreErrorCode::StoreClosed) {
-                drain_store_worker(&receiver);
-                return;
+            match reject_unstarted(command, NativeStoreErrorCode::StoreClosed) {
+                Ok(MainThreadDispatchOutcome::Enqueued) => continue,
+                Ok(MainThreadDispatchOutcome::Closing) | Err(()) => {
+                    drain_store_worker(&receiver);
+                    return;
+                }
             }
-            continue;
         }
 
         let RunCommand {
@@ -1428,7 +1510,8 @@ fn run_store_worker(receiver: mpsc::Receiver<StoreWorkerCommand>) {
             Ok(transaction) => transaction,
             Err(code) => {
                 terminal_fence(&store);
-                let _ = complete_deferred(outer, Err(code));
+                let deferred_dispatch = complete_deferred(outer, Err(code));
+                observe_deferred_dispatch(&store, deferred_dispatch);
                 drop((callback, dispatch, command_store));
                 drain_store_worker(&receiver);
                 return;
@@ -1443,9 +1526,12 @@ fn run_store_worker(receiver: mpsc::Receiver<StoreWorkerCommand>) {
             outer: Some(outer),
             worker_ack: Some(ack_sender),
         };
-        if !dispatch.dispatch(Box::new(task)) {
-            drain_store_worker(&receiver);
-            return;
+        match dispatch.dispatch(Box::new(task)) {
+            MainThreadDispatchOutcome::Enqueued => {}
+            MainThreadDispatchOutcome::Closing => {
+                drain_store_worker(&receiver);
+                return;
+            }
         }
         // Exactly one transaction can be entered or waiting on its callback per
         // store. Queued admissions consume no libuv worker threads.
@@ -1475,16 +1561,18 @@ fn run_exclusive(
         Err(_) => {
             clear_pending_exception(env);
             terminal_fence(&store);
-            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            let deferred_dispatch =
+                complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            observe_deferred_dispatch(&store, deferred_dispatch);
             return Ok(promise);
         }
     };
     let callback = match Function::<RawValue, RawValue>::from_unknown(callback_value) {
         Ok(callback) => callback,
         Err(_) => {
-            if !complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid)) {
-                terminal_fence(&store);
-            }
+            let deferred_dispatch =
+                complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            observe_deferred_dispatch(&store, deferred_dispatch);
             return Ok(promise);
         }
     };
@@ -1493,7 +1581,9 @@ fn run_exclusive(
         Err(_) => {
             clear_pending_exception(env);
             terminal_fence(&store);
-            let _ = complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            let deferred_dispatch =
+                complete_deferred(outer, Err(NativeStoreErrorCode::NativeInterfaceInvalid));
+            observe_deferred_dispatch(&store, deferred_dispatch);
             return Ok(promise);
         }
     };
@@ -1501,9 +1591,8 @@ fn run_exclusive(
     let state = lock_recover(&store.state);
     if state.admission_closed {
         drop(state);
-        if !complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed)) {
-            terminal_fence(&store);
-        }
+        let deferred_dispatch = complete_deferred(outer, Err(NativeStoreErrorCode::StoreClosed));
+        observe_deferred_dispatch(&store, deferred_dispatch);
         return Ok(promise);
     }
     let admission = match store.port.admit() {
@@ -1511,7 +1600,8 @@ fn run_exclusive(
         Err(code) => {
             drop(state);
             terminal_fence(&store);
-            let _ = complete_deferred(outer, Err(code));
+            let deferred_dispatch = complete_deferred(outer, Err(code));
+            observe_deferred_dispatch(&store, deferred_dispatch);
             return Ok(promise);
         }
     };
@@ -1816,6 +1906,7 @@ mod tests {
         let fallback_called = AtomicBool::new(false);
 
         let settlement = settle_deferred_with_fallback(
+            || true,
             || false,
             || terminal.store(true, Ordering::Release),
             || {
@@ -1826,6 +1917,60 @@ mod tests {
         );
 
         assert_eq!(settlement, DeferredSettlementOutcome::Fallback);
+        assert!(terminal.load(Ordering::Acquire));
+        assert!(fallback_called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deferred_primary_success_occurs_only_after_fixed_fallback_cleanup() {
+        let cleaned = AtomicBool::new(false);
+        let terminal = AtomicBool::new(false);
+        let fallback_called = AtomicBool::new(false);
+
+        let settlement = settle_deferred_with_fallback(
+            || {
+                cleaned.store(true, Ordering::Release);
+                true
+            },
+            || {
+                assert!(cleaned.load(Ordering::Acquire));
+                true
+            },
+            || terminal.store(true, Ordering::Release),
+            || {
+                fallback_called.store(true, Ordering::Release);
+                true
+            },
+        );
+
+        assert_eq!(settlement, DeferredSettlementOutcome::Primary);
+        assert!(cleaned.load(Ordering::Acquire));
+        assert!(!terminal.load(Ordering::Acquire));
+        assert!(!fallback_called.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn deferred_cleanup_failure_skips_primary_and_terminals_before_fixed_fallback() {
+        let primary_called = AtomicBool::new(false);
+        let terminal = AtomicBool::new(false);
+        let fallback_called = AtomicBool::new(false);
+
+        let settlement = settle_deferred_with_fallback(
+            || false,
+            || {
+                primary_called.store(true, Ordering::Release);
+                true
+            },
+            || terminal.store(true, Ordering::Release),
+            || {
+                assert!(terminal.load(Ordering::Acquire));
+                fallback_called.store(true, Ordering::Release);
+                true
+            },
+        );
+
+        assert_eq!(settlement, DeferredSettlementOutcome::Fallback);
+        assert!(!primary_called.load(Ordering::Acquire));
         assert!(terminal.load(Ordering::Acquire));
         assert!(fallback_called.load(Ordering::Acquire));
     }
