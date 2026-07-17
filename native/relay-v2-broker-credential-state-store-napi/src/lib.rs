@@ -10,7 +10,7 @@ use crate::state::{
 };
 use napi::bindgen_prelude::{
     Array, FnArgs, FromNapiValue, Function, FunctionCallContext, FunctionRef, JsObjectValue,
-    Object, ToNapiValue, TypeName, Uint8Array, Unknown,
+    Object, ObjectRef, ToNapiValue, TypeName, Uint8Array, Unknown,
 };
 use napi::{sys, Env, Error, JsValue, Property, Result, Status, ValueType};
 use napi_derive::napi;
@@ -21,7 +21,7 @@ use std::mem::ManuallyDrop;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock, Weak};
 use std::thread;
 
 const MAX_STATE_BYTES: usize = 67_108_864;
@@ -207,6 +207,8 @@ unsafe extern "C" fn run_main_thread_task(
 struct BindingDeferred {
     raw: usize,
     dispatcher: MainThreadDispatcher,
+    fallback: ObjectRef<false>,
+    store: Weak<NapiStoreState>,
 }
 
 struct Intrinsics {
@@ -482,68 +484,182 @@ fn resolved_promise(env: &Env, value: RawValue) -> Result<RawValue> {
     }
 }
 
-fn create_binding_deferred(env: &Env) -> Result<(BindingDeferred, RawValue)> {
+fn create_binding_deferred(
+    env: &Env,
+    store: &Arc<NapiStoreState>,
+) -> Result<(BindingDeferred, RawValue)> {
     // Capture the dispatcher before allocating a Promise so a TSFN failure
     // cannot strand a deferred that the binding can no longer complete.
     let dispatcher = MainThreadDispatcher::new(env)?;
+    let fallback = create_error_object(env, NativeStoreErrorCode::NativeInterfaceInvalid)?
+        .create_ref::<false>()?;
     let mut deferred = ptr::null_mut();
     let mut promise = ptr::null_mut();
     let status = unsafe { sys::napi_create_promise(env.raw(), &mut deferred, &mut promise) };
     if status != sys::Status::napi_ok {
+        let _ = fallback.unref(env);
         return Err(napi_failure("failed to create binding promise"));
     }
     Ok((
         BindingDeferred {
             raw: deferred as usize,
             dispatcher,
+            fallback,
+            store: Arc::downgrade(store),
         },
         RawValue(promise),
     ))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum DeferredSettlementOutcome {
+    Primary,
+    Fallback,
+    Failed,
+}
+
+fn settle_deferred_with_fallback<P, T, F>(
+    primary: P,
+    terminal: T,
+    fallback: F,
+) -> DeferredSettlementOutcome
+where
+    P: FnOnce() -> bool,
+    T: FnOnce(),
+    F: FnOnce() -> bool,
+{
+    if primary() {
+        return DeferredSettlementOutcome::Primary;
+    }
+    terminal();
+    if fallback() {
+        DeferredSettlementOutcome::Fallback
+    } else {
+        DeferredSettlementOutcome::Failed
+    }
+}
+
+fn terminal_deferred_store(store: &Option<Arc<NapiStoreState>>) {
+    let Some(store) = store else {
+        return;
+    };
+    store.terminal.store(true, Ordering::Release);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| terminal_fence(store)));
+}
+
+fn fatal_unsettled_binding_promise() -> ! {
+    let location = b"relay-v2-broker-credential-state-store-napi";
+    let message = b"unable to settle binding promise with fixed fallback";
+    unsafe {
+        sys::napi_fatal_error(
+            location.as_ptr().cast(),
+            location.len() as isize,
+            message.as_ptr().cast(),
+            message.len() as isize,
+        );
+    }
+    std::process::abort()
+}
+
 struct CompleteDeferredTask {
     deferred: usize,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
+    fallback: Option<ObjectRef<false>>,
+    store: Option<Arc<NapiStoreState>>,
 }
 
 impl MainThreadTask for CompleteDeferredTask {
     fn run(&mut self, env: Env) {
         let deferred = self.deferred as sys::napi_deferred;
-        let status = match self.outcome {
-            Ok(()) => raw_undefined(&env).and_then(|value| {
-                let status = unsafe { sys::napi_resolve_deferred(env.raw(), deferred, value.0) };
-                if status == sys::Status::napi_ok {
-                    Ok(())
-                } else {
-                    Err(napi_failure("failed to resolve binding promise"))
-                }
-            }),
-            Err(code) => create_error_object(&env, code).and_then(|error| {
-                let status = unsafe { sys::napi_reject_deferred(env.raw(), deferred, error.raw()) };
-                if status == sys::Status::napi_ok {
-                    Ok(())
-                } else {
-                    Err(napi_failure("failed to reject binding promise"))
-                }
-            }),
+        let Some(fallback) = self.fallback.as_ref() else {
+            terminal_deferred_store(&self.store);
+            fatal_unsettled_binding_promise();
         };
-        if status.is_err() {
-            clear_pending_exception(&env);
+        let settlement = settle_deferred_with_fallback(
+            || {
+                let status = match self.outcome {
+                    Ok(()) => raw_undefined(&env).and_then(|value| {
+                        let status =
+                            unsafe { sys::napi_resolve_deferred(env.raw(), deferred, value.0) };
+                        if status == sys::Status::napi_ok {
+                            Ok(())
+                        } else {
+                            Err(napi_failure("failed to resolve binding promise"))
+                        }
+                    }),
+                    Err(code) => create_error_object(&env, code).and_then(|error| {
+                        let status =
+                            unsafe { sys::napi_reject_deferred(env.raw(), deferred, error.raw()) };
+                        if status == sys::Status::napi_ok {
+                            Ok(())
+                        } else {
+                            Err(napi_failure("failed to reject binding promise"))
+                        }
+                    }),
+                };
+                if status.is_err() {
+                    clear_pending_exception(&env);
+                    false
+                } else {
+                    true
+                }
+            },
+            || terminal_deferred_store(&self.store),
+            || {
+                let fallback = match fallback.get_value(&env) {
+                    Ok(fallback) => fallback,
+                    Err(_) => {
+                        clear_pending_exception(&env);
+                        return false;
+                    }
+                };
+                let status =
+                    unsafe { sys::napi_reject_deferred(env.raw(), deferred, fallback.raw()) };
+                if status == sys::Status::napi_ok {
+                    true
+                } else {
+                    clear_pending_exception(&env);
+                    false
+                }
+            },
+        );
+        if settlement == DeferredSettlementOutcome::Failed {
+            fatal_unsettled_binding_promise();
+        }
+        if let Some(fallback) = self.fallback.take() {
+            if fallback.unref(&env).is_err() {
+                clear_pending_exception(&env);
+                terminal_deferred_store(&self.store);
+            }
         }
     }
 
-    fn dispatch_failed(&mut self) {}
+    fn dispatch_failed(&mut self) {
+        terminal_deferred_store(&self.store);
+    }
+
+    fn panic_fallback(&mut self) {
+        terminal_deferred_store(&self.store);
+    }
 }
 
 fn complete_deferred(
     deferred: BindingDeferred,
     outcome: std::result::Result<(), NativeStoreErrorCode>,
 ) -> bool {
+    let BindingDeferred {
+        raw,
+        dispatcher,
+        fallback,
+        store,
+    } = deferred;
     let task = CompleteDeferredTask {
-        deferred: deferred.raw,
+        deferred: raw,
         outcome,
+        fallback: Some(fallback),
+        store: store.upgrade(),
     };
-    deferred.dispatcher.dispatch(Box::new(task))
+    dispatcher.dispatch(Box::new(task))
 }
 
 fn exact_string_keys(array: &Array<'_>, expected: &[&str]) -> Result<bool> {
@@ -1346,7 +1462,7 @@ fn run_exclusive(
     store: Arc<NapiStoreState>,
     callback_value: Unknown<'_>,
 ) -> Result<RawValue> {
-    let (outer, promise) = match create_binding_deferred(env) {
+    let (outer, promise) = match create_binding_deferred(env, &store) {
         Ok(value) => value,
         Err(_) => {
             clear_pending_exception(env);
@@ -1417,7 +1533,7 @@ fn run_exclusive(
 }
 
 fn close_store(env: &Env, store: Arc<NapiStoreState>) -> Result<RawValue> {
-    let (waiter, promise) = create_binding_deferred(env)?;
+    let (waiter, promise) = create_binding_deferred(env, &store)?;
     request_close(&store, Some(waiter), false);
     Ok(promise)
 }
@@ -1692,6 +1808,26 @@ mod tests {
         assert_eq!(dispatch_count.load(Ordering::Relaxed), 1);
         assert_eq!(fallback_count.load(Ordering::Relaxed), 1);
         assert_eq!(drop_count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn deferred_primary_settlement_failure_terminals_before_fixed_fallback() {
+        let terminal = AtomicBool::new(false);
+        let fallback_called = AtomicBool::new(false);
+
+        let settlement = settle_deferred_with_fallback(
+            || false,
+            || terminal.store(true, Ordering::Release),
+            || {
+                assert!(terminal.load(Ordering::Acquire));
+                fallback_called.store(true, Ordering::Release);
+                true
+            },
+        );
+
+        assert_eq!(settlement, DeferredSettlementOutcome::Fallback);
+        assert!(terminal.load(Ordering::Acquire));
+        assert!(fallback_called.load(Ordering::Acquire));
     }
 
     #[test]

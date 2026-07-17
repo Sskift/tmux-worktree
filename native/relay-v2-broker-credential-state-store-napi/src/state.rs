@@ -183,7 +183,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use std::sync::{mpsc, Mutex};
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     static NEXT_HOME: AtomicU64 = AtomicU64::new(90_000);
 
@@ -386,7 +386,23 @@ mod tests {
                     .unwrap()
             })
             .unwrap();
-        assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        let admission_close_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match store.admit() {
+                Err(NativeStoreErrorCode::StoreClosed) => break,
+                Ok(ticket) => drop(ticket),
+                Err(code) => panic!("unexpected admission result while close starts: {code:?}"),
+            }
+            assert!(
+                Instant::now() < admission_close_deadline,
+                "ordinary close did not close native admission"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(matches!(
+            close_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         assert!(!terminal.load(Ordering::Acquire));
 
         let first_snapshot = first_transaction.read().unwrap();
@@ -398,7 +414,10 @@ mod tests {
             panic!("expected ordinary-close transaction publish to swap");
         };
         assert_eq!(first_published.bytes, Some(vec![4, 5, 6]));
-        assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(matches!(
+            close_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
 
         first_transaction.settle().unwrap();
         ack_tx.send(()).unwrap();
@@ -409,7 +428,10 @@ mod tests {
             second_transaction.read().unwrap().bytes,
             Some(vec![4, 5, 6])
         );
-        assert!(close_rx.recv_timeout(Duration::from_millis(40)).is_err());
+        assert!(matches!(
+            close_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         second_transaction.settle().unwrap();
         ack_tx.send(()).unwrap();
         assert_eq!(
