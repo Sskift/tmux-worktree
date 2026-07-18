@@ -1,4 +1,5 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { issueRelayV2CanonicalBackendInstanceKey } from "./canonicalBackendIdentity.js";
 import type {
   RelayV2HostJson,
   RelayV2HostStateCriticalSection,
@@ -18,16 +19,24 @@ import {
   type RelayV2TerminalDurableOpenClaimResult,
   type RelayV2TerminalDurableOpenCommitResult,
   type RelayV2TerminalDurableOpenOutcome,
+  type RelayV2TerminalDurableOpenPrepareResult,
+  type RelayV2TerminalDurableOpenReplayResult,
   type RelayV2TerminalDurableStreamAuthority,
   type RelayV2TerminalDurableStreamClosedResult,
   type RelayV2TerminalDurableStreamReleaseResult,
   type RelayV2TerminalOpenFailureStreamEffect,
+  type RelayV2TerminalCanonicalResolver,
+  type RelayV2TerminalCanonicalResolution,
+  type RelayV2TerminalCanonicalTargetBindingV1,
   type RelayV2TerminalRoute,
   type RelayV2TerminalWireTarget,
 } from "./terminalManager.js";
 
 const TERMINAL_LINEAGE_KEY = "h3:terminal-durable-lineage:v1";
-const TERMINAL_LINEAGE_SCHEMA_VERSION = 2 as const;
+// Revision 3 adds the mandatory prepared exact H2/control binding. Revisions 1
+// and 2 are deliberately not migrated: this foundation is not production
+// wired, and accepting their weaker target identity would be unsafe.
+const TERMINAL_LINEAGE_SCHEMA_VERSION = 3 as const;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const MAX_UINT64 = 18_446_744_073_709_551_615n;
 
@@ -43,6 +52,7 @@ export const RELAY_V2_TERMINAL_DURABLE_LINEAGE_LIMITS:
 });
 
 export type RelayV2TerminalDurableLineageErrorCode =
+  | "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE"
   | "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT"
   | "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT"
   | "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT";
@@ -61,6 +71,11 @@ export interface RelayV2TerminalDurableLineageAuthorityOptions {
   store: Pick<RelayV2HostStateStore, "serialize" | "hostInstanceId">;
   now?: () => number;
   issueAuthorityId?: (kind: "claim" | "fence") => string;
+  /**
+   * Independent exact resolver fence. Omission keeps write admission
+   * unreachable; it never falls back to terminal-control v1 target.resolve.
+   */
+  admissionFence?: Pick<RelayV2TerminalCanonicalResolver, "fenceSessionForAdmission">;
   /** Tests may only shrink the frozen authority bounds. */
   testLimits?: Partial<RelayV2TerminalDurableLineageLimits>;
 }
@@ -73,6 +88,7 @@ interface PersistedStreamAuthority {
   target: RelayV2TerminalWireTarget;
   pane: number;
   resumeTokenHash: string;
+  canonicalBinding: RelayV2TerminalCanonicalTargetBindingV1;
   closeSlotReserved: boolean;
   closedExpiresAtMs: number | null;
 }
@@ -84,6 +100,7 @@ interface PersistedLostAuthority {
   target: RelayV2TerminalWireTarget;
   pane: number;
   resumeTokenHash: string;
+  canonicalBinding: RelayV2TerminalCanonicalTargetBindingV1;
   expiresAtMs: number;
 }
 
@@ -96,6 +113,7 @@ type PersistedClaimStreamAuthority =
       target: RelayV2TerminalWireTarget;
       pane: number;
       resumeTokenHash: string;
+      canonicalBinding: RelayV2TerminalCanonicalTargetBindingV1;
       requestedOffset: string | null;
     };
 
@@ -114,8 +132,11 @@ interface PersistedOpenRecord {
   previousGeneration: string | null;
   requestedOffset: string | null;
   streamAuthority: PersistedClaimStreamAuthority;
+  /** Exact digest of same-stream lost/close rows at the claim transaction cut. */
+  retainedAuthorityDigest: string;
   reservesStreamSlot: boolean;
   issuedGeneration: string | null;
+  preparedBinding: RelayV2TerminalCanonicalTargetBindingV1 | null;
   expiresAtMs: number;
   outcome: RelayV2TerminalDurableOpenOutcome | null;
 }
@@ -147,6 +168,26 @@ function lineageError(
   throw new RelayV2TerminalDurableLineageError(code, message);
 }
 
+function requireSynchronousAdmissionFence(value: unknown): void {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return;
+  let then: unknown;
+  try {
+    then = (value as { then?: unknown }).then;
+  } catch {
+    void Promise.resolve(value).catch(() => undefined);
+    return lineageError(
+      "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE",
+      "Relay v2 terminal admission fence exposed an unsafe asynchronous result",
+    );
+  }
+  if (typeof then !== "function") return;
+  void Promise.resolve(value).catch(() => undefined);
+  return lineageError(
+    "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE",
+    "Relay v2 terminal admission fence must complete synchronously",
+  );
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -172,6 +213,16 @@ function isDurableKey(value: unknown): value is string {
 
 function isFingerprint(value: unknown): value is string {
   return typeof value === "string" && SHA256_HEX.test(value);
+}
+
+function retainedAuthorityDigest(
+  state: Pick<PersistedTerminalLineageState, "lostAuthorities" | "closeRecords">,
+  streamKey: string,
+): string {
+  return createHash("sha256").update(JSON.stringify({
+    lost: state.lostAuthorities.filter((candidate) => candidate.streamKey === streamKey),
+    close: state.closeRecords.filter((candidate) => candidate.value.streamKey === streamKey),
+  })).digest("hex");
 }
 
 function isCounter(value: unknown): value is string {
@@ -239,6 +290,120 @@ function sameTarget(left: RelayV2TerminalWireTarget, right: RelayV2TerminalWireT
 
 function cloneTarget(value: RelayV2TerminalWireTarget): RelayV2TerminalWireTarget {
   return { hostId: value.hostId, scopeId: value.scopeId, sessionId: value.sessionId };
+}
+
+function parseCanonicalBinding(
+  value: unknown,
+  code: RelayV2TerminalDurableLineageErrorCode =
+    "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+): RelayV2TerminalCanonicalTargetBindingV1 {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "hostId", "scopeId", "sessionId", "pane", "processTarget",
+      "backendInstanceKey", "managedTarget", "exactControlIdentity",
+    ])
+    || value.schemaVersion !== 1
+    || !isOpaque(value.hostId)
+    || !isOpaque(value.scopeId)
+    || !isOpaque(value.sessionId)
+    || !isRecord(value.processTarget)
+    || !exactKeys(value.processTarget, ["kind", "targetId"])
+    || (value.processTarget.kind !== "local" && value.processTarget.kind !== "ssh")
+    || !isOpaque(value.processTarget.targetId)
+    || !isOpaque(value.backendInstanceKey)
+    || !isRecord(value.managedTarget)
+    || !exactKeys(value.managedTarget, ["name", "kind", "incarnation"])
+    || !isOpaque(value.managedTarget.name)
+    || (value.managedTarget.kind !== "worktree" && value.managedTarget.kind !== "terminal")
+    || !isOpaque(value.managedTarget.incarnation)
+    || !/^twinc2\.[A-Za-z0-9_-]{43}$/.test(value.managedTarget.incarnation)
+    || !isRecord(value.exactControlIdentity)
+    || !exactKeys(value.exactControlIdentity, [
+      "schemaVersion", "controlTargetId", "controlEpoch", "targetIncarnationProof",
+    ])
+    || value.exactControlIdentity.schemaVersion !== 1
+    || !isOpaque(value.exactControlIdentity.controlTargetId)
+    || !isOpaque(value.exactControlIdentity.controlEpoch)
+    || !isOpaque(value.exactControlIdentity.targetIncarnationProof)) {
+    return lineageError(code, "Relay v2 terminal canonical binding is malformed");
+  }
+  const pane = (() => {
+    if (!Number.isSafeInteger(value.pane)
+      || (value.pane as number) < 0
+      || (value.pane as number) > 65_535) {
+      return lineageError(code, "Relay v2 terminal canonical binding pane is malformed");
+    }
+    return value.pane as number;
+  })();
+  let expectedBackendInstanceKey: string;
+  try {
+    expectedBackendInstanceKey = issueRelayV2CanonicalBackendInstanceKey({
+      processTarget: {
+        kind: value.processTarget.kind,
+        targetId: value.processTarget.targetId,
+      },
+      incarnation: value.managedTarget.incarnation,
+    });
+  } catch {
+    return lineageError(code, "Relay v2 terminal canonical backend identity is invalid");
+  }
+  if (value.backendInstanceKey !== expectedBackendInstanceKey) {
+    return lineageError(code, "Relay v2 terminal canonical backend identity is mismatched");
+  }
+  return {
+    schemaVersion: 1,
+    hostId: value.hostId,
+    scopeId: value.scopeId,
+    sessionId: value.sessionId,
+    pane,
+    processTarget: {
+      kind: value.processTarget.kind,
+      targetId: value.processTarget.targetId,
+    },
+    backendInstanceKey: value.backendInstanceKey,
+    managedTarget: {
+      name: value.managedTarget.name,
+      kind: value.managedTarget.kind,
+      incarnation: value.managedTarget.incarnation,
+    },
+    exactControlIdentity: {
+      schemaVersion: 1,
+      controlTargetId: value.exactControlIdentity.controlTargetId,
+      controlEpoch: value.exactControlIdentity.controlEpoch,
+      targetIncarnationProof: value.exactControlIdentity.targetIncarnationProof,
+    },
+  };
+}
+
+function cloneCanonicalBinding(
+  value: RelayV2TerminalCanonicalTargetBindingV1,
+): RelayV2TerminalCanonicalTargetBindingV1 {
+  return {
+    ...value,
+    processTarget: { ...value.processTarget },
+    managedTarget: { ...value.managedTarget },
+    exactControlIdentity: { ...value.exactControlIdentity },
+  };
+}
+
+function sameCanonicalBinding(
+  left: RelayV2TerminalCanonicalTargetBindingV1,
+  right: RelayV2TerminalCanonicalTargetBindingV1,
+): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && sameTarget(left, right)
+    && left.pane === right.pane
+    && left.processTarget.kind === right.processTarget.kind
+    && left.processTarget.targetId === right.processTarget.targetId
+    && left.backendInstanceKey === right.backendInstanceKey
+    && left.managedTarget.name === right.managedTarget.name
+    && left.managedTarget.kind === right.managedTarget.kind
+    && left.managedTarget.incarnation === right.managedTarget.incarnation
+    && left.exactControlIdentity.schemaVersion === right.exactControlIdentity.schemaVersion
+    && left.exactControlIdentity.controlTargetId === right.exactControlIdentity.controlTargetId
+    && left.exactControlIdentity.controlEpoch === right.exactControlIdentity.controlEpoch
+    && left.exactControlIdentity.targetIncarnationProof
+      === right.exactControlIdentity.targetIncarnationProof;
 }
 
 function parseRoute(value: unknown): RelayV2TerminalRoute {
@@ -322,7 +487,9 @@ function parseOpenOutcome(value: unknown): RelayV2TerminalDurableOpenOutcome {
   }
   if (value.kind === "error") {
     if (!exactKeys(value, ["kind", "code", "message"])
-      || (value.code !== "BUSY" && value.code !== "TERMINAL_STREAM_CONFLICT")
+      || (value.code !== "BUSY"
+        && value.code !== "CAPABILITY_UNAVAILABLE"
+        && value.code !== "TERMINAL_STREAM_CONFLICT")
       || typeof value.message !== "string"
       || value.message.length === 0
       || value.message.includes("\0")
@@ -371,7 +538,7 @@ function parseClaimAuthority(value: unknown): PersistedClaimStreamAuthority {
   if (!isRecord(value)
     || !exactKeys(value, [
       "status", "generation", "hostInstanceId", "target", "pane", "resumeTokenHash",
-      "requestedOffset",
+      "requestedOffset", "canonicalBinding",
     ])
     || (value.status !== "live" && value.status !== "closed" && value.status !== "lost")
     || !isOpaque(value.generation)
@@ -391,6 +558,7 @@ function parseClaimAuthority(value: unknown): PersistedClaimStreamAuthority {
     pane: parsePane(value.pane),
     resumeTokenHash: value.resumeTokenHash,
     requestedOffset: value.requestedOffset,
+    canonicalBinding: parseCanonicalBinding(value.canonicalBinding),
   };
 }
 
@@ -398,7 +566,7 @@ function parseLost(value: unknown): PersistedLostAuthority {
   if (!isRecord(value)
     || !exactKeys(value, [
       "streamKey", "generation", "ownerHostInstanceId", "target", "pane",
-      "resumeTokenHash", "expiresAtMs",
+      "resumeTokenHash", "canonicalBinding", "expiresAtMs",
     ])
     || !isDurableKey(value.streamKey)
     || !isOpaque(value.generation)
@@ -417,6 +585,7 @@ function parseLost(value: unknown): PersistedLostAuthority {
     target: parseTarget(value.target),
     pane: parsePane(value.pane),
     resumeTokenHash: value.resumeTokenHash,
+    canonicalBinding: parseCanonicalBinding(value.canonicalBinding),
     expiresAtMs: value.expiresAtMs,
   };
 }
@@ -431,6 +600,7 @@ function parseStream(value: unknown): PersistedStreamAuthority {
       "target",
       "pane",
       "resumeTokenHash",
+      "canonicalBinding",
       "closeSlotReserved",
       "closedExpiresAtMs",
     ])
@@ -456,6 +626,7 @@ function parseStream(value: unknown): PersistedStreamAuthority {
     target: parseTarget(value.target),
     pane: parsePane(value.pane),
     resumeTokenHash: value.resumeTokenHash,
+    canonicalBinding: parseCanonicalBinding(value.canonicalBinding),
     closeSlotReserved: value.closeSlotReserved,
     closedExpiresAtMs: value.closedExpiresAtMs,
   };
@@ -478,8 +649,10 @@ function parseOpenRecord(value: unknown): PersistedOpenRecord {
       "previousGeneration",
       "requestedOffset",
       "streamAuthority",
+      "retainedAuthorityDigest",
       "reservesStreamSlot",
       "issuedGeneration",
+      "preparedBinding",
       "expiresAtMs",
       "outcome",
     ])
@@ -494,8 +667,10 @@ function parseOpenRecord(value: unknown): PersistedOpenRecord {
     || !(value.resumeTokenHash === null || isFingerprint(value.resumeTokenHash))
     || !(value.previousGeneration === null || isOpaque(value.previousGeneration))
     || !(value.requestedOffset === null || isCounter(value.requestedOffset))
+    || !isFingerprint(value.retainedAuthorityDigest)
     || typeof value.reservesStreamSlot !== "boolean"
     || !(value.issuedGeneration === null || isOpaque(value.issuedGeneration))
+    || !(value.preparedBinding === null || isRecord(value.preparedBinding))
     || !isSafeTime(value.expiresAtMs)
     || (value.status === "pending" && value.outcome !== null)
     || (value.status === "final" && value.outcome === null)
@@ -520,8 +695,12 @@ function parseOpenRecord(value: unknown): PersistedOpenRecord {
     previousGeneration: value.previousGeneration,
     requestedOffset: value.requestedOffset,
     streamAuthority: parseClaimAuthority(value.streamAuthority),
+    retainedAuthorityDigest: value.retainedAuthorityDigest,
     reservesStreamSlot: value.reservesStreamSlot,
     issuedGeneration: value.issuedGeneration,
+    preparedBinding: value.preparedBinding === null
+      ? null
+      : parseCanonicalBinding(value.preparedBinding),
     expiresAtMs: value.expiresAtMs,
     outcome: value.outcome === null ? null : parseOpenOutcome(value.outcome),
   };
@@ -729,6 +908,7 @@ function parseState(
     target: RelayV2TerminalWireTarget;
     pane: number | null;
     resumeTokenHash: string | null;
+    canonicalBinding: RelayV2TerminalCanonicalTargetBindingV1 | null;
   }>();
   const bindGeneration = (
     generation: string,
@@ -737,6 +917,7 @@ function parseState(
       target: RelayV2TerminalWireTarget;
       pane: number | null;
       resumeTokenHash: string | null;
+      canonicalBinding: RelayV2TerminalCanonicalTargetBindingV1 | null;
     },
     label: string,
   ) => {
@@ -750,6 +931,9 @@ function parseState(
       || (existing.resumeTokenHash !== null
         && binding.resumeTokenHash !== null
         && existing.resumeTokenHash !== binding.resumeTokenHash)
+      || (existing.canonicalBinding !== null
+        && binding.canonicalBinding !== null
+        && !sameCanonicalBinding(existing.canonicalBinding, binding.canonicalBinding))
     )) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
@@ -761,6 +945,10 @@ function parseState(
       target: cloneTarget(binding.target),
       pane: existing?.pane ?? binding.pane,
       resumeTokenHash: existing?.resumeTokenHash ?? binding.resumeTokenHash,
+      canonicalBinding: existing?.canonicalBinding
+        ?? (binding.canonicalBinding === null
+          ? null
+          : cloneCanonicalBinding(binding.canonicalBinding)),
     });
   };
   if ((state.activeHostInstanceId === null) !== (state.ownerFence === "0")) {
@@ -800,6 +988,20 @@ function parseState(
         "Relay v2 terminal durable open claim invariants are malformed",
       );
     }
+    if (record.preparedBinding !== null && (
+      !sameTarget(record.preparedBinding, record.target)
+      || record.preparedBinding.pane !== record.pane
+      || (record.streamAuthority.status !== "absent"
+        && !sameCanonicalBinding(
+          record.preparedBinding,
+          record.streamAuthority.canonicalBinding,
+        ))
+    )) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+        "Relay v2 terminal prepared binding lost its exact claim authority",
+      );
+    }
     if (pending && record.ownerHostInstanceId !== state.activeHostInstanceId) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
@@ -807,6 +1009,20 @@ function parseState(
       );
     }
     if (record.issuedGeneration !== null) {
+      const openedWinner = record.status === "final" && record.outcome?.kind === "opened";
+      const overlapsAuthority = state.streamAuthorities.some(
+        (stream) => stream.generation === record.issuedGeneration,
+      ) || state.lostAuthorities.some(
+        (stream) => stream.generation === record.issuedGeneration,
+      ) || state.closeRecords.some(
+        (close) => close.value.generation === record.issuedGeneration,
+      );
+      if (!openedWinner && overlapsAuthority) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+          "Relay v2 terminal unused claimed generation overlaps executable or closed authority",
+        );
+      }
       requireIssued(record.issuedGeneration, "claimed generation");
       bindGeneration(record.issuedGeneration, {
         streamKey: record.streamKey,
@@ -815,15 +1031,24 @@ function parseState(
         resumeTokenHash: record.outcome?.kind === "opened"
           ? record.outcome.resumeTokenHash
           : null,
+        canonicalBinding: record.preparedBinding,
       }, "issued generation");
     }
     if (record.streamAuthority.status !== "absent") {
+      if (!sameTarget(record.streamAuthority.canonicalBinding, record.streamAuthority.target)
+        || record.streamAuthority.canonicalBinding.pane !== record.streamAuthority.pane) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+          "Relay v2 terminal captured canonical binding is mismatched",
+        );
+      }
       requireIssued(record.streamAuthority.generation, "captured generation");
       bindGeneration(record.streamAuthority.generation, {
         streamKey: record.streamKey,
         target: record.streamAuthority.target,
         pane: record.streamAuthority.pane,
         resumeTokenHash: record.streamAuthority.resumeTokenHash,
+        canonicalBinding: record.streamAuthority.canonicalBinding,
       }, "captured authority");
       if (record.mode === "reset" && (
         record.previousGeneration !== record.streamAuthority.generation
@@ -845,7 +1070,8 @@ function parseState(
         : record.mode === "resume"
           ? "resumed"
           : "reset";
-      if (record.outcome.disposition !== disposition
+      if (record.preparedBinding === null
+        || record.outcome.disposition !== disposition
         || (record.mode !== "resume" && record.outcome.generation !== record.issuedGeneration)
         || ((record.mode === "new" || record.mode === "reset")
           && record.outcome.replayFromOffset !== "0")
@@ -879,16 +1105,25 @@ function parseState(
         target: record.target,
         pane: record.pane,
         resumeTokenHash: record.outcome.resumeTokenHash,
+        canonicalBinding: record.preparedBinding,
       }, "opened outcome");
     }
   }
   for (const stream of state.streamAuthorities) {
+    if (!sameTarget(stream.canonicalBinding, stream.target)
+      || stream.canonicalBinding.pane !== stream.pane) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+        "Relay v2 terminal stream canonical binding is mismatched",
+      );
+    }
     requireIssued(stream.generation, "stream generation");
     bindGeneration(stream.generation, {
       streamKey: stream.streamKey,
       target: stream.target,
       pane: stream.pane,
       resumeTokenHash: stream.resumeTokenHash,
+      canonicalBinding: stream.canonicalBinding,
     }, "stream authority");
     if (stream.hostInstanceId !== state.activeHostInstanceId) {
       return lineageError(
@@ -920,12 +1155,20 @@ function parseState(
     }
   }
   for (const lost of state.lostAuthorities) {
+    if (!sameTarget(lost.canonicalBinding, lost.target)
+      || lost.canonicalBinding.pane !== lost.pane) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+        "Relay v2 terminal lost canonical binding is mismatched",
+      );
+    }
     requireIssued(lost.generation, "lost generation");
     bindGeneration(lost.generation, {
       streamKey: lost.streamKey,
       target: lost.target,
       pane: lost.pane,
       resumeTokenHash: lost.resumeTokenHash,
+      canonicalBinding: lost.canonicalBinding,
     }, "lost authority");
   }
   for (const close of state.closeRecords) {
@@ -935,6 +1178,7 @@ function parseState(
       target: close.value.target,
       pane: null,
       resumeTokenHash: null,
+      canonicalBinding: null,
     }, "close binding");
     if (BigInt(close.ownerFence) > BigInt(state.ownerFence)) {
       return lineageError(
@@ -968,10 +1212,37 @@ function emptyState(hostEpoch: string): PersistedTerminalLineageState {
   };
 }
 
-function cloneOutcome(
-  outcome: RelayV2TerminalDurableOpenOutcome,
-): RelayV2TerminalDurableOpenOutcome {
+function cloneOutcome<T extends RelayV2TerminalDurableOpenOutcome>(outcome: T): T {
   return { ...outcome };
+}
+
+function replayOpenResult(record: PersistedOpenRecord): RelayV2TerminalDurableOpenReplayResult {
+  if (record.status !== "final" || record.outcome === null) {
+    return lineageError(
+      "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+      "Relay v2 terminal replay record is not final",
+    );
+  }
+  if (record.outcome.kind === "opened") {
+    if (record.preparedBinding === null) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT",
+        "Relay v2 terminal opened replay lacks its exact preparation",
+      );
+    }
+    return {
+      status: "replay",
+      outcome: cloneOutcome(record.outcome),
+      preparedBinding: cloneCanonicalBinding(record.preparedBinding),
+    };
+  }
+  return {
+    status: "replay",
+    outcome: cloneOutcome(record.outcome),
+    preparedBinding: record.preparedBinding === null
+      ? null
+      : cloneCanonicalBinding(record.preparedBinding),
+  };
 }
 
 function publicAuthority(
@@ -986,6 +1257,7 @@ function publicAuthority(
     target: cloneTarget(authority.target),
     pane: authority.pane,
     resumeTokenHash: authority.resumeTokenHash,
+    canonicalBinding: cloneCanonicalBinding(authority.canonicalBinding),
   };
 }
 
@@ -1001,6 +1273,7 @@ function claimAuthorityFromStream(
     target: cloneTarget(stream.target),
     pane: stream.pane,
     resumeTokenHash: stream.resumeTokenHash,
+    canonicalBinding: cloneCanonicalBinding(stream.canonicalBinding),
     requestedOffset,
   };
 }
@@ -1017,6 +1290,7 @@ function claimAuthorityFromLost(
     target: cloneTarget(stream.target),
     pane: stream.pane,
     resumeTokenHash: stream.resumeTokenHash,
+    canonicalBinding: cloneCanonicalBinding(stream.canonicalBinding),
     requestedOffset,
   };
 }
@@ -1034,6 +1308,7 @@ function sameClaimAuthority(
     && sameTarget(left.target, right.target)
     && left.pane === right.pane
     && left.resumeTokenHash === right.resumeTokenHash
+    && sameCanonicalBinding(left.canonicalBinding, right.canonicalBinding)
     && left.requestedOffset === right.requestedOffset;
 }
 
@@ -1047,7 +1322,8 @@ function streamMatchesClaim(
     && stream.hostInstanceId === authority.hostInstanceId
     && sameTarget(stream.target, authority.target)
     && stream.pane === authority.pane
-    && stream.resumeTokenHash === authority.resumeTokenHash;
+    && stream.resumeTokenHash === authority.resumeTokenHash
+    && sameCanonicalBinding(stream.canonicalBinding, authority.canonicalBinding);
 }
 
 function lostMatchesClaim(
@@ -1059,7 +1335,8 @@ function lostMatchesClaim(
     && stream.ownerHostInstanceId === authority.hostInstanceId
     && sameTarget(stream.target, authority.target)
     && stream.pane === authority.pane
-    && stream.resumeTokenHash === authority.resumeTokenHash;
+    && stream.resumeTokenHash === authority.resumeTokenHash
+    && sameCanonicalBinding(stream.canonicalBinding, authority.canonicalBinding);
 }
 
 function cloneClose(
@@ -1115,6 +1392,9 @@ export class RelayV2TerminalDurableLineageAuthority
   private readonly store: Pick<RelayV2HostStateStore, "serialize" | "hostInstanceId">;
   private readonly now: () => number;
   private readonly issueAuthorityId: (kind: "claim" | "fence") => string;
+  private readonly admissionFence:
+    | Pick<RelayV2TerminalCanonicalResolver, "fenceSessionForAdmission">
+    | undefined;
   private activated = false;
 
   constructor(options: RelayV2TerminalDurableLineageAuthorityOptions) {
@@ -1129,6 +1409,12 @@ export class RelayV2TerminalDurableLineageAuthority
     this.now = options.now ?? Date.now;
     this.issueAuthorityId = options.issueAuthorityId
       ?? ((kind) => `${kind}_${randomUUID().replaceAll("-", "")}`);
+    if (options.admissionFence !== undefined
+      && (!isRecord(options.admissionFence)
+        || typeof options.admissionFence.fenceSessionForAdmission !== "function")) {
+      throw new TypeError("Relay v2 terminal durable lineage admission fence is invalid");
+    }
+    this.admissionFence = options.admissionFence;
     const limits = {
       ...RELAY_V2_TERMINAL_DURABLE_LINEAGE_LIMITS,
       ...options.testLimits,
@@ -1164,10 +1450,7 @@ export class RelayV2TerminalDurableLineageAuthority
           }
           if (existing.status === "pending") this.settlePendingAsStreamLost(state, existing);
           return {
-            result: {
-              status: "replay",
-              outcome: cloneOutcome(existing.outcome!),
-            } as const,
+            result: replayOpenResult(existing),
             state,
           };
         }
@@ -1195,15 +1478,17 @@ export class RelayV2TerminalDurableLineageAuthority
             previousGeneration: normalized.previousGeneration,
             requestedOffset: normalized.requestedOffset,
             streamAuthority,
+            retainedAuthorityDigest: retainedAuthorityDigest(state, normalized.streamKey),
             reservesStreamSlot: false,
             issuedGeneration: null,
+            preparedBinding: null,
             expiresAtMs: Math.max(normalized.expiresAtMs, authorityExpiresAtMs),
             outcome: null,
           };
           this.finishOpenRecord(record, this.streamLostOutcome(record));
           state.openRecords.push(record);
           return {
-            result: { status: "replay", outcome: cloneOutcome(record.outcome!) } as const,
+            result: replayOpenResult(record),
             state,
           };
         }
@@ -1231,8 +1516,10 @@ export class RelayV2TerminalDurableLineageAuthority
           previousGeneration: normalized.previousGeneration,
           requestedOffset: normalized.requestedOffset,
           streamAuthority,
+          retainedAuthorityDigest: retainedAuthorityDigest(state, normalized.streamKey),
           reservesStreamSlot,
           issuedGeneration: allocatedGeneration,
+          preparedBinding: null,
           expiresAtMs: Math.max(normalized.expiresAtMs, authorityExpiresAtMs),
           outcome: null,
         };
@@ -1248,9 +1535,171 @@ export class RelayV2TerminalDurableLineageAuthority
           state,
         };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => {
-        return this.openClaimAfterCommit(snapshot, normalized, claimToken, fence);
-      });
+      return this.commitAndReconcile<RelayV2TerminalDurableOpenClaimResult>(
+        section,
+        mutate,
+        (snapshot) => this.openClaimAfterCommit(snapshot, normalized, claimToken, fence),
+      );
+    });
+    this.activated = true;
+    return result;
+  }
+
+  async prepareOpen(rawInput: {
+    key: string;
+    fingerprint: string;
+    hostInstanceId: string;
+    claimToken: string;
+    fence: string;
+    preparation:
+      | { kind: "current"; resolution: RelayV2TerminalCanonicalResolution }
+      | { kind: "retained"; binding: RelayV2TerminalCanonicalTargetBindingV1 };
+  }): Promise<RelayV2TerminalDurableOpenPrepareResult> {
+    const input = this.validatePrepareOpen(rawInput);
+    const proposedBinding = input.preparation.kind === "current"
+      ? input.preparation.resolution.binding
+      : input.preparation.binding;
+    const result = await this.store.serialize((section) => {
+      const authorityExpiresAtMs = this.authorityRetentionExpiresAtMs();
+      const mutate = (transaction: RelayV2HostStateTransaction) => {
+        const state = this.stateForTransaction(transaction);
+        this.cleanup(state);
+        this.prepareOwner(state, authorityExpiresAtMs);
+        const record = state.openRecords.find((candidate) => candidate.key === input.key);
+        if (!record
+          || record.fingerprint !== input.fingerprint
+          || record.ownerHostInstanceId !== input.hostInstanceId
+          || record.claimToken !== input.claimToken
+          || record.fence !== input.fence) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal prepare owner is missing or mismatched",
+          );
+        }
+        if (record.status === "final") {
+          return {
+            result: replayOpenResult(record),
+            state,
+          };
+        }
+        const expectedPreparationKind = record.mode === "resume" ? "retained" : "current";
+        if (input.preparation.kind !== expectedPreparationKind) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal preparation kind crossed its claimed mode",
+          );
+        }
+        if (!sameTarget(record.target, proposedBinding)
+          || record.pane !== proposedBinding.pane) {
+          return lineageError(
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+            "Relay v2 terminal prepare target differs from the claimed target",
+          );
+        }
+        this.recheckPrepareAuthority(state, record);
+        if (record.preparedBinding !== null) {
+          if (!sameCanonicalBinding(record.preparedBinding, proposedBinding)) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal pending claim has a different prepared binding",
+            );
+          }
+          return {
+            result: {
+              status: "prepared",
+              binding: cloneCanonicalBinding(record.preparedBinding),
+            } as const,
+            state,
+          };
+        }
+        if (input.preparation.kind === "retained") {
+          if (record.mode !== "resume"
+            || record.streamAuthority.status === "absent"
+            || record.streamAuthority.status === "lost"
+            || !sameCanonicalBinding(
+              record.streamAuthority.canonicalBinding,
+              proposedBinding,
+            )) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal resume lost its retained exact binding",
+            );
+          }
+        } else {
+          if (record.mode === "resume") {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal resume cannot resolve a current target",
+            );
+          }
+          if (record.streamAuthority.status !== "absent"
+            && !sameCanonicalBinding(
+              record.streamAuthority.canonicalBinding,
+              proposedBinding,
+            )) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal replacement changed its exact target/control binding",
+            );
+          }
+          if (!this.admissionFence) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE",
+              "Relay v2 exact terminal target admission is not wired",
+            );
+          }
+          let fenceResult: unknown;
+          try {
+            fenceResult = this.admissionFence.fenceSessionForAdmission(
+              transaction,
+              input.preparation.resolution,
+            );
+          } catch {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE",
+              "Relay v2 terminal admission fence rejected the exact target",
+            );
+          }
+          requireSynchronousAdmissionFence(fenceResult);
+        }
+        record.preparedBinding = cloneCanonicalBinding(proposedBinding);
+        return {
+          result: {
+            status: "prepared",
+            binding: cloneCanonicalBinding(proposedBinding),
+          } as const,
+          state,
+        };
+      };
+      return this.commitAndReconcile<RelayV2TerminalDurableOpenPrepareResult>(
+        section,
+        mutate,
+        (snapshot) => {
+          const record = this.stateFromSnapshot(snapshot).openRecords.find(
+            (candidate) => candidate.key === input.key,
+          );
+          if (!record || record.fingerprint !== input.fingerprint) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal preparation could not be reconciled",
+            );
+          }
+          if (record.status === "final") {
+            return replayOpenResult(record);
+          }
+          if (record.preparedBinding === null
+            || !sameCanonicalBinding(record.preparedBinding, proposedBinding)) {
+            return lineageError(
+              "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+              "Relay v2 terminal preparation remained uncommitted",
+            );
+          }
+          return {
+            status: "prepared",
+            binding: cloneCanonicalBinding(record.preparedBinding),
+          } as const;
+        },
+      );
     });
     this.activated = true;
     return result;
@@ -1357,7 +1806,7 @@ export class RelayV2TerminalDurableLineageAuthority
           state,
         };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => (
+      return this.commitAndReconcile<RelayV2TerminalDurableCloseClaimResult>(section, mutate, (snapshot) => (
         this.closeClaimAfterCommit(snapshot, normalized)
       ));
     });
@@ -1393,7 +1842,7 @@ export class RelayV2TerminalDurableLineageAuthority
         record.status = "final";
         return { result: cloneClose(record.value), state };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => {
+      return this.commitAndReconcile<RelayV2TerminalDurableCloseTombstone>(section, mutate, (snapshot) => {
         const state = this.stateFromSnapshot(snapshot);
         const record = state.closeRecords.find(
           (candidate) => candidate.value.key === normalized.key,
@@ -1451,7 +1900,7 @@ export class RelayV2TerminalDurableLineageAuthority
           state,
         };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => {
+      return this.commitAndReconcile<RelayV2TerminalDurableStreamClosedResult>(section, mutate, (snapshot) => {
         const stream = this.stateFromSnapshot(snapshot).streamAuthorities.find(
           (candidate) => candidate.streamKey === normalized.streamKey,
         );
@@ -1498,7 +1947,7 @@ export class RelayV2TerminalDurableLineageAuthority
         state.streamAuthorities.splice(index, 1);
         return { result: { status: "released" } as const, state };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => {
+      return this.commitAndReconcile<RelayV2TerminalDurableStreamReleaseResult>(section, mutate, (snapshot) => {
         const stream = this.stateFromSnapshot(snapshot).streamAuthorities.find(
           (candidate) => candidate.streamKey === normalized.streamKey,
         );
@@ -1548,7 +1997,7 @@ export class RelayV2TerminalDurableLineageAuthority
         }
         if (record.status === "final") {
           return {
-            result: { status: "replay", outcome: cloneOutcome(record.outcome!) } as const,
+            result: replayOpenResult(record),
             state,
           };
         }
@@ -1557,7 +2006,7 @@ export class RelayV2TerminalDurableLineageAuthority
           if (completion === "stream_lost") {
             this.finishOpenRecord(record, this.streamLostOutcome(record));
             return {
-              result: { status: "replay", outcome: cloneOutcome(record.outcome!) } as const,
+              result: replayOpenResult(record),
               state,
             };
           }
@@ -1570,7 +2019,7 @@ export class RelayV2TerminalDurableLineageAuthority
           state,
         };
       };
-      return this.commitAndReconcile(section, mutate, (snapshot) => {
+      return this.commitAndReconcile<RelayV2TerminalDurableOpenCommitResult>(section, mutate, (snapshot) => {
         const record = this.stateFromSnapshot(snapshot).openRecords.find(
           (candidate) => candidate.key === input.key,
         );
@@ -1586,10 +2035,10 @@ export class RelayV2TerminalDurableLineageAuthority
             "Relay v2 terminal open settlement remained pending after reconciliation",
           );
         }
-        return {
-          status: sameOutcome(record.outcome, input.outcome) ? "committed" : "replay",
-          outcome: cloneOutcome(record.outcome),
-        };
+        if (sameOutcome(record.outcome!, input.outcome)) {
+          return { status: "committed", outcome: cloneOutcome(record.outcome!) };
+        }
+        return replayOpenResult(record);
       });
     });
     this.activated = true;
@@ -1601,6 +2050,14 @@ export class RelayV2TerminalDurableLineageAuthority
     record: PersistedOpenRecord,
     outcome: Extract<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>,
   ): "completed" | "stream_lost" {
+    if (record.preparedBinding === null
+      || !sameTarget(record.preparedBinding, record.target)
+      || record.preparedBinding.pane !== record.pane) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+        "Relay v2 terminal opened outcome lacks a durable exact preparation",
+      );
+    }
     const expectedDisposition = record.mode === "new"
       ? "new"
       : record.mode === "resume"
@@ -1627,6 +2084,10 @@ export class RelayV2TerminalDurableLineageAuthority
         || record.pane !== record.streamAuthority.pane
         || record.resumeTokenHash !== record.streamAuthority.resumeTokenHash
         || record.requestedOffset !== record.streamAuthority.requestedOffset
+        || !sameCanonicalBinding(
+          record.preparedBinding,
+          record.streamAuthority.canonicalBinding,
+        )
         || outcome.generation !== record.streamAuthority.generation
         || outcome.resumeTokenHash !== record.streamAuthority.resumeTokenHash
         || outcome.replayFromOffset !== record.requestedOffset
@@ -1648,6 +2109,10 @@ export class RelayV2TerminalDurableLineageAuthority
       || record.pane !== record.streamAuthority.pane
       || record.requestedOffset === null
       || record.requestedOffset !== record.streamAuthority.requestedOffset
+      || !sameCanonicalBinding(
+        record.preparedBinding,
+        record.streamAuthority.canonicalBinding,
+      )
     )) {
       return "stream_lost";
     }
@@ -1671,6 +2136,7 @@ export class RelayV2TerminalDurableLineageAuthority
       target: cloneTarget(record.target),
       pane: record.pane,
       resumeTokenHash: outcome.resumeTokenHash,
+      canonicalBinding: cloneCanonicalBinding(record.preparedBinding!),
       closeSlotReserved,
       closedExpiresAtMs: null,
     };
@@ -1750,6 +2216,79 @@ export class RelayV2TerminalDurableLineageAuthority
     };
   }
 
+  private recheckPrepareAuthority(
+    state: PersistedTerminalLineageState,
+    record: PersistedOpenRecord,
+  ): void {
+    if (record.retainedAuthorityDigest !== retainedAuthorityDigest(state, record.streamKey)) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+        "Relay v2 terminal preparation crossed a retained authority change",
+      );
+    }
+    const current = state.streamAuthorities.find(
+      (candidate) => candidate.streamKey === record.streamKey,
+    );
+    const exactLost = state.lostAuthorities.find((candidate) => (
+      candidate.streamKey === record.streamKey
+      && lostMatchesClaim(candidate, record.streamAuthority)
+    ));
+    if (record.mode === "new") {
+      const retainedClose = state.closeRecords.some(
+        (candidate) => candidate.value.streamKey === record.streamKey,
+      );
+      if (record.streamAuthority.status !== "absent"
+        || current !== undefined
+        || state.lostAuthorities.some(
+          (candidate) => candidate.streamKey === record.streamKey,
+        )
+        || retainedClose) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+          "Relay v2 terminal new preparation no longer has absent authority",
+        );
+      }
+      return;
+    }
+    if (record.mode === "resume") {
+      if (record.streamAuthority.status === "absent"
+        || record.streamAuthority.status === "lost"
+        || !streamMatchesClaim(current, record.streamAuthority)
+        || current.hostInstanceId !== record.ownerHostInstanceId) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+          "Relay v2 terminal resume preparation lost its current exact authority",
+        );
+      }
+      return;
+    }
+    if (record.streamAuthority.status === "absent") {
+      if (current !== undefined) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+          "Relay v2 terminal reset preparation gained a different authority",
+        );
+      }
+      return;
+    }
+    if (record.streamAuthority.status === "lost") {
+      if (current !== undefined || exactLost === undefined) {
+        return lineageError(
+          "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+          "Relay v2 terminal reset preparation lost its captured lost authority",
+        );
+      }
+      return;
+    }
+    if (!streamMatchesClaim(current, record.streamAuthority)
+      || current.hostInstanceId !== record.ownerHostInstanceId) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
+        "Relay v2 terminal reset preparation lost its current exact authority",
+      );
+    }
+  }
+
   private applyFailureEffect(
     state: PersistedTerminalLineageState,
     record: PersistedOpenRecord,
@@ -1764,6 +2303,11 @@ export class RelayV2TerminalDurableLineageAuthority
       || !sameTarget(record.streamAuthority.target, record.target)
       || record.streamAuthority.pane !== record.pane
       || record.streamAuthority.resumeTokenHash !== record.resumeTokenHash
+      || (record.preparedBinding !== null
+        && !sameCanonicalBinding(
+          record.preparedBinding,
+          record.streamAuthority.canonicalBinding,
+        ))
       || record.streamAuthority.requestedOffset !== record.requestedOffset) {
       return lineageError(
         "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT",
@@ -1800,6 +2344,11 @@ export class RelayV2TerminalDurableLineageAuthority
       && sameTarget(record.streamAuthority.target, record.target)
       && record.streamAuthority.pane === record.pane
       && record.streamAuthority.resumeTokenHash === record.resumeTokenHash
+      && (record.preparedBinding === null
+        || sameCanonicalBinding(
+          record.preparedBinding,
+          record.streamAuthority.canonicalBinding,
+        ))
       && record.streamAuthority.requestedOffset === record.requestedOffset) {
       const index = state.streamAuthorities.findIndex(
         (stream) => stream.streamKey === record.streamKey,
@@ -1901,15 +2450,18 @@ export class RelayV2TerminalDurableLineageAuthority
           target: cloneTarget(stream.target),
           pane: stream.pane,
           resumeTokenHash: stream.resumeTokenHash,
+          canonicalBinding: cloneCanonicalBinding(stream.canonicalBinding),
           expiresAtMs: authorityExpiresAtMs,
         });
       }
     }
     state.streamAuthorities = [];
     for (const record of state.openRecords) {
-      if (record.status === "pending" || record.outcome?.kind === "opened") {
-        this.finishOpenRecord(record, this.streamLostOutcome(record));
-      }
+      // A completed opened winner remains the immutable proof for its issued
+      // generation. H3 converts that replay to stream_lost when no exact local
+      // effect target survives this process fence. Only unfinished claims are
+      // settled here.
+      if (record.status === "pending") this.finishOpenRecord(record, this.streamLostOutcome(record));
     }
     state.activeHostInstanceId = this.hostInstanceId;
     state.ownerFence = fence;
@@ -2060,6 +2612,86 @@ export class RelayV2TerminalDurableLineageAuthority
       && record.mode === claim.mode
       && record.previousGeneration === claim.previousGeneration
       && record.requestedOffset === claim.requestedOffset;
+  }
+
+  private validatePrepareOpen(value: {
+    key: string;
+    fingerprint: string;
+    hostInstanceId: string;
+    claimToken: string;
+    fence: string;
+    preparation:
+      | { kind: "current"; resolution: RelayV2TerminalCanonicalResolution }
+      | { kind: "retained"; binding: RelayV2TerminalCanonicalTargetBindingV1 };
+  }): typeof value {
+    if (!isRecord(value)
+      || !exactKeys(value, [
+        "key", "fingerprint", "hostInstanceId", "claimToken", "fence", "preparation",
+      ])
+      || !isDurableKey(value.key)
+      || !isFingerprint(value.fingerprint)
+      || !isOpaque(value.hostInstanceId)
+      || value.hostInstanceId !== this.hostInstanceId
+      || !isOpaque(value.claimToken)
+      || !isOpaque(value.fence)
+      || !isRecord(value.preparation)) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+        "Relay v2 terminal prepare input is invalid",
+      );
+    }
+    if (value.preparation.kind === "retained"
+      && exactKeys(value.preparation, ["kind", "binding"])) {
+      return {
+        ...value,
+        preparation: {
+          kind: "retained",
+          binding: parseCanonicalBinding(
+            value.preparation.binding,
+            "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+          ),
+        },
+      };
+    }
+    if (value.preparation.kind !== "current"
+      || !exactKeys(value.preparation, ["kind", "resolution"])
+      || !isRecord(value.preparation.resolution)
+      || !exactKeys(value.preparation.resolution, ["target", "binding", "admission"])
+      || !isRecord(value.preparation.resolution.target)
+      || !exactKeys(value.preparation.resolution.target, [
+        "hostId", "scopeId", "sessionId", "pane", "canonicalTargetId", "controlTargetId",
+      ])) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+        "Relay v2 terminal current preparation is invalid",
+      );
+    }
+    const binding = parseCanonicalBinding(
+      value.preparation.resolution.binding,
+      "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+    );
+    const target = value.preparation.resolution.target;
+    if (!sameTarget(binding, target as unknown as RelayV2TerminalWireTarget)
+      || target.pane !== binding.pane
+      || target.canonicalTargetId !== binding.backendInstanceKey
+      || target.controlTargetId !== binding.exactControlIdentity.controlTargetId
+      || !isRecord(value.preparation.resolution.admission)) {
+      return lineageError(
+        "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT",
+        "Relay v2 terminal current preparation binding is mismatched",
+      );
+    }
+    return {
+      ...value,
+      preparation: {
+        kind: "current",
+        resolution: {
+          ...value.preparation.resolution,
+          target: { ...value.preparation.resolution.target },
+          binding,
+        },
+      },
+    };
   }
 
   private validateSettleOpen(
@@ -2234,7 +2866,7 @@ export class RelayV2TerminalDurableLineageAuthority
         return { status: "conflict", reason: "open_conflict" };
       }
       if (record.status === "final") {
-        return { status: "replay", outcome: cloneOutcome(record.outcome!) };
+        return replayOpenResult(record);
       }
       if (record.claimToken === claimToken && record.fence === fence) {
         return {

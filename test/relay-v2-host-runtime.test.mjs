@@ -7,6 +7,7 @@ import test from "node:test";
 import { loadRelayV2FixtureCorpus } from "./support/relayV2Fixtures.mjs";
 
 const broker = await import("../dist/relay/v2/brokerCore.js");
+const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const hostCarrier = await import("../dist/relay/v2/hostCarrier.js");
@@ -334,6 +335,31 @@ function actualTerminalRuntimeHarness(options = {}) {
   const closeRecords = new Map();
   const openRecords = new Map();
   const streamAuthorities = new Map();
+  const processTarget = { kind: "local", targetId: "actual-runtime-process" };
+  const incarnation = `twinc2.${"d".repeat(43)}`;
+  const backendInstanceKey =
+    canonicalBackendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+      processTarget,
+      incarnation,
+    });
+  const canonicalBinding = (target, pane) => ({
+    schemaVersion: 1,
+    ...structuredClone(target),
+    pane,
+    processTarget: structuredClone(processTarget),
+    backendInstanceKey,
+    managedTarget: {
+      name: "actual-runtime-managed-terminal",
+      kind: "terminal",
+      incarnation,
+    },
+    exactControlIdentity: {
+      schemaVersion: 1,
+      controlTargetId: "actual-runtime-control-target",
+      controlEpoch: "actual-runtime-control-epoch",
+      targetIncarnationProof: "actual-runtime-target-incarnation-proof",
+    },
+  });
   const backend = {
     opens: [],
     async open(_target, _openOptions, observer) {
@@ -356,7 +382,13 @@ function actualTerminalRuntimeHarness(options = {}) {
         if (openRecord.fingerprint !== claim.fingerprint) {
           return { status: "conflict", reason: "open_conflict" };
         }
-        return { status: "replay", outcome: structuredClone(openRecord.outcome) };
+        return {
+          status: "replay",
+          outcome: structuredClone(openRecord.outcome),
+          preparedBinding: openRecord.preparedBinding === null
+            ? null
+            : structuredClone(openRecord.preparedBinding),
+        };
       }
       const retained = streamAuthorities.get(claim.streamKey);
       const streamAuthority = retained
@@ -366,6 +398,7 @@ function actualTerminalRuntimeHarness(options = {}) {
             target: structuredClone(retained.target),
             pane: retained.pane,
             resumeTokenHash: retained.resumeTokenHash,
+            canonicalBinding: structuredClone(retained.canonicalBinding),
           }
         : { status: "absent" };
       const issuedGeneration = claim.mode === "resume"
@@ -378,6 +411,7 @@ function actualTerminalRuntimeHarness(options = {}) {
         pane: claim.pane,
         issuedGeneration,
         streamAuthority: structuredClone(streamAuthority),
+        preparedBinding: null,
         outcome: null,
       });
       return {
@@ -387,6 +421,18 @@ function actualTerminalRuntimeHarness(options = {}) {
         issuedGeneration,
         streamAuthority,
       };
+    },
+    async prepareOpen(input) {
+      const openRecord = openRecords.get(input.key);
+      assert.ok(openRecord);
+      const binding = input.preparation.kind === "current"
+        ? input.preparation.resolution.binding
+        : input.preparation.binding;
+      if (input.preparation.kind === "retained") {
+        assert.deepEqual(binding, openRecord.streamAuthority.canonicalBinding);
+      }
+      openRecord.preparedBinding = structuredClone(binding);
+      return { status: "prepared", binding: structuredClone(binding) };
     },
     async completeOpen(input) {
       const openRecord = openRecords.get(input.key);
@@ -400,6 +446,7 @@ function actualTerminalRuntimeHarness(options = {}) {
           target: structuredClone(openRecord.target),
           pane: openRecord.pane,
           resumeTokenHash: input.outcome.resumeTokenHash,
+          canonicalBinding: structuredClone(openRecord.preparedBinding),
         });
       }
       return { status: "committed", outcome: structuredClone(input.outcome) };
@@ -479,13 +526,38 @@ function actualTerminalRuntimeHarness(options = {}) {
     hostInstanceId: HOST_INSTANCE_ID,
     resolver: {
       async resolve(input) {
+        const exactBinding = canonicalBinding(input.target, input.pane);
         return {
-          ...structuredClone(input.target),
-          pane: input.pane,
-          canonicalTargetId: "actual-runtime-canonical-target",
-          controlTargetId: "actual-runtime-control-target",
+          target: {
+            ...structuredClone(input.target),
+            pane: input.pane,
+            canonicalTargetId: backendInstanceKey,
+            controlTargetId: exactBinding.exactControlIdentity.controlTargetId,
+          },
+          binding: exactBinding,
+          admission: {
+            resourceToken: {
+              schemaVersion: 1,
+              hostEpoch: HOST_EPOCH,
+              resourceMappingDigest: "actual-runtime-resource-digest",
+              discoveryGeneration: "actual-runtime-discovery-generation",
+            },
+            resourceTarget: {
+              authorization: "evidence_only",
+              hostEpoch: HOST_EPOCH,
+              discoveryGeneration: "actual-runtime-discovery-generation",
+              scopeId: input.target.scopeId,
+              processTarget: structuredClone(processTarget),
+              capabilities: ["terminal.stream.v1"],
+              sessionId: input.target.sessionId,
+              backendInstanceKey,
+              managedTarget: structuredClone(exactBinding.managedTarget),
+            },
+            exactControlToken: "actual-runtime-exact-control-token",
+          },
         };
       },
+      fenceSessionForAdmission() {},
     },
     lineage,
     backend,
@@ -2600,6 +2672,7 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
               bufferStartOffset: null,
               tailOffset: null,
             },
+            preparedBinding: null,
           };
         },
         async releaseStreamReservation() {

@@ -42,6 +42,7 @@ export default defineConfig({
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
     "src/relay/v2/terminalDurableLineage.ts",
+    "src/relay/v2/canonicalTerminalTargetResolverAdapter.ts",
     "src/relay/v2/terminalControlAuthorityAdapter.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/authority.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/codec.ts",

@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 const hostState = await import("../dist/relay/v2/hostState.js");
+const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
 const terminalLineage = await import("../dist/relay/v2/terminalDurableLineage.js");
 
 const TERMINAL_TARGET = {
@@ -22,6 +23,73 @@ const TERMINAL_TARGET = {
 };
 const TOKEN_HASH_ONE = "1".repeat(64);
 const TOKEN_HASH_TWO = "2".repeat(64);
+const EMPTY_RETAINED_AUTHORITY_DIGEST =
+  "efecf7d026a4a0aae2adaf877573c868b79ded287d83ccca4a9a1d429020ccae";
+const TERMINAL_INCARNATION = `twinc2.${"b".repeat(43)}`;
+const TERMINAL_PROCESS_TARGET = { kind: "local", targetId: "host-state-local" };
+const TERMINAL_BACKEND_INSTANCE_KEY =
+  canonicalBackendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+    processTarget: TERMINAL_PROCESS_TARGET,
+    incarnation: TERMINAL_INCARNATION,
+  });
+
+function canonicalBinding(target = TERMINAL_TARGET, pane = 0, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    ...target,
+    pane,
+    processTarget: { ...TERMINAL_PROCESS_TARGET },
+    backendInstanceKey: TERMINAL_BACKEND_INSTANCE_KEY,
+    managedTarget: {
+      name: "host-state-managed-terminal",
+      kind: "terminal",
+      incarnation: TERMINAL_INCARNATION,
+    },
+    exactControlIdentity: {
+      schemaVersion: 1,
+      controlTargetId: "host-state-control-target",
+      controlEpoch: "host-state-control-epoch",
+      targetIncarnationProof: "host-state-target-incarnation-proof",
+    },
+    ...overrides,
+  };
+}
+
+function terminalResolution(target = TERMINAL_TARGET, pane = 0, binding = canonicalBinding(target, pane)) {
+  return {
+    target: {
+      ...target,
+      pane,
+      canonicalTargetId: binding.backendInstanceKey,
+      controlTargetId: binding.exactControlIdentity.controlTargetId,
+    },
+    binding,
+    admission: {
+      resourceToken: {
+        schemaVersion: 1,
+        hostEpoch: "authority-epoch-placeholder",
+        resourceMappingDigest: "host-state-resource-digest",
+        discoveryGeneration: "host-state-discovery-generation",
+      },
+      resourceTarget: {
+        authorization: "evidence_only",
+        hostEpoch: "authority-epoch-placeholder",
+        discoveryGeneration: "host-state-discovery-generation",
+        scopeId: target.scopeId,
+        processTarget: { ...binding.processTarget },
+        capabilities: ["terminal.stream.v1"],
+        sessionId: target.sessionId,
+        backendInstanceKey: binding.backendInstanceKey,
+        managedTarget: { ...binding.managedTarget },
+      },
+      exactControlToken: "host-state-exact-control-token",
+    },
+  };
+}
+
+const NOOP_ADMISSION_FENCE = {
+  fenceSessionForAdmission() {},
+};
 
 function terminalOpenClaim(overrides = {}) {
   return {
@@ -46,6 +114,7 @@ function terminalAuthority(store, options = {}) {
     store,
     now: () => 1_000_000,
     issueAuthorityId: (kind) => `${kind}-${store.hostInstanceId}-${++issued}`,
+    admissionFence: NOOP_ADMISSION_FENCE,
     ...options,
   });
 }
@@ -65,6 +134,17 @@ async function commitTerminalOpen(
 ) {
   const winner = await authority.claimOpen(claim);
   assert.equal(winner.status, "claimed");
+  const prepared = await authority.prepareOpen({
+    key: claim.key,
+    fingerprint: claim.fingerprint,
+    hostInstanceId: claim.hostInstanceId,
+    claimToken: winner.claimToken,
+    fence: winner.fence,
+    preparation: claim.mode === "resume"
+      ? { kind: "retained", binding: winner.streamAuthority.canonicalBinding }
+      : { kind: "current", resolution: terminalResolution(claim.target, claim.pane) },
+  });
+  assert.equal(prepared.status, "prepared");
   const proposed = {
     kind: "opened",
     generation: winner.issuedGeneration,
@@ -437,7 +517,7 @@ test("HostState terminal lineage persists exact binding, monotonic issuance, and
     });
 
     const pending = terminalState(await store.read());
-    assert.equal(pending.schemaVersion, 2);
+    assert.equal(pending.schemaVersion, 3);
     assert.deepEqual(pending.openRecords[0], {
       status: "pending",
       key: original.key,
@@ -453,11 +533,22 @@ test("HostState terminal lineage persists exact binding, monotonic issuance, and
       previousGeneration: null,
       requestedOffset: null,
       streamAuthority: { status: "absent" },
+      retainedAuthorityDigest: EMPTY_RETAINED_AUTHORITY_DIGEST,
       reservesStreamSlot: true,
       issuedGeneration: claimed.issuedGeneration,
+      preparedBinding: null,
       expiresAtMs: original.expiresAtMs,
       outcome: null,
     });
+
+    assert.deepEqual(await authority.prepareOpen({
+      key: original.key,
+      fingerprint: original.fingerprint,
+      hostInstanceId: original.hostInstanceId,
+      claimToken: claimed.claimToken,
+      fence: claimed.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    }), { status: "prepared", binding: canonicalBinding() });
 
     const openedOutcome = {
       kind: "opened",
@@ -485,6 +576,7 @@ test("HostState terminal lineage persists exact binding, monotonic issuance, and
       target: TERMINAL_TARGET,
       pane: 0,
       resumeTokenHash: TOKEN_HASH_ONE,
+      canonicalBinding: canonicalBinding(),
       closeSlotReserved: true,
       closedExpiresAtMs: null,
     }]);
@@ -497,14 +589,8 @@ test("HostState terminal lineage persists exact binding, monotonic issuance, and
       hostInstanceId: restartedStore.hostInstanceId,
     }), {
       status: "replay",
-      outcome: {
-        kind: "reset",
-        generation: claimed.issuedGeneration,
-        reason: "stream_lost",
-        requestedOffset: null,
-        bufferStartOffset: null,
-        tailOffset: null,
-      },
+      outcome: openedOutcome,
+      preparedBinding: canonicalBinding(),
     });
 
     const reconciled = terminalState(await restartedStore.read());
@@ -557,6 +643,7 @@ test("persisted pending terminal claim remains readable across a fresh transacti
         bufferStartOffset: null,
         tailOffset: null,
       },
+      preparedBinding: null,
     };
     assert.deepEqual(await secondAuthority.claimOpen({
       ...claim,
@@ -588,6 +675,329 @@ test("persisted pending terminal claim remains readable across a fresh transacti
   }
 });
 
+test("terminal prepare rejects asynchronous fences without persisting a binding", async (t) => {
+  const cases = [
+    {
+      name: "resolved promise",
+      fenceResult: () => Promise.resolve("unsafe asynchronous fence"),
+    },
+    {
+      name: "throwing then getter",
+      fenceResult: () => Object.defineProperty({}, "then", {
+        get() {
+          throw new Error("unsafe then getter");
+        },
+      }),
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const h = harness();
+      try {
+        const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+        let fenceCalls = 0;
+        const authority = terminalAuthority(store, {
+          admissionFence: {
+            fenceSessionForAdmission() {
+              fenceCalls += 1;
+              return scenario.fenceResult();
+            },
+          },
+        });
+        const claim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+        const winner = await authority.claimOpen(claim);
+        assert.equal(winner.status, "claimed");
+        await assert.rejects(authority.prepareOpen({
+          key: claim.key,
+          fingerprint: claim.fingerprint,
+          hostInstanceId: store.hostInstanceId,
+          claimToken: winner.claimToken,
+          fence: winner.fence,
+          preparation: { kind: "current", resolution: terminalResolution() },
+        }), (error) => (
+          error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE"
+        ));
+        assert.equal(fenceCalls, 1);
+        const record = terminalState(await store.read()).openRecords[0];
+        assert.equal(record.status, "pending");
+        assert.equal(record.preparedBinding, null);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+});
+
+test("terminal prepare requires an explicit H0 admission fence", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    let issued = 0;
+    const authority = new terminalLineage.RelayV2TerminalDurableLineageAuthority({
+      store,
+      now: () => 1_000_000,
+      issueAuthorityId: (kind) => `${kind}-${store.hostInstanceId}-${++issued}`,
+    });
+    const claim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const winner = await authority.claimOpen(claim);
+    assert.equal(winner.status, "claimed");
+    await assert.rejects(authority.prepareOpen({
+      key: claim.key,
+      fingerprint: claim.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    }), (error) => (
+      error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CAPABILITY_UNAVAILABLE"
+    ));
+    const record = terminalState(await store.read()).openRecords[0];
+    assert.equal(record.status, "pending");
+    assert.equal(record.preparedBinding, null);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("terminal prepare replay returns the closed durable proof shape", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const openedClaim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const winner = await authority.claimOpen(openedClaim);
+    const owner = {
+      key: openedClaim.key,
+      fingerprint: openedClaim.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+    };
+    const preparation = {
+      ...owner,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    };
+    await authority.prepareOpen(preparation);
+    const openedOutcome = {
+      kind: "opened",
+      generation: winner.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      disposition: "new",
+      replayFromOffset: "0",
+    };
+    assert.equal((await authority.completeOpen({ ...owner, outcome: openedOutcome })).status, "committed");
+    assert.deepEqual(await authority.prepareOpen(preparation), {
+      status: "replay",
+      outcome: openedOutcome,
+      preparedBinding: canonicalBinding(),
+    });
+
+    const failedClaim = terminalOpenClaim({
+      key: "terminal-open:prepared-failure-proof",
+      streamKey: "terminal-stream:prepared-failure-proof",
+      fingerprint: "b".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+    });
+    const failedWinner = await authority.claimOpen(failedClaim);
+    const failedOwner = {
+      key: failedClaim.key,
+      fingerprint: failedClaim.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: failedWinner.claimToken,
+      fence: failedWinner.fence,
+    };
+    const failedPreparation = {
+      ...failedOwner,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    };
+    await authority.prepareOpen(failedPreparation);
+    const failureOutcome = {
+      kind: "error",
+      code: "CAPABILITY_UNAVAILABLE",
+      message: "backend rejected after exact preparation",
+    };
+    await authority.failOpen({
+      ...failedOwner,
+      outcome: failureOutcome,
+      streamEffect: { kind: "preserve" },
+    });
+    assert.deepEqual(await authority.prepareOpen(failedPreparation), {
+      status: "replay",
+      outcome: failureOutcome,
+      preparedBinding: canonicalBinding(),
+    });
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("terminal prepare reuses one exact binding but rejects cross-mode or control-identity changes", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    let fenceCalls = 0;
+    const authority = terminalAuthority(store, {
+      admissionFence: {
+        fenceSessionForAdmission() {
+          fenceCalls += 1;
+        },
+      },
+    });
+    const claim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const winner = await authority.claimOpen(claim);
+    const prepare = {
+      key: claim.key,
+      fingerprint: claim.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+    };
+    const current = { kind: "current", resolution: terminalResolution() };
+    assert.deepEqual(await authority.prepareOpen({ ...prepare, preparation: current }), {
+      status: "prepared",
+      binding: canonicalBinding(),
+    });
+    assert.deepEqual(await authority.prepareOpen({ ...prepare, preparation: current }), {
+      status: "prepared",
+      binding: canonicalBinding(),
+    });
+    assert.equal(fenceCalls, 1);
+
+    await assert.rejects(authority.prepareOpen({
+      ...prepare,
+      preparation: { kind: "retained", binding: canonicalBinding() },
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+    const changedControlBinding = canonicalBinding(TERMINAL_TARGET, 0, {
+      exactControlIdentity: {
+        ...canonicalBinding().exactControlIdentity,
+        controlEpoch: "changed-control-epoch",
+      },
+    });
+    await assert.rejects(authority.prepareOpen({
+      ...prepare,
+      preparation: {
+        kind: "current",
+        resolution: terminalResolution(TERMINAL_TARGET, 0, changedControlBinding),
+      },
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+    assert.equal(fenceCalls, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("reset prepare rejects cleanup of claim-time retained lost authority before fencing", async () => {
+  const h = harness();
+  try {
+    let now = 1_000_000;
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore, { now: () => now });
+    const original = terminalOpenClaim({
+      key: "terminal-open:retained-race-source",
+      streamKey: "terminal-stream:retained-race",
+      fingerprint: "5".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+    });
+    await commitTerminalOpen(firstAuthority, original);
+
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    let fenceCalls = 0;
+    const authority = terminalAuthority(store, {
+      now: () => now,
+      admissionFence: {
+        fenceSessionForAdmission() {
+          fenceCalls += 1;
+        },
+      },
+    });
+    const activation = terminalOpenClaim({
+      key: "terminal-open:retained-race-activation",
+      streamKey: "terminal-stream:retained-race-activation",
+      fingerprint: "4".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+    });
+    const activationWinner = await authority.claimOpen(activation);
+    await authority.failOpen({
+      key: activation.key,
+      fingerprint: activation.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: activationWinner.claimToken,
+      fence: activationWinner.fence,
+      outcome: { kind: "error", code: "BUSY", message: "activation only" },
+      streamEffect: { kind: "preserve" },
+    });
+    now += 100_000;
+    const reset = terminalOpenClaim({
+      key: "terminal-open:reset-retained-close-race",
+      streamKey: original.streamKey,
+      fingerprint: "6".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "reset",
+      expiresAtMs: now + 600_000,
+    });
+    const winner = await authority.claimOpen(reset);
+    assert.equal(winner.status, "claimed");
+    const claimedState = terminalState(await store.read());
+    assert.equal(claimedState.lostAuthorities.length, 1);
+    now = claimedState.lostAuthorities[0].expiresAtMs + 1;
+    await assert.rejects(authority.prepareOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+    assert.equal(fenceCalls, 0);
+    assert.equal(
+      terminalState(await store.read()).openRecords.find(({ key }) => key === reset.key)
+        .preparedBinding,
+      null,
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("resume prepare rejects release of its captured current authority", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const original = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const opened = await commitTerminalOpen(authority, original);
+    const resume = terminalOpenClaim({
+      key: "terminal-open:resume-release-race",
+      fingerprint: "8".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "resume",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_ONE,
+    });
+    const winner = await authority.claimOpen(resume);
+    assert.equal(winner.status, "claimed");
+    assert.deepEqual(await authority.releaseStreamReservation({
+      streamKey: original.streamKey,
+      generation: opened.generation,
+      hostInstanceId: store.hostInstanceId,
+    }), { status: "released" });
+    await assert.rejects(authority.prepareOpen({
+      key: resume.key,
+      fingerprint: resume.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: {
+        kind: "retained",
+        binding: winner.streamAuthority.canonicalBinding,
+      },
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+  } finally {
+    h.cleanup();
+  }
+});
+
 test("host restart atomically retires executable terminal lineage and requires explicit reset", async () => {
   const h = harness();
   try {
@@ -608,6 +1018,17 @@ test("host restart atomically retires executable terminal lineage and requires e
     const sameProcessWinner = await firstAuthority.claimOpen(sameProcessResume);
     assert.equal(sameProcessWinner.status, "claimed");
     assert.equal(sameProcessWinner.issuedGeneration, null);
+    assert.equal((await firstAuthority.prepareOpen({
+      key: sameProcessResume.key,
+      fingerprint: sameProcessResume.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      claimToken: sameProcessWinner.claimToken,
+      fence: sameProcessWinner.fence,
+      preparation: {
+        kind: "retained",
+        binding: sameProcessWinner.streamAuthority.canonicalBinding,
+      },
+    })).status, "prepared");
     assert.deepEqual(await firstAuthority.completeOpen({
       key: sameProcessResume.key,
       fingerprint: sameProcessResume.fingerprint,
@@ -650,6 +1071,7 @@ test("host restart atomically retires executable terminal lineage and requires e
         bufferStartOffset: null,
         tailOffset: null,
       },
+      preparedBinding: null,
     };
     assert.deepEqual(await secondAuthority.claimOpen(crossProcessResume), lost);
     assert.deepEqual(await secondAuthority.claimOpen(crossProcessResume), lost);
@@ -678,6 +1100,14 @@ test("host restart atomically retires executable terminal lineage and requires e
     assert.equal(resetWinner.status, "claimed");
     assert.notEqual(resetWinner.issuedGeneration, opened.generation);
     assert.deepEqual(resetWinner.streamAuthority, { status: "absent" });
+    assert.equal((await secondAuthority.prepareOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: resetWinner.claimToken,
+      fence: resetWinner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    })).status, "prepared");
     await secondAuthority.completeOpen({
       key: reset.key,
       fingerprint: reset.fingerprint,
@@ -702,13 +1132,13 @@ test("host restart atomically retires executable terminal lineage and requires e
     const retiredReset = {
       status: "replay",
       outcome: {
-        kind: "reset",
+        kind: "opened",
         generation: resetWinner.issuedGeneration,
-        reason: "stream_lost",
-        requestedOffset: "0",
-        bufferStartOffset: null,
-        tailOffset: null,
+        resumeTokenHash: TOKEN_HASH_TWO,
+        disposition: "reset",
+        replayFromOffset: "0",
       },
+      preparedBinding: canonicalBinding(),
     };
     const resetRetry = {
       ...reset,
@@ -782,29 +1212,25 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
     const nonExactResumeWinner = await secondAuthority.claimOpen(nonExactResume);
     assert.equal(nonExactResumeWinner.status, "claimed");
     assert.deepEqual(nonExactResumeWinner.streamAuthority, { status: "absent" });
-    assert.deepEqual(await secondAuthority.completeOpen({
+    const nonExactReset = {
+      kind: "reset",
+      generation: opened.generation,
+      reason: "stream_lost",
+      requestedOffset: "0",
+      bufferStartOffset: null,
+      tailOffset: null,
+    };
+    assert.deepEqual(await secondAuthority.failOpen({
       key: nonExactResume.key,
       fingerprint: nonExactResume.fingerprint,
       hostInstanceId: secondStore.hostInstanceId,
       claimToken: nonExactResumeWinner.claimToken,
       fence: nonExactResumeWinner.fence,
-      outcome: {
-        kind: "opened",
-        generation: opened.generation,
-        resumeTokenHash: TOKEN_HASH_TWO,
-        disposition: "resumed",
-        replayFromOffset: "0",
-      },
+      outcome: nonExactReset,
+      streamEffect: { kind: "preserve" },
     }), {
-      status: "replay",
-      outcome: {
-        kind: "reset",
-        generation: opened.generation,
-        reason: "stream_lost",
-        requestedOffset: "0",
-        bufferStartOffset: null,
-        tailOffset: null,
-      },
+      status: "committed",
+      outcome: nonExactReset,
     });
 
     const allNullReset = terminalOpenClaim({
@@ -831,6 +1257,14 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
       disposition: "reset",
       replayFromOffset: "0",
     };
+    assert.equal((await secondAuthority.prepareOpen({
+      key: allNullReset.key,
+      fingerprint: allNullReset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    })).status, "prepared");
     assert.deepEqual(await secondAuthority.completeOpen({
       key: allNullReset.key,
       fingerprint: allNullReset.fingerprint,
@@ -864,6 +1298,7 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
       target: TERMINAL_TARGET,
       pane: 0,
       resumeTokenHash: TOKEN_HASH_TWO,
+      canonicalBinding: canonicalBinding(),
     });
     const resumed = {
       kind: "opened",
@@ -872,6 +1307,17 @@ test("restart-lost reset admits all-null recovery but rejects wrong or partial o
       disposition: "resumed",
       replayFromOffset: "0",
     };
+    assert.equal((await secondAuthority.prepareOpen({
+      key: currentResume.key,
+      fingerprint: currentResume.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: currentResumeWinner.claimToken,
+      fence: currentResumeWinner.fence,
+      preparation: {
+        kind: "retained",
+        binding: currentResumeWinner.streamAuthority.canonicalBinding,
+      },
+    })).status, "prepared");
     assert.deepEqual(await secondAuthority.completeOpen({
       key: currentResume.key,
       fingerprint: currentResume.fingerprint,
@@ -1389,6 +1835,7 @@ test("retained close identity blocks new and resume after restart while all-null
         bufferStartOffset: null,
         tailOffset: null,
       },
+      preparedBinding: null,
     };
     assert.deepEqual(await secondAuthority.claimOpen(resume), lost);
     assert.deepEqual(await secondAuthority.claimOpen(resume), lost);
@@ -1441,7 +1888,7 @@ test("host-owner retirement is durable before BUSY and definite publish failure 
       assert.equal(retired.activeHostInstanceId, secondStore.hostInstanceId);
       assert.deepEqual(retired.streamAuthorities, []);
       assert.equal(retired.lostAuthorities[0].generation, opened.generation);
-      assert.equal(retired.openRecords[0].outcome.reason, "stream_lost");
+      assert.equal(retired.openRecords[0].outcome.kind, "opened");
       assert.equal(retired.openRecords[0].outcome.generation, opened.generation);
       assert.deepEqual(await secondAuthority.claimOpen(blocked), {
         status: "busy",
@@ -1616,6 +2063,14 @@ test("reset completion and parsing preserve the full captured recovery tuple", a
     });
     const winner = await authority.claimOpen(reset);
     assert.equal(winner.status, "claimed");
+    assert.equal((await authority.prepareOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      preparation: { kind: "current", resolution: terminalResolution() },
+    })).status, "prepared");
     const snapshot = await store.read();
     const [key, value] = Object.entries(snapshot.materialized).find(([, candidate]) => (
       candidate?.authority === "relay_v2_terminal_durable_lineage"
@@ -1744,6 +2199,35 @@ test("HostState terminal parser rejects generation reuse across incompatible dur
     const base = structuredClone(value);
     const cases = [
       {
+        name: "pending unused issued generation overlaps executable authority",
+        damage: (state) => {
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === secondClaim.key,
+          );
+          record.status = "pending";
+          record.outcome = null;
+          record.reservesStreamSlot = true;
+          return state;
+        },
+      },
+      {
+        name: "final reset unused issued generation overlaps executable authority",
+        damage: (state) => {
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === secondClaim.key,
+          );
+          record.outcome = {
+            kind: "reset",
+            generation: record.issuedGeneration,
+            reason: "stream_lost",
+            requestedOffset: null,
+            bufferStartOffset: null,
+            tailOffset: null,
+          };
+          return state;
+        },
+      },
+      {
         name: "executable and lost authorities reuse one generation",
         damage: (state) => {
           const stream = state.streamAuthorities.find(
@@ -1756,6 +2240,7 @@ test("HostState terminal parser rejects generation reuse across incompatible dur
             target: { ...stream.target },
             pane: stream.pane,
             resumeTokenHash: stream.resumeTokenHash,
+            canonicalBinding: structuredClone(stream.canonicalBinding),
             expiresAtMs: 1_600_000,
           });
           return state;
@@ -1779,6 +2264,17 @@ test("HostState terminal parser rejects generation reuse across incompatible dur
             (candidate) => candidate.key === secondClaim.key,
           );
           record.outcome.resumeTokenHash = TOKEN_HASH_ONE;
+          return state;
+        },
+      },
+      {
+        name: "opened preparation and current stream fork the canonical binding",
+        damage: (state) => {
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === secondClaim.key,
+          );
+          record.preparedBinding.exactControlIdentity.controlEpoch =
+            "forked-prepared-control-epoch";
           return state;
         },
       },
@@ -1848,7 +2344,11 @@ test("HostState terminal nested corrupt and future schemas fail closed without r
   const cases = [
     {
       name: "future schema",
-      damage: (value) => ({ ...value, schemaVersion: 3 }),
+      damage: (value) => ({ ...value, schemaVersion: 4 }),
+    },
+    {
+      name: "retired weaker schema",
+      damage: (value) => ({ ...value, schemaVersion: 2 }),
     },
     {
       name: "unknown field",
