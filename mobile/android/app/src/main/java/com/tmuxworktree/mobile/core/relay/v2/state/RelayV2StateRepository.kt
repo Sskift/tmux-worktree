@@ -372,6 +372,10 @@ private class RoomTransaction(
     }
 
     override fun deleteProfileState(profileId: String) {
+        // Header deletion cascades only to records for the same exact Agent snapshot namespace.
+        dao.deleteProfileAgentTranscriptSnapshots(profileId)
+        dao.deleteProfileAgentTranscriptPendingEvents(profileId)
+        dao.deleteProfileAgentTranscriptEntries(profileId)
         dao.deleteProfileAgentTranscriptLifecycleNotificationClaims(profileId)
         dao.deleteProfileAgentTranscriptLifecycleStates(profileId)
         dao.deleteProfileTerminalCheckpoints(profileId)

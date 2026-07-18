@@ -1,6 +1,7 @@
 package com.tmuxworktree.mobile.core.relay.v2.state
 
 import androidx.room.Entity
+import androidx.room.ForeignKey
 import androidx.room.Index
 
 @Entity(
@@ -461,4 +462,367 @@ internal data class RelayV2AgentTranscriptLifecycleNotificationClaimEntity(
     val payloadUtf8Bytes: Int,
     val payloadCanonicalJson: String,
     val payloadSha256: String,
+)
+
+/**
+ * One materialized Agent text entry or retained anti-revival tombstone.
+ *
+ * Room 2.8.4 cannot express a table CHECK for the closed visible/redacted/deleted union. The
+ * nullable columns and discriminator are frozen here; the future typed repository adapter must
+ * validate the union in the same transaction before using the INSERT-ABORT DAO primitive. A
+ * snapshot-absence tombstone is local anti-revival evidence at the frozen snapshot watermark; it
+ * is never represented as a synthetic wire delete mutation.
+ */
+@Entity(
+    tableName = "relay_v2_agent_transcript_entries",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpoch",
+        "entryId",
+    ],
+    indices = [
+        Index(
+            name = "index_agent_transcript_entries_namespace_created_seq",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "createdAgentSeq",
+            ],
+            unique = true,
+        ),
+        Index(
+            name = "index_agent_transcript_entries_namespace_created_order",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "createdAgentSeqOrder",
+            ],
+        ),
+        Index(
+            name = "index_agent_transcript_entries_namespace_last_modified_order",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "lastModifiedAgentSeqOrder",
+                "entryId",
+            ],
+        ),
+    ],
+)
+internal data class RelayV2AgentTranscriptEntryEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpoch: String,
+    val entryId: String,
+    val runId: String,
+    val turnId: String,
+    val role: String,
+    val commandId: String?,
+    val createdAtMs: Long,
+    val createdAgentSeq: String,
+    val createdAgentSeqOrder: String,
+    val lastModifiedAgentSeq: String,
+    val lastModifiedAgentSeqOrder: String,
+    val entryState: String,
+    val text: String?,
+    val redactionReason: String?,
+    val tombstoneOrigin: String?,
+    val tombstoneEvidenceThroughAgentSeq: String?,
+    val tombstoneEvidenceThroughAgentSeqOrder: String?,
+    val payloadCanonicalJson: String,
+    val payloadUtf8Bytes: Int,
+    val payloadSha256: String,
+)
+
+/** One active pinned Agent snapshot header for an exact consumer timeline. */
+@Entity(
+    tableName = "relay_v2_agent_transcript_snapshot_staging",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpoch",
+        "snapshotId",
+    ],
+    indices = [
+        Index(
+            name = "index_agent_transcript_snapshot_staging_active_namespace",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+            unique = true,
+        ),
+    ],
+)
+internal data class RelayV2AgentTranscriptSnapshotStagingEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpoch: String,
+    val snapshotRequestId: String,
+    val requestLocalGeneration: String,
+    val requestNetworkToken: String,
+    val snapshotId: String,
+    val nextPageIndex: Long,
+    val nextCursor: String?,
+    val throughAgentSeq: String,
+    val throughAgentSeqOrder: String,
+    val earliestRetainedSeq: String,
+    val earliestRetainedSeqOrder: String,
+    val receivedRecordCount: Long,
+    val receivedCanonicalBytes: Long,
+    val receivedRawUtf8Bytes: Long,
+    val lastAgentSeq: String?,
+    val lastAgentSeqOrder: String?,
+    val lastRecordKind: String?,
+    val lastStableIdentity: String?,
+    val complete: Boolean,
+)
+
+/** One bounded canonical record belonging to one exact pinned Agent snapshot header. */
+@Entity(
+    tableName = "relay_v2_agent_transcript_snapshot_records",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpoch",
+        "snapshotId",
+        "recordIndex",
+    ],
+    foreignKeys = [
+        ForeignKey(
+            entity = RelayV2AgentTranscriptSnapshotStagingEntity::class,
+            parentColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "snapshotId",
+            ],
+            childColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "snapshotId",
+            ],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [
+        Index(
+            name = "index_agent_transcript_snapshot_records_header",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "snapshotId",
+            ],
+        ),
+        Index(
+            name = "index_agent_transcript_snapshot_records_stable",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "snapshotId",
+                "recordKind",
+                "stableIdentity",
+            ],
+            unique = true,
+        ),
+        Index(
+            name = "index_agent_transcript_snapshot_records_order",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "snapshotId",
+                "agentEventSeqOrder",
+                "stableIdentity",
+            ],
+            unique = true,
+        ),
+    ],
+)
+internal data class RelayV2AgentTranscriptSnapshotRecordEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpoch: String,
+    val snapshotId: String,
+    val pageIndex: Long,
+    val recordIndex: Long,
+    val recordKind: String,
+    val stableIdentity: String,
+    val agentEventSeq: String,
+    val agentEventSeqOrder: String,
+    val payloadCanonicalJson: String,
+    val payloadRawUtf8Bytes: Int,
+    val payloadSha256: String,
+)
+
+/**
+ * One closed LIVE event retained durably while snapshot/gap handling blocks cursor advancement.
+ *
+ * REPLAY pages are not staged here; the future consumer applies them sequentially in its own
+ * transaction. The future typed adapter must accept only verified closed-LIVE provenance before
+ * using the INSERT-ABORT primitive.
+ */
+@Entity(
+    tableName = "relay_v2_agent_transcript_pending_events",
+    primaryKeys = [
+        "profileId",
+        "profileActivationGeneration",
+        "principalId",
+        "clientInstanceId",
+        "hostId",
+        "hostEpoch",
+        "scopeId",
+        "sessionId",
+        "timelineEpoch",
+        "agentEventSeq",
+    ],
+    indices = [
+        Index(
+            name = "index_agent_transcript_pending_events_event_id",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "eventId",
+            ],
+            unique = true,
+        ),
+        Index(
+            name = "index_agent_transcript_pending_events_order",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+                "agentEventSeqOrder",
+            ],
+        ),
+    ],
+)
+internal data class RelayV2AgentTranscriptPendingEventEntity(
+    val profileId: String,
+    val profileActivationGeneration: Long,
+    val principalId: String,
+    val clientInstanceId: String,
+    val hostId: String,
+    val hostEpoch: String,
+    val scopeId: String,
+    val sessionId: String,
+    val timelineEpoch: String,
+    val agentEventSeq: String,
+    val agentEventSeqOrder: String,
+    val eventId: String,
+    val closedEventDigest: String,
+    val trustedProvenance: String,
+    val eventCanonicalJson: String,
+    val eventRawUtf8Bytes: Int,
 )

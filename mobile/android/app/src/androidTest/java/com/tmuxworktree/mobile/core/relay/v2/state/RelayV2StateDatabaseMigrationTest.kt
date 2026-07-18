@@ -262,6 +262,94 @@ class RelayV2StateDatabaseMigrationTest {
     }
 
     @Test
+    fun migration4To5PreservesAgentEvidenceAndAddsEmptyTranscriptTables() {
+        migration.createDatabase(DATABASE_NAME, 4).apply {
+            insertLegacyAuthority()
+            execSQL(
+                """
+                INSERT INTO relay_v2_agent_transcript_lifecycle_states (
+                    profileId, profileActivationGeneration, principalId, clientInstanceId,
+                    hostId, hostEpoch, scopeId, sessionId, timelineEpochKey,
+                    codecVersion, payloadUtf8Bytes, payloadCanonicalJson, payloadSha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "profile-v2", 7, "principal-v2", "android-install-v2", "host-a", "epoch-a",
+                    "scope-a", "session-a", "timeline-a", 1, 26,
+                    "{\"agentState\":\"before-v5\"}", "state-digest-before-v5",
+                ),
+            )
+            execSQL(
+                """
+                INSERT INTO relay_v2_agent_transcript_lifecycle_notification_claims (
+                    profileId, profileActivationGeneration, principalId, clientInstanceId,
+                    hostId, hostEpoch, scopeId, sessionId, timelineEpoch, lifecycleEventId,
+                    lifecycleState, claimedLocalGeneration, codecVersion, payloadUtf8Bytes,
+                    payloadCanonicalJson, payloadSha256
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """.trimIndent(),
+                arrayOf<Any?>(
+                    "profile-v2", 7, "principal-v2", "android-install-v2", "host-a", "epoch-a",
+                    "scope-a", "session-a", "timeline-a", "event-a", "WAITING_FOR_USER", "4",
+                    1, 27, "{\"agentClaim\":\"before-v5\"}", "claim-digest-before-v5",
+                ),
+            )
+            close()
+        }
+
+        migration.runMigrationsAndValidate(
+            DATABASE_NAME,
+            5,
+            true,
+            RelayV2StateDatabase.MIGRATION_4_5,
+        ).use { migrated ->
+            migrated.query("SELECT * FROM relay_v2_authority").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals("profile-v2", cursor.getString(cursor.getColumnIndexOrThrow("profileId")))
+                assertEquals("principal-v2", cursor.getString(cursor.getColumnIndexOrThrow("principalId")))
+                assertEquals("android-install-v2", cursor.getString(cursor.getColumnIndexOrThrow("clientInstanceId")))
+                assertEquals("host-a", cursor.getString(cursor.getColumnIndexOrThrow("hostId")))
+                assertEquals("epoch-a", cursor.getString(cursor.getColumnIndexOrThrow("hostEpoch")))
+                assertEquals("7", cursor.getString(cursor.getColumnIndexOrThrow("cursorEventSeq")))
+                assertEquals("7", cursor.getString(cursor.getColumnIndexOrThrow("requiredThroughEventSeq")))
+                assertEquals("3", cursor.getString(cursor.getColumnIndexOrThrow("scopesRevision")))
+                assertEquals("LIVE", cursor.getString(cursor.getColumnIndexOrThrow("phase")))
+                assertEquals(0, cursor.getLong(cursor.getColumnIndexOrThrow("cacheRecordCount")))
+                assertEquals(2, cursor.getLong(cursor.getColumnIndexOrThrow("cacheCanonicalBytes")))
+            }
+            migrated.query("SELECT * FROM relay_v2_agent_transcript_lifecycle_states").use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(
+                    listOf(
+                        "profile-v2", "7", "principal-v2", "android-install-v2", "host-a",
+                        "epoch-a", "scope-a", "session-a", "timeline-a", "1", "26",
+                        "{\"agentState\":\"before-v5\"}", "state-digest-before-v5",
+                    ),
+                    (0 until cursor.columnCount).map(cursor::getString),
+                )
+            }
+            migrated.query(
+                "SELECT * FROM relay_v2_agent_transcript_lifecycle_notification_claims",
+            ).use { cursor ->
+                assertTrue(cursor.moveToFirst())
+                assertEquals(
+                    listOf(
+                        "profile-v2", "7", "principal-v2", "android-install-v2", "host-a",
+                        "epoch-a", "scope-a", "session-a", "timeline-a", "event-a",
+                        "WAITING_FOR_USER", "4", "1", "27",
+                        "{\"agentClaim\":\"before-v5\"}", "claim-digest-before-v5",
+                    ),
+                    (0 until cursor.columnCount).map(cursor::getString),
+                )
+            }
+            assertEquals(0, migrated.count("relay_v2_agent_transcript_entries"))
+            assertEquals(0, migrated.count("relay_v2_agent_transcript_snapshot_staging"))
+            assertEquals(0, migrated.count("relay_v2_agent_transcript_snapshot_records"))
+            assertEquals(0, migrated.count("relay_v2_agent_transcript_pending_events"))
+        }
+    }
+
+    @Test
     fun migratedReleaseJournalCorruptionFailsClosedOnReopen() {
         val context = ApplicationProvider.getApplicationContext<Context>()
         migration.createDatabase(DATABASE_NAME, 2).apply {
@@ -282,6 +370,7 @@ class RelayV2StateDatabaseMigrationTest {
             RelayV2StateDatabase.MIGRATION_1_2,
             RelayV2StateDatabase.MIGRATION_2_3,
             RelayV2StateDatabase.MIGRATION_3_4,
+            RelayV2StateDatabase.MIGRATION_4_5,
         ).build()
         val corruptions = listOf(
             "pendingReleaseSnapshotRequestId='request-only'",

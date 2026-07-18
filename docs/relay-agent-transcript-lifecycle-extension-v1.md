@@ -1,6 +1,6 @@
 # Relay Agent transcript、lifecycle 与本地通知 extension v1
 
-状态：**Frozen extension contract + 未接线的 Node durable host authority/public codec/replay runtime 与 Android lifecycle/notification reducer foundations；生产 capability 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
+状态：**Frozen extension contract + 未接线的 Node durable host authority/public codec/replay runtime、Android lifecycle/notification reducer 与 row-oriented Room v5 storage foundations；生产 capability 尚未交付，不得宣告 Agent reply、lifecycle 或 notification capability**
 
 当前 Node 交付包含 contract/machine fixtures、完整消费 accepted authority machine cases 的纯 reducer、独立 public codec、durable authority store，以及只连接这些 extension owner 的 capability-gated replay runtime foundation。store 把 reducer snapshot、source cursor/dedupe、公开 event/replay log 与 pinned cut 放入同一个 optimistic transaction candidate，再在既有跨进程锁内以 expected-current CAS原子发布；retention 使用 host commit time并只裁连续前缀，最终 serialized bytes 在 publish 前执行与读取完全相同的 strict byte/key/node inspection 和完整 restore 校验，snapshot/replay cut 也在持久化前按真实 codec wire bytes 与 JSON limits逐页冻结。因此这些 foundation artifact 与对应专项测试已经存在。
 
@@ -10,7 +10,7 @@ future external authority 的互操作/安全边界另由 frozen [`external-cont
 
 这些 Node 模块仍没有接入基础 `HostRuntime`、`relayHost` 或 broker，也没有进入任何 production composition/adapter、capability intersection或 advertisement；`runtimeConsumers=pending`、`nodeRuntimeIntegrated=false`、G4 与 production capability 仍为 false。它们只能称为**可接线的 host authority foundation**，不能称为远端 Agent reply/lifecycle 已上线。
 
-Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。共享 fixture 的 `command_status` 步骤由测试中的 base-owner composition stub处理，生产 reducer不拥有基础 command ledger，因此尚不存在 production composition consumer，`androidConsumerMachineConformance` 仍为 false；单独的 reducer fixture conformance不构成 runtime conformance。它没有接入 public extension codec、Room schema/DAO、repository、Relay actor/OkHttp、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending，G4 尚未通过。
+Android 生产源码另有一个独立、纯、确定性、可持久化友好的 lifecycle/notification reducer foundation，并由专项 JVM test 直接消费完整 `client-machine-cases.json`。共享 fixture 的 `command_status` 步骤由测试中的 base-owner composition stub处理，生产 reducer不拥有基础 command ledger，因此尚不存在 production composition consumer，`androidConsumerMachineConformance` 仍为 false；单独的 reducer fixture conformance不构成 runtime conformance。Android 还已有独立、未接线的 row-oriented Room v5 storage/entity/DAO/profile-cleanup foundation，保存 materialized entry、pinned snapshot staging/records 与 snapshot/gap 期间的 durable LIVE buffer，并复用现有 `RelayV2StateDatabase`/DAO/repository owner 和 exact disconnect receipt transaction。该 storage foundation 尚未接 transcript reducer、public extension codec消费链、production transcript repository/Relay actor/composition、V2ViewModel/Compose、Android `NotificationManager` 或 capability negotiation/advertisement；Android codec conformance 与所有 runtime wiring 仍 pending，G4 尚未通过。
 
 本 extension 是 Relay v2 的可选扩展，规范版本为 `1`，唯一 capability 名称为 `agent.transcript-lifecycle.v1`。它不属于 [`relay-v2-contract.md`](relay-v2-contract.md) 冻结的六项基础能力，也不修改基础 v2 envelope、command ledger、host `eventSeq`、terminal stream 或任何 Relay v1 wire。
 
@@ -386,7 +386,7 @@ Android 必须在尝试系统通知前持久化该 key 与 disposition：`shown|
 
 1. 按 external continuity authority v1 contract交付真正 rollback-independent、linearizable、已确认CAS RPO=0的production backend/adapter与稳定`anchorId` provisioning/ACL；使用独立`agent-transcript-lifecycle.v1` namespace和`(hostId, hostEpoch)` owner binding，验证restart/旧备份拒绝serving/failover high-water/reset/decommission/tombstone，且不复用`broker-credential.v1` anchor；G3后才可在真实relay-host composition显式注入，并交付结构化SDK/adapter认证、disconnect barrier与production capability intersection/advertisement；
 2. 完成 Android 独立 public codec并与 Node共同消费 extension fixture，且未协商时双方不发送 agent frame；
-3. 把现有独立 Android reducer foundation 接入独立 Room namespace、public codec/actor、unsupported UI，以及 durable notification claim/permission/lock-screen/profile隔离；
+3. 把现有独立 Android reducer foundation 接入已有独立 row-oriented Room v5 namespace、public codec/actor、unsupported UI，以及 durable notification claim/permission/lock-screen/profile隔离；
 4. 重复、source gap、公开 event gap、断线 replay、Agent重启、旧 source迟到终态、redaction/delete和store reset的跨端故障注入；另注入`agent-transcript-lifecycle.v1` external authority unavailable/BUSY、commit uncertain/reconcile-required与invalid/conflict/rollback，证明三组分别使用既有`AGENT_AUTHORITY_STORE_*` mapping且只隔离extension；unavailable不能reset或换epoch，只有独立corrupt case可reset/new epoch，基础credential、Upgrade/route、command、terminal与既有connection继续；
 5. 真实结构化 SDK/hook或受控 adapter证据。terminal文本、command ACK和计时测试不能替代。
 

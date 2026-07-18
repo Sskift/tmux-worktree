@@ -2,6 +2,7 @@ package com.tmuxworktree.mobile.core.relay.v2.state
 
 import android.content.Context
 import androidx.room.Room
+import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.*
@@ -99,9 +100,34 @@ class RelayV2StateDatabaseInstrumentedTest {
         val retained = durableNamespace("other-profile", activation = 1)
         listOf(first, second, retained).forEach(::putDurableAuthorities)
         listOf(first, second, retained).forEach { putAgentConsumer(it) }
+        listOf(first, second, retained).forEach(::putAgentTranscriptStorage)
         listOf(first, second, retained).forEach(::assertDurablePayloadByteCounts)
         listOf(first, second, retained).forEach { assertEquals(1, agentRows(it).size) }
         listOf(first, second, retained).forEach { assertTrue(agentClaim(it) != null) }
+        listOf(first, second, retained).forEach { assertAgentTranscriptStorageCount(it, 1) }
+
+        val committedPending = agentTranscriptPendingEvents(retained).single()
+        val insertedBeforeConflict = pendingEvent(
+            retained,
+            agentEventSeq = "7",
+            eventId = "live-event-new",
+            canonicalJson = "{\"live\":\"new-before-conflict\"}",
+        )
+        val conflicting = pendingEvent(
+            retained,
+            agentEventSeq = "8",
+            eventId = committedPending.eventId,
+            canonicalJson = "{\"live\":\"different-conflict\"}",
+        )
+        val conflictFailure = runCatching {
+            database.withTransaction {
+                dao.insertAgentTranscriptPendingEvent(insertedBeforeConflict)
+                dao.insertAgentTranscriptPendingEvent(conflicting)
+            }
+        }.exceptionOrNull()
+
+        assertTrue(conflictFailure != null)
+        assertEquals(listOf(committedPending), agentTranscriptPendingEvents(retained))
 
         RelayV2StateRepository(database).clearProfileAfterDisconnect(
             RelayProfileDisconnectReceipt(
@@ -122,6 +148,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertNull(terminalCheckpoint(cleared))
             assertEquals(emptyList<RelayV2AgentTranscriptLifecycleStateEntity>(), agentRows(cleared))
             assertNull(agentClaim(cleared))
+            assertAgentTranscriptStorageCount(cleared, 0)
         }
         assertEquals(1L, outboxMeta(retained)?.nextCreationOrder)
         assertEquals(1, outboxEntries(retained).size)
@@ -131,6 +158,8 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
         assertEquals(1, agentRows(retained).size)
         assertTrue(agentClaim(retained) != null)
+        assertAgentTranscriptStorageCount(retained, 1)
+        assertEquals(listOf(committedPending), agentTranscriptPendingEvents(retained))
     }
 
     @Test
@@ -412,6 +441,212 @@ class RelayV2StateDatabaseInstrumentedTest {
             ) is AgentTranscriptLifecycleNotificationClaimResult.Claimed,
         )
     }
+
+    private fun putAgentTranscriptStorage(namespace: RelayV2OutboxAuthorityNamespace) {
+        val consumer = agentConsumer(namespace)
+        val entryId = "entry-${namespace.profileActivationGeneration}"
+        val entryText = "agent text ${namespace.profileId}"
+        val entryPayload = RelayV2StorageJson.encode(
+            codecVersion = 1,
+            value = linkedMapOf(
+                "entryId" to entryId,
+                "state" to "visible",
+                "text" to entryText,
+            ),
+        )
+        dao.insertAgentTranscriptEntry(
+            RelayV2AgentTranscriptEntryEntity(
+                profileId = consumer.profileId,
+                profileActivationGeneration = consumer.profileActivationGeneration,
+                principalId = consumer.principalId,
+                clientInstanceId = consumer.clientInstanceId,
+                hostId = consumer.hostId,
+                hostEpoch = consumer.hostEpoch,
+                scopeId = consumer.scopeId,
+                sessionId = consumer.sessionId,
+                timelineEpoch = AGENT_TIMELINE_EPOCH,
+                entryId = entryId,
+                runId = "run-${namespace.profileActivationGeneration}",
+                turnId = "turn-${namespace.profileActivationGeneration}",
+                role = "agent",
+                commandId = null,
+                createdAtMs = 10,
+                createdAgentSeq = "4",
+                createdAgentSeqOrder = orderKey("4"),
+                lastModifiedAgentSeq = "4",
+                lastModifiedAgentSeqOrder = orderKey("4"),
+                entryState = "visible",
+                text = entryText,
+                redactionReason = null,
+                tombstoneOrigin = null,
+                tombstoneEvidenceThroughAgentSeq = null,
+                tombstoneEvidenceThroughAgentSeqOrder = null,
+                payloadCanonicalJson = entryPayload.canonicalJson,
+                payloadUtf8Bytes = entryPayload.payloadUtf8Bytes,
+                payloadSha256 = entryPayload.sha256,
+            ),
+        )
+
+        val snapshotId = agentSnapshotId(namespace)
+        dao.insertAgentTranscriptSnapshot(
+            RelayV2AgentTranscriptSnapshotStagingEntity(
+                profileId = consumer.profileId,
+                profileActivationGeneration = consumer.profileActivationGeneration,
+                principalId = consumer.principalId,
+                clientInstanceId = consumer.clientInstanceId,
+                hostId = consumer.hostId,
+                hostEpoch = consumer.hostEpoch,
+                scopeId = consumer.scopeId,
+                sessionId = consumer.sessionId,
+                timelineEpoch = AGENT_TIMELINE_EPOCH,
+                snapshotRequestId = "agent-snapshot-request-${namespace.profileActivationGeneration}",
+                requestLocalGeneration = "4",
+                requestNetworkToken = "network-request-${namespace.profileActivationGeneration}",
+                snapshotId = snapshotId,
+                nextPageIndex = 1,
+                nextCursor = null,
+                throughAgentSeq = "5",
+                throughAgentSeqOrder = orderKey("5"),
+                earliestRetainedSeq = "1",
+                earliestRetainedSeqOrder = orderKey("1"),
+                receivedRecordCount = 1,
+                receivedCanonicalBytes = entryPayload.payloadUtf8Bytes.toLong(),
+                receivedRawUtf8Bytes = entryPayload.payloadUtf8Bytes + 7L,
+                lastAgentSeq = "4",
+                lastAgentSeqOrder = orderKey("4"),
+                lastRecordKind = "text_entry",
+                lastStableIdentity = entryId,
+                complete = true,
+            ),
+        )
+        dao.insertAgentTranscriptSnapshotRecords(
+            listOf(
+                RelayV2AgentTranscriptSnapshotRecordEntity(
+                    profileId = consumer.profileId,
+                    profileActivationGeneration = consumer.profileActivationGeneration,
+                    principalId = consumer.principalId,
+                    clientInstanceId = consumer.clientInstanceId,
+                    hostId = consumer.hostId,
+                    hostEpoch = consumer.hostEpoch,
+                    scopeId = consumer.scopeId,
+                    sessionId = consumer.sessionId,
+                    timelineEpoch = AGENT_TIMELINE_EPOCH,
+                    snapshotId = snapshotId,
+                    pageIndex = 0,
+                    recordIndex = 0,
+                    recordKind = "text_entry",
+                    stableIdentity = entryId,
+                    agentEventSeq = "4",
+                    agentEventSeqOrder = orderKey("4"),
+                    payloadCanonicalJson = entryPayload.canonicalJson,
+                    payloadRawUtf8Bytes = entryPayload.payloadUtf8Bytes + 7,
+                    payloadSha256 = entryPayload.sha256,
+                ),
+            ),
+        )
+        dao.insertAgentTranscriptPendingEvent(
+            pendingEvent(
+                namespace,
+                agentEventSeq = "6",
+                eventId = "live-event-${namespace.profileActivationGeneration}",
+                canonicalJson = "{\"live\":\"${namespace.profileId}-6\"}",
+            ),
+        )
+    }
+
+    private fun pendingEvent(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        agentEventSeq: String,
+        eventId: String,
+        canonicalJson: String,
+    ): RelayV2AgentTranscriptPendingEventEntity {
+        val consumer = agentConsumer(namespace)
+        return RelayV2AgentTranscriptPendingEventEntity(
+            profileId = consumer.profileId,
+            profileActivationGeneration = consumer.profileActivationGeneration,
+            principalId = consumer.principalId,
+            clientInstanceId = consumer.clientInstanceId,
+            hostId = consumer.hostId,
+            hostEpoch = consumer.hostEpoch,
+            scopeId = consumer.scopeId,
+            sessionId = consumer.sessionId,
+            timelineEpoch = AGENT_TIMELINE_EPOCH,
+            agentEventSeq = agentEventSeq,
+            agentEventSeqOrder = orderKey(agentEventSeq),
+            eventId = eventId,
+            closedEventDigest = digest(canonicalJson).value,
+            trustedProvenance = AgentEventProvenance.LIVE.name,
+            eventCanonicalJson = canonicalJson,
+            eventRawUtf8Bytes = canonicalJson.toByteArray(Charsets.UTF_8).size,
+        )
+    }
+
+    private fun assertAgentTranscriptStorageCount(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        expected: Long,
+    ) {
+        val consumer = agentConsumer(namespace)
+        val identity = arrayOf(
+            consumer.profileId,
+            consumer.principalId,
+            consumer.clientInstanceId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+        )
+        assertEquals(
+            expected,
+            dao.agentTranscriptEntryCount(
+                identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
+                identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
+            ),
+        )
+        assertEquals(
+            expected,
+            dao.agentTranscriptSnapshotCount(
+                identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
+                identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
+            ),
+        )
+        assertEquals(
+            expected,
+            dao.agentTranscriptSnapshotRecordCount(
+                identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
+                identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
+                agentSnapshotId(namespace),
+            ),
+        )
+        assertEquals(
+            expected,
+            dao.agentTranscriptPendingEventCount(
+                identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
+                identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
+            ),
+        )
+    }
+
+    private fun agentTranscriptPendingEvents(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): List<RelayV2AgentTranscriptPendingEventEntity> {
+        val consumer = agentConsumer(namespace)
+        return dao.agentTranscriptPendingEvents(
+            consumer.profileId,
+            consumer.profileActivationGeneration,
+            consumer.principalId,
+            consumer.clientInstanceId,
+            consumer.hostId,
+            consumer.hostEpoch,
+            consumer.scopeId,
+            consumer.sessionId,
+            AGENT_TIMELINE_EPOCH,
+        )
+    }
+
+    private fun agentSnapshotId(namespace: RelayV2OutboxAuthorityNamespace): String =
+        "agent-snapshot-${namespace.profileActivationGeneration}"
+
+    private fun orderKey(value: String): String = value.padStart(20, '0')
 
     private fun assertNamespacePresent(namespace: RelayV2StateNamespace, suffix: String) {
         assertEquals(namespace.principalId, authority(namespace)?.principalId)
@@ -730,5 +965,6 @@ class RelayV2StateDatabaseInstrumentedTest {
         const val SNAPSHOT_ID = "snapshot"
         const val EVENT_SEQ = "1"
         const val FRESH_REQUIRED_EVENT_SEQ = "7"
+        const val AGENT_TIMELINE_EPOCH = "timeline"
     }
 }

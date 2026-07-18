@@ -20,8 +20,12 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2TerminalCheckpointEntity::class,
         RelayV2AgentTranscriptLifecycleStateEntity::class,
         RelayV2AgentTranscriptLifecycleNotificationClaimEntity::class,
+        RelayV2AgentTranscriptEntryEntity::class,
+        RelayV2AgentTranscriptSnapshotStagingEntity::class,
+        RelayV2AgentTranscriptSnapshotRecordEntity::class,
+        RelayV2AgentTranscriptPendingEventEntity::class,
     ],
-    version = 4,
+    version = 5,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
@@ -35,7 +39,12 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
             context.applicationContext,
             RelayV2StateDatabase::class.java,
             DATABASE_NAME,
-        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4).build()
+        ).addMigrations(
+            MIGRATION_1_2,
+            MIGRATION_2_3,
+            MIGRATION_3_4,
+            MIGRATION_4_5,
+        ).build()
 
         /**
          * Additive storage-owner migration. Existing v2 state-sync rows remain byte-for-byte
@@ -210,6 +219,256 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                             `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                             `timelineEpoch`, `lifecycleEventId`
                         )
+                    )
+                    """.trimIndent(),
+                )
+            }
+        }
+
+        /**
+         * Adds row-oriented Agent transcript materialization, snapshot staging, and the bounded
+         * durable LIVE buffer used only while snapshot/gap handling blocks cursor advancement.
+         * Existing version 4 payloads remain opaque and byte-for-byte untouched.
+         */
+        val MIGRATION_4_5: Migration = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_transcript_entries` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `entryId` TEXT NOT NULL,
+                        `runId` TEXT NOT NULL,
+                        `turnId` TEXT NOT NULL,
+                        `role` TEXT NOT NULL,
+                        `commandId` TEXT,
+                        `createdAtMs` INTEGER NOT NULL,
+                        `createdAgentSeq` TEXT NOT NULL,
+                        `createdAgentSeqOrder` TEXT NOT NULL,
+                        `lastModifiedAgentSeq` TEXT NOT NULL,
+                        `lastModifiedAgentSeqOrder` TEXT NOT NULL,
+                        `entryState` TEXT NOT NULL,
+                        `text` TEXT,
+                        `redactionReason` TEXT,
+                        `tombstoneOrigin` TEXT,
+                        `tombstoneEvidenceThroughAgentSeq` TEXT,
+                        `tombstoneEvidenceThroughAgentSeqOrder` TEXT,
+                        `payloadCanonicalJson` TEXT NOT NULL,
+                        `payloadUtf8Bytes` INTEGER NOT NULL,
+                        `payloadSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `entryId`
+                        )
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_transcript_entries_namespace_created_seq`
+                    ON `relay_v2_agent_transcript_entries` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `createdAgentSeq`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                        `index_agent_transcript_entries_namespace_created_order`
+                    ON `relay_v2_agent_transcript_entries` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `createdAgentSeqOrder`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                        `index_agent_transcript_entries_namespace_last_modified_order`
+                    ON `relay_v2_agent_transcript_entries` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lastModifiedAgentSeqOrder`, `entryId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_transcript_snapshot_staging` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `snapshotRequestId` TEXT NOT NULL,
+                        `requestLocalGeneration` TEXT NOT NULL,
+                        `requestNetworkToken` TEXT NOT NULL,
+                        `snapshotId` TEXT NOT NULL,
+                        `nextPageIndex` INTEGER NOT NULL,
+                        `nextCursor` TEXT,
+                        `throughAgentSeq` TEXT NOT NULL,
+                        `throughAgentSeqOrder` TEXT NOT NULL,
+                        `earliestRetainedSeq` TEXT NOT NULL,
+                        `earliestRetainedSeqOrder` TEXT NOT NULL,
+                        `receivedRecordCount` INTEGER NOT NULL,
+                        `receivedCanonicalBytes` INTEGER NOT NULL,
+                        `receivedRawUtf8Bytes` INTEGER NOT NULL,
+                        `lastAgentSeq` TEXT,
+                        `lastAgentSeqOrder` TEXT,
+                        `lastRecordKind` TEXT,
+                        `lastStableIdentity` TEXT,
+                        `complete` INTEGER NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `snapshotId`
+                        )
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_transcript_snapshot_staging_active_namespace`
+                    ON `relay_v2_agent_transcript_snapshot_staging` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_transcript_snapshot_records` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `snapshotId` TEXT NOT NULL,
+                        `pageIndex` INTEGER NOT NULL,
+                        `recordIndex` INTEGER NOT NULL,
+                        `recordKind` TEXT NOT NULL,
+                        `stableIdentity` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        `payloadCanonicalJson` TEXT NOT NULL,
+                        `payloadRawUtf8Bytes` INTEGER NOT NULL,
+                        `payloadSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `snapshotId`, `recordIndex`
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `snapshotId`
+                        ) REFERENCES `relay_v2_agent_transcript_snapshot_staging` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `snapshotId`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_transcript_snapshot_records_header`
+                    ON `relay_v2_agent_transcript_snapshot_records` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `snapshotId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_transcript_snapshot_records_stable`
+                    ON `relay_v2_agent_transcript_snapshot_records` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `snapshotId`, `recordKind`, `stableIdentity`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_transcript_snapshot_records_order`
+                    ON `relay_v2_agent_transcript_snapshot_records` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `snapshotId`, `agentEventSeqOrder`, `stableIdentity`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_transcript_pending_events` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        `eventId` TEXT NOT NULL,
+                        `closedEventDigest` TEXT NOT NULL,
+                        `trustedProvenance` TEXT NOT NULL,
+                        `eventCanonicalJson` TEXT NOT NULL,
+                        `eventRawUtf8Bytes` INTEGER NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `agentEventSeq`
+                        )
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_transcript_pending_events_event_id`
+                    ON `relay_v2_agent_transcript_pending_events` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `eventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_transcript_pending_events_order`
+                    ON `relay_v2_agent_transcript_pending_events` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeqOrder`
                     )
                     """.trimIndent(),
                 )

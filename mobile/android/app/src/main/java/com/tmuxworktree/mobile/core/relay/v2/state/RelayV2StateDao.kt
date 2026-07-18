@@ -413,6 +413,396 @@ internal interface RelayV2StateDao {
     fun deleteProfileTerminalCheckpoints(profileId: String)
 
     @Query(
+        "SELECT * FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "ORDER BY createdAgentSeqOrder, entryId",
+    )
+    fun agentTranscriptEntries(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): List<RelayV2AgentTranscriptEntryEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun agentTranscriptEntryCount(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Long
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptEntry(entry: RelayV2AgentTranscriptEntryEntity)
+
+    @Query(
+        "UPDATE relay_v2_agent_transcript_entries SET " +
+            "lastModifiedAgentSeq = :lastModifiedAgentSeq, " +
+            "lastModifiedAgentSeqOrder = :lastModifiedAgentSeqOrder, " +
+            "entryState = :entryState, text = :text, redactionReason = :redactionReason, " +
+            "tombstoneOrigin = :tombstoneOrigin, " +
+            "tombstoneEvidenceThroughAgentSeq = :tombstoneEvidenceThroughAgentSeq, " +
+            "tombstoneEvidenceThroughAgentSeqOrder = " +
+            ":tombstoneEvidenceThroughAgentSeqOrder, " +
+            "payloadCanonicalJson = :payloadCanonicalJson, " +
+            "payloadUtf8Bytes = :payloadUtf8Bytes, payloadSha256 = :payloadSha256 " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND entryId = :entryId " +
+            "AND lastModifiedAgentSeq = :expectedLastModifiedAgentSeq " +
+            "AND lastModifiedAgentSeqOrder = :expectedLastModifiedAgentSeqOrder " +
+            "AND entryState = :expectedEntryState AND entryState != 'deleted' " +
+            "AND payloadSha256 = :expectedPayloadSha256",
+    )
+    fun compareAndSetAgentTranscriptEntry(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        entryId: String,
+        expectedLastModifiedAgentSeq: String,
+        expectedLastModifiedAgentSeqOrder: String,
+        expectedEntryState: String,
+        expectedPayloadSha256: String,
+        lastModifiedAgentSeq: String,
+        lastModifiedAgentSeqOrder: String,
+        entryState: String,
+        text: String?,
+        redactionReason: String?,
+        tombstoneOrigin: String?,
+        tombstoneEvidenceThroughAgentSeq: String?,
+        tombstoneEvidenceThroughAgentSeqOrder: String?,
+        payloadCanonicalJson: String,
+        payloadUtf8Bytes: Int,
+        payloadSha256: String,
+    ): Int
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun deleteAgentTranscriptEntries(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Int
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_snapshot_staging " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun agentTranscriptSnapshots(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): List<RelayV2AgentTranscriptSnapshotStagingEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM relay_v2_agent_transcript_snapshot_staging " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun agentTranscriptSnapshotCount(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Long
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptSnapshot(snapshot: RelayV2AgentTranscriptSnapshotStagingEntity)
+
+    @Query(
+        "UPDATE relay_v2_agent_transcript_snapshot_staging SET " +
+            "nextPageIndex = :nextPageIndex, nextCursor = :nextCursor, " +
+            "receivedRecordCount = :receivedRecordCount, " +
+            "receivedCanonicalBytes = :receivedCanonicalBytes, " +
+            "receivedRawUtf8Bytes = :receivedRawUtf8Bytes, " +
+            "lastAgentSeq = :lastAgentSeq, lastAgentSeqOrder = :lastAgentSeqOrder, " +
+            "lastRecordKind = :lastRecordKind, lastStableIdentity = :lastStableIdentity, " +
+            "complete = :complete WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId AND snapshotRequestId = :snapshotRequestId " +
+            "AND requestLocalGeneration = :requestLocalGeneration " +
+            "AND requestNetworkToken = :requestNetworkToken " +
+            "AND throughAgentSeq = :throughAgentSeq " +
+            "AND throughAgentSeqOrder = :throughAgentSeqOrder " +
+            "AND earliestRetainedSeq = :earliestRetainedSeq " +
+            "AND earliestRetainedSeqOrder = :earliestRetainedSeqOrder " +
+            "AND nextPageIndex = :expectedNextPageIndex " +
+            "AND nextCursor IS :expectedNextCursor " +
+            "AND receivedRecordCount = :expectedReceivedRecordCount " +
+            "AND receivedCanonicalBytes = :expectedReceivedCanonicalBytes " +
+            "AND receivedRawUtf8Bytes = :expectedReceivedRawUtf8Bytes " +
+            "AND lastAgentSeq IS :expectedLastAgentSeq " +
+            "AND lastAgentSeqOrder IS :expectedLastAgentSeqOrder " +
+            "AND lastRecordKind IS :expectedLastRecordKind " +
+            "AND lastStableIdentity IS :expectedLastStableIdentity " +
+            "AND complete = :expectedComplete",
+    )
+    fun compareAndSetAgentTranscriptSnapshot(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        snapshotRequestId: String,
+        requestLocalGeneration: String,
+        requestNetworkToken: String,
+        snapshotId: String,
+        throughAgentSeq: String,
+        throughAgentSeqOrder: String,
+        earliestRetainedSeq: String,
+        earliestRetainedSeqOrder: String,
+        expectedNextPageIndex: Long,
+        expectedNextCursor: String?,
+        expectedReceivedRecordCount: Long,
+        expectedReceivedCanonicalBytes: Long,
+        expectedReceivedRawUtf8Bytes: Long,
+        expectedLastAgentSeq: String?,
+        expectedLastAgentSeqOrder: String?,
+        expectedLastRecordKind: String?,
+        expectedLastStableIdentity: String?,
+        expectedComplete: Boolean,
+        nextPageIndex: Long,
+        nextCursor: String?,
+        receivedRecordCount: Long,
+        receivedCanonicalBytes: Long,
+        receivedRawUtf8Bytes: Long,
+        lastAgentSeq: String?,
+        lastAgentSeqOrder: String?,
+        lastRecordKind: String?,
+        lastStableIdentity: String?,
+        complete: Boolean,
+    ): Int
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_snapshot_staging " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun deleteAgentTranscriptSnapshot(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Int
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_snapshot_records " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId ORDER BY recordIndex",
+    )
+    fun agentTranscriptSnapshotRecords(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        snapshotId: String,
+    ): List<RelayV2AgentTranscriptSnapshotRecordEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM relay_v2_agent_transcript_snapshot_records " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId",
+    )
+    fun agentTranscriptSnapshotRecordCount(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        snapshotId: String,
+    ): Long
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptSnapshotRecords(
+        records: List<RelayV2AgentTranscriptSnapshotRecordEntity>,
+    )
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "ORDER BY agentEventSeqOrder",
+    )
+    fun agentTranscriptPendingEvents(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): List<RelayV2AgentTranscriptPendingEventEntity>
+
+    @Query(
+        "SELECT COUNT(*) FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun agentTranscriptPendingEventCount(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Long
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptPendingEvent(event: RelayV2AgentTranscriptPendingEventEntity)
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND agentEventSeq = :agentEventSeq AND eventId = :eventId " +
+            "AND closedEventDigest = :closedEventDigest",
+    )
+    fun deleteAgentTranscriptPendingEvent(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        agentEventSeq: String,
+        eventId: String,
+        closedEventDigest: String,
+    ): Int
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+    )
+    fun deleteAgentTranscriptPendingEvents(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): Int
+
+    @Query("DELETE FROM relay_v2_agent_transcript_snapshot_staging WHERE profileId = :profileId")
+    fun deleteProfileAgentTranscriptSnapshots(profileId: String)
+
+    @Query("DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId")
+    fun deleteProfileAgentTranscriptPendingEvents(profileId: String)
+
+    @Query("DELETE FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId")
+    fun deleteProfileAgentTranscriptEntries(profileId: String)
+
+    @Query(
         "SELECT * FROM relay_v2_agent_transcript_lifecycle_states " +
             "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
