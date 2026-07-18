@@ -202,7 +202,7 @@ class RelayV2StateDatabaseInstrumentedTest {
                 payloadSha256 = "0".repeat(64),
             ),
             committed.copy(
-                lifecycleState = AgentLifecycleState.COMPLETED.name,
+                lifecycleState = AgentLifecycleState.WAITING_FOR_USER.name,
                 claimedLocalGeneration = "2",
                 payloadSha256 = "f".repeat(64),
             ),
