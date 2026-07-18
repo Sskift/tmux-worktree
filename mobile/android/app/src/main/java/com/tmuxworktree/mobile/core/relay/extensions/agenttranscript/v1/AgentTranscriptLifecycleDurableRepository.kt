@@ -49,32 +49,32 @@ internal class AgentTranscriptLifecycleDurableRepository(
         core.claimNotificationUnderApplyLease(expectedNamespace, intent)
 
     /** Closed operation seam; each call is executed by the core in one Room transaction. */
-    suspend fun applyControlUnderApplyLease(
+    override suspend fun applyControlUnderApplyLease(
         command: AgentTranscriptLifecycleDurableControlCommand,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.applyControlUnderApplyLease(command, limits)
 
-    suspend fun consumeLiveEventUnderApplyLease(
+    override suspend fun consumeLiveEventUnderApplyLease(
         command: AgentTranscriptLifecycleDurableLiveEventCommand,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.consumeLiveEventUnderApplyLease(command, limits)
 
-    suspend fun consumeReplayPageUnderApplyLease(
+    override suspend fun consumeReplayPageUnderApplyLease(
         command: AgentTranscriptLifecycleDurableReplayPageCommand,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.consumeReplayPageUnderApplyLease(command, limits)
 
-    suspend fun persistSnapshotRequestUnderApplyLease(
+    override suspend fun persistSnapshotRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurableSnapshotRequestCommand,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.persistSnapshotRequestUnderApplyLease(command)
 
-    suspend fun consumeSnapshotPageUnderApplyLease(
+    override suspend fun consumeSnapshotPageUnderApplyLease(
         command: AgentTranscriptLifecycleDurableSnapshotPageCommand,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.consumeSnapshotPageUnderApplyLease(command, limits)
 }

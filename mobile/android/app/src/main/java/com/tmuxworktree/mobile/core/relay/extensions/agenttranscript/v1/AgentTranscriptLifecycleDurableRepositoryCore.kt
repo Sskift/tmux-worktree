@@ -661,6 +661,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     command.snapshotRequestId,
                     command.pageZeroNetworkToken,
                 ),
+                AgentClientReducerLimits(),
             ),
         )
 
@@ -2257,7 +2258,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             when (compareStorageCounters(record.agentEventSeq, highest.agentEventSeq)) {
                 -1 -> storageMalformed()
                 0 -> if (existingById == null ||
-                    !existingById.matchesPublicLifecycle(record)
+                    existingById.witnessSha256 != record.toWitnessEntity(namespace, null, publicCodec).witnessSha256
                 ) storageMalformed()
                 else -> if (highest.sourceEpoch != record.sourceEpoch ||
                     highest.lifecycleState.toLifecycleState().terminal
