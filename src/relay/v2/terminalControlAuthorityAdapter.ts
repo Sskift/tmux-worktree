@@ -633,10 +633,10 @@ export class RelayV2TerminalControlAuthorityAdapter implements RelayV2TerminalCo
       parsedOperationId = operationId(input.operationId);
       if (!Number.isSafeInteger(input.cols)
         || !Number.isSafeInteger(input.rows)
-        || input.cols < 20
-        || input.cols > 300
-        || input.rows < 5
-        || input.rows > 200) {
+        || input.cols < 1
+        || input.cols > 1000
+        || input.rows < 1
+        || input.rows > 500) {
         throw new AdapterInputError("INTERNAL");
       }
     } catch (error) {

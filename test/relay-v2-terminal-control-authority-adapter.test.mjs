@@ -248,6 +248,62 @@ test("target, owner, lease, pane, operation and correlated success mismatches fa
   assert.equal(renewal.status, "uncertain", "a rotated success cannot prove the old renewal disposition");
 });
 
+test("resize preserves frozen boundaries and rejects out-of-range dimensions before dispatch", async () => {
+  const minimumOperationId = "resize-minimum-boundary";
+  const maximumOperationId = "resize-maximum-boundary";
+  const boundaryPort = new ScriptedPort([
+    operationResult(minimumOperationId),
+    operationResult(maximumOperationId),
+  ]);
+  const boundaryAuthority = adapter(boundaryPort);
+
+  assert.deepEqual(await boundaryAuthority.resize(authorityInput(LEASE, {
+    operationId: minimumOperationId,
+    cols: 1,
+    rows: 1,
+  })), { accepted: true });
+  assert.deepEqual(await boundaryAuthority.resize(authorityInput(LEASE, {
+    operationId: maximumOperationId,
+    cols: 1000,
+    rows: 500,
+  })), { accepted: true });
+  assert.deepEqual(boundaryPort.calls, [
+    {
+      type: "input.resize",
+      lease: LEASE,
+      operationId: minimumOperationId,
+      pane: "0",
+      cols: 1,
+      rows: 1,
+    },
+    {
+      type: "input.resize",
+      lease: LEASE,
+      operationId: maximumOperationId,
+      pane: "0",
+      cols: 1000,
+      rows: 500,
+    },
+  ]);
+
+  const rejectedPort = new ScriptedPort();
+  const rejectedAuthority = adapter(rejectedPort);
+  const rejectedDimensions = [
+    { operationId: "resize-cols-below-minimum", cols: 0, rows: 24 },
+    { operationId: "resize-cols-above-maximum", cols: 1001, rows: 24 },
+    { operationId: "resize-rows-below-minimum", cols: 80, rows: 0 },
+    { operationId: "resize-rows-above-maximum", cols: 80, rows: 501 },
+    { operationId: "resize-cols-not-integer", cols: 1.5, rows: 24 },
+    { operationId: "resize-rows-not-safe-integer", cols: 80, rows: Number.MAX_SAFE_INTEGER + 1 },
+  ];
+  for (const dimensions of rejectedDimensions) {
+    const result = await rejectedAuthority.resize(authorityInput(LEASE, dimensions));
+    assert.equal(result.accepted, false, dimensions.operationId);
+    assert.equal(result.uncertain, false, dimensions.operationId);
+  }
+  assert.equal(rejectedPort.calls.length, 0, "out-of-range resize must fail before dispatch");
+});
+
 test("definite rejections stay definite while timeout, transport and in-doubt failures stay uncertain", async () => {
   const terminalBytes = "TERMINAL_BYTES_MUST_NOT_ESCAPE";
   const definitePort = new ScriptedPort([
