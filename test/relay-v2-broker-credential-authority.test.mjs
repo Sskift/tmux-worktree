@@ -571,6 +571,70 @@ test("pre-body source admission is durable, source-bound, one-use, rate-limited,
   await authority.close();
 });
 
+test("HTTP source admission release is exact, one-use, non-refunding, and closed with the authority", async () => {
+  const store = new InMemoryRelayV2BrokerCredentialStateStore();
+  const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(store, new MemoryContinuityAuthority(), {
+      idPrefix: "source-release",
+    }),
+  );
+  const receipt = await admitHostBootstrap(authority, "released-source");
+  assert.throws(
+    () => authority.releaseHttpSourceAdmission(
+      receipt,
+      "enrollment_redeem",
+      "released-source",
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  assert.throws(
+    () => authority.releaseHttpSourceAdmission(
+      receipt,
+      "host_bootstrap",
+      "different-source",
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  assert.throws(
+    () => authority.releaseHttpSourceAdmission(
+      Object.freeze(() => undefined),
+      "host_bootstrap",
+      "released-source",
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  authority.releaseHttpSourceAdmission(
+    receipt,
+    "host_bootstrap",
+    "released-source",
+  );
+  assert.throws(
+    () => authority.releaseHttpSourceAdmission(
+      receipt,
+      "host_bootstrap",
+      "released-source",
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  assert.deepEqual(decodeState(store.snapshotBytes()).rateLimits, [{
+    scope: "host.bootstrap.source",
+    subjectHash: createHash("sha256").update("released-source").digest("hex"),
+    windowStartedAtMs: NOW_MS,
+    attempts: 1,
+  }]);
+
+  const clearedByClose = await admitHostBootstrap(authority, "close-source");
+  await authority.close();
+  assert.throws(
+    () => authority.releaseHttpSourceAdmission(
+      clearedByClose,
+      "host_bootstrap",
+      "close-source",
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+});
+
 test("fresh host bootstrap issues the frozen host credential once and exactly replays ACK loss", async () => {
   const external = new MemoryContinuityAuthority();
   const store = new InMemoryRelayV2BrokerCredentialStateStore();

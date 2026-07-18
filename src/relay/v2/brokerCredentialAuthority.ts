@@ -73,6 +73,9 @@ const MAX_ISSUER_KEY_IDENTITIES = 1_024;
 const MAX_ACCESS_TOKEN_BYTES = 8_192;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const CANONICAL_BASE64URL = /^[A-Za-z0-9_-]+$/;
+const AUTHORITY_ERROR_BRAND = Symbol.for(
+  "tmux-worktree.relay-v2.broker-credential-authority-error.v1",
+);
 
 export type RelayV2BrokerCredentialAuthorityErrorCode =
   | "AUTHORITY_NOT_READY"
@@ -131,6 +134,24 @@ export class RelayV2BrokerCredentialAuthorityError extends Error {
   ) {
     super(AUTHORITY_ERROR_MESSAGES[code]);
     this.name = "RelayV2BrokerCredentialAuthorityError";
+    Object.defineProperty(this, AUTHORITY_ERROR_BRAND, { value: true });
+  }
+}
+
+/** Preserves exact authority errors across separately bundled entry points. */
+export function isRelayV2BrokerCredentialAuthorityError(
+  error: unknown,
+): error is RelayV2BrokerCredentialAuthorityError {
+  try {
+    if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+      return false;
+    }
+    const candidate = error as Record<PropertyKey, unknown>;
+    return candidate[AUTHORITY_ERROR_BRAND] === true
+      && typeof candidate.code === "string"
+      && Object.prototype.hasOwnProperty.call(AUTHORITY_ERROR_MESSAGES, candidate.code);
+  } catch {
+    return false;
   }
 }
 
@@ -2386,6 +2407,20 @@ implements RelayV2BrokerAuthControlAuthority {
     ) throw authorityError("INVALID_ARGUMENT");
     this.sourceAdmissions.delete(admission as object);
     return record;
+  }
+
+  /**
+   * Releases an admitted HTTP source receipt when the transport boundary
+   * cannot hand a decoded request to the credential transition. The durable
+   * rate attempt remains consumed. A copied, expired, mismatched, or already
+   * released receipt is never accepted.
+   */
+  releaseHttpSourceAdmission(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    endpoint: RelayV2BrokerCredentialHttpSourceEndpoint,
+    sourceKey: string,
+  ): void {
+    this.takeSourceAdmission(admission, endpoint, sourceIdentityHash(sourceKey));
   }
 
   async bootstrapHost(

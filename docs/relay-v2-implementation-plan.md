@@ -90,6 +90,7 @@ B 内部可以按持久认证控制面、在线目录与 carrier router 三条 l
 
 工作边界：
 
+- B1 已有严格、未接线的 `POST /v2/hosts/bootstrap` HTTP ingress foundation，只做 admission、bounded read、closed decode/mapping并调用 T1 窄 port；它不构造 authority/native store/server，不接 production composition/E0，也不产生 ready、enrollment 或 capability。
 - issuer keyring、一次性 client enrollment、host bootstrap、refresh rotation、exact response replay、revoke 和 socket expiry。
 - credential business authority 只经 N0 port 的 T1 injection 使用 native store；broker composition 不接收 storage path，也不拥有 native cleanup。
 - broker/composition拥有`broker-credential.v1` ready-loss生产fence：T1同步撤回credential admission后，必须同步阻止新Upgrade/route/auth-control与既有连接业务frame，再在owning contract冻结的有限deadline内close；external adapter不选择public close code或deadline。`agent-transcript-lifecycle.v1` authority failure不进入该全局fence。
