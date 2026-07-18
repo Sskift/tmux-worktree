@@ -11,7 +11,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
-import kotlinx.coroutines.sync.Mutex
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -21,7 +20,6 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
     @Test
     fun `unnegotiated input is neither decoded nor leased`() = runBlocking {
         val harness = Harness(sessionId = "session-shell", statusRequestId = "agent-status-2")
-        val before = harness.repository.load(harness.consumer)
 
         val result = harness.runtime.consume(
             byteArrayOf(0xc3.toByte()),
@@ -30,36 +28,36 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
 
         assertEquals(AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionNotNegotiated, result)
         assertEquals(0, harness.lease.blockCount)
-        assertEquals(before, harness.repository.load(harness.consumer))
+        assertTrue(harness.operations.controlCommands.isEmpty())
     }
 
     @Test
-    fun `correlated unavailable waits for commit inside the controlled lease block`() =
+    fun `correlated unavailable waits for durable operation inside apply lease`() =
         runBlocking {
             val harness = Harness(sessionId = "session-shell", statusRequestId = "agent-status-2")
-            val commit = harness.store.blockNextCommit()
+            val applyGate = harness.operations.blockNextApply()
             val applying = async(Dispatchers.Default) {
                 harness.runtime.consume(
                     fixtureWire("status-unsupported-agent"),
                     harness.fence(),
                 )
             }
-            commit.entered.await()
+            applyGate.entered.await()
             assertFalse(applying.isCompleted)
             assertTrue(harness.lease.insideBlock)
-            commit.release.complete(Unit)
+            applyGate.release.complete(Unit)
 
             val result = applying.await()
             assertTrue(result is AgentTranscriptLifecycleRuntimeConsumeResult.Applied)
             assertFalse(harness.lease.insideBlock)
             assertEquals(1, harness.lease.blockCount)
-            val restored = requireNotNull(harness.repository.load(harness.consumer)).state
-            assertEquals(AgentExtensionSupport.UNAVAILABLE, restored.extensionLane.support)
+            val command = harness.operations.controlCommands.single()
+            val input = command.input as AgentTranscriptLifecycleClientInput.StatusUnavailable
             assertEquals(
                 AgentExtensionUnavailableReason.AGENT_UNSUPPORTED,
-                restored.extensionLane.unavailableReason,
+                input.reason,
             )
-            assertEquals("0", restored.extensionLane.lastAgentSeq)
+            assertEquals(AgentLocalRequestFence("1", "agent-status-2"), input.requestFence)
         }
 
     @Test
@@ -69,7 +67,6 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             statusRequestId = "agent-status-1",
             timelineEpoch = "timeline-1",
         )
-        val before = harness.repository.load(harness.consumer)
         val statusAvailable = fixtureWire("status-available")
         val cases = listOf(
             CursorCase(
@@ -97,7 +94,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             assertEquals(
                 case.fixture,
                 AgentTranscriptLifecycleRuntimeConsumeResult.Unavailable(
-                    AgentTranscriptLifecycleRuntimeUnavailableReason.COMPLETE_CONSUMER_NOT_READY,
+                    AgentTranscriptLifecycleRuntimeUnavailableReason.INVALID_PUBLIC_FRAME,
                 ),
                 result,
             )
@@ -143,12 +140,11 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
                 result,
             )
             assertEquals(case.name, 0, harness.lease.blockCount)
-            assertEquals(case.name, before, harness.repository.load(harness.consumer))
+            assertTrue(case.name, harness.operations.controlCommands.isEmpty())
         }
 
         assertEquals(0, harness.lease.blockCount)
-        assertEquals(before, harness.repository.load(harness.consumer))
-        assertEquals("8", requireNotNull(before).state.extensionLane.lastAgentSeq)
+        assertTrue(harness.operations.controlCommands.isEmpty())
     }
 
     private data class CursorCase(
@@ -187,35 +183,13 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             hostId = "mac-admin",
             hostEpoch = "host-epoch-1",
         )
-        val store = SingleRowStore()
-        val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+        val operations = RecordingDurableOperationPort()
         val lease = RecordingApplyLease(authority)
-        val runtime = AgentTranscriptLifecycleRuntimeConsumer(lease, repository)
+        val runtime = AgentTranscriptLifecycleRuntimeConsumer(lease, operations)
         private val namespace: AgentTranscriptLifecycleDurableNamespace
 
         init {
-            val extension = if (timelineEpoch == null) {
-                AgentTranscriptLifecycleExtensionState(
-                    localGeneration = "1",
-                    support = AgentExtensionSupport.UNKNOWN,
-                    unavailableReason = null,
-                    pendingStatusRequest = AgentLocalRequestFence("1", statusRequestId),
-                )
-            } else {
-                AgentTranscriptLifecycleExtensionState(
-                    localGeneration = "1",
-                    support = AgentExtensionSupport.AVAILABLE,
-                    unavailableReason = null,
-                    liveSource = AgentLiveSourceState.CONNECTED,
-                    activeSourceEpoch = "source-1",
-                    timelineEpoch = timelineEpoch,
-                    lastAgentSeq = "8",
-                    notificationBaselineAgentSeq = "8",
-                )
-            }
-            val state = AgentTranscriptLifecycleClientState(consumer.sessionIdentity, extension)
             namespace = AgentTranscriptLifecycleDurableNamespace(consumer, timelineEpoch)
-            runBlocking { repository.initializeUnderApplyLease(namespace, state) }
         }
 
         fun fence(
@@ -262,70 +236,60 @@ private class RecordingApplyLease(
     }
 }
 
-private class SingleRowStore : AgentTranscriptLifecycleDurableStore {
-    data class CommitGate(
+private class RecordingDurableOperationPort : AgentTranscriptLifecycleDurableOperationPort {
+    data class ApplyGate(
         val entered: CompletableDeferred<Unit> = CompletableDeferred(),
         val release: CompletableDeferred<Unit> = CompletableDeferred(),
     )
 
-    private val mutex = Mutex()
-    private var row: AgentTranscriptLifecyclePersistedState? = null
-    private var nextCommitGate: CommitGate? = null
+    val controlCommands = mutableListOf<AgentTranscriptLifecycleDurableControlCommand>()
+    private var nextApplyGate: ApplyGate? = null
 
-    fun blockNextCommit(): CommitGate = CommitGate().also { nextCommitGate = it }
+    fun blockNextApply(): ApplyGate = ApplyGate().also { nextApplyGate = it }
 
-    override suspend fun <T> transaction(
-        block: AgentTranscriptLifecycleDurableTransaction.() -> T,
-    ): T {
-        mutex.lock()
-        try {
-            val transaction = Transaction(row)
-            val result = transaction.block()
-            if (transaction.changed) {
-                nextCommitGate?.also { gate ->
-                    nextCommitGate = null
-                    gate.entered.complete(Unit)
-                    gate.release.await()
-                }
-                row = transaction.row
-            }
-            return result
-        } finally {
-            mutex.unlock()
+    override suspend fun applyControlUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableControlCommand,
+        limits: AgentClientReducerLimits,
+    ): AgentTranscriptLifecycleDurableOperationResult {
+        nextApplyGate?.also { gate ->
+            nextApplyGate = null
+            gate.entered.complete(Unit)
+            gate.release.await()
         }
+        controlCommands += command
+        val unavailable = command.input as AgentTranscriptLifecycleClientInput.StatusUnavailable
+        val initial = AgentTranscriptLifecycleClientState(
+            identity = command.fence.expectedNamespace.consumer.sessionIdentity,
+            extensionLane = AgentTranscriptLifecycleExtensionState(
+                localGeneration = unavailable.requestFence.localGeneration,
+                support = AgentExtensionSupport.UNKNOWN,
+                unavailableReason = null,
+                pendingStatusRequest = unavailable.requestFence,
+            ),
+        )
+        return AgentTranscriptLifecycleDurableOperationResult(
+            AgentTranscriptLifecycleClientReducer.reduce(initial, unavailable, limits),
+        )
     }
 
-    private class Transaction(
-        var row: AgentTranscriptLifecyclePersistedState?,
-    ) : AgentTranscriptLifecycleDurableTransaction {
-        var changed = false
+    override suspend fun consumeLiveEventUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableLiveEventCommand,
+        limits: AgentClientReducerLimits,
+    ) = error("Live events are outside this runtime consumer suite")
 
-        override fun states(
-            consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
-        ): List<AgentTranscriptLifecyclePersistedState> =
-            listOfNotNull(row?.takeIf { it.namespace.consumer == consumer })
+    override suspend fun consumeReplayPageUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableReplayPageCommand,
+        limits: AgentClientReducerLimits,
+    ) = error("Replay pages are outside this runtime consumer suite")
 
-        override fun deleteConsumer(consumer: AgentTranscriptLifecycleDurableConsumerIdentity) {
-            if (row?.namespace?.consumer == consumer) {
-                row = null
-                changed = true
-            }
-        }
+    override suspend fun persistSnapshotRequestUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableSnapshotRequestCommand,
+    ) = error("Snapshot requests are outside this runtime consumer suite")
 
-        override fun insertState(state: AgentTranscriptLifecyclePersistedState) {
-            check(row == null)
-            row = state
-            changed = true
-        }
-
-        override fun notificationClaims(
-            eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
-        ): List<AgentTranscriptLifecyclePersistedNotificationClaim> = emptyList()
-
-        override fun insertNotificationClaim(
-            claim: AgentTranscriptLifecyclePersistedNotificationClaim,
-        ) = error("Notification claim is outside this consumer test")
-    }
+    override suspend fun consumeSnapshotPageUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableSnapshotPageCommand,
+        limits: AgentClientReducerLimits,
+    ) = error("Snapshot pages are outside this runtime consumer suite")
 }
 
 private fun fixtureWire(name: String): ByteArray {

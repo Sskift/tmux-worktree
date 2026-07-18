@@ -36,7 +36,7 @@ class AgentTranscriptLifecyclePresentationTest {
             present(selected = otherSession),
             present(lineage = AgentTimelineLineage(otherSession, activeLineage.timelineEpoch)),
             present(source = state.copy(
-                extensionLane = state.extensionLane.copy(requiresSnapshot = true),
+                extensionLane = state.extensionLane.copy(syncState = AgentTimelineSyncState.Snapshot),
             )),
         ).forEach { presentation ->
             assertSame(AgentLifecycleNotificationPresentation.Unavailable, presentation)
@@ -172,6 +172,8 @@ private fun presentationState(): AgentTranscriptLifecycleClientState {
             activeSourceEpoch = PRESENTATION_SOURCE_EPOCH,
             timelineEpoch = timelineEpoch,
             lastAgentSeq = "4",
+            effectiveHostLimits = presentationHostLimits(),
+            syncState = AgentTimelineSyncState.Current,
             notificationBaselineAgentSeq = "0",
             lifecycleByIdentity = records,
             currentLifecycleIdentityByEventId = records.entries.associate { (key, record) ->
@@ -201,21 +203,29 @@ private fun presentationRecord(
     state: AgentLifecycleState,
     turnId: String? = null,
 ): AgentLifecycleRecord = AgentLifecycleRecord(
-    eventId,
-    PRESENTATION_SOURCE_EPOCH,
-    AgentLifecycleIdentity(scope, runId, turnId),
-    state,
-    sequence,
+    lifecycleEventId = eventId,
+    sourceEpoch = PRESENTATION_SOURCE_EPOCH,
+    identity = AgentLifecycleIdentity(scope, runId, turnId),
+    state = state,
+    failure = if (state == AgentLifecycleState.FAILED) {
+        AgentLifecycleFailure("presentation_failure", "presentation failure")
+    } else {
+        null
+    },
+    occurredAtMs = sequence.toLong(),
+    agentEventSeq = sequence,
 )
 
 private fun AgentLifecycleRecord.presentationWitness(): AgentLifecycleEventIdentityWitness =
     AgentLifecycleEventIdentityWitness(
-        lifecycleEventId,
-        agentEventSeq,
-        identity,
-        sourceEpoch,
-        state,
-        null,
+        eventId = lifecycleEventId,
+        agentEventSeq = agentEventSeq,
+        lifecycleIdentity = identity,
+        sourceEpoch = sourceEpoch,
+        state = state,
+        failure = failure,
+        occurredAtMs = occurredAtMs,
+        closedEventDigest = null,
     )
 
 private fun presentationNotification(
@@ -244,3 +254,10 @@ private fun presentationNotification(
 }
 
 private const val PRESENTATION_SOURCE_EPOCH = "source-presentation"
+
+private fun presentationHostLimits(): AgentTimelineEffectiveLimits = AgentTimelineEffectiveLimits(
+    maxTextUtf8Bytes = 65_536,
+    maxPageRecords = 256,
+    eventReplayRetentionMs = 604_800_000,
+    snapshotLeaseMs = 300_000,
+)

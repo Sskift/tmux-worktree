@@ -583,6 +583,38 @@ internal interface RelayV2AgentLifecycleDao {
         limit: Int,
     ): List<RelayV2AgentLifecycleEventWitnessEntity>
 
+    /** Namespace-local permanent-chain audit order; callers retain only the prior identity row. */
+    @Query(
+        "SELECT * FROM relay_v2_agent_lifecycle_event_witnesses " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch AND " +
+            "(lifecycleScope, runId, turnIdKey, agentEventSeqOrder, eventId) > " +
+            "(:afterLifecycleScope, :afterRunId, :afterTurnIdKey, " +
+            ":afterAgentEventSeqOrder, :afterEventId) " +
+            "ORDER BY lifecycleScope, runId, turnIdKey, agentEventSeqOrder, eventId " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
+    )
+    fun witnessIdentityAuditRowsAfter(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        afterLifecycleScope: String,
+        afterRunId: String,
+        afterTurnIdKey: String,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        limit: Int,
+    ): List<RelayV2AgentLifecycleEventWitnessEntity>
+
     @Query(
         "SELECT EXISTS(SELECT 1 FROM relay_v2_agent_lifecycle_event_witnesses " +
             "WHERE profileId = :profileId " +

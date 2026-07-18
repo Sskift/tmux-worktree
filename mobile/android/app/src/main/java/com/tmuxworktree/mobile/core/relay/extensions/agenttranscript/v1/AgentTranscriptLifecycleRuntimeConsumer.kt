@@ -37,7 +37,6 @@ internal data class AgentTranscriptLifecycleRuntimeFence(
 internal enum class AgentTranscriptLifecycleRuntimeUnavailableReason {
     INVALID_PUBLIC_FRAME,
     EXACT_FENCE_MISMATCH,
-    COMPLETE_CONSUMER_NOT_READY,
     STALE_GENERATION,
 }
 
@@ -54,15 +53,12 @@ internal sealed interface AgentTranscriptLifecycleRuntimeConsumeResult {
 }
 
 /**
- * Strict public decode/fence/apply module for the unwired Android extension consumer.
- *
- * The current durable owner can safely commit only a correlated `support=unavailable` status.
- * Every cursor-bearing closed input remains extension-unavailable until transcript, replay and
- * snapshot staging have one complete durable owner; none may partially advance lifecycle state.
+ * Strict public decode/fence/apply module. The codec-issued artifact is handed to the single
+ * durable operation owner; runtime does not construct wire bytes or reducer payloads.
  */
 internal class AgentTranscriptLifecycleRuntimeConsumer(
     private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
-    private val durableRepository: AgentTranscriptLifecycleDurableReductionPort,
+    private val durableRepository: AgentTranscriptLifecycleDurableOperationPort,
     private val codec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
 ) {
     suspend fun consume(
@@ -74,20 +70,19 @@ internal class AgentTranscriptLifecycleRuntimeConsumer(
         if (AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in fence.negotiatedCapabilities) {
             return AgentTranscriptLifecycleRuntimeConsumeResult.ExtensionNotNegotiated
         }
-        val frame = try {
-            codec.decodePublicFrame(rawFrame, metadata)
+        val artifact = try {
+            codec.decodePublicFrameArtifact(rawFrame, metadata)
         } catch (_: AgentTranscriptLifecycleV1CodecException) {
             return unavailable(AgentTranscriptLifecycleRuntimeUnavailableReason.INVALID_PUBLIC_FRAME)
         }
+        val frame = artifact.frame
         if (!frame.hasExactFence(fence)) {
             return unavailable(AgentTranscriptLifecycleRuntimeUnavailableReason.EXACT_FENCE_MISMATCH)
         }
 
         val status = (frame as? AgentTimelineStatusFrame)?.status
         if (status !is AgentTimelineUnavailableStatus) {
-            return unavailable(
-                AgentTranscriptLifecycleRuntimeUnavailableReason.COMPLETE_CONSUMER_NOT_READY,
-            )
+            return unavailable(AgentTranscriptLifecycleRuntimeUnavailableReason.INVALID_PUBLIC_FRAME)
         }
         val ingress = fence.ingress as? AgentTranscriptLifecycleTrustedIngress.CorrelatedStatus
             ?: return unavailable(
@@ -105,7 +100,24 @@ internal class AgentTranscriptLifecycleRuntimeConsumer(
             reason = status.reason.toReducerReason(),
         )
         val result = applyLease.withEffectApplyLease(fence.authority) {
-            durableRepository.reduceUnderApplyLease(fence.expectedNamespace, input)
+            durableRepository.applyControlUnderApplyLease(
+                AgentTranscriptLifecycleDurableControlCommand(
+                    AgentTranscriptLifecycleDurableOperationFence(
+                        AgentTranscriptLifecycleDurableConsumerIdentity(
+                            profileId = fence.authority.profileId,
+                            profileActivationGeneration = fence.authority.profileActivationGeneration,
+                            principalId = fence.authority.principalId,
+                            clientInstanceId = fence.authority.clientInstanceId,
+                            hostId = fence.authority.hostId,
+                            hostEpoch = fence.authority.hostEpoch,
+                            scopeId = fence.expectedNamespace.consumer.scopeId,
+                            sessionId = fence.expectedNamespace.consumer.sessionId,
+                        ),
+                        fence.expectedNamespace,
+                    ),
+                    input,
+                ),
+            ).reduction
         }
         return when (result) {
             RelayV2EffectApplyResult.Stale -> unavailable(

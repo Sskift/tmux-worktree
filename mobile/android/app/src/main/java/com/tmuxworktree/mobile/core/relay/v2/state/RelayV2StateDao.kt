@@ -10,6 +10,67 @@ internal data class RelayV2SqlStats(
     val byteCount: Long,
 )
 
+/** Small projection used to choose one heap-bounded materialized transcript batch. */
+internal data class RelayV2AgentTranscriptEntryBatchMetadata(
+    val createdAgentSeq: String,
+    val createdAgentSeqOrder: String,
+    val entryId: String,
+    val payloadUtf8Bytes: Int,
+    val actualPayloadUtf8Bytes: Long,
+    val actualTextUtf8Bytes: Long,
+)
+
+/** Small projection used to choose one heap-bounded pinned snapshot-record batch. */
+internal data class RelayV2AgentTranscriptSnapshotRecordBatchMetadata(
+    val recordIndex: Long,
+    val pageIndex: Long,
+    val payloadRawUtf8Bytes: Int,
+    val actualPayloadUtf8Bytes: Long,
+)
+
+internal data class RelayV2AgentTranscriptPendingEventBatchMetadata(
+    val agentEventSeq: String,
+    val agentEventSeqOrder: String,
+    val eventId: String,
+    val eventRawUtf8Bytes: Int,
+    val actualPayloadUtf8Bytes: Long,
+)
+
+/** One-row, no-payload preflight for the exact nine-column transcript namespace. */
+internal data class RelayV2AgentTranscriptNamespaceStats(
+    val entryCount: Long,
+    val entryPayloadUtf8Bytes: Long,
+    val entryTextUtf8Bytes: Long,
+    val entryMaxPayloadUtf8Bytes: Long,
+    val entryMaxTextUtf8Bytes: Long,
+    val entryMaxBoundedTextUtf8Bytes: Long,
+    val snapshotCount: Long,
+    val snapshotMaxIdUtf8Bytes: Long,
+    val snapshotMaxCursorUtf8Bytes: Long,
+    val snapshotRecordCount: Long,
+    val snapshotRecordPayloadUtf8Bytes: Long,
+    val snapshotRecordRawUtf8Bytes: Long,
+    val snapshotRecordMinRawUtf8Bytes: Long,
+    val snapshotRecordMaxRawUtf8Bytes: Long,
+    val snapshotRecordMaxPayloadUtf8Bytes: Long,
+    val snapshotRecordMaxBoundedTextUtf8Bytes: Long,
+    val pendingEventCount: Long,
+    val pendingEventPayloadUtf8Bytes: Long,
+    val pendingEventRawUtf8Bytes: Long,
+    val pendingEventMinRawUtf8Bytes: Long,
+    val pendingEventMaxRawUtf8Bytes: Long,
+    val pendingEventMaxPayloadUtf8Bytes: Long,
+    val pendingEventMaxBoundedTextUtf8Bytes: Long,
+)
+
+/** One-row orphan check across every timeline epoch owned by one exact consumer identity. */
+internal data class RelayV2AgentTranscriptConsumerStats(
+    val entryCount: Long,
+    val snapshotCount: Long,
+    val snapshotRecordCount: Long,
+    val pendingEventCount: Long,
+)
+
 @Dao
 internal interface RelayV2StateDao {
     @Query(
@@ -415,6 +476,179 @@ internal interface RelayV2StateDao {
     fun deleteProfileTerminalCheckpoints(profileId: String)
 
     @Query(
+        "WITH entry_stats AS (SELECT COUNT(*) AS entryCount, " +
+            "COALESCE(SUM(LENGTH(CAST(payloadCanonicalJson AS BLOB))), 0) " +
+            "AS entryPayloadUtf8Bytes, " +
+            "COALESCE(SUM(COALESCE(LENGTH(CAST(text AS BLOB)), 0)), 0) " +
+            "AS entryTextUtf8Bytes, " +
+            "COALESCE(MAX(LENGTH(CAST(payloadCanonicalJson AS BLOB))), 0) " +
+            "AS entryMaxPayloadUtf8Bytes, " +
+            "COALESCE(MAX(COALESCE(LENGTH(CAST(text AS BLOB)), 0)), 0) " +
+            "AS entryMaxTextUtf8Bytes, " +
+            "COALESCE(MAX(MAX(LENGTH(CAST(entryId AS BLOB))), " +
+            "MAX(LENGTH(CAST(runId AS BLOB))), " +
+            "MAX(COALESCE(LENGTH(CAST(turnId AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(commandId AS BLOB)), 0)), " +
+            "MAX(LENGTH(CAST(role AS BLOB))), MAX(LENGTH(CAST(entryState AS BLOB))), " +
+            "MAX(COALESCE(LENGTH(CAST(redactionReason AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(tombstoneOrigin AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(tombstoneEvidenceThroughAgentSeq AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(tombstoneEvidenceThroughAgentSeqOrder AS BLOB)), 0)), " +
+            "MAX(LENGTH(CAST(createdAgentSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(createdAgentSeqOrder AS BLOB))), " +
+            "MAX(LENGTH(CAST(lastModifiedAgentSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(lastModifiedAgentSeqOrder AS BLOB))), " +
+            "MAX(LENGTH(CAST(payloadSha256 AS BLOB)))), 0) " +
+            "AS entryMaxBoundedTextUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch), " +
+            "snapshot_stats AS (SELECT COUNT(*) AS snapshotCount, " +
+            "COALESCE(MAX(MAX(LENGTH(CAST(snapshotRequestId AS BLOB))), " +
+            "MAX(LENGTH(CAST(requestLocalGeneration AS BLOB))), " +
+            "MAX(LENGTH(CAST(requestNetworkToken AS BLOB))), " +
+            "MAX(LENGTH(CAST(snapshotId AS BLOB))), " +
+            "MAX(LENGTH(CAST(throughAgentSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(throughAgentSeqOrder AS BLOB))), " +
+            "MAX(LENGTH(CAST(earliestRetainedSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(earliestRetainedSeqOrder AS BLOB))), " +
+            "MAX(COALESCE(LENGTH(CAST(lastAgentSeq AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(lastAgentSeqOrder AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(lastRecordKind AS BLOB)), 0)), " +
+            "MAX(COALESCE(LENGTH(CAST(lastStableIdentity AS BLOB)), 0))), 0) " +
+            "AS snapshotMaxIdUtf8Bytes, " +
+            "COALESCE(MAX(COALESCE(LENGTH(CAST(nextCursor AS BLOB)), 0)), 0) " +
+            "AS snapshotMaxCursorUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_snapshot_staging WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch), " +
+            "record_stats AS (SELECT COUNT(*) AS snapshotRecordCount, " +
+            "COALESCE(SUM(LENGTH(CAST(payloadCanonicalJson AS BLOB))), 0) " +
+            "AS snapshotRecordPayloadUtf8Bytes, " +
+            "COALESCE(SUM(payloadRawUtf8Bytes), 0) AS snapshotRecordRawUtf8Bytes, " +
+            "COALESCE(MIN(payloadRawUtf8Bytes), 0) AS snapshotRecordMinRawUtf8Bytes, " +
+            "COALESCE(MAX(payloadRawUtf8Bytes), 0) AS snapshotRecordMaxRawUtf8Bytes, " +
+            "COALESCE(MAX(LENGTH(CAST(payloadCanonicalJson AS BLOB))), 0) " +
+            "AS snapshotRecordMaxPayloadUtf8Bytes, " +
+            "COALESCE(MAX(MAX(LENGTH(CAST(snapshotId AS BLOB))), " +
+            "MAX(LENGTH(CAST(recordKind AS BLOB))), " +
+            "MAX(LENGTH(CAST(stableIdentity AS BLOB))), " +
+            "MAX(LENGTH(CAST(agentEventSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(agentEventSeqOrder AS BLOB))), " +
+            "MAX(LENGTH(CAST(payloadSha256 AS BLOB)))), 0) " +
+            "AS snapshotRecordMaxBoundedTextUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_snapshot_records WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch), " +
+            "pending_stats AS (SELECT COUNT(*) AS pendingEventCount, " +
+            "COALESCE(SUM(LENGTH(CAST(eventCanonicalJson AS BLOB))), 0) " +
+            "AS pendingEventPayloadUtf8Bytes, " +
+            "COALESCE(SUM(eventRawUtf8Bytes), 0) AS pendingEventRawUtf8Bytes, " +
+            "COALESCE(MIN(eventRawUtf8Bytes), 0) AS pendingEventMinRawUtf8Bytes, " +
+            "COALESCE(MAX(eventRawUtf8Bytes), 0) AS pendingEventMaxRawUtf8Bytes, " +
+            "COALESCE(MAX(LENGTH(CAST(eventCanonicalJson AS BLOB))), 0) " +
+            "AS pendingEventMaxPayloadUtf8Bytes, " +
+            "COALESCE(MAX(MAX(LENGTH(CAST(agentEventSeq AS BLOB))), " +
+            "MAX(LENGTH(CAST(agentEventSeqOrder AS BLOB))), " +
+            "MAX(LENGTH(CAST(eventId AS BLOB))), " +
+            "MAX(LENGTH(CAST(closedEventDigest AS BLOB))), " +
+            "MAX(LENGTH(CAST(trustedProvenance AS BLOB)))), 0) " +
+            "AS pendingEventMaxBoundedTextUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch) " +
+            "SELECT * FROM entry_stats, snapshot_stats, record_stats, pending_stats",
+    )
+    fun agentTranscriptNamespaceStats(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+    ): RelayV2AgentTranscriptNamespaceStats
+
+    @Query(
+        "SELECT " +
+            "(SELECT COUNT(*) FROM relay_v2_agent_transcript_entries " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId) AS entryCount, " +
+            "(SELECT COUNT(*) FROM relay_v2_agent_transcript_snapshot_staging " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId) AS snapshotCount, " +
+            "(SELECT COUNT(*) FROM relay_v2_agent_transcript_snapshot_records " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId) AS snapshotRecordCount, " +
+            "(SELECT COUNT(*) FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId) AS pendingEventCount",
+    )
+    fun agentTranscriptConsumerStats(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+    ): RelayV2AgentTranscriptConsumerStats
+
+    @Query(
+        "SELECT createdAgentSeq, createdAgentSeqOrder, entryId, " +
+            "payloadUtf8Bytes, LENGTH(CAST(payloadCanonicalJson AS BLOB)) " +
+            "AS actualPayloadUtf8Bytes, " +
+            "COALESCE(LENGTH(CAST(text AS BLOB)), 0) AS actualTextUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND (:afterCreatedAgentSeqOrder IS NULL OR " +
+            "createdAgentSeqOrder > :afterCreatedAgentSeqOrder OR " +
+            "(createdAgentSeqOrder = :afterCreatedAgentSeqOrder " +
+            "AND entryId > :afterEntryId COLLATE BINARY)) " +
+            "ORDER BY createdAgentSeqOrder, entryId COLLATE BINARY LIMIT :limit",
+    )
+    fun agentTranscriptEntryBatchMetadata(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        afterCreatedAgentSeqOrder: String?,
+        afterEntryId: String?,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptEntryBatchMetadata>
+
+    @Query(
         "SELECT * FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
@@ -439,6 +673,27 @@ internal interface RelayV2StateDao {
         afterEntryId: String,
         limit: Int,
     ): List<RelayV2AgentTranscriptEntryEntity>
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND entryId = :entryId LIMIT 1",
+    )
+    fun agentTranscriptEntryById(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        entryId: String,
+    ): RelayV2AgentTranscriptEntryEntity?
 
     @Query(
         "SELECT COUNT(*) AS itemCount, COALESCE(SUM(payloadUtf8Bytes), 0) AS byteCount " +
@@ -585,6 +840,7 @@ internal interface RelayV2StateDao {
 
     @Query(
         "UPDATE relay_v2_agent_transcript_snapshot_staging SET " +
+            "requestNetworkToken = :nextRequestNetworkToken, " +
             "nextPageIndex = :nextPageIndex, nextCursor = :nextCursor, " +
             "receivedRecordCount = :receivedRecordCount, " +
             "receivedCanonicalBytes = :receivedCanonicalBytes, " +
@@ -627,6 +883,7 @@ internal interface RelayV2StateDao {
         snapshotRequestId: String,
         requestLocalGeneration: String,
         requestNetworkToken: String,
+        nextRequestNetworkToken: String,
         snapshotId: String,
         throughAgentSeq: String,
         throughAgentSeqOrder: String,
@@ -660,7 +917,8 @@ internal interface RelayV2StateDao {
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
-            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId",
     )
     fun deleteAgentTranscriptSnapshot(
         profileId: String,
@@ -672,7 +930,35 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
+        snapshotId: String,
     ): Int
+
+    @Query(
+        "SELECT recordIndex, pageIndex, payloadRawUtf8Bytes, " +
+            "LENGTH(CAST(payloadCanonicalJson AS BLOB)) AS actualPayloadUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_snapshot_records " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId AND recordIndex > :afterRecordIndex " +
+            "ORDER BY recordIndex LIMIT :limit",
+    )
+    fun agentTranscriptSnapshotRecordBatchMetadata(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        snapshotId: String,
+        afterRecordIndex: Long,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptSnapshotRecordBatchMetadata>
 
     @Query(
         "SELECT * FROM relay_v2_agent_transcript_snapshot_records " +
@@ -698,6 +984,30 @@ internal interface RelayV2StateDao {
         snapshotId: String,
         afterRecordIndex: Long,
         limit: Int,
+    ): List<RelayV2AgentTranscriptSnapshotRecordEntity>
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_snapshot_records " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND snapshotId = :snapshotId AND stableIdentity = :stableIdentity " +
+            "ORDER BY recordKind LIMIT 2",
+    )
+    fun agentTranscriptSnapshotRecordsByStableIdentity(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        snapshotId: String,
+        stableIdentity: String,
     ): List<RelayV2AgentTranscriptSnapshotRecordEntity>
 
     @Query(
@@ -729,6 +1039,33 @@ internal interface RelayV2StateDao {
     )
 
     @Query(
+        "SELECT agentEventSeq, agentEventSeqOrder, eventId, eventRawUtf8Bytes, " +
+            "LENGTH(CAST(eventCanonicalJson AS BLOB)) AS actualPayloadUtf8Bytes " +
+            "FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND (:afterAgentEventSeqOrder IS NULL OR " +
+            "agentEventSeqOrder > :afterAgentEventSeqOrder) " +
+            "ORDER BY agentEventSeqOrder LIMIT :limit",
+    )
+    fun agentTranscriptPendingEventBatchMetadata(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        afterAgentEventSeqOrder: String?,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptPendingEventBatchMetadata>
+
+    @Query(
         "SELECT * FROM relay_v2_agent_transcript_pending_events " +
             "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
@@ -754,6 +1091,50 @@ internal interface RelayV2StateDao {
         afterEventId: String,
         limit: Int,
     ): List<RelayV2AgentTranscriptPendingEventEntity>
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND agentEventSeq = :agentEventSeq LIMIT 1",
+    )
+    fun agentTranscriptPendingEventBySeq(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        agentEventSeq: String,
+    ): RelayV2AgentTranscriptPendingEventEntity?
+
+    @Query(
+        "SELECT * FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "AND eventId = :eventId LIMIT 1",
+    )
+    fun agentTranscriptPendingEventByEventId(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpoch: String,
+        eventId: String,
+    ): RelayV2AgentTranscriptPendingEventEntity?
 
     @Query(
         "SELECT COUNT(*) AS itemCount, COALESCE(SUM(eventRawUtf8Bytes), 0) AS byteCount " +
@@ -858,6 +1239,25 @@ internal interface RelayV2StateDao {
         sessionId: String,
     ): List<RelayV2AgentTranscriptLifecycleStateEntity>
 
+    @Query(
+        "SELECT COUNT(*) FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND scopeId = :scopeId AND sessionId = :sessionId",
+    )
+    fun agentTranscriptLifecycleStateCount(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+    ): Long
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptLifecycleState(
         state: RelayV2AgentTranscriptLifecycleStateEntity,
@@ -881,6 +1281,27 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
     )
+
+    @Query(
+        "DELETE FROM relay_v2_agent_transcript_lifecycle_states " +
+            "WHERE profileId = :profileId " +
+            "AND profileActivationGeneration = :profileActivationGeneration " +
+            "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
+            "AND hostId = :hostId AND hostEpoch = :hostEpoch " +
+            "AND scopeId = :scopeId AND sessionId = :sessionId " +
+            "AND timelineEpochKey = :timelineEpochKey",
+    )
+    fun deleteAgentTranscriptLifecycleState(
+        profileId: String,
+        profileActivationGeneration: Long,
+        principalId: String,
+        clientInstanceId: String,
+        hostId: String,
+        hostEpoch: String,
+        scopeId: String,
+        sessionId: String,
+        timelineEpochKey: String,
+    ): Int
 
     @Query(
         "DELETE FROM relay_v2_agent_transcript_lifecycle_states WHERE profileId = :profileId",

@@ -6,6 +6,7 @@ import androidx.room.withTransaction
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.*
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.*
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDisconnectReceipt
@@ -107,6 +108,15 @@ class RelayV2StateDatabaseInstrumentedTest {
         listOf(first, second, retained).forEach { assertEquals(1, agentRows(it).size) }
         listOf(first, second, retained).forEach { assertTrue(agentClaim(it) != null) }
         listOf(first, second, retained).forEach { assertAgentTranscriptStorageCount(it, 1) }
+        listOf(first, second, retained).forEach {
+            assertAgentLifecycleNamespaceCounts(
+                AgentTranscriptLifecycleDurableNamespace(agentConsumer(it), AGENT_TIMELINE_EPOCH),
+                current = 1,
+                witness = 2,
+                recent = 0,
+                notification = 1,
+            )
+        }
 
         val committedPending = agentTranscriptPendingEvents(retained).single()
         val insertedBeforeConflict = pendingEvent(
@@ -151,6 +161,16 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertEquals(emptyList<RelayV2AgentTranscriptLifecycleStateEntity>(), agentRows(cleared))
             assertNull(agentClaim(cleared))
             assertAgentTranscriptStorageCount(cleared, 0)
+            assertAgentLifecycleNamespaceCounts(
+                AgentTranscriptLifecycleDurableNamespace(
+                    agentConsumer(cleared),
+                    AGENT_TIMELINE_EPOCH,
+                ),
+                current = 0,
+                witness = 0,
+                recent = 0,
+                notification = 0,
+            )
         }
         assertEquals(1L, outboxMeta(retained)?.nextCreationOrder)
         assertEquals(1, outboxEntries(retained).size)
@@ -161,6 +181,13 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals(1, agentRows(retained).size)
         assertTrue(agentClaim(retained) != null)
         assertAgentTranscriptStorageCount(retained, 1)
+        assertAgentLifecycleNamespaceCounts(
+            AgentTranscriptLifecycleDurableNamespace(agentConsumer(retained), AGENT_TIMELINE_EPOCH),
+            current = 1,
+            witness = 2,
+            recent = 0,
+            notification = 1,
+        )
         assertEquals(listOf(committedPending), agentTranscriptPendingEvents(retained))
     }
 
@@ -175,7 +202,7 @@ class RelayV2StateDatabaseInstrumentedTest {
                 payloadSha256 = "0".repeat(64),
             ),
             committed.copy(
-                lifecycleState = AgentLifecycleState.COMPLETED.name,
+                lifecycleState = AgentLifecycleState.WAITING_FOR_USER.name,
                 claimedLocalGeneration = "2",
                 payloadSha256 = "f".repeat(64),
             ),
@@ -189,6 +216,249 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertTrue(failure != null)
             assertEquals(committed, agentClaim(namespace))
         }
+    }
+
+    @Test
+    fun typedReplayConsumesTwoPagesAndKeepsRowOwnedMaterializationOutOfParent() = runBlocking {
+        val authority = durableNamespace("replay-profile", activation = 1)
+        val consumer = agentConsumer(authority)
+        val initial = operationalAgentState(consumer)
+        val namespace = AgentTranscriptLifecycleDurableNamespace.from(consumer, initial)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        repository.initializeUnderApplyLease(namespace, initial)
+        enterReplay(repository, namespace, throughAgentSeq = "3")
+
+        val firstPage = replayPageArtifact(
+            namespace = namespace,
+            requestNetworkToken = "replay-page-zero",
+            replayThroughAgentSeq = "3",
+            isLast = false,
+            nextCursor = "replay-cursor-one",
+            events = listOf(
+                lifecyclePublicEvent(
+                    sequence = "1",
+                    eventId = "replay-running",
+                    state = AgentTimelineLifecycleState.RUNNING,
+                    runId = "replay-run",
+                ),
+                textAppendPublicEvent(
+                    sequence = "2",
+                    eventId = "replay-text",
+                    entryId = "replay-entry",
+                    runId = "replay-run",
+                ),
+            ),
+        )
+        val staged = repository.consumeReplayPageUnderApplyLease(
+            AgentTranscriptLifecycleDurableReplayPageCommand.NonFinal(
+                operationFence(namespace),
+                firstPage,
+                nextRequestNetworkToken = "replay-page-one",
+            ),
+        ).reduction
+
+        assertEquals(AgentClientDisposition.CONFIG_APPLIED, staged.disposition)
+        assertEquals("2", staged.state.extensionLane.lastAgentSeq)
+        assertAgentLifecycleNamespaceCounts(namespace, current = 1, witness = 1, recent = 1,
+            notification = 0)
+        assertEquals(listOf("replay-entry"), agentEntries(namespace).map { it.entryId })
+        assertParentHasNoRowOwnedMaterialization(authority)
+
+        val finalPage = replayPageArtifact(
+            namespace = namespace,
+            requestNetworkToken = "replay-page-one",
+            replayThroughAgentSeq = "3",
+            isLast = true,
+            nextCursor = null,
+            events = listOf(
+                lifecyclePublicEvent(
+                    sequence = "3",
+                    eventId = "replay-completed",
+                    state = AgentTimelineLifecycleState.COMPLETED,
+                    runId = "replay-run",
+                ),
+            ),
+        )
+        val committed = repository.consumeReplayPageUnderApplyLease(
+            AgentTranscriptLifecycleDurableReplayPageCommand.Final(
+                operationFence(namespace),
+                finalPage,
+            ),
+        ).reduction
+
+        assertEquals(AgentClientDisposition.CONFIG_APPLIED, committed.disposition)
+        assertEquals(AgentTimelineSyncState.Current, committed.state.extensionLane.syncState)
+        assertEquals("3", committed.state.extensionLane.lastAgentSeq)
+        assertAgentLifecycleNamespaceCounts(namespace, current = 1, witness = 2, recent = 1,
+            notification = 1)
+        assertParentHasNoRowOwnedMaterialization(authority)
+    }
+
+    @Test
+    fun typedSnapshotStagesNonFinalPageAndCommitsFinalCutAtomically() = runBlocking {
+        val authority = durableNamespace("snapshot-profile", activation = 1)
+        val consumer = agentConsumer(authority)
+        val initial = operationalAgentState(consumer)
+        val namespace = AgentTranscriptLifecycleDurableNamespace.from(consumer, initial)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        repository.initializeUnderApplyLease(namespace, initial)
+        enterSnapshot(repository, namespace, throughAgentSeq = "3")
+        repository.persistSnapshotRequestUnderApplyLease(
+            AgentTranscriptLifecycleDurableSnapshotRequestCommand(
+                operationFence(namespace),
+                snapshotRequestId = "snapshot-request",
+                pageZeroNetworkToken = "snapshot-page-zero",
+            ),
+        )
+
+        val firstPage = snapshotPageArtifact(
+            namespace = namespace,
+            requestNetworkToken = "snapshot-page-zero",
+            snapshotRequestId = "snapshot-request",
+            snapshotId = "snapshot-pinned",
+            pageIndex = 0,
+            isLast = false,
+            nextCursor = "snapshot-cursor-one",
+            throughAgentSeq = "3",
+            records = listOf(snapshotTextRecord("1", "snapshot-entry", "snapshot-run")),
+        )
+        repository.consumeSnapshotPageUnderApplyLease(
+            AgentTranscriptLifecycleDurableSnapshotPageCommand.NonFinalStage(
+                operationFence(namespace),
+                firstPage,
+                nextRequestNetworkToken = "snapshot-page-one",
+            ),
+        )
+
+        val stagedHeader = agentSnapshots(namespace).single()
+        assertEquals(1L, stagedHeader.nextPageIndex)
+        assertEquals("snapshot-cursor-one", stagedHeader.nextCursor)
+        assertEquals(1L, stagedHeader.receivedRecordCount)
+        assertEquals(listOf(0L), agentSnapshotRecords(namespace, "snapshot-pinned")
+            .map { it.pageIndex })
+        assertEquals(emptyList<RelayV2AgentTranscriptEntryEntity>(), agentEntries(namespace))
+        assertAgentLifecycleNamespaceCounts(namespace, current = 0, witness = 0, recent = 0,
+            notification = 0)
+        assertParentHasNoRowOwnedMaterialization(authority)
+
+        val finalPage = snapshotPageArtifact(
+            namespace = namespace,
+            requestNetworkToken = "snapshot-page-one",
+            snapshotRequestId = "snapshot-request",
+            snapshotId = "snapshot-pinned",
+            pageIndex = 1,
+            isLast = true,
+            nextCursor = null,
+            throughAgentSeq = "3",
+            records = listOf(
+                lifecycleSnapshotRecord(
+                    sequence = "3",
+                    eventId = "snapshot-completed",
+                    state = AgentTimelineLifecycleState.COMPLETED,
+                    runId = "snapshot-run",
+                ),
+            ),
+        )
+        val committed = repository.consumeSnapshotPageUnderApplyLease(
+            AgentTranscriptLifecycleDurableSnapshotPageCommand.FinalPageCut(
+                operationFence(namespace),
+                finalPage,
+            ),
+        ).reduction
+
+        assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, committed.disposition)
+        assertEquals(AgentTimelineSyncState.Current, committed.state.extensionLane.syncState)
+        assertEquals("3", committed.state.extensionLane.lastAgentSeq)
+        assertEquals(emptyList<RelayV2AgentTranscriptSnapshotStagingEntity>(),
+            agentSnapshots(namespace))
+        assertEquals(emptyList<RelayV2AgentTranscriptSnapshotRecordEntity>(),
+            agentSnapshotRecords(namespace, "snapshot-pinned"))
+        assertEquals(listOf("snapshot-entry"), agentEntries(namespace).map { it.entryId })
+        assertAgentLifecycleNamespaceCounts(namespace, current = 1, witness = 1, recent = 0,
+            notification = 1)
+        assertParentHasNoRowOwnedMaterialization(authority)
+    }
+
+    @Test
+    fun typedSnapshotFinalPageFailureRollsBackEveryRoomOwnedRow() = runBlocking {
+        val authority = durableNamespace("snapshot-rollback-profile", activation = 1)
+        val fixture = prepareAgentClaimFixture(authority)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        enterSnapshot(repository, fixture.namespace, throughAgentSeq = "4")
+        repository.persistSnapshotRequestUnderApplyLease(
+            AgentTranscriptLifecycleDurableSnapshotRequestCommand(
+                operationFence(fixture.namespace),
+                snapshotRequestId = "rollback-snapshot-request",
+                pageZeroNetworkToken = "rollback-snapshot-page-zero",
+            ),
+        )
+        val firstPage = snapshotPageArtifact(
+            namespace = fixture.namespace,
+            requestNetworkToken = "rollback-snapshot-page-zero",
+            snapshotRequestId = "rollback-snapshot-request",
+            snapshotId = "rollback-snapshot-pinned",
+            pageIndex = 0,
+            isLast = false,
+            nextCursor = "rollback-snapshot-cursor-one",
+            throughAgentSeq = "4",
+            records = emptyList(),
+        )
+        repository.consumeSnapshotPageUnderApplyLease(
+            AgentTranscriptLifecycleDurableSnapshotPageCommand.NonFinalStage(
+                operationFence(fixture.namespace),
+                firstPage,
+                nextRequestNetworkToken = "rollback-snapshot-page-one",
+            ),
+        )
+
+        val parentBeforeFinal = agentRows(authority).single()
+        val headerBeforeFinal = agentSnapshots(fixture.namespace).single()
+        val currentBeforeFinal = agentCurrentRows(fixture.namespace)
+        val witnessesBeforeFinal = agentWitnessRows(fixture.namespace)
+        val evidenceBeforeFinal = agentRecentEvidenceRows(fixture.namespace)
+        val notificationsBeforeFinal = agentNotificationRows(fixture.namespace)
+        val entriesBeforeFinal = agentEntries(fixture.namespace)
+        val finalPage = snapshotPageArtifact(
+            namespace = fixture.namespace,
+            requestNetworkToken = "rollback-snapshot-page-one",
+            snapshotRequestId = "rollback-snapshot-request",
+            snapshotId = "rollback-snapshot-pinned",
+            pageIndex = 1,
+            isLast = true,
+            nextCursor = null,
+            throughAgentSeq = "4",
+            records = listOf(
+                lifecycleSnapshotRecord(
+                    sequence = "2",
+                    eventId = claimCompletedEventId(authority),
+                    state = AgentTimelineLifecycleState.WAITING_FOR_USER,
+                    runId = claimRunId(authority),
+                ),
+            ),
+        )
+
+        val failure = runCatching {
+            repository.consumeSnapshotPageUnderApplyLease(
+                AgentTranscriptLifecycleDurableSnapshotPageCommand.FinalPageCut(
+                    operationFence(fixture.namespace),
+                    finalPage,
+                ),
+            )
+        }.exceptionOrNull()
+
+        assertTrue(failure is RelayV2StorageException)
+        assertEquals(RelayV2StorageFailure.MALFORMED,
+            (failure as RelayV2StorageException).failure)
+        assertEquals(parentBeforeFinal, agentRows(authority).single())
+        assertEquals(headerBeforeFinal, agentSnapshots(fixture.namespace).single())
+        assertEquals(emptyList<RelayV2AgentTranscriptSnapshotRecordEntity>(),
+            agentSnapshotRecords(fixture.namespace, "rollback-snapshot-pinned"))
+        assertEquals(currentBeforeFinal, agentCurrentRows(fixture.namespace))
+        assertEquals(witnessesBeforeFinal, agentWitnessRows(fixture.namespace))
+        assertEquals(evidenceBeforeFinal, agentRecentEvidenceRows(fixture.namespace))
+        assertEquals(notificationsBeforeFinal, agentNotificationRows(fixture.namespace))
+        assertEquals(entriesBeforeFinal, agentEntries(fixture.namespace))
+        assertParentHasNoRowOwnedMaterialization(authority)
     }
 
     @Test
@@ -230,14 +500,13 @@ class RelayV2StateDatabaseInstrumentedTest {
     @Test
     fun unknownNotificationClaimLifecycleStateFailsClosedWithoutOverwrite() = runBlocking {
         val namespace = durableNamespace("profile", activation = 1)
-        putAgentConsumer(namespace)
+        val fixture = putAgentConsumer(namespace)
         val committed = requireNotNull(agentClaim(namespace))
         val unknownState = "UNKNOWN_PERSISTED_LIFECYCLE_STATE"
         dao.deleteProfileAgentTranscriptLifecycleNotificationClaims(namespace.profileId)
         dao.insertAgentTranscriptLifecycleNotificationClaim(
             committed.copy(lifecycleState = unknownState),
         )
-        val fixture = agentClaimFixture(namespace)
         val repository = AgentTranscriptLifecycleDurableRepository(database)
 
         val failure = runCatching {
@@ -644,19 +913,18 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertEquals(notification.toLong(), lifecycleDao.notificationGlobalStats().itemCount)
     }
 
-    private suspend fun putAgentConsumer(namespace: RelayV2OutboxAuthorityNamespace) {
-        val fixture = agentClaimFixture(namespace)
+    private suspend fun putAgentConsumer(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): AgentClaimFixture {
+        val fixture = prepareAgentClaimFixture(namespace)
         val repository = AgentTranscriptLifecycleDurableRepository(database)
-        repository.initializeUnderApplyLease(
-            fixture.namespace,
-            fixture.state,
-        )
         assertTrue(
             repository.claimNotificationUnderApplyLease(
                 fixture.namespace,
                 fixture.intent,
             ) is AgentTranscriptLifecycleNotificationClaimResult.Claimed,
         )
+        return fixture
     }
 
     private fun putAgentTranscriptStorage(namespace: RelayV2OutboxAuthorityNamespace) {
@@ -1059,9 +1327,7 @@ class RelayV2StateDatabaseInstrumentedTest {
     private fun agentClaims(
         namespace: RelayV2OutboxAuthorityNamespace,
     ): List<RelayV2AgentTranscriptLifecycleNotificationClaimEntity> {
-        val fixture = agentClaimFixture(namespace)
-        val key = fixture.intent.dedupeKey
-        val consumer = fixture.namespace.consumer
+        val consumer = agentConsumer(namespace)
         return dao.agentTranscriptLifecycleNotificationClaims(
             consumer.profileId,
             consumer.profileActivationGeneration,
@@ -1071,87 +1337,431 @@ class RelayV2StateDatabaseInstrumentedTest {
             consumer.hostEpoch,
             consumer.scopeId,
             consumer.sessionId,
-            key.timelineEpoch,
-            key.lifecycleEventId,
+            AGENT_TIMELINE_EPOCH,
+            claimCompletedEventId(namespace),
         )
     }
 
-    private fun agentClaimFixture(namespace: RelayV2OutboxAuthorityNamespace): AgentClaimFixture {
+    private suspend fun prepareAgentClaimFixture(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): AgentClaimFixture {
         val consumer = agentConsumer(namespace)
-        val lifecycleIdentity = AgentLifecycleIdentity(
-            AgentLifecycleScope.TURN,
-            "run-${namespace.profileActivationGeneration}",
-            "turn-${namespace.profileActivationGeneration}",
+        val initial = operationalAgentState(consumer)
+        val durableNamespace = AgentTranscriptLifecycleDurableNamespace.from(consumer, initial)
+        val repository = AgentTranscriptLifecycleDurableRepository(database)
+        repository.initializeUnderApplyLease(durableNamespace, initial)
+        consumeLive(
+            repository,
+            durableNamespace,
+            lifecyclePublicEvent(
+                sequence = "1",
+                eventId = "event-${namespace.profileActivationGeneration}-running",
+                state = AgentTimelineLifecycleState.RUNNING,
+                runId = claimRunId(namespace),
+            ),
         )
-        val record = AgentLifecycleRecord(
-            "event-${namespace.profileActivationGeneration}",
-            "source",
-            lifecycleIdentity,
-            AgentLifecycleState.WAITING_FOR_USER,
-            "1",
+        val completed = consumeLive(
+            repository,
+            durableNamespace,
+            lifecyclePublicEvent(
+                sequence = "2",
+                eventId = claimCompletedEventId(namespace),
+                state = AgentTimelineLifecycleState.COMPLETED,
+                runId = claimRunId(namespace),
+            ),
         )
-        val closedDigest = digest("claim-${namespace.profileId}-${namespace.profileActivationGeneration}")
-        val witness = AgentLifecycleEventIdentityWitness(
-            record.lifecycleEventId,
-            record.agentEventSeq,
-            lifecycleIdentity,
-            record.sourceEpoch,
-            record.state,
-            closedDigest,
+        val intent = requireNotNull(
+            completed.notificationDecisions.single().systemNotificationIntent,
         )
-        val dedupeKey = AgentNotificationDedupeKey(
-            consumer.profileId,
-            consumer.hostId,
-            consumer.hostEpoch,
-            consumer.scopeId,
-            consumer.sessionId,
-            "timeline",
-            record.lifecycleEventId,
-            record.state,
+        assertAgentLifecycleNamespaceCounts(
+            durableNamespace,
+            current = 1,
+            witness = 2,
+            recent = 0,
+            notification = 1,
         )
-        val state = AgentTranscriptLifecycleClientState(
-            identity = consumer.sessionIdentity,
-            extensionLane = AgentTranscriptLifecycleExtensionState(
-                localGeneration = "1",
-                support = AgentExtensionSupport.AVAILABLE,
-                unavailableReason = null,
-                liveSource = AgentLiveSourceState.CONNECTED,
-                activeSourceEpoch = record.sourceEpoch,
-                timelineEpoch = dedupeKey.timelineEpoch,
-                lastAgentSeq = "1",
-                notificationBaselineAgentSeq = "0",
-                lifecycleByIdentity = mapOf(lifecycleIdentity to record),
-                currentLifecycleIdentityByEventId = mapOf(
-                    record.lifecycleEventId to lifecycleIdentity,
-                ),
-                runsWithTurnRecords = setOf(lifecycleIdentity.runId),
-                appliedEventsBySeq = mapOf(
-                    "1" to AgentAppliedEventEvidence(record.lifecycleEventId, closedDigest),
-                ),
-                eventWitnessById = mapOf(record.lifecycleEventId to witness),
-                eventIdBySeq = mapOf("1" to record.lifecycleEventId),
-                notificationLedger = mapOf(
-                    dedupeKey to AgentNotificationLedgerEntry(
-                        AgentNotificationDisposition.SHOWN,
-                        witness,
-                        "1",
+        assertParentHasNoRowOwnedMaterialization(namespace)
+        return AgentClaimFixture(durableNamespace, intent)
+    }
+
+    private fun operationalAgentState(
+        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    ) = AgentTranscriptLifecycleClientState(
+        identity = consumer.sessionIdentity,
+        extensionLane = AgentTranscriptLifecycleExtensionState(
+            support = AgentExtensionSupport.AVAILABLE,
+            unavailableReason = null,
+            liveSource = AgentLiveSourceState.CONNECTED,
+            activeSourceEpoch = "source-a",
+            timelineEpoch = AGENT_TIMELINE_EPOCH,
+            effectiveHostLimits = productionHostLimits(),
+            syncState = AgentTimelineSyncState.Current,
+            notificationBaselineAgentSeq = "0",
+        ),
+        notificationConfig = AgentNotificationConfig(
+            permission = AgentNotificationPermission.GRANTED,
+            profileActive = true,
+            policy = AgentNotificationPolicy.ALLOW,
+        ),
+    )
+
+    private fun productionHostLimits() = AgentTimelineEffectiveLimits(
+        maxTextUtf8Bytes = 65_536,
+        maxPageRecords = 256,
+        eventReplayRetentionMs = 604_800_000,
+        snapshotLeaseMs = 300_000,
+    )
+
+    private fun operationFence(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) = AgentTranscriptLifecycleDurableOperationFence(namespace.consumer, namespace)
+
+    private suspend fun consumeLive(
+        repository: AgentTranscriptLifecycleDurableRepository,
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        event: AgentTimelineEventRecord,
+    ): AgentTranscriptLifecycleClientReduction {
+        val consumer = namespace.consumer
+        val artifact = AgentTranscriptLifecycleV1Codec().let { codec ->
+            codec.decodePublicFrameArtifact(
+                codec.encodePublicFrame(
+                    AgentTimelineEventFrame(
+                        consumer.hostId,
+                        consumer.hostEpoch,
+                        consumer.scopeId,
+                        consumer.sessionId,
+                        requireNotNull(namespace.timelineEpoch),
+                        event,
                     ),
                 ),
-                notificationKeyByLifecycleEventId = mapOf(
-                    record.lifecycleEventId to dedupeKey,
+            )
+        }
+        return repository.consumeLiveEventUnderApplyLease(
+            AgentTranscriptLifecycleDurableLiveEventCommand(
+                operationFence(namespace),
+                artifact,
+            ),
+        ).reduction
+    }
+
+    private suspend fun enterReplay(
+        repository: AgentTranscriptLifecycleDurableRepository,
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        throughAgentSeq: String,
+    ) {
+        val requested = repository.applyControlUnderApplyLease(
+            AgentTranscriptLifecycleDurableControlCommand(
+                operationFence(namespace),
+                AgentTranscriptLifecycleClientInput.StatusRequestStarted(
+                    "replay-status-${namespace.consumer.sessionId}",
                 ),
             ),
-            notificationConfig = AgentNotificationConfig(
-                permission = AgentNotificationPermission.GRANTED,
-                profileActive = true,
-                policy = AgentNotificationPolicy.ALLOW,
+        ).reduction
+        val status = repository.applyControlUnderApplyLease(
+            AgentTranscriptLifecycleDurableControlCommand(
+                operationFence(namespace),
+                AgentTranscriptLifecycleClientInput.StatusAvailable(
+                    authority = namespace.consumer,
+                    lineage = AgentTimelineLineage(
+                        namespace.consumer.sessionIdentity,
+                        requireNotNull(namespace.timelineEpoch),
+                    ),
+                    requestFence = requireNotNull(
+                        requested.state.extensionLane.pendingStatusRequest,
+                    ),
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    activeSourceEpoch = "source-a",
+                    currentAgentSeq = throughAgentSeq,
+                    earliestReplaySeq = "1",
+                    hostLimits = productionHostLimits(),
+                ),
+            ),
+        ).reduction
+        assertTrue(status.state.extensionLane.syncState is AgentTimelineSyncState.Replay)
+        repository.applyControlUnderApplyLease(
+            AgentTranscriptLifecycleDurableControlCommand(
+                operationFence(namespace),
+                AgentTranscriptLifecycleClientInput.ReplayRequestStarted(
+                    requestNetworkToken = "replay-page-zero",
+                    cursor = null,
+                    limit = 256,
+                ),
             ),
         )
-        return AgentClaimFixture(
-            AgentTranscriptLifecycleDurableNamespace.from(consumer, state),
-            state,
-            AgentSystemNotificationIntent(dedupeKey, "1"),
+    }
+
+    private suspend fun enterSnapshot(
+        repository: AgentTranscriptLifecycleDurableRepository,
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        throughAgentSeq: String,
+    ) {
+        val requested = repository.applyControlUnderApplyLease(
+            AgentTranscriptLifecycleDurableControlCommand(
+                operationFence(namespace),
+                AgentTranscriptLifecycleClientInput.StatusRequestStarted(
+                    "snapshot-status-${namespace.consumer.profileId}-$throughAgentSeq",
+                ),
+            ),
+        ).reduction
+        val status = repository.applyControlUnderApplyLease(
+            AgentTranscriptLifecycleDurableControlCommand(
+                operationFence(namespace),
+                AgentTranscriptLifecycleClientInput.StatusAvailable(
+                    authority = namespace.consumer,
+                    lineage = AgentTimelineLineage(
+                        namespace.consumer.sessionIdentity,
+                        requireNotNull(namespace.timelineEpoch),
+                    ),
+                    requestFence = requireNotNull(
+                        requested.state.extensionLane.pendingStatusRequest,
+                    ),
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    activeSourceEpoch = "source-a",
+                    currentAgentSeq = throughAgentSeq,
+                    earliestReplaySeq = throughAgentSeq,
+                    hostLimits = productionHostLimits(),
+                ),
+            ),
+        ).reduction
+        assertEquals(AgentTimelineSyncState.Snapshot, status.state.extensionLane.syncState)
+    }
+
+    private fun replayPageArtifact(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        requestNetworkToken: String,
+        replayThroughAgentSeq: String,
+        isLast: Boolean,
+        nextCursor: String?,
+        events: List<AgentTimelineEventRecord>,
+    ): AgentTimelineReplayPagePublicFrameArtifact {
+        val consumer = namespace.consumer
+        val codec = AgentTranscriptLifecycleV1Codec()
+        return codec.decodePublicFrameArtifact(
+            codec.encodePublicFrame(
+                AgentTimelineReplayPageFrame(
+                    requestId = requestNetworkToken,
+                    hostId = consumer.hostId,
+                    hostEpoch = consumer.hostEpoch,
+                    scopeId = consumer.scopeId,
+                    sessionId = consumer.sessionId,
+                    page = AgentTimelineReplayPage(
+                        timelineEpoch = requireNotNull(namespace.timelineEpoch),
+                        afterAgentSeq = "0",
+                        replayThroughAgentSeq = replayThroughAgentSeq,
+                        isLast = isLast,
+                        nextCursor = nextCursor,
+                        events = events,
+                    ),
+                ),
+            ),
+        ) as AgentTimelineReplayPagePublicFrameArtifact
+    }
+
+    private fun snapshotPageArtifact(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        requestNetworkToken: String,
+        snapshotRequestId: String,
+        snapshotId: String,
+        pageIndex: Long,
+        isLast: Boolean,
+        nextCursor: String?,
+        throughAgentSeq: String,
+        records: List<AgentTimelineSnapshotRecord>,
+    ): AgentTimelineSnapshotPagePublicFrameArtifact {
+        val consumer = namespace.consumer
+        val codec = AgentTranscriptLifecycleV1Codec()
+        return codec.decodePublicFrameArtifact(
+            codec.encodePublicFrame(
+                AgentTimelineSnapshotPageFrame(
+                    requestId = requestNetworkToken,
+                    hostId = consumer.hostId,
+                    hostEpoch = consumer.hostEpoch,
+                    scopeId = consumer.scopeId,
+                    sessionId = consumer.sessionId,
+                    page = AgentTimelineSnapshotPage(
+                        timelineEpoch = requireNotNull(namespace.timelineEpoch),
+                        snapshotRequestId = snapshotRequestId,
+                        snapshotId = snapshotId,
+                        pageIndex = pageIndex,
+                        isLast = isLast,
+                        nextCursor = nextCursor,
+                        throughAgentSeq = throughAgentSeq,
+                        earliestRetainedSeq = "1",
+                        records = records,
+                    ),
+                ),
+            ),
+        ) as AgentTimelineSnapshotPagePublicFrameArtifact
+    }
+
+    private fun lifecyclePublicEvent(
+        sequence: String,
+        eventId: String,
+        state: AgentTimelineLifecycleState,
+        runId: String,
+    ) = AgentTimelineEventRecord(
+        agentEventSeq = sequence,
+        eventId = eventId,
+        occurredAtMs = sequence.toLong() * 1_000,
+        mutation = AgentTimelineLifecycleChangedMutation(
+            lifecycleSnapshotRecord(sequence, eventId, state, runId),
+        ),
+    )
+
+    private fun lifecycleSnapshotRecord(
+        sequence: String,
+        eventId: String,
+        state: AgentTimelineLifecycleState,
+        runId: String,
+    ) = AgentTimelineLifecycleRecord(
+        lifecycleEventId = eventId,
+        sourceEpoch = "source-a",
+        scope = AgentTimelineLifecycleScope.RUN,
+        runId = runId,
+        turnId = null,
+        state = state,
+        failure = null,
+        occurredAtMs = sequence.toLong() * 1_000,
+        agentEventSeq = sequence,
+    )
+
+    private fun textAppendPublicEvent(
+        sequence: String,
+        eventId: String,
+        entryId: String,
+        runId: String,
+    ) = AgentTimelineEventRecord(
+        agentEventSeq = sequence,
+        eventId = eventId,
+        occurredAtMs = sequence.toLong() * 1_000,
+        mutation = AgentTimelineTextEntryAppendedMutation(
+            snapshotTextRecord(sequence, entryId, runId),
+        ),
+    )
+
+    private fun snapshotTextRecord(
+        sequence: String,
+        entryId: String,
+        runId: String,
+    ) = AgentTimelineVisibleTextEntryRecord(
+        metadata = AgentTimelineTextEntryMetadata(
+            entryId = entryId,
+            runId = runId,
+            turnId = "turn-$runId",
+            role = com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
+                .AgentTimelineEntryRole.AGENT,
+            commandId = null,
+            createdAtMs = sequence.toLong() * 1_000,
+            createdAgentSeq = sequence,
+            lastModifiedAgentSeq = sequence,
+        ),
+        text = "text-$entryId",
+    )
+
+    private fun claimRunId(namespace: RelayV2OutboxAuthorityNamespace) =
+        "run-${namespace.profileActivationGeneration}"
+
+    private fun claimCompletedEventId(namespace: RelayV2OutboxAuthorityNamespace) =
+        "event-${namespace.profileActivationGeneration}-completed"
+
+    private fun agentEntries(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentTranscriptEntryEntity> = namespace.consumer.let { consumer ->
+        dao.agentTranscriptEntryPageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), "", "", 256,
         )
+    }
+
+    private fun agentSnapshots(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentTranscriptSnapshotStagingEntity> = namespace.consumer.let { consumer ->
+        dao.agentTranscriptSnapshots(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch),
+        )
+    }
+
+    private fun agentSnapshotRecords(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        snapshotId: String,
+    ): List<RelayV2AgentTranscriptSnapshotRecordEntity> = namespace.consumer.let { consumer ->
+        dao.agentTranscriptSnapshotRecordPageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), snapshotId, -1, 256,
+        )
+    }
+
+    private fun agentCurrentRows(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentLifecycleCurrentEntity> = namespace.consumer.let { consumer ->
+        lifecycleDao.currentPageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), "", "", 256,
+        )
+    }
+
+    private fun agentWitnessRows(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentLifecycleEventWitnessEntity> = namespace.consumer.let { consumer ->
+        lifecycleDao.witnessPageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), "", "", 256,
+        )
+    }
+
+    private fun agentRecentEvidenceRows(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentRecentEventEvidenceEntity> = namespace.consumer.let { consumer ->
+        lifecycleDao.recentEvidencePageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), "", "", 256,
+        )
+    }
+
+    private fun agentNotificationRows(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): List<RelayV2AgentNotificationLedgerEntity> = namespace.consumer.let { consumer ->
+        lifecycleDao.notificationPageAfter(
+            consumer.profileId, consumer.profileActivationGeneration, consumer.principalId,
+            consumer.clientInstanceId, consumer.hostId, consumer.hostEpoch, consumer.scopeId,
+            consumer.sessionId, requireNotNull(namespace.timelineEpoch), "", "", "", 256,
+        )
+    }
+
+    private fun assertAgentLifecycleNamespaceCounts(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        current: Int,
+        witness: Int,
+        recent: Int,
+        notification: Int,
+    ) {
+        assertEquals(current, agentCurrentRows(namespace).size)
+        assertEquals(witness, agentWitnessRows(namespace).size)
+        assertEquals(recent, agentRecentEvidenceRows(namespace).size)
+        assertEquals(notification, agentNotificationRows(namespace).size)
+    }
+
+    private fun assertParentHasNoRowOwnedMaterialization(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ) {
+        val parent = agentRows(namespace).single()
+        assertEquals(AgentTranscriptLifecycleDurableStateCodec.CODEC_VERSION, parent.codecVersion)
+        listOf(
+            "lifecycleRecords",
+            "runsWithTurnRecords",
+            "appliedEventEvidence",
+            "eventIdentityWitnesses",
+            "notificationLedger",
+        ).forEach { rowOwnedMember ->
+            assertTrue("\"$rowOwnedMember\":" !in parent.payloadCanonicalJson)
+        }
     }
 
     private fun agentConsumer(
@@ -1175,7 +1785,6 @@ class RelayV2StateDatabaseInstrumentedTest {
 
     private data class AgentClaimFixture(
         val namespace: AgentTranscriptLifecycleDurableNamespace,
-        val state: AgentTranscriptLifecycleClientState,
         val intent: AgentSystemNotificationIntent,
     )
 
