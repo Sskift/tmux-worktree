@@ -81,6 +81,8 @@ function authContext(role, now) {
     jti: role === "host" ? "host-access-jti" : `client-${randomUUID()}`,
     kid: "key-2026-07",
     expiresAtMs: now + 3_600_000,
+    authorizationRevision: "1",
+    authorizationFence: "authorization-fence-1",
   };
 }
 

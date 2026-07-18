@@ -19,6 +19,8 @@ function authContext(role, overrides = {}) {
     jti: role === "host" ? "host-jti" : "client-jti",
     kid: "key-2026-07",
     expiresAtMs: NOW_MS + 3_600_000,
+    authorizationRevision: "1",
+    authorizationFence: "authorization-fence-1",
     ...overrides,
   };
 }
@@ -55,12 +57,13 @@ function hostHello({
   };
 }
 
-async function registerHost(core, transportId, hello = hostHello()) {
+async function registerHost(core, transportId, hello = hostHello(), authOverrides = {}) {
   const hostId = hello.payload.hostId;
   const directoryBefore = core.inspectHost(hostId);
   core.attachHostCarrier(transportId, authContext("host", {
     hostId,
     jti: `${transportId}-jti`,
+    ...authOverrides,
   }));
   const result = await core.receiveHostFrame(transportId, carrierBytes(hello));
   assert.equal(result.accepted, true);
@@ -91,10 +94,12 @@ async function openRoute(
   connectionId = randomUUID(),
   openedMaxFrameBytes = 1_048_576,
   hostId = HOST_ID,
+  authOverrides = {},
 ) {
   const opened = core.openClientRoute(connectionId, authContext("client", {
     hostId,
     jti: `${connectionId}-jti`,
+    ...authOverrides,
   }));
   assert.equal(opened.accepted, true);
   const deliveries = core.drainHostCarrier(transportId, { maxFrames: 1 });
@@ -231,6 +236,23 @@ function hostTerminalAck(streamId = "stream-1") {
     type: "terminal.input_ack",
     streamId,
     payload: { generation: "generation-1", ackedThroughInputSeq: "0" },
+  };
+}
+
+function hostRouteData(identity, seq = "1", frame = hostTerminalAck()) {
+  return {
+    carrierVersion: 1,
+    type: "route.data",
+    connectorId: identity.connectorId,
+    routeId: identity.routeId,
+    routeFence: identity.routeFence,
+    direction: "host_to_client",
+    seq,
+    payload: {
+      opcode: "text",
+      encoding: "base64",
+      data: Buffer.from(publicBytes(frame)).toString("base64"),
+    },
   };
 }
 
@@ -681,183 +703,713 @@ test("unconfigured enrollment authority returns correlated capability failure wi
   assert.equal(core.openClientRoute(randomUUID(), authContext("client")).accepted, true);
 });
 
-test("live-auth commit fence blocks re-entrant admission and fails closed without a synchronous receipt", async () => {
-  const core = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(core, "host-live-auth");
-  const route = await openRoute(core, "host-live-auth", "client-live-auth");
-  let reentrant;
-  const revoked = core.linearizeLiveAuthFence({
-    reason: "grant_revoked",
-    role: "client",
-    hostId: HOST_ID,
-    grantId: "client-grant",
-  }, () => {
-    reentrant = core.forwardClientFrame(
-      route.connectionId,
-      publicBytes(clientTerminalAck("must-not-cross-revoke")),
-    );
-    return true;
+test("committed exact live-auth fence persists across late attach and preserves unrelated old revisions", async () => {
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
   });
-  assert.equal(reentrant.accepted, false);
-  assert.equal(reentrant.error.code, "AUTH_INVALID");
-  assert.equal(revoked.accepted, true);
-  assert.equal(revoked.actions.some((action) => (
-    action.kind === "close_client"
-      && action.connectionId === route.connectionId
-      && action.closeCode === 4403
-  )), true);
-  const revokedCarrier = core.drainHostCarrier("host-live-auth");
-  assert.deepEqual(revokedCarrier.map((delivery) => delivery.frame.type), ["route.unbind"]);
-  assert.equal(
-    core.forwardClientFrame(
-      route.connectionId,
-      publicBytes(clientTerminalAck("after-revoke")),
-    ).accepted,
-    false,
-  );
+  await registerHost(core, "host-live-auth");
 
-  const opening = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(opening, "host-live-auth-opening");
-  assert.equal(opening.openClientRoute(
-    "client-live-auth-opening",
-    authContext("client", { jti: "client-live-auth-opening-jti" }),
+  const staleVerified = authContext("client", {
+    grantId: "revoked-grant",
+    jti: "revoked-jti",
+  });
+  const matched = await openRoute(
+    core,
+    "host-live-auth",
+    "client-live-auth-matched",
+    1_048_576,
+    HOST_ID,
+    staleVerified,
+  );
+  const unrelated = await openRoute(
+    core,
+    "host-live-auth",
+    "client-live-auth-unrelated",
+    1_048_576,
+    HOST_ID,
+    { grantId: "unrelated-grant", jti: "unrelated-jti" },
+  );
+  assert.equal(core.forwardClientFrame(
+    matched.connectionId,
+    publicBytes(clientTerminalAck("matched-queued")),
   ).accepted, true);
-  const [openingDelivery] = opening.drainHostCarrier(
-    "host-live-auth-opening",
-    { maxFrames: 1 },
-  );
-  opening.acknowledgeHostDelivery(
-    "host-live-auth-opening",
-    openingDelivery.deliveryId,
-  );
-  const openingFence = opening.linearizeLiveAuthFence({
+  assert.equal(core.forwardClientFrame(
+    unrelated.connectionId,
+    publicBytes(clientTerminalAck("unrelated-queued")),
+  ).accepted, true);
+  assert.equal((await core.receiveHostFrame(
+    "host-live-auth",
+    carrierBytes(hostRouteData(matched.routeOpen, "1", hostTerminalAck("matched-host-queued"))),
+  )).accepted, true);
+  assert.equal((await core.receiveHostFrame(
+    "host-live-auth",
+    carrierBytes(hostRouteData(unrelated.routeOpen, "1", hostTerminalAck("unrelated-host-queued"))),
+  )).accepted, true);
+
+  const barrier = core.liveAuthorizationFencePort.begin({
     reason: "grant_revoked",
     role: "client",
     hostId: HOST_ID,
-    grantId: "client-grant",
-  }, () => true);
-  assert.deepEqual(openingFence.actions.map((action) => action.kind), ["route_unavailable"]);
-  const lateOpeningAck = await opening.receiveHostFrame(
-    "host-live-auth-opening",
+    grantId: "revoked-grant",
+  });
+  assert.equal(core.forwardClientFrame(
+    matched.connectionId,
+    publicBytes(clientTerminalAck("pending-must-not-dispatch")),
+  ).accepted, false);
+  assert.equal(core.openClientRoute("pending-late-attach", staleVerified).accepted, false);
+  assert.equal(core.forwardClientFrame(
+    unrelated.connectionId,
+    publicBytes(clientTerminalAck("unrelated-during-pending")),
+  ).accepted, true);
+
+  barrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  assert.equal(closeSignals.length, 1);
+  assert.equal(closeSignals[0].connectionId, matched.connectionId);
+  assert.equal(closeSignals[0].reason, "grant_revoked");
+  assert.equal(closeSignals[0].authorization.authorizationRevision, "2");
+  assert.equal(closeSignals[0].authorization.authorizationFence, "authorization-fence-2");
+  assert.equal(Object.hasOwn(closeSignals[0].authorization, "accessToken"), false);
+  assert.equal(Object.hasOwn(closeSignals[0].authorization, "secret"), false);
+
+  const hostDeliveries = core.drainHostCarrier("host-live-auth");
+  assert.equal(hostDeliveries.some((delivery) => (
+    delivery.frame.type === "route.data"
+      && delivery.frame.routeId === matched.routeOpen.routeId
+  )), false);
+  assert.equal(hostDeliveries.some((delivery) => (
+    delivery.frame.type === "route.unbind"
+      && delivery.frame.routeId === matched.routeOpen.routeId
+  )), true);
+  assert.equal(hostDeliveries.some((delivery) => (
+    delivery.frame.type === "route.data"
+      && delivery.frame.routeId === unrelated.routeOpen.routeId
+  )), true);
+  assert.equal(core.drainClient(matched.connectionId).length, 0);
+  assert.equal(core.drainClient(unrelated.connectionId).length, 1);
+
+  assert.equal(core.openClientRoute("committed-late-attach", staleVerified).accepted, false);
+  assert.equal(core.openClientRoute(
+    "unrelated-old-revision",
+    authContext("client", {
+      grantId: "another-unrelated-grant",
+      jti: "another-unrelated-jti",
+      authorizationRevision: "1",
+      authorizationFence: "authorization-fence-1",
+    }),
+  ).accepted, true);
+  assert.equal(core.forwardClientFrame(
+    matched.connectionId,
+    publicBytes(clientTerminalAck("after-commit")),
+  ).accepted, false);
+  barrier.committed({
+    authorizationRevision: "3",
+    authorizationFence: "authorization-fence-3",
+  });
+  barrier.cancelled();
+  barrier.failClosed();
+  assert.equal(closeSignals.length, 1, "close signal is once-only");
+});
+
+test("unscoped kid removal gives direct host and client the exact committed reason and receipt", async () => {
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
+  });
+  await registerHost(core, "host-shared-kid");
+  await openRoute(core, "host-shared-kid", "client-shared-kid");
+  const barrier = core.liveAuthorizationFencePort.begin({
+    reason: "kid_removed",
+    kid: "key-2026-07",
+  });
+  barrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  assert.equal(closeSignals.length, 2);
+  assert.deepEqual(
+    closeSignals.map((signal) => signal.connectionKind).sort(),
+    ["client", "host"],
+  );
+  for (const signal of closeSignals) {
+    assert.equal(signal.reason, "kid_removed");
+    assert.equal(signal.authorization.authorizationRevision, "2");
+    assert.equal(signal.authorization.authorizationFence, "authorization-fence-2");
+  }
+  barrier.committed({
+    authorizationRevision: "3",
+    authorizationFence: "authorization-fence-3",
+  });
+  assert.equal(closeSignals.length, 2);
+});
+
+test("credential-authority ready loss synchronously latches every broker gate once", async () => {
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
+  });
+  await registerHost(core, "host-authority-ready-loss");
+  const route = await openRoute(
+    core,
+    "host-authority-ready-loss",
+    "client-authority-ready-loss",
+  );
+  assert.equal(core.forwardClientFrame(
+    route.connectionId,
+    publicBytes(clientTerminalAck("queued-before-authority-ready-loss")),
+  ).accepted, true);
+
+  core.liveAuthorizationFencePort.failClosed();
+  core.liveAuthorizationFencePort.failClosed();
+
+  assert.equal(core.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.deepEqual(
+    closeSignals.map((signal) => signal.connectionKind).sort(),
+    ["client", "host"],
+  );
+  assert.equal(core.drainHostCarrier("host-authority-ready-loss").length, 0);
+  assert.equal(core.drainClient(route.connectionId).length, 0);
+  assert.equal(core.forwardClientFrame(
+    route.connectionId,
+    publicBytes(clientTerminalAck("after-authority-ready-loss")),
+  ).accepted, false);
+  assert.equal(core.openClientRoute(
+    "late-client-after-authority-ready-loss",
+    authContext("client", { jti: "late-client-ready-loss-jti" }),
+  ).accepted, false);
+
+  let armTimeReentry = false;
+  let timeReentered = false;
+  let authControlCalls = 0;
+  const reentrantCloseSignals = [];
+  let reentrantCore;
+  reentrantCore = new broker.RelayV2BrokerCore({
+    now: () => {
+      if (armTimeReentry && !timeReentered) {
+        timeReentered = true;
+        reentrantCore.liveAuthorizationFencePort.failClosed();
+      }
+      return NOW_MS;
+    },
+    authControlAuthority: {
+      handle() {
+        authControlCalls += 1;
+        throw new Error("auth control must not run after reentrant ready loss");
+      },
+    },
+    onLiveAuthorizationClose: (signal) => { reentrantCloseSignals.push(signal); },
+  });
+  const reentrantHost = await registerHost(reentrantCore, "host-time-reentry");
+  const reentrantRoute = await openRoute(
+    reentrantCore,
+    "host-time-reentry",
+    "client-time-reentry",
+  );
+  assert.equal(reentrantCore.forwardClientFrame(
+    reentrantRoute.connectionId,
+    publicBytes(clientTerminalAck("queued-before-time-reentry")),
+  ).accepted, true);
+  assert.equal((await reentrantCore.receiveHostFrame(
+    "host-time-reentry",
+    carrierBytes(hostRouteData(
+      reentrantRoute.routeOpen,
+      "1",
+      hostTerminalAck("queued-client-before-time-reentry"),
+    )),
+  )).accepted, true);
+
+  armTimeReentry = true;
+  const authControl = await reentrantCore.receiveHostFrame(
+    "host-time-reentry",
     carrierBytes({
       carrierVersion: 1,
-      type: "route.opened",
-      requestId: openingDelivery.frame.requestId,
-      connectorId: openingDelivery.frame.connectorId,
-      routeId: openingDelivery.frame.routeId,
-      routeFence: openingDelivery.frame.routeFence,
-      payload: { acceptedAtMs: NOW_MS, maxFrameBytes: 1_048_576 },
+      type: "host.reauthenticate",
+      requestId: randomUUID(),
+      connectorId: reentrantHost.connectorId,
+      payload: { accessToken: "twcap2.must-not-reach-authority" },
     }),
   );
-  assert.equal(lateOpeningAck.accepted, true);
-  assert.deepEqual(lateOpeningAck.actions, []);
+  assert.equal(authControl.accepted, false);
+  assert.equal(timeReentered, true);
+  assert.equal(authControlCalls, 0);
+  assert.equal(reentrantCore.drainHostCarrier("host-time-reentry").length, 0);
+  assert.equal(reentrantCore.drainClient(reentrantRoute.connectionId).length, 0);
   assert.deepEqual(
-    opening.drainHostCarrier("host-live-auth-opening").map((delivery) => delivery.frame.type),
-    ["route.unbind"],
+    reentrantCloseSignals.map((signal) => signal.connectionKind).sort(),
+    ["client", "host"],
   );
+});
 
-  const expiryRace = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(expiryRace, "host-live-auth-expiry-race");
-  const expiringClient = authContext("client", { jti: "client-expiry-race-jti" });
-  let expiryAdmission;
-  const expiryFence = expiryRace.linearizeLiveAuthFence({
-    reason: "access_expired",
-    role: "client",
-    hostId: HOST_ID,
-    jti: expiringClient.jti,
-  }, () => {
-    expiryAdmission = expiryRace.openClientRoute(
-      "client-live-auth-expiry-race",
-      expiringClient,
-    );
-    return true;
+test("queued dispatch and host route admission recheck injected expiry", async () => {
+  let now = NOW_MS;
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => now,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
   });
-  assert.equal(expiryFence.accepted, true);
-  assert.equal(expiryRace.inspectLiveAuthCompositionLatch(), "open");
-  assert.equal(expiryAdmission.accepted, false);
-  assert.equal(expiryAdmission.actions[0].kind, "route_unavailable");
-  assert.equal(expiryAdmission.actions[0].closeCode, 4401);
-  assert.equal(expiryRace.openClientRoute(
-    "client-after-sync-live-auth",
-    authContext("client", { jti: "client-after-sync-live-auth-jti" }),
+  await registerHost(core, "host-expiry-dispatch");
+  const clientToHost = await openRoute(
+    core,
+    "host-expiry-dispatch",
+    "client-expiry-to-host",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs: NOW_MS + 1 },
+  );
+  const hostToClient = await openRoute(
+    core,
+    "host-expiry-dispatch",
+    "client-expiry-from-host",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs: NOW_MS + 1 },
+  );
+  assert.equal(core.forwardClientFrame(
+    clientToHost.connectionId,
+    publicBytes(clientTerminalAck("expires-before-host-drain")),
   ).accepted, true);
+  assert.equal((await core.receiveHostFrame(
+    "host-expiry-dispatch",
+    carrierBytes(hostRouteData(
+      hostToClient.routeOpen,
+      "1",
+      hostTerminalAck("expires-before-client-drain"),
+    )),
+  )).accepted, true);
 
-  const unsupported = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(unsupported, "host-live-auth-async");
-  const asyncRoute = await openRoute(
-    unsupported,
-    "host-live-auth-async",
-    "client-live-auth-async",
+  now = NOW_MS + 2;
+  assert.equal(core.drainHostCarrier("host-expiry-dispatch").length, 0);
+  assert.equal(core.drainClient(hostToClient.connectionId).length, 0);
+  assert.deepEqual(
+    closeSignals.filter((signal) => signal.connectionKind === "client")
+      .map((signal) => signal.connectionId)
+      .sort(),
+    [clientToHost.connectionId, hostToClient.connectionId].sort(),
   );
-  let resolveAsyncCommit;
-  const pendingAsyncCommit = new Promise((resolve) => {
-    resolveAsyncCommit = resolve;
+
+  now = NOW_MS + 3_600_001;
+  const afterHostExpiry = core.openClientRoute(
+    "client-after-host-expiry",
+    authContext("client", {
+      expiresAtMs: NOW_MS + 7_200_000,
+      jti: "client-after-host-expiry-jti",
+    }),
+  );
+  assert.equal(afterHostExpiry.accepted, false);
+  assert.equal(closeSignals.filter((signal) => signal.connectionKind === "host").length, 1);
+  assert.equal(core.drainHostCarrier("host-expiry-dispatch").length, 0);
+
+  let admissionNow = NOW_MS;
+  const admissionCloseSignals = [];
+  const admissionCore = new broker.RelayV2BrokerCore({
+    now: () => admissionNow,
+    onLiveAuthorizationClose: (signal) => { admissionCloseSignals.push(signal); },
   });
-  const asyncCommit = unsupported.linearizeLiveAuthFence({
-    reason: "access_expired",
-    role: "client",
-    hostId: HOST_ID,
-    jti: "client-live-auth-async-jti",
-  }, () => pendingAsyncCommit);
-  assert.equal(asyncCommit.accepted, false);
-  assert.equal(asyncCommit.error.code, "CAPABILITY_UNAVAILABLE");
-  assert.equal(unsupported.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
-  assert.equal(asyncCommit.actions.some((action) => (
-    action.kind === "close_client"
-      && action.connectionId === asyncRoute.connectionId
-      && action.closeCode === 4401
-  )), true);
-  const pendingReopen = unsupported.openClientRoute(
-    "client-live-auth-async-pending-reopen",
-    authContext("client", { jti: "client-live-auth-async-jti" }),
+  await registerHost(
+    admissionCore,
+    "host-expiry-client-admission",
+    hostHello(),
+    { expiresAtMs: NOW_MS + 1 },
   );
-  assert.equal(pendingReopen.accepted, false);
-  assert.equal(pendingReopen.error.code, "CAPABILITY_UNAVAILABLE");
-  resolveAsyncCommit(true);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(unsupported.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
-  assert.equal(unsupported.openClientRoute(
-    "client-live-auth-async-resolved-reopen",
-    authContext("client", { jti: "client-live-auth-async-jti" }),
+  const rejectedAtAdmission = await openRoute(
+    admissionCore,
+    "host-expiry-client-admission",
+    "client-valid-at-host-admission-expiry",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs: NOW_MS + 7_200_000 },
+  );
+  admissionNow = NOW_MS + 2;
+  assert.equal(admissionCore.forwardClientFrame(
+    rejectedAtAdmission.connectionId,
+    publicBytes(clientTerminalAck("host-expired-before-client-admission")),
   ).accepted, false);
+  assert.equal(admissionCore.drainHostCarrier("host-expiry-client-admission").length, 0);
+  assert.deepEqual(
+    admissionCloseSignals.map((signal) => [signal.connectionKind, signal.reason]).sort(),
+    [
+      ["client", "host_authorization_fenced"],
+      ["host", "access_expired"],
+    ],
+  );
 
-  const rejected = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(rejected, "host-live-auth-rejected");
-  let rejectAsyncCommit;
-  const rejectedAsyncCommit = new Promise((_resolve, reject) => {
-    rejectAsyncCommit = reject;
+  let sourceNow = NOW_MS;
+  const sourceCloseSignals = [];
+  const sourceCore = new broker.RelayV2BrokerCore({
+    now: () => sourceNow,
+    onLiveAuthorizationClose: (signal) => { sourceCloseSignals.push(signal); },
   });
-  const rejectedResult = rejected.linearizeLiveAuthFence({
+  await registerHost(
+    sourceCore,
+    "host-expiry-client-drain",
+    hostHello(),
+    { expiresAtMs: NOW_MS + 1 },
+  );
+  const queuedFromHost = await openRoute(
+    sourceCore,
+    "host-expiry-client-drain",
+    "client-valid-after-host-expiry",
+    1_048_576,
+    HOST_ID,
+    { expiresAtMs: NOW_MS + 7_200_000 },
+  );
+  assert.equal((await sourceCore.receiveHostFrame(
+    "host-expiry-client-drain",
+    carrierBytes(hostRouteData(
+      queuedFromHost.routeOpen,
+      "1",
+      hostTerminalAck("host-expires-before-client-drain"),
+    )),
+  )).accepted, true);
+  sourceNow = NOW_MS + 2;
+  assert.equal(sourceCore.drainClient(queuedFromHost.connectionId).length, 0);
+  assert.deepEqual(
+    sourceCloseSignals.map((signal) => [
+      signal.connectionKind,
+      signal.reason,
+    ]).sort(),
+    [
+      ["client", "host_authorization_fenced"],
+      ["host", "access_expired"],
+    ],
+  );
+});
+
+test("throwing receipt and callback cleanup failures latch all dispatch gates", async () => {
+  const receiptSignals = [];
+  const receiptCore = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => { receiptSignals.push(signal); },
+  });
+  await registerHost(receiptCore, "host-throwing-receipt");
+  assert.throws(() => receiptCore.liveAuthorizationFencePort.begin({
+    reason: "unknown_reason",
+    role: "bogus",
+    hostId: HOST_ID,
+    grantId: "grant",
+  }));
+  assert.throws(() => receiptCore.liveAuthorizationFencePort.begin({
     reason: "grant_revoked",
-    role: "client",
+    role: "bogus",
     hostId: HOST_ID,
-    grantId: "client-grant",
-  }, () => rejectedAsyncCommit);
-  assert.equal(rejectedResult.accepted, false);
-  assert.equal(rejected.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
-  rejectAsyncCommit(new Error("authority commit failed"));
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(rejected.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
-  assert.equal(rejected.openClientRoute(
-    "client-live-auth-rejected-reopen",
-    authContext("client"),
-  ).accepted, false);
+    grantId: "grant",
+    jti: "wrong-variant-field",
+  }));
 
-  const hostFence = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(hostFence, "host-live-auth-kid");
-  const removedKid = hostFence.linearizeLiveAuthFence({
+  const receiptBarrier = receiptCore.liveAuthorizationFencePort.begin({
     reason: "kid_removed",
     role: "host",
     hostId: HOST_ID,
     kid: "key-2026-07",
-  }, () => true);
-  assert.equal(removedKid.accepted, true);
-  assert.equal(hostFence.inspectHost(HOST_ID).state, "offline");
-  assert.equal(removedKid.actions.some((action) => (
-    action.kind === "close_host"
-      && action.transportId === "host-live-auth-kid"
-      && action.closeCode === 4403
-  )), true);
+  });
+  let getterCalls = 0;
+  const throwingReceipt = {};
+  Object.defineProperties(throwingReceipt, {
+    authorizationRevision: {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("receipt getter must not run");
+      },
+    },
+    authorizationFence: { enumerable: true, value: "authorization-fence-2" },
+  });
+  assert.doesNotThrow(() => receiptBarrier.committed(throwingReceipt));
+  assert.equal(getterCalls, 0, "accessor receipt is rejected from its descriptor");
+  assert.equal(receiptCore.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.equal(receiptCore.drainHostCarrier("host-throwing-receipt").length, 0);
+  receiptBarrier.cancelled();
+  assert.equal(receiptCore.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+
+  let throwTime = false;
+  let throwFirstClose = true;
+  const cleanupSignals = [];
+  const cleanupCore = new broker.RelayV2BrokerCore({
+    now: () => {
+      if (throwTime) throw new Error("directory clock failed");
+      return NOW_MS;
+    },
+    onLiveAuthorizationClose: (signal) => {
+      cleanupSignals.push(signal);
+      if (throwFirstClose) {
+        throwFirstClose = false;
+        throwTime = true;
+        throw new Error("socket owner failed");
+      }
+    },
+  });
+  await registerHost(cleanupCore, "host-global-cleanup");
+  const matched = await openRoute(
+    cleanupCore,
+    "host-global-cleanup",
+    "client-global-matched",
+    1_048_576,
+    HOST_ID,
+    { grantId: "global-revoked-grant" },
+  );
+  const unrelated = await openRoute(
+    cleanupCore,
+    "host-global-cleanup",
+    "client-global-unrelated",
+    1_048_576,
+    HOST_ID,
+    { grantId: "global-unrelated-grant" },
+  );
+  assert.equal(cleanupCore.forwardClientFrame(
+    unrelated.connectionId,
+    publicBytes(clientTerminalAck("queued-before-global-latch")),
+  ).accepted, true);
+  const cleanupBarrier = cleanupCore.liveAuthorizationFencePort.begin({
+    reason: "grant_revoked",
+    role: "client",
+    hostId: HOST_ID,
+    grantId: "global-revoked-grant",
+  });
+  cleanupBarrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  assert.equal(cleanupCore.inspectLiveAuthCompositionLatch(), "latched_fail_closed");
+  assert.deepEqual(
+    cleanupSignals.map((signal) => signal.connectionKind === "host"
+      ? "host-global-cleanup"
+      : signal.connectionId).sort(),
+    ["client-global-matched", "client-global-unrelated", "host-global-cleanup"].sort(),
+  );
+  assert.equal(new Set(cleanupSignals.map((signal) => signal.connectionIncarnation)).size, 3);
+  assert.equal(cleanupCore.drainHostCarrier("host-global-cleanup").length, 0);
+  assert.equal(cleanupCore.drainClient(matched.connectionId).length, 0);
+  assert.equal(cleanupCore.drainClient(unrelated.connectionId).length, 0);
+});
+
+test("authorization clone rejects credential extras and getter TOCTOU without leaking close state", async () => {
+  const closeSignals = [];
+  const core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => { closeSignals.push(signal); },
+  });
+  await registerHost(core, "host-closed-auth");
+
+  const credentialBearing = {
+    ...authContext("client"),
+    accessToken: "must-never-enter-runtime-state",
+  };
+  const upgrade = await broker.dispatchRelayBrokerUpgrade({
+    pathname: "/client",
+    search: "",
+    authorizationHeaders: ["Bearer twcap2.redacted"],
+    legacyQuerySecret: null,
+    offeredProtocols: ["tw-relay.v2"],
+  }, {
+    verifyLegacySecret: () => true,
+    verifyV2AccessToken: () => credentialBearing,
+  });
+  assert.equal(upgrade.outcome, "reject");
+  assert.equal(core.openClientRoute("credential-extra", credentialBearing).accepted, false);
+  assert.throws(() => core.attachHostCarrier("host-secret-extra", {
+    ...authContext("host", { hostId: "other-host" }),
+    secret: "must-never-enter-close-signal",
+  }));
+
+  let getterCalls = 0;
+  const getterAuth = authContext("client");
+  Object.defineProperty(getterAuth, "hostId", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return getterCalls === 1 ? HOST_ID : "other-host";
+    },
+  });
+  assert.equal(core.inspectClientAdmission(getterAuth).outcome, "reject");
+  assert.equal(core.readHostsSnapshot(getterAuth, "getter-snapshot"), undefined);
+  assert.equal(core.readHostPresence(getterAuth), undefined);
+  assert.equal(getterCalls, 0, "authorization accessors are never evaluated");
+  assert.equal(closeSignals.length, 0);
+});
+
+test("host live-auth close keeps transport tombstone through reentrant signal and exposes incarnation", async () => {
+  const closeSignals = [];
+  let sameIdRejected = false;
+  let unrelatedAttached = false;
+  let core;
+  core = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    onLiveAuthorizationClose: (signal) => {
+      closeSignals.push(signal);
+      if (signal.connectionKind !== "host") return;
+      try {
+        core.attachHostCarrier("host-aba", authContext("host", {
+          hostId: "unrelated-host",
+          kid: "unrelated-kid",
+          jti: "same-id-new-incarnation",
+        }));
+      } catch {
+        sameIdRejected = true;
+      }
+      core.attachHostCarrier("host-unrelated-new-id", authContext("host", {
+        hostId: "unrelated-host",
+        kid: "unrelated-kid",
+        jti: "new-id-new-incarnation",
+      }));
+      unrelatedAttached = true;
+    },
+  });
+  await registerHost(core, "host-aba");
+  const barrier = core.liveAuthorizationFencePort.begin({
+    reason: "kid_removed",
+    role: "host",
+    hostId: HOST_ID,
+    kid: "key-2026-07",
+  });
+  barrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  assert.equal(sameIdRejected, true);
+  assert.equal(unrelatedAttached, true);
+  assert.equal(closeSignals.length, 1);
+  assert.equal(closeSignals[0].transportId, "host-aba");
+  assert.match(closeSignals[0].connectionIncarnation, /^[0-9a-f-]{36}$/i);
+
+  const unrelatedHello = await core.receiveHostFrame(
+    "host-unrelated-new-id",
+    carrierBytes(hostHello({ hostId: "unrelated-host" })),
+  );
+  assert.equal(unrelatedHello.accepted, true);
+  assert.equal(core.drainHostCarrier("host-unrelated-new-id").length, 0);
+});
+
+test("auth-control await cannot replace a concurrently fenced current or replacement authorization", async () => {
+  let resolveCurrent;
+  const currentAuthority = {
+    handle() {
+      return new Promise((resolve) => { resolveCurrent = resolve; });
+    },
+  };
+  const currentCore = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    authControlAuthority: currentAuthority,
+    onLiveAuthorizationClose: () => {},
+  });
+  const currentHost = await registerHost(currentCore, "host-reauth-current-race");
+  const currentRequestId = randomUUID();
+  const currentResultPromise = currentCore.receiveHostFrame(
+    "host-reauth-current-race",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "host.reauthenticate",
+      requestId: currentRequestId,
+      connectorId: currentHost.connectorId,
+      payload: { accessToken: "twcap2.replacement-redacted" },
+    }),
+  );
+  const currentBarrier = currentCore.liveAuthorizationFencePort.begin({
+    reason: "kid_removed",
+    role: "host",
+    hostId: HOST_ID,
+    kid: "key-2026-07",
+  });
+  currentBarrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  const nextCurrent = authContext("host", {
+    jti: "replacement-current-jti",
+    kid: "replacement-kid",
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  resolveCurrent({
+    outcome: "success",
+    replayed: false,
+    nextAuthContext: nextCurrent,
+    response: {
+      carrierVersion: 1,
+      type: "host.reauthenticated",
+      requestId: currentRequestId,
+      connectorId: currentHost.connectorId,
+      payload: {
+        grantId: nextCurrent.grantId,
+        jti: nextCurrent.jti,
+        expiresAtMs: nextCurrent.expiresAtMs,
+        deduplicated: false,
+      },
+    },
+  });
+  const currentResult = await currentResultPromise;
+  assert.equal(currentResult.accepted, false);
+  assert.equal(currentResult.error.code, "HOST_SUPERSEDED");
+
+  let resolveReplacement;
+  const replacementAuthority = {
+    handle() {
+      return new Promise((resolve) => { resolveReplacement = resolve; });
+    },
+  };
+  const replacementCore = new broker.RelayV2BrokerCore({
+    now: () => NOW_MS,
+    authControlAuthority: replacementAuthority,
+    onLiveAuthorizationClose: () => {},
+  });
+  const replacementHost = await registerHost(replacementCore, "host-reauth-replacement-race");
+  const replacementRequestId = randomUUID();
+  const replacementResultPromise = replacementCore.receiveHostFrame(
+    "host-reauth-replacement-race",
+    carrierBytes({
+      carrierVersion: 1,
+      type: "host.reauthenticate",
+      requestId: replacementRequestId,
+      connectorId: replacementHost.connectorId,
+      payload: { accessToken: "twcap2.replacement-redacted" },
+    }),
+  );
+  const replacementBarrier = replacementCore.liveAuthorizationFencePort.begin({
+    reason: "kid_removed",
+    role: "host",
+    hostId: HOST_ID,
+    kid: "replacement-kid",
+  });
+  replacementBarrier.committed({
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  const fencedReplacement = authContext("host", {
+    jti: "fenced-replacement-jti",
+    kid: "replacement-kid",
+    authorizationRevision: "2",
+    authorizationFence: "authorization-fence-2",
+  });
+  resolveReplacement({
+    outcome: "success",
+    replayed: false,
+    nextAuthContext: fencedReplacement,
+    response: {
+      carrierVersion: 1,
+      type: "host.reauthenticated",
+      requestId: replacementRequestId,
+      connectorId: replacementHost.connectorId,
+      payload: {
+        grantId: fencedReplacement.grantId,
+        jti: fencedReplacement.jti,
+        expiresAtMs: fencedReplacement.expiresAtMs,
+        deduplicated: false,
+      },
+    },
+  });
+  const replacementResult = await replacementResultPromise;
+  assert.equal(replacementResult.accepted, false);
+  assert.equal(replacementResult.error.code, "INTERNAL");
+  const [failure] = replacementCore.drainHostCarrier(
+    "host-reauth-replacement-race",
+    { maxFrames: 1 },
+  );
+  assert.equal(failure.frame.type, "carrier.error");
 });
 
 test("broker public codec rejects forged identity and limits each route to 64 in-flight requests", async () => {

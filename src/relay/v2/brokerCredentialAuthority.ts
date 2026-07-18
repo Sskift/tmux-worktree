@@ -17,6 +17,10 @@ import type {
   RelayV2AuthControlDecision,
   RelayV2AuthControlRequest,
   RelayV2BrokerAuthControlAuthority,
+  RelayV2BrokerConnectionAuthorization,
+  RelayV2LiveAuthorizationCommitBarrier,
+  RelayV2LiveAuthorizationFencePort,
+  RelayV2LiveAuthorizationInvalidation,
   RelayV2StructuredError,
 } from "./brokerCore.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
@@ -38,6 +42,7 @@ import {
 import {
   parseRelayV2IssuerKeyring,
   prepareRelayV2AccessTokenIssuance,
+  removeRelayV2VerifyOnlyKey,
   rotateRelayV2IssuerKeyring,
   verifyRelayV2IssuerAccessToken,
   type RelayV2IssuerKeyring,
@@ -90,6 +95,7 @@ export type RelayV2BrokerCredentialAuthorityErrorCode =
   | "EXTERNAL_CONTINUITY_UNAVAILABLE"
   | "EXTERNAL_CONTINUITY_INVALID"
   | "CLOSE_BARRIER_FAILED"
+  | "LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"
   | "BUSY"
   | "IDEMPOTENCY_CONFLICT"
   | "AUTH_INVALID"
@@ -114,6 +120,7 @@ const AUTHORITY_ERROR_MESSAGES: Readonly<Record<
   EXTERNAL_CONTINUITY_UNAVAILABLE: "Relay v2 broker credential external continuity is unavailable",
   EXTERNAL_CONTINUITY_INVALID: "Relay v2 broker credential external continuity is invalid",
   CLOSE_BARRIER_FAILED: "Relay v2 broker credential authority close barrier failed",
+  LIVE_AUTHORIZATION_FENCE_UNAVAILABLE: "Relay v2 broker live authorization fence is unavailable",
   BUSY: "Relay v2 broker credential authority is busy",
   IDEMPOTENCY_CONFLICT: "Relay v2 broker credential request conflicts with a prior request",
   AUTH_INVALID: "Relay v2 credential is invalid",
@@ -194,6 +201,7 @@ export interface RelayV2BrokerCredentialAuthorityOptions {
   now?: () => number;
   randomId?: () => string;
   randomBytes?: (length: number) => Uint8Array;
+  liveAuthorizationFence?: RelayV2LiveAuthorizationFencePort;
 }
 
 export interface RelayV2BrokerCredentialEnrollmentCreated {
@@ -291,7 +299,8 @@ type ReplayOperation =
   | "enrollment.redeem"
   | "host.bootstrap"
   | "grant.refresh"
-  | "host.reauthenticate";
+  | "host.reauthenticate"
+  | "grant.revoke";
 
 interface ReplayRecord {
   operation: ReplayOperation;
@@ -335,7 +344,12 @@ interface CredentialAuthorityEnvelope {
 }
 
 type TransitionResult<Result> =
-  | { disposition: "return"; value: Result; changed: boolean }
+  | {
+      disposition: "return";
+      value: Result;
+      changed: boolean;
+      liveAuthorizationInvalidation?: RelayV2LiveAuthorizationInvalidation;
+    }
   | {
       disposition: "reject";
       error: RelayV2BrokerCredentialAuthorityError;
@@ -367,6 +381,71 @@ function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): 
   const expected = [...keys].sort(compareUtf8);
   return actual.length === expected.length
     && actual.every((key, index) => key === expected[index]);
+}
+
+function readExactOwnMethodSnapshot(
+  source: unknown,
+  keys: readonly string[],
+): readonly Function[] | undefined {
+  if (!isRecord(source)) return undefined;
+  try {
+    const actual = Reflect.ownKeys(source);
+    if (
+      actual.length !== keys.length
+      || actual.some((key) => typeof key !== "string" || !keys.includes(key))
+    ) return undefined;
+    const methods: Function[] = [];
+    for (const key of keys) {
+      const descriptor = Reflect.getOwnPropertyDescriptor(source, key);
+      if (
+        descriptor === undefined
+        || !("value" in descriptor)
+        || typeof descriptor.value !== "function"
+      ) return undefined;
+      methods.push(descriptor.value as Function);
+    }
+    return Object.freeze(methods);
+  } catch {
+    return undefined;
+  }
+}
+
+function cloneLiveAuthorizationFencePort(
+  source: unknown,
+): RelayV2LiveAuthorizationFencePort | undefined {
+  const methods = readExactOwnMethodSnapshot(source, ["begin", "failClosed"]);
+  if (!methods || !isRecord(source)) return undefined;
+  const [begin, failClosed] = methods;
+  return Object.freeze({
+    begin: (invalidation: RelayV2LiveAuthorizationInvalidation) => (
+      Reflect.apply(begin!, source, [invalidation]) as RelayV2LiveAuthorizationCommitBarrier
+    ),
+    failClosed: () => {
+      Reflect.apply(failClosed!, source, []);
+    },
+  });
+}
+
+function cloneLiveAuthorizationCommitBarrier(
+  source: unknown,
+): RelayV2LiveAuthorizationCommitBarrier | undefined {
+  const methods = readExactOwnMethodSnapshot(
+    source,
+    ["committed", "cancelled", "failClosed"],
+  );
+  if (!methods || !isRecord(source)) return undefined;
+  const [committed, cancelled, failClosed] = methods;
+  return Object.freeze({
+    committed: (receipt: RelayV2LiveAuthorizationCommitReceipt) => {
+      Reflect.apply(committed!, source, [receipt]);
+    },
+    cancelled: () => {
+      Reflect.apply(cancelled!, source, []);
+    },
+    failClosed: () => {
+      Reflect.apply(failClosed!, source, []);
+    },
+  });
 }
 
 function isTimestamp(value: unknown): value is number {
@@ -640,6 +719,7 @@ function parseReplay(value: unknown): ReplayRecord {
       "host.bootstrap",
       "grant.refresh",
       "host.reauthenticate",
+      "grant.revoke",
     ].includes(value.operation as string)
     || !isRelayV2AuthIdentifier(value.subjectId)
     || !isRelayV2AuthIdentifier(value.attemptId)
@@ -906,6 +986,7 @@ function carrierDecisionForAuthorityError(
       };
     case "AUTHORITY_NOT_READY":
     case "AUTHORITY_CLOSED":
+    case "LIVE_AUTHORIZATION_FENCE_UNAVAILABLE":
       return {
         outcome: "reject",
         error: structuredReject(
@@ -930,8 +1011,19 @@ function rejectTransition<Result>(
   return { disposition: "reject", error: authorityError(code), changed };
 }
 
-function returnTransition<Result>(value: Result, changed: boolean): TransitionResult<Result> {
-  return { disposition: "return", value, changed };
+function returnTransition<Result>(
+  value: Result,
+  changed: boolean,
+  liveAuthorizationInvalidation?: RelayV2LiveAuthorizationInvalidation,
+): TransitionResult<Result> {
+  return {
+    disposition: "return",
+    value,
+    changed,
+    ...(liveAuthorizationInvalidation === undefined
+      ? {}
+      : { liveAuthorizationInvalidation }),
+  };
 }
 
 function replayAad(record: Pick<ReplayRecord, "operation" | "subjectId" | "attemptId" | "fingerprint">): Buffer {
@@ -1007,6 +1099,13 @@ function openReplayResponse(
       case "host.reauthenticate":
         if (
           value.type !== "host.reauthenticated"
+          || value.requestId !== record.attemptId
+          || value.connectorId !== record.subjectId
+        ) invalidState();
+        break;
+      case "grant.revoke":
+        if (
+          value.type !== "grant.revoked"
           || value.requestId !== record.attemptId
           || value.connectorId !== record.subjectId
         ) invalidState();
@@ -1307,6 +1406,54 @@ function enrollmentCreatedFromFrame(
   };
 }
 
+function grantRevokedFrame(input: {
+  requestId: string;
+  connectorId: string;
+  grantId: string;
+  revokedAtMs: number;
+  alreadyRevoked: boolean;
+}): RelayV2JsonObject {
+  return {
+    carrierVersion: 1,
+    type: "grant.revoked",
+    requestId: input.requestId,
+    connectorId: input.connectorId,
+    payload: {
+      grantId: input.grantId,
+      revokedAtMs: input.revokedAtMs,
+      alreadyRevoked: input.alreadyRevoked,
+    },
+  };
+}
+
+function grantRevokedFromFrame(
+  frame: RelayV2JsonObject,
+  expected: { requestId: string; connectorId: string },
+): RelayV2JsonObject {
+  if (
+    !isRecord(frame)
+    || !hasExactKeys(frame, [
+      "carrierVersion", "type", "requestId", "connectorId", "payload",
+    ])
+    || frame.carrierVersion !== 1
+    || frame.type !== "grant.revoked"
+    || frame.requestId !== expected.requestId
+    || frame.connectorId !== expected.connectorId
+    || !isRecord(frame.payload)
+    || !hasExactKeys(frame.payload, ["grantId", "revokedAtMs", "alreadyRevoked"])
+    || !isRelayV2AuthIdentifier(frame.payload.grantId)
+    || !isTimestamp(frame.payload.revokedAtMs)
+    || typeof frame.payload.alreadyRevoked !== "boolean"
+  ) invalidState();
+  return grantRevokedFrame({
+    requestId: expected.requestId,
+    connectorId: expected.connectorId,
+    grantId: frame.payload.grantId,
+    revokedAtMs: frame.payload.revokedAtMs,
+    alreadyRevoked: frame.payload.alreadyRevoked,
+  });
+}
+
 function hostReauthenticatedFrame(input: {
   requestId: string;
   connectorId: string;
@@ -1437,7 +1584,7 @@ function grantCredentialFromResponse(
 
 function revalidateCurrentAuthContext(
   state: CredentialAuthorityEnvelope,
-  context: Readonly<RelayV2AuthContext>,
+  context: Readonly<RelayV2BrokerConnectionAuthorization>,
   now: number,
   expectedRole: RelayV2AccessRole,
 ): GrantRecord {
@@ -1451,6 +1598,8 @@ function revalidateCurrentAuthContext(
     "jti",
     "kid",
     "expiresAtMs",
+    "authorizationRevision",
+    "authorizationFence",
   ])) throw authorityError("AUTH_INVALID");
   if (
     context.scheme !== "twcap2"
@@ -1462,6 +1611,11 @@ function revalidateCurrentAuthContext(
     || !isRelayV2AuthIdentifier(context.kid)
     || !isTimestamp(context.expiresAtMs)
     || context.expiresAtMs <= now
+    || !isCanonicalUint64(context.authorizationRevision)
+    || !isRelayV2AuthIdentifier(context.authorizationFence)
+    || BigInt(context.authorizationRevision) > BigInt(state.commitSequence)
+    || (context.authorizationRevision === state.commitSequence
+      && context.authorizationFence !== state.commitId)
     || (context.role === "client"
       ? !isRelayV2AuthIdentifier(context.clientInstanceId)
       : context.clientInstanceId !== null)
@@ -1508,6 +1662,25 @@ function verifyAuthorizedAccessToken(
     if (error instanceof RelayV2AuthError) throw authorityError(error.code);
     throw authorityError("AUTH_INVALID");
   }
+}
+
+function bindConnectionAuthorization(
+  state: CredentialAuthorityEnvelope,
+  context: Readonly<RelayV2AuthContext>,
+): RelayV2BrokerConnectionAuthorization {
+  return Object.freeze({
+    scheme: context.scheme,
+    role: context.role,
+    hostId: context.hostId,
+    principalId: context.principalId,
+    grantId: context.grantId,
+    clientInstanceId: context.clientInstanceId,
+    jti: context.jti,
+    kid: context.kid,
+    expiresAtMs: context.expiresAtMs,
+    authorizationRevision: state.commitSequence,
+    authorizationFence: state.commitId,
+  });
 }
 
 function sourceIdentityHash(value: unknown): string {
@@ -1603,6 +1776,7 @@ implements RelayV2BrokerAuthControlAuthority {
   private readonly now: () => number;
   private readonly randomId: () => string;
   private readonly random: (length: number) => Uint8Array;
+  private readonly liveAuthorizationFence: RelayV2LiveAuthorizationFencePort | undefined;
   private readonly sourceAdmissions = new Map<object, SourceAdmissionRecord>();
   private authorityContinuityReadinessValue:
     RelayV2BrokerCredentialAuthorityContinuityReadiness = { status: "opening" };
@@ -1617,7 +1791,11 @@ implements RelayV2BrokerAuthControlAuthority {
       ...(Object.hasOwn(options, "now") ? ["now"] : []),
       ...(Object.hasOwn(options, "randomId") ? ["randomId"] : []),
       ...(Object.hasOwn(options, "randomBytes") ? ["randomBytes"] : []),
+      ...(Object.hasOwn(options, "liveAuthorizationFence") ? ["liveAuthorizationFence"] : []),
     ])) throw authorityError("INVALID_ARGUMENT");
+    const installedLiveAuthorizationFence = options.liveAuthorizationFence === undefined
+      ? undefined
+      : cloneLiveAuthorizationFencePort(options.liveAuthorizationFence);
     if (
       !isRecord(options.store)
       || typeof options.store.runExclusive !== "function"
@@ -1627,6 +1805,8 @@ implements RelayV2BrokerAuthControlAuthority {
       || (options.now !== undefined && typeof options.now !== "function")
       || (options.randomId !== undefined && typeof options.randomId !== "function")
       || (options.randomBytes !== undefined && typeof options.randomBytes !== "function")
+      || (options.liveAuthorizationFence !== undefined
+        && installedLiveAuthorizationFence === undefined)
     ) throw authorityError("INVALID_ARGUMENT");
     this.store = options.store;
     this.anchorId = options.continuityAnchor.anchorId;
@@ -1634,6 +1814,7 @@ implements RelayV2BrokerAuthControlAuthority {
     this.now = options.now ?? Date.now;
     this.randomId = options.randomId ?? randomUUID;
     this.random = options.randomBytes ?? ((length) => systemRandomBytes(length));
+    this.liveAuthorizationFence = installedLiveAuthorizationFence;
     try {
       this.continuity = new RelayV2ContinuityAnchor(options.continuityAnchor);
     } catch {
@@ -1706,11 +1887,20 @@ implements RelayV2BrokerAuthControlAuthority {
 
   private withdrawAdmission(reason: RelayV2BrokerCredentialAuthorityWithdrawalReason): void {
     if (this.authorityContinuityReadinessValue.status === "closed") return;
+    const firstWithdrawal = this.authorityContinuityReadinessValue.status !== "withdrawn";
     const retainedReason = this.authorityContinuityReadinessValue.status === "withdrawn"
       ? this.authorityContinuityReadinessValue.reason
       : reason;
     this.sourceAdmissions.clear();
     this.setAuthorityContinuityReadiness({ status: "withdrawn", reason: retainedReason });
+    if (firstWithdrawal && this.liveAuthorizationFence) {
+      try {
+        this.liveAuthorizationFence.failClosed();
+      } catch {
+        // Broker notification follows the authority's own synchronous
+        // withdrawal. An injected owner can never reopen this authority.
+      }
+    }
   }
 
   private beginCloseBarrier(
@@ -1868,6 +2058,8 @@ implements RelayV2BrokerAuthControlAuthority {
   ): Promise<Result> {
     this.assertReady();
     let publicationStarted = false;
+    let liveAuthorizationBarrier: RelayV2LiveAuthorizationCommitBarrier | null = null;
+    let liveAuthorizationBarrierSettled = false;
     const flags = {
       storePublicationUncertain: false,
       definiteStateConflict: false,
@@ -1906,6 +2098,34 @@ implements RelayV2BrokerAuthControlAuthority {
           working.lastObservedAtMs = now;
           const nextBytes = encodeEnvelope(working);
           const next = checkpointForBytes(working, nextBytes);
+          if (
+            outcome.disposition === "return"
+            && outcome.liveAuthorizationInvalidation !== undefined
+          ) {
+            if (!this.liveAuthorizationFence) {
+              throw new DomainRejection(
+                authorityError("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"),
+              );
+            }
+            let candidateBarrier: unknown;
+            try {
+              candidateBarrier = this.liveAuthorizationFence.begin(
+                outcome.liveAuthorizationInvalidation,
+              );
+            } catch {
+              throw new DomainRejection(
+                authorityError("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"),
+              );
+            }
+            const installedBarrier = cloneLiveAuthorizationCommitBarrier(candidateBarrier);
+            if (!installedBarrier) {
+              // begin may already have installed unknown state. Treat a
+              // malformed barrier as fatal so withdrawal closes admission
+              // before its failClosed notification can re-enter authority.
+              throw authorityError("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE");
+            }
+            liveAuthorizationBarrier = installedBarrier;
+          }
           publicationStarted = true;
           await this.continuity.advance({
             current,
@@ -1915,9 +2135,26 @@ implements RelayV2BrokerAuthControlAuthority {
             ),
           });
           this.currentCheckpoint = next;
+          if (liveAuthorizationBarrier) {
+            liveAuthorizationBarrier.committed({
+              authorizationRevision: working.commitSequence,
+              authorizationFence: working.commitId,
+            });
+            liveAuthorizationBarrierSettled = true;
+          }
           if (outcome.disposition === "reject") throw new DomainRejection(outcome.error);
           return outcome.value;
         } catch (error) {
+          if (liveAuthorizationBarrier && !liveAuthorizationBarrierSettled) {
+            try {
+              if (publicationStarted) liveAuthorizationBarrier.failClosed();
+              else liveAuthorizationBarrier.cancelled();
+            } catch {
+              // The authority still withdraws below; an injected fence owner
+              // can never turn publication uncertainty into reopened admission.
+            }
+            liveAuthorizationBarrierSettled = true;
+          }
           if (error instanceof DomainRejection) throw error;
           if (
             !publicationStarted
@@ -2068,6 +2305,34 @@ implements RelayV2BrokerAuthControlAuthority {
     });
   }
 
+  async adminRemoveIssuerKey(input: {
+    kid: string;
+    emergency?: boolean;
+  }): Promise<{ kid: string }> {
+    if (!isRecord(input) || !hasExactKeys(input, [
+      "kid",
+      ...(Object.hasOwn(input, "emergency") ? ["emergency"] : []),
+    ])) throw authorityError("INVALID_ARGUMENT");
+    const kid = ensureIdentifier(input.kid);
+    if (input.emergency !== undefined && typeof input.emergency !== "boolean") {
+      throw authorityError("INVALID_ARGUMENT");
+    }
+    return this.mutate((state, now) => {
+      try {
+        state.issuer = removeRelayV2VerifyOnlyKey(state.issuer, kid, {
+          nowSeconds: Math.floor(now / 1_000),
+          ...(input.emergency === undefined ? {} : { emergency: input.emergency }),
+        });
+      } catch {
+        return rejectTransition("INVALID_ARGUMENT", false);
+      }
+      return returnTransition({ kid }, true, {
+        reason: "kid_removed",
+        kid,
+      });
+    });
+  }
+
   async adminCreateHostBootstrap(input: {
     expiresInMs?: number;
   } = {}): Promise<RelayV2BrokerCredentialHostBootstrapCreated> {
@@ -2118,13 +2383,14 @@ implements RelayV2BrokerAuthControlAuthority {
   async authorizeAccessToken(
     token: string,
     expectedRole: RelayV2AccessRole,
-  ): Promise<RelayV2AuthContext> {
+  ): Promise<RelayV2BrokerConnectionAuthorization> {
     if (expectedRole !== "client" && expectedRole !== "host") {
       throw authorityError("INVALID_ARGUMENT");
     }
     const accessToken = accessTokenInput(token);
-    return this.readState((state, now) => (
-      verifyAuthorizedAccessToken(state, accessToken, expectedRole, now)
+    return this.readState((state, now) => bindConnectionAuthorization(
+      state,
+      verifyAuthorizedAccessToken(state, accessToken, expectedRole, now),
     ));
   }
 
@@ -2133,7 +2399,7 @@ implements RelayV2BrokerAuthControlAuthority {
     connectorId: string;
     expiresInMs: number;
     deviceLabel: string | null;
-    currentAuthContext: Readonly<RelayV2AuthContext>;
+    currentAuthContext: Readonly<RelayV2BrokerConnectionAuthorization>;
   }): Promise<RelayV2BrokerCredentialEnrollmentCreated> {
     if (!isRecord(input) || !hasExactKeys(input, [
       "requestId",
@@ -2232,7 +2498,7 @@ implements RelayV2BrokerAuthControlAuthority {
     requestId: string;
     connectorId: string;
     accessToken: string;
-    currentAuthContext: Readonly<RelayV2AuthContext>;
+    currentAuthContext: Readonly<RelayV2BrokerConnectionAuthorization>;
   }): Promise<RelayV2AuthControlDecision> {
     if (!isRecord(input) || !hasExactKeys(input, [
       "requestId", "connectorId", "accessToken", "currentAuthContext",
@@ -2250,9 +2516,12 @@ implements RelayV2BrokerAuthControlAuthority {
         }
         throw error;
       }
-      let nextAuthContext: RelayV2AuthContext;
+      let nextAuthContext: RelayV2BrokerConnectionAuthorization;
       try {
-        nextAuthContext = verifyAuthorizedAccessToken(state, accessToken, "host", now);
+        nextAuthContext = bindConnectionAuthorization(
+          state,
+          verifyAuthorizedAccessToken(state, accessToken, "host", now),
+        );
       } catch (error) {
         if (error instanceof RelayV2BrokerCredentialAuthorityError) {
           return rejectTransition(error.code, false);
@@ -2318,6 +2587,92 @@ implements RelayV2BrokerAuthControlAuthority {
         replayed: false,
         nextAuthContext,
       }, true);
+    });
+  }
+
+  private async revokeGrant(input: {
+    requestId: string;
+    connectorId: string;
+    grantId: string;
+    reason: "user_revoked";
+    currentAuthContext: Readonly<RelayV2BrokerConnectionAuthorization>;
+  }): Promise<RelayV2AuthControlDecision> {
+    if (!isRecord(input) || !hasExactKeys(input, [
+      "requestId", "connectorId", "grantId", "reason", "currentAuthContext",
+    ])) throw authorityError("INVALID_ARGUMENT");
+    const requestId = ensureIdentifier(input.requestId);
+    const connectorId = ensureIdentifier(input.connectorId);
+    const grantId = ensureIdentifier(input.grantId);
+    if (input.reason !== "user_revoked") throw authorityError("INVALID_ARGUMENT");
+    return this.mutate<RelayV2AuthControlDecision>((state, now) => {
+      let hostGrant: GrantRecord;
+      try {
+        hostGrant = revalidateCurrentAuthContext(
+          state,
+          input.currentAuthContext,
+          now,
+          "host",
+        );
+      } catch (error) {
+        if (error instanceof RelayV2BrokerCredentialAuthorityError) {
+          return rejectTransition(error.code, false);
+        }
+        throw error;
+      }
+      const fingerprint = fixedFieldFingerprint({
+        hostId: hostGrant.hostId,
+        connectorId,
+        grantId,
+        reason: input.reason,
+      }, ["hostId", "connectorId", "grantId", "reason"]);
+      const replay = replayFor(state, "grant.revoke", connectorId, requestId);
+      if (replay) {
+        if (replay.fingerprint !== fingerprint) {
+          return rejectTransition("IDEMPOTENCY_CONFLICT", false);
+        }
+        return returnTransition({
+          outcome: "success",
+          response: grantRevokedFromFrame(
+            openReplayResponse(state, replay),
+            { requestId, connectorId },
+          ),
+          replayed: true,
+        }, false);
+      }
+      const target = state.grants.find((candidate) => candidate.grantId === grantId);
+      if (!target) return rejectTransition("GRANT_NOT_FOUND", false);
+      if (target.role !== "client" || target.hostId !== hostGrant.hostId) {
+        return rejectTransition("PERMISSION_DENIED", false);
+      }
+      if (state.replays.length >= MAX_REPLAYS) {
+        return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      }
+      const alreadyRevoked = target.revokedAtMs !== null;
+      const revokedAtMs = target.revokedAtMs ?? now;
+      const response = grantRevokedFrame({
+        requestId,
+        connectorId,
+        grantId,
+        revokedAtMs,
+        alreadyRevoked,
+      });
+      if (!alreadyRevoked) target.revokedAtMs = revokedAtMs;
+      addReplay(state, {
+        operation: "grant.revoke",
+        subjectId: connectorId,
+        attemptId: requestId,
+        fingerprint,
+      }, response, now, (length) => this.randomExact(length));
+      return returnTransition({
+        outcome: "success",
+        response,
+        replayed: false,
+      }, true, alreadyRevoked ? undefined : {
+        reason: "grant_revoked",
+        role: "client",
+        hostId: target.hostId,
+        grantId: target.grantId,
+      });
     });
   }
 
@@ -2870,16 +3225,13 @@ implements RelayV2BrokerAuthControlAuthority {
           || !isRelayV2AuthIdentifier(request.payload.grantId)
           || request.payload.reason !== "user_revoked"
         ) throw authorityError("INVALID_ARGUMENT");
-        await this.readState((state, now) => {
-          revalidateCurrentAuthContext(state, request.currentAuthContext, now, "host");
+        return await this.revokeGrant({
+          requestId: request.requestId,
+          connectorId: request.connectorId,
+          grantId: request.payload.grantId,
+          reason: request.payload.reason,
+          currentAuthContext: request.currentAuthContext,
         });
-        return {
-          outcome: "reject",
-          error: structuredReject(
-            "CAPABILITY_UNAVAILABLE",
-            "Grant revoke requires a live authorization fence that is not configured",
-          ),
-        };
       }
       throw authorityError("INVALID_ARGUMENT");
     } catch (error) {
