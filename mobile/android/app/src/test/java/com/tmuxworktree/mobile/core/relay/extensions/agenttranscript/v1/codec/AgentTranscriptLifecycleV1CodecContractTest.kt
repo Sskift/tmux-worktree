@@ -5,6 +5,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -55,6 +56,10 @@ class AgentTranscriptLifecycleV1CodecContractTest {
 
     @Test
     fun everySharedInvalidFrameFailsForItsContractCategory() {
+        assertEquals(
+            fixtures.manifestRequiredInvalidCategories,
+            fixtures.invalid.map { it.category }.toSet(),
+        )
         fixtures.invalid.forEach { fixture ->
             val error = assertThrows(
                 fixture.name,
@@ -72,8 +77,15 @@ class AgentTranscriptLifecycleV1CodecContractTest {
                     "attachment",
                     -> "unknown-field"
                     "noncanonical-counter" -> "non-canonical-counter"
+                    "nonpositive-agent-event-sequence",
+                    "nonpositive-available-cut-sequence",
+                    -> "invalid-argument"
+                    "timeline-reset-lineage-rotation" -> "reset-shape"
+                    "replay-page-continuation" -> "replay-page-shape"
                     "invalid-lifecycle-scope" -> "lifecycle-binding"
                     "snapshot-page-shape" -> "page-shape"
+                    "snapshot-watermark" -> "snapshot-watermark"
+                    "host-epoch-error-details" -> "missing-field"
                     "agent-command-correlation" -> "agent-command-correlation"
                     else -> error("Unmapped invalid category " + fixture.category)
                 },
@@ -106,8 +118,32 @@ class AgentTranscriptLifecycleV1CodecContractTest {
 
         assertEquals(fixtures.manifestExtensionErrorCodes, decodedCodes)
         assertEquals(
-            fixtures.manifestExtensionErrorCodes,
+            fixtures.manifestExtensionErrorCodes + "HOST_EPOCH_MISMATCH",
             AgentTimelineErrorCode.entries.map { it.wireValue }.toSet(),
+        )
+
+        val hostEpochMismatch = correlatedErrorFrame(
+            code = "HOST_EPOCH_MISMATCH",
+            message = "",
+            details = linkedMapOf(
+                "expectedHostEpoch" to "host-epoch-1",
+                "actualHostEpoch" to "host-epoch-2",
+            ),
+        )
+        hostEpochMismatch["hostEpoch"] = "host-epoch-2"
+        val decodedHostEpochMismatch = decode(hostEpochMismatch) as AgentTimelineErrorFrame
+        assertEquals(AgentTimelineErrorCode.HOST_EPOCH_MISMATCH, decodedHostEpochMismatch.error.code)
+        assertEquals("", decodedHostEpochMismatch.error.message)
+        assertEquals(
+            AgentTimelineHostEpochMismatchDetails(
+                expectedHostEpoch = "host-epoch-1",
+                actualHostEpoch = "host-epoch-2",
+            ),
+            decodedHostEpochMismatch.error.details,
+        )
+        assertArrayEquals(
+            RelayV2StrictJson.stringify(hostEpochMismatch).toByteArray(StandardCharsets.UTF_8),
+            codec.encodePublicFrame(decodedHostEpochMismatch),
         )
 
         val retryable = correlatedErrorFrame(
@@ -174,6 +210,155 @@ class AgentTranscriptLifecycleV1CodecContractTest {
     }
 
     @Test
+    fun publicDecoderAcceptsSemanticWhitespaceKeyOrderAndEscapes() {
+        val canonical = fixtures.golden.single { it.name == "status-get" }.wire
+        val expected = codec.decodePublicFrame(canonical.toByteArray(StandardCharsets.UTF_8))
+        listOf(
+            " $canonical",
+            canonical.replace(
+                "{\"protocolVersion\":2,\"kind\":\"request\"",
+                "{\"kind\":\"request\",\"protocolVersion\":2",
+            ),
+            canonical.replace("\"mac-admin\"", "\"\\u006d\\u0061c-admin\""),
+        ).forEach { variant ->
+            assertEquals(
+                expected,
+                codec.decodePublicFrame(variant.toByteArray(StandardCharsets.UTF_8)),
+            )
+        }
+    }
+
+    @Test
+    fun codecIssuedPageArtifactsBindTheCompleteTypedFrameToActualRawByteCount() {
+        val replayFrame = fixtures.frame("replay-page-lifecycle-and-entry")
+        replayFrame.payload().apply {
+            this["replayThroughAgentSeq"] = "12"
+            this["isLast"] = false
+            this["nextCursor"] = "cursor-page-2"
+        }
+        val replayRaw = RelayV2StrictJson.stringify(replayFrame)
+            .toByteArray(StandardCharsets.UTF_8)
+        val replay = codec.decodePublicFrameArtifact(replayRaw)
+            as AgentTimelineReplayPagePublicFrameArtifact
+
+        assertEquals(replayRaw.size, replay.rawUtf8ByteCount)
+        assertEquals(2, replay.protocolVersion)
+        assertEquals(AgentTranscriptLifecycleV1FrameKind.RESPONSE, replay.kind)
+        assertEquals("agent.timeline.replay.page", replay.type)
+        assertEquals("agent.transcript-lifecycle.v1", replay.capability)
+        assertEquals("agent-replay-1", replay.requestId)
+        assertEquals("mac-admin", replay.hostId)
+        assertEquals("host-epoch-1", replay.hostEpoch)
+        assertEquals("scope-local", replay.scopeId)
+        assertEquals("session-1", replay.sessionId)
+        assertSame(replay.frame.page, replay.payload)
+        assertEquals("timeline-1", replay.timelineEpoch)
+        assertEquals("8", replay.afterAgentSeq)
+        assertEquals("12", replay.replayThroughAgentSeq)
+        assertEquals(false, replay.isLast)
+        assertEquals("cursor-page-2", replay.nextCursor)
+        assertSame(replay.frame.page.events, replay.events)
+        assertEquals(replay.frame, codec.decodePublicFrame(replayRaw))
+        val replayEventsBeforeMutation = replay.events.toList()
+        val mutableReplayEvents = replay.events as MutableList<AgentTimelineEventRecord>
+        assertThrows(UnsupportedOperationException::class.java) {
+            mutableReplayEvents.clear()
+        }
+        assertEquals(replayEventsBeforeMutation, replay.events)
+        assertSame(replay.frame.page.events, replay.events)
+
+        val canonicalSnapshotRaw = fixtures.wire("snapshot-page-materialized")
+        val nonCanonicalSnapshotRaw = fixtures.golden
+            .single { it.name == "snapshot-page-materialized" }
+            .wire
+            .replace(
+                "{\"protocolVersion\":2,\"kind\":\"response\"",
+                "{\n  \"kind\": \"response\", \"protocolVersion\": 2",
+            )
+            .replace("\"mac-admin\"", "\"\\u006d\\u0061c-admin\"")
+            .toByteArray(StandardCharsets.UTF_8)
+        val canonicalSnapshot = codec.decodePublicFrameArtifact(canonicalSnapshotRaw)
+            as AgentTimelineSnapshotPagePublicFrameArtifact
+        val snapshot = codec.decodePublicFrameArtifact(nonCanonicalSnapshotRaw)
+            as AgentTimelineSnapshotPagePublicFrameArtifact
+
+        assertEquals(canonicalSnapshot.frame, snapshot.frame)
+        assertTrue(canonicalSnapshot.rawUtf8ByteCount != snapshot.rawUtf8ByteCount)
+        assertEquals(canonicalSnapshotRaw.size, canonicalSnapshot.rawUtf8ByteCount)
+        assertEquals(nonCanonicalSnapshotRaw.size, snapshot.rawUtf8ByteCount)
+        assertEquals(2, snapshot.protocolVersion)
+        assertEquals(AgentTranscriptLifecycleV1FrameKind.RESPONSE, snapshot.kind)
+        assertEquals("agent.timeline.snapshot.page", snapshot.type)
+        assertEquals("agent.transcript-lifecycle.v1", snapshot.capability)
+        assertEquals("agent-snapshot-attempt-1", snapshot.requestId)
+        assertEquals("mac-admin", snapshot.hostId)
+        assertEquals("host-epoch-1", snapshot.hostEpoch)
+        assertEquals("scope-local", snapshot.scopeId)
+        assertEquals("session-1", snapshot.sessionId)
+        assertSame(snapshot.frame.page, snapshot.payload)
+        assertEquals("timeline-1", snapshot.timelineEpoch)
+        assertEquals("agent-snapshot-logical-1", snapshot.snapshotRequestId)
+        assertEquals("agent-snapshot-cut-1", snapshot.snapshotId)
+        assertEquals(0L, snapshot.pageIndex)
+        assertEquals(true, snapshot.isLast)
+        assertEquals(null, snapshot.nextCursor)
+        assertEquals("8", snapshot.throughAgentSeq)
+        assertEquals("1", snapshot.earliestRetainedSeq)
+        assertSame(snapshot.frame.page.records, snapshot.records)
+        val snapshotRecordsBeforeMutation = snapshot.records.toList()
+        val mutableSnapshotRecords =
+            snapshot.records as MutableList<AgentTimelineSnapshotRecord>
+        assertThrows(UnsupportedOperationException::class.java) {
+            mutableSnapshotRecords.clear()
+        }
+        assertEquals(snapshotRecordsBeforeMutation, snapshot.records)
+        assertSame(snapshot.frame.page.records, snapshot.records)
+    }
+
+    @Test
+    fun canonicalPublicRecordSeamsRequireFixedOrderExactBytes() {
+        val replay = codec.decodePublicFrame(
+            fixtures.wire("replay-page-lifecycle-and-entry"),
+        ) as AgentTimelineReplayPageFrame
+        val event = replay.page.events.first()
+        val eventBytes = codec.encodeCanonicalPublicEventRecord(event)
+        assertEquals(event, codec.decodeCanonicalPublicEventRecord(eventBytes))
+        listOf(
+            " " + eventBytes.toString(StandardCharsets.UTF_8),
+            eventBytes.toString(StandardCharsets.UTF_8).replace(
+                "{\"agentEventSeq\":\"9\",\"eventId\":\"event-9\"",
+                "{\"eventId\":\"event-9\",\"agentEventSeq\":\"9\"",
+            ),
+            eventBytes.toString(StandardCharsets.UTF_8)
+                .replace("\"event-9\"", "\"\\u0065vent-9\""),
+        ).forEach { variant ->
+            val error = assertThrows(AgentTranscriptLifecycleV1CodecException::class.java) {
+                codec.decodeCanonicalPublicEventRecord(
+                    variant.toByteArray(StandardCharsets.UTF_8),
+                )
+            }
+            assertEquals("non-canonical-record", error.failureClass)
+        }
+
+        val snapshot = codec.decodePublicFrame(
+            fixtures.wire("snapshot-page-materialized"),
+        ) as AgentTimelineSnapshotPageFrame
+        val record = snapshot.page.records.first()
+        val recordBytes = codec.encodeCanonicalPublicSnapshotRecord(record)
+        assertEquals(record, codec.decodeCanonicalPublicSnapshotRecord(recordBytes))
+        val reorderedRecord = recordBytes.toString(StandardCharsets.UTF_8).replace(
+            "{\"recordType\":\"lifecycle\",\"lifecycleEventId\":\"event-2\"",
+            "{\"lifecycleEventId\":\"event-2\",\"recordType\":\"lifecycle\"",
+        )
+        val recordError = assertThrows(AgentTranscriptLifecycleV1CodecException::class.java) {
+            codec.decodeCanonicalPublicSnapshotRecord(
+                reorderedRecord.toByteArray(StandardCharsets.UTF_8),
+            )
+        }
+        assertEquals("non-canonical-record", recordError.failureClass)
+    }
+
+    @Test
     fun opaqueIdsAndCanonicalUint64CountersStayOpaqueAndBounded() {
         val arbitraryId = fixtures.frame("live-entry-redacted")
         arbitraryId["hostId"] = "__proto__/not-a-uuid"
@@ -187,14 +372,14 @@ class AgentTranscriptLifecycleV1CodecContractTest {
         oversizedId["hostId"] = "x".repeat(129)
         assertRejected(oversizedId, "id-byte-limit")
 
-        val exactCursor = "é".repeat(64)
-        assertEquals(128, exactCursor.toByteArray(StandardCharsets.UTF_8).size)
+        val exactCursor = "é".repeat(512)
+        assertEquals(1_024, exactCursor.toByteArray(StandardCharsets.UTF_8).size)
         val cursorAtLimit = fixtures.frame("replay-get")
         cursorAtLimit.payload()["cursor"] = exactCursor
         decode(cursorAtLimit)
 
         val oversizedCursor = exactCursor + "x"
-        assertEquals(129, oversizedCursor.toByteArray(StandardCharsets.UTF_8).size)
+        assertEquals(1_025, oversizedCursor.toByteArray(StandardCharsets.UTF_8).size)
         val cursorOverLimit = fixtures.frame("replay-get")
         cursorOverLimit.payload()["cursor"] = oversizedCursor
         assertRejected(cursorOverLimit, "id-byte-limit")
@@ -268,6 +453,29 @@ class AgentTranscriptLifecycleV1CodecContractTest {
     }
 
     @Test
+    fun availableStatusAndSnapshotWatermarksUseFrozenPositiveLimits() {
+        listOf(
+            "maxTextUtf8Bytes" to 65_535L,
+            "maxPageRecords" to 255L,
+            "snapshotLeaseMs" to 299_999L,
+        ).forEach { (field, value) ->
+            val status = fixtures.frame("status-available")
+            status.payload().mapValue("limits")[field] = value
+            assertRejected(status, "schema-mismatch")
+        }
+
+        val statusWatermark = fixtures.frame("status-available")
+        statusWatermark.payload()["currentAgentSeq"] = "7"
+        statusWatermark.payload()["earliestReplaySeq"] = "8"
+        assertRejected(statusWatermark, "status-watermark")
+
+        val snapshotWatermark = fixtures.frame("snapshot-page-materialized")
+        snapshotWatermark.payload()["throughAgentSeq"] = "7"
+        snapshotWatermark.payload()["earliestRetainedSeq"] = "8"
+        assertRejected(snapshotWatermark, "snapshot-watermark")
+    }
+
+    @Test
     fun snapshotAndReplayPagesAcceptAtMost256TypedItems() {
         val snapshotAtLimit = fixtures.frame("snapshot-page-materialized")
         snapshotAtLimit.payload()["throughAgentSeq"] = "256"
@@ -300,6 +508,52 @@ class AgentTranscriptLifecycleV1CodecContractTest {
             deletionEvent((index + 1).toString())
         }.toMutableList()
         assertRejected(replayOverLimit, "invalid-argument")
+    }
+
+    @Test
+    fun snapshotRecordsAreGloballyOrderedWithinThePinnedPage() {
+        val outOfOrder = fixtures.frame("snapshot-page-materialized")
+        val records = outOfOrder.snapshotRecords()
+        val first = records.removeAt(0)
+        records.add(1, first)
+        assertRejected(outOfOrder, "snapshot-record-order")
+    }
+
+    @Test
+    fun replayPagesAreContinuousAndTerminateExactlyAtThePinnedCut() {
+        val laterContinuation = fixtures.frame("replay-page-lifecycle-and-entry")
+        laterContinuation.replayEvents().removeAt(0)
+        val decodedContinuation = decode(laterContinuation) as AgentTimelineReplayPageFrame
+        assertEquals("10", decodedContinuation.page.events.first().agentEventSeq)
+
+        val gapWithinPage = fixtures.frame("replay-page-lifecycle-and-entry")
+        gapWithinPage.replayEvents().removeAt(1)
+        assertRejected(gapWithinPage, "replay-sequence")
+
+        val afterAhead = fixtures.frame("replay-page-lifecycle-and-entry")
+        afterAhead.payload()["afterAgentSeq"] = "12"
+        assertRejected(afterAhead, "replay-watermark")
+
+        val validContinuation = fixtures.frame("replay-page-lifecycle-and-entry")
+        validContinuation.payload()["replayThroughAgentSeq"] = "12"
+        validContinuation.payload()["isLast"] = false
+        validContinuation.payload()["nextCursor"] = "cursor-page-2"
+        decode(validContinuation)
+
+        val finalStopsEarly = fixtures.frame("replay-page-lifecycle-and-entry")
+        finalStopsEarly.payload()["replayThroughAgentSeq"] = "12"
+        assertRejected(finalStopsEarly, "replay-page-shape")
+
+        val invalidEmpty = fixtures.frame("replay-page-empty-genesis-cut")
+        invalidEmpty.payload()["replayThroughAgentSeq"] = "1"
+        assertRejected(invalidEmpty, "replay-page-shape")
+
+        val genesis = codec.decodePublicFrame(
+            fixtures.wire("replay-page-empty-genesis-cut"),
+        ) as AgentTimelineReplayPageFrame
+        assertEquals("0", genesis.page.afterAgentSeq)
+        assertEquals("0", genesis.page.replayThroughAgentSeq)
+        assertTrue(genesis.page.events.isEmpty())
     }
 
     @Test
@@ -354,6 +608,22 @@ class AgentTranscriptLifecycleV1CodecContractTest {
             this["lastModifiedAgentSeq"] = "9"
         }
         assertRejected(appendMirrorConflict, "entry-event-binding")
+
+        val appendTimeConflict = fixtures.frame("replay-page-lifecycle-and-entry")
+        appendTimeConflict.replayEvents()[1].mutation().entry()["createdAtMs"] =
+            1_783_700_500_001L
+        assertRejected(appendTimeConflict, "entry-event-binding")
+
+        val interruptedWithoutReason = fixtures.frame("replay-page-lifecycle-and-entry")
+        interruptedWithoutReason.replayEvents()[2].mutation()["reason"] = null
+        assertRejected(interruptedWithoutReason, "source-availability-binding")
+
+        val connectedAfterRestart = fixtures.frame("replay-page-lifecycle-and-entry")
+        connectedAfterRestart.replayEvents()[2].mutation().apply {
+            this["state"] = "connected"
+            this["reason"] = "source_restarted"
+        }
+        decode(connectedAfterRestart)
     }
 
     @Test
@@ -463,6 +733,11 @@ private class AgentTranscriptLifecycleV1Fixtures {
         .map { it as? String ?: error("Manifest extension error code must be a string") }
         .toSet()
 
+    val manifestRequiredInvalidCategories: Set<String> = manifest
+        .list("requiredInvalidCategories")
+        .map { it as? String ?: error("Manifest invalid category must be a string") }
+        .toSet()
+
     val golden: List<AgentTranscriptLifecycleV1GoldenFixture> =
         readArray("$base/$goldenPath").map {
             AgentTranscriptLifecycleV1GoldenFixture(
@@ -545,14 +820,17 @@ private fun deletionEvent(sequence: String): LinkedHashMap<String, Any?> = linke
 private fun correlatedErrorFrame(
     code: String,
     retryAfterMs: Long? = null,
+    message: String = "Agent timeline request failed",
+    details: Map<String, Any?>? = null,
 ): LinkedHashMap<String, Any?> {
     val error = linkedMapOf<String, Any?>(
         "code" to code,
-        "message" to "Agent timeline request failed",
+        "message" to message,
         "retryable" to (retryAfterMs != null),
     )
     retryAfterMs?.let { error["retryAfterMs"] = it }
     error["commandDisposition"] = "not_applicable"
+    details?.let { error["details"] = it }
     return linkedMapOf(
         "protocolVersion" to 2L,
         "kind" to "response",
@@ -586,6 +864,10 @@ private fun MutableMap<String, Any?>.lifecycle(): MutableMap<String, Any?> =
 @Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.failure(): MutableMap<String, Any?> =
     getValue("failure") as MutableMap<String, Any?>
+
+@Suppress("UNCHECKED_CAST")
+private fun MutableMap<String, Any?>.mapValue(name: String): MutableMap<String, Any?> =
+    getValue(name) as MutableMap<String, Any?>
 
 @Suppress("UNCHECKED_CAST")
 private fun MutableMap<String, Any?>.structuredError(): MutableMap<String, Any?> =

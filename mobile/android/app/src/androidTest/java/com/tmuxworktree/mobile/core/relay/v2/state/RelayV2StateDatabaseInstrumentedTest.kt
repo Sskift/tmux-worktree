@@ -24,6 +24,7 @@ import org.junit.runner.RunWith
 class RelayV2StateDatabaseInstrumentedTest {
     private lateinit var database: RelayV2StateDatabase
     private lateinit var dao: RelayV2StateDao
+    private lateinit var lifecycleDao: RelayV2AgentLifecycleDao
 
     @Before
     fun setUp() {
@@ -32,6 +33,7 @@ class RelayV2StateDatabaseInstrumentedTest {
             .allowMainThreadQueries()
             .build()
         dao = database.stateDao()
+        lifecycleDao = database.agentLifecycleDao()
     }
 
     @After
@@ -187,6 +189,42 @@ class RelayV2StateDatabaseInstrumentedTest {
             assertTrue(failure != null)
             assertEquals(committed, agentClaim(namespace))
         }
+    }
+
+    @Test
+    fun rowOrientedAgentPointersUseExactCasAndPreserveWitnessesOnParentAdvance() {
+        val rows = agentLifecycleRows(durableNamespace("profile", activation = 1))
+        dao.insertAgentTranscriptLifecycleState(rows.parent)
+        lifecycleDao.insertWitnesses(listOf(rows.waiting, rows.completed))
+
+        assertTrue(
+            runCatching {
+                lifecycleDao.insertCurrent(listOf(rows.current.copy(runId = "wrong-run")))
+            }.exceptionOrNull() != null,
+        )
+        lifecycleDao.insertCurrent(listOf(rows.current))
+        assertEquals(0, updateCurrent(rows, expectedAgentEventSeq = "wrong-sequence"))
+        assertEquals(1, updateCurrent(rows, expectedAgentEventSeq = rows.waiting.agentEventSeq))
+
+        lifecycleDao.insertRecentEvidence(listOf(rows.recent))
+        assertEquals(0, deleteRecentEvidence(rows.recent, expectedSha256 = "wrong-hash"))
+
+        assertTrue(
+            runCatching {
+                lifecycleDao.insertNotifications(
+                    listOf(rows.notification.copy(lifecycleState = "COMPLETED")),
+                )
+            }.exceptionOrNull() != null,
+        )
+        lifecycleDao.insertNotifications(listOf(rows.notification))
+        assertAgentLifecycleFamilyCounts(current = 1, witness = 2, recent = 1, notification = 1)
+
+        assertEquals(0, updateConsumerAuthority(rows, expectedSha256 = "wrong-hash"))
+        assertEquals(1, updateConsumerAuthority(rows, expectedSha256 = rows.parent.payloadSha256))
+        assertAgentLifecycleFamilyCounts(current = 1, witness = 2, recent = 1, notification = 1)
+
+        assertEquals(1, rotateConsumerAuthority(rows.parent))
+        assertAgentLifecycleFamilyCounts(current = 0, witness = 0, recent = 0, notification = 0)
     }
 
     @Test
@@ -427,6 +465,185 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
     }
 
+    private fun agentLifecycleRows(
+        namespace: RelayV2OutboxAuthorityNamespace,
+    ): AgentLifecycleRowFixture {
+        val consumer = agentConsumer(namespace)
+        fun payload(kind: String) = RelayV2StorageJson.encode(1, linkedMapOf("kind" to kind))
+        val parentPayload = payload("parent-old")
+        val parent = RelayV2AgentTranscriptLifecycleStateEntity(
+            profileId = consumer.profileId,
+            profileActivationGeneration = consumer.profileActivationGeneration,
+            principalId = consumer.principalId,
+            clientInstanceId = consumer.clientInstanceId,
+            hostId = consumer.hostId,
+            hostEpoch = consumer.hostEpoch,
+            scopeId = consumer.scopeId,
+            sessionId = consumer.sessionId,
+            timelineEpochKey = AGENT_TIMELINE_EPOCH,
+            codecVersion = parentPayload.codecVersion,
+            payloadUtf8Bytes = parentPayload.payloadUtf8Bytes,
+            payloadCanonicalJson = parentPayload.canonicalJson,
+            payloadSha256 = parentPayload.sha256,
+        )
+        fun witness(eventId: String, agentEventSeq: String, lifecycleState: String):
+            RelayV2AgentLifecycleEventWitnessEntity {
+            val witnessPayload = payload("witness-$eventId")
+            return RelayV2AgentLifecycleEventWitnessEntity(
+                profileId = consumer.profileId,
+                profileActivationGeneration = consumer.profileActivationGeneration,
+                principalId = consumer.principalId,
+                clientInstanceId = consumer.clientInstanceId,
+                hostId = consumer.hostId,
+                hostEpoch = consumer.hostEpoch,
+                scopeId = consumer.scopeId,
+                sessionId = consumer.sessionId,
+                timelineEpoch = AGENT_TIMELINE_EPOCH,
+                eventId = eventId,
+                agentEventSeq = agentEventSeq,
+                agentEventSeqOrder = orderKey(agentEventSeq),
+                lifecycleScope = "TURN",
+                runId = "run",
+                turnIdKey = "turn",
+                sourceEpoch = "source",
+                lifecycleState = lifecycleState,
+                failureCode = null,
+                failureSummary = null,
+                occurredAtMs = agentEventSeq.toLong(),
+                closedEventDigest = digest("closed-$eventId").value,
+                witnessCanonicalJson = witnessPayload.canonicalJson,
+                witnessCanonicalUtf8Bytes = witnessPayload.payloadUtf8Bytes,
+                witnessSha256 = witnessPayload.sha256,
+            )
+        }
+        val waiting = witness("turn-waiting", "1", "WAITING_FOR_USER")
+        val completed = witness("turn-completed", "2", "COMPLETED")
+        val recentPayload = payload("recent")
+        val ledgerPayload = payload("ledger")
+        return AgentLifecycleRowFixture(
+            parent = parent,
+            nextParentPayload = payload("parent-new"),
+            waiting = waiting,
+            completed = completed,
+            current = RelayV2AgentLifecycleCurrentEntity(
+                profileId = waiting.profileId,
+                profileActivationGeneration = waiting.profileActivationGeneration,
+                principalId = waiting.principalId,
+                clientInstanceId = waiting.clientInstanceId,
+                hostId = waiting.hostId,
+                hostEpoch = waiting.hostEpoch,
+                scopeId = waiting.scopeId,
+                sessionId = waiting.sessionId,
+                timelineEpoch = waiting.timelineEpoch,
+                lifecycleScope = waiting.lifecycleScope,
+                runId = waiting.runId,
+                turnIdKey = waiting.turnIdKey,
+                lifecycleEventId = waiting.eventId,
+                agentEventSeq = waiting.agentEventSeq,
+                agentEventSeqOrder = waiting.agentEventSeqOrder,
+            ),
+            recent = RelayV2AgentRecentEventEvidenceEntity(
+                profileId = waiting.profileId,
+                profileActivationGeneration = waiting.profileActivationGeneration,
+                principalId = waiting.principalId,
+                clientInstanceId = waiting.clientInstanceId,
+                hostId = waiting.hostId,
+                hostEpoch = waiting.hostEpoch,
+                scopeId = waiting.scopeId,
+                sessionId = waiting.sessionId,
+                timelineEpoch = waiting.timelineEpoch,
+                agentEventSeq = "3",
+                agentEventSeqOrder = orderKey("3"),
+                eventId = "non-lifecycle",
+                closedEventDigest = digest("non-lifecycle").value,
+                evidenceCanonicalJson = recentPayload.canonicalJson,
+                evidenceCanonicalUtf8Bytes = recentPayload.payloadUtf8Bytes,
+                evidenceSha256 = recentPayload.sha256,
+            ),
+            notification = RelayV2AgentNotificationLedgerEntity(
+                profileId = waiting.profileId,
+                profileActivationGeneration = waiting.profileActivationGeneration,
+                principalId = waiting.principalId,
+                clientInstanceId = waiting.clientInstanceId,
+                hostId = waiting.hostId,
+                hostEpoch = waiting.hostEpoch,
+                scopeId = waiting.scopeId,
+                sessionId = waiting.sessionId,
+                timelineEpoch = waiting.timelineEpoch,
+                lifecycleEventId = waiting.eventId,
+                lifecycleState = waiting.lifecycleState,
+                agentEventSeq = waiting.agentEventSeq,
+                agentEventSeqOrder = waiting.agentEventSeqOrder,
+                disposition = "SHOWN",
+                localGeneration = "1",
+                ledgerCanonicalJson = ledgerPayload.canonicalJson,
+                ledgerCanonicalUtf8Bytes = ledgerPayload.payloadUtf8Bytes,
+                ledgerSha256 = ledgerPayload.sha256,
+            ),
+        )
+    }
+
+    private fun updateCurrent(
+        rows: AgentLifecycleRowFixture,
+        expectedAgentEventSeq: String,
+    ): Int = rows.current.let { current ->
+        lifecycleDao.updateCurrentExact(
+            current.profileId, current.profileActivationGeneration, current.principalId,
+            current.clientInstanceId, current.hostId, current.hostEpoch, current.scopeId,
+            current.sessionId, current.timelineEpoch, current.lifecycleScope, current.runId,
+            current.turnIdKey, current.lifecycleEventId, expectedAgentEventSeq,
+            current.agentEventSeqOrder, rows.completed.eventId, rows.completed.agentEventSeq,
+            rows.completed.agentEventSeqOrder,
+        )
+    }
+
+    private fun deleteRecentEvidence(
+        evidence: RelayV2AgentRecentEventEvidenceEntity,
+        expectedSha256: String,
+    ): Int = lifecycleDao.deleteRecentEvidenceExact(
+        evidence.profileId, evidence.profileActivationGeneration, evidence.principalId,
+        evidence.clientInstanceId, evidence.hostId, evidence.hostEpoch, evidence.scopeId,
+        evidence.sessionId, evidence.timelineEpoch, evidence.agentEventSeq,
+        evidence.agentEventSeqOrder, evidence.eventId, evidence.closedEventDigest,
+        evidence.evidenceCanonicalJson, evidence.evidenceCanonicalUtf8Bytes, expectedSha256,
+    )
+
+    private fun updateConsumerAuthority(
+        rows: AgentLifecycleRowFixture,
+        expectedSha256: String,
+    ): Int = rows.parent.let { parent ->
+        lifecycleDao.updateConsumerAuthorityExact(
+            parent.profileId, parent.profileActivationGeneration, parent.principalId,
+            parent.clientInstanceId, parent.hostId, parent.hostEpoch, parent.scopeId,
+            parent.sessionId, parent.timelineEpochKey, parent.codecVersion,
+            parent.payloadUtf8Bytes, parent.payloadCanonicalJson, expectedSha256,
+            rows.nextParentPayload.codecVersion, rows.nextParentPayload.payloadUtf8Bytes,
+            rows.nextParentPayload.canonicalJson, rows.nextParentPayload.sha256,
+        )
+    }
+
+    private fun rotateConsumerAuthority(
+        parent: RelayV2AgentTranscriptLifecycleStateEntity,
+    ): Int = lifecycleDao.deleteConsumerAuthorityForTimelineRotation(
+        parent.profileId, parent.profileActivationGeneration, parent.principalId,
+        parent.clientInstanceId, parent.hostId, parent.hostEpoch, parent.scopeId,
+        parent.sessionId, parent.timelineEpochKey,
+    )
+
+    private fun assertAgentLifecycleFamilyCounts(
+        current: Int,
+        witness: Int,
+        recent: Int,
+        notification: Int,
+    ) {
+        val currentStats = lifecycleDao.currentGlobalStats()
+        assertEquals(current.toLong(), currentStats.itemCount)
+        assertEquals(0L, currentStats.byteCount)
+        assertEquals(witness.toLong(), lifecycleDao.witnessGlobalStats().itemCount)
+        assertEquals(recent.toLong(), lifecycleDao.recentEvidenceGlobalStats().itemCount)
+        assertEquals(notification.toLong(), lifecycleDao.notificationGlobalStats().itemCount)
+    }
+
     private suspend fun putAgentConsumer(namespace: RelayV2OutboxAuthorityNamespace) {
         val fixture = agentClaimFixture(namespace)
         val repository = AgentTranscriptLifecycleDurableRepository(database)
@@ -597,10 +814,10 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
         assertEquals(
             expected,
-            dao.agentTranscriptEntryCount(
+            dao.agentTranscriptEntryStats(
                 identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
                 identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
-            ),
+            ).itemCount,
         )
         assertEquals(
             expected,
@@ -611,18 +828,18 @@ class RelayV2StateDatabaseInstrumentedTest {
         )
         assertEquals(
             expected,
-            dao.agentTranscriptSnapshotRecordCount(
+            dao.agentTranscriptSnapshotRecordStats(
                 identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
                 identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
                 agentSnapshotId(namespace),
-            ),
+            ).itemCount,
         )
         assertEquals(
             expected,
-            dao.agentTranscriptPendingEventCount(
+            dao.agentTranscriptPendingEventStats(
                 identity[0], consumer.profileActivationGeneration, identity[1], identity[2],
                 identity[3], identity[4], identity[5], identity[6], AGENT_TIMELINE_EPOCH,
-            ),
+            ).itemCount,
         )
     }
 
@@ -630,7 +847,7 @@ class RelayV2StateDatabaseInstrumentedTest {
         namespace: RelayV2OutboxAuthorityNamespace,
     ): List<RelayV2AgentTranscriptPendingEventEntity> {
         val consumer = agentConsumer(namespace)
-        return dao.agentTranscriptPendingEvents(
+        return dao.agentTranscriptPendingEventPageAfter(
             consumer.profileId,
             consumer.profileActivationGeneration,
             consumer.principalId,
@@ -640,6 +857,9 @@ class RelayV2StateDatabaseInstrumentedTest {
             consumer.scopeId,
             consumer.sessionId,
             AGENT_TIMELINE_EPOCH,
+            "",
+            "",
+            256,
         )
     }
 
@@ -957,6 +1177,16 @@ class RelayV2StateDatabaseInstrumentedTest {
         val namespace: AgentTranscriptLifecycleDurableNamespace,
         val state: AgentTranscriptLifecycleClientState,
         val intent: AgentSystemNotificationIntent,
+    )
+
+    private data class AgentLifecycleRowFixture(
+        val parent: RelayV2AgentTranscriptLifecycleStateEntity,
+        val nextParentPayload: RelayV2EncodedPayload,
+        val waiting: RelayV2AgentLifecycleEventWitnessEntity,
+        val completed: RelayV2AgentLifecycleEventWitnessEntity,
+        val current: RelayV2AgentLifecycleCurrentEntity,
+        val recent: RelayV2AgentRecentEventEvidenceEntity,
+        val notification: RelayV2AgentNotificationLedgerEntity,
     )
 
     private companion object {

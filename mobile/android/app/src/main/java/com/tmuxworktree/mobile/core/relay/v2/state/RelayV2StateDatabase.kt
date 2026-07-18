@@ -24,12 +24,17 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RelayV2AgentTranscriptSnapshotStagingEntity::class,
         RelayV2AgentTranscriptSnapshotRecordEntity::class,
         RelayV2AgentTranscriptPendingEventEntity::class,
+        RelayV2AgentLifecycleCurrentEntity::class,
+        RelayV2AgentLifecycleEventWitnessEntity::class,
+        RelayV2AgentRecentEventEvidenceEntity::class,
+        RelayV2AgentNotificationLedgerEntity::class,
     ],
     version = 5,
     exportSchema = true,
 )
 internal abstract class RelayV2StateDatabase : RoomDatabase() {
     abstract fun stateDao(): RelayV2StateDao
+    abstract fun agentLifecycleDao(): RelayV2AgentLifecycleDao
 
     companion object {
         const val DATABASE_NAME = "tw_mobile_relay_v2_state.db"
@@ -226,9 +231,10 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
         }
 
         /**
-         * Adds row-oriented Agent transcript materialization, snapshot staging, and the bounded
-         * durable LIVE buffer used only while snapshot/gap handling blocks cursor advancement.
-         * Existing version 4 payloads remain opaque and byte-for-byte untouched.
+         * Adds row-oriented Agent transcript materialization, lifecycle current/permanent/recent
+         * evidence, notification ledger, snapshot staging, and the bounded durable LIVE buffer.
+         * Existing version 4 payloads remain opaque and byte-for-byte untouched; no timeline is
+         * read, lifted, or fabricated during this migration.
          */
         val MIGRATION_4_5: Migration = object : Migration(4, 5) {
             override fun migrate(db: SupportSQLiteDatabase) {
@@ -267,8 +273,27 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                             `profileId`, `profileActivationGeneration`, `principalId`,
                             `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                             `timelineEpoch`, `entryId`
-                        )
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
                     )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_transcript_entries_authority`
+                    ON `relay_v2_agent_transcript_entries` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                        )
                     """.trimIndent(),
                 )
                 db.execSQL(
@@ -338,7 +363,16 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                             `profileId`, `profileActivationGeneration`, `principalId`,
                             `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                             `timelineEpoch`, `snapshotId`
-                        )
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
                     )
                     """.trimIndent(),
                 )
@@ -447,7 +481,26 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                             `profileId`, `profileActivationGeneration`, `principalId`,
                             `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                             `timelineEpoch`, `agentEventSeq`
-                        )
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_transcript_pending_events_authority`
+                    ON `relay_v2_agent_transcript_pending_events` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
                     )
                     """.trimIndent(),
                 )
@@ -469,6 +522,401 @@ internal abstract class RelayV2StateDatabase : RoomDatabase() {
                         `profileId`, `profileActivationGeneration`, `principalId`,
                         `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
                         `timelineEpoch`, `agentEventSeqOrder`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_lifecycle_current` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `lifecycleScope` TEXT NOT NULL,
+                        `runId` TEXT NOT NULL,
+                        `turnIdKey` TEXT NOT NULL,
+                        `lifecycleEventId` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `lifecycleScope`, `runId`, `turnIdKey`
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`,
+                            `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`
+                        ) REFERENCES `relay_v2_agent_lifecycle_event_witnesses` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`,
+                            `lifecycleScope`, `runId`, `turnIdKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_current_authority`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_event`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lifecycleEventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_seq`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeq`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_order`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeqOrder`, `lifecycleEventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_current_witness`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`,
+                        `agentEventSeqOrder`, `lifecycleScope`, `runId`, `turnIdKey`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_current_run_turn`
+                    ON `relay_v2_agent_lifecycle_current` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `runId`, `lifecycleScope`, `turnIdKey`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `eventId` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        `lifecycleScope` TEXT NOT NULL,
+                        `runId` TEXT NOT NULL,
+                        `turnIdKey` TEXT NOT NULL,
+                        `sourceEpoch` TEXT NOT NULL,
+                        `lifecycleState` TEXT NOT NULL,
+                        `failureCode` TEXT,
+                        `failureSummary` TEXT,
+                        `occurredAtMs` INTEGER NOT NULL,
+                        `closedEventDigest` TEXT,
+                        `witnessCanonicalJson` TEXT NOT NULL,
+                        `witnessCanonicalUtf8Bytes` INTEGER NOT NULL,
+                        `witnessSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `eventId`
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_authority`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_seq`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeq`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_lifecycle_witnesses_order`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeqOrder`, `eventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_lifecycle_witnesses_current_binding`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`,
+                        `lifecycleScope`, `runId`, `turnIdKey`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_lifecycle_witnesses_notification_binding`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`,
+                        `lifecycleState`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS
+                        `index_agent_lifecycle_witnesses_run_turn_history`
+                    ON `relay_v2_agent_lifecycle_event_witnesses` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lifecycleScope`, `runId`, `turnIdKey`,
+                        `agentEventSeqOrder`, `eventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_recent_event_evidence` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        `eventId` TEXT NOT NULL,
+                        `closedEventDigest` TEXT NOT NULL,
+                        `evidenceCanonicalJson` TEXT NOT NULL,
+                        `evidenceCanonicalUtf8Bytes` INTEGER NOT NULL,
+                        `evidenceSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `agentEventSeq`
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_recent_evidence_authority`
+                    ON `relay_v2_agent_recent_event_evidence` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_recent_evidence_event`
+                    ON `relay_v2_agent_recent_event_evidence` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `eventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_recent_evidence_order`
+                    ON `relay_v2_agent_recent_event_evidence` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeqOrder`, `eventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS `relay_v2_agent_notification_ledger` (
+                        `profileId` TEXT NOT NULL,
+                        `profileActivationGeneration` INTEGER NOT NULL,
+                        `principalId` TEXT NOT NULL,
+                        `clientInstanceId` TEXT NOT NULL,
+                        `hostId` TEXT NOT NULL,
+                        `hostEpoch` TEXT NOT NULL,
+                        `scopeId` TEXT NOT NULL,
+                        `sessionId` TEXT NOT NULL,
+                        `timelineEpoch` TEXT NOT NULL,
+                        `lifecycleEventId` TEXT NOT NULL,
+                        `lifecycleState` TEXT NOT NULL,
+                        `agentEventSeq` TEXT NOT NULL,
+                        `agentEventSeqOrder` TEXT NOT NULL,
+                        `disposition` TEXT NOT NULL,
+                        `localGeneration` TEXT NOT NULL,
+                        `ledgerCanonicalJson` TEXT NOT NULL,
+                        `ledgerCanonicalUtf8Bytes` INTEGER NOT NULL,
+                        `ledgerSha256` TEXT NOT NULL,
+                        PRIMARY KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `lifecycleEventId`, `lifecycleState`
+                        ),
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`
+                        ) REFERENCES `relay_v2_agent_transcript_lifecycle_states` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpochKey`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE,
+                        FOREIGN KEY(
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`,
+                            `agentEventSeqOrder`, `lifecycleState`
+                        ) REFERENCES `relay_v2_agent_lifecycle_event_witnesses` (
+                            `profileId`, `profileActivationGeneration`, `principalId`,
+                            `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                            `timelineEpoch`, `eventId`, `agentEventSeq`, `agentEventSeqOrder`,
+                            `lifecycleState`
+                        ) ON UPDATE NO ACTION ON DELETE CASCADE
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_authority`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_notification_ledger_event`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lifecycleEventId`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS `index_agent_notification_ledger_seq`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeq`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_witness`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `lifecycleEventId`, `agentEventSeq`,
+                        `agentEventSeqOrder`, `lifecycleState`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        `index_agent_notification_ledger_pending_order`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `disposition`, `agentEventSeqOrder`,
+                        `lifecycleEventId`, `lifecycleState`
+                    )
+                    """.trimIndent(),
+                )
+                db.execSQL(
+                    """
+                    CREATE INDEX IF NOT EXISTS `index_agent_notification_ledger_audit_order`
+                    ON `relay_v2_agent_notification_ledger` (
+                        `profileId`, `profileActivationGeneration`, `principalId`,
+                        `clientInstanceId`, `hostId`, `hostEpoch`, `scopeId`, `sessionId`,
+                        `timelineEpoch`, `agentEventSeqOrder`, `lifecycleEventId`, `lifecycleState`
                     )
                     """.trimIndent(),
                 )

@@ -49,16 +49,20 @@ import {
   type RelayV2AccessRole,
 } from "./token.js";
 
-const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION = 1 as const;
+const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_LEGACY_ENVELOPE_VERSION = 1 as const;
+const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION = 2 as const;
 const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_MAX_BYTES = 8 * 1024 * 1024;
 export const RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS = 600_000;
 export const RELAY_V2_BROKER_CREDENTIAL_ENROLLMENT_MAX_FAILURES = 5;
+export const RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES = 5;
+export const RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS = 300_000;
 export const RELAY_V2_BROKER_CREDENTIAL_SOURCE_RATE_WINDOW_MS = 60_000;
 export const RELAY_V2_BROKER_CREDENTIAL_SOURCE_RATE_MAX_ATTEMPTS = 20;
 const RELAY_V2_BROKER_CREDENTIAL_SOURCE_ADMISSION_TTL_MS = 15_000;
 
 const MAX_UINT64 = 18_446_744_073_709_551_615n;
 const MAX_ENROLLMENTS = 2_048;
+const MAX_HOST_BOOTSTRAPS = 2_048;
 const MAX_GRANTS = 4_096;
 const MAX_REPLAYS = 4_096;
 const MAX_RATE_BUCKETS = 4_096;
@@ -69,6 +73,9 @@ const MAX_ISSUER_KEY_IDENTITIES = 1_024;
 const MAX_ACCESS_TOKEN_BYTES = 8_192;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const CANONICAL_BASE64URL = /^[A-Za-z0-9_-]+$/;
+const AUTHORITY_ERROR_BRAND = Symbol.for(
+  "tmux-worktree.relay-v2.broker-credential-authority-error.v1",
+);
 
 export type RelayV2BrokerCredentialAuthorityErrorCode =
   | "AUTHORITY_NOT_READY"
@@ -127,6 +134,24 @@ export class RelayV2BrokerCredentialAuthorityError extends Error {
   ) {
     super(AUTHORITY_ERROR_MESSAGES[code]);
     this.name = "RelayV2BrokerCredentialAuthorityError";
+    Object.defineProperty(this, AUTHORITY_ERROR_BRAND, { value: true });
+  }
+}
+
+/** Preserves exact authority errors across separately bundled entry points. */
+export function isRelayV2BrokerCredentialAuthorityError(
+  error: unknown,
+): error is RelayV2BrokerCredentialAuthorityError {
+  try {
+    if ((typeof error !== "object" && typeof error !== "function") || error === null) {
+      return false;
+    }
+    const candidate = error as Record<PropertyKey, unknown>;
+    return candidate[AUTHORITY_ERROR_BRAND] === true
+      && typeof candidate.code === "string"
+      && Object.prototype.hasOwnProperty.call(AUTHORITY_ERROR_MESSAGES, candidate.code);
+  } catch {
+    return false;
   }
 }
 
@@ -148,7 +173,9 @@ export interface RelayV2BrokerCredentialAuthorityGenesis {
   relayUrl: string;
 }
 
-export type RelayV2BrokerCredentialHttpSourceEndpoint = "enrollment_redeem";
+export type RelayV2BrokerCredentialHttpSourceEndpoint =
+  | "enrollment_redeem"
+  | "host_bootstrap";
 
 declare const relayV2HttpSourceAdmissionBrand: unique symbol;
 
@@ -179,6 +206,11 @@ export interface RelayV2BrokerCredentialEnrollmentCreated {
   deduplicated: boolean;
 }
 
+export interface RelayV2BrokerCredentialHostBootstrapCreated {
+  bootstrapToken: string;
+  expiresAtMs: number;
+}
+
 export interface RelayV2BrokerCredentialGrantResponseBody {
   principalId: string;
   grantId: string;
@@ -207,6 +239,13 @@ export type RelayV2BrokerCredentialGrantCredential =
       replayed: boolean;
     }
   | {
+      endpoint: "host_bootstrap";
+      body: Readonly<RelayV2BrokerCredentialGrantResponseBody & {
+        bootstrapAttemptId: string;
+      }>;
+      replayed: boolean;
+    }
+  | {
       endpoint: "host_refresh";
       body: Readonly<RelayV2BrokerCredentialGrantResponseBody & {
         refreshAttemptId: string;
@@ -222,6 +261,16 @@ interface EnrollmentRecord {
   expiresAtMs: number;
   failedAttempts: number;
   consumedAtMs: number | null;
+}
+
+interface HostBootstrapRecord {
+  selector: string;
+  tokenHash: string;
+  createdAtMs: number;
+  expiresAtMs: number;
+  failedAttempts: number;
+  terminalAtMs: number | null;
+  terminalReason: "consumed" | "failures_exhausted" | null;
 }
 
 interface GrantRecord {
@@ -240,6 +289,7 @@ interface GrantRecord {
 type ReplayOperation =
   | "enrollment.create"
   | "enrollment.redeem"
+  | "host.bootstrap"
   | "grant.refresh"
   | "host.reauthenticate";
 
@@ -253,7 +303,7 @@ interface ReplayRecord {
 }
 
 interface RateLimitRecord {
-  scope: "enrollment.redeem.source";
+  scope: "enrollment.redeem.source" | "host.bootstrap.source";
   subjectHash: string;
   windowStartedAtMs: number;
   attempts: number;
@@ -278,6 +328,7 @@ interface CredentialAuthorityEnvelope {
   replayKeyBase64url: string;
   issuer: RelayV2IssuerKeyring;
   enrollments: EnrollmentRecord[];
+  hostBootstraps: HostBootstrapRecord[];
   grants: GrantRecord[];
   replays: ReplayRecord[];
   rateLimits: RateLimitRecord[];
@@ -473,6 +524,63 @@ function parseEnrollment(value: unknown): EnrollmentRecord {
   };
 }
 
+function parseHostBootstrap(
+  value: unknown,
+  lastObservedAtMs: number,
+): HostBootstrapRecord {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "selector",
+    "tokenHash",
+    "createdAtMs",
+    "expiresAtMs",
+    "failedAttempts",
+    "terminalAtMs",
+    "terminalReason",
+  ])) invalidState();
+  if (!isRelayV2AuthIdentifier(value.selector)) invalidState();
+  exactBase64UrlBytes(value.selector, 16);
+  if (
+    typeof value.tokenHash !== "string"
+    || !SHA256_HEX.test(value.tokenHash)
+    || !isTimestamp(value.createdAtMs)
+    || value.createdAtMs > lastObservedAtMs
+    || !isTimestamp(value.expiresAtMs)
+    || value.expiresAtMs <= value.createdAtMs
+    || value.expiresAtMs > Number.MAX_SAFE_INTEGER
+      - RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS
+    || value.expiresAtMs - value.createdAtMs
+      > RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS
+    || typeof value.failedAttempts !== "number"
+    || !Number.isSafeInteger(value.failedAttempts)
+    || value.failedAttempts < 0
+    || value.failedAttempts > RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES
+    || (value.terminalAtMs !== null
+      && (!isTimestamp(value.terminalAtMs)
+        || value.terminalAtMs < value.createdAtMs
+        || value.terminalAtMs >= value.expiresAtMs
+        || value.terminalAtMs > lastObservedAtMs))
+    || (value.terminalReason !== null
+      && value.terminalReason !== "consumed"
+      && value.terminalReason !== "failures_exhausted")
+    || (value.terminalAtMs === null) !== (value.terminalReason === null)
+    || (value.terminalReason === null
+      && value.failedAttempts >= RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES)
+    || (value.terminalReason === "consumed"
+      && value.failedAttempts >= RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES)
+    || (value.terminalReason === "failures_exhausted"
+      && value.failedAttempts !== RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES)
+  ) invalidState();
+  return {
+    selector: value.selector,
+    tokenHash: value.tokenHash,
+    createdAtMs: value.createdAtMs,
+    expiresAtMs: value.expiresAtMs,
+    failedAttempts: value.failedAttempts,
+    terminalAtMs: value.terminalAtMs as number | null,
+    terminalReason: value.terminalReason as HostBootstrapRecord["terminalReason"],
+  };
+}
+
 function parseGrant(value: unknown): GrantRecord {
   if (!isRecord(value) || !hasExactKeys(value, [
     "role",
@@ -529,6 +637,7 @@ function parseReplay(value: unknown): ReplayRecord {
     ![
       "enrollment.create",
       "enrollment.redeem",
+      "host.bootstrap",
       "grant.refresh",
       "host.reauthenticate",
     ].includes(value.operation as string)
@@ -550,7 +659,7 @@ function parseReplay(value: unknown): ReplayRecord {
   };
 }
 
-function parseRateLimit(value: unknown): RateLimitRecord {
+function parseRateLimit(value: unknown, lastObservedAtMs: number): RateLimitRecord {
   if (!isRecord(value) || !hasExactKeys(value, [
     "scope",
     "subjectHash",
@@ -558,17 +667,19 @@ function parseRateLimit(value: unknown): RateLimitRecord {
     "attempts",
   ])) invalidState();
   if (
-    value.scope !== "enrollment.redeem.source"
+    (value.scope !== "enrollment.redeem.source"
+      && value.scope !== "host.bootstrap.source")
     || typeof value.subjectHash !== "string"
     || !SHA256_HEX.test(value.subjectHash)
     || !isTimestamp(value.windowStartedAtMs)
+    || value.windowStartedAtMs > lastObservedAtMs
     || typeof value.attempts !== "number"
     || !Number.isSafeInteger(value.attempts)
     || value.attempts < 1
     || value.attempts > RELAY_V2_BROKER_CREDENTIAL_SOURCE_RATE_MAX_ATTEMPTS
   ) invalidState();
   return {
-    scope: "enrollment.redeem.source",
+    scope: value.scope,
     subjectHash: value.subjectHash,
     windowStartedAtMs: value.windowStartedAtMs,
     attempts: value.attempts as number,
@@ -589,7 +700,7 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
   } catch {
     return invalidState();
   }
-  if (!isRecord(value) || !hasExactKeys(value, [
+  const legacyKeys = [
     "version",
     "anchorId",
     "commitSequence",
@@ -604,10 +715,19 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     "grants",
     "replays",
     "rateLimits",
-  ])) invalidState();
+  ] as const;
+  if (!isRecord(value)) invalidState();
+  const isLegacyEnvelope = value.version
+    === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_LEGACY_ENVELOPE_VERSION;
+  if (isLegacyEnvelope) {
+    if (!hasExactKeys(value, legacyKeys)) invalidState();
+  } else if (value.version === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION) {
+    if (!hasExactKeys(value, [...legacyKeys, "hostBootstraps"])) invalidState();
+  } else {
+    invalidState();
+  }
   if (
-    value.version !== RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION
-    || value.anchorId !== expectedAnchorId
+    value.anchorId !== expectedAnchorId
     || !isRelayV2AuthIdentifier(value.anchorId)
     || !isCanonicalUint64(value.commitSequence)
     || !isRelayV2AuthIdentifier(value.commitId)
@@ -616,10 +736,12 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     || value.commitId === value.parentCommitId
     || !isTimestamp(value.lastObservedAtMs)
     || !Array.isArray(value.enrollments)
+    || (!isLegacyEnvelope && !Array.isArray(value.hostBootstraps))
     || !Array.isArray(value.grants)
     || !Array.isArray(value.replays)
     || !Array.isArray(value.rateLimits)
     || value.enrollments.length > MAX_ENROLLMENTS
+    || (!isLegacyEnvelope && value.hostBootstraps.length > MAX_HOST_BOOTSTRAPS)
     || value.grants.length > MAX_GRANTS
     || value.replays.length > MAX_REPLAYS
     || value.rateLimits.length > MAX_RATE_BUCKETS
@@ -632,11 +754,51 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     return invalidState();
   }
   const enrollments = value.enrollments.map(parseEnrollment);
+  const hostBootstraps = isLegacyEnvelope
+    ? []
+    : value.hostBootstraps.map((record) => parseHostBootstrap(record, value.lastObservedAtMs));
   const grants = value.grants.map(parseGrant);
   const replays = value.replays.map(parseReplay);
-  const rateLimits = value.rateLimits.map(parseRateLimit);
+  const rateLimits = value.rateLimits.map((record) => (
+    parseRateLimit(record, value.lastObservedAtMs)
+  ));
+  if (
+    isLegacyEnvelope
+    && rateLimits.some((record) => record.scope === "host.bootstrap.source")
+  ) invalidState();
+  const hostBootstrapTokenHashes = new Set(hostBootstraps.map((item) => item.tokenHash));
+  const hostBootstrapReplayAttempts = new Set<string>();
+  const hostBootstrapReplaysBySelector = new Map<string, ReplayRecord>();
+  for (const replay of replays) {
+    if (replay.operation !== "host.bootstrap") continue;
+    exactBase64UrlBytes(replay.subjectId, 16);
+    if (
+      replay.expiresAtMs <= value.lastObservedAtMs
+      || hostBootstrapReplayAttempts.has(replay.attemptId)
+      || hostBootstrapReplaysBySelector.has(replay.subjectId)
+    ) invalidState();
+    hostBootstrapReplayAttempts.add(replay.attemptId);
+    hostBootstrapReplaysBySelector.set(replay.subjectId, replay);
+  }
+  for (const bootstrap of hostBootstraps) {
+    const replay = hostBootstrapReplaysBySelector.get(bootstrap.selector);
+    if (bootstrap.terminalReason === "consumed") {
+      if (
+        !replay
+        || bootstrap.terminalAtMs === null
+        || replay.expiresAtMs !== bootstrap.terminalAtMs
+          + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS
+      ) invalidState();
+      hostBootstrapReplaysBySelector.delete(bootstrap.selector);
+    } else if (replay) {
+      invalidState();
+    }
+  }
+  if (hostBootstrapReplaysBySelector.size !== 0) invalidState();
   if (
     !strictlySortedUnique(enrollments, (item) => item.enrollmentId)
+    || !strictlySortedUnique(hostBootstraps, (item) => item.selector)
+    || hostBootstrapTokenHashes.size !== hostBootstraps.length
     || !strictlySortedUnique(grants, (item) => item.grantId)
     || !strictlySortedUnique(replays, replayIdentity)
     || !strictlySortedUnique(rateLimits, rateLimitIdentity)
@@ -653,6 +815,7 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     replayKeyBase64url: value.replayKeyBase64url as string,
     issuer,
     enrollments,
+    hostBootstraps,
     grants,
     replays,
     rateLimits,
@@ -832,6 +995,9 @@ function openReplayResponse(
       case "enrollment.redeem":
         if (value.exchangeAttemptId !== record.attemptId) invalidState();
         break;
+      case "host.bootstrap":
+        if (value.bootstrapAttemptId !== record.attemptId) invalidState();
+        break;
       case "grant.refresh":
         if (
           value.refreshAttemptId !== record.attemptId
@@ -863,6 +1029,16 @@ function replayFor(
   return state.replays.find((record) => replayIdentity(record) === identity);
 }
 
+function replayForAttempt(
+  state: CredentialAuthorityEnvelope,
+  operation: ReplayOperation,
+  attemptId: string,
+): ReplayRecord | undefined {
+  return state.replays.find((record) => (
+    record.operation === operation && record.attemptId === attemptId
+  ));
+}
+
 function addReplay(
   state: CredentialAuthorityEnvelope,
   record: Omit<ReplayRecord, "ciphertextBase64url" | "expiresAtMs">,
@@ -887,11 +1063,13 @@ function addReplay(
 
 function consumeSourceRateLimit(
   state: CredentialAuthorityEnvelope,
-  sourceKey: string,
+  endpoint: RelayV2BrokerCredentialHttpSourceEndpoint,
+  subjectHash: string,
   now: number,
 ): boolean {
-  const scope = "enrollment.redeem.source";
-  const subjectHash = sha256Hex(sourceKey);
+  const scope: RateLimitRecord["scope"] = endpoint === "host_bootstrap"
+    ? "host.bootstrap.source"
+    : "enrollment.redeem.source";
   let record = state.rateLimits.find((candidate) => (
     candidate.scope === scope && candidate.subjectHash === subjectHash
   ));
@@ -943,6 +1121,14 @@ function pruneExpiredAuthorityState(state: CredentialAuthorityEnvelope, now: num
     state.enrollments = enrollments;
     changed = true;
   }
+  const hostBootstraps = state.hostBootstraps.filter((record) => {
+    const terminalAt = record.terminalAtMs ?? record.expiresAtMs;
+    return terminalAt + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS > now;
+  });
+  if (hostBootstraps.length !== state.hostBootstraps.length) {
+    state.hostBootstraps = hostBootstraps;
+    changed = true;
+  }
   const grantRetentionMs = RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS;
   const clockSkewMs = RELAY_V2_MAX_CLOCK_SKEW_SECONDS * 1_000;
   const grants = state.grants.filter((grant) => {
@@ -990,6 +1176,33 @@ function credentialInput(value: unknown, prefix: "twenroll2" | "twref2"): string
   return value;
 }
 
+function hostBootstrapCredentialInput(value: unknown): {
+  selector: string;
+  tokenHash: string;
+} {
+  if (typeof value !== "string") throw authorityError("INVALID_ARGUMENT");
+  if (Buffer.byteLength(value, "utf8") > 512 || value.includes("\0")) {
+    throw authorityError("AUTH_INVALID");
+  }
+  const parts = value.split(".");
+  if (parts.length !== 3 || parts[0] !== "twhostboot2") {
+    throw authorityError("AUTH_INVALID");
+  }
+  const [, selector, secret] = parts;
+  if (!CANONICAL_BASE64URL.test(selector) || !CANONICAL_BASE64URL.test(secret)) {
+    throw authorityError("AUTH_INVALID");
+  }
+  const selectorBytes = Buffer.from(selector, "base64url");
+  const secretBytes = Buffer.from(secret, "base64url");
+  if (
+    selectorBytes.byteLength !== 16
+    || selectorBytes.toString("base64url") !== selector
+    || secretBytes.byteLength !== 32
+    || secretBytes.toString("base64url") !== secret
+  ) throw authorityError("AUTH_INVALID");
+  return { selector, tokenHash: sha256Hex(value) };
+}
+
 function accessTokenInput(value: unknown): string {
   if (typeof value !== "string") throw authorityError("INVALID_ARGUMENT");
   if (
@@ -1003,6 +1216,13 @@ function accessTokenInput(value: unknown): string {
 function generatedSecret(prefix: string, bytes: Uint8Array): string {
   if (bytes.byteLength < 16) throw authorityError("STATE_INVALID");
   return `${prefix}.${Buffer.from(bytes).toString("base64url")}`;
+}
+
+function generatedHostBootstrapToken(selector: Uint8Array, secret: Uint8Array): string {
+  if (selector.byteLength !== 16 || secret.byteLength !== 32) {
+    throw authorityError("STATE_INVALID");
+  }
+  return `twhostboot2.${Buffer.from(selector).toString("base64url")}.${Buffer.from(secret).toString("base64url")}`;
 }
 
 function stateCredentialSecret(
@@ -1145,6 +1365,7 @@ function hostReauthenticatedFromFrame(
 type GrantCredentialResponseExpectation =
   | { endpoint: "enrollment_redeem"; attemptId: string }
   | { endpoint: "client_refresh"; attemptId: string }
+  | { endpoint: "host_bootstrap"; attemptId: string }
   | { endpoint: "host_refresh"; attemptId: string };
 
 function grantCredentialFromResponse(
@@ -1168,8 +1389,11 @@ function grantCredentialFromResponse(
     : expected.endpoint === "client_refresh"
       ? hasExactKeys(response, ["refreshAttemptId", ...commonKeys, "relayUrl"])
         && response.refreshAttemptId === expected.attemptId
-      : hasExactKeys(response, ["refreshAttemptId", ...commonKeys])
-        && response.refreshAttemptId === expected.attemptId;
+      : expected.endpoint === "host_bootstrap"
+        ? hasExactKeys(response, ["bootstrapAttemptId", ...commonKeys])
+          && response.bootstrapAttemptId === expected.attemptId
+        : hasExactKeys(response, ["refreshAttemptId", ...commonKeys])
+          && response.refreshAttemptId === expected.attemptId;
   if (
     !validShape
     || !isRelayV2AuthIdentifier(response.principalId)
@@ -1202,6 +1426,10 @@ function grantCredentialFromResponse(
       relayUrl: stateUrl(response.relayUrl, "wss:"),
     });
     return Object.freeze({ endpoint: "client_refresh", body, replayed });
+  }
+  if (expected.endpoint === "host_bootstrap") {
+    const body = Object.freeze({ bootstrapAttemptId: expected.attemptId, ...common });
+    return Object.freeze({ endpoint: "host_bootstrap", body, replayed });
   }
   const body = Object.freeze({ refreshAttemptId: expected.attemptId, ...common });
   return Object.freeze({ endpoint: "host_refresh", body, replayed });
@@ -1562,6 +1790,7 @@ implements RelayV2BrokerAuthControlAuthority {
       replayKeyBase64url,
       issuer: structuredClone(this.genesis.issuerKeyring),
       enrollments: [],
+      hostBootstraps: [],
       grants: [],
       replays: [],
       rateLimits: [],
@@ -1839,6 +2068,53 @@ implements RelayV2BrokerAuthControlAuthority {
     });
   }
 
+  async adminCreateHostBootstrap(input: {
+    expiresInMs?: number;
+  } = {}): Promise<RelayV2BrokerCredentialHostBootstrapCreated> {
+    if (!isRecord(input) || !hasExactKeys(input, [
+      ...(Object.hasOwn(input, "expiresInMs") ? ["expiresInMs"] : []),
+    ])) throw authorityError("INVALID_ARGUMENT");
+    const expiresInMs = input.expiresInMs
+      ?? RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS;
+    if (
+      !Number.isSafeInteger(expiresInMs)
+      || expiresInMs <= 0
+      || expiresInMs > RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_TTL_MS
+    ) throw authorityError("INVALID_ARGUMENT");
+    return this.mutate((state, now) => {
+      if (state.hostBootstraps.length >= MAX_HOST_BOOTSTRAPS) {
+        return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      }
+      const expiresAtMs = now + expiresInMs;
+      if (
+        !Number.isSafeInteger(expiresAtMs)
+        || expiresAtMs > Number.MAX_SAFE_INTEGER
+          - RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const bootstrapToken = generatedHostBootstrapToken(
+        this.randomExact(16),
+        this.randomExact(32),
+      );
+      const parsed = hostBootstrapCredentialInput(bootstrapToken);
+      if (
+        state.hostBootstraps.some((record) => (
+          record.selector === parsed.selector || record.tokenHash === parsed.tokenHash
+        ))
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      state.hostBootstraps.push({
+        selector: parsed.selector,
+        tokenHash: parsed.tokenHash,
+        createdAtMs: now,
+        expiresAtMs,
+        failedAttempts: 0,
+        terminalAtMs: null,
+        terminalReason: null,
+      });
+      state.hostBootstraps.sort((left, right) => compareUtf8(left.selector, right.selector));
+      return returnTransition(Object.freeze({ bootstrapToken, expiresAtMs }), true);
+    });
+  }
+
   async authorizeAccessToken(
     token: string,
     expectedRole: RelayV2AccessRole,
@@ -2052,7 +2328,7 @@ implements RelayV2BrokerAuthControlAuthority {
     if (
       !isRecord(input)
       || !hasExactKeys(input, ["endpoint", "sourceKey"])
-      || input.endpoint !== "enrollment_redeem"
+      || (input.endpoint !== "enrollment_redeem" && input.endpoint !== "host_bootstrap")
     ) throw authorityError("INVALID_ARGUMENT");
     this.assertReady();
     const sourceHash = sourceIdentityHash(input.sourceKey);
@@ -2092,7 +2368,7 @@ implements RelayV2BrokerAuthControlAuthority {
     });
     try {
       const admittedAtMs = await this.mutate<number>((state, now) => {
-        if (!consumeSourceRateLimit(state, input.sourceKey, now)) {
+        if (!consumeSourceRateLimit(state, input.endpoint, sourceHash, now)) {
           return rejectTransition("RATE_LIMITED", false);
         }
         return returnTransition(now, true);
@@ -2131,6 +2407,163 @@ implements RelayV2BrokerAuthControlAuthority {
     ) throw authorityError("INVALID_ARGUMENT");
     this.sourceAdmissions.delete(admission as object);
     return record;
+  }
+
+  /**
+   * Releases an admitted HTTP source receipt when the transport boundary
+   * cannot hand a decoded request to the credential transition. The durable
+   * rate attempt remains consumed. A copied, expired, mismatched, or already
+   * released receipt is never accepted.
+   */
+  releaseHttpSourceAdmission(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    endpoint: RelayV2BrokerCredentialHttpSourceEndpoint,
+    sourceKey: string,
+  ): void {
+    this.takeSourceAdmission(admission, endpoint, sourceIdentityHash(sourceKey));
+  }
+
+  async bootstrapHost(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    sourceKey: string,
+    input: {
+      bootstrapAttemptId: string;
+      bootstrapToken: string;
+      hostId: string;
+      hostEpoch: string;
+      hostInstanceId: string;
+    },
+  ): Promise<RelayV2BrokerCredentialGrantCredential> {
+    this.assertReady();
+    const sourceAdmission = this.takeSourceAdmission(
+      admission,
+      "host_bootstrap",
+      sourceIdentityHash(sourceKey),
+    );
+    if (!isRecord(input) || !hasExactKeys(input, [
+      "bootstrapAttemptId",
+      "bootstrapToken",
+      "hostId",
+      "hostEpoch",
+      "hostInstanceId",
+    ])) throw authorityError("INVALID_ARGUMENT");
+    const bootstrapAttemptId = ensureIdentifier(input.bootstrapAttemptId);
+    const hostId = ensureIdentifier(input.hostId);
+    const hostEpoch = ensureIdentifier(input.hostEpoch);
+    const hostInstanceId = ensureIdentifier(input.hostInstanceId);
+    const bootstrapToken = hostBootstrapCredentialInput(input.bootstrapToken);
+    const fingerprint = fixedFieldFingerprint({
+      selector: bootstrapToken.selector,
+      tokenHash: bootstrapToken.tokenHash,
+      hostId,
+      hostEpoch,
+      hostInstanceId,
+    }, ["selector", "tokenHash", "hostId", "hostEpoch", "hostInstanceId"]);
+    return this.mutate((state, now) => {
+      if (sourceAdmission.expiresAtMs <= now) {
+        return rejectTransition("INVALID_ARGUMENT", false);
+      }
+      const replay = replayForAttempt(state, "host.bootstrap", bootstrapAttemptId);
+      if (replay) {
+        if (
+          replay.subjectId !== bootstrapToken.selector
+          || replay.fingerprint !== fingerprint
+        ) return rejectTransition("IDEMPOTENCY_CONFLICT", false);
+        return returnTransition(grantCredentialFromResponse(
+          openReplayResponse(state, replay),
+          true,
+          { endpoint: "host_bootstrap", attemptId: bootstrapAttemptId },
+        ), false);
+      }
+      const bootstrap = state.hostBootstraps.find((candidate) => (
+        candidate.selector === bootstrapToken.selector
+      ));
+      if (
+        !bootstrap
+        || bootstrap.terminalAtMs !== null
+        || bootstrap.expiresAtMs <= now
+        || bootstrap.failedAttempts
+          >= RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES
+      ) return rejectTransition("AUTH_INVALID", false);
+      if (!sameSha256Digest(bootstrap.tokenHash, bootstrapToken.tokenHash)) {
+        bootstrap.failedAttempts += 1;
+        if (
+          bootstrap.failedAttempts
+          === RELAY_V2_BROKER_CREDENTIAL_HOST_BOOTSTRAP_MAX_FAILURES
+        ) {
+          bootstrap.terminalAtMs = now;
+          bootstrap.terminalReason = "failures_exhausted";
+        }
+        return rejectTransition("AUTH_INVALID", true);
+      }
+      if (state.grants.length >= MAX_GRANTS || state.replays.length >= MAX_REPLAYS) {
+        return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      }
+      const refreshExpiresAtMs = now + 30 * 24 * 60 * 60 * 1_000;
+      if (
+        !Number.isSafeInteger(refreshExpiresAtMs)
+        || refreshExpiresAtMs > Number.MAX_SAFE_INTEGER
+          - RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const ttlSeconds = accessTtlSeconds(refreshExpiresAtMs, now);
+      if (ttlSeconds === null) return rejectTransition("AUTH_INVALID", false);
+      const principalId = this.generatedId();
+      const grantId = this.generatedId();
+      const refreshToken = generatedSecret("twref2", this.randomExact(32));
+      const grant: GrantRecord = {
+        role: "host",
+        hostId,
+        principalId,
+        grantId,
+        clientInstanceId: null,
+        refreshTokenHash: sha256Hex(refreshToken),
+        credentialVersion: "1",
+        refreshExpiresAtMs,
+        maxAccessExpiresAtMs: 0,
+        revokedAtMs: null,
+      };
+      let prepared;
+      try {
+        prepared = prepareRelayV2AccessTokenIssuance(state.issuer, {
+          role: "host",
+          hostId,
+          principalId,
+          grantId,
+          nowSeconds: Math.floor(now / 1_000),
+          ttlSeconds,
+          jti: this.generatedId(),
+        });
+      } catch {
+        throw authorityError("STATE_INVALID");
+      }
+      state.issuer = prepared.nextKeyring;
+      grant.maxAccessExpiresAtMs = prepared.claims.exp * 1_000;
+      state.grants.push(grant);
+      state.grants.sort((left, right) => compareUtf8(left.grantId, right.grantId));
+      bootstrap.terminalAtMs = now;
+      bootstrap.terminalReason = "consumed";
+      const response: RelayV2JsonObject = {
+        bootstrapAttemptId,
+        principalId,
+        grantId,
+        hostId,
+        accessToken: prepared.token,
+        accessExpiresAtMs: prepared.claims.exp * 1_000,
+        refreshToken,
+        refreshExpiresAtMs,
+      };
+      addReplay(state, {
+        operation: "host.bootstrap",
+        subjectId: bootstrapToken.selector,
+        attemptId: bootstrapAttemptId,
+        fingerprint,
+      }, response, now, (length) => this.randomExact(length));
+      return returnTransition(grantCredentialFromResponse(
+        response,
+        false,
+        { endpoint: "host_bootstrap", attemptId: bootstrapAttemptId },
+      ), true);
+    });
   }
 
   async redeemEnrollment(

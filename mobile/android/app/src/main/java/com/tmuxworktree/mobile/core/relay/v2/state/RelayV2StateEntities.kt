@@ -487,7 +487,49 @@ internal data class RelayV2AgentTranscriptLifecycleNotificationClaimEntity(
         "timelineEpoch",
         "entryId",
     ],
+    foreignKeys = [
+        ForeignKey(
+            entity = RelayV2AgentTranscriptLifecycleStateEntity::class,
+            parentColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpochKey",
+            ],
+            childColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
     indices = [
+        Index(
+            name = "index_agent_transcript_entries_authority",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+        ),
         Index(
             name = "index_agent_transcript_entries_namespace_created_seq",
             value = [
@@ -582,6 +624,34 @@ internal data class RelayV2AgentTranscriptEntryEntity(
         "sessionId",
         "timelineEpoch",
         "snapshotId",
+    ],
+    foreignKeys = [
+        ForeignKey(
+            entity = RelayV2AgentTranscriptLifecycleStateEntity::class,
+            parentColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpochKey",
+            ],
+            childColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+            onDelete = ForeignKey.CASCADE,
+        ),
     ],
     indices = [
         Index(
@@ -774,7 +844,49 @@ internal data class RelayV2AgentTranscriptSnapshotRecordEntity(
         "timelineEpoch",
         "agentEventSeq",
     ],
+    foreignKeys = [
+        ForeignKey(
+            entity = RelayV2AgentTranscriptLifecycleStateEntity::class,
+            parentColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpochKey",
+            ],
+            childColumns = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
     indices = [
+        Index(
+            name = "index_agent_transcript_pending_events_authority",
+            value = [
+                "profileId",
+                "profileActivationGeneration",
+                "principalId",
+                "clientInstanceId",
+                "hostId",
+                "hostEpoch",
+                "scopeId",
+                "sessionId",
+                "timelineEpoch",
+            ],
+        ),
         Index(
             name = "index_agent_transcript_pending_events_event_id",
             value = [

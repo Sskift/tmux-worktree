@@ -1,6 +1,5 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
 
-import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.isValidAgentTimelineCursor
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonException
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonObject
@@ -17,12 +16,12 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.jsonObject
 import com.tmuxworktree.mobile.core.relay.v2.codec.jsonOneOf
 import com.tmuxworktree.mobile.core.relay.v2.codec.required
 import com.tmuxworktree.mobile.core.relay.v2.codec.schemaFailure
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 import java.math.BigInteger
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.Collections
 
 class AgentTranscriptLifecycleV1CodecException(
     val code: String,
@@ -46,7 +45,13 @@ class AgentTranscriptLifecycleV1Codec {
         bytes: ByteArray,
         metadata: AgentTranscriptLifecycleV1FrameMetadata =
             AgentTranscriptLifecycleV1FrameMetadata(),
-    ): AgentTranscriptLifecycleV1Frame = mapCodecFailures {
+    ): AgentTranscriptLifecycleV1Frame = decodePublicFrameArtifact(bytes, metadata).frame
+
+    fun decodePublicFrameArtifact(
+        bytes: ByteArray,
+        metadata: AgentTranscriptLifecycleV1FrameMetadata =
+            AgentTranscriptLifecycleV1FrameMetadata(),
+    ): AgentTranscriptLifecycleV1PublicFrameArtifact = mapCodecFailures {
         if (metadata.opcode != "text") {
             throw AgentTranscriptLifecycleV1CodecException(
                 code = "INVALID_ENVELOPE",
@@ -76,7 +81,10 @@ class AgentTranscriptLifecycleV1Codec {
         } else {
             STANDARD_JSON_LIMITS
         }
-        decodeFrame(RelayV2StrictJson.parseObject(source, limits))
+        decodedPublicFrameArtifact(
+            frame = decodeFrame(RelayV2StrictJson.parseObject(source, limits)),
+            rawUtf8ByteCount = bytes.size,
+        )
     }
 
     fun encodePublicFrame(frame: AgentTranscriptLifecycleV1Frame): ByteArray = mapCodecFailures {
@@ -94,47 +102,67 @@ class AgentTranscriptLifecycleV1Codec {
         bytes
     }
 
-    /** Canonical closed event bytes reused by the durable pending-event owner. */
-    fun encodeCanonicalEventRecord(record: AgentTimelineEventRecord): ByteArray =
-        mapCodecFailures {
-            val wireObject = record.toWireObject()
-            if (decodeEventRecord(wireObject) != record) schemaFailure("event-roundtrip")
-            val bytes = RelayV2StrictJson.stringify(wireObject)
-                .toByteArray(StandardCharsets.UTF_8)
-            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
-            if (decodeCanonicalEventRecord(bytes) != record) schemaFailure("event-roundtrip")
-            bytes
-        }
+    fun decodeCanonicalPublicEventRecord(bytes: ByteArray): AgentTimelineEventRecord =
+        decodeCanonicalPublicRecord(
+            bytes = bytes,
+            decode = ::decodeEventRecord,
+            encode = AgentTimelineEventRecord::toWireObject,
+        )
 
-    /** Strict decode for a persisted canonical closed event; no second event codec exists. */
-    fun decodeCanonicalEventRecord(bytes: ByteArray): AgentTimelineEventRecord =
-        mapCodecFailures {
-            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
-            val source = RelayV2StrictJson.decodeUtf8(bytes)
-            decodeEventRecord(RelayV2StrictJson.parseObject(source, PAGED_JSON_LIMITS))
-        }
+    fun encodeCanonicalPublicEventRecord(record: AgentTimelineEventRecord): ByteArray =
+        encodeCanonicalPublicRecord(
+            value = record,
+            encode = AgentTimelineEventRecord::toWireObject,
+            decode = ::decodeCanonicalPublicEventRecord,
+        )
 
-    /** Canonical snapshot-record bytes reused by Room C and materialized entry validation. */
-    fun encodeCanonicalSnapshotRecord(record: AgentTimelineSnapshotRecord): ByteArray =
-        mapCodecFailures {
-            val wireObject = record.toWireObject()
-            if (decodeSnapshotRecord(wireObject) != record) schemaFailure("record-roundtrip")
-            val bytes = RelayV2StrictJson.stringify(wireObject)
-                .toByteArray(StandardCharsets.UTF_8)
-            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
-            if (decodeCanonicalSnapshotRecord(bytes) != record) {
-                schemaFailure("record-roundtrip")
-            }
-            bytes
-        }
+    fun decodeCanonicalPublicSnapshotRecord(bytes: ByteArray): AgentTimelineSnapshotRecord =
+        decodeCanonicalPublicRecord(
+            bytes = bytes,
+            decode = ::decodeSnapshotRecord,
+            encode = AgentTimelineSnapshotRecord::toWireObject,
+        )
 
-    /** Strict decode for one persisted Room-C/A canonical record. */
-    fun decodeCanonicalSnapshotRecord(bytes: ByteArray): AgentTimelineSnapshotRecord =
-        mapCodecFailures {
-            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
-            val source = RelayV2StrictJson.decodeUtf8(bytes)
-            decodeSnapshotRecord(RelayV2StrictJson.parseObject(source, PAGED_JSON_LIMITS))
+    fun encodeCanonicalPublicSnapshotRecord(record: AgentTimelineSnapshotRecord): ByteArray =
+        encodeCanonicalPublicRecord(
+            value = record,
+            encode = AgentTimelineSnapshotRecord::toWireObject,
+            decode = ::decodeCanonicalPublicSnapshotRecord,
+        )
+
+    private fun <T> decodeCanonicalPublicRecord(
+        bytes: ByteArray,
+        decode: (Any?) -> T,
+        encode: (T) -> RelayV2JsonObject,
+    ): T = mapCodecFailures {
+        if (bytes.size > MAX_PUBLIC_FRAME_BYTES) {
+            throw AgentTranscriptLifecycleV1CodecException(
+                code = "INVALID_ENVELOPE",
+                failureClass = "frame-limit",
+            )
         }
+        val source = RelayV2StrictJson.decodeUtf8(bytes)
+        val decoded = decode(RelayV2StrictJson.parseObject(source, STANDARD_JSON_LIMITS))
+        val canonicalBytes = RelayV2StrictJson.stringify(encode(decoded))
+            .toByteArray(StandardCharsets.UTF_8)
+        if (!bytes.contentEquals(canonicalBytes)) {
+            throw AgentTranscriptLifecycleV1CodecException(
+                code = "INVALID_ENVELOPE",
+                failureClass = "non-canonical-record",
+            )
+        }
+        decoded
+    }
+
+    private fun <T> encodeCanonicalPublicRecord(
+        value: T,
+        encode: (T) -> RelayV2JsonObject,
+        decode: (ByteArray) -> T,
+    ): ByteArray = mapCodecFailures {
+        val bytes = RelayV2StrictJson.stringify(encode(value)).toByteArray(StandardCharsets.UTF_8)
+        decode(bytes)
+        bytes
+    }
 
     private fun decodeFrame(frame: RelayV2JsonObject): AgentTranscriptLifecycleV1Frame {
         val type = extensionString(required(frame, "type"), maxBytes = MAX_ID_BYTES)
@@ -151,6 +179,41 @@ class AgentTranscriptLifecycleV1Codec {
             else -> schemaFailure("unknown-message-type")
         }
     }
+
+    private fun decodedPublicFrameArtifact(
+        frame: AgentTranscriptLifecycleV1Frame,
+        rawUtf8ByteCount: Int,
+    ): AgentTranscriptLifecycleV1PublicFrameArtifact = when (frame) {
+        is AgentTimelineSnapshotPageFrame -> {
+            val frozenFrame = frame.copy(
+                page = frame.page.copy(
+                    records = immutableCopy(frame.page.records),
+                ),
+            )
+            DecodedAgentTimelineSnapshotPagePublicFrameArtifact(
+                frame = frozenFrame,
+                rawUtf8ByteCount = rawUtf8ByteCount,
+            )
+        }
+        is AgentTimelineReplayPageFrame -> {
+            val frozenFrame = frame.copy(
+                page = frame.page.copy(
+                    events = immutableCopy(frame.page.events),
+                ),
+            )
+            DecodedAgentTimelineReplayPagePublicFrameArtifact(
+                frame = frozenFrame,
+                rawUtf8ByteCount = rawUtf8ByteCount,
+            )
+        }
+        else -> DecodedAgentTranscriptLifecycleV1PublicFrameArtifact(
+            frame = frame,
+            rawUtf8ByteCount = rawUtf8ByteCount,
+        )
+    }
+
+    private fun <T> immutableCopy(values: List<T>): List<T> =
+        Collections.unmodifiableList(ArrayList(values))
 
     private fun decodeError(frame: RelayV2JsonObject): AgentTimelineErrorFrame {
         errorRoot(frame)
@@ -174,6 +237,7 @@ class AgentTranscriptLifecycleV1Codec {
             "AGENT_SNAPSHOT_EXPIRED" -> AgentTimelineErrorCode.AGENT_SNAPSHOT_EXPIRED
             "AGENT_TIMELINE_EPOCH_MISMATCH" ->
                 AgentTimelineErrorCode.AGENT_TIMELINE_EPOCH_MISMATCH
+            "HOST_EPOCH_MISMATCH" -> AgentTimelineErrorCode.HOST_EPOCH_MISMATCH
             else -> schemaFailure("schema-mismatch")
         }
         val commandDisposition = when (
@@ -187,7 +251,20 @@ class AgentTranscriptLifecycleV1Codec {
         } else {
             null
         }
-        if (error.containsKey("details")) jsonNull(error["details"])
+        val details = when (code) {
+            AgentTimelineErrorCode.HOST_EPOCH_MISMATCH -> {
+                val detailsObject = jsonObject(required(error, "details"))
+                exactKeys(detailsObject, listOf("expectedHostEpoch", "actualHostEpoch"))
+                AgentTimelineHostEpochMismatchDetails(
+                    expectedHostEpoch = opaqueId(required(detailsObject, "expectedHostEpoch")),
+                    actualHostEpoch = opaqueId(required(detailsObject, "actualHostEpoch")),
+                )
+            }
+            else -> {
+                if (error.containsKey("details")) jsonNull(error["details"])
+                null
+            }
+        }
         return AgentTimelineErrorFrame(
             requestId = opaqueId(frame["requestId"]),
             hostId = opaqueId(frame["hostId"]),
@@ -198,12 +275,14 @@ class AgentTranscriptLifecycleV1Codec {
                 code = code,
                 message = extensionString(
                     value = required(error, "message"),
+                    allowEmpty = true,
                     allowOuterWhitespace = true,
                     maxBytes = MAX_ERROR_MESSAGE_UTF8_BYTES,
                 ),
                 retryable = jsonBoolean(required(error, "retryable")),
                 retryAfterMs = retryAfterMs,
                 commandDisposition = commandDisposition,
+                details = details,
             ),
         )
     }
@@ -264,12 +343,17 @@ class AgentTranscriptLifecycleV1Codec {
             "interrupted" -> AgentTimelineActiveSourceState.INTERRUPTED
             else -> schemaFailure("schema-mismatch")
         }
+        val currentAgentSeq = positiveCounter(required(payload, "currentAgentSeq"))
+        val earliestReplaySeq = positiveCounter(required(payload, "earliestReplaySeq"))
+        if (compareCounters(earliestReplaySeq, currentAgentSeq) > 0) {
+            schemaFailure("status-watermark")
+        }
         return AgentTimelineAvailableStatus(
             liveSource = liveSource,
             activeSourceEpoch = opaqueId(required(payload, "activeSourceEpoch")),
             timelineEpoch = opaqueId(required(payload, "timelineEpoch")),
-            currentAgentSeq = canonicalCounter(required(payload, "currentAgentSeq")),
-            earliestReplaySeq = canonicalCounter(required(payload, "earliestReplaySeq")),
+            currentAgentSeq = currentAgentSeq,
+            earliestReplaySeq = earliestReplaySeq,
             limits = decodeLimits(required(payload, "limits")),
         )
     }
@@ -311,23 +395,21 @@ class AgentTranscriptLifecycleV1Codec {
             ),
         )
         return AgentTimelineLimits(
-            maxTextUtf8Bytes = strictInteger(
+            maxTextUtf8Bytes = strictLiteralInteger(
                 required(limits, "maxTextUtf8Bytes"),
-                minimum = 1,
-                maximum = MAX_TEXT_UTF8_BYTES.toLong(),
+                MAX_TEXT_UTF8_BYTES.toLong(),
             ),
-            maxPageRecords = strictInteger(
+            maxPageRecords = strictLiteralInteger(
                 required(limits, "maxPageRecords"),
-                minimum = 1,
-                maximum = MAX_PAGE_RECORDS.toLong(),
+                MAX_PAGE_RECORDS.toLong(),
             ),
             eventReplayRetentionMs = strictInteger(
                 required(limits, "eventReplayRetentionMs"),
                 minimum = MIN_EVENT_REPLAY_RETENTION_MS,
             ),
-            snapshotLeaseMs = strictInteger(
+            snapshotLeaseMs = strictLiteralInteger(
                 required(limits, "snapshotLeaseMs"),
-                minimum = 1,
+                DEFAULT_SNAPSHOT_LEASE_MS,
             ),
         )
     }
@@ -382,8 +464,14 @@ class AgentTranscriptLifecycleV1Codec {
         val isLast = jsonBoolean(required(payload, "isLast"))
         val nextCursor = nullableCursor(required(payload, "nextCursor"))
         validatePageCursor(isLast, nextCursor)
+        val throughAgentSeq = positiveCounter(required(payload, "throughAgentSeq"))
+        val earliestRetainedSeq = positiveCounter(required(payload, "earliestRetainedSeq"))
+        if (compareCounters(earliestRetainedSeq, throughAgentSeq) > 0) {
+            schemaFailure("snapshot-watermark")
+        }
         val records = jsonArray(required(payload, "records"), maximum = MAX_PAGE_RECORDS) {}
             .map(::decodeSnapshotRecord)
+        validateSnapshotRecords(records, throughAgentSeq)
         return AgentTimelineSnapshotPageFrame(
             requestId = opaqueId(frame["requestId"]),
             hostId = opaqueId(frame["hostId"]),
@@ -397,10 +485,8 @@ class AgentTranscriptLifecycleV1Codec {
                 pageIndex = strictInteger(required(payload, "pageIndex")),
                 isLast = isLast,
                 nextCursor = nextCursor,
-                throughAgentSeq = canonicalCounter(required(payload, "throughAgentSeq")),
-                earliestRetainedSeq = canonicalCounter(
-                    required(payload, "earliestRetainedSeq"),
-                ),
+                throughAgentSeq = throughAgentSeq,
+                earliestRetainedSeq = earliestRetainedSeq,
                 records = records,
             ),
         )
@@ -448,8 +534,18 @@ class AgentTranscriptLifecycleV1Codec {
         val isLast = jsonBoolean(required(payload, "isLast"))
         val nextCursor = nullableCursor(required(payload, "nextCursor"))
         validatePageCursor(isLast, nextCursor)
+        val afterAgentSeq = canonicalCounter(required(payload, "afterAgentSeq"))
+        val replayThroughAgentSeq = canonicalCounter(
+            required(payload, "replayThroughAgentSeq"),
+        )
         val events = jsonArray(required(payload, "events"), maximum = MAX_PAGE_RECORDS) {}
             .map(::decodeEventRecord)
+        validateReplayEvents(
+            afterAgentSeq = afterAgentSeq,
+            replayThroughAgentSeq = replayThroughAgentSeq,
+            isLast = isLast,
+            events = events,
+        )
         return AgentTimelineReplayPageFrame(
             requestId = opaqueId(frame["requestId"]),
             hostId = opaqueId(frame["hostId"]),
@@ -458,10 +554,8 @@ class AgentTranscriptLifecycleV1Codec {
             sessionId = opaqueId(frame["sessionId"]),
             page = AgentTimelineReplayPage(
                 timelineEpoch = opaqueId(required(payload, "timelineEpoch")),
-                afterAgentSeq = canonicalCounter(required(payload, "afterAgentSeq")),
-                replayThroughAgentSeq = canonicalCounter(
-                    required(payload, "replayThroughAgentSeq"),
-                ),
+                afterAgentSeq = afterAgentSeq,
+                replayThroughAgentSeq = replayThroughAgentSeq,
                 isLast = isLast,
                 nextCursor = nextCursor,
                 events = events,
@@ -770,7 +864,7 @@ class AgentTranscriptLifecycleV1Codec {
                     (state == AgentTimelineSourceAvailabilityState.CONNECTED &&
                         reason == AgentTimelineSourceAvailabilityReason.SOURCE_DISCONNECTED) ||
                     (state == AgentTimelineSourceAvailabilityState.INTERRUPTED &&
-                        reason == AgentTimelineSourceAvailabilityReason.SOURCE_RESTARTED)
+                        reason != AgentTimelineSourceAvailabilityReason.SOURCE_DISCONNECTED)
                 ) {
                     schemaFailure("source-availability-binding")
                 }
@@ -790,7 +884,8 @@ class AgentTranscriptLifecycleV1Codec {
                 val metadata = mutation.entry.metadata
                 if (
                     metadata.createdAgentSeq != event.agentEventSeq ||
-                    metadata.lastModifiedAgentSeq != event.agentEventSeq
+                    metadata.lastModifiedAgentSeq != event.agentEventSeq ||
+                    metadata.createdAtMs != event.occurredAtMs
                 ) {
                     schemaFailure("entry-event-binding")
                 }
@@ -810,6 +905,94 @@ class AgentTranscriptLifecycleV1Codec {
             is AgentTimelineSourceAvailabilityMutation,
             -> Unit
         }
+    }
+
+    private fun validateSnapshotRecords(
+        records: List<AgentTimelineSnapshotRecord>,
+        throughAgentSeq: String,
+    ) {
+        var previousSequence: String? = null
+        var previousStableId: String? = null
+        records.forEach { record ->
+            val sequence: String
+            val stableId: String
+            when (record) {
+                is AgentTimelineLifecycleRecord -> {
+                    sequence = record.agentEventSeq
+                    stableId = record.lifecycleEventId
+                    if (compareCounters(sequence, throughAgentSeq) > 0) {
+                        schemaFailure("snapshot-watermark")
+                    }
+                }
+                is AgentTimelineTextEntryRecord -> {
+                    sequence = record.metadata.createdAgentSeq
+                    stableId = record.metadata.entryId
+                    if (
+                        compareCounters(sequence, throughAgentSeq) > 0 ||
+                        compareCounters(
+                            record.metadata.lastModifiedAgentSeq,
+                            throughAgentSeq,
+                        ) > 0
+                    ) {
+                        schemaFailure("snapshot-watermark")
+                    }
+                }
+            }
+            if (previousSequence != null && previousStableId != null) {
+                val sequenceOrder = compareCounters(previousSequence!!, sequence)
+                if (
+                    sequenceOrder > 0 ||
+                    (sequenceOrder == 0 && compareUtf8Bytes(previousStableId!!, stableId) >= 0)
+                ) {
+                    schemaFailure("snapshot-record-order")
+                }
+            }
+            previousSequence = sequence
+            previousStableId = stableId
+        }
+    }
+
+    private fun validateReplayEvents(
+        afterAgentSeq: String,
+        replayThroughAgentSeq: String,
+        isLast: Boolean,
+        events: List<AgentTimelineEventRecord>,
+    ) {
+        if (compareCounters(afterAgentSeq, replayThroughAgentSeq) > 0) {
+            schemaFailure("replay-watermark")
+        }
+        var previous: String? = null
+        events.forEach { event ->
+            if (
+                compareCounters(event.agentEventSeq, afterAgentSeq) <= 0 ||
+                compareCounters(event.agentEventSeq, replayThroughAgentSeq) > 0 ||
+                (previous != null && event.agentEventSeq != nextCounter(previous!!))
+            ) {
+                schemaFailure("replay-sequence")
+            }
+            previous = event.agentEventSeq
+        }
+        if (
+            (!isLast && (events.isEmpty() || previous == replayThroughAgentSeq)) ||
+            (isLast && (
+                (events.isEmpty() && afterAgentSeq != replayThroughAgentSeq) ||
+                    (events.isNotEmpty() && previous != replayThroughAgentSeq)
+                ))
+        ) {
+            schemaFailure("replay-page-shape")
+        }
+    }
+
+    private fun compareUtf8Bytes(left: String, right: String): Int {
+        val leftBytes = left.toByteArray(StandardCharsets.UTF_8)
+        val rightBytes = right.toByteArray(StandardCharsets.UTF_8)
+        val sharedLength = minOf(leftBytes.size, rightBytes.size)
+        repeat(sharedLength) { index ->
+            val comparison = (leftBytes[index].toInt() and 0xff)
+                .compareTo(rightBytes[index].toInt() and 0xff)
+            if (comparison != 0) return comparison
+        }
+        return leftBytes.size.compareTo(rightBytes.size)
     }
 
     private fun decodeRedactionReason(value: Any?): AgentTimelineRedactionReason =
@@ -928,12 +1111,23 @@ class AgentTranscriptLifecycleV1Codec {
         return jsonInteger(value, minimum, maximum)
     }
 
+    private fun strictLiteralInteger(value: Any?, expected: Long): Long =
+        strictInteger(value).also {
+            if (it != expected) schemaFailure("schema-mismatch")
+        }
+
     private fun positiveCounter(value: Any?): String = canonicalCounter(value).also {
         if (it == "0") schemaFailure("invalid-argument")
     }
 
     private fun compareCounters(left: String, right: String): Int =
         BigInteger(left).compareTo(BigInteger(right))
+
+    private fun nextCounter(value: String): String {
+        val next = BigInteger(value).add(BigInteger.ONE)
+        if (next > UINT64_MAX) schemaFailure("counter-overflow")
+        return next.toString()
+    }
 
     private fun nullableOpaqueId(value: Any?): String? = value?.let(::opaqueId)
 
@@ -947,17 +1141,13 @@ class AgentTranscriptLifecycleV1Codec {
         failureClass = "id-byte-limit",
     )
 
-    private fun opaqueCursor(value: Any?): String {
-        val decoded = extensionString(
-            value = value,
-            allowEmpty = false,
-            allowOuterWhitespace = false,
-            maxBytes = RelayV2StateLimits.MAX_CURSOR_UTF8_BYTES,
-            failureClass = "id-byte-limit",
-        )
-        if (!isValidAgentTimelineCursor(decoded)) schemaFailure("id-byte-limit")
-        return decoded
-    }
+    private fun opaqueCursor(value: Any?): String = extensionString(
+        value = value,
+        allowEmpty = false,
+        allowOuterWhitespace = false,
+        maxBytes = MAX_CURSOR_BYTES,
+        failureClass = "id-byte-limit",
+    )
 
     private fun contentText(value: Any?, maxBytes: Int): String = extensionString(
         value = value,
@@ -1023,8 +1213,11 @@ class AgentTranscriptLifecycleV1Codec {
 
         private const val CAPABILITY = "agent.transcript-lifecycle.v1"
         private const val MAX_ID_BYTES = 128
+        private const val MAX_CURSOR_BYTES = 1_024
         private const val MAX_ERROR_MESSAGE_UTF8_BYTES = 4_096
         private const val MIN_EVENT_REPLAY_RETENTION_MS = 86_400_000L
+        private const val DEFAULT_SNAPSHOT_LEASE_MS = 300_000L
+        private val UINT64_MAX = BigInteger("18446744073709551615")
 
         private val PAGED_MESSAGE_TYPES = setOf(
             "agent.timeline.snapshot.page",
@@ -1044,6 +1237,21 @@ class AgentTranscriptLifecycleV1Codec {
         )
     }
 }
+
+private class DecodedAgentTranscriptLifecycleV1PublicFrameArtifact(
+    override val frame: AgentTranscriptLifecycleV1Frame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTranscriptLifecycleV1PublicFrameArtifact
+
+private class DecodedAgentTimelineSnapshotPagePublicFrameArtifact(
+    override val frame: AgentTimelineSnapshotPageFrame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTimelineSnapshotPagePublicFrameArtifact
+
+private class DecodedAgentTimelineReplayPagePublicFrameArtifact(
+    override val frame: AgentTimelineReplayPageFrame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTimelineReplayPagePublicFrameArtifact
 
 private fun AgentTranscriptLifecycleV1Frame.toWireObject(): LinkedHashMap<String, Any?> =
     when (this) {
@@ -1155,7 +1363,15 @@ private fun AgentTimelineStructuredError.toWireObject(): LinkedHashMap<String, A
     ).apply {
         retryAfterMs?.let { put("retryAfterMs", it) }
         put("commandDisposition", commandDisposition.wireValue)
+        details?.let { put("details", it.toWireObject()) }
     }
+
+private fun AgentTimelineErrorDetails.toWireObject(): LinkedHashMap<String, Any?> = when (this) {
+    is AgentTimelineHostEpochMismatchDetails -> wireObject(
+        "expectedHostEpoch" to expectedHostEpoch,
+        "actualHostEpoch" to actualHostEpoch,
+    )
+}
 
 private fun AgentTimelineStatus.toWireObject(): LinkedHashMap<String, Any?> = when (this) {
     is AgentTimelineAvailableStatus -> wireObject(

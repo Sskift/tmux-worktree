@@ -259,7 +259,9 @@ internal interface RelayV2StateDao {
         "SELECT * FROM relay_v2_snapshot_records WHERE profileId = :profileId " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND snapshotId = :snapshotId " +
-            "ORDER BY recordIndex LIMIT :limit OFFSET :offset",
+            "ORDER BY recordIndex " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END " +
+            "OFFSET :offset",
     )
     fun snapshotRecordPage(
         profileId: String,
@@ -644,14 +646,13 @@ internal interface RelayV2StateDao {
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
-            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
-            "AND (:afterCreatedAgentSeqOrder IS NULL OR " +
-            "createdAgentSeqOrder > :afterCreatedAgentSeqOrder OR " +
-            "(createdAgentSeqOrder = :afterCreatedAgentSeqOrder " +
-            "AND entryId > :afterEntryId COLLATE BINARY)) " +
-            "ORDER BY createdAgentSeqOrder, entryId COLLATE BINARY LIMIT :limit",
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch AND " +
+            "(createdAgentSeqOrder > :afterCreatedAgentSeqOrder OR " +
+            "(createdAgentSeqOrder = :afterCreatedAgentSeqOrder AND entryId > :afterEntryId)) " +
+            "ORDER BY createdAgentSeqOrder, entryId " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun agentTranscriptEntries(
+    fun agentTranscriptEntryPageAfter(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -661,19 +662,20 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
-        afterCreatedAgentSeqOrder: String?,
-        afterEntryId: String?,
+        afterCreatedAgentSeqOrder: String,
+        afterEntryId: String,
         limit: Int,
     ): List<RelayV2AgentTranscriptEntryEntity>
 
     @Query(
-        "SELECT COUNT(*) FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+        "SELECT COUNT(*) AS itemCount, COALESCE(SUM(payloadUtf8Bytes), 0) AS byteCount " +
+            "FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
             "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
     )
-    fun agentTranscriptEntryCount(
+    fun agentTranscriptEntryStats(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -683,10 +685,13 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
-    ): Long
+    ): RelayV2SqlStats
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptEntry(entry: RelayV2AgentTranscriptEntryEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptEntries(entries: List<RelayV2AgentTranscriptEntryEntity>)
 
     @Query(
         "UPDATE relay_v2_agent_transcript_entries SET " +
@@ -739,13 +744,17 @@ internal interface RelayV2StateDao {
     ): Int
 
     @Query(
-        "DELETE FROM relay_v2_agent_transcript_entries WHERE profileId = :profileId " +
+        "DELETE FROM relay_v2_agent_transcript_entries WHERE rowid IN " +
+            "(SELECT rowid FROM relay_v2_agent_transcript_entries " +
+            "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
-            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "ORDER BY createdAgentSeqOrder, entryId " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END)",
     )
-    fun deleteAgentTranscriptEntries(
+    fun deleteAgentTranscriptEntryBatch(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -755,6 +764,7 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
+        limit: Int,
     ): Int
 
     @Query(
@@ -930,9 +940,10 @@ internal interface RelayV2StateDao {
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
             "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
             "AND snapshotId = :snapshotId AND recordIndex > :afterRecordIndex " +
-            "ORDER BY recordIndex LIMIT :limit",
+            "ORDER BY recordIndex " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun agentTranscriptSnapshotRecords(
+    fun agentTranscriptSnapshotRecordPageAfter(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -948,7 +959,8 @@ internal interface RelayV2StateDao {
     ): List<RelayV2AgentTranscriptSnapshotRecordEntity>
 
     @Query(
-        "SELECT COUNT(*) FROM relay_v2_agent_transcript_snapshot_records " +
+        "SELECT COUNT(*) AS itemCount, COALESCE(SUM(payloadRawUtf8Bytes), 0) AS byteCount " +
+            "FROM relay_v2_agent_transcript_snapshot_records " +
             "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
@@ -956,7 +968,7 @@ internal interface RelayV2StateDao {
             "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
             "AND snapshotId = :snapshotId",
     )
-    fun agentTranscriptSnapshotRecordCount(
+    fun agentTranscriptSnapshotRecordStats(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -967,7 +979,7 @@ internal interface RelayV2StateDao {
         sessionId: String,
         timelineEpoch: String,
         snapshotId: String,
-    ): Long
+    ): RelayV2SqlStats
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptSnapshotRecords(
@@ -1007,12 +1019,13 @@ internal interface RelayV2StateDao {
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
-            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
-            "AND (:afterAgentEventSeqOrder IS NULL OR " +
-            "agentEventSeqOrder > :afterAgentEventSeqOrder) " +
-            "ORDER BY agentEventSeqOrder LIMIT :limit",
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch AND " +
+            "(agentEventSeqOrder > :afterAgentEventSeqOrder OR " +
+            "(agentEventSeqOrder = :afterAgentEventSeqOrder AND eventId > :afterEventId)) " +
+            "ORDER BY agentEventSeqOrder, eventId " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END",
     )
-    fun agentTranscriptPendingEvents(
+    fun agentTranscriptPendingEventPageAfter(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -1022,19 +1035,21 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
-        afterAgentEventSeqOrder: String?,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
         limit: Int,
     ): List<RelayV2AgentTranscriptPendingEventEntity>
 
     @Query(
-        "SELECT COUNT(*) FROM relay_v2_agent_transcript_pending_events " +
+        "SELECT COUNT(*) AS itemCount, COALESCE(SUM(eventRawUtf8Bytes), 0) AS byteCount " +
+            "FROM relay_v2_agent_transcript_pending_events " +
             "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
             "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
     )
-    fun agentTranscriptPendingEventCount(
+    fun agentTranscriptPendingEventStats(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -1044,10 +1059,13 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
-    ): Long
+    ): RelayV2SqlStats
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     fun insertAgentTranscriptPendingEvent(event: RelayV2AgentTranscriptPendingEventEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    fun insertAgentTranscriptPendingEvents(events: List<RelayV2AgentTranscriptPendingEventEntity>)
 
     @Query(
         "DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
@@ -1074,13 +1092,17 @@ internal interface RelayV2StateDao {
     ): Int
 
     @Query(
-        "DELETE FROM relay_v2_agent_transcript_pending_events WHERE profileId = :profileId " +
+        "DELETE FROM relay_v2_agent_transcript_pending_events WHERE rowid IN " +
+            "(SELECT rowid FROM relay_v2_agent_transcript_pending_events " +
+            "WHERE profileId = :profileId " +
             "AND profileActivationGeneration = :profileActivationGeneration " +
             "AND principalId = :principalId AND clientInstanceId = :clientInstanceId " +
             "AND hostId = :hostId AND hostEpoch = :hostEpoch AND scopeId = :scopeId " +
-            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch",
+            "AND sessionId = :sessionId AND timelineEpoch = :timelineEpoch " +
+            "ORDER BY agentEventSeqOrder, eventId " +
+            "LIMIT CASE WHEN :limit < 1 THEN 1 WHEN :limit > 256 THEN 256 ELSE :limit END)",
     )
-    fun deleteAgentTranscriptPendingEvents(
+    fun deleteAgentTranscriptPendingEventBatch(
         profileId: String,
         profileActivationGeneration: Long,
         principalId: String,
@@ -1090,6 +1112,7 @@ internal interface RelayV2StateDao {
         scopeId: String,
         sessionId: String,
         timelineEpoch: String,
+        limit: Int,
     ): Int
 
     @Query("DELETE FROM relay_v2_agent_transcript_snapshot_staging WHERE profileId = :profileId")

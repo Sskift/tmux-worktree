@@ -7,12 +7,10 @@ import {
   type RelayV2BrokerCredentialStateStoreFailure,
   type RelayV2BrokerCredentialStateStoreOpenResult,
 } from "./brokerCredentialStateStore.js";
-
-type SupportedNativeTarget =
-  | "darwin-arm64"
-  | "darwin-x64"
-  | "linux-arm64"
-  | "linux-x64";
+import {
+  selectRelayV2BrokerCredentialStateStoreNativeTargetDescriptor,
+  type RelayV2BrokerCredentialStateStoreNativeArtifactDescriptor,
+} from "./brokerCredentialStateStoreNativeTarget.js";
 
 export interface RelayV2BrokerCredentialStateStoreNativeTarget {
   readonly platform: string;
@@ -20,10 +18,8 @@ export interface RelayV2BrokerCredentialStateStoreNativeTarget {
   readonly napiVersion: number;
 }
 
-export interface RelayV2BrokerCredentialStateStoreNativeArtifact {
-  readonly target: SupportedNativeTarget;
-  readonly moduleSpecifier: string;
-}
+export type RelayV2BrokerCredentialStateStoreNativeArtifact =
+  RelayV2BrokerCredentialStateStoreNativeArtifactDescriptor;
 
 export type RelayV2BrokerCredentialStateStoreNativeArtifactLoad =
   | { readonly status: "loaded"; readonly binding: unknown }
@@ -48,30 +44,6 @@ export interface RelayV2BrokerCredentialStateStoreNativeLoader {
   open(trustedHome: string): Promise<RelayV2BrokerCredentialStateStoreOpenResult>;
 }
 
-const ARTIFACTS: Readonly<Record<SupportedNativeTarget, RelayV2BrokerCredentialStateStoreNativeArtifact>> =
-  Object.freeze({
-    "darwin-arm64": Object.freeze({
-      target: "darwin-arm64",
-      moduleSpecifier:
-        "./native/relay-v2-broker-credential-state-store-v1-darwin-arm64.node",
-    }),
-    "darwin-x64": Object.freeze({
-      target: "darwin-x64",
-      moduleSpecifier:
-        "./native/relay-v2-broker-credential-state-store-v1-darwin-x64.node",
-    }),
-    "linux-arm64": Object.freeze({
-      target: "linux-arm64",
-      moduleSpecifier:
-        "./native/relay-v2-broker-credential-state-store-v1-linux-arm64.node",
-    }),
-    "linux-x64": Object.freeze({
-      target: "linux-x64",
-      moduleSpecifier:
-        "./native/relay-v2-broker-credential-state-store-v1-linux-x64.node",
-    }),
-  });
-
 function invalidFailure(): RelayV2BrokerCredentialStateStoreFailure {
   return Object.freeze({ code: "NATIVE_INTERFACE_INVALID" });
 }
@@ -83,8 +55,10 @@ function invalidCapability(): RelayV2BrokerCredentialStateStoreCapability {
 function selectArtifact(
   target: RelayV2BrokerCredentialStateStoreNativeTarget,
 ): RelayV2BrokerCredentialStateStoreNativeArtifact | null {
-  const targetName = `${target.platform}-${target.architecture}` as SupportedNativeTarget;
-  return Object.hasOwn(ARTIFACTS, targetName) ? ARTIFACTS[targetName] : null;
+  return selectRelayV2BrokerCredentialStateStoreNativeTargetDescriptor(
+    target.platform,
+    target.architecture,
+  )?.runtimeArtifact ?? null;
 }
 
 function capabilityAsOpenResult(

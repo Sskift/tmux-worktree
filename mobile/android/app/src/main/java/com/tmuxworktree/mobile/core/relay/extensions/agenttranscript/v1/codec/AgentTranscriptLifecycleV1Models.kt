@@ -18,6 +18,24 @@ sealed interface AgentTranscriptLifecycleV1Frame {
     val type: String
 }
 
+/**
+ * Codec-issued evidence that one complete public frame passed the strict raw-byte boundary.
+ *
+ * Implementations are closed to this codec module. Consumers can read the bound typed frame and
+ * its byte accounting, but cannot construct an artifact from independently assembled DTOs.
+ */
+sealed interface AgentTranscriptLifecycleV1PublicFrameArtifact {
+    val frame: AgentTranscriptLifecycleV1Frame
+    val rawUtf8ByteCount: Int
+
+    val protocolVersion: Int
+        get() = 2
+    val kind: AgentTranscriptLifecycleV1FrameKind
+        get() = frame.kind
+    val type: String
+        get() = frame.type
+}
+
 /** Strictly decoded server-to-client frame bound to one host session identity. */
 sealed interface AgentTranscriptLifecycleV1InboundFrame : AgentTranscriptLifecycleV1Frame {
     val hostId: String
@@ -32,6 +50,7 @@ enum class AgentTimelineErrorCode(val wireValue: String) {
     AGENT_CURSOR_AHEAD("AGENT_CURSOR_AHEAD"),
     AGENT_SNAPSHOT_EXPIRED("AGENT_SNAPSHOT_EXPIRED"),
     AGENT_TIMELINE_EPOCH_MISMATCH("AGENT_TIMELINE_EPOCH_MISMATCH"),
+    HOST_EPOCH_MISMATCH("HOST_EPOCH_MISMATCH"),
 }
 
 enum class AgentTimelineErrorCommandDisposition(val wireValue: String) {
@@ -45,9 +64,17 @@ data class AgentTimelineStructuredError(
     val retryAfterMs: Long? = null,
     val commandDisposition: AgentTimelineErrorCommandDisposition =
         AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+    val details: AgentTimelineErrorDetails? = null,
 )
 
-/** Correlated base-v2 error envelope carrying only extension-owned error codes. */
+sealed interface AgentTimelineErrorDetails
+
+data class AgentTimelineHostEpochMismatchDetails(
+    val expectedHostEpoch: String,
+    val actualHostEpoch: String,
+) : AgentTimelineErrorDetails
+
+/** Correlated extension error or the base-v2 host-lineage mismatch allowed by this codec. */
 data class AgentTimelineErrorFrame(
     val requestId: String,
     override val hostId: String,
@@ -165,6 +192,45 @@ data class AgentTimelineSnapshotPage(
     val records: List<AgentTimelineSnapshotRecord>,
 )
 
+/** Closed, codec-issued full-frame artifact for one decoded pinned snapshot page. */
+sealed interface AgentTimelineSnapshotPagePublicFrameArtifact :
+    AgentTranscriptLifecycleV1PublicFrameArtifact {
+    override val frame: AgentTimelineSnapshotPageFrame
+
+    val capability: String
+        get() = "agent.transcript-lifecycle.v1"
+    val requestId: String
+        get() = frame.requestId
+    val hostId: String
+        get() = frame.hostId
+    val hostEpoch: String
+        get() = frame.hostEpoch
+    val scopeId: String
+        get() = frame.scopeId
+    val sessionId: String
+        get() = frame.sessionId
+    val payload: AgentTimelineSnapshotPage
+        get() = frame.page
+    val timelineEpoch: String
+        get() = payload.timelineEpoch
+    val snapshotRequestId: String
+        get() = payload.snapshotRequestId
+    val snapshotId: String
+        get() = payload.snapshotId
+    val pageIndex: Long
+        get() = payload.pageIndex
+    val isLast: Boolean
+        get() = payload.isLast
+    val nextCursor: String?
+        get() = payload.nextCursor
+    val throughAgentSeq: String
+        get() = payload.throughAgentSeq
+    val earliestRetainedSeq: String
+        get() = payload.earliestRetainedSeq
+    val records: List<AgentTimelineSnapshotRecord>
+        get() = payload.records
+}
+
 data class AgentTimelineReplayGetFrame(
     val requestId: String,
     val hostId: String,
@@ -206,6 +272,39 @@ data class AgentTimelineReplayPage(
     val nextCursor: String?,
     val events: List<AgentTimelineEventRecord>,
 )
+
+/** Closed, codec-issued full-frame artifact for one decoded pinned replay page. */
+sealed interface AgentTimelineReplayPagePublicFrameArtifact :
+    AgentTranscriptLifecycleV1PublicFrameArtifact {
+    override val frame: AgentTimelineReplayPageFrame
+
+    val capability: String
+        get() = "agent.transcript-lifecycle.v1"
+    val requestId: String
+        get() = frame.requestId
+    val hostId: String
+        get() = frame.hostId
+    val hostEpoch: String
+        get() = frame.hostEpoch
+    val scopeId: String
+        get() = frame.scopeId
+    val sessionId: String
+        get() = frame.sessionId
+    val payload: AgentTimelineReplayPage
+        get() = frame.page
+    val timelineEpoch: String
+        get() = payload.timelineEpoch
+    val afterAgentSeq: String
+        get() = payload.afterAgentSeq
+    val replayThroughAgentSeq: String
+        get() = payload.replayThroughAgentSeq
+    val isLast: Boolean
+        get() = payload.isLast
+    val nextCursor: String?
+        get() = payload.nextCursor
+    val events: List<AgentTimelineEventRecord>
+        get() = payload.events
+}
 
 data class AgentTimelineEventFrame(
     override val hostId: String,
