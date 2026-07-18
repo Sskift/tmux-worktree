@@ -5,10 +5,15 @@ import {
   encodeRelayAgentTranscriptLifecycleFrame,
   RELAY_AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
 } from "./codec.js";
-import type {
-  RelayAgentAuthorityPublicEvent,
-  RelayAgentAuthorityReduction,
-  RelayAgentTrustedAdapterBinding,
+/*
+ * Binding normalization stays in the authority trust boundary. This runtime
+ * owns only the process-local publication attempt and ingest admission.
+ */
+import {
+  normalizeRelayAgentTrustedAdapterBinding,
+  type RelayAgentAuthorityPublicEvent,
+  type RelayAgentAuthorityReduction,
+  type RelayAgentTrustedAdapterBinding,
 } from "./authority.js";
 import {
   RelayAgentAuthorityStore,
@@ -42,6 +47,26 @@ export interface RelayAgentRuntimeDelivery {
 export interface RelayAgentTrustedIngestResult {
   reduction: RelayAgentAuthorityReduction;
   delivery: RelayAgentRuntimeDelivery | null;
+}
+
+export type RelayAgentTrustedSourceIngressLeaseErrorCode =
+  | "DISABLED"
+  | "ALREADY_ENABLED"
+  | "BUSY"
+  | "SEALED"
+  | "CLOSED";
+
+export class RelayAgentTrustedSourceIngressLeaseError extends Error {
+  constructor(readonly code: RelayAgentTrustedSourceIngressLeaseErrorCode) {
+    super({
+      DISABLED: "Relay Agent trusted-source ingress is disabled",
+      ALREADY_ENABLED: "Relay Agent trusted-source ingress is already enabled",
+      BUSY: "Relay Agent trusted-source ingress already has a durable ingest in progress",
+      SEALED: "Relay Agent trusted-source ingress was sealed by a failed durable ingest",
+      CLOSED: "Relay Agent trusted-source ingress is closed",
+    }[code]);
+    this.name = "RelayAgentTrustedSourceIngressLeaseError";
+  }
 }
 
 export class RelayAgentExtensionNotNegotiatedError extends Error {
@@ -354,5 +379,128 @@ export class RelayAgentTranscriptLifecycleRuntime {
 
   async deleteTimeline(target: RelayAgentAuthorityTarget): Promise<RelayAgentRuntimeDelivery> {
     return delivery("LIVE", resetFrame(await this.store.deleteTimeline(target)));
+  }
+}
+
+type RelayAgentTrustedSourceIngressState =
+  | "disabled"
+  | "enabling"
+  | "enabled"
+  | "sealed"
+  | "closed";
+
+/**
+ * Process-local admission owner for one authenticated trusted-source adapter.
+ * It is deliberately default-off and owns neither parsing nor durable state.
+ */
+export class RelayAgentTrustedSourceIngressLease {
+  readonly #runtime: RelayAgentTranscriptLifecycleRuntime;
+  #state: RelayAgentTrustedSourceIngressState = "disabled";
+  #binding: Readonly<RelayAgentTrustedAdapterBinding> | null = null;
+  #enablingAttempt: object | null = null;
+  #operationPending = false;
+  #inFlightBarrier: Promise<void> | null = null;
+  #closePromise: Promise<void> | null = null;
+
+  constructor(runtime: RelayAgentTranscriptLifecycleRuntime) {
+    this.#runtime = runtime;
+  }
+
+  enable(binding: RelayAgentTrustedAdapterBinding): void {
+    if (this.#state === "closed") {
+      throw new RelayAgentTrustedSourceIngressLeaseError("CLOSED");
+    }
+    if (this.#state === "sealed") {
+      throw new RelayAgentTrustedSourceIngressLeaseError("SEALED");
+    }
+    if (this.#state === "enabled") {
+      throw new RelayAgentTrustedSourceIngressLeaseError("ALREADY_ENABLED");
+    }
+    if (this.#state === "enabling") {
+      this.#state = "sealed";
+      this.#enablingAttempt = null;
+      this.#binding = null;
+      throw new RelayAgentTrustedSourceIngressLeaseError("SEALED");
+    }
+
+    const attempt = Object.freeze({});
+    this.#state = "enabling";
+    this.#enablingAttempt = attempt;
+    let normalized: Readonly<RelayAgentTrustedAdapterBinding>;
+    try {
+      normalized = normalizeRelayAgentTrustedAdapterBinding(binding);
+    } catch (error) {
+      if (this.#state === "enabling" && this.#enablingAttempt === attempt) {
+        this.#state = "sealed";
+        this.#enablingAttempt = null;
+      }
+      throw error;
+    }
+    if (this.#state !== "enabling" || this.#enablingAttempt !== attempt) {
+      throw new RelayAgentTrustedSourceIngressLeaseError(
+        this.#state === "closed" ? "CLOSED" : "SEALED",
+      );
+    }
+    this.#binding = normalized;
+    this.#enablingAttempt = null;
+    this.#state = "enabled";
+  }
+
+  ingestTrustedSource(sourceInput: unknown): Promise<RelayAgentTrustedIngestResult> {
+    if (this.#state === "disabled") {
+      return Promise.reject(new RelayAgentTrustedSourceIngressLeaseError("DISABLED"));
+    }
+    if (this.#state === "closed") {
+      return Promise.reject(new RelayAgentTrustedSourceIngressLeaseError("CLOSED"));
+    }
+    if (this.#state === "sealed") {
+      return Promise.reject(new RelayAgentTrustedSourceIngressLeaseError("SEALED"));
+    }
+    if (this.#state === "enabling") {
+      this.#state = "sealed";
+      this.#enablingAttempt = null;
+      return Promise.reject(new RelayAgentTrustedSourceIngressLeaseError("SEALED"));
+    }
+    if (this.#operationPending) {
+      return Promise.reject(new RelayAgentTrustedSourceIngressLeaseError("BUSY"));
+    }
+
+    const binding = this.#binding!;
+    let settleBarrier!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      settleBarrier = resolve;
+    });
+    this.#operationPending = true;
+    this.#inFlightBarrier = barrier;
+
+    const settle = (failed: boolean): void => {
+      if (!this.#operationPending) return;
+      this.#operationPending = false;
+      this.#inFlightBarrier = null;
+      if (failed && this.#state !== "closed") this.#state = "sealed";
+      settleBarrier();
+    };
+
+    let operation: Promise<RelayAgentTrustedIngestResult>;
+    try {
+      operation = Promise.resolve(this.#runtime.ingestTrustedSource(binding, sourceInput));
+    } catch (error) {
+      settle(true);
+      return Promise.reject(error);
+    }
+    void operation.then(
+      () => settle(false),
+      () => settle(true),
+    );
+    return operation;
+  }
+
+  close(): Promise<void> {
+    if (this.#closePromise !== null) return this.#closePromise;
+    this.#state = "closed";
+    this.#enablingAttempt = null;
+    this.#binding = null;
+    this.#closePromise = this.#inFlightBarrier ?? Promise.resolve();
+    return this.#closePromise;
   }
 }

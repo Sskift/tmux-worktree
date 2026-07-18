@@ -1070,7 +1070,9 @@ function sameBinding(left: RelayAgentAuthorityBinding, right: RelayAgentAuthorit
     && left.timelineEpoch === right.timelineEpoch;
 }
 
-function parseTrustedAdapterBinding(value: unknown): RelayAgentTrustedAdapterBinding {
+export function normalizeRelayAgentTrustedAdapterBinding(
+  value: unknown,
+): Readonly<RelayAgentTrustedAdapterBinding> {
   try {
     const record = asClosedObject(value, "trusted adapter binding", ["hostId", "hostEpoch", "scopeId", "sessionId"]);
     return Object.freeze({
@@ -1088,7 +1090,7 @@ function parseTrustedAdapterBinding(value: unknown): RelayAgentTrustedAdapterBin
 }
 
 function assertTrustedAdapterBinding(state: RelayAgentAuthorityState, value: unknown): void {
-  const binding = parseTrustedAdapterBinding(value);
+  const binding = normalizeRelayAgentTrustedAdapterBinding(value);
   if (
     binding.hostId !== state.binding.hostId
     || binding.hostEpoch !== state.binding.hostEpoch

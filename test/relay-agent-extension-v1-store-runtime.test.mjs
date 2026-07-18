@@ -970,6 +970,195 @@ test("deferred anchor overlap never holds the file lock across reconcile", async
   assert.equal(h.continuityAuthority.current.checkpoint.sequence, durable.commitSeq);
 });
 
+test("trusted-source ingress freezes binding and provides zero-queue admission with a durable close barrier", async (t) => {
+  const h = await harness(t);
+  const runtime = runtimeFor(h.store);
+  const originalIngest = runtime.ingestTrustedSource.bind(runtime);
+  let runtimeCalls = 0;
+  runtime.ingestTrustedSource = (...args) => {
+    runtimeCalls += 1;
+    return originalIngest(...args);
+  };
+  const ingress = new runtimeModule.RelayAgentTrustedSourceIngressLease(runtime);
+  const ingressError = (code) => (error) => (
+    error instanceof runtimeModule.RelayAgentTrustedSourceIngressLeaseError
+      && error.code === code
+  );
+
+  await assert.rejects(
+    ingress.ingestTrustedSource(sourceEvent(1, "disabled", { mutationType: "source.started" })),
+    ingressError("DISABLED"),
+  );
+  assert.equal(runtimeCalls, 0);
+
+  const mutableBinding = { ...trustedBinding };
+  ingress.enable(mutableBinding);
+  mutableBinding.sessionId = "caller-mutated-session";
+  const started = await ingress.ingestTrustedSource(
+    sourceEvent(1, "leased-source-started", { mutationType: "source.started" }),
+  );
+  assert.equal(started.reduction.disposition, "applied");
+  assert.equal(started.delivery.provenance, "LIVE");
+  assert.equal(started.delivery.frame.type, "agent.timeline.event");
+  assert.equal(started.delivery.frame.sessionId, trustedBinding.sessionId);
+  assert.equal(started.delivery.frame.payload.eventId, started.reduction.publicEvent.eventId);
+  assert.equal(
+    started.delivery.frame.payload.agentEventSeq,
+    started.reduction.publicEvent.agentEventSeq,
+  );
+  assert.equal(runtimeCalls, 1);
+
+  const gap = await ingress.ingestTrustedSource(sourceEvent(3, "leased-source-gap", {
+    mutationType: "source.availability",
+    state: "interrupted",
+    reason: "source_disconnected",
+  }));
+  assert.equal(gap.reduction.disposition, "source_gap");
+  assert.equal(gap.delivery, null);
+
+  const durableIngestEntered = deferred();
+  const releaseDurableIngest = deferred();
+  h.continuityAuthority.onCas = async (_request, commit) => {
+    h.continuityAuthority.onCas = null;
+    durableIngestEntered.resolve();
+    await releaseDurableIngest.promise;
+    return commit();
+  };
+  const pending = ingress.ingestTrustedSource(sourceEvent(2, "leased-run-running", {
+    mutationType: "lifecycle.changed",
+    scope: "run",
+    runId: "leased-run",
+    turnId: null,
+    state: "running",
+    failure: null,
+  }));
+  let pendingSettled = false;
+  void pending.then(
+    () => { pendingSettled = true; },
+    () => { pendingSettled = true; },
+  );
+  await durableIngestEntered.promise;
+  assert.equal(runtimeCalls, 3);
+  await assert.rejects(
+    ingress.ingestTrustedSource(sourceEvent(3, "must-not-queue", {
+      mutationType: "source.availability",
+      state: "interrupted",
+      reason: "source_disconnected",
+    })),
+    ingressError("BUSY"),
+  );
+  assert.equal(runtimeCalls, 3);
+
+  const closing = ingress.close();
+  assert.equal(ingress.close(), closing);
+  let closeSettled = false;
+  void closing.then(() => { closeSettled = true; });
+  await assert.rejects(
+    ingress.ingestTrustedSource(sourceEvent(3, "closed-admission", {
+      mutationType: "source.availability",
+      state: "interrupted",
+      reason: "source_disconnected",
+    })),
+    ingressError("CLOSED"),
+  );
+  await nextTurn();
+  assert.equal(pendingSettled, false);
+  assert.equal(closeSettled, false);
+  assert.equal(runtimeCalls, 3);
+
+  releaseDurableIngest.resolve();
+  const applied = await pending;
+  assert.equal(applied.reduction.disposition, "applied");
+  await closing;
+  assert.equal(closeSettled, true);
+});
+
+test("trusted-source ingress closes binding publication on extra fields and getter reentry", async (t) => {
+  const h = await harness(t);
+  const runtime = runtimeFor(h.store);
+  const originalIngest = runtime.ingestTrustedSource.bind(runtime);
+  let runtimeCalls = 0;
+  runtime.ingestTrustedSource = (...args) => {
+    runtimeCalls += 1;
+    return originalIngest(...args);
+  };
+  const ingressError = (code) => (error) => (
+    error instanceof runtimeModule.RelayAgentTrustedSourceIngressLeaseError
+      && error.code === code
+  );
+
+  const extraIngress = new runtimeModule.RelayAgentTrustedSourceIngressLease(runtime);
+  assert.throws(
+    () => extraIngress.enable({ ...trustedBinding, extra: "must-not-be-normalized-away" }),
+    (error) => error?.code === "adapter_binding_invalid",
+  );
+  await assert.rejects(
+    extraIngress.ingestTrustedSource(sourceEvent(1, "extra-rejected", {
+      mutationType: "source.started",
+    })),
+    ingressError("SEALED"),
+  );
+
+  const closeIngress = new runtimeModule.RelayAgentTrustedSourceIngressLease(runtime);
+  const closeReentrantBinding = { ...trustedBinding };
+  Object.defineProperty(closeReentrantBinding, "sessionId", {
+    enumerable: true,
+    get() {
+      void closeIngress.close();
+      return trustedBinding.sessionId;
+    },
+  });
+  assert.throws(() => closeIngress.enable(closeReentrantBinding), ingressError("CLOSED"));
+
+  const enableIngress = new runtimeModule.RelayAgentTrustedSourceIngressLease(runtime);
+  const enableReentrantBinding = { ...trustedBinding };
+  Object.defineProperty(enableReentrantBinding, "sessionId", {
+    enumerable: true,
+    get() {
+      assert.throws(() => enableIngress.enable({ ...trustedBinding }), ingressError("SEALED"));
+      return trustedBinding.sessionId;
+    },
+  });
+  assert.throws(() => enableIngress.enable(enableReentrantBinding), ingressError("SEALED"));
+  assert.equal(runtimeCalls, 0);
+});
+
+test("trusted-source ingress seals after a durable ingest rejection", async (t) => {
+  const h = await harness(t);
+  const runtime = runtimeFor(h.store);
+  const originalIngest = runtime.ingestTrustedSource.bind(runtime);
+  let runtimeCalls = 0;
+  runtime.ingestTrustedSource = (...args) => {
+    runtimeCalls += 1;
+    return originalIngest(...args);
+  };
+  const ingress = new runtimeModule.RelayAgentTrustedSourceIngressLease(runtime);
+  ingress.enable({ ...trustedBinding });
+  h.continuityAuthority.failReads = true;
+
+  await assert.rejects(
+    ingress.ingestTrustedSource(sourceEvent(1, "fatal-source-started", {
+      mutationType: "source.started",
+    })),
+    storeModule.RelayAgentAuthorityStoreContinuityUnavailableError,
+  );
+  assert.equal(runtimeCalls, 1);
+
+  h.continuityAuthority.failReads = false;
+  await assert.rejects(
+    ingress.ingestTrustedSource(sourceEvent(1, "blind-retry", {
+      mutationType: "source.started",
+    })),
+    (error) => error instanceof runtimeModule.RelayAgentTrustedSourceIngressLeaseError
+      && error.code === "SEALED",
+  );
+  assert.equal(runtimeCalls, 1);
+  const closing = ingress.close();
+  assert.equal(ingress.close(), closing);
+  await closing;
+  assert.equal(runtimeCalls, 1);
+});
+
 test("missing or unavailable external continuity keeps the extension foundation unavailable", async (t) => {
   const missingHome = mkdtempSync(join(tmpdir(), "tw-agent-authority-missing-anchor-"));
   t.after(() => rmSync(missingHome, { recursive: true, force: true }));
