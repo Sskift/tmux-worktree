@@ -626,7 +626,11 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         if (consumerStats.entryCount != 0L || consumerStats.snapshotCount != 0L ||
             consumerStats.snapshotRecordCount != 0L || consumerStats.pendingEventCount != 0L
         ) storageMalformed()
-        val emptyStats = transcriptNamespaceStats(namespace)
+        val emptyStats = if (namespace.timelineEpoch == null) {
+            emptyTimelineNamespaceStats(namespace.consumer)
+        } else {
+            transcriptNamespaceStats(namespace)
+        }
         validateTranscriptNamespaceStats(emptyStats)
         if (emptyStats.entryCount != 0L || emptyStats.snapshotCount != 0L ||
             emptyStats.snapshotRecordCount != 0L || emptyStats.pendingEventCount != 0L
@@ -915,6 +919,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             namespace,
             state.extensionLane.lastAgentSeq,
             state.extensionLane.snapshotCheckpoint?.throughAgentSeq,
+            state.extensionLane.localGeneration,
         )
 
         validateEntryBatches(namespace, state.extensionLane.lastAgentSeq, stats)
@@ -974,6 +979,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         lastAgentSeq: String,
         snapshotThroughAgentSeq: String?,
+        parentGeneration: String,
     ): LifecycleIndexAccounting {
         val currentStats = lifecycleCurrentStats(namespace)
         val witnessStats = lifecycleWitnessAudit(namespace)
@@ -1032,7 +1038,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         }
         validateCurrentPointers(namespace, currentStats.itemCount, lastAgentSeq)
         validateRecentEvidenceRows(namespace, lastAgentSeq, recentStats)
-        validateNotificationRows(namespace, notificationStats, lastAgentSeq)
+        validateNotificationRows(namespace, notificationStats, lastAgentSeq, parentGeneration)
         return LifecycleIndexAccounting(
             currentCount = currentStats.itemCount,
             witnessCount = witnessStats.itemCount,
@@ -1243,6 +1249,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         stats: RelayV2AgentLifecycleSqlAudit,
         lastAgentSeq: String,
+        parentGeneration: String,
     ) {
         var processed = 0L
         var bytes = 0L
@@ -1258,6 +1265,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 requireExactLifecycleNamespace(namespace, row)
                 requireExactOrderKey(row.agentEventSeq, row.agentEventSeqOrder)
                 if (compareStorageCounters(row.agentEventSeq, lastAgentSeq) > 0) storageMalformed()
+                if (compareStorageCounters(row.localGeneration, parentGeneration) > 0) storageMalformed()
                 val expectedPayload = canonicalNotificationPayload(
                     row.disposition,
                     row.localGeneration,
@@ -2221,6 +2229,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         val rebuiltAccounting = rebuildAccountingAfterSnapshot(
             namespace,
             currentBeforeCut.storageAccounting,
+            header.throughAgentSeq,
+            AgentSnapshotCheckpoint(header.throughAgentSeq, nextGeneration),
+            currentBeforeCut.state.extensionLane.lastAgentSeq,
         )
         var current = persistOperationState(
             currentBeforeCut,
@@ -2595,10 +2606,22 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.rebuildAccountingAfterSnapshot(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         old: AgentTranscriptDurableStorageAccounting,
+        throughAgentSeq: String,
+        nextCheckpoint: AgentSnapshotCheckpoint,
+        parentLastAgentSeq: String,
     ): AgentTranscriptDurableStorageAccounting {
         val stats = transcriptNamespaceStats(namespace)
-        validateEntryBatches(namespace, UINT64_MAX_STORAGE.toString(), stats)
-        val lifecycle = validateLifecycleIndex(namespace, UINT64_MAX_STORAGE.toString(), null)
+        requireCanonicalStorageCounter(throughAgentSeq, positive = true)
+        if (compareStorageCounters(throughAgentSeq, parentLastAgentSeq) < 0 ||
+            nextCheckpoint.throughAgentSeq != throughAgentSeq
+        ) storageMalformed()
+        validateEntryBatches(namespace, throughAgentSeq, stats)
+        val lifecycle = validateLifecycleIndex(
+            namespace,
+            throughAgentSeq,
+            throughAgentSeq,
+            nextCheckpoint.localGeneration,
+        )
         return old.copy(
             entryCount = stats.entryCount,
             entryCanonicalBytes = canonicalArrayBytes(
