@@ -19,6 +19,7 @@ export default defineConfig({
     "src/relay/v2/canonicalBackendIdentity.ts",
     "src/relay/v2/canonicalCommandExecutorAdapter.ts",
     "src/relay/v2/canonicalTwRpcDiscovery.ts",
+    "src/relay/v2/canonicalTwRpcQueryTransportAdapter.ts",
     "src/relay/v2/resourceState.ts",
     "src/relay/v2/stateSnapshotSpool.ts",
     "src/relay/v2/token.ts",

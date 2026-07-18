@@ -58,7 +58,10 @@ export type RelayV2CanonicalTwRpcDiscoveryQuery =
 
 /**
  * Typed boundary to canonical tw rpc-v2. Implementations own target resolution
- * and JSON-line I/O; this adapter never consumes raw process output.
+ * and JSON-line I/O; this adapter never consumes raw process output. Once the
+ * signal is aborted, query() must settle only after its child/transport/stdio
+ * resource barrier has settled. A non-settling port intentionally keeps the
+ * discovery scan fail-closed rather than allowing a later scan to overlap it.
  */
 export interface RelayV2CanonicalTwRpcDiscoveryQueryPort {
   query(request: RelayV2CanonicalTwRpcDiscoveryQuery): Promise<unknown>;
@@ -506,6 +509,7 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
   ): Promise<QueryResult> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     try {
       const request: RelayV2CanonicalTwRpcDiscoveryQuery = command === "capabilities"
         ? {
@@ -525,13 +529,13 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
         (value) => ({ kind: "succeeded", value }),
         () => ({ kind: "transport_error" }),
       );
-      const timeout = new Promise<QueryResult>((resolve) => {
-        timer = setTimeout(() => {
-          controller.abort();
-          resolve({ kind: "timed_out" });
-        }, this.queryTimeoutMs);
-      });
-      return await Promise.race([transport, timeout]);
+      timer = setTimeout(() => {
+        if (timedOut) return;
+        timedOut = true;
+        controller.abort();
+      }, this.queryTimeoutMs);
+      const result = await transport;
+      return timedOut ? { kind: "timed_out" } : result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }

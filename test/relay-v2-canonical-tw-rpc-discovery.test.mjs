@@ -14,12 +14,16 @@ import {
   RelayV2CanonicalTwRpcDiscoveryAdapter,
 } from "../dist/relay/v2/canonicalTwRpcDiscovery.js";
 import {
+  RelayV2CanonicalTwRpcQueryTransportAdapter,
+} from "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js";
+import {
   RELAY_V2_MATERIALIZED_CAPACITY,
   RelayV2MaterializedStateFoundation,
 } from "../dist/relay/v2/resourceState.js";
 
 const INCARNATION_A = `twinc2.${"A".repeat(43)}`;
 const INCARNATION_B = `twinc2.${"B".repeat(43)}`;
+const encoder = new TextEncoder();
 
 function capabilities(overrides = {}) {
   return {
@@ -101,6 +105,25 @@ function queryPort(handler) {
       return handler(request);
     },
   };
+}
+
+function settleAfterAbort(signal, value, reject = false) {
+  return new Promise((resolve, rejectPromise) => {
+    const settle = () => {
+      if (reject) rejectPromise(new Error("query resource barrier settled after abort"));
+      else resolve(value);
+    };
+    if (signal.aborted) settle();
+    else signal.addEventListener("abort", settle, { once: true });
+  });
+}
+
+async function waitUntil(predicate, message) {
+  const deadline = Date.now() + 500;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail(message);
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
 }
 
 test("canonical TW RPC v2 discovery scans only configured scopes and projects deterministic complete results", async () => {
@@ -258,7 +281,7 @@ test("timeout, transport, capability, and malformed-session failures remain part
   const cases = [
     {
       name: "timeout",
-      handler: () => new Promise(() => {}),
+      handler: ({ signal }) => settleAfterAbort(signal, capabilities()),
       expectedCode: "SCOPE_UNREACHABLE",
       expectedReachability: "unreachable",
       expectedCommands: ["capabilities"],
@@ -336,9 +359,10 @@ test("materialized reconciliation preserves a stale cut for unreachable and dupl
   const temporaryHome = mkdtempSync(join(tmpdir(), "tw-rpc-v2-discovery-"));
   try {
     let mode = "complete";
-    const port = queryPort(({ command }) => {
+    const port = queryPort((request) => {
+      const { command } = request;
       if (command === "capabilities") return capabilities();
-      if (mode === "timeout") return new Promise(() => {});
+      if (mode === "timeout") return settleAfterAbort(request.signal, null, true);
       if (mode === "duplicate") {
         return {
           protocolVersion: 2,
@@ -397,6 +421,139 @@ test("materialized reconciliation preserves a stale cut for unreachable and dupl
     )).payload;
     assert.equal(staleAfterDuplicate.scopes[0].completeness, "partial");
     assert.equal(staleAfterDuplicate.scopes[0].items[0].sessionId, seededSessionId);
+  } finally {
+    rmSync(temporaryHome, { recursive: true, force: true });
+  }
+});
+
+test("discovery timeout waits for the query transport child barrier before preserving existing state", async () => {
+  const temporaryHome = mkdtempSync(join(tmpdir(), "tw-rpc-v2-query-barrier-"));
+  try {
+    let mode = "complete";
+    let controlled;
+    const runner = {
+      calls: [],
+      spawn(request) {
+        this.calls.push({
+          executable: request.executable,
+          argv: [...request.argv],
+          shell: request.shell,
+        });
+        const command = request.argv.at(-1);
+        if (mode === "blocked") {
+          assert.equal(command, "capabilities");
+          return controlled.handle;
+        }
+        const value = command === "capabilities"
+          ? capabilities()
+          : { protocolVersion: 2, sessions: [terminalSession()] };
+        const stdout = encoder.encode(`${JSON.stringify(value)}\n`);
+        return {
+          stdout: {
+            async *[Symbol.asyncIterator]() { yield stdout; },
+          },
+          stderr: {
+            async *[Symbol.asyncIterator]() {},
+          },
+          exited: Promise.resolve({ exitCode: 0, signal: null }),
+          kill: () => assert.fail("completed query must not be killed"),
+        };
+      },
+    };
+    const transport = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: [{
+        kind: "local",
+        targetId: "explicit-local",
+        executable: "/fake/canonical/tw",
+      }],
+      runner,
+    });
+    const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+      scopes: [scope("local", "explicit-local", "scope:explicit-local")],
+      queryPort: transport,
+      queryTimeoutMs: 5,
+    });
+    let observedScan;
+    const trackedDiscovery = {
+      scan() {
+        observedScan = discovery.scan();
+        return observedScan;
+      },
+    };
+    const store = await RelayV2HostStateStore.open({
+      paths: relayV2HostStatePaths(temporaryHome),
+    });
+    const foundation = new RelayV2MaterializedStateFoundation({
+      hostId: "host-under-test",
+      discovery: trackedDiscovery,
+      store,
+      readinessSink: { apply: () => true },
+    });
+
+    const seeded = await foundation.reconcile();
+    const seededScan = observedScan;
+    const seededCut = (await foundation.sessionsSnapshot(
+      "seeded-barrier-cut",
+      seeded.snapshot.hostEpoch,
+      null,
+    )).payload;
+    const seededSessionId = seededCut.scopes[0].items[0].sessionId;
+
+    let releaseBarrier;
+    let killCalls = 0;
+    const barrier = new Promise((resolve) => { releaseBarrier = resolve; });
+    const lateStdout = encoder.encode(`${JSON.stringify(capabilities())}\n`);
+    controlled = {
+      handle: {
+        stdout: {
+          async *[Symbol.asyncIterator]() {
+            await barrier;
+            yield lateStdout;
+          },
+        },
+        stderr: {
+          async *[Symbol.asyncIterator]() { await barrier; },
+        },
+        exited: barrier.then(() => ({ exitCode: 0, signal: null })),
+        kill(signal) {
+          assert.equal(signal, "SIGKILL");
+          killCalls += 1;
+        },
+      },
+    };
+    mode = "blocked";
+    const pendingReconcile = foundation.reconcile();
+    await waitUntil(() => observedScan !== seededScan, "discovery scan did not start");
+    const pendingScan = observedScan;
+    let scanSettled = false;
+    pendingScan.then(
+      () => { scanSettled = true; },
+      () => { scanSettled = true; },
+    );
+
+    await waitUntil(() => killCalls === 1, "deadline did not kill the query child");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(killCalls, 1, "discovery and transport deadlines must share one kill");
+    assert.equal(scanSettled, false, "scan must wait for exit and stdio barriers");
+
+    releaseBarrier();
+    const scan = await pendingScan;
+    assert.equal(scan.coverage, "partial");
+    assert.equal(scan.scopes[0].reachability, "unreachable");
+    assert.equal(scan.scopes[0].sessionsCompleteness, "partial");
+    assert.deepEqual(scan.scopes[0].sessions, []);
+    assert.equal(scan.scopes[0].error.code, "SCOPE_UNREACHABLE");
+
+    const reconciled = await pendingReconcile;
+    assert.equal(reconciled.readiness.snapshotMaterializationReady, false);
+    assert.equal(reconciled.events.some((event) => event.payload?.change?.op === "delete"), false);
+    const preserved = (await foundation.sessionsSnapshot(
+      "preserved-barrier-cut",
+      reconciled.snapshot.hostEpoch,
+      null,
+    )).payload;
+    assert.equal(preserved.scopes[0].items[0].sessionId, seededSessionId);
+    assert.equal(killCalls, 1);
   } finally {
     rmSync(temporaryHome, { recursive: true, force: true });
   }
