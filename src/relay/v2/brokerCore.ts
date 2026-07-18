@@ -883,11 +883,16 @@ export class RelayV2BrokerCore {
   attachHostCarrier(
     transportId: string,
     authContext: RelayV2BrokerConnectionAuthorization,
+    connectionIncarnation = randomUUID(),
   ): void {
     if (this.liveAuthCompositionLatched) {
       throw new Error("Relay v2 live-auth composition is latched fail-closed");
     }
-    if (!isIdentifier(transportId) || this.carriers.has(transportId)) {
+    if (
+      !isIdentifier(transportId)
+      || !isIdentifier(connectionIncarnation)
+      || this.carriers.has(transportId)
+    ) {
       throw new Error("invalid or duplicate Relay v2 carrier transport ID");
     }
     const authorization = cloneClosedConnectionAuthorization(authContext);
@@ -900,7 +905,7 @@ export class RelayV2BrokerCore {
     }
     this.carriers.set(transportId, {
       transportId,
-      connectionIncarnation: randomUUID(),
+      connectionIncarnation,
       authContext: authorization,
       authorizationState: "active",
       authorizationCloseSignalled: false,
@@ -1110,8 +1115,13 @@ export class RelayV2BrokerCore {
   openClientRoute(
     connectionId: string,
     authContext: RelayV2BrokerConnectionAuthorization,
+    connectionIncarnation = randomUUID(),
   ): RelayV2RouteOpenResult {
-    if (!isIdentifier(connectionId) || this.clients.has(connectionId)) {
+    if (
+      !isIdentifier(connectionId)
+      || !isIdentifier(connectionIncarnation)
+      || this.clients.has(connectionId)
+    ) {
       return this.failure("INVALID_ENVELOPE", "Client connection ID is invalid");
     }
     const authorization = cloneClosedConnectionAuthorization(authContext);
@@ -1268,7 +1278,7 @@ export class RelayV2BrokerCore {
     carrier.routeIds.add(routeId);
     this.clients.set(connectionId, {
       connectionId,
-      connectionIncarnation: randomUUID(),
+      connectionIncarnation,
       authContext: authorization,
       authorizationState: "active",
       authorizationCloseSignalled: false,

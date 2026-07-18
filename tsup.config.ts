@@ -33,6 +33,7 @@ export default defineConfig({
     "src/relay/v2/brokerHostBootstrapHttpIngress.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",
+    "src/relay/v2/brokerTransportCloseCoordinator.ts",
     "src/relay/v2/carrierPump.ts",
     "src/relay/v2/terminalManager.ts",
     "src/relay/extensions/agentTranscriptLifecycle/v1/authority.ts",

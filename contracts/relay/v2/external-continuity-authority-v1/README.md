@@ -73,7 +73,8 @@ failure处理严格按namespace隔离。只有`broker-credential.v1`的fatal ext
 
 `agent-transcript-lifecycle.v1`复用现有extension store mapping，不新增error：`ANCHOR_UNAVAILABLE|BUSY` → `AGENT_AUTHORITY_STORE_CONTINUITY_UNAVAILABLE`；`STATE_COMMIT_UNCERTAIN|ANCHOR_COMMIT_UNCERTAIN|RECONCILIATION_REQUIRED` → `AGENT_AUTHORITY_STORE_COMMIT_UNCERTAIN`；`INVALID_CHECKPOINT|INVALID_AUTHORITY_RESPONSE|LOCAL_STATE_CONFLICT|CAS_CONFLICT|ROLLBACK_DETECTED` → `AGENT_AUTHORITY_STORE_CORRUPT`。`CONTINUITY_UNAVAILABLE`只把extension标记unavailable并保留可证明的timeline/cache lineage，下一步只能repair或reopen新Agent authority；reopen不能自行生成新timelineEpoch。`COMMIT_UNCERTAIN`在同一lineage内reconcile，未证明corrupt前也不能reset。只有独立的`CORRUPT`/明确continuity loss case才允许extension-only explicit reset并生成新timelineEpoch。三类都不得撤回broker credential readiness，不得阻止基础v2 Upgrade/route/command/terminal，不得全局fence或关闭基础v2 connection。machine fixture使用独立`agentAuthorityError`观察字段；其中`ready/admission/connectionFence`表达基础broker路径仍为ready/open/unfenced，而不是声称extension仍可用。
 
-具体 Relay client route/host carrier close code和 close deadline不由 external backend/adapter拥有，也不能借用现有 handshake/backpressure常量。本 v1将二者列为 production adapter开始前必须在 owning broker/composition contract冻结的 required choice；在选择完成前 production wiring继续 NO-GO。当前仓库没有上述 production readiness subscription、connection fence、backend transport、extension authority reset wiring或 adapter，因此本条只是冻结未来接线的验收语义，不描述当前 runtime。
+具体 Relay client route/host carrier close code和 close deadline不由 external backend/adapter拥有，也不能借用现有 handshake/backpressure常量。独立未接线的 transport close coordinator 已在 broker owner 侧实现 4401/4403/1013 与 5000ms force-destroy policy；production adapter 开始前，owning composition 仍须显式采用、接线和验收，production wiring 继续 NO-GO。当前仓库没有上述 production readiness subscription、close-policy listener/socket wiring、backend transport、extension authority reset wiring或 adapter，因此本条只是冻结未来接线的验收语义，不描述当前 runtime。
+
 
 ## Machine fixture
 
