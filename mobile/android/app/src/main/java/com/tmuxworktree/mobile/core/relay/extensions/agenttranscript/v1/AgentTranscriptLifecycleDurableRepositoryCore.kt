@@ -2007,6 +2007,16 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         header: RelayV2AgentTranscriptSnapshotStagingEntity,
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult {
+        // Destructive replacement is forbidden until the complete pre-state has been
+        // strictly audited.  In particular, do not clear L/E or prune N and then audit the
+        // cleaned graph: corruption must fail closed and leave the transaction unchanged.
+        val preStateAudit = validateTranscriptStorage(
+            namespace,
+            currentBeforeCut.state,
+        )
+        if (preStateAudit.accounting != currentBeforeCut.storageAccounting) {
+            storageMalformed()
+        }
         retireSnapshotAbsentEntries(namespace, header)
         clearLifecycleCurrent(namespace, currentBeforeCut.storageAccounting.lifecycleCurrentCount)
         clearRecentEvidence(namespace)
