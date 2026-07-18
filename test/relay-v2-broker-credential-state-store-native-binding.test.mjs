@@ -2,11 +2,33 @@ import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import test from "node:test";
+import { pathToFileURL } from "node:url";
 
-const stateStore = await import("../dist/relay/v2/brokerCredentialStateStore.js");
+const explicitStateStoreModule =
+  process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_STATE_STORE_MODULE;
+if (explicitStateStoreModule !== undefined) {
+  assert.equal(isAbsolute(explicitStateStoreModule), true);
+  assert.equal(existsSync(explicitStateStoreModule), true);
+}
+const stateStore = explicitStateStoreModule === undefined
+  ? await import("../dist/relay/v2/brokerCredentialStateStore.js")
+  : await import(pathToFileURL(explicitStateStoreModule).href);
 const nativeArtifact = process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT;
+const explicitExpectedPlatform =
+  process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_EXPECTED_PLATFORM;
+const explicitExpectedArchitecture =
+  process.env.RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_EXPECTED_ARCHITECTURE;
+assert.equal(
+  explicitExpectedPlatform === undefined,
+  explicitExpectedArchitecture === undefined,
+  "expected platform and architecture must be supplied together",
+);
+const expectedPlatform = explicitExpectedPlatform ?? "darwin";
+const expectedArchitecture = explicitExpectedArchitecture ?? process.arch;
+assert.match(expectedPlatform, /^(darwin|linux)$/);
+assert.match(expectedArchitecture, /^(arm64|x64)$/);
 
 const EXPORT_KEYS = [
   "openRelayV2BrokerCredentialStateStore",
@@ -49,13 +71,13 @@ function exactOwnDataKeys(value) {
   return Reflect.ownKeys(descriptors).sort();
 }
 
-test("actual Darwin binding is exact, prototype-safe, wrapper-decodable, and closed before store observation", {
+test("actual selected-target binding is exact, prototype-safe, wrapper-decodable, and closed before store observation", {
   skip: nativeArtifact === undefined
     ? "RELAY_V2_BROKER_CREDENTIAL_NATIVE_TEST_ARTIFACT is required for the focused native run"
     : false,
 }, async () => {
-  assert.equal(process.platform, "darwin");
-  assert.match(process.arch, /^(arm64|x64)$/);
+  assert.equal(process.platform, expectedPlatform);
+  assert.equal(process.arch, expectedArchitecture);
   const artifact = nativeArtifact;
   assert.equal(typeof artifact, "string");
   assert.equal(resolve(artifact), artifact);
