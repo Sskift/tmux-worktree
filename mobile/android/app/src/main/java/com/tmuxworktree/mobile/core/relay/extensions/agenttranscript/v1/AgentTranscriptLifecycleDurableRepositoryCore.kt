@@ -1306,7 +1306,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         current: ReadyOperationState,
         unbound: ClosedDurableEvent,
-        rawFrameUtf8Bytes: Int,
+        rawArtifactUtf8Bytes: Int,
         reductionOverride: AgentTranscriptLifecycleClientReduction? = null,
     ): AgentTranscriptLifecycleClientReduction {
         val input = unbound.bindLineage(namespace)
@@ -1333,13 +1333,13 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         )
         val nextRaw = Math.addExact(
             accounting.pendingLiveEventRawUtf8Bytes,
-            rawFrameUtf8Bytes.toLong(),
+            rawArtifactUtf8Bytes.toLong(),
         )
         if (nextCount > RelayV2StateLimits.MAX_BUFFERED_STATE_EVENTS ||
             nextCanonical > RelayV2StateLimits.MAX_BUFFERED_STATE_EVENT_BYTES ||
             nextRaw > RelayV2StateLimits.MAX_BUFFERED_STATE_EVENT_BYTES
         ) throw RelayV2StorageException(RelayV2StorageFailure.LIMIT_EXCEEDED)
-        insertPendingEvent(unbound.toPendingEntity(namespace, rawFrameUtf8Bytes))
+        insertPendingEvent(unbound.toPendingEntity(namespace, rawArtifactUtf8Bytes))
         val reduction = reductionOverride ?: AgentTranscriptLifecycleClientReducer.reduce(
             current.state,
             input,
@@ -1357,7 +1357,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         current: ReadyOperationState,
         unbound: ClosedDurableEvent,
-        rawFrameUtf8Bytes: Int,
+        rawArtifactUtf8Bytes: Int,
         limits: AgentClientReducerLimits,
     ): EventConsumption {
         val input = unbound.bindLineage(namespace)
@@ -1378,7 +1378,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 namespace,
                 current,
                 unbound,
-                rawFrameUtf8Bytes,
+                rawArtifactUtf8Bytes,
                 reduction,
             )
             val reloadedDecoded = loadSingle(namespace.consumer)
@@ -1914,6 +1914,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         val oldRecordBytes = header.receivedCanonicalBytes - 2L -
             if (header.receivedRecordCount > 0) header.receivedRecordCount - 1 else 0
         val totalCanonical = canonicalArrayBytes(totalCount, oldRecordBytes + recordBytes)
+        // Raw accounting is owned by the codec artifact (the complete frame), not by
+        // caller-supplied record metadata.  The envelope therefore contributes even when
+        // this page has no records.
         val totalRaw = Math.addExact(
             header.receivedRawUtf8Bytes,
             artifact.rawUtf8ByteCount.toLong(),
@@ -3452,7 +3455,7 @@ private fun AgentTranscriptDurableStorageAccounting.afterEntryUpdate(
 
 private fun AgentTranscriptLifecycleDurableRepositoryCore.ClosedDurableEvent.toPendingEntity(
     namespace: AgentTranscriptLifecycleDurableNamespace,
-    rawFrameUtf8Bytes: Int,
+    rawArtifactUtf8Bytes: Int,
 ): RelayV2AgentTranscriptPendingEventEntity {
     val consumer = namespace.consumer
     return RelayV2AgentTranscriptPendingEventEntity(
@@ -3461,7 +3464,7 @@ private fun AgentTranscriptLifecycleDurableRepositoryCore.ClosedDurableEvent.toP
         consumer.sessionId, namespace.timelineEpoch ?: storageMalformed(),
         publicRecord.agentEventSeq, storageOrderKey(publicRecord.agentEventSeq),
         publicRecord.eventId, digest.value, TRUSTED_LIVE_PROVENANCE, canonicalJson,
-        rawFrameUtf8Bytes,
+        rawArtifactUtf8Bytes,
     )
 }
 

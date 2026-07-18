@@ -54,6 +54,36 @@ internal class AgentTranscriptLifecycleDurableRepository(
         intent: AgentSystemNotificationIntent,
     ): AgentTranscriptLifecycleNotificationClaimResult =
         core.claimNotificationUnderApplyLease(expectedNamespace, intent)
+
+    /** Closed operation seam; each call is executed by the core in one Room transaction. */
+    suspend fun applyControlUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableControlCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.applyControlUnderApplyLease(command, limits)
+
+    suspend fun consumeLiveEventUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableLiveEventCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.consumeLiveEventUnderApplyLease(command, limits)
+
+    suspend fun consumeReplayPageUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableReplayPageCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.consumeReplayPageUnderApplyLease(command, limits)
+
+    suspend fun persistSnapshotRequestUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableSnapshotRequestCommand,
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.persistSnapshotRequestUnderApplyLease(command)
+
+    suspend fun consumeSnapshotPageUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableSnapshotPageCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.consumeSnapshotPageUnderApplyLease(command, limits)
 }
 
 private class RoomAgentTranscriptLifecycleDurableStore(
