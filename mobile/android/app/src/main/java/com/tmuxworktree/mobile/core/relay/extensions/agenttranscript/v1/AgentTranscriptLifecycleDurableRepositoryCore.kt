@@ -1767,6 +1767,15 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 artifact.requestId != preFirst.pageZeroNetworkToken ||
                 preFirst.localGeneration != extension.localGeneration
             ) throw AgentTranscriptLifecyclePersistenceConflictException()
+            // The first page, including a final page-0 cut, is still a watermark
+            // assertion.  Reject it before inserting B/C if it would move the durable
+            // cursor or suppression/checkpoint backwards.
+            requireCanonicalStorageCounter(artifact.throughAgentSeq, positive = true)
+            requireCanonicalStorageCounter(artifact.earliestRetainedSeq, positive = true)
+            requireExactOrderKey(artifact.throughAgentSeq, storageOrderKey(artifact.throughAgentSeq))
+            if (compareStorageCounters(artifact.earliestRetainedSeq, artifact.throughAgentSeq) > 0 ||
+                compareStorageCounters(extension.lastAgentSeq, artifact.throughAgentSeq) > 0
+            ) throw AgentTranscriptLifecyclePersistenceConflictException()
             RelayV2AgentTranscriptSnapshotStagingEntity(
                 namespace.consumer.profileId,
                 namespace.consumer.profileActivationGeneration,
