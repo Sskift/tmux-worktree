@@ -327,7 +327,8 @@ async function ready(harness, routeBinding = binding()) {
 
 function actualTerminalRuntimeHarness(options = {}) {
   let manager;
-  let nextId = 0;
+  let nextGeneration = 0;
+  let nextCloseOwnerFence = 0;
   let nextToken = 0;
   let now = 1_000_000;
   const closeRecords = new Map();
@@ -359,11 +360,23 @@ function actualTerminalRuntimeHarness(options = {}) {
       }
       const retained = streamAuthorities.get(claim.streamKey);
       const streamAuthority = retained
-        ? { status: retained.status, generation: retained.generation }
+        ? {
+            status: retained.status,
+            generation: retained.generation,
+            target: structuredClone(retained.target),
+            pane: retained.pane,
+            resumeTokenHash: retained.resumeTokenHash,
+          }
         : { status: "absent" };
+      const issuedGeneration = claim.mode === "resume"
+        ? null
+        : `actual-authority-generation-${++nextGeneration}`;
       openRecords.set(claim.key, {
         fingerprint: claim.fingerprint,
         streamKey: claim.streamKey,
+        target: structuredClone(claim.target),
+        pane: claim.pane,
+        issuedGeneration,
         streamAuthority: structuredClone(streamAuthority),
         outcome: null,
       });
@@ -371,6 +384,7 @@ function actualTerminalRuntimeHarness(options = {}) {
         status: "claimed",
         claimToken: `actual-claim-${claim.key}`,
         fence: `actual-fence-${claim.key}`,
+        issuedGeneration,
         streamAuthority,
       };
     },
@@ -379,9 +393,13 @@ function actualTerminalRuntimeHarness(options = {}) {
       assert.ok(openRecord);
       openRecord.outcome = structuredClone(input.outcome);
       if (input.outcome.kind === "opened" && input.outcome.disposition !== "resumed") {
+        assert.equal(input.outcome.generation, openRecord.issuedGeneration);
         streamAuthorities.set(openRecord.streamKey, {
           status: "live",
           generation: input.outcome.generation,
+          target: structuredClone(openRecord.target),
+          pane: openRecord.pane,
+          resumeTokenHash: input.outcome.resumeTokenHash,
         });
       }
       return { status: "committed", outcome: structuredClone(input.outcome) };
@@ -402,21 +420,43 @@ function actualTerminalRuntimeHarness(options = {}) {
       lineage.claimCloseCalls.push(structuredClone(input));
       const retained = closeRecords.get(input.key);
       if (retained) {
-        return retained.state === "final"
-          ? { status: "final", tombstone: structuredClone(retained.value) }
-          : { status: "existing_intent", intent: structuredClone(retained.value) };
+        if (retained.state === "final") {
+          return { status: "final", tombstone: structuredClone(retained.value) };
+        }
+        retained.ownerFence = `${++nextCloseOwnerFence}`;
+        return {
+          status: "existing_intent",
+          intent: structuredClone(retained.value),
+          ownerFence: retained.ownerFence,
+        };
       }
       if (!input.intent) return { status: "not_found" };
-      closeRecords.set(input.key, { state: "intent", value: structuredClone(input.intent) });
-      return { status: "claimed", intent: structuredClone(input.intent) };
+      const ownerFence = `${++nextCloseOwnerFence}`;
+      closeRecords.set(input.key, {
+        state: "intent",
+        ownerFence,
+        value: structuredClone(input.intent),
+      });
+      return { status: "claimed", intent: structuredClone(input.intent), ownerFence };
     },
     async finalizeClose(input) {
       const retained = closeRecords.get(input.key);
       assert.ok(retained);
+      assert.equal(input.fingerprint, retained.value.fingerprint);
+      assert.equal(input.ownerFence, retained.ownerFence);
       retained.state = "final";
       const authority = streamAuthorities.get(retained.value.streamKey);
       if (authority?.generation === retained.value.generation) authority.status = "closed";
       return structuredClone(retained.value);
+    },
+    async markStreamClosed(input) {
+      const retained = streamAuthorities.get(input.streamKey);
+      if (!retained || retained.generation !== input.generation) {
+        return { status: "conflict", reason: "stream_identity_mismatch" };
+      }
+      const alreadyClosed = retained.status === "closed";
+      retained.status = "closed";
+      return { status: alreadyClosed ? "already_closed" : "closed" };
     },
     async releaseStreamReservation(input) {
       const retained = streamAuthorities.get(input.streamKey);
@@ -462,7 +502,6 @@ function actualTerminalRuntimeHarness(options = {}) {
       return deliver();
     },
     now: () => now,
-    issueId: () => `actual-runtime-id-${++nextId}`,
     issueToken: () => `actual-runtime-token-${++nextToken}`,
     limits: options.terminalLimits,
   });
@@ -1511,7 +1550,7 @@ test("actual H3 durable mode=new retry correlates its retained generation and of
     const reset = h.state.sent.find(({ frame }) => frame.requestId === retry.requestId)?.frame;
     assert.equal(reset.type, "terminal.reset_required");
     assert.equal(reset.payload.origin, "open");
-    assert.equal(reset.payload.generation, "actual-runtime-id-1");
+    assert.equal(reset.payload.generation, "actual-authority-generation-1");
     assert.equal(reset.payload.requestedOffset, "0");
     assert.equal(backend.opens.length, 1, "durable exact retry must not create a second backend");
   } finally {
@@ -1586,7 +1625,7 @@ test("actual H3 durable mode=reset retry correlates the replacement generation",
     const reset = h.state.sent.find(({ frame }) => frame.requestId === retry.requestId)?.frame;
     assert.equal(reset.type, "terminal.reset_required");
     assert.equal(reset.payload.origin, "open");
-    assert.equal(reset.payload.generation, "actual-runtime-id-2");
+    assert.equal(reset.payload.generation, "actual-authority-generation-2");
     assert.equal(reset.payload.requestedOffset, "0");
     assert.equal(backend.opens.length, 2, "durable reset retry must not replace the backend twice");
   } finally {

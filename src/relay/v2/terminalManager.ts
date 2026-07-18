@@ -1,7 +1,6 @@
 import {
   createHash,
   randomBytes,
-  randomUUID,
   timingSafeEqual,
 } from "node:crypto";
 import type {
@@ -427,6 +426,8 @@ export type RelayV2TerminalDurableOpenClaimResult =
       status: "claimed";
       claimToken: string;
       fence: string;
+      /** H0-issued for new/reset; null for resume. */
+      issuedGeneration: string | null;
       streamAuthority: RelayV2TerminalDurableStreamAuthority;
     }
   | { status: "busy"; reason: "control_record_quota" }
@@ -439,6 +440,7 @@ export type RelayV2TerminalDurableOpenClaimResult =
 export interface RelayV2TerminalDurableOpenClaimAuthority {
   claimToken: string;
   fence: string;
+  issuedGeneration: string | null;
   streamAuthority: RelayV2TerminalDurableStreamAuthority;
 }
 
@@ -448,8 +450,7 @@ export type RelayV2TerminalOpenFailureStreamEffect =
 
 export type RelayV2TerminalDurableOpenCommitResult =
   | { status: "committed"; outcome: RelayV2TerminalDurableOpenOutcome }
-  | { status: "replay"; outcome: RelayV2TerminalDurableOpenOutcome }
-  | { status: "rejected"; reason: "generation_reuse" };
+  | { status: "replay"; outcome: RelayV2TerminalDurableOpenOutcome };
 
 export type RelayV2TerminalDurableStreamReleaseResult =
   | { status: "released" }
@@ -482,8 +483,8 @@ export interface RelayV2TerminalDurableCloseIntent
   extends RelayV2TerminalDurableCloseTombstone {}
 
 export type RelayV2TerminalDurableCloseClaimResult =
-  | { status: "claimed"; intent: RelayV2TerminalDurableCloseIntent }
-  | { status: "existing_intent"; intent: RelayV2TerminalDurableCloseIntent }
+  | { status: "claimed"; intent: RelayV2TerminalDurableCloseIntent; ownerFence: string }
+  | { status: "existing_intent"; intent: RelayV2TerminalDurableCloseIntent; ownerFence: string }
   | { status: "final"; tombstone: RelayV2TerminalDurableCloseTombstone }
   | { status: "not_found" }
   | { status: "close_conflict" };
@@ -503,15 +504,19 @@ export type RelayV2TerminalDurableCloseClaimResult =
  * Only the returned claimToken/fence winner may complete or fail it; both
  * transitions are compare-and-swap and a late caller receives the retained
  * outcome without replacing it. failOpen must atomically preserve the current
- * stream reservation or retire the named previous generation. A
- * generation_reuse rejection leaves the same claim available for an exact
- * failOpen settlement; it must not leave a second pending claim. Durable opened
- * outcomes contain only a token hash, never the plaintext resume token.
+ * stream reservation or retire the named previous generation. A successful
+ * resume completion must compare the complete frozen stream binding. A new
+ * hostInstance retires the old process-scoped backend/generation as lost and
+ * may only return retained stream_lost evidence; it never adopts that
+ * generation. Durable opened outcomes contain only a token hash, never the
+ * plaintext resume token.
  * claimClose persists the immutable close winner and original connector route
- * before lease/backend cleanup; finalizeClose atomically advances only that
- * intent to a final tombstone. markStreamClosed is only the natural backend
- * lifecycle transition: it atomically compares the exact
- * streamKey/generation/hostInstanceId and establishes the supplied closed
+ * before lease/backend cleanup. An exact retry of a retained pending intent
+ * atomically adopts the caller's current hostInstance owner before returning;
+ * a final tombstone never changes owner. finalizeClose atomically advances
+ * only the current owner's intent to a final tombstone. markStreamClosed is
+ * only the natural backend lifecycle transition: it atomically compares the
+ * exact streamKey/generation/hostInstanceId and establishes the supplied closed
  * retention before H3 exposes process-local closed replay or an event. Explicit
  * client close remains exclusively claimClose→finalizeClose.
  * releaseStreamReservation compares the same exact stream identity before
@@ -550,6 +555,7 @@ export interface RelayV2TerminalDurableLineage {
     key: string;
     fingerprint: string;
     hostInstanceId: string;
+    ownerFence: string;
   }): Promise<RelayV2TerminalDurableCloseTombstone>;
   /**
    * This implementation remains inside the H0 owner. H0 must serially
@@ -557,9 +563,10 @@ export interface RelayV2TerminalDurableLineage {
    * call. `closed` and `already_closed` both certify that the same definitive
    * transaction verified the exact supplied stream identity and observed or
    * established an effective closed retention expiry at least `expiresAtMs`;
-   * `conflict` is likewise definitive. Post-commit uncertainty must not be
-   * surfaced directly as a rejection for H3 to reconcile, because H3 owns no
-   * durable state machine.
+   * `conflict` is likewise definitive and requires H3 to evict its stale-local
+   * generation without exposing a closed event. Post-commit uncertainty must
+   * not be surfaced directly as a rejection for H3 to reconcile, because H3
+   * owns no durable state machine.
    */
   markStreamClosed(input: {
     streamKey: string;
@@ -567,6 +574,7 @@ export interface RelayV2TerminalDurableLineage {
     hostInstanceId: string;
     expiresAtMs: number;
   }): Promise<RelayV2TerminalDurableStreamClosedResult>;
+  /** A definitive generation conflict retires only H3's stale-local record. */
   releaseStreamReservation(input: {
     streamKey: string;
     generation: string;
@@ -588,7 +596,6 @@ export interface RelayV2TerminalManagerOptions {
     lineage?: RelayV2TerminalOpenResponseLineage,
   ): Promise<void>;
   now?: () => number;
-  issueId?: () => string;
   issueToken?: () => string;
   /** Stricter limits for bounded simulators; values may never exceed the contract. */
   limits?: Partial<RelayV2TerminalLimits>;
@@ -733,11 +740,10 @@ type LocalStreamLineageReconciliation =
   | { status: "divergent"; stream: TerminalStream };
 
 type OpenCommitResult =
-  | {
-      status: "committed" | "replay";
-      outcome: OpenRecordOutcome;
-    }
-  | { status: "rejected"; reason: "generation_reuse" };
+  {
+    status: "committed" | "replay";
+    outcome: OpenRecordOutcome;
+  };
 
 type OpenCommitProposal =
   | {
@@ -1103,6 +1109,22 @@ function sameDurableClose(
   left: RelayV2TerminalDurableCloseTombstone,
   right: RelayV2TerminalDurableCloseTombstone,
 ): boolean {
+  return sameDurableCloseWithoutExpiry(left, right)
+    && left.expiresAtMs === right.expiresAtMs;
+}
+
+function sameDurableCloseProposal(
+  durable: RelayV2TerminalDurableCloseTombstone,
+  proposed: RelayV2TerminalDurableCloseTombstone,
+): boolean {
+  return sameDurableCloseWithoutExpiry(durable, proposed)
+    && durable.expiresAtMs >= proposed.expiresAtMs;
+}
+
+function sameDurableCloseWithoutExpiry(
+  left: RelayV2TerminalDurableCloseTombstone,
+  right: RelayV2TerminalDurableCloseTombstone,
+): boolean {
   return left.key === right.key
     && left.streamKey === right.streamKey
     && left.fingerprint === right.fingerprint
@@ -1115,8 +1137,7 @@ function sameDurableClose(
     && left.generation === right.generation
     && left.finalOffset === right.finalOffset
     && left.reason === right.reason
-    && left.exitCode === right.exitCode
-    && left.expiresAtMs === right.expiresAtMs;
+    && left.exitCode === right.exitCode;
 }
 
 function asJson(frame: Record<string, unknown>): RelayV2JsonObject {
@@ -1394,7 +1415,6 @@ export class RelayV2TerminalManager {
   private readonly terminalControl: RelayV2TerminalControlAuthority;
   private readonly sendFrame: RelayV2TerminalManagerOptions["send"];
   private readonly now: () => number;
-  private readonly issueId: () => string;
   private readonly issueToken: () => string;
 
   constructor(options: RelayV2TerminalManagerOptions) {
@@ -1407,7 +1427,6 @@ export class RelayV2TerminalManager {
     this.terminalControl = options.terminalControl;
     this.sendFrame = options.send;
     this.now = options.now ?? Date.now;
-    this.issueId = options.issueId ?? randomUUID;
     this.issueToken = options.issueToken
       ?? (() => randomBytes(32).toString("base64url"));
     this.limits = Object.freeze(resolveLimits(options.limits));
@@ -1848,7 +1867,9 @@ export class RelayV2TerminalManager {
   private openClaimAuthority(
     claim: Extract<RelayV2TerminalDurableOpenClaimResult, { status: "claimed" }>,
   ): RelayV2TerminalDurableOpenClaimAuthority {
-    if (!isOpaqueId(claim.claimToken) || !isOpaqueId(claim.fence)) {
+    if (!isOpaqueId(claim.claimToken)
+      || !isOpaqueId(claim.fence)
+      || !(claim.issuedGeneration === null || isOpaqueId(claim.issuedGeneration))) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid open claim authority");
     }
     const authority: unknown = claim.streamAuthority;
@@ -1895,6 +1916,7 @@ export class RelayV2TerminalManager {
     return Object.freeze({
       claimToken: claim.claimToken,
       fence: claim.fence,
+      issuedGeneration: claim.issuedGeneration,
       streamAuthority,
     });
   }
@@ -2146,15 +2168,9 @@ export class RelayV2TerminalManager {
     if (
       !result
       || typeof result !== "object"
-      || !(result.status === "committed" || result.status === "replay" || result.status === "rejected")
+      || !(result.status === "committed" || result.status === "replay")
     ) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable terminal open commit result is invalid");
-    }
-    if (result.status === "rejected") {
-      if (result.reason !== "generation_reuse" || durableProposed.kind !== "opened") {
-        throw new RelayV2TerminalManagerError("INTERNAL", "durable terminal open rejection is invalid");
-      }
-      return { status: "rejected", reason: "generation_reuse" };
     }
     let outcome = this.localOpenOutcome(result.outcome);
     if (result.status === "committed" && !sameDurableOpenOutcome(result.outcome, durableProposed)) {
@@ -2201,12 +2217,6 @@ export class RelayV2TerminalManager {
       claimAuthority,
       retainLocal,
     );
-    if (result.status === "rejected") {
-      throw new RelayV2TerminalManagerError(
-        "INTERNAL",
-        "durable terminal lineage rejected a failure outcome as generation reuse",
-      );
-    }
     return result.outcome;
   }
 
@@ -2329,9 +2339,9 @@ export class RelayV2TerminalManager {
     let resumeToken: string;
     let resolvedTarget: RelayV2TerminalResolvedTarget;
     try {
-      generation = this.issueId();
+      generation = claimAuthority.issuedGeneration;
       if (!isOpaqueId(generation)) {
-        throw new RelayV2TerminalManagerError("INTERNAL", "terminal generation issuer returned an invalid ID");
+        throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage omitted its issued generation");
       }
       resumeToken = this.issueToken();
       tokenHash(resumeToken);
@@ -2463,42 +2473,6 @@ export class RelayV2TerminalManager {
     } catch (error) {
       await this.discardProvisionalGeneration(provisional);
       throw error;
-    }
-    if (completion.status === "rejected") {
-      await this.discardProvisionalGeneration(provisional);
-      const rejectionEffect: RelayV2TerminalOpenFailureStreamEffect = previous
-        ? { kind: "retire_previous", generation: previous.generation }
-        : { kind: "preserve" };
-      const settled = await this.failOpenRecord(
-        request,
-        key,
-        recordKey,
-        requestFingerprint,
-        {
-          kind: "reset",
-          generation,
-          reason: "stream_lost",
-          requestedOffset: request.resume
-            ? parseCounter(request.resume.nextOffset, "nextOffset")
-            : null,
-          bufferStartOffset: null,
-          tailOffset: null,
-        },
-        claimAuthority,
-        rejectionEffect,
-        false,
-      );
-      if (settled.kind === "opened") {
-        throw new RelayV2TerminalManagerError(
-          "INTERNAL",
-          "durable terminal generation rejection did not settle its pending claim",
-        );
-      }
-      if (previous) previous.reservedCloseRecord = false;
-      throw new RelayV2TerminalManagerError(
-        "INTERNAL",
-        "durable terminal lineage rejected a reused generation",
-      );
     }
     const completed = completion.outcome;
     if (completion.status === "replay") {
@@ -2654,12 +2628,6 @@ export class RelayV2TerminalManager {
       { outcome, stream: authoritativeStream! },
       claimAuthority,
     );
-    if (completion.status === "rejected") {
-      throw new RelayV2TerminalManagerError(
-        "INTERNAL",
-        "durable terminal lineage rejected an exact resume generation",
-      );
-    }
     const completed = completion.outcome;
     this.throwOpenError(completed);
     if (completed.kind === "reset") {
@@ -3862,11 +3830,18 @@ export class RelayV2TerminalManager {
     if (claim.status !== "claimed" && claim.status !== "existing_intent") {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an unknown close claim");
     }
+    if (typeof claim.ownerFence !== "string"
+      || !/^[1-9][0-9]*$/.test(claim.ownerFence)
+      || BigInt(claim.ownerFence) > MAX_COUNTER) {
+      throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid close owner fence");
+    }
     if (claim.status === "claimed" && !proposed) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage claimed a close without an intent");
     }
     const intent = this.closeRecordFromDurable(claim.intent, recordKey, request);
-    if (claim.status === "claimed" && proposed && !sameDurableClose(claim.intent, proposed)) {
+    if (claim.status === "claimed"
+      && proposed
+      && !sameDurableCloseProposal(claim.intent, proposed)) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable terminal close claim changed the proposed winner");
     }
     if (
@@ -3892,6 +3867,7 @@ export class RelayV2TerminalManager {
       key: recordKey,
       fingerprint: requestFingerprint,
       hostInstanceId: this.hostInstanceId,
+      ownerFence: claim.ownerFence,
     });
     const record = this.closeRecordFromDurable(final, recordKey, request);
     if (!sameDurableClose(final, claim.intent)) {
@@ -3989,7 +3965,6 @@ export class RelayV2TerminalManager {
       && isOpaqueId(value.generation)
       && Number.isSafeInteger(value.expiresAtMs)
       && value.expiresAtMs > this.now()
-      && value.expiresAtMs <= this.now() + this.limits.controlRetentionMs
       && (
         (reason === "client_closed" && exitCode === null)
         || (reason === "backend_exit" && Number.isInteger(exitCode))
@@ -4184,10 +4159,15 @@ export class RelayV2TerminalManager {
       result = { reason: "backend_error", exitCode: null };
     }
     try {
-      await this.markDurableStreamClosed(
+      const marked = await this.markDurableStreamClosed(
         stream,
         this.now() + this.limits.controlRetentionMs,
       );
+      if (!marked) {
+        await this.evictStaleLocalStream(stream);
+        await this.refreshBackpressure();
+        return;
+      }
     } catch (error) {
       await this.loseStream(stream, "stream_lost", false);
       await this.refreshBackpressure();
@@ -4209,7 +4189,7 @@ export class RelayV2TerminalManager {
   private async markDurableStreamClosed(
     stream: TerminalStream,
     expiresAtMs: number,
-  ): Promise<void> {
+  ): Promise<boolean> {
     let result: RelayV2TerminalDurableStreamClosedResult;
     try {
       result = await this.lineage.markStreamClosed({
@@ -4228,17 +4208,14 @@ export class RelayV2TerminalManager {
       hasExactOwnKeys(result, ["status"])
       && (result.status === "closed" || result.status === "already_closed")
     ) {
-      return;
+      return true;
     }
     if (
       hasExactOwnKeys(result, ["status", "reason"])
       && result.status === "conflict"
       && result.reason === "stream_identity_mismatch"
     ) {
-      throw new RelayV2TerminalManagerError(
-        "INTERNAL",
-        "durable terminal natural close identity mismatched",
-      );
+      return false;
     }
     throw new RelayV2TerminalManagerError(
       "INTERNAL",
@@ -4390,6 +4367,12 @@ export class RelayV2TerminalManager {
     }
   }
 
+  private async evictStaleLocalStream(stream: TerminalStream): Promise<void> {
+    await this.loseStream(stream, "stream_lost", false);
+    stream.reservedCloseRecord = false;
+    if (this.streams.get(stream.key) === stream) this.streams.delete(stream.key);
+  }
+
   private async refreshBackpressure(): Promise<void> {
     const hostLowWater = Math.floor(this.limits.hostRingBytes * 3 / 4);
     if (!this.hostPressure && this.ringBytes >= this.limits.hostRingBytes) {
@@ -4462,10 +4445,7 @@ export class RelayV2TerminalManager {
       && result.status === "conflict"
       && result.reason === "generation_mismatch"
     ) {
-      throw new RelayV2TerminalManagerError(
-        "INTERNAL",
-        "durable terminal stream reservation generation mismatched",
-      );
+      return;
     }
     throw new RelayV2TerminalManagerError(
       "INTERNAL",

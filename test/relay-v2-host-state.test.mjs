@@ -13,6 +13,78 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 
 const hostState = await import("../dist/relay/v2/hostState.js");
+const terminalLineage = await import("../dist/relay/v2/terminalDurableLineage.js");
+
+const TERMINAL_TARGET = {
+  hostId: "mac-admin",
+  scopeId: "scope-local",
+  sessionId: "ses_01JOPAQUE",
+};
+const TOKEN_HASH_ONE = "1".repeat(64);
+const TOKEN_HASH_TWO = "2".repeat(64);
+
+function terminalOpenClaim(overrides = {}) {
+  return {
+    key: "terminal-open:one",
+    streamKey: "terminal-stream:one",
+    fingerprint: "a".repeat(64),
+    hostInstanceId: "host-process-one",
+    target: { ...TERMINAL_TARGET },
+    pane: 0,
+    resumeTokenHash: null,
+    mode: "new",
+    previousGeneration: null,
+    requestedOffset: null,
+    expiresAtMs: 1_600_000,
+    ...overrides,
+  };
+}
+
+function terminalAuthority(store, options = {}) {
+  let issued = 0;
+  return new terminalLineage.RelayV2TerminalDurableLineageAuthority({
+    store,
+    now: () => 1_000_000,
+    issueAuthorityId: (kind) => `${kind}-${store.hostInstanceId}-${++issued}`,
+    ...options,
+  });
+}
+
+function terminalState(snapshot) {
+  const matches = Object.values(snapshot.materialized).filter((value) => (
+    value?.authority === "relay_v2_terminal_durable_lineage"
+  ));
+  assert.equal(matches.length, 1);
+  return matches[0];
+}
+
+async function commitTerminalOpen(
+  authority,
+  claim = terminalOpenClaim({ hostInstanceId: authority.hostInstanceId }),
+  outcome,
+) {
+  const winner = await authority.claimOpen(claim);
+  assert.equal(winner.status, "claimed");
+  const proposed = {
+    kind: "opened",
+    generation: winner.issuedGeneration,
+    resumeTokenHash: TOKEN_HASH_ONE,
+    disposition: claim.mode === "new" ? "new" : "reset",
+    replayFromOffset: "0",
+    ...outcome,
+    generation: winner.issuedGeneration,
+  };
+  const committed = await authority.completeOpen({
+    key: claim.key,
+    fingerprint: claim.fingerprint,
+    hostInstanceId: claim.hostInstanceId,
+    claimToken: winner.claimToken,
+    fence: winner.fence,
+    outcome: proposed,
+  });
+  assert.equal(committed.status, "committed");
+  return { winner, committed, generation: winner.issuedGeneration };
+}
 
 function harness() {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-host-state-"));
@@ -345,4 +417,1476 @@ test("commit faults expose either the previous cut or the complete associated cu
       h.cleanup();
     }
   });
+});
+
+test("HostState terminal lineage persists exact binding, monotonic issuance, and restart loss", async () => {
+  const h = harness();
+  let issued = 0;
+  const issueAuthorityId = (kind) => `${kind}-durable-${++issued}`;
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store, { issueAuthorityId });
+    const original = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const claimed = await authority.claimOpen(original);
+    assert.deepEqual(claimed, {
+      status: "claimed",
+      claimToken: "claim-durable-1",
+      fence: "fence-durable-2",
+      issuedGeneration: claimed.issuedGeneration,
+      streamAuthority: { status: "absent" },
+    });
+
+    const pending = terminalState(await store.read());
+    assert.equal(pending.schemaVersion, 2);
+    assert.deepEqual(pending.openRecords[0], {
+      status: "pending",
+      key: original.key,
+      streamKey: original.streamKey,
+      fingerprint: original.fingerprint,
+      ownerHostInstanceId: original.hostInstanceId,
+      claimToken: claimed.claimToken,
+      fence: claimed.fence,
+      target: TERMINAL_TARGET,
+      pane: 0,
+      resumeTokenHash: null,
+      mode: "new",
+      previousGeneration: null,
+      requestedOffset: null,
+      streamAuthority: { status: "absent" },
+      reservesStreamSlot: true,
+      issuedGeneration: claimed.issuedGeneration,
+      expiresAtMs: original.expiresAtMs,
+      outcome: null,
+    });
+
+    const openedOutcome = {
+      kind: "opened",
+      generation: claimed.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      disposition: "new",
+      replayFromOffset: "0",
+    };
+    assert.deepEqual(await authority.completeOpen({
+      key: original.key,
+      fingerprint: original.fingerprint,
+      hostInstanceId: original.hostInstanceId,
+      claimToken: claimed.claimToken,
+      fence: claimed.fence,
+      outcome: openedOutcome,
+    }), { status: "committed", outcome: openedOutcome });
+
+    const persisted = terminalState(await store.read());
+    assert.equal(persisted.generationHighWater, "1");
+    assert.deepEqual(persisted.streamAuthorities, [{
+      status: "live",
+      streamKey: original.streamKey,
+      generation: claimed.issuedGeneration,
+      hostInstanceId: original.hostInstanceId,
+      target: TERMINAL_TARGET,
+      pane: 0,
+      resumeTokenHash: TOKEN_HASH_ONE,
+      closeSlotReserved: true,
+      closedExpiresAtMs: null,
+    }]);
+    assert.equal(JSON.stringify(persisted).includes("plaintext-resume-token"), false);
+
+    const restartedStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const restarted = terminalAuthority(restartedStore, { issueAuthorityId });
+    assert.deepEqual(await restarted.claimOpen({
+      ...original,
+      hostInstanceId: restartedStore.hostInstanceId,
+    }), {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: claimed.issuedGeneration,
+        reason: "stream_lost",
+        requestedOffset: null,
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    });
+
+    const reconciled = terminalState(await restartedStore.read());
+    assert.deepEqual(reconciled.streamAuthorities, []);
+    assert.equal(reconciled.lostAuthorities.length, 1);
+    assert.equal(reconciled.lostAuthorities[0].generation, claimed.issuedGeneration);
+
+    const replacement = await restarted.claimOpen(terminalOpenClaim({
+      key: "terminal-open:replacement",
+      streamKey: "terminal-stream:replacement",
+      fingerprint: "c".repeat(64),
+      hostInstanceId: restartedStore.hostInstanceId,
+    }));
+    assert.equal(replacement.status, "claimed");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("persisted pending terminal claim remains readable across a fresh transaction and rebuilt authority", async () => {
+  const h = harness();
+  let issued = 0;
+  const issueAuthorityId = (kind) => `${kind}-restart-regression-${++issued}`;
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore, { issueAuthorityId });
+    const claim = terminalOpenClaim({
+      key: "terminal-open:persisted-pending",
+      streamKey: "terminal-stream:persisted-pending",
+      fingerprint: "8".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+    });
+    const winner = await firstAuthority.claimOpen(claim);
+    assert.equal(winner.status, "claimed");
+    const pendingSnapshot = await firstStore.read();
+    const pendingRecord = terminalState(pendingSnapshot).openRecords[0];
+    assert.equal(pendingRecord.status, "pending");
+    assert.equal(pendingRecord.claimToken, winner.claimToken);
+    assert.equal(pendingRecord.fence, winner.fence);
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore, { issueAuthorityId });
+    const expectedReplay = {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: winner.issuedGeneration,
+        reason: "stream_lost",
+        requestedOffset: null,
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    };
+    assert.deepEqual(await secondAuthority.claimOpen({
+      ...claim,
+      hostInstanceId: secondStore.hostInstanceId,
+    }), expectedReplay);
+    const reconciledSnapshot = await secondStore.read();
+    assert.equal(
+      BigInt(reconciledSnapshot.commitSeq),
+      BigInt(pendingSnapshot.commitSeq) + 1n,
+    );
+    const reconciledRecord = terminalState(reconciledSnapshot).openRecords[0];
+    assert.equal(reconciledRecord.status, "final");
+    assert.equal(reconciledRecord.claimToken, winner.claimToken);
+    assert.equal(reconciledRecord.fence, winner.fence);
+    assert.deepEqual(reconciledRecord.outcome, expectedReplay.outcome);
+
+    const thirdStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const thirdAuthority = terminalAuthority(thirdStore, { issueAuthorityId });
+    assert.deepEqual(await thirdAuthority.claimOpen({
+      ...claim,
+      hostInstanceId: thirdStore.hostInstanceId,
+    }), expectedReplay);
+    const stable = terminalState(await thirdStore.read());
+    assert.deepEqual(stable.streamAuthorities, []);
+    assert.equal(stable.openRecords[0].claimToken, winner.claimToken);
+    assert.equal(stable.openRecords[0].fence, winner.fence);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("host restart atomically retires executable terminal lineage and requires explicit reset", async () => {
+  const h = harness();
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+
+    const sameProcessResume = terminalOpenClaim({
+      key: "terminal-open:same-process-resume",
+      fingerprint: "3".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+      mode: "resume",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_ONE,
+    });
+    const sameProcessWinner = await firstAuthority.claimOpen(sameProcessResume);
+    assert.equal(sameProcessWinner.status, "claimed");
+    assert.equal(sameProcessWinner.issuedGeneration, null);
+    assert.deepEqual(await firstAuthority.completeOpen({
+      key: sameProcessResume.key,
+      fingerprint: sameProcessResume.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      claimToken: sameProcessWinner.claimToken,
+      fence: sameProcessWinner.fence,
+      outcome: {
+        kind: "opened",
+        generation: opened.generation,
+        resumeTokenHash: TOKEN_HASH_ONE,
+        disposition: "resumed",
+        replayFromOffset: "0",
+      },
+    }), {
+      status: "committed",
+      outcome: {
+        kind: "opened",
+        generation: opened.generation,
+        resumeTokenHash: TOKEN_HASH_ONE,
+        disposition: "resumed",
+        replayFromOffset: "0",
+      },
+    });
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore);
+    const crossProcessResume = {
+      ...sameProcessResume,
+      key: "terminal-open:cross-process-resume",
+      fingerprint: "4".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+    };
+    const lost = {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: opened.generation,
+        reason: "stream_lost",
+        requestedOffset: "0",
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    };
+    assert.deepEqual(await secondAuthority.claimOpen(crossProcessResume), lost);
+    assert.deepEqual(await secondAuthority.claimOpen(crossProcessResume), lost);
+
+    const retired = terminalState(await secondStore.read());
+    assert.deepEqual(retired.streamAuthorities, []);
+    assert.equal(retired.lostAuthorities.length, 1);
+    assert.equal(retired.lostAuthorities[0].generation, opened.generation);
+    await assert.rejects(firstAuthority.markStreamClosed({
+      streamKey: original.streamKey,
+      generation: opened.generation,
+      hostInstanceId: firstStore.hostInstanceId,
+      expiresAtMs: 1_600_000,
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+
+    const reset = terminalOpenClaim({
+      key: "terminal-open:explicit-reset-after-restart",
+      fingerprint: "5".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_ONE,
+    });
+    const resetWinner = await secondAuthority.claimOpen(reset);
+    assert.equal(resetWinner.status, "claimed");
+    assert.notEqual(resetWinner.issuedGeneration, opened.generation);
+    assert.deepEqual(resetWinner.streamAuthority, { status: "absent" });
+    await secondAuthority.completeOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: resetWinner.claimToken,
+      fence: resetWinner.fence,
+      outcome: {
+        kind: "opened",
+        generation: resetWinner.issuedGeneration,
+        resumeTokenHash: TOKEN_HASH_TWO,
+        disposition: "reset",
+        replayFromOffset: "0",
+      },
+    });
+    const replaced = terminalState(await secondStore.read());
+    assert.equal(replaced.generationHighWater, "2");
+    assert.equal(replaced.streamAuthorities[0].generation, resetWinner.issuedGeneration);
+    assert.deepEqual(replaced.lostAuthorities, []);
+
+    const thirdStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const thirdAuthority = terminalAuthority(thirdStore);
+    const retiredReset = {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: resetWinner.issuedGeneration,
+        reason: "stream_lost",
+        requestedOffset: "0",
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    };
+    const resetRetry = {
+      ...reset,
+      hostInstanceId: thirdStore.hostInstanceId,
+    };
+    assert.deepEqual(await thirdAuthority.claimOpen(resetRetry), retiredReset);
+    assert.deepEqual(await thirdAuthority.claimOpen(resetRetry), retiredReset);
+    const retained = terminalState(await thirdStore.read());
+    assert.deepEqual(retained.streamAuthorities, []);
+    assert.equal(retained.generationHighWater, "2");
+    assert.equal(retained.lostAuthorities.length, 1);
+    assert.equal(retained.lostAuthorities[0].generation, resetWinner.issuedGeneration);
+    assert.deepEqual(
+      retained.openRecords.find((record) => record.key === reset.key).outcome,
+      retiredReset.outcome,
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("restart-lost reset admits all-null recovery but rejects wrong or partial old tuples", async () => {
+  const h = harness();
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore);
+    await assert.rejects(secondAuthority.claimOpen(terminalOpenClaim({
+      key: "terminal-open:partial-reset-after-restart",
+      fingerprint: "6".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: null,
+      resumeTokenHash: TOKEN_HASH_ONE,
+    })), (error) => (
+      error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_INVALID_INPUT"
+    ));
+
+    const wrongOldTuple = terminalOpenClaim({
+      key: "terminal-open:wrong-lost-reset-after-restart",
+      fingerprint: "7".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    assert.deepEqual(await secondAuthority.claimOpen(wrongOldTuple), {
+      status: "conflict",
+      reason: "stream_conflict",
+    });
+    const retired = terminalState(await secondStore.read());
+    assert.deepEqual(retired.streamAuthorities, []);
+    assert.equal(retired.lostAuthorities.length, 1);
+    assert.equal(retired.lostAuthorities[0].generation, opened.generation);
+
+    const nonExactResume = terminalOpenClaim({
+      key: "terminal-open:non-exact-lost-resume",
+      fingerprint: "9".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "resume",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    const nonExactResumeWinner = await secondAuthority.claimOpen(nonExactResume);
+    assert.equal(nonExactResumeWinner.status, "claimed");
+    assert.deepEqual(nonExactResumeWinner.streamAuthority, { status: "absent" });
+    assert.deepEqual(await secondAuthority.completeOpen({
+      key: nonExactResume.key,
+      fingerprint: nonExactResume.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: nonExactResumeWinner.claimToken,
+      fence: nonExactResumeWinner.fence,
+      outcome: {
+        kind: "opened",
+        generation: opened.generation,
+        resumeTokenHash: TOKEN_HASH_TWO,
+        disposition: "resumed",
+        replayFromOffset: "0",
+      },
+    }), {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: opened.generation,
+        reason: "stream_lost",
+        requestedOffset: "0",
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    });
+
+    const allNullReset = terminalOpenClaim({
+      key: "terminal-open:all-null-reset-after-restart",
+      fingerprint: "8".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+    });
+    const winner = await secondAuthority.claimOpen(allNullReset);
+    assert.equal(winner.status, "claimed");
+    assert.notEqual(winner.issuedGeneration, opened.generation);
+    assert.deepEqual(winner.streamAuthority, { status: "absent" });
+    let state = terminalState(await secondStore.read());
+    assert.deepEqual(
+      state.openRecords.find(({ key }) => key === allNullReset.key).streamAuthority,
+      { status: "absent" },
+    );
+    assert.equal(state.lostAuthorities[0].generation, opened.generation);
+
+    const outcome = {
+      kind: "opened",
+      generation: winner.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_TWO,
+      disposition: "reset",
+      replayFromOffset: "0",
+    };
+    assert.deepEqual(await secondAuthority.completeOpen({
+      key: allNullReset.key,
+      fingerprint: allNullReset.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      outcome,
+    }), { status: "committed", outcome });
+    state = terminalState(await secondStore.read());
+    assert.equal(state.generationHighWater, "2");
+    assert.equal(state.streamAuthorities.length, 1);
+    assert.equal(state.streamAuthorities[0].generation, winner.issuedGeneration);
+    assert.equal(state.lostAuthorities.length, 1);
+    assert.equal(state.lostAuthorities[0].generation, opened.generation);
+
+    const currentResume = terminalOpenClaim({
+      key: "terminal-open:resume-current-beside-old-lost",
+      fingerprint: "b".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "resume",
+      previousGeneration: winner.issuedGeneration,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    const currentResumeWinner = await secondAuthority.claimOpen(currentResume);
+    assert.equal(currentResumeWinner.status, "claimed");
+    assert.equal(currentResumeWinner.issuedGeneration, null);
+    assert.deepEqual(currentResumeWinner.streamAuthority, {
+      status: "live",
+      generation: winner.issuedGeneration,
+      target: TERMINAL_TARGET,
+      pane: 0,
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    const resumed = {
+      kind: "opened",
+      generation: winner.issuedGeneration,
+      resumeTokenHash: TOKEN_HASH_TWO,
+      disposition: "resumed",
+      replayFromOffset: "0",
+    };
+    assert.deepEqual(await secondAuthority.completeOpen({
+      key: currentResume.key,
+      fingerprint: currentResume.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      claimToken: currentResumeWinner.claimToken,
+      fence: currentResumeWinner.fence,
+      outcome: resumed,
+    }), { status: "committed", outcome: resumed });
+    state = terminalState(await secondStore.read());
+    assert.equal(state.streamAuthorities[0].generation, winner.issuedGeneration);
+    assert.equal(state.lostAuthorities[0].generation, opened.generation);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("HostState terminal lineage admits one stream mutation, enforces quotas, and retires only exact reset binding", async (t) => {
+  await t.test("pending stream owner and hard quotas are atomic", async () => {
+    const h = harness();
+    try {
+      const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const authority = terminalAuthority(store, {
+        testLimits: { maxControlRecords: 2, maxStreams: 1 },
+      });
+      const first = await authority.claimOpen(terminalOpenClaim({
+        hostInstanceId: store.hostInstanceId,
+      }));
+      assert.equal(first.status, "claimed");
+      assert.deepEqual(await authority.claimOpen(terminalOpenClaim({
+        key: "terminal-open:competing",
+        fingerprint: "b".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+      })), { status: "conflict", reason: "stream_conflict" });
+      assert.deepEqual(await authority.claimOpen(terminalOpenClaim({
+        key: "terminal-open:over-quota",
+        streamKey: "terminal-stream:over-quota",
+        fingerprint: "c".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+      })), { status: "busy", reason: "control_record_quota" });
+      assert.equal(terminalState(await store.read()).openRecords.length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("retained closed rows do not consume live quota but closed reset does", async () => {
+    const h = harness();
+    try {
+      const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const authority = terminalAuthority(store, {
+        testLimits: { maxControlRecords: 20, maxStreams: 1 },
+      });
+      const closedClaim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+      const closed = await commitTerminalOpen(authority, closedClaim);
+      assert.deepEqual(await authority.markStreamClosed({
+        streamKey: closedClaim.streamKey,
+        generation: closed.generation,
+        hostInstanceId: store.hostInstanceId,
+        expiresAtMs: 1_600_000,
+      }), { status: "closed" });
+
+      const liveClaim = terminalOpenClaim({
+        key: "terminal-open:live-beside-retained-closed",
+        streamKey: "terminal-stream:live-beside-retained-closed",
+        fingerprint: "c".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+      });
+      const live = await commitTerminalOpen(authority, liveClaim, {
+        resumeTokenHash: TOKEN_HASH_TWO,
+      });
+      let state = terminalState(await store.read());
+      assert.deepEqual(state.streamAuthorities.map(({ status }) => status).sort(), [
+        "closed",
+        "live",
+      ]);
+
+      const resetClosed = terminalOpenClaim({
+        key: "terminal-open:reset-retained-closed-at-live-limit",
+        fingerprint: "d".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+        mode: "reset",
+        previousGeneration: closed.generation,
+        requestedOffset: "0",
+        resumeTokenHash: TOKEN_HASH_ONE,
+      });
+      assert.deepEqual(await authority.claimOpen(resetClosed), {
+        status: "busy",
+        reason: "control_record_quota",
+      });
+      state = terminalState(await store.read());
+      assert.equal(state.generationHighWater, "2");
+      assert.equal(state.streamAuthorities.find(
+        ({ streamKey }) => streamKey === liveClaim.streamKey,
+      ).generation, live.generation);
+      assert.equal(state.openRecords.some(({ key }) => key === resetClosed.key), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("reset retirement requires exact target, pane, token hash, and generation", async () => {
+    const h = harness();
+    try {
+      const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const authority = terminalAuthority(store);
+      const opened = await commitTerminalOpen(authority);
+      const mismatched = terminalOpenClaim({
+        key: "terminal-open:mismatched-reset",
+        fingerprint: "d".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+        target: { ...TERMINAL_TARGET, sessionId: "ses_DIFFERENT" },
+        resumeTokenHash: TOKEN_HASH_ONE,
+        mode: "reset",
+        previousGeneration: opened.generation,
+        requestedOffset: "0",
+      });
+      assert.deepEqual(await authority.claimOpen(mismatched), {
+        status: "conflict",
+        reason: "stream_conflict",
+      });
+      const state = terminalState(await store.read());
+      assert.equal(state.streamAuthorities.length, 1);
+      assert.equal(state.streamAuthorities[0].generation, opened.generation);
+      assert.deepEqual(state.streamAuthorities[0].target, TERMINAL_TARGET);
+      assert.equal(state.streamAuthorities[0].pane, 0);
+      assert.equal(state.streamAuthorities[0].resumeTokenHash, TOKEN_HASH_ONE);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+test("HostState terminal close, natural-close, finalize, release, and uncertain commits reconcile durably", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const opened = await commitTerminalOpen(authority);
+    const closeIntent = {
+      key: "terminal-close:one",
+      streamKey: "terminal-stream:one",
+      fingerprint: "e".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      target: { ...TERMINAL_TARGET },
+      streamId: "stream-one",
+      closeId: "close-one",
+      requestId: "request-close-one",
+      requestRoute: {
+        connectorId: "connector-one",
+        routeId: "route-one",
+        routeFence: "route-fence-one",
+      },
+      generation: opened.generation,
+      finalOffset: "23",
+      reason: "client_closed",
+      exitCode: null,
+      expiresAtMs: 1_600_000,
+    };
+    const closeClaim = await authority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: closeIntent.hostInstanceId,
+      intent: closeIntent,
+    });
+    assert.equal(closeClaim.status, "claimed");
+    assert.deepEqual(closeClaim.intent, closeIntent);
+    let state = terminalState(await store.read());
+    assert.equal(state.streamAuthorities[0].status, "closed");
+    assert.equal(state.streamAuthorities[0].closeSlotReserved, false);
+    assert.equal(state.closeRecords[0].status, "intent");
+
+    assert.deepEqual(await authority.finalizeClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: closeIntent.hostInstanceId,
+      ownerFence: closeClaim.ownerFence,
+    }), closeIntent);
+    assert.deepEqual(await authority.releaseStreamReservation({
+      streamKey: closeIntent.streamKey,
+      generation: closeIntent.generation,
+      hostInstanceId: closeIntent.hostInstanceId,
+    }), { status: "released" });
+    state = terminalState(await store.read());
+    assert.deepEqual(state.streamAuthorities, []);
+    assert.equal(state.closeRecords[0].status, "final");
+
+    const secondClaim = terminalOpenClaim({
+      key: "terminal-open:natural-close",
+      streamKey: "terminal-stream:natural-close",
+      fingerprint: "f".repeat(64),
+      hostInstanceId: "replaced-below",
+    });
+
+    let failWitnessRename = false;
+    const uncertainStore = await hostState.RelayV2HostStateStore.open({
+      paths: h.paths,
+      renameFile: (source, destination) => {
+        if (failWitnessRename && destination === h.paths.continuity) {
+          failWitnessRename = false;
+          throw new Error("injected terminal lineage witness failure");
+        }
+        renameSync(source, destination);
+      },
+    });
+    const uncertainAuthority = terminalAuthority(uncertainStore);
+    assert.deepEqual(await uncertainAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: uncertainStore.hostInstanceId,
+    }), { status: "final", tombstone: closeIntent });
+    secondClaim.hostInstanceId = uncertainStore.hostInstanceId;
+    const secondOpened = await commitTerminalOpen(uncertainAuthority, secondClaim, {
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    failWitnessRename = true;
+    assert.deepEqual(await uncertainAuthority.markStreamClosed({
+      streamKey: secondClaim.streamKey,
+      generation: secondOpened.generation,
+      hostInstanceId: secondClaim.hostInstanceId,
+      expiresAtMs: 1_600_000,
+    }), { status: "closed" });
+    const reopened = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const afterUncertain = terminalState(await reopened.read());
+    const naturallyClosed = afterUncertain.streamAuthorities.find(
+      ({ streamKey }) => streamKey === secondClaim.streamKey,
+    );
+    assert.equal(naturallyClosed.status, "closed");
+    assert.equal(naturallyClosed.closedExpiresAtMs, 1_600_000);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("terminal authority freezes ten-minute retention after entering the HostState critical section", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    let now = 1_000_000;
+    let delayed = false;
+    const delayedStore = {
+      hostInstanceId: store.hostInstanceId,
+      serialize: (callback) => store.serialize((section) => {
+        if (!delayed) {
+          delayed = true;
+          now = 1_100_000;
+        }
+        return callback(section);
+      }),
+    };
+    const authority = terminalAuthority(delayedStore, { now: () => now });
+    const claim = terminalOpenClaim({
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 1_000_001,
+    });
+    const opened = await commitTerminalOpen(authority, claim);
+    let state = terminalState(await store.read());
+    assert.equal(state.openRecords[0].expiresAtMs, 1_700_000);
+
+    assert.deepEqual(await authority.markStreamClosed({
+      streamKey: claim.streamKey,
+      generation: opened.generation,
+      hostInstanceId: store.hostInstanceId,
+      expiresAtMs: 1_100_001,
+    }), { status: "closed" });
+    state = terminalState(await store.read());
+    assert.equal(state.streamAuthorities[0].closedExpiresAtMs, 1_700_000);
+
+    const closeIntent = {
+      key: "terminal-close:short-caller-retention",
+      streamKey: claim.streamKey,
+      fingerprint: "7".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      target: { ...TERMINAL_TARGET },
+      streamId: "stream-short-caller-retention",
+      closeId: "close-short-caller-retention",
+      requestId: "request-short-caller-retention",
+      requestRoute: {
+        connectorId: "connector-short-caller-retention",
+        routeId: "route-short-caller-retention",
+        routeFence: "route-fence-short-caller-retention",
+      },
+      generation: opened.generation,
+      finalOffset: "0",
+      reason: "client_closed",
+      exitCode: null,
+      expiresAtMs: 1_100_001,
+    };
+    const close = await authority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      intent: closeIntent,
+    });
+    assert.equal(close.status, "claimed");
+    assert.equal(close.intent.expiresAtMs, 1_700_000);
+    assert.equal(closeIntent.expiresAtMs, 1_100_001);
+    state = terminalState(await store.read());
+    assert.equal(state.closeRecords[0].value.expiresAtMs, 1_700_000);
+    assert.equal(state.streamAuthorities[0].closedExpiresAtMs, 1_700_000);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("rebuilt authority atomically adopts an exact pending close owner before finalization", async () => {
+  const h = harness();
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+    const closeIntent = {
+      key: "terminal-close:pending-owner-transfer",
+      streamKey: original.streamKey,
+      fingerprint: "e".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+      target: { ...TERMINAL_TARGET },
+      streamId: "stream-pending-owner-transfer",
+      closeId: "close-pending-owner-transfer",
+      requestId: "request-pending-owner-transfer",
+      requestRoute: {
+        connectorId: "connector-pending-owner-transfer",
+        routeId: "route-pending-owner-transfer",
+        routeFence: "route-fence-pending-owner-transfer",
+      },
+      generation: opened.generation,
+      finalOffset: "23",
+      reason: "client_closed",
+      exitCode: null,
+      expiresAtMs: 1_600_000,
+    };
+    const originalCloseClaim = await firstAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      intent: closeIntent,
+    });
+    assert.equal(originalCloseClaim.status, "claimed");
+    assert.deepEqual(originalCloseClaim.intent, closeIntent);
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    assert.notEqual(secondStore.hostInstanceId, firstStore.hostInstanceId);
+    const secondAuthority = terminalAuthority(secondStore);
+    const retryIntent = {
+      ...closeIntent,
+      hostInstanceId: secondStore.hostInstanceId,
+      requestId: "request-pending-owner-transfer-retry",
+      requestRoute: {
+        connectorId: "connector-pending-owner-transfer-retry",
+        routeId: "route-pending-owner-transfer-retry",
+        routeFence: "route-fence-pending-owner-transfer-retry",
+      },
+      finalOffset: "99",
+      reason: "backend_error",
+      exitCode: null,
+      expiresAtMs: 1_400_000,
+    };
+    assert.deepEqual(await secondAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: "f".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+    }), { status: "close_conflict" });
+    assert.deepEqual(await secondAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      intent: {
+        ...retryIntent,
+        target: { ...TERMINAL_TARGET, sessionId: "ses_DIFFERENT" },
+      },
+    }), { status: "close_conflict" });
+    assert.equal(
+      terminalState(await secondStore.read()).closeRecords[0].value.hostInstanceId,
+      firstStore.hostInstanceId,
+    );
+
+    const adopted = await secondAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      intent: retryIntent,
+    });
+    assert.deepEqual(adopted, {
+      status: "existing_intent",
+      intent: closeIntent,
+      ownerFence: adopted.ownerFence,
+    });
+    await assert.rejects(firstAuthority.finalizeClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      ownerFence: originalCloseClaim.ownerFence,
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+
+    const finalized = await secondAuthority.finalizeClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: secondStore.hostInstanceId,
+      ownerFence: adopted.ownerFence,
+    });
+    assert.deepEqual(finalized, adopted.intent);
+    const thirdStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const thirdAuthority = terminalAuthority(thirdStore);
+    assert.deepEqual(await thirdAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: thirdStore.hostInstanceId,
+      intent: {
+        ...finalized,
+        hostInstanceId: thirdStore.hostInstanceId,
+        generation: "terminal-generation-other",
+      },
+    }), { status: "close_conflict" });
+    assert.deepEqual(await thirdAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: thirdStore.hostInstanceId,
+      intent: {
+        ...retryIntent,
+        hostInstanceId: thirdStore.hostInstanceId,
+        requestId: "request-pending-owner-transfer-final-retry",
+        requestRoute: {
+          connectorId: "connector-pending-owner-transfer-final-retry",
+          routeId: "route-pending-owner-transfer-final-retry",
+          routeFence: "route-fence-pending-owner-transfer-final-retry",
+        },
+        expiresAtMs: 1_300_000,
+      },
+    }), { status: "final", tombstone: finalized });
+    await assert.rejects(thirdAuthority.finalizeClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: thirdStore.hostInstanceId,
+      ownerFence: adopted.ownerFence,
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+    assert.deepEqual(
+      terminalState(await thirdStore.read()).closeRecords[0],
+      {
+        status: "final",
+        ownerHostInstanceId: secondStore.hostInstanceId,
+        ownerFence: adopted.ownerFence,
+        value: finalized,
+      },
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("retained close identity blocks new and resume after restart while all-null reset signs a fresh generation", async () => {
+  const h = harness();
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+    const opened = await commitTerminalOpen(firstAuthority, original);
+    const closeIntent = {
+      key: "terminal-close:retained-stream-identity",
+      streamKey: original.streamKey,
+      fingerprint: "6".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+      target: { ...TERMINAL_TARGET },
+      streamId: "stream-retained-stream-identity",
+      closeId: "close-retained-stream-identity",
+      requestId: "request-retained-stream-identity",
+      requestRoute: {
+        connectorId: "connector-retained-stream-identity",
+        routeId: "route-retained-stream-identity",
+        routeFence: "route-fence-retained-stream-identity",
+      },
+      generation: opened.generation,
+      finalOffset: "5",
+      reason: "client_closed",
+      exitCode: null,
+      expiresAtMs: 1_600_000,
+    };
+    const close = await firstAuthority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      intent: closeIntent,
+    });
+    assert.equal(close.status, "claimed");
+    await firstAuthority.finalizeClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: firstStore.hostInstanceId,
+      ownerFence: close.ownerFence,
+    });
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore);
+    assert.deepEqual(await secondAuthority.claimOpen(terminalOpenClaim({
+      key: "terminal-open:new-over-retained-close",
+      fingerprint: "7".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+    })), { status: "conflict", reason: "stream_conflict" });
+
+    const resume = terminalOpenClaim({
+      key: "terminal-open:resume-over-retained-close",
+      fingerprint: "8".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "resume",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_ONE,
+    });
+    const lost = {
+      status: "replay",
+      outcome: {
+        kind: "reset",
+        generation: opened.generation,
+        reason: "stream_lost",
+        requestedOffset: "0",
+        bufferStartOffset: null,
+        tailOffset: null,
+      },
+    };
+    assert.deepEqual(await secondAuthority.claimOpen(resume), lost);
+    assert.deepEqual(await secondAuthority.claimOpen(resume), lost);
+
+    const reset = terminalOpenClaim({
+      key: "terminal-open:reset-over-retained-close",
+      fingerprint: "9".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+      mode: "reset",
+    });
+    const replacement = await secondAuthority.claimOpen(reset);
+    assert.equal(replacement.status, "claimed");
+    assert.notEqual(replacement.issuedGeneration, opened.generation);
+    assert.deepEqual(replacement.streamAuthority, { status: "absent" });
+    const retained = terminalState(await secondStore.read());
+    assert.deepEqual(retained.streamAuthorities, []);
+    assert.deepEqual(retained.lostAuthorities, []);
+    assert.equal(retained.closeRecords[0].value.generation, opened.generation);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("host-owner retirement is durable before BUSY and definite publish failure does not poison retry", async (t) => {
+  await t.test("full control quota still retires the abandoned process", async () => {
+    const h = harness();
+    try {
+      const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const firstAuthority = terminalAuthority(firstStore, {
+        testLimits: { maxControlRecords: 2, maxStreams: 1 },
+      });
+      const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+      const opened = await commitTerminalOpen(firstAuthority, original);
+
+      const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const secondAuthority = terminalAuthority(secondStore, {
+        testLimits: { maxControlRecords: 2, maxStreams: 1 },
+      });
+      const blocked = terminalOpenClaim({
+        key: "terminal-open:busy-after-retirement",
+        streamKey: "terminal-stream:busy-after-retirement",
+        fingerprint: "6".repeat(64),
+        hostInstanceId: secondStore.hostInstanceId,
+      });
+      assert.deepEqual(await secondAuthority.claimOpen(blocked), {
+        status: "busy",
+        reason: "control_record_quota",
+      });
+      const retired = terminalState(await secondStore.read());
+      assert.equal(retired.activeHostInstanceId, secondStore.hostInstanceId);
+      assert.deepEqual(retired.streamAuthorities, []);
+      assert.equal(retired.lostAuthorities[0].generation, opened.generation);
+      assert.equal(retired.openRecords[0].outcome.reason, "stream_lost");
+      assert.equal(retired.openRecords[0].outcome.generation, opened.generation);
+      assert.deepEqual(await secondAuthority.claimOpen(blocked), {
+        status: "busy",
+        reason: "control_record_quota",
+      });
+      await assert.rejects(firstAuthority.releaseStreamReservation({
+        streamKey: original.streamKey,
+        generation: opened.generation,
+        hostInstanceId: firstStore.hostInstanceId,
+      }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CONFLICT");
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("failure before state publication leaves the authority retryable", async () => {
+    const h = harness();
+    try {
+      const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const firstAuthority = terminalAuthority(firstStore);
+      const original = terminalOpenClaim({ hostInstanceId: firstStore.hostInstanceId });
+      const opened = await commitTerminalOpen(firstAuthority, original);
+      let failStateRename = true;
+      const secondStore = await hostState.RelayV2HostStateStore.open({
+        paths: h.paths,
+        renameFile: (source, destination) => {
+          if (failStateRename && destination === h.paths.state) {
+            failStateRename = false;
+            throw new Error("injected prepublish owner-retirement failure");
+          }
+          renameSync(source, destination);
+        },
+      });
+      const secondAuthority = terminalAuthority(secondStore);
+      const resume = terminalOpenClaim({
+        key: "terminal-open:retry-owner-retirement",
+        fingerprint: "7".repeat(64),
+        hostInstanceId: secondStore.hostInstanceId,
+        mode: "resume",
+        previousGeneration: opened.generation,
+        requestedOffset: "0",
+        resumeTokenHash: TOKEN_HASH_ONE,
+      });
+      await assert.rejects(secondAuthority.claimOpen(resume), /prepublish owner-retirement/);
+      const afterFailure = terminalState(await firstStore.read());
+      assert.equal(afterFailure.activeHostInstanceId, firstStore.hostInstanceId);
+      assert.equal(afterFailure.streamAuthorities[0].generation, opened.generation);
+      const retry = await secondAuthority.claimOpen(resume);
+      assert.equal(retry.status, "replay");
+      assert.equal(retry.outcome.reason, "stream_lost");
+      assert.equal(terminalState(await secondStore.read()).activeHostInstanceId, secondStore.hostInstanceId);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+test("open admission reconciliation reuses exact post-retirement quota math", async (t) => {
+  await t.test("control max-minus-one new claim remains BUSY after uncertain commit", async () => {
+    const h = harness();
+    try {
+      const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+      const firstAuthority = terminalAuthority(firstStore, {
+        testLimits: { maxControlRecords: 3, maxStreams: 1 },
+      });
+      await commitTerminalOpen(firstAuthority, terminalOpenClaim({
+        hostInstanceId: firstStore.hostInstanceId,
+      }));
+      let failWitnessRename = true;
+      const secondStore = await hostState.RelayV2HostStateStore.open({
+        paths: h.paths,
+        renameFile: (source, destination) => {
+          if (failWitnessRename && destination === h.paths.continuity) {
+            failWitnessRename = false;
+            throw new Error("injected BUSY witness failure");
+          }
+          renameSync(source, destination);
+        },
+      });
+      const secondAuthority = terminalAuthority(secondStore, {
+        testLimits: { maxControlRecords: 3, maxStreams: 1 },
+      });
+      assert.deepEqual(await secondAuthority.claimOpen(terminalOpenClaim({
+        key: "terminal-open:uncertain-control-busy",
+        streamKey: "terminal-stream:uncertain-control-busy",
+        fingerprint: "8".repeat(64),
+        hostInstanceId: secondStore.hostInstanceId,
+      })), { status: "busy", reason: "control_record_quota" });
+      const state = terminalState(await secondStore.read());
+      assert.equal(state.activeHostInstanceId, secondStore.hostInstanceId);
+      assert.equal(state.lostAuthorities.length, 1);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  await t.test("closed reset remains live-quota BUSY after uncertain commit", async () => {
+    const h = harness();
+    try {
+      let failWitnessRename = false;
+      const store = await hostState.RelayV2HostStateStore.open({
+        paths: h.paths,
+        renameFile: (source, destination) => {
+          if (failWitnessRename && destination === h.paths.continuity) {
+            failWitnessRename = false;
+            throw new Error("injected stream BUSY witness failure");
+          }
+          renameSync(source, destination);
+        },
+      });
+      const authority = terminalAuthority(store, {
+        testLimits: { maxControlRecords: 20, maxStreams: 1 },
+      });
+      const closedClaim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+      const closed = await commitTerminalOpen(authority, closedClaim);
+      await authority.markStreamClosed({
+        streamKey: closedClaim.streamKey,
+        generation: closed.generation,
+        hostInstanceId: store.hostInstanceId,
+        expiresAtMs: 1_600_000,
+      });
+      const liveClaim = terminalOpenClaim({
+        key: "terminal-open:uncertain-live-beside-closed",
+        streamKey: "terminal-stream:uncertain-live-beside-closed",
+        fingerprint: "9".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+      });
+      await commitTerminalOpen(authority, liveClaim, {
+        resumeTokenHash: TOKEN_HASH_TWO,
+      });
+      const resetClosed = terminalOpenClaim({
+        key: "terminal-open:uncertain-reset-closed",
+        fingerprint: "a".repeat(64),
+        hostInstanceId: store.hostInstanceId,
+        mode: "reset",
+        previousGeneration: closed.generation,
+        requestedOffset: "0",
+        resumeTokenHash: TOKEN_HASH_ONE,
+      });
+      failWitnessRename = true;
+      assert.deepEqual(await authority.claimOpen(resetClosed), {
+        status: "busy",
+        reason: "control_record_quota",
+      });
+      assert.equal(failWitnessRename, false);
+      const state = terminalState(await store.read());
+      assert.deepEqual(state.streamAuthorities.map(({ status }) => status).sort(), [
+        "closed",
+        "live",
+      ]);
+      assert.equal(state.openRecords.some(({ key }) => key === resetClosed.key), false);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
+test("reset completion and parsing preserve the full captured recovery tuple", async () => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const opened = await commitTerminalOpen(authority);
+    const reset = terminalOpenClaim({
+      key: "terminal-open:reset-tuple",
+      fingerprint: "b".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      mode: "reset",
+      previousGeneration: opened.generation,
+      requestedOffset: "0",
+      resumeTokenHash: TOKEN_HASH_ONE,
+    });
+    const winner = await authority.claimOpen(reset);
+    assert.equal(winner.status, "claimed");
+    const snapshot = await store.read();
+    const [key, value] = Object.entries(snapshot.materialized).find(([, candidate]) => (
+      candidate?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    const damaged = structuredClone(value);
+    damaged.openRecords.find((record) => record.key === reset.key).requestedOffset = "1";
+    await store.transaction((transaction) => transaction.putMaterializedRecord(key, damaged));
+    await assert.rejects(authority.completeOpen({
+      key: reset.key,
+      fingerprint: reset.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      claimToken: winner.claimToken,
+      fence: winner.fence,
+      outcome: {
+        kind: "opened",
+        generation: winner.issuedGeneration,
+        resumeTokenHash: TOKEN_HASH_TWO,
+        disposition: "reset",
+        replayFromOffset: "0",
+      },
+    }), (error) => error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT");
+    assert.equal(terminalState(await store.read()).streamAuthorities[0].generation, opened.generation);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("generation high-water crosses the former history threshold without reuse", async () => {
+  const h = harness();
+  try {
+    const firstStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const firstAuthority = terminalAuthority(firstStore);
+    const seed = await firstAuthority.claimOpen(terminalOpenClaim({
+      hostInstanceId: firstStore.hostInstanceId,
+    }));
+    assert.equal(seed.status, "claimed");
+    await firstAuthority.failOpen({
+      key: "terminal-open:one",
+      fingerprint: "a".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+      claimToken: seed.claimToken,
+      fence: seed.fence,
+      outcome: { kind: "error", code: "BUSY", message: "seed" },
+      streamEffect: { kind: "preserve" },
+    });
+    const snapshot = await firstStore.read();
+    const [key, value] = Object.entries(snapshot.materialized).find(([, candidate]) => (
+      candidate?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    await firstStore.transaction((transaction) => transaction.putMaterializedRecord(key, {
+      ...value,
+      generationHighWater: "4095",
+    }));
+    const atThreshold = await firstAuthority.claimOpen(terminalOpenClaim({
+      key: "terminal-open:generation-4096",
+      streamKey: "terminal-stream:generation-4096",
+      fingerprint: "c".repeat(64),
+      hostInstanceId: firstStore.hostInstanceId,
+    }));
+    assert.equal(atThreshold.status, "claimed");
+    assert.ok(atThreshold.issuedGeneration.endsWith("-4096"));
+
+    const secondStore = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const secondAuthority = terminalAuthority(secondStore);
+    const afterRestart = await secondAuthority.claimOpen(terminalOpenClaim({
+      key: "terminal-open:generation-4097",
+      streamKey: "terminal-stream:generation-4097",
+      fingerprint: "d".repeat(64),
+      hostInstanceId: secondStore.hostInstanceId,
+    }));
+    assert.equal(afterRestart.status, "claimed");
+    assert.ok(afterRestart.issuedGeneration.endsWith("-4097"));
+    assert.notEqual(afterRestart.issuedGeneration, atThreshold.issuedGeneration);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("HostState terminal parser rejects generation reuse across incompatible durable lineages", async (t) => {
+  const h = harness();
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+    const authority = terminalAuthority(store);
+    const firstClaim = terminalOpenClaim({ hostInstanceId: store.hostInstanceId });
+    const first = await commitTerminalOpen(authority, firstClaim);
+    const secondClaim = terminalOpenClaim({
+      key: "terminal-open:generation-lineage-two",
+      streamKey: "terminal-stream:generation-lineage-two",
+      fingerprint: "2".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+    });
+    const second = await commitTerminalOpen(authority, secondClaim, {
+      resumeTokenHash: TOKEN_HASH_TWO,
+    });
+    const closeIntent = {
+      key: "terminal-close:generation-lineage-one",
+      streamKey: firstClaim.streamKey,
+      fingerprint: "3".repeat(64),
+      hostInstanceId: store.hostInstanceId,
+      target: { ...TERMINAL_TARGET },
+      streamId: "stream-generation-lineage-one",
+      closeId: "close-generation-lineage-one",
+      requestId: "request-generation-lineage-one",
+      requestRoute: {
+        connectorId: "connector-generation-lineage-one",
+        routeId: "route-generation-lineage-one",
+        routeFence: "route-fence-generation-lineage-one",
+      },
+      generation: first.generation,
+      finalOffset: "7",
+      reason: "client_closed",
+      exitCode: null,
+      expiresAtMs: 1_600_000,
+    };
+    assert.equal((await authority.claimClose({
+      key: closeIntent.key,
+      fingerprint: closeIntent.fingerprint,
+      hostInstanceId: store.hostInstanceId,
+      intent: closeIntent,
+    })).status, "claimed");
+
+    const snapshot = await store.read();
+    const [key, value] = Object.entries(snapshot.materialized).find(([, candidate]) => (
+      candidate?.authority === "relay_v2_terminal_durable_lineage"
+    ));
+    const base = structuredClone(value);
+    const cases = [
+      {
+        name: "executable and lost authorities reuse one generation",
+        damage: (state) => {
+          const stream = state.streamAuthorities.find(
+            (candidate) => candidate.streamKey === secondClaim.streamKey,
+          );
+          state.lostAuthorities.push({
+            streamKey: "terminal-stream:incompatible-lost-lineage",
+            generation: stream.generation,
+            ownerHostInstanceId: stream.hostInstanceId,
+            target: { ...stream.target },
+            pane: stream.pane,
+            resumeTokenHash: stream.resumeTokenHash,
+            expiresAtMs: 1_600_000,
+          });
+          return state;
+        },
+      },
+      {
+        name: "issued and opened generation is reused by another stream",
+        damage: (state) => {
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === secondClaim.key,
+          );
+          record.issuedGeneration = first.generation;
+          record.outcome.generation = first.generation;
+          return state;
+        },
+      },
+      {
+        name: "opened outcome disagrees with the authority token binding",
+        damage: (state) => {
+          const record = state.openRecords.find(
+            (candidate) => candidate.key === secondClaim.key,
+          );
+          record.outcome.resumeTokenHash = TOKEN_HASH_ONE;
+          return state;
+        },
+      },
+      {
+        name: "close binding reuses another stream generation",
+        damage: (state) => {
+          const close = structuredClone(state.closeRecords[0]);
+          close.value.key = "terminal-close:incompatible-generation-lineage";
+          close.value.streamKey = secondClaim.streamKey;
+          close.value.fingerprint = "4".repeat(64);
+          close.value.streamId = "stream-incompatible-generation-lineage";
+          close.value.closeId = "close-incompatible-generation-lineage";
+          close.value.requestId = "request-incompatible-generation-lineage";
+          state.closeRecords.push(close);
+          return state;
+        },
+      },
+      {
+        name: "live executable authority contradicts its exact committed close",
+        damage: (state) => {
+          const stream = state.streamAuthorities.find(
+            (candidate) => candidate.streamKey === firstClaim.streamKey,
+          );
+          stream.status = "live";
+          stream.closedExpiresAtMs = null;
+          return state;
+        },
+      },
+      {
+        name: "exact committed close claims a different process owner",
+        damage: (state) => {
+          state.closeRecords[0].value.hostInstanceId = "different-close-stream-owner";
+          return state;
+        },
+      },
+    ];
+    for (const scenario of cases) {
+      await t.test(scenario.name, async () => {
+        const damaged = scenario.damage(structuredClone(base));
+        await store.transaction((transaction) => {
+          transaction.putMaterializedRecord(key, damaged);
+        });
+        const before = await store.read();
+        await assert.rejects(authority.claimOpen(terminalOpenClaim({
+          key: "terminal-open:after-generation-reuse",
+          streamKey: "terminal-stream:after-generation-reuse",
+          fingerprint: "9".repeat(64),
+          hostInstanceId: store.hostInstanceId,
+        })), (error) => (
+          error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT"
+        ));
+        const after = await store.read();
+        assert.equal(after.commitSeq, before.commitSeq);
+        assert.deepEqual(after.materialized[key], damaged);
+        await store.transaction((transaction) => {
+          transaction.putMaterializedRecord(key, base);
+        });
+      });
+    }
+    assert.notEqual(first.generation, second.generation);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("HostState terminal nested corrupt and future schemas fail closed without repair", async (t) => {
+  const cases = [
+    {
+      name: "future schema",
+      damage: (value) => ({ ...value, schemaVersion: 3 }),
+    },
+    {
+      name: "unknown field",
+      damage: (value) => ({ ...value, unexpected: true }),
+    },
+  ];
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const h = harness();
+      try {
+        const store = await hostState.RelayV2HostStateStore.open({ paths: h.paths });
+        const authority = terminalAuthority(store);
+        await authority.claimOpen(terminalOpenClaim({
+          hostInstanceId: store.hostInstanceId,
+        }));
+        const snapshot = await store.read();
+        const [key, value] = Object.entries(snapshot.materialized).find(([, candidate]) => (
+          candidate?.authority === "relay_v2_terminal_durable_lineage"
+        ));
+        const damaged = scenario.damage(structuredClone(value));
+        await store.transaction((transaction) => {
+          transaction.putMaterializedRecord(key, damaged);
+        });
+        const before = await store.read();
+        await assert.rejects(authority.claimOpen(terminalOpenClaim({
+          key: "terminal-open:after-damage",
+          streamKey: "terminal-stream:after-damage",
+          fingerprint: "9".repeat(64),
+          hostInstanceId: store.hostInstanceId,
+        })), (error) => (
+          error.code === "RELAY_V2_TERMINAL_DURABLE_LINEAGE_CORRUPT"
+        ));
+        const after = await store.read();
+        assert.equal(after.commitSeq, before.commitSeq);
+        assert.deepEqual(after.materialized[key], damaged);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
 });
