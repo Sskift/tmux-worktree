@@ -10,6 +10,8 @@ const resourceState = await import("../dist/relay/v2/resourceState.js");
 const commandPlane = await import("../dist/relay/v2/hostCommandPlane.js");
 const codec = await import("../dist/relay/v2/codec.js");
 const canonicalDiscovery = await import("../dist/relay/v2/canonicalTwRpcDiscovery.js");
+const canonicalBackendIdentity = await import("../dist/relay/v2/canonicalBackendIdentity.js");
+const { RPC_V2_CAPABILITIES } = await import("../dist/rpcV2.js");
 const relayV2Corpus = loadRelayV2FixtureCorpus();
 const backendIdentityFixture = JSON.parse(readFileSync(
   new URL("./fixtures/relay-v2-canonical-backend-identity-v1.json", import.meta.url),
@@ -24,11 +26,28 @@ const welcomeTemplate = handshakeFixture.find((item) => (
   item.name === "host-welcome-snapshot-required"
 )).frame;
 
+function cloneDiscoveryScan(scan) {
+  const cloned = structuredClone(scan);
+  const resolverCut = scan[resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT];
+  if (resolverCut !== undefined) {
+    Object.defineProperty(cloned, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: {
+        generation: resolverCut.generation,
+        scopeTargets: structuredClone(resolverCut.scopeTargets),
+        sessionTargets: structuredClone(resolverCut.sessionTargets),
+        isCurrent: resolverCut.isCurrent,
+      },
+      enumerable: false,
+    });
+  }
+  return cloned;
+}
+
 class QueueDiscovery {
   #scans = [];
 
   push(scan) {
-    this.#scans.push(structuredClone(scan));
+    this.#scans.push(cloneDiscoveryScan(scan));
   }
 
   pushDeferred(scan, onStart) {
@@ -40,9 +59,9 @@ class QueueDiscovery {
     if (!scan) throw new Error("test discovery has no queued scan");
     if (scan.deferredScan) {
       scan.onStart?.();
-      return structuredClone(await scan.deferredScan);
+      return cloneDiscoveryScan(await scan.deferredScan);
     }
-    return structuredClone(scan);
+    return cloneDiscoveryScan(scan);
   }
 }
 
@@ -134,6 +153,10 @@ function scope({
     result.reservationCorrelationCompleteness = reservationCorrelationCompleteness;
   }
   return result;
+}
+
+function resolverProcessTarget(kind, targetId) {
+  return { kind, targetId };
 }
 
 function partialScope({
@@ -257,6 +280,580 @@ test("H2 materializes the canonical discovery key from the shared backend identi
     assert.equal(JSON.stringify(persisted).includes("raw-terminal-backend-7"), false);
   } finally {
     h.cleanup();
+  }
+});
+
+test("resolver reconcile rejects forged managed incarnation evidence without publishing a target", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-forged-resolver-"));
+  try {
+    const paths = hostState.relayV2HostStatePaths(home);
+    const store = await hostState.RelayV2HostStateStore.open({ paths });
+    const vector = backendIdentityFixture.vectors.find((item) => (
+      item.name === "configured SSH target identity"
+    ));
+    assert.ok(vector);
+    const incarnationB = `twinc2.${"B".repeat(43)}`;
+    const forgedScan = {
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "scope:forged",
+        displayName: "Configured forged target",
+        sessions: [terminal(vector.expected, "Public terminal A")],
+      })],
+    };
+    Object.defineProperty(forgedScan, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: {
+        generation: "forged",
+        scopeTargets: [{
+          scopeBackendIdentity: "scope:forged",
+          processTarget: resolverProcessTarget(
+            vector.processTarget.kind,
+            vector.processTarget.targetId,
+          ),
+          capabilities: ["session.list"],
+        }],
+        sessionTargets: [{
+          scopeBackendIdentity: "scope:forged",
+          sessionBackendIdentity: vector.expected,
+          backendKind: "terminal",
+          processTarget: resolverProcessTarget(
+            vector.processTarget.kind,
+            vector.processTarget.targetId,
+          ),
+          capabilities: ["session.list"],
+          managedTarget: {
+            name: "managed-terminal-b",
+            kind: "terminal",
+            incarnation: incarnationB,
+          },
+        }],
+        isCurrent: () => true,
+      },
+      enumerable: false,
+    });
+    const foundation = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery: { async scan() { return forgedScan; } },
+      store,
+      readinessSink: new ReadinessSink(),
+    });
+    const before = await store.read();
+
+    await assert.rejects(
+      foundation.reconcile(),
+      assertMaterializedError("INTERNAL"),
+    );
+    assert.deepEqual((await store.read()).materialized, before.materialized);
+    await assert.rejects(
+      foundation.canonicalTargetResolver.captureToken(before.hostEpoch),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession({
+        schemaVersion: 1,
+        hostEpoch: before.hostEpoch,
+        resourceMappingDigest: `twrmap1.${"A".repeat(43)}`,
+        discoveryGeneration: "forged",
+      }, "scope-forged", "session-forged"),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("resolver admission fence binds command-expected IDs and rejects persisted readiness withdrawal", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-admission-fence-"));
+  try {
+    const store = await hostState.RelayV2HostStateStore.open({
+      paths: hostState.relayV2HostStatePaths(home),
+    });
+    const processA = resolverProcessTarget("local", "configured-a");
+    const processB = resolverProcessTarget("local", "configured-b");
+    const incarnationA = `twinc2.${"A".repeat(43)}`;
+    const incarnationB = `twinc2.${"B".repeat(43)}`;
+    const backendA = canonicalBackendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+      processTarget: processA,
+      incarnation: incarnationA,
+    });
+    const backendB = canonicalBackendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+      processTarget: processA,
+      incarnation: incarnationB,
+    });
+    const scan = {
+      coverage: "complete",
+      scopes: [
+        scope({
+          backendIdentity: "scope:a",
+          displayName: "Scope A",
+          kind: "local",
+          sessions: [terminal(backendA, "Session A"), terminal(backendB, "Session B")],
+        }),
+        scope({ backendIdentity: "scope:b", displayName: "Scope B", kind: "local" }),
+      ],
+    };
+    Object.defineProperty(scan, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: {
+        generation: "admission-fence-cut",
+        scopeTargets: [
+          { scopeBackendIdentity: "scope:a", processTarget: processA, capabilities: ["session.list"] },
+          { scopeBackendIdentity: "scope:b", processTarget: processB, capabilities: ["session.list"] },
+        ],
+        sessionTargets: [
+          {
+            scopeBackendIdentity: "scope:a",
+            sessionBackendIdentity: backendA,
+            backendKind: "terminal",
+            processTarget: processA,
+            capabilities: ["session.list"],
+            managedTarget: { name: "raw-a", kind: "terminal", incarnation: incarnationA },
+          },
+          {
+            scopeBackendIdentity: "scope:a",
+            sessionBackendIdentity: backendB,
+            backendKind: "terminal",
+            processTarget: processA,
+            capabilities: ["session.list"],
+            managedTarget: { name: "raw-b", kind: "terminal", incarnation: incarnationB },
+          },
+        ],
+        isCurrent: () => true,
+      },
+      enumerable: false,
+    });
+    const discovery = new QueueDiscovery();
+    discovery.push(scan);
+    const foundation = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery,
+      store,
+      readinessSink: new ReadinessSink(),
+    });
+    const reconciled = await foundation.reconcile();
+    const token = await foundation.canonicalTargetResolver.captureToken(
+      reconciled.snapshot.hostEpoch,
+    );
+    const scopes = payload(await foundation.scopesSnapshot(
+      "admission-fence-scopes",
+      reconciled.snapshot.hostEpoch,
+    )).items;
+    const scopeA = scopes.find((item) => item.displayName === "Scope A");
+    const scopeB = scopes.find((item) => item.displayName === "Scope B");
+    const sessions = payload(await foundation.sessionsSnapshot(
+      "admission-fence-sessions",
+      reconciled.snapshot.hostEpoch,
+      [scopeA.scopeId],
+    )).scopes[0].items;
+    const targetScopeA = await foundation.canonicalTargetResolver.resolveScope(token, scopeA.scopeId);
+    const targetScopeB = await foundation.canonicalTargetResolver.resolveScope(token, scopeB.scopeId);
+    const targetSessionA = await foundation.canonicalTargetResolver.resolveSession(
+      token,
+      scopeA.scopeId,
+      sessions[0].sessionId,
+    );
+    const targetSessionB = await foundation.canonicalTargetResolver.resolveSession(
+      token,
+      scopeA.scopeId,
+      sessions[1].sessionId,
+    );
+
+    await assert.rejects(
+      store.transaction((transaction) => foundation.canonicalTargetResolver.fenceScopeForAdmission(
+        transaction,
+        token,
+        scopeA.scopeId,
+        targetScopeB,
+      )),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      store.transaction((transaction) => foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        transaction,
+        token,
+        scopeA.scopeId,
+        sessions[0].sessionId,
+        targetSessionB,
+      )),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      store.transaction((transaction) => {
+        transaction.latchMaterializedReadinessFence("materialized_authority_conflict");
+        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+          transaction,
+          token,
+          scopeA.scopeId,
+          sessions[0].sessionId,
+          targetSessionA,
+        );
+      }),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    assert.notDeepEqual(targetScopeA, targetScopeB);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("canonical resolver publishes only an accepted exact reconcile and fences rebuild, config, restart, and partial cuts", async () => {
+  const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-canonical-resolver-"));
+  try {
+    const paths = hostState.relayV2HostStatePaths(home);
+    const store = await hostState.RelayV2HostStateStore.open({ paths });
+    const incarnationA = `twinc2.${"A".repeat(43)}`;
+    const incarnationB = `twinc2.${"B".repeat(43)}`;
+    const canonicalSession = (incarnation) => ({
+      name: "managed-terminal",
+      kind: "terminal",
+      profile: "cli",
+      project: null,
+      label: "Stable public label",
+      repoPath: null,
+      worktreePath: null,
+      branch: null,
+      baseBranch: null,
+      cwd: "/repo/terminal",
+      createdAt: "2026-07-18T01:00:00.000Z",
+      attached: false,
+      windows: 1,
+      created: 1_752_804_000,
+      activity: 1_752_804_001,
+      incarnation,
+      lifecycleMarked: true,
+      reservationCorrelation: null,
+    });
+    const capabilities = {
+      protocolVersion: 2,
+      app: "tmux-worktree",
+      capabilities: [...RPC_V2_CAPABILITIES],
+    };
+    const scopeConfig = (targetId, backendIdentity, queryPort) => ({
+      scopes: [{
+        backendIdentity,
+        displayName: `Configured ${targetId}`,
+        kind: "ssh",
+        processTarget: resolverProcessTarget("ssh", targetId),
+      }],
+      queryPort,
+    });
+    let currentIncarnation = incarnationA;
+    let blockNextList = false;
+    let announceConcurrentScan;
+    let releaseConcurrentScan;
+    let initialPortCalls = 0;
+    const concurrentScanStarted = new Promise((resolve) => { announceConcurrentScan = resolve; });
+    const concurrentScanBarrier = new Promise((resolve) => { releaseConcurrentScan = resolve; });
+    const initialPort = {
+      async query(request) {
+        initialPortCalls += 1;
+        if (request.command === "list" && blockNextList) {
+          announceConcurrentScan();
+          await concurrentScanBarrier;
+        }
+        return request.command === "capabilities"
+          ? capabilities
+          : { protocolVersion: 2, sessions: [canonicalSession(currentIncarnation)] };
+      },
+    };
+    const discovery = new canonicalDiscovery.RelayV2CanonicalTwRpcDiscoveryAdapter(
+      scopeConfig("configured-a", "scope:configured-a", initialPort),
+    );
+    const resolverReadinessSink = new ReadinessSink();
+    const foundation = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery,
+      store,
+      readinessSink: resolverReadinessSink,
+    });
+
+    const initial = await foundation.reconcile();
+    const initialScopes = payload(await foundation.scopesSnapshot(
+      "resolver-scopes-a",
+      initial.snapshot.hostEpoch,
+    )).items;
+    const initialSessions = payload(await foundation.sessionsSnapshot(
+      "resolver-sessions-a",
+      initial.snapshot.hostEpoch,
+      null,
+    )).scopes[0].items;
+    const scopeIdA = initialScopes[0].scopeId;
+    const sessionIdA = initialSessions[0].sessionId;
+    const tokenA = await foundation.canonicalTargetResolver.captureToken(
+      initial.snapshot.hostEpoch,
+    );
+    const scopeTargetA = await foundation.canonicalTargetResolver.resolveScope(
+      tokenA,
+      scopeIdA,
+    );
+    assert.equal(scopeTargetA.authorization, "evidence_only");
+    assert.deepEqual(
+      scopeTargetA.processTarget,
+      resolverProcessTarget("ssh", "configured-a"),
+    );
+    const targetA = await foundation.canonicalTargetResolver.resolveSession(
+      tokenA,
+      scopeIdA,
+      sessionIdA,
+    );
+    assert.deepEqual(targetA.processTarget, resolverProcessTarget("ssh", "configured-a"));
+    assert.deepEqual(targetA.managedTarget, {
+      name: "managed-terminal",
+      kind: "terminal",
+      incarnation: incarnationA,
+    });
+    await store.transaction((transaction) => {
+      foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        transaction,
+        tokenA,
+        scopeIdA,
+        sessionIdA,
+        targetA,
+      );
+    });
+    await assert.rejects(
+      store.transaction((transaction) => {
+        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+          transaction,
+          tokenA,
+          scopeIdA,
+          sessionIdA,
+          {
+            ...structuredClone(targetA),
+            managedTarget: {
+              ...structuredClone(targetA.managedTarget),
+              incarnation: incarnationB,
+            },
+          },
+        );
+      }),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+
+    blockNextList = true;
+    const callsBeforeConcurrent = initialPortCalls;
+    const firstConcurrent = foundation.reconcile();
+    const secondConcurrent = foundation.reconcile();
+    assert.equal(firstConcurrent, secondConcurrent, "concurrent reconciles must share one H0 winner");
+    await concurrentScanStarted;
+    assert.deepEqual(
+      await foundation.canonicalTargetResolver.resolveSession(tokenA, scopeIdA, sessionIdA),
+      targetA,
+      "a running scan must not withdraw the last completed winner",
+    );
+    releaseConcurrentScan();
+    const [firstWinner, secondWinner] = await Promise.all([firstConcurrent, secondConcurrent]);
+    blockNextList = false;
+    assert.equal(firstWinner.snapshot.commitSeq, secondWinner.snapshot.commitSeq);
+    assert.equal(initialPortCalls - callsBeforeConcurrent, 2, "one scan must query one exact winner");
+    assert.equal((await store.read()).materializedReadinessFence, null);
+    const concurrentToken = await foundation.canonicalTargetResolver.captureToken(
+      firstWinner.snapshot.hostEpoch,
+    );
+    assert.notEqual(concurrentToken.discoveryGeneration, tokenA.discoveryGeneration);
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(tokenA, scopeIdA, sessionIdA),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+
+    resolverReadinessSink.accept = false;
+    const refused = await foundation.reconcile();
+    assert.equal(refused.readiness.snapshotMaterializationReady, true);
+    await assert.rejects(
+      foundation.canonicalTargetResolver.captureToken(refused.snapshot.hostEpoch),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(concurrentToken, scopeIdA, sessionIdA),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    resolverReadinessSink.accept = true;
+
+    const beforeRebuild = await foundation.reconcile();
+    const beforeRebuildToken = await foundation.canonicalTargetResolver.captureToken(
+      beforeRebuild.snapshot.hostEpoch,
+    );
+    const beforeRebuildTarget = await foundation.canonicalTargetResolver.resolveSession(
+      beforeRebuildToken,
+      scopeIdA,
+      sessionIdA,
+    );
+    currentIncarnation = incarnationB;
+    const rebuilt = await foundation.reconcile();
+    const rebuiltSessions = payload(await foundation.sessionsSnapshot(
+      "resolver-sessions-rebuilt",
+      rebuilt.snapshot.hostEpoch,
+      null,
+    )).scopes[0].items;
+    const sessionIdB = rebuiltSessions[0].sessionId;
+    const tokenB = await foundation.canonicalTargetResolver.captureToken(
+      rebuilt.snapshot.hostEpoch,
+    );
+    assert.notEqual(sessionIdB, sessionIdA, "same-name backend rebuild needs a new opaque Session ID");
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(beforeRebuildToken, scopeIdA, sessionIdA),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      store.transaction((transaction) => {
+        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+          transaction,
+          beforeRebuildToken,
+          scopeIdA,
+          sessionIdA,
+          beforeRebuildTarget,
+        );
+      }),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(tokenB, scopeIdA, sessionIdA),
+      assertMaterializedError("SESSION_NOT_FOUND"),
+    );
+    const targetB = await foundation.canonicalTargetResolver.resolveSession(
+      tokenB,
+      scopeIdA,
+      sessionIdB,
+    );
+    assert.equal(targetB.managedTarget.incarnation, incarnationB);
+    assert.notEqual(tokenA.discoveryGeneration, tokenB.discoveryGeneration);
+
+    let announceStaleScan;
+    let releaseStaleScan;
+    const staleScanStarted = new Promise((resolve) => { announceStaleScan = resolve; });
+    const staleScanBarrier = new Promise((resolve) => { releaseStaleScan = resolve; });
+    const stalePort = {
+      async query(request) {
+        if (request.command === "capabilities") return capabilities;
+        announceStaleScan();
+        await staleScanBarrier;
+        return { protocolVersion: 2, sessions: [canonicalSession(incarnationB)] };
+      },
+    };
+    discovery.reconfigure(scopeConfig("configured-a", "scope:configured-a", stalePort));
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(tokenB, scopeIdA, sessionIdB),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      store.transaction((transaction) => {
+        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+          transaction,
+          tokenB,
+          scopeIdA,
+          sessionIdB,
+          targetB,
+        );
+      }),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    const pendingReconcile = foundation.reconcile();
+    await staleScanStarted;
+    const configuredBPort = {
+      async query(request) {
+        return request.command === "capabilities"
+          ? capabilities
+          : { protocolVersion: 2, sessions: [canonicalSession(incarnationB)] };
+      },
+    };
+    discovery.reconfigure(scopeConfig(
+      "configured-b",
+      "scope:configured-b",
+      configuredBPort,
+    ));
+    releaseStaleScan();
+    const configWinner = await pendingReconcile;
+    const winnerScopes = payload(await foundation.scopesSnapshot(
+      "resolver-config-winner-scopes",
+      configWinner.snapshot.hostEpoch,
+    )).items;
+    const winnerSessions = payload(await foundation.sessionsSnapshot(
+      "resolver-config-winner-sessions",
+      configWinner.snapshot.hostEpoch,
+      null,
+    )).scopes[0].items;
+    const winnerToken = await foundation.canonicalTargetResolver.captureToken(
+      configWinner.snapshot.hostEpoch,
+    );
+    const winnerTarget = await foundation.canonicalTargetResolver.resolveSession(
+      winnerToken,
+      winnerScopes[0].scopeId,
+      winnerSessions[0].sessionId,
+    );
+    assert.deepEqual(winnerTarget.processTarget, resolverProcessTarget("ssh", "configured-b"));
+    assert.notEqual(winnerToken.discoveryGeneration, tokenB.discoveryGeneration);
+
+    resolverReadinessSink.accept = false;
+    await assert.rejects(
+      foundation.linearizeWelcome(
+        "resolver-welcome-readiness-rejected",
+        { enqueue: () => true },
+        buildWelcome,
+      ),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      foundation.canonicalTargetResolver.captureToken(configWinner.snapshot.hostEpoch),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      foundation.canonicalTargetResolver.resolveSession(
+        winnerToken,
+        winnerScopes[0].scopeId,
+        winnerSessions[0].sessionId,
+      ),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+
+    const restartedStore = await hostState.RelayV2HostStateStore.open({ paths });
+    const restarted = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery,
+      store: restartedStore,
+      readinessSink: { apply: () => true },
+    });
+    await assert.rejects(
+      restarted.canonicalTargetResolver.captureToken(configWinner.snapshot.hostEpoch),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await restarted.reconcile();
+    const restartedToken = await restarted.canonicalTargetResolver.captureToken(
+      configWinner.snapshot.hostEpoch,
+    );
+    assert.notEqual(restartedToken.discoveryGeneration, winnerToken.discoveryGeneration);
+
+    discovery.reconfigure(scopeConfig("configured-b", "scope:configured-b", {
+      async query() { throw new Error("configured host unavailable"); },
+    }));
+    const partial = await restarted.reconcile();
+    assert.equal(partial.readiness.snapshotMaterializationReady, false);
+    assert.equal(partial.events.some((event) => event.payload?.change?.op === "delete"), false);
+    const retained = payload(await restarted.sessionsSnapshot(
+      "resolver-partial-retained",
+      partial.snapshot.hostEpoch,
+      null,
+    )).scopes[0].items;
+    assert.equal(retained[0].sessionId, winnerSessions[0].sessionId);
+    await assert.rejects(
+      restarted.canonicalTargetResolver.resolveSession(
+        restartedToken,
+        winnerScopes[0].scopeId,
+        winnerSessions[0].sessionId,
+      ),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      restarted.canonicalTargetResolver.resolveScope(
+        restartedToken,
+        winnerScopes[0].scopeId,
+      ),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+    await assert.rejects(
+      restarted.canonicalTargetResolver.captureToken(partial.snapshot.hostEpoch),
+      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });
 
@@ -658,16 +1255,38 @@ function invalidSynchronousSinkResult(mode, h) {
   throw new Error("sink threw synchronously");
 }
 
-async function seedLocalScope(h) {
-  h.discovery.push({
+async function seedLocalScope(h, { withResolver = false } = {}) {
+  const scan = {
     coverage: "complete",
     scopes: [scope({ backendIdentity: "local", displayName: "Local", kind: "local" })],
-  });
+  };
+  if (withResolver) {
+    Object.defineProperty(scan, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: {
+        generation: "test-local-complete",
+        scopeTargets: [{
+          scopeBackendIdentity: "local",
+          processTarget: resolverProcessTarget("local", "configured-local"),
+          capabilities: ["session.list"],
+        }],
+        sessionTargets: [],
+        isCurrent: () => true,
+      },
+      enumerable: false,
+    });
+  }
+  h.discovery.push(scan);
   const seeded = await h.foundation.reconcile();
   const scopeId = payload(
     await h.foundation.scopesSnapshot("joint-scope", seeded.snapshot.hostEpoch),
   ).items[0].scopeId;
-  return { seeded, scopeId };
+  return {
+    seeded,
+    scopeId,
+    resolverToken: withResolver
+      ? await h.foundation.canonicalTargetResolver.captureToken(seeded.snapshot.hostEpoch)
+      : null,
+  };
 }
 
 test("oversized convenience session snapshots direct clients to state.snapshot", async () => {
@@ -956,7 +1575,11 @@ test("H1 restart runner consumes the persisted H2 binding without an H2 worker",
 test("an exact persisted reservation replay precedes later partial-readiness rejection", async () => {
   const h = await harness();
   try {
-    const { seeded, scopeId } = await seedLocalScope(h);
+    const { seeded, scopeId, resolverToken } = await seedLocalScope(h, { withResolver: true });
+    const resolverTarget = await h.foundation.canonicalTargetResolver.resolveScope(
+      resolverToken,
+      scopeId,
+    );
     let releaseExecution;
     let executionStarted;
     const started = new Promise((resolve) => { executionStarted = resolve; });
@@ -977,6 +1600,23 @@ test("an exact persisted reservation replay precedes later partial-readiness rej
       ),
     );
     await started;
+    assert.deepEqual(
+      await h.foundation.canonicalTargetResolver.captureToken(seeded.snapshot.hostEpoch),
+      resolverToken,
+      "reservation ledger writes must not rotate the resource mapping cut",
+    );
+    assert.deepEqual(
+      await h.foundation.canonicalTargetResolver.resolveScope(resolverToken, scopeId),
+      resolverTarget,
+    );
+    await h.store.transaction((transaction) => {
+      h.foundation.canonicalTargetResolver.fenceScopeForAdmission(
+        transaction,
+        resolverToken,
+        scopeId,
+        resolverTarget,
+      );
+    });
     const snapshot = await h.store.read();
     const record = Object.values(snapshot.commands).find((item) => (
       item.commandId === "cmd-reservation-replay"

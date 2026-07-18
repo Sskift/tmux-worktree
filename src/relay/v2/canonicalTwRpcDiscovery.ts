@@ -16,7 +16,10 @@ import type {
   RelayV2DiscoveryError,
   RelayV2ResourceDiscovery,
   RelayV2ResourceDiscoveryScan,
+  RelayV2ResourceResolverScopeEvidence,
+  RelayV2ResourceResolverSessionEvidence,
 } from "./resourceState.js";
+import { RELAY_V2_RESOURCE_RESOLVER_CUT } from "./resourceState.js";
 
 const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_FIXED_RECORDS_PER_SCOPE = 2;
 export const RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SCOPES = Math.floor(
@@ -71,6 +74,19 @@ export interface RelayV2CanonicalTwRpcDiscoveryAdapterOptions {
   scopes: readonly RelayV2CanonicalTwRpcDiscoveryScope[];
   queryPort: RelayV2CanonicalTwRpcDiscoveryQueryPort;
   queryTimeoutMs?: number;
+}
+
+interface NormalizedDiscoveryConfiguration {
+  revision: string;
+  scopes: readonly RelayV2CanonicalTwRpcDiscoveryScope[];
+  queryPort: RelayV2CanonicalTwRpcDiscoveryQueryPort;
+  queryTimeoutMs: number;
+}
+
+interface ScannedScope {
+  publicScope: RelayV2DiscoveredScope;
+  scopeTarget: RelayV2ResourceResolverScopeEvidence | null;
+  sessionTargets: RelayV2ResourceResolverSessionEvidence[];
 }
 
 export interface RelayV2CanonicalTwRpcDiscoveryInput {
@@ -187,7 +203,14 @@ const TRANSPORT_ERROR: RelayV2DiscoveryError = Object.freeze({
 type QueryResult =
   | { kind: "succeeded"; value: unknown }
   | { kind: "timed_out" }
+  | { kind: "aborted" }
   | { kind: "transport_error" };
+
+interface DiscoveryScanFlight {
+  configuration: NormalizedDiscoveryConfiguration;
+  controller: AbortController;
+  promise: Promise<RelayV2ResourceDiscoveryScan>;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -395,78 +418,278 @@ function failedScope(
   };
 }
 
+function normalizeConfiguration(
+  options: RelayV2CanonicalTwRpcDiscoveryAdapterOptions,
+  revision: string,
+): NormalizedDiscoveryConfiguration {
+  if (!isRecord(options)
+    || !isRecord(options.queryPort)
+    || typeof options.queryPort.query !== "function") {
+    throw new TypeError("invalid canonical TW RPC v2 discovery adapter options");
+  }
+  const queryTimeoutMs = options.queryTimeoutMs
+    ?? RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS;
+  if (!Number.isSafeInteger(queryTimeoutMs)
+    || queryTimeoutMs < 1
+    || queryTimeoutMs > RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS) {
+    throw new TypeError("invalid canonical TW RPC v2 discovery query timeout");
+  }
+  return {
+    revision,
+    scopes: normalizeScopes(options.scopes),
+    queryPort: options.queryPort,
+    queryTimeoutMs,
+  };
+}
+
 export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDiscovery {
-  private readonly scopes: readonly RelayV2CanonicalTwRpcDiscoveryScope[];
+  private configuration: NormalizedDiscoveryConfiguration;
 
-  private readonly queryPort: RelayV2CanonicalTwRpcDiscoveryQueryPort;
+  private configurationRevision = 1;
 
-  private readonly queryTimeoutMs: number;
+  private scanRevision = 0;
+
+  private completedWinner: object | null = null;
+
+  private scanInFlight: DiscoveryScanFlight | null = null;
+
+  private reconfigurationBarrier: Promise<void> | null = null;
+
+  private configurationWithdrawn = false;
 
   constructor(options: RelayV2CanonicalTwRpcDiscoveryAdapterOptions) {
-    if (!isRecord(options)
-      || !isRecord(options.queryPort)
-      || typeof options.queryPort.query !== "function") {
-      throw new TypeError("invalid canonical TW RPC v2 discovery adapter options");
-    }
-    const queryTimeoutMs = options.queryTimeoutMs
-      ?? RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS;
-    if (!Number.isSafeInteger(queryTimeoutMs)
-      || queryTimeoutMs < 1
-      || queryTimeoutMs > RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS) {
-      throw new TypeError("invalid canonical TW RPC v2 discovery query timeout");
-    }
-    this.scopes = normalizeScopes(options.scopes);
-    this.queryPort = options.queryPort;
-    this.queryTimeoutMs = queryTimeoutMs;
+    this.configuration = normalizeConfiguration(options, "1");
   }
 
-  async scan(): Promise<RelayV2ResourceDiscoveryScan> {
+  /** Atomically swaps one already-explicit scope/query-target configuration. */
+  reconfigure(options: RelayV2CanonicalTwRpcDiscoveryAdapterOptions): void {
+    if (this.reconfigurationBarrier !== null) {
+      throw new TypeError("canonical TW RPC v2 discovery reconfiguration is already active");
+    }
+    const nextRevision = this.configurationRevision + 1;
+    const next = normalizeConfiguration(options, String(nextRevision));
+    this.configurationRevision = nextRevision;
+    this.configuration = next;
+    this.configurationWithdrawn = false;
+    this.completedWinner = null;
+    this.scanInFlight?.controller.abort();
+  }
+
+  /**
+   * Retires the old scan through its transport barrier before a synchronous
+   * caller-owned target authority swap. New scans wait behind the same gate.
+   */
+  async reconfigureAfterRetirement(
+    options: RelayV2CanonicalTwRpcDiscoveryAdapterOptions,
+    replaceTargetAuthority: () => void,
+  ): Promise<void> {
+    if (this.reconfigurationBarrier !== null || typeof replaceTargetAuthority !== "function") {
+      throw new TypeError("canonical TW RPC v2 discovery reconfiguration is already active");
+    }
+    const nextRevision = this.configurationRevision + 1;
+    const next = normalizeConfiguration(options, String(nextRevision));
+    const retired = this.scanInFlight?.promise ?? Promise.resolve();
+    let releaseGate: (() => void) | undefined;
+    let rejectGate: ((error: unknown) => void) | undefined;
+    const gate = new Promise<void>((resolve, reject) => {
+      releaseGate = resolve;
+      rejectGate = reject;
+    });
+    void gate.catch(() => {});
+    this.reconfigurationBarrier = gate;
+    this.configurationRevision = nextRevision;
+    this.configuration = next;
+    this.configurationWithdrawn = false;
+    this.completedWinner = null;
+    this.scanInFlight?.controller.abort();
+    try {
+      await retired.catch(() => {});
+      const result = (replaceTargetAuthority as () => unknown)();
+      if (result !== null && typeof result === "object"
+        && typeof (result as { then?: unknown }).then === "function") {
+        throw new TypeError("canonical target authority replacement must be synchronous");
+      }
+      releaseGate?.();
+    } catch (error) {
+      rejectGate?.(error);
+      throw error;
+    } finally {
+      if (this.reconfigurationBarrier === gate) this.reconfigurationBarrier = null;
+    }
+  }
+
+  /** Withdraws config authority without manufacturing complete-empty deletion authority. */
+  async withdrawAfterRetirement(): Promise<void> {
+    if (this.reconfigurationBarrier !== null) {
+      throw new TypeError("canonical TW RPC v2 discovery reconfiguration is already active");
+    }
+    const retired = this.scanInFlight?.promise ?? Promise.resolve();
+    let releaseGate: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { releaseGate = resolve; });
+    this.reconfigurationBarrier = gate;
+    this.configurationRevision += 1;
+    this.configuration = {
+      ...this.configuration,
+      revision: String(this.configurationRevision),
+    };
+    this.configurationWithdrawn = true;
+    this.completedWinner = null;
+    this.scanInFlight?.controller.abort();
+    try {
+      await retired.catch(() => {});
+      releaseGate?.();
+    } finally {
+      if (this.reconfigurationBarrier === gate) this.reconfigurationBarrier = null;
+    }
+  }
+
+  scan(): Promise<RelayV2ResourceDiscoveryScan> {
+    if (this.reconfigurationBarrier !== null) {
+      return this.reconfigurationBarrier.then(() => this.scan());
+    }
+    if (this.configurationWithdrawn) {
+      return Promise.resolve({ coverage: "partial", scopes: [] });
+    }
+    const configuration = this.configuration;
+    const active = this.scanInFlight;
+    if (active !== null) {
+      if (active.configuration === configuration) return active.promise;
+      return active.promise.then(
+        () => this.scan(),
+        () => this.scan(),
+      );
+    }
+    const controller = new AbortController();
+    const scanMarker = {
+      configuration,
+      generation: `${configuration.revision}.${++this.scanRevision}`,
+    };
+    const promise = Promise.resolve().then(() => (
+      this.runScan(configuration, scanMarker, controller.signal)
+    ));
+    const flight: DiscoveryScanFlight = { configuration, controller, promise };
+    this.scanInFlight = flight;
+    void promise.finally(() => {
+      if (this.scanInFlight === flight) this.scanInFlight = null;
+    }).catch(() => {});
+    return promise;
+  }
+
+  private async runScan(
+    configuration: NormalizedDiscoveryConfiguration,
+    scanMarker: { configuration: NormalizedDiscoveryConfiguration; generation: string },
+    signal: AbortSignal,
+  ): Promise<RelayV2ResourceDiscoveryScan> {
     // H2's full cut always spends one scope and one sessions_scope record per
     // configured scope. Sorted sequential scans keep both the query boundary
     // and the projected aggregate within the one shared record budget.
-    const fixedRecordCount = this.scopes.length
+    const fixedRecordCount = configuration.scopes.length
       * RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_FIXED_RECORDS_PER_SCOPE;
     let remainingSessionRecords = RELAY_V2_MATERIALIZED_CAPACITY.maxSnapshotRecords
       - fixedRecordCount;
     const scopes: RelayV2DiscoveredScope[] = [];
-    for (const scope of this.scopes) {
-      const scanned = await this.scanScope(scope, remainingSessionRecords);
-      scopes.push(scanned);
-      if (scanned.sessionsCompleteness === "complete") {
-        remainingSessionRecords -= scanned.sessions.length;
+    const scopeTargets: RelayV2ResourceResolverScopeEvidence[] = [];
+    const sessionTargets: RelayV2ResourceResolverSessionEvidence[] = [];
+    let aborted = false;
+    for (const scope of configuration.scopes) {
+      if (signal.aborted || this.configuration !== configuration) {
+        aborted = true;
+        break;
+      }
+      const scanned = await this.scanScope(
+        configuration,
+        scope,
+        remainingSessionRecords,
+        signal,
+      );
+      if (scanned === null) {
+        aborted = true;
+        break;
+      }
+      scopes.push(scanned.publicScope);
+      if (scanned.scopeTarget !== null) scopeTargets.push(scanned.scopeTarget);
+      sessionTargets.push(...scanned.sessionTargets);
+      if (scanned.publicScope.sessionsCompleteness === "complete") {
+        remainingSessionRecords -= scanned.publicScope.sessions.length;
       }
     }
-    return {
-      coverage: scopes.every((scope) => scope.sessionsCompleteness === "complete")
+    const result: RelayV2ResourceDiscoveryScan = {
+      coverage: !aborted && scopes.length === configuration.scopes.length
+        && scopes.every((scope) => scope.sessionsCompleteness === "complete")
         ? "complete"
         : "partial",
       scopes,
     };
+    if (!aborted && this.configuration === configuration) {
+      this.completedWinner = scanMarker;
+    }
+    Object.defineProperty(result, RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: Object.freeze({
+        generation: scanMarker.generation,
+        scopeTargets: Object.freeze(scopeTargets),
+        sessionTargets: Object.freeze(sessionTargets),
+        isCurrent: () => (
+          this.configuration === configuration && this.completedWinner === scanMarker
+        ),
+      }),
+      enumerable: false,
+    });
+    return result;
   }
 
   private async scanScope(
+    configuration: NormalizedDiscoveryConfiguration,
     scope: RelayV2CanonicalTwRpcDiscoveryScope,
     maxSessions: number,
-  ): Promise<RelayV2DiscoveredScope> {
-    const capabilitiesResult = await this.query(scope, "capabilities");
+    signal: AbortSignal,
+  ): Promise<ScannedScope | null> {
+    const capabilitiesResult = await this.query(
+      configuration,
+      scope,
+      "capabilities",
+      signal,
+    );
+    if (capabilitiesResult.kind === "aborted") return null;
     if (capabilitiesResult.kind === "timed_out") {
-      return failedScope(scope, TIMEOUT_ERROR, "unreachable");
+      return {
+        publicScope: failedScope(scope, TIMEOUT_ERROR, "unreachable"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
     if (capabilitiesResult.kind === "transport_error") {
-      return failedScope(scope, TRANSPORT_ERROR, "unreachable");
+      return {
+        publicScope: failedScope(scope, TRANSPORT_ERROR, "unreachable"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
+    let capabilities: RpcV2CapabilitiesResponse;
     try {
-      parseCapabilitiesResponse(capabilitiesResult.value);
+      capabilities = parseCapabilitiesResponse(capabilitiesResult.value);
     } catch {
-      return failedScope(scope, CAPABILITY_ERROR, "online");
+      return {
+        publicScope: failedScope(scope, CAPABILITY_ERROR, "online"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
 
-    const listResult = await this.query(scope, "list", maxSessions);
+    const listResult = await this.query(configuration, scope, "list", signal, maxSessions);
+    if (listResult.kind === "aborted") return null;
     if (listResult.kind === "timed_out") {
-      return failedScope(scope, TIMEOUT_ERROR, "unreachable");
+      return {
+        publicScope: failedScope(scope, TIMEOUT_ERROR, "unreachable"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
     if (listResult.kind === "transport_error") {
-      return failedScope(scope, TRANSPORT_ERROR, "unreachable");
+      return {
+        publicScope: failedScope(scope, TRANSPORT_ERROR, "unreachable"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
     try {
       const response = parseListResponse(listResult.value, maxSessions);
@@ -488,44 +711,77 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
         }
       }
       return {
-        backendIdentity: scope.backendIdentity,
-        displayName: scope.displayName,
-        kind: scope.kind,
-        reachability: "online",
-        sessionsCompleteness: "complete",
-        sessions,
-        error: null,
-        reservationCorrelationCompleteness: "complete",
+        publicScope: {
+          backendIdentity: scope.backendIdentity,
+          displayName: scope.displayName,
+          kind: scope.kind,
+          reachability: "online",
+          sessionsCompleteness: "complete",
+          sessions,
+          error: null,
+          reservationCorrelationCompleteness: "complete",
+        },
+        scopeTarget: {
+          scopeBackendIdentity: scope.backendIdentity,
+          processTarget: { ...scope.processTarget },
+          capabilities: [...capabilities.capabilities],
+        },
+        sessionTargets: response.sessions.map((session) => ({
+          scopeBackendIdentity: scope.backendIdentity,
+          sessionBackendIdentity: issueRelayV2CanonicalBackendInstanceKey({
+            processTarget: scope.processTarget,
+            incarnation: session.incarnation,
+          }),
+          backendKind: session.kind,
+          processTarget: { ...scope.processTarget },
+          capabilities: [...capabilities.capabilities],
+          managedTarget: {
+            name: session.name,
+            kind: session.kind,
+            incarnation: session.incarnation,
+          },
+        })),
       };
     } catch {
-      return failedScope(scope, MALFORMED_RESPONSE_ERROR, "online");
+      return {
+        publicScope: failedScope(scope, MALFORMED_RESPONSE_ERROR, "online"),
+        scopeTarget: null,
+        sessionTargets: [],
+      };
     }
   }
 
   private async query(
+    configuration: NormalizedDiscoveryConfiguration,
     scope: RelayV2CanonicalTwRpcDiscoveryScope,
     command: RelayV2CanonicalTwRpcDiscoveryCommand,
+    scanSignal: AbortSignal,
     maxSessions?: number,
   ): Promise<QueryResult> {
     const controller = new AbortController();
     let timer: ReturnType<typeof setTimeout> | undefined;
     let timedOut = false;
+    const abortForScan = () => controller.abort();
+    scanSignal.addEventListener("abort", abortForScan, { once: true });
+    if (scanSignal.aborted) controller.abort();
     try {
       const request: RelayV2CanonicalTwRpcDiscoveryQuery = command === "capabilities"
         ? {
           processTarget: { ...scope.processTarget },
           command,
-          timeoutMs: this.queryTimeoutMs,
+          timeoutMs: configuration.queryTimeoutMs,
           signal: controller.signal,
         }
         : {
           processTarget: { ...scope.processTarget },
           command,
           maxSessions: maxSessions as number,
-          timeoutMs: this.queryTimeoutMs,
+          timeoutMs: configuration.queryTimeoutMs,
           signal: controller.signal,
         };
-      const transport = Promise.resolve().then(() => this.queryPort.query(request)).then<QueryResult>(
+      const transport = Promise.resolve().then(() => (
+        configuration.queryPort.query(request)
+      )).then<QueryResult>(
         (value) => ({ kind: "succeeded", value }),
         () => ({ kind: "transport_error" }),
       );
@@ -533,11 +789,13 @@ export class RelayV2CanonicalTwRpcDiscoveryAdapter implements RelayV2ResourceDis
         if (timedOut) return;
         timedOut = true;
         controller.abort();
-      }, this.queryTimeoutMs);
+      }, configuration.queryTimeoutMs);
       const result = await transport;
+      if (scanSignal.aborted) return { kind: "aborted" };
       return timedOut ? { kind: "timed_out" } : result;
     } finally {
       if (timer !== undefined) clearTimeout(timer);
+      scanSignal.removeEventListener("abort", abortForScan);
     }
   }
 }

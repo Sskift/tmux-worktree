@@ -18,6 +18,7 @@ import {
 } from "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js";
 import {
   RELAY_V2_MATERIALIZED_CAPACITY,
+  RELAY_V2_RESOURCE_RESOLVER_CUT,
   RelayV2MaterializedStateFoundation,
 } from "../dist/relay/v2/resourceState.js";
 
@@ -82,12 +83,31 @@ function worktreeSession(overrides = {}) {
   };
 }
 
-function scope(kind, targetId, backendIdentity = `${kind}:${targetId}`) {
+function scope(
+  kind,
+  targetId,
+  backendIdentity = `${kind}:${targetId}`,
+  processTarget = { kind, targetId },
+) {
   return {
     backendIdentity,
     displayName: `${kind} ${targetId}`,
     kind,
-    processTarget: { kind, targetId },
+    processTarget,
+  };
+}
+
+function sshQueryTarget(targetId) {
+  return {
+    kind: "ssh",
+    targetId,
+    host: `${targetId}.example.com`,
+    knownHostsFile: "/configured/ssh/known_hosts",
+    sshExecutable: "/usr/bin/ssh",
+    user: "builder",
+    port: 2222,
+    identityFile: "/configured/ssh/id_ed25519",
+    twExecutable: "/opt/tw/bin/tw",
   };
 }
 
@@ -164,6 +184,56 @@ test("canonical TW RPC v2 discovery scans only configured scopes and projects de
       ["capabilities", "list"],
     );
   }
+});
+
+test("canonical discovery swaps explicit config generations atomically and keeps raw targets process-local", async () => {
+  const portA = queryPort(({ command }) => (
+    command === "capabilities"
+      ? capabilities()
+      : { protocolVersion: 2, sessions: [terminalSession()] }
+  ));
+  const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: [scope("ssh", "configured-a", "scope:configured-a")],
+    queryPort: portA,
+  });
+  const scanA = await discovery.scan();
+  const cutA = scanA[RELAY_V2_RESOURCE_RESOLVER_CUT];
+  assert.equal(cutA.isCurrent(), true);
+  assert.deepEqual(cutA.sessionTargets[0].managedTarget, {
+    name: "raw.tmux.terminal",
+    kind: "terminal",
+    incarnation: INCARNATION_A,
+  });
+  assert.equal(JSON.stringify(scanA).includes("raw.tmux.terminal"), false);
+
+  assert.throws(
+    () => discovery.reconfigure({
+      scopes: [scope("ssh", "duplicate", "same"), scope("ssh", "duplicate", "other")],
+      queryPort: portA,
+    }),
+    /duplicate .*process target/,
+  );
+  assert.equal(cutA.isCurrent(), true, "rejected config must not replace the active generation");
+
+  const portB = queryPort(({ command }) => (
+    command === "capabilities"
+      ? capabilities()
+      : { protocolVersion: 2, sessions: [terminalSession({ incarnation: INCARNATION_B })] }
+  ));
+  discovery.reconfigure({
+    scopes: [scope("ssh", "configured-b", "scope:configured-b")],
+    queryPort: portB,
+  });
+  assert.equal(cutA.isCurrent(), false);
+  const scanB = await discovery.scan();
+  const cutB = scanB[RELAY_V2_RESOURCE_RESOLVER_CUT];
+  assert.equal(cutB.isCurrent(), true);
+  assert.notEqual(cutB.generation, cutA.generation);
+  assert.deepEqual(portB.calls.map((call) => call.processTarget.targetId), [
+    "configured-b",
+    "configured-b",
+  ]);
+  assert.equal(portA.calls.length, 2, "new config must not query the retired target");
 });
 
 test("only a successful complete-empty scan is represented as complete deletion authority", async () => {
@@ -469,7 +539,12 @@ test("discovery timeout waits for the query transport child barrier before prese
       runner,
     });
     const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
-      scopes: [scope("local", "explicit-local", "scope:explicit-local")],
+      scopes: [scope(
+        "local",
+        "explicit-local",
+        "scope:explicit-local",
+        transport.processTarget("local", "explicit-local"),
+      )],
       queryPort: transport,
       queryTimeoutMs: 5,
     });
@@ -557,4 +632,94 @@ test("discovery timeout waits for the query transport child barrier before prese
   } finally {
     rmSync(temporaryHome, { recursive: true, force: true });
   }
+});
+
+test("reconfigure aborts the active scan barrier before any retired later scope can spawn", async () => {
+  let releaseOldBarrier;
+  const oldBarrier = new Promise((resolve) => { releaseOldBarrier = resolve; });
+  let oldKillCalls = 0;
+  const calls = [];
+  const runner = {
+    spawn(request) {
+      const target = ["old-a", "old-b", "new-c"].find((item) => (
+        request.argv.includes(`${item}.example.com`)
+      ));
+      calls.push({ target, command: request.argv.at(-1) });
+      if (target === "old-a") {
+        return {
+          stdout: {
+            async *[Symbol.asyncIterator]() {
+              await oldBarrier;
+              yield encoder.encode(`${JSON.stringify(capabilities())}\n`);
+            },
+          },
+          stderr: { async *[Symbol.asyncIterator]() { await oldBarrier; } },
+          exited: oldBarrier.then(() => ({ exitCode: 0, signal: null })),
+          kill(signal) {
+            assert.equal(signal, "SIGKILL");
+            oldKillCalls += 1;
+          },
+        };
+      }
+      const value = request.argv.at(-1) === "capabilities"
+        ? capabilities()
+        : { protocolVersion: 2, sessions: [terminalSession()] };
+      return {
+        stdout: {
+          async *[Symbol.asyncIterator]() {
+            yield encoder.encode(`${JSON.stringify(value)}\n`);
+          },
+        },
+        stderr: { async *[Symbol.asyncIterator]() {} },
+        exited: Promise.resolve({ exitCode: 0, signal: null }),
+        kill: () => assert.fail("settled new query must not be killed"),
+      };
+    },
+  };
+  const transport = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+    targets: [sshQueryTarget("old-a"), sshQueryTarget("old-b"), sshQueryTarget("new-c")],
+    runner,
+  });
+  const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: [
+      scope("ssh", "old-a", "scope:old-a", transport.processTarget("ssh", "old-a")),
+      scope("ssh", "old-b", "scope:old-b", transport.processTarget("ssh", "old-b")),
+    ],
+    queryPort: transport,
+  });
+
+  const retiredScan = discovery.scan();
+  await waitUntil(() => calls.length === 1, "first retired scope did not start");
+  discovery.reconfigure({
+    scopes: [scope(
+      "ssh",
+      "new-c",
+      "scope:new-c",
+      transport.processTarget("ssh", "new-c"),
+    )],
+    queryPort: transport,
+  });
+  const currentScan = discovery.scan();
+  await waitUntil(() => oldKillCalls === 1, "reconfigure did not abort the active child");
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, [{ target: "old-a", command: "capabilities" }]);
+
+  let currentSettled = false;
+  currentScan.finally(() => { currentSettled = true; }).catch(() => {});
+  assert.equal(currentSettled, false, "new config must wait for the old process barrier");
+  releaseOldBarrier();
+
+  const retired = await retiredScan;
+  const current = await currentScan;
+  assert.equal(retired.coverage, "partial");
+  assert.equal(retired[RELAY_V2_RESOURCE_RESOLVER_CUT].isCurrent(), false);
+  assert.equal(current.coverage, "complete");
+  assert.equal(current[RELAY_V2_RESOURCE_RESOLVER_CUT].isCurrent(), true);
+  assert.deepEqual(calls, [
+    { target: "old-a", command: "capabilities" },
+    { target: "new-c", command: "capabilities" },
+    { target: "new-c", command: "list" },
+  ]);
+  assert.equal(calls.some((call) => call.target === "old-b"), false);
+  assert.equal(oldKillCalls, 1);
 });

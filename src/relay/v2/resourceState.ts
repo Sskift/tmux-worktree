@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+import { issueRelayV2CanonicalBackendInstanceKey } from "./canonicalBackendIdentity.js";
 import { encodeRelayV2WebSocketFrame } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
 import { relayV2CommandReservationLedgerState } from "./hostCommandPlane.js";
@@ -125,10 +127,110 @@ export interface RelayV2DiscoveredScope {
 export interface RelayV2ResourceDiscoveryScan {
   coverage: RelayV2DiscoveryCompleteness;
   scopes: readonly RelayV2DiscoveredScope[];
+  /** Process-local exact-target evidence; deliberately omitted from JSON/storage. */
+  [RELAY_V2_RESOURCE_RESOLVER_CUT]?: RelayV2ResourceResolverDiscoveryCut;
 }
 
 export interface RelayV2ResourceDiscovery {
   scan(): Promise<RelayV2ResourceDiscoveryScan>;
+}
+
+export interface RelayV2ResourceResolverProcessTarget {
+  kind: RelayV2ScopeKind;
+  targetId: string;
+}
+
+export interface RelayV2ResourceResolverScopeEvidence {
+  scopeBackendIdentity: string;
+  processTarget: RelayV2ResourceResolverProcessTarget;
+  capabilities: readonly string[];
+}
+
+export interface RelayV2ResourceResolverSessionEvidence {
+  scopeBackendIdentity: string;
+  sessionBackendIdentity: string;
+  backendKind: RelayV2Session["kind"];
+  processTarget: RelayV2ResourceResolverProcessTarget;
+  capabilities: readonly string[];
+  managedTarget: {
+    name: string;
+    kind: RelayV2Session["kind"];
+    incarnation: string;
+  };
+}
+
+/**
+ * One immutable discovery/config winner. isCurrent() is checked inside the H0
+ * serializer, so a concurrent reconfiguration cannot publish its old targets.
+ */
+export interface RelayV2ResourceResolverDiscoveryCut {
+  generation: string;
+  scopeTargets: readonly RelayV2ResourceResolverScopeEvidence[];
+  sessionTargets: readonly RelayV2ResourceResolverSessionEvidence[];
+  isCurrent(): boolean;
+}
+
+export const RELAY_V2_RESOURCE_RESOLVER_CUT = Symbol.for(
+  "tmux-worktree.relay-v2.resource-resolver-cut",
+);
+
+export interface RelayV2CanonicalResourceResolverToken {
+  schemaVersion: 1;
+  hostEpoch: string;
+  resourceMappingDigest: string;
+  discoveryGeneration: string;
+}
+
+export interface RelayV2CanonicalResolvedScopeTarget {
+  authorization: "evidence_only";
+  hostEpoch: string;
+  discoveryGeneration: string;
+  scopeId: string;
+  processTarget: RelayV2ResourceResolverProcessTarget;
+  capabilities: readonly string[];
+}
+
+export interface RelayV2CanonicalResolvedSessionTarget
+extends RelayV2CanonicalResolvedScopeTarget {
+  sessionId: string;
+  backendInstanceKey: string;
+  managedTarget: {
+    name: string;
+    kind: RelayV2Session["kind"];
+    incarnation: string;
+  };
+}
+
+/**
+ * Exact, side-effect-free discovery evidence. A resolved target never grants
+ * execution authority. Future composition must call the synchronous fence
+ * below with the same token and target inside the H0 admission transaction.
+ * This foundation is not connected to H1/H3 production composition.
+ */
+export interface RelayV2CanonicalResourceResolverPort {
+  captureToken(expectedHostEpoch: string): Promise<RelayV2CanonicalResourceResolverToken>;
+  resolveScope(
+    token: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+  ): Promise<RelayV2CanonicalResolvedScopeTarget>;
+  resolveSession(
+    token: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<RelayV2CanonicalResolvedSessionTarget>;
+  fenceScopeForAdmission(
+    transaction: RelayV2HostStateTransaction,
+    token: RelayV2CanonicalResourceResolverToken,
+    expectedScopeId: string,
+    target: RelayV2CanonicalResolvedScopeTarget,
+  ): void;
+  fenceSessionForAdmission(
+    transaction: RelayV2HostStateTransaction,
+    token: RelayV2CanonicalResourceResolverToken,
+    expectedScopeId: string,
+    expectedSessionId: string,
+    target: RelayV2CanonicalResolvedSessionTarget,
+  ): void;
 }
 
 export interface RelayV2FencedNegativeCandidate {
@@ -286,6 +388,7 @@ export type RelayV2MaterializedErrorCode =
   | "IDEMPOTENCY_CONFLICT"
   | "INTERNAL"
   | "INVALID_ARGUMENT"
+  | "SESSION_NOT_FOUND"
   | "SNAPSHOT_TOO_LARGE"
   | "SCOPE_NOT_FOUND";
 
@@ -377,6 +480,18 @@ interface PersistedMaterializedState {
 interface Subscriber {
   epoch: string;
   sink: RelayV2StateEventSink<RelayV2JsonObject>;
+}
+
+interface PublishedCanonicalResolver {
+  token: RelayV2CanonicalResourceResolverToken;
+  discoveryCut: RelayV2ResourceResolverDiscoveryCut;
+  scopes: ReadonlyMap<string, RelayV2CanonicalResolvedScopeTarget>;
+  sessions: ReadonlyMap<string, RelayV2CanonicalResolvedSessionTarget>;
+}
+
+interface MaterializedPublicationOutcome {
+  readiness: RelayV2MaterializedReadiness;
+  accepted: boolean;
 }
 
 interface PendingChange {
@@ -533,6 +648,32 @@ function validateOpaqueInput(value: string, label: string): void {
     || value.includes("\0")
   ) {
     throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", `${label} is invalid`);
+  }
+}
+
+function normalizeCanonicalResolverToken(
+  value: unknown,
+): RelayV2CanonicalResourceResolverToken {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "hostEpoch", "resourceMappingDigest", "discoveryGeneration",
+    ])
+    || value.schemaVersion !== 1) {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "resolver token is invalid");
+  }
+  for (const field of [
+    "hostEpoch", "resourceMappingDigest", "discoveryGeneration",
+  ] as const) {
+    validateOpaqueInput(value[field] as string, `resolver token ${field}`);
+  }
+  return clone(value) as unknown as RelayV2CanonicalResourceResolverToken;
+}
+
+function resolverCutIsCurrent(cut: RelayV2ResourceResolverDiscoveryCut): boolean {
+  try {
+    return cut.isCurrent() === true;
+  } catch {
+    return false;
   }
 }
 
@@ -1036,6 +1177,19 @@ function sameJson(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
 }
 
+function canonicalResolverResourceMappingDigest(
+  hostEpoch: string,
+  state: PersistedMaterializedState,
+): string {
+  const digest = createHash("sha256").update(canonicalJson({
+    hostEpoch,
+    aggregateAuthorityEstablished: state.aggregateAuthorityEstablished,
+    aggregateCoverage: state.aggregateCoverage,
+    scopes: state.scopes,
+  }), "utf8").digest("base64url");
+  return `twrmap1.${digest}`;
+}
+
 function parseRequestFingerprint(value: unknown): RelayV2CommandRequestFingerprint {
   if (!isRecord(value)
     || !exactKeys(value, ["schemaVersion", "algorithm", "digest"])
@@ -1316,6 +1470,156 @@ function revisionFor(snapshot: RelayV2HostStateSnapshot, key: string): string {
   return snapshot.revisions[key] ?? "0";
 }
 
+function normalizeResolverProcessTarget(
+  value: unknown,
+): RelayV2ResourceResolverProcessTarget {
+  if (!isRecord(value)
+    || !exactKeys(value, ["kind", "targetId"])
+    || (value.kind !== "local" && value.kind !== "ssh")) {
+    throw new RelayV2MaterializedStateError("INTERNAL", "resolver process target is malformed");
+  }
+  assertString(value.targetId, "resolver process target ID", 128);
+  return { kind: value.kind, targetId: value.targetId };
+}
+
+function normalizeResolverCapabilities(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 64) {
+    throw new RelayV2MaterializedStateError("INTERNAL", "resolver capabilities are malformed");
+  }
+  const capabilities = value.map((capability) => {
+    assertString(capability, "resolver capability", 128);
+    return capability;
+  });
+  if (new Set(capabilities).size !== capabilities.length) {
+    throw new RelayV2MaterializedStateError("INTERNAL", "resolver capabilities are duplicated");
+  }
+  return capabilities;
+}
+
+function resolverEvidenceSessionKey(
+  scopeBackendIdentity: string,
+  backendKind: RelayV2Session["kind"],
+  sessionBackendIdentity: string,
+): string {
+  return canonicalJson({ scopeBackendIdentity, backendKind, sessionBackendIdentity });
+}
+
+function normalizeResolverDiscoveryCut(
+  value: unknown,
+  scopes: readonly RelayV2DiscoveredScope[],
+): RelayV2ResourceResolverDiscoveryCut {
+  if (!isRecord(value)
+    || !exactKeys(value, ["generation", "scopeTargets", "sessionTargets", "isCurrent"])
+    || !Array.isArray(value.scopeTargets)
+    || !Array.isArray(value.sessionTargets)
+    || typeof value.isCurrent !== "function") {
+    throw new RelayV2MaterializedStateError("INTERNAL", "resolver discovery cut is malformed");
+  }
+  assertString(value.generation, "resolver discovery generation", 128);
+  const discoveredScopes = new Map(scopes.map((scope) => [scope.backendIdentity, scope]));
+  const scopeKeys = new Set<string>();
+  const scopeTargets = value.scopeTargets.map((raw) => {
+    if (!isRecord(raw)
+      || !exactKeys(raw, ["scopeBackendIdentity", "processTarget", "capabilities"])) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "resolver Scope evidence is malformed");
+    }
+    assertString(raw.scopeBackendIdentity, "resolver Scope backend identity", 4_096);
+    const discovered = discoveredScopes.get(raw.scopeBackendIdentity);
+    const processTarget = normalizeResolverProcessTarget(raw.processTarget);
+    if (!discovered || discovered.kind !== processTarget.kind
+      || scopeKeys.has(raw.scopeBackendIdentity)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "resolver Scope evidence crossed authority");
+    }
+    scopeKeys.add(raw.scopeBackendIdentity);
+    return {
+      scopeBackendIdentity: raw.scopeBackendIdentity,
+      processTarget,
+      capabilities: normalizeResolverCapabilities(raw.capabilities),
+    };
+  });
+  const discoveredSessions = new Set(scopes.flatMap((scope) => (
+    scope.sessions.map((session) => resolverEvidenceSessionKey(
+      scope.backendIdentity,
+      session.kind,
+      session.backendIdentity,
+    ))
+  )));
+  const sessionKeys = new Set<string>();
+  const sessionTargets = value.sessionTargets.map((raw) => {
+    if (!isRecord(raw)
+      || !exactKeys(raw, [
+        "scopeBackendIdentity", "sessionBackendIdentity", "backendKind",
+        "processTarget", "capabilities", "managedTarget",
+      ])
+      || (raw.backendKind !== "worktree" && raw.backendKind !== "terminal")
+      || !isRecord(raw.managedTarget)
+      || !exactKeys(raw.managedTarget, ["name", "kind", "incarnation"])
+      || raw.managedTarget.kind !== raw.backendKind) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "resolver Session evidence is malformed");
+    }
+    assertString(raw.scopeBackendIdentity, "resolver Session Scope backend identity", 4_096);
+    assertString(raw.sessionBackendIdentity, "resolver Session backend identity", 4_096);
+    assertString(raw.managedTarget.name, "resolver managed Session name", 128);
+    assertString(raw.managedTarget.incarnation, "resolver managed Session incarnation", 128);
+    const key = resolverEvidenceSessionKey(
+      raw.scopeBackendIdentity,
+      raw.backendKind,
+      raw.sessionBackendIdentity,
+    );
+    const processTarget = normalizeResolverProcessTarget(raw.processTarget);
+    const scopeTarget = scopeTargets.find((candidate) => (
+      candidate.scopeBackendIdentity === raw.scopeBackendIdentity
+    ));
+    if (!discoveredSessions.has(key)
+      || sessionKeys.has(key)
+      || scopeTarget === undefined
+      || !sameJson(scopeTarget.processTarget, processTarget)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "resolver Session evidence crossed authority");
+    }
+    sessionKeys.add(key);
+    const capabilities = normalizeResolverCapabilities(raw.capabilities);
+    if (!sameJson(scopeTarget.capabilities, capabilities)) {
+      throw new RelayV2MaterializedStateError("INTERNAL", "resolver capabilities crossed Scope authority");
+    }
+    let expectedBackendIdentity: string;
+    try {
+      expectedBackendIdentity = issueRelayV2CanonicalBackendInstanceKey({
+        processTarget,
+        incarnation: raw.managedTarget.incarnation,
+      });
+    } catch {
+      throw new RelayV2MaterializedStateError(
+        "INTERNAL",
+        "resolver managed Session incarnation is invalid",
+      );
+    }
+    if (expectedBackendIdentity !== raw.sessionBackendIdentity) {
+      throw new RelayV2MaterializedStateError(
+        "INTERNAL",
+        "resolver managed Session incarnation crossed backend authority",
+      );
+    }
+    return {
+      scopeBackendIdentity: raw.scopeBackendIdentity,
+      sessionBackendIdentity: raw.sessionBackendIdentity,
+      backendKind: raw.backendKind,
+      processTarget,
+      capabilities,
+      managedTarget: {
+        name: raw.managedTarget.name,
+        kind: raw.managedTarget.kind,
+        incarnation: raw.managedTarget.incarnation,
+      },
+    };
+  });
+  return {
+    generation: value.generation,
+    scopeTargets,
+    sessionTargets,
+    isCurrent: () => (value.isCurrent as () => unknown)() === true,
+  };
+}
+
 function normalizeScan(scan: RelayV2ResourceDiscoveryScan): RelayV2ResourceDiscoveryScan {
   if (!scan || (scan.coverage !== "complete" && scan.coverage !== "partial") || !Array.isArray(scan.scopes)) {
     throw new RelayV2MaterializedStateError("INTERNAL", "discovery returned an invalid scan");
@@ -1378,7 +1682,15 @@ function normalizeScan(scan: RelayV2ResourceDiscoveryScan): RelayV2ResourceDisco
     ));
     return { ...clone(scope), reservationCorrelationCompleteness, sessions };
   }).sort((left, right) => utf8Compare(left.backendIdentity, right.backendIdentity));
-  return { coverage: scan.coverage, scopes };
+  const normalized: RelayV2ResourceDiscoveryScan = { coverage: scan.coverage, scopes };
+  const resolverCut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
+  if (resolverCut !== undefined) {
+    Object.defineProperty(normalized, RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: normalizeResolverDiscoveryCut(resolverCut, scopes),
+      enumerable: false,
+    });
+  }
+  return normalized;
 }
 
 function unreachableDiscoveryError(): RelayV2DiscoveryError {
@@ -2308,12 +2620,15 @@ export class RelayV2MaterializedStateFoundation {
   readonly reservationLimits: ResourceReservationLimits;
   readonly commandResourceMutationOwner: RelayV2CommandResourceMutationOwner;
   readonly snapshotCutSource: RelayV2MaterializedStateCutSource;
+  readonly canonicalTargetResolver: RelayV2CanonicalResourceResolverPort;
 
   private readonly discovery: RelayV2ResourceDiscovery;
   private readonly reservationSettlementAuthority: RelayV2ReservationSettlementAuthority | undefined;
   private readonly store: Pick<RelayV2HostStateStore, "serialize">;
   private readonly readinessSink: RelayV2MaterializedReadinessSink;
   private readonly subscribers = new Map<string, Subscriber>();
+  private publishedCanonicalResolver: PublishedCanonicalResolver | null = null;
+  private reconcileInFlight: Promise<RelayV2MaterializedReconcileResult> | null = null;
   private observedHostEpoch: string | null = null;
   private continuityFenceReason: ContinuityFenceReason | null = null;
 
@@ -2374,21 +2689,25 @@ export class RelayV2MaterializedStateFoundation {
         snapshot: RelayV2HostStateSnapshot,
         evidence: RelayV2CommandResourceCommitEvidence,
       ) => {
+        this.publishedCanonicalResolver = null;
         this.afterCommit(
           snapshot,
           evidence.events,
           readinessFor(snapshot, parseMaterializedState(snapshot), this.capacity),
         );
       },
-      fenceCommitUncertain: (snapshot: RelayV2HostStateSnapshot) => (
-        this.fenceCommitUncertain(snapshot)
-      ),
-      fencePersistedCapacity: (snapshot: RelayV2HostStateSnapshot) => (
-        this.withdrawReadiness(snapshot, "persisted_capacity_exceeded")
-      ),
-      fenceMaterializedAuthority: (snapshot: RelayV2HostStateSnapshot) => (
-        this.withdrawReadiness(snapshot, "materialized_authority_conflict")
-      ),
+      fenceCommitUncertain: (snapshot: RelayV2HostStateSnapshot) => {
+        this.publishedCanonicalResolver = null;
+        this.fenceCommitUncertain(snapshot);
+      },
+      fencePersistedCapacity: (snapshot: RelayV2HostStateSnapshot) => {
+        this.publishedCanonicalResolver = null;
+        this.withdrawReadiness(snapshot, "persisted_capacity_exceeded");
+      },
+      fenceMaterializedAuthority: (snapshot: RelayV2HostStateSnapshot) => {
+        this.publishedCanonicalResolver = null;
+        this.withdrawReadiness(snapshot, "materialized_authority_conflict");
+      },
     });
     this.snapshotCutSource = Object.freeze({
       currentHostEpoch: () => this.currentSnapshotHostEpoch(),
@@ -2401,6 +2720,44 @@ export class RelayV2MaterializedStateFoundation {
       ),
       capture: (expectedHostEpoch: string) => (
         this.captureMaterializedStateCut(expectedHostEpoch)
+      ),
+    });
+    this.canonicalTargetResolver = Object.freeze({
+      captureToken: (expectedHostEpoch: string) => (
+        this.captureCanonicalResolverToken(expectedHostEpoch)
+      ),
+      resolveScope: (token: RelayV2CanonicalResourceResolverToken, scopeId: string) => (
+        this.resolveCanonicalScopeTarget(token, scopeId)
+      ),
+      resolveSession: (
+        token: RelayV2CanonicalResourceResolverToken,
+        scopeId: string,
+        sessionId: string,
+      ) => this.resolveCanonicalSessionTarget(token, scopeId, sessionId),
+      fenceScopeForAdmission: (
+        transaction: RelayV2HostStateTransaction,
+        token: RelayV2CanonicalResourceResolverToken,
+        expectedScopeId: string,
+        target: RelayV2CanonicalResolvedScopeTarget,
+      ) => this.fenceCanonicalTargetForAdmission(
+        transaction,
+        token,
+        expectedScopeId,
+        null,
+        target,
+      ),
+      fenceSessionForAdmission: (
+        transaction: RelayV2HostStateTransaction,
+        token: RelayV2CanonicalResourceResolverToken,
+        expectedScopeId: string,
+        expectedSessionId: string,
+        target: RelayV2CanonicalResolvedSessionTarget,
+      ) => this.fenceCanonicalTargetForAdmission(
+        transaction,
+        token,
+        expectedScopeId,
+        expectedSessionId,
+        target,
       ),
     });
   }
@@ -2856,7 +3213,219 @@ export class RelayV2MaterializedStateFoundation {
     return true;
   }
 
-  async reconcile(): Promise<RelayV2MaterializedReconcileResult> {
+  private async captureCanonicalResolverToken(
+    expectedHostEpoch: string,
+  ): Promise<RelayV2CanonicalResourceResolverToken> {
+    validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const publication = this.requireCanonicalResolver(snapshot, state);
+      return clone(publication.token);
+    });
+  }
+
+  private async resolveCanonicalScopeTarget(
+    rawToken: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+  ): Promise<RelayV2CanonicalResolvedScopeTarget> {
+    const token = normalizeCanonicalResolverToken(rawToken);
+    validateOpaqueInput(scopeId, "scopeId");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const publication = this.requireCanonicalResolver(snapshot, state, token);
+      const target = publication.scopes.get(scopeId);
+      if (target === undefined) {
+        throw new RelayV2MaterializedStateError(
+          "SCOPE_NOT_FOUND",
+          "Scope is absent from the complete canonical resolver cut",
+        );
+      }
+      return clone(target);
+    });
+  }
+
+  private async resolveCanonicalSessionTarget(
+    rawToken: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<RelayV2CanonicalResolvedSessionTarget> {
+    const token = normalizeCanonicalResolverToken(rawToken);
+    validateOpaqueInput(scopeId, "scopeId");
+    validateOpaqueInput(sessionId, "sessionId");
+    return this.store.serialize((section) => {
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      assertExpectedEpoch(token.hostEpoch, snapshot.hostEpoch);
+      const state = parseMaterializedState(snapshot);
+      const publication = this.requireCanonicalResolver(snapshot, state, token);
+      if (!publication.scopes.has(scopeId)) {
+        throw new RelayV2MaterializedStateError(
+          "SCOPE_NOT_FOUND",
+          "Scope is absent from the complete canonical resolver cut",
+        );
+      }
+      const target = publication.sessions.get(`${scopeId}\0${sessionId}`);
+      if (target === undefined) {
+        throw new RelayV2MaterializedStateError(
+          "SESSION_NOT_FOUND",
+          "Session is absent from the complete canonical resolver cut",
+        );
+      }
+      return clone(target);
+    });
+  }
+
+  private fenceCanonicalTargetForAdmission(
+    transaction: RelayV2HostStateTransaction,
+    rawToken: RelayV2CanonicalResourceResolverToken,
+    expectedScopeId: string,
+    expectedSessionId: string | null,
+    rawTarget: RelayV2CanonicalResolvedScopeTarget | RelayV2CanonicalResolvedSessionTarget,
+  ): void {
+    const token = normalizeCanonicalResolverToken(rawToken);
+    validateOpaqueInput(expectedScopeId, "expectedScopeId");
+    if (expectedSessionId !== null) validateOpaqueInput(expectedSessionId, "expectedSessionId");
+    if (transaction.hostEpoch !== token.hostEpoch) {
+      throw new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical target admission fence crossed host lineage",
+      );
+    }
+    if (transaction.getMaterializedReadinessFence() !== null) {
+      throw new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical target admission fence observed withdrawn materialized readiness",
+      );
+    }
+    const snapshot = materializedSnapshotForTransaction(transaction, transaction.hostEpoch);
+    const state = parseMaterializedState(snapshot);
+    const publication = this.requireCanonicalResolver(snapshot, state, token);
+    const target = isRecord(rawTarget) ? rawTarget : null;
+    const exactIdentity = target?.scopeId === expectedScopeId
+      && (expectedSessionId === null || target?.sessionId === expectedSessionId);
+    const expected = !exactIdentity
+      ? undefined
+      : expectedSessionId === null
+        ? publication.scopes.get(expectedScopeId)
+        : publication.sessions.get(`${expectedScopeId}\0${expectedSessionId}`);
+    if (expected === undefined || !sameJson(expected, rawTarget)) {
+      throw new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical target admission evidence is stale or inexact",
+      );
+    }
+  }
+
+  private requireCanonicalResolver(
+    snapshot: RelayV2HostStateSnapshot,
+    state: PersistedMaterializedState,
+    token?: RelayV2CanonicalResourceResolverToken,
+  ): PublishedCanonicalResolver {
+    const publication = this.publishedCanonicalResolver;
+    if (publication === null
+      || !resolverCutIsCurrent(publication.discoveryCut)
+      || publication.token.hostEpoch !== snapshot.hostEpoch
+      || publication.token.resourceMappingDigest
+        !== canonicalResolverResourceMappingDigest(snapshot.hostEpoch, state)
+      || (token !== undefined && !sameJson(token, publication.token))) {
+      throw new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "canonical target resolver has no current complete discovery cut",
+      );
+    }
+    return publication;
+  }
+
+  private publishCanonicalResolver(
+    snapshot: RelayV2HostStateSnapshot,
+    scan: RelayV2ResourceDiscoveryScan,
+  ): void {
+    this.publishedCanonicalResolver = null;
+    const discoveryCut = scan[RELAY_V2_RESOURCE_RESOLVER_CUT];
+    if (discoveryCut === undefined
+      || scan.coverage !== "complete"
+      || !resolverCutIsCurrent(discoveryCut)) return;
+    const state = parseMaterializedState(snapshot);
+    if (state.aggregateCoverage !== "complete"
+      || !state.aggregateAuthorityEstablished
+      || state.scopes.some((scope) => (
+        scope.item.reachability !== "online"
+        || scope.sessionsCompleteness !== "complete"
+        || !scope.sessionsAuthorityEstablished
+      ))) return;
+    const scopeEvidence = new Map(discoveryCut.scopeTargets.map((target) => (
+      [target.scopeBackendIdentity, target]
+    )));
+    const sessionEvidence = new Map(discoveryCut.sessionTargets.map((target) => [
+      resolverEvidenceSessionKey(
+        target.scopeBackendIdentity,
+        target.backendKind,
+        target.sessionBackendIdentity,
+      ),
+      target,
+    ]));
+    if (scopeEvidence.size !== state.scopes.length
+      || sessionEvidence.size !== state.scopes.reduce((total, scope) => (
+        total + scope.sessions.length
+      ), 0)) return;
+    const scopes = new Map<string, RelayV2CanonicalResolvedScopeTarget>();
+    const sessions = new Map<string, RelayV2CanonicalResolvedSessionTarget>();
+    for (const scope of state.scopes) {
+      const evidence = scopeEvidence.get(scope.backendIdentity);
+      if (evidence === undefined || evidence.processTarget.kind !== scope.item.kind) return;
+      const resolvedScope: RelayV2CanonicalResolvedScopeTarget = {
+        authorization: "evidence_only",
+        hostEpoch: snapshot.hostEpoch,
+        discoveryGeneration: discoveryCut.generation,
+        scopeId: scope.item.scopeId,
+        processTarget: clone(evidence.processTarget),
+        capabilities: clone(evidence.capabilities),
+      };
+      scopes.set(scope.item.scopeId, resolvedScope);
+      for (const session of scope.sessions) {
+        const sessionTarget = sessionEvidence.get(resolverEvidenceSessionKey(
+          scope.backendIdentity,
+          session.item.kind,
+          session.backendIdentity,
+        ));
+        if (sessionTarget === undefined
+          || !sameJson(sessionTarget.processTarget, evidence.processTarget)
+          || !sameJson(sessionTarget.capabilities, evidence.capabilities)
+          || sessionTarget.managedTarget.kind !== session.item.kind) return;
+        sessions.set(`${scope.item.scopeId}\0${session.item.sessionId}`, {
+          ...clone(resolvedScope),
+          sessionId: session.item.sessionId,
+          backendInstanceKey: session.backendIdentity,
+          managedTarget: clone(sessionTarget.managedTarget),
+        });
+      }
+    }
+    const token: RelayV2CanonicalResourceResolverToken = {
+      schemaVersion: 1,
+      hostEpoch: snapshot.hostEpoch,
+      resourceMappingDigest: canonicalResolverResourceMappingDigest(snapshot.hostEpoch, state),
+      discoveryGeneration: discoveryCut.generation,
+    };
+    this.publishedCanonicalResolver = { token, discoveryCut, scopes, sessions };
+  }
+
+  reconcile(): Promise<RelayV2MaterializedReconcileResult> {
+    if (this.reconcileInFlight !== null) return this.reconcileInFlight;
+    const promise = Promise.resolve().then(() => this.runReconcile());
+    this.reconcileInFlight = promise;
+    void promise.finally(() => {
+      if (this.reconcileInFlight === promise) this.reconcileInFlight = null;
+    }).catch(() => {});
+    return promise;
+  }
+
+  private async runReconcile(): Promise<RelayV2MaterializedReconcileResult> {
     for (let attemptNumber = 1; attemptNumber <= RECONCILE_MAX_ATTEMPTS; attemptNumber += 1) {
       const scanCut = await this.store.serialize((section) => {
         const snapshot = section.read();
@@ -2887,7 +3456,9 @@ export class RelayV2MaterializedStateFoundation {
         this.observeLineage(before);
         const current = parseMaterializedState(before);
         if (before.hostEpoch !== scanCut.hostEpoch
-          || current.generation !== scanCut.generation) {
+          || current.generation !== scanCut.generation
+          || (scan[RELAY_V2_RESOURCE_RESOLVER_CUT] !== undefined
+            && !resolverCutIsCurrent(scan[RELAY_V2_RESOURCE_RESOLVER_CUT]))) {
           if (attemptNumber === RECONCILE_MAX_ATTEMPTS) {
             this.latchPersistentWithdrawal(section, "reconcile_generation_conflict");
             return { kind: "exhausted" as const };
@@ -2936,7 +3507,7 @@ export class RelayV2MaterializedStateFoundation {
           }
           throw error;
         }
-        const readiness = this.afterCommit(
+        const publication = this.afterCommit(
           commit.snapshot,
           commit.value.events,
           readinessFor(
@@ -2945,6 +3516,11 @@ export class RelayV2MaterializedStateFoundation {
             this.capacity,
           ),
         );
+        if (commit.value.authorityConflict === null && publication.accepted) {
+          this.publishCanonicalResolver(commit.snapshot, scan);
+        } else {
+          this.publishedCanonicalResolver = null;
+        }
         if (commit.value.authorityConflict !== null) {
           throw new RelayV2MaterializedStateError(
             "INTERNAL",
@@ -2956,7 +3532,7 @@ export class RelayV2MaterializedStateFoundation {
           value: {
             events: clone(commit.value.events),
             snapshot: commit.snapshot,
-            readiness,
+            readiness: publication.readiness,
           },
         };
       });
@@ -3208,27 +3784,28 @@ export class RelayV2MaterializedStateFoundation {
     snapshot: RelayV2HostStateSnapshot,
     events: readonly RelayV2JsonObject[],
     readiness: RelayV2MaterializedReadiness,
-  ): RelayV2MaterializedReadiness {
+  ): MaterializedPublicationOutcome {
     this.observeLineage(snapshot);
     this.dropSubscribersFromOtherLineages(snapshot.hostEpoch);
     const effectiveReadiness = this.continuityFenceReason === null
       ? readiness
       : continuityFenceReadiness(snapshot, this.continuityFenceReason);
-    if (
-      !this.applyReadiness(effectiveReadiness)
-      || !effectiveReadiness.snapshotMaterializationReady
-    ) {
+    const accepted = this.applyReadiness(effectiveReadiness)
+      && effectiveReadiness.snapshotMaterializationReady;
+    if (!accepted) {
+      this.publishedCanonicalResolver = null;
       this.closeAllSubscribers(new RelayV2MaterializedStateError(
         "CAPABILITY_UNAVAILABLE",
         `materialized readiness withdrawn: ${effectiveReadiness.reason}`,
       ));
-      return effectiveReadiness;
+      return { readiness: effectiveReadiness, accepted: false };
     }
     for (const event of events) this.publishEvent(event);
-    return effectiveReadiness;
+    return { readiness: effectiveReadiness, accepted: true };
   }
 
   private fenceCommitUncertain(snapshot: RelayV2HostStateSnapshot): void {
+    this.publishedCanonicalResolver = null;
     this.observedHostEpoch = snapshot.hostEpoch;
     this.continuityFenceReason = "commit_uncertain";
     this.applyReadiness(continuityFenceReadiness(snapshot, "commit_uncertain"));
@@ -3244,6 +3821,7 @@ export class RelayV2MaterializedStateFoundation {
       | "reconcile_generation_conflict"
       | "materialized_authority_conflict",
   ): void {
+    this.publishedCanonicalResolver = null;
     const readiness = withdrawnReadiness(snapshot, reason);
     this.applyReadiness(readiness);
     this.closeAllSubscribers(new RelayV2MaterializedStateError(
@@ -3274,6 +3852,7 @@ export class RelayV2MaterializedStateFoundation {
       return;
     }
     if (this.observedHostEpoch === snapshot.hostEpoch) return;
+    this.publishedCanonicalResolver = null;
     this.observedHostEpoch = snapshot.hostEpoch;
     this.continuityFenceReason = "host_epoch_changed";
     this.applyReadiness(continuityFenceReadiness(snapshot, "host_epoch_changed"));
@@ -3284,11 +3863,16 @@ export class RelayV2MaterializedStateFoundation {
   }
 
   private applyReadiness(readiness: RelayV2MaterializedReadiness): boolean {
+    let accepted = false;
     try {
-      return strictSynchronousTrue(this.readinessSink.apply(clone(readiness)));
+      accepted = strictSynchronousTrue(this.readinessSink.apply(clone(readiness)));
     } catch {
-      return false;
+      accepted = false;
     }
+    if (!accepted || !readiness.snapshotMaterializationReady || readiness.closeV2Routes) {
+      this.publishedCanonicalResolver = null;
+    }
+    return accepted;
   }
 
   private validateWelcome(

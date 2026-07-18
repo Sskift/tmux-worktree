@@ -10,6 +10,7 @@ import {
   RELAY_V2_CANONICAL_TW_RPC_QUERY_STDERR_MAX_BYTES,
   RELAY_V2_CANONICAL_TW_RPC_QUERY_STDOUT_MAX_BYTES,
   RelayV2CanonicalTwRpcQueryTransportAdapter,
+  createRelayV2CanonicalTwRpcConfigSnapshotFoundation,
 } from "../dist/relay/v2/canonicalTwRpcQueryTransportAdapter.js";
 
 const encoder = new TextEncoder();
@@ -123,11 +124,11 @@ test("query transport invokes only structured no-shell canonical read entrypoint
 
   const localResult = await adapter.query(query(
     "capabilities",
-    { kind: "local", targetId: "bundled-local-cli" },
+    adapter.processTarget("local", "bundled-local-cli"),
   ));
   const sshResult = await adapter.query(query(
     "list",
-    { kind: "ssh", targetId: "configured-devbox" },
+    adapter.processTarget("ssh", "configured-devbox"),
   ));
 
   assert.equal(localResult.protocolVersion, 2);
@@ -173,13 +174,16 @@ test("query transport invokes only structured no-shell canonical read entrypoint
 
   await assert.rejects(
     adapter.query({
-      ...query("capabilities", { kind: "local", targetId: "bundled-local-cli" }),
+      ...query("capabilities", adapter.processTarget("local", "bundled-local-cli")),
       command: "kill-session",
     }),
     assertTransportCode("INVALID_REQUEST"),
   );
   await assert.rejects(
-    adapter.query(query("list", { kind: "ssh", targetId: "ssh-config-alias" })),
+    adapter.query(query("list", {
+      kind: "ssh",
+      targetId: "ssh-config-alias",
+    })),
     assertTransportCode("TARGET_UNAVAILABLE"),
   );
   assert.throws(
@@ -189,7 +193,181 @@ test("query transport invokes only structured no-shell canonical read entrypoint
     }),
     /invalid canonical remote tw executable/,
   );
+  for (const missing of ["knownHostsFile", "user", "port", "identityFile", "twExecutable"]) {
+    const incomplete = { ...sshTarget() };
+    delete incomplete[missing];
+    assert.throws(
+      () => new RelayV2CanonicalTwRpcQueryTransportAdapter({
+        targets: [incomplete],
+        runner,
+      }),
+      /invalid canonical TW RPC v2 SSH query target/,
+      `SSH target must explicitly bind ${missing}`,
+    );
+  }
   assert.equal(runner.calls.length, 2, "rejection must not invoke a mutation or fallback");
+});
+
+test("default-off config factory derives only local plus explicit Hosts and retires old descriptors before replacement", async () => {
+  let configSnapshot = {
+    hosts: [{
+      id: "stable-host-id",
+      label: "Configured build host",
+      host: "old.example.com",
+      user: "builder",
+      port: 2222,
+      identityFile: "/configured/ssh/old_ed25519",
+      twPath: "/opt/tw/bin/tw",
+    }],
+  };
+  let releaseOld;
+  const oldBarrier = new Promise((resolve) => { releaseOld = resolve; });
+  let oldKills = 0;
+  let blockOld = false;
+  const runner = fakeRunner((request) => {
+    const command = request.argv.at(-1);
+    if (request.argv.includes("old.example.com") && blockOld) {
+      return {
+        stdout: {
+          async *[Symbol.asyncIterator]() {
+            await oldBarrier;
+            yield encoder.encode(`${JSON.stringify(capabilities())}\n`);
+          },
+        },
+        stderr: { async *[Symbol.asyncIterator]() { await oldBarrier; } },
+        exited: oldBarrier.then(() => ({ exitCode: 0, signal: null })),
+        kill(signal) {
+          assert.equal(signal, "SIGKILL");
+          oldKills += 1;
+        },
+      };
+    }
+    return command === "capabilities"
+      ? jsonProcess(capabilities())
+      : jsonProcess({ protocolVersion: 2, sessions: [] });
+  });
+  const foundation = createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
+    configLoader: () => structuredClone(configSnapshot),
+    localTarget: localTarget(),
+    knownHostsFile: "/configured/ssh/known_hosts",
+    sshExecutable: "/usr/bin/ssh",
+    runner,
+  });
+  assert.equal(runner.calls.length, 0, "factory construction must not spawn");
+
+  const initialScan = await foundation.discovery.scan();
+  const oldTarget = initialScan[Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")]
+    .scopeTargets.find((target) => target.processTarget.kind === "ssh").processTarget;
+  assert.ok(oldTarget);
+  assert.throws(
+    () => foundation.queryPort.installContentAddressedTargets([{
+      ...sshTarget(),
+      targetId: oldTarget.targetId,
+      host: "masquerade.example.com",
+    }]),
+    /not content-addressed/,
+  );
+  blockOld = true;
+  const callsBeforeBlockedScan = runner.calls.length;
+  const oldScanPromise = foundation.discovery.scan();
+  while (runner.calls.length === callsBeforeBlockedScan) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+  assert.equal(runner.calls.at(-1).argv.includes("old.example.com"), true);
+  configSnapshot = {
+    hosts: [{
+      ...configSnapshot.hosts[0],
+      host: "new.example.com",
+      identityFile: "/configured/ssh/new_ed25519",
+    }],
+  };
+  const reconfigured = foundation.reconfigure();
+  const currentScanPromise = foundation.discovery.scan();
+  const callsDuringRetirement = runner.calls.length;
+  await assert.rejects(
+    foundation.queryPort.query(query("capabilities", oldTarget)),
+    assertTransportCode("TARGET_UNAVAILABLE"),
+  );
+  assert.equal(
+    runner.calls.length,
+    callsDuringRetirement,
+    "retirement window must synchronously withdraw the old binding",
+  );
+  while (oldKills === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(runner.calls.some((call) => call.argv.includes("new.example.com")), false);
+
+  releaseOld();
+  await oldScanPromise;
+  await reconfigured;
+  assert.equal(
+    initialScan[Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")].isCurrent(),
+    false,
+  );
+  const currentScan = await currentScanPromise;
+  const callsBeforeOldPlan = runner.calls.length;
+  await assert.rejects(
+    foundation.queryPort.query(query("capabilities", oldTarget)),
+    assertTransportCode("TARGET_UNAVAILABLE"),
+  );
+  assert.equal(runner.calls.length, callsBeforeOldPlan, "retired plan must reach zero spawns");
+
+  const currentTarget = currentScan[
+    Symbol.for("tmux-worktree.relay-v2.resource-resolver-cut")
+  ].scopeTargets.find((target) => target.processTarget.kind === "ssh").processTarget;
+  assert.match(oldTarget.targetId, /^twcfg2\.[A-Za-z0-9_-]{43}$/);
+  assert.match(currentTarget.targetId, /^twcfg2\.[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(currentTarget.targetId, oldTarget.targetId);
+  assert.equal(currentScan.scopes.some((item) => item.backendIdentity === "configured-host:stable-host-id"), true);
+  assert.equal(runner.calls.some((call) => call.argv.includes("new.example.com")), true);
+  assert.equal(oldKills, 1);
+});
+
+test("config factory rejects incomplete Host provenance before any process spawn", () => {
+  const validHost = {
+    id: "configured",
+    host: "configured.example.com",
+    user: "builder",
+    port: 2222,
+    identityFile: "/configured/ssh/id_ed25519",
+    twPath: "/opt/tw/bin/tw",
+  };
+  const runner = fakeRunner(() => assert.fail("invalid config must not spawn"));
+  for (const missing of ["user", "port", "identityFile", "twPath"]) {
+    const host = { ...validHost };
+    delete host[missing];
+    assert.throws(
+      () => createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
+        configLoader: () => ({ hosts: [host] }),
+        localTarget: localTarget(),
+        knownHostsFile: "/configured/ssh/known_hosts",
+        sshExecutable: "/usr/bin/ssh",
+        runner,
+      }),
+      /lacks explicit/,
+      missing,
+    );
+  }
+  assert.throws(
+    () => createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
+      configLoader: () => ({ hosts: [validHost] }),
+      localTarget: localTarget(),
+      knownHostsFile: "known_hosts",
+      sshExecutable: "/usr/bin/ssh",
+      runner,
+    }),
+    /absolute paths/,
+  );
+  assert.throws(
+    () => createRelayV2CanonicalTwRpcConfigSnapshotFoundation({
+      configLoader: () => ({ hosts: [validHost] }),
+      localTarget: localTarget(),
+      sshExecutable: "/usr/bin/ssh",
+      runner,
+    }),
+    /absolute paths/,
+  );
+  assert.equal(runner.calls.length, 0);
 });
 
 test("query transport accepts exactly one bounded strict UTF-8 JSON object", async (t) => {
@@ -263,7 +441,7 @@ test("query transport accepts exactly one bounded strict UTF-8 JSON object", asy
       await assert.rejects(
         adapter.query(query(
           "capabilities",
-          { kind: "local", targetId: "bundled-local-cli" },
+          adapter.processTarget("local", "bundled-local-cli"),
         )),
         assertTransportCode(item.code),
       );
@@ -274,18 +452,27 @@ test("query transport accepts exactly one bounded strict UTF-8 JSON object", asy
 });
 
 function controlledProcess(events) {
-  let release;
-  const barrier = new Promise((resolve) => { release = resolve; });
-  const stream = {
-    async *[Symbol.asyncIterator]() {
-      await barrier;
-    },
-  };
+  let releaseExit;
+  let releaseStdout;
+  let releaseStderr;
+  const exitBarrier = new Promise((resolve) => { releaseExit = resolve; });
+  const stdoutBarrier = new Promise((resolve) => { releaseStdout = resolve; });
+  const stderrBarrier = new Promise((resolve) => { releaseStderr = resolve; });
   return {
     handle: {
-      stdout: stream,
-      stderr: stream,
-      exited: barrier.then(() => {
+      stdout: {
+        async *[Symbol.asyncIterator]() {
+          await stdoutBarrier;
+          events.push("stdout");
+        },
+      },
+      stderr: {
+        async *[Symbol.asyncIterator]() {
+          await stderrBarrier;
+          events.push("stderr");
+        },
+      },
+      exited: exitBarrier.then(() => {
         events.push("exit");
         return { exitCode: null, signal: "SIGKILL" };
       }),
@@ -294,11 +481,13 @@ function controlledProcess(events) {
         events.push("kill");
       },
     },
-    release,
+    releaseExit,
+    releaseStdout,
+    releaseStderr,
   };
 }
 
-test("timeout and AbortSignal kill once and reject only after the exit barrier", async (t) => {
+test("timeout and AbortSignal reject only after kill, exit, stdout, and stderr settle", async (t) => {
   await t.test("timeout", async () => {
     const events = [];
     const controlled = controlledProcess(events);
@@ -310,18 +499,24 @@ test("timeout and AbortSignal kill once and reject only after the exit barrier",
     let settled = false;
     const pending = adapter.query(query(
       "capabilities",
-      { kind: "local", targetId: "bundled-local-cli" },
+      adapter.processTarget("local", "bundled-local-cli"),
       { timeoutMs: 5 },
     ));
     pending.then(() => { settled = true; }, () => { settled = true; });
 
     await new Promise((resolve) => setTimeout(resolve, 15));
     assert.deepEqual(events, ["kill"]);
-    assert.equal(settled, false, "timeout must await child exit");
-    controlled.release();
+    assert.equal(settled, false, "timeout must await child resources");
+    controlled.releaseExit();
+    await Promise.resolve();
+    assert.equal(settled, false, "timeout must await stdout and stderr after exit");
+    controlled.releaseStdout();
+    await Promise.resolve();
+    assert.equal(settled, false, "timeout must await stderr after stdout");
+    controlled.releaseStderr();
     await assert.rejects(pending, assertTransportCode("TIMED_OUT"));
     events.push("rejected");
-    assert.deepEqual(events, ["kill", "exit", "rejected"]);
+    assert.deepEqual(events, ["kill", "exit", "stdout", "stderr", "rejected"]);
     assert.equal(runner.calls.length, 1);
   });
 
@@ -337,7 +532,7 @@ test("timeout and AbortSignal kill once and reject only after the exit barrier",
     let settled = false;
     const pending = adapter.query(query(
       "list",
-      { kind: "local", targetId: "bundled-local-cli" },
+      adapter.processTarget("local", "bundled-local-cli"),
       { timeoutMs: 100, signal: controller.signal },
     ));
     pending.then(() => { settled = true; }, () => { settled = true; });
@@ -346,11 +541,17 @@ test("timeout and AbortSignal kill once and reject only after the exit barrier",
     await Promise.resolve();
 
     assert.deepEqual(events, ["kill"]);
-    assert.equal(settled, false, "abort must await child exit");
-    controlled.release();
+    assert.equal(settled, false, "abort must await child resources");
+    controlled.releaseStderr();
+    await Promise.resolve();
+    assert.equal(settled, false, "abort must await exit and stdout after stderr");
+    controlled.releaseExit();
+    await Promise.resolve();
+    assert.equal(settled, false, "abort must await stdout after exit");
+    controlled.releaseStdout();
     await assert.rejects(pending, assertTransportCode("ABORTED"));
     events.push("rejected");
-    assert.deepEqual(events, ["kill", "exit", "rejected"]);
+    assert.deepEqual(events, ["kill", "stderr", "exit", "stdout", "rejected"]);
     assert.equal(runner.calls.length, 1);
   });
 });
@@ -394,7 +595,7 @@ test("process and response failures stay partial through discovery and never aut
           backendIdentity: "configured-scope",
           displayName: "Configured devbox",
           kind: "ssh",
-          processTarget: { kind: "ssh", targetId: "configured-devbox" },
+          processTarget: transport.processTarget("ssh", "configured-devbox"),
         }],
         queryPort: transport,
         queryTimeoutMs: 50,

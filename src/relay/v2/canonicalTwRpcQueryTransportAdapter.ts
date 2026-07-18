@@ -1,4 +1,7 @@
+import { spawn as spawnChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { isAbsolute } from "node:path";
+import { loadConfigFile, type Config } from "../../config.js";
 import type {
   RelayV2CanonicalTwRpcDiscoveryQuery,
   RelayV2CanonicalTwRpcDiscoveryQueryPort,
@@ -7,6 +10,7 @@ import {
   RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SCOPES,
   RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_MAX_SESSIONS_PER_SCOPE,
   RELAY_V2_CANONICAL_TW_RPC_DISCOVERY_QUERY_TIMEOUT_MS,
+  RelayV2CanonicalTwRpcDiscoveryAdapter,
 } from "./canonicalTwRpcDiscovery.js";
 import {
   decodeRelayV2StrictUtf8,
@@ -45,11 +49,11 @@ export interface RelayV2CanonicalTwRpcSshQueryTargetDescriptor {
   host: string;
   knownHostsFile: string;
   sshExecutable?: string;
-  user?: string;
-  port?: number;
-  identityFile?: string;
-  /** Must be the literal `tw` lookup or one absolute, shell-safe remote path. */
-  twExecutable?: string;
+  user: string;
+  port: number;
+  identityFile: string;
+  /** Absolute, shell-safe remote path to the caller-selected canonical tw CLI. */
+  twExecutable: string;
 }
 
 export type RelayV2CanonicalTwRpcQueryTargetDescriptor =
@@ -87,9 +91,56 @@ export interface RelayV2CanonicalTwRpcQueryProcessRunner {
   ): RelayV2CanonicalTwRpcQueryProcessHandle;
 }
 
+/**
+ * Default-disabled Node child runner for a future relay-host composition root.
+ * Constructing it has no side effects; only an injected discovery scan spawns.
+ */
+export class RelayV2CanonicalTwRpcChildProcessRunner
+implements RelayV2CanonicalTwRpcQueryProcessRunner {
+  spawn(
+    request: RelayV2CanonicalTwRpcQueryProcessRequest,
+  ): RelayV2CanonicalTwRpcQueryProcessHandle {
+    const child = spawnChildProcess(request.executable, [...request.argv], {
+      shell: request.shell,
+      stdio: [request.stdin, request.stdout, request.stderr],
+      windowsHide: true,
+    });
+    if (child.stdout === null || child.stderr === null) {
+      try { child.kill("SIGKILL"); } catch {}
+      throw new RelayV2CanonicalTwRpcQueryTransportError("SPAWN_FAILED");
+    }
+    const exited = new Promise<RelayV2CanonicalTwRpcQueryProcessExit>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("exit", (exitCode, signal) => resolve({ exitCode, signal }));
+    });
+    return {
+      stdout: child.stdout,
+      stderr: child.stderr,
+      exited,
+      kill: (signal) => { child.kill(signal); },
+    };
+  }
+}
+
 export interface RelayV2CanonicalTwRpcQueryTransportAdapterOptions {
   targets: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[];
   runner: RelayV2CanonicalTwRpcQueryProcessRunner;
+}
+
+export interface RelayV2CanonicalTwRpcConfigSnapshotFactoryOptions {
+  configLoader?: () => Pick<Config, "hosts"> | null;
+  localTarget: RelayV2CanonicalTwRpcLocalQueryTargetDescriptor;
+  /** Explicit trust store selected by future composition; never inferred from SSH config. */
+  knownHostsFile: string;
+  sshExecutable: string;
+  runner: RelayV2CanonicalTwRpcQueryProcessRunner;
+  queryTimeoutMs?: number;
+}
+
+export interface RelayV2CanonicalTwRpcConfigSnapshotFoundation {
+  readonly discovery: RelayV2CanonicalTwRpcDiscoveryAdapter;
+  readonly queryPort: RelayV2CanonicalTwRpcQueryTransportAdapter;
+  reconfigure(): Promise<void>;
 }
 
 export type RelayV2CanonicalTwRpcQueryTransportErrorCode =
@@ -122,9 +173,9 @@ type NormalizedTarget =
       host: string;
       knownHostsFile: string;
       sshExecutable: string;
-      user?: string;
-      port?: number;
-      identityFile?: string;
+      user: string;
+      port: number;
+      identityFile: string;
       twExecutable: string;
     }>;
 
@@ -167,6 +218,54 @@ function absolutePath(value: unknown): string {
   return path;
 }
 
+function canonicalDescriptorJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalDescriptorJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => (
+    `${JSON.stringify(key)}:${canonicalDescriptorJson(record[key])}`
+  )).join(",")}}`;
+}
+
+function effectiveTargetId(value: object): string {
+  const canonical = canonicalDescriptorJson({
+    domain: "tmux-worktree.relay-v2.configured-process-target.v1",
+    descriptor: value,
+  });
+  return `twcfg2.${createHash("sha256").update(canonical, "utf8").digest("base64url")}`;
+}
+
+function targetDescriptorForHash(target: NormalizedTarget): object {
+  return target.kind === "local"
+    ? {
+      kind: target.kind,
+      executable: target.executable,
+      argvPrefix: [...target.argvPrefix],
+    }
+    : {
+      kind: target.kind,
+      host: target.host,
+      knownHostsFile: target.knownHostsFile,
+      sshExecutable: target.sshExecutable,
+      user: target.user,
+      port: target.port,
+      identityFile: target.identityFile,
+      twExecutable: target.twExecutable,
+    };
+}
+
+function normalizeContentAddressedTargets(
+  value: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[],
+): ReadonlyMap<string, NormalizedTarget> {
+  const targets = normalizeTargets(value);
+  for (const target of targets.values()) {
+    if (target.targetId !== effectiveTargetId(targetDescriptorForHash(target))) {
+      throw new TypeError("canonical TW RPC v2 target ID is not content-addressed");
+    }
+  }
+  return targets;
+}
+
 function normalizeLocalTarget(
   value: Record<string, unknown>,
 ): Extract<NormalizedTarget, { kind: "local" }> {
@@ -187,9 +286,8 @@ function normalizeLocalTarget(
 }
 
 function normalizeRemoteTwExecutable(value: unknown): string {
-  const executable = boundedString(value ?? "tw");
-  if (executable !== "tw"
-    && (!executable.startsWith("/") || !/^\/[A-Za-z0-9._+@%=/:-]+$/.test(executable))) {
+  const executable = boundedString(value);
+  if (!executable.startsWith("/") || !/^\/[A-Za-z0-9._+@%=/:-]+$/.test(executable)) {
     throw new TypeError("invalid canonical remote tw executable");
   }
   return executable;
@@ -200,8 +298,11 @@ function normalizeSshTarget(
 ): Extract<NormalizedTarget, { kind: "ssh" }> {
   if (!hasExactKeys(
     value,
-    ["kind", "targetId", "host", "knownHostsFile"],
-    ["sshExecutable", "user", "port", "identityFile", "twExecutable"],
+    [
+      "kind", "targetId", "host", "knownHostsFile", "user", "port",
+      "identityFile", "twExecutable",
+    ],
+    ["sshExecutable"],
   )) {
     throw new TypeError("invalid canonical TW RPC v2 SSH query target");
   }
@@ -209,13 +310,12 @@ function normalizeSshTarget(
   if (host.startsWith("-") || !/^[A-Za-z0-9._:[\]-]+$/.test(host)) {
     throw new TypeError("invalid canonical TW RPC v2 SSH host");
   }
-  const user = value.user === undefined ? undefined : boundedString(value.user, 128);
-  if (user !== undefined && !/^[A-Za-z0-9._-]+$/.test(user)) {
+  const user = boundedString(value.user, 128);
+  if (!/^[A-Za-z0-9._-]+$/.test(user)) {
     throw new TypeError("invalid canonical TW RPC v2 SSH user");
   }
   const port = value.port;
-  if (port !== undefined
-    && (!Number.isSafeInteger(port) || (port as number) < 1 || (port as number) > 65_535)) {
+  if (!Number.isSafeInteger(port) || (port as number) < 1 || (port as number) > 65_535) {
     throw new TypeError("invalid canonical TW RPC v2 SSH port");
   }
   return Object.freeze({
@@ -224,11 +324,9 @@ function normalizeSshTarget(
     host,
     knownHostsFile: absolutePath(value.knownHostsFile),
     sshExecutable: boundedString(value.sshExecutable ?? "ssh"),
-    ...(user === undefined ? {} : { user }),
-    ...(port === undefined ? {} : { port: port as number }),
-    ...(value.identityFile === undefined
-      ? {}
-      : { identityFile: absolutePath(value.identityFile) }),
+    user,
+    port: port as number,
+    identityFile: absolutePath(value.identityFile),
     twExecutable: normalizeRemoteTwExecutable(value.twExecutable),
   });
 }
@@ -321,11 +419,10 @@ function invocationFor(
     "-o", "ClearAllForwardings=yes",
     "-o", "RequestTTY=no",
     "-o", `ConnectTimeout=${Math.max(1, Math.ceil(request.timeoutMs / 1_000))}`,
-    ...(target.identityFile === undefined
-      ? []
-      : ["-o", "IdentitiesOnly=yes", "-i", target.identityFile]),
-    ...(target.port === undefined ? [] : ["-p", String(target.port)]),
-    ...(target.user === undefined ? [] : ["-l", target.user]),
+    "-o", "IdentitiesOnly=yes",
+    "-i", target.identityFile,
+    "-p", String(target.port),
+    "-l", target.user,
     "--",
     target.host,
     target.twExecutable,
@@ -492,7 +589,7 @@ function parseStdout(value: Uint8Array): { [key: string]: RelayV2JsonValue } {
  */
 export class RelayV2CanonicalTwRpcQueryTransportAdapter
 implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
-  private readonly targets: ReadonlyMap<string, NormalizedTarget>;
+  private targets: ReadonlyMap<string, NormalizedTarget>;
 
   private readonly runner: RelayV2CanonicalTwRpcQueryProcessRunner;
 
@@ -505,6 +602,34 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
     }
     this.targets = normalizeTargets(options.targets);
     this.runner = options.runner;
+  }
+
+  /** Exact opaque descriptor identity for discovery/evidence, not execution authority. */
+  processTarget(
+    kind: "local" | "ssh",
+    targetId: string,
+  ): { kind: "local" | "ssh"; targetId: string } {
+    const normalizedId = boundedString(targetId, 128);
+    const target = this.targets.get(`${kind}\0${normalizedId}`);
+    if (target === undefined) {
+      throw new RelayV2CanonicalTwRpcQueryTransportError("TARGET_UNAVAILABLE");
+    }
+    return {
+      kind: target.kind,
+      targetId: target.targetId,
+    };
+  }
+
+  /** Synchronously withdraws every binding while a config generation retires. */
+  beginContentAddressedTargetTransition(): void {
+    this.targets = new Map();
+  }
+
+  /** Installs only descriptors whose opaque ID hashes their exact contents. */
+  installContentAddressedTargets(
+    targets: readonly RelayV2CanonicalTwRpcQueryTargetDescriptor[],
+  ): void {
+    this.targets = normalizeContentAddressedTargets(targets);
   }
 
   async query(rawRequest: RelayV2CanonicalTwRpcDiscoveryQuery): Promise<unknown> {
@@ -533,4 +658,162 @@ implements RelayV2CanonicalTwRpcDiscoveryQueryPort {
     }
     return parseStdout(result.stdout);
   }
+}
+
+interface DerivedConfigSnapshotTargets {
+  descriptors: RelayV2CanonicalTwRpcQueryTargetDescriptor[];
+  scopes: Array<{
+    backendIdentity: string;
+    displayName: string;
+    kind: "local" | "ssh";
+    targetId: string;
+  }>;
+}
+
+function deriveExplicitConfigSnapshotTargets(
+  configSnapshot: Pick<Config, "hosts"> | null,
+  options: Pick<
+    RelayV2CanonicalTwRpcConfigSnapshotFactoryOptions,
+    "localTarget" | "knownHostsFile" | "sshExecutable"
+  >,
+): DerivedConfigSnapshotTargets {
+  if (typeof options.localTarget?.executable !== "string"
+    || !isAbsolute(options.localTarget.executable)
+    || !Array.isArray(options.localTarget.argvPrefix ?? [])
+    || (options.localTarget.argvPrefix ?? []).some((argument) => (
+      typeof argument !== "string" || !isAbsolute(argument)
+    ))
+    || typeof options.knownHostsFile !== "string"
+    || !isAbsolute(options.knownHostsFile)
+    || typeof options.sshExecutable !== "string"
+    || !isAbsolute(options.sshExecutable)) {
+    throw new TypeError("canonical TW RPC v2 config factory requires explicit absolute paths");
+  }
+  if (configSnapshot !== null
+    && (!isRecord(configSnapshot) || !Array.isArray(configSnapshot.hosts))) {
+    throw new TypeError("canonical TW RPC v2 config snapshot is malformed");
+  }
+  const localDescriptor = {
+    kind: "local" as const,
+    executable: options.localTarget.executable,
+    argvPrefix: [...(options.localTarget.argvPrefix ?? [])],
+  };
+  const localTargetId = effectiveTargetId(localDescriptor);
+  const descriptors: RelayV2CanonicalTwRpcQueryTargetDescriptor[] = [{
+    kind: "local",
+    targetId: localTargetId,
+    executable: localDescriptor.executable,
+    argvPrefix: localDescriptor.argvPrefix,
+  }];
+  const scopes: DerivedConfigSnapshotTargets["scopes"] = [{
+    backendIdentity: `local:${options.localTarget.targetId}`,
+    displayName: "local",
+    kind: "local",
+    targetId: localTargetId,
+  }];
+  for (const host of configSnapshot?.hosts ?? []) {
+    if (!isRecord(host)
+      || typeof host.id !== "string"
+      || typeof host.host !== "string"
+      || typeof host.user !== "string"
+      || !Number.isSafeInteger(host.port)
+      || typeof host.identityFile !== "string"
+      || !isAbsolute(host.identityFile)
+      || typeof host.twPath !== "string"
+      || !isAbsolute(host.twPath)) {
+      throw new TypeError(
+        "canonical TW RPC v2 configured Host lacks explicit user/port/key/absolute tw path",
+      );
+    }
+    const sshDescriptor = {
+      kind: "ssh",
+      host: host.host,
+      knownHostsFile: options.knownHostsFile,
+      sshExecutable: options.sshExecutable,
+      user: host.user,
+      port: host.port as number,
+      identityFile: host.identityFile,
+      twExecutable: host.twPath,
+    } as const;
+    const targetId = effectiveTargetId(sshDescriptor);
+    descriptors.push({ ...sshDescriptor, targetId });
+    scopes.push({
+      backendIdentity: `configured-host:${host.id}`,
+      displayName: typeof host.label === "string" && host.label.length > 0
+        ? host.label
+        : host.id,
+      kind: "ssh",
+      targetId,
+    });
+  }
+  return { descriptors, scopes };
+}
+
+/**
+ * Default-off provenance factory for a future relay-host composition root.
+ * The only remote scopes come from loadConfigFile() (or an injected test
+ * loader). It does not read SSH config, start discovery, or wire H1/H3.
+ */
+export function createRelayV2CanonicalTwRpcConfigSnapshotFoundation(
+  options: RelayV2CanonicalTwRpcConfigSnapshotFactoryOptions,
+): RelayV2CanonicalTwRpcConfigSnapshotFoundation {
+  if (!isRecord(options) || !isRecord(options.runner) || !isRecord(options.localTarget)) {
+    throw new TypeError("invalid canonical TW RPC v2 config snapshot factory options");
+  }
+  const fixed = {
+    localTarget: { ...options.localTarget, argvPrefix: [...(options.localTarget.argvPrefix ?? [])] },
+    knownHostsFile: options.knownHostsFile,
+    sshExecutable: options.sshExecutable,
+  };
+  const configLoader = options.configLoader ?? loadConfigFile;
+  if (typeof configLoader !== "function") {
+    throw new TypeError("canonical TW RPC v2 config loader is invalid");
+  }
+  const build = (snapshot: Pick<Config, "hosts"> | null) => {
+    const derived = deriveExplicitConfigSnapshotTargets(snapshot, fixed);
+    const validator = new RelayV2CanonicalTwRpcQueryTransportAdapter({
+      targets: derived.descriptors,
+      runner: options.runner,
+    });
+    validator.installContentAddressedTargets(derived.descriptors);
+    const scopes = derived.scopes.map((scope) => ({
+      backendIdentity: scope.backendIdentity,
+      displayName: scope.displayName,
+      kind: scope.kind,
+      processTarget: validator.processTarget(scope.kind, scope.targetId),
+    }));
+    return { ...derived, scopes, validator };
+  };
+  const initial = build(configLoader());
+  const queryPort = initial.validator;
+  const discovery = new RelayV2CanonicalTwRpcDiscoveryAdapter({
+    scopes: initial.scopes,
+    queryPort,
+    queryTimeoutMs: options.queryTimeoutMs,
+  });
+  return Object.freeze({
+    discovery,
+    queryPort,
+    async reconfigure(): Promise<void> {
+      let next: ReturnType<typeof build>;
+      try {
+        next = build(configLoader());
+        new RelayV2CanonicalTwRpcDiscoveryAdapter({
+          scopes: next.scopes,
+          queryPort: next.validator,
+          queryTimeoutMs: options.queryTimeoutMs,
+        });
+      } catch (error) {
+        queryPort.beginContentAddressedTargetTransition();
+        await discovery.withdrawAfterRetirement();
+        throw error;
+      }
+      queryPort.beginContentAddressedTargetTransition();
+      await discovery.reconfigureAfterRetirement({
+        scopes: next.scopes,
+        queryPort,
+        queryTimeoutMs: options.queryTimeoutMs,
+      }, () => queryPort.installContentAddressedTargets(next.descriptors));
+    },
+  });
 }
