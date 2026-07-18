@@ -11,10 +11,17 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
+import com.tmuxworktree.mobile.core.relay.v2.profile.RelayProfileDialect
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2AgentExtensionUnavailableReason
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2CommandDedupeWindow
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectApplyResult
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2HandshakeContext
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2NegotiatedLimits
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectApplyLeasePort
 import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RepositoryEffectAuthority
+import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2RuntimeEffect
 import java.nio.charset.StandardCharsets
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +29,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -426,6 +434,116 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
         assertTrue(harness.handoff.accepted.isEmpty())
     }
 
+    @Test
+    fun `composition is inert until explicit effects and shares its durable owner`() = runBlocking {
+        val harness = Harness(
+            sessionId = "session-1",
+            statusRequestId = "agent-status-1",
+            timelineEpoch = "timeline-1",
+        )
+        val failClosedPlatform = AgentTranscriptLifecycleNotificationPlatformPort {
+            error("Platform must not be reached before an enabled negotiated frame")
+        }
+        val disabled = AgentTranscriptLifecycleRuntimeComposition(
+            harness.lease,
+            harness.operations,
+            harness.handoff,
+            failClosedPlatform,
+        )
+        val guarded = AgentTranscriptLifecycleRuntimeComposition(
+            harness.lease,
+            harness.operations,
+            harness.handoff,
+            failClosedPlatform,
+            enabled = true,
+        )
+        suspend fun assertNotOwned(effect: RelayV2RuntimeEffect) = assertSame(
+            effect,
+            (guarded.handle(effect) as
+                AgentTranscriptLifecycleRuntimeCompositionResult.NotOwned).effect,
+        )
+        val context = compositionHandshakeContext()
+        val generation = RelayV2EffectGeneration("profile-1", 7, 11)
+        val effect = RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+            context = context,
+            artifact = artifact("live-run-failed"),
+            ingress = AgentTranscriptLifecycleTrustedIngress.Live,
+            requestAdmission = null,
+            generation = generation,
+        )
+
+        assertEquals(
+            AgentTranscriptLifecycleRuntimeCompositionResult.Disabled,
+            disabled.handle(effect),
+        )
+        assertNotOwned(
+            RelayV2RuntimeEffect.Disconnected(
+                context.profile,
+                "not-agent-owned",
+                generation,
+                generation.connectionGeneration,
+            ),
+        )
+        val failedAdmission = harness.admission(
+            AgentTranscriptLifecycleRequestKind.STATUS,
+            "agent-status-1",
+        )
+        val failedRequest = AgentTranscriptLifecycleDurablePreparedRequest.Status(
+            AgentLocalRequestFence("1", "agent-status-1"),
+        ).toActorRequest(harness.fence())
+        val unavailable = RelayV2RuntimeEffect.AgentExtensionUnavailable(
+            context = context,
+            reason = RelayV2AgentExtensionUnavailableReason.REQUEST_TIMEOUT,
+            failedRequest = failedRequest,
+            requestAdmission = failedAdmission,
+            generation = generation,
+        )
+        assertNotOwned(unavailable)
+        assertEquals(
+            AgentTranscriptLifecycleRuntimeCompositionResult.ExtensionNotNegotiated,
+            guarded.handle(
+                effect.copy(
+                    context = compositionHandshakeContext(emptySet()),
+                    repositoryAuthority = effect.repositoryAuthority,
+                ),
+            ),
+        )
+
+        harness.operations.compositionNamespace = harness.namespace
+        val enabled = AgentTranscriptLifecycleRuntimeComposition(
+            harness.lease,
+            harness.operations,
+            harness.handoff,
+            AgentTranscriptLifecycleNotificationPlatformPort {
+                AgentTranscriptLifecycleNotificationPlatformResult.Posted
+            },
+            enabled = true,
+        )
+
+        val handled = enabled.handle(effect)
+            as AgentTranscriptLifecycleRuntimeCompositionResult.Consumed
+        val consumption = handled.consumption
+            as AgentTranscriptLifecycleRuntimeConsumeResult.Applied
+        assertTrue(
+            consumption.postCommitEffects.single() is
+                AgentTranscriptLifecycleRuntimePostCommitEffect.SyncRequired,
+        )
+        assertEquals(
+            listOf(
+                AgentTranscriptLifecycleNotificationDispatchResult.Completed(
+                    AgentTranscriptLifecycleNotificationExecutionResult.Platform(
+                        AgentTranscriptLifecycleNotificationPlatformResult.Posted,
+                    ),
+                ),
+            ),
+            handled.notificationDispatches,
+        )
+
+        val read = enabled.read(compositionReadRequest(harness.namespace))
+            as AgentTranscriptLifecycleReadState.Page
+        assertEquals(harness.namespace, read.namespace)
+    }
+
     private class Harness(
         sessionId: String,
         private val statusRequestId: String,
@@ -461,7 +579,7 @@ class AgentTranscriptLifecycleRuntimeConsumerTest {
             handoff,
             nextRequestToken = { "next-page-token" },
         )
-        private val namespace = AgentTranscriptLifecycleDurableNamespace(consumer, timelineEpoch)
+        val namespace = AgentTranscriptLifecycleDurableNamespace(consumer, timelineEpoch)
 
         fun fence(
             negotiated: Boolean = true,
@@ -549,7 +667,7 @@ private class RecordingApplyLease(
     }
 }
 
-private class RecordingDurableOperationPort : AgentTranscriptLifecycleDurableOperationPort {
+private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDurableRepository {
     data class ApplyGate(
         val entered: CompletableDeferred<Unit> = CompletableDeferred(),
         val release: CompletableDeferred<Unit> = CompletableDeferred(),
@@ -569,8 +687,70 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleDurableOpe
     private var nextApplyGate: ApplyGate? = null
     var forcedPageDirective: AgentTimelineSyncDirective? = null
     var failCorrelatedError: Boolean = false
+    var compositionNamespace: AgentTranscriptLifecycleDurableNamespace? = null
 
     fun blockNextApply(): ApplyGate = ApplyGate().also { nextApplyGate = it }
+
+    override suspend fun load(
+        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    ): AgentTranscriptLifecycleDurableRecord? {
+        val namespace = compositionNamespace ?: return null
+        if (namespace.consumer != consumer) return null
+        return AgentTranscriptLifecycleDurableRecord(
+            namespace,
+            AgentTranscriptLifecycleClientState(namespace.consumer.sessionIdentity),
+            AgentTranscriptDurableStorageAccounting.EMPTY,
+        )
+    }
+
+    override suspend fun claimNotificationUnderApplyLease(
+        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+        intent: AgentSystemNotificationIntent,
+    ): AgentTranscriptLifecycleNotificationClaimResult {
+        if (expectedNamespace != compositionNamespace) {
+            return AgentTranscriptLifecycleNotificationClaimResult.NotExecutable(
+                AgentTranscriptLifecycleNotificationNotExecutableReason.NAMESPACE_CHANGED,
+            )
+        }
+        return AgentTranscriptLifecycleNotificationClaimResult.Claimed(
+            AgentTranscriptLifecycleNotificationExecutionTicket(
+                "0123456789abcdef".repeat(4),
+                expectedNamespace,
+                intent,
+            ),
+        )
+    }
+
+    override suspend fun readRevisionPinnedPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        cursor: AgentTranscriptLifecycleReadCursor?,
+        limit: Int,
+    ): AgentTranscriptLifecycleRevisionPinnedReadResult {
+        require(limit in 1..AGENT_TRANSCRIPT_LIFECYCLE_READ_PAGE_LIMIT)
+        if (cursor != null && cursor.namespace != namespace) {
+            return AgentTranscriptLifecycleRevisionPinnedReadResult.NamespaceChanged
+        }
+        val storedNamespace = compositionNamespace
+            ?: return AgentTranscriptLifecycleRevisionPinnedReadResult.Missing
+        if (namespace != storedNamespace) {
+            return AgentTranscriptLifecycleRevisionPinnedReadResult.NamespaceChanged
+        }
+        val revision = AgentTranscriptLifecycleReadRevision(
+            namespace = storedNamespace,
+            parentPayloadSha256 = "1".repeat(64),
+            localGeneration = "1",
+            materializedThroughAgentSeq = "14",
+        )
+        if (cursor != null && cursor.revision != revision) {
+            return AgentTranscriptLifecycleRevisionPinnedReadResult.CursorRevisionChanged
+        }
+        return AgentTranscriptLifecycleRevisionPinnedReadResult.Page(
+            revision = revision,
+            items = emptyList(),
+            nextCursor = null,
+            endReached = true,
+        )
+    }
 
     override suspend fun prepareRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
@@ -595,7 +775,15 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleDurableOpe
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult {
         liveCommands += command
-        return reduction(command.fence)
+        val reduced = reduction(command.fence)
+        val decision = compositionNamespace?.let(::compositionNotificationDecision)
+            ?: return reduced
+        return reduced.copy(
+            reduction = reduced.reduction.copy(
+                notificationDecisions = listOf(decision),
+                syncDirective = AgentTimelineSyncDirective.StatusRefresh,
+            ),
+        )
     }
 
     override suspend fun consumeCorrelatedErrorUnderApplyLease(
@@ -742,6 +930,78 @@ private class RecordingDurableHandoff(
 
 private fun AgentTranscriptLifecycleDurableNamespace.lineage(): AgentTimelineLineage =
     AgentTimelineLineage(consumer.sessionIdentity, requireNotNull(timelineEpoch))
+
+private fun compositionNotificationDecision(
+    namespace: AgentTranscriptLifecycleDurableNamespace,
+): AgentNotificationDecision {
+    val witness = AgentLifecycleEventIdentityWitness(
+        eventId = "event-14",
+        agentEventSeq = "14",
+        lifecycleIdentity = AgentLifecycleIdentity(
+            AgentLifecycleScope.RUN,
+            "run-startup",
+            null,
+        ),
+        sourceEpoch = "source-startup",
+        state = AgentLifecycleState.FAILED,
+        failure = AgentLifecycleFailure("agent_start_failed", null),
+        occurredAtMs = 1_783_700_900_000,
+        closedEventDigest = null,
+    )
+    val consumer = namespace.consumer
+    val key = AgentNotificationDedupeKey(
+        profileId = consumer.profileId,
+        hostId = consumer.hostId,
+        hostEpoch = consumer.hostEpoch,
+        scopeId = consumer.scopeId,
+        sessionId = consumer.sessionId,
+        timelineEpoch = requireNotNull(namespace.timelineEpoch),
+        lifecycleEventId = witness.eventId,
+        state = witness.state,
+    )
+    val intent = AgentSystemNotificationIntent(key, localGeneration = "1")
+    return AgentNotificationDecision(
+        dedupeKey = key,
+        ledgerEntry = AgentNotificationLedgerEntry(
+            disposition = AgentNotificationDisposition.SHOWN,
+            eventIdentity = witness,
+            localGeneration = "1",
+        ),
+        systemNotificationIntent = intent,
+    )
+}
+
+private fun compositionReadRequest(namespace: AgentTranscriptLifecycleDurableNamespace) =
+    AgentTranscriptLifecycleReadRequest(
+        selectedNamespace = namespace,
+        access = AgentTranscriptLifecycleReadAccess(
+            dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
+            negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            support = AgentExtensionSupport.AVAILABLE,
+            activeNamespace = namespace,
+        ),
+        limit = 16,
+    )
+
+private fun compositionHandshakeContext(
+    negotiatedCapabilities: Set<String> = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+) = RelayV2HandshakeContext(
+    profile = RelayActiveProfileIdentity("profile-1", RelayProfileDialect.V2, 7),
+    principalId = "principal-1",
+    clientInstanceId = "client-1",
+    hostId = "mac-admin",
+    brokerEpoch = "broker-epoch-1",
+    hostEpoch = "host-epoch-1",
+    hostInstanceId = "host-instance-1",
+    eventSeq = "10",
+    negotiatedCapabilities = negotiatedCapabilities,
+    negotiatedLimits = RelayV2NegotiatedLimits(
+        1_048_576, 1_500_000, 1_048_576, 524_288, 256, 64, 32, 262_144,
+        256, 67_108_864, 100_000, 4_194_304, 16_777_216, 1_048_576, 262_144,
+        emptyMap(),
+    ),
+    commandDedupeWindow = RelayV2CommandDedupeWindow("window-agent", "1", 1_000, 2_000),
+)
 
 private fun correlatedErrorFrame(
     requestId: String,

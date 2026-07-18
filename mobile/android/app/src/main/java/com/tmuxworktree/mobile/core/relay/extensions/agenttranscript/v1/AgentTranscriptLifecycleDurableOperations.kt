@@ -320,6 +320,22 @@ internal interface AgentTranscriptLifecycleNotificationClaimPort {
     ): AgentTranscriptLifecycleNotificationClaimResult
 }
 
+/**
+ * Lower-level durable contract consumed by the optional runtime composition.
+ *
+ * This is not another repository: one implementation instance must own mutation, current
+ * namespace lookup, notification claim, and revision-pinned reads. The Room implementation is
+ * [AgentTranscriptLifecycleDurableRepository].
+ */
+internal interface AgentTranscriptLifecycleRuntimeDurableRepository :
+    AgentTranscriptLifecycleDurableOperationPort,
+    AgentTranscriptLifecycleNotificationClaimPort,
+    AgentTranscriptLifecycleRevisionPinnedReadPort {
+    suspend fun load(
+        consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+    ): AgentTranscriptLifecycleDurableRecord?
+}
+
 private fun requireReplayArtifactNamespace(
     fence: AgentTranscriptLifecycleDurableOperationFence,
     artifact: AgentTimelineReplayPagePublicFrameArtifact,

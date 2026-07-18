@@ -336,7 +336,7 @@ class RelayV2StateDatabaseInstrumentedTest {
         materialize(firstNamespace, "first")
         materialize(secondNamespace, "second")
 
-        val projection = AgentTranscriptLifecycleRoomReadProjection(database)
+        val projection = AgentTranscriptLifecycleRoomReadProjection(durable)
         val firstPage = projection.read(readProjectionRequest(firstNamespace, limit = 1))
             as AgentTranscriptLifecycleReadState.Page
         assertEquals(listOf("entry-first"), firstPage.items.map { it.stableIdentity })

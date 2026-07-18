@@ -1,6 +1,5 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
-import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDatabase
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageException
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageFailure
 import kotlinx.coroutines.CancellationException
@@ -339,13 +338,11 @@ internal class AgentTranscriptLifecycleReadProjectionCore(
         AgentTranscriptLifecycleReadState.Unavailable(reason)
 }
 
-/** Room-backed adapter left deliberately unconstructed by production composition. */
+/** Room-backed adapter over the caller-owned durable repository instance. */
 internal class AgentTranscriptLifecycleRoomReadProjection(
-    database: RelayV2StateDatabase,
+    durableRead: AgentTranscriptLifecycleRevisionPinnedReadPort,
 ) {
-    private val core = AgentTranscriptLifecycleReadProjectionCore(
-        AgentTranscriptLifecycleDurableRepository(database),
-    )
+    private val core = AgentTranscriptLifecycleReadProjectionCore(durableRead)
 
     suspend fun read(
         request: AgentTranscriptLifecycleReadRequest,

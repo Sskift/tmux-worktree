@@ -27,14 +27,12 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 /** Room adapter for the Agent transcript/lifecycle durable consumer. */
 internal class AgentTranscriptLifecycleDurableRepository(
     database: RelayV2StateDatabase,
-) : AgentTranscriptLifecycleDurableOperationPort,
-    AgentTranscriptLifecycleNotificationClaimPort,
-    AgentTranscriptLifecycleRevisionPinnedReadPort {
+) : AgentTranscriptLifecycleRuntimeDurableRepository {
     private val core = AgentTranscriptLifecycleDurableRepositoryCore(
         RoomAgentTranscriptLifecycleDurableStore(database),
     )
 
-    suspend fun load(
+    override suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = core.load(consumer)
 
