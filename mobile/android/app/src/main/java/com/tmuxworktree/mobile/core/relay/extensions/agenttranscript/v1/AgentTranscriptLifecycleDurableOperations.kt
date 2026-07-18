@@ -161,6 +161,19 @@ internal interface AgentTranscriptLifecycleDurableOperationPort {
     ): AgentTranscriptLifecycleDurableOperationResult
 }
 
+/**
+ * Narrow durable owner for the one-shot notification claim transaction.
+ *
+ * Callers must invoke this only while holding the serialized actor apply lease. A claimed result
+ * is post-commit authority; no platform call belongs inside this port.
+ */
+internal interface AgentTranscriptLifecycleNotificationClaimPort {
+    suspend fun claimNotificationUnderApplyLease(
+        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
+        intent: AgentSystemNotificationIntent,
+    ): AgentTranscriptLifecycleNotificationClaimResult
+}
+
 private fun requireReplayArtifactNamespace(
     fence: AgentTranscriptLifecycleDurableOperationFence,
     artifact: AgentTimelineReplayPagePublicFrameArtifact,

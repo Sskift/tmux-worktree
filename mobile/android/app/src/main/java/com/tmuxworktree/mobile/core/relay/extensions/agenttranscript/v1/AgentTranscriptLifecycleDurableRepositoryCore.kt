@@ -600,7 +600,8 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
 internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val store: AgentTranscriptLifecycleDurableStore,
     private val publicCodec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
-) : AgentTranscriptLifecycleDurableOperationPort {
+) : AgentTranscriptLifecycleDurableOperationPort,
+    AgentTranscriptLifecycleNotificationClaimPort {
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = store.transaction {
@@ -3189,7 +3190,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         ) storageMalformed()
     }
 
-    suspend fun claimNotificationUnderApplyLease(
+    override suspend fun claimNotificationUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         intent: AgentSystemNotificationIntent,
     ): AgentTranscriptLifecycleNotificationClaimResult {
