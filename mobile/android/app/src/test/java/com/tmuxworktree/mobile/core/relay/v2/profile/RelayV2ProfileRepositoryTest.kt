@@ -14,8 +14,11 @@ import java.io.DataInputStream
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.file.Files
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -508,7 +511,223 @@ class RelayV2ProfileRepositoryTest {
         }
 
     @Test
-    fun `startup recovery cannot roll back a live switch blocked in disconnect`() =
+    fun `startup admission recovers a completed journal then reconciles the exact winner`() =
+        runBlocking {
+            val harness = Harness()
+            val confirmed = enrollmentDraft(
+                "enrollment-startup-completed",
+                "twenroll2.code-startup-completed",
+            ).confirm(deviceLabel = "Pixel")
+            harness.profiles.failNextCredentialReadyBeforeWrite = true
+
+            assertTrue(runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure)
+            val journal = requireNotNull(harness.profiles.journal)
+            assertEquals(RelayV2ProfileActivationPhase.PREPARED, journal.phase)
+            assertTrue(
+                requireNotNull(harness.credentials.read(journal.targetCredentialReference))
+                    .hasCredentialMaterial,
+            )
+            val redeemCalls = harness.exchange.redeemCalls
+            harness.restartRepository()
+
+            val ready = harness.repository.admitStartup()
+                as RelayV2StartupAdmissionResult.Ready
+
+            assertEquals(journal.targetCredentialReference, ready.profile.credentialReference)
+            assertEquals(journal.targetActivationGeneration, ready.profile.activationGeneration)
+            assertEquals(journal.targetCredentialVersion, ready.profile.credentialVersion)
+            assertEquals(ready.profile, harness.profiles.activeV2)
+            assertEquals(null, harness.profiles.journal)
+            assertEquals(redeemCalls, harness.exchange.redeemCalls)
+        }
+
+    @Test
+    fun `startup admission closes pending and incompatible recovery without exchange`() =
+        runBlocking {
+            val pending = Harness()
+            val pendingConfirmation = enrollmentDraft(
+                "enrollment-startup-pending",
+                "twenroll2.code-startup-pending",
+            ).confirm(deviceLabel = "Pending Pixel")
+            pending.credentials.failNextCasBeforeWriteCount = 2
+            assertTrue(
+                runCatching {
+                    pending.repository.confirmEnrollment(pendingConfirmation)
+                }.isFailure,
+            )
+            val pendingJournal = requireNotNull(pending.profiles.journal)
+            val pendingRedeemCalls = pending.exchange.redeemCalls
+            pending.restartRepository()
+
+            assertEquals(
+                RelayV2StartupAdmissionResult.ReenrollmentRequired(
+                    pendingJournal.targetCredentialReference,
+                ),
+                pending.repository.admitStartup(),
+            )
+            assertEquals(null, pending.profiles.journal)
+            assertEquals(pendingRedeemCalls, pending.exchange.redeemCalls)
+
+            val incompatibleCases = listOf(
+                RelayV2CredentialRecoveryReason.INCOMPATIBLE_LEGACY_COMPLETED_CREDENTIAL to
+                    { blob: RelayV2CredentialBlob ->
+                        blob.copy(
+                            schemaVersion = RelayV2CredentialBlob.LEGACY_SCHEMA_VERSION,
+                            completedAttemptId = null,
+                            completedSecretReference = null,
+                        )
+                    },
+                RelayV2CredentialRecoveryReason.COMPLETION_PROOF_MISSING_OR_MISMATCHED to
+                    { blob: RelayV2CredentialBlob ->
+                        blob.copy(
+                            completedAttemptId = null,
+                            completedSecretReference = null,
+                        )
+                    },
+            )
+            incompatibleCases.forEachIndexed { index, (reason, corrupt) ->
+                val harness = Harness()
+                val confirmed = enrollmentDraft(
+                    "enrollment-startup-incompatible-$index",
+                    "twenroll2.code-startup-incompatible-$index",
+                ).confirm(deviceLabel = "Incompatible Pixel $index")
+                harness.profiles.failNextCredentialReadyBeforeWrite = true
+                assertTrue(
+                    runCatching { harness.repository.confirmEnrollment(confirmed) }.isFailure,
+                )
+                val journal = requireNotNull(harness.profiles.journal)
+                val completed = requireNotNull(
+                    harness.credentials.read(journal.targetCredentialReference),
+                )
+                assertEquals(
+                    RelayV2CredentialCasResult.Updated(completed.credentialVersion),
+                    harness.credentials.compareAndSet(
+                        journal.targetCredentialReference,
+                        completed.expectation(),
+                        corrupt(completed),
+                    ),
+                )
+                val redeemCalls = harness.exchange.redeemCalls
+                harness.restartRepository()
+
+                assertEquals(
+                    RelayV2StartupAdmissionResult.RecoveryRequired(
+                        credentialReference = journal.targetCredentialReference,
+                        reason = reason,
+                    ),
+                    harness.repository.admitStartup(),
+                )
+                assertEquals(journal, harness.profiles.journal)
+                assertEquals(redeemCalls, harness.exchange.redeemCalls)
+            }
+        }
+
+    @Test
+    fun `startup admission repairs only monotonic credential state and types unavailability`() =
+        runBlocking {
+            val inactive = Harness()
+            assertEquals(
+                RelayV2StartupAdmissionResult.NoActiveProfile,
+                inactive.repository.admitStartup(),
+            )
+            assertEquals(0, inactive.exchange.redeemCalls)
+
+            val ahead = Harness()
+            val aheadActivation = ahead.repository.confirmEnrollment(
+                enrollmentDraft(
+                    "enrollment-startup-ahead",
+                    "twenroll2.code-startup-ahead",
+                ).confirm(deviceLabel = "Ahead Pixel"),
+            ) as RelayV2EnrollmentResult.Activated
+            val versionOne = requireNotNull(
+                ahead.credentials.read(aheadActivation.profile.credentialReference),
+            )
+            assertEquals(
+                RelayV2CredentialCasResult.Updated(2),
+                ahead.credentials.compareAndSet(
+                    aheadActivation.profile.credentialReference,
+                    versionOne.expectation(),
+                    versionOne.copy(credentialVersion = 2),
+                ),
+            )
+            val aheadRedeemCalls = ahead.exchange.redeemCalls
+            val repaired = aheadActivation.profile.copy(credentialVersion = 2)
+            assertEquals(
+                RelayV2StartupAdmissionResult.Ready(repaired),
+                ahead.repository.admitStartup(),
+            )
+            assertEquals(repaired, ahead.profiles.activeV2)
+            assertEquals(aheadRedeemCalls, ahead.exchange.redeemCalls)
+
+            StartupUnavailableCase.entries.forEach { unavailableCase ->
+                val harness = Harness()
+                val activated = harness.repository.confirmEnrollment(
+                    enrollmentDraft(
+                        "enrollment-startup-${unavailableCase.name.lowercase()}",
+                        "twenroll2.code-startup-${unavailableCase.name.lowercase()}",
+                    ).confirm(deviceLabel = "Unavailable Pixel"),
+                ) as RelayV2EnrollmentResult.Activated
+                val reference = activated.profile.credentialReference
+                val blob = requireNotNull(harness.credentials.read(reference))
+                val expectedReason = when (unavailableCase) {
+                    StartupUnavailableCase.MISSING -> {
+                        harness.credentials.clear(reference)
+                        RelayV2StartupCredentialUnavailableReason.CREDENTIAL_MISSING
+                    }
+                    StartupUnavailableCase.BINDING_MISMATCH -> {
+                        assertEquals(
+                            RelayV2CredentialCasResult.Updated(blob.credentialVersion),
+                            harness.credentials.compareAndSet(
+                                reference,
+                                blob.expectation(),
+                                blob.copy(hostId = "different-host"),
+                            ),
+                        )
+                        RelayV2StartupCredentialUnavailableReason.BINDING_MISMATCH
+                    }
+                    StartupUnavailableCase.BLOB_BEHIND -> {
+                        assertTrue(
+                            harness.profiles.updateRelayV2CredentialVersion(
+                                profileId = activated.profile.profileId,
+                                credentialReference = reference,
+                                expectedActivationGeneration =
+                                    activated.profile.activationGeneration,
+                                expectedVersion = activated.profile.credentialVersion,
+                                newVersion = activated.profile.credentialVersion + 1,
+                            ),
+                        )
+                        RelayV2StartupCredentialUnavailableReason
+                            .CREDENTIAL_BLOB_BEHIND_PROFILE
+                    }
+                    StartupUnavailableCase.REPAIR_CONFLICT -> {
+                        assertEquals(
+                            RelayV2CredentialCasResult.Updated(blob.credentialVersion + 1),
+                            harness.credentials.compareAndSet(
+                                reference,
+                                blob.expectation(),
+                                blob.copy(credentialVersion = blob.credentialVersion + 1),
+                            ),
+                        )
+                        harness.profiles.failNextCredentialVersionUpdate = true
+                        RelayV2StartupCredentialUnavailableReason.REPAIR_CONFLICT
+                    }
+                }
+                val durableWinner = requireNotNull(harness.profiles.activeV2)
+                val redeemCalls = harness.exchange.redeemCalls
+
+                assertEquals(
+                    RelayV2StartupAdmissionResult.CredentialUnavailable(
+                        profile = durableWinner,
+                        reason = expectedReason,
+                    ),
+                    harness.repository.admitStartup(),
+                )
+                assertEquals(redeemCalls, harness.exchange.redeemCalls)
+            }
+        }
+
+    @Test
+    fun `startup admission waits for a live switch and exposes only its durable winner`() =
         runBlocking {
             val harness = Harness(blockDisconnect = true)
             val confirmed = enrollmentDraft(
@@ -524,21 +743,85 @@ class RelayV2ProfileRepositoryTest {
                 requireNotNull(harness.credentials.read(prepared.targetCredentialReference))
                     .hasCredentialMaterial,
             )
-            val recovery = async { harness.repository.recoverPendingActivation() }
+            val redeemCalls = harness.exchange.redeemCalls
+            val admission = async { harness.repository.admitStartup() }
             yield()
-            assertFalse(recovery.isCompleted)
+            assertFalse(admission.isCompleted)
 
             harness.barrier.release.complete(Unit)
             val activated = (activation.await() as RelayV2EnrollmentResult.Activated).profile
             assertEquals(
-                RelayV2ActivationRecoveryResult.NoPendingActivation,
-                recovery.await(),
+                RelayV2StartupAdmissionResult.Ready(activated),
+                admission.await(),
             )
             assertEquals(activated, harness.profiles.activeV2)
             assertEquals(null, harness.profiles.journal)
+            assertEquals(redeemCalls, harness.exchange.redeemCalls)
             assertTrue(
                 requireNotNull(harness.credentials.read(activated.credentialReference))
                     .hasCredentialMaterial,
+            )
+        }
+
+    @Test
+    fun `startup credential admission serializes refresh mutation through winner validation`() =
+        runBlocking {
+            val harness = Harness()
+            val activated = harness.repository.confirmEnrollment(
+                enrollmentDraft(
+                    "enrollment-startup-refresh-race",
+                    "twenroll2.code-startup-refresh-race",
+                ).confirm(deviceLabel = "Refresh Race Pixel"),
+            ) as RelayV2EnrollmentResult.Activated
+            val prepared = harness.repository.prepareRefresh(activated.profile)
+            val credentialRead = harness.credentials.blockNextReadAfterSnapshot()
+            val admission = async(Dispatchers.Default) {
+                harness.repository.admitStartup()
+            }
+            credentialRead.awaitStarted()
+
+            val profileRepair = harness.profiles.blockNextCredentialVersionUpdate()
+            val refresh = async(start = CoroutineStart.UNDISPATCHED) {
+                harness.repository.applyRefreshResponse(
+                    prepared,
+                    refreshResponse(prepared, version = 2),
+                )
+            }
+            val refreshEnteredRepairBeforeAdmissionReleased =
+                profileRepair.started.isCompleted
+
+            credentialRead.release()
+            val admitted = withTimeout(1_000) { admission.await() }
+            withTimeout(1_000) { profileRepair.started.await() }
+            val blobVersionBeforeRepair =
+                harness.credentials.read(activated.profile.credentialReference)?.credentialVersion
+            val profileVersionBeforeRepair = harness.profiles.activeV2?.credentialVersion
+            profileRepair.release.complete(Unit)
+            val refreshResult = withTimeout(1_000) { refresh.await() }
+
+            assertFalse(
+                "Startup returned stale Ready after refresh committed a newer credential blob",
+                refreshEnteredRepairBeforeAdmissionReleased &&
+                    admitted == RelayV2StartupAdmissionResult.Ready(activated.profile) &&
+                    blobVersionBeforeRepair == 2L &&
+                    profileVersionBeforeRepair == 1L,
+            )
+            assertEquals(
+                RelayV2StartupAdmissionResult.Ready(activated.profile),
+                admitted,
+            )
+            assertEquals(
+                RelayV2RefreshApplyResult.Applied(
+                    credentialVersion = 2,
+                    repairedProfileVersion = true,
+                ),
+                refreshResult,
+            )
+            assertEquals(2L, harness.profiles.activeV2?.credentialVersion)
+            assertEquals(
+                2L,
+                harness.credentials.read(activated.profile.credentialReference)
+                    ?.credentialVersion,
             )
         }
 
@@ -1869,10 +2152,22 @@ class RelayV2ProfileRepositoryTest {
         var failNextCasWithBindingMismatch = false
         var failNextCasWithAttemptMismatch = false
         var failNextCasWithSecretReferenceMismatch = false
+        private var nextReadAfterSnapshotGate: BlockingGate? = null
 
-        @Synchronized
-        override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? =
-            blobs[reference]
+        fun blockNextReadAfterSnapshot(): BlockingGate = synchronized(this) {
+            check(nextReadAfterSnapshotGate == null)
+            BlockingGate().also { nextReadAfterSnapshotGate = it }
+        }
+
+        override fun read(reference: RelayV2CredentialReference): RelayV2CredentialBlob? {
+            val (snapshot, gate) = synchronized(this) {
+                Pair(blobs[reference], nextReadAfterSnapshotGate).also {
+                    nextReadAfterSnapshotGate = null
+                }
+            }
+            gate?.block()
+            return snapshot
+        }
 
         @Synchronized
         override fun create(
@@ -2009,6 +2304,7 @@ class RelayV2ProfileRepositoryTest {
         private var nextPendingActivationReadGate: SuspensionGate? = null
         private var nextPreparedRollbackGate: SuspensionGate? = null
         private var nextProfilePublishReturnGate: SuspensionGate? = null
+        private var nextCredentialVersionUpdateGate: SuspensionGate? = null
 
         fun blockNextActiveProfileRead(): SuspensionGate = SuspensionGate().also {
             check(nextActiveProfileReadGate == null)
@@ -2029,6 +2325,11 @@ class RelayV2ProfileRepositoryTest {
         fun blockNextProfilePublishReturn(): SuspensionGate = SuspensionGate().also {
             check(nextProfilePublishReturnGate == null)
             nextProfilePublishReturnGate = it
+        }
+
+        fun blockNextCredentialVersionUpdate(): SuspensionGate = SuspensionGate().also {
+            check(nextCredentialVersionUpdateGate == null)
+            nextCredentialVersionUpdateGate = it
         }
 
         override suspend fun activeProfileIdentity(): RelayActiveProfileIdentity? {
@@ -2249,6 +2550,11 @@ class RelayV2ProfileRepositoryTest {
                 current.activationGeneration != expectedActivationGeneration ||
                 current.credentialVersion != expectedVersion
             ) return false
+            nextCredentialVersionUpdateGate?.also {
+                nextCredentialVersionUpdateGate = null
+                it.started.complete(Unit)
+                it.release.await()
+            }
             val updated = current.copy(credentialVersion = newVersion)
             storedActiveV2 = updated
             storedActiveIdentity = updated.identity
@@ -2437,6 +2743,28 @@ class RelayV2ProfileRepositoryTest {
         val release = CompletableDeferred<Unit>()
     }
 
+    private class BlockingGate {
+        private val started = CountDownLatch(1)
+        private val released = CountDownLatch(1)
+
+        fun awaitStarted() {
+            check(started.await(5, TimeUnit.SECONDS)) {
+                "Timed out waiting for the credential read gate"
+            }
+        }
+
+        fun block() {
+            started.countDown()
+            check(released.await(5, TimeUnit.SECONDS)) {
+                "Timed out waiting to release the credential read gate"
+            }
+        }
+
+        fun release() {
+            released.countDown()
+        }
+    }
+
     private suspend fun assertSameReferenceRetryRedeems(
         harness: Harness,
         confirmed: RelayV2ConfirmedEnrollment,
@@ -2501,6 +2829,13 @@ class RelayV2ProfileRepositoryTest {
         BINDING_MISMATCH,
         ATTEMPT_MISMATCH,
         SECRET_REFERENCE_MISMATCH,
+    }
+
+    private enum class StartupUnavailableCase {
+        MISSING,
+        BINDING_MISMATCH,
+        BLOB_BEHIND,
+        REPAIR_CONFLICT,
     }
 
     private fun relayV2Profile(): RelayV2Profile = RelayV2Profile(

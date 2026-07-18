@@ -325,6 +325,33 @@ internal sealed interface RelayV2ActivationRecoveryResult {
     data class Activated(val profile: RelayV2Profile) : RelayV2ActivationRecoveryResult
 }
 
+internal enum class RelayV2StartupCredentialUnavailableReason {
+    CREDENTIAL_MISSING,
+    BINDING_MISMATCH,
+    CREDENTIAL_BLOB_BEHIND_PROFILE,
+    REPAIR_CONFLICT,
+}
+
+internal sealed interface RelayV2StartupAdmissionResult {
+    data class Ready(val profile: RelayV2Profile) : RelayV2StartupAdmissionResult
+
+    data object NoActiveProfile : RelayV2StartupAdmissionResult
+
+    data class ReenrollmentRequired(
+        val credentialReference: RelayV2CredentialReference,
+    ) : RelayV2StartupAdmissionResult
+
+    data class RecoveryRequired(
+        val credentialReference: RelayV2CredentialReference,
+        val reason: RelayV2CredentialRecoveryReason,
+    ) : RelayV2StartupAdmissionResult
+
+    data class CredentialUnavailable(
+        val profile: RelayV2Profile,
+        val reason: RelayV2StartupCredentialUnavailableReason,
+    ) : RelayV2StartupAdmissionResult
+}
+
 internal data class RelayV2PreparedRefresh(
     val profileIdentity: RelayActiveProfileIdentity,
     val credentialReference: RelayV2CredentialReference,
@@ -757,6 +784,88 @@ internal class RelayV2ProfileRepository(
      */
     suspend fun recoverPendingActivation(): RelayV2ActivationRecoveryResult =
         recoverDurableActivation(allowedIntent = null)
+
+    /**
+     * Closed startup admission for a future explicitly enabled Relay v2 composition.
+     *
+     * Durable activation recovery and credential reconciliation share the activation lease. This
+     * then takes the credential mutation lease through final winner validation; no credential
+     * mutation holder acquires the activation lease in reverse. This method performs no exchange
+     * or transport work and does not advertise runtime readiness.
+     */
+    suspend fun admitStartup(): RelayV2StartupAdmissionResult =
+        activationOperationMutex.withLock {
+            when (val recovery = recoverDurableActivationWithLease(allowedIntent = null)) {
+                is RelayV2ActivationRecoveryResult.Activated ->
+                    reconcileStartupWinner(recovery.profile)
+                RelayV2ActivationRecoveryResult.NoPendingActivation -> {
+                    val active = profileStore.activeRelayV2Profile()
+                        ?: return@withLock RelayV2StartupAdmissionResult.NoActiveProfile
+                    reconcileStartupWinner(active)
+                }
+                is RelayV2ActivationRecoveryResult.ReenrollmentRequired ->
+                    RelayV2StartupAdmissionResult.ReenrollmentRequired(
+                        recovery.credentialReference,
+                    )
+                is RelayV2ActivationRecoveryResult.Incompatible ->
+                    RelayV2StartupAdmissionResult.RecoveryRequired(
+                        credentialReference = recovery.credentialReference,
+                        reason = recovery.reason,
+                    )
+            }
+        }
+
+    private suspend fun reconcileStartupWinner(
+        winner: RelayV2Profile,
+    ): RelayV2StartupAdmissionResult = credentialMutationMutex.withLock {
+        val reconciliation = credentialReconciler.reconcileExpected(
+            profileIdentity = winner.identity,
+            credentialReference = winner.credentialReference,
+        )
+        val candidate = when (reconciliation) {
+            is RelayV2CredentialReconciliationResult.InSync ->
+                reconciliation.profile.takeIf { it == winner }
+            is RelayV2CredentialReconciliationResult.Repaired ->
+                reconciliation.profile.takeIf {
+                    it.identity == winner.identity &&
+                        it.credentialReference == winner.credentialReference &&
+                        it.credentialVersion > winner.credentialVersion
+                }
+            is RelayV2CredentialReconciliationResult.Failed -> {
+                return@withLock RelayV2StartupAdmissionResult.CredentialUnavailable(
+                    profile = winner,
+                    reason = reconciliation.failure.toStartupUnavailableReason(),
+                )
+            }
+            is RelayV2CredentialReconciliationResult.ActiveProfileChanged,
+            RelayV2CredentialReconciliationResult.NoActiveV2Profile,
+            -> null
+        } ?: return@withLock RelayV2StartupAdmissionResult.CredentialUnavailable(
+            profile = winner,
+            reason = RelayV2StartupCredentialUnavailableReason.REPAIR_CONFLICT,
+        )
+
+        if (profileStore.activeRelayV2Profile() == candidate) {
+            RelayV2StartupAdmissionResult.Ready(candidate)
+        } else {
+            RelayV2StartupAdmissionResult.CredentialUnavailable(
+                profile = winner,
+                reason = RelayV2StartupCredentialUnavailableReason.REPAIR_CONFLICT,
+            )
+        }
+    }
+
+    private fun RelayV2CredentialReconciliationFailure.toStartupUnavailableReason():
+        RelayV2StartupCredentialUnavailableReason = when (this) {
+        RelayV2CredentialReconciliationFailure.CREDENTIAL_MISSING ->
+            RelayV2StartupCredentialUnavailableReason.CREDENTIAL_MISSING
+        RelayV2CredentialReconciliationFailure.BINDING_MISMATCH ->
+            RelayV2StartupCredentialUnavailableReason.BINDING_MISMATCH
+        RelayV2CredentialReconciliationFailure.CREDENTIAL_BLOB_BEHIND_PROFILE ->
+            RelayV2StartupCredentialUnavailableReason.CREDENTIAL_BLOB_BEHIND_PROFILE
+        RelayV2CredentialReconciliationFailure.PROFILE_VERSION_UPDATE_REJECTED ->
+            RelayV2StartupCredentialUnavailableReason.REPAIR_CONFLICT
+    }
 
     private suspend fun recoverDurableActivation(
         allowedIntent: EnrollmentIntent?,
