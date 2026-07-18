@@ -876,7 +876,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     ): ValidatedAgentTranscriptStorage {
         val stats = transcriptNamespaceStats(namespace)
         validateTranscriptNamespaceStats(stats)
-        val lifecycleAccounting = validateLifecycleIndex(namespace)
+        val lifecycleAccounting = validateLifecycleIndex(namespace, state.extensionLane.lastAgentSeq)
         if (namespace.timelineEpoch == null) {
             if (stats.entryCount != 0L || stats.snapshotCount != 0L ||
                 stats.snapshotRecordCount != 0L || stats.pendingEventCount != 0L ||
@@ -888,7 +888,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             )
         }
 
-        validateEntryBatches(namespace, stats)
+        validateEntryBatches(namespace, state.extensionLane.lastAgentSeq, stats)
 
         val snapshotRows = snapshots(namespace)
         if (snapshotRows.size.toLong() != stats.snapshotCount) storageMalformed()
@@ -943,6 +943,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     /** Full restore/final-cut audit. Ordinary operations use only targeted point reads. */
     private fun AgentTranscriptLifecycleDurableTransaction.validateLifecycleIndex(
         namespace: AgentTranscriptLifecycleDurableNamespace,
+        lastAgentSeq: String,
     ): LifecycleIndexAccounting {
         val currentStats = lifecycleCurrentStats(namespace)
         val witnessStats = lifecycleWitnessAudit(namespace)
@@ -958,7 +959,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
         validatePermanentWitnessChains(namespace, witnessStats)
         validateCurrentPointers(namespace, currentStats.itemCount)
-        validateRecentEvidenceRows(namespace, recentStats)
+        validateRecentEvidenceRows(namespace, lastAgentSeq, recentStats)
         validateNotificationRows(namespace, notificationStats)
         return LifecycleIndexAccounting(
             currentCount = currentStats.itemCount,
@@ -1068,6 +1069,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
     private fun AgentTranscriptLifecycleDurableTransaction.validateRecentEvidenceRows(
         namespace: AgentTranscriptLifecycleDurableNamespace,
+        lastAgentSeq: String,
         stats: RelayV2AgentLifecycleSqlAudit,
     ) {
         var processed = 0L
@@ -1081,6 +1083,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             if (rows.isEmpty() || rows.size > DURABLE_STORAGE_BATCH_RECORDS) storageMalformed()
             rows.forEach { row ->
                 requireExactLifecycleNamespace(namespace, row)
+                if (compareStorageCounters(row.agentEventSeq, lastAgentSeq) > 0) storageMalformed()
                 requireExactOrderKey(row.agentEventSeq, row.agentEventSeqOrder)
                 val canonical = strictStorageUtf8(row.evidenceCanonicalJson)
                 val event = try {
@@ -1096,6 +1099,30 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     witnessByEventId(namespace, row.eventId) != null ||
                     witnessByAgentEventSeq(namespace, row.agentEventSeq) != null
                 ) storageMalformed()
+                when (val mutation = event.mutation) {
+                    is PublicAppendMutation -> {
+                        val entry = entryById(namespace, mutation.entry.metadata.entryId)
+                            ?: storageMalformed()
+                        validateEntry(namespace, entry)
+                        if (entry.createdAgentSeq != mutation.entry.metadata.createdAgentSeq ||
+                            entry.lastModifiedAgentSeq != mutation.entry.metadata.lastModifiedAgentSeq
+                        ) storageMalformed()
+                    }
+                    is PublicRedactMutation,
+                    is PublicDeleteMutation -> {
+                        val entryId = when (mutation) {
+                            is PublicRedactMutation -> mutation.entryId
+                            is PublicDeleteMutation -> mutation.entryId
+                            else -> storageMalformed()
+                        }
+                        val entry = entryById(namespace, entryId) ?: storageMalformed()
+                        validateEntry(namespace, entry)
+                        if (compareStorageCounters(entry.lastModifiedAgentSeq, row.agentEventSeq) >= 0) {
+                            storageMalformed()
+                        }
+                    }
+                    else -> Unit
+                }
                 bytes = addBounded(bytes, canonical.size.toLong(), Long.MAX_VALUE)
             }
             processed += rows.size
@@ -2411,8 +2438,8 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         old: AgentTranscriptDurableStorageAccounting,
     ): AgentTranscriptDurableStorageAccounting {
         val stats = transcriptNamespaceStats(namespace)
-        validateEntryBatches(namespace, stats)
-        val lifecycle = validateLifecycleIndex(namespace)
+        validateEntryBatches(namespace, UINT64_MAX_STORAGE.toString(), stats)
+        val lifecycle = validateLifecycleIndex(namespace, UINT64_MAX_STORAGE.toString())
         return old.copy(
             entryCount = stats.entryCount,
             entryCanonicalBytes = canonicalArrayBytes(
@@ -2533,6 +2560,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
     private fun AgentTranscriptLifecycleDurableTransaction.validateEntryBatches(
         namespace: AgentTranscriptLifecycleDurableNamespace,
+        lastAgentSeq: String,
         stats: RelayV2AgentTranscriptNamespaceStats,
     ) {
         val storedEntryCount = stats.entryCount
@@ -2595,7 +2623,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     actualPayloadBytes != item.actualPayloadUtf8Bytes ||
                     actualTextBytes != item.actualTextUtf8Bytes
                 ) storageMalformed()
-                validateEntry(namespace, row)
+                validateEntry(namespace, row, lastAgentSeq)
                 if (previousSequence != null &&
                     compareCanonicalAgentOrder(
                         previousSequence ?: storageMalformed(),
@@ -3097,6 +3125,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 private fun validateEntry(
     namespace: AgentTranscriptLifecycleDurableNamespace,
     row: RelayV2AgentTranscriptEntryEntity,
+    lastAgentSeq: String = UINT64_MAX_STORAGE.toString(),
 ): ValidatedAgentTranscriptEntry {
     requireExactTranscriptNamespace(
         namespace,
@@ -3120,6 +3149,12 @@ private fun validateEntry(
     ) storageMalformed()
     requireCanonicalStorageCounter(row.createdAgentSeq, positive = true)
     requireCanonicalStorageCounter(row.lastModifiedAgentSeq, positive = true)
+    if (compareStorageCounters(row.createdAgentSeq, lastAgentSeq) > 0 ||
+        compareStorageCounters(row.lastModifiedAgentSeq, lastAgentSeq) > 0 ||
+        row.tombstoneEvidenceThroughAgentSeq?.let {
+            compareStorageCounters(it, lastAgentSeq) > 0
+        } == true
+    ) storageMalformed()
     requireExactOrderKey(row.createdAgentSeq, row.createdAgentSeqOrder)
     requireExactOrderKey(row.lastModifiedAgentSeq, row.lastModifiedAgentSeqOrder)
     if (compareStorageCounters(row.createdAgentSeq, row.lastModifiedAgentSeq) > 0) {
