@@ -591,15 +591,6 @@ internal interface AgentTranscriptLifecycleDurableTransaction {
     fun insertNotificationClaim(claim: AgentTranscriptLifecyclePersistedNotificationClaim)
 }
 
-/** Legacy WIP reducer seam retained until the closed operation port has a real Room owner. */
-internal interface AgentTranscriptLifecycleDurableReductionPort {
-    suspend fun reduceUnderApplyLease(
-        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
-        input: AgentTranscriptLifecycleClientInput,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
-    ): AgentTranscriptLifecycleClientReduction
-}
-
 /**
  * Atomic persistence owner for the optional Agent reducer.
  *
@@ -609,7 +600,7 @@ internal interface AgentTranscriptLifecycleDurableReductionPort {
 internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val store: AgentTranscriptLifecycleDurableStore,
     private val publicCodec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
-) : AgentTranscriptLifecycleDurableReductionPort, AgentTranscriptLifecycleDurableOperationPort {
+) : AgentTranscriptLifecycleDurableOperationPort {
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = store.transaction {
@@ -779,7 +770,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         consumeSnapshotPage(command, limits)
     }
 
-    override suspend fun reduceUnderApplyLease(
+    private suspend fun reduceUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         input: AgentTranscriptLifecycleClientInput,
         limits: AgentClientReducerLimits,

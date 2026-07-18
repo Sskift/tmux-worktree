@@ -24,10 +24,10 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDao
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateDatabase
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 
-/** Room adapter for the optional, still-unwired Agent transcript/lifecycle durable consumer. */
+/** Room adapter for the Agent transcript/lifecycle durable consumer. */
 internal class AgentTranscriptLifecycleDurableRepository(
     database: RelayV2StateDatabase,
-) : AgentTranscriptLifecycleDurableReductionPort {
+) : AgentTranscriptLifecycleDurableOperationPort {
     private val core = AgentTranscriptLifecycleDurableRepositoryCore(
         RoomAgentTranscriptLifecycleDurableStore(database),
     )
@@ -41,13 +41,6 @@ internal class AgentTranscriptLifecycleDurableRepository(
         state: AgentTranscriptLifecycleClientState,
     ): AgentTranscriptLifecycleInitializeResult =
         core.initializeUnderApplyLease(namespace, state)
-
-    override suspend fun reduceUnderApplyLease(
-        expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
-        input: AgentTranscriptLifecycleClientInput,
-        limits: AgentClientReducerLimits,
-    ): AgentTranscriptLifecycleClientReduction =
-        core.reduceUnderApplyLease(expectedNamespace, input, limits)
 
     suspend fun claimNotificationUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
