@@ -710,6 +710,74 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             reduceUnderApplyLease(command.fence.expectedNamespace, command.input, limits),
         )
 
+    override suspend fun prepareRequestUnderApplyLease(
+        command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
+        limits: AgentClientReducerLimits,
+    ): AgentTranscriptLifecycleDurablePrepareRequestResult = store.transaction {
+        val current = requireOperationState(command.fence)
+        val audited = validateTranscriptStorage(current.namespace, current.state)
+        if (audited.accounting != current.storageAccounting) storageMalformed()
+        val existing = preparedRequests(current, audited.snapshot)
+            .singleOrNull { it.requestKind == command.requestKind }
+        if (existing != null) {
+            requirePreparedRequestMatches(command, existing)
+            return@transaction AgentTranscriptLifecycleDurablePrepareRequestResult(
+                reduction = AgentTranscriptLifecycleClientReduction(
+                    state = current.state,
+                    disposition = AgentClientDisposition.CONFIG_APPLIED,
+                ),
+                preparedRequest = existing,
+            )
+        }
+        val input = when (command) {
+            is AgentTranscriptLifecycleDurablePrepareRequestCommand.Status ->
+                AgentTranscriptLifecycleClientInput.StatusRequestStarted(
+                    command.proposedRequestNetworkToken,
+                )
+            is AgentTranscriptLifecycleDurablePrepareRequestCommand.Replay ->
+                AgentTranscriptLifecycleClientInput.ReplayRequestStarted(
+                    requestNetworkToken = command.proposedRequestNetworkToken,
+                    cursor = command.directive.cursor,
+                    limit = command.directive.limit,
+                )
+            is AgentTranscriptLifecycleDurablePrepareRequestCommand.Snapshot -> {
+                if (audited.snapshot != null) {
+                    throw AgentTranscriptLifecyclePersistenceConflictException()
+                }
+                AgentTranscriptLifecycleClientInput.SnapshotRequestStarted(
+                    snapshotRequestId = command.proposedSnapshotRequestId,
+                    pageZeroNetworkToken = command.proposedPageZeroNetworkToken,
+                )
+            }
+        }
+        val reduction = AgentTranscriptLifecycleClientReducer.reduce(current.state, input, limits)
+        if (reduction.disposition != AgentClientDisposition.CONFIG_APPLIED) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        val persisted = persistOperationState(
+            current,
+            reduction.state,
+            current.storageAccounting,
+        )
+        val prepared = preparedRequests(persisted, snapshot = null)
+            .singleOrNull { it.requestKind == command.requestKind }
+            ?: throw AgentTranscriptLifecyclePersistenceConflictException()
+        requirePreparedRequestMatches(command, prepared)
+        AgentTranscriptLifecycleDurablePrepareRequestResult(
+            reduction = reduction.copy(state = persisted.state),
+            preparedRequest = prepared,
+        )
+    }
+
+    override suspend fun loadPreparedRequestsUnderApplyLease(
+        fence: AgentTranscriptLifecycleDurableOperationFence,
+    ): List<AgentTranscriptLifecycleDurablePreparedRequest> = store.transaction {
+        val current = requireOperationState(fence)
+        val audited = validateTranscriptStorage(current.namespace, current.state)
+        if (audited.accounting != current.storageAccounting) storageMalformed()
+        preparedRequests(current, audited.snapshot)
+    }
+
     override suspend fun persistSnapshotRequestUnderApplyLease(
         command: AgentTranscriptLifecycleDurableSnapshotRequestCommand,
     ): AgentTranscriptLifecycleDurableOperationResult =
@@ -745,6 +813,106 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             ).reduction
         }
         AgentTranscriptLifecycleDurableOperationResult(reduction)
+    }
+
+    override suspend fun consumeCorrelatedErrorUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableCorrelatedErrorCommand,
+        limits: AgentClientReducerLimits,
+    ): AgentTranscriptLifecycleDurableOperationResult = store.transaction {
+        val current = requireOperationState(command.fence)
+        val audited = validateTranscriptStorage(current.namespace, current.state)
+        if (audited.accounting != current.storageAccounting) storageMalformed()
+        val beforePrepared = preparedRequests(current, audited.snapshot)
+        if (beforePrepared.map { it.requestNetworkToken }.distinct().size != beforePrepared.size ||
+            beforePrepared.any {
+                it.requestNetworkToken == command.replacementStatusRequestNetworkToken
+            }
+        ) throw AgentTranscriptLifecyclePersistenceConflictException()
+        val extension = current.state.extensionLane
+        val requestToken = command.frame.requestId
+        val snapshotContinuation: Boolean
+        val requestLocalGeneration = when (command.requestKind) {
+            AgentTranscriptLifecycleRequestKind.STATUS -> {
+                snapshotContinuation = false
+                val pending = extension.pendingStatusRequest
+                    ?: throw AgentTranscriptLifecyclePersistenceConflictException()
+                if (pending.requestToken != requestToken) {
+                    throw AgentTranscriptLifecyclePersistenceConflictException()
+                }
+                pending.localGeneration
+            }
+            AgentTranscriptLifecycleRequestKind.REPLAY -> {
+                snapshotContinuation = false
+                val pending = (extension.syncState as? AgentTimelineSyncState.Replay)
+                    ?.pageFence ?: throw AgentTranscriptLifecyclePersistenceConflictException()
+                if (pending.currentRequestNetworkToken != requestToken) {
+                    throw AgentTranscriptLifecyclePersistenceConflictException()
+                }
+                pending.localGeneration
+            }
+            AgentTranscriptLifecycleRequestKind.SNAPSHOT -> {
+                val preFirst = extension.pendingSnapshotRequest
+                if (preFirst != null) {
+                    snapshotContinuation = false
+                    if (preFirst.pageZeroNetworkToken != requestToken || audited.snapshot != null) {
+                        throw AgentTranscriptLifecyclePersistenceConflictException()
+                    }
+                    preFirst.localGeneration
+                } else {
+                    snapshotContinuation = true
+                    val header = audited.snapshot
+                        ?: throw AgentTranscriptLifecyclePersistenceConflictException()
+                    if (header.requestNetworkToken != requestToken) {
+                        throw AgentTranscriptLifecyclePersistenceConflictException()
+                    }
+                    header.requestLocalGeneration
+                }
+            }
+        }
+        val failedReduction = AgentTranscriptLifecycleClientReducer.reduce(
+            current.state,
+            AgentTranscriptLifecycleClientInput.CorrelatedRequestFailed(
+                requestKind = command.requestKind,
+                requestNetworkToken = requestToken,
+                requestLocalGeneration = requestLocalGeneration,
+                snapshotContinuation = snapshotContinuation,
+            ),
+            limits,
+        )
+        if (failedReduction.disposition != AgentClientDisposition.GAP_RESYNC ||
+            failedReduction.state.extensionLane.localGeneration == extension.localGeneration
+        ) throw AgentTranscriptLifecyclePersistenceConflictException()
+        val preparedReduction = AgentTranscriptLifecycleClientReducer.reduce(
+            failedReduction.state,
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted(
+                command.replacementStatusRequestNetworkToken,
+            ),
+            limits,
+        )
+        if (preparedReduction.disposition != AgentClientDisposition.CONFIG_APPLIED) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        clearSnapshotFence(current.namespace)
+        val persisted = persistOperationState(
+            current,
+            preparedReduction.state,
+            current.storageAccounting,
+        )
+        val afterPrepared = preparedRequests(persisted, snapshot = null)
+        val prepared = afterPrepared
+            .singleOrNull { it.requestKind == AgentTranscriptLifecycleRequestKind.STATUS }
+            ?: throw AgentTranscriptLifecyclePersistenceConflictException()
+        if (prepared.requestNetworkToken != command.replacementStatusRequestNetworkToken) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        val afterIdentities = afterPrepared.map { it.toDurableRequestIdentity() }.toSet()
+        AgentTranscriptLifecycleDurableOperationResult(
+            reduction = failedReduction.copy(state = persisted.state),
+            preparedRequests = listOf(prepared),
+            retiredRequests = beforePrepared
+                .map { it.toDurableRequestIdentity() }
+                .filter { it !in afterIdentities },
+        )
     }
 
     override suspend fun consumeReplayPageUnderApplyLease(
@@ -1467,6 +1635,77 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             val next: RelayV2AgentTranscriptEntryEntity,
         ) : EntryMutationPlan
         data object Conflict : EntryMutationPlan
+    }
+
+    private fun preparedRequests(
+        current: ReadyOperationState,
+        snapshot: RelayV2AgentTranscriptSnapshotStagingEntity?,
+    ): List<AgentTranscriptLifecycleDurablePreparedRequest> {
+        val extension = current.state.extensionLane
+        val prepared = mutableListOf<AgentTranscriptLifecycleDurablePreparedRequest>()
+        extension.pendingStatusRequest?.let {
+            prepared += AgentTranscriptLifecycleDurablePreparedRequest.Status(it)
+        }
+        val timelineEpoch = current.namespace.timelineEpoch
+        val lineage = timelineEpoch?.let {
+            AgentTimelineLineage(current.namespace.consumer.sessionIdentity, it)
+        }
+        (extension.syncState as? AgentTimelineSyncState.Replay)?.pageFence?.let { pageFence ->
+            prepared += AgentTranscriptLifecycleDurablePreparedRequest.Replay(
+                lineage ?: throw AgentTranscriptLifecyclePersistenceConflictException(),
+                pageFence,
+            )
+        }
+        val pendingSnapshot = extension.pendingSnapshotRequest
+        if (pendingSnapshot != null) {
+            if (snapshot != null) throw AgentTranscriptLifecyclePersistenceConflictException()
+            prepared += AgentTranscriptLifecycleDurablePreparedRequest.Snapshot(
+                lineage = lineage
+                    ?: throw AgentTranscriptLifecyclePersistenceConflictException(),
+                snapshotRequestId = pendingSnapshot.snapshotRequestId,
+                requestNetworkToken = pendingSnapshot.pageZeroNetworkToken,
+                snapshotId = null,
+                cursor = null,
+                nextPageIndex = 0,
+            )
+        } else if (snapshot != null) {
+            prepared += AgentTranscriptLifecycleDurablePreparedRequest.Snapshot(
+                lineage = lineage
+                    ?: throw AgentTranscriptLifecyclePersistenceConflictException(),
+                snapshotRequestId = snapshot.snapshotRequestId,
+                requestNetworkToken = snapshot.requestNetworkToken,
+                snapshotId = snapshot.snapshotId,
+                cursor = snapshot.nextCursor
+                    ?: throw AgentTranscriptLifecyclePersistenceConflictException(),
+                nextPageIndex = snapshot.nextPageIndex,
+            )
+        }
+        if (prepared.size > 2) throw AgentTranscriptLifecyclePersistenceConflictException()
+        return prepared
+    }
+
+    private fun AgentTranscriptLifecycleDurablePreparedRequest.toDurableRequestIdentity() =
+        AgentTranscriptLifecycleDurableRequestIdentity(requestKind, requestNetworkToken)
+
+    private fun requirePreparedRequestMatches(
+        command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
+        prepared: AgentTranscriptLifecycleDurablePreparedRequest,
+    ) {
+        val matches = when {
+            command is AgentTranscriptLifecycleDurablePrepareRequestCommand.Status &&
+                prepared is AgentTranscriptLifecycleDurablePreparedRequest.Status -> true
+            command is AgentTranscriptLifecycleDurablePrepareRequestCommand.Replay &&
+                prepared is AgentTranscriptLifecycleDurablePreparedRequest.Replay ->
+                prepared.lineage == command.directive.lineage &&
+                    prepared.pageFence.stableAfterAgentSeq == command.directive.afterAgentSeq &&
+                    prepared.pageFence.expectedNextCursor == command.directive.cursor &&
+                    prepared.pageFence.requestedLimit == command.directive.limit
+            command is AgentTranscriptLifecycleDurablePrepareRequestCommand.Snapshot &&
+                prepared is AgentTranscriptLifecycleDurablePreparedRequest.Snapshot ->
+                prepared.lineage == command.directive.lineage
+            else -> false
+        }
+        if (!matches) throw AgentTranscriptLifecyclePersistenceConflictException()
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.requireOperationState(

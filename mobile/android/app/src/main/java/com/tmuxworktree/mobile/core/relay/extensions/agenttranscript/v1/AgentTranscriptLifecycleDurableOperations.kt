@@ -1,6 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCode
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineHostEpochMismatchDetails
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineReplayPagePublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotPagePublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
@@ -8,6 +11,12 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+
+internal enum class AgentTranscriptLifecycleRequestKind {
+    STATUS,
+    REPLAY,
+    SNAPSHOT,
+}
 
 /**
  * Exact durable authority supplied by the serialized v2 apply owner.
@@ -44,6 +53,118 @@ internal data class AgentTranscriptLifecycleDurableLiveEventCommand(
             eventFrame.scopeId, eventFrame.sessionId, eventFrame.timelineEpoch)
     }
 }
+
+/** One codec-closed correlated error whose exact request fence is still owned durably. */
+internal data class AgentTranscriptLifecycleDurableCorrelatedErrorCommand(
+    val fence: AgentTranscriptLifecycleDurableOperationFence,
+    val artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
+    val requestKind: AgentTranscriptLifecycleRequestKind,
+    val replacementStatusRequestNetworkToken: String,
+) {
+    val frame: AgentTimelineErrorFrame
+        get() = artifact.frame as AgentTimelineErrorFrame
+
+    init {
+        val errorFrame = artifact.frame
+        require(errorFrame is AgentTimelineErrorFrame)
+        val consumer = fence.expectedNamespace.consumer
+        require(errorFrame.hostId == consumer.hostId)
+        require(errorFrame.scopeId == consumer.scopeId)
+        require(errorFrame.sessionId == consumer.sessionId)
+        if (errorFrame.error.code == AgentTimelineErrorCode.HOST_EPOCH_MISMATCH) {
+            val details = errorFrame.error.details as? AgentTimelineHostEpochMismatchDetails
+            require(details != null)
+            require(details.expectedHostEpoch == consumer.hostEpoch)
+            require(details.actualHostEpoch == errorFrame.hostEpoch)
+        } else {
+            require(errorFrame.hostEpoch == consumer.hostEpoch)
+        }
+        requireOperationOpaqueId(replacementStatusRequestNetworkToken)
+        require(replacementStatusRequestNetworkToken != errorFrame.requestId)
+    }
+}
+
+internal sealed interface AgentTranscriptLifecycleDurablePrepareRequestCommand {
+    val fence: AgentTranscriptLifecycleDurableOperationFence
+    val requestKind: AgentTranscriptLifecycleRequestKind
+
+    data class Status(
+        override val fence: AgentTranscriptLifecycleDurableOperationFence,
+        val proposedRequestNetworkToken: String,
+    ) : AgentTranscriptLifecycleDurablePrepareRequestCommand {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.STATUS
+        init {
+            requireOperationOpaqueId(proposedRequestNetworkToken)
+        }
+    }
+
+    data class Replay(
+        override val fence: AgentTranscriptLifecycleDurableOperationFence,
+        val directive: AgentTimelineSyncDirective.Replay,
+        val proposedRequestNetworkToken: String,
+    ) : AgentTranscriptLifecycleDurablePrepareRequestCommand {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.REPLAY
+        init {
+            requireOperationOpaqueId(proposedRequestNetworkToken)
+        }
+    }
+
+    data class Snapshot(
+        override val fence: AgentTranscriptLifecycleDurableOperationFence,
+        val directive: AgentTimelineSyncDirective.Snapshot,
+        val proposedSnapshotRequestId: String,
+        val proposedPageZeroNetworkToken: String,
+    ) : AgentTranscriptLifecycleDurablePrepareRequestCommand {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.SNAPSHOT
+        init {
+            requireOperationOpaqueId(proposedSnapshotRequestId)
+            requireOperationOpaqueId(proposedPageZeroNetworkToken)
+        }
+    }
+}
+
+internal sealed interface AgentTranscriptLifecycleDurablePreparedRequest {
+    val requestKind: AgentTranscriptLifecycleRequestKind
+    val requestNetworkToken: String
+
+    data class Status(
+        val requestFence: AgentLocalRequestFence,
+    ) : AgentTranscriptLifecycleDurablePreparedRequest {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.STATUS
+        override val requestNetworkToken: String = requestFence.requestToken
+    }
+
+    data class Replay(
+        val lineage: AgentTimelineLineage,
+        val pageFence: AgentReplayPageFence,
+    ) : AgentTranscriptLifecycleDurablePreparedRequest {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.REPLAY
+        override val requestNetworkToken: String = pageFence.currentRequestNetworkToken
+    }
+
+    data class Snapshot(
+        val lineage: AgentTimelineLineage,
+        val snapshotRequestId: String,
+        override val requestNetworkToken: String,
+        val snapshotId: String?,
+        val cursor: String?,
+        val nextPageIndex: Long,
+    ) : AgentTranscriptLifecycleDurablePreparedRequest {
+        override val requestKind = AgentTranscriptLifecycleRequestKind.SNAPSHOT
+
+        init {
+            requireOperationOpaqueId(snapshotRequestId)
+            requireOperationOpaqueId(requestNetworkToken)
+            require((snapshotId == null) == (cursor == null))
+            require((snapshotId == null) == (nextPageIndex == 0L))
+        }
+    }
+}
+
+internal data class AgentTranscriptLifecycleDurablePrepareRequestResult(
+    val reduction: AgentTranscriptLifecycleClientReduction,
+    val preparedRequest: AgentTranscriptLifecycleDurablePreparedRequest,
+)
 
 /**
  * A complete replay response. The wire artifact owns after/through/cursor/events/raw accounting;
@@ -132,10 +253,30 @@ internal sealed interface AgentTranscriptLifecycleDurableSnapshotPageCommand {
 
 internal data class AgentTranscriptLifecycleDurableOperationResult(
     val reduction: AgentTranscriptLifecycleClientReduction,
+    val preparedRequests: List<AgentTranscriptLifecycleDurablePreparedRequest> = emptyList(),
+    val retiredRequests: List<AgentTranscriptLifecycleDurableRequestIdentity> = emptyList(),
 )
+
+internal data class AgentTranscriptLifecycleDurableRequestIdentity(
+    val requestKind: AgentTranscriptLifecycleRequestKind,
+    val requestNetworkToken: String,
+) {
+    init {
+        requireOperationOpaqueId(requestNetworkToken)
+    }
+}
 
 /** One deep production seam: every method maps to one outer Room transaction. */
 internal interface AgentTranscriptLifecycleDurableOperationPort {
+    suspend fun prepareRequestUnderApplyLease(
+        command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurablePrepareRequestResult
+
+    suspend fun loadPreparedRequestsUnderApplyLease(
+        fence: AgentTranscriptLifecycleDurableOperationFence,
+    ): List<AgentTranscriptLifecycleDurablePreparedRequest>
+
     suspend fun applyControlUnderApplyLease(
         command: AgentTranscriptLifecycleDurableControlCommand,
         limits: AgentClientReducerLimits = AgentClientReducerLimits(),
@@ -143,6 +284,11 @@ internal interface AgentTranscriptLifecycleDurableOperationPort {
 
     suspend fun consumeLiveEventUnderApplyLease(
         command: AgentTranscriptLifecycleDurableLiveEventCommand,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+    ): AgentTranscriptLifecycleDurableOperationResult
+
+    suspend fun consumeCorrelatedErrorUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableCorrelatedErrorCommand,
         limits: AgentClientReducerLimits = AgentClientReducerLimits(),
     ): AgentTranscriptLifecycleDurableOperationResult
 

@@ -1,5 +1,28 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedHandoffReceipt
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableHandoffPort
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExactRedriveReplacement
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExtensionRequestSender
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestAdmission
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestKind
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCode
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineHostEpochMismatchDetails
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineReplayPageFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineResetFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotPageFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1CodecException
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1FrameMetadata
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1InboundFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.runtime.BoundedActionQueue
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2CodecException
@@ -42,6 +65,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 
 /**
  * Serialized Relay v2 client runtime seam.
@@ -56,6 +80,9 @@ internal class RelayV2ConnectionActor(
     private val credentialStore: RelayV2CredentialStore,
     private val connectPlanSource: RelayV2ConnectPlanSource,
     private val codec: RelayV2Codec = RelayV2Codec(),
+    optionalCapabilities: Set<String> = emptySet(),
+    private val agentExtensionCodec: AgentTranscriptLifecycleV1Codec =
+        AgentTranscriptLifecycleV1Codec(),
     private val clock: () -> Long = System::currentTimeMillis,
     private val attemptId: () -> String = { UUID.randomUUID().toString() },
     private val watchdogDelay: suspend (Long) -> Unit = { delay(it) },
@@ -77,7 +104,19 @@ internal class RelayV2ConnectionActor(
     eventCapacity: Int = DEFAULT_EVENT_CAPACITY,
     private val actionByteCapacity: Long = DEFAULT_ACTION_BYTE_CAPACITY,
     private val effectByteCapacity: Long = DEFAULT_EFFECT_BYTE_CAPACITY,
-) : RelayProfileDisconnectBarrier, RelayV2RepositoryEffectApplyLeasePort, Closeable {
+    extensionActionCapacity: Int = MAX_PENDING_AGENT_EXTENSION_REQUESTS,
+    extensionEventCapacity: Int = DEFAULT_EXTENSION_EVENT_CAPACITY,
+    private val extensionActionByteCapacity: Long = DEFAULT_EXTENSION_ACTION_BYTE_CAPACITY,
+    private val extensionEffectByteCapacity: Long = DEFAULT_EXTENSION_EFFECT_BYTE_CAPACITY,
+    private val extensionRequestTimeoutMs: Long = EXTENSION_REQUEST_TIMEOUT_MS,
+    private val extensionRequestWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
+    private val beforeAgentExtensionRequestSend: suspend () -> Unit = {},
+    private val afterAgentExtensionRedriveEnqueuedBeforeSwap: () -> Unit = {},
+) : RelayProfileDisconnectBarrier,
+    RelayV2RepositoryEffectApplyLeasePort,
+    AgentTranscriptLifecycleExtensionRequestSender,
+    AgentTranscriptLifecycleDurableHandoffPort,
+    Closeable {
     private val actorDispatcher: ExecutorCoroutineDispatcher = Executors
         .newSingleThreadExecutor { runnable ->
             Thread(runnable, "tw-relay-v2-actor").apply { isDaemon = true }
@@ -95,11 +134,27 @@ internal class RelayV2ConnectionActor(
     private val effectChannel = Channel<QueuedEffect>(
         eventCapacity.also { require(it > 0) { "eventCapacity must be positive" } },
     )
+    private val agentExtensionActions = Channel<SendAgentExtensionRequestAction>(
+        extensionActionCapacity.also {
+            require(it > 0) { "extensionActionCapacity must be positive" }
+        },
+    )
+    private val agentExtensionEffectChannel = Channel<QueuedEffect>(
+        extensionEventCapacity.also {
+            require(it > 0) { "extensionEventCapacity must be positive" }
+        },
+    )
+    private val agentExtensionHandoffEffectChannel =
+        Channel<QueuedEffect>(MAX_PENDING_AGENT_EXTENSION_REQUESTS)
+    private val agentExtensionControlEffectChannel = Channel<QueuedEffect>(1)
     private val resourcesClosed = AtomicBoolean(false)
     private val lastTerminationGeneration = AtomicReference<RelayV2EffectGeneration?>(null)
     private val publishedEffectGeneration = AtomicReference<RelayV2EffectGeneration?>(null)
+    private val agentExtensionSendFence = AtomicReference<AgentExtensionSendFence?>(null)
     private val queuedActionBytes = AtomicLong(0)
     private val queuedEffectBytes = AtomicLong(0)
+    private val queuedAgentExtensionActionBytes = AtomicLong(0)
+    private val queuedAgentExtensionEffectBytes = AtomicLong(0)
     private val effectApplyGate = EffectApplyGate()
     private val callbackAdmissions = CallbackAdmissionGate()
     private val lifecycleLock = Any()
@@ -115,18 +170,11 @@ internal class RelayV2ConnectionActor(
         CompletableDeferred<RelayProfileDisconnectReceipt>,
         RelayProfileDisconnectReceipt,
         >()
+    private val advertisedOptionalCapabilities = optionalCapabilities.toSet()
 
     private val _state = MutableStateFlow(RelayV2ConnectionState(changedAtMs = clock()))
     val state: StateFlow<RelayV2ConnectionState> = _state.asStateFlow()
-    val effects: Flow<RelayV2RuntimeEffect> = flow {
-        for (queued in effectChannel) {
-            try {
-                emit(queued.effect)
-            } finally {
-                releaseBytes(queuedEffectBytes, queued.rawBytes)
-            }
-        }
-    }
+    val effects: Flow<RelayV2RuntimeEffect> = multiplexedEffectFlow()
 
     /**
      * Runs a repository/Room commit while holding the actor-owned generation lease.
@@ -202,6 +250,11 @@ internal class RelayV2ConnectionActor(
     private var onlineContext: RelayV2HandshakeContext? = null
     private val recentIssuedIds = LinkedHashSet<String>()
     private val completedRecoveryResponses = LinkedHashSet<CompletedRecoveryResponse>()
+    private val pendingAgentExtensionRequests =
+        linkedMapOf<String, PendingAgentExtensionRequest>()
+    private val retiredAgentExtensionRequests =
+        linkedMapOf<String, RetiredAgentExtensionRequestIdentity>()
+    private var nextAgentExtensionAdmissionSequence = 0L
 
     init {
         require(relayWelcomeTimeoutMs > 0) { "relayWelcomeTimeoutMs must be positive" }
@@ -209,6 +262,21 @@ internal class RelayV2ConnectionActor(
         require(recoveryStepTimeoutMs > 0) { "recoveryStepTimeoutMs must be positive" }
         require(actionByteCapacity > 0) { "actionByteCapacity must be positive" }
         require(effectByteCapacity > 0) { "effectByteCapacity must be positive" }
+        require(extensionActionByteCapacity > 0) {
+            "extensionActionByteCapacity must be positive"
+        }
+        require(extensionEffectByteCapacity > 0) {
+            "extensionEffectByteCapacity must be positive"
+        }
+        require(extensionRequestTimeoutMs > 0) {
+            "extensionRequestTimeoutMs must be positive"
+        }
+        require(advertisedOptionalCapabilities.all { it in SUPPORTED_OPTIONAL_CAPABILITIES }) {
+            "Unsupported Relay v2 optional capability"
+        }
+        require(advertisedOptionalCapabilities.none { it in REQUIRED_CAPABILITIES }) {
+            "Relay v2 optional capabilities must remain separate from required capabilities"
+        }
         scope.launch {
             try {
                 while (true) {
@@ -223,6 +291,7 @@ internal class RelayV2ConnectionActor(
             } finally {
                 cancelHandshakeWatchdogs()
                 clearRecoveryAttempt()
+                clearPendingAgentExtensionRequests()
                 invalidateConnectionOwnershipAndDrain()
                 val source = activeTransport
                 activeTransport = null
@@ -231,6 +300,23 @@ internal class RelayV2ConnectionActor(
                     beginRetirement(listOf(it), closeCode = null, forceCancel = true)
                 }
                 finishResources()
+            }
+        }
+        scope.launch {
+            for (action in agentExtensionActions) {
+                try {
+                    beforeAgentExtensionRequestSend()
+                    sendAgentExtensionRequest(action)
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Throwable) {
+                    requestAgentExtensionRetry(
+                        action.admission,
+                        RelayV2AgentExtensionUnavailableReason.REQUEST_SEND_FAILED,
+                    )
+                } finally {
+                    releaseBytes(queuedAgentExtensionActionBytes, action.rawBytes)
+                }
             }
         }
         scope.coroutineContext[Job]?.invokeOnCompletion {
@@ -291,6 +377,190 @@ internal class RelayV2ConnectionActor(
         }
         signalQueueSaturation(overload.first, overload.second)
         return false
+    }
+
+    override fun send(
+        request: AgentTranscriptLifecycleActorRequest,
+    ): AgentTranscriptLifecycleRequestAdmission? {
+        val encoded = try {
+            agentExtensionCodec.encodePublicFrame(request.frame)
+        } catch (_: AgentTranscriptLifecycleV1CodecException) {
+            return null
+        }
+        return synchronized(lifecycleLock) {
+            val fence = agentExtensionSendFence.get()
+            if (lifecycleState != LifecycleState.OPEN ||
+                fence == null ||
+                fence.authority != request.authority ||
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in fence.negotiatedCapabilities ||
+                _state.value.phase !in AGENT_EXTENSION_INBOUND_PHASES ||
+                pendingAgentExtensionRequests.size >= MAX_PENDING_AGENT_EXTENSION_REQUESTS ||
+                pendingAgentExtensionRequests.size + retiredAgentExtensionRequests.size >=
+                    MAX_TRACKED_AGENT_EXTENSION_REQUESTS ||
+                request.requestId in pendingAgentExtensionRequests ||
+                request.requestId in retiredAgentExtensionRequests
+            ) {
+                return@synchronized null
+            }
+            val sequence = try {
+                Math.addExact(nextAgentExtensionAdmissionSequence, 1L)
+            } catch (_: ArithmeticException) {
+                return@synchronized null
+            }
+            val admission = AgentTranscriptLifecycleRequestAdmission(
+                authority = request.authority,
+                requestKind = request.kind,
+                requestId = request.requestId,
+                admissionSequence = sequence,
+            )
+            val action = SendAgentExtensionRequestAction(request, admission, encoded)
+            if (!reserveBytes(
+                    queuedAgentExtensionActionBytes,
+                    action.rawBytes,
+                    extensionActionByteCapacity,
+                )
+            ) return@synchronized null
+            pendingAgentExtensionRequests[request.requestId] = PendingAgentExtensionRequest(
+                request = request,
+                admission = admission,
+            )
+            if (agentExtensionActions.trySend(action).isFailure) {
+                pendingAgentExtensionRequests.remove(request.requestId)
+                releaseBytes(queuedAgentExtensionActionBytes, action.rawBytes)
+                return@synchronized null
+            }
+            nextAgentExtensionAdmissionSequence = sequence
+            admission
+        }
+    }
+
+    override fun acceptDurableHandoff(
+        receipt: AgentTranscriptLifecycleCompletedHandoffReceipt,
+    ): Boolean = synchronized(lifecycleLock) {
+        val admission = receipt.admission
+        val pending = pendingAgentExtensionRequests[admission.requestId]
+            ?: return@synchronized false
+        if (pending.admission != admission ||
+            pending.state != AgentExtensionPendingState.HANDOFF_QUEUED ||
+            pending.delivery == null
+        ) return@synchronized false
+        pending.watchdog?.cancel()
+        removeQueuedAgentExtensionDeliveriesLocked(setOf(admission))
+        retireAgentExtensionRequestLocked(pending)
+        pendingAgentExtensionRequests.remove(admission.requestId)
+        releasePendingAgentExtensionDeliveryBytesLocked(pending)
+        true
+    }
+
+    override fun replaceForExactRedrive(
+        replacement: AgentTranscriptLifecycleExactRedriveReplacement,
+    ): AgentTranscriptLifecycleRequestAdmission? {
+        val request = replacement.exactRequest
+        val encoded = try {
+            agentExtensionCodec.encodePublicFrame(request.frame)
+        } catch (_: AgentTranscriptLifecycleV1CodecException) {
+            return null
+        }
+        return synchronized(lifecycleLock) {
+            val oldAdmission = replacement.oldAdmission
+            val oldPending = pendingAgentExtensionRequests[oldAdmission.requestId]
+                ?: return@synchronized null
+            val fence = agentExtensionSendFence.get()
+            if (oldPending.admission != oldAdmission ||
+                oldPending.request != request ||
+                oldPending.state != AgentExtensionPendingState.HANDOFF_QUEUED ||
+                oldPending.delivery == null ||
+                lifecycleState != LifecycleState.OPEN ||
+                fence == null ||
+                fence.authority != request.authority ||
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in fence.negotiatedCapabilities ||
+                _state.value.phase !in AGENT_EXTENSION_INBOUND_PHASES ||
+                request.requestId in retiredAgentExtensionRequests
+            ) return@synchronized null
+
+            val sequence = try {
+                Math.addExact(nextAgentExtensionAdmissionSequence, 1L)
+            } catch (_: ArithmeticException) {
+                return@synchronized null
+            }
+            val admission = AgentTranscriptLifecycleRequestAdmission(
+                authority = request.authority,
+                requestKind = request.kind,
+                requestId = request.requestId,
+                admissionSequence = sequence,
+            )
+            val action = SendAgentExtensionRequestAction(request, admission, encoded)
+            if (!reserveBytes(
+                    queuedAgentExtensionActionBytes,
+                    action.rawBytes,
+                    extensionActionByteCapacity,
+                )
+            ) return@synchronized null
+            if (agentExtensionActions.trySend(action).isFailure) {
+                releaseBytes(queuedAgentExtensionActionBytes, action.rawBytes)
+                return@synchronized null
+            }
+
+            afterAgentExtensionRedriveEnqueuedBeforeSwap()
+            oldPending.watchdog?.cancel()
+            removeQueuedAgentExtensionDeliveriesLocked(setOf(oldAdmission))
+            pendingAgentExtensionRequests.remove(oldAdmission.requestId)
+            releasePendingAgentExtensionDeliveryBytesLocked(oldPending)
+            pendingAgentExtensionRequests[request.requestId] = PendingAgentExtensionRequest(
+                request = request,
+                admission = admission,
+            )
+            nextAgentExtensionAdmissionSequence = sequence
+            admission
+        }
+    }
+
+    override fun acceptDurableHandoff(
+        receipt: AgentTranscriptLifecycleCompletedBatchHandoffReceipt,
+    ): Boolean = synchronized(lifecycleLock) {
+        val triggering = receipt.triggeringAdmission
+        val triggeringPending = pendingAgentExtensionRequests[triggering.requestId]
+            ?: return@synchronized false
+        if (!triggeringPending.matchesRetirementReceipt(receipt) ||
+            triggeringPending.admission != triggering ||
+            triggeringPending.state != AgentExtensionPendingState.HANDOFF_QUEUED ||
+            triggeringPending.delivery == null
+        ) return@synchronized false
+
+        val retired = receipt.retiredRequests.map { identity ->
+            val pending = pendingAgentExtensionRequests[identity.requestNetworkToken]
+                ?: return@map null
+            if (pending.request.kind != identity.requestKind ||
+                !pending.matchesRetirementReceipt(receipt)
+            ) return@synchronized false
+            pending
+        }.filterNotNull()
+
+        removeQueuedAgentExtensionDeliveriesLocked(retired.map { it.admission }.toSet())
+        retired.forEach { pending ->
+            pending.watchdog?.cancel()
+            retireAgentExtensionRequestLocked(pending)
+            pendingAgentExtensionRequests.remove(pending.admission.requestId)
+            releasePendingAgentExtensionDeliveryBytesLocked(pending)
+        }
+        true
+    }
+
+    private fun PendingAgentExtensionRequest.matchesRetirementReceipt(
+        receipt: AgentTranscriptLifecycleCompletedBatchHandoffReceipt,
+    ): Boolean = request.authority == receipt.authority &&
+        request.scopeId == receipt.scopeId &&
+        request.sessionId == receipt.sessionId
+
+    private fun retireAgentExtensionRequestLocked(pending: PendingAgentExtensionRequest) {
+        val identity = pending.request.retiredIdentity()
+        val existing = retiredAgentExtensionRequests.putIfAbsent(identity.requestId, identity)
+        check(existing == null || existing == identity) {
+            "Relay v2 extension request retirement identity conflict"
+        }
+        check(retiredAgentExtensionRequests.size <= MAX_TRACKED_AGENT_EXTENSION_REQUESTS) {
+            "Relay v2 extension request retirement capacity invariant violated"
+        }
     }
 
     override suspend fun disconnectAndDrain(
@@ -365,7 +635,7 @@ internal class RelayV2ConnectionActor(
                 lifecycleState = LifecycleState.SHUTTING_DOWN
                 check(shutdownDrainCompletion == null) { "Relay v2 shutdown drain already exists" }
                 shutdownDrainCompletion = CompletableDeferred()
-                publishedEffectGeneration.set(null)
+                clearPublishedEffectAuthority()
                 effectApplyGate.invalidateAndDrain()
                 actions.trySendReserved(Action.Shutdown)
             }
@@ -460,7 +730,7 @@ internal class RelayV2ConnectionActor(
 
             val preparation = synchronized(lifecycleLock) {
                 if (!isConnectTokenCurrentLocked(token)) return@synchronized null
-                publishedEffectGeneration.set(null)
+                clearPublishedEffectAuthority()
                 revokeCallbackOwnersLocked()
                 val previous = activeTransport
                 activeTransport = null
@@ -468,6 +738,7 @@ internal class RelayV2ConnectionActor(
                 lastTerminationGeneration.set(null)
                 pendingTerminalIntent = null
                 clearRecoveryAttempt()
+                clearPendingAgentExtensionRequests()
                 recentIssuedIds.clear()
                 completedRecoveryResponses.clear()
                 onlineQueryWindow = null
@@ -833,7 +1104,7 @@ internal class RelayV2ConnectionActor(
         ) {
             callbackAdmissions.sealThrough(committed.key)
             committedCallbackOwner = null
-            publishedEffectGeneration.set(null)
+            clearPublishedEffectAuthority()
         }
         effectApplyGate.invalidateThrough(profile.profileId, fenced)
     }
@@ -858,13 +1129,14 @@ internal class RelayV2ConnectionActor(
             }
             committedCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
             committedCallbackOwner = null
-            publishedEffectGeneration.set(null)
+            clearPublishedEffectAuthority()
             effectApplyGate.invalidateAndDrain()
             val source = activeTransport
             activeTransport = null
             activeProfile = profile
             pendingHelloRequestId = null
             clearRecoveryAttempt()
+            clearPendingAgentExtensionRequests()
             updateState(RelayV2ConnectionPhase.FAILED, profile, failure)
             source
         }
@@ -1320,9 +1592,10 @@ internal class RelayV2ConnectionActor(
                 action.metadata,
             )
         } catch (_: RelayV2CodecException) {
-            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            handlePotentialAgentExtensionFrame(action.bytes, action.metadata)
             return
         }
+        if (routeOverlappingAgentExtensionError(decoded, action.bytes, action.metadata)) return
         when (_state.value.phase) {
             RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME -> handleRelayWelcome(decoded, action.bytes.size)
             RelayV2ConnectionPhase.AWAITING_HOST_WELCOME -> handleHostWelcome(decoded, action.bytes.size)
@@ -1336,6 +1609,358 @@ internal class RelayV2ConnectionActor(
             else -> failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
         }
     }
+
+    private fun handlePotentialAgentExtensionFrame(
+        bytes: ByteArray,
+        metadata: RelayV2FrameMetadata,
+    ) {
+        val artifact = try {
+            agentExtensionCodec.decodePublicFrameArtifact(
+                bytes,
+                AgentTranscriptLifecycleV1FrameMetadata(
+                    opcode = metadata.opcode,
+                    compressed = metadata.compressed,
+                ),
+            )
+        } catch (_: AgentTranscriptLifecycleV1CodecException) {
+            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            return
+        }
+        deliverAgentExtensionArtifact(artifact)
+    }
+
+    /**
+     * The base and Agent schemas deliberately overlap only at selected `type=error` codes. Route
+     * one such frame to the extension only when it is bound to this generation's exact pending or
+     * retired request and the strict extension codec issues the artifact. Every other base error
+     * keeps the frozen base route.
+     */
+    private fun routeOverlappingAgentExtensionError(
+        decoded: RelayV2DecodedMessage,
+        bytes: ByteArray,
+        metadata: RelayV2FrameMetadata,
+    ): Boolean {
+        if (decoded.type() != "error" || _state.value.phase !in AGENT_EXTENSION_INBOUND_PHASES) {
+            return false
+        }
+        val context = onlineContext ?: return false
+        if (AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in context.negotiatedCapabilities) return false
+        val frame = decoded.frame
+        val requestId = frame["requestId"] as? String ?: return false
+        val errorCode = (frame["error"] as? Map<*, *>)?.get("code") as? String ?: return false
+        if (errorCode !in BASE_AGENT_EXTENSION_OVERLAPPING_ERROR_CODES) return false
+        val owner = agentExtensionRequestOwnerForOverlappingError(requestId) ?: return false
+        fun isolateOwnedError(): Boolean {
+            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE)
+            return true
+        }
+        val sendFence = agentExtensionSendFence.get() ?: return isolateOwnedError()
+        if (owner.identity.authority != sendFence.authority ||
+            context.repositoryEffectAuthority(sendFence.authority.generation) != sendFence.authority
+        ) return isolateOwnedError()
+        val artifact = try {
+            agentExtensionCodec.decodePublicFrameArtifact(
+                bytes,
+                AgentTranscriptLifecycleV1FrameMetadata(
+                    opcode = metadata.opcode,
+                    compressed = metadata.compressed,
+                ),
+            )
+        } catch (_: AgentTranscriptLifecycleV1CodecException) {
+            return isolateOwnedError()
+        }
+        val extensionError = artifact.frame as? AgentTimelineErrorFrame
+            ?: return isolateOwnedError()
+        if (extensionError.requestId != requestId || extensionError.error.code.wireValue != errorCode) {
+            return isolateOwnedError()
+        }
+        if (!extensionError.matchesErrorRequest(owner.identity)) return isolateOwnedError()
+        if (owner.uncorrelatedOnly) return isolateOwnedError()
+        deliverAgentExtensionArtifact(artifact)
+        return true
+    }
+
+    private fun deliverAgentExtensionArtifact(
+        artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
+    ) {
+        val phase = _state.value.phase
+        val context = onlineContext
+        if (phase !in AGENT_EXTENSION_INBOUND_PHASES ||
+            context == null ||
+            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in context.negotiatedCapabilities
+        ) {
+            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            return
+        }
+        val resolved = resolveAgentExtensionIngress(artifact, context) ?: return
+        val profile = activeProfile ?: return
+        emitAgentExtensionDelivery(
+            effect = RelayV2RuntimeEffect.DeliverAgentExtensionFrame(
+                context = context,
+                artifact = artifact,
+                ingress = resolved.ingress,
+                requestAdmission = resolved.admission,
+                generation = currentEffectGeneration(profile),
+            ),
+            admission = resolved.admission,
+        )
+    }
+
+    private fun resolveAgentExtensionIngress(
+        artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
+        context: RelayV2HandshakeContext,
+    ): ResolvedAgentExtensionIngress? = when (val frame = artifact.frame) {
+        is AgentTimelineEventFrame,
+        is AgentTimelineResetFrame,
+        -> if ((frame as AgentTranscriptLifecycleV1InboundFrame).matchesHost(context)) {
+            ResolvedAgentExtensionIngress(AgentTranscriptLifecycleTrustedIngress.Live, null)
+        } else {
+            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH)
+        }
+        is AgentTimelineStatusFrame -> correlateAgentExtensionResponse(
+            frame,
+            frame.requestId,
+            AgentTranscriptLifecycleRequestKind.STATUS,
+        )
+        is AgentTimelineReplayPageFrame -> correlateAgentExtensionResponse(
+            frame,
+            frame.requestId,
+            AgentTranscriptLifecycleRequestKind.REPLAY,
+        )
+        is AgentTimelineSnapshotPageFrame -> correlateAgentExtensionResponse(
+            frame,
+            frame.requestId,
+            AgentTranscriptLifecycleRequestKind.SNAPSHOT,
+        )
+        is AgentTimelineErrorFrame -> {
+            val pending = pendingAgentExtensionRequestForResponse(frame.requestId)
+                ?: return isolateAgentExtension(
+                    RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                )
+            if (!frame.matchesErrorRequest(pending.request)) {
+                isolateAgentExtension(
+                    RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH,
+                )
+            } else {
+                ResolvedAgentExtensionIngress(
+                    ingress = AgentTranscriptLifecycleTrustedIngress.CorrelatedError(
+                        requestKind = pending.request.kind,
+                        requestId = frame.requestId,
+                        statusRequestFence =
+                            (pending.request as? AgentTranscriptLifecycleActorRequest.Status)
+                                ?.requestFence,
+                    ),
+                    admission = pending.admission,
+                )
+            }
+        }
+        else -> {
+            failConnection(RelayV2FailureKind.SCHEMA, "INVALID_ENVELOPE", false, 4400)
+            null
+        }
+    }
+
+    private fun correlateAgentExtensionResponse(
+        frame: AgentTranscriptLifecycleV1InboundFrame,
+        requestId: String,
+        expectedKind: AgentTranscriptLifecycleRequestKind,
+    ): ResolvedAgentExtensionIngress? {
+        val pending = pendingAgentExtensionRequestForResponse(requestId)
+            ?: return isolateAgentExtension(
+                RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+            )
+        if (pending.request.kind != expectedKind || !frame.matchesRequest(pending.request)) {
+            return isolateAgentExtension(
+                RelayV2AgentExtensionUnavailableReason.RESPONSE_ROUTE_MISMATCH,
+            )
+        }
+        val ingress = when (val request = pending.request) {
+            is AgentTranscriptLifecycleActorRequest.Status ->
+                AgentTranscriptLifecycleTrustedIngress.CorrelatedStatus(request.requestFence)
+            is AgentTranscriptLifecycleActorRequest.Replay ->
+                AgentTranscriptLifecycleTrustedIngress.Replay
+            is AgentTranscriptLifecycleActorRequest.Snapshot ->
+                AgentTranscriptLifecycleTrustedIngress.Snapshot
+        }
+        return ResolvedAgentExtensionIngress(ingress, pending.admission)
+    }
+
+    private fun isolateAgentExtension(
+        reason: RelayV2AgentExtensionUnavailableReason,
+    ): ResolvedAgentExtensionIngress? {
+        val context = onlineContext ?: return null
+        val profile = activeProfile ?: return null
+        emitAgentExtensionControlEffect(
+            RelayV2RuntimeEffect.AgentExtensionUnavailable(
+                context = context,
+                reason = reason,
+                generation = currentEffectGeneration(profile),
+            ),
+        )
+        return null
+    }
+
+    private fun sendAgentExtensionRequest(action: SendAgentExtensionRequestAction) {
+        val source = synchronized(lifecycleLock) {
+            val pending = pendingAgentExtensionRequests[action.request.requestId]
+            val fence = agentExtensionSendFence.get()
+            val context = onlineContext
+            if (pending?.admission != action.admission ||
+                pending.state != AgentExtensionPendingState.QUEUED ||
+                fence == null ||
+                fence.authority != action.request.authority ||
+                context == null ||
+                context.repositoryEffectAuthority(fence.authority.generation) != fence.authority ||
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY !in fence.negotiatedCapabilities ||
+                _state.value.phase !in AGENT_EXTENSION_INBOUND_PHASES
+            ) return@synchronized null
+            activeTransport
+        } ?: return
+        if (!runCatching { source.send(action.bytes) }.getOrDefault(false)) {
+            requestAgentExtensionRetry(
+                action.admission,
+                RelayV2AgentExtensionUnavailableReason.REQUEST_SEND_FAILED,
+            )
+            return
+        }
+        val admitted = synchronized(lifecycleLock) {
+            val pending = pendingAgentExtensionRequests[action.request.requestId]
+            if (pending?.admission != action.admission ||
+                pending.state != AgentExtensionPendingState.QUEUED
+            ) return@synchronized false
+            pending.state = AgentExtensionPendingState.SENT
+            true
+        }
+        if (admitted) scheduleAgentExtensionRequestWatchdog(action.admission)
+    }
+
+    private fun pendingAgentExtensionRequestForResponse(
+        requestId: String,
+    ): PendingAgentExtensionRequest? = synchronized(lifecycleLock) {
+        pendingAgentExtensionRequests[requestId]
+            ?.takeIf { it.state == AgentExtensionPendingState.SENT }
+    }
+
+    private fun agentExtensionRequestOwnerForOverlappingError(
+        requestId: String,
+    ): AgentExtensionOverlappingErrorOwner? = synchronized(lifecycleLock) {
+        val pending = pendingAgentExtensionRequests[requestId]
+        if (pending != null) {
+            return@synchronized AgentExtensionOverlappingErrorOwner(
+                identity = pending.request.retiredIdentity(),
+                uncorrelatedOnly = pending.state != AgentExtensionPendingState.SENT,
+            )
+        }
+        retiredAgentExtensionRequests[requestId]?.let {
+            AgentExtensionOverlappingErrorOwner(it, uncorrelatedOnly = true)
+        }
+    }
+
+    private fun clearPendingAgentExtensionRequests() = synchronized(lifecycleLock) {
+        pendingAgentExtensionRequests.values.forEach {
+            it.watchdog?.cancel()
+            releasePendingAgentExtensionDeliveryBytesLocked(it)
+        }
+        pendingAgentExtensionRequests.clear()
+        retiredAgentExtensionRequests.clear()
+        drainQueuedEffects(agentExtensionHandoffEffectChannel, null)
+    }
+
+    private fun scheduleAgentExtensionRequestWatchdog(
+        admission: AgentTranscriptLifecycleRequestAdmission,
+    ) {
+        val job = scope.launch {
+            extensionRequestWatchdogDelay(extensionRequestTimeoutMs)
+            requestAgentExtensionRetry(
+                admission,
+                RelayV2AgentExtensionUnavailableReason.REQUEST_TIMEOUT,
+            )
+        }
+        synchronized(lifecycleLock) {
+            val pending = pendingAgentExtensionRequests[admission.requestId]
+            if (pending?.admission == admission &&
+                pending.state == AgentExtensionPendingState.SENT
+            ) {
+                pending.watchdog?.cancel()
+                pending.watchdog = job
+            } else {
+                job.cancel()
+            }
+        }
+    }
+
+    private fun requestAgentExtensionRetry(
+        admission: AgentTranscriptLifecycleRequestAdmission,
+        reason: RelayV2AgentExtensionUnavailableReason,
+    ) {
+        val queued = synchronized(lifecycleLock) {
+            val context = onlineContext ?: return
+            val profile = activeProfile ?: return
+            val pending = pendingAgentExtensionRequests[admission.requestId]
+                ?.takeIf {
+                    it.admission == admission &&
+                        it.state != AgentExtensionPendingState.HANDOFF_QUEUED
+                } ?: return
+            pending.watchdog?.cancel()
+            pending.watchdog = null
+            pending.state = AgentExtensionPendingState.HANDOFF_QUEUED
+            pending.delivery = PendingAgentExtensionDelivery(
+                effect = RelayV2RuntimeEffect.AgentExtensionUnavailable(
+                    context = context,
+                    reason = reason,
+                    failedRequest = pending.request,
+                    requestAdmission = admission,
+                    generation = currentEffectGeneration(profile),
+                ),
+                rawBytes = 0,
+            )
+            enqueueAgentExtensionDeliveryLocked(pending)
+        }
+        if (!queued) {
+            // The exact failure remains actor-owned and will be retried on its bounded lane.
+            // Only the optional extension is isolated; base routes remain online.
+            isolateAgentExtension(reason)
+        }
+    }
+
+    private fun AgentTranscriptLifecycleV1InboundFrame.matchesHost(
+        context: RelayV2HandshakeContext,
+    ): Boolean = hostId == context.hostId && hostEpoch == context.hostEpoch
+
+    private fun AgentTranscriptLifecycleV1InboundFrame.matchesRequest(
+        request: AgentTranscriptLifecycleActorRequest,
+    ): Boolean = hostId == request.authority.hostId &&
+        hostEpoch == request.authority.hostEpoch &&
+        scopeId == request.scopeId &&
+        sessionId == request.sessionId
+
+    private fun AgentTranscriptLifecycleActorRequest.retiredIdentity() =
+        RetiredAgentExtensionRequestIdentity(
+            authority = authority,
+            requestKind = kind,
+            requestId = requestId,
+            scopeId = scopeId,
+            sessionId = sessionId,
+        )
+
+    private fun AgentTimelineErrorFrame.matchesErrorRequest(
+        request: RetiredAgentExtensionRequestIdentity,
+    ): Boolean {
+        if (hostId != request.authority.hostId ||
+            scopeId != request.scopeId ||
+            sessionId != request.sessionId
+        ) return false
+        if (error.code != AgentTimelineErrorCode.HOST_EPOCH_MISMATCH) {
+            return hostEpoch == request.authority.hostEpoch
+        }
+        val details = error.details as? AgentTimelineHostEpochMismatchDetails ?: return false
+        return details.expectedHostEpoch == request.authority.hostEpoch &&
+            details.actualHostEpoch == hostEpoch
+    }
+
+    private fun AgentTimelineErrorFrame.matchesErrorRequest(
+        request: AgentTranscriptLifecycleActorRequest,
+    ): Boolean = matchesErrorRequest(request.retiredIdentity())
 
     private fun handleRecoveryFrame(decoded: RelayV2DecodedMessage, rawBytes: Int) {
         val profile = activeProfile ?: return
@@ -1833,7 +2458,8 @@ internal class RelayV2ConnectionActor(
             "hostId" to profile.hostId,
             "payload" to linkedMapOf(
                 "clientInstanceId" to profile.clientInstanceId,
-                "capabilities" to REQUIRED_CAPABILITIES,
+                "capabilities" to REQUIRED_CAPABILITIES +
+                    advertisedOptionalCapabilities.sorted(),
                 "requiredCapabilities" to REQUIRED_CAPABILITIES,
                 "resume" to requestedResume?.let {
                     linkedMapOf(
@@ -1894,10 +2520,10 @@ internal class RelayV2ConnectionActor(
         }
         val payload = frame.objectValue("payload")
         val hostCapabilities = payload.stringList("capabilities").toSet()
-        val negotiated = REQUIRED_CAPABILITIES.toSet()
+        val negotiatedRequired = REQUIRED_CAPABILITIES.toSet()
             .intersect(brokerCapabilities)
             .intersect(hostCapabilities)
-        if (!negotiated.containsAll(REQUIRED_CAPABILITIES)) {
+        if (!negotiatedRequired.containsAll(REQUIRED_CAPABILITIES)) {
             failConnection(
                 RelayV2FailureKind.CAPABILITY,
                 "CAPABILITY_UNAVAILABLE",
@@ -1906,6 +2532,9 @@ internal class RelayV2ConnectionActor(
             )
             return
         }
+        val negotiated = negotiatedRequired + advertisedOptionalCapabilities
+            .intersect(brokerCapabilities)
+            .intersect(hostCapabilities)
         val hostLimits = payload.objectValue("limits").longMap()
         val negotiatedLimits = negotiateLimits(requireNotNull(brokerLimits), hostLimits)
         if (negotiatedLimits == null) {
@@ -1957,6 +2586,7 @@ internal class RelayV2ConnectionActor(
         if (!activateEffectGenerationIfCurrent(
                 effectGeneration,
                 context.repositoryEffectAuthority(effectGeneration),
+                context.negotiatedCapabilities,
             )
         ) {
             return
@@ -2694,10 +3324,11 @@ internal class RelayV2ConnectionActor(
             effectApplyGate.activate(effectGeneration)
             callbackAdmissions.sealThrough(committed.key)
             committedCallbackOwner = null
-            publishedEffectGeneration.set(null)
+            clearPublishedEffectAuthority()
             activeTransport.also { activeTransport = null }
         }
         clearRecoveryAttempt()
+        clearPendingAgentExtensionRequests()
         source?.let {
             beginRetirement(listOf(it), closeCode = 4400, reason = "event cursor ahead")
         }
@@ -3031,11 +3662,12 @@ internal class RelayV2ConnectionActor(
         val terminalSource = activeTransport ?: source
         betweenTerminalCauseReadAndOwnerRevoke()
         revokeCallbackOwnersLocked()
-        publishedEffectGeneration.set(null)
+        clearPublishedEffectAuthority()
         effectApplyGate.invalidateAndDrain()
         activeTransport = null
         pendingTerminalIntent = null
         clearRecoveryAttempt()
+        clearPendingAgentExtensionRequests()
         val retirementCommand = terminalSource?.let {
             claimTerminalRetirementLocked(terminalCause, it)
         }
@@ -3260,12 +3892,13 @@ internal class RelayV2ConnectionActor(
         val fencedGeneration = current?.let(::currentEffectGeneration)
         val preparation = synchronized(lifecycleLock) {
             revokeCallbackOwnersLocked()
-            publishedEffectGeneration.set(null)
+            clearPublishedEffectAuthority()
             val applyDrain = effectApplyGate.invalidateAndDrain()
             val source = activeTransport
             activeTransport = null
             connectionGeneration += 1
             clearRecoveryAttempt()
+            clearPendingAgentExtensionRequests()
             updateState(_state.value.phase, current, _state.value.failure)
             DisconnectPreparation(source, applyDrain)
         }
@@ -3492,6 +4125,110 @@ internal class RelayV2ConnectionActor(
         return false
     }
 
+    private fun emitAgentExtensionDelivery(
+        effect: RelayV2RuntimeEffect.DeliverAgentExtensionFrame,
+        admission: AgentTranscriptLifecycleRequestAdmission?,
+    ): Boolean {
+        val rawBytes = effect.artifact.rawUtf8ByteCount
+        if (admission == null) {
+            val reserved = reserveBytes(
+                queuedAgentExtensionEffectBytes,
+                rawBytes,
+                extensionEffectByteCapacity,
+            )
+            if (reserved &&
+                agentExtensionEffectChannel.trySend(QueuedEffect(effect, rawBytes)).isSuccess
+            ) return true
+            if (reserved) releaseBytes(queuedAgentExtensionEffectBytes, rawBytes)
+            isolateAgentExtension(RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED)
+            return false
+        }
+
+        val enqueued = synchronized(lifecycleLock) {
+            val pending = pendingAgentExtensionRequests[admission.requestId]
+            if (pending?.admission != admission ||
+                pending.state != AgentExtensionPendingState.SENT
+            ) return@synchronized false
+            pending.watchdog?.cancel()
+            pending.watchdog = null
+            if (!reserveBytes(
+                    queuedAgentExtensionEffectBytes,
+                    rawBytes,
+                    extensionEffectByteCapacity,
+                )
+            ) return@synchronized false
+            pending.state = AgentExtensionPendingState.HANDOFF_QUEUED
+            pending.delivery = PendingAgentExtensionDelivery(
+                effect = effect,
+                rawBytes = rawBytes,
+                ownsByteReservation = true,
+            )
+            if (enqueueAgentExtensionDeliveryLocked(pending)) {
+                true
+            } else {
+                releasePendingAgentExtensionDeliveryBytesLocked(pending)
+                pending.delivery = null
+                pending.state = AgentExtensionPendingState.SENT
+                false
+            }
+        }
+        if (enqueued) return true
+        requestAgentExtensionRetry(
+            admission,
+            RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED,
+        )
+        return false
+    }
+
+    private fun emitAgentExtensionControlEffect(effect: RelayV2RuntimeEffect): Boolean {
+        val result = agentExtensionControlEffectChannel.trySend(QueuedEffect(effect, 0))
+        if (result.isSuccess) return true
+        // One already-queued unavailable effect is a bounded coalesced handoff for the lane.
+        return !result.isClosed && !resourcesClosed.get()
+    }
+
+    private fun enqueueAgentExtensionDeliveryLocked(
+        pending: PendingAgentExtensionRequest,
+    ): Boolean {
+        val delivery = pending.delivery ?: return false
+        if (delivery.state != AgentExtensionDeliveryState.READY_TO_EMIT &&
+            delivery.state != AgentExtensionDeliveryState.DELIVERED
+        ) return false
+        val queued = QueuedEffect(
+            effect = delivery.effect,
+            rawBytes = delivery.rawBytes,
+            deliveryAdmission = pending.admission,
+        )
+        val accepted = agentExtensionHandoffEffectChannel.trySend(queued).isSuccess
+        if (accepted) delivery.state = AgentExtensionDeliveryState.QUEUED
+        return accepted
+    }
+
+    private fun releasePendingAgentExtensionDeliveryBytesLocked(
+        pending: PendingAgentExtensionRequest,
+    ) {
+        val delivery = pending.delivery ?: return
+        if (!delivery.ownsByteReservation) return
+        delivery.ownsByteReservation = false
+        releaseBytes(queuedAgentExtensionEffectBytes, delivery.rawBytes)
+    }
+
+    private fun removeQueuedAgentExtensionDeliveriesLocked(
+        admissions: Set<AgentTranscriptLifecycleRequestAdmission>,
+    ) {
+        if (admissions.isEmpty()) return
+        val retained = ArrayDeque<QueuedEffect>(MAX_PENDING_AGENT_EXTENSION_REQUESTS)
+        while (true) {
+            val queued = agentExtensionHandoffEffectChannel.tryReceive().getOrNull() ?: break
+            if (queued.deliveryAdmission !in admissions) retained.addLast(queued)
+        }
+        retained.forEach { queued ->
+            check(agentExtensionHandoffEffectChannel.trySend(queued).isSuccess) {
+                "Correlated handoff FIFO restore capacity invariant violated"
+            }
+        }
+    }
+
     private fun failEffectQueue() {
         if (!resourcesClosed.get()) {
             processInlineTerminal(TerminalIntentCause.QueueSaturated)
@@ -3499,9 +4236,123 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun drainQueuedEffects() {
+        drainQueuedEffects(effectChannel, queuedEffectBytes)
+        drainQueuedEffects(agentExtensionEffectChannel, queuedAgentExtensionEffectBytes)
+        drainQueuedEffects(agentExtensionHandoffEffectChannel, null)
+        drainQueuedEffects(agentExtensionControlEffectChannel, null)
+    }
+
+    private fun drainQueuedEffects(channel: Channel<QueuedEffect>, counter: AtomicLong?) {
         while (true) {
-            val queued = effectChannel.tryReceive().getOrNull() ?: return
-            releaseBytes(queuedEffectBytes, queued.rawBytes)
+            val queued = channel.tryReceive().getOrNull() ?: return
+            counter?.let { releaseBytes(it, queued.rawBytes) }
+        }
+    }
+
+    /**
+     * Directly arbitrates the four bounded producer lanes without an intermediate Flow buffer.
+     * A correlated emit therefore remains in flight until the downstream collector returns, so
+     * its durable ACK can atomically retire the actor-owned artifact before this method requeues.
+     */
+    private fun multiplexedEffectFlow(): Flow<RelayV2RuntimeEffect> = flow {
+        val sources = listOf(
+            QueuedEffectSource(effectChannel, queuedEffectBytes),
+            QueuedEffectSource(agentExtensionControlEffectChannel, null),
+            QueuedEffectSource(agentExtensionEffectChannel, queuedAgentExtensionEffectBytes),
+            QueuedEffectSource(agentExtensionHandoffEffectChannel, null, correlatedHandoff = true),
+        )
+        val openSources = BooleanArray(sources.size) { true }
+        var nextSourceIndex = 0
+
+        while (openSources.any { it }) {
+            var selected: SelectedQueuedEffect? = null
+            repeat(sources.size) { offset ->
+                if (selected != null) return@repeat
+                val sourceIndex = (nextSourceIndex + offset) % sources.size
+                if (!openSources[sourceIndex]) return@repeat
+                val result = sources[sourceIndex].channel.tryReceive()
+                when {
+                    result.isSuccess -> selected = SelectedQueuedEffect(
+                        sourceIndex,
+                        result.getOrThrow(),
+                    )
+                    result.isClosed -> openSources[sourceIndex] = false
+                }
+            }
+            if (selected == null && openSources.any { it }) {
+                selected = select {
+                    repeat(sources.size) { offset ->
+                        val sourceIndex = (nextSourceIndex + offset) % sources.size
+                        if (!openSources[sourceIndex]) return@repeat
+                        sources[sourceIndex].channel.onReceiveCatching { result ->
+                            if (result.isClosed) {
+                                openSources[sourceIndex] = false
+                                null
+                            } else {
+                                SelectedQueuedEffect(sourceIndex, result.getOrThrow())
+                            }
+                        }
+                    }
+                }
+            }
+            val delivery = selected ?: continue
+            nextSourceIndex = (delivery.sourceIndex + 1) % sources.size
+            val source = sources[delivery.sourceIndex]
+            val queued = delivery.queued
+            if (source.correlatedHandoff) {
+                val admission = requireNotNull(queued.deliveryAdmission)
+                val claimed = claimAgentExtensionDelivery(admission, queued.effect)
+                try {
+                    if (claimed) emit(queued.effect)
+                } finally {
+                    if (claimed) requeueUnacknowledgedAgentExtensionDelivery(
+                        admission,
+                        queued.effect,
+                    )
+                }
+            } else {
+                try {
+                    emit(queued.effect)
+                } finally {
+                    source.byteCounter?.let { releaseBytes(it, queued.rawBytes) }
+                }
+            }
+        }
+    }
+
+    private fun claimAgentExtensionDelivery(
+        admission: AgentTranscriptLifecycleRequestAdmission,
+        effect: RelayV2RuntimeEffect,
+    ): Boolean = synchronized(lifecycleLock) {
+        val pending = pendingAgentExtensionRequests[admission.requestId]
+            ?: return@synchronized false
+        val delivery = pending.delivery ?: return@synchronized false
+        if (pending.admission != admission ||
+            pending.state != AgentExtensionPendingState.HANDOFF_QUEUED ||
+            delivery.effect !== effect ||
+            delivery.state != AgentExtensionDeliveryState.QUEUED
+        ) return@synchronized false
+        delivery.state = AgentExtensionDeliveryState.IN_FLIGHT
+        true
+    }
+
+    private fun requeueUnacknowledgedAgentExtensionDelivery(
+        admission: AgentTranscriptLifecycleRequestAdmission,
+        effect: RelayV2RuntimeEffect,
+    ) {
+        synchronized(lifecycleLock) {
+            val pending = pendingAgentExtensionRequests[admission.requestId]
+                ?: return@synchronized
+            val delivery = pending.delivery ?: return@synchronized
+            if (pending.admission != admission ||
+                pending.state != AgentExtensionPendingState.HANDOFF_QUEUED ||
+                delivery.effect !== effect ||
+                delivery.state != AgentExtensionDeliveryState.IN_FLIGHT
+            ) return@synchronized
+            delivery.state = AgentExtensionDeliveryState.DELIVERED
+            check(enqueueAgentExtensionDeliveryLocked(pending)) {
+                "Correlated handoff requeue capacity invariant violated"
+            }
         }
     }
 
@@ -3589,9 +4440,14 @@ internal class RelayV2ConnectionActor(
     private fun invalidateConnectionOwnershipAndDrain(): CompletableDeferred<Unit> =
         synchronized(lifecycleLock) {
             revokeCallbackOwnersLocked()
-            publishedEffectGeneration.set(null)
+            clearPublishedEffectAuthority()
             effectApplyGate.invalidateAndDrain()
         }
+
+    private fun clearPublishedEffectAuthority() {
+        publishedEffectGeneration.set(null)
+        agentExtensionSendFence.set(null)
+    }
 
     private fun revokeCallbackOwnersLocked() {
         provisionalCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
@@ -3603,6 +4459,7 @@ internal class RelayV2ConnectionActor(
     private fun activateEffectGenerationIfCurrent(
         generation: RelayV2EffectGeneration,
         repositoryAuthority: RelayV2RepositoryEffectAuthority? = null,
+        negotiatedCapabilities: Set<String> = emptySet(),
     ): Boolean = synchronized(lifecycleLock) {
         val committed = committedCallbackOwner
         if (lifecycleState != LifecycleState.OPEN ||
@@ -3612,6 +4469,11 @@ internal class RelayV2ConnectionActor(
             return@synchronized false
         }
         effectApplyGate.activate(generation, repositoryAuthority)
+        agentExtensionSendFence.set(
+            repositoryAuthority?.let {
+                AgentExtensionSendFence(it, negotiatedCapabilities.toSet())
+            },
+        )
         true
     }
 
@@ -3622,6 +4484,7 @@ internal class RelayV2ConnectionActor(
         activeTransport = null
         connectionGeneration += 1
         clearRecoveryAttempt()
+        clearPendingAgentExtensionRequests()
         source?.let {
             beginRetirement(listOf(it), closeCode = null, forceCancel = true)
         }
@@ -3674,10 +4537,22 @@ internal class RelayV2ConnectionActor(
             it.completeExceptionally(CancellationException("Relay v2 actor stopped"))
         }
         actions.close()
+        agentExtensionActions.close()
+        drainQueuedAgentExtensionActions()
         drainQueuedEffects()
         effectChannel.close()
+        agentExtensionEffectChannel.close()
+        agentExtensionHandoffEffectChannel.close()
+        agentExtensionControlEffectChannel.close()
         scope.cancel()
         actorDispatcher.close()
+    }
+
+    private fun drainQueuedAgentExtensionActions() {
+        while (true) {
+            val action = agentExtensionActions.tryReceive().getOrNull() ?: return
+            releaseBytes(queuedAgentExtensionActionBytes, action.rawBytes)
+        }
     }
 
     private sealed interface Action {
@@ -3793,6 +4668,11 @@ internal class RelayV2ConnectionActor(
         var fallbackCause: TerminalIntentCause? = null,
     )
 
+    private data class AgentExtensionSendFence(
+        val authority: RelayV2RepositoryEffectAuthority,
+        val negotiatedCapabilities: Set<String>,
+    )
+
     private data class ClaimedTerminal(
         val cause: TerminalIntentCause,
         val profile: RelayV2Profile?,
@@ -3844,7 +4724,73 @@ internal class RelayV2ConnectionActor(
     private data class QueuedEffect(
         val effect: RelayV2RuntimeEffect,
         val rawBytes: Int,
+        val deliveryAdmission: AgentTranscriptLifecycleRequestAdmission? = null,
     )
+
+    private data class QueuedEffectSource(
+        val channel: Channel<QueuedEffect>,
+        val byteCounter: AtomicLong?,
+        val correlatedHandoff: Boolean = false,
+    )
+
+    private data class SelectedQueuedEffect(
+        val sourceIndex: Int,
+        val queued: QueuedEffect,
+    )
+
+    private data class ResolvedAgentExtensionIngress(
+        val ingress: AgentTranscriptLifecycleTrustedIngress,
+        val admission: AgentTranscriptLifecycleRequestAdmission?,
+    )
+
+    private data class PendingAgentExtensionRequest(
+        val request: AgentTranscriptLifecycleActorRequest,
+        val admission: AgentTranscriptLifecycleRequestAdmission,
+        var state: AgentExtensionPendingState = AgentExtensionPendingState.QUEUED,
+        var watchdog: Job? = null,
+        var delivery: PendingAgentExtensionDelivery? = null,
+    )
+
+    private data class RetiredAgentExtensionRequestIdentity(
+        val authority: RelayV2RepositoryEffectAuthority,
+        val requestKind: AgentTranscriptLifecycleRequestKind,
+        val requestId: String,
+        val scopeId: String,
+        val sessionId: String,
+    )
+
+    private data class AgentExtensionOverlappingErrorOwner(
+        val identity: RetiredAgentExtensionRequestIdentity,
+        val uncorrelatedOnly: Boolean,
+    )
+
+    private data class PendingAgentExtensionDelivery(
+        val effect: RelayV2RuntimeEffect,
+        val rawBytes: Int,
+        var ownsByteReservation: Boolean = false,
+        var state: AgentExtensionDeliveryState = AgentExtensionDeliveryState.READY_TO_EMIT,
+    )
+
+    private enum class AgentExtensionDeliveryState {
+        READY_TO_EMIT,
+        QUEUED,
+        IN_FLIGHT,
+        DELIVERED,
+    }
+
+    private data class SendAgentExtensionRequestAction(
+        val request: AgentTranscriptLifecycleActorRequest,
+        val admission: AgentTranscriptLifecycleRequestAdmission,
+        val bytes: ByteArray,
+    ) {
+        val rawBytes: Int = bytes.size
+    }
+
+    private enum class AgentExtensionPendingState {
+        QUEUED,
+        SENT,
+        HANDOFF_QUEUED,
+    }
 
     private data class ShutdownCompletion(
         val shutdownDrain: CompletableDeferred<Unit>,
@@ -4239,18 +5185,38 @@ internal class RelayV2ConnectionActor(
             "terminal.stream.resume.v1",
         )
 
+        private val SUPPORTED_OPTIONAL_CAPABILITIES = setOf(
+            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+        )
+
         internal const val DEFAULT_ACTION_CAPACITY = 64
         internal const val DEFAULT_RESERVED_ACTION_CAPACITY = 8
         internal const val DEFAULT_EVENT_CAPACITY = 32
         internal const val DEFAULT_ACTION_BYTE_CAPACITY = 1_048_576L
         internal const val DEFAULT_EFFECT_BYTE_CAPACITY = 1_048_576L
+        internal const val DEFAULT_EXTENSION_EVENT_CAPACITY = 32
+        internal const val DEFAULT_EXTENSION_ACTION_BYTE_CAPACITY = 1_048_576L
+        internal const val DEFAULT_EXTENSION_EFFECT_BYTE_CAPACITY = 1_048_576L
         internal const val RELAY_WELCOME_TIMEOUT_MS = 5_000L
         internal const val HOST_WELCOME_TIMEOUT_MS = 10_000L
         internal const val RECOVERY_STEP_TIMEOUT_MS = 15_000L
+        internal const val EXTENSION_REQUEST_TIMEOUT_MS = 15_000L
         private const val CONTROL_ENQUEUE_RETRY_MS = 1L
         private const val MAX_RECENT_ISSUED_IDS = 1_024
         private const val MAX_COMPLETED_RECOVERY_RESPONSES = 128
         private const val MAX_QUERY_WINDOW_BINDINGS = 129
+        private const val MAX_PENDING_AGENT_EXTENSION_REQUESTS = 64
+        private const val MAX_TRACKED_AGENT_EXTENSION_REQUESTS = 1_024
+
+        private val AGENT_EXTENSION_INBOUND_PHASES = setOf(
+            RelayV2ConnectionPhase.QUERYING,
+            RelayV2ConnectionPhase.RESYNCING,
+            RelayV2ConnectionPhase.ONLINE,
+        )
+
+        private val BASE_AGENT_EXTENSION_OVERLAPPING_ERROR_CODES = setOf(
+            "HOST_EPOCH_MISMATCH",
+        )
 
         private val UUID_PATTERN = Regex(
             "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-" +

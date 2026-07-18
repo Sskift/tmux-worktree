@@ -865,6 +865,20 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
         }
     }
 
+    /** Trusted durable-owner proof that one exact persisted request completed with an error. */
+    data class CorrelatedRequestFailed(
+        val requestKind: AgentTranscriptLifecycleRequestKind,
+        val requestNetworkToken: String,
+        val requestLocalGeneration: String,
+        val snapshotContinuation: Boolean = false,
+    ) : AgentTranscriptLifecycleClientInput {
+        init {
+            requireOpaqueId(requestNetworkToken, "Correlated error request token")
+            requireCanonicalCounter(requestLocalGeneration, "Correlated error generation")
+            require(!snapshotContinuation || requestKind == AgentTranscriptLifecycleRequestKind.SNAPSHOT)
+        }
+    }
+
     data class ClientConfigChanged(
         val config: AgentNotificationConfig,
     ) : AgentTranscriptLifecycleControlInput
@@ -1064,6 +1078,8 @@ internal object AgentTranscriptLifecycleClientReducer {
             reduceSnapshotPageZeroAccepted(state, input)
         is AgentTranscriptLifecycleClientInput.ReplayRequestStarted ->
             reduceReplayRequestStarted(state, input)
+        is AgentTranscriptLifecycleClientInput.CorrelatedRequestFailed ->
+            reduceCorrelatedRequestFailed(state, input)
         is AgentTranscriptLifecycleClientInput.ClientConfigChanged -> reduceConfig(state, input)
         is AgentTranscriptLifecycleClientInput.StatusAvailable ->
             reduceAvailableStatus(state, input, limits)
@@ -1162,6 +1178,57 @@ internal object AgentTranscriptLifecycleClientReducer {
         return AgentTranscriptLifecycleClientReduction(
             state.copy(extensionLane = extension.copy(syncState = replay.copy(pageFence = nextFence))),
             AgentClientDisposition.CONFIG_APPLIED,
+        )
+    }
+
+    private fun reduceCorrelatedRequestFailed(
+        state: AgentTranscriptLifecycleClientState,
+        input: AgentTranscriptLifecycleClientInput.CorrelatedRequestFailed,
+    ): AgentTranscriptLifecycleClientReduction {
+        val previous = state.extensionLane
+        if (previous.support == AgentExtensionSupport.UNNEGOTIATED ||
+            previous.localGeneration != input.requestLocalGeneration
+        ) return continuityConflict(state)
+        val ownsExactRequest = when (input.requestKind) {
+            AgentTranscriptLifecycleRequestKind.STATUS ->
+                previous.pendingStatusRequest == AgentLocalRequestFence(
+                    input.requestLocalGeneration,
+                    input.requestNetworkToken,
+                )
+            AgentTranscriptLifecycleRequestKind.REPLAY ->
+                (previous.syncState as? AgentTimelineSyncState.Replay)?.pageFence?.let { page ->
+                    page.localGeneration == input.requestLocalGeneration &&
+                        page.currentRequestNetworkToken == input.requestNetworkToken
+                } == true
+            AgentTranscriptLifecycleRequestKind.SNAPSHOT -> if (input.snapshotContinuation) {
+                previous.syncState == AgentTimelineSyncState.Snapshot &&
+                    previous.pendingSnapshotRequest == null
+            } else {
+                previous.pendingSnapshotRequest?.let { pending ->
+                    pending.localGeneration == input.requestLocalGeneration &&
+                        pending.pageZeroNetworkToken == input.requestNetworkToken
+                } == true
+            }
+        }
+        if (!ownsExactRequest) return continuityConflict(state)
+        val nextGeneration = incrementCounterOrNull(previous.localGeneration)
+            ?: return continuityConflict(state)
+        val requireSnapshot = input.requestKind != AgentTranscriptLifecycleRequestKind.STATUS ||
+            previous.support != AgentExtensionSupport.AVAILABLE ||
+            previous.syncState == AgentTimelineSyncState.Snapshot ||
+            (previous.syncState as? AgentTimelineSyncState.StatusRefresh)
+                ?.requireSnapshotAfterRefresh == true ||
+            previous.requiresTimelineRotation
+        val extension = previous.copy(
+            localGeneration = nextGeneration,
+            syncState = AgentTimelineSyncState.StatusRefresh(requireSnapshot),
+            pendingStatusRequest = null,
+            pendingSnapshotRequest = null,
+        )
+        return AgentTranscriptLifecycleClientReduction(
+            state = state.copy(extensionLane = extension),
+            disposition = AgentClientDisposition.GAP_RESYNC,
+            syncDirective = AgentTimelineSyncDirective.StatusRefresh,
         )
     }
 

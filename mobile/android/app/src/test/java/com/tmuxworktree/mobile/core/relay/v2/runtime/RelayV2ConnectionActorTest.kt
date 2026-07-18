@@ -1,5 +1,31 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentLocalRequestFence
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedBatchHandoffReceipt
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleDurableRequestIdentity
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestAdmission
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestKind
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleCompletedHandoffReceipt
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleExactRedriveReplacement
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCode
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCommandDisposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineHostEpochMismatchDetails
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineReplayGetFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineReplayRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotGetFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSnapshotRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineResetFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineResetReason
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusFrame
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStructuredError
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineUnavailableReason
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineUnavailableStatus
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Frame
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2ContractFixtures
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
@@ -55,6 +81,7 @@ import org.junit.Test
 
 class RelayV2ConnectionActorTest {
     private val codec = RelayV2Codec()
+    private val agentExtensionCodec = AgentTranscriptLifecycleV1Codec()
     private val fixtures = RelayV2ContractFixtures()
 
     @Test
@@ -165,6 +192,1047 @@ class RelayV2ConnectionActorTest {
             } finally {
                 harness.close()
             }
+        }
+    }
+
+    @Test
+    fun `optional agent capability is explicit and requires broker host intersection`() =
+        runBlocking {
+            assertEquals(6, RelayV2ConnectionActor.REQUIRED_CAPABILITIES.size)
+            assertFalse(
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
+                    RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
+            )
+
+            val defaultHarness = Harness()
+            try {
+                val hello = defaultHarness.connectThroughRelayWelcome(null)
+                assertEquals(
+                    RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
+                    hello.payload().stringList("capabilities"),
+                )
+            } finally {
+                defaultHarness.close()
+            }
+
+            listOf(false to true, true to false, true to true).forEach { (broker, host) ->
+                val harness = Harness(
+                    optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                )
+                try {
+                    val brokerOptional = if (broker) {
+                        setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY)
+                    } else {
+                        emptySet()
+                    }
+                    val hello = harness.connectThroughRelayWelcome(
+                        resume = null,
+                        brokerOptionalCapabilities = brokerOptional,
+                    )
+                    assertEquals(
+                        RelayV2ConnectionActor.REQUIRED_CAPABILITIES +
+                            AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY,
+                        hello.payload().stringList("capabilities"),
+                    )
+                    assertEquals(
+                        RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
+                        hello.payload().stringList("requiredCapabilities"),
+                    )
+                    val welcome = fixture("host-welcome-snapshot-required")
+                    welcome["requestId"] = hello.stringValue("requestId")
+                    welcome.payload()["capabilities"] =
+                        RelayV2ConnectionActor.REQUIRED_CAPABILITIES +
+                        if (host) listOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY) else emptyList()
+                    harness.transport().sendFrame(welcome)
+                    val effect = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                        as RelayV2RuntimeEffect.BeginStateResync
+                    assertEquals(
+                        broker && host,
+                        AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
+                            effect.context.negotiatedCapabilities,
+                    )
+                } finally {
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `negotiated agent frames use strict artifacts and isolate correlation faults`() =
+        runBlocking {
+            val harness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                val hello = harness.connectThroughRelayWelcome(
+                    resume = null,
+                    brokerOptionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                )
+                val welcome = fixture("host-welcome-snapshot-required")
+                welcome["requestId"] = hello.stringValue("requestId")
+                welcome.payload()["capabilities"] =
+                    RelayV2ConnectionActor.REQUIRED_CAPABILITIES +
+                    AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+                harness.transport().sendFrame(welcome)
+                val handshake = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.BeginStateResync
+
+                val statusRequest = AgentTranscriptLifecycleActorRequest.Status(
+                    authority = handshake.repositoryAuthority,
+                    frame = com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusGetFrame(
+                        requestId = "agent-status-runtime-1",
+                        hostId = HOST_ID,
+                        expectedHostEpoch = HOST_EPOCH,
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                    ),
+                    requestFence = AgentLocalRequestFence("1", "agent-status-runtime-1"),
+                )
+                assertTrue(harness.actor.send(statusRequest) != null)
+                assertEquals(
+                    statusRequest.frame,
+                    harness.transport().awaitAgentSentFrame(1),
+                )
+
+                harness.transport().sendAgentFrame(
+                    AgentTimelineStatusFrame(
+                        requestId = "agent-status-runtime-1",
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        status = AgentTimelineUnavailableStatus(
+                            AgentTimelineUnavailableReason.AGENT_UNSUPPORTED,
+                        ),
+                    ),
+                )
+                val delivered = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                assertTrue(
+                    delivered.ingress is AgentTranscriptLifecycleTrustedIngress.CorrelatedStatus,
+                )
+                assertEquals("agent.timeline.status", delivered.artifact.type)
+                assertTrue(
+                    harness.actor.acceptDurableHandoff(
+                        completedHandoff(requireNotNull(delivered.requestAdmission)),
+                    ),
+                )
+
+                val replayRequest = AgentTranscriptLifecycleActorRequest.Replay(
+                    authority = handshake.repositoryAuthority,
+                    frame = AgentTimelineReplayGetFrame(
+                        requestId = "agent-replay-runtime-1",
+                        hostId = HOST_ID,
+                        expectedHostEpoch = HOST_EPOCH,
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        request = AgentTimelineReplayRequest(
+                            timelineEpoch = "timeline-1",
+                            afterAgentSeq = "8",
+                            cursor = null,
+                            limit = 256,
+                        ),
+                    ),
+                )
+                assertTrue(harness.actor.send(replayRequest) != null)
+                assertEquals(replayRequest.frame, harness.transport().awaitAgentSentFrame(2))
+                harness.transport().sendAgentFrame(
+                    AgentTimelineErrorFrame(
+                        requestId = "agent-replay-runtime-1",
+                        hostId = HOST_ID,
+                        hostEpoch = "host-epoch-runtime-actual",
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        error = AgentTimelineStructuredError(
+                            code = AgentTimelineErrorCode.HOST_EPOCH_MISMATCH,
+                            message = "host epoch changed",
+                            retryable = false,
+                            commandDisposition =
+                                AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+                            details = AgentTimelineHostEpochMismatchDetails(
+                                expectedHostEpoch = HOST_EPOCH,
+                                actualHostEpoch = "host-epoch-runtime-actual",
+                            ),
+                        ),
+                    ),
+                )
+                val correlatedError = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first()
+                } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                assertTrue(
+                    correlatedError.ingress is
+                        AgentTranscriptLifecycleTrustedIngress.CorrelatedError,
+                )
+                assertTrue(
+                    harness.actor.acceptDurableHandoff(
+                        completedHandoff(requireNotNull(correlatedError.requestAdmission)),
+                    ),
+                )
+
+                harness.transport().sendAgentFrame(
+                    AgentTimelineStatusFrame(
+                        requestId = "agent-status-uncorrelated",
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        status = AgentTimelineUnavailableStatus(
+                            AgentTimelineUnavailableReason.AGENT_UNSUPPORTED,
+                        ),
+                    ),
+                )
+                val isolated = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                assertEquals(
+                    RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                    isolated.reason,
+                )
+
+                harness.transport().sendAgentFrame(
+                    AgentTimelineResetFrame(
+                        hostId = HOST_ID,
+                        hostEpoch = HOST_EPOCH,
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        previousTimelineEpoch = "timeline-1",
+                        newTimelineEpoch = "timeline-2",
+                        reason = AgentTimelineResetReason.DELETED,
+                    ),
+                )
+                val live = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                    as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                assertEquals(AgentTranscriptLifecycleTrustedIngress.Live, live.ingress)
+                assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+                assertTrue(harness.transport().closeCodes.isEmpty())
+
+                harness.transport().sendAgentFrame(
+                    AgentTimelineErrorFrame(
+                        requestId = "base-error-not-agent-pending",
+                        hostId = HOST_ID,
+                        hostEpoch = "host-epoch-base-actual",
+                        scopeId = "scope-local",
+                        sessionId = "session-1",
+                        error = AgentTimelineStructuredError(
+                            code = AgentTimelineErrorCode.HOST_EPOCH_MISMATCH,
+                            message = "base request host epoch changed",
+                            retryable = false,
+                            commandDisposition =
+                                AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+                            details = AgentTimelineHostEpochMismatchDetails(
+                                expectedHostEpoch = HOST_EPOCH,
+                                actualHostEpoch = "host-epoch-base-actual",
+                            ),
+                        ),
+                    ),
+                )
+                val baseFailure = harness.actor.awaitFailure(RelayV2FailureKind.SCHEMA)
+                assertEquals("INVALID_ENVELOPE", baseFailure.failure?.code)
+                assertEquals(4400, harness.transport().closeCodes.single())
+            } finally {
+                harness.close()
+            }
+        }
+
+    @Test
+    fun `agent admission reserves exact request capacity until durable handoff`() = runBlocking {
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+        )
+        try {
+            val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+            val requests = (1..64).map { index ->
+                agentStatusRequest(authority, "agent-capacity-$index")
+            }
+            val admissions = requests.map { request ->
+                requireNotNull(harness.actor.send(request))
+            }
+
+            assertNull(harness.actor.send(agentStatusRequest(authority, "agent-capacity-65")))
+            assertNull(harness.actor.send(requests.first()))
+            assertEquals(requests.last().frame, harness.transport().awaitAgentSentFrame(64))
+
+            harness.transport().sendAgentFrame(
+                agentUnavailableStatus(requests.first().requestId),
+            )
+            val delivered = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(admissions.first(), delivered.requestAdmission)
+            assertNull(harness.actor.send(requests.first()))
+
+            assertTrue(
+                harness.actor.acceptDurableHandoff(completedHandoff(admissions.first())),
+            )
+            assertFalse(
+                harness.actor.acceptDurableHandoff(completedHandoff(admissions.first())),
+            )
+            assertNull(harness.actor.send(requests.first()))
+            harness.transport().sendAgentFrame(hostEpochMismatch(requests.first().requestId))
+            val lateCompleted = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(
+                RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                lateCompleted.reason,
+            )
+            assertTrue(
+                harness.actor.send(agentStatusRequest(authority, "agent-capacity-fresh")) != null,
+            )
+            assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+            assertTrue(harness.transport().closeCodes.isEmpty())
+
+            harness.transport().fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+            val replacementAuthority = harness.negotiateAgentExtension(
+                RelayV2ConnectionPhase.RESYNCING,
+            )
+            assertFalse(replacementAuthority.generation == authority.generation)
+            assertTrue(
+                harness.actor.send(
+                    agentStatusRequest(replacementAuthority, requests.first().requestId),
+                ) != null,
+            )
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `queued agent admission is revoked without send when generation changes`() = runBlocking {
+        val sendEntered = CompletableDeferred<Unit>()
+        val releaseSend = CompletableDeferred<Unit>()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            beforeAgentExtensionRequestSend = {
+                sendEntered.complete(Unit)
+                releaseSend.await()
+            },
+        )
+        try {
+            val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+            val admission = requireNotNull(
+                harness.actor.send(agentStatusRequest(authority, "agent-generation-old")),
+            )
+            sendEntered.await()
+
+            val oldTransport = harness.transport()
+            oldTransport.fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            harness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+            releaseSend.complete(Unit)
+            delay(25)
+
+            assertEquals(1, oldTransport.sent.size)
+            assertFalse(harness.actor.acceptDurableHandoff(completedHandoff(admission)))
+            assertEquals(RelayV2ConnectionPhase.FAILED, harness.actor.state.value.phase)
+
+            val replacementAuthority = harness.negotiateAgentExtension(
+                RelayV2ConnectionPhase.RESYNCING,
+            )
+            assertFalse(replacementAuthority.generation == admission.authority.generation)
+            oldTransport.sendAgentFrame(agentUnavailableStatus(admission.requestId))
+            assertEquals(null, withTimeoutOrNull(50) { harness.actor.effects.first() })
+            assertEquals(1, harness.transport().sent.size)
+            assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+        } finally {
+            releaseSend.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `agent socket failure and timeout isolate exact durable retry identity`() = runBlocking {
+        val failedSendHarness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+        )
+        try {
+            val authority = failedSendHarness.negotiateAgentExtension(
+                RelayV2ConnectionPhase.RESYNCING,
+            )
+            val request = agentStatusRequest(authority, "agent-send-retry-exact")
+            failedSendHarness.transport().sendResult = false
+            val failedAdmission = requireNotNull(failedSendHarness.actor.send(request))
+            val unavailable = withTimeout(TIMEOUT_MS) {
+                failedSendHarness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(
+                RelayV2AgentExtensionUnavailableReason.REQUEST_SEND_FAILED,
+                unavailable.reason,
+            )
+            assertEquals(request, unavailable.failedRequest)
+            assertEquals(failedAdmission, unavailable.requestAdmission)
+            failedSendHarness.transport().sendResult = true
+            assertNull(failedSendHarness.actor.send(request))
+            val replacementAdmission = requireNotNull(
+                failedSendHarness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(failedAdmission, request),
+                ),
+            )
+            assertNull(
+                failedSendHarness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(failedAdmission, request),
+                ),
+            )
+            assertTrue(replacementAdmission.admissionSequence > failedAdmission.admissionSequence)
+            assertEquals(request.frame, failedSendHarness.transport().awaitAgentSentFrame(2))
+            assertEquals(
+                RelayV2ConnectionPhase.RESYNCING,
+                failedSendHarness.actor.state.value.phase,
+            )
+            assertTrue(failedSendHarness.transport().closeCodes.isEmpty())
+
+            failedSendHarness.transport().fail(
+                RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+            )
+            failedSendHarness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+            val replacementAuthority = failedSendHarness.negotiateAgentExtension(
+                RelayV2ConnectionPhase.RESYNCING,
+            )
+            assertFalse(replacementAuthority.generation == authority.generation)
+            assertTrue(
+                failedSendHarness.actor.send(
+                    agentStatusRequest(replacementAuthority, request.requestId),
+                ) != null,
+            )
+        } finally {
+            failedSendHarness.close()
+        }
+
+        val watchdog = ManualWatchdog()
+        val timeoutHarness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            extensionRequestWatchdogDelay = watchdog::await,
+        )
+        try {
+            val authority = timeoutHarness.negotiateAgentExtension(
+                RelayV2ConnectionPhase.RESYNCING,
+            )
+            val request = agentStatusRequest(authority, "agent-timeout-retry-exact")
+            val timedOutAdmission = requireNotNull(timeoutHarness.actor.send(request))
+            assertEquals(request.frame, timeoutHarness.transport().awaitAgentSentFrame(1))
+            watchdog.fire(0)
+            val unavailable = withTimeout(TIMEOUT_MS) {
+                timeoutHarness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(
+                RelayV2AgentExtensionUnavailableReason.REQUEST_TIMEOUT,
+                unavailable.reason,
+            )
+            assertEquals(request, unavailable.failedRequest)
+            assertEquals(timedOutAdmission, unavailable.requestAdmission)
+            val sentBeforeRedelivery = timeoutHarness.transport().sent.size
+            val redelivered = withTimeout(TIMEOUT_MS) {
+                timeoutHarness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable &&
+                        it.requestAdmission == timedOutAdmission
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(unavailable, redelivered)
+            assertEquals(sentBeforeRedelivery, timeoutHarness.transport().sent.size)
+            assertNull(timeoutHarness.actor.send(request))
+            assertTrue(
+                timeoutHarness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(timedOutAdmission, request),
+                ) != null,
+            )
+            assertEquals(request.frame, timeoutHarness.transport().awaitAgentSentFrame(2))
+            assertEquals(RelayV2ConnectionPhase.RESYNCING, timeoutHarness.actor.state.value.phase)
+            assertTrue(timeoutHarness.transport().closeCodes.isEmpty())
+        } finally {
+            timeoutHarness.close()
+        }
+    }
+
+    @Test
+    fun `exact redrive atomically swaps owner before queued late error is routed`() = runBlocking {
+        val sendCalls = AtomicInteger()
+        val replacementSendEntered = CompletableDeferred<Unit>()
+        val releaseReplacementSend = CompletableDeferred<Unit>()
+        val redriveEnqueued = CountDownLatch(1)
+        val releaseRedriveSwap = CountDownLatch(1)
+        val captureLateCallback = AtomicBoolean(false)
+        val lateCallbackAdmitted = CompletableDeferred<Unit>()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            beforeAgentExtensionRequestSend = {
+                if (sendCalls.incrementAndGet() == 2) {
+                    replacementSendEntered.complete(Unit)
+                    releaseReplacementSend.await()
+                }
+            },
+            afterAgentExtensionRedriveEnqueuedBeforeSwap = {
+                redriveEnqueued.countDown()
+                check(releaseRedriveSwap.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            },
+            afterCallbackAdmission = {
+                if (captureLateCallback.get()) lateCallbackAdmitted.complete(Unit)
+            },
+        )
+        try {
+            val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.ONLINE)
+            val request = agentStatusRequest(authority, "agent-atomic-redrive")
+            harness.transport().sendResult = false
+            val oldAdmission = requireNotNull(harness.actor.send(request))
+            val failed = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable &&
+                        it.requestAdmission == oldAdmission
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(RelayV2AgentExtensionUnavailableReason.REQUEST_SEND_FAILED, failed.reason)
+
+            harness.transport().sendResult = true
+            val replacing = async(Dispatchers.Default) {
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(oldAdmission, request),
+                )
+            }
+            assertTrue(redriveEnqueued.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
+            captureLateCallback.set(true)
+            val lateFrame = async(Dispatchers.Default) {
+                harness.transport().sendAgentFrame(hostEpochMismatch(request.requestId))
+            }
+            lateCallbackAdmitted.await()
+            releaseRedriveSwap.countDown()
+
+            val newAdmission = requireNotNull(replacing.await())
+            lateFrame.await()
+            replacementSendEntered.await()
+            val isolated = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable &&
+                        it.reason == RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertNull(isolated.requestAdmission)
+            assertFalse(harness.actor.acceptDurableHandoff(completedHandoff(oldAdmission)))
+            assertNull(
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(oldAdmission, request),
+                ),
+            )
+            assertEquals(request.requestId, newAdmission.requestId)
+            assertTrue(newAdmission.admissionSequence > oldAdmission.admissionSequence)
+            assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+            assertTrue(harness.transport().closeCodes.isEmpty())
+
+            harness.transport().sendFixture("host-presence-online")
+            val base = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                }
+            } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+            assertEquals("host.presence", base.message.frame["type"])
+        } finally {
+            releaseRedriveSwap.countDown()
+            releaseReplacementSend.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `queued extension owner isolates overlapping and impossible error throughout recovery`() =
+        runBlocking {
+            listOf(
+                RelayV2ConnectionPhase.QUERYING,
+                RelayV2ConnectionPhase.RESYNCING,
+            ).forEach { phase ->
+                val sendEntered = CompletableDeferred<Unit>()
+                val releaseSend = CompletableDeferred<Unit>()
+                val harness = Harness(
+                    optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                    beforeAgentExtensionRequestSend = {
+                        sendEntered.complete(Unit)
+                        releaseSend.await()
+                    },
+                )
+                try {
+                    val authority = harness.negotiateAgentExtension(phase)
+                    val request = agentStatusRequest(authority, "agent-queued-owner-${phase.name}")
+                    requireNotNull(harness.actor.send(request))
+                    sendEntered.await()
+                    listOf(
+                        hostEpochMismatch(request.requestId),
+                        hostEpochMismatch(request.requestId).copy(scopeId = "scope-impossible"),
+                    ).forEach { frame ->
+                        harness.transport().sendAgentFrame(frame)
+                        val isolated = withTimeout(TIMEOUT_MS) {
+                            harness.actor.effects.first {
+                                it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                            }
+                        } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                        assertEquals(
+                            RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                            isolated.reason,
+                        )
+                        assertNull(isolated.requestAdmission)
+                        assertEquals(phase, harness.actor.state.value.phase)
+                        assertTrue(harness.transport().closeCodes.isEmpty())
+                    }
+                } finally {
+                    releaseSend.complete(Unit)
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `failed atomic redrive admission retains old owner for one successful retry`() = runBlocking {
+        val sendCalls = AtomicInteger()
+        val blockerEntered = CompletableDeferred<Unit>()
+        val releaseBlocker = CompletableDeferred<Unit>()
+        val oldRequestId = "agent-redrive-aaaaaaaa"
+        val probeRequestId = "agent-redrive-bbbbbbbb"
+        val freshRequestId = "agent-redrive-cccccccc"
+        val responseBytes = agentExtensionCodec
+            .encodePublicFrame(agentUnavailableStatus(oldRequestId))
+            .size
+            .toLong()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            extensionActionCapacity = 1,
+            extensionEffectByteCapacity = responseBytes,
+            beforeAgentExtensionRequestSend = {
+                if (sendCalls.incrementAndGet() == 2) {
+                    blockerEntered.complete(Unit)
+                    releaseBlocker.await()
+                }
+            },
+        )
+        try {
+            val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+            val request = agentStatusRequest(authority, oldRequestId)
+            val oldAdmission = requireNotNull(harness.actor.send(request))
+            assertEquals(request.frame, harness.transport().awaitAgentSentFrame(1))
+            harness.transport().sendAgentFrame(agentUnavailableStatus(request.requestId))
+            val oldDelivery = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame &&
+                        it.requestAdmission == oldAdmission
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(oldAdmission, oldDelivery.requestAdmission)
+
+            val blocker = agentStatusRequest(authority, "agent-redrive-dddddddd")
+            val filler = agentStatusRequest(authority, "agent-redrive-eeeeeeee")
+            requireNotNull(harness.actor.send(blocker))
+            blockerEntered.await()
+            requireNotNull(harness.actor.send(filler))
+            assertNull(
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(oldAdmission, request),
+                ),
+            )
+            assertNull(harness.actor.send(request))
+
+            releaseBlocker.complete(Unit)
+            assertEquals(filler.frame, harness.transport().awaitAgentSentFrame(3))
+            val probe = agentStatusRequest(authority, probeRequestId)
+            val probeAdmission = requireNotNull(harness.actor.send(probe))
+            assertEquals(probe.frame, harness.transport().awaitAgentSentFrame(4))
+            harness.transport().sendAgentFrame(agentUnavailableStatus(probe.requestId))
+            val saturated = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable &&
+                        it.requestAdmission == probeAdmission
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(
+                RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED,
+                saturated.reason,
+            )
+
+            val replacement = requireNotNull(
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(oldAdmission, request),
+                ),
+            )
+            assertEquals(request.frame, harness.transport().awaitAgentSentFrame(5))
+            assertEquals(request.requestId, replacement.requestId)
+            assertEquals(probeAdmission.admissionSequence + 1, replacement.admissionSequence)
+            assertFalse(harness.actor.acceptDurableHandoff(completedHandoff(oldAdmission)))
+            assertNull(
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(oldAdmission, request),
+                ),
+            )
+            val fresh = agentStatusRequest(authority, freshRequestId)
+            val freshAdmission = requireNotNull(harness.actor.send(fresh))
+            assertEquals(fresh.frame, harness.transport().awaitAgentSentFrame(6))
+            harness.transport().sendAgentFrame(agentUnavailableStatus(fresh.requestId))
+            val freshDelivery = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame &&
+                        it.requestAdmission == freshAdmission
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(freshAdmission, freshDelivery.requestAdmission)
+            assertTrue(harness.actor.acceptDurableHandoff(completedHandoff(freshAdmission)))
+            assertEquals(RelayV2ConnectionPhase.RESYNCING, harness.actor.state.value.phase)
+            assertTrue(harness.transport().closeCodes.isEmpty())
+        } finally {
+            releaseBlocker.complete(Unit)
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `correlated handoff nack retains bytes and redelivers without socket resend`() = runBlocking {
+        val firstFrame = agentUnavailableStatus("agent-nack-one")
+        val byteCapacity = agentExtensionCodec.encodePublicFrame(firstFrame).size.toLong()
+        val harness = Harness(
+            optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            extensionEffectByteCapacity = byteCapacity,
+        )
+        try {
+            val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.ONLINE)
+            val firstRequest = agentStatusRequest(authority, "agent-nack-one")
+            val firstAdmission = requireNotNull(harness.actor.send(firstRequest))
+            assertEquals(firstRequest.frame, harness.transport().awaitAgentSentFrame(1))
+            harness.transport().sendAgentFrame(firstFrame)
+
+            val firstDelivery = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(firstAdmission, firstDelivery.requestAdmission)
+
+            val secondRequest = agentStatusRequest(authority, "agent-nack-two")
+            val secondAdmission = requireNotNull(harness.actor.send(secondRequest))
+            assertEquals(secondRequest.frame, harness.transport().awaitAgentSentFrame(2))
+            harness.transport().sendAgentFrame(agentUnavailableStatus(secondRequest.requestId))
+            val saturated = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.AgentExtensionUnavailable &&
+                        it.requestAdmission == secondAdmission
+                }
+            } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+            assertEquals(
+                RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED,
+                saturated.reason,
+            )
+            assertTrue(
+                harness.actor.replaceForExactRedrive(
+                    AgentTranscriptLifecycleExactRedriveReplacement(
+                        secondAdmission,
+                        secondRequest,
+                    ),
+                ) != null,
+            )
+            assertEquals(secondRequest.frame, harness.transport().awaitAgentSentFrame(3))
+
+            val sentBeforeRedelivery = harness.transport().sent.size
+            val redelivered = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame &&
+                        it.requestAdmission == firstAdmission
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(firstDelivery.artifact, redelivered.artifact)
+            assertEquals(sentBeforeRedelivery, harness.transport().sent.size)
+            assertTrue(harness.actor.acceptDurableHandoff(completedHandoff(firstAdmission)))
+            val freshRequest = agentStatusRequest(authority, "agent-nack-new")
+            val freshAdmission = requireNotNull(harness.actor.send(freshRequest))
+            assertEquals(freshRequest.frame, harness.transport().awaitAgentSentFrame(4))
+            harness.transport().sendAgentFrame(agentUnavailableStatus(freshRequest.requestId))
+            val freshDelivery = withTimeout(TIMEOUT_MS) {
+                harness.actor.effects.first {
+                    it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame &&
+                        it.requestAdmission == freshAdmission
+                }
+            } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+            assertEquals(freshAdmission, freshDelivery.requestAdmission)
+            assertTrue(harness.actor.acceptDurableHandoff(completedHandoff(freshAdmission)))
+            assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+            assertTrue(harness.transport().closeCodes.isEmpty())
+        } finally {
+            harness.close()
+        }
+    }
+
+    @Test
+    fun `correlated error receipt retires status and snapshot sibling exactly`() =
+        runBlocking {
+            listOf(RelayV2ConnectionPhase.ONLINE, RelayV2ConnectionPhase.RESYNCING).forEach { phase ->
+                val harness = Harness(
+                    optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                )
+                try {
+                    val authority = harness.negotiateAgentExtension(phase)
+                    val status = agentStatusRequest(authority, "retired-status-${phase.name}")
+                    val snapshot = agentSnapshotRequest(authority, "retired-snapshot-${phase.name}")
+                    val statusAdmission = requireNotNull(harness.actor.send(status))
+                    val snapshotAdmission = requireNotNull(harness.actor.send(snapshot))
+                    assertEquals(status.frame, harness.transport().awaitAgentSentFrame(1))
+                    assertEquals(snapshot.frame, harness.transport().awaitAgentSentFrame(2))
+                    harness.transport().sendAgentFrame(agentUnavailableStatus(status.requestId))
+                    harness.transport().sendAgentFrame(hostEpochMismatch(snapshot.requestId))
+                    val error = withTimeout(TIMEOUT_MS) {
+                        harness.actor.effects.first {
+                            it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame &&
+                                it.requestAdmission == snapshotAdmission
+                        }
+                    } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+
+                    assertTrue(
+                        harness.actor.acceptDurableHandoff(
+                            AgentTranscriptLifecycleCompletedBatchHandoffReceipt(
+                                authority = authority,
+                                scopeId = snapshot.scopeId,
+                                sessionId = snapshot.sessionId,
+                                triggeringAdmission = requireNotNull(error.requestAdmission),
+                                retiredRequests = listOf(
+                                    AgentTranscriptLifecycleDurableRequestIdentity(
+                                        AgentTranscriptLifecycleRequestKind.STATUS,
+                                        status.requestId,
+                                    ),
+                                    AgentTranscriptLifecycleDurableRequestIdentity(
+                                        AgentTranscriptLifecycleRequestKind.SNAPSHOT,
+                                        snapshot.requestId,
+                                    ),
+                                ),
+                            ),
+                        ),
+                    )
+                    assertFalse(
+                        harness.actor.acceptDurableHandoff(completedHandoff(statusAdmission)),
+                    )
+                    assertFalse(
+                        harness.actor.acceptDurableHandoff(completedHandoff(snapshotAdmission)),
+                    )
+
+                    suspend fun expectUncorrelatedResponse() {
+                        val unavailable = withTimeout(TIMEOUT_MS) {
+                            harness.actor.effects.first {
+                                it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                            }
+                        } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                        assertEquals(
+                            RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                            unavailable.reason,
+                        )
+                    }
+
+                    harness.transport().sendAgentFrame(agentUnavailableStatus(status.requestId))
+                    expectUncorrelatedResponse()
+                    listOf(status.requestId, snapshot.requestId).forEach { retiredRequestId ->
+                        harness.transport().sendAgentFrame(hostEpochMismatch(retiredRequestId))
+                        expectUncorrelatedResponse()
+                        assertEquals(phase, harness.actor.state.value.phase)
+                        assertTrue(harness.transport().closeCodes.isEmpty())
+                    }
+
+                    if (phase == RelayV2ConnectionPhase.ONLINE) {
+                        harness.transport().sendFixture("host-presence-online")
+                        val base = withTimeout(TIMEOUT_MS) {
+                            harness.actor.effects.first {
+                                it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                            }
+                        } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                        assertEquals("host.presence", base.message.frame["type"])
+                    }
+                    assertEquals(phase, harness.actor.state.value.phase)
+                    assertTrue(harness.transport().closeCodes.isEmpty())
+                    assertTrue(
+                        harness.actor.send(
+                            agentStatusRequest(authority, "fresh-status-${phase.name}"),
+                        ) != null,
+                    )
+                    assertTrue(
+                        harness.actor.send(
+                            agentSnapshotRequest(authority, "fresh-snapshot-${phase.name}"),
+                        ) != null,
+                    )
+                } finally {
+                    harness.close()
+                }
+            }
+        }
+
+    @Test
+    fun `agent effect saturation leaves online base route available`() = runBlocking {
+        data class Saturation(
+            val name: String,
+            val eventCapacity: Int,
+            val byteCapacity: Long,
+        )
+        val cases = listOf(
+            Saturation("count", eventCapacity = 1, byteCapacity = 1_048_576),
+            Saturation("bytes", eventCapacity = 1, byteCapacity = 1),
+        )
+
+        cases.forEach { case ->
+            val harness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                extensionEventCapacity = case.eventCapacity,
+                extensionEffectByteCapacity = case.byteCapacity,
+            )
+            try {
+                val authority = harness.negotiateAgentExtension(RelayV2ConnectionPhase.ONLINE)
+                if (case.name == "count") {
+                    repeat(2) { index ->
+                        harness.transport().sendAgentFrame(
+                            AgentTimelineResetFrame(
+                                hostId = HOST_ID,
+                                hostEpoch = HOST_EPOCH,
+                                scopeId = "scope-local",
+                                sessionId = "session-1",
+                                previousTimelineEpoch = "timeline-${index + 1}",
+                                newTimelineEpoch = "timeline-${index + 2}",
+                                reason = AgentTimelineResetReason.DELETED,
+                            ),
+                        )
+                    }
+                } else {
+                    val request = agentStatusRequest(authority, "agent-effect-bytes")
+                    assertTrue(harness.actor.send(request) != null)
+                    assertEquals(request.frame, harness.transport().awaitAgentSentFrame(1))
+                    harness.transport().sendAgentFrame(agentUnavailableStatus(request.requestId))
+                }
+                delay(25)
+                val unavailable = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                    }
+                } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                assertEquals(
+                    case.name,
+                    RelayV2AgentExtensionUnavailableReason.EFFECT_QUEUE_SATURATED,
+                    unavailable.reason,
+                )
+                if (case.name == "bytes") {
+                    assertTrue(case.name, unavailable.failedRequest != null)
+                    assertTrue(case.name, unavailable.requestAdmission != null)
+                    assertNull(harness.actor.send(requireNotNull(unavailable.failedRequest)))
+                } else {
+                    assertNull(unavailable.failedRequest)
+                    assertNull(unavailable.requestAdmission)
+                }
+                harness.transport().sendFixture("host-presence-online")
+
+                val base = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                    }
+                } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                assertEquals(case.name, "host.presence", base.message.frame["type"])
+                assertEquals(case.name, RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+                assertTrue(case.name, harness.transport().closeCodes.isEmpty())
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `overlapping extension errors route by exact owner in querying and online`() = runBlocking {
+        listOf(RelayV2ConnectionPhase.QUERYING, RelayV2ConnectionPhase.ONLINE).forEach { phase ->
+            val harness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                val authority = harness.negotiateAgentExtension(phase)
+                val request = agentStatusRequest(authority, "agent-overlap-${phase.name}")
+                val admission = requireNotNull(harness.actor.send(request))
+                assertEquals(request.frame, harness.transport().awaitAgentSentFrame(1))
+                harness.transport().sendAgentFrame(hostEpochMismatch(request.requestId))
+
+                val extension = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                    }
+                } as RelayV2RuntimeEffect.DeliverAgentExtensionFrame
+                assertEquals(admission, extension.requestAdmission)
+                assertTrue(
+                    extension.ingress is AgentTranscriptLifecycleTrustedIngress.CorrelatedError,
+                )
+                harness.transport().sendAgentFrame(hostEpochMismatch(request.requestId))
+                val duplicate = withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.AgentExtensionUnavailable
+                    }
+                } as RelayV2RuntimeEffect.AgentExtensionUnavailable
+                assertEquals(
+                    RelayV2AgentExtensionUnavailableReason.UNCORRELATED_RESPONSE,
+                    duplicate.reason,
+                )
+                assertEquals(phase, harness.actor.state.value.phase)
+                assertTrue(harness.transport().closeCodes.isEmpty())
+                assertTrue(harness.actor.acceptDurableHandoff(completedHandoff(admission)))
+
+                harness.transport().sendAgentFrame(hostEpochMismatch("base-owned-${phase.name}"))
+                if (phase == RelayV2ConnectionPhase.QUERYING) {
+                    harness.actor.awaitFailure(RelayV2FailureKind.SCHEMA)
+                    assertEquals(4400, harness.transport().closeCodes.single())
+                } else {
+                    val base = withTimeout(TIMEOUT_MS) {
+                        harness.actor.effects.first {
+                            it is RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                        }
+                    } as RelayV2RuntimeEffect.DeliverPostHandshakeFrame
+                    assertEquals("base-owned-${phase.name}", base.message.frame["requestId"])
+                    assertEquals(RelayV2ConnectionPhase.ONLINE, harness.actor.state.value.phase)
+                    assertTrue(harness.transport().closeCodes.isEmpty())
+                }
+            } finally {
+                harness.close()
+            }
+        }
+    }
+
+    @Test
+    fun `unnegotiated agent runtime has zero send and fails inbound closed`() = runBlocking {
+        val harness = Harness()
+        try {
+            val hello = harness.connectThroughRelayWelcome(null)
+            harness.transport().sendFixture(
+                "host-welcome-snapshot-required",
+                hello.stringValue("requestId"),
+            )
+            val handshake = withTimeout(TIMEOUT_MS) { harness.actor.effects.first() }
+                as RelayV2RuntimeEffect.BeginStateResync
+            val request = AgentTranscriptLifecycleActorRequest.Status(
+                authority = handshake.repositoryAuthority,
+                frame = com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStatusGetFrame(
+                    requestId = "agent-status-disabled",
+                    hostId = HOST_ID,
+                    expectedHostEpoch = HOST_EPOCH,
+                    scopeId = "scope-local",
+                    sessionId = "session-1",
+                ),
+                requestFence = AgentLocalRequestFence("1", "agent-status-disabled"),
+            )
+            assertNull(harness.actor.send(request))
+            assertEquals(1, harness.transport().sent.size)
+
+            harness.transport().sendAgentFrame(
+                AgentTimelineResetFrame(
+                    hostId = HOST_ID,
+                    hostEpoch = HOST_EPOCH,
+                    scopeId = "scope-local",
+                    sessionId = "session-1",
+                    previousTimelineEpoch = "timeline-1",
+                    newTimelineEpoch = "timeline-2",
+                    reason = AgentTimelineResetReason.DELETED,
+                ),
+            )
+            val failed = harness.actor.awaitFailure(RelayV2FailureKind.SCHEMA)
+            assertEquals("INVALID_ENVELOPE", failed.failure?.code)
+            assertEquals(4400, harness.transport().closeCodes.single())
+        } finally {
+            harness.close()
         }
     }
 
@@ -4451,6 +5519,75 @@ class RelayV2ConnectionActorTest {
         }
     }
 
+    private fun completedHandoff(admission: AgentTranscriptLifecycleRequestAdmission) =
+        AgentTranscriptLifecycleCompletedHandoffReceipt(admission)
+
+    private fun agentStatusRequest(
+        authority: RelayV2RepositoryEffectAuthority,
+        requestId: String,
+    ) = AgentTranscriptLifecycleActorRequest.Status(
+        authority = authority,
+        frame =
+            com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
+                .AgentTimelineStatusGetFrame(
+                    requestId = requestId,
+                    hostId = HOST_ID,
+                    expectedHostEpoch = HOST_EPOCH,
+                    scopeId = "scope-local",
+                    sessionId = "session-1",
+                ),
+        requestFence = AgentLocalRequestFence("1", requestId),
+    )
+
+    private fun agentSnapshotRequest(
+        authority: RelayV2RepositoryEffectAuthority,
+        requestId: String,
+    ) = AgentTranscriptLifecycleActorRequest.Snapshot(
+        authority = authority,
+        frame = AgentTimelineSnapshotGetFrame(
+            requestId = requestId,
+            hostId = HOST_ID,
+            expectedHostEpoch = HOST_EPOCH,
+            scopeId = "scope-local",
+            sessionId = "session-1",
+            request = AgentTimelineSnapshotRequest(
+                snapshotRequestId = "snapshot-cut-$requestId",
+                snapshotId = null,
+                cursor = null,
+                nextPageIndex = 0,
+            ),
+        ),
+    )
+
+    private fun agentUnavailableStatus(requestId: String) = AgentTimelineStatusFrame(
+        requestId = requestId,
+        hostId = HOST_ID,
+        hostEpoch = HOST_EPOCH,
+        scopeId = "scope-local",
+        sessionId = "session-1",
+        status = AgentTimelineUnavailableStatus(
+            AgentTimelineUnavailableReason.AGENT_UNSUPPORTED,
+        ),
+    )
+
+    private fun hostEpochMismatch(requestId: String) = AgentTimelineErrorFrame(
+        requestId = requestId,
+        hostId = HOST_ID,
+        hostEpoch = "host-epoch-agent-actual",
+        scopeId = "scope-local",
+        sessionId = "session-1",
+        error = AgentTimelineStructuredError(
+            code = AgentTimelineErrorCode.HOST_EPOCH_MISMATCH,
+            message = "host epoch changed",
+            retryable = false,
+            commandDisposition = AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+            details = AgentTimelineHostEpochMismatchDetails(
+                expectedHostEpoch = HOST_EPOCH,
+                actualHostEpoch = "host-epoch-agent-actual",
+            ),
+        ),
+    )
+
     private inner class Harness(
         val factory: FakeTransportFactory = FakeTransportFactory(),
         normalActionCapacity: Int = RelayV2ConnectionActor.DEFAULT_ACTION_CAPACITY,
@@ -4458,6 +5595,16 @@ class RelayV2ConnectionActorTest {
         eventCapacity: Int = RelayV2ConnectionActor.DEFAULT_EVENT_CAPACITY,
         actionByteCapacity: Long = RelayV2ConnectionActor.DEFAULT_ACTION_BYTE_CAPACITY,
         effectByteCapacity: Long = RelayV2ConnectionActor.DEFAULT_EFFECT_BYTE_CAPACITY,
+        extensionActionCapacity: Int = 64,
+        extensionEventCapacity: Int = RelayV2ConnectionActor.DEFAULT_EXTENSION_EVENT_CAPACITY,
+        extensionActionByteCapacity: Long =
+            RelayV2ConnectionActor.DEFAULT_EXTENSION_ACTION_BYTE_CAPACITY,
+        extensionEffectByteCapacity: Long =
+            RelayV2ConnectionActor.DEFAULT_EXTENSION_EFFECT_BYTE_CAPACITY,
+        extensionRequestTimeoutMs: Long = RelayV2ConnectionActor.EXTENSION_REQUEST_TIMEOUT_MS,
+        extensionRequestWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
+        beforeAgentExtensionRequestSend: suspend () -> Unit = {},
+        afterAgentExtensionRedriveEnqueuedBeforeSwap: () -> Unit = {},
         watchdogDelay: suspend (Long) -> Unit = { delay(it) },
         recoveryWatchdogDelay: suspend (Long) -> Unit = { delay(it) },
         afterRecoveryWatchdogArmed: (RelayV2RecoveryBinding, () -> Unit) -> Unit =
@@ -4470,6 +5617,7 @@ class RelayV2ConnectionActorTest {
         afterCallbackAdmission: (RelayV2Transport) -> Unit = {},
         afterDisconnectOwnerSeal: () -> Unit = {},
         durableConnectPlanSource: RelayV2ConnectPlanSource? = null,
+        optionalCapabilities: Set<String> = emptySet(),
     ) {
         private val parent = CoroutineScope(SupervisorJob() + Dispatchers.Default)
         private val credentials = MemoryCredentialStore()
@@ -4481,6 +5629,7 @@ class RelayV2ConnectionActorTest {
             credentialStore = credentials,
             connectPlanSource = durableConnectPlanSource ?: connectPlans,
             codec = codec,
+            optionalCapabilities = optionalCapabilities,
             clock = { NOW_MS },
             watchdogDelay = watchdogDelay,
             recoveryWatchdogDelay = recoveryWatchdogDelay,
@@ -4498,6 +5647,15 @@ class RelayV2ConnectionActorTest {
             eventCapacity = eventCapacity,
             actionByteCapacity = actionByteCapacity,
             effectByteCapacity = effectByteCapacity,
+            extensionActionCapacity = extensionActionCapacity,
+            extensionEventCapacity = extensionEventCapacity,
+            extensionActionByteCapacity = extensionActionByteCapacity,
+            extensionEffectByteCapacity = extensionEffectByteCapacity,
+            extensionRequestTimeoutMs = extensionRequestTimeoutMs,
+            extensionRequestWatchdogDelay = extensionRequestWatchdogDelay,
+            beforeAgentExtensionRequestSend = beforeAgentExtensionRequestSend,
+            afterAgentExtensionRedriveEnqueuedBeforeSwap =
+                afterAgentExtensionRedriveEnqueuedBeforeSwap,
         )
 
         fun installProfile(suffix: String, activationGeneration: Long): RelayV2Profile {
@@ -4539,16 +5697,70 @@ class RelayV2ConnectionActorTest {
         suspend fun connectThroughRelayWelcome(
             resume: RelayV2ResumeCursor?,
             connectingProfile: RelayV2Profile = profile,
+            brokerOptionalCapabilities: Set<String> = emptySet(),
         ): MutableMap<String, Any?> {
             val transportIndex = factory.transports.size
             assertTrue(connect(connectingProfile, resume))
             val transport = awaitTransport(transportIndex)
             transport.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
             actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME)
-            transport.sendFixture("relay-welcome")
+            val relayWelcome = fixture("relay-welcome")
+            relayWelcome.payload()["capabilities"] =
+                RelayV2ConnectionActor.REQUIRED_CAPABILITIES +
+                brokerOptionalCapabilities.sorted()
+            transport.sendFrame(relayWelcome)
             val hello = transport.awaitSentFrame()
             actor.awaitPhase(RelayV2ConnectionPhase.AWAITING_HOST_WELCOME)
             return hello
+        }
+
+        suspend fun negotiateAgentExtension(
+            targetPhase: RelayV2ConnectionPhase,
+        ): RelayV2RepositoryEffectAuthority {
+            require(
+                targetPhase == RelayV2ConnectionPhase.QUERYING ||
+                    targetPhase == RelayV2ConnectionPhase.RESYNCING ||
+                    targetPhase == RelayV2ConnectionPhase.ONLINE,
+            )
+            val matched = targetPhase != RelayV2ConnectionPhase.RESYNCING
+            val hello = connectThroughRelayWelcome(
+                resume = if (matched) RelayV2ResumeCursor(HOST_EPOCH, "91") else null,
+                brokerOptionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            val welcome = fixture(
+                if (matched) "host-welcome-caught-up" else "host-welcome-snapshot-required",
+            )
+            welcome["requestId"] = hello.stringValue("requestId")
+            welcome.payload()["capabilities"] =
+                RelayV2ConnectionActor.REQUIRED_CAPABILITIES +
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+            transport().sendFrame(welcome)
+            val effect = withTimeout(TIMEOUT_MS) {
+                actor.effects.first {
+                    it is RelayV2RuntimeEffect.QueryPendingCommands ||
+                        it is RelayV2RuntimeEffect.BeginStateResync
+                }
+            }
+                as RelayV2RuntimeEffect.RepositoryScoped
+            if (targetPhase == RelayV2ConnectionPhase.ONLINE) {
+                val query = effect as RelayV2RuntimeEffect.QueryPendingCommands
+                assertTrue(
+                    actor.commitRecoveryReceipt(
+                        query,
+                        RelayV2RecoveryReceipt.HelloApplied(
+                            binding = query.recovery,
+                            hostId = HOST_ID,
+                            hostEpoch = HOST_EPOCH,
+                            durableCursorEventSeq = "91",
+                            pendingCommands = emptyList(),
+                        ),
+                    ),
+                )
+                actor.awaitPhase(RelayV2ConnectionPhase.ONLINE)
+            } else {
+                actor.awaitPhase(targetPhase)
+            }
+            return effect.repositoryAuthority
         }
 
         fun connect(
@@ -4712,13 +5924,16 @@ class RelayV2ConnectionActorTest {
         @Volatile
         var throwOnSecondClose: Boolean = false
 
+        @Volatile
+        var sendResult: Boolean = true
+
         override fun send(bytes: ByteArray): Boolean {
             if (blockFirstSend && sendCount++ == 0) {
                 sendEntered.countDown()
                 check(releaseSend.await(TIMEOUT_MS, TimeUnit.MILLISECONDS))
             }
             sent += bytes.copyOf()
-            return true
+            return sendResult
         }
 
         override fun close(code: Int, reason: String) {
@@ -4797,6 +6012,10 @@ class RelayV2ConnectionActorTest {
             listener.onFrame(this, bytes, RelayV2FrameMetadata())
         }
 
+        fun sendAgentFrame(frame: AgentTranscriptLifecycleV1Frame) {
+            sendRaw(agentExtensionCodec.encodePublicFrame(frame))
+        }
+
         fun fail(failure: RelayV2TransportFailure) {
             termination.complete(true)
             listener.onFailure(this, failure)
@@ -4816,6 +6035,12 @@ class RelayV2ConnectionActorTest {
                         sent[index],
                     ).frame,
                 )
+            }
+
+        suspend fun awaitAgentSentFrame(index: Int): AgentTranscriptLifecycleV1Frame =
+            withTimeout(TIMEOUT_MS) {
+                while (sent.size <= index) delay(1)
+                agentExtensionCodec.decodePublicFrame(sent[index])
             }
     }
 

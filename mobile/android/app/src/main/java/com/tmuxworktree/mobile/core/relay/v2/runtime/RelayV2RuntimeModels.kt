@@ -1,5 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleActorRequest
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleRequestAdmission
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.AgentTranscriptLifecycleTrustedIngress
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1PublicFrameArtifact
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2FrameMetadata
 import com.tmuxworktree.mobile.core.relay.v2.profile.RelayActiveProfileIdentity
@@ -851,6 +855,45 @@ internal sealed interface RelayV2RuntimeEffect {
         }
     }
 
+    /** Strict-codec-issued optional frame, still requiring a durable consumer apply lease. */
+    data class DeliverAgentExtensionFrame(
+        val context: RelayV2HandshakeContext,
+        val artifact: AgentTranscriptLifecycleV1PublicFrameArtifact,
+        val ingress: AgentTranscriptLifecycleTrustedIngress,
+        val requestAdmission: AgentTranscriptLifecycleRequestAdmission?,
+        override val generation: RelayV2EffectGeneration,
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
+        init {
+            require(artifact.rawUtf8ByteCount in 1..1_048_576)
+            require((ingress == AgentTranscriptLifecycleTrustedIngress.Live) ==
+                (requestAdmission == null)
+            ) { "Only unsolicited extension frames omit request admission" }
+        }
+    }
+
+    /** A valid negotiated extension frame that cannot safely enter its durable namespace. */
+    data class AgentExtensionUnavailable(
+        val context: RelayV2HandshakeContext,
+        val reason: RelayV2AgentExtensionUnavailableReason,
+        val failedRequest: AgentTranscriptLifecycleActorRequest? = null,
+        val requestAdmission: AgentTranscriptLifecycleRequestAdmission? = null,
+        override val generation: RelayV2EffectGeneration,
+        override val repositoryAuthority: RelayV2RepositoryEffectAuthority =
+            context.repositoryEffectAuthority(generation),
+    ) : RepositoryScoped {
+        init {
+            require((failedRequest == null) == (requestAdmission == null))
+            if (failedRequest != null && requestAdmission != null) {
+                require(failedRequest.authority == repositoryAuthority)
+                require(requestAdmission.authority == repositoryAuthority)
+                require(failedRequest.kind == requestAdmission.requestKind)
+                require(failedRequest.requestId == requestAdmission.requestId)
+            }
+        }
+    }
+
     data class ConnectionFailed(
         val profile: RelayActiveProfileIdentity?,
         val generation: RelayV2EffectGeneration?,
@@ -868,6 +911,14 @@ internal sealed interface RelayV2RuntimeEffect {
         val fencedGeneration: RelayV2EffectGeneration?,
         val barrierConnectionGeneration: Long,
     ) : RelayV2RuntimeEffect
+}
+
+internal enum class RelayV2AgentExtensionUnavailableReason {
+    UNCORRELATED_RESPONSE,
+    RESPONSE_ROUTE_MISMATCH,
+    REQUEST_SEND_FAILED,
+    REQUEST_TIMEOUT,
+    EFFECT_QUEUE_SATURATED,
 }
 
 /**

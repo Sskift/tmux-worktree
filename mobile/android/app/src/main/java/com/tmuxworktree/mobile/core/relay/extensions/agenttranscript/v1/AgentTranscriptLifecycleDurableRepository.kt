@@ -58,6 +58,17 @@ internal class AgentTranscriptLifecycleDurableRepository(
         core.claimNotificationUnderApplyLease(expectedNamespace, intent)
 
     /** Closed operation seam; each call is executed by the core in one Room transaction. */
+    override suspend fun prepareRequestUnderApplyLease(
+        command: AgentTranscriptLifecycleDurablePrepareRequestCommand,
+        limits: AgentClientReducerLimits,
+    ): AgentTranscriptLifecycleDurablePrepareRequestResult =
+        core.prepareRequestUnderApplyLease(command, limits)
+
+    override suspend fun loadPreparedRequestsUnderApplyLease(
+        fence: AgentTranscriptLifecycleDurableOperationFence,
+    ): List<AgentTranscriptLifecycleDurablePreparedRequest> =
+        core.loadPreparedRequestsUnderApplyLease(fence)
+
     override suspend fun applyControlUnderApplyLease(
         command: AgentTranscriptLifecycleDurableControlCommand,
         limits: AgentClientReducerLimits,
@@ -69,6 +80,12 @@ internal class AgentTranscriptLifecycleDurableRepository(
         limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleDurableOperationResult =
         core.consumeLiveEventUnderApplyLease(command, limits)
+
+    override suspend fun consumeCorrelatedErrorUnderApplyLease(
+        command: AgentTranscriptLifecycleDurableCorrelatedErrorCommand,
+        limits: AgentClientReducerLimits,
+    ): AgentTranscriptLifecycleDurableOperationResult =
+        core.consumeCorrelatedErrorUnderApplyLease(command, limits)
 
     override suspend fun consumeReplayPageUnderApplyLease(
         command: AgentTranscriptLifecycleDurableReplayPageCommand,

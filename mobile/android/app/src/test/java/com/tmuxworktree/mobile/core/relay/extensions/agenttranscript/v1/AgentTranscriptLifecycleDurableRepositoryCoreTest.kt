@@ -2,6 +2,9 @@ package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventRecord
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCode
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorCommandDisposition
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineErrorFrame
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineLifecycleChangedMutation
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineLifecycleRecord
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineLifecycleScope
@@ -13,6 +16,7 @@ import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.Ag
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityMutation
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityReason
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineStructuredError
 import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptEntryEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptEntryBatchMetadata
@@ -76,6 +80,139 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         assertEquals(publicRecord, command.frame.event)
         assertEquals(namespace, command.fence.expectedNamespace)
     }
+
+    @Test
+    fun `correlated snapshot error atomically closes continuation fence before resync`() =
+        runBlocking {
+            val store = MemoryStore()
+            val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+            val consumer = consumer(sessionId = "session-error-fence")
+            val initial = operationalState(consumer, "timeline-error-fence")
+            val namespace = namespace(consumer, initial)
+            repository.initializeUnderApplyLease(namespace, initial)
+            enterSnapshot(repository, namespace, currentAgentSeq = "2", earliestReplaySeq = "2")
+            persistSnapshotRequest(
+                repository,
+                namespace,
+                snapshotRequestId = "snapshot-error-fence",
+                pageZeroNetworkToken = "snapshot-page-zero",
+            )
+            val codec = AgentTranscriptLifecycleV1Codec()
+            val firstPage = codec.decodePublicFrameArtifact(
+                codec.encodePublicFrame(
+                    AgentTimelineSnapshotPageFrame(
+                        requestId = "snapshot-page-zero",
+                        hostId = consumer.hostId,
+                        hostEpoch = consumer.hostEpoch,
+                        scopeId = consumer.scopeId,
+                        sessionId = consumer.sessionId,
+                        page = AgentTimelineSnapshotPage(
+                            timelineEpoch = "timeline-error-fence",
+                            snapshotRequestId = "snapshot-error-fence",
+                            snapshotId = "snapshot-pinned",
+                            pageIndex = 0,
+                            isLast = false,
+                            nextCursor = "snapshot-cursor-next",
+                            throughAgentSeq = "2",
+                            earliestRetainedSeq = "1",
+                            records = listOf(
+                                lifecycleSnapshotRecord(
+                                    sequence = "1",
+                                    eventId = "event-snapshot-running",
+                                    state = AgentTimelineLifecycleState.RUNNING,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+            ) as AgentTimelineSnapshotPagePublicFrameArtifact
+            repository.consumeSnapshotPageUnderApplyLease(
+                AgentTranscriptLifecycleDurableSnapshotPageCommand.NonFinalStage(
+                    operationFence(namespace),
+                    firstPage,
+                    nextRequestNetworkToken = "snapshot-page-one",
+                ),
+            )
+            repository.prepareRequestUnderApplyLease(
+                AgentTranscriptLifecycleDurablePrepareRequestCommand.Status(
+                    operationFence(namespace),
+                    proposedRequestNetworkToken = "status-sibling-before-error",
+                ),
+            )
+            val errorArtifact = codec.decodePublicFrameArtifact(
+                codec.encodePublicFrame(
+                    AgentTimelineErrorFrame(
+                        requestId = "snapshot-page-one",
+                        hostId = consumer.hostId,
+                        hostEpoch = consumer.hostEpoch,
+                        scopeId = consumer.scopeId,
+                        sessionId = consumer.sessionId,
+                        error = AgentTimelineStructuredError(
+                            code = AgentTimelineErrorCode.AGENT_SNAPSHOT_EXPIRED,
+                            message = "snapshot expired",
+                            retryable = false,
+                            commandDisposition =
+                                AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+                        ),
+                    ),
+                ),
+            )
+            val command = AgentTranscriptLifecycleDurableCorrelatedErrorCommand(
+                operationFence(namespace),
+                errorArtifact,
+                AgentTranscriptLifecycleRequestKind.SNAPSHOT,
+                replacementStatusRequestNetworkToken = "status-after-snapshot-error",
+            )
+
+            val result = repository.consumeCorrelatedErrorUnderApplyLease(command)
+            val reduction = result.reduction
+
+            assertEquals(AgentClientDisposition.GAP_RESYNC, reduction.disposition)
+            assertEquals(AgentTimelineSyncDirective.StatusRefresh, reduction.syncDirective)
+            assertEquals(
+                AgentTimelineSyncState.StatusRefresh(requireSnapshotAfterRefresh = true),
+                reduction.state.extensionLane.syncState,
+            )
+            assertEquals("2", reduction.state.extensionLane.localGeneration)
+            assertEquals(
+                AgentLocalRequestFence("2", "status-after-snapshot-error"),
+                reduction.state.extensionLane.pendingStatusRequest,
+            )
+            assertEquals(
+                listOf(
+                    AgentTranscriptLifecycleDurablePreparedRequest.Status(
+                        AgentLocalRequestFence("2", "status-after-snapshot-error"),
+                    ),
+                ),
+                result.preparedRequests,
+            )
+            assertEquals(
+                result.preparedRequests,
+                AgentTranscriptLifecycleDurableRepositoryCore(store)
+                    .loadPreparedRequestsUnderApplyLease(operationFence(namespace)),
+            )
+            assertEquals(
+                setOf(
+                    AgentTranscriptLifecycleDurableRequestIdentity(
+                        AgentTranscriptLifecycleRequestKind.STATUS,
+                        "status-sibling-before-error",
+                    ),
+                    AgentTranscriptLifecycleDurableRequestIdentity(
+                        AgentTranscriptLifecycleRequestKind.SNAPSHOT,
+                        "snapshot-page-one",
+                    ),
+                ),
+                result.retiredRequests.toSet(),
+            )
+            assertEquals(0, store.snapshotCount(namespace))
+            val committedImage = store.durableImage()
+            assertTrue(
+                runCatching {
+                    repository.consumeCorrelatedErrorUnderApplyLease(command)
+                }.exceptionOrNull() is AgentTranscriptLifecyclePersistenceConflictException,
+            )
+            assertEquals(committedImage, store.durableImage())
+        }
 
     @Test
     fun `storage identity boundary rejects malformed and oversized UTF8`() {
