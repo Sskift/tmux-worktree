@@ -34,6 +34,7 @@ export default defineConfig({
     "src/relay/v2/brokerCredentialHttpBoundary.ts",
     "src/relay/v2/brokerCredentialHttpIngress.ts",
     "src/relay/v2/brokerHostBootstrapHttpIngress.ts",
+    "src/relay/v2/brokerCredentialNodeHttpAdapter.ts",
     "src/relay/v2/codec.ts",
     "src/relay/v2/brokerCore.ts",
     "src/relay/v2/brokerTransportCloseCoordinator.ts",
