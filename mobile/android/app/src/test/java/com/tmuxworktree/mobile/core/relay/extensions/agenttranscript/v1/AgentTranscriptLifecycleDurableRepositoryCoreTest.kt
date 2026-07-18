@@ -778,6 +778,7 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         runBlocking {
             val labels = listOf(
                 "old-generation",
+                "old-state",
                 "old-timeline",
                 "inactive-profile",
                 "permission-denied",
@@ -824,6 +825,11 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                         )
                         fixture.intent
                     }
+                    "old-state" -> fixture.intent.copy(
+                        dedupeKey = fixture.intent.dedupeKey.copy(
+                            state = AgentLifecycleState.WAITING_FOR_USER,
+                        ),
+                    )
                     "old-timeline" -> fixture.intent.copy(
                         dedupeKey = fixture.intent.dedupeKey.copy(
                             timelineEpoch = "timeline-old",
@@ -874,6 +880,7 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                     "not-shown" -> fixture.intent
                     else -> error("unhandled stale case")
                 }
+                val imageBeforeClaim = store.durableImage()
 
                 assertEquals(
                     label,
@@ -883,6 +890,9 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                     repository.claimNotificationUnderApplyLease(fixture.namespace, intent),
                 )
                 assertEquals(label, 0, store.claimCount)
+                if (label == "old-state") {
+                    assertEquals(label, imageBeforeClaim, store.durableImage())
+                }
             }
 
             val activationStore = MemoryStore()
