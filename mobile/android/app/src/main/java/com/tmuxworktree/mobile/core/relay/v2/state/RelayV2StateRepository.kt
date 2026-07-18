@@ -23,7 +23,7 @@ import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalStoredCheck
  */
 internal class RelayV2StateRepository(
     database: RelayV2StateDatabase,
-) : RelayV2StateSyncAuthority {
+) : RelayV2StateSyncAuthority, RelayV2OutboxRecoveryAuthority {
     private val core = RelayV2StateSyncRepositoryCore(RoomRelayV2StateStore(database))
     private val durableCore = RelayV2DurableStateRepositoryCore(
         RoomRelayV2DurableStateStore(database),
@@ -79,6 +79,14 @@ internal class RelayV2StateRepository(
         namespace: RelayV2OutboxAuthorityNamespace,
         action: RelayV2OutboxAction,
     ): RelayV2OutboxResult = durableCore.reduceOutboxUnderApplyLease(namespace, action)
+
+    override suspend fun reduceOutboxBatchUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
+    ): RelayV2OutboxBatchResult = durableCore.reduceOutboxBatchUnderApplyLease(
+        namespace,
+        actionSource,
+    )
 
     suspend fun loadTerminal(
         key: RelayV2TerminalCheckpointKey,

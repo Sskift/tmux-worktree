@@ -4,7 +4,10 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAction
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxAuthorityCore
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntry
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxMutation
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.terminal.RelayV2TerminalAction
@@ -73,6 +76,26 @@ internal interface RelayV2DurableStateTransaction {
     fun putTerminalCheckpoint(checkpoint: RelayV2PersistedTerminalCheckpoint)
 }
 
+internal sealed interface RelayV2OutboxBatchResult {
+    data class Applied(
+        val state: RelayV2OutboxState,
+        val effects: List<RelayV2OutboxEffect>,
+    ) : RelayV2OutboxBatchResult
+
+    data class Rejected(
+        val state: RelayV2OutboxState,
+        val reason: RelayV2OutboxRejection?,
+    ) : RelayV2OutboxBatchResult
+}
+
+/** Narrow durable port used by the unwired command-status recovery bridge. */
+internal interface RelayV2OutboxRecoveryAuthority {
+    suspend fun reduceOutboxBatchUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
+    ): RelayV2OutboxBatchResult
+}
+
 /**
  * Single transaction owner for the accepted pure Outbox and terminal authorities.
  *
@@ -83,7 +106,7 @@ internal interface RelayV2DurableStateTransaction {
 internal class RelayV2DurableStateRepositoryCore(
     private val store: RelayV2DurableStateStore,
     private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
-) {
+) : RelayV2OutboxRecoveryAuthority {
     private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
     private val resetAuthorizedTerminalKeys =
         ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
@@ -115,6 +138,55 @@ internal class RelayV2DurableStateRepositoryCore(
             )
         }
         result
+    }
+
+    override suspend fun reduceOutboxBatchUnderApplyLease(
+        namespace: RelayV2OutboxAuthorityNamespace,
+        actionSource: (RelayV2OutboxState) -> List<RelayV2OutboxAction>?,
+    ): RelayV2OutboxBatchResult = store.transaction {
+        val current = decodeOutbox(namespace)
+        val actions = actionSource(current)
+            ?: return@transaction RelayV2OutboxBatchResult.Rejected(current, null)
+        if (actions.size !in 1..RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH) {
+            return@transaction RelayV2OutboxBatchResult.Rejected(current, null)
+        }
+
+        var reducedState = current
+        val applied = ArrayList<RelayV2OutboxResult.Applied>(actions.size)
+        actions.forEach { action ->
+            when (val result = outboxAuthority.reduce(reducedState, action)) {
+                is RelayV2OutboxResult.Rejected ->
+                    return@transaction RelayV2OutboxBatchResult.Rejected(
+                        current,
+                        result.reason,
+                    )
+                is RelayV2OutboxResult.Applied -> {
+                    requireOutboxNamespace(namespace, result.state)
+                    applied += result
+                    reducedState = result.state
+                }
+            }
+        }
+
+        var persistedState = current
+        applied.forEach { result ->
+            applyOutboxPlan(namespace, persistedState, result)
+            persistedState = result.state
+        }
+        putOutboxMeta(
+            RelayV2PersistedOutboxMeta(
+                namespace,
+                reducedState.nextCreationOrder,
+                RelayV2OutboxStorageCodec.encodeMeta(
+                    namespace,
+                    reducedState.nextCreationOrder,
+                ),
+            ),
+        )
+        RelayV2OutboxBatchResult.Applied(
+            reducedState,
+            applied.flatMap { it.effects },
+        )
     }
 
     suspend fun loadTerminal(

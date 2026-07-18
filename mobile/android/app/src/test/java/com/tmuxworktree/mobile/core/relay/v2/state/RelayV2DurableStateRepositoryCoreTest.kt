@@ -153,6 +153,66 @@ class RelayV2DurableStateRepositoryCoreTest {
     }
 
     @Test
+    fun `batch pre-reduction writes nothing when the second action is rejected`() = runBlocking {
+        val store = MemoryStore()
+        val repository = RelayV2DurableStateRepositoryCore(store)
+        val namespace = outboxNamespace()
+        listOf("a", "b").forEachIndexed { index, suffix ->
+            repository.reduceOutboxUnderApplyLease(
+                namespace,
+                RelayV2OutboxAction.Enqueue(
+                    RelayV2OutboxDraft(
+                        profileId = namespace.profileId,
+                        principalId = namespace.principalId,
+                        hostId = "host-a",
+                        expectedHostEpoch = "epoch-a",
+                        dedupeWindowId = "window-a",
+                        commandId = "command-$suffix",
+                        scopeId = "scope-a",
+                        sessionId = "session-$suffix",
+                        arguments = RelayV2OutboxArguments.killSession(),
+                    ),
+                    createdAtMillis = index.toLong() + 1,
+                ),
+            ) as RelayV2OutboxResult.Applied
+        }
+        var entries = repository.loadOutbox(namespace).entries
+        repository.reduceOutboxUnderApplyLease(
+            namespace,
+            RelayV2OutboxAction.DispatchEligible(
+                entries.associate { it.id to "execute-${it.commandId}" },
+                effectBudget = entries.size,
+            ),
+        ) as RelayV2OutboxResult.Applied
+        entries = repository.loadOutbox(namespace).entries
+        repository.reduceOutboxUnderApplyLease(
+            namespace,
+            RelayV2OutboxAction.BeginQueries(entries.map { it.id }, listOf("query-a")),
+        ) as RelayV2OutboxResult.Applied
+        entries = repository.loadOutbox(namespace).entries
+        val writesBefore = store.writeCount
+
+        val result = repository.reduceOutboxBatchUnderApplyLease(namespace) { current ->
+            val first = current.entries.single { it.commandId == "command-a" }
+            val second = current.entries.single { it.commandId == "command-b" }
+            listOf(
+                RelayV2OutboxAction.ReconcileStatus(
+                    succeededKill(first),
+                    RelayV2OutboxRecovery.None,
+                ),
+                RelayV2OutboxAction.ReconcileStatus(
+                    succeededKill(second).copy(scopeId = "wrong-scope"),
+                    RelayV2OutboxRecovery.None,
+                ),
+            )
+        }
+
+        assertTrue(result is RelayV2OutboxBatchResult.Rejected)
+        assertEquals(writesBefore, store.writeCount)
+        assertEquals(entries, repository.loadOutbox(namespace).entries)
+    }
+
+    @Test
     fun `terminal pre-open commits before effect and full fences round trip fail closed`() =
         runBlocking {
             val store = MemoryStore()
@@ -493,6 +553,20 @@ class RelayV2DurableStateRepositoryCoreTest {
         errorCode = "COMMAND_WINDOW_EXPIRED",
         commandDisposition = RelayV2CommandDisposition.NOT_ACCEPTED,
         detailsReissueRequired = true,
+    )
+
+    private fun succeededKill(entry: RelayV2OutboxEntry) = RelayV2CommandStatusEvidence(
+        entryId = entry.id,
+        dedupeWindowId = entry.dedupeWindowId,
+        hostEpoch = entry.expectedHostEpoch,
+        scopeId = entry.scopeId,
+        sessionId = entry.sessionId,
+        operation = entry.operation,
+        source = RelayV2CommandStatusSource.QUERY_RESPONSE,
+        attemptKind = RelayV2OutboxAttemptKind.QUERY,
+        state = RelayV2CommandStatusState.SUCCEEDED,
+        attemptRequestId = "query-a",
+        result = RelayV2CommandResult.KilledSession(requireNotNull(entry.sessionId), true),
     )
 
     private fun outboxNamespace() = RelayV2OutboxAuthorityNamespace(
