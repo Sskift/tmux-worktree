@@ -32,6 +32,7 @@ enum class AgentTimelineErrorCode(val wireValue: String) {
     AGENT_CURSOR_AHEAD("AGENT_CURSOR_AHEAD"),
     AGENT_SNAPSHOT_EXPIRED("AGENT_SNAPSHOT_EXPIRED"),
     AGENT_TIMELINE_EPOCH_MISMATCH("AGENT_TIMELINE_EPOCH_MISMATCH"),
+    HOST_EPOCH_MISMATCH("HOST_EPOCH_MISMATCH"),
 }
 
 enum class AgentTimelineErrorCommandDisposition(val wireValue: String) {
@@ -45,9 +46,17 @@ data class AgentTimelineStructuredError(
     val retryAfterMs: Long? = null,
     val commandDisposition: AgentTimelineErrorCommandDisposition =
         AgentTimelineErrorCommandDisposition.NOT_APPLICABLE,
+    val details: AgentTimelineErrorDetails? = null,
 )
 
-/** Correlated base-v2 error envelope carrying only extension-owned error codes. */
+sealed interface AgentTimelineErrorDetails
+
+data class AgentTimelineHostEpochMismatchDetails(
+    val expectedHostEpoch: String,
+    val actualHostEpoch: String,
+) : AgentTimelineErrorDetails
+
+/** Correlated extension error or the base-v2 host-lineage mismatch allowed by this codec. */
 data class AgentTimelineErrorFrame(
     val requestId: String,
     override val hostId: String,
