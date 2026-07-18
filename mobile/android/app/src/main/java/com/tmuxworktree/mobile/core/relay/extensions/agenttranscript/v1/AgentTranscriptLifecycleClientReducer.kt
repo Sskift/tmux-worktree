@@ -831,7 +831,7 @@ internal sealed interface AgentTranscriptLifecycleClientInput {
     data class SnapshotRequestStarted(
         val snapshotRequestId: String,
         val pageZeroNetworkToken: String,
-    ) : AgentTranscriptLifecycleClientInput {
+    ) : AgentTranscriptLifecycleControlInput {
         init {
             requireOpaqueId(snapshotRequestId, "Snapshot request ID")
             requireOpaqueId(pageZeroNetworkToken, "Snapshot page-zero network token")

@@ -12,6 +12,11 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptPending
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptSnapshotRecordEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptSnapshotRecordBatchMetadata
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptSnapshotStagingEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentLifecycleDao
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentLifecycleCurrentEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentLifecycleEventWitnessEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentNotificationLedgerEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentRecentEventEvidenceEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2EncodedPayload
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageException
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageFailure
@@ -55,16 +60,18 @@ private class RoomAgentTranscriptLifecycleDurableStore(
     private val database: RelayV2StateDatabase,
 ) : AgentTranscriptLifecycleDurableStore {
     private val dao = database.stateDao()
+    private val lifecycleDao = database.agentLifecycleDao()
 
     override suspend fun <T> transaction(
         block: AgentTranscriptLifecycleDurableTransaction.() -> T,
     ): T = database.withTransaction {
-        RoomAgentTranscriptLifecycleDurableTransaction(dao).block()
+        RoomAgentTranscriptLifecycleDurableTransaction(dao, lifecycleDao).block()
     }
 }
 
 private class RoomAgentTranscriptLifecycleDurableTransaction(
     private val dao: RelayV2StateDao,
+    private val lifecycleDao: RelayV2AgentLifecycleDao,
 ) : AgentTranscriptLifecycleDurableTransaction {
     override fun stateCount(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
@@ -92,9 +99,42 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         consumer.sessionId,
     ).map(RelayV2AgentTranscriptLifecycleStateEntity::toPersisted)
 
-    override fun deleteState(namespace: AgentTranscriptLifecycleDurableNamespace): Int {
+    override fun insertState(state: AgentTranscriptLifecyclePersistedState) {
+        dao.insertAgentTranscriptLifecycleState(state.toEntity())
+    }
+
+    override fun compareAndSetState(
+        expected: AgentTranscriptLifecyclePersistedState,
+        next: AgentTranscriptLifecyclePersistedState,
+    ): Int {
+        require(expected.namespace == next.namespace)
+        val consumer = expected.namespace.consumer
+        return lifecycleDao.updateConsumerAuthorityExact(
+            profileId = consumer.profileId,
+            profileActivationGeneration = consumer.profileActivationGeneration,
+            principalId = consumer.principalId,
+            clientInstanceId = consumer.clientInstanceId,
+            hostId = consumer.hostId,
+            hostEpoch = consumer.hostEpoch,
+            scopeId = consumer.scopeId,
+            sessionId = consumer.sessionId,
+            timelineEpoch = expected.namespace.timelineEpochKey,
+            expectedCodecVersion = expected.payload.codecVersion,
+            expectedPayloadUtf8Bytes = expected.payload.payloadUtf8Bytes,
+            expectedPayloadCanonicalJson = expected.payload.canonicalJson,
+            expectedPayloadSha256 = expected.payload.sha256,
+            newCodecVersion = next.payload.codecVersion,
+            newPayloadUtf8Bytes = next.payload.payloadUtf8Bytes,
+            newPayloadCanonicalJson = next.payload.canonicalJson,
+            newPayloadSha256 = next.payload.sha256,
+        )
+    }
+
+    override fun deleteStateForTimelineRotation(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ): Int {
         val consumer = namespace.consumer
-        return dao.deleteAgentTranscriptLifecycleState(
+        return lifecycleDao.deleteConsumerAuthorityForTimelineRotation(
             consumer.profileId,
             consumer.profileActivationGeneration,
             consumer.principalId,
@@ -105,10 +145,6 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
             consumer.sessionId,
             namespace.timelineEpochKey,
         )
-    }
-
-    override fun insertState(state: AgentTranscriptLifecyclePersistedState) {
-        dao.insertAgentTranscriptLifecycleState(state.toEntity())
     }
 
     override fun transcriptNamespaceStats(
@@ -150,10 +186,10 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
 
     override fun entryCount(namespace: AgentTranscriptLifecycleDurableNamespace): Long {
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptEntryCount(
+        return dao.agentTranscriptEntryStats(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
-        )
+        ).itemCount
     }
 
     override fun entries(
@@ -165,10 +201,10 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         requireTranscriptBatchLimit(limit)
         require((afterCreatedAgentSeqOrder == null) == (afterEntryId == null))
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptEntries(
+        return dao.agentTranscriptEntryPageAfter(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
-            afterCreatedAgentSeqOrder, afterEntryId, limit,
+            afterCreatedAgentSeqOrder ?: "", afterEntryId ?: "", limit,
         )
     }
 
@@ -190,6 +226,16 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
 
     override fun insertEntry(entry: RelayV2AgentTranscriptEntryEntity) {
         dao.insertAgentTranscriptEntry(entry)
+    }
+
+    override fun entryById(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        entryId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        dao.agentTranscriptEntryById(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, entryId,
+        )
     }
 
     override fun compareAndSetEntry(
@@ -225,10 +271,16 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
 
     override fun deleteEntries(namespace: AgentTranscriptLifecycleDurableNamespace): Int {
         val n = namespace.roomTranscriptNamespace()
-        return dao.deleteAgentTranscriptEntries(
-            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
-            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
-        )
+        var total = 0
+        while (true) {
+            val deleted = dao.deleteAgentTranscriptEntryBatch(
+                n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+                n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+                RelayV2StateLimits.MAX_SNAPSHOT_CHUNK_RECORDS,
+            )
+            if (deleted == 0) return total
+            total = Math.addExact(total, deleted)
+        }
     }
 
     override fun snapshotCount(namespace: AgentTranscriptLifecycleDurableNamespace): Long {
@@ -316,10 +368,10 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
         snapshotId: String,
     ): Long {
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptSnapshotRecordCount(
+        return dao.agentTranscriptSnapshotRecordStats(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, snapshotId,
-        )
+        ).itemCount
     }
 
     override fun snapshotRecords(
@@ -330,10 +382,23 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
     ): List<RelayV2AgentTranscriptSnapshotRecordEntity> {
         requireTranscriptBatchLimit(limit)
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptSnapshotRecords(
+        return dao.agentTranscriptSnapshotRecordPageAfter(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, snapshotId,
             afterRecordIndex, limit,
+        )
+    }
+
+    override fun snapshotRecordsByStableIdentity(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        snapshotId: String,
+        stableIdentity: String,
+    ): List<RelayV2AgentTranscriptSnapshotRecordEntity> {
+        val n = namespace.roomTranscriptNamespace()
+        return dao.agentTranscriptSnapshotRecordsByStableIdentity(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, snapshotId,
+            stableIdentity,
         )
     }
 
@@ -358,24 +423,62 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
 
     override fun pendingEventCount(namespace: AgentTranscriptLifecycleDurableNamespace): Long {
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptPendingEventCount(
+        return dao.agentTranscriptPendingEventStats(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
-        )
+        ).itemCount
     }
 
     override fun pendingEvents(
         namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String?,
+        limit: Int,
     ): List<RelayV2AgentTranscriptPendingEventEntity> {
+        requireTranscriptBatchLimit(limit)
         val n = namespace.roomTranscriptNamespace()
-        return dao.agentTranscriptPendingEvents(
+        return dao.agentTranscriptPendingEventPageAfter(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder ?: "", "", limit,
+        )
+    }
+
+    override fun pendingEventBatchMetadata(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String?,
+        limit: Int,
+    ): List<RelayV2AgentTranscriptPendingEventBatchMetadata> {
+        requireTranscriptBatchLimit(limit)
+        val n = namespace.roomTranscriptNamespace()
+        return dao.agentTranscriptPendingEventBatchMetadata(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder, limit,
         )
     }
 
     override fun insertPendingEvent(event: RelayV2AgentTranscriptPendingEventEntity) {
         dao.insertAgentTranscriptPendingEvent(event)
+    }
+
+    override fun pendingEventBySeq(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        agentEventSeq: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        dao.agentTranscriptPendingEventBySeq(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, agentEventSeq,
+        )
+    }
+
+    override fun pendingEventByEventId(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        dao.agentTranscriptPendingEventByEventId(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId,
+        )
     }
 
     override fun deletePendingEvent(event: RelayV2AgentTranscriptPendingEventEntity): Int =
@@ -396,11 +499,348 @@ private class RoomAgentTranscriptLifecycleDurableTransaction(
 
     override fun deletePendingEvents(namespace: AgentTranscriptLifecycleDurableNamespace): Int {
         val n = namespace.roomTranscriptNamespace()
-        return dao.deleteAgentTranscriptPendingEvents(
+        var total = 0
+        while (true) {
+            val deleted = dao.deleteAgentTranscriptPendingEventBatch(
+                n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+                n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+                RelayV2StateLimits.MAX_SNAPSHOT_CHUNK_RECORDS,
+            )
+            if (deleted == 0) return total
+            total = Math.addExact(total, deleted)
+        }
+    }
+
+    override fun lifecycleCurrentStats(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentStats(
             n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
             n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
         )
     }
+
+    override fun lifecycleWitnessAudit(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.witnessAudit(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+        )
+    }
+
+    override fun recentEvidenceAudit(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.recentEvidenceAudit(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+        )
+    }
+
+    override fun notificationLedgerAudit(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.notificationAudit(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+        )
+    }
+
+    override fun lifecycleCurrentPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentPageAfter(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder, afterEventId, limit,
+        )
+    }
+
+    override fun lifecycleWitnessPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.witnessPageAfter(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder, afterEventId, limit,
+        )
+    }
+
+    override fun lifecycleWitnessIdentityAuditPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterLifecycleScope: String,
+        afterRunId: String,
+        afterTurnIdKey: String,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.witnessIdentityAuditRowsAfter(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterLifecycleScope, afterRunId, afterTurnIdKey, afterAgentEventSeqOrder,
+            afterEventId, limit,
+        )
+    }
+
+    override fun recentEvidencePage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.recentEvidencePageAfter(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder, afterEventId, limit,
+        )
+    }
+
+    override fun notificationLedgerPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        afterAgentEventSeqOrder: String,
+        afterEventId: String,
+        afterState: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.notificationPageAfter(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            afterAgentEventSeqOrder, afterEventId, afterState, limit,
+        )
+    }
+
+    override fun lifecycleCurrentByIdentity(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        identity: AgentLifecycleIdentity,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentByIdentity(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            identity.scope.name, identity.runId, identity.turnId ?: "",
+        )
+    }
+
+    override fun lifecycleCurrentByEventId(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentByEventId(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId,
+        )
+    }
+
+    override fun lifecycleCurrentByAgentEventSeq(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        agentEventSeq: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentByAgentEventSeq(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, agentEventSeq,
+        )
+    }
+
+    override fun currentRun(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        runId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentRun(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, runId,
+        )
+    }
+
+    override fun currentNonterminalTurnsForRun(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        runId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentNonterminalTurnsForRun(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, runId,
+        )
+    }
+
+    override fun currentRunSourceEpochs(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        runId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.currentRunSourceEpochs(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, runId,
+        )
+    }
+
+    override fun terminalRunEvidence(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        runId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.terminalRunEvidence(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, runId,
+        )
+    }
+
+    override fun witnessByEventId(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.witnessByEventId(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId,
+        )
+    }
+
+    override fun witnessByAgentEventSeq(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        agentEventSeq: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.witnessByAgentEventSeq(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, agentEventSeq,
+        )
+    }
+
+    override fun highestWitnessForIdentity(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        identity: AgentLifecycleIdentity,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.highestWitnessForIdentity(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            identity.scope.name, identity.runId, identity.turnId ?: "",
+        )
+    }
+
+    override fun hasPermanentTurnEvidence(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        runId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.hasPermanentTurnEvidence(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, runId,
+        )
+    }
+
+    override fun recentEvidenceByEventId(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.recentEvidenceByEventId(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId,
+        )
+    }
+
+    override fun recentEvidenceByAgentEventSeq(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        agentEventSeq: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.recentEvidenceByAgentEventSeq(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, agentEventSeq,
+        )
+    }
+
+    override fun notificationByLifecycleEventId(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.notificationByLifecycleEventId(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId,
+        )
+    }
+
+    override fun notificationByDedupeKey(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        eventId: String,
+        state: AgentLifecycleState,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.notificationByDedupeKey(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch, eventId, state.name,
+        )
+    }
+
+    override fun insertLifecycleWitnesses(rows: List<RelayV2AgentLifecycleEventWitnessEntity>) {
+        lifecycleDao.insertWitnesses(rows)
+    }
+
+    override fun insertLifecycleCurrent(rows: List<RelayV2AgentLifecycleCurrentEntity>) {
+        lifecycleDao.insertCurrent(rows)
+    }
+
+    override fun updateLifecycleCurrentExact(
+        expected: RelayV2AgentLifecycleCurrentEntity,
+        next: RelayV2AgentLifecycleCurrentEntity,
+    ): Int = lifecycleDao.updateCurrentExact(
+        expected.profileId, expected.profileActivationGeneration, expected.principalId,
+        expected.clientInstanceId, expected.hostId, expected.hostEpoch, expected.scopeId,
+        expected.sessionId, expected.timelineEpoch, expected.lifecycleScope, expected.runId,
+        expected.turnIdKey, expected.lifecycleEventId, expected.agentEventSeq,
+        expected.agentEventSeqOrder, next.lifecycleEventId, next.agentEventSeq,
+        next.agentEventSeqOrder,
+    )
+
+    override fun deleteLifecycleCurrentExact(
+        expected: RelayV2AgentLifecycleCurrentEntity,
+    ): Int = lifecycleDao.deleteCurrentExact(
+        expected.profileId, expected.profileActivationGeneration, expected.principalId,
+        expected.clientInstanceId, expected.hostId, expected.hostEpoch, expected.scopeId,
+        expected.sessionId, expected.timelineEpoch, expected.lifecycleScope, expected.runId,
+        expected.turnIdKey, expected.lifecycleEventId, expected.agentEventSeq,
+        expected.agentEventSeqOrder,
+    )
+
+    override fun insertRecentEvidence(rows: List<RelayV2AgentRecentEventEvidenceEntity>) {
+        lifecycleDao.insertRecentEvidence(rows)
+    }
+
+    override fun deleteRecentEvidenceExact(
+        expected: RelayV2AgentRecentEventEvidenceEntity,
+    ): Int = lifecycleDao.deleteRecentEvidenceExact(
+        expected.profileId, expected.profileActivationGeneration, expected.principalId,
+        expected.clientInstanceId, expected.hostId, expected.hostEpoch, expected.scopeId,
+        expected.sessionId, expected.timelineEpoch, expected.agentEventSeq,
+        expected.agentEventSeqOrder, expected.eventId, expected.closedEventDigest,
+        expected.evidenceCanonicalJson, expected.evidenceCanonicalUtf8Bytes,
+        expected.evidenceSha256,
+    )
+
+    override fun deleteRecentEvidenceThroughBatch(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        throughAgentEventSeqOrder: String,
+        limit: Int,
+    ) = namespace.roomTranscriptNamespace().let { n ->
+        lifecycleDao.deleteRecentEvidenceThroughBatch(
+            n.profileId, n.profileActivationGeneration, n.principalId, n.clientInstanceId,
+            n.hostId, n.hostEpoch, n.scopeId, n.sessionId, n.timelineEpoch,
+            throughAgentEventSeqOrder, limit,
+        )
+    }
+
+    override fun insertNotificationLedger(rows: List<RelayV2AgentNotificationLedgerEntity>) {
+        lifecycleDao.insertNotifications(rows)
+    }
+
+    override fun deleteNotificationLedgerExact(
+        expected: RelayV2AgentNotificationLedgerEntity,
+    ): Int = lifecycleDao.deleteNotificationExact(
+        expected.profileId, expected.profileActivationGeneration, expected.principalId,
+        expected.clientInstanceId, expected.hostId, expected.hostEpoch, expected.scopeId,
+        expected.sessionId, expected.timelineEpoch, expected.lifecycleEventId,
+        expected.lifecycleState, expected.agentEventSeq, expected.agentEventSeqOrder,
+        expected.disposition, expected.localGeneration, expected.ledgerCanonicalJson,
+        expected.ledgerCanonicalUtf8Bytes, expected.ledgerSha256,
+    )
 
     override fun notificationClaims(
         eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,

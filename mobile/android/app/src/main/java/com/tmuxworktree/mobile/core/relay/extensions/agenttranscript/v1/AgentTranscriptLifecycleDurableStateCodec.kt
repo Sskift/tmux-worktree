@@ -21,6 +21,9 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
     ): RelayV2EncodedPayload {
         require(state.identity == namespace.consumer.sessionIdentity)
         require(state.extensionLane.timelineEpoch == namespace.timelineEpoch)
+        require(state.extensionLane.hasNoRowOwnedMaterialization()) {
+            "Room L/W/E/N materialization cannot be duplicated in the parent payload"
+        }
         return RelayV2StorageJson.encode(
             CODEC_VERSION,
             linkedMapOf(
@@ -65,7 +68,7 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             storedNamespace,
             RelayV2StorageJson.objectValue(root, "state"),
             payload.codecVersion,
-        }
+        )
         if (state.identity != expectedNamespace.consumer.sessionIdentity ||
             state.extensionLane.timelineEpoch != expectedNamespace.timelineEpoch
         ) malformed()
@@ -114,14 +117,25 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         val commonKeys = arrayOf(
             "localGeneration", "support", "unavailableReason", "liveSource",
             "activeSourceEpoch", "timelineEpoch", "lastAgentSeq",
-            "notificationBaselineAgentSeq", "lifecycleRecords", "runsWithTurnRecords",
-            "appliedEventEvidence", "eventIdentityWitnesses", "notificationLedger",
+            "notificationBaselineAgentSeq",
             "retiredTimelineEpochs", "retiredEpochCompactionGeneration",
             "snapshotCheckpoint", "snapshotNotificationSuppressedThroughAgentSeq",
             "pendingStatusRequest", "pendingSnapshotRequest", "requiresTimelineRotation",
         )
         if (codecVersion == LEGACY_CODEC_VERSION) {
-            RelayV2StorageJson.requireKeys(value, *(commonKeys + "requiresSnapshot"))
+            RelayV2StorageJson.requireKeys(
+                value,
+                *(
+                    commonKeys + arrayOf(
+                        "lifecycleRecords",
+                        "runsWithTurnRecords",
+                        "appliedEventEvidence",
+                        "eventIdentityWitnesses",
+                        "notificationLedger",
+                        "requiresSnapshot",
+                    )
+                    ),
+            )
         } else {
             RelayV2StorageJson.requireKeys(
                 value,
@@ -169,21 +183,21 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             value,
             "requiresTimelineRotation",
         )
-        val encodedRunsWithTurns = RelayV2StorageJson.stringList(
-            value,
-            "runsWithTurnRecords",
-            MAX_EVER_TURN_MARKERS,
-        )
+        val encodedRunsWithTurns = if (codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.stringList(value, "runsWithTurnRecords", MAX_EVER_TURN_MARKERS)
+        } else {
+            emptyList()
+        }
         if (encodedRunsWithTurns.toSet().size != encodedRunsWithTurns.size) malformed()
         encodedRunsWithTurns.forEach {
             AgentLifecycleIdentity(AgentLifecycleScope.RUN, it, null)
         }
 
-        val encodedLifecycleRecords = RelayV2StorageJson.list(
-            value,
-            "lifecycleRecords",
-            MAX_LIFECYCLE_RECORDS,
-        )
+        val encodedLifecycleRecords = if (codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.list(value, "lifecycleRecords", MAX_LIFECYCLE_RECORDS)
+        } else {
+            emptyList()
+        }
         val legacyLifecycleRecords = if (codecVersion == LEGACY_CODEC_VERSION) {
             encodedLifecycleRecords.map {
                 decodeLegacyLifecycleRecord(RelayV2StorageJson.objectValue(it))
@@ -191,39 +205,32 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
         } else {
             emptyList()
         }
-        val lifecycleRecords = if (codecVersion == CODEC_VERSION) {
-            encodedLifecycleRecords.map { decodeLifecycleRecord(RelayV2StorageJson.objectValue(it)) }
-        } else {
-            emptyList()
-        }
+        val lifecycleRecords = emptyList<AgentLifecycleRecord>()
         val lifecycleByIdentity = uniqueMap(lifecycleRecords, AgentLifecycleRecord::identity)
         val lifecycleEventIndex = uniqueMap(lifecycleRecords, AgentLifecycleRecord::lifecycleEventId)
             .mapValues { (_, record) -> record.identity }
 
-        val encodedAppliedEvidence = RelayV2StorageJson.list(
-            value,
-            "appliedEventEvidence",
-            MAX_APPLIED_EVENT_EVIDENCE,
-        ).map { decodeAppliedEvidence(RelayV2StorageJson.objectValue(it)) }
+        val encodedAppliedEvidence = if (codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.list(value, "appliedEventEvidence", MAX_APPLIED_EVENT_EVIDENCE)
+                .map { decodeAppliedEvidence(RelayV2StorageJson.objectValue(it)) }
+        } else {
+            emptyList()
+        }
         val decodedAppliedBySeq = uniqueMap(encodedAppliedEvidence) { it.first }
             .mapValues { (_, pair) -> pair.second }
-        val appliedBySeq = if (codecVersion == CODEC_VERSION) decodedAppliedBySeq else emptyMap()
+        val appliedBySeq = emptyMap<String, AgentAppliedEventEvidence>()
 
-        val encodedWitnesses = RelayV2StorageJson.list(
-            value,
-            "eventIdentityWitnesses",
-            MAX_EVENT_IDENTITY_WITNESSES,
-        )
+        val encodedWitnesses = if (codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.list(value, "eventIdentityWitnesses", MAX_EVENT_IDENTITY_WITNESSES)
+        } else {
+            emptyList()
+        }
         val legacyWitnesses = if (codecVersion == LEGACY_CODEC_VERSION) {
             encodedWitnesses.map { decodeLegacyEventWitness(RelayV2StorageJson.objectValue(it)) }
         } else {
             emptyList()
         }
-        val witnesses = if (codecVersion == CODEC_VERSION) {
-            encodedWitnesses.map { decodeEventWitness(RelayV2StorageJson.objectValue(it)) }
-        } else {
-            emptyList()
-        }
+        val witnesses = emptyList<AgentLifecycleEventIdentityWitness>()
         val witnessById = uniqueMap(witnesses, AgentLifecycleEventIdentityWitness::eventId)
         val eventIdBySeq = uniqueMap(witnesses, AgentLifecycleEventIdentityWitness::agentEventSeq)
             .mapValues { (_, witness) -> witness.eventId }
@@ -233,22 +240,16 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             if (existing != null && existing != evidence.eventId) malformed()
         }
 
-        val encodedNotificationEntries = RelayV2StorageJson.list(
-            value,
-            "notificationLedger",
-            MAX_NOTIFICATION_LEDGER_ENTRIES,
-        )
-        val notificationEntries = if (codecVersion == CODEC_VERSION) {
-            encodedNotificationEntries.map { item ->
-                decodeNotificationLedgerEntry(
-                    namespace,
-                    RelayV2StorageJson.objectValue(item),
-                    witnessById,
-                )
-            }
+        val encodedNotificationEntries = if (codecVersion == LEGACY_CODEC_VERSION) {
+            RelayV2StorageJson.list(
+                value,
+                "notificationLedger",
+                MAX_NOTIFICATION_LEDGER_ENTRIES,
+            )
         } else {
             emptyList()
         }
+        val notificationEntries = emptyList<Pair<AgentNotificationDedupeKey, AgentNotificationLedgerEntry>>()
         val notificationLedger = uniqueMap(notificationEntries) { it.first }
             .mapValues { (_, pair) -> pair.second }
         val notificationIndex = uniqueMap(notificationEntries) { it.first.lifecycleEventId }
@@ -432,6 +433,14 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             "pendingLiveEventCount",
             "pendingLiveEventCanonicalBytes",
             "pendingLiveEventRawUtf8Bytes",
+            "lifecycleCurrentCount",
+            "lifecycleCurrentCanonicalBytes",
+            "lifecycleWitnessCount",
+            "lifecycleWitnessCanonicalBytes",
+            "recentEventEvidenceCount",
+            "recentEventEvidenceCanonicalBytes",
+            "notificationLedgerCount",
+            "notificationLedgerCanonicalBytes",
         )
         return AgentTranscriptDurableStorageAccounting(
             entryCount = storageLong(value, "entryCount"),
@@ -445,6 +454,26 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             pendingLiveEventRawUtf8Bytes = storageLong(
                 value,
                 "pendingLiveEventRawUtf8Bytes",
+            ),
+            lifecycleCurrentCount = storageLong(value, "lifecycleCurrentCount"),
+            lifecycleCurrentCanonicalBytes = storageLong(
+                value,
+                "lifecycleCurrentCanonicalBytes",
+            ),
+            lifecycleWitnessCount = storageLong(value, "lifecycleWitnessCount"),
+            lifecycleWitnessCanonicalBytes = storageLong(
+                value,
+                "lifecycleWitnessCanonicalBytes",
+            ),
+            recentEventEvidenceCount = storageLong(value, "recentEventEvidenceCount"),
+            recentEventEvidenceCanonicalBytes = storageLong(
+                value,
+                "recentEventEvidenceCanonicalBytes",
+            ),
+            notificationLedgerCount = storageLong(value, "notificationLedgerCount"),
+            notificationLedgerCanonicalBytes = storageLong(
+                value,
+                "notificationLedgerCanonicalBytes",
             ),
         )
     }
@@ -1042,32 +1071,6 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             "effectiveHostLimits" to effectiveHostLimits?.toStorageMap(),
             "syncState" to syncState.toStorageMap(),
             "notificationBaselineAgentSeq" to notificationBaselineAgentSeq,
-            "lifecycleRecords" to lifecycleByIdentity.values
-                .sortedWith(lifecycleRecordComparator)
-                .map { it.toStorageMap() },
-            "runsWithTurnRecords" to runsWithTurnRecords.sorted(),
-            "appliedEventEvidence" to appliedEventsBySeq.entries
-                .sortedWith(compareByCounter { it.key })
-                .map { (sequence, evidence) ->
-                    linkedMapOf(
-                        "agentEventSeq" to sequence,
-                        "eventId" to evidence.eventId,
-                        "closedEventDigest" to evidence.closedEventDigest.value,
-                    )
-                },
-            "eventIdentityWitnesses" to eventWitnessById.values
-                .sortedWith(eventWitnessComparator)
-                .map { it.toStorageMap() },
-            "notificationLedger" to notificationLedger.entries
-                .sortedWith(compareBy({ it.key.lifecycleEventId }, { it.key.state.name }))
-                .map { (key, entry) ->
-                    linkedMapOf(
-                        "dedupeKey" to key.toStorageMap(),
-                        "disposition" to entry.disposition.name,
-                        "eventId" to entry.eventIdentity.eventId,
-                        "localGeneration" to entry.localGeneration,
-                    )
-                },
             "retiredTimelineEpochs" to retiredTimelineEpochs.sorted(),
             "retiredEpochCompactionGeneration" to retiredEpochCompactionGeneration,
             "snapshotCheckpoint" to snapshotCheckpoint?.toStorageMap(),
@@ -1077,6 +1080,16 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             "pendingSnapshotRequest" to pendingSnapshotRequest?.toStorageMap(),
             "requiresTimelineRotation" to requiresTimelineRotation,
         )
+
+    private fun AgentTranscriptLifecycleExtensionState.hasNoRowOwnedMaterialization(): Boolean =
+        lifecycleByIdentity.isEmpty() &&
+            currentLifecycleIdentityByEventId.isEmpty() &&
+            runsWithTurnRecords.isEmpty() &&
+            appliedEventsBySeq.isEmpty() &&
+            eventWitnessById.isEmpty() &&
+            eventIdBySeq.isEmpty() &&
+            notificationLedger.isEmpty() &&
+            notificationKeyByLifecycleEventId.isEmpty()
 
     private fun AgentLifecycleRecord.toStorageMap(): Map<String, Any?> = linkedMapOf(
         "lifecycleEventId" to lifecycleEventId,
@@ -1152,6 +1165,16 @@ internal object AgentTranscriptLifecycleDurableStateCodec {
             "pendingLiveEventCount" to pendingLiveEventCount.toString(),
             "pendingLiveEventCanonicalBytes" to pendingLiveEventCanonicalBytes.toString(),
             "pendingLiveEventRawUtf8Bytes" to pendingLiveEventRawUtf8Bytes.toString(),
+            "lifecycleCurrentCount" to lifecycleCurrentCount.toString(),
+            "lifecycleCurrentCanonicalBytes" to lifecycleCurrentCanonicalBytes.toString(),
+            "lifecycleWitnessCount" to lifecycleWitnessCount.toString(),
+            "lifecycleWitnessCanonicalBytes" to lifecycleWitnessCanonicalBytes.toString(),
+            "recentEventEvidenceCount" to recentEventEvidenceCount.toString(),
+            "recentEventEvidenceCanonicalBytes" to
+                recentEventEvidenceCanonicalBytes.toString(),
+            "notificationLedgerCount" to notificationLedgerCount.toString(),
+            "notificationLedgerCanonicalBytes" to
+                notificationLedgerCanonicalBytes.toString(),
         )
 
     private fun AgentReplayPageFence.toStorageMap(): Map<String, Any?> = linkedMapOf(
