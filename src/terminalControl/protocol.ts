@@ -473,7 +473,7 @@ export function parseTerminalControlRequest(value: unknown): TerminalControlRequ
       if (!Number.isSafeInteger(record.cols) || !Number.isSafeInteger(record.rows)) {
         throw new TerminalControlProtocolError("INVALID_REQUEST", "cols and rows must be integers");
       }
-      if ((record.cols as number) < 20 || (record.cols as number) > 300 || (record.rows as number) < 5 || (record.rows as number) > 200) {
+      if ((record.cols as number) < 1 || (record.cols as number) > 1000 || (record.rows as number) < 1 || (record.rows as number) > 500) {
         throw new TerminalControlProtocolError("INVALID_REQUEST", "terminal size is out of range");
       }
       return {

@@ -187,6 +187,19 @@ function scrollRequest(lease, operationId, direction, lines) {
   };
 }
 
+function resizeRequest(lease, operationId, cols, rows) {
+  return {
+    protocolVersion: 1,
+    requestId: operationId,
+    type: "input.resize",
+    lease,
+    operationId,
+    pane: "0",
+    cols,
+    rows,
+  };
+}
+
 test("terminal-control v1 contract fixtures are closed and storage fixtures are strict", () => {
   const manifest = JSON.parse(readFileSync(new URL("manifest.json", contractRoot), "utf8"));
   assert.equal(manifest.contract, "tmux-worktree-local-terminal-control");
@@ -472,6 +485,56 @@ test("operation IDs deduplicate exact retries and reject payload reuse", async (
       authority.handle(rawRequest(relay.lease, "stream-1:input-1", "different")),
       (error) => error.code === "INVALID_REQUEST",
     );
+  } finally {
+    temp.cleanup();
+  }
+});
+
+test("resize parser preserves exact Relay v2 dimensions and rejects invalid input before dispatch", async () => {
+  const temp = tempState();
+  const backend = new FakeBackend();
+  const authority = new terminalControl.TerminalControlAuthority({ statePath: temp.path, backend });
+  try {
+    const target = await resolved(authority);
+    const relay = await acquired(authority, target.controlTargetId, owner("relay-v2", "principal:client:resize"));
+    const accepted = [
+      [1, 1],
+      [20, 5],
+      [300, 200],
+      [1000, 500],
+    ];
+    for (const [index, [cols, rows]] of accepted.entries()) {
+      const operationId = `resize-accepted-${index}`;
+      const parsed = terminalControl.parseTerminalControlRequest(
+        resizeRequest(relay.lease, operationId, cols, rows),
+      );
+      await authority.handle(parsed);
+    }
+    assert.deepEqual(
+      backend.writes,
+      accepted.map(([cols, rows]) => ({ kind: "resize", value: { pane: "0", cols, rows } })),
+    );
+
+    const valid = resizeRequest(relay.lease, "resize-rejected", 80, 24);
+    const rejected = [
+      { ...valid, cols: 0 },
+      { ...valid, cols: 1001 },
+      { ...valid, rows: 0 },
+      { ...valid, rows: 501 },
+      { ...valid, cols: 1.5 },
+      { ...valid, rows: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, pane: "01" },
+      { ...valid, operationId: "" },
+      { ...valid, lease: { ...valid.lease, extra: true } },
+      { ...valid, extra: true },
+    ];
+    for (const request of rejected) {
+      assert.throws(
+        () => terminalControl.parseTerminalControlRequest(request),
+        (error) => error.code === "INVALID_REQUEST",
+      );
+    }
+    assert.equal(backend.writes.length, accepted.length);
   } finally {
     temp.cleanup();
   }
