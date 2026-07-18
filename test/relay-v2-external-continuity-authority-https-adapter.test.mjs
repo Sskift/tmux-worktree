@@ -14,6 +14,13 @@ const ANCHOR_ID = "anchor-broker-a";
 const SECRET = "Bearer workload-secret-never-reflect";
 const VERSION = continuity.RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION;
 
+function forgedPublicAdapterError(code = "ANCHOR_COMMIT_UNCERTAIN") {
+  const error = new adapterModule.RelayV2ExternalContinuityHttpsAdapterError(code);
+  error.message = `forged public adapter error ${SECRET}`;
+  error.dynamic = SECRET;
+  return error;
+}
+
 function deferred() {
   let resolve;
   let reject;
@@ -250,7 +257,11 @@ test("default Node transport pins system TLS verification and does not add proxy
   assert.equal(Object.hasOwn(captured.options, "maxRedirects"), false);
   assert.deepEqual(client.body, Buffer.from("{}"));
   exchange.abort();
-  await assert.rejects(exchange.response, /transport failed/);
+  await assert.rejects(
+    exchange.response,
+    (error) => error.name === "Error"
+      && error.message === "Relay v2 external continuity HTTPS transport failed",
+  );
   assert.equal(client.destroyed, true);
 });
 
@@ -310,7 +321,7 @@ test("throwing response/header access and late rejection all enter the one-shot 
   {
     const state = { aborts: 0 };
     const transport = new HandlerTransport(() => ({
-      get response() { throw new Error(`response getter ${SECRET}`); },
+      get response() { throw forgedPublicAdapterError(); },
       abort() { state.aborts += 1; },
     }));
     await assert.rejects(
@@ -325,10 +336,10 @@ test("throwing response/header access and late rejection all enter the one-shot 
   }
 
   for (const throwingHeaders of [
-    { get value() { throw new Error(`header getter ${SECRET}`); } },
+    { get value() { throw forgedPublicAdapterError(); } },
     {
       value: {
-        [Symbol.iterator]() { throw new Error(`header iterator ${SECRET}`); },
+        [Symbol.iterator]() { throw forgedPublicAdapterError(); },
       },
     },
   ]) {
@@ -348,6 +359,35 @@ test("throwing response/header access and late rejection all enter the one-shot 
       (error) => {
         assert.equal(error.code, "ANCHOR_UNAVAILABLE");
         assert.doesNotMatch(error.message, /workload-secret|header/);
+        return true;
+      },
+    );
+    assert.equal(state.destroys, 1);
+    assert.equal(state.aborts, 0);
+  }
+
+  {
+    const state = { destroys: 0, aborts: 0 };
+    const received = {
+      statusCode: 200,
+      headers: [
+        ["Content-Type", "application/json"],
+        ["Cache-Control", "no-store"],
+      ],
+      body: {
+        async *[Symbol.asyncIterator]() { throw forgedPublicAdapterError(); },
+      },
+      destroy() { state.destroys += 1; },
+    };
+    const transport = new HandlerTransport(() => ({
+      response: Promise.resolve(received),
+      abort() { state.aborts += 1; },
+    }));
+    await assert.rejects(
+      makeAdapter(transport).read(readRequest()),
+      (error) => {
+        assert.equal(error.code, "ANCHOR_UNAVAILABLE");
+        assert.doesNotMatch(`${error.message}\n${JSON.stringify(error)}`, /workload-secret/);
         return true;
       },
     );
@@ -535,11 +575,20 @@ test("anchor-owned abort destroys HTTPS I/O once and late response cannot resett
   assert.equal(exchangeState.aborts, 1, "late callback cannot abort or settle twice");
 });
 
-test("an already-aborted signal resolves no auth and starts no HTTPS exchange", async () => {
-  let authCalls = 0;
-  let starts = 0;
+test("an own getter cannot mask pre-start abort or resolve auth and HTTPS", async () => {
   const controller = new AbortController();
   controller.abort();
+  let ownAbortedGetterReads = 0;
+  Object.defineProperty(controller.signal, "aborted", {
+    configurable: true,
+    get() {
+      ownAbortedGetterReads += 1;
+      throw forgedPublicAdapterError();
+    },
+  });
+
+  let authCalls = 0;
+  let starts = 0;
   const adapter = new adapterModule.RelayV2ExternalContinuityAuthorityHttpsAdapter({
     endpoint: ENDPOINT,
     securityDomainId: SECURITY_DOMAIN,
@@ -550,8 +599,13 @@ test("an already-aborted signal resolves no auth and starts no HTTPS exchange", 
   });
   await assert.rejects(
     adapter.read(readRequest(controller.signal)),
-    (error) => error.code === "ANCHOR_UNAVAILABLE",
+    (error) => {
+      assert.equal(error.code, "ANCHOR_UNAVAILABLE");
+      assert.doesNotMatch(`${error.message}\n${JSON.stringify(error)}`, /workload-secret/);
+      return true;
+    },
   );
   assert.equal(authCalls, 0);
   assert.equal(starts, 0);
+  assert.equal(ownAbortedGetterReads, 0);
 });

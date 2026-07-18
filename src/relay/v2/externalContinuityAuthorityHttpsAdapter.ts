@@ -1,10 +1,4 @@
 import { randomBytes } from "node:crypto";
-import type { ClientRequest, IncomingMessage } from "node:http";
-import {
-  request as nodeHttpsRequest,
-  type RequestOptions as NodeHttpsRequestOptions,
-} from "node:https";
-import { checkServerIdentity } from "node:tls";
 
 import {
   RELAY_V2_CONTINUITY_ANCHOR_PROTOCOL_VERSION,
@@ -17,6 +11,16 @@ import {
   parseRelayV2JsonObject,
   type RelayV2JsonValue,
 } from "./strictJson.js";
+import {
+  createRelayV2SingleExchangeNodeHttpsTransport,
+  performRelayV2SingleExchangeHttps,
+  readRelayV2SingleExchangeAbortState,
+  type RelayV2SingleExchangeNodeHttpsRequest,
+  type RelayV2SingleExchangeHttpsTransport,
+  type RelayV2SingleExchangeHttpsTransportExchange,
+  type RelayV2SingleExchangeHttpsTransportRequest,
+  type RelayV2SingleExchangeHttpsTransportResponse,
+} from "./singleExchangeHttpsTransport.js";
 
 const CONTRACT_VERSION = 1 as const;
 const MAX_ENDPOINT_BYTES = 2_048;
@@ -64,30 +68,30 @@ export class RelayV2ExternalContinuityHttpsAdapterError extends Error {
   }
 }
 
-export interface RelayV2ExternalContinuityHttpsTransportRequest {
-  endpoint: string;
-  method: "POST";
-  headers: Readonly<Record<string, string>>;
-  body: Uint8Array;
-}
+export type RelayV2ExternalContinuityHttpsTransportRequest =
+  RelayV2SingleExchangeHttpsTransportRequest;
+export type RelayV2ExternalContinuityHttpsTransportResponse =
+  RelayV2SingleExchangeHttpsTransportResponse;
+export type RelayV2ExternalContinuityHttpsTransportExchange =
+  RelayV2SingleExchangeHttpsTransportExchange;
+export type RelayV2ExternalContinuityHttpsTransport =
+  RelayV2SingleExchangeHttpsTransport;
 
-export interface RelayV2ExternalContinuityHttpsTransportResponse {
-  statusCode: number;
-  /** Raw header pairs preserve duplicates so the adapter can fail closed. */
-  headers: readonly (readonly [name: string, value: string])[];
-  body: AsyncIterable<Uint8Array>;
-  destroy(): void;
-}
-
-export interface RelayV2ExternalContinuityHttpsTransportExchange {
-  response: PromiseLike<RelayV2ExternalContinuityHttpsTransportResponse>;
-  abort(): void;
-}
-
-export interface RelayV2ExternalContinuityHttpsTransport {
-  start(
-    request: RelayV2ExternalContinuityHttpsTransportRequest,
-  ): RelayV2ExternalContinuityHttpsTransportExchange;
+export function createRelayV2ExternalContinuityNodeHttpsTransport(
+  request?: RelayV2SingleExchangeNodeHttpsRequest,
+): RelayV2ExternalContinuityHttpsTransport {
+  const transport = createRelayV2SingleExchangeNodeHttpsTransport(request);
+  return {
+    start(input): RelayV2ExternalContinuityHttpsTransportExchange {
+      const exchange = transport.start(input);
+      return {
+        response: Promise.resolve(exchange.response).catch(() => {
+          throw new Error("Relay v2 external continuity HTTPS transport failed");
+        }),
+        abort: () => { exchange.abort(); },
+      };
+    },
+  };
 }
 
 export interface RelayV2ExternalContinuityHttpsAdapterOptions {
@@ -105,12 +109,6 @@ export interface RelayV2ExternalContinuityHttpsAdapterOptions {
 }
 
 type ExternalOperation = "read" | "compare_and_swap";
-
-type NodeHttpsRequest = (
-  url: URL,
-  options: NodeHttpsRequestOptions,
-  callback: (response: IncomingMessage) => void,
-) => ClientRequest;
 
 const EXTERNAL_ERROR_DEFINITIONS = {
   AUTHENTICATION_FAILED: {
@@ -397,80 +395,6 @@ function decodeResponseEnvelope(
   throw mappedFailure(operation);
 }
 
-function nodeResponseHeaders(response: IncomingMessage): readonly (readonly [string, string])[] {
-  const result: Array<readonly [string, string]> = [];
-  for (let index = 0; index < response.rawHeaders.length; index += 2) {
-    result.push([response.rawHeaders[index]!, response.rawHeaders[index + 1]!]);
-  }
-  return result;
-}
-
-export function createRelayV2ExternalContinuityNodeHttpsTransport(
-  request: NodeHttpsRequest = nodeHttpsRequest as NodeHttpsRequest,
-): RelayV2ExternalContinuityHttpsTransport {
-  return {
-    start(input): RelayV2ExternalContinuityHttpsTransportExchange {
-      let client: ClientRequest | undefined;
-      let incoming: IncomingMessage | undefined;
-      let aborted = false;
-      let responseSettled = false;
-      let resolveResponse!: (value: RelayV2ExternalContinuityHttpsTransportResponse) => void;
-      let rejectResponse!: (reason: Error) => void;
-      const response = new Promise<RelayV2ExternalContinuityHttpsTransportResponse>((resolve, reject) => {
-        resolveResponse = resolve;
-        rejectResponse = reject;
-      });
-      const rejectSafely = () => {
-        if (responseSettled) return;
-        responseSettled = true;
-        rejectResponse(new Error("Relay v2 external continuity HTTPS transport failed"));
-      };
-
-      try {
-        client = request(
-          new URL(input.endpoint),
-          {
-            method: "POST",
-            headers: input.headers,
-            agent: false,
-            rejectUnauthorized: true,
-            checkServerIdentity,
-          },
-          (received) => {
-            incoming = received;
-            if (aborted || responseSettled) {
-              received.destroy();
-              return;
-            }
-            responseSettled = true;
-            resolveResponse({
-              statusCode: received.statusCode ?? 0,
-              headers: nodeResponseHeaders(received),
-              body: received as AsyncIterable<Uint8Array>,
-              destroy: () => { received.destroy(); },
-            });
-          },
-        );
-        client.once("error", rejectSafely);
-        client.end(Buffer.from(input.body.buffer, input.body.byteOffset, input.body.byteLength));
-      } catch {
-        rejectSafely();
-      }
-
-      return {
-        response,
-        abort: () => {
-          if (aborted) return;
-          aborted = true;
-          try { incoming?.destroy(); } catch {}
-          try { client?.destroy(); } catch {}
-          rejectSafely();
-        },
-      };
-    },
-  };
-}
-
 export class RelayV2ExternalContinuityAuthorityHttpsAdapter
 implements RelayV2MonotonicCasAuthority {
   private readonly endpoint: string;
@@ -530,140 +454,53 @@ implements RelayV2MonotonicCasAuthority {
     }, request.signal);
   }
 
-  private perform(
+  private async perform(
     operation: ExternalOperation,
     payload: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<unknown> {
-    return new Promise<unknown>((resolve, reject) => {
-      let settled = false;
-      let exchange: RelayV2ExternalContinuityHttpsTransportExchange | undefined;
-      let response: RelayV2ExternalContinuityHttpsTransportResponse | undefined;
-      let transportCancelled = false;
-      let lateResponseDestroyed = false;
+    if (readRelayV2SingleExchangeAbortState(signal) !== false) {
+      throw mappedFailure(operation);
+    }
 
-      const cleanup = () => { signal.removeEventListener("abort", onAbort); };
-      const destroy = (target: unknown): boolean => {
-        try {
-          if (!isRecord(target) || typeof target.destroy !== "function") return false;
-          target.destroy();
-          return true;
-        } catch {
-          return false;
-        }
-      };
-      const cancelTransport = () => {
-        if (transportCancelled) return;
-        transportCancelled = true;
-        if (response !== undefined && destroy(response)) return;
-        try { exchange?.abort(); } catch {}
-      };
-      const destroyLateResponse = (target: unknown) => {
-        if (lateResponseDestroyed) return;
-        lateResponseDestroyed = true;
-        destroy(target);
-      };
-      const fail = () => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        cancelTransport();
-        reject(mappedFailure(operation));
-      };
-      const succeed = (value: unknown) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        resolve(value);
-      };
-      const onAbort = () => { fail(); };
-
-      signal.addEventListener("abort", onAbort, { once: true });
-      if (signal.aborted) {
-        fail();
-        return;
-      }
-
-      const requestOperationId = operationId();
-      let body: Uint8Array;
-      let headers: Readonly<Record<string, string>>;
-      try {
-        body = encodeRequestBody({
-          contractVersion: CONTRACT_VERSION,
-          operationId: requestOperationId,
-          securityDomainId: this.securityDomainId,
-          namespace: this.namespace,
-          anchorId: this.anchorId,
-          operation,
-          payload,
-        });
-        headers = requestHeaders(body.byteLength, this.authenticationHeaders);
-      } catch {
-        fail();
-        return;
-      }
-
-      if (signal.aborted) {
-        fail();
-        return;
-      }
-      try {
-        exchange = this.transport.start({
-          endpoint: this.endpoint,
-          method: "POST",
-          headers,
-          body,
-        });
-        if (
-          !isRecord(exchange)
-          || typeof exchange.abort !== "function"
-          || !Object.hasOwn(exchange, "response")
-        ) {
-          fail();
-          return;
-        }
-      } catch {
-        fail();
-        return;
-      }
-      if (signal.aborted) {
-        fail();
-        return;
-      }
-
-      let responsePromise: Promise<RelayV2ExternalContinuityHttpsTransportResponse>;
-      try {
-        responsePromise = Promise.resolve(exchange.response);
-      } catch {
-        fail();
-        return;
-      }
-      responsePromise.then((received) => {
-        void (async () => {
-          if (settled) {
-            destroyLateResponse(received);
-            return;
-          }
-          response = received;
-          try {
-            const contentLength = acceptedResponseHeaders(received);
-            if (contentLength === undefined) {
-              fail();
-              return;
-            }
-            const bytes = await readBoundedBody(received, contentLength);
-            if (settled) return;
-            const decoded = decodeResponseEnvelope(bytes, operation, requestOperationId);
-            succeed(decoded);
-          } catch {
-            fail();
-          }
-        })();
-      }, () => {
-        if (!settled) {
-          fail();
-        }
+    const requestOperationId = operationId();
+    let body: Uint8Array;
+    let headers: Readonly<Record<string, string>>;
+    try {
+      body = encodeRequestBody({
+        contractVersion: CONTRACT_VERSION,
+        operationId: requestOperationId,
+        securityDomainId: this.securityDomainId,
+        namespace: this.namespace,
+        anchorId: this.anchorId,
+        operation,
+        payload,
       });
+      headers = requestHeaders(body.byteLength, this.authenticationHeaders);
+    } catch {
+      throw mappedFailure(operation);
+    }
+    if (readRelayV2SingleExchangeAbortState(signal) !== false) {
+      throw mappedFailure(operation);
+    }
+
+    const outcome = await performRelayV2SingleExchangeHttps({
+      transport: this.transport,
+      request: {
+        endpoint: this.endpoint,
+        method: "POST",
+        headers,
+        body,
+      },
+      signal,
+      consume: async (received) => {
+        const contentLength = acceptedResponseHeaders(received);
+        if (contentLength === undefined) throw mappedFailure(operation);
+        const bytes = await readBoundedBody(received, contentLength);
+        return decodeResponseEnvelope(bytes, operation, requestOperationId);
+      },
     });
+    if (outcome.kind === "completed") return outcome.value;
+    throw mappedFailure(operation);
   }
 }
