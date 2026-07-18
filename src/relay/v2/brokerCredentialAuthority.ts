@@ -55,7 +55,8 @@ import {
 } from "./token.js";
 
 const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_LEGACY_ENVELOPE_VERSION = 1 as const;
-const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION = 2 as const;
+const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_HOST_BOOTSTRAP_ENVELOPE_VERSION = 2 as const;
+const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION = 3 as const;
 const RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_MAX_BYTES = 8 * 1024 * 1024;
 export const RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS = 600_000;
 export const RELAY_V2_BROKER_CREDENTIAL_ENROLLMENT_MAX_FAILURES = 5;
@@ -75,6 +76,8 @@ const MAX_REPLAY_PLAINTEXT_BYTES = 64 * 1024;
 const MAX_REPLAY_CIPHERTEXT_BYTES = MAX_REPLAY_PLAINTEXT_BYTES + 64;
 const MAX_SOURCE_ADMISSIONS = 256;
 const MAX_ISSUER_KEY_IDENTITIES = 1_024;
+const MAX_REPLAY_DECRYPT_ONLY_KEYS = 32;
+const MAX_REPLAY_KEY_ROTATIONS = 1_023;
 const MAX_ACCESS_TOKEN_BYTES = 8_192;
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const CANONICAL_BASE64URL = /^[A-Za-z0-9_-]+$/;
@@ -307,8 +310,29 @@ interface ReplayRecord {
   subjectId: string;
   attemptId: string;
   fingerprint: string;
+  replayKeyId: string;
+  aadVersion: 1 | 2;
   ciphertextBase64url: string;
   expiresAtMs: number;
+}
+
+interface ReplayKeyMaterial {
+  replayKeyId: string;
+  keyBase64url: string;
+  legacyAad: boolean;
+}
+
+interface ReplayKeyRotationRecord {
+  rotationId: string;
+  replayKeyId: string;
+  commitSequence: string;
+}
+
+interface ReplayKeyring {
+  originKeyId: string;
+  activeKey: ReplayKeyMaterial;
+  decryptOnlyKeys: ReplayKeyMaterial[];
+  rotations: ReplayKeyRotationRecord[];
 }
 
 interface RateLimitRecord {
@@ -334,7 +358,7 @@ interface CredentialAuthorityEnvelope {
   lastObservedAtMs: number;
   issuerUrl: string;
   relayUrl: string;
-  replayKeyBase64url: string;
+  replayKeyring: ReplayKeyring;
   issuer: RelayV2IssuerKeyring;
   enrollments: EnrollmentRecord[];
   hostBootstraps: HostBootstrapRecord[];
@@ -564,6 +588,19 @@ function strictlySortedUnique<T>(
   return true;
 }
 
+function strictlyIncreasingUint64<T>(
+  values: readonly T[],
+  key: (value: T) => string,
+): boolean {
+  let previous: bigint | null = null;
+  for (const value of values) {
+    const current = BigInt(key(value));
+    if (previous !== null && current <= previous) return false;
+    previous = current;
+  }
+  return true;
+}
+
 function cloneEnvelope(value: CredentialAuthorityEnvelope): CredentialAuthorityEnvelope {
   return structuredClone(value);
 }
@@ -703,12 +740,17 @@ function parseGrant(value: unknown): GrantRecord {
   };
 }
 
-function parseReplay(value: unknown): ReplayRecord {
+function parseReplay(
+  value: unknown,
+  legacyReplayKeyId?: string,
+): ReplayRecord {
+  const legacy = legacyReplayKeyId !== undefined;
   if (!isRecord(value) || !hasExactKeys(value, [
     "operation",
     "subjectId",
     "attemptId",
     "fingerprint",
+    ...(legacy ? [] : ["replayKeyId", "aadVersion"]),
     "ciphertextBase64url",
     "expiresAtMs",
   ])) invalidState();
@@ -725,6 +767,8 @@ function parseReplay(value: unknown): ReplayRecord {
     || !isRelayV2AuthIdentifier(value.attemptId)
     || typeof value.fingerprint !== "string"
     || !SHA256_HEX.test(value.fingerprint)
+    || (!legacy && !isRelayV2AuthIdentifier(value.replayKeyId))
+    || (!legacy && value.aadVersion !== 1 && value.aadVersion !== 2)
     || !isTimestamp(value.expiresAtMs)
   ) invalidState();
   const ciphertext = exactBase64UrlBytes(value.ciphertextBase64url);
@@ -734,8 +778,114 @@ function parseReplay(value: unknown): ReplayRecord {
     subjectId: value.subjectId,
     attemptId: value.attemptId,
     fingerprint: value.fingerprint,
+    replayKeyId: legacy ? legacyReplayKeyId! : value.replayKeyId as string,
+    aadVersion: legacy ? 1 : value.aadVersion as 1 | 2,
     ciphertextBase64url: value.ciphertextBase64url as string,
     expiresAtMs: value.expiresAtMs,
+  };
+}
+
+function replayKeyIdForLegacyKey(keyBase64url: string): string {
+  return `replay-key-legacy-${sha256Hex(exactBase64UrlBytes(keyBase64url, 32))}`;
+}
+
+function replayKeyIdForGenesis(anchorId: string, commitId: string): string {
+  return `replay-key-${sha256Hex(`genesis\u0000${anchorId}\u0000${commitId}`)}`;
+}
+
+function replayKeyIdForRotation(anchorId: string, rotationId: string): string {
+  return `replay-key-${sha256Hex(`rotation\u0000${anchorId}\u0000${rotationId}`)}`;
+}
+
+function parseReplayKeyMaterial(value: unknown): ReplayKeyMaterial {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "replayKeyId",
+    "keyBase64url",
+    "legacyAad",
+  ])) invalidState();
+  if (
+    !isRelayV2AuthIdentifier(value.replayKeyId)
+    || typeof value.legacyAad !== "boolean"
+  ) invalidState();
+  exactBase64UrlBytes(value.keyBase64url, 32);
+  return {
+    replayKeyId: value.replayKeyId,
+    keyBase64url: value.keyBase64url as string,
+    legacyAad: value.legacyAad,
+  };
+}
+
+function parseReplayKeyRotation(value: unknown): ReplayKeyRotationRecord {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "rotationId",
+    "replayKeyId",
+    "commitSequence",
+  ])) invalidState();
+  if (
+    !isRelayV2AuthIdentifier(value.rotationId)
+    || !isRelayV2AuthIdentifier(value.replayKeyId)
+    || !isCanonicalUint64(value.commitSequence)
+    || value.commitSequence === "0"
+  ) invalidState();
+  return {
+    rotationId: value.rotationId,
+    replayKeyId: value.replayKeyId,
+    commitSequence: value.commitSequence,
+  };
+}
+
+function parseReplayKeyring(
+  value: unknown,
+  envelopeCommitSequence: string,
+): ReplayKeyring {
+  if (!isRecord(value) || !hasExactKeys(value, [
+    "originKeyId",
+    "activeKey",
+    "decryptOnlyKeys",
+    "rotations",
+  ])) invalidState();
+  if (
+    !isRelayV2AuthIdentifier(value.originKeyId)
+    || !Array.isArray(value.decryptOnlyKeys)
+    || value.decryptOnlyKeys.length > MAX_REPLAY_DECRYPT_ONLY_KEYS
+    || !Array.isArray(value.rotations)
+    || value.rotations.length > MAX_REPLAY_KEY_ROTATIONS
+  ) invalidState();
+  const activeKey = parseReplayKeyMaterial(value.activeKey);
+  const decryptOnlyKeys = value.decryptOnlyKeys.map(parseReplayKeyMaterial);
+  const rotations = value.rotations.map(parseReplayKeyRotation);
+  if (
+    !strictlySortedUnique(decryptOnlyKeys, (item) => item.replayKeyId)
+    || !strictlyIncreasingUint64(rotations, (item) => item.commitSequence)
+  ) invalidState();
+  const currentKeys = [activeKey, ...decryptOnlyKeys];
+  const currentKeyIds = new Set(currentKeys.map((item) => item.replayKeyId));
+  const currentKeySecrets = new Set(currentKeys.map((item) => item.keyBase64url));
+  const rotationIds = new Set(rotations.map((item) => item.rotationId));
+  const rotatedKeyIds = new Set(rotations.map((item) => item.replayKeyId));
+  if (
+    currentKeyIds.size !== currentKeys.length
+    || currentKeySecrets.size !== currentKeys.length
+    || rotationIds.size !== rotations.length
+    || rotatedKeyIds.size !== rotations.length
+    || rotatedKeyIds.has(value.originKeyId)
+    || rotations.some((item) => BigInt(item.commitSequence) > BigInt(envelopeCommitSequence))
+    || currentKeys.some((item) => (
+      item.replayKeyId !== value.originKeyId && !rotatedKeyIds.has(item.replayKeyId)
+    ))
+    || currentKeys.filter((item) => item.legacyAad).some((item) => (
+      item.replayKeyId !== value.originKeyId
+    ))
+  ) invalidState();
+  const expectedActiveKeyId = rotations.length === 0
+    ? value.originKeyId
+    : rotations[rotations.length - 1]!.replayKeyId;
+  if (activeKey.replayKeyId !== expectedActiveKeyId) invalidState();
+  return {
+    originKeyId: value.originKeyId,
+    activeKey,
+    decryptOnlyKeys,
+    rotations,
   };
 }
 
@@ -780,7 +930,7 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
   } catch {
     return invalidState();
   }
-  const legacyKeys = [
+  const commonKeys = [
     "version",
     "anchorId",
     "commitSequence",
@@ -789,7 +939,6 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     "lastObservedAtMs",
     "issuerUrl",
     "relayUrl",
-    "replayKeyBase64url",
     "issuer",
     "enrollments",
     "grants",
@@ -799,10 +948,22 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
   if (!isRecord(value)) invalidState();
   const isLegacyEnvelope = value.version
     === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_LEGACY_ENVELOPE_VERSION;
+  const isHostBootstrapEnvelope = value.version
+    === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_HOST_BOOTSTRAP_ENVELOPE_VERSION;
+  const isCurrentEnvelope = value.version
+    === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION;
   if (isLegacyEnvelope) {
-    if (!hasExactKeys(value, legacyKeys)) invalidState();
-  } else if (value.version === RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION) {
-    if (!hasExactKeys(value, [...legacyKeys, "hostBootstraps"])) invalidState();
+    if (!hasExactKeys(value, [...commonKeys, "replayKeyBase64url"])) invalidState();
+  } else if (isHostBootstrapEnvelope) {
+    if (!hasExactKeys(value, [
+      ...commonKeys,
+      "replayKeyBase64url",
+      "hostBootstraps",
+    ])) invalidState();
+  } else if (isCurrentEnvelope) {
+    if (!hasExactKeys(value, [...commonKeys, "replayKeyring", "hostBootstraps"])) {
+      invalidState();
+    }
   } else {
     invalidState();
   }
@@ -816,17 +977,37 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     || value.commitId === value.parentCommitId
     || !isTimestamp(value.lastObservedAtMs)
     || !Array.isArray(value.enrollments)
-    || (!isLegacyEnvelope && !Array.isArray(value.hostBootstraps))
+    || ((isHostBootstrapEnvelope || isCurrentEnvelope)
+      && !Array.isArray(value.hostBootstraps))
     || !Array.isArray(value.grants)
     || !Array.isArray(value.replays)
     || !Array.isArray(value.rateLimits)
     || value.enrollments.length > MAX_ENROLLMENTS
-    || (!isLegacyEnvelope && value.hostBootstraps.length > MAX_HOST_BOOTSTRAPS)
+    || ((isHostBootstrapEnvelope || isCurrentEnvelope)
+      && value.hostBootstraps.length > MAX_HOST_BOOTSTRAPS)
     || value.grants.length > MAX_GRANTS
     || value.replays.length > MAX_REPLAYS
     || value.rateLimits.length > MAX_RATE_BUCKETS
   ) invalidState();
-  exactBase64UrlBytes(value.replayKeyBase64url, 32);
+  let replayKeyring: ReplayKeyring;
+  let legacyReplayKeyId: string | undefined;
+  if (isCurrentEnvelope) {
+    replayKeyring = parseReplayKeyring(value.replayKeyring, value.commitSequence);
+  } else {
+    const legacyKeyBase64url = value.replayKeyBase64url as string;
+    exactBase64UrlBytes(legacyKeyBase64url, 32);
+    legacyReplayKeyId = replayKeyIdForLegacyKey(legacyKeyBase64url);
+    replayKeyring = {
+      originKeyId: legacyReplayKeyId,
+      activeKey: {
+        replayKeyId: legacyReplayKeyId,
+        keyBase64url: legacyKeyBase64url,
+        legacyAad: true,
+      },
+      decryptOnlyKeys: [],
+      rotations: [],
+    };
+  }
   let issuer: RelayV2IssuerKeyring;
   try {
     issuer = structuredClone(parseRelayV2IssuerKeyring(value.issuer));
@@ -838,7 +1019,7 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     ? []
     : value.hostBootstraps.map((record) => parseHostBootstrap(record, value.lastObservedAtMs));
   const grants = value.grants.map(parseGrant);
-  const replays = value.replays.map(parseReplay);
+  const replays = value.replays.map((record) => parseReplay(record, legacyReplayKeyId));
   const rateLimits = value.rateLimits.map((record) => (
     parseRateLimit(record, value.lastObservedAtMs)
   ));
@@ -847,6 +1028,21 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     && rateLimits.some((record) => record.scope === "host.bootstrap.source")
   ) invalidState();
   const hostBootstrapTokenHashes = new Set(hostBootstraps.map((item) => item.tokenHash));
+  const replayKeysById = new Map([
+    replayKeyring.activeKey,
+    ...replayKeyring.decryptOnlyKeys,
+  ].map((item) => [item.replayKeyId, item] as const));
+  const referencedDecryptOnlyKeyIds = new Set<string>();
+  for (const replay of replays) {
+    const replayKey = replayKeysById.get(replay.replayKeyId);
+    if (!replayKey || (replay.aadVersion === 1 && !replayKey.legacyAad)) invalidState();
+    if (replay.replayKeyId !== replayKeyring.activeKey.replayKeyId) {
+      referencedDecryptOnlyKeyIds.add(replay.replayKeyId);
+    }
+  }
+  if (replayKeyring.decryptOnlyKeys.some((item) => (
+    !referencedDecryptOnlyKeyIds.has(item.replayKeyId)
+  ))) invalidState();
   const hostBootstrapReplayAttempts = new Set<string>();
   const hostBootstrapReplaysBySelector = new Map<string, ReplayRecord>();
   for (const replay of replays) {
@@ -892,7 +1088,7 @@ function parseEnvelope(bytes: Uint8Array, expectedAnchorId: string): CredentialA
     lastObservedAtMs: value.lastObservedAtMs,
     issuerUrl: stateUrl(value.issuerUrl, "https:"),
     relayUrl: stateUrl(value.relayUrl, "wss:"),
-    replayKeyBase64url: value.replayKeyBase64url as string,
+    replayKeyring,
     issuer,
     enrollments,
     hostBootstraps,
@@ -1026,18 +1222,39 @@ function returnTransition<Result>(
   };
 }
 
-function replayAad(record: Pick<ReplayRecord, "operation" | "subjectId" | "attemptId" | "fingerprint">): Buffer {
-  return Buffer.from(JSON.stringify({
+function replayAad(
+  record: Pick<
+    ReplayRecord,
+    "operation" | "subjectId" | "attemptId" | "fingerprint" | "replayKeyId" | "aadVersion"
+  >,
+): Buffer {
+  const aad = {
     operation: record.operation,
     subjectId: record.subjectId,
     attemptId: record.attemptId,
     fingerprint: record.fingerprint,
-  }), "utf8");
+    ...(record.aadVersion === 2 ? { replayKeyId: record.replayKeyId } : {}),
+  };
+  return Buffer.from(JSON.stringify(aad), "utf8");
+}
+
+function replayKeyFor(
+  state: CredentialAuthorityEnvelope,
+  replayKeyId: string,
+): ReplayKeyMaterial {
+  const replayKey = state.replayKeyring.activeKey.replayKeyId === replayKeyId
+    ? state.replayKeyring.activeKey
+    : state.replayKeyring.decryptOnlyKeys.find((item) => item.replayKeyId === replayKeyId);
+  if (!replayKey) invalidState();
+  return replayKey;
 }
 
 function sealReplayResponse(
   state: CredentialAuthorityEnvelope,
-  record: Pick<ReplayRecord, "operation" | "subjectId" | "attemptId" | "fingerprint">,
+  record: Pick<
+    ReplayRecord,
+    "operation" | "subjectId" | "attemptId" | "fingerprint" | "replayKeyId" | "aadVersion"
+  >,
   response: RelayV2JsonObject,
   random: (length: number) => Uint8Array,
 ): string {
@@ -1045,7 +1262,10 @@ function sealReplayResponse(
   if (plaintext.byteLength === 0 || plaintext.byteLength > MAX_REPLAY_PLAINTEXT_BYTES) {
     throw authorityError("STATE_CAPACITY_EXHAUSTED");
   }
-  const key = exactBase64UrlBytes(state.replayKeyBase64url, 32);
+  const key = exactBase64UrlBytes(
+    replayKeyFor(state, record.replayKeyId).keyBase64url,
+    32,
+  );
   const iv = Buffer.from(random(12));
   if (iv.byteLength !== 12) throw authorityError("STATE_INVALID");
   const cipher = createCipheriv("aes-256-gcm", key, iv);
@@ -1062,7 +1282,9 @@ function openReplayResponse(
   try {
     const sealed = exactBase64UrlBytes(record.ciphertextBase64url);
     if (sealed.byteLength < 29 || sealed.byteLength > MAX_REPLAY_CIPHERTEXT_BYTES) invalidState();
-    const key = exactBase64UrlBytes(state.replayKeyBase64url, 32);
+    const replayKey = replayKeyFor(state, record.replayKeyId);
+    if (record.aadVersion === 1 && !replayKey.legacyAad) invalidState();
+    const key = exactBase64UrlBytes(replayKey.keyBase64url, 32);
     const decipher = createDecipheriv("aes-256-gcm", key, sealed.subarray(0, 12));
     decipher.setAAD(replayAad(record));
     decipher.setAuthTag(sealed.subarray(12, 28));
@@ -1140,7 +1362,10 @@ function replayForAttempt(
 
 function addReplay(
   state: CredentialAuthorityEnvelope,
-  record: Omit<ReplayRecord, "ciphertextBase64url" | "expiresAtMs">,
+  record: Omit<
+    ReplayRecord,
+    "replayKeyId" | "aadVersion" | "ciphertextBase64url" | "expiresAtMs"
+  >,
   response: RelayV2JsonObject,
   now: number,
   random: (length: number) => Uint8Array,
@@ -1150,12 +1375,15 @@ function addReplay(
   }
   const next: ReplayRecord = {
     ...record,
-    ciphertextBase64url: sealReplayResponse(state, record, response, random),
+    replayKeyId: state.replayKeyring.activeKey.replayKeyId,
+    aadVersion: 2,
+    ciphertextBase64url: "",
     expiresAtMs: now + RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS,
   };
   if (!Number.isSafeInteger(next.expiresAtMs)) {
     throw authorityError("STATE_CAPACITY_EXHAUSTED");
   }
+  next.ciphertextBase64url = sealReplayResponse(state, next, response, random);
   state.replays.push(next);
   state.replays.sort((left, right) => compareUtf8(replayIdentity(left), replayIdentity(right)));
 }
@@ -1203,6 +1431,14 @@ function pruneExpiredAuthorityState(state: CredentialAuthorityEnvelope, now: num
   const replays = state.replays.filter((record) => record.expiresAtMs > now);
   if (replays.length !== state.replays.length) {
     state.replays = replays;
+    changed = true;
+  }
+  const referencedReplayKeyIds = new Set(state.replays.map((record) => record.replayKeyId));
+  const decryptOnlyKeys = state.replayKeyring.decryptOnlyKeys.filter((key) => (
+    referencedReplayKeyIds.has(key.replayKeyId)
+  ));
+  if (decryptOnlyKeys.length !== state.replayKeyring.decryptOnlyKeys.length) {
+    state.replayKeyring.decryptOnlyKeys = decryptOnlyKeys;
     changed = true;
   }
   const rateLimits = state.rateLimits.filter((record) => (
@@ -1968,16 +2204,27 @@ implements RelayV2BrokerAuthControlAuthority {
   private freshEnvelope(): CredentialAuthorityEnvelope {
     const now = this.observedNow(0);
     const replayKeyBase64url = Buffer.from(this.randomExact(32)).toString("base64url");
+    const commitId = this.generatedId();
+    const replayKeyId = replayKeyIdForGenesis(this.anchorId, commitId);
     return {
       version: RELAY_V2_BROKER_CREDENTIAL_AUTHORITY_ENVELOPE_VERSION,
       anchorId: this.anchorId,
       commitSequence: "0",
-      commitId: this.generatedId(),
+      commitId,
       parentCommitId: null,
       lastObservedAtMs: now,
       issuerUrl: this.genesis.issuerUrl,
       relayUrl: this.genesis.relayUrl,
-      replayKeyBase64url,
+      replayKeyring: {
+        originKeyId: replayKeyId,
+        activeKey: {
+          replayKeyId,
+          keyBase64url: replayKeyBase64url,
+          legacyAad: false,
+        },
+        decryptOnlyKeys: [],
+        rotations: [],
+      },
       issuer: structuredClone(this.genesis.issuerKeyring),
       enrollments: [],
       hostBootstraps: [],
@@ -2330,6 +2577,66 @@ implements RelayV2BrokerAuthControlAuthority {
         reason: "kid_removed",
         kid,
       });
+    });
+  }
+
+  async adminRotateReplayKey(input: {
+    rotationId: string;
+  }): Promise<Readonly<{ rotationId: string; replayKeyId: string }>> {
+    if (!isRecord(input) || !hasExactKeys(input, ["rotationId"])) {
+      throw authorityError("INVALID_ARGUMENT");
+    }
+    const rotationId = ensureIdentifier(input.rotationId);
+    return this.mutate((state) => {
+      const prior = state.replayKeyring.rotations.find((item) => (
+        item.rotationId === rotationId
+      ));
+      if (prior) {
+        return returnTransition(Object.freeze({
+          rotationId: prior.rotationId,
+          replayKeyId: prior.replayKeyId,
+        }), false);
+      }
+      if (state.replayKeyring.rotations.length >= MAX_REPLAY_KEY_ROTATIONS) {
+        return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      }
+      const activeKey = state.replayKeyring.activeKey;
+      const activeKeyHasReplay = state.replays.some((record) => (
+        record.replayKeyId === activeKey.replayKeyId
+      ));
+      if (
+        activeKeyHasReplay
+        && state.replayKeyring.decryptOnlyKeys.length >= MAX_REPLAY_DECRYPT_ONLY_KEYS
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const replayKeyId = replayKeyIdForRotation(state.anchorId, rotationId);
+      if (
+        replayKeyId === state.replayKeyring.originKeyId
+        || state.replayKeyring.rotations.some((item) => item.replayKeyId === replayKeyId)
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      const keyBase64url = Buffer.from(this.randomExact(32)).toString("base64url");
+      if (
+        keyBase64url === activeKey.keyBase64url
+        || state.replayKeyring.decryptOnlyKeys.some((item) => (
+          item.keyBase64url === keyBase64url
+        ))
+      ) return rejectTransition("STATE_CAPACITY_EXHAUSTED", false);
+      if (activeKeyHasReplay) {
+        state.replayKeyring.decryptOnlyKeys.push(activeKey);
+        state.replayKeyring.decryptOnlyKeys.sort((left, right) => (
+          compareUtf8(left.replayKeyId, right.replayKeyId)
+        ));
+      }
+      state.replayKeyring.activeKey = {
+        replayKeyId,
+        keyBase64url,
+        legacyAad: false,
+      };
+      state.replayKeyring.rotations.push({
+        rotationId,
+        replayKeyId,
+        commitSequence: nextUint64(state.commitSequence),
+      });
+      return returnTransition(Object.freeze({ rotationId, replayKeyId }), true);
     });
   }
 

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash } from "node:crypto";
 import test from "node:test";
 import { InMemoryRelayV2BrokerCredentialStateStore } from "./support/inMemoryRelayV2BrokerCredentialStateStore.mjs";
 
@@ -134,6 +134,23 @@ function decodeState(bytes) {
 
 function encodeState(state) {
   return Buffer.from(JSON.stringify(state), "utf8");
+}
+
+function sealLegacyReplayResponse(state, replay, response) {
+  const key = Buffer.from(state.replayKeyring.activeKey.keyBase64url, "base64url");
+  const iv = Buffer.alloc(12, 0x5a);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  cipher.setAAD(Buffer.from(JSON.stringify({
+    operation: replay.operation,
+    subjectId: replay.subjectId,
+    attemptId: replay.attemptId,
+    fingerprint: replay.fingerprint,
+  }), "utf8"));
+  const ciphertext = Buffer.concat([
+    cipher.update(Buffer.from(JSON.stringify(response), "utf8")),
+    cipher.final(),
+  ]);
+  return Buffer.concat([iv, cipher.getAuthTag(), ciphertext]).toString("base64url");
 }
 
 function checkpointForStateBytes(bytes) {
@@ -915,7 +932,7 @@ test("host bootstrap pre-body admission is limited to twenty attempts per source
   await authority.close();
 });
 
-test("credential envelope revisions read legacy v1 and publish only explicit v2 successors", async () => {
+test("credential envelope revisions read v1/v2 replay keys and publish only explicit v3 successors", async (t) => {
   const seedStore = new InMemoryRelayV2BrokerCredentialStateStore();
   const seed = await credential.RelayV2BrokerCredentialAuthority.open(
     authorityOptions(seedStore, new MemoryContinuityAuthority(), {
@@ -923,40 +940,331 @@ test("credential envelope revisions read legacy v1 and publish only explicit v2 
     }),
   );
   await seed.close();
+  const current = decodeState(seedStore.snapshotBytes());
+  assert.equal(current.version, 3);
+  for (const version of [1, 2]) {
+    await t.test(`v${version}`, async () => {
+      const legacyState = clone(current);
+      legacyState.version = version;
+      legacyState.replayKeyBase64url = legacyState.replayKeyring.activeKey.keyBase64url;
+      delete legacyState.replayKeyring;
+      if (version === 1) delete legacyState.hostBootstraps;
+      legacyState.enrollments.push({
+        enrollmentId: `preserved-v${version}-enrollment`,
+        hostId: `preserved-v${version}-host`,
+        codeHash: createHash("sha256").update(`legacy-code-${version}`).digest("hex"),
+        createdAtMs: NOW_MS,
+        expiresAtMs: NOW_MS + 300_000,
+        failedAttempts: 0,
+        consumedAtMs: null,
+      });
+      const legacyBytes = encodeState(legacyState);
+      const store = new InMemoryRelayV2BrokerCredentialStateStore({
+        initialBytes: legacyBytes,
+      });
+      const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+        authorityOptions(store, continuityAtStateBytes(legacyBytes), {
+          idPrefix: `legacy-v${version}-open`,
+        }),
+      );
+      assert.equal(Buffer.from(store.snapshotBytes()).equals(legacyBytes), true);
+      const created = await authority.adminCreateHostBootstrap();
+      const upgraded = decodeState(store.snapshotBytes());
+      assert.equal(upgraded.version, 3);
+      assert.equal(upgraded.commitSequence, "1");
+      assert.equal(upgraded.parentCommitId, legacyState.commitId);
+      assert.deepEqual(upgraded.enrollments, legacyState.enrollments);
+      assert.equal(Object.hasOwn(upgraded, "replayKeyBase64url"), false);
+      assert.equal(
+        upgraded.replayKeyring.activeKey.keyBase64url,
+        legacyState.replayKeyBase64url,
+      );
+      assert.equal(upgraded.replayKeyring.activeKey.legacyAad, true);
+      assert.equal(upgraded.hostBootstraps.length, 1);
+      assert.equal(
+        upgraded.hostBootstraps[0].selector,
+        created.bootstrapToken.split(".")[1],
+      );
+      await authority.close();
+    });
+  }
+});
+
+test("replay-key rotation migrates legacy ciphertext, is ACK-loss idempotent, and retains old keys only for original TTL", async () => {
+  const seedStore = new InMemoryRelayV2BrokerCredentialStateStore();
+  const seed = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(seedStore, new MemoryContinuityAuthority(), {
+      idPrefix: "replay-rotation-seed",
+    }),
+  );
+  const originalBootstrap = await seed.adminCreateHostBootstrap();
+  const originalAdmission = await admitHostBootstrap(seed, "replay-rotation-seed-source");
+  const originalInput = hostBootstrapInput(originalBootstrap.bootstrapToken, {
+    bootstrapAttemptId: "legacy-replay-attempt",
+  });
+  const original = await seed.bootstrapHost(
+    originalAdmission,
+    "replay-rotation-seed-source",
+    originalInput,
+  );
+  await seed.close();
+
   const legacyState = decodeState(seedStore.snapshotBytes());
-  assert.equal(legacyState.version, 2);
-  legacyState.version = 1;
-  delete legacyState.hostBootstraps;
-  legacyState.enrollments.push({
-    enrollmentId: "preserved-legacy-enrollment",
-    hostId: "preserved-legacy-host",
-    codeHash: createHash("sha256").update("legacy-code").digest("hex"),
-    createdAtMs: NOW_MS,
-    expiresAtMs: NOW_MS + 300_000,
-    failedAttempts: 0,
-    consumedAtMs: null,
-  });
+  const legacyReplay = legacyState.replays.find((record) => (
+    record.operation === "host.bootstrap" && record.attemptId === originalInput.bootstrapAttemptId
+  ));
+  assert.ok(legacyReplay);
+  const originalCiphertext = sealLegacyReplayResponse(legacyState, legacyReplay, original.body);
+  const originalExpiresAtMs = legacyReplay.expiresAtMs;
+  legacyReplay.ciphertextBase64url = originalCiphertext;
+  delete legacyReplay.replayKeyId;
+  delete legacyReplay.aadVersion;
+  legacyState.version = 2;
+  legacyState.replayKeyBase64url = legacyState.replayKeyring.activeKey.keyBase64url;
+  delete legacyState.replayKeyring;
   const legacyBytes = encodeState(legacyState);
-  const store = new InMemoryRelayV2BrokerCredentialStateStore({
-    initialBytes: legacyBytes,
-  });
+  const store = new InMemoryRelayV2BrokerCredentialStateStore({ initialBytes: legacyBytes });
+  let clock = NOW_MS;
+  let rotationRandomCounter = 0;
   const authority = await credential.RelayV2BrokerCredentialAuthority.open(
-    authorityOptions(store, new MemoryContinuityAuthority(), {
-      idPrefix: "legacy-open",
+    authorityOptions(store, continuityAtStateBytes(legacyBytes), {
+      idPrefix: "replay-rotation",
+      now: () => clock,
+      randomBytes: (length) => createHash("sha256")
+        .update(`replay-rotation-random-${++rotationRandomCounter}`)
+        .digest()
+        .subarray(0, length),
     }),
   );
   assert.equal(Buffer.from(store.snapshotBytes()).equals(legacyBytes), true);
-  const created = await authority.adminCreateHostBootstrap();
-  const upgraded = decodeState(store.snapshotBytes());
-  assert.equal(upgraded.version, 2);
-  assert.equal(upgraded.commitSequence, "1");
-  assert.equal(upgraded.parentCommitId, legacyState.commitId);
-  assert.deepEqual(upgraded.enrollments, legacyState.enrollments);
-  assert.equal(upgraded.hostBootstraps.length, 1);
-  assert.equal(
-    upgraded.hostBootstraps[0].selector,
-    created.bootstrapToken.split(".")[1],
+
+  const rotated = await authority.adminRotateReplayKey({
+    rotationId: "replay-rotation-one",
+  });
+  const afterRotation = decodeState(store.snapshotBytes());
+  assert.equal(afterRotation.version, 3);
+  assert.deepEqual(Object.keys(rotated).sort(), ["replayKeyId", "rotationId"]);
+  assert.equal(rotated.rotationId, "replay-rotation-one");
+  assert.equal(rotated.replayKeyId, afterRotation.replayKeyring.activeKey.replayKeyId);
+  assert.equal(JSON.stringify(rotated).includes(afterRotation.replayKeyring.activeKey.keyBase64url), false);
+  assert.equal(afterRotation.replayKeyring.decryptOnlyKeys.length, 1);
+  const legacyKeyId = afterRotation.replayKeyring.decryptOnlyKeys[0].replayKeyId;
+  assert.equal(afterRotation.replayKeyring.decryptOnlyKeys[0].legacyAad, true);
+  const migratedReplay = afterRotation.replays.find((record) => (
+    record.attemptId === originalInput.bootstrapAttemptId
+  ));
+  assert.equal(migratedReplay.replayKeyId, legacyKeyId);
+  assert.equal(migratedReplay.aadVersion, 1);
+  assert.equal(migratedReplay.ciphertextBase64url, originalCiphertext);
+  assert.equal(migratedReplay.expiresAtMs, originalExpiresAtMs);
+
+  const beforeRetryBytes = store.snapshotBytes();
+  const beforeRetryPublishes = store.compareAndPublishCalls;
+  const retriedRotation = await authority.adminRotateReplayKey({
+    rotationId: "replay-rotation-one",
+  });
+  assert.deepEqual(retriedRotation, rotated);
+  assert.deepEqual(store.snapshotBytes(), beforeRetryBytes);
+  assert.equal(store.compareAndPublishCalls, beforeRetryPublishes);
+  assert.equal(decodeState(store.snapshotBytes()).replayKeyring.rotations.length, 1);
+
+  const replayAdmission = await admitHostBootstrap(authority, "legacy-replay-source");
+  const replayed = await authority.bootstrapHost(
+    replayAdmission,
+    "legacy-replay-source",
+    originalInput,
   );
+  assert.equal(replayed.replayed, true);
+  assert.deepEqual(replayed.body, original.body);
+
+  const nextBootstrap = await authority.adminCreateHostBootstrap();
+  const nextAdmission = await admitHostBootstrap(authority, "active-replay-source");
+  const nextInput = hostBootstrapInput(nextBootstrap.bootstrapToken, {
+    bootstrapAttemptId: "active-replay-attempt",
+    hostId: "host-two",
+    hostEpoch: "host-epoch-two",
+    hostInstanceId: "host-instance-two",
+  });
+  await authority.bootstrapHost(nextAdmission, "active-replay-source", nextInput);
+  const afterNewReplay = decodeState(store.snapshotBytes());
+  const newReplay = afterNewReplay.replays.find((record) => (
+    record.attemptId === nextInput.bootstrapAttemptId
+  ));
+  assert.equal(newReplay.replayKeyId, rotated.replayKeyId);
+  assert.equal(newReplay.aadVersion, 2);
+  assert.equal(
+    afterNewReplay.replays.find((record) => (
+      record.attemptId === originalInput.bootstrapAttemptId
+    )).expiresAtMs,
+    originalExpiresAtMs,
+  );
+
+  clock = originalExpiresAtMs - 1;
+  const lastReplayAdmission = await admitHostBootstrap(authority, "last-legacy-replay-source");
+  const lastReplay = await authority.bootstrapHost(
+    lastReplayAdmission,
+    "last-legacy-replay-source",
+    originalInput,
+  );
+  assert.equal(lastReplay.replayed, true);
+  const beforeExpiry = decodeState(store.snapshotBytes());
+  assert.equal(beforeExpiry.replayKeyring.decryptOnlyKeys[0].replayKeyId, legacyKeyId);
+  assert.equal(
+    beforeExpiry.replays.find((record) => (
+      record.attemptId === originalInput.bootstrapAttemptId
+    )).expiresAtMs,
+    originalExpiresAtMs,
+  );
+
+  clock = originalExpiresAtMs;
+  const expiredAdmission = await admitHostBootstrap(authority, "expired-legacy-replay-source");
+  const afterExpiry = decodeState(store.snapshotBytes());
+  assert.equal(afterExpiry.replays.some((record) => record.replayKeyId === legacyKeyId), false);
+  assert.equal(
+    afterExpiry.replayKeyring.decryptOnlyKeys.some((key) => key.replayKeyId === legacyKeyId),
+    false,
+  );
+  assert.equal(afterExpiry.replayKeyring.rotations[0].replayKeyId, rotated.replayKeyId);
+  await assert.rejects(
+    authority.bootstrapHost(
+      expiredAdmission,
+      "expired-legacy-replay-source",
+      originalInput,
+    ),
+    errorCode("AUTH_INVALID"),
+  );
+  assert.equal(authority.authorityContinuityReadiness.status, "ready");
+  await authority.close();
+});
+
+test("unknown replay keys fail on open and AEAD failure withdraws instead of becoming a replay miss", async (t) => {
+  const seedStore = new InMemoryRelayV2BrokerCredentialStateStore();
+  const seed = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(seedStore, new MemoryContinuityAuthority(), {
+      idPrefix: "replay-failure-seed",
+    }),
+  );
+  const created = await seed.adminCreateHostBootstrap();
+  const input = hostBootstrapInput(created.bootstrapToken, {
+    bootstrapAttemptId: "replay-failure-attempt",
+  });
+  const admission = await admitHostBootstrap(seed, "replay-failure-seed-source");
+  await seed.bootstrapHost(admission, "replay-failure-seed-source", input);
+  await seed.close();
+  const base = decodeState(seedStore.snapshotBytes());
+
+  await t.test("unknown key id", async () => {
+    const state = clone(base);
+    state.replays[0].replayKeyId = "unknown-replay-key";
+    const bytes = encodeState(state);
+    const store = new InMemoryRelayV2BrokerCredentialStateStore({ initialBytes: bytes });
+    await assert.rejects(
+      credential.RelayV2BrokerCredentialAuthority.open(
+        authorityOptions(store, continuityAtStateBytes(bytes), {
+          idPrefix: "unknown-replay-key",
+        }),
+      ),
+      errorCode("STATE_INVALID"),
+    );
+    assert.equal(Buffer.from(store.snapshotBytes()).equals(bytes), true);
+    assert.equal(store.closeCalls, 1);
+  });
+
+  await t.test("ciphertext authentication failure", async () => {
+    const state = clone(base);
+    const replay = state.replays.find((record) => record.operation === "host.bootstrap");
+    const sealed = Buffer.from(replay.ciphertextBase64url, "base64url");
+    sealed[sealed.length - 1] ^= 1;
+    replay.ciphertextBase64url = sealed.toString("base64url");
+    const bytes = encodeState(state);
+    const store = new InMemoryRelayV2BrokerCredentialStateStore({ initialBytes: bytes });
+    const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(store, continuityAtStateBytes(bytes), {
+        idPrefix: "replay-aead-failure",
+      }),
+    );
+    const replayAdmission = await admitHostBootstrap(authority, "replay-aead-source");
+    await assert.rejects(
+      authority.bootstrapHost(replayAdmission, "replay-aead-source", input),
+      (error) => errorCode("STATE_INVALID")(error)
+        && !error.message.includes(replay.ciphertextBase64url)
+        && !error.message.includes(created.bootstrapToken),
+    );
+    assert.equal(authority.authorityContinuityReadiness.status, "closed");
+    assert.equal(store.closeCalls, 1);
+  });
+});
+
+test("replay-key rotation is bounded until every decrypt-only key loses its original replay references", async () => {
+  const store = new InMemoryRelayV2BrokerCredentialStateStore();
+  let clock = NOW_MS;
+  let randomCounter = 0;
+  const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(store, new MemoryContinuityAuthority(), {
+      idPrefix: "replay-key-bound",
+      now: () => clock,
+      randomBytes: (length) => createHash("sha256")
+        .update(`replay-key-bound-random-${++randomCounter}`)
+        .digest()
+        .subarray(0, length),
+    }),
+  );
+  for (let index = 0; index < 32; index += 1) {
+    const created = await authority.adminCreateHostBootstrap();
+    const sourceKey = `replay-key-bound-source-${index}`;
+    const admission = await admitHostBootstrap(authority, sourceKey);
+    await authority.bootstrapHost(
+      admission,
+      sourceKey,
+      hostBootstrapInput(created.bootstrapToken, {
+        bootstrapAttemptId: `replay-key-bound-attempt-${index}`,
+        hostId: `replay-key-bound-host-${index}`,
+        hostEpoch: `replay-key-bound-epoch-${index}`,
+        hostInstanceId: `replay-key-bound-instance-${index}`,
+      }),
+    );
+    await authority.adminRotateReplayKey({
+      rotationId: `replay-key-bound-rotation-${index}`,
+    });
+  }
+  const activeCreated = await authority.adminCreateHostBootstrap();
+  const activeAdmission = await admitHostBootstrap(authority, "replay-key-bound-active-source");
+  await authority.bootstrapHost(
+    activeAdmission,
+    "replay-key-bound-active-source",
+    hostBootstrapInput(activeCreated.bootstrapToken, {
+      bootstrapAttemptId: "replay-key-bound-active-attempt",
+      hostId: "replay-key-bound-active-host",
+      hostEpoch: "replay-key-bound-active-epoch",
+      hostInstanceId: "replay-key-bound-active-instance",
+    }),
+  );
+  const full = decodeState(store.snapshotBytes());
+  assert.equal(full.replayKeyring.decryptOnlyKeys.length, 32);
+  assert.equal(full.replayKeyring.rotations.length, 32);
+  const beforeRejectedBytes = store.snapshotBytes();
+  const beforeRejectedPublishes = store.compareAndPublishCalls;
+  await assert.rejects(
+    authority.adminRotateReplayKey({ rotationId: "replay-key-bound-blocked" }),
+    errorCode("STATE_CAPACITY_EXHAUSTED"),
+  );
+  assert.deepEqual(store.snapshotBytes(), beforeRejectedBytes);
+  assert.equal(store.compareAndPublishCalls, beforeRejectedPublishes);
+  assert.equal(authority.authorityContinuityReadiness.status, "ready");
+
+  clock += credential.RELAY_V2_BROKER_CREDENTIAL_RESPONSE_REPLAY_RETENTION_MS;
+  const afterExpiry = await authority.adminRotateReplayKey({
+    rotationId: "replay-key-bound-blocked",
+  });
+  const pruned = decodeState(store.snapshotBytes());
+  assert.equal(afterExpiry.replayKeyId, pruned.replayKeyring.activeKey.replayKeyId);
+  assert.equal(pruned.replayKeyring.decryptOnlyKeys.length, 0);
+  assert.equal(pruned.replays.length, 0);
+  assert.equal(pruned.replayKeyring.rotations.length, 33);
+  assert.equal(new Set([
+    pruned.replayKeyring.originKeyId,
+    ...pruned.replayKeyring.rotations.map((item) => item.replayKeyId),
+  ]).size, 34);
   await authority.close();
 });
 
@@ -1001,24 +1309,66 @@ test("credential envelope cross-revision shapes and malformed bootstrap collecti
   ));
   const cases = [
     {
-      name: "v1 with v2 field",
+      name: "v1 with v3 fields",
       mutate(state) { state.version = 1; },
     },
     {
-      name: "v2 without v2 field",
+      name: "v2 with v3 fields",
+      mutate(state) { state.version = 2; },
+    },
+    {
+      name: "v3 without host bootstrap field",
       mutate(state) { delete state.hostBootstraps; },
+    },
+    {
+      name: "v3 without replay keyring",
+      mutate(state) { delete state.replayKeyring; },
     },
     {
       name: "v1 with v2 rate vocabulary",
       mutate(state) {
         state.version = 1;
+        state.replayKeyBase64url = state.replayKeyring.activeKey.keyBase64url;
+        delete state.replayKeyring;
         delete state.hostBootstraps;
         state.replays = state.replays.filter((record) => record.operation !== "host.bootstrap");
+        state.replays.forEach((record) => {
+          delete record.replayKeyId;
+          delete record.aadVersion;
+        });
       },
     },
     {
       name: "unknown envelope version",
-      mutate(state) { state.version = 3; },
+      mutate(state) { state.version = 4; },
+    },
+    {
+      name: "replay keyring has no active key",
+      mutate(state) {
+        delete state.replayKeyring.activeKey;
+      },
+    },
+    {
+      name: "replay key rotation reuses a key id",
+      mutate(state) {
+        state.replayKeyring.rotations.push({
+          rotationId: "malformed-reused-key-rotation",
+          replayKeyId: state.replayKeyring.originKeyId,
+          commitSequence: state.commitSequence,
+        });
+      },
+    },
+    {
+      name: "replay record names an unknown key",
+      mutate(state) {
+        state.replays[0].replayKeyId = "unknown-replay-key";
+      },
+    },
+    {
+      name: "replay record downgrades AAD on a non-legacy key",
+      mutate(state) {
+        state.replays[0].aadVersion = 1;
+      },
     },
     {
       name: "record unknown field",
