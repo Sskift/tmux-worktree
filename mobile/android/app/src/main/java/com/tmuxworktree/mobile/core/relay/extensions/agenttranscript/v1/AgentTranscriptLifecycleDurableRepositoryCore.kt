@@ -792,6 +792,14 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         val currentAccounting = current.storageAccounting
             ?: throw AgentTranscriptLifecyclePersistenceConflictException()
         val reduction = AgentTranscriptLifecycleClientReducer.reduce(current.state, input, limits)
+        // Control transitions invalidate any in-flight snapshot fence.  Clear B by exact
+        // identity in this same transaction; the FK removes C.  D remains governed by the
+        // reducer's sync semantics and is intentionally not bulk-dropped here.
+        if (reduction.state.extensionLane.localGeneration !=
+            current.state.extensionLane.localGeneration
+        ) {
+            clearSnapshotFence(expectedNamespace)
+        }
         val nextNamespace = AgentTranscriptLifecycleDurableNamespace.from(
             expectedNamespace.consumer,
             reduction.state,
@@ -831,6 +839,16 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             insertState(replacement)
         }
         reduction
+    }
+
+    private fun AgentTranscriptLifecycleDurableTransaction.clearSnapshotFence(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+    ) {
+        snapshots(namespace).singleOrNull()?.let { snapshot ->
+            if (deleteSnapshot(snapshot) != 1) {
+                throw AgentTranscriptLifecyclePersistenceConflictException()
+            }
+        }
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.loadAuditedSingle(
@@ -2026,10 +2044,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                             baseline,
                             record.toDomainLifecycleRecord(),
                             witness,
+                            decisions.size < limits.maxNotificationDecisionsPerReduction,
                         )
-                        if (decision != null && decisions.size <
-                            limits.maxNotificationDecisionsPerReduction
-                        ) decisions += decision
+                        if (decision != null) decisions += decision
                     }
                 }
             }
@@ -2307,7 +2324,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         baseline: String,
         record: AgentLifecycleRecord,
         witnessRow: RelayV2AgentLifecycleEventWitnessEntity,
+        allowNotification: Boolean,
     ): AgentNotificationDecision? {
+        if (!allowNotification) return null
         if (prior.notificationBaselineAgentSeq == null ||
             compareStorageCounters(record.agentEventSeq, baseline) <= 0 ||
             prior.snapshotNotificationSuppressedThroughAgentSeq?.let {
