@@ -262,7 +262,7 @@ class RelayV2StateDatabaseMigrationTest {
     }
 
     @Test
-    fun migration4To5PreservesAgentEvidenceAndAddsEmptyTranscriptTables() {
+    fun migration4To5PreservesAgentEvidenceAndAddsEmptyRowOrientedTables() {
         migration.createDatabase(DATABASE_NAME, 4).apply {
             insertLegacyAuthority()
             execSQL(
@@ -346,6 +346,10 @@ class RelayV2StateDatabaseMigrationTest {
             assertEquals(0, migrated.count("relay_v2_agent_transcript_snapshot_staging"))
             assertEquals(0, migrated.count("relay_v2_agent_transcript_snapshot_records"))
             assertEquals(0, migrated.count("relay_v2_agent_transcript_pending_events"))
+            assertEquals(0, migrated.count("relay_v2_agent_lifecycle_current"))
+            assertEquals(0, migrated.count("relay_v2_agent_lifecycle_event_witnesses"))
+            assertEquals(0, migrated.count("relay_v2_agent_recent_event_evidence"))
+            assertEquals(0, migrated.count("relay_v2_agent_notification_ledger"))
         }
     }
 
