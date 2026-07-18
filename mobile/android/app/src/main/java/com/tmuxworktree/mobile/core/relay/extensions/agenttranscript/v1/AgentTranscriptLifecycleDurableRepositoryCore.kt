@@ -981,7 +981,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         }
         if (currentStats.itemCount < 0 || currentStats.byteCount != 0L) storageMalformed()
 
-        validatePermanentWitnessChains(namespace, witnessStats)
+        validatePermanentWitnessChains(namespace, witnessStats, lastAgentSeq)
         // The turn-marker set is derived from permanent TURN witnesses; it is not a
         // second writable authority.  Bound the distinct run graph in the same audit.
         val turnMarkerRuns = linkedSetOf<String>()
@@ -999,7 +999,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             if (page.isEmpty()) storageMalformed()
             page.forEach { row ->
                 if (row.closedEventDigest != null) closedWitnessCount++
-                if (row.lifecycleScope == "turn") {
+                if (row.lifecycleScope == "TURN") {
                     turnMarkerRuns += row.runId
                     if (turnMarkerRuns.size > limits.maxEverTurnMarkers) storageMalformed()
                 }
@@ -1015,9 +1015,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         if (closedWitnessCount + recentStats.itemCount > limits.maxAppliedEventEvidence) {
             storageMalformed()
         }
-        validateCurrentPointers(namespace, currentStats.itemCount)
+        validateCurrentPointers(namespace, currentStats.itemCount, lastAgentSeq)
         validateRecentEvidenceRows(namespace, lastAgentSeq, recentStats)
-        validateNotificationRows(namespace, notificationStats)
+        validateNotificationRows(namespace, notificationStats, lastAgentSeq)
         return LifecycleIndexAccounting(
             currentCount = currentStats.itemCount,
             witnessCount = witnessStats.itemCount,
@@ -1032,6 +1032,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.validatePermanentWitnessChains(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         stats: RelayV2AgentLifecycleSqlAudit,
+        lastAgentSeq: String,
     ) {
         var processed = 0L
         var afterScope = ""
@@ -1049,6 +1050,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             if (rows.isEmpty() || rows.size > DURABLE_STORAGE_BATCH_RECORDS) storageMalformed()
             rows.forEach { row ->
                 validateWitnessRow(namespace, row)
+                if (compareStorageCounters(row.agentEventSeq, lastAgentSeq) > 0) storageMalformed()
                 val prior = previous
                 if (prior != null && prior.lifecycleIdentityKey() == row.lifecycleIdentityKey()) {
                     if (prior.sourceEpoch != row.sourceEpoch ||
@@ -1096,6 +1098,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.validateCurrentPointers(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         expectedCount: Long,
+        lastAgentSeq: String,
     ) {
         var processed = 0L
         var afterOrder = ""
@@ -1108,6 +1111,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             rows.forEach { row ->
                 requireExactLifecycleNamespace(namespace, row)
                 requireExactOrderKey(row.agentEventSeq, row.agentEventSeqOrder)
+                if (compareStorageCounters(row.agentEventSeq, lastAgentSeq) > 0) storageMalformed()
                 val identity = row.toLifecycleIdentity()
                 val witness = witnessByEventId(namespace, row.lifecycleEventId)
                     ?: storageMalformed()
@@ -1223,6 +1227,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.validateNotificationRows(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         stats: RelayV2AgentLifecycleSqlAudit,
+        lastAgentSeq: String,
     ) {
         var processed = 0L
         var bytes = 0L
@@ -1237,6 +1242,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             rows.forEach { row ->
                 requireExactLifecycleNamespace(namespace, row)
                 requireExactOrderKey(row.agentEventSeq, row.agentEventSeqOrder)
+                if (compareStorageCounters(row.agentEventSeq, lastAgentSeq) > 0) storageMalformed()
                 val expectedPayload = canonicalNotificationPayload(
                     row.disposition,
                     row.localGeneration,
@@ -1467,6 +1473,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     ): EventConsumption {
         val input = unbound.bindLineage(namespace)
         val hydrated = hydrateForEvent(namespace, current.state, unbound, input)
+        enforceEventCapacity(current.storageAccounting, limits)
         val entryPlan = planEntryMutation(namespace, input)
         if (entryPlan == EntryMutationPlan.Conflict) {
             val quarantine = continuityQuarantine(current.state)
@@ -1521,6 +1528,17 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             persisted,
             reduction.copy(state = reduction.state.withoutRowOwnedMaterialization()),
         )
+    }
+
+    private fun enforceEventCapacity(
+        accounting: AgentTranscriptDurableStorageAccounting,
+        limits: AgentClientReducerLimits,
+    ) {
+        if (accounting.lifecycleWitnessCount >= limits.maxEventIdentityWitnesses ||
+            accounting.lifecycleCurrentCount >= limits.maxLifecycleRecords ||
+            accounting.recentEventEvidenceCount >= limits.maxAppliedEventEvidence ||
+            accounting.notificationLedgerCount >= limits.maxNotificationLedgerEntries
+        ) throw AgentTranscriptLifecyclePersistenceConflictException()
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.hydrateForEvent(
