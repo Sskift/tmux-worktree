@@ -1122,11 +1122,19 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                         val entry = entryById(namespace, mutation.entry.metadata.entryId)
                             ?: storageMalformed()
                         validateEntry(namespace, entry)
-                        if (entry.createdAgentSeq != mutation.entry.metadata.createdAgentSeq ||
+                        val metadata = mutation.entry.metadata
+                        if (entry.runId != metadata.runId || entry.turnId != metadata.turnId ||
+                            entry.role != metadata.role.wireValue || entry.commandId != metadata.commandId ||
+                            entry.createdAtMs != metadata.createdAtMs ||
+                            entry.createdAgentSeq != metadata.createdAgentSeq ||
                             compareStorageCounters(entry.lastModifiedAgentSeq, row.agentEventSeq) < 0
                         ) storageMalformed()
-                        if (entry.lastModifiedAgentSeq == row.agentEventSeq &&
-                            entry.entryState != ENTRY_STATE_VISIBLE
+                        if (entry.lastModifiedAgentSeq == row.agentEventSeq) {
+                            if (entry.entryState != ENTRY_STATE_VISIBLE || entry.text != mutation.entry.text) {
+                                storageMalformed()
+                            }
+                        } else if (entry.entryState != ENTRY_STATE_REDACTED &&
+                            entry.entryState != ENTRY_STATE_DELETED
                         ) storageMalformed()
                     }
                     is PublicRedactMutation,
@@ -1141,20 +1149,23 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                         if (compareStorageCounters(entry.lastModifiedAgentSeq, row.agentEventSeq) < 0) {
                             storageMalformed()
                         }
-                        if (entry.lastModifiedAgentSeq == row.agentEventSeq) {
-                            when (mutation) {
-                                is PublicRedactMutation -> {
-                                    if (entry.entryState != ENTRY_STATE_REDACTED ||
-                                        entry.redactionReason != mutation.reason.wireValue
-                                    ) storageMalformed()
-                                }
-                                is PublicDeleteMutation -> {
-                                    if (entry.entryState != ENTRY_STATE_DELETED ||
-                                        entry.tombstoneOrigin != AgentTranscriptEntryTombstoneOrigin.WIRE_DELETE.storageValue
-                                    ) storageMalformed()
-                                }
-                                else -> Unit
+                        when (mutation) {
+                            is PublicRedactMutation -> {
+                                if (entry.entryState != ENTRY_STATE_REDACTED &&
+                                    entry.entryState != ENTRY_STATE_DELETED
+                                ) storageMalformed()
+                                if (entry.lastModifiedAgentSeq == row.agentEventSeq &&
+                                    (entry.entryState != ENTRY_STATE_REDACTED ||
+                                        entry.redactionReason != mutation.reason.wireValue)
+                                ) storageMalformed()
                             }
+                            is PublicDeleteMutation -> {
+                                if (entry.entryState != ENTRY_STATE_DELETED ||
+                                    entry.tombstoneOrigin != AgentTranscriptEntryTombstoneOrigin.WIRE_DELETE.storageValue ||
+                                    entry.redactionReason != mutation.reason.wireValue
+                                ) storageMalformed()
+                            }
+                            else -> Unit
                         }
                     }
                     else -> Unit
@@ -1778,6 +1789,11 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             existingHeaders.size > 1
         ) storageMalformed()
         val isFirst = existingHeaders.isEmpty()
+        // Audit the pre-page graph before a first-page provisional B can exist.  The
+        // persisted header validator intentionally rejects nextPageIndex=0, so auditing
+        // after insert would reject valid page-0 final and non-final operations.
+        val preStateAudit = validateTranscriptStorage(namespace, current.state)
+        if (preStateAudit.accounting != current.storageAccounting) storageMalformed()
         val header = if (isFirst) {
             val preFirst = extension.pendingSnapshotRequest
                 ?: throw AgentTranscriptLifecyclePersistenceConflictException()
@@ -1838,11 +1854,6 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             }
         }
 
-        // Audit the existing durable graph before this page can add C rows or alter B.
-        // The page itself is validated separately by closeSnapshotPage; this keeps a
-        // valid first-final/continuation-final cut from auditing its own newly staged rows.
-        val preStateAudit = validateTranscriptStorage(namespace, current.state)
-        if (preStateAudit.accounting != current.storageAccounting) storageMalformed()
         val staged = closeSnapshotPage(namespace, header, artifact)
         insertSnapshotRecordBatches(staged.rows)
         var stateAfterPage = current.state
