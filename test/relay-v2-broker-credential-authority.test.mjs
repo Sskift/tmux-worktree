@@ -122,6 +122,8 @@ function hostContext(overrides = {}) {
     jti: "jti-one",
     kid: "credential-test-kid",
     expiresAtMs: NOW_MS + 60_000,
+    authorizationRevision: "0",
+    authorizationFence: "authority-id-classifications-1",
     ...overrides,
   };
 }
@@ -262,6 +264,11 @@ test("open owns a recognizable store across constructor and initialization failu
       name: "invalid random seam result",
       expected: "STATE_INVALID",
       change: { randomBytes: () => new Uint8Array(1) },
+    },
+    {
+      name: "incomplete live authorization fence port",
+      expected: "INVALID_ARGUMENT",
+      change: { liveAuthorizationFence: { begin() {} } },
     },
   ];
   for (const item of cases) {
@@ -447,14 +454,36 @@ test("close is a synchronous admission withdrawal and a truthful barrier", async
     let finishClose;
     const closeGate = new Promise((resolve) => { finishClose = resolve; });
     const store = new InMemoryRelayV2BrokerCredentialStateStore({ onClose: () => closeGate });
-    const authority = await credential.RelayV2BrokerCredentialAuthority.open(
-      authorityOptions(store, new MemoryContinuityAuthority(), { idPrefix: "barrier" }),
+    let authority;
+    let reentrantReadiness;
+    let reentrantAdmission;
+    authority = await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(store, new MemoryContinuityAuthority(), {
+        idPrefix: "barrier",
+        liveAuthorizationFence: {
+          begin() {
+            throw new Error("no invalidation is expected during close");
+          },
+          failClosed() {
+            reentrantReadiness = authority.authorityContinuityReadiness;
+            reentrantAdmission = authority.admitHttpSource({
+              endpoint: "enrollment_redeem",
+              sourceKey: "reentrant-close-source",
+            });
+          },
+        },
+      }),
     );
     const closing = authority.close();
     assert.deepEqual(authority.authorityContinuityReadiness, {
       status: "withdrawn",
       reason: "close_requested",
     });
+    assert.deepEqual(reentrantReadiness, {
+      status: "withdrawn",
+      reason: "close_requested",
+    });
+    await assert.rejects(reentrantAdmission, errorCode("AUTHORITY_NOT_READY"));
     const calls = store.runExclusiveCalls;
     const decision = await authority.handle({
       type: "enrollment.create",
@@ -1159,6 +1188,393 @@ test("host bootstrap rejects grant capacity before consuming its secret or issui
   assert.equal(after.hostBootstraps[0].failedAttempts, 0);
   assert.equal(after.grants.length, 4_096);
   await authority.close();
+});
+
+test("durable revoke and kid removal commit exact live fences before returning carrier success", async () => {
+  const external = new MemoryContinuityAuthority();
+  const store = new InMemoryRelayV2BrokerCredentialStateStore();
+  const fenceEvents = [];
+  let trackedOperation = null;
+  store.onCompareAndPublish = ({ defaultPublish }) => {
+    const result = defaultPublish();
+    if (trackedOperation !== null) {
+      fenceEvents.push({ type: "durable_publish", operation: trackedOperation });
+    }
+    return result;
+  };
+  const liveAuthorizationFence = {
+    begin(invalidation) {
+      const operation = trackedOperation;
+      fenceEvents.push({ type: "pending", operation, invalidation });
+      let settled = false;
+      return {
+        committed(receipt) {
+          if (settled) return;
+          settled = true;
+          const state = decodeState(store.snapshotBytes());
+          assert.equal(state.commitSequence, receipt.authorizationRevision);
+          assert.equal(state.commitId, receipt.authorizationFence);
+          fenceEvents.push({ type: "committed", operation, receipt });
+        },
+        cancelled() {
+          if (settled) return;
+          settled = true;
+          fenceEvents.push({ type: "cancelled", operation });
+        },
+        failClosed() {
+          if (settled) return;
+          settled = true;
+          fenceEvents.push({ type: "fail_closed", operation });
+        },
+      };
+    },
+    failClosed() {
+      fenceEvents.push({ type: "authority_fail_closed" });
+    },
+  };
+  const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(store, external, {
+      idPrefix: "live-fence",
+      liveAuthorizationFence,
+    }),
+  );
+  const bootstrap = await authority.adminCreateHostBootstrap();
+  const bootstrapAdmission = await admitHostBootstrap(authority, "live-fence-bootstrap-source");
+  const hostCredential = await authority.bootstrapHost(
+    bootstrapAdmission,
+    "live-fence-bootstrap-source",
+    hostBootstrapInput(bootstrap.bootstrapToken, {
+      bootstrapAttemptId: "live-fence-host-bootstrap",
+    }),
+  );
+  const hostAuthorization = await authority.authorizeAccessToken(
+    hostCredential.body.accessToken,
+    "host",
+  );
+  assert.deepEqual(Object.keys(hostAuthorization).sort(), [
+    "authorizationFence",
+    "authorizationRevision",
+    "clientInstanceId",
+    "expiresAtMs",
+    "grantId",
+    "hostId",
+    "jti",
+    "kid",
+    "principalId",
+    "role",
+    "scheme",
+  ]);
+
+  const enrollment = await authority.handle({
+    type: "enrollment.create",
+    requestId: "live-fence-enrollment-request",
+    connectorId: "live-fence-connector",
+    payload: { expiresInMs: 300_000, deviceLabel: "test-device" },
+    currentAuthContext: hostAuthorization,
+  });
+  assert.equal(enrollment.outcome, "success");
+  const enrollmentAdmission = await authority.admitHttpSource({
+    endpoint: "enrollment_redeem",
+    sourceKey: "live-fence-enrollment-source",
+  });
+  const clientCredential = await authority.redeemEnrollment(
+    enrollmentAdmission,
+    "live-fence-enrollment-source",
+    {
+      exchangeAttemptId: "live-fence-exchange-attempt",
+      enrollmentId: enrollment.response.payload.enrollmentId,
+      enrollmentCode: enrollment.response.payload.enrollmentCode,
+      clientInstanceId: "live-fence-client-instance",
+      deviceLabel: "test-device",
+    },
+  );
+  const clientAuthorization = await authority.authorizeAccessToken(
+    clientCredential.body.accessToken,
+    "client",
+  );
+  await assert.rejects(
+    authority.authorizeAccessToken(clientCredential.body.accessToken, "host"),
+    errorCode("ROLE_MISMATCH"),
+  );
+  const wrongHost = await authority.handle({
+    type: "grant.revoke",
+    requestId: "live-fence-wrong-host",
+    connectorId: "live-fence-connector",
+    payload: { grantId: clientAuthorization.grantId, reason: "user_revoked" },
+    currentAuthContext: { ...hostAuthorization, hostId: "different-host" },
+  });
+  assert.equal(wrongHost.outcome, "reject");
+  assert.equal(wrongHost.error.code, "PERMISSION_DENIED");
+
+  trackedOperation = "grant_revoke";
+  const revoked = await authority.handle({
+    type: "grant.revoke",
+    requestId: "live-fence-revoke-request",
+    connectorId: "live-fence-connector",
+    payload: { grantId: clientAuthorization.grantId, reason: "user_revoked" },
+    currentAuthContext: hostAuthorization,
+  });
+  trackedOperation = null;
+  assert.equal(revoked.outcome, "success");
+  assert.deepEqual(revoked.response.payload, {
+    grantId: clientAuthorization.grantId,
+    revokedAtMs: NOW_MS,
+    alreadyRevoked: false,
+  });
+  assert.deepEqual(
+    fenceEvents.slice(-3).map((event) => event.type),
+    ["pending", "durable_publish", "committed"],
+  );
+  assert.deepEqual(fenceEvents.at(-3).invalidation, {
+    reason: "grant_revoked",
+    role: "client",
+    hostId: clientAuthorization.hostId,
+    grantId: clientAuthorization.grantId,
+  });
+  await assert.rejects(
+    authority.authorizeAccessToken(clientCredential.body.accessToken, "client"),
+    errorCode("PERMISSION_DENIED"),
+  );
+  const fenceEventCount = fenceEvents.length;
+  const replayed = await authority.handle({
+    type: "grant.revoke",
+    requestId: "live-fence-revoke-request",
+    connectorId: "live-fence-connector",
+    payload: { grantId: clientAuthorization.grantId, reason: "user_revoked" },
+    currentAuthContext: hostAuthorization,
+  });
+  assert.equal(replayed.outcome, "success");
+  assert.deepEqual(replayed.response, revoked.response);
+  assert.equal(fenceEvents.length, fenceEventCount);
+  const alreadyRevoked = await authority.handle({
+    type: "grant.revoke",
+    requestId: "live-fence-revoke-query",
+    connectorId: "live-fence-connector",
+    payload: { grantId: clientAuthorization.grantId, reason: "user_revoked" },
+    currentAuthContext: hostAuthorization,
+  });
+  assert.equal(alreadyRevoked.outcome, "success");
+  assert.equal(alreadyRevoked.response.payload.alreadyRevoked, true);
+  assert.equal(alreadyRevoked.response.payload.revokedAtMs, NOW_MS);
+  assert.equal(fenceEvents.length, fenceEventCount);
+  const hostGrantRevoke = await authority.handle({
+    type: "grant.revoke",
+    requestId: "live-fence-host-grant-revoke",
+    connectorId: "live-fence-connector",
+    payload: { grantId: hostAuthorization.grantId, reason: "user_revoked" },
+    currentAuthContext: hostAuthorization,
+  });
+  assert.equal(hostGrantRevoke.outcome, "reject");
+  assert.equal(hostGrantRevoke.error.code, "PERMISSION_DENIED");
+
+  await authority.adminRotateIssuerKey({
+    kid: "live-fence-next-kid",
+    secretBase64url: Buffer.alloc(32, 19).toString("base64url"),
+  });
+  trackedOperation = "kid_removal";
+  await authority.adminRemoveIssuerKey({ kid: "credential-test-kid", emergency: true });
+  trackedOperation = null;
+  assert.deepEqual(
+    fenceEvents.slice(-3).map((event) => event.type),
+    ["pending", "durable_publish", "committed"],
+  );
+  assert.deepEqual(fenceEvents.at(-3).invalidation, {
+    reason: "kid_removed",
+    kid: "credential-test-kid",
+  });
+  await assert.rejects(
+    authority.authorizeAccessToken(hostCredential.body.accessToken, "host"),
+    errorCode("AUTH_INVALID"),
+  );
+  const serializedFenceEvents = JSON.stringify(fenceEvents);
+  assert.equal(serializedFenceEvents.includes(hostCredential.body.accessToken), false);
+  assert.equal(serializedFenceEvents.includes(hostCredential.body.refreshToken), false);
+  assert.equal(serializedFenceEvents.includes(enrollment.response.payload.enrollmentCode), false);
+  await authority.close();
+});
+
+test("live fence publication failures preserve the durable commit boundary", async (t) => {
+  await t.test("missing fence rejects before publication and stays ready", async () => {
+    const store = new InMemoryRelayV2BrokerCredentialStateStore();
+    const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(store, new MemoryContinuityAuthority(), { idPrefix: "missing-fence" }),
+    );
+    await authority.adminRotateIssuerKey({
+      kid: "missing-fence-next-kid",
+      secretBase64url: Buffer.alloc(32, 23).toString("base64url"),
+    });
+    const beforeBytes = store.snapshotBytes();
+    const beforeCompares = store.compareAndPublishCalls;
+    await assert.rejects(
+      authority.adminRemoveIssuerKey({ kid: "credential-test-kid", emergency: true }),
+      errorCode("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"),
+    );
+    assert.deepEqual(store.snapshotBytes(), beforeBytes);
+    assert.equal(store.compareAndPublishCalls, beforeCompares);
+    assert.equal(authority.authorityContinuityReadiness.status, "ready");
+    await authority.close();
+  });
+
+  await t.test("throwing begin rejects before publication and stays ready", async () => {
+    const store = new InMemoryRelayV2BrokerCredentialStateStore();
+    let beginCalls = 0;
+    let authorityFailClosedCalls = 0;
+    const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(store, new MemoryContinuityAuthority(), {
+        idPrefix: "throwing-fence-begin",
+        liveAuthorizationFence: {
+          begin() {
+            beginCalls += 1;
+            throw new Error("injected fence begin failure");
+          },
+          failClosed() {
+            authorityFailClosedCalls += 1;
+          },
+        },
+      }),
+    );
+    await authority.adminRotateIssuerKey({
+      kid: "throwing-fence-next-kid",
+      secretBase64url: Buffer.alloc(32, 24).toString("base64url"),
+    });
+    const beforeBytes = store.snapshotBytes();
+    const beforeCompares = store.compareAndPublishCalls;
+    await assert.rejects(
+      authority.adminRemoveIssuerKey({ kid: "credential-test-kid", emergency: true }),
+      errorCode("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"),
+    );
+    assert.equal(beginCalls, 1);
+    assert.deepEqual(store.snapshotBytes(), beforeBytes);
+    assert.equal(store.compareAndPublishCalls, beforeCompares);
+    assert.equal(authorityFailClosedCalls, 0);
+    assert.equal(authority.authorityContinuityReadiness.status, "ready");
+    await authority.close();
+    assert.equal(authorityFailClosedCalls, 1);
+  });
+
+  const malformedBarriers = [
+    {
+      name: "null barrier",
+      create: () => null,
+      getterCalls: () => 0,
+    },
+    {
+      name: "incomplete barrier",
+      create: () => ({ committed() {}, cancelled() {} }),
+      getterCalls: () => 0,
+    },
+    (() => {
+      let getterCalls = 0;
+      return {
+        name: "accessor barrier",
+        create: () => {
+          const barrier = {};
+          Object.defineProperties(barrier, {
+            committed: {
+              enumerable: true,
+              get() {
+                getterCalls += 1;
+                return () => {};
+              },
+            },
+            cancelled: { enumerable: true, value() {} },
+            failClosed: { enumerable: true, value() {} },
+          });
+          return barrier;
+        },
+        getterCalls: () => getterCalls,
+      };
+    })(),
+  ];
+  for (const item of malformedBarriers) {
+    await t.test(`${item.name} withdraws without publication`, async () => {
+      const store = new InMemoryRelayV2BrokerCredentialStateStore();
+      let authority;
+      let failClosedCalls = 0;
+      let readinessAtFailClosed;
+      authority = await credential.RelayV2BrokerCredentialAuthority.open(
+        authorityOptions(store, new MemoryContinuityAuthority(), {
+          idPrefix: item.name.replaceAll(" ", "-"),
+          liveAuthorizationFence: {
+            begin() {
+              return item.create();
+            },
+            failClosed() {
+              failClosedCalls += 1;
+              readinessAtFailClosed = authority.authorityContinuityReadiness;
+            },
+          },
+        }),
+      );
+      await authority.adminRotateIssuerKey({
+        kid: `${item.name.replaceAll(" ", "-")}-next-kid`,
+        secretBase64url: Buffer.alloc(32, 26).toString("base64url"),
+      });
+      const beforeBytes = store.snapshotBytes();
+      const beforeCompares = store.compareAndPublishCalls;
+      await assert.rejects(
+        authority.adminRemoveIssuerKey({ kid: "credential-test-kid", emergency: true }),
+        errorCode("LIVE_AUTHORIZATION_FENCE_UNAVAILABLE"),
+      );
+      assert.deepEqual(store.snapshotBytes(), beforeBytes);
+      assert.equal(store.compareAndPublishCalls, beforeCompares);
+      assert.equal(item.getterCalls(), 0);
+      assert.equal(failClosedCalls, 1);
+      assert.equal(readinessAtFailClosed.status, "withdrawn");
+      assert.equal(authority.authorityContinuityReadiness.status, "closed");
+      assert.equal(store.closeCalls, 1);
+    });
+  }
+
+  await t.test("uncertain publication fails the pending barrier and withdraws authority", async () => {
+    const store = new InMemoryRelayV2BrokerCredentialStateStore();
+    const events = [];
+    const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+      authorityOptions(store, new MemoryContinuityAuthority(), {
+        idPrefix: "uncertain-live-fence",
+        liveAuthorizationFence: {
+          begin(invalidation) {
+            events.push({ type: "begin", invalidation });
+            return {
+              committed(receipt) {
+                events.push({ type: "committed", receipt });
+              },
+              cancelled() {
+                events.push({ type: "cancelled" });
+              },
+              failClosed() {
+                events.push({ type: "barrier_fail_closed" });
+              },
+            };
+          },
+          failClosed() {
+            events.push({ type: "authority_fail_closed" });
+            throw new Error("injected authority fence notification failure");
+          },
+        },
+      }),
+    );
+    await authority.adminRotateIssuerKey({
+      kid: "uncertain-live-fence-next-kid",
+      secretBase64url: Buffer.alloc(32, 25).toString("base64url"),
+    });
+    store.onCompareAndPublish = ({ defaultPublish }) => {
+      defaultPublish();
+      throw new Error("injected post-publication uncertainty");
+    };
+    await assert.rejects(
+      authority.adminRemoveIssuerKey({ kid: "credential-test-kid", emergency: true }),
+      errorCode("STORE_PUBLICATION_UNCERTAIN"),
+    );
+    assert.deepEqual(
+      events.map((event) => event.type),
+      ["begin", "barrier_fail_closed", "authority_fail_closed"],
+    );
+    assert.equal(events.some((event) => event.type === "committed"), false);
+    assert.equal(events.some((event) => event.type === "cancelled"), false);
+    assert.equal(authority.authorityContinuityReadiness.status, "closed");
+    assert.equal(store.closeCalls, 1);
+  });
 });
 
 test("carrier and token authorization preserve frozen error classifications on reachable empty state", async () => {

@@ -1,7 +1,7 @@
-import type { RelayV2AuthContext } from "./auth.js";
 import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
   type RelayV2BrokerAction,
+  type RelayV2BrokerConnectionAuthorization,
   type RelayV2BrokerResult,
   type RelayV2CarrierDelivery,
   type RelayV2BrokerCore,
@@ -41,7 +41,7 @@ export interface RelayV2CarrierPumpOptions {
   broker: RelayV2BrokerCore;
   host: RelayV2HostCarrierActor;
   transportId: string;
-  hostAuthContext: RelayV2AuthContext;
+  hostAuthContext: RelayV2BrokerConnectionAuthorization;
   credentialReference: string;
   queueLimits?: RelayV2CarrierPumpQueueLimits;
   deliveryTimeoutMs?: number;
