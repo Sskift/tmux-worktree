@@ -1552,13 +1552,24 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             if (oldKey != null && oldKey != key) storageMalformed()
         }
 
+        // The point-hydrated evidence and permanent witness namespaces are disjoint for
+        // one applied event.  Never merge both sides into a synthetic duplicate: a local
+        // corruption containing E xor W violations must abort this operation.
+        val recentBySeq = recentEvidenceByAgentEventSeq(namespace, input.agentEventSeq)
+        val recentById = recentEvidenceByEventId(namespace, input.eventId)
+        val witnessBySeq = witnessByAgentEventSeq(namespace, input.agentEventSeq)
+        val witnessById = witnessByEventId(namespace, input.eventId)
+        if ((recentBySeq != null || recentById != null) &&
+            (witnessBySeq != null || witnessById != null)
+        ) storageMalformed()
+
         listOfNotNull(
-            recentEvidenceByAgentEventSeq(namespace, input.agentEventSeq),
-            recentEvidenceByEventId(namespace, input.eventId),
+            recentBySeq,
+            recentById,
         ).distinct().forEach(::addRecent)
         listOfNotNull(
-            witnessByAgentEventSeq(namespace, input.agentEventSeq),
-            witnessByEventId(namespace, input.eventId),
+            witnessBySeq,
+            witnessById,
         ).distinct().forEach(::addWitness)
 
         val lifecycle = (input.mutation as? AgentTimelineMutation.Lifecycle)?.record
