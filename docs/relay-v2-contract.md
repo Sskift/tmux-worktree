@@ -4,7 +4,7 @@
 
 范围：Android、relay-server、relay-host 的首个可互操作 v2 slice。
 
-当前另有严格、未接线的 `POST /v2/hosts/bootstrap` HTTP ingress foundation，只经窄 port 调用现有 credential authority；它没有 production server/composition/E0 接线，也不产生 ready、enrollment 或 capability。
+当前 credential authority 的 enrollment create/redeem、client/host refresh、host reauthentication 与 host bootstrap API，以及严格的 B1 `POST /v2/hosts/bootstrap` ingress adapter，均已在隔离模块和专项测试中可调用。B1 尚未接 production listener/router/composition/E0，因此这些流程没有外部生产 HTTP 可达路径，不产生 ready/capability，也不能宣告已经交付。
 
 当前仓库的 Dashboard、relay-server、relay-host 和 Android connection actor 仍只运行 Relay v1。Node 与 Android 已有相互独立的 strict v2 codec，共同消费 `contracts/relay/v2` fixture，但尚未接入 broker/host/client runtime。本文定义后续 v2 实现边界；任何一端都不得仅凭本文、fixture 或 codec 存在而发布 v2 capability、生成 v2 配对二维码或把 v1 credential 当作 v2 credential。
 
