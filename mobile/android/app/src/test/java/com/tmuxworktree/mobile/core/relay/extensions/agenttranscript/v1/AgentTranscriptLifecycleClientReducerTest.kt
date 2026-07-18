@@ -1608,6 +1608,298 @@ class AgentTranscriptLifecycleClientReducerTest {
         }
     }
 
+    @Test
+    fun canonicalSnapshotOrderUsesBareUtf8BytesForSupplementaryAndBmpPrivateUseIds() {
+        val supplementary = "\uD800\uDC00"
+        val bmpPrivateUse = "\uE000"
+
+        assertTrue("UTF-16 order must exercise the opposite boundary", supplementary < bmpPrivateUse)
+        assertTrue(
+            "canonical UTF-8 places the BMP private-use identity before the supplementary one",
+            compareCanonicalAgentOrder("7", bmpPrivateUse, "7", supplementary) < 0,
+        )
+        assertTrue(
+            "numeric sequence remains the primary key",
+            compareCanonicalAgentOrder("8", bmpPrivateUse, "7", supplementary) > 0,
+        )
+        val boundedPrefix = listOf(supplementary, bmpPrivateUse)
+            .sortedWith(Comparator { left, right ->
+                compareCanonicalAgentOrder("7", left, "7", right)
+            })
+            .take(1)
+        assertEquals(
+            "a full decision batch must retain the canonical prefix",
+            listOf(bmpPrivateUse),
+            boundedPrefix,
+        )
+    }
+
+    @Test
+    fun permanentLifecycleWitnessRejectsSnapshotRollbackRebindAndPostOmissionResurrection() {
+        val session = fixtureSessionIdentity()
+        val identity = AgentLifecycleIdentity(AgentLifecycleScope.RUN, "run-permanent", null)
+        val limits = AgentTimelineEffectiveLimits(
+            maxTextUtf8Bytes = 65_536,
+            maxPageRecords = 256,
+            eventReplayRetentionMs = 604_800_000,
+            snapshotLeaseMs = 300_000,
+        )
+        fun record(
+            eventId: String,
+            sequence: String,
+            state: AgentLifecycleState,
+            sourceEpoch: String = "source-permanent",
+        ) = AgentLifecycleRecord(
+            lifecycleEventId = eventId,
+            sourceEpoch = sourceEpoch,
+            identity = identity,
+            state = state,
+            failure = null,
+            occurredAtMs = sequence.toLong() * 1_000,
+            agentEventSeq = sequence,
+        )
+        fun snapshotState(committed: AgentLifecycleRecord): AgentTranscriptLifecycleClientState {
+            val witness = AgentLifecycleEventIdentityWitness(
+                eventId = committed.lifecycleEventId,
+                agentEventSeq = committed.agentEventSeq,
+                lifecycleIdentity = committed.identity,
+                sourceEpoch = committed.sourceEpoch,
+                state = committed.state,
+                failure = committed.failure,
+                occurredAtMs = committed.occurredAtMs,
+                closedEventDigest = digestOf("closed-${committed.lifecycleEventId}"),
+            )
+            return AgentTranscriptLifecycleClientState(
+                identity = session,
+                extensionLane = AgentTranscriptLifecycleExtensionState(
+                    support = AgentExtensionSupport.AVAILABLE,
+                    unavailableReason = null,
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    activeSourceEpoch = committed.sourceEpoch,
+                    timelineEpoch = "timeline-permanent",
+                    lastAgentSeq = committed.agentEventSeq,
+                    effectiveHostLimits = limits,
+                    syncState = AgentTimelineSyncState.Snapshot,
+                    notificationBaselineAgentSeq = "0",
+                    lifecycleByIdentity = mapOf(identity to committed),
+                    currentLifecycleIdentityByEventId = mapOf(
+                        committed.lifecycleEventId to identity,
+                    ),
+                    eventWitnessById = mapOf(witness.eventId to witness),
+                    eventIdBySeq = mapOf(witness.agentEventSeq to witness.eventId),
+                ),
+            )
+        }
+
+        val completed = record("event-completed", "2", AgentLifecycleState.COMPLETED)
+        val completedState = snapshotState(completed)
+        val runningState = snapshotState(
+            record("event-running", "2", AgentLifecycleState.RUNNING),
+        )
+        val snapshotConflicts = listOf(
+            Triple(
+                "completed to older running",
+                completedState,
+                record("event-old-running", "1", AgentLifecycleState.RUNNING),
+            ),
+            Triple(
+                "source epoch rebind",
+                runningState,
+                record(
+                    "event-rebound",
+                    "3",
+                    AgentLifecycleState.WAITING_FOR_USER,
+                    sourceEpoch = "source-rebound",
+                ),
+            ),
+        )
+        snapshotConflicts.forEach { (label, inputState, conflictingRecord) ->
+            val conflict = AgentTranscriptLifecycleClientReducer.reduce(
+                inputState,
+                AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                    lineage = AgentTimelineLineage(session, "timeline-permanent"),
+                    localGeneration = "0",
+                    throughAgentSeq = "3",
+                    records = listOf(conflictingRecord),
+                ),
+            )
+            assertEquals(label, AgentClientDisposition.CONTINUITY_CONFLICT, conflict.disposition)
+            assertEquals(label, inputState, conflict.state)
+            assertTrue(label, conflict.syncDirective is AgentTimelineSyncDirective.Snapshot)
+        }
+
+        val roundTripStart = snapshotState(
+            record("event-round-trip-start", "1", AgentLifecycleState.RUNNING),
+        )
+        val roundTripEnd = record(
+            "event-round-trip-end",
+            "3",
+            AgentLifecycleState.RUNNING,
+        )
+        val roundTrip = AgentTranscriptLifecycleClientReducer.reduce(
+            roundTripStart,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(session, "timeline-permanent"),
+                localGeneration = "0",
+                throughAgentSeq = "3",
+                records = listOf(roundTripEnd),
+            ),
+        )
+        assertEquals(AgentClientDisposition.SNAPSHOT_APPLIED, roundTrip.disposition)
+        assertEquals(
+            roundTripEnd,
+            roundTrip.state.extensionLane.lifecycleByIdentity[identity],
+        )
+
+        val omitted = AgentTranscriptLifecycleClientReducer.reduce(
+            runningState,
+            AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                lineage = AgentTimelineLineage(session, "timeline-permanent"),
+                localGeneration = "0",
+                throughAgentSeq = "2",
+                records = emptyList(),
+            ),
+        ).state
+        assertTrue(omitted.extensionLane.lifecycleByIdentity.isEmpty())
+        assertTrue(
+            omitted.extensionLane.eventWitnessById.containsKey("event-running"),
+        )
+
+        AgentEventProvenance.entries.forEach { provenance ->
+            val inputState = if (provenance == AgentEventProvenance.REPLAY) {
+                omitted.copy(
+                    extensionLane = omitted.extensionLane.copy(
+                        syncState = AgentTimelineSyncState.Replay(
+                            observedCurrentAgentSeq = "3",
+                            observedStatusEarliestReplaySeq = "1",
+                            pageFence = AgentReplayPageFence(
+                                localGeneration = omitted.extensionLane.localGeneration,
+                                stableAfterAgentSeq = "2",
+                                currentRequestNetworkToken = "replay-permanent",
+                                pinnedReplayThroughAgentSeq = null,
+                                expectedNextCursor = null,
+                                requestedLimit = 256,
+                            ),
+                        ),
+                    ),
+                )
+            } else {
+                omitted
+            }
+            val resurrected = record(
+                "event-resurrected-$provenance",
+                "3",
+                AgentLifecycleState.WAITING_FOR_USER,
+            )
+            val conflict = AgentTranscriptLifecycleClientReducer.reduce(
+                inputState,
+                AgentTranscriptLifecycleClientInput.AgentEvent(
+                    lineage = AgentTimelineLineage(session, "timeline-permanent"),
+                    agentEventSeq = "3",
+                    eventId = resurrected.lifecycleEventId,
+                    closedEventDigest = digestOf("closed-resurrected-$provenance"),
+                    mutation = AgentTimelineMutation.Lifecycle(resurrected),
+                    provenance = provenance,
+                ),
+            )
+            assertEquals(
+                provenance.name,
+                AgentClientDisposition.CONTINUITY_CONFLICT,
+                conflict.disposition,
+            )
+            assertEquals(provenance.name, "2", conflict.state.extensionLane.lastAgentSeq)
+            assertTrue(provenance.name, conflict.state.extensionLane.lifecycleByIdentity.isEmpty())
+            assertEquals(
+                provenance.name,
+                AgentTimelineSyncState.Snapshot,
+                conflict.state.extensionLane.syncState,
+            )
+        }
+    }
+
+    @Test
+    fun persistedPermanentWitnessChainsRejectCorruptionAndAllowSnapshotRoundTrip() {
+        val identity = AgentLifecycleIdentity(AgentLifecycleScope.RUN, "run-chain", null)
+        fun witness(
+            eventId: String,
+            sequence: String,
+            state: AgentLifecycleState,
+            sourceEpoch: String = "source-chain",
+            actual: Boolean = true,
+        ) = AgentLifecycleEventIdentityWitness(
+            eventId = eventId,
+            agentEventSeq = sequence,
+            lifecycleIdentity = identity,
+            sourceEpoch = sourceEpoch,
+            state = state,
+            failure = null,
+            occurredAtMs = sequence.toLong() * 1_000,
+            closedEventDigest = if (actual) digestOf("closed-$eventId") else null,
+        )
+        fun extension(
+            witnesses: List<AgentLifecycleEventIdentityWitness>,
+            current: AgentLifecycleRecord? = null,
+        ) = AgentTranscriptLifecycleExtensionState(
+            lastAgentSeq = witnesses.maxOf { it.agentEventSeq.toLong() }.toString(),
+            lifecycleByIdentity = current?.let { mapOf(identity to it) } ?: emptyMap(),
+            currentLifecycleIdentityByEventId = current?.let {
+                mapOf(it.lifecycleEventId to identity)
+            } ?: emptyMap(),
+            eventWitnessById = witnesses.associateBy(AgentLifecycleEventIdentityWitness::eventId),
+            eventIdBySeq = witnesses.associate {
+                it.agentEventSeq to it.eventId
+            },
+        )
+
+        val corruptChains = listOf(
+            "terminal successor" to listOf(
+                witness("event-running", "1", AgentLifecycleState.RUNNING),
+                witness("event-completed", "2", AgentLifecycleState.COMPLETED),
+                witness("event-after-terminal", "3", AgentLifecycleState.RUNNING),
+            ),
+            "source rebind" to listOf(
+                witness("event-source-running", "1", AgentLifecycleState.RUNNING),
+                witness(
+                    "event-source-waiting",
+                    "2",
+                    AgentLifecycleState.WAITING_FOR_USER,
+                    sourceEpoch = "source-rebound",
+                ),
+            ),
+            "actual first non-running" to listOf(
+                witness("event-first-waiting", "1", AgentLifecycleState.WAITING_FOR_USER),
+            ),
+        )
+        corruptChains.forEach { (label, witnesses) ->
+            assertTrue(
+                label,
+                runCatching { extension(witnesses) }.exceptionOrNull() is
+                    IllegalArgumentException,
+            )
+        }
+
+        val start = witness("event-snapshot-start", "1", AgentLifecycleState.RUNNING)
+        val snapshotTail = witness(
+            "event-snapshot-tail",
+            "3",
+            AgentLifecycleState.RUNNING,
+            actual = false,
+        )
+        val current = AgentLifecycleRecord(
+            lifecycleEventId = snapshotTail.eventId,
+            sourceEpoch = snapshotTail.sourceEpoch,
+            identity = identity,
+            state = snapshotTail.state,
+            failure = snapshotTail.failure,
+            occurredAtMs = snapshotTail.occurredAtMs,
+            agentEventSeq = snapshotTail.agentEventSeq,
+        )
+        assertEquals(
+            current,
+            extension(listOf(start, snapshotTail), current).lifecycleByIdentity[identity],
+        )
+    }
+
     private fun assertEveryExpectation(
         label: String,
         expected: Map<String, Any?>,

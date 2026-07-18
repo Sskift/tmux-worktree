@@ -1,7 +1,19 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineEventRecord
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityMutation
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityReason
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTimelineSourceAvailabilityState
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec.AgentTranscriptLifecycleV1Codec
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptEntryEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptPendingEventEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptSnapshotRecordEntity
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2AgentTranscriptSnapshotStagingEntity
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2EncodedPayload
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageJson
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StorageException
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.security.MessageDigest
 import java.util.Base64
 import kotlinx.coroutines.runBlocking
@@ -10,6 +22,47 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class AgentTranscriptLifecycleDurableRepositoryCoreTest {
+    @Test
+    fun `closed artifact factory derives domain and rejects noncanonical bytes`() {
+        val codec = AgentTranscriptLifecycleV1Codec()
+        val factory = AgentTranscriptLifecycleClosedArtifactFactory(codec)
+        val publicRecord = AgentTimelineEventRecord(
+            agentEventSeq = "1",
+            eventId = "event-1",
+            occurredAtMs = 1_000,
+            mutation = AgentTimelineSourceAvailabilityMutation(
+                state = AgentTimelineSourceAvailabilityState.INTERRUPTED,
+                sourceEpoch = "source-1",
+                reason = AgentTimelineSourceAvailabilityReason.SOURCE_DISCONNECTED,
+            ),
+        )
+        val canonical = codec.encodeCanonicalEventRecord(publicRecord)
+        val closed = factory.closeEvent(
+            lineage = AgentTimelineLineage(consumer().sessionIdentity, "timeline-1"),
+            provenance = AgentEventProvenance.LIVE,
+            canonicalBytes = canonical,
+            rawUtf8Bytes = canonical.size,
+        )
+
+        assertEquals(publicRecord.agentEventSeq, closed.input.agentEventSeq)
+        assertEquals(publicRecord.eventId, closed.input.eventId)
+        assertTrue(closed.input.mutation is AgentTimelineMutation.SourceAvailability)
+
+        val noncanonical = closed.canonicalJson
+            .replaceFirst("{\"agentEventSeq\":\"1\",\"eventId\":\"event-1\"", "{\"eventId\":\"event-1\",\"agentEventSeq\":\"1\"")
+            .toByteArray(Charsets.UTF_8)
+        assertTrue(
+            runCatching {
+                factory.closeEvent(
+                    lineage = closed.input.lineage,
+                    provenance = AgentEventProvenance.LIVE,
+                    canonicalBytes = noncanonical,
+                    rawUtf8Bytes = noncanonical.size,
+                )
+            }.exceptionOrNull() is IllegalArgumentException,
+        )
+    }
+
     @Test
     fun `storage identity boundary rejects malformed and oversized UTF8`() {
         val invalid = listOf(
@@ -112,6 +165,115 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
         assertEquals(state, repository.load(consumer)?.state)
         assertEquals(writesAfterCreate, store.writeCount)
     }
+
+    @Test
+    fun `available status rejects every non session authority mismatch before durable writes`() =
+        runBlocking {
+            val expectedConsumer = consumer()
+            val authorityCases = listOf(
+                "old activation generation" to expectedConsumer.copy(
+                    profileActivationGeneration = expectedConsumer.profileActivationGeneration - 1,
+                ),
+                "different principal" to expectedConsumer.copy(principalId = "principal-stale"),
+                "different client instance" to expectedConsumer.copy(
+                    clientInstanceId = "client-stale",
+                ),
+            )
+
+            authorityCases.forEach { (label, inputAuthority) ->
+                val store = MemoryStore()
+                val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+                val state = richState(expectedConsumer, "timeline-a")
+                val namespace = namespace(expectedConsumer, state)
+                repository.initializeUnderApplyLease(namespace, state)
+                val writesBeforeStatus = store.writeCount
+
+                val failure = runCatching {
+                    repository.reduceUnderApplyLease(
+                        namespace,
+                        AgentTranscriptLifecycleClientInput.StatusAvailable(
+                            authority = inputAuthority,
+                            lineage = AgentTimelineLineage(
+                                expectedConsumer.sessionIdentity,
+                                "timeline-a",
+                            ),
+                            requestFence = requireNotNull(
+                                state.extensionLane.pendingStatusRequest,
+                            ),
+                            liveSource = AgentLiveSourceState.CONNECTED,
+                            activeSourceEpoch = "source-a",
+                            currentAgentSeq = "2",
+                            earliestReplaySeq = "1",
+                            hostLimits = productionHostLimits(),
+                        ),
+                    )
+                }.exceptionOrNull()
+
+                assertTrue(label, failure is AgentTranscriptLifecyclePersistenceConflictException)
+                assertEquals(label, writesBeforeStatus, store.writeCount)
+                assertEquals(label, state, repository.load(expectedConsumer)?.state)
+            }
+        }
+
+    @Test
+    fun `legacy available text only cut requires fresh snapshot despite matching status cursor`() =
+        runBlocking {
+            val consumer = consumer()
+            val completeState = richState(consumer, "timeline-a")
+            val legacyTextOnlyState = completeState.copy(
+                extensionLane = completeState.extensionLane.copy(
+                    lifecycleByIdentity = emptyMap(),
+                    currentLifecycleIdentityByEventId = emptyMap(),
+                    runsWithTurnRecords = emptySet(),
+                    appliedEventsBySeq = emptyMap(),
+                    eventWitnessById = emptyMap(),
+                    eventIdBySeq = emptyMap(),
+                    notificationLedger = emptyMap(),
+                    notificationKeyByLifecycleEventId = emptyMap(),
+                    notificationBaselineAgentSeq = "2",
+                    snapshotNotificationSuppressedThroughAgentSeq = null,
+                    pendingStatusRequest = null,
+                    syncState = AgentTimelineSyncState.Current,
+                ),
+            )
+            val namespace = namespace(consumer, legacyTextOnlyState)
+            val store = MemoryStore()
+            val repository = AgentTranscriptLifecycleDurableRepositoryCore(store)
+            repository.initializeUnderApplyLease(namespace, legacyTextOnlyState)
+            store.mutatePayload(consumer, ::encodeAsLegacyV1)
+
+            val migrated = requireNotNull(repository.load(consumer)).state
+            assertEquals("2", migrated.extensionLane.lastAgentSeq)
+            assertEquals(AgentSnapshotCheckpoint("2", "2"), migrated.extensionLane.snapshotCheckpoint)
+            assertEquals("2", migrated.extensionLane.notificationBaselineAgentSeq)
+            assertEquals("2", migrated.extensionLane.snapshotNotificationSuppressedThroughAgentSeq)
+            assertEquals(
+                AgentTimelineSyncState.StatusRefresh(requireSnapshotAfterRefresh = true),
+                migrated.extensionLane.syncState,
+            )
+
+            val requested = repository.reduceUnderApplyLease(
+                namespace,
+                AgentTranscriptLifecycleClientInput.StatusRequestStarted("legacy-status"),
+            ).state
+            val status = repository.reduceUnderApplyLease(
+                namespace,
+                AgentTranscriptLifecycleClientInput.StatusAvailable(
+                    authority = consumer,
+                    lineage = AgentTimelineLineage(consumer.sessionIdentity, "timeline-a"),
+                    requestFence = requireNotNull(requested.extensionLane.pendingStatusRequest),
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    activeSourceEpoch = "source-a",
+                    currentAgentSeq = "2",
+                    earliestReplaySeq = "1",
+                    hostLimits = productionHostLimits(),
+                ),
+            )
+
+            assertEquals(AgentTimelineSyncState.Snapshot, status.state.extensionLane.syncState)
+            assertTrue(status.syncDirective is AgentTimelineSyncDirective.Snapshot)
+            assertEquals("2", status.state.extensionLane.lastAgentSeq)
+        }
 
     @Test
     fun `integrity codec and identity corruption fail closed without repair writes`() = runBlocking {
@@ -565,9 +727,14 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             it.namespace.consumer == consumer
         }
 
-        override fun deleteConsumer(consumer: AgentTranscriptLifecycleDurableConsumerIdentity) {
-            val removed = rows.removeAll { it.namespace.consumer == consumer }
+        override fun stateCount(
+            consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
+        ): Long = rows.count { it.namespace.consumer == consumer }.toLong()
+
+        override fun deleteState(namespace: AgentTranscriptLifecycleDurableNamespace): Int {
+            val removed = rows.removeAll { it.namespace == namespace }
             if (removed) writeCount += 1
+            return if (removed) 1 else 0
         }
 
         override fun insertState(state: AgentTranscriptLifecyclePersistedState) {
@@ -579,6 +746,69 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             rows += state
             writeCount += 1
         }
+
+        override fun entryCount(namespace: AgentTranscriptLifecycleDurableNamespace): Long = 0
+
+        override fun entries(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+        ): List<RelayV2AgentTranscriptEntryEntity> = emptyList()
+
+        override fun insertEntry(entry: RelayV2AgentTranscriptEntryEntity) =
+            error("entry store is not used by this test fixture")
+
+        override fun compareAndSetEntry(
+            expected: RelayV2AgentTranscriptEntryEntity,
+            next: RelayV2AgentTranscriptEntryEntity,
+        ): Int = error("entry store is not used by this test fixture")
+
+        override fun deleteEntries(namespace: AgentTranscriptLifecycleDurableNamespace): Int = 0
+
+        override fun snapshotCount(namespace: AgentTranscriptLifecycleDurableNamespace): Long = 0
+
+        override fun snapshots(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+        ): List<RelayV2AgentTranscriptSnapshotStagingEntity> = emptyList()
+
+        override fun insertSnapshot(snapshot: RelayV2AgentTranscriptSnapshotStagingEntity) =
+            error("snapshot store is not used by this test fixture")
+
+        override fun compareAndSetSnapshot(
+            expected: RelayV2AgentTranscriptSnapshotStagingEntity,
+            next: RelayV2AgentTranscriptSnapshotStagingEntity,
+        ): Int = error("snapshot store is not used by this test fixture")
+
+        override fun deleteSnapshot(snapshot: RelayV2AgentTranscriptSnapshotStagingEntity): Int = 0
+
+        override fun snapshotRecordCount(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+            snapshotId: String,
+        ): Long = 0
+
+        override fun snapshotRecords(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+            snapshotId: String,
+        ): List<RelayV2AgentTranscriptSnapshotRecordEntity> = emptyList()
+
+        override fun insertSnapshotRecords(
+            records: List<RelayV2AgentTranscriptSnapshotRecordEntity>,
+        ) = error("snapshot record store is not used by this test fixture")
+
+        override fun pendingEventCount(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+        ): Long = 0
+
+        override fun pendingEvents(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+        ): List<RelayV2AgentTranscriptPendingEventEntity> = emptyList()
+
+        override fun insertPendingEvent(event: RelayV2AgentTranscriptPendingEventEntity) =
+            error("pending event store is not used by this test fixture")
+
+        override fun deletePendingEvent(event: RelayV2AgentTranscriptPendingEventEntity): Int = 0
+
+        override fun deletePendingEvents(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+        ): Int = 0
 
         override fun notificationClaims(
             eventIdentity: AgentTranscriptLifecycleNotificationClaimEventIdentity,
@@ -701,6 +931,8 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 "source-a",
                 runIdentity,
                 AgentLifecycleState.RUNNING,
+                null,
+                1_000,
                 "1",
             )
             val turnRecord = AgentLifecycleRecord(
@@ -708,6 +940,8 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 "source-a",
                 turnIdentity,
                 AgentLifecycleState.WAITING_FOR_USER,
+                null,
+                2_000,
                 "2",
             )
             val runWitness = witness(runRecord, "closed-run")
@@ -732,6 +966,7 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                     activeSourceEpoch = "source-a",
                     timelineEpoch = timelineEpoch,
                     lastAgentSeq = "2",
+                    effectiveHostLimits = productionHostLimits(),
                     notificationBaselineAgentSeq = "0",
                     lifecycleByIdentity = linkedMapOf(
                         runIdentity to runRecord,
@@ -791,7 +1026,17 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
                 sequence,
                 eventId,
                 digest(fingerprint),
-                AgentLifecycleRecord(eventId, "source-a", identity, state, sequence),
+                AgentTimelineMutation.Lifecycle(
+                    AgentLifecycleRecord(
+                        eventId,
+                        "source-a",
+                        identity,
+                        state,
+                        null,
+                        sequence.toLong() * 1_000,
+                        sequence,
+                    ),
+                ),
                 AgentEventProvenance.LIVE,
             )
         }
@@ -805,8 +1050,39 @@ class AgentTranscriptLifecycleDurableRepositoryCoreTest {
             record.identity,
             record.sourceEpoch,
             record.state,
+            record.failure,
+            record.occurredAtMs,
             digest(fingerprint),
         )
+
+        fun productionHostLimits() = AgentTimelineEffectiveLimits(
+            maxTextUtf8Bytes = 65_536,
+            maxPageRecords = 256,
+            eventReplayRetentionMs = 604_800_000,
+            snapshotLeaseMs = 300_000,
+        )
+
+        fun encodeAsLegacyV1(payload: RelayV2EncodedPayload): RelayV2EncodedPayload {
+            val root = RelayV2StrictJson.parseObject(
+                payload.canonicalJson,
+                RelayV2JsonLimits(
+                    maxDepth = 32,
+                    maxDirectKeys = 256,
+                    maxTotalKeys = 32_768,
+                    maxNodes = 100_000,
+                ),
+            ).toMutableMap()
+            @Suppress("UNCHECKED_CAST")
+            val state = (root.getValue("state") as Map<String, Any?>).toMutableMap()
+            @Suppress("UNCHECKED_CAST")
+            val extension = (state.getValue("extension") as Map<String, Any?>).toMutableMap()
+            extension.remove("effectiveHostLimits")
+            extension.remove("syncState")
+            extension["requiresSnapshot"] = false
+            state["extension"] = extension
+            root["state"] = state
+            return RelayV2StorageJson.encode(codecVersion = 1, value = root)
+        }
 
         fun digest(value: String): AgentClosedEventDigest = AgentClosedEventDigest(
             Base64.getUrlEncoder().withoutPadding().encodeToString(

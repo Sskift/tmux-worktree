@@ -1364,7 +1364,7 @@ private fun canonicalArrayBytes(canonicalRecords: List<String>): Long =
     2L + canonicalRecords.sumOf { it.toByteArray(Charsets.UTF_8).size.toLong() } +
         max(0, canonicalRecords.size - 1)
 
-private fun canonicalArrayBytes(recordCount: Long, recordJsonBytes: Long): Long =
+internal fun canonicalArrayBytes(recordCount: Long, recordJsonBytes: Long): Long =
     2L + recordJsonBytes + max(0L, recordCount - 1)
 
 private fun canonicalJsonBytesFromArray(totalCanonicalBytes: Long, recordCount: Long): Long =

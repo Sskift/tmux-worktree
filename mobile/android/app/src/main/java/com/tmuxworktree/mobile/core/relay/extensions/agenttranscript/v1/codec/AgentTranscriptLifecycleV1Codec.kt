@@ -1,5 +1,6 @@
 package com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
 
+import com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.isValidAgentTimelineCursor
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonException
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonLimits
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2JsonObject
@@ -16,6 +17,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.jsonObject
 import com.tmuxworktree.mobile.core.relay.v2.codec.jsonOneOf
 import com.tmuxworktree.mobile.core.relay.v2.codec.required
 import com.tmuxworktree.mobile.core.relay.v2.codec.schemaFailure
+import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 import java.math.BigInteger
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
@@ -91,6 +93,48 @@ class AgentTranscriptLifecycleV1Codec {
         decodePublicFrame(bytes)
         bytes
     }
+
+    /** Canonical closed event bytes reused by the durable pending-event owner. */
+    fun encodeCanonicalEventRecord(record: AgentTimelineEventRecord): ByteArray =
+        mapCodecFailures {
+            val wireObject = record.toWireObject()
+            if (decodeEventRecord(wireObject) != record) schemaFailure("event-roundtrip")
+            val bytes = RelayV2StrictJson.stringify(wireObject)
+                .toByteArray(StandardCharsets.UTF_8)
+            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
+            if (decodeCanonicalEventRecord(bytes) != record) schemaFailure("event-roundtrip")
+            bytes
+        }
+
+    /** Strict decode for a persisted canonical closed event; no second event codec exists. */
+    fun decodeCanonicalEventRecord(bytes: ByteArray): AgentTimelineEventRecord =
+        mapCodecFailures {
+            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
+            val source = RelayV2StrictJson.decodeUtf8(bytes)
+            decodeEventRecord(RelayV2StrictJson.parseObject(source, PAGED_JSON_LIMITS))
+        }
+
+    /** Canonical snapshot-record bytes reused by Room C and materialized entry validation. */
+    fun encodeCanonicalSnapshotRecord(record: AgentTimelineSnapshotRecord): ByteArray =
+        mapCodecFailures {
+            val wireObject = record.toWireObject()
+            if (decodeSnapshotRecord(wireObject) != record) schemaFailure("record-roundtrip")
+            val bytes = RelayV2StrictJson.stringify(wireObject)
+                .toByteArray(StandardCharsets.UTF_8)
+            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
+            if (decodeCanonicalSnapshotRecord(bytes) != record) {
+                schemaFailure("record-roundtrip")
+            }
+            bytes
+        }
+
+    /** Strict decode for one persisted Room-C/A canonical record. */
+    fun decodeCanonicalSnapshotRecord(bytes: ByteArray): AgentTimelineSnapshotRecord =
+        mapCodecFailures {
+            if (bytes.size > MAX_PUBLIC_FRAME_BYTES) schemaFailure("frame-limit")
+            val source = RelayV2StrictJson.decodeUtf8(bytes)
+            decodeSnapshotRecord(RelayV2StrictJson.parseObject(source, PAGED_JSON_LIMITS))
+        }
 
     private fun decodeFrame(frame: RelayV2JsonObject): AgentTranscriptLifecycleV1Frame {
         val type = extensionString(required(frame, "type"), maxBytes = MAX_ID_BYTES)
@@ -903,13 +947,17 @@ class AgentTranscriptLifecycleV1Codec {
         failureClass = "id-byte-limit",
     )
 
-    private fun opaqueCursor(value: Any?): String = extensionString(
-        value = value,
-        allowEmpty = false,
-        allowOuterWhitespace = false,
-        maxBytes = MAX_CURSOR_BYTES,
-        failureClass = "id-byte-limit",
-    )
+    private fun opaqueCursor(value: Any?): String {
+        val decoded = extensionString(
+            value = value,
+            allowEmpty = false,
+            allowOuterWhitespace = false,
+            maxBytes = RelayV2StateLimits.MAX_CURSOR_UTF8_BYTES,
+            failureClass = "id-byte-limit",
+        )
+        if (!isValidAgentTimelineCursor(decoded)) schemaFailure("id-byte-limit")
+        return decoded
+    }
 
     private fun contentText(value: Any?, maxBytes: Int): String = extensionString(
         value = value,
@@ -975,7 +1023,6 @@ class AgentTranscriptLifecycleV1Codec {
 
         private const val CAPABILITY = "agent.transcript-lifecycle.v1"
         private const val MAX_ID_BYTES = 128
-        private const val MAX_CURSOR_BYTES = 128
         private const val MAX_ERROR_MESSAGE_UTF8_BYTES = 4_096
         private const val MIN_EVENT_REPLAY_RETENTION_MS = 86_400_000L
 
