@@ -1743,6 +1743,147 @@ test("durable revoke and kid removal commit exact live fences before returning c
   await authority.close();
 });
 
+test("HTTP self-revoke uses only a preauthenticated client context and converges concurrent commits", async () => {
+  let now = NOW_MS;
+  const store = new InMemoryRelayV2BrokerCredentialStateStore();
+  const fenceEvents = [];
+  const authority = await credential.RelayV2BrokerCredentialAuthority.open(
+    authorityOptions(store, new MemoryContinuityAuthority(), {
+      idPrefix: "http-self-revoke",
+      liveAuthorizationFence: {
+        begin(invalidation) {
+          fenceEvents.push({ type: "begin", invalidation });
+          return {
+            committed(receipt) { fenceEvents.push({ type: "committed", receipt }); },
+            cancelled() { fenceEvents.push({ type: "cancelled" }); },
+            failClosed() { fenceEvents.push({ type: "fail_closed" }); },
+          };
+        },
+        failClosed() {},
+      },
+      now: () => now,
+    }),
+  );
+  const bootstrap = await authority.adminCreateHostBootstrap();
+  const bootstrapAdmission = await admitHostBootstrap(authority, "self-revoke-host-source");
+  const hostCredential = await authority.bootstrapHost(
+    bootstrapAdmission,
+    "self-revoke-host-source",
+    hostBootstrapInput(bootstrap.bootstrapToken, {
+      bootstrapAttemptId: "self-revoke-host-bootstrap",
+    }),
+  );
+  const hostAuthorization = await authority.authorizeAccessToken(
+    hostCredential.body.accessToken,
+    "host",
+  );
+  const enrollment = await authority.handle({
+    type: "enrollment.create",
+    requestId: "self-revoke-enrollment",
+    connectorId: "self-revoke-connector",
+    payload: { expiresInMs: 300_000, deviceLabel: "self-revoke-device" },
+    currentAuthContext: hostAuthorization,
+  });
+  assert.equal(enrollment.outcome, "success");
+  const redeemAdmission = await authority.admitHttpSource({
+    endpoint: "enrollment_redeem",
+    sourceKey: "self-revoke-redeem-source",
+  });
+  const clientCredential = await authority.redeemEnrollment(
+    redeemAdmission,
+    "self-revoke-redeem-source",
+    {
+      exchangeAttemptId: "self-revoke-exchange",
+      enrollmentId: enrollment.response.payload.enrollmentId,
+      enrollmentCode: enrollment.response.payload.enrollmentCode,
+      clientInstanceId: "self-revoke-client",
+      deviceLabel: "self-revoke-device",
+    },
+  );
+
+  const expiredAdmission = await authority.admitHttpSource({
+    endpoint: "self_revoke",
+    sourceKey: "self-revoke-expired-source",
+  });
+  const expiredContext = await authority.authorizeAccessToken(
+    clientCredential.body.accessToken,
+    "client",
+  );
+  const beforeExpired = store.compareAndPublishCalls;
+  now += 15_001;
+  await assert.rejects(
+    authority.selfRevokeGrantFromHttp(
+      expiredAdmission,
+      "self-revoke-expired-source",
+      expiredContext,
+      { reason: "user_revoked" },
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+  assert.equal(store.compareAndPublishCalls, beforeExpired);
+  assert.deepEqual(fenceEvents, []);
+  await assert.rejects(
+    authority.selfRevokeGrantFromHttp(
+      expiredAdmission,
+      "self-revoke-expired-source",
+      expiredContext,
+      { reason: "user_revoked" },
+    ),
+    errorCode("INVALID_ARGUMENT"),
+  );
+
+  const firstAdmission = await authority.admitHttpSource({
+    endpoint: "self_revoke",
+    sourceKey: "self-revoke-source",
+  });
+  const secondAdmission = await authority.admitHttpSource({
+    endpoint: "self_revoke",
+    sourceKey: "self-revoke-source",
+  });
+  const firstContext = await authority.authorizeAccessToken(
+    clientCredential.body.accessToken,
+    "client",
+  );
+  const secondContext = await authority.authorizeAccessToken(
+    clientCredential.body.accessToken,
+    "client",
+  );
+  const first = await authority.selfRevokeGrantFromHttp(
+    firstAdmission,
+    "self-revoke-source",
+    firstContext,
+    { reason: "user_revoked" },
+  );
+  const second = await authority.selfRevokeGrantFromHttp(
+    secondAdmission,
+    "self-revoke-source",
+    secondContext,
+    { reason: "user_revoked" },
+  );
+  assert.deepEqual(first, {
+    grantId: firstContext.grantId,
+    revokedAtMs: now,
+    alreadyRevoked: false,
+  });
+  assert.deepEqual(second, {
+    grantId: firstContext.grantId,
+    revokedAtMs: now,
+    alreadyRevoked: true,
+  });
+  assert.deepEqual(fenceEvents.map((event) => event.type), ["begin", "committed"]);
+  assert.deepEqual(fenceEvents[0].invalidation, {
+    reason: "grant_revoked",
+    role: "client",
+    hostId: firstContext.hostId,
+    grantId: firstContext.grantId,
+  });
+  await assert.rejects(
+    authority.authorizeAccessToken(clientCredential.body.accessToken, "client"),
+    errorCode("PERMISSION_DENIED"),
+  );
+  await authority.close();
+});
+
 test("live fence publication failures preserve the durable commit boundary", async (t) => {
   await t.test("missing fence rejects before publication and stays ready", async () => {
     const store = new InMemoryRelayV2BrokerCredentialStateStore();

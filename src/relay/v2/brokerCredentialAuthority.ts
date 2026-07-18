@@ -185,7 +185,10 @@ export interface RelayV2BrokerCredentialAuthorityGenesis {
 
 export type RelayV2BrokerCredentialHttpSourceEndpoint =
   | "enrollment_redeem"
-  | "host_bootstrap";
+  | "client_refresh"
+  | "host_bootstrap"
+  | "host_refresh"
+  | "self_revoke";
 
 declare const relayV2HttpSourceAdmissionBrand: unique symbol;
 
@@ -263,6 +266,12 @@ export type RelayV2BrokerCredentialGrantCredential =
       }>;
       replayed: boolean;
     };
+
+export interface RelayV2BrokerCredentialSelfRevokeResult {
+  grantId: string;
+  revokedAtMs: number;
+  alreadyRevoked: boolean;
+}
 
 interface EnrollmentRecord {
   enrollmentId: string;
@@ -1394,7 +1403,9 @@ function consumeSourceRateLimit(
   subjectHash: string,
   now: number,
 ): boolean {
-  const scope: RateLimitRecord["scope"] = endpoint === "host_bootstrap"
+  const scope: RateLimitRecord["scope"] = (
+    endpoint === "host_bootstrap" || endpoint === "host_refresh"
+  )
     ? "host.bootstrap.source"
     : "enrollment.redeem.source";
   let record = state.rateLimits.find((candidate) => (
@@ -1823,6 +1834,7 @@ function revalidateCurrentAuthContext(
   context: Readonly<RelayV2BrokerConnectionAuthorization>,
   now: number,
   expectedRole: RelayV2AccessRole,
+  options: Readonly<{ allowRevoked?: boolean }> = {},
 ): GrantRecord {
   if (!isRecord(context) || !hasExactKeys(context, [
     "scheme",
@@ -1863,7 +1875,7 @@ function revalidateCurrentAuthContext(
   if (!grant) throw authorityError("GRANT_NOT_FOUND");
   if (grant.role !== context.role) throw authorityError("ROLE_MISMATCH");
   if (
-    grant.revokedAtMs !== null
+    (!options.allowRevoked && grant.revokedAtMs !== null)
     || grant.refreshExpiresAtMs <= now
     || grant.hostId !== context.hostId
     || grant.principalId !== context.principalId
@@ -2990,7 +3002,13 @@ implements RelayV2BrokerAuthControlAuthority {
     if (
       !isRecord(input)
       || !hasExactKeys(input, ["endpoint", "sourceKey"])
-      || (input.endpoint !== "enrollment_redeem" && input.endpoint !== "host_bootstrap")
+      || ![
+        "enrollment_redeem",
+        "client_refresh",
+        "host_bootstrap",
+        "host_refresh",
+        "self_revoke",
+      ].includes(input.endpoint)
     ) throw authorityError("INVALID_ARGUMENT");
     this.assertReady();
     const sourceHash = sourceIdentityHash(input.sourceKey);
@@ -3030,7 +3048,16 @@ implements RelayV2BrokerAuthControlAuthority {
     });
     try {
       const admittedAtMs = await this.mutate<number>((state, now) => {
-        if (!consumeSourceRateLimit(state, input.endpoint, sourceHash, now)) {
+        const rateLimitSubjectHash = input.endpoint === "enrollment_redeem"
+          || input.endpoint === "host_bootstrap"
+          ? sourceHash
+          : sha256Hex(`${input.endpoint}\u0000${sourceHash}`);
+        if (!consumeSourceRateLimit(
+          state,
+          input.endpoint,
+          rateLimitSubjectHash,
+          now,
+        )) {
           return rejectTransition("RATE_LIMITED", false);
         }
         return returnTransition(now, true);
@@ -3071,11 +3098,28 @@ implements RelayV2BrokerAuthControlAuthority {
     return record;
   }
 
+  private takeSourceAdmissionForTransition(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    endpoint: RelayV2BrokerCredentialHttpSourceEndpoint,
+    sourceHash: string,
+  ): SourceAdmissionRecord {
+    try {
+      return this.takeSourceAdmission(admission, endpoint, sourceHash);
+    } catch (error) {
+      // Withdrawal clears every outstanding receipt synchronously. Attempt
+      // exact ownership settlement first, then preserve the readiness failure
+      // instead of misclassifying that race as a malformed request.
+      this.assertReady();
+      throw error;
+    }
+  }
+
   /**
    * Releases an admitted HTTP source receipt when the transport boundary
    * cannot hand a decoded request to the credential transition. The durable
-   * rate attempt remains consumed. A copied, expired, mismatched, or already
-   * released receipt is never accepted.
+   * rate attempt remains consumed. A copied, mismatched, or already released
+   * receipt is never accepted. Expiry is checked against trusted transaction
+   * time only by a credential transition; release merely settles ownership.
    */
   releaseHttpSourceAdmission(
     admission: RelayV2BrokerCredentialHttpSourceAdmission,
@@ -3083,6 +3127,95 @@ implements RelayV2BrokerAuthControlAuthority {
     sourceKey: string,
   ): void {
     this.takeSourceAdmission(admission, endpoint, sourceIdentityHash(sourceKey));
+  }
+
+  async refreshClientGrantFromHttp(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    sourceKey: string,
+    input: {
+      refreshAttemptId: string;
+      grantId: string;
+      clientInstanceId: string;
+      refreshToken: string;
+    },
+  ): Promise<RelayV2BrokerCredentialGrantCredential> {
+    const sourceAdmission = this.takeSourceAdmissionForTransition(
+      admission,
+      "client_refresh",
+      sourceIdentityHash(sourceKey),
+    );
+    return this.refreshGrantWithSourceAdmission(sourceAdmission, input);
+  }
+
+  async refreshHostGrantFromHttp(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    sourceKey: string,
+    input: {
+      refreshAttemptId: string;
+      grantId: string;
+      hostInstanceId: string;
+      refreshToken: string;
+    },
+  ): Promise<RelayV2BrokerCredentialGrantCredential> {
+    const sourceAdmission = this.takeSourceAdmissionForTransition(
+      admission,
+      "host_refresh",
+      sourceIdentityHash(sourceKey),
+    );
+    return this.refreshGrantWithSourceAdmission(sourceAdmission, input);
+  }
+
+  async selfRevokeGrantFromHttp(
+    admission: RelayV2BrokerCredentialHttpSourceAdmission,
+    sourceKey: string,
+    currentAuthContext: Readonly<RelayV2BrokerConnectionAuthorization>,
+    input: { reason: "user_revoked" },
+  ): Promise<Readonly<RelayV2BrokerCredentialSelfRevokeResult>> {
+    const sourceAdmission = this.takeSourceAdmissionForTransition(
+      admission,
+      "self_revoke",
+      sourceIdentityHash(sourceKey),
+    );
+    if (!isRecord(input) || !hasExactKeys(input, ["reason"])) {
+      throw authorityError("INVALID_ARGUMENT");
+    }
+    if (input.reason !== "user_revoked") throw authorityError("INVALID_ARGUMENT");
+    return this.mutate((state, now) => {
+      if (sourceAdmission.expiresAtMs <= now) {
+        return rejectTransition("INVALID_ARGUMENT", false);
+      }
+      let grant: GrantRecord;
+      try {
+        // A second request authenticated before the first revoke commit may
+        // finish afterwards. Its trusted context can observe the same durable
+        // revocation fact, but a post-commit token can no longer authenticate.
+        grant = revalidateCurrentAuthContext(
+          state,
+          currentAuthContext,
+          now,
+          "client",
+          { allowRevoked: true },
+        );
+      } catch (error) {
+        if (error instanceof RelayV2BrokerCredentialAuthorityError) {
+          return rejectTransition(error.code, false);
+        }
+        throw error;
+      }
+      const alreadyRevoked = grant.revokedAtMs !== null;
+      const revokedAtMs = grant.revokedAtMs ?? now;
+      if (!alreadyRevoked) grant.revokedAtMs = revokedAtMs;
+      return returnTransition(Object.freeze({
+        grantId: grant.grantId,
+        revokedAtMs,
+        alreadyRevoked,
+      }), !alreadyRevoked, alreadyRevoked ? undefined : {
+        reason: "grant_revoked",
+        role: "client",
+        hostId: grant.hostId,
+        grantId: grant.grantId,
+      });
+    });
   }
 
   async bootstrapHost(
@@ -3096,8 +3229,7 @@ implements RelayV2BrokerAuthControlAuthority {
       hostInstanceId: string;
     },
   ): Promise<RelayV2BrokerCredentialGrantCredential> {
-    this.assertReady();
-    const sourceAdmission = this.takeSourceAdmission(
+    const sourceAdmission = this.takeSourceAdmissionForTransition(
       admission,
       "host_bootstrap",
       sourceIdentityHash(sourceKey),
@@ -3239,8 +3371,7 @@ implements RelayV2BrokerAuthControlAuthority {
       deviceLabel: string;
     },
   ): Promise<RelayV2BrokerCredentialGrantCredential> {
-    this.assertReady();
-    const sourceAdmission = this.takeSourceAdmission(
+    const sourceAdmission = this.takeSourceAdmissionForTransition(
       admission,
       "enrollment_redeem",
       sourceIdentityHash(sourceKey),
@@ -3371,6 +3502,19 @@ implements RelayV2BrokerAuthControlAuthority {
     clientInstanceId?: string;
     hostInstanceId?: string;
   }): Promise<RelayV2BrokerCredentialGrantCredential> {
+    return this.refreshGrantWithSourceAdmission(null, input);
+  }
+
+  private async refreshGrantWithSourceAdmission(
+    sourceAdmission: SourceAdmissionRecord | null,
+    input: {
+      refreshAttemptId: string;
+      grantId: string;
+      refreshToken: string;
+      clientInstanceId?: string;
+      hostInstanceId?: string;
+    },
+  ): Promise<RelayV2BrokerCredentialGrantCredential> {
     if (!isRecord(input) || !hasExactKeys(input, [
       "refreshAttemptId",
       "grantId",
@@ -3403,6 +3547,9 @@ implements RelayV2BrokerAuthControlAuthority {
       binding: refreshBinding,
     }, ["grantId", "oldSecretHash", "bindingKind", "binding"]);
     return this.mutate((state, now) => {
+      if (sourceAdmission !== null && sourceAdmission.expiresAtMs <= now) {
+        return rejectTransition("INVALID_ARGUMENT", false);
+      }
       const replay = replayFor(state, "grant.refresh", grantId, attemptId);
       if (replay) {
         if (replay.fingerprint !== fingerprint) {

@@ -4,7 +4,7 @@
 
 范围：Android、relay-server、relay-host 的首个可互操作 v2 slice。
 
-当前 credential authority 的 enrollment create/redeem、client/host refresh、host reauthentication 与 host bootstrap API、严格的 B1 `POST /v2/hosts/bootstrap` ingress adapter，以及 E1 external continuity authority HTTPS adapter，均已在隔离模块和专项测试中可调用。B1 与 E1 都未接 production listener/composition，E0 production backend 仍未实现；这些流程没有外部生产 HTTP 可达路径，不产生 ready/capability，也不能宣告已经交付。
+当前 credential authority 的 enrollment create/redeem、client/host refresh、host reauthentication 与 host bootstrap API、严格的 B1 `POST /v2/hosts/bootstrap` ingress adapter、覆盖 enrollment redeem、client/host refresh 与 self-revoke 四个冻结端点的 B4 credential HTTPS ingress foundation，以及 E1 external continuity authority HTTPS adapter，均已在隔离模块和专项测试中可调用。B1、B4 与 E1 都未接 production listener/composition，E0 production backend 仍未实现；这些流程没有外部生产 HTTP 可达路径，不产生 ready/capability，也不能宣告已经交付。
 
 Credential authority 另已有未接 production composition 的 response replay-key rotation lifecycle：私有 credential envelope 显式升为 v3，旧 v1/v2 单 `replayKeyBase64url` envelope 仍可无损读取，并只在后续真实 mutation 时迁移。该内部 state revision、rotation API 与 replay-key id 都不改变本文 public Relay wire，也不产生 ready/capability。
 
