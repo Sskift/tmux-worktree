@@ -28,7 +28,8 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateLimits
 internal class AgentTranscriptLifecycleDurableRepository(
     database: RelayV2StateDatabase,
 ) : AgentTranscriptLifecycleDurableOperationPort,
-    AgentTranscriptLifecycleNotificationClaimPort {
+    AgentTranscriptLifecycleNotificationClaimPort,
+    AgentTranscriptLifecycleRevisionPinnedReadPort {
     private val core = AgentTranscriptLifecycleDurableRepositoryCore(
         RoomAgentTranscriptLifecycleDurableStore(database),
     )
@@ -36,6 +37,13 @@ internal class AgentTranscriptLifecycleDurableRepository(
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = core.load(consumer)
+
+    override suspend fun readRevisionPinnedPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        cursor: AgentTranscriptLifecycleReadCursor?,
+        limit: Int,
+    ): AgentTranscriptLifecycleRevisionPinnedReadResult =
+        core.readRevisionPinnedPage(namespace, cursor, limit)
 
     suspend fun initializeUnderApplyLease(
         namespace: AgentTranscriptLifecycleDurableNamespace,

@@ -15,6 +15,7 @@ import java.util.Base64
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -292,6 +293,161 @@ class RelayV2StateDatabaseInstrumentedTest {
         assertAgentLifecycleNamespaceCounts(namespace, current = 1, witness = 2, recent = 1,
             notification = 1)
         assertParentHasNoRowOwnedMaterialization(authority)
+    }
+
+    @Test
+    fun agentReadProjectionPinsAuditedRoomCutAndFailsClosedOnCorruptRows() = runBlocking {
+        val firstAuthority = durableNamespace("read-profile", activation = 1)
+        val secondAuthority = durableNamespace("read-profile", activation = 2)
+        val firstConsumer = agentConsumer(firstAuthority)
+        val secondConsumer = agentConsumer(secondAuthority)
+        val firstNamespace = AgentTranscriptLifecycleDurableNamespace.from(
+            firstConsumer,
+            operationalAgentState(firstConsumer),
+        )
+        val secondNamespace = AgentTranscriptLifecycleDurableNamespace.from(
+            secondConsumer,
+            operationalAgentState(secondConsumer),
+        )
+        val durable = AgentTranscriptLifecycleDurableRepository(database)
+        durable.initializeUnderApplyLease(firstNamespace, operationalAgentState(firstConsumer))
+        durable.initializeUnderApplyLease(secondNamespace, operationalAgentState(secondConsumer))
+
+        suspend fun materialize(
+            namespace: AgentTranscriptLifecycleDurableNamespace,
+            suffix: String,
+        ) {
+            consumeLive(
+                durable,
+                namespace,
+                textAppendPublicEvent("1", "append-$suffix", "entry-$suffix", "run-$suffix"),
+            )
+            consumeLive(
+                durable,
+                namespace,
+                lifecyclePublicEvent(
+                    "2",
+                    "running-$suffix",
+                    AgentTimelineLifecycleState.RUNNING,
+                    "run-$suffix",
+                ),
+            )
+        }
+        materialize(firstNamespace, "first")
+        materialize(secondNamespace, "second")
+
+        val projection = AgentTranscriptLifecycleRoomReadProjection(database)
+        val firstPage = projection.read(readProjectionRequest(firstNamespace, limit = 1))
+            as AgentTranscriptLifecycleReadState.Page
+        assertEquals(listOf("entry-first"), firstPage.items.map { it.stableIdentity })
+        assertFalse(firstPage.endReached)
+        val firstCursor = requireNotNull(firstPage.nextCursor)
+
+        val secondPage = projection.read(readProjectionRequest(secondNamespace, limit = 4))
+            as AgentTranscriptLifecycleReadState.Page
+        assertEquals(
+            listOf("entry-second", "running-second"),
+            secondPage.items.map { it.stableIdentity },
+        )
+        assertTrue(secondPage.endReached)
+        assertTrue(secondPage.items.none { it.stableIdentity.contains("first") })
+
+        consumeLive(
+            durable,
+            firstNamespace,
+            lifecyclePublicEvent(
+                "3",
+                "waiting-first",
+                AgentTimelineLifecycleState.WAITING_FOR_USER,
+                "run-first",
+            ),
+        )
+        val staleContinuation = projection.read(
+            readProjectionRequest(firstNamespace, cursor = firstCursor, limit = 4),
+        ) as AgentTranscriptLifecycleReadState.Unavailable
+        assertEquals(
+            AgentTranscriptLifecycleReadUnavailableReason.CURSOR_REVISION_CHANGED,
+            staleContinuation.reason,
+        )
+
+        val afterPointerUpdate = projection.read(readProjectionRequest(firstNamespace, limit = 4))
+            as AgentTranscriptLifecycleReadState.Page
+        assertEquals(
+            listOf("entry-first", "waiting-first"),
+            afterPointerUpdate.items.map { it.stableIdentity },
+        )
+        assertEquals(
+            AgentLifecycleState.WAITING_FOR_USER,
+            (afterPointerUpdate.items.last() as
+                AgentTranscriptLifecycleReadItem.LifecycleEvidence).lifecycle.state,
+        )
+
+        consumeLive(
+            durable,
+            firstNamespace,
+            lifecyclePublicEvent(
+                "4",
+                "running-extra-first",
+                AgentTimelineLifecycleState.RUNNING,
+                "run-extra-first",
+            ),
+        )
+        consumeLive(
+            durable,
+            firstNamespace,
+            AgentTimelineEventRecord(
+                agentEventSeq = "5",
+                eventId = "delete-first",
+                occurredAtMs = 5_000,
+                mutation = AgentTimelineEntryDeletedMutation(
+                    "entry-first",
+                    com.tmuxworktree.mobile.core.relay.extensions.agenttranscript.v1.codec
+                        .AgentTimelineRedactionReason.POLICY,
+                ),
+            ),
+        )
+        val afterDelete = projection.read(readProjectionRequest(firstNamespace, limit = 4))
+            as AgentTranscriptLifecycleReadState.Page
+        assertEquals(
+            listOf("waiting-first", "running-extra-first"),
+            afterDelete.items.map { it.stableIdentity },
+        )
+
+        val deleted = agentEntries(firstNamespace).single()
+        database.openHelper.writableDatabase.execSQL(
+            "UPDATE relay_v2_agent_transcript_entries SET payloadSha256 = ? " +
+                "WHERE profileId = ? AND profileActivationGeneration = ? " +
+                "AND principalId = ? AND clientInstanceId = ? AND hostId = ? " +
+                "AND hostEpoch = ? AND scopeId = ? AND sessionId = ? " +
+                "AND timelineEpoch = ? AND entryId = ?",
+            arrayOf<Any?>(
+                "0".repeat(64), deleted.profileId, deleted.profileActivationGeneration,
+                deleted.principalId, deleted.clientInstanceId, deleted.hostId,
+                deleted.hostEpoch, deleted.scopeId, deleted.sessionId, deleted.timelineEpoch,
+                deleted.entryId,
+            ),
+        )
+        assertInvalidMaterializedProjection(
+            projection.read(readProjectionRequest(firstNamespace, limit = 1)),
+        )
+
+        val witness = agentWitnessRows(secondNamespace).single()
+        database.openHelper.writableDatabase.execSQL(
+            "UPDATE relay_v2_agent_lifecycle_event_witnesses SET witnessSha256 = ? " +
+                "WHERE profileId = ? AND profileActivationGeneration = ? " +
+                "AND principalId = ? AND clientInstanceId = ? AND hostId = ? " +
+                "AND hostEpoch = ? AND scopeId = ? AND sessionId = ? " +
+                "AND timelineEpoch = ? AND eventId = ?",
+            arrayOf<Any?>(
+                "0".repeat(64), witness.profileId, witness.profileActivationGeneration,
+                witness.principalId, witness.clientInstanceId, witness.hostId,
+                witness.hostEpoch, witness.scopeId, witness.sessionId, witness.timelineEpoch,
+                witness.eventId,
+            ),
+        )
+        assertInvalidMaterializedProjection(
+            projection.read(readProjectionRequest(secondNamespace, limit = 4)),
+        )
     }
 
     @Test
@@ -1411,6 +1567,32 @@ class RelayV2StateDatabaseInstrumentedTest {
         eventReplayRetentionMs = 604_800_000,
         snapshotLeaseMs = 300_000,
     )
+
+    private fun readProjectionRequest(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        cursor: AgentTranscriptLifecycleReadCursor? = null,
+        limit: Int,
+    ) = AgentTranscriptLifecycleReadRequest(
+        selectedNamespace = namespace,
+        access = AgentTranscriptLifecycleReadAccess(
+            dialect = AgentTranscriptLifecycleReadDialect.RELAY_V2,
+            negotiatedCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            support = AgentExtensionSupport.AVAILABLE,
+            activeNamespace = namespace,
+        ),
+        cursor = cursor,
+        limit = limit,
+    )
+
+    private fun assertInvalidMaterializedProjection(
+        state: AgentTranscriptLifecycleReadState,
+    ) {
+        val unavailable = state as AgentTranscriptLifecycleReadState.Unavailable
+        assertEquals(
+            AgentTranscriptLifecycleReadUnavailableReason.MATERIALIZED_STATE_INVALID,
+            unavailable.reason,
+        )
+    }
 
     private fun operationFence(
         namespace: AgentTranscriptLifecycleDurableNamespace,

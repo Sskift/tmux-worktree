@@ -4,8 +4,104 @@ internal const val AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY =
     "agent.transcript-lifecycle.v1"
 
 /**
+ * Immutable UI-domain foundation for a future ViewModel.
+ *
+ * This is intentionally not wired to Compose and does not determine capability availability. It
+ * can expose content only when the Room read projection has already returned an exact-lineage
+ * page. Mobile Outbox delivery remains the separate base-command domain; a transcript command ID
+ * below is correlation only, while Waiting/Failed/Completed can occur only on [Lifecycle].
+ * Future UI composition must separately define live-source/current-source presentation; this
+ * unassembled domain foundation intentionally does not infer either status.
+ */
+internal sealed interface AgentTranscriptLifecyclePresentation {
+    data object Unavailable : AgentTranscriptLifecyclePresentation
+
+    data class Page(
+        val revision: AgentTranscriptLifecycleReadRevision,
+        val items: List<AgentTranscriptLifecyclePresentationItem>,
+        val nextCursor: AgentTranscriptLifecycleReadCursor?,
+        val endReached: Boolean,
+    ) : AgentTranscriptLifecyclePresentation {
+        val namespace: AgentTranscriptLifecycleDurableNamespace
+            get() = revision.namespace
+    }
+}
+
+internal sealed interface AgentTranscriptLifecyclePresentationItem {
+    data class Transcript(
+        val entryId: String,
+        val runId: String,
+        val turnId: String,
+        val role: AgentTimelineEntryRole,
+        val commandCorrelationId: String?,
+        val createdAtMs: Long,
+        val createdAgentSeq: String,
+        val lastModifiedAgentSeq: String,
+        val content: AgentTranscriptEntryContent,
+    ) : AgentTranscriptLifecyclePresentationItem
+
+    data class Lifecycle(
+        val identity: AgentLifecycleIdentity,
+        val lifecycleEventId: String,
+        val sourceEpoch: String,
+        val state: AgentLifecycleState,
+        val failure: AgentLifecycleFailure?,
+        val occurredAtMs: Long,
+        val agentEventSeq: String,
+    ) : AgentTranscriptLifecyclePresentationItem
+}
+
+internal object AgentTranscriptLifecyclePresentationMapper {
+    fun map(
+        state: AgentTranscriptLifecycleReadState,
+    ): AgentTranscriptLifecyclePresentation = when (state) {
+        is AgentTranscriptLifecycleReadState.Unavailable ->
+            AgentTranscriptLifecyclePresentation.Unavailable
+        is AgentTranscriptLifecycleReadState.Page -> AgentTranscriptLifecyclePresentation.Page(
+            revision = state.revision,
+            items = state.items.map { item ->
+                when (item) {
+                    is AgentTranscriptLifecycleReadItem.TranscriptEntry -> {
+                        val entry = item.entry
+                        AgentTranscriptLifecyclePresentationItem.Transcript(
+                            entryId = entry.entryId,
+                            runId = entry.runId,
+                            turnId = entry.turnId,
+                            role = entry.role,
+                            commandCorrelationId = entry.commandCorrelationId,
+                            createdAtMs = entry.createdAtMs,
+                            createdAgentSeq = entry.createdAgentSeq,
+                            lastModifiedAgentSeq = entry.lastModifiedAgentSeq,
+                            content = entry.content,
+                        )
+                    }
+                    is AgentTranscriptLifecycleReadItem.LifecycleEvidence -> {
+                        val lifecycle = item.lifecycle
+                        AgentTranscriptLifecyclePresentationItem.Lifecycle(
+                            identity = lifecycle.identity,
+                            lifecycleEventId = lifecycle.lifecycleEventId,
+                            sourceEpoch = lifecycle.sourceEpoch,
+                            state = lifecycle.state,
+                            failure = lifecycle.failure,
+                            occurredAtMs = lifecycle.occurredAtMs,
+                            agentEventSeq = lifecycle.agentEventSeq,
+                        )
+                    }
+                }
+            }.toList(),
+            nextCursor = state.nextCursor,
+            endReached = state.endReached,
+        )
+    }
+}
+
+/**
  * Capability- and lineage-fenced lifecycle/notification presentation of the optional Agent
  * extension.
+ *
+ * This reducer-backed mapper remains only for the isolated notification preflight foundation. It
+ * is not a Session detail/Inbox read source; future screen state must use the Room-backed
+ * [AgentTranscriptLifecyclePresentationMapper] above.
  *
  * [Unavailable] intentionally carries no cached data or reason. A caller that has not negotiated
  * the capability, selected another Session, or moved to another active lineage must not learn

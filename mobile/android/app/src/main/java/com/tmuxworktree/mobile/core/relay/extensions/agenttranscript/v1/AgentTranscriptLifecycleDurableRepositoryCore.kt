@@ -227,6 +227,11 @@ private data class ValidatedAgentTranscriptStorage(
     val accounting: AgentTranscriptDurableStorageAccounting,
 )
 
+private data class AuditedAgentTranscriptLifecycleDurableRecord(
+    val record: AgentTranscriptLifecycleDurableRecord,
+    val payload: RelayV2EncodedPayload,
+)
+
 /** Immutable one-shot key. Local generation is evidence, not a way to reclaim the same event. */
 internal data class AgentTranscriptLifecycleNotificationClaimKey(
     val consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
@@ -601,11 +606,60 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private val store: AgentTranscriptLifecycleDurableStore,
     private val publicCodec: AgentTranscriptLifecycleV1Codec = AgentTranscriptLifecycleV1Codec(),
 ) : AgentTranscriptLifecycleDurableOperationPort,
-    AgentTranscriptLifecycleNotificationClaimPort {
+    AgentTranscriptLifecycleNotificationClaimPort,
+    AgentTranscriptLifecycleRevisionPinnedReadPort {
     suspend fun load(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
     ): AgentTranscriptLifecycleDurableRecord? = store.transaction {
         loadAuditedSingle(consumer)
+    }
+
+    /**
+     * Reads one immutable projection page from the same transaction as its complete durable audit.
+     * A continuation first compares only the canonical parent revision, so a changed cut returns
+     * no content without touching entry/lifecycle materialization.
+     */
+    override suspend fun readRevisionPinnedPage(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        cursor: AgentTranscriptLifecycleReadCursor?,
+        limit: Int,
+    ): AgentTranscriptLifecycleRevisionPinnedReadResult = store.transaction {
+        require(limit in 1..AGENT_TRANSCRIPT_LIFECYCLE_READ_PAGE_LIMIT)
+        if (cursor != null && cursor.namespace != namespace) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.NamespaceChanged
+        }
+        val decoded = loadSingle(namespace.consumer)
+            ?: return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.Missing
+        if (decoded.namespace != namespace) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.NamespaceChanged
+        }
+        val candidateRevision = decoded.readRevision()
+        if (cursor != null && cursor.revision != candidateRevision) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult
+                .CursorRevisionChanged
+        }
+        val extension = decoded.state.extensionLane
+        if (extension.support != AgentExtensionSupport.AVAILABLE ||
+            extension.requiresSnapshot || extension.requiresTimelineRotation
+        ) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.ParentUnavailable
+        }
+
+        val candidates = AgentTranscriptLifecycleReadCandidateCollector(cursor, limit)
+        val audited = auditSingle(decoded, candidates)
+        val revision = AgentTranscriptLifecycleReadRevision(
+            namespace = audited.record.namespace,
+            parentPayloadSha256 = audited.payload.sha256,
+            localGeneration = audited.record.state.extensionLane.localGeneration,
+            materializedThroughAgentSeq = audited.record.state.extensionLane.lastAgentSeq,
+        )
+        if (cursor != null && cursor.revision != revision) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult
+                .CursorRevisionChanged
+        }
+        candidates.page(
+            revision = revision,
+        )
     }
 
     suspend fun initializeUnderApplyLease(
@@ -858,17 +912,29 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
     private fun AgentTranscriptLifecycleDurableTransaction.loadAuditedSingle(
         consumer: AgentTranscriptLifecycleDurableConsumerIdentity,
-    ): AgentTranscriptLifecycleDurableRecord? {
-        val current = loadSingle(consumer) ?: return null
-        val audited = validateTranscriptStorage(current.namespace, current.state)
+    ): AgentTranscriptLifecycleDurableRecord? =
+        loadSingle(consumer)?.let { auditSingle(it).record }
+
+    private fun AgentTranscriptLifecycleDurableTransaction.auditSingle(
+        current: DecodedAgentTranscriptLifecycleDurableRecord,
+        candidates: AgentTranscriptLifecycleReadCandidateCollector? = null,
+    ): AuditedAgentTranscriptLifecycleDurableRecord {
+        val audited = validateTranscriptStorage(
+            current.namespace,
+            current.state,
+            candidates,
+        )
         val storedAccounting = current.storageAccounting
         if (storedAccounting != null && storedAccounting != audited.accounting) {
             storageMalformed()
         }
-        if (storedAccounting != null) return AgentTranscriptLifecycleDurableRecord(
-            current.namespace,
-            current.state,
-            storedAccounting,
+        if (storedAccounting != null) return AuditedAgentTranscriptLifecycleDurableRecord(
+            record = AgentTranscriptLifecycleDurableRecord(
+                current.namespace,
+                current.state,
+                storedAccounting,
+            ),
+            payload = current.payload,
         )
 
         val replacement = AgentTranscriptLifecyclePersistedState(
@@ -886,16 +952,20 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         if (compareAndSetState(expected, replacement) != 1) {
             throw AgentTranscriptLifecyclePersistenceConflictException()
         }
-        return AgentTranscriptLifecycleDurableRecord(
-            current.namespace,
-            current.state,
-            audited.accounting,
+        return AuditedAgentTranscriptLifecycleDurableRecord(
+            record = AgentTranscriptLifecycleDurableRecord(
+                current.namespace,
+                current.state,
+                audited.accounting,
+            ),
+            payload = replacement.payload,
         )
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.validateTranscriptStorage(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         state: AgentTranscriptLifecycleClientState,
+        candidates: AgentTranscriptLifecycleReadCandidateCollector? = null,
     ): ValidatedAgentTranscriptStorage {
         // A null lineage is the pre-first-lineage profile slot.  It must use the
         // read-only empty-key audit seam; do not construct the normal Room namespace
@@ -921,9 +991,15 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             state.extensionLane.lastAgentSeq,
             state.extensionLane.snapshotCheckpoint?.throughAgentSeq,
             state.extensionLane.localGeneration,
+            candidates = candidates,
         )
 
-        validateEntryBatches(namespace, state.extensionLane.lastAgentSeq, stats)
+        validateEntryBatches(
+            namespace,
+            state.extensionLane.lastAgentSeq,
+            stats,
+            candidates,
+        )
 
         val snapshotRows = snapshots(namespace)
         if (snapshotRows.size.toLong() != stats.snapshotCount) storageMalformed()
@@ -982,6 +1058,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         snapshotThroughAgentSeq: String?,
         parentGeneration: String,
         limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        candidates: AgentTranscriptLifecycleReadCandidateCollector? = null,
     ): LifecycleIndexAccounting {
         val currentStats = lifecycleCurrentStats(namespace)
         val witnessStats = lifecycleWitnessAudit(namespace)
@@ -1037,7 +1114,12 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         if (closedWitnessCount + recentStats.itemCount > limits.maxAppliedEventEvidence) {
             storageMalformed()
         }
-        validateCurrentPointers(namespace, currentStats.itemCount, lastAgentSeq)
+        validateCurrentPointers(
+            namespace,
+            currentStats.itemCount,
+            lastAgentSeq,
+            candidates,
+        )
         validateRecentEvidenceRows(namespace, lastAgentSeq, recentStats)
         validateNotificationRows(namespace, notificationStats, lastAgentSeq, parentGeneration)
         return LifecycleIndexAccounting(
@@ -1121,6 +1203,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         expectedCount: Long,
         lastAgentSeq: String,
+        candidates: AgentTranscriptLifecycleReadCandidateCollector? = null,
     ) {
         var processed = 0L
         var afterOrder = ""
@@ -1140,6 +1223,17 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 val highest = highestWitnessForIdentity(namespace, identity)
                     ?: storageMalformed()
                 if (!row.pointsExactlyTo(witness) || highest != witness) storageMalformed()
+                candidates?.considerLifecycle(
+                    AgentTranscriptLifecycleReadKey(
+                        row.agentEventSeqOrder,
+                        AgentTranscriptLifecycleReadRecordKind.LIFECYCLE.storageValue,
+                        row.lifecycleEventId,
+                    ),
+                ) {
+                    AgentTranscriptLifecycleReadItem.LifecycleEvidence(
+                        witness.toDomainRecord(),
+                    )
+                }
             }
             processed += rows.size
             afterOrder = rows.last().agentEventSeqOrder
@@ -1319,8 +1413,18 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         } catch (_: IllegalArgumentException) {
             storageMalformed()
         } as? AgentTimelineLifecycleRecord ?: storageMalformed()
+        val expectedClosedEventDigest = row.closedEventDigest?.let {
+            val event = PublicEventRecord(
+                agentEventSeq = row.agentEventSeq,
+                eventId = row.eventId,
+                occurredAtMs = row.occurredAtMs,
+                mutation = AgentTimelineLifecycleChangedMutation(record),
+            )
+            digestBase64Url(publicCodec.encodeCanonicalPublicEventRecord(event))
+        }
         if (canonical.size != row.witnessCanonicalUtf8Bytes ||
             sha256Hex(canonical) != row.witnessSha256 ||
+            row.closedEventDigest != expectedClosedEventDigest ||
             record.lifecycleEventId != row.eventId ||
             record.agentEventSeq != row.agentEventSeq ||
             record.scope.name != row.lifecycleScope ||
@@ -2749,6 +2853,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         lastAgentSeq: String,
         stats: RelayV2AgentTranscriptNamespaceStats,
+        candidates: AgentTranscriptLifecycleReadCandidateCollector? = null,
     ) {
         val storedEntryCount = stats.entryCount
         var processedCount = 0L
@@ -2810,7 +2915,18 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     actualPayloadBytes != item.actualPayloadUtf8Bytes ||
                     actualTextBytes != item.actualTextUtf8Bytes
                 ) storageMalformed()
-                validateEntry(namespace, row, lastAgentSeq)
+                val validated = validateEntry(namespace, row, lastAgentSeq)
+                if (validated !is ValidatedAgentTranscriptEntry.Deleted) {
+                    candidates?.considerTranscript(
+                        AgentTranscriptLifecycleReadKey(
+                            row.createdAgentSeqOrder,
+                            AgentTranscriptLifecycleReadRecordKind.ENTRY.storageValue,
+                            row.entryId,
+                        ),
+                    ) {
+                        validated.toReadItem()
+                    }
+                }
                 if (previousSequence != null &&
                     compareCanonicalAgentOrder(
                         previousSequence ?: storageMalformed(),
@@ -3404,6 +3520,45 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         }
     }
 }
+
+private fun DecodedAgentTranscriptLifecycleDurableRecord.readRevision() =
+    AgentTranscriptLifecycleReadRevision(
+        namespace = namespace,
+        parentPayloadSha256 = payload.sha256,
+        localGeneration = state.extensionLane.localGeneration,
+        materializedThroughAgentSeq = state.extensionLane.lastAgentSeq,
+    )
+
+private fun ValidatedAgentTranscriptEntry.toReadItem():
+    AgentTranscriptLifecycleReadItem.TranscriptEntry = when (this) {
+    is ValidatedAgentTranscriptEntry.Visible -> entity.toReadItem(
+        AgentTranscriptEntryContent.Visible(requireNotNull(entity.text)),
+    )
+    is ValidatedAgentTranscriptEntry.Redacted -> entity.toReadItem(
+        AgentTranscriptEntryContent.Redacted(reason),
+    )
+    is ValidatedAgentTranscriptEntry.Deleted -> storageMalformed()
+}
+
+private fun RelayV2AgentTranscriptEntryEntity.toReadItem(
+    content: AgentTranscriptEntryContent,
+) = AgentTranscriptLifecycleReadItem.TranscriptEntry(
+    AgentTranscriptEntryReadModel(
+        entryId = entryId,
+        runId = runId,
+        turnId = turnId,
+        role = when (role) {
+            "user" -> AgentTimelineEntryRole.USER
+            ENTRY_ROLE_AGENT -> AgentTimelineEntryRole.AGENT
+            else -> storageMalformed()
+        },
+        commandCorrelationId = commandId,
+        createdAtMs = createdAtMs,
+        createdAgentSeq = createdAgentSeq,
+        lastModifiedAgentSeq = lastModifiedAgentSeq,
+        content = content,
+    ),
+)
 
 private fun validateEntry(
     namespace: AgentTranscriptLifecycleDurableNamespace,
