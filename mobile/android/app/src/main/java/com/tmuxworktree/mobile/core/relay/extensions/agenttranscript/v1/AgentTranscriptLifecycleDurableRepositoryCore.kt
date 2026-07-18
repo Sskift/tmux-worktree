@@ -967,6 +967,12 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         val witnessStats = lifecycleWitnessAudit(namespace)
         val recentStats = recentEvidenceAudit(namespace)
         val notificationStats = notificationLedgerAudit(namespace)
+        val limits = AgentClientReducerLimits()
+        if (currentStats.itemCount > limits.maxLifecycleRecords ||
+            witnessStats.itemCount > limits.maxEventIdentityWitnesses ||
+            notificationStats.itemCount > limits.maxNotificationLedgerEntries
+        ) storageMalformed()
+        var closedWitnessCount = 0L
         listOf(witnessStats, recentStats, notificationStats).forEach { audit ->
             if (audit.itemCount < 0 || audit.declaredCanonicalBytes < 0 ||
                 audit.declaredCanonicalBytes != audit.actualCanonicalBytes ||
@@ -976,6 +982,39 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         if (currentStats.itemCount < 0 || currentStats.byteCount != 0L) storageMalformed()
 
         validatePermanentWitnessChains(namespace, witnessStats)
+        // The turn-marker set is derived from permanent TURN witnesses; it is not a
+        // second writable authority.  Bound the distinct run graph in the same audit.
+        val turnMarkerRuns = linkedSetOf<String>()
+        var markerProcessed = 0L
+        var markerScope = ""
+        var markerRun = ""
+        var markerTurn = ""
+        var markerOrder = ""
+        var markerEvent = ""
+        while (markerProcessed < witnessStats.itemCount) {
+            val page = lifecycleWitnessIdentityAuditPage(
+                namespace, markerScope, markerRun, markerTurn, markerOrder, markerEvent,
+                DURABLE_STORAGE_BATCH_RECORDS,
+            )
+            if (page.isEmpty()) storageMalformed()
+            page.forEach { row ->
+                if (row.closedEventDigest != null) closedWitnessCount++
+                if (row.lifecycleScope == "turn") {
+                    turnMarkerRuns += row.runId
+                    if (turnMarkerRuns.size > limits.maxEverTurnMarkers) storageMalformed()
+                }
+            }
+            markerProcessed += page.size
+            val last = page.last()
+            markerScope = last.lifecycleScope
+            markerRun = last.runId
+            markerTurn = last.turnIdKey
+            markerOrder = last.agentEventSeqOrder
+            markerEvent = last.eventId
+        }
+        if (closedWitnessCount + recentStats.itemCount > limits.maxAppliedEventEvidence) {
+            storageMalformed()
+        }
         validateCurrentPointers(namespace, currentStats.itemCount)
         validateRecentEvidenceRows(namespace, lastAgentSeq, recentStats)
         validateNotificationRows(namespace, notificationStats)
