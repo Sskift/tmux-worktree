@@ -2231,7 +2231,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             currentBeforeCut.storageAccounting,
             header.throughAgentSeq,
             AgentSnapshotCheckpoint(header.throughAgentSeq, nextGeneration),
-            currentBeforeCut.state.extensionLane.lastAgentSeq,
+            nextState.extensionLane.lastAgentSeq,
         )
         var current = persistOperationState(
             currentBeforeCut,
@@ -2613,7 +2613,8 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         val stats = transcriptNamespaceStats(namespace)
         requireCanonicalStorageCounter(throughAgentSeq, positive = true)
         if (compareStorageCounters(throughAgentSeq, parentLastAgentSeq) < 0 ||
-            nextCheckpoint.throughAgentSeq != throughAgentSeq
+            nextCheckpoint.throughAgentSeq != throughAgentSeq ||
+            nextCheckpoint.throughAgentSeq != parentLastAgentSeq
         ) storageMalformed()
         validateEntryBatches(namespace, throughAgentSeq, stats)
         val lifecycle = validateLifecycleIndex(
