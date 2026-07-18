@@ -6,6 +6,7 @@ import { relayV2CommandReservationLedgerState } from "./hostCommandPlane.js";
 import type {
   RelayV2CanonicalBackendOutcome,
   RelayV2CommandRequestFingerprint,
+  RelayV2CommandResolutionTransaction,
   RelayV2CommandResourceCommitEvidence,
   RelayV2CommandResourceCommitIntent,
   RelayV2CommandResourceMutationOwner,
@@ -201,10 +202,31 @@ extends RelayV2CanonicalResolvedScopeTarget {
   };
 }
 
+export type RelayV2CanonicalResourceResolutionResult =
+  | {
+      kind: "positive";
+      target: RelayV2CanonicalResolvedScopeTarget | RelayV2CanonicalResolvedSessionTarget;
+    }
+  | {
+      kind: "complete_negative";
+      code: "SCOPE_NOT_FOUND" | "SESSION_NOT_FOUND";
+    };
+
+export interface RelayV2CanonicalResourceResolutionFence {
+  schemaVersion: 1;
+  token: RelayV2CanonicalResourceResolverToken;
+  expectedScopeId: string;
+  expectedSessionId: string | null;
+  result: RelayV2CanonicalResourceResolutionResult;
+}
+
 /**
- * Exact, side-effect-free discovery evidence. A resolved target never grants
- * execution authority. Future composition must call the synchronous fence
- * below with the same token and target inside the H0 admission transaction.
+ * Exact, side-effect-free H2 discovery evidence. A resource cut never proves a
+ * command-level PROJECT_NOT_FOUND/PANE_NOT_FOUND result and never grants
+ * execution authority. The composed canonical resolver must first fence its
+ * command owner (including catalog, pane, and terminal lease identities), bind
+ * that proof to the command request/target, and only then delegate this opaque
+ * resource cut to the synchronous H2 seam inside the H0 admission transaction.
  * This foundation is not connected to H1/H3 production composition.
  */
 export interface RelayV2CanonicalResourceResolverPort {
@@ -218,18 +240,18 @@ export interface RelayV2CanonicalResourceResolverPort {
     scopeId: string,
     sessionId: string,
   ): Promise<RelayV2CanonicalResolvedSessionTarget>;
-  fenceScopeForAdmission(
-    transaction: RelayV2HostStateTransaction,
+  resolveScopeForAdmission(
     token: RelayV2CanonicalResourceResolverToken,
-    expectedScopeId: string,
-    target: RelayV2CanonicalResolvedScopeTarget,
-  ): void;
-  fenceSessionForAdmission(
-    transaction: RelayV2HostStateTransaction,
+    scopeId: string,
+  ): Promise<RelayV2CanonicalResourceResolutionFence>;
+  resolveSessionForAdmission(
     token: RelayV2CanonicalResourceResolverToken,
-    expectedScopeId: string,
-    expectedSessionId: string,
-    target: RelayV2CanonicalResolvedSessionTarget,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<RelayV2CanonicalResourceResolutionFence>;
+  fenceResourceCutForAdmission(
+    transaction: RelayV2CommandResolutionTransaction,
+    fence: RelayV2CanonicalResourceResolutionFence,
   ): void;
 }
 
@@ -667,6 +689,49 @@ function normalizeCanonicalResolverToken(
     validateOpaqueInput(value[field] as string, `resolver token ${field}`);
   }
   return clone(value) as unknown as RelayV2CanonicalResourceResolverToken;
+}
+
+function normalizeCanonicalResolutionFence(
+  value: unknown,
+): RelayV2CanonicalResourceResolutionFence {
+  if (!isRecord(value)
+    || !exactKeys(value, [
+      "schemaVersion", "token", "expectedScopeId", "expectedSessionId", "result",
+    ])
+    || value.schemaVersion !== 1) {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "resolution fence is invalid");
+  }
+  const token = normalizeCanonicalResolverToken(value.token);
+  validateOpaqueInput(value.expectedScopeId as string, "resolution fence expectedScopeId");
+  if (value.expectedSessionId !== null) {
+    validateOpaqueInput(
+      value.expectedSessionId as string,
+      "resolution fence expectedSessionId",
+    );
+  }
+  if (!isRecord(value.result)) {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "resolution fence result is invalid");
+  }
+  if (value.result.kind === "positive") {
+    if (!exactKeys(value.result, ["kind", "target"]) || !isRecord(value.result.target)) {
+      throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "positive resolution fence is invalid");
+    }
+  } else if (value.result.kind === "complete_negative") {
+    if (!exactKeys(value.result, ["kind", "code"])
+      || (value.result.code !== "SCOPE_NOT_FOUND"
+        && value.result.code !== "SESSION_NOT_FOUND")) {
+      throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "negative resolution fence is invalid");
+    }
+  } else {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "resolution fence result is invalid");
+  }
+  return clone({
+    schemaVersion: 1,
+    token,
+    expectedScopeId: value.expectedScopeId,
+    expectedSessionId: value.expectedSessionId,
+    result: value.result,
+  }) as RelayV2CanonicalResourceResolutionFence;
 }
 
 function resolverCutIsCurrent(cut: RelayV2ResourceResolverDiscoveryCut): boolean {
@@ -1373,7 +1438,10 @@ function validateResourceIntentIdentity(
 }
 
 function materializedSnapshotForTransaction(
-  transaction: RelayV2CommandResourceTransaction,
+  transaction: Pick<
+    RelayV2CommandResourceTransaction,
+    "getMaterializedRecord" | "getMaterializedReadinessFence"
+  >,
   hostEpoch: string,
 ): RelayV2HostStateSnapshot {
   const materialized: Record<string, RelayV2HostJson> = {};
@@ -2734,30 +2802,21 @@ export class RelayV2MaterializedStateFoundation {
         scopeId: string,
         sessionId: string,
       ) => this.resolveCanonicalSessionTarget(token, scopeId, sessionId),
-      fenceScopeForAdmission: (
-        transaction: RelayV2HostStateTransaction,
+      resolveScopeForAdmission: (
         token: RelayV2CanonicalResourceResolverToken,
-        expectedScopeId: string,
-        target: RelayV2CanonicalResolvedScopeTarget,
-      ) => this.fenceCanonicalTargetForAdmission(
-        transaction,
-        token,
-        expectedScopeId,
-        null,
-        target,
-      ),
-      fenceSessionForAdmission: (
-        transaction: RelayV2HostStateTransaction,
+        scopeId: string,
+      ) => this.resolveCanonicalScopeForAdmission(token, scopeId),
+      resolveSessionForAdmission: (
         token: RelayV2CanonicalResourceResolverToken,
-        expectedScopeId: string,
-        expectedSessionId: string,
-        target: RelayV2CanonicalResolvedSessionTarget,
-      ) => this.fenceCanonicalTargetForAdmission(
+        scopeId: string,
+        sessionId: string,
+      ) => this.resolveCanonicalSessionForAdmission(token, scopeId, sessionId),
+      fenceResourceCutForAdmission: (
+        transaction: RelayV2CommandResolutionTransaction,
+        fence: RelayV2CanonicalResourceResolutionFence,
+      ) => this.fenceCanonicalResourceCutForAdmission(
         transaction,
-        token,
-        expectedScopeId,
-        expectedSessionId,
-        target,
+        fence,
       ),
     });
   }
@@ -3281,16 +3340,57 @@ export class RelayV2MaterializedStateFoundation {
     });
   }
 
-  private fenceCanonicalTargetForAdmission(
-    transaction: RelayV2HostStateTransaction,
-    rawToken: RelayV2CanonicalResourceResolverToken,
-    expectedScopeId: string,
-    expectedSessionId: string | null,
-    rawTarget: RelayV2CanonicalResolvedScopeTarget | RelayV2CanonicalResolvedSessionTarget,
+  private async resolveCanonicalScopeForAdmission(
+    token: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+  ): Promise<RelayV2CanonicalResourceResolutionFence> {
+    let result: RelayV2CanonicalResourceResolutionResult;
+    try {
+      result = { kind: "positive", target: await this.resolveCanonicalScopeTarget(token, scopeId) };
+    } catch (error) {
+      if (!isRelayV2MaterializedStateError(error) || error.code !== "SCOPE_NOT_FOUND") throw error;
+      result = { kind: "complete_negative", code: "SCOPE_NOT_FOUND" };
+    }
+    return normalizeCanonicalResolutionFence({
+      schemaVersion: 1,
+      token,
+      expectedScopeId: scopeId,
+      expectedSessionId: null,
+      result,
+    });
+  }
+
+  private async resolveCanonicalSessionForAdmission(
+    token: RelayV2CanonicalResourceResolverToken,
+    scopeId: string,
+    sessionId: string,
+  ): Promise<RelayV2CanonicalResourceResolutionFence> {
+    let result: RelayV2CanonicalResourceResolutionResult;
+    try {
+      result = {
+        kind: "positive",
+        target: await this.resolveCanonicalSessionTarget(token, scopeId, sessionId),
+      };
+    } catch (error) {
+      if (!isRelayV2MaterializedStateError(error)
+        || (error.code !== "SCOPE_NOT_FOUND" && error.code !== "SESSION_NOT_FOUND")) throw error;
+      result = { kind: "complete_negative", code: error.code };
+    }
+    return normalizeCanonicalResolutionFence({
+      schemaVersion: 1,
+      token,
+      expectedScopeId: scopeId,
+      expectedSessionId: sessionId,
+      result,
+    });
+  }
+
+  private fenceCanonicalResourceCutForAdmission(
+    transaction: RelayV2CommandResolutionTransaction,
+    rawFence: RelayV2CanonicalResourceResolutionFence,
   ): void {
-    const token = normalizeCanonicalResolverToken(rawToken);
-    validateOpaqueInput(expectedScopeId, "expectedScopeId");
-    if (expectedSessionId !== null) validateOpaqueInput(expectedSessionId, "expectedSessionId");
+    const fence = normalizeCanonicalResolutionFence(rawFence);
+    const { token, expectedScopeId, expectedSessionId, result } = fence;
     if (transaction.hostEpoch !== token.hostEpoch) {
       throw new RelayV2MaterializedStateError(
         "CAPABILITY_UNAVAILABLE",
@@ -3306,15 +3406,31 @@ export class RelayV2MaterializedStateFoundation {
     const snapshot = materializedSnapshotForTransaction(transaction, transaction.hostEpoch);
     const state = parseMaterializedState(snapshot);
     const publication = this.requireCanonicalResolver(snapshot, state, token);
-    const target = isRecord(rawTarget) ? rawTarget : null;
-    const exactIdentity = target?.scopeId === expectedScopeId
-      && (expectedSessionId === null || target?.sessionId === expectedSessionId);
+    if (result.kind === "complete_negative") {
+      const scope = publication.scopes.get(expectedScopeId);
+      const exactAbsence = result.code === "SCOPE_NOT_FOUND"
+        ? scope === undefined
+        : expectedSessionId !== null
+          && scope !== undefined
+          && !publication.sessions.has(`${expectedScopeId}\0${expectedSessionId}`);
+      if (!exactAbsence) {
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "canonical negative admission evidence is stale or inexact",
+        );
+      }
+      return;
+    }
+    const target = result.target;
+    const exactIdentity = target.scopeId === expectedScopeId
+      && (expectedSessionId === null || ("sessionId" in target
+        && target.sessionId === expectedSessionId));
     const expected = !exactIdentity
       ? undefined
       : expectedSessionId === null
         ? publication.scopes.get(expectedScopeId)
         : publication.sessions.get(`${expectedScopeId}\0${expectedSessionId}`);
-    if (expected === undefined || !sameJson(expected, rawTarget)) {
+    if (expected === undefined || !sameJson(expected, target)) {
       throw new RelayV2MaterializedStateError(
         "CAPABILITY_UNAVAILABLE",
         "canonical target admission evidence is stale or inexact",

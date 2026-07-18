@@ -2493,9 +2493,29 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
   let spool;
   let h3;
   let runtime;
+  let resolutionFenceCalls = 0;
   try {
     const store = await hostState.RelayV2HostStateStore.open({ home });
     const now = 1_783_700_000_000;
+    const discoveryScan = { coverage: "complete", scopes: [] };
+    Object.defineProperty(discoveryScan, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
+      value: {
+        generation: "actual-empty-complete-cut",
+        scopeTargets: [],
+        sessionTargets: [],
+        isCurrent: () => true,
+      },
+      enumerable: false,
+    });
+    const h2 = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: HOST_ID,
+      store,
+      discovery: {
+        async scan() { return discoveryScan; },
+      },
+      readinessSink: { apply: () => true },
+    });
+    const reconciled = await h2.reconcile();
     const h1 = await commandPlane.RelayV2HostCommandPlane.open({
       store,
       hostId: HOST_ID,
@@ -2503,8 +2523,26 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
       now: () => now,
       executor: {
         async resolve(request) {
+          const token = await h2.canonicalTargetResolver.captureToken(request.hostEpoch);
+          const resourceFence = await h2.canonicalTargetResolver.resolveSessionForAdmission(
+            token,
+            request.scopeId,
+            request.sessionId,
+          );
+          assert.equal(resourceFence.result.kind, "complete_negative");
+          assert.equal(resourceFence.result.code, "SCOPE_NOT_FOUND");
           return {
             kind: "immutable_business_failure",
+            resolutionFence: {
+              schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+              outcome: "complete_negative",
+              authority: request.authority,
+              operation: request.operation,
+              expectedScopeId: request.scopeId,
+              expectedSessionId: request.sessionId,
+              code: "SCOPE_NOT_FOUND",
+              evidence: { resourceCut: resourceFence },
+            },
             authorityEvidence: {
               schemaVersion: commandPlane.RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
               coverage: "complete",
@@ -2516,13 +2554,22 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
               evidence: { source: "actual-port-test-authority" },
             },
             error: {
-              code: "SESSION_NOT_FOUND",
-              message: "Actual command authority found no retained Session",
+              code: "SCOPE_NOT_FOUND",
+              message: "Actual command authority found no retained Scope",
               retryable: false,
               commandDisposition: "completed",
               details: null,
             },
           };
+        },
+        fenceResolution(transaction, request, fence) {
+          resolutionFenceCalls += 1;
+          const resourceCut = fence.evidence.resourceCut;
+          assert.equal(fence.expectedScopeId, request.scopeId);
+          assert.equal(fence.expectedSessionId, request.sessionId);
+          assert.equal(fence.outcome, "complete_negative");
+          assert.equal(fence.code, resourceCut.result.code);
+          h2.canonicalTargetResolver.fenceResourceCutForAdmission(transaction, resourceCut);
         },
         async executeTwRpc() { throw new Error("actual adapter test never executes tw rpc"); },
         async executeTerminalControl() {
@@ -2530,15 +2577,6 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
         },
       },
     });
-    const h2 = new resourceState.RelayV2MaterializedStateFoundation({
-      hostId: HOST_ID,
-      store,
-      discovery: {
-        async scan() { return { coverage: "complete", scopes: [] }; },
-      },
-      readinessSink: { apply: () => true },
-    });
-    const reconciled = await h2.reconcile();
     spool = await snapshotSpool.RelayV2StateSnapshotSpool.open({
       hostId: HOST_ID,
       cutSource: h2.snapshotCutSource,
@@ -2637,7 +2675,8 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
     const commandStatus = sent.find(({ frame }) => frame.requestId === execute.requestId)?.frame;
     assert.equal(commandStatus.type, "command.status");
     assert.equal(commandStatus.payload.state, "failed");
-    assert.equal(commandStatus.error.code, "SESSION_NOT_FOUND");
+    assert.equal(commandStatus.error.code, "SCOPE_NOT_FOUND");
+    assert.equal(resolutionFenceCalls, 1);
 
     const query = fixture("command-query");
     query.hostId = HOST_ID;

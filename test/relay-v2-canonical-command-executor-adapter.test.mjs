@@ -73,6 +73,23 @@ function evidence(coverage = "complete") {
   };
 }
 
+function admissionFenceFor(request, outcome, negativeCode = "SESSION_NOT_FOUND") {
+  return {
+    schemaVersion: 1,
+    token: {
+      schemaVersion: 1,
+      hostEpoch: request.hostEpoch,
+      resourceMappingDigest: "mapping-digest-1",
+      discoveryGeneration: "discovery-generation-1",
+    },
+    expectedScopeId: request.scopeId,
+    expectedSessionId: request.sessionId,
+    result: outcome === "positive"
+      ? { kind: "positive", targetIdentity: "exact-test-target" }
+      : { kind: "complete_negative", code: negativeCode },
+  };
+}
+
 function prospectiveSession(operation, execution) {
   const terminal = operation === "create_terminal";
   return {
@@ -90,7 +107,11 @@ function prospectiveSession(operation, execution) {
 }
 
 function resolvedFor(request) {
-  const base = { kind: "resolved", ...evidence() };
+  const base = {
+    kind: "resolved",
+    ...evidence(),
+    admissionFence: admissionFenceFor(request, "positive"),
+  };
   if (request.operation === "create_worktree" || request.operation === "create_terminal") {
     const args = structuredClone(request.arguments);
     const execution = request.operation === "create_worktree"
@@ -222,13 +243,26 @@ function successResponseForProcessCall(call) {
 }
 
 function fakePorts(overrides = {}) {
-  const calls = { resolve: [], process: [], terminal: [] };
+  const calls = { resolve: [], fence: [], process: [], terminal: [] };
   return {
     calls,
     resolver: {
       async resolve(request) {
         calls.resolve.push(structuredClone(request));
-        return overrides.resolve ? overrides.resolve(request) : resolvedFor(request);
+        const resolution = overrides.resolve
+          ? await overrides.resolve(request)
+          : resolvedFor(request);
+        return resolution;
+      },
+      fenceResolution(transaction, request, fence) {
+        calls.fence.push({
+          hostEpoch: transaction.hostEpoch,
+          request: structuredClone(request),
+          fence: structuredClone(fence),
+        });
+        if (overrides.fenceResolution) {
+          return overrides.fenceResolution(transaction, request, fence);
+        }
       },
     },
     process: {
@@ -303,6 +337,93 @@ test("create adapter state reserves resources without carrying a public Session 
   assert.equal(ports.calls.resolve.length, 1);
   assert.equal(ports.calls.process.length, 0);
   assert.equal(ports.calls.terminal.length, 0);
+});
+
+test("resolution fences delegate exact evidence and reject thenables", async () => {
+  const request = canonicalRequest("create_terminal");
+  const ports = fakePorts();
+  const executor = executorFor(ports);
+  const admission = await executor.resolve(request);
+  assert.equal(admission.kind, "executable");
+  assert.equal(admission.resolutionFence.outcome, "positive");
+
+  const transaction = {
+    hostEpoch: request.hostEpoch,
+    getMaterializedRecord: () => undefined,
+    getMaterializedReadinessFence: () => null,
+  };
+  executor.fenceResolution(transaction, request, admission.resolutionFence);
+  assert.deepEqual(ports.calls.fence[0].request, request);
+  assert.deepEqual(
+    ports.calls.fence[0].fence.evidence,
+    admissionFenceFor(request, "positive"),
+  );
+  assert.equal(ports.calls.fence[0].fence.expectedScopeId, request.scopeId);
+  assert.equal(ports.calls.fence[0].fence.expectedSessionId, request.sessionId);
+  assert.deepEqual(ports.calls.fence[0].fence.target, resolvedFor(request).target);
+
+  const asynchronousPorts = fakePorts({
+    fenceResolution: () => Promise.reject(new Error("late stale resolver cut")),
+  });
+  const asynchronousExecutor = executorFor(asynchronousPorts);
+  const asynchronousAdmission = await asynchronousExecutor.resolve(request);
+  assert.throws(
+    () => asynchronousExecutor.fenceResolution(
+      transaction,
+      request,
+      asynchronousAdmission.resolutionFence,
+    ),
+    /must be synchronous/,
+  );
+});
+
+test("terminal resolver fence rejects each independently legal lease identity swap", async (t) => {
+  for (const [field, replacement] of [
+    ["controlTargetId", "target-exact-other"],
+    ["leaseId", "lease-exact-other"],
+  ]) {
+    await t.test(field, async () => {
+      const request = canonicalRequest("send_agent_message");
+      const resolution = resolvedFor(request);
+      const expectedLease = structuredClone(resolution.target.lease);
+      resolution.admissionFence = {
+        ...admissionFenceFor(request, "positive"),
+        expectedLease,
+      };
+      resolution.target.lease = {
+        ...structuredClone(expectedLease),
+        [field]: replacement,
+      };
+      const unchangedField = field === "leaseId" ? "controlTargetId" : "leaseId";
+      assert.equal(resolution.target.lease[unchangedField], expectedLease[unchangedField]);
+      const ports = fakePorts({
+        resolve: () => resolution,
+        fenceResolution: (_transaction, fencedRequest, fence) => {
+          const sameLease = JSON.stringify(fence.target.lease)
+            === JSON.stringify(fence.evidence.expectedLease);
+          if (fencedRequest.sessionId !== request.sessionId || !sameLease) {
+            throw new Error("terminal lease binding mismatch");
+          }
+        },
+      });
+      const executor = executorFor(ports);
+      const admission = await executor.resolve(request);
+      assert.equal(admission.kind, "executable");
+      assert.throws(
+        () => executor.fenceResolution(
+          {
+            hostEpoch: request.hostEpoch,
+            getMaterializedRecord: () => undefined,
+            getMaterializedReadinessFence: () => null,
+          },
+          request,
+          admission.resolutionFence,
+        ),
+        /terminal lease binding mismatch/,
+      );
+      assert.equal(ports.calls.terminal.length, 0);
+    });
+  }
 });
 
 test("canonical executor translates all four operations to one exact authority call", async () => {
@@ -416,13 +537,29 @@ test("resolver coverage alone controls immutable not-found admission", async () 
       retryAfterMs: 100,
     }],
   ]);
-  const ports = fakePorts({ resolve: (request) => responses.get(request.commandId) });
+  const ports = fakePorts({
+    resolve: (request) => {
+      const response = structuredClone(responses.get(request.commandId));
+      if (response.kind === "not_found" && response.coverage === "complete") {
+        response.admissionFence = admissionFenceFor(
+          request,
+          "complete_negative",
+          response.code,
+        );
+      }
+      return response;
+    },
+  });
   const executor = executorFor(ports);
 
   const complete = await executor.resolve(canonicalRequest("kill_session", { commandId: "cmd-complete" }));
   assert.equal(complete.kind, "immutable_business_failure");
   assert.equal(complete.error.code, "SESSION_NOT_FOUND");
   assert.equal(complete.authorityEvidence.coverage, "complete");
+  assert.equal(complete.resolutionFence.outcome, "complete_negative");
+  assert.equal(complete.resolutionFence.expectedScopeId, SCOPE_ID);
+  assert.equal(complete.resolutionFence.expectedSessionId, "ses_opaque_existing");
+  assert.equal(complete.resolutionFence.code, "SESSION_NOT_FOUND");
 
   for (const commandId of ["cmd-partial", "cmd-unreachable"]) {
     const admission = await executor.resolve(canonicalRequest("kill_session", { commandId }));
@@ -463,7 +600,12 @@ test("complete not-found evidence is closed over each operation", async (t) => {
     for (const code of codes) {
       await t.test(`${operation}/${code}`, async () => {
         const ports = fakePorts({
-          resolve: () => ({ kind: "not_found", ...evidence("complete"), code }),
+          resolve: (request) => ({
+            kind: "not_found",
+            ...evidence("complete"),
+            code,
+            admissionFence: admissionFenceFor(request, "complete_negative", code),
+          }),
         });
         const admission = await executorFor(ports).resolve(canonicalRequest(operation));
         if (operationCodes.has(code)) {
@@ -483,10 +625,11 @@ test("complete not-found evidence is closed over each operation", async (t) => {
 
 test("PROJECT_NOT_FOUND is final only for catalog lookup without an explicit path", async () => {
   const ports = fakePorts({
-    resolve: () => ({
+    resolve: (request) => ({
       kind: "not_found",
       ...evidence("complete"),
       code: "PROJECT_NOT_FOUND",
+      admissionFence: admissionFenceFor(request, "complete_negative", "PROJECT_NOT_FOUND"),
     }),
   });
   const executor = executorFor(ports);

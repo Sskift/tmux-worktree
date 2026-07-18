@@ -128,9 +128,30 @@ function authorityEvidence(request, coverage = "complete") {
   };
 }
 
+function resolutionFence(request, outcome) {
+  return {
+    schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+    outcome,
+    authority: request.authority,
+    operation: request.operation,
+    expectedScopeId: request.scopeId,
+    expectedSessionId: request.sessionId,
+    ...(outcome === "positive"
+      ? { target: { testTarget: request.scopeId } }
+      : { code: request.sessionId === null ? "SCOPE_NOT_FOUND" : "SESSION_NOT_FOUND" }),
+    evidence: {
+      resolverToken: "test-canonical-cut",
+      expectedScopeId: request.scopeId,
+      expectedSessionId: request.sessionId,
+      result: outcome,
+    },
+  };
+}
+
 function fakeExecutor(overrides = {}) {
   const calls = {
     resolve: [],
+    fence: [],
     twRpc: [],
     terminalControl: [],
   };
@@ -139,12 +160,23 @@ function fakeExecutor(overrides = {}) {
     executor: {
       async resolve(request) {
         calls.resolve.push(structuredClone(request));
-        if (overrides.resolve) return overrides.resolve(request);
-        return {
+        const admission = overrides.resolve ? await overrides.resolve(request) : {
           kind: "executable",
           adapterState: { resolvedTarget: request.scopeId },
+          resolutionFence: resolutionFence(request, "positive"),
           ...reservationPlanFor(request),
         };
+        return admission;
+      },
+      fenceResolution(transaction, request, fence) {
+        calls.fence.push({
+          hostEpoch: transaction.hostEpoch,
+          request: structuredClone(request),
+          fence: structuredClone(fence),
+        });
+        if (overrides.fenceResolution) {
+          return overrides.fenceResolution(transaction, request, fence);
+        }
       },
       async executeTwRpc(plan) {
         calls.twRpc.push(structuredClone(plan));
@@ -346,21 +378,23 @@ test("Relay v2 command fixtures persist RUNNING before routing each fixed operat
       executeTwRpc: async (plan) => {
         const snapshot = await store.read();
         const records = Object.values(snapshot.commands);
-        assert.ok(records.some((record) => (
+        const running = records.find((record) => (
           record.commandId === plan.commandId
           && record.fingerprint.digest === plan.requestFingerprint.digest
           && record.state === "running"
-        )), `${plan.operation} must be durably RUNNING before TW RPC`);
+        ));
+        assert.ok(running, `${plan.operation} must be durably RUNNING before TW RPC`);
         return successFor(plan);
       },
       executeTerminalControl: async (plan) => {
         const snapshot = await store.read();
         const records = Object.values(snapshot.commands);
-        assert.ok(records.some((record) => (
+        const running = records.find((record) => (
           record.commandId === plan.commandId
           && record.fingerprint.digest === plan.requestFingerprint.digest
           && record.state === "running"
-        )), "send_agent_message must be durably RUNNING before terminal-control");
+        ));
+        assert.ok(running, "send_agent_message must be durably RUNNING before terminal-control");
         return successFor(plan);
       },
     });
@@ -384,6 +418,7 @@ test("Relay v2 command fixtures persist RUNNING before routing each fixed operat
         return {
           kind: "executable",
           adapterState: { commandId },
+          resolutionFence: resolutionFence(request, "positive"),
           ...reservationPlanFor(request),
         };
       };
@@ -532,10 +567,13 @@ test("two command-plane instances sharing H0 claim one RUNNING winner", async ()
     const second = secondPlane.execute(auth(), competingFrame);
     await started;
     assert.equal(fake.calls.terminalControl.length, 1);
+    assert.equal(fake.calls.fence.length, 1);
+    assert.ok(fake.calls.resolve.length >= 1 && fake.calls.resolve.length <= 2);
     releaseExecution();
     const responses = await Promise.all([first, second]);
     assert.ok(responses.some(({ payload }) => payload.state === "succeeded"));
     assert.equal(fake.calls.terminalControl.length, 1);
+    assert.equal(fake.calls.fence.length, 1);
 
     const responseLossRetry = structuredClone(frame);
     responseLossRetry.requestId = "second-client-after-response-loss";
@@ -543,6 +581,7 @@ test("two command-plane instances sharing H0 claim one RUNNING winner", async ()
     assert.equal(retry.payload.state, "succeeded");
     assert.equal(retry.payload.deduplicated, true);
     assert.equal(fake.calls.terminalControl.length, 1);
+    assert.equal(fake.calls.fence.length, 1);
   } finally {
     h.cleanup();
   }
@@ -739,6 +778,128 @@ test("H1 rejects non-message command whitespace before resolution or ledger work
   }
 });
 
+test("missing or malformed resolution fences reject both final admission outcomes pre-ledger", async (t) => {
+  for (const outcome of ["executable", "immutable_business_failure"]) {
+    for (const shape of ["missing", "malformed"]) {
+      await t.test(`${outcome}/${shape}`, async () => {
+        const h = harness();
+        try {
+          const fake = fakeExecutor({
+            resolve: async (request) => {
+              const admission = outcome === "executable"
+                ? {
+                    kind: "executable",
+                    adapterState: { resolvedTarget: request.scopeId },
+                    ...reservationPlanFor(request),
+                  }
+                : {
+                    kind: "immutable_business_failure",
+                    authorityEvidence: authorityEvidence(request),
+                    error: {
+                      code: "SCOPE_NOT_FOUND",
+                      message: "Scope is absent from the complete authority cut",
+                      retryable: false,
+                      commandDisposition: "completed",
+                      details: null,
+                    },
+                  };
+              if (shape === "malformed") {
+                admission.resolutionFence = {
+                  ...resolutionFence(
+                    request,
+                    outcome === "executable" ? "positive" : "complete_negative",
+                  ),
+                  expectedScopeId: "scope-swapped-after-resolve",
+                };
+              }
+              return admission;
+            },
+          });
+          const resource = fakeResourceMutationOwner();
+          const configured = await setup(h, fake.executor, true, resource);
+          const before = await configured.store.read();
+          const frame = commandFrame(
+            "command-execute-create-terminal",
+            configured.snapshot.hostEpoch,
+            configured.window.windowId,
+          );
+          const response = await configured.plane.execute(auth(), frame);
+          assert.equal(response.type, "error");
+          assert.equal(response.requestId, frame.requestId);
+          assert.equal(response.commandId, frame.commandId);
+          assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+          assert.equal(response.error.commandDisposition, "not_accepted");
+          assert.equal(fake.calls.fence.length, 0);
+          assert.equal(resource.calls.reserve.length, 0);
+          assert.equal(fake.calls.twRpc.length, 0);
+          assert.equal(fake.calls.terminalControl.length, 0);
+          const after = await configured.store.read();
+          assert.equal(after.commitSeq, before.commitSeq);
+          assert.deepEqual(after.commands, before.commands);
+          assert.deepEqual(after.materialized, before.materialized);
+        } finally {
+          h.cleanup();
+        }
+      });
+    }
+  }
+});
+
+test("final admission fences synchronously before reservation or any ledger write", async (t) => {
+  for (const fenceFailure of ["thenable_positive", "throwing_complete_negative"]) {
+    await t.test(fenceFailure, async () => {
+      const h = harness();
+      try {
+        const negative = fenceFailure === "throwing_complete_negative";
+        const fake = fakeExecutor({
+          resolve: negative
+            ? async (request) => ({
+                kind: "immutable_business_failure",
+                resolutionFence: resolutionFence(request, "complete_negative"),
+                authorityEvidence: authorityEvidence(request),
+                error: {
+                  code: "SESSION_NOT_FOUND",
+                  message: "Session is absent from the complete authority cut",
+                  retryable: false,
+                  commandDisposition: "completed",
+                  details: null,
+                },
+              })
+            : undefined,
+          fenceResolution: () => {
+            if (negative) throw new Error("stale complete-negative cut");
+            return Promise.resolve();
+          },
+        });
+        const resource = fakeResourceMutationOwner();
+        const configured = await setup(h, fake.executor, true, resource);
+        const before = await configured.store.read();
+        const frame = commandFrame(
+          negative ? "command-execute-kill-session" : "command-execute-create-terminal",
+          configured.snapshot.hostEpoch,
+          configured.window.windowId,
+        );
+        const response = await configured.plane.execute(auth(), frame);
+        assert.equal(response.type, "error");
+        assert.equal(response.requestId, frame.requestId);
+        assert.equal(response.commandId, frame.commandId);
+        assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+        assert.equal(response.error.commandDisposition, "not_accepted");
+        assert.equal(fake.calls.fence.length, 1);
+        assert.equal(resource.calls.reserve.length, 0);
+        assert.equal(fake.calls.twRpc.length, 0);
+        assert.equal(fake.calls.terminalControl.length, 0);
+        const after = await configured.store.read();
+        assert.equal(after.commitSeq, before.commitSeq);
+        assert.deepEqual(after.commands, before.commands);
+        assert.deepEqual(after.materialized, before.materialized);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+});
+
 test("immutable admission and canonical executor failures become durable final failed states", async () => {
   const h = harness();
   try {
@@ -746,6 +907,7 @@ test("immutable admission and canonical executor failures become durable final f
       resolve: async (request) => request.operation === "kill_session"
         ? {
             kind: "immutable_business_failure",
+            resolutionFence: resolutionFence(request, "complete_negative"),
             authorityEvidence: authorityEvidence(request),
             error: {
               code: "SESSION_NOT_FOUND",
@@ -758,6 +920,7 @@ test("immutable admission and canonical executor failures become durable final f
         : {
             kind: "executable",
             adapterState: { resolvedTarget: request.scopeId },
+            resolutionFence: resolutionFence(request, "positive"),
             ...reservationPlanFor(request),
           },
       executeTwRpc: async () => ({

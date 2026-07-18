@@ -18,6 +18,7 @@ import {
 export const RELAY_V2_COMMAND_FINGERPRINT_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_PLAN_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION = 1 as const;
+export const RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_RESOURCE_COMMIT_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION = 1 as const;
 export const RELAY_V2_COMMAND_RESULT_RETENTION_MS = 86_400_000;
@@ -209,6 +210,38 @@ export interface RelayV2CommandResourceTransaction {
   latchMaterializedReadinessFence(reason: "materialized_authority_conflict"): void;
 }
 
+export interface RelayV2CommandResolutionTransaction {
+  readonly hostEpoch: string;
+  getMaterializedRecord(key: string): RelayV2HostJson | undefined;
+  getMaterializedReadinessFence(): RelayV2MaterializedReadinessFence | null;
+}
+
+/**
+ * One resolve-to-admission proof. This value is process-local and must never
+ * enter the immutable execution plan or command ledger.
+ */
+export type RelayV2CommandResolutionFence =
+  | {
+      schemaVersion: typeof RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION;
+      outcome: "positive";
+      authority: "tw_rpc" | "terminal_control";
+      operation: RelayV2CommandOperation;
+      expectedScopeId: string;
+      expectedSessionId: string | null;
+      target: RelayV2HostJson;
+      evidence: RelayV2HostJson;
+    }
+  | {
+      schemaVersion: typeof RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION;
+      outcome: "complete_negative";
+      authority: "tw_rpc" | "terminal_control";
+      operation: RelayV2CommandOperation;
+      expectedScopeId: string;
+      expectedSessionId: string | null;
+      code: string;
+      evidence: RelayV2HostJson;
+    };
+
 /**
  * H2 owns backend-evidence parsing, opaque Session identity reservation/reuse,
  * Session mappings, revisions, and event sequence allocation. reserve runs in
@@ -251,11 +284,13 @@ export type RelayV2CommandAdmission =
       kind: "executable";
       adapterState: RelayV2HostJson;
       resourceReservationPlan?: RelayV2HostJson;
+      resolutionFence: RelayV2CommandResolutionFence;
     }
   | {
       kind: "immutable_business_failure";
       error: RelayV2CommandStructuredError;
       authorityEvidence: RelayV2CommandAuthorityEvidence;
+      resolutionFence: RelayV2CommandResolutionFence;
     }
   | {
       kind: "transient_admission_failure";
@@ -297,12 +332,18 @@ type RelayV2FinalizedExecutionOutcome = RelayV2TerminalControlExecutionOutcome;
 
 /**
  * Runtime adapters must resolve immutable targets without side effects, then
+ * synchronously re-fence that resolution in the final H0 transaction, then
  * make exactly one call through the selected canonical authority. The command
  * plane deliberately has no git/tmux primitive and never retries executeTwRpc
  * or executeTerminalControl after RUNNING has been persisted.
  */
 export interface RelayV2CanonicalCommandExecutor {
   resolve(request: RelayV2CanonicalCommandRequest): Promise<RelayV2CommandAdmission>;
+  fenceResolution(
+    transaction: RelayV2CommandResolutionTransaction,
+    request: RelayV2CanonicalCommandRequest,
+    fence: RelayV2CommandResolutionFence,
+  ): void;
   executeTwRpc(plan: RelayV2TwRpcExecutionPlan): Promise<RelayV2TwRpcExecutionOutcome>;
   executeTerminalControl(
     plan: RelayV2TerminalControlExecutionPlan,
@@ -424,6 +465,7 @@ class TransitionAbort extends Error {
 type AdmissionTransactionResult =
   | { kind: "epoch_mismatch"; actualHostEpoch: string }
   | { kind: "window_expired" }
+  | { kind: "resolution_rejected"; error: RelayV2CommandStructuredError }
   | { kind: "resource_rejected"; error: RelayV2CommandStructuredError }
   | { kind: "existing"; record: StoredCommand }
   | { kind: "inserted"; record: StoredCommandRecord };
@@ -532,6 +574,34 @@ function assertJson(value: unknown, seen = new Set<object>()): asserts value is 
 function cloneJson<T>(value: T): T {
   assertJson(value);
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function validateResolutionFence(
+  admission: Exclude<RelayV2CommandAdmission, { kind: "transient_admission_failure" }>,
+  request: RelayV2CanonicalCommandRequest,
+): RelayV2CommandResolutionFence {
+  const value: unknown = admission.resolutionFence;
+  const expectedOutcome = admission.kind === "executable" ? "positive" : "complete_negative";
+  const outcomeKeys = expectedOutcome === "positive" ? ["target"] : ["code"];
+  if (!isRecord(value)
+    || !hasExactKeys(value, [
+      "schemaVersion", "outcome", "authority", "operation", "expectedScopeId",
+      "expectedSessionId", "evidence", ...outcomeKeys,
+    ])
+    || value.schemaVersion !== RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION
+    || value.outcome !== expectedOutcome
+    || value.authority !== request.authority
+    || value.operation !== request.operation
+    || value.expectedScopeId !== request.scopeId
+    || value.expectedSessionId !== request.sessionId
+    || (expectedOutcome === "complete_negative"
+      && (typeof value.code !== "string"
+        || value.code !== (admission as { error: RelayV2CommandStructuredError }).error.code))) {
+    throw new TypeError("canonical resolution fence is invalid");
+  }
+  assertJson(value.evidence);
+  if (expectedOutcome === "positive") assertJson(value.target);
+  return cloneJson(value) as RelayV2CommandResolutionFence;
 }
 
 function assertWellFormedString(value: string): void {
@@ -1494,6 +1564,16 @@ function resourceTransactionFacade(
   });
 }
 
+function resolutionTransactionFacade(
+  transaction: RelayV2HostStateTransaction,
+): RelayV2CommandResolutionTransaction {
+  return Object.freeze({
+    hostEpoch: transaction.hostEpoch,
+    getMaterializedRecord: (key: string) => transaction.getMaterializedRecord(key),
+    getMaterializedReadinessFence: () => transaction.getMaterializedReadinessFence(),
+  });
+}
+
 function assertNoCanonicalSessionId(value: RelayV2HostJson): void {
   if (Array.isArray(value)) {
     for (const item of value) assertNoCanonicalSessionId(item);
@@ -1964,6 +2044,19 @@ export class RelayV2HostCommandPlane {
       }
     }
 
+    let resolutionFence: RelayV2CommandResolutionFence;
+    try {
+      resolutionFence = validateResolutionFence(admission, canonicalRequest);
+    } catch {
+      return this.preLedgerFailure(command, {
+        code: "CAPABILITY_UNAVAILABLE",
+        message: "Canonical target admission fence is unavailable",
+        retryable: true,
+        commandDisposition: "not_accepted",
+        details: null,
+      });
+    }
+
     let admitted: AdmissionTransactionResult;
     try {
       const commit = await this.store.serialize((section) => {
@@ -1983,6 +2076,27 @@ export class RelayV2HostCommandPlane {
             const now = this.now();
             if (window === undefined || now > window.acceptUntilMs) {
               throw new AdmissionAbort({ kind: "window_expired" });
+            }
+            try {
+              const fenced = this.executor.fenceResolution(
+                resolutionTransactionFacade(transaction),
+                canonicalRequest,
+                resolutionFence,
+              );
+              if (isThenable(fenced)) {
+                throw new TypeError("canonical resolution fence must be synchronous");
+              }
+            } catch {
+              throw new AdmissionAbort({
+                kind: "resolution_rejected",
+                error: {
+                  code: "CAPABILITY_UNAVAILABLE",
+                  message: "Canonical target changed before final admission",
+                  retryable: true,
+                  commandDisposition: "not_accepted",
+                  details: null,
+                },
+              });
             }
             let resourceReservation: RelayV2CommandResourceReservationBinding | null = null;
             if (admission.kind === "executable"
@@ -2100,6 +2214,9 @@ export class RelayV2HostCommandPlane {
     }
     if (admitted.kind === "window_expired") {
       return commandWindowExpiredFrame(command, command.expectedHostEpoch);
+    }
+    if (admitted.kind === "resolution_rejected") {
+      return this.preLedgerFailure(command, admitted.error);
     }
     if (admitted.kind === "resource_rejected") {
       return this.preLedgerFailure(command, admitted.error);

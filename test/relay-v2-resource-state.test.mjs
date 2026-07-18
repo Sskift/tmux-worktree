@@ -159,6 +159,35 @@ function resolverProcessTarget(kind, targetId) {
   return { kind, targetId };
 }
 
+function commandResolutionFence(resourceFence, overrides = {}) {
+  const base = {
+    schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+    outcome: resourceFence.result.kind,
+    authority: "tw_rpc",
+    operation: resourceFence.expectedSessionId === null ? "create_terminal" : "kill_session",
+    expectedScopeId: resourceFence.expectedScopeId,
+    expectedSessionId: resourceFence.expectedSessionId,
+    evidence: { resourceCut: structuredClone(resourceFence) },
+  };
+  if (resourceFence.result.kind === "complete_negative") {
+    return { ...base, code: resourceFence.result.code, ...overrides };
+  }
+  const resourceTarget = resourceFence.result.target;
+  const target = {
+    authority: "tw_rpc",
+    operation: resourceFence.expectedSessionId === null ? "create_terminal" : "kill_session",
+    processTarget: {
+      ...structuredClone(resourceTarget.processTarget),
+      scopeId: resourceFence.expectedScopeId,
+    },
+    capabilities: structuredClone(resourceTarget.capabilities),
+    ...(resourceFence.expectedSessionId === null
+      ? {}
+      : { managedTarget: structuredClone(resourceTarget.managedTarget) }),
+  };
+  return { ...base, target, ...overrides };
+}
+
 function partialScope({
   backendIdentity,
   displayName,
@@ -444,52 +473,113 @@ test("resolver admission fence binds command-expected IDs and rejects persisted 
       reconciled.snapshot.hostEpoch,
       [scopeA.scopeId],
     )).scopes[0].items;
-    const targetScopeA = await foundation.canonicalTargetResolver.resolveScope(token, scopeA.scopeId);
     const targetScopeB = await foundation.canonicalTargetResolver.resolveScope(token, scopeB.scopeId);
-    const targetSessionA = await foundation.canonicalTargetResolver.resolveSession(
-      token,
-      scopeA.scopeId,
-      sessions[0].sessionId,
-    );
     const targetSessionB = await foundation.canonicalTargetResolver.resolveSession(
       token,
       scopeA.scopeId,
       sessions[1].sessionId,
     );
-
-    await assert.rejects(
-      store.transaction((transaction) => foundation.canonicalTargetResolver.fenceScopeForAdmission(
-        transaction,
-        token,
-        scopeA.scopeId,
-        targetScopeB,
-      )),
-      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    const fenceScopeA = await foundation.canonicalTargetResolver.resolveScopeForAdmission(
+      token,
+      scopeA.scopeId,
     );
-    await assert.rejects(
-      store.transaction((transaction) => foundation.canonicalTargetResolver.fenceSessionForAdmission(
-        transaction,
-        token,
-        scopeA.scopeId,
-        sessions[0].sessionId,
-        targetSessionB,
-      )),
-      assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+    const fenceSessionA = await foundation.canonicalTargetResolver.resolveSessionForAdmission(
+      token,
+      scopeA.scopeId,
+      sessions[0].sessionId,
     );
+    const negativeFence = await foundation.canonicalTargetResolver.resolveSessionForAdmission(
+      token,
+      scopeA.scopeId,
+      "ses_missing_from_complete_cut",
+    );
+    assert.equal(negativeFence.result.kind, "complete_negative");
+    await store.transaction((transaction) => {
+      foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
+        transaction,
+        negativeFence,
+      );
+    });
     await assert.rejects(
       store.transaction((transaction) => {
         transaction.latchMaterializedReadinessFence("materialized_authority_conflict");
-        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
           transaction,
-          token,
-          scopeA.scopeId,
-          sessions[0].sessionId,
-          targetSessionA,
+          fenceSessionA,
         );
       }),
       assertMaterializedError("CAPABILITY_UNAVAILABLE"),
     );
-    assert.notDeepEqual(targetScopeA, targetScopeB);
+    const resourceSwaps = [
+      {
+        ...structuredClone(fenceScopeA),
+        result: { kind: "positive", target: targetScopeB },
+      },
+      {
+        ...structuredClone(fenceSessionA),
+        result: { kind: "positive", target: targetSessionB },
+      },
+      {
+        ...structuredClone(fenceScopeA),
+        expectedScopeId: scopeB.scopeId,
+      },
+      {
+        ...structuredClone(fenceSessionA),
+        expectedSessionId: sessions[1].sessionId,
+      },
+      {
+        ...structuredClone(fenceScopeA),
+        result: {
+          kind: "positive",
+          target: {
+            ...structuredClone(fenceScopeA.result.target),
+            processTarget: structuredClone(targetScopeB.processTarget),
+          },
+        },
+      },
+      {
+        ...structuredClone(fenceScopeA),
+        result: {
+          kind: "positive",
+          target: {
+            ...structuredClone(fenceScopeA.result.target),
+            capabilities: [...fenceScopeA.result.target.capabilities, "future.capability"],
+          },
+        },
+      },
+      {
+        ...structuredClone(fenceSessionA),
+        result: {
+          kind: "positive",
+          target: {
+            ...structuredClone(fenceSessionA.result.target),
+            managedTarget: {
+              ...structuredClone(fenceSessionA.result.target.managedTarget),
+              incarnation: targetSessionB.managedTarget.incarnation,
+            },
+          },
+        },
+      },
+      {
+        ...structuredClone(negativeFence),
+        result: { kind: "complete_negative", code: "SCOPE_NOT_FOUND" },
+      },
+      {
+        ...structuredClone(negativeFence),
+        expectedSessionId: sessions[0].sessionId,
+      },
+    ];
+    for (const swapped of resourceSwaps) {
+      await assert.rejects(
+        store.transaction((transaction) => (
+          foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
+            transaction,
+            swapped,
+          )
+        )),
+        assertMaterializedError("CAPABILITY_UNAVAILABLE"),
+      );
+    }
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -601,27 +691,32 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
       kind: "terminal",
       incarnation: incarnationA,
     });
+    const admissionFenceA = await foundation.canonicalTargetResolver.resolveSessionForAdmission(
+      tokenA,
+      scopeIdA,
+      sessionIdA,
+    );
     await store.transaction((transaction) => {
-      foundation.canonicalTargetResolver.fenceSessionForAdmission(
+      foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
         transaction,
-        tokenA,
-        scopeIdA,
-        sessionIdA,
-        targetA,
+        admissionFenceA,
       );
     });
     await assert.rejects(
       store.transaction((transaction) => {
-        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
           transaction,
-          tokenA,
-          scopeIdA,
-          sessionIdA,
           {
-            ...structuredClone(targetA),
-            managedTarget: {
-              ...structuredClone(targetA.managedTarget),
-              incarnation: incarnationB,
+            ...structuredClone(admissionFenceA),
+            result: {
+              kind: "positive",
+              target: {
+                ...structuredClone(targetA),
+                managedTarget: {
+                  ...structuredClone(targetA.managedTarget),
+                  incarnation: incarnationB,
+                },
+              },
             },
           },
         );
@@ -672,11 +767,8 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
     const beforeRebuildToken = await foundation.canonicalTargetResolver.captureToken(
       beforeRebuild.snapshot.hostEpoch,
     );
-    const beforeRebuildTarget = await foundation.canonicalTargetResolver.resolveSession(
-      beforeRebuildToken,
-      scopeIdA,
-      sessionIdA,
-    );
+    const beforeRebuildFence = await foundation.canonicalTargetResolver
+      .resolveSessionForAdmission(beforeRebuildToken, scopeIdA, sessionIdA);
     currentIncarnation = incarnationB;
     const rebuilt = await foundation.reconcile();
     const rebuiltSessions = payload(await foundation.sessionsSnapshot(
@@ -695,12 +787,9 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
     );
     await assert.rejects(
       store.transaction((transaction) => {
-        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
           transaction,
-          beforeRebuildToken,
-          scopeIdA,
-          sessionIdA,
-          beforeRebuildTarget,
+          beforeRebuildFence,
         );
       }),
       assertMaterializedError("CAPABILITY_UNAVAILABLE"),
@@ -710,6 +799,11 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
       assertMaterializedError("SESSION_NOT_FOUND"),
     );
     const targetB = await foundation.canonicalTargetResolver.resolveSession(
+      tokenB,
+      scopeIdA,
+      sessionIdB,
+    );
+    const fenceB = await foundation.canonicalTargetResolver.resolveSessionForAdmission(
       tokenB,
       scopeIdA,
       sessionIdB,
@@ -736,12 +830,9 @@ test("canonical resolver publishes only an accepted exact reconcile and fences r
     );
     await assert.rejects(
       store.transaction((transaction) => {
-        foundation.canonicalTargetResolver.fenceSessionForAdmission(
+        foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
           transaction,
-          tokenB,
-          scopeIdA,
-          sessionIdB,
-          targetB,
+          fenceB,
         );
       }),
       assertMaterializedError("CAPABILITY_UNAVAILABLE"),
@@ -1155,6 +1246,18 @@ function createTerminalFrame(hostEpoch, windowId, scopeId, commandId = "cmd-h1-h
   return frame;
 }
 
+function killSessionFrame(hostEpoch, windowId, scopeId, sessionId, commandId) {
+  const frame = structuredClone(
+    relayV2Corpus.goldenByName.get("command-execute-kill-session").frame,
+  );
+  frame.expectedHostEpoch = hostEpoch;
+  frame.payload.dedupeWindowId = windowId;
+  frame.commandId = commandId;
+  frame.scopeId = scopeId;
+  frame.sessionId = sessionId;
+  return frame;
+}
+
 function commandSession(displayName, overrides = {}) {
   return {
     ...prospectiveTerminal(displayName),
@@ -1177,18 +1280,27 @@ function successfulCreate(plan, backendInstanceKey, overrides = {}) {
 }
 
 function commandExecutor(overrides = {}) {
-  const calls = { resolve: [], execute: [] };
+  const calls = { resolve: [], fence: [], execute: [] };
   return {
     calls,
     executor: {
       async resolve(request) {
         calls.resolve.push(structuredClone(request));
-        if (overrides.resolve) return overrides.resolve(request);
         const displayName = request.arguments.label ?? "terminal";
-        return {
+        const admission = overrides.resolve ? await overrides.resolve(request) : {
           kind: "executable",
           adapterState: {
             executionTarget: { scopeId: request.scopeId },
+          },
+          resolutionFence: {
+            schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+            outcome: "positive",
+            authority: request.authority,
+            operation: request.operation,
+            expectedScopeId: request.scopeId,
+            expectedSessionId: request.sessionId,
+            target: { testTarget: request.scopeId },
+            evidence: { testResolver: "joint-h1-h2" },
           },
           resourceReservationPlan: {
             logicalTarget: {
@@ -1200,6 +1312,17 @@ function commandExecutor(overrides = {}) {
             session: commandSession(displayName),
           },
         };
+        return admission;
+      },
+      fenceResolution(transaction, request, fence) {
+        calls.fence.push({
+          hostEpoch: transaction.hostEpoch,
+          request: structuredClone(request),
+          fence: structuredClone(fence),
+        });
+        if (overrides.fenceResolution) {
+          return overrides.fenceResolution(transaction, request, fence);
+        }
       },
       async executeTwRpc(plan) {
         calls.execute.push(structuredClone(plan));
@@ -1255,10 +1378,23 @@ function invalidSynchronousSinkResult(mode, h) {
   throw new Error("sink threw synchronously");
 }
 
-async function seedLocalScope(h, { withResolver = false } = {}) {
+async function seedLocalScope(h, { withResolver = false, withSession = false } = {}) {
+  const seededIncarnation = `twinc2.${"S".repeat(43)}`;
+  const seededSession = terminal(
+    canonicalBackendIdentity.issueRelayV2CanonicalBackendInstanceKey({
+      processTarget: resolverProcessTarget("local", "configured-local"),
+      incarnation: seededIncarnation,
+    }),
+    "managed-terminal",
+  );
   const scan = {
     coverage: "complete",
-    scopes: [scope({ backendIdentity: "local", displayName: "Local", kind: "local" })],
+    scopes: [scope({
+      backendIdentity: "local",
+      displayName: "Local",
+      kind: "local",
+      sessions: withSession ? [seededSession] : [],
+    })],
   };
   if (withResolver) {
     Object.defineProperty(scan, resourceState.RELAY_V2_RESOURCE_RESOLVER_CUT, {
@@ -1269,7 +1405,18 @@ async function seedLocalScope(h, { withResolver = false } = {}) {
           processTarget: resolverProcessTarget("local", "configured-local"),
           capabilities: ["session.list"],
         }],
-        sessionTargets: [],
+        sessionTargets: withSession ? [{
+          scopeBackendIdentity: "local",
+          sessionBackendIdentity: seededSession.backendIdentity,
+          backendKind: "terminal",
+          processTarget: resolverProcessTarget("local", "configured-local"),
+          capabilities: ["session.list"],
+          managedTarget: {
+            name: "managed-terminal",
+            kind: "terminal",
+            incarnation: seededIncarnation,
+          },
+        }] : [],
         isCurrent: () => true,
       },
       enumerable: false,
@@ -1280,9 +1427,17 @@ async function seedLocalScope(h, { withResolver = false } = {}) {
   const scopeId = payload(
     await h.foundation.scopesSnapshot("joint-scope", seeded.snapshot.hostEpoch),
   ).items[0].scopeId;
+  const sessionId = withSession
+    ? payload(await h.foundation.sessionsSnapshot(
+        "joint-session",
+        seeded.snapshot.hostEpoch,
+        [scopeId],
+      )).scopes[0].items[0].sessionId
+    : null;
   return {
     seeded,
     scopeId,
+    sessionId,
     resolverToken: withResolver
       ? await h.foundation.canonicalTargetResolver.captureToken(seeded.snapshot.hostEpoch)
       : null,
@@ -1345,6 +1500,124 @@ async function issueWindow(h, plane) {
     queryUntilMs: h.now() + 60_000 + commandPlane.RELAY_V2_COMMAND_DEDUPE_RETENTION_MS,
   });
 }
+
+test("H2 resolution cuts are re-fenced inside H1 final admission", async (t) => {
+  for (const outcome of ["positive", "complete_negative"]) {
+    await t.test(outcome, async () => {
+      const h = await harness();
+      try {
+        const { seeded, scopeId, resolverToken } = await seedLocalScope(
+          h,
+          { withResolver: true },
+        );
+        const missingSessionId = "ses_missing_from_complete_cut";
+        const h2Fence = outcome === "positive"
+          ? await h.foundation.canonicalTargetResolver.resolveScopeForAdmission(
+              resolverToken,
+              scopeId,
+            )
+          : await h.foundation.canonicalTargetResolver.resolveSessionForAdmission(
+              resolverToken,
+              scopeId,
+              missingSessionId,
+            );
+        assert.equal(h2Fence.result.kind, outcome);
+        await h.store.transaction((transaction) => {
+          h.foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
+            transaction,
+            h2Fence,
+          );
+        });
+
+        let invalidatedSnapshot;
+        const fake = commandExecutor({
+          resolve: async (request) => {
+            h.discovery.push({
+              coverage: "complete",
+              scopes: [scope({
+                backendIdentity: "local",
+                displayName: "Local",
+                kind: "local",
+              })],
+            });
+            await h.foundation.reconcile();
+            invalidatedSnapshot = await h.store.read();
+            if (outcome === "complete_negative") {
+              return {
+                kind: "immutable_business_failure",
+                resolutionFence: commandResolutionFence(h2Fence),
+                authorityEvidence: {
+                  schemaVersion: commandPlane.RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
+                  coverage: "complete",
+                  authority: request.authority,
+                  hostId: request.hostId,
+                  hostEpoch: request.hostEpoch,
+                  scopeId: request.scopeId,
+                  sessionId: request.sessionId,
+                  evidence: { resolver: "h2-complete-cut" },
+                },
+                error: {
+                  code: "SESSION_NOT_FOUND",
+                  message: "Session is absent from the complete authority cut",
+                  retryable: false,
+                  commandDisposition: "completed",
+                  details: null,
+                },
+              };
+            }
+            const displayName = request.arguments.label ?? "terminal";
+            return {
+              kind: "executable",
+              resolutionFence: commandResolutionFence(h2Fence),
+              adapterState: { executionTarget: { scopeId: request.scopeId } },
+              resourceReservationPlan: {
+                logicalTarget: { scopeId: request.scopeId },
+                session: commandSession(displayName),
+              },
+            };
+          },
+          fenceResolution: (transaction, request, fence) => {
+            const resourceCut = fence.evidence.resourceCut;
+            assert.equal(fence.expectedScopeId, request.scopeId);
+            assert.equal(fence.expectedSessionId, request.sessionId);
+            assert.equal(resourceCut.result.kind, fence.outcome);
+            if (fence.outcome === "complete_negative") {
+              assert.equal(resourceCut.result.code, fence.code);
+            }
+            h.foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
+              transaction,
+              resourceCut,
+            );
+          },
+        });
+        const plane = await openCommandPlane(h, fake.executor);
+        const window = await issueWindow(h, plane);
+        const commandId = `cmd-stale-${outcome}`;
+        const frame = outcome === "positive"
+          ? createTerminalFrame(seeded.snapshot.hostEpoch, window.windowId, scopeId, commandId)
+          : killSessionFrame(
+              seeded.snapshot.hostEpoch,
+              window.windowId,
+              scopeId,
+              missingSessionId,
+              commandId,
+            );
+        const response = await plane.execute(commandAuth(), frame);
+        assert.equal(response.type, "error");
+        assert.equal(response.commandId, commandId);
+        assert.equal(response.error.code, "CAPABILITY_UNAVAILABLE");
+        assert.equal(response.error.commandDisposition, "not_accepted");
+        assert.equal(fake.calls.fence.length, 1);
+        assert.equal(fake.calls.execute.length, 0);
+        const after = await h.store.read();
+        assert.deepEqual(after.commands, invalidatedSnapshot.commands);
+        assert.equal(materializedRoot(after).capacityReservations.length, 0);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+});
 
 test("H1 ACCEPTED and H2 reservation roll back together on the H0 state rename", async () => {
   const h = await harness();
@@ -1580,6 +1853,10 @@ test("an exact persisted reservation replay precedes later partial-readiness rej
       resolverToken,
       scopeId,
     );
+    const resolverFence = await h.foundation.canonicalTargetResolver.resolveScopeForAdmission(
+      resolverToken,
+      scopeId,
+    );
     let releaseExecution;
     let executionStarted;
     const started = new Promise((resolve) => { executionStarted = resolve; });
@@ -1610,11 +1887,9 @@ test("an exact persisted reservation replay precedes later partial-readiness rej
       resolverTarget,
     );
     await h.store.transaction((transaction) => {
-      h.foundation.canonicalTargetResolver.fenceScopeForAdmission(
+      h.foundation.canonicalTargetResolver.fenceResourceCutForAdmission(
         transaction,
-        resolverToken,
-        scopeId,
-        resolverTarget,
+        resolverFence,
       );
     });
     const snapshot = await h.store.read();
@@ -2930,9 +3205,19 @@ test("H2 INVALID_ARGUMENT reservation rejection remains non-retryable through H1
   try {
     const { seeded, scopeId } = await seedLocalScope(h);
     const fake = commandExecutor({
-      resolve: async () => ({
+      resolve: async (request) => ({
         kind: "executable",
         adapterState: { executionTarget: "invalid-plan" },
+        resolutionFence: {
+          schemaVersion: commandPlane.RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+          outcome: "positive",
+          authority: request.authority,
+          operation: request.operation,
+          expectedScopeId: request.scopeId,
+          expectedSessionId: request.sessionId,
+          target: { testTarget: request.scopeId },
+          evidence: { testResolver: "invalid-resource-plan" },
+        },
         resourceReservationPlan: null,
       }),
     });

@@ -25,6 +25,7 @@ import type { RelayV2JsonObject } from "./codecSchema.js";
 import {
   RELAY_V2_COMMAND_AUTHORITY_EVIDENCE_SCHEMA_VERSION,
   RELAY_V2_COMMAND_BACKEND_OUTCOME_SCHEMA_VERSION,
+  RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
   type RelayV2CanonicalBackendOutcome,
   type RelayV2CanonicalCommandExecutor,
   type RelayV2CanonicalCommandRequest,
@@ -32,6 +33,8 @@ import {
   type RelayV2CommandAuthorityEvidence,
   type RelayV2CommandOperation,
   type RelayV2CommandRequestFingerprint,
+  type RelayV2CommandResolutionFence,
+  type RelayV2CommandResolutionTransaction,
   type RelayV2CommandStructuredError,
   type RelayV2TerminalControlExecutionOutcome,
   type RelayV2TerminalControlExecutionPlan,
@@ -131,10 +134,18 @@ export type RelayV2CanonicalTargetResolution =
       coverage: "complete";
       evidence: RelayV2CanonicalResolverEvidence;
       target: RelayV2CanonicalResolvedTarget;
+      admissionFence: RelayV2JsonObject;
     }
   | {
       kind: "not_found";
-      coverage: "complete" | "partial" | "unreachable";
+      coverage: "complete";
+      evidence: RelayV2CanonicalResolverEvidence;
+      code: "SCOPE_NOT_FOUND" | "PROJECT_NOT_FOUND" | "SESSION_NOT_FOUND" | "PANE_NOT_FOUND";
+      admissionFence: RelayV2JsonObject;
+    }
+  | {
+      kind: "not_found";
+      coverage: "partial" | "unreachable";
       evidence: RelayV2CanonicalResolverEvidence;
       code: "SCOPE_NOT_FOUND" | "PROJECT_NOT_FOUND" | "SESSION_NOT_FOUND" | "PANE_NOT_FOUND";
     }
@@ -149,10 +160,20 @@ export type RelayV2CanonicalTargetResolution =
 /**
  * The resolver is the only source of target truth. It must be side-effect free:
  * no discovery scan, lease acquisition, name fallback, or public ID allocation
- * is permitted while satisfying this port.
+ * is permitted while satisfying this port. fenceResolution must synchronously
+ * bind the full target carried in the command fence to its own authority proof;
+ * when it delegates an embedded H2 resource cut, it must first bind the outer
+ * process target, capabilities, managed incarnation, and overlapping IDs to
+ * that exact cut. For terminal control this also includes the exact lease and
+ * control-target identity owned by the terminal resolver.
  */
 export interface RelayV2CanonicalTargetResolverPort {
   resolve(request: RelayV2CanonicalCommandRequest): Promise<RelayV2CanonicalTargetResolution>;
+  fenceResolution(
+    transaction: RelayV2CommandResolutionTransaction,
+    request: RelayV2CanonicalCommandRequest,
+    fence: RelayV2CommandResolutionFence,
+  ): void;
 }
 
 export interface RelayV2StructuredProcessRequest {
@@ -222,6 +243,18 @@ interface StoredAdapterState {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isThenable(value: unknown): boolean {
+  try {
+    const thenable = ((typeof value === "object" && value !== null)
+      || typeof value === "function")
+      && typeof (value as { then?: unknown }).then === "function";
+    if (thenable) void Promise.resolve(value).catch(() => undefined);
+    return thenable;
+  } catch {
+    return true;
+  }
 }
 
 function exactKeys(
@@ -915,8 +948,12 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         || raw.coverage === "unreachable")
         ? raw.coverage as "complete" | "partial" | "unreachable"
         : null;
-      if (!exactKeys(raw, ["kind", "coverage", "evidence", "code"])
+      const expectedKeys = coverage === "complete"
+        ? ["kind", "coverage", "evidence", "code", "admissionFence"]
+        : ["kind", "coverage", "evidence", "code"];
+      if (!exactKeys(raw, expectedKeys)
         || coverage === null
+        || (coverage === "complete" && !isRecord(raw.admissionFence))
         || !notFoundCodeAllowed(request, raw.code)) {
         return {
           kind: "transient_admission_failure",
@@ -942,6 +979,16 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       return {
         kind: "immutable_business_failure",
         authorityEvidence: observed,
+        resolutionFence: {
+          schemaVersion: RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+          outcome: "complete_negative",
+          authority: request.authority,
+          operation: request.operation,
+          expectedScopeId: request.scopeId,
+          expectedSessionId: request.sessionId,
+          code: raw.code as string,
+          evidence: clone(raw.admissionFence) as RelayV2JsonObject,
+        },
         error: {
           code: raw.code as string,
           message: "Canonical target does not exist in the complete authority view",
@@ -1004,7 +1051,8 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         error: transientError("INTERNAL", "Canonical target evidence is invalid"),
       };
     }
-    if (!exactKeys(raw, ["kind", "coverage", "evidence", "target"])
+    if (!exactKeys(raw, ["kind", "coverage", "evidence", "target", "admissionFence"])
+      || !isRecord(raw.admissionFence)
       || raw.coverage !== "complete") {
       const coverage = raw.coverage === "partial" || raw.coverage === "unreachable"
         ? raw.coverage
@@ -1024,6 +1072,16 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
         return {
           kind: "executable",
           adapterState: state as unknown as RelayV2JsonObject,
+          resolutionFence: {
+            schemaVersion: RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+            outcome: "positive",
+            authority: request.authority,
+            operation: request.operation,
+            expectedScopeId: request.scopeId,
+            expectedSessionId: request.sessionId,
+            target: clone(target) as unknown as RelayV2JsonObject,
+            evidence: clone(raw.admissionFence) as RelayV2JsonObject,
+          },
           resourceReservationPlan: {
             logicalTarget: {
               operation: target.operation,
@@ -1037,6 +1095,16 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
       return {
         kind: "executable",
         adapterState: state as unknown as RelayV2JsonObject,
+        resolutionFence: {
+          schemaVersion: RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION,
+          outcome: "positive",
+          authority: request.authority,
+          operation: request.operation,
+          expectedScopeId: request.scopeId,
+          expectedSessionId: request.sessionId,
+          target: clone(target) as unknown as RelayV2JsonObject,
+          evidence: clone(raw.admissionFence) as RelayV2JsonObject,
+        },
       };
     } catch (error) {
       const capability = error instanceof Error && error.message.includes("capability");
@@ -1050,6 +1118,38 @@ export class RelayV2CanonicalCommandExecutorAdapter implements RelayV2CanonicalC
             : "Canonical target evidence is invalid",
         ),
       };
+    }
+  }
+
+  fenceResolution(
+    transaction: RelayV2CommandResolutionTransaction,
+    request: RelayV2CanonicalCommandRequest,
+    fence: RelayV2CommandResolutionFence,
+  ): void {
+    if (transaction.hostEpoch !== request.hostEpoch
+      || fence.schemaVersion !== RELAY_V2_COMMAND_RESOLUTION_FENCE_SCHEMA_VERSION
+      || fence.authority !== request.authority
+      || fence.operation !== request.operation
+      || fence.expectedScopeId !== request.scopeId
+      || fence.expectedSessionId !== request.sessionId
+      || !isRecord(fence.evidence)) {
+      throw new TypeError("canonical resolution fence crossed command authority");
+    }
+    if (fence.outcome === "positive") {
+      const target = resolvedTarget(fence.target, request);
+      if (canonicalJson(target) !== canonicalJson(fence.target)) {
+        throw new TypeError("canonical resolution fence target is inexact");
+      }
+    } else if (!notFoundCodeAllowed(request, fence.code)) {
+      throw new TypeError("canonical negative resolution fence is inexact");
+    }
+    const fenced = this.resolver.fenceResolution(
+      transaction,
+      clone(request),
+      clone(fence),
+    );
+    if (isThenable(fenced)) {
+      throw new TypeError("canonical target resolver fence must be synchronous");
     }
   }
 
