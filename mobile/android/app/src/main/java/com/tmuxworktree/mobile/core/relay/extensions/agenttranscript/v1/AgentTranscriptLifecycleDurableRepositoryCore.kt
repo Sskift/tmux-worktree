@@ -775,10 +775,10 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         consumeSnapshotPage(command, limits)
     }
 
-    internal suspend fun reduceUnderApplyLease(
+    private suspend fun reduceUnderApplyLease(
         expectedNamespace: AgentTranscriptLifecycleDurableNamespace,
         input: AgentTranscriptLifecycleClientInput,
-        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptLifecycleClientReduction = store.transaction {
         if (input !is AgentTranscriptLifecycleControlInput) {
             throw AgentTranscriptLifecyclePersistenceConflictException()
