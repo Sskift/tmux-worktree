@@ -980,12 +980,12 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         lastAgentSeq: String,
         snapshotThroughAgentSeq: String?,
         parentGeneration: String,
+        limits: AgentClientReducerLimits = AgentClientReducerLimits(),
     ): LifecycleIndexAccounting {
         val currentStats = lifecycleCurrentStats(namespace)
         val witnessStats = lifecycleWitnessAudit(namespace)
         val recentStats = recentEvidenceAudit(namespace)
         val notificationStats = notificationLedgerAudit(namespace)
-        val limits = AgentClientReducerLimits()
         if (currentStats.itemCount > limits.maxLifecycleRecords ||
             witnessStats.itemCount > limits.maxEventIdentityWitnesses ||
             notificationStats.itemCount > limits.maxNotificationLedgerEntries
@@ -2232,6 +2232,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             header.throughAgentSeq,
             AgentSnapshotCheckpoint(header.throughAgentSeq, nextGeneration),
             nextState.extensionLane.lastAgentSeq,
+            limits,
         )
         var current = persistOperationState(
             currentBeforeCut,
@@ -2609,6 +2610,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         throughAgentSeq: String,
         nextCheckpoint: AgentSnapshotCheckpoint,
         parentLastAgentSeq: String,
+        limits: AgentClientReducerLimits,
     ): AgentTranscriptDurableStorageAccounting {
         val stats = transcriptNamespaceStats(namespace)
         requireCanonicalStorageCounter(throughAgentSeq, positive = true)
@@ -2622,6 +2624,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             throughAgentSeq,
             throughAgentSeq,
             nextCheckpoint.localGeneration,
+            limits,
         )
         return old.copy(
             entryCount = stats.entryCount,
@@ -3225,7 +3228,17 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 throw AgentTranscriptLifecyclePersistenceConflictException()
             }
 
-            if (!intent.isPreflightAuthorizedBy(current.state)) {
+            val claimFacts = notificationClaimPreflightFacts(
+                expectedNamespace,
+                current.state,
+                intent,
+            )
+            if (claimFacts == null || !intent.isPreflightAuthorizedBy(
+                    current.state,
+                    claimFacts.ledgerEntry,
+                    claimFacts.currentRecord,
+                )
+            ) {
                 return@transaction NotificationClaimTransactionResult.NotExecutable(
                     AgentTranscriptLifecycleNotificationNotExecutableReason.INTENT_NOT_CURRENT,
                 )
@@ -3269,6 +3282,92 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                     transactionResult.reason,
                 )
         }
+    }
+
+    private data class NotificationClaimPreflightFacts(
+        val ledgerEntry: AgentNotificationLedgerEntry,
+        val currentRecord: AgentLifecycleRecord?,
+    )
+
+    private fun AgentTranscriptLifecycleDurableTransaction.notificationClaimPreflightFacts(
+        namespace: AgentTranscriptLifecycleDurableNamespace,
+        state: AgentTranscriptLifecycleClientState,
+        intent: AgentSystemNotificationIntent,
+    ): NotificationClaimPreflightFacts? {
+        val eventId = intent.dedupeKey.lifecycleEventId
+        val byKey = notificationByDedupeKey(namespace, eventId, intent.dedupeKey.state)
+            ?: return null
+        val byEvent = notificationByLifecycleEventId(namespace, eventId)
+        if (byEvent != byKey) storageMalformed()
+        val notification = byKey
+        requireExactLifecycleNamespace(namespace, notification)
+        requireExactOrderKey(notification.agentEventSeq, notification.agentEventSeqOrder)
+        if (compareStorageCounters(
+                notification.agentEventSeq,
+                state.extensionLane.lastAgentSeq,
+            ) > 0 || compareStorageCounters(
+                notification.localGeneration,
+                state.extensionLane.localGeneration,
+            ) > 0
+        ) storageMalformed()
+        val expectedPayload = canonicalNotificationPayload(
+            notification.disposition,
+            notification.localGeneration,
+        )
+        val notificationState = notification.lifecycleState.toLifecycleState()
+        if (notificationState !in setOf(
+                AgentLifecycleState.WAITING_FOR_USER,
+                AgentLifecycleState.FAILED,
+                AgentLifecycleState.COMPLETED,
+            ) || notification.ledgerCanonicalJson != expectedPayload.canonicalJson ||
+            notification.ledgerCanonicalUtf8Bytes != expectedPayload.payloadUtf8Bytes ||
+            notification.ledgerSha256 != expectedPayload.sha256
+        ) storageMalformed()
+
+        val eventWitness = witnessByEventId(namespace, eventId) ?: storageMalformed()
+        validateWitnessRow(namespace, eventWitness)
+        if (compareStorageCounters(
+                eventWitness.agentEventSeq,
+                state.extensionLane.lastAgentSeq,
+            ) > 0 || !notification.pointsExactlyTo(eventWitness)
+        ) storageMalformed()
+        val eventIdentity = eventWitness.toDomainWitness()
+        val disposition = try {
+            AgentNotificationDisposition.valueOf(notification.disposition)
+        } catch (_: IllegalArgumentException) {
+            storageMalformed()
+        }
+        val ledgerEntry = AgentNotificationLedgerEntry(
+            disposition,
+            eventIdentity,
+            notification.localGeneration,
+        )
+
+        val currentByEvent = lifecycleCurrentByEventId(namespace, eventId)
+        val currentByIdentity = lifecycleCurrentByIdentity(
+            namespace,
+            eventIdentity.lifecycleIdentity,
+        )
+        if (currentByEvent != null && currentByEvent != currentByIdentity) storageMalformed()
+        val currentRecord = currentByIdentity?.let { current ->
+            requireExactLifecycleNamespace(namespace, current)
+            requireExactOrderKey(current.agentEventSeq, current.agentEventSeqOrder)
+            if (compareStorageCounters(
+                    current.agentEventSeq,
+                    state.extensionLane.lastAgentSeq,
+                ) > 0
+            ) storageMalformed()
+            val currentWitness = witnessByEventId(namespace, current.lifecycleEventId)
+                ?: storageMalformed()
+            validateWitnessRow(namespace, currentWitness)
+            val highest = highestWitnessForIdentity(namespace, current.toLifecycleIdentity())
+                ?: storageMalformed()
+            if (!current.pointsExactlyTo(currentWitness) || highest != currentWitness) {
+                storageMalformed()
+            }
+            currentWitness.toDomainRecord()
+        }
+        return NotificationClaimPreflightFacts(ledgerEntry, currentRecord)
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.loadSingle(

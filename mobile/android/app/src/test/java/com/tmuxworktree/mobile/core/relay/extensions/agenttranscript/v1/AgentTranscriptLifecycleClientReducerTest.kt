@@ -32,6 +32,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             fixtureCase.list("steps").forEachIndexed { stepIndex, rawStep ->
                 val step = rawStep.asMap()
                 val rawInput = step.map("input")
+                state = prepareFixtureStateForInput(state, rawInput)
                 val label = "$caseName step ${stepIndex + 1}"
                 val commandId = rawInput.optionalString("commandId")
                 val input: AgentTranscriptLifecycleClientInput?
@@ -43,7 +44,21 @@ class AgentTranscriptLifecycleClientReducerTest {
                     reduction = FixtureReduction(state, "command_applied", emptyList())
                 } else {
                     input = rawInput.toClientInput(state)
-                    val extensionReduction = AgentTranscriptLifecycleClientReducer.reduce(state, input)
+                    val firstReduction = AgentTranscriptLifecycleClientReducer.reduce(state, input)
+                    val extensionReduction = if (
+                        input is AgentTranscriptLifecycleClientInput.SnapshotRequestStarted
+                    ) {
+                        AgentTranscriptLifecycleClientReducer.reduce(
+                            firstReduction.state,
+                            AgentTranscriptLifecycleClientInput.SnapshotPageZeroAccepted(
+                                requireNotNull(
+                                    firstReduction.state.extensionLane.pendingSnapshotRequest,
+                                ),
+                            ),
+                        )
+                    } else {
+                        firstReduction
+                    }
                     reduction = FixtureReduction(
                         extensionReduction.state,
                         extensionReduction.disposition.toFixtureDisposition(),
@@ -88,6 +103,8 @@ class AgentTranscriptLifecycleClientReducerTest {
             sourceEpoch = "source-large",
             identity = runIdentity,
             state = AgentLifecycleState.RUNNING,
+            failure = null,
+            occurredAtMs = 0,
             agentEventSeq = signedLongOverflow,
         )
         val initial = AgentTranscriptLifecycleClientState(
@@ -99,6 +116,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 activeSourceEpoch = "source-large",
                 timelineEpoch = "timeline-large",
                 lastAgentSeq = signedLongOverflow,
+                effectiveHostLimits = productionHostLimits(),
                 notificationBaselineAgentSeq = signedLongOverflow,
                 lifecycleByIdentity = mapOf(runIdentity to currentRun),
                 currentLifecycleIdentityByEventId = mapOf(currentRun.lifecycleEventId to runIdentity),
@@ -155,10 +173,12 @@ class AgentTranscriptLifecycleClientReducerTest {
             agentEventSeq = "9223372036854775810",
             eventId = "event-wrong-lineage",
             closedEventDigest = digestOf("closed-event-wrong-lineage"),
-            record = currentRun.copy(
-                lifecycleEventId = "event-wrong-lineage",
-                state = AgentLifecycleState.COMPLETED,
-                agentEventSeq = "9223372036854775810",
+            mutation = AgentTimelineMutation.Lifecycle(
+                currentRun.copy(
+                    lifecycleEventId = "event-wrong-lineage",
+                    state = AgentLifecycleState.COMPLETED,
+                    agentEventSeq = "9223372036854775810",
+                ),
             ),
         )
         val lineageRejected = AgentTranscriptLifecycleClientReducer.reduce(applied.state, wrongHostLineage)
@@ -169,11 +189,11 @@ class AgentTranscriptLifecycleClientReducerTest {
             lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-unexpected"),
         )
         val timelineResync = AgentTranscriptLifecycleClientReducer.reduce(applied.state, differentTimeline)
-        assertEquals(AgentClientDisposition.GAP_RESYNC, timelineResync.disposition)
+        assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, timelineResync.disposition)
         assertEquals(AgentExtensionSupport.AVAILABLE, timelineResync.state.extensionLane.support)
         assertEquals("timeline-large", timelineResync.state.extensionLane.timelineEpoch)
         assertEquals(nextSequence, timelineResync.state.extensionLane.lastAgentSeq)
-        assertTrue(timelineResync.state.extensionLane.requiresSnapshot)
+        assertFalse(timelineResync.state.extensionLane.requiresSnapshot)
     }
 
     @Test
@@ -228,7 +248,11 @@ class AgentTranscriptLifecycleClientReducerTest {
             provenance = AgentEventProvenance.REPLAY,
         )
         val replayedRunning = AgentTranscriptLifecycleClientReducer.reduce(
-            availableState("timeline-old-source-replay", baseline = "0"),
+            replayRequestAccepted(
+                availableState("timeline-old-source-replay", baseline = "0"),
+                "replay-old-source",
+                observedCurrentAgentSeq = "2",
+            ),
             replayRunning,
         )
         assertEquals(AgentClientDisposition.APPLIED, replayedRunning.disposition)
@@ -282,6 +306,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 activeSourceEpoch = "source-test",
                 timelineEpoch = "timeline-resync",
                 lastAgentSeq = "1",
+                effectiveHostLimits = productionHostLimits(),
                 notificationBaselineAgentSeq = "1",
                 lifecycleByIdentity = mapOf(
                     staleIdentity to lifecycleRecord(
@@ -312,16 +337,10 @@ class AgentTranscriptLifecycleClientReducerTest {
                 profileActive = true,
             ),
         )
-        val snapshotRequested = AgentTranscriptLifecycleClientReducer.reduce(
-            initial,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-resync",
-            ),
-        ).state
+        val snapshotRequested = snapshotRequestAccepted(initial, "snapshot-resync")
         val snapshot = AgentTranscriptLifecycleClientInput.SnapshotCommit(
             lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-resync"),
-            requestFence = AgentLocalRequestFence("0", "snapshot-resync"),
+            localGeneration = "0",
             throughAgentSeq = "4",
             records = listOf(
                 lifecycleRecord(
@@ -431,13 +450,10 @@ class AgentTranscriptLifecycleClientReducerTest {
     @Test
     fun resyncSnapshotRetainsNotificationDispositionWithoutReplayingShownIntent() {
         val initial = availableState("timeline-notification-resnapshot", baseline = null)
-        val initialRequest = AgentTranscriptLifecycleClientReducer.reduce(
+        val initialRequest = snapshotRequestAccepted(
             initial,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-notification-initial",
-            ),
-        ).state
+            "snapshot-notification-initial",
+        )
         val running = lifecycleRecord(
             "event-notification-running",
             "1",
@@ -450,7 +466,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             initialRequest,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 AgentTimelineLineage(SESSION_IDENTITY, "timeline-notification-resnapshot"),
-                AgentLocalRequestFence("0", "snapshot-notification-initial"),
+                "0",
                 "1",
                 listOf(running),
             ),
@@ -470,18 +486,15 @@ class AgentTranscriptLifecycleClientReducerTest {
         val oldIntent = requireNotNull(shown.notificationDecisions.single().systemNotificationIntent)
         val shownKey = shown.notificationDecisions.single().dedupeKey
 
-        val resnapshotRequest = AgentTranscriptLifecycleClientReducer.reduce(
+        val resnapshotRequest = snapshotRequestAccepted(
             shown.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-notification-resync",
-            ),
-        ).state
+            "snapshot-notification-resync",
+        )
         val resnapshot = AgentTranscriptLifecycleClientReducer.reduce(
             resnapshotRequest,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 AgentTimelineLineage(SESSION_IDENTITY, "timeline-notification-resnapshot"),
-                AgentLocalRequestFence("1", "snapshot-notification-resync"),
+                "1",
                 "2",
                 listOf(waitingEvent.record),
             ),
@@ -523,7 +536,7 @@ class AgentTranscriptLifecycleClientReducerTest {
     }
 
     @Test
-    fun snapshotCheckpointRetainsHistoricalSeenEventBindingAndExactDigestDuplicate() {
+    fun snapshotCheckpointRetainsHistoricalSeenEventBindingAndRejectsReuse() {
         val historicalEvent = lifecycleEvent(
             "timeline-historical-witness",
             "1",
@@ -537,18 +550,12 @@ class AgentTranscriptLifecycleClientReducerTest {
             availableState("timeline-historical-witness", baseline = "0"),
             historicalEvent,
         ).state
-        val requested = AgentTranscriptLifecycleClientReducer.reduce(
-            applied,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-omit-historical",
-            ),
-        ).state
+        val requested = snapshotRequestAccepted(applied, "snapshot-omit-historical")
         val checkpoint = AgentTranscriptLifecycleClientReducer.reduce(
             requested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 AgentTimelineLineage(SESSION_IDENTITY, "timeline-historical-witness"),
-                AgentLocalRequestFence("0", "snapshot-omit-historical"),
+                "0",
                 "1",
                 emptyList(),
             ),
@@ -560,12 +567,6 @@ class AgentTranscriptLifecycleClientReducerTest {
             historicalEvent.record.toEventIdentityWitness(historicalEvent.closedEventDigest),
             checkpoint.state.extensionLane.eventWitnessById[historicalEvent.eventId],
         )
-        val retainedExactDuplicate = AgentTranscriptLifecycleClientReducer.reduce(
-            checkpoint.state,
-            historicalEvent.copy(provenance = AgentEventProvenance.REPLAY),
-        )
-        assertEquals(AgentClientDisposition.DUPLICATE, retainedExactDuplicate.disposition)
-
         val reusedId = AgentTranscriptLifecycleClientReducer.reduce(
             checkpoint.state,
             lifecycleEvent(
@@ -648,18 +649,19 @@ class AgentTranscriptLifecycleClientReducerTest {
 
         val statusRequested = AgentTranscriptLifecycleClientReducer.reduce(
             resetApplied.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.STATUS,
-                "status-after-reset",
-            ),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-after-reset"),
         ).state
         val lateOldGeneration = AgentTranscriptLifecycleClientReducer.reduce(
             statusRequested,
             AgentTranscriptLifecycleClientInput.StatusAvailable(
+                authority = fixtureDurableAuthority(),
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-reset-old"),
                 requestFence = AgentLocalRequestFence("0", "status-before-reset"),
                 liveSource = AgentLiveSourceState.CONNECTED,
                 activeSourceEpoch = "source-before-reset",
+                currentAgentSeq = "2",
+                earliestReplaySeq = "1",
+                hostLimits = productionHostLimits(),
             ),
         )
         assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, lateOldGeneration.disposition)
@@ -667,10 +669,14 @@ class AgentTranscriptLifecycleClientReducerTest {
         val retiredStatus = AgentTranscriptLifecycleClientReducer.reduce(
             lateOldGeneration.state,
             AgentTranscriptLifecycleClientInput.StatusAvailable(
+                authority = fixtureDurableAuthority(),
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-reset-old"),
                 requestFence = AgentLocalRequestFence("1", "status-after-reset"),
                 liveSource = AgentLiveSourceState.CONNECTED,
                 activeSourceEpoch = "source-after-reset",
+                currentAgentSeq = "2",
+                earliestReplaySeq = "1",
+                hostLimits = productionHostLimits(),
             ),
         )
         assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, retiredStatus.disposition)
@@ -696,18 +702,12 @@ class AgentTranscriptLifecycleClientReducerTest {
             lifecycle = mapOf(runIdentity to current),
             runsWithTurns = setOf("run-ever-turn"),
         )
-        val staleRequested = AgentTranscriptLifecycleClientReducer.reduce(
-            initial,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-stale",
-            ),
-        ).state
+        val staleRequested = snapshotRequestAccepted(initial, "snapshot-stale")
         val stale = AgentTranscriptLifecycleClientReducer.reduce(
             staleRequested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
-                requestFence = AgentLocalRequestFence("0", "snapshot-stale"),
+                localGeneration = "0",
                 throughAgentSeq = "4",
                 records = emptyList(),
             ),
@@ -717,18 +717,17 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertTrue(stale.state.extensionLane.requiresSnapshot)
         assertTrue(stale.notificationDecisions.isEmpty())
 
-        val freshRequested = AgentTranscriptLifecycleClientReducer.reduce(
-            stale.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-fresh",
+        val freshRequested = snapshotRequestAccepted(
+            stale.state.copy(
+                extensionLane = stale.state.extensionLane.copy(localGeneration = "1"),
             ),
-        ).state
+            "snapshot-fresh",
+        )
         val lateOldRequest = AgentTranscriptLifecycleClientReducer.reduce(
             freshRequested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
-                requestFence = AgentLocalRequestFence("0", "snapshot-stale"),
+                localGeneration = "0",
                 throughAgentSeq = "6",
                 records = emptyList(),
             ),
@@ -740,7 +739,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             lateOldRequest.state,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
-                requestFence = AgentLocalRequestFence("1", "snapshot-fresh"),
+                localGeneration = "1",
                 throughAgentSeq = "6",
                 records = listOf(
                     lifecycleRecord(
@@ -760,18 +759,15 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertTrue("run fallback must remain suppressed", recovered.notificationDecisions.isEmpty())
         assertFalse(recovered.state.extensionLane.requiresSnapshot)
 
-        val invalidRequested = AgentTranscriptLifecycleClientReducer.reduce(
+        val invalidRequested = snapshotRequestAccepted(
             recovered.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-invalid-graph",
-            ),
-        ).state
+            "snapshot-invalid-graph",
+        )
         val invalidGraph = AgentTranscriptLifecycleClientReducer.reduce(
             invalidRequested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-safe"),
-                requestFence = AgentLocalRequestFence("2", "snapshot-invalid-graph"),
+                localGeneration = "2",
                 throughAgentSeq = "8",
                 records = listOf(
                     lifecycleRecord(
@@ -853,19 +849,16 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertTrue(saturated.state.extensionLane.requiresSnapshot)
         assertEquals(atCapacity.extensionLane.appliedEventsBySeq, saturated.state.extensionLane.appliedEventsBySeq)
 
-        val snapshotRequested = AgentTranscriptLifecycleClientReducer.reduce(
+        val snapshotRequested = snapshotRequestAccepted(
             saturated.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-cap-repair",
-            ),
+            "snapshot-cap-repair",
             limits,
-        ).state
+        )
         val repaired = AgentTranscriptLifecycleClientReducer.reduce(
             snapshotRequested,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-cap"),
-                requestFence = AgentLocalRequestFence("1", "snapshot-cap-repair"),
+                localGeneration = "1",
                 throughAgentSeq = "1",
                 records = listOf(duplicate.record),
             ),
@@ -932,18 +925,15 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertEquals(initial.extensionLane.notificationLedger, illegalTurnResume.state.extensionLane.notificationLedger)
 
         val duplicateSeqBase = availableState("timeline-snapshot-seq", baseline = "0")
-        val duplicateSeqRequest = AgentTranscriptLifecycleClientReducer.reduce(
+        val duplicateSeqRequest = snapshotRequestAccepted(
             duplicateSeqBase,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-duplicate-seq",
-            ),
-        ).state
+            "snapshot-duplicate-seq",
+        )
         val duplicateSeq = AgentTranscriptLifecycleClientReducer.reduce(
             duplicateSeqRequest,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-seq"),
-                requestFence = AgentLocalRequestFence("0", "snapshot-duplicate-seq"),
+                localGeneration = "0",
                 throughAgentSeq = "1",
                 records = listOf(
                     lifecycleRecord("event-seq-a", "1", AgentLifecycleScope.RUN, "run-seq-a", AgentLifecycleState.RUNNING),
@@ -966,18 +956,12 @@ class AgentTranscriptLifecycleClientReducerTest {
                 fingerprint = "closed-bound",
             ),
         ).state
-        val bindRequest = AgentTranscriptLifecycleClientReducer.reduce(
-            applied,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.SNAPSHOT,
-                "snapshot-rebind",
-            ),
-        ).state
+        val bindRequest = snapshotRequestAccepted(applied, "snapshot-rebind")
         val rebound = AgentTranscriptLifecycleClientReducer.reduce(
             bindRequest,
             AgentTranscriptLifecycleClientInput.SnapshotCommit(
                 lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-snapshot-bind"),
-                requestFence = AgentLocalRequestFence("0", "snapshot-rebind"),
+                localGeneration = "0",
                 throughAgentSeq = "2",
                 records = listOf(
                     lifecycleRecord("event-bound", "2", AgentLifecycleScope.RUN, "run-other", AgentLifecycleState.RUNNING),
@@ -1006,7 +990,7 @@ class AgentTranscriptLifecycleClientReducerTest {
 
         val statusRequest = AgentTranscriptLifecycleClientReducer.reduce(
             completed.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-adapter-down"),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-adapter-down"),
         ).state
         val unavailable = AgentTranscriptLifecycleClientReducer.reduce(
             statusRequest,
@@ -1032,15 +1016,19 @@ class AgentTranscriptLifecycleClientReducerTest {
         ).state
         val recoveryRequest = AgentTranscriptLifecycleClientReducer.reduce(
             negotiated,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-recover"),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-recover"),
         ).state
         val recovered = AgentTranscriptLifecycleClientReducer.reduce(
             recoveryRequest,
             AgentTranscriptLifecycleClientInput.StatusAvailable(
-                AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
-                AgentLocalRequestFence("3", "status-recover"),
-                AgentLiveSourceState.CONNECTED,
-                "source-test",
+                authority = fixtureDurableAuthority(),
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
+                requestFence = AgentLocalRequestFence("3", "status-recover"),
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-test",
+                currentAgentSeq = "2",
+                earliestReplaySeq = "1",
+                hostLimits = productionHostLimits(),
             ),
         )
         assertEquals(AgentClientDisposition.STATUS_APPLIED, recovered.disposition)
@@ -1050,15 +1038,19 @@ class AgentTranscriptLifecycleClientReducerTest {
 
         val interruptedRequest = AgentTranscriptLifecycleClientReducer.reduce(
             recovered.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-interrupted"),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-interrupted"),
         ).state
         val interrupted = AgentTranscriptLifecycleClientReducer.reduce(
             interruptedRequest,
             AgentTranscriptLifecycleClientInput.StatusAvailable(
-                AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
-                AgentLocalRequestFence("4", "status-interrupted"),
-                AgentLiveSourceState.INTERRUPTED,
-                "source-test",
+                authority = fixtureDurableAuthority(),
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
+                requestFence = AgentLocalRequestFence("4", "status-interrupted"),
+                liveSource = AgentLiveSourceState.INTERRUPTED,
+                activeSourceEpoch = "source-test",
+                currentAgentSeq = "2",
+                earliestReplaySeq = "1",
+                hostLimits = productionHostLimits(),
             ),
         )
         assertFalse(oldIntent.isPreflightAuthorizedBy(interrupted.state))
@@ -1066,10 +1058,7 @@ class AgentTranscriptLifecycleClientReducerTest {
 
         val storeUnavailableRequest = AgentTranscriptLifecycleClientReducer.reduce(
             interrupted.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.STATUS,
-                "status-store-unavailable",
-            ),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-store-unavailable"),
         ).state
         val storeUnavailable = AgentTranscriptLifecycleClientReducer.reduce(
             storeUnavailableRequest,
@@ -1087,18 +1076,19 @@ class AgentTranscriptLifecycleClientReducerTest {
         assertTrue(storeUnavailable.state.extensionLane.retiredTimelineEpochs.isEmpty())
         val storeRecoveryRequest = AgentTranscriptLifecycleClientReducer.reduce(
             storeUnavailable.state,
-            AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                AgentLocalRequestKind.STATUS,
-                "status-store-recover",
-            ),
+            AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-store-recover"),
         ).state
         val storeRecovered = AgentTranscriptLifecycleClientReducer.reduce(
             storeRecoveryRequest,
             AgentTranscriptLifecycleClientInput.StatusAvailable(
-                AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
-                AgentLocalRequestFence("6", "status-store-recover"),
-                AgentLiveSourceState.CONNECTED,
-                "source-test",
+                authority = fixtureDurableAuthority(),
+                lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-availability"),
+                requestFence = AgentLocalRequestFence("6", "status-store-recover"),
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-test",
+                currentAgentSeq = "2",
+                earliestReplaySeq = "1",
+                hostLimits = productionHostLimits(),
             ),
         )
         assertEquals(AgentClientDisposition.STATUS_APPLIED, storeRecovered.disposition)
@@ -1121,16 +1111,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 )
                 assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
                 assertEquals("1", blocked.state.extensionLane.lastAgentSeq)
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                val requested = snapshotRequestAccepted(
                     blocked.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-life-repair"),
+                    "snapshot-life-repair",
                     limits,
-                ).state
+                )
                 val checkpoint = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-life-cap"),
-                        AgentLocalRequestFence("1", "snapshot-life-repair"),
+                        "1",
                         "1",
                         emptyList(),
                     ),
@@ -1171,16 +1161,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 )
                 assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
                 assertEquals("3", blocked.state.extensionLane.lastAgentSeq)
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                val requested = snapshotRequestAccepted(
                     blocked.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-marker-repair"),
+                    "snapshot-marker-repair",
                     limits,
-                ).state
+                )
                 val repaired = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-turn-marker-cap"),
-                        AgentLocalRequestFence("1", "snapshot-marker-repair"),
+                        "1",
                         "3",
                         listOf(lifecycleRecord("event-marker-run-2", "3", AgentLifecycleScope.RUN, "run-marker-2", AgentLifecycleState.RUNNING)),
                     ),
@@ -1213,16 +1203,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
                 assertTrue(blocked.state.extensionLane.requiresTimelineRotation)
                 assertEquals("1", blocked.state.extensionLane.lastAgentSeq)
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                val requested = snapshotRequestAccepted(
                     blocked.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-witness-cannot-forget"),
+                    "snapshot-witness-cannot-forget",
                     limits,
-                ).state
+                )
                 val refusedSnapshot = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-witness-cap"),
-                        AgentLocalRequestFence("1", "snapshot-witness-cannot-forget"),
+                        "1",
                         "1",
                         listOf(first.record),
                     ),
@@ -1244,24 +1234,46 @@ class AgentTranscriptLifecycleClientReducerTest {
                 assertTrue(reset.state.extensionLane.eventWitnessById.isEmpty())
                 val statusRequested = AgentTranscriptLifecycleClientReducer.reduce(
                     reset.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-witness-rotated"),
+                    AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-witness-rotated"),
                     limits,
                 ).state
                 val recovered = AgentTranscriptLifecycleClientReducer.reduce(
                     statusRequested,
                     AgentTranscriptLifecycleClientInput.StatusAvailable(
-                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-witness-rotated"),
-                        AgentLocalRequestFence("2", "status-witness-rotated"),
-                        AgentLiveSourceState.CONNECTED,
-                        "source-test",
+                        authority = fixtureDurableAuthority(),
+                        lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-witness-rotated"),
+                        requestFence = AgentLocalRequestFence("2", "status-witness-rotated"),
+                        liveSource = AgentLiveSourceState.CONNECTED,
+                        activeSourceEpoch = "source-test",
+                        currentAgentSeq = "1",
+                        earliestReplaySeq = "1",
+                        hostLimits = productionHostLimits(),
+                    ),
+                    limits,
+                )
+                val snapshotReady = snapshotRequestAccepted(
+                    recovered.state,
+                    "snapshot-witness-rotated",
+                    limits,
+                )
+                val checkpoint = AgentTranscriptLifecycleClientReducer.reduce(
+                    snapshotReady,
+                    AgentTranscriptLifecycleClientInput.SnapshotCommit(
+                        lineage = AgentTimelineLineage(
+                            SESSION_IDENTITY,
+                            "timeline-witness-rotated",
+                        ),
+                        localGeneration = snapshotReady.extensionLane.localGeneration,
+                        throughAgentSeq = "1",
+                        records = emptyList(),
                     ),
                     limits,
                 )
                 assertEquals(
                     AgentClientDisposition.APPLIED,
                     AgentTranscriptLifecycleClientReducer.reduce(
-                        recovered.state,
-                        lifecycleEvent("timeline-witness-rotated", "1", "event-witness-new-lineage", AgentLifecycleScope.RUN, "run-witness-new", AgentLifecycleState.RUNNING, "closed-witness-new-lineage"),
+                        checkpoint.state,
+                        lifecycleEvent("timeline-witness-rotated", "2", "event-witness-new-lineage", AgentLifecycleScope.RUN, "run-witness-new", AgentLifecycleState.RUNNING, "closed-witness-new-lineage"),
                         limits,
                     ).disposition,
                 )
@@ -1269,16 +1281,16 @@ class AgentTranscriptLifecycleClientReducerTest {
             "snapshot" to {
                 val initial = availableState("timeline-page-cap", baseline = "0")
                 val limits = AgentClientReducerLimits(maxSnapshotRecords = 1)
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                val requested = snapshotRequestAccepted(
                     initial,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-too-wide"),
+                    "snapshot-too-wide",
                     limits,
-                ).state
+                )
                 val blocked = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-page-cap"),
-                        AgentLocalRequestFence("0", "snapshot-too-wide"),
+                        "0",
                         "2",
                         listOf(
                             lifecycleRecord("event-page-1", "1", AgentLifecycleScope.RUN, "run-page-1", AgentLifecycleState.RUNNING),
@@ -1287,20 +1299,20 @@ class AgentTranscriptLifecycleClientReducerTest {
                     ),
                     limits,
                 )
-                assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
+                assertEquals(AgentClientDisposition.CONTINUITY_CONFLICT, blocked.disposition)
                 assertEquals("0", blocked.state.extensionLane.lastAgentSeq)
-                val retry = AgentTranscriptLifecycleClientReducer.reduce(
+                val retry = snapshotRequestAccepted(
                     blocked.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-narrow"),
+                    "snapshot-narrow",
                     limits,
-                ).state
+                )
                 assertEquals(
                     AgentClientDisposition.SNAPSHOT_APPLIED,
                     AgentTranscriptLifecycleClientReducer.reduce(
                         retry,
                         AgentTranscriptLifecycleClientInput.SnapshotCommit(
                             AgentTimelineLineage(SESSION_IDENTITY, "timeline-page-cap"),
-                            AgentLocalRequestFence("1", "snapshot-narrow"),
+                            "0",
                             "1",
                             listOf(lifecycleRecord("event-page-1", "1", AgentLifecycleScope.RUN, "run-page-1", AgentLifecycleState.RUNNING)),
                         ),
@@ -1334,16 +1346,16 @@ class AgentTranscriptLifecycleClientReducerTest {
                 )
                 assertEquals(AgentClientDisposition.GAP_RESYNC, blocked.disposition)
                 assertEquals("3", blocked.state.extensionLane.lastAgentSeq)
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
+                val requested = snapshotRequestAccepted(
                     blocked.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-ledger-repair"),
+                    "snapshot-ledger-repair",
                     limits,
-                ).state
+                )
                 val repaired = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-ledger-cap"),
-                        AgentLocalRequestFence("1", "snapshot-ledger-repair"),
+                        "1",
                         "3",
                         listOf(lifecycleRecord("event-ledger-run-2", "3", AgentLifecycleScope.RUN, "run-ledger-2", AgentLifecycleState.RUNNING)),
                     ),
@@ -1361,10 +1373,7 @@ class AgentTranscriptLifecycleClientReducerTest {
             },
             "notification-decision-batch" to {
                 val initial = availableState("timeline-effect-cap", baseline = "0")
-                val requested = AgentTranscriptLifecycleClientReducer.reduce(
-                    initial,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.SNAPSHOT, "snapshot-effects"),
-                ).state
+                val requested = snapshotRequestAccepted(initial, "snapshot-effects")
                 val limits = AgentClientReducerLimits(
                     maxNotificationDecisionsPerReduction = 1,
                 )
@@ -1372,7 +1381,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                     requested,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
                         AgentTimelineLineage(SESSION_IDENTITY, "timeline-effect-cap"),
-                        AgentLocalRequestFence("0", "snapshot-effects"),
+                        "0",
                         "3",
                         listOf(
                             lifecycleRecord("event-effect-1", "1", AgentLifecycleScope.RUN, "run-effect-1", AgentLifecycleState.COMPLETED),
@@ -1405,7 +1414,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 val limits = AgentClientReducerLimits(maxRetiredTimelineEpochs = 1)
                 val unavailableRequested = AgentTranscriptLifecycleClientReducer.reduce(
                     full,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-retired-temporary"),
+                    AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-retired-temporary"),
                     limits,
                 ).state
                 val temporarilyUnavailable = AgentTranscriptLifecycleClientReducer.reduce(
@@ -1422,16 +1431,20 @@ class AgentTranscriptLifecycleClientReducerTest {
                 assertEquals("timeline-retire-current", temporarilyUnavailable.state.extensionLane.timelineEpoch)
                 val recoveryRequested = AgentTranscriptLifecycleClientReducer.reduce(
                     temporarilyUnavailable.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-retired-recover"),
+                    AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-retired-recover"),
                     limits,
                 ).state
                 val activeAgain = AgentTranscriptLifecycleClientReducer.reduce(
                     recoveryRequested,
                     AgentTranscriptLifecycleClientInput.StatusAvailable(
-                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-retire-current"),
-                        AgentLocalRequestFence("1", "status-retired-recover"),
-                        AgentLiveSourceState.CONNECTED,
-                        "source-test",
+                        authority = fixtureDurableAuthority(),
+                        lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-retire-current"),
+                        requestFence = AgentLocalRequestFence("1", "status-retired-recover"),
+                        liveSource = AgentLiveSourceState.CONNECTED,
+                        activeSourceEpoch = "source-test",
+                        currentAgentSeq = "1",
+                        earliestReplaySeq = "1",
+                        hostLimits = productionHostLimits(),
                     ),
                     limits,
                 ).state
@@ -1450,16 +1463,20 @@ class AgentTranscriptLifecycleClientReducerTest {
                 assertEquals("3", reset.state.extensionLane.retiredEpochCompactionGeneration)
                 val requested = AgentTranscriptLifecycleClientReducer.reduce(
                     reset.state,
-                    AgentTranscriptLifecycleClientInput.LocalRequestStarted(AgentLocalRequestKind.STATUS, "status-after-compaction"),
+                    AgentTranscriptLifecycleClientInput.StatusRequestStarted("status-after-compaction"),
                     limits,
                 ).state
                 val recovered = AgentTranscriptLifecycleClientReducer.reduce(
                     requested,
                     AgentTranscriptLifecycleClientInput.StatusAvailable(
-                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-retire-new"),
-                        AgentLocalRequestFence("3", "status-after-compaction"),
-                        AgentLiveSourceState.CONNECTED,
-                        "source-repaired",
+                        authority = fixtureDurableAuthority(),
+                        lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-retire-new"),
+                        requestFence = AgentLocalRequestFence("3", "status-after-compaction"),
+                        liveSource = AgentLiveSourceState.CONNECTED,
+                        activeSourceEpoch = "source-repaired",
+                        currentAgentSeq = "1",
+                        earliestReplaySeq = "1",
+                        hostLimits = productionHostLimits(),
                     ),
                     limits,
                 )
@@ -1502,26 +1519,31 @@ class AgentTranscriptLifecycleClientReducerTest {
                 pending to AgentTranscriptLifecycleClientReducer.reduce(
                     pending,
                     AgentTranscriptLifecycleClientInput.StatusAvailable(
-                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-generation-max"),
-                        AgentLocalRequestFence(maxGeneration, "status-generation-max"),
-                        AgentLiveSourceState.INTERRUPTED,
-                        "source-test",
+                        authority = fixtureDurableAuthority(),
+                        lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-generation-max"),
+                        requestFence = AgentLocalRequestFence(maxGeneration, "status-generation-max"),
+                        liveSource = AgentLiveSourceState.INTERRUPTED,
+                        activeSourceEpoch = "source-test",
+                        currentAgentSeq = "1",
+                        earliestReplaySeq = "1",
+                        hostLimits = productionHostLimits(),
                     ),
                 )
             },
             "snapshot" to {
                 val pending = base.copy(
                     extensionLane = base.extensionLane.copy(
-                        pendingSnapshotRequest = AgentLocalRequestFence(maxGeneration, "snapshot-generation-max"),
+                        syncState = AgentTimelineSyncState.Snapshot,
+                        pendingSnapshotRequest = null,
                     ),
                 )
                 pending to AgentTranscriptLifecycleClientReducer.reduce(
                     pending,
                     AgentTranscriptLifecycleClientInput.SnapshotCommit(
-                        AgentTimelineLineage(SESSION_IDENTITY, "timeline-generation-max"),
-                        AgentLocalRequestFence(maxGeneration, "snapshot-generation-max"),
-                        "0",
-                        emptyList(),
+                        lineage = AgentTimelineLineage(SESSION_IDENTITY, "timeline-generation-max"),
+                        localGeneration = maxGeneration,
+                        throughAgentSeq = "0",
+                        records = emptyList(),
                     ),
                 )
             },
@@ -1584,10 +1606,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 )
             },
             "request-token" to {
-                AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-                    AgentLocalRequestKind.STATUS,
-                    oversized,
-                )
+                AgentTranscriptLifecycleClientInput.StatusRequestStarted(oversized)
             },
             "ever-turn-marker" to {
                 AgentTranscriptLifecycleExtensionState(
@@ -1667,7 +1686,7 @@ class AgentTranscriptLifecycleClientReducerTest {
                 state = committed.state,
                 failure = committed.failure,
                 occurredAtMs = committed.occurredAtMs,
-                closedEventDigest = digestOf("closed-${committed.lifecycleEventId}"),
+                closedEventDigest = null,
             )
             return AgentTranscriptLifecycleClientState(
                 identity = session,
@@ -2059,6 +2078,12 @@ class AgentTranscriptLifecycleClientReducerTest {
                 sourceEpoch = "source-client",
                 identity = identity,
                 state = rawState.asString().toLifecycleState(),
+                failure = if (rawState.asString() == "failed") {
+                    AgentLifecycleFailure("fixture_failure", null)
+                } else {
+                    null
+                },
+                occurredAtMs = lastAgentSeq.toLongOrNull() ?: 0,
                 agentEventSeq = lastAgentSeq,
             )
         }.toMap()
@@ -2079,6 +2104,19 @@ class AgentTranscriptLifecycleClientReducerTest {
                 },
                 timelineEpoch = optionalString("timelineEpoch"),
                 lastAgentSeq = lastAgentSeq,
+                effectiveHostLimits = if (string("support") == "available") {
+                    productionHostLimits()
+                } else {
+                    null
+                },
+                syncState = if (
+                    string("support") == "available" &&
+                    optionalString("notificationBaselineAgentSeq") == null
+                ) {
+                    AgentTimelineSyncState.Snapshot
+                } else {
+                    AgentTimelineSyncState.Current
+                },
                 notificationBaselineAgentSeq = optionalString("notificationBaselineAgentSeq"),
                 lifecycleByIdentity = lifecycle,
                 currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
@@ -2104,13 +2142,12 @@ class AgentTranscriptLifecycleClientReducerTest {
     private fun Map<String, Any?>.toClientInput(
         state: AgentTranscriptLifecycleClientState,
     ): AgentTranscriptLifecycleClientInput = when (string("kind")) {
-        "status_request_started" -> AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-            kind = AgentLocalRequestKind.STATUS,
-            requestToken = string("requestToken"),
+        "status_request_started" -> AgentTranscriptLifecycleClientInput.StatusRequestStarted(
+            requestNetworkToken = string("requestToken"),
         )
-        "snapshot_request_started" -> AgentTranscriptLifecycleClientInput.LocalRequestStarted(
-            kind = AgentLocalRequestKind.SNAPSHOT,
-            requestToken = string("requestToken"),
+        "snapshot_request_started" -> AgentTranscriptLifecycleClientInput.SnapshotRequestStarted(
+            snapshotRequestId = string("requestToken"),
+            pageZeroNetworkToken = string("requestToken"),
         )
         "client_config" -> AgentTranscriptLifecycleClientInput.ClientConfigChanged(
             AgentNotificationConfig(
@@ -2138,16 +2175,19 @@ class AgentTranscriptLifecycleClientReducerTest {
                 agentEventSeq = sequence,
                 eventId = eventId,
                 closedEventDigest = digestOf(RelayV2StrictJson.stringify(this)),
-                record = map("record").toLifecycleRecord(eventId, sequence),
-                provenance = AgentEventProvenance.LIVE,
+                mutation = AgentTimelineMutation.Lifecycle(
+                    map("record").toLifecycleRecord(eventId, sequence),
+                ),
+                provenance = if (state.extensionLane.syncState is AgentTimelineSyncState.Replay) {
+                    AgentEventProvenance.REPLAY
+                } else {
+                    AgentEventProvenance.LIVE
+                },
             )
         }
         "snapshot_commit" -> AgentTranscriptLifecycleClientInput.SnapshotCommit(
             lineage = AgentTimelineLineage(SESSION_IDENTITY, string("timelineEpoch")),
-            requestFence = AgentLocalRequestFence(
-                localGeneration = string("localGeneration"),
-                requestToken = string("requestToken"),
-            ),
+            localGeneration = string("localGeneration"),
             throughAgentSeq = string("throughAgentSeq"),
             records = list("records").map { rawRecord ->
                 val record = rawRecord.asMap()
@@ -2185,11 +2225,18 @@ class AgentTranscriptLifecycleClientReducerTest {
             turnId = optionalString("turnId"),
         ),
         state = string("state").toLifecycleState(),
+        failure = if (string("state") == "failed") {
+            AgentLifecycleFailure("fixture_failure", null)
+        } else {
+            null
+        },
+        occurredAtMs = (optionalString("agentEventSeq") ?: fallbackSequence)
+            .toLongOrNull() ?: 0,
         agentEventSeq = optionalString("agentEventSeq") ?: fallbackSequence,
     )
 
     private fun AgentTranscriptLifecycleClientInput?.lifecycleIdentityOrNull(): AgentLifecycleIdentity? =
-        (this as? AgentTranscriptLifecycleClientInput.AgentEvent)?.record?.identity
+        (this as? AgentTranscriptLifecycleClientInput.AgentEvent)?.lifecycleRecord?.identity
 
     private fun readClientMachineCases(): List<Map<String, Any?>> {
         val path = "extensions/agent-transcript-lifecycle/v1/client-machine-cases.json"
@@ -2236,6 +2283,7 @@ private fun availableState(
         activeSourceEpoch = lifecycle.values.firstOrNull()?.sourceEpoch ?: "source-test",
         timelineEpoch = timelineEpoch,
         lastAgentSeq = lastAgentSeq,
+        effectiveHostLimits = productionHostLimits(),
         notificationBaselineAgentSeq = baseline,
         lifecycleByIdentity = lifecycle,
         currentLifecycleIdentityByEventId = lifecycle.entries.associate { (identity, record) ->
@@ -2263,6 +2311,116 @@ private fun fixtureSessionIdentity(): AgentExtensionSessionIdentity = AgentExten
     sessionId = "session-fixture",
 )
 
+private fun fixtureDurableAuthority(): AgentTranscriptLifecycleDurableConsumerIdentity =
+    AgentTranscriptLifecycleDurableConsumerIdentity(
+        profileId = "profile-fixture",
+        profileActivationGeneration = 1,
+        principalId = "principal-fixture",
+        clientInstanceId = "client-fixture",
+        hostId = "mac-admin",
+        hostEpoch = "host-epoch-fixture",
+        scopeId = "scope-local",
+        sessionId = "session-fixture",
+    )
+
+private fun snapshotRequestAccepted(
+    state: AgentTranscriptLifecycleClientState,
+    snapshotRequestId: String,
+    limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+): AgentTranscriptLifecycleClientState {
+    val snapshotState = state.copy(
+        extensionLane = state.extensionLane.copy(
+            syncState = AgentTimelineSyncState.Snapshot,
+            pendingSnapshotRequest = null,
+        ),
+    )
+    val started = AgentTranscriptLifecycleClientReducer.reduce(
+        snapshotState,
+        AgentTranscriptLifecycleClientInput.SnapshotRequestStarted(
+            snapshotRequestId = snapshotRequestId,
+            pageZeroNetworkToken = "$snapshotRequestId-page-zero",
+        ),
+        limits,
+    )
+    check(started.disposition == AgentClientDisposition.CONFIG_APPLIED)
+    val accepted = AgentTranscriptLifecycleClientReducer.reduce(
+        started.state,
+        AgentTranscriptLifecycleClientInput.SnapshotPageZeroAccepted(
+            requireNotNull(started.state.extensionLane.pendingSnapshotRequest),
+        ),
+        limits,
+    )
+    check(accepted.disposition == AgentClientDisposition.CONFIG_APPLIED)
+    return accepted.state
+}
+
+private fun replayRequestAccepted(
+    state: AgentTranscriptLifecycleClientState,
+    requestNetworkToken: String,
+    observedCurrentAgentSeq: String,
+    observedStatusEarliestReplaySeq: String = "1",
+    limits: AgentClientReducerLimits = AgentClientReducerLimits(),
+): AgentTranscriptLifecycleClientState {
+    val replayState = state.copy(
+        extensionLane = state.extensionLane.copy(
+            syncState = AgentTimelineSyncState.Replay(
+                observedCurrentAgentSeq = observedCurrentAgentSeq,
+                observedStatusEarliestReplaySeq = observedStatusEarliestReplaySeq,
+            ),
+        ),
+    )
+    val requested = AgentTranscriptLifecycleClientReducer.reduce(
+        replayState,
+        AgentTranscriptLifecycleClientInput.ReplayRequestStarted(
+            requestNetworkToken = requestNetworkToken,
+            cursor = null,
+            limit = requireNotNull(replayState.extensionLane.effectiveHostLimits).maxPageRecords,
+        ),
+        limits,
+    )
+    check(requested.disposition == AgentClientDisposition.CONFIG_APPLIED)
+    return requested.state
+}
+
+private fun prepareFixtureStateForInput(
+    state: AgentTranscriptLifecycleClientState,
+    rawInput: Map<String, Any?>,
+): AgentTranscriptLifecycleClientState {
+    val refresh = state.extensionLane.syncState as? AgentTimelineSyncState.StatusRefresh
+        ?: return state
+    if (refresh.requireSnapshotAfterRefresh || rawInput.string("kind") != "agent_event") {
+        return state
+    }
+    val sequence = rawInput.string("agentEventSeq")
+    val statusToken = "fixture-status-$sequence"
+    val statusRequested = AgentTranscriptLifecycleClientReducer.reduce(
+        state,
+        AgentTranscriptLifecycleClientInput.StatusRequestStarted(statusToken),
+    ).state
+    val available = AgentTranscriptLifecycleClientReducer.reduce(
+        statusRequested,
+        AgentTranscriptLifecycleClientInput.StatusAvailable(
+            authority = fixtureDurableAuthority(),
+            lineage = AgentTimelineLineage(
+                state.identity,
+                requireNotNull(state.extensionLane.timelineEpoch),
+            ),
+            requestFence = requireNotNull(statusRequested.extensionLane.pendingStatusRequest),
+            liveSource = AgentLiveSourceState.CONNECTED,
+            activeSourceEpoch = requireNotNull(state.extensionLane.activeSourceEpoch),
+            currentAgentSeq = sequence,
+            earliestReplaySeq = sequence,
+            hostLimits = requireNotNull(state.extensionLane.effectiveHostLimits),
+        ),
+    ).state
+    return replayRequestAccepted(
+        available,
+        requestNetworkToken = "fixture-replay-$sequence",
+        observedCurrentAgentSeq = sequence,
+        observedStatusEarliestReplaySeq = sequence,
+    )
+}
+
 private fun lifecycleEvent(
     timelineEpoch: String,
     sequence: String,
@@ -2283,14 +2441,16 @@ private fun lifecycleEvent(
         agentEventSeq = sequence,
         eventId = eventId,
         closedEventDigest = digestOf(fingerprint),
-        record = lifecycleRecord(
-            eventId = eventId,
-            sequence = sequence,
-            scope = scope,
-            runId = runId,
-            turnId = turnId,
-            state = state,
-            sourceEpoch = sourceEpoch,
+        mutation = AgentTimelineMutation.Lifecycle(
+            lifecycleRecord(
+                eventId = eventId,
+                sequence = sequence,
+                scope = scope,
+                runId = runId,
+                turnId = turnId,
+                state = state,
+                sourceEpoch = sourceEpoch,
+            ),
         ),
         provenance = provenance,
     )
@@ -2303,7 +2463,11 @@ private fun lifecycleRecord(
     state: AgentLifecycleState,
     turnId: String? = null,
     sourceEpoch: String = "source-test",
-    failure: AgentLifecycleFailure? = null,
+    failure: AgentLifecycleFailure? = if (state == AgentLifecycleState.FAILED) {
+        AgentLifecycleFailure("test_failure", null)
+    } else {
+        null
+    },
     occurredAtMs: Long = 0,
 ): AgentLifecycleRecord = AgentLifecycleRecord(
     lifecycleEventId = eventId,
@@ -2323,7 +2487,22 @@ private fun AgentLifecycleRecord.toEventIdentityWitness(
     lifecycleIdentity = identity,
     sourceEpoch = sourceEpoch,
     state = state,
+    failure = failure,
+    occurredAtMs = occurredAtMs,
     closedEventDigest = digest,
+)
+
+private val AgentTranscriptLifecycleClientInput.AgentEvent.lifecycleRecord: AgentLifecycleRecord
+    get() = (mutation as AgentTimelineMutation.Lifecycle).record
+
+private val AgentTranscriptLifecycleClientInput.AgentEvent.record: AgentLifecycleRecord
+    get() = lifecycleRecord
+
+private fun productionHostLimits(): AgentTimelineEffectiveLimits = AgentTimelineEffectiveLimits(
+    maxTextUtf8Bytes = 65_536,
+    maxPageRecords = 256,
+    eventReplayRetentionMs = 604_800_000,
+    snapshotLeaseMs = 300_000,
 )
 
 private fun digestOf(value: String): AgentClosedEventDigest = AgentClosedEventDigest(

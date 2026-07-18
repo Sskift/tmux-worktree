@@ -503,11 +503,21 @@ internal data class AgentSystemNotificationIntent(
      * claim an intent before calling the platform; repeated true results are not one-shot proof.
      */
     fun isPreflightAuthorizedBy(clientState: AgentTranscriptLifecycleClientState): Boolean {
-        val identity = clientState.identity
         val extension = clientState.extensionLane
         val ledgerEntry = extension.notificationLedger[dedupeKey] ?: return false
         val eventIdentity = ledgerEntry.eventIdentity
         val currentRecord = extension.currentSourceLifecycleOrNull(eventIdentity.lifecycleIdentity)
+        return isPreflightAuthorizedBy(clientState, ledgerEntry, currentRecord)
+    }
+
+    internal fun isPreflightAuthorizedBy(
+        clientState: AgentTranscriptLifecycleClientState,
+        ledgerEntry: AgentNotificationLedgerEntry,
+        currentRecord: AgentLifecycleRecord?,
+    ): Boolean {
+        val identity = clientState.identity
+        val extension = clientState.extensionLane
+        val eventIdentity = ledgerEntry.eventIdentity
         return dedupeKey.profileId == identity.profileId &&
             dedupeKey.hostId == identity.hostId &&
             dedupeKey.hostEpoch == identity.hostEpoch &&
@@ -1387,6 +1397,9 @@ internal object AgentTranscriptLifecycleClientReducer {
         if (extension.support != AgentExtensionSupport.AVAILABLE) {
             return if (input.provenance == AgentEventProvenance.REPLAY) inactive(state)
             else continuityConflict(state)
+        }
+        if (input.provenance == AgentEventProvenance.LIVE && extension.requiresSnapshot) {
+            return continuityConflict(state)
         }
         if (input.provenance == AgentEventProvenance.LIVE &&
             extension.syncState != AgentTimelineSyncState.Current
