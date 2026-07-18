@@ -12,6 +12,7 @@ if (!root || typeof process.send !== "function") {
 }
 
 let acquireCount = 0;
+let snapshotOwnerWithdrawCount = 0;
 let releaseAcquire;
 let releaseStale;
 const acquireGate = new Promise((resolve) => { releaseAcquire = resolve; });
@@ -42,6 +43,14 @@ const source = {
   },
   async admissionEstimate() {
     return { hostEpoch: cut.hostEpoch, totalRecords: 0, totalCanonicalBytes: 2 };
+  },
+  async withdrawSnapshotOwnerAuthority() {
+    snapshotOwnerWithdrawCount += 1;
+    process.send({
+      type: "snapshot-owner-withdraw",
+      pid: process.pid,
+      count: snapshotOwnerWithdrawCount,
+    });
   },
   async capture() {
     return structuredClone(cut);

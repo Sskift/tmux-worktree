@@ -19,12 +19,20 @@ import {
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import type {
+  RelayV2JsonObject,
+  RelayV2MaterializedStateCutActivationLease,
   RelayV2MaterializedStateCut,
   RelayV2MaterializedStateCutAdmissionEstimate,
+  RelayV2MaterializedStateCutCandidate,
+  RelayV2MaterializedStateCutCandidateLease,
   RelayV2MaterializedStateCutRecord,
   RelayV2MaterializedStateCutSource,
+  RelayV2StateEventSink,
 } from "./resourceState.js";
-import { canonicalizeRelayV2MaterializedJson as canonicalizeSnapshotJson } from "./resourceState.js";
+import {
+  canonicalizeRelayV2MaterializedJson as canonicalizeSnapshotJson,
+  RelayV2MaterializedStateError,
+} from "./resourceState.js";
 
 const SPOOL_VERSION = 1 as const;
 const LEASE_VERSION = 1 as const;
@@ -80,6 +88,14 @@ export const RELAY_V2_STATE_SNAPSHOT_LIMITS: Readonly<RelayV2StateSnapshotLimits
   releaseTombstoneMs: 600_000,
 });
 
+const RELAY_V2_READINESS_RECEIPT_LIMITS = Object.freeze({
+  maxReceipts: 16,
+  maxRetainedBytes: 65_536,
+  receiptTtlMs: 300_000,
+});
+
+type ReadinessReceiptLimits = typeof RELAY_V2_READINESS_RECEIPT_LIMITS;
+
 type SnapshotLimits = RelayV2StateSnapshotLimits;
 
 export interface RelayV2StateSnapshotSpoolPaths {
@@ -116,6 +132,13 @@ export interface RelayV2StateSnapshotSpoolTestHooks {
     snapshotId: string,
     disposition: "released" | "expired",
   ) => void;
+  beforeReadinessReceiptOwnerRecheck?: (
+    issue: RelayV2StateSnapshotReadinessReceiptIssue,
+  ) => void;
+  /** Runs after H0 attached the sink but before the spool commits activation. */
+  afterReadinessActivationAttached?: (
+    receipt: RelayV2StateSnapshotReadinessReceipt,
+  ) => void;
 }
 
 export interface RelayV2StateSnapshotSpoolOptions {
@@ -130,6 +153,8 @@ export interface RelayV2StateSnapshotSpoolOptions {
   takeoverExistingOwner?: boolean;
   /** Tests may only shrink production-frozen boundaries. */
   testLimits?: Partial<SnapshotLimits>;
+  /** Tests may only shrink the owner-issued receipt boundaries. */
+  testReadinessReceiptLimits?: Partial<ReadinessReceiptLimits>;
   /** Deterministic fault injection only; production composition must omit it. */
   testHooks?: RelayV2StateSnapshotSpoolTestHooks;
 }
@@ -179,6 +204,36 @@ export interface RelayV2StateSnapshotReleased {
   released: boolean;
   alreadyReleased: boolean;
   releasedAtMs: number;
+}
+
+declare const relayV2StateSnapshotReadinessReceiptBrand: unique symbol;
+
+/**
+ * Owner-issued H2 proof with no wire or persisted representation. Exact object
+ * identity is meaningful only to the live spool instance that signed it.
+ */
+export interface RelayV2StateSnapshotReadinessReceipt {
+  readonly [relayV2StateSnapshotReadinessReceiptBrand]: true;
+}
+
+export interface RelayV2StateSnapshotReadinessReceiptBinding {
+  hostId: string;
+  hostEpoch: string;
+  hostInstanceId: string;
+  materializedCutIdentity: string;
+}
+
+export interface RelayV2StateSnapshotReadinessReceiptIssue {
+  receipt: RelayV2StateSnapshotReadinessReceipt;
+  /** Descriptive only; exact receipt identity remains the sole authority. */
+  binding: Readonly<RelayV2StateSnapshotReadinessReceiptBinding>;
+}
+
+declare const relayV2StateSnapshotActivationLeaseBrand: unique symbol;
+
+/** Exact, live-process lease for one successfully attached route sink. */
+export interface RelayV2StateSnapshotActivationLease {
+  readonly [relayV2StateSnapshotActivationLeaseBrand]: true;
 }
 
 export type RelayV2StateSnapshotSpoolErrorCode =
@@ -329,6 +384,52 @@ interface ActiveCut {
   directory: string;
   manifest: PersistedManifest;
   lease: PersistedLease;
+  readinessCandidate: RelayV2MaterializedStateCutCandidateLease | null;
+  readinessReceipt: RelayV2StateSnapshotReadinessReceipt | null;
+  readinessActivation: RelayV2StateSnapshotActivationLease | null;
+}
+
+interface ReadinessReceiptRecord extends RelayV2StateSnapshotReadinessReceiptBinding {
+  receipt: RelayV2StateSnapshotReadinessReceipt;
+  snapshotId: string;
+  ownerFence: string;
+  ownerInstanceId: string;
+  processIncarnation: string;
+  spoolIdentity: object;
+  spoolGeneration: string;
+  source: RelayV2MaterializedStateCutSource;
+  materializedSourceGeneration: string;
+  materializedGeneration: string;
+  throughEventSeq: string;
+  scopesRevision: string;
+  cutRecordCount: number;
+  cutCanonicalBytes: number;
+  cutDigest: string;
+  manifestIdentity: PersistedManifest;
+  manifestDigest: string;
+  subscriptionQueueGeneration: string;
+  candidate: RelayV2MaterializedStateCutCandidateLease;
+  cut: ActiveCut;
+  nonce: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  retainedBytes: number;
+}
+
+interface ReadinessActivationRecord {
+  activation: RelayV2StateSnapshotActivationLease;
+  sourceActivation: RelayV2MaterializedStateCutActivationLease;
+  source: RelayV2MaterializedStateCutSource;
+  cut: ActiveCut;
+  snapshotId: string;
+  ownerFence: string;
+  ownerInstanceId: string;
+  processIncarnation: string;
+  spoolIdentity: object;
+  spoolGeneration: string;
+  receiptNonce: string;
+  activationNonce: string;
+  sinkIdentity: object;
 }
 
 interface SnapshotTombstone {
@@ -698,6 +799,63 @@ function sameBinding(left: SnapshotBinding, right: SnapshotBinding): boolean {
 
 function logicalKey(binding: SnapshotBinding): string {
   return canonicalizeSnapshotJson(binding);
+}
+
+function normalizeReadinessReceiptBinding(
+  value: unknown,
+): RelayV2StateSnapshotReadinessReceiptBinding | null {
+  try {
+    if (!isRecord(value) || Object.getPrototypeOf(value) !== Object.prototype) return null;
+    const keys = [
+      "hostId", "hostEpoch", "hostInstanceId", "materializedCutIdentity",
+    ] as const;
+    if (!exactKeys(value, keys)) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    if (keys.some((key) => descriptors[key]?.get !== undefined
+      || descriptors[key]?.set !== undefined
+      || !("value" in descriptors[key]!))) return null;
+    for (const key of keys) assertOpaqueId(descriptors[key]!.value, key);
+    return {
+      hostId: descriptors.hostId!.value as string,
+      hostEpoch: descriptors.hostEpoch!.value as string,
+      hostInstanceId: descriptors.hostInstanceId!.value as string,
+      materializedCutIdentity: descriptors.materializedCutIdentity!.value as string,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function candidateMatchesManifest(
+  candidate: RelayV2MaterializedStateCutCandidate,
+  manifest: PersistedManifest,
+  hostId: string,
+): boolean {
+  try {
+    const canonical = Buffer.from(
+      canonicalizeSnapshotJson(candidate.cut.records),
+      "utf8",
+    );
+    return candidate.hostId === hostId
+      && candidate.hostEpoch === manifest.binding.hostEpoch
+      && candidate.cut.hostEpoch === candidate.hostEpoch
+      && candidate.cut.throughEventSeq === manifest.throughEventSeq
+      && candidate.cut.scopesRevision === manifest.scopesRevision
+      && candidate.cutRecordCount === manifest.totalRecords
+      && candidate.cutRecordCount === candidate.cut.records.length
+      && candidate.cutCanonicalBytes === manifest.totalCanonicalBytes
+      && candidate.cutCanonicalBytes === canonical.byteLength
+      && createHash("sha256").update(canonical).digest("base64url")
+        === manifest.cutDigest;
+  } catch {
+    return false;
+  }
+}
+
+function manifestIdentityDigest(manifest: PersistedManifest): string {
+  return createHash("sha256")
+    .update(canonicalizeSnapshotJson(manifest), "utf8")
+    .digest("base64url");
 }
 
 function validateGet(request: RelayV2StateSnapshotGet): void {
@@ -1385,6 +1543,23 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, milliseconds));
 }
 
+function closeReadinessActivationSink(
+  sink: RelayV2StateEventSink<RelayV2JsonObject>,
+  message: string,
+): void {
+  try {
+    const close = sink.close;
+    if (typeof close !== "function") return;
+    const result = Reflect.apply(close, sink, [
+      new RelayV2MaterializedStateError("CAPABILITY_UNAVAILABLE", message),
+    ]) as unknown;
+    if (((typeof result === "object" && result !== null) || typeof result === "function")
+      && typeof (result as { then?: unknown }).then === "function") {
+      void Promise.resolve(result).catch(() => undefined);
+    }
+  } catch {}
+}
+
 export class RelayV2StateSnapshotSpool {
   readonly hostId: string;
   readonly paths: RelayV2StateSnapshotSpoolPaths;
@@ -1393,6 +1568,7 @@ export class RelayV2StateSnapshotSpool {
 
   private readonly cutSource: RelayV2MaterializedStateCutSource;
   private readonly now: () => number;
+  private readonly readinessReceiptLimits: Readonly<ReadinessReceiptLimits>;
   private readonly trustedBoundary: string;
   private readonly verifyTrustedAncestors: boolean;
   private readonly takeoverExistingOwner: boolean;
@@ -1400,13 +1576,19 @@ export class RelayV2StateSnapshotSpool {
   private readonly processIncarnationProbe: (pid: number) => string | null | undefined;
   private readonly processIncarnation: string;
   private readonly ownerFence = randomBytes(32).toString("base64url");
+  private readonly spoolIdentity = Object.freeze(Object.create(null)) as object;
+  private readonly spoolGeneration = randomBytes(32).toString("base64url");
   private readonly activeById = new Map<string, ActiveCut>();
   private readonly activeByLogicalKey = new Map<string, ActiveCut>();
   private readonly reservationsById = new Map<string, PersistedReservation>();
   private readonly tombstonesById = new Map<string, SnapshotTombstone>();
   private readonly tombstonesByLogicalKey = new Map<string, SnapshotTombstone>();
   private readonly buildsByLogicalKey = new Map<string, BuildEntry>();
+  private readonly readinessReceipts = new Map<object, ReadinessReceiptRecord>();
+  private readonly readinessActivations = new Map<object, ReadinessActivationRecord>();
+  private readinessReceiptRetainedBytes = 0;
   private metadataTail: Promise<void> = Promise.resolve();
+  private closeBarrier: Promise<void> | null = null;
   private ownerMetadataBytes = 0;
   private closed = false;
   private fatalUnavailable = false;
@@ -1450,6 +1632,10 @@ export class RelayV2StateSnapshotSpool {
       ...RELAY_V2_STATE_SNAPSHOT_LIMITS,
       ...options.testLimits,
     });
+    this.readinessReceiptLimits = Object.freeze({
+      ...RELAY_V2_READINESS_RECEIPT_LIMITS,
+      ...options.testReadinessReceiptLimits,
+    });
     this.validateLimits();
   }
 
@@ -1466,6 +1652,7 @@ export class RelayV2StateSnapshotSpool {
       await spool.serializeMetadata(
         async () => {
           spool.acquireOwnership();
+          await spool.withdrawPriorSnapshotOwnerAuthority();
           const hostEpoch = await spool.readCurrentHostEpoch();
           spool.recover(hostEpoch);
         },
@@ -1623,8 +1810,305 @@ export class RelayV2StateSnapshotSpool {
     });
   }
 
-  async close(): Promise<void> {
-    await this.serializeMetadata(() => {
+  async issueReadinessReceipt(
+    snapshotId: string,
+  ): Promise<RelayV2StateSnapshotReadinessReceiptIssue> {
+    assertOpaqueId(snapshotId, "snapshotId");
+    let installed: ReadinessReceiptRecord | undefined;
+    try {
+      return await this.serializeMetadata(async () => {
+        const now = this.readNow();
+        this.cleanupExpiredAt(now);
+        this.pruneExpiredReadinessReceipts(now);
+        const cut = this.activeById.get(snapshotId);
+        if (!cut || cut.readinessCandidate === null) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot cut has no live owner-issued readiness candidate",
+          );
+        }
+        const candidateLease = cut.readinessCandidate;
+        const receipt = await this.withCandidateFence(candidateLease, (candidate) => {
+          this.assertCurrentOwner();
+          if (this.activeById.get(snapshotId) !== cut
+            || cut.readinessCandidate !== candidateLease
+            || this.ownerInstanceId !== candidate.hostInstanceId
+            || !candidateMatchesManifest(candidate, cut.manifest, this.hostId)) {
+            throw new RelayV2StateSnapshotSpoolError(
+              "CAPABILITY_UNAVAILABLE",
+              "snapshot cut no longer matches its materialized owner candidate",
+            );
+          }
+          if (cut.readinessReceipt !== null) {
+            const existing = this.readinessReceipts.get(cut.readinessReceipt as object);
+            if (existing !== undefined
+              && this.readinessReceiptRecordMatches(existing, candidate, cut, now)) {
+              return cut.readinessReceipt;
+            }
+            if (existing !== undefined) this.revokeReadinessReceipt(existing);
+          }
+          const expiresAtMs = Math.min(
+            now + this.readinessReceiptLimits.receiptTtlMs,
+            cut.lease.snapshotLeaseExpiresAtMs,
+            cut.manifest.snapshotAbsoluteExpiresAtMs,
+          );
+          if (!Number.isSafeInteger(expiresAtMs) || expiresAtMs <= now) {
+            throw new RelayV2StateSnapshotSpoolError(
+              "CAPABILITY_UNAVAILABLE",
+              "snapshot readiness candidate expired before receipt issuance",
+            );
+          }
+          const nonce = randomBytes(32).toString("base64url");
+          const manifestDigest = manifestIdentityDigest(cut.manifest);
+          const retainedBytes = Buffer.byteLength(canonicalizeSnapshotJson({
+            hostId: candidate.hostId,
+            hostEpoch: candidate.hostEpoch,
+            hostInstanceId: candidate.hostInstanceId,
+            materializedSourceGeneration: candidate.materializedSourceGeneration,
+            materializedGeneration: candidate.materializedGeneration,
+            materializedCutIdentity: candidate.materializedCutIdentity,
+            throughEventSeq: candidate.cut.throughEventSeq,
+            scopesRevision: candidate.cut.scopesRevision,
+            cutRecordCount: candidate.cutRecordCount,
+            cutCanonicalBytes: candidate.cutCanonicalBytes,
+            cutDigest: cut.manifest.cutDigest,
+            snapshotId,
+            manifestDigest,
+            subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
+            ownerFence: this.ownerFence,
+            ownerInstanceId: this.ownerInstanceId,
+            processIncarnation: this.processIncarnation,
+            spoolGeneration: this.spoolGeneration,
+            nonce,
+            issuedAtMs: now,
+            expiresAtMs,
+          }), "utf8");
+          if (this.readinessReceipts.size >= this.readinessReceiptLimits.maxReceipts
+            || this.readinessReceiptRetainedBytes + retainedBytes
+              > this.readinessReceiptLimits.maxRetainedBytes) {
+            throw new RelayV2StateSnapshotSpoolError(
+              "BUSY",
+              "snapshot readiness receipt capacity is exhausted",
+            );
+          }
+          const receipt = Object.freeze(() => undefined) as unknown as
+            RelayV2StateSnapshotReadinessReceipt;
+          installed = {
+            receipt,
+            hostId: candidate.hostId,
+            hostEpoch: candidate.hostEpoch,
+            hostInstanceId: candidate.hostInstanceId,
+            materializedCutIdentity: candidate.materializedCutIdentity,
+            snapshotId,
+            ownerFence: this.ownerFence,
+            ownerInstanceId: this.ownerInstanceId,
+            processIncarnation: this.processIncarnation,
+            spoolIdentity: this.spoolIdentity,
+            spoolGeneration: this.spoolGeneration,
+            source: this.cutSource,
+            materializedSourceGeneration: candidate.materializedSourceGeneration,
+            materializedGeneration: candidate.materializedGeneration,
+            throughEventSeq: candidate.cut.throughEventSeq,
+            scopesRevision: candidate.cut.scopesRevision,
+            cutRecordCount: candidate.cutRecordCount,
+            cutCanonicalBytes: candidate.cutCanonicalBytes,
+            cutDigest: cut.manifest.cutDigest,
+            manifestIdentity: cut.manifest,
+            manifestDigest,
+            subscriptionQueueGeneration: candidate.subscriptionQueueGeneration,
+            candidate: candidateLease,
+            cut,
+            nonce,
+            issuedAtMs: now,
+            expiresAtMs,
+            retainedBytes,
+          };
+          this.readinessReceipts.set(receipt as object, installed);
+          this.readinessReceiptRetainedBytes += retainedBytes;
+          cut.readinessReceipt = receipt;
+          return receipt;
+        });
+        const record = this.readinessReceipts.get(receipt as object);
+        if (record === undefined) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot readiness receipt was withdrawn before return",
+          );
+        }
+        const issue = this.readinessReceiptIssue(record);
+        this.testHooks?.beforeReadinessReceiptOwnerRecheck?.(issue);
+        this.assertCurrentOwner();
+        return issue;
+      });
+    } catch (error) {
+      if (installed !== undefined) this.revokeReadinessReceipt(installed);
+      throw error;
+    }
+  }
+
+  async verifyReadinessReceipt(
+    receipt: unknown,
+    expected: unknown,
+  ): Promise<boolean> {
+    const binding = normalizeReadinessReceiptBinding(expected);
+    if (binding === null
+      || ((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)) {
+      return false;
+    }
+    const record = this.readinessReceipts.get(receipt as object);
+    if (record === undefined
+      || record.hostId !== binding.hostId
+      || record.hostEpoch !== binding.hostEpoch
+      || record.hostInstanceId !== binding.hostInstanceId
+      || record.materializedCutIdentity !== binding.materializedCutIdentity) return false;
+    try {
+      return await this.serializeMetadata(async () => {
+        const now = this.readNow();
+        this.pruneExpiredReadinessReceipts(now);
+        if (this.readinessReceipts.get(receipt as object) !== record) return false;
+        return this.withCandidateFence(record.candidate, (candidate) => {
+          this.assertCurrentOwner();
+          return this.readinessReceiptRecordMatches(record, candidate, record.cut, now);
+        });
+      });
+    } catch {
+      if (this.readinessReceipts.get(receipt as object) === record) {
+        this.retireActiveCutReadinessAuthority(record.cut);
+      }
+      return false;
+    }
+  }
+
+  async activateReadinessReceipt(
+    receipt: unknown,
+    sink: RelayV2StateEventSink<RelayV2JsonObject>,
+  ): Promise<RelayV2StateSnapshotActivationLease> {
+    if (((typeof receipt !== "object" && typeof receipt !== "function") || receipt === null)
+      || ((typeof sink !== "object" && typeof sink !== "function") || sink === null)) {
+      if ((typeof sink === "object" || typeof sink === "function") && sink !== null) {
+        closeReadinessActivationSink(sink, "snapshot readiness activation input was invalid");
+      }
+      throw new RelayV2StateSnapshotSpoolError(
+        "INVALID_ARGUMENT",
+        "snapshot readiness receipt or activation sink is invalid",
+      );
+    }
+    let sourceActivation: RelayV2MaterializedStateCutActivationLease | undefined;
+    let installed: ReadinessActivationRecord | undefined;
+    let receiptRecord: ReadinessReceiptRecord | undefined;
+    let sourceAttempted = false;
+    try {
+      return await this.serializeMetadata(async () => {
+        const now = this.readNow();
+        this.cleanupExpiredAt(now);
+        this.pruneExpiredReadinessReceipts(now);
+        receiptRecord = this.readinessReceipts.get(receipt as object);
+        if (receiptRecord === undefined
+          || receiptRecord.cut.readinessActivation !== null) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot readiness receipt is unavailable or already consumed",
+          );
+        }
+        const record = receiptRecord;
+        const assertActivationFence = (
+          candidate: RelayV2MaterializedStateCutCandidate,
+        ): true => {
+          this.assertCurrentOwner();
+          if (!this.readinessReceiptRecordMatches(record, candidate, record.cut, this.readNow())) {
+            throw new RelayV2StateSnapshotSpoolError(
+              "CAPABILITY_UNAVAILABLE",
+              "snapshot readiness receipt lost its same-cut owner fence",
+            );
+          }
+          return true;
+        };
+        try {
+          sourceAttempted = true;
+          sourceActivation = await this.cutSource.activateCandidate(
+            record.candidate,
+            sink,
+            assertActivationFence,
+            (candidate, activation) => {
+              sourceActivation = activation;
+              return assertActivationFence(candidate);
+            },
+          );
+        } catch (error) {
+          if (isRelayV2StateSnapshotSpoolError(error)) throw error;
+          throw mapSourceError(error);
+        }
+
+        this.testHooks?.afterReadinessActivationAttached?.(record.receipt);
+        this.assertCurrentOwner();
+        if (this.readinessReceipts.get(record.receipt as object) !== record
+          || this.activeById.get(record.snapshotId) !== record.cut
+          || record.cut.readinessReceipt !== record.receipt
+          || record.cut.readinessCandidate !== record.candidate
+          || record.cut.readinessActivation !== null
+          || record.ownerFence !== this.ownerFence
+          || record.ownerInstanceId !== this.ownerInstanceId
+          || record.processIncarnation !== this.processIncarnation
+          || record.spoolIdentity !== this.spoolIdentity
+          || record.spoolGeneration !== this.spoolGeneration
+          || record.source !== this.cutSource) {
+          throw new RelayV2StateSnapshotSpoolError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot owner changed while activation was being committed",
+          );
+        }
+        const activation = Object.freeze(() => undefined) as unknown as
+          RelayV2StateSnapshotActivationLease;
+        installed = {
+          activation,
+          sourceActivation: sourceActivation!,
+          source: this.cutSource,
+          cut: record.cut,
+          snapshotId: record.snapshotId,
+          ownerFence: this.ownerFence,
+          ownerInstanceId: this.ownerInstanceId,
+          processIncarnation: this.processIncarnation,
+          spoolIdentity: this.spoolIdentity,
+          spoolGeneration: this.spoolGeneration,
+          receiptNonce: record.nonce,
+          activationNonce: randomBytes(32).toString("base64url"),
+          sinkIdentity: sink as object,
+        };
+        this.readinessActivations.set(activation as object, installed);
+        record.cut.readinessActivation = activation;
+        this.consumeReadinessReceiptForActivation(record);
+        return activation;
+      });
+    } catch (error) {
+      if (installed !== undefined) {
+        this.revokeReadinessActivation(installed);
+      } else if (sourceActivation !== undefined) {
+        this.cutSource.releaseCandidateActivation(sourceActivation);
+      } else if (!sourceAttempted) {
+        closeReadinessActivationSink(sink, "snapshot readiness receipt was rejected");
+      }
+      if (receiptRecord !== undefined
+        && (this.readinessReceipts.get(receiptRecord.receipt as object) === receiptRecord
+          || receiptRecord.cut.readinessCandidate !== null)) {
+        this.retireActiveCutReadinessAuthority(receiptRecord.cut);
+      }
+      throw structuredSpoolError(error);
+    }
+  }
+
+  releaseReadinessActivation(activation: unknown): void {
+    if ((typeof activation !== "object" && typeof activation !== "function")
+      || activation === null) return;
+    const record = this.readinessActivations.get(activation as object);
+    if (record !== undefined) this.revokeReadinessActivation(record);
+  }
+
+  close(): Promise<void> {
+    if (this.closeBarrier !== null) return this.closeBarrier;
+    this.closed = true;
+    this.invalidateAllReadinessAuthority();
+    this.closeBarrier = this.serializeMetadata(() => {
+      this.invalidateAllReadinessAuthority();
       try {
         for (const reservation of [...this.reservationsById.values()]) {
           this.expireReservation(reservation, expiredError());
@@ -1632,17 +2116,17 @@ export class RelayV2StateSnapshotSpool {
         rmSync(this.paths.owner, { force: true });
         fsyncDirectory(this.paths.root);
       } catch (error) {
-        this.fatalUnavailable = true;
+        this.markFatalUnavailable();
         throw error;
       }
-      this.closed = true;
       this.activeById.clear();
       this.activeByLogicalKey.clear();
       this.reservationsById.clear();
       this.tombstonesById.clear();
       this.tombstonesByLogicalKey.clear();
       this.buildsByLogicalKey.clear();
-    }, true, false);
+    }, true, false, true);
+    return this.closeBarrier;
   }
 
   private validateLimits(): void {
@@ -1665,6 +2149,17 @@ export class RelayV2StateSnapshotSpool {
         "Relay v2 snapshot limits are internally inconsistent",
       );
     }
+    for (const [name, value] of Object.entries(this.readinessReceiptLimits)) {
+      const production = RELAY_V2_READINESS_RECEIPT_LIMITS[
+        name as keyof ReadinessReceiptLimits
+      ];
+      if (!Number.isSafeInteger(value) || value <= 0 || value > production) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INVALID_ARGUMENT",
+          `invalid or widened Relay v2 readiness receipt limit ${name}`,
+        );
+      }
+    }
   }
 
   private readNow(): number {
@@ -1685,6 +2180,14 @@ export class RelayV2StateSnapshotSpool {
     }
   }
 
+  private async withdrawPriorSnapshotOwnerAuthority(): Promise<void> {
+    try {
+      await this.cutSource.withdrawSnapshotOwnerAuthority();
+    } catch (error) {
+      throw mapSourceError(error);
+    }
+  }
+
   private async withLineageFence<T>(
     expectedHostEpoch: string,
     operation: () => T | Promise<T>,
@@ -1693,6 +2196,24 @@ export class RelayV2StateSnapshotSpool {
       return await this.cutSource.withHostEpochFence(expectedHostEpoch, async () => {
         try {
           return await operation();
+        } catch (error) {
+          throw new LineageOperationError(error);
+        }
+      });
+    } catch (error) {
+      if (error instanceof LineageOperationError) throw error.cause;
+      throw mapSourceError(error);
+    }
+  }
+
+  private async withCandidateFence<T>(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+    operation: (candidate: RelayV2MaterializedStateCutCandidate) => T | Promise<T>,
+  ): Promise<T> {
+    try {
+      return await this.cutSource.withCandidateFence(lease, async (candidate) => {
+        try {
+          return await operation(candidate);
         } catch (error) {
           throw new LineageOperationError(error);
         }
@@ -1741,22 +2262,24 @@ export class RelayV2StateSnapshotSpool {
     operation: () => T | Promise<T>,
     requireOwner = true,
     verifyOwnerAfter = true,
+    allowClosed = false,
   ): Promise<T> {
     let release!: () => void;
     const previous = this.metadataTail;
     this.metadataTail = new Promise<void>((resolve) => { release = resolve; });
     await previous;
     try {
-      if (this.closed) throw ownerFencedError();
+      if (this.closed && !allowClosed) throw ownerFencedError();
       return await this.withDiskMutex(async () => {
         if (requireOwner) this.assertCurrentOwner();
         const result = await operation();
+        if (this.closed && !allowClosed) throw ownerFencedError();
         if (verifyOwnerAfter) this.assertCurrentOwner();
         return result;
       });
     } catch (error) {
       if (!(error instanceof RelayV2StateSnapshotSpoolError)) {
-        this.fatalUnavailable = true;
+        this.markFatalUnavailable();
       }
       throw structuredSpoolError(error);
     } finally {
@@ -1902,7 +2425,7 @@ export class RelayV2StateSnapshotSpool {
       assertPrivateFile(quarantine, 4_096);
       const quarantined = lstatSync(quarantine);
       if (quarantined.dev !== observed.device || quarantined.ino !== observed.inode) {
-        this.fatalUnavailable = true;
+        this.markFatalUnavailable();
         throw new RelayV2StateSnapshotSpoolError(
           "INTERNAL",
           "snapshot spool stale lock quarantine identity conflicts",
@@ -1954,7 +2477,7 @@ export class RelayV2StateSnapshotSpool {
     if (observed.holder?.token !== token
       || observed.holder.pid !== process.pid
       || observed.holder.processIncarnation !== this.processIncarnation) {
-      this.fatalUnavailable = true;
+      this.markFatalUnavailable();
       throw new RelayV2StateSnapshotSpoolError(
         "INTERNAL",
         "snapshot spool metadata lock was lost",
@@ -2002,21 +2525,29 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private assertCurrentOwner(): void {
-    const owner = readCanonicalPrivateFile(
-      this.paths.owner,
-      this.limits.maxMetadataBytes,
-      parseOwner,
-    ).record;
+    let owner: PersistedSpoolOwner;
+    try {
+      owner = readCanonicalPrivateFile(
+        this.paths.owner,
+        this.limits.maxMetadataBytes,
+        parseOwner,
+      ).record;
+    } catch (error) {
+      this.invalidateAllReadinessAuthority();
+      throw error;
+    }
     if (owner.hostId !== this.hostId
       || owner.ownerInstanceId !== this.ownerInstanceId
       || owner.fence !== this.ownerFence
       || owner.pid !== process.pid
       || owner.processIncarnation !== this.processIncarnation) {
+      this.invalidateAllReadinessAuthority();
       throw ownerFencedError();
     }
     this.ownerMetadataBytes = jsonFile(owner).byteLength
       + COORDINATION_METADATA_ALLOWANCE_BYTES;
     if (this.fatalUnavailable) {
+      this.invalidateAllReadinessAuthority();
       throw new RelayV2StateSnapshotSpoolError(
         "INTERNAL",
         "snapshot spool is fail-closed after an uncertain persistence result",
@@ -2036,7 +2567,7 @@ export class RelayV2StateSnapshotSpool {
     try {
       atomicWritePrivateFile(path, contents);
     } catch (error) {
-      this.fatalUnavailable = true;
+      this.markFatalUnavailable();
       throw error;
     }
   }
@@ -2070,6 +2601,7 @@ export class RelayV2StateSnapshotSpool {
     assertOwnedDirectory(this.paths.tombstones, true);
     assertOwnedDirectory(this.paths.lockCandidates, true);
     assertOwnedDirectory(this.paths.lockQuarantine, true);
+    this.invalidateAllReadinessAuthority();
     this.activeById.clear();
     this.activeByLogicalKey.clear();
     this.reservationsById.clear();
@@ -2552,7 +3084,14 @@ export class RelayV2StateSnapshotSpool {
       || fullDigest.digest("base64url") !== manifest.cutDigest) {
       throw new Error("snapshot cut digest or totals do not match");
     }
-    return { directory, manifest, lease };
+    return {
+      directory,
+      manifest,
+      lease,
+      readinessCandidate: null,
+      readinessReceipt: null,
+      readinessActivation: null,
+    };
   }
 
   private enforceRecoveredQuota(): void {
@@ -2705,10 +3244,15 @@ export class RelayV2StateSnapshotSpool {
   }
 
   private async buildAndPublish(reservation: PersistedReservation): Promise<void> {
+    let candidateLease: RelayV2MaterializedStateCutCandidateLease | undefined;
+    let candidate: RelayV2MaterializedStateCutCandidate;
     let cut: RelayV2MaterializedStateCut;
     try {
-      cut = await this.cutSource.capture(reservation.binding.hostEpoch);
+      candidateLease = await this.cutSource.captureCandidate(reservation.binding.hostEpoch);
+      candidate = this.cutSource.inspectCandidate(candidateLease);
+      cut = candidate.cut;
     } catch (error) {
+      if (candidateLease !== undefined) this.cutSource.releaseCandidate(candidateLease);
       const sourceError = mapSourceError(error);
       await this.serializeMetadata(() => this.expireReservation(reservation, sourceError));
       throw sourceError;
@@ -2723,31 +3267,59 @@ export class RelayV2StateSnapshotSpool {
       assertCanonicalCounter(cut.throughEventSeq, "throughEventSeq");
       assertCanonicalCounter(cut.scopesRevision, "scopesRevision");
       validateRecordStream(cut.records);
+      if (candidate.hostId !== this.hostId
+        || candidate.hostEpoch !== cut.hostEpoch
+        || candidate.cutRecordCount !== cut.records.length
+        || !candidateMatchesManifest(candidate, {
+          version: SPOOL_VERSION,
+          snapshotId: reservation.snapshotId,
+          hostId: this.hostId,
+          binding: clone(reservation.binding),
+          snapshotCreatedAtMs: reservation.snapshotCreatedAtMs,
+          snapshotAbsoluteExpiresAtMs: reservation.snapshotAbsoluteExpiresAtMs,
+          throughEventSeq: cut.throughEventSeq,
+          scopesRevision: cut.scopesRevision,
+          totalRecords: cut.records.length,
+          totalCanonicalBytes: candidate.cutCanonicalBytes,
+          cutDigest: createHash("sha256")
+            .update(canonicalizeSnapshotJson(cut.records), "utf8")
+            .digest("base64url"),
+          metadataBytes: 0,
+          chunks: [],
+        }, this.hostId)) {
+        throw new RelayV2StateSnapshotSpoolError(
+          "INTERNAL",
+          "materialized candidate metadata does not bind its projected cut",
+        );
+      }
     } catch (error) {
+      this.cutSource.releaseCandidate(candidateLease!);
       const failure = structuredSpoolError(error);
       await this.serializeMetadata(() => this.expireReservation(reservation, failure));
       throw failure;
     }
 
-    await this.serializeMetadata(async () => {
-      let stagingDirectory: string | undefined;
-      let finalDirectory: string | undefined;
-      let publication: "precommit" | "renamed" | "published" = "precommit";
-      const publicationState = (): "precommit" | "renamed" | "published" => publication;
-      let reservationRemoved = false;
-      const removePublishedReservation = () => {
-        if (reservationRemoved) return;
-        this.removeReservationFile(reservation);
-        reservationRemoved = true;
-      };
-      const expireBuildingReservation = (
-        failure: RelayV2StateSnapshotSpoolError,
-      ) => {
-        if (reservationRemoved) return;
-        this.expireReservation(reservation, failure);
-        reservationRemoved = true;
-      };
-      try {
+    let candidateTransferred = false;
+    try {
+      await this.serializeMetadata(async () => {
+        let stagingDirectory: string | undefined;
+        let finalDirectory: string | undefined;
+        let publication: "precommit" | "renamed" | "published" = "precommit";
+        const publicationState = (): "precommit" | "renamed" | "published" => publication;
+        let reservationRemoved = false;
+        const removePublishedReservation = () => {
+          if (reservationRemoved) return;
+          this.removeReservationFile(reservation);
+          reservationRemoved = true;
+        };
+        const expireBuildingReservation = (
+          failure: RelayV2StateSnapshotSpoolError,
+        ) => {
+          if (reservationRemoved) return;
+          this.expireReservation(reservation, failure);
+          reservationRemoved = true;
+        };
+        try {
         const activeReservation = this.reservationsById.get(reservation.reservationId);
         if (!activeReservation
           || activeReservation.ownerFence !== this.ownerFence
@@ -2796,14 +3368,18 @@ export class RelayV2StateSnapshotSpool {
             directory: finalDirectory,
             manifest: built.manifest,
             lease: built.lease,
+            readinessCandidate: candidateLease!,
+            readinessReceipt: null,
+            readinessActivation: null,
           };
           this.activeById.set(reservation.snapshotId, cutRecord);
           this.activeByLogicalKey.set(logicalKey(reservation.binding), cutRecord);
+          candidateTransferred = true;
           removePublishedReservation();
         });
-      } catch (error) {
-        const failure = structuredSpoolError(error);
-        try {
+        } catch (error) {
+          const failure = structuredSpoolError(error);
+          try {
           if (publicationState() !== "published") {
             expireBuildingReservation(failure);
           }
@@ -2817,23 +3393,28 @@ export class RelayV2StateSnapshotSpool {
             fsyncDirectory(this.paths.staging);
             stagingDirectory = undefined;
           }
-        } catch {
-          this.fatalUnavailable = true;
-          throw new RelayV2StateSnapshotSpoolError(
-            "INTERNAL",
-            "snapshot publication rollback is uncertain and the spool is fail-closed",
-          );
+          } catch {
+            this.markFatalUnavailable();
+            throw new RelayV2StateSnapshotSpoolError(
+              "INTERNAL",
+              "snapshot publication rollback is uncertain and the spool is fail-closed",
+            );
+          }
+          if (publicationState() === "published") {
+            this.markFatalUnavailable();
+            throw new RelayV2StateSnapshotSpoolError(
+              "INTERNAL",
+              "snapshot publication committed with uncertain metadata cleanup",
+            );
+          }
+          this.cutSource.releaseCandidate(candidateLease!);
+          throw failure;
         }
-        if (publicationState() === "published") {
-          this.fatalUnavailable = true;
-          throw new RelayV2StateSnapshotSpoolError(
-            "INTERNAL",
-            "snapshot publication committed with uncertain metadata cleanup",
-          );
-        }
-        throw failure;
-      }
-    });
+      });
+    } catch (error) {
+      if (!candidateTransferred) this.cutSource.releaseCandidate(candidateLease);
+      throw error;
+    }
   }
 
   private syncDirectory(
@@ -3026,7 +3607,7 @@ export class RelayV2StateSnapshotSpool {
         }
       } catch (error) {
         if (error instanceof UnsafeSpoolPathError) {
-          this.fatalUnavailable = true;
+          this.markFatalUnavailable();
           throw error;
         }
         this.expireActiveCut(cut, now);
@@ -3183,9 +3764,145 @@ export class RelayV2StateSnapshotSpool {
       rmSync(path, { force: true });
       fsyncDirectory(this.paths.tombstones);
     } catch (error) {
-      this.fatalUnavailable = true;
+      this.markFatalUnavailable();
       throw error;
     }
+  }
+
+  private readinessReceiptRecordMatches(
+    record: ReadinessReceiptRecord,
+    candidate: RelayV2MaterializedStateCutCandidate,
+    cut: ActiveCut,
+    now: number,
+  ): boolean {
+    return this.readinessReceipts.get(record.receipt as object) === record
+      && this.activeById.get(record.snapshotId) === cut
+      && cut === record.cut
+      && cut.readinessCandidate === record.candidate
+      && cut.readinessReceipt === record.receipt
+      && record.ownerFence === this.ownerFence
+      && record.ownerInstanceId === this.ownerInstanceId
+      && record.processIncarnation === this.processIncarnation
+      && record.spoolIdentity === this.spoolIdentity
+      && record.spoolGeneration === this.spoolGeneration
+      && record.source === this.cutSource
+      && record.nonce.length === 43
+      && now >= record.issuedAtMs
+      && now < record.expiresAtMs
+      && now < cut.lease.snapshotLeaseExpiresAtMs
+      && now < cut.manifest.snapshotAbsoluteExpiresAtMs
+      && record.hostId === candidate.hostId
+      && record.hostEpoch === candidate.hostEpoch
+      && record.hostInstanceId === candidate.hostInstanceId
+      && record.materializedSourceGeneration === candidate.materializedSourceGeneration
+      && record.materializedGeneration === candidate.materializedGeneration
+      && record.materializedCutIdentity === candidate.materializedCutIdentity
+      && record.throughEventSeq === candidate.cut.throughEventSeq
+      && record.scopesRevision === candidate.cut.scopesRevision
+      && record.cutRecordCount === candidate.cutRecordCount
+      && record.cutCanonicalBytes === candidate.cutCanonicalBytes
+      && record.cutDigest === cut.manifest.cutDigest
+      && record.manifestIdentity === cut.manifest
+      && record.manifestDigest === manifestIdentityDigest(cut.manifest)
+      && record.subscriptionQueueGeneration === candidate.subscriptionQueueGeneration
+      && candidateMatchesManifest(candidate, cut.manifest, this.hostId);
+  }
+
+  private readinessReceiptIssue(
+    record: ReadinessReceiptRecord,
+  ): RelayV2StateSnapshotReadinessReceiptIssue {
+    const binding = Object.freeze({
+      hostId: record.hostId,
+      hostEpoch: record.hostEpoch,
+      hostInstanceId: record.hostInstanceId,
+      materializedCutIdentity: record.materializedCutIdentity,
+    });
+    return Object.freeze({ receipt: record.receipt, binding });
+  }
+
+  private pruneExpiredReadinessReceipts(now: number): void {
+    for (const record of [...this.readinessReceipts.values()]) {
+      if (now >= record.expiresAtMs
+        || now >= record.cut.lease.snapshotLeaseExpiresAtMs
+        || now >= record.cut.manifest.snapshotAbsoluteExpiresAtMs) {
+        this.retireActiveCutReadinessAuthority(record.cut);
+      }
+    }
+  }
+
+  private consumeReadinessReceiptForActivation(record: ReadinessReceiptRecord): void {
+    if (this.readinessReceipts.get(record.receipt as object) !== record) {
+      throw new RelayV2StateSnapshotSpoolError(
+        "CAPABILITY_UNAVAILABLE",
+        "snapshot readiness receipt was consumed concurrently",
+      );
+    }
+    this.readinessReceipts.delete(record.receipt as object);
+    this.readinessReceiptRetainedBytes = Math.max(
+      0,
+      this.readinessReceiptRetainedBytes - record.retainedBytes,
+    );
+    if (record.cut.readinessReceipt === record.receipt) {
+      record.cut.readinessReceipt = null;
+    }
+    if (record.cut.readinessCandidate === record.candidate) {
+      record.cut.readinessCandidate = null;
+    }
+  }
+
+  private revokeReadinessReceipt(record: ReadinessReceiptRecord): void {
+    if (this.readinessReceipts.get(record.receipt as object) !== record) return;
+    this.readinessReceipts.delete(record.receipt as object);
+    this.readinessReceiptRetainedBytes = Math.max(
+      0,
+      this.readinessReceiptRetainedBytes - record.retainedBytes,
+    );
+    if (record.cut.readinessReceipt === record.receipt) {
+      record.cut.readinessReceipt = null;
+    }
+  }
+
+  private revokeReadinessActivation(record: ReadinessActivationRecord): void {
+    if (this.readinessActivations.get(record.activation as object) !== record) return;
+    this.readinessActivations.delete(record.activation as object);
+    if (record.cut.readinessActivation === record.activation) {
+      record.cut.readinessActivation = null;
+    }
+    record.source.releaseCandidateActivation(record.sourceActivation);
+  }
+
+  private retireActiveCutReadinessAuthority(cut: ActiveCut): void {
+    if (cut.readinessActivation !== null) {
+      const activation = this.readinessActivations.get(cut.readinessActivation as object);
+      if (activation !== undefined) this.revokeReadinessActivation(activation);
+      cut.readinessActivation = null;
+    }
+    if (cut.readinessReceipt !== null) {
+      const record = this.readinessReceipts.get(cut.readinessReceipt as object);
+      if (record !== undefined) this.revokeReadinessReceipt(record);
+      cut.readinessReceipt = null;
+    }
+    if (cut.readinessCandidate !== null) {
+      this.cutSource.releaseCandidate(cut.readinessCandidate);
+      cut.readinessCandidate = null;
+    }
+  }
+
+  private invalidateAllReadinessAuthority(): void {
+    for (const cut of this.activeById.values()) {
+      this.retireActiveCutReadinessAuthority(cut);
+    }
+    for (const activation of [...this.readinessActivations.values()]) {
+      this.revokeReadinessActivation(activation);
+    }
+    this.readinessActivations.clear();
+    this.readinessReceipts.clear();
+    this.readinessReceiptRetainedBytes = 0;
+  }
+
+  private markFatalUnavailable(): void {
+    this.fatalUnavailable = true;
+    this.invalidateAllReadinessAuthority();
   }
 
   private expireActiveCut(cut: ActiveCut, now: number): void {
@@ -3198,9 +3915,10 @@ export class RelayV2StateSnapshotSpool {
       rmSync(cut.directory, { recursive: true, force: true });
       fsyncDirectory(this.paths.cuts);
     } catch (error) {
-      this.fatalUnavailable = true;
+      this.markFatalUnavailable();
       throw error;
     }
+    this.retireActiveCutReadinessAuthority(cut);
     this.activeById.delete(cut.manifest.snapshotId);
     const key = logicalKey(cut.manifest.binding);
     if (this.activeByLogicalKey.get(key) === cut) this.activeByLogicalKey.delete(key);
@@ -3235,7 +3953,7 @@ export class RelayV2StateSnapshotSpool {
       rmSync(join(this.paths.reservations, `${reservation.reservationId}.json`), { force: true });
       fsyncDirectory(this.paths.reservations);
     } catch (error) {
-      this.fatalUnavailable = true;
+      this.markFatalUnavailable();
       throw error;
     }
     this.reservationsById.delete(reservation.reservationId);

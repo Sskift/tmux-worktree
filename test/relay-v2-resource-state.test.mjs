@@ -238,6 +238,9 @@ async function harness(options = {}) {
     reservationSettlementAuthority: options.settlementAuthority,
     testCapacityLimits: options.capacityLimits,
     testReservationLimits: options.reservationLimits,
+    testSnapshotCandidateLimits: options.snapshotCandidateLimits,
+    now: () => now,
+    testHooks: options.testHooks,
   });
   return {
     home,
@@ -3369,6 +3372,307 @@ test("linearized welcome is codec-valid, bound to the captured cut, and followed
     assert.equal(committed.events[0].eventSeq, delivered[1].eventSeq);
   } finally {
     h.cleanup();
+  }
+});
+
+test("snapshot candidate is owner-issued at W and its provisional queue closes the W+1 gap", async () => {
+  const h = await harness();
+  try {
+    const { seeded } = await seedLocalScope(h, { withSession: true });
+    const source = h.foundation.snapshotCutSource;
+    const lease = await source.captureCandidate(seeded.snapshot.hostEpoch);
+    const captured = source.inspectCandidate(lease);
+
+    assert.equal(typeof lease, "function");
+    assert.equal(Object.isFrozen(lease), true);
+    assert.equal(JSON.stringify(lease), undefined);
+    assert.throws(() => structuredClone(lease));
+    assert.equal(captured.hostId, "mac-admin");
+    assert.equal(captured.hostEpoch, seeded.snapshot.hostEpoch);
+    assert.equal(captured.hostInstanceId, h.store.hostInstanceId);
+    assert.equal(captured.cut.throughEventSeq, seeded.snapshot.eventSeq);
+    assert.equal(captured.cutRecordCount, captured.cut.records.length);
+    assert.equal(
+      captured.cutCanonicalBytes,
+      Buffer.byteLength(resourceState.canonicalizeRelayV2MaterializedJson(captured.cut.records)),
+    );
+
+    const forgedFunction = () => undefined;
+    Object.setPrototypeOf(forgedFunction, Object.getPrototypeOf(lease));
+    await assert.rejects(
+      source.withCandidateFence(forgedFunction, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+    assert.throws(
+      () => source.inspectCandidate(Object.create(Object.getPrototypeOf(lease))),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local",
+        kind: "local",
+        sessions: [terminal("pane:next", "next")],
+      })],
+    });
+    const committed = await h.foundation.reconcile();
+    assert.ok(BigInt(committed.snapshot.eventSeq) > BigInt(captured.cut.throughEventSeq));
+    const fenced = await source.withCandidateFence(lease, (candidate) => candidate);
+    assert.equal(fenced.materializedCutIdentity, captured.materializedCutIdentity);
+    assert.equal(fenced.subscriptionQueueGeneration, captured.subscriptionQueueGeneration);
+
+    const restartedOwner = new resourceState.RelayV2MaterializedStateFoundation({
+      hostId: "mac-admin",
+      discovery: new QueueDiscovery(),
+      store: h.store,
+      readinessSink: new ReadinessSink(),
+    });
+    assert.throws(
+      () => restartedOwner.snapshotCutSource.inspectCandidate(lease),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+
+    source.releaseCandidate(lease);
+    await assert.rejects(
+      source.withCandidateFence(lease, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("snapshot candidate hands buffered W+1 and future events to one exact sink without a gap", async () => {
+  const h = await harness();
+  try {
+    const { seeded } = await seedLocalScope(h, { withSession: true });
+    const source = h.foundation.snapshotCutSource;
+    const candidate = await source.captureCandidate(seeded.snapshot.hostEpoch);
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local",
+        kind: "local",
+        sessions: [
+          terminal("pane:seeded", "seeded"),
+          terminal("pane:buffered", "buffered"),
+        ],
+      })],
+    });
+    const bufferedCommit = await h.foundation.reconcile();
+    const delivered = [];
+    const closed = [];
+    const phases = [];
+    const activation = await source.activateCandidate(
+      candidate,
+      {
+        enqueue(event) { delivered.push(structuredClone(event)); return true; },
+        close(error) { closed.push(error); },
+      },
+      (cut) => { phases.push(["before", cut.cut.throughEventSeq]); return true; },
+      (cut, exactActivation) => {
+        phases.push(["after", cut.subscriptionQueueGeneration]);
+        assert.equal(typeof exactActivation, "function");
+        return true;
+      },
+    );
+    assert.deepEqual(
+      delivered.map((event) => event.eventSeq),
+      bufferedCommit.events.map((event) => event.eventSeq),
+    );
+    assert.deepEqual(phases.map(([phase]) => phase), ["before", "after"]);
+    await assert.rejects(
+      source.withCandidateFence(candidate, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local live",
+        kind: "local",
+        sessions: [terminal("pane:live", "live")],
+      })],
+    });
+    const liveCommit = await h.foundation.reconcile();
+    assert.deepEqual(
+      delivered.slice(bufferedCommit.events.length).map((event) => event.eventSeq),
+      liveCommit.events.map((event) => event.eventSeq),
+    );
+
+    const forged = () => undefined;
+    Object.setPrototypeOf(forged, Object.getPrototypeOf(activation));
+    source.releaseCandidateActivation(forged);
+    assert.equal(closed.length, 0);
+    source.releaseCandidateActivation(activation);
+    source.releaseCandidateActivation(activation);
+    assert.equal(closed.length, 1);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("snapshot activation rejection rolls back the exact sink and consumes failed authority", async (t) => {
+  for (const failure of [
+    "owner_before_drain",
+    "enqueue_false",
+    "enqueue_throw",
+    "owner_after_attach",
+  ]) {
+    await t.test(failure, async () => {
+      const h = await harness();
+      try {
+        const { seeded } = await seedLocalScope(h, { withSession: true });
+        const source = h.foundation.snapshotCutSource;
+        const candidate = await source.captureCandidate(seeded.snapshot.hostEpoch);
+        h.discovery.push({
+          coverage: "complete",
+          scopes: [scope({
+            backendIdentity: "local",
+            displayName: "Changed",
+            kind: "local",
+            sessions: [terminal(`pane:${failure}`, failure)],
+          })],
+        });
+        await h.foundation.reconcile();
+        const delivered = [];
+        const closed = [];
+        await assert.rejects(
+          source.activateCandidate(
+            candidate,
+            {
+              enqueue(event) {
+                delivered.push(event.eventSeq);
+                if (failure === "enqueue_throw") throw new Error("injected enqueue failure");
+                return failure !== "enqueue_false";
+              },
+              close(error) { closed.push(error); },
+            },
+            () => {
+              if (failure === "owner_before_drain") {
+                throw new Error("injected owner pre-drain failure");
+              }
+              return true;
+            },
+            () => {
+              if (failure === "owner_after_attach") {
+                throw new Error("injected owner recheck failure");
+              }
+              return true;
+            },
+          ),
+          failure === "owner_before_drain"
+            ? /injected owner pre-drain failure/
+            : failure === "owner_after_attach"
+              ? /injected owner recheck failure/
+              : assertMaterializedError("BUSY"),
+        );
+        assert.equal(closed.length, 1);
+        if (failure === "owner_before_drain") {
+          assert.equal(delivered.length, 0, "pre-drain failure delivered a buffered event");
+        }
+        await assert.rejects(
+          source.withCandidateFence(candidate, () => undefined),
+          assertMaterializedError("INVALID_ARGUMENT"),
+        );
+        const deliveredAtFailure = delivered.length;
+        h.discovery.push({ coverage: "complete", scopes: [] });
+        await h.foundation.reconcile();
+        assert.equal(delivered.length, deliveredAtFailure, "failed activation left a live subscriber");
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+});
+
+test("snapshot candidate install, buffer, count, bytes, TTL, and readiness fences fail closed", async () => {
+  let failInstall = true;
+  const h = await harness({
+    snapshotCandidateLimits: {
+      maxCandidates: 1,
+      maxBufferedEventsPerCandidate: 1,
+      candidateTtlMs: 10,
+    },
+    testHooks: {
+      afterSnapshotCandidateSubscriptionInstall() {
+        if (failInstall) {
+          failInstall = false;
+          throw new Error("injected provisional subscription install failure");
+        }
+      },
+    },
+  });
+  try {
+    const { seeded } = await seedLocalScope(h);
+    const source = h.foundation.snapshotCutSource;
+    await assert.rejects(
+      source.captureCandidate(seeded.snapshot.hostEpoch),
+      /injected provisional subscription install failure/,
+    );
+    const lease = await source.captureCandidate(seeded.snapshot.hostEpoch);
+    await assert.rejects(
+      source.captureCandidate(seeded.snapshot.hostEpoch),
+      assertMaterializedError("BUSY"),
+    );
+
+    h.discovery.push({
+      coverage: "complete",
+      scopes: [scope({
+        backendIdentity: "local",
+        displayName: "Local updated",
+        kind: "local",
+        sessions: [terminal("pane:overflow", "overflow")],
+      })],
+    });
+    await h.foundation.reconcile();
+    await assert.rejects(
+      source.withCandidateFence(lease, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+
+    const ttlLease = await source.captureCandidate(seeded.snapshot.hostEpoch);
+    h.setNow(h.now() + 10);
+    await assert.rejects(
+      source.withCandidateFence(ttlLease, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+
+    h.setNow(h.now() + 1);
+    const uncertainLease = await source.captureCandidate(seeded.snapshot.hostEpoch);
+    h.foundation.commandResourceMutationOwner.fenceCommitUncertain(await h.store.read());
+    await assert.rejects(
+      source.withCandidateFence(uncertainLease, () => undefined),
+      assertMaterializedError("INVALID_ARGUMENT"),
+    );
+  } finally {
+    h.cleanup();
+  }
+
+  const byteBound = await harness({
+    snapshotCandidateLimits: { maxCandidates: 2, maxRetainedBytes: 2 },
+  });
+  try {
+    byteBound.discovery.push({ coverage: "complete", scopes: [] });
+    const seeded = await byteBound.foundation.reconcile();
+    const first = await byteBound.foundation.snapshotCutSource.captureCandidate(
+      seeded.snapshot.hostEpoch,
+    );
+    await assert.rejects(
+      byteBound.foundation.snapshotCutSource.captureCandidate(seeded.snapshot.hostEpoch),
+      assertMaterializedError("BUSY"),
+    );
+    byteBound.foundation.snapshotCutSource.releaseCandidate(first);
+    const afterRelease = await byteBound.foundation.snapshotCutSource.captureCandidate(
+      seeded.snapshot.hostEpoch,
+    );
+    byteBound.foundation.snapshotCutSource.releaseCandidate(afterRelease);
+  } finally {
+    byteBound.cleanup();
   }
 });
 

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { issueRelayV2CanonicalBackendInstanceKey } from "./canonicalBackendIdentity.js";
 import { encodeRelayV2WebSocketFrame } from "./codec.js";
 import type { RelayV2JsonObject } from "./codecSchema.js";
@@ -41,6 +41,14 @@ const SESSIONS_REVISION_PREFIX = "sessions:";
 const MATERIALIZED_STATE_VERSION = 1 as const;
 const RECONCILE_MAX_ATTEMPTS = 3;
 const RECONCILE_RETRY_BASE_MS = 5;
+
+const RELAY_V2_MATERIALIZED_CUT_CANDIDATE_LIMITS = Object.freeze({
+  maxCandidates: 16,
+  maxRetainedBytes: 536_870_912,
+  maxBufferedEventsPerCandidate: 512,
+  maxBufferedBytesPerCandidate: 4_194_304,
+  candidateTtlMs: 300_000,
+});
 
 export const RELAY_V2_MATERIALIZED_CAPACITY = Object.freeze({
   maxSnapshotRecords: 100_000,
@@ -383,13 +391,49 @@ export interface RelayV2MaterializedStateCutAdmissionEstimate {
   totalCanonicalBytes: number;
 }
 
+declare const relayV2MaterializedStateCutCandidateLeaseBrand: unique symbol;
+declare const relayV2MaterializedStateCutActivationLeaseBrand: unique symbol;
+
+/**
+ * Instance-private H0 lease for one exact serializer cut. It has no JSON or
+ * structured-clone representation; only its issuing cut source can inspect or
+ * fence it. A candidate is not an H2 readiness receipt.
+ */
+export interface RelayV2MaterializedStateCutCandidateLease {
+  readonly [relayV2MaterializedStateCutCandidateLeaseBrand]: true;
+}
+
+/**
+ * Process-local exact lease for the subscriber that consumed one candidate.
+ * Only the issuing H0 cut source can release it; it is never persisted or
+ * serialized.
+ */
+export interface RelayV2MaterializedStateCutActivationLease {
+  readonly [relayV2MaterializedStateCutActivationLeaseBrand]: true;
+}
+
+export interface RelayV2MaterializedStateCutCandidate {
+  hostId: string;
+  hostEpoch: string;
+  hostInstanceId: string;
+  materializedSourceGeneration: string;
+  materializedGeneration: string;
+  materializedCutIdentity: string;
+  cutRecordCount: number;
+  cutCanonicalBytes: number;
+  subscriptionQueueGeneration: string;
+  cut: RelayV2MaterializedStateCut;
+}
+
 /**
  * Read-only H0/H2 seam for the pinned snapshot spool.
  *
- * capture() projects every counter and record from one H0 serializer cut. It
- * never performs discovery or other backend I/O. admissionEstimate() uses the
- * same materialized authority's conservative capacity measure, including H1
- * capacity reservations that capture() deliberately does not project.
+ * captureCandidate() projects every counter and record from one H0 serializer
+ * cut and installs its bounded W+1 provisional subscriber before releasing the
+ * serializer. It never performs discovery or other backend I/O.
+ * admissionEstimate() uses the same materialized authority's conservative
+ * capacity measure, including H1 capacity reservations that the cut
+ * deliberately does not project.
  */
 export interface RelayV2MaterializedStateCutSource {
   currentHostEpoch(): Promise<string>;
@@ -400,7 +444,31 @@ export interface RelayV2MaterializedStateCutSource {
   admissionEstimate(
     expectedHostEpoch: string,
   ): Promise<RelayV2MaterializedStateCutAdmissionEstimate>;
-  capture(expectedHostEpoch: string): Promise<RelayV2MaterializedStateCut>;
+  captureCandidate(
+    expectedHostEpoch: string,
+  ): Promise<RelayV2MaterializedStateCutCandidateLease>;
+  inspectCandidate(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+  ): RelayV2MaterializedStateCutCandidate;
+  withCandidateFence<T>(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+    operation: (candidate: RelayV2MaterializedStateCutCandidate) => T | Promise<T>,
+  ): Promise<T>;
+  activateCandidate(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+    sink: RelayV2StateEventSink<RelayV2JsonObject>,
+    beforeDrain: (candidate: RelayV2MaterializedStateCutCandidate) => true,
+    afterAttach: (
+      candidate: RelayV2MaterializedStateCutCandidate,
+      activation: RelayV2MaterializedStateCutActivationLease,
+    ) => true,
+  ): Promise<RelayV2MaterializedStateCutActivationLease>;
+  releaseCandidateActivation(
+    activation: RelayV2MaterializedStateCutActivationLease,
+  ): void;
+  /** A new spool owner synchronously withdraws prior in-process H2 authority. */
+  withdrawSnapshotOwnerAuthority(): Promise<void>;
+  releaseCandidate(lease: RelayV2MaterializedStateCutCandidateLease): void;
 }
 
 export type RelayV2MaterializedErrorCode =
@@ -502,6 +570,10 @@ interface PersistedMaterializedState {
 interface Subscriber {
   epoch: string;
   sink: RelayV2StateEventSink<RelayV2JsonObject>;
+  enqueue: (item: RelayV2JsonObject) => unknown;
+  close: ((error: RelayV2MaterializedStateError) => unknown) | null;
+  activationLease: object | null;
+  closed: boolean;
 }
 
 interface PublishedCanonicalResolver {
@@ -514,6 +586,37 @@ interface PublishedCanonicalResolver {
 interface MaterializedPublicationOutcome {
   readiness: RelayV2MaterializedReadiness;
   accepted: boolean;
+}
+
+interface MaterializedCutCandidateRecord extends RelayV2MaterializedStateCutCandidate {
+  sourceIdentity: object;
+  leaseNonce: string;
+  subscriptionIdentity: object;
+  capturedAtMs: number;
+  expiresAtMs: number;
+  lastQueuedEventSeq: string;
+  bufferedEventCount: number;
+  bufferedCanonicalBytes: number;
+  retainedBytes: number;
+  events: RelayV2JsonObject[];
+}
+
+interface MaterializedCutActivationRecord {
+  activation: RelayV2MaterializedStateCutActivationLease;
+  sourceIdentity: object;
+  sourceGeneration: string;
+  subscriptionIdentity: object;
+  subscriptionQueueGeneration: string;
+  candidateNonce: string;
+  activationNonce: string;
+  sinkIdentity: object;
+  subscriber: Subscriber;
+}
+
+type MaterializedCutCandidateLimits = typeof RELAY_V2_MATERIALIZED_CUT_CANDIDATE_LIMITS;
+
+export interface RelayV2MaterializedStateTestHooks {
+  afterSnapshotCandidateSubscriptionInstall?: () => void;
 }
 
 interface PendingChange {
@@ -536,6 +639,12 @@ export interface RelayV2MaterializedStateOptions {
   testCapacityLimits?: Partial<MaterializedCapacity>;
   /** Tests may only shrink the frozen conservative Session charge. */
   testReservationLimits?: Partial<ResourceReservationLimits>;
+  /** Tests may only shrink the provisional W+1 candidate boundaries. */
+  testSnapshotCandidateLimits?: Partial<MaterializedCutCandidateLimits>;
+  /** Deterministic clock injection only; production composition must omit it. */
+  now?: () => number;
+  /** Deterministic fault injection only; production composition must omit it. */
+  testHooks?: RelayV2MaterializedStateTestHooks;
 }
 
 const EMPTY_STATE: PersistedMaterializedState = {
@@ -597,6 +706,50 @@ function closeSubscriber(
 ): void {
   try {
     consumeThenable(sink.close?.(error) as unknown);
+  } catch {}
+}
+
+function captureSubscriber(
+  epoch: string,
+  sink: RelayV2StateEventSink<RelayV2JsonObject>,
+  activationLease: object | null,
+): Subscriber {
+  if ((typeof sink !== "object" && typeof sink !== "function") || sink === null) {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "subscriber sink is invalid");
+  }
+  let enqueue: unknown;
+  let close: unknown;
+  try {
+    enqueue = sink.enqueue;
+    close = sink.close;
+  } catch {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "subscriber sink is invalid");
+  }
+  if (typeof enqueue !== "function" || (close !== undefined && typeof close !== "function")) {
+    throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", "subscriber sink is invalid");
+  }
+  const exactEnqueue = enqueue;
+  const exactClose = close;
+  return {
+    epoch,
+    sink,
+    enqueue: (item) => Reflect.apply(exactEnqueue, sink, [item]),
+    close: exactClose === undefined
+      ? null
+      : (error) => Reflect.apply(exactClose, sink, [error]),
+    activationLease,
+    closed: false,
+  };
+}
+
+function closeCapturedSubscriber(
+  subscriber: Subscriber,
+  error: RelayV2MaterializedStateError,
+): void {
+  if (subscriber.closed) return;
+  subscriber.closed = true;
+  try {
+    consumeThenable(subscriber.close?.(error));
   } catch {}
 }
 
@@ -671,6 +824,10 @@ function validateOpaqueInput(value: string, label: string): void {
   ) {
     throw new RelayV2MaterializedStateError("INVALID_ARGUMENT", `${label} is invalid`);
   }
+}
+
+function isCanonicalCounter(value: unknown): value is string {
+  return typeof value === "string" && /^(0|[1-9][0-9]*)$/.test(value);
 }
 
 function normalizeCanonicalResolverToken(
@@ -2626,6 +2783,25 @@ function projectMaterializedStateCut(
   };
 }
 
+function materializedCutIdentity(
+  hostId: string,
+  snapshot: RelayV2HostStateSnapshot,
+  state: PersistedMaterializedState,
+  cut: RelayV2MaterializedStateCut,
+): string {
+  const digest = createHash("sha256").update(canonicalJson({
+    schemaVersion: 1,
+    hostId,
+    hostEpoch: snapshot.hostEpoch,
+    hostInstanceId: snapshot.hostInstanceId,
+    materializedGeneration: state.generation,
+    throughEventSeq: cut.throughEventSeq,
+    scopesRevision: cut.scopesRevision,
+    records: cut.records,
+  }), "utf8").digest("base64url");
+  return `twh2cut1.${digest}`;
+}
+
 type ContinuityFenceReason = "commit_uncertain" | "host_epoch_changed";
 
 function continuityFenceReadiness(
@@ -2694,7 +2870,15 @@ export class RelayV2MaterializedStateFoundation {
   private readonly reservationSettlementAuthority: RelayV2ReservationSettlementAuthority | undefined;
   private readonly store: Pick<RelayV2HostStateStore, "serialize">;
   private readonly readinessSink: RelayV2MaterializedReadinessSink;
-  private readonly subscribers = new Map<string, Subscriber>();
+  private readonly now: () => number;
+  private readonly snapshotCandidateLimits: Readonly<MaterializedCutCandidateLimits>;
+  private readonly testHooks: RelayV2MaterializedStateTestHooks | undefined;
+  private readonly snapshotCutSourceIdentity = Object.freeze(Object.create(null)) as object;
+  private readonly materializedSourceGeneration = randomBytes(32).toString("base64url");
+  private readonly subscribers = new Map<string | object, Subscriber>();
+  private readonly snapshotCutCandidates = new Map<object, MaterializedCutCandidateRecord>();
+  private readonly snapshotCutActivations = new Map<object, MaterializedCutActivationRecord>();
+  private snapshotCutCandidateRetainedBytes = 0;
   private publishedCanonicalResolver: PublishedCanonicalResolver | null = null;
   private reconcileInFlight: Promise<RelayV2MaterializedReconcileResult> | null = null;
   private observedHostEpoch: string | null = null;
@@ -2707,6 +2891,8 @@ export class RelayV2MaterializedStateFoundation {
     this.reservationSettlementAuthority = options.reservationSettlementAuthority;
     this.store = options.store;
     this.readinessSink = options.readinessSink;
+    this.now = options.now ?? Date.now;
+    this.testHooks = options.testHooks;
     this.capacity = Object.freeze({
       ...RELAY_V2_MATERIALIZED_CAPACITY,
       ...options.testCapacityLimits,
@@ -2735,6 +2921,18 @@ export class RelayV2MaterializedStateFoundation {
     if (this.reservationLimits.maxSessionCanonicalBytes
       > RELAY_V2_RESOURCE_RESERVATION_LIMITS.maxSessionCanonicalBytes) {
       throw new Error("Relay v2 frozen resource reservation limits cannot be widened");
+    }
+    this.snapshotCandidateLimits = Object.freeze({
+      ...RELAY_V2_MATERIALIZED_CUT_CANDIDATE_LIMITS,
+      ...options.testSnapshotCandidateLimits,
+    });
+    for (const [name, value] of Object.entries(this.snapshotCandidateLimits)) {
+      const production = RELAY_V2_MATERIALIZED_CUT_CANDIDATE_LIMITS[
+        name as keyof MaterializedCutCandidateLimits
+      ];
+      if (!Number.isSafeInteger(value) || value <= 0 || value > production) {
+        throw new Error(`invalid or widened Relay v2 snapshot candidate limit ${name}`);
+      }
     }
     this.commandResourceMutationOwner = Object.freeze({
       reserve: (
@@ -2786,9 +2984,39 @@ export class RelayV2MaterializedStateFoundation {
       admissionEstimate: (expectedHostEpoch: string) => (
         this.estimateMaterializedStateCutAdmission(expectedHostEpoch)
       ),
-      capture: (expectedHostEpoch: string) => (
-        this.captureMaterializedStateCut(expectedHostEpoch)
+      captureCandidate: (expectedHostEpoch: string) => (
+        this.captureMaterializedStateCutCandidate(expectedHostEpoch)
       ),
+      inspectCandidate: (lease: RelayV2MaterializedStateCutCandidateLease) => (
+        this.inspectMaterializedStateCutCandidate(lease)
+      ),
+      withCandidateFence: <T>(
+        lease: RelayV2MaterializedStateCutCandidateLease,
+        operation: (candidate: RelayV2MaterializedStateCutCandidate) => T | Promise<T>,
+      ) => this.withMaterializedStateCutCandidateFence(lease, operation),
+      activateCandidate: (
+        lease: RelayV2MaterializedStateCutCandidateLease,
+        sink: RelayV2StateEventSink<RelayV2JsonObject>,
+        beforeDrain: (candidate: RelayV2MaterializedStateCutCandidate) => true,
+        afterAttach: (
+          candidate: RelayV2MaterializedStateCutCandidate,
+          activation: RelayV2MaterializedStateCutActivationLease,
+        ) => true,
+      ) => this.activateMaterializedStateCutCandidate(
+        lease,
+        sink,
+        beforeDrain,
+        afterAttach,
+      ),
+      releaseCandidateActivation: (
+        activation: RelayV2MaterializedStateCutActivationLease,
+      ) => {
+        this.releaseMaterializedStateCutActivation(activation);
+      },
+      withdrawSnapshotOwnerAuthority: () => this.withdrawSnapshotOwnerAuthority(),
+      releaseCandidate: (lease: RelayV2MaterializedStateCutCandidateLease) => {
+        this.releaseMaterializedStateCutCandidate(lease);
+      },
     });
     this.canonicalTargetResolver = Object.freeze({
       captureToken: (expectedHostEpoch: string) => (
@@ -3674,6 +3902,7 @@ export class RelayV2MaterializedStateFoundation {
     buildWelcome: (cut: RelayV2WelcomeCut) => RelayV2JsonObject,
   ): Promise<RelayV2JsonObject> {
     validateOpaqueInput(subscriberId, "subscriberId");
+    const subscriber = captureSubscriber("", sink, null);
     return this.store.serialize((section) => {
       if (this.subscribers.has(subscriberId)) {
         throw new RelayV2MaterializedStateError("BUSY", "subscriber is already active");
@@ -3706,12 +3935,13 @@ export class RelayV2MaterializedStateFoundation {
         throw new RelayV2MaterializedStateError("CAPABILITY_UNAVAILABLE", "readiness adapter rejected state");
       }
       this.dropSubscribersFromOtherLineages(snapshot.hostEpoch);
-      this.subscribers.set(subscriberId, { epoch: snapshot.hostEpoch, sink });
+      subscriber.epoch = snapshot.hostEpoch;
+      this.subscribers.set(subscriberId, subscriber);
       let accepted = false;
-      try { accepted = strictSynchronousTrue(sink.enqueue(clone(welcome))); } catch {}
+      try { accepted = strictSynchronousTrue(subscriber.enqueue(clone(welcome))); } catch {}
       if (!accepted) {
         this.subscribers.delete(subscriberId);
-        closeSubscriber(sink, new RelayV2MaterializedStateError(
+        closeCapturedSubscriber(subscriber, new RelayV2MaterializedStateError(
           "BUSY",
           "subscriber rejected host.welcome synchronously",
         ));
@@ -3762,25 +3992,430 @@ export class RelayV2MaterializedStateFoundation {
     });
   }
 
-  private async captureMaterializedStateCut(
+  private async captureMaterializedStateCutCandidate(
     expectedHostEpoch: string,
-  ): Promise<RelayV2MaterializedStateCut> {
+  ): Promise<RelayV2MaterializedStateCutCandidateLease> {
     validateOpaqueInput(expectedHostEpoch, "expectedHostEpoch");
     return this.store.serialize((section) => {
+      const now = this.readSnapshotCandidateNow();
+      this.pruneExpiredSnapshotCutCandidates(now);
       const snapshot = section.read();
       this.observeLineage(snapshot);
       assertExpectedEpoch(expectedHostEpoch, snapshot.hostEpoch);
       const state = parseMaterializedState(snapshot);
       const readiness = readinessFor(snapshot, state, this.capacity);
-      if (!readiness.snapshotMaterializationReady) {
+      if (!readiness.snapshotMaterializationReady || this.continuityFenceReason !== null) {
         throw new RelayV2MaterializedStateError(
           "CAPABILITY_UNAVAILABLE",
-          `materialized state is not snapshot-ready: ${readiness.reason}`,
-          { readinessReason: readiness.reason },
+          `materialized state is not snapshot-ready: ${this.continuityFenceReason ?? readiness.reason}`,
+          { readinessReason: this.continuityFenceReason ?? readiness.reason },
         );
       }
-      return projectMaterializedStateCut(snapshot, state);
+      if (this.snapshotCutCandidates.size >= this.snapshotCandidateLimits.maxCandidates) {
+        throw new RelayV2MaterializedStateError(
+          "BUSY",
+          "materialized snapshot cut candidate capacity is exhausted",
+        );
+      }
+      const cut = projectMaterializedStateCut(snapshot, state);
+      const cutCanonicalBytes = Buffer.byteLength(canonicalJson(cut.records), "utf8");
+      if (cut.records.length > readiness.totalRecords
+        || cutCanonicalBytes > readiness.totalCanonicalBytes
+        || this.snapshotCutCandidateRetainedBytes + cutCanonicalBytes
+          > this.snapshotCandidateLimits.maxRetainedBytes) {
+        throw new RelayV2MaterializedStateError(
+          "BUSY",
+          "materialized snapshot cut candidate byte capacity is exhausted",
+        );
+      }
+      const record: MaterializedCutCandidateRecord = {
+        hostId: this.hostId,
+        hostEpoch: snapshot.hostEpoch,
+        hostInstanceId: snapshot.hostInstanceId,
+        materializedSourceGeneration: this.materializedSourceGeneration,
+        materializedGeneration: state.generation,
+        materializedCutIdentity: materializedCutIdentity(
+          this.hostId,
+          snapshot,
+          state,
+          cut,
+        ),
+        cutRecordCount: cut.records.length,
+        cutCanonicalBytes,
+        subscriptionQueueGeneration: randomBytes(32).toString("base64url"),
+        cut,
+        sourceIdentity: this.snapshotCutSourceIdentity,
+        leaseNonce: randomBytes(32).toString("base64url"),
+        subscriptionIdentity: Object.freeze(Object.create(null)) as object,
+        capturedAtMs: now,
+        expiresAtMs: now + this.snapshotCandidateLimits.candidateTtlMs,
+        lastQueuedEventSeq: cut.throughEventSeq,
+        bufferedEventCount: 0,
+        bufferedCanonicalBytes: 0,
+        retainedBytes: cutCanonicalBytes,
+        events: [],
+      };
+      if (!Number.isSafeInteger(record.expiresAtMs)) {
+        throw new RelayV2MaterializedStateError(
+          "INTERNAL",
+          "materialized snapshot cut candidate lifetime overflowed",
+        );
+      }
+      // A function cannot be serialized or structured-cloned. Exact object
+      // identity plus the private nonce and source/subscription identities in
+      // this registry are the only candidate authority.
+      const lease = Object.freeze(() => undefined) as unknown as
+        RelayV2MaterializedStateCutCandidateLease;
+      this.snapshotCutCandidates.set(lease as object, record);
+      this.snapshotCutCandidateRetainedBytes += record.retainedBytes;
+      try {
+        this.testHooks?.afterSnapshotCandidateSubscriptionInstall?.();
+      } catch (error) {
+        this.revokeSnapshotCutCandidate(lease as object, record);
+        throw error;
+      }
+      return lease;
     });
+  }
+
+  private inspectMaterializedStateCutCandidate(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+  ): RelayV2MaterializedStateCutCandidate {
+    const record = this.materializedStateCutCandidateRecord(lease);
+    return clone({
+      hostId: record.hostId,
+      hostEpoch: record.hostEpoch,
+      hostInstanceId: record.hostInstanceId,
+      materializedSourceGeneration: record.materializedSourceGeneration,
+      materializedGeneration: record.materializedGeneration,
+      materializedCutIdentity: record.materializedCutIdentity,
+      cutRecordCount: record.cutRecordCount,
+      cutCanonicalBytes: record.cutCanonicalBytes,
+      subscriptionQueueGeneration: record.subscriptionQueueGeneration,
+      cut: record.cut,
+    });
+  }
+
+  private async withMaterializedStateCutCandidateFence<T>(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+    operation: (candidate: RelayV2MaterializedStateCutCandidate) => T | Promise<T>,
+  ): Promise<T> {
+    return this.store.serialize(async (section) => {
+      const now = this.readSnapshotCandidateNow();
+      this.pruneExpiredSnapshotCutCandidates(now);
+      const record = this.materializedStateCutCandidateRecord(lease);
+      const snapshot = section.read();
+      this.observeLineage(snapshot);
+      const state = parseMaterializedState(snapshot);
+      const readiness = readinessFor(snapshot, state, this.capacity);
+      if (this.continuityFenceReason !== null
+        || !readiness.snapshotMaterializationReady
+        || this.snapshotCutCandidates.get(lease as object) !== record
+        || record.hostId !== this.hostId
+        || record.sourceIdentity !== this.snapshotCutSourceIdentity
+        || record.materializedSourceGeneration !== this.materializedSourceGeneration
+        || record.subscriptionIdentity === null
+        || record.hostEpoch !== snapshot.hostEpoch
+        || record.hostInstanceId !== snapshot.hostInstanceId
+        || record.lastQueuedEventSeq !== snapshot.eventSeq
+        || record.cut.hostEpoch !== record.hostEpoch
+        || BigInt(record.cut.throughEventSeq) > BigInt(record.lastQueuedEventSeq)
+        || record.cut.records.length !== record.cutRecordCount
+        || Buffer.byteLength(canonicalJson(record.cut.records), "utf8")
+          !== record.cutCanonicalBytes) {
+        this.revokeSnapshotCutCandidate(lease as object, record);
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "materialized snapshot cut candidate lost its exact H0/W+1 authority",
+        );
+      }
+      const result = await operation(this.inspectMaterializedStateCutCandidate(lease));
+      if (this.snapshotCutCandidates.get(lease as object) !== record
+        || this.readSnapshotCandidateNow() >= record.expiresAtMs) {
+        this.revokeSnapshotCutCandidate(lease as object, record);
+        throw new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "materialized snapshot cut candidate was withdrawn during verification",
+        );
+      }
+      return result;
+    });
+  }
+
+  private async activateMaterializedStateCutCandidate(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+    sink: RelayV2StateEventSink<RelayV2JsonObject>,
+    beforeDrain: (candidate: RelayV2MaterializedStateCutCandidate) => true,
+    afterAttach: (
+      candidate: RelayV2MaterializedStateCutCandidate,
+      activation: RelayV2MaterializedStateCutActivationLease,
+    ) => true,
+  ): Promise<RelayV2MaterializedStateCutActivationLease> {
+    if (typeof beforeDrain !== "function" || typeof afterAttach !== "function") {
+      closeSubscriber(sink, new RelayV2MaterializedStateError(
+        "INVALID_ARGUMENT",
+        "materialized snapshot activation fence is invalid",
+      ));
+      throw new RelayV2MaterializedStateError(
+        "INVALID_ARGUMENT",
+        "materialized snapshot activation fence is invalid",
+      );
+    }
+    let candidateRecord: MaterializedCutCandidateRecord | undefined;
+    let activationRecord: MaterializedCutActivationRecord | undefined;
+    let capturedSubscriber: Subscriber | undefined;
+    let rollbackApplied = false;
+    const rollback = (): void => {
+      if (rollbackApplied) return;
+      rollbackApplied = true;
+      if (activationRecord !== undefined) {
+        this.rollbackSnapshotCutActivation(activationRecord, new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "snapshot candidate activation was rolled back",
+        ));
+      } else if (capturedSubscriber !== undefined) {
+        closeCapturedSubscriber(capturedSubscriber, new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "snapshot candidate activation was rolled back",
+        ));
+      } else {
+        closeSubscriber(sink, new RelayV2MaterializedStateError(
+          "CAPABILITY_UNAVAILABLE",
+          "snapshot candidate activation was rejected",
+        ));
+      }
+      if (candidateRecord !== undefined
+        && this.snapshotCutCandidates.get(lease as object) === candidateRecord) {
+        this.revokeSnapshotCutCandidate(lease as object, candidateRecord);
+      }
+    };
+    try {
+      return await this.store.serialize((section) => {
+        try {
+        const now = this.readSnapshotCandidateNow();
+        this.pruneExpiredSnapshotCutCandidates(now);
+        candidateRecord = this.materializedStateCutCandidateRecord(lease);
+        const snapshot = section.read();
+        this.observeLineage(snapshot);
+        const state = parseMaterializedState(snapshot);
+        const readiness = readinessFor(snapshot, state, this.capacity);
+        if (this.continuityFenceReason !== null
+          || !readiness.snapshotMaterializationReady
+          || this.snapshotCutCandidates.get(lease as object) !== candidateRecord
+          || candidateRecord.sourceIdentity !== this.snapshotCutSourceIdentity
+          || candidateRecord.materializedSourceGeneration !== this.materializedSourceGeneration
+          || candidateRecord.hostId !== this.hostId
+          || candidateRecord.hostEpoch !== snapshot.hostEpoch
+          || candidateRecord.hostInstanceId !== snapshot.hostInstanceId
+          || candidateRecord.lastQueuedEventSeq !== snapshot.eventSeq
+          || candidateRecord.cut.hostEpoch !== candidateRecord.hostEpoch
+          || candidateRecord.cut.records.length !== candidateRecord.cutRecordCount
+          || Buffer.byteLength(canonicalJson(candidateRecord.cut.records), "utf8")
+            !== candidateRecord.cutCanonicalBytes) {
+          throw new RelayV2MaterializedStateError(
+            "CAPABILITY_UNAVAILABLE",
+            "materialized snapshot cut candidate lost authority before activation",
+          );
+        }
+        let expectedEventSeq = BigInt(candidateRecord.cut.throughEventSeq);
+        let bufferedBytes = 0;
+        for (const event of candidateRecord.events) {
+          if (event.hostId !== candidateRecord.hostId
+            || event.hostEpoch !== candidateRecord.hostEpoch
+            || !isCanonicalCounter(event.eventSeq)
+            || BigInt(event.eventSeq) !== expectedEventSeq + 1n) {
+            throw new RelayV2MaterializedStateError(
+              "CAPABILITY_UNAVAILABLE",
+              "materialized snapshot activation buffer is discontinuous",
+            );
+          }
+          expectedEventSeq += 1n;
+          bufferedBytes += Buffer.byteLength(JSON.stringify(event), "utf8");
+        }
+        if (expectedEventSeq.toString() !== candidateRecord.lastQueuedEventSeq
+          || candidateRecord.events.length !== candidateRecord.bufferedEventCount
+          || bufferedBytes !== candidateRecord.bufferedCanonicalBytes) {
+          throw new RelayV2MaterializedStateError(
+            "CAPABILITY_UNAVAILABLE",
+            "materialized snapshot activation buffer lost its exact queue identity",
+          );
+        }
+        const candidate = this.inspectMaterializedStateCutCandidate(lease);
+        if (!strictSynchronousTrue(beforeDrain(candidate))) {
+          throw new RelayV2MaterializedStateError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot owner rejected candidate activation before drain",
+          );
+        }
+        const activation = Object.freeze(() => undefined) as unknown as
+          RelayV2MaterializedStateCutActivationLease;
+        capturedSubscriber = captureSubscriber(
+          candidateRecord.hostEpoch,
+          sink,
+          activation as object,
+        );
+        for (const event of candidateRecord.events) {
+          let accepted = false;
+          try {
+            accepted = strictSynchronousTrue(capturedSubscriber.enqueue(clone(event)));
+          } catch {}
+          if (!accepted) {
+            throw new RelayV2MaterializedStateError(
+              "BUSY",
+              "snapshot activation sink rejected its buffered event queue",
+            );
+          }
+        }
+        activationRecord = {
+          activation,
+          sourceIdentity: this.snapshotCutSourceIdentity,
+          sourceGeneration: this.materializedSourceGeneration,
+          subscriptionIdentity: candidateRecord.subscriptionIdentity,
+          subscriptionQueueGeneration: candidateRecord.subscriptionQueueGeneration,
+          candidateNonce: candidateRecord.leaseNonce,
+          activationNonce: randomBytes(32).toString("base64url"),
+          sinkIdentity: sink as object,
+          subscriber: capturedSubscriber,
+        };
+        this.snapshotCutActivations.set(activation as object, activationRecord);
+        this.subscribers.set(candidateRecord.subscriptionIdentity, capturedSubscriber);
+        if (!strictSynchronousTrue(afterAttach(candidate, activation))) {
+          throw new RelayV2MaterializedStateError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot owner rejected candidate activation after attach",
+          );
+        }
+        if (this.snapshotCutCandidates.get(lease as object) !== candidateRecord
+          || this.subscribers.get(candidateRecord.subscriptionIdentity) !== capturedSubscriber
+          || this.snapshotCutActivations.get(activation as object) !== activationRecord) {
+          throw new RelayV2MaterializedStateError(
+            "CAPABILITY_UNAVAILABLE",
+            "snapshot activation lost exact candidate or subscriber identity",
+          );
+        }
+        this.revokeSnapshotCutCandidate(lease as object, candidateRecord);
+        return activation;
+        } catch (error) {
+          rollback();
+          throw error;
+        }
+      });
+    } catch (error) {
+      rollback();
+      throw error;
+    }
+  }
+
+  private releaseMaterializedStateCutActivation(
+    activation: RelayV2MaterializedStateCutActivationLease,
+  ): void {
+    if ((typeof activation !== "object" && typeof activation !== "function")
+      || activation === null) return;
+    const record = this.snapshotCutActivations.get(activation as object);
+    if (record === undefined
+      || record.sourceIdentity !== this.snapshotCutSourceIdentity
+      || record.sourceGeneration !== this.materializedSourceGeneration
+      || record.activationNonce.length !== 43) return;
+    this.rollbackSnapshotCutActivation(record, new RelayV2MaterializedStateError(
+      "CAPABILITY_UNAVAILABLE",
+      "snapshot activation was released",
+    ));
+  }
+
+  private async withdrawSnapshotOwnerAuthority(): Promise<void> {
+    await this.store.serialize(() => {
+      this.invalidateSnapshotCutCandidates();
+      this.invalidateSnapshotCutActivations(new RelayV2MaterializedStateError(
+        "CAPABILITY_UNAVAILABLE",
+        "snapshot spool owner changed",
+      ));
+    });
+  }
+
+  private rollbackSnapshotCutActivation(
+    record: MaterializedCutActivationRecord,
+    error: RelayV2MaterializedStateError,
+  ): void {
+    if (this.snapshotCutActivations.get(record.activation as object) !== record) return;
+    this.snapshotCutActivations.delete(record.activation as object);
+    if (this.subscribers.get(record.subscriptionIdentity) === record.subscriber) {
+      this.subscribers.delete(record.subscriptionIdentity);
+    }
+    closeCapturedSubscriber(record.subscriber, error);
+  }
+
+  private invalidateSnapshotCutActivations(error: RelayV2MaterializedStateError): void {
+    for (const record of [...this.snapshotCutActivations.values()]) {
+      this.rollbackSnapshotCutActivation(record, error);
+    }
+  }
+
+  private releaseMaterializedStateCutCandidate(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+  ): void {
+    if ((typeof lease !== "object" && typeof lease !== "function") || lease === null) return;
+    const record = this.snapshotCutCandidates.get(lease as object);
+    if (record !== undefined) this.revokeSnapshotCutCandidate(lease as object, record);
+  }
+
+  private materializedStateCutCandidateRecord(
+    lease: RelayV2MaterializedStateCutCandidateLease,
+  ): MaterializedCutCandidateRecord {
+    if ((typeof lease !== "object" && typeof lease !== "function") || lease === null) {
+      throw new RelayV2MaterializedStateError(
+        "INVALID_ARGUMENT",
+        "materialized snapshot cut candidate lease is invalid",
+      );
+    }
+    const record = this.snapshotCutCandidates.get(lease as object);
+    if (record !== undefined && this.readSnapshotCandidateNow() >= record.expiresAtMs) {
+      this.revokeSnapshotCutCandidate(lease as object, record);
+    }
+    const current = this.snapshotCutCandidates.get(lease as object);
+    if (current === undefined
+      || current.sourceIdentity !== this.snapshotCutSourceIdentity
+      || current.materializedSourceGeneration !== this.materializedSourceGeneration
+      || current.leaseNonce.length !== 43
+      || current.subscriptionQueueGeneration.length !== 43) {
+      throw new RelayV2MaterializedStateError(
+        "INVALID_ARGUMENT",
+        "materialized snapshot cut candidate lease is invalid or withdrawn",
+      );
+    }
+    return current;
+  }
+
+  private readSnapshotCandidateNow(): number {
+    const now = this.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+      throw new RelayV2MaterializedStateError(
+        "INTERNAL",
+        "materialized snapshot candidate clock is invalid",
+      );
+    }
+    return now;
+  }
+
+  private pruneExpiredSnapshotCutCandidates(now: number): void {
+    for (const [lease, record] of this.snapshotCutCandidates) {
+      if (now >= record.expiresAtMs) this.revokeSnapshotCutCandidate(lease, record);
+    }
+  }
+
+  private revokeSnapshotCutCandidate(
+    lease: object,
+    record: MaterializedCutCandidateRecord,
+  ): void {
+    if (this.snapshotCutCandidates.get(lease) !== record) return;
+    this.snapshotCutCandidates.delete(lease);
+    this.snapshotCutCandidateRetainedBytes = Math.max(
+      0,
+      this.snapshotCutCandidateRetainedBytes - record.retainedBytes,
+    );
+    record.events.length = 0;
+    record.bufferedEventCount = 0;
+    record.bufferedCanonicalBytes = 0;
+    record.retainedBytes = 0;
   }
 
   private async estimateMaterializedStateCutAdmission(
@@ -3921,6 +4556,7 @@ export class RelayV2MaterializedStateFoundation {
   }
 
   private fenceCommitUncertain(snapshot: RelayV2HostStateSnapshot): void {
+    this.invalidateSnapshotCutCandidates();
     this.publishedCanonicalResolver = null;
     this.observedHostEpoch = snapshot.hostEpoch;
     this.continuityFenceReason = "commit_uncertain";
@@ -3937,6 +4573,7 @@ export class RelayV2MaterializedStateFoundation {
       | "reconcile_generation_conflict"
       | "materialized_authority_conflict",
   ): void {
+    this.invalidateSnapshotCutCandidates();
     this.publishedCanonicalResolver = null;
     const readiness = withdrawnReadiness(snapshot, reason);
     this.applyReadiness(readiness);
@@ -3968,6 +4605,7 @@ export class RelayV2MaterializedStateFoundation {
       return;
     }
     if (this.observedHostEpoch === snapshot.hostEpoch) return;
+    this.invalidateSnapshotCutCandidates();
     this.publishedCanonicalResolver = null;
     this.observedHostEpoch = snapshot.hostEpoch;
     this.continuityFenceReason = "host_epoch_changed";
@@ -3986,6 +4624,7 @@ export class RelayV2MaterializedStateFoundation {
       accepted = false;
     }
     if (!accepted || !readiness.snapshotMaterializationReady || readiness.closeV2Routes) {
+      this.invalidateSnapshotCutCandidates();
       this.publishedCanonicalResolver = null;
     }
     return accepted;
@@ -4021,22 +4660,56 @@ export class RelayV2MaterializedStateFoundation {
     for (const [subscriberId, subscriber] of this.subscribers) {
       let accepted = false;
       if (subscriber.epoch === event.hostEpoch) {
-        try { accepted = strictSynchronousTrue(subscriber.sink.enqueue(clone(event))); } catch {}
+        try { accepted = strictSynchronousTrue(subscriber.enqueue(clone(event))); } catch {}
       }
       if (accepted) continue;
-      this.subscribers.delete(subscriberId);
-      closeSubscriber(subscriber.sink, new RelayV2MaterializedStateError(
+      this.retireSubscriber(subscriberId, subscriber, new RelayV2MaterializedStateError(
         "BUSY",
         "subscriber queue cannot preserve event continuity",
       ));
+    }
+    this.publishSnapshotCandidateEvent(event);
+  }
+
+  private publishSnapshotCandidateEvent(event: RelayV2JsonObject): void {
+    const now = this.readSnapshotCandidateNow();
+    this.pruneExpiredSnapshotCutCandidates(now);
+    for (const [lease, record] of [...this.snapshotCutCandidates]) {
+      let eventBytes = 0;
+      let nextIsContinuous = false;
+      try {
+        if (!isCanonicalCounter(event.eventSeq)) throw new Error("invalid eventSeq");
+        eventBytes = Buffer.byteLength(JSON.stringify(event), "utf8");
+        nextIsContinuous = BigInt(event.eventSeq)
+          === BigInt(record.lastQueuedEventSeq) + 1n;
+      } catch {
+        nextIsContinuous = false;
+      }
+      if (event.hostId !== record.hostId
+        || event.hostEpoch !== record.hostEpoch
+        || !nextIsContinuous
+        || record.bufferedEventCount + 1
+          > this.snapshotCandidateLimits.maxBufferedEventsPerCandidate
+        || record.bufferedCanonicalBytes + eventBytes
+          > this.snapshotCandidateLimits.maxBufferedBytesPerCandidate
+        || this.snapshotCutCandidateRetainedBytes + eventBytes
+          > this.snapshotCandidateLimits.maxRetainedBytes) {
+        this.revokeSnapshotCutCandidate(lease, record);
+        continue;
+      }
+      record.events.push(clone(event));
+      record.lastQueuedEventSeq = event.eventSeq as string;
+      record.bufferedEventCount += 1;
+      record.bufferedCanonicalBytes += eventBytes;
+      record.retainedBytes += eventBytes;
+      this.snapshotCutCandidateRetainedBytes += eventBytes;
     }
   }
 
   private dropSubscribersFromOtherLineages(hostEpoch: string): void {
     for (const [subscriberId, subscriber] of this.subscribers) {
       if (subscriber.epoch === hostEpoch) continue;
-      this.subscribers.delete(subscriberId);
-      closeSubscriber(subscriber.sink, new RelayV2MaterializedStateError(
+      this.retireSubscriber(subscriberId, subscriber, new RelayV2MaterializedStateError(
         "HOST_EPOCH_MISMATCH",
         "host lineage changed",
       ));
@@ -4044,10 +4717,31 @@ export class RelayV2MaterializedStateFoundation {
   }
 
   private closeAllSubscribers(error: RelayV2MaterializedStateError): void {
-    const subscribers = [...this.subscribers.values()];
-    this.subscribers.clear();
-    for (const subscriber of subscribers) {
-      closeSubscriber(subscriber.sink, error);
+    for (const [subscriberId, subscriber] of [...this.subscribers]) {
+      this.retireSubscriber(subscriberId, subscriber, error);
+    }
+  }
+
+  private retireSubscriber(
+    subscriberId: string | object,
+    subscriber: Subscriber,
+    error: RelayV2MaterializedStateError,
+  ): void {
+    if (this.subscribers.get(subscriberId) === subscriber) {
+      this.subscribers.delete(subscriberId);
+    }
+    if (subscriber.activationLease !== null) {
+      const activation = this.snapshotCutActivations.get(subscriber.activationLease);
+      if (activation !== undefined && activation.subscriber === subscriber) {
+        this.snapshotCutActivations.delete(subscriber.activationLease);
+      }
+    }
+    closeCapturedSubscriber(subscriber, error);
+  }
+
+  private invalidateSnapshotCutCandidates(): void {
+    for (const [lease, record] of [...this.snapshotCutCandidates]) {
+      this.revokeSnapshotCutCandidate(lease, record);
     }
   }
 }
