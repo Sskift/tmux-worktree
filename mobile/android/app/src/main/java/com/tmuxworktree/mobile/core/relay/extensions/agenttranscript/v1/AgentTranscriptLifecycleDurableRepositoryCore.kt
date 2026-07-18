@@ -892,19 +892,30 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         state: AgentTranscriptLifecycleClientState,
     ): ValidatedAgentTranscriptStorage {
-        val stats = transcriptNamespaceStats(namespace)
+        // A null lineage is the pre-first-lineage profile slot.  It must use the
+        // read-only empty-key audit seam; do not construct the normal Room namespace
+        // key (which would make the null branch unreachable).
+        val stats = if (namespace.timelineEpoch == null) {
+            emptyTimelineNamespaceStats(namespace.consumer)
+        } else {
+            transcriptNamespaceStats(namespace)
+        }
         validateTranscriptNamespaceStats(stats)
-        val lifecycleAccounting = validateLifecycleIndex(namespace, state.extensionLane.lastAgentSeq)
         if (namespace.timelineEpoch == null) {
             if (stats.entryCount != 0L || stats.snapshotCount != 0L ||
-                stats.snapshotRecordCount != 0L || stats.pendingEventCount != 0L ||
-                lifecycleAccounting != LifecycleIndexAccounting.EMPTY
+                stats.snapshotRecordCount != 0L || stats.pendingEventCount != 0L
             ) storageMalformed()
             return ValidatedAgentTranscriptStorage(
                 snapshot = null,
                 accounting = AgentTranscriptDurableStorageAccounting.EMPTY,
             )
         }
+
+        val lifecycleAccounting = validateLifecycleIndex(
+            namespace,
+            state.extensionLane.lastAgentSeq,
+            state.extensionLane.snapshotCheckpoint?.throughAgentSeq,
+        )
 
         validateEntryBatches(namespace, state.extensionLane.lastAgentSeq, stats)
 
@@ -962,6 +973,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     private fun AgentTranscriptLifecycleDurableTransaction.validateLifecycleIndex(
         namespace: AgentTranscriptLifecycleDurableNamespace,
         lastAgentSeq: String,
+        snapshotThroughAgentSeq: String?,
     ): LifecycleIndexAccounting {
         val currentStats = lifecycleCurrentStats(namespace)
         val witnessStats = lifecycleWitnessAudit(namespace)
@@ -998,7 +1010,10 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             )
             if (page.isEmpty()) storageMalformed()
             page.forEach { row ->
-                if (row.closedEventDigest != null) closedWitnessCount++
+                if (row.closedEventDigest != null &&
+                    (snapshotThroughAgentSeq == null ||
+                        compareStorageCounters(row.agentEventSeq, snapshotThroughAgentSeq) > 0)
+                ) closedWitnessCount++
                 if (row.lifecycleScope == "TURN") {
                     turnMarkerRuns += row.runId
                     if (turnMarkerRuns.size > limits.maxEverTurnMarkers) storageMalformed()
@@ -1473,7 +1488,6 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     ): EventConsumption {
         val input = unbound.bindLineage(namespace)
         val hydrated = hydrateForEvent(namespace, current.state, unbound, input)
-        enforceEventCapacity(current.storageAccounting, limits)
         val entryPlan = planEntryMutation(namespace, input)
         if (entryPlan == EntryMutationPlan.Conflict) {
             val quarantine = continuityQuarantine(current.state)
@@ -1483,6 +1497,9 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
             )
         }
         val reduction = AgentTranscriptLifecycleClientReducer.reduce(hydrated, input, limits)
+        if (reduction.disposition == AgentClientDisposition.APPLIED) {
+            enforceEventCapacity(hydrated, reduction.state, input, limits)
+        }
         if (reduction.disposition == AgentClientDisposition.GAP_RESYNC &&
             input.provenance == AgentEventProvenance.LIVE
         ) {
@@ -1531,14 +1548,26 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     }
 
     private fun enforceEventCapacity(
-        accounting: AgentTranscriptDurableStorageAccounting,
+        before: AgentTranscriptLifecycleClientState,
+        after: AgentTranscriptLifecycleClientState,
+        input: AgentTranscriptLifecycleClientInput.AgentEvent,
         limits: AgentClientReducerLimits,
     ) {
-        if (accounting.lifecycleWitnessCount >= limits.maxEventIdentityWitnesses ||
-            accounting.lifecycleCurrentCount >= limits.maxLifecycleRecords ||
-            accounting.recentEventEvidenceCount >= limits.maxAppliedEventEvidence ||
-            accounting.notificationLedgerCount >= limits.maxNotificationLedgerEntries
-        ) throw AgentTranscriptLifecyclePersistenceConflictException()
+        val b = before.extensionLane
+        val a = after.extensionLane
+        if (a.eventWitnessById.size > limits.maxEventIdentityWitnesses ||
+            a.lifecycleByIdentity.size > limits.maxLifecycleRecords ||
+            a.runsWithTurnRecords.size > limits.maxEverTurnMarkers ||
+            a.notificationLedger.size > limits.maxNotificationLedgerEntries
+        ) {
+            if (a.eventWitnessById.size > limits.maxEventIdentityWitnesses) {
+                throw AgentTranscriptLifecyclePersistenceConflictException()
+            }
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
+        if (a.appliedEventsBySeq.size > limits.maxAppliedEventEvidence) {
+            throw AgentTranscriptLifecyclePersistenceConflictException()
+        }
     }
 
     private fun AgentTranscriptLifecycleDurableTransaction.hydrateForEvent(
@@ -2569,7 +2598,7 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
     ): AgentTranscriptDurableStorageAccounting {
         val stats = transcriptNamespaceStats(namespace)
         validateEntryBatches(namespace, UINT64_MAX_STORAGE.toString(), stats)
-        val lifecycle = validateLifecycleIndex(namespace, UINT64_MAX_STORAGE.toString())
+        val lifecycle = validateLifecycleIndex(namespace, UINT64_MAX_STORAGE.toString(), null)
         return old.copy(
             entryCount = stats.entryCount,
             entryCanonicalBytes = canonicalArrayBytes(
