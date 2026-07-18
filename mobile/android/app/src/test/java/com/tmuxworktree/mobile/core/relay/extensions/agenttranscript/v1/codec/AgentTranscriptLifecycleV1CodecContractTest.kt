@@ -5,6 +5,7 @@ import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
 import java.nio.charset.StandardCharsets
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -225,6 +226,93 @@ class AgentTranscriptLifecycleV1CodecContractTest {
                 codec.decodePublicFrame(variant.toByteArray(StandardCharsets.UTF_8)),
             )
         }
+    }
+
+    @Test
+    fun codecIssuedPageArtifactsBindTheCompleteTypedFrameToActualRawByteCount() {
+        val replayFrame = fixtures.frame("replay-page-lifecycle-and-entry")
+        replayFrame.payload().apply {
+            this["replayThroughAgentSeq"] = "12"
+            this["isLast"] = false
+            this["nextCursor"] = "cursor-page-2"
+        }
+        val replayRaw = RelayV2StrictJson.stringify(replayFrame)
+            .toByteArray(StandardCharsets.UTF_8)
+        val replay = codec.decodePublicFrameArtifact(replayRaw)
+            as AgentTimelineReplayPagePublicFrameArtifact
+
+        assertEquals(replayRaw.size, replay.rawUtf8ByteCount)
+        assertEquals(2, replay.protocolVersion)
+        assertEquals(AgentTranscriptLifecycleV1FrameKind.RESPONSE, replay.kind)
+        assertEquals("agent.timeline.replay.page", replay.type)
+        assertEquals("agent.transcript-lifecycle.v1", replay.capability)
+        assertEquals("agent-replay-1", replay.requestId)
+        assertEquals("mac-admin", replay.hostId)
+        assertEquals("host-epoch-1", replay.hostEpoch)
+        assertEquals("scope-local", replay.scopeId)
+        assertEquals("session-1", replay.sessionId)
+        assertSame(replay.frame.page, replay.payload)
+        assertEquals("timeline-1", replay.timelineEpoch)
+        assertEquals("8", replay.afterAgentSeq)
+        assertEquals("12", replay.replayThroughAgentSeq)
+        assertEquals(false, replay.isLast)
+        assertEquals("cursor-page-2", replay.nextCursor)
+        assertSame(replay.frame.page.events, replay.events)
+        assertEquals(replay.frame, codec.decodePublicFrame(replayRaw))
+        val replayEventsBeforeMutation = replay.events.toList()
+        val mutableReplayEvents = replay.events as MutableList<AgentTimelineEventRecord>
+        assertThrows(UnsupportedOperationException::class.java) {
+            mutableReplayEvents.clear()
+        }
+        assertEquals(replayEventsBeforeMutation, replay.events)
+        assertSame(replay.frame.page.events, replay.events)
+
+        val canonicalSnapshotRaw = fixtures.wire("snapshot-page-materialized")
+        val nonCanonicalSnapshotRaw = fixtures.golden
+            .single { it.name == "snapshot-page-materialized" }
+            .wire
+            .replace(
+                "{\"protocolVersion\":2,\"kind\":\"response\"",
+                "{\n  \"kind\": \"response\", \"protocolVersion\": 2",
+            )
+            .replace("\"mac-admin\"", "\"\\u006d\\u0061c-admin\"")
+            .toByteArray(StandardCharsets.UTF_8)
+        val canonicalSnapshot = codec.decodePublicFrameArtifact(canonicalSnapshotRaw)
+            as AgentTimelineSnapshotPagePublicFrameArtifact
+        val snapshot = codec.decodePublicFrameArtifact(nonCanonicalSnapshotRaw)
+            as AgentTimelineSnapshotPagePublicFrameArtifact
+
+        assertEquals(canonicalSnapshot.frame, snapshot.frame)
+        assertTrue(canonicalSnapshot.rawUtf8ByteCount != snapshot.rawUtf8ByteCount)
+        assertEquals(canonicalSnapshotRaw.size, canonicalSnapshot.rawUtf8ByteCount)
+        assertEquals(nonCanonicalSnapshotRaw.size, snapshot.rawUtf8ByteCount)
+        assertEquals(2, snapshot.protocolVersion)
+        assertEquals(AgentTranscriptLifecycleV1FrameKind.RESPONSE, snapshot.kind)
+        assertEquals("agent.timeline.snapshot.page", snapshot.type)
+        assertEquals("agent.transcript-lifecycle.v1", snapshot.capability)
+        assertEquals("agent-snapshot-attempt-1", snapshot.requestId)
+        assertEquals("mac-admin", snapshot.hostId)
+        assertEquals("host-epoch-1", snapshot.hostEpoch)
+        assertEquals("scope-local", snapshot.scopeId)
+        assertEquals("session-1", snapshot.sessionId)
+        assertSame(snapshot.frame.page, snapshot.payload)
+        assertEquals("timeline-1", snapshot.timelineEpoch)
+        assertEquals("agent-snapshot-logical-1", snapshot.snapshotRequestId)
+        assertEquals("agent-snapshot-cut-1", snapshot.snapshotId)
+        assertEquals(0L, snapshot.pageIndex)
+        assertEquals(true, snapshot.isLast)
+        assertEquals(null, snapshot.nextCursor)
+        assertEquals("8", snapshot.throughAgentSeq)
+        assertEquals("1", snapshot.earliestRetainedSeq)
+        assertSame(snapshot.frame.page.records, snapshot.records)
+        val snapshotRecordsBeforeMutation = snapshot.records.toList()
+        val mutableSnapshotRecords =
+            snapshot.records as MutableList<AgentTimelineSnapshotRecord>
+        assertThrows(UnsupportedOperationException::class.java) {
+            mutableSnapshotRecords.clear()
+        }
+        assertEquals(snapshotRecordsBeforeMutation, snapshot.records)
+        assertSame(snapshot.frame.page.records, snapshot.records)
     }
 
     @Test

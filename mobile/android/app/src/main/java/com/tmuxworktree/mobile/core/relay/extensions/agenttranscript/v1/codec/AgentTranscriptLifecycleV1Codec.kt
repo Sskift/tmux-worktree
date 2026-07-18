@@ -21,6 +21,7 @@ import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
+import java.util.Collections
 
 class AgentTranscriptLifecycleV1CodecException(
     val code: String,
@@ -44,7 +45,13 @@ class AgentTranscriptLifecycleV1Codec {
         bytes: ByteArray,
         metadata: AgentTranscriptLifecycleV1FrameMetadata =
             AgentTranscriptLifecycleV1FrameMetadata(),
-    ): AgentTranscriptLifecycleV1Frame = mapCodecFailures {
+    ): AgentTranscriptLifecycleV1Frame = decodePublicFrameArtifact(bytes, metadata).frame
+
+    fun decodePublicFrameArtifact(
+        bytes: ByteArray,
+        metadata: AgentTranscriptLifecycleV1FrameMetadata =
+            AgentTranscriptLifecycleV1FrameMetadata(),
+    ): AgentTranscriptLifecycleV1PublicFrameArtifact = mapCodecFailures {
         if (metadata.opcode != "text") {
             throw AgentTranscriptLifecycleV1CodecException(
                 code = "INVALID_ENVELOPE",
@@ -74,7 +81,10 @@ class AgentTranscriptLifecycleV1Codec {
         } else {
             STANDARD_JSON_LIMITS
         }
-        decodeFrame(RelayV2StrictJson.parseObject(source, limits))
+        decodedPublicFrameArtifact(
+            frame = decodeFrame(RelayV2StrictJson.parseObject(source, limits)),
+            rawUtf8ByteCount = bytes.size,
+        )
     }
 
     fun encodePublicFrame(frame: AgentTranscriptLifecycleV1Frame): ByteArray = mapCodecFailures {
@@ -169,6 +179,41 @@ class AgentTranscriptLifecycleV1Codec {
             else -> schemaFailure("unknown-message-type")
         }
     }
+
+    private fun decodedPublicFrameArtifact(
+        frame: AgentTranscriptLifecycleV1Frame,
+        rawUtf8ByteCount: Int,
+    ): AgentTranscriptLifecycleV1PublicFrameArtifact = when (frame) {
+        is AgentTimelineSnapshotPageFrame -> {
+            val frozenFrame = frame.copy(
+                page = frame.page.copy(
+                    records = immutableCopy(frame.page.records),
+                ),
+            )
+            DecodedAgentTimelineSnapshotPagePublicFrameArtifact(
+                frame = frozenFrame,
+                rawUtf8ByteCount = rawUtf8ByteCount,
+            )
+        }
+        is AgentTimelineReplayPageFrame -> {
+            val frozenFrame = frame.copy(
+                page = frame.page.copy(
+                    events = immutableCopy(frame.page.events),
+                ),
+            )
+            DecodedAgentTimelineReplayPagePublicFrameArtifact(
+                frame = frozenFrame,
+                rawUtf8ByteCount = rawUtf8ByteCount,
+            )
+        }
+        else -> DecodedAgentTranscriptLifecycleV1PublicFrameArtifact(
+            frame = frame,
+            rawUtf8ByteCount = rawUtf8ByteCount,
+        )
+    }
+
+    private fun <T> immutableCopy(values: List<T>): List<T> =
+        Collections.unmodifiableList(ArrayList(values))
 
     private fun decodeError(frame: RelayV2JsonObject): AgentTimelineErrorFrame {
         errorRoot(frame)
@@ -1192,6 +1237,21 @@ class AgentTranscriptLifecycleV1Codec {
         )
     }
 }
+
+private class DecodedAgentTranscriptLifecycleV1PublicFrameArtifact(
+    override val frame: AgentTranscriptLifecycleV1Frame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTranscriptLifecycleV1PublicFrameArtifact
+
+private class DecodedAgentTimelineSnapshotPagePublicFrameArtifact(
+    override val frame: AgentTimelineSnapshotPageFrame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTimelineSnapshotPagePublicFrameArtifact
+
+private class DecodedAgentTimelineReplayPagePublicFrameArtifact(
+    override val frame: AgentTimelineReplayPageFrame,
+    override val rawUtf8ByteCount: Int,
+) : AgentTimelineReplayPagePublicFrameArtifact
 
 private fun AgentTranscriptLifecycleV1Frame.toWireObject(): LinkedHashMap<String, Any?> =
     when (this) {
