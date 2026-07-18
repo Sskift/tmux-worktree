@@ -2303,11 +2303,15 @@ private fun lifecycleRecord(
     state: AgentLifecycleState,
     turnId: String? = null,
     sourceEpoch: String = "source-test",
+    failure: AgentLifecycleFailure? = null,
+    occurredAtMs: Long = 0,
 ): AgentLifecycleRecord = AgentLifecycleRecord(
     lifecycleEventId = eventId,
     sourceEpoch = sourceEpoch,
     identity = AgentLifecycleIdentity(scope, runId, turnId),
     state = state,
+    failure = failure,
+    occurredAtMs = occurredAtMs,
     agentEventSeq = sequence,
 )
 
