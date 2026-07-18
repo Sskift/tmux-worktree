@@ -163,6 +163,8 @@ H2 使用现有 local/SSH discovery 作为查询 adapter，但以 H0 materialize
 
 H3 是 process-scoped terminal authority，复用现有 local/SSH byte transport和 terminal-control single writer，但不复用 v1 stream map、stream ID或 lease identity。
 
+当前已有未接 production composition 的 existing terminal-control protocol adapter foundation。它只接受显式注入的 bounded request port，把 H3 acquire/renew/release/continuity/input/resize 翻译为现有 closed request；lease、operation 和 backend side-effect 事实仍由 `src/terminalControl/authority.ts` 独占。adapter 不 auto-start daemon、不重发 input/resize、不保存平行状态，也没有 direct tmux fallback；`src/relayHost.ts`、carrier、H0/H2 与 capability gate 仍未接线，因此该 foundation 不改变本工作包或 G2 的未完成状态。
+
 工作边界：
 
 - generation、raw-byte offset ring、resume token、open/close dedupe、route rebind fence。
