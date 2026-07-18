@@ -36,6 +36,10 @@ function clone(value) {
   return structuredClone(value);
 }
 
+function resumeTokenHash(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 function exactRoute(route) {
   route.runtimeBindingToken ??= [
     "runtime-binding",
@@ -223,6 +227,7 @@ class FakeDurableLineage {
   failOpenCalls = [];
   claimCloseCalls = [];
   finalizeCloseCalls = [];
+  markStreamClosedCalls = [];
   releaseStreamReservationCalls = [];
   failFinalizeOnce = false;
   claimCounter = 0;
@@ -231,6 +236,8 @@ class FakeDurableLineage {
   failFailOpenOnce = false;
   busyClaimOpenOnce = false;
   rejectGenerationReuseOnce = false;
+  markStreamClosedWait = undefined;
+  markStreamClosedResults = [];
   releaseStreamReservationResults = [];
   usedGenerations = new Set();
 
@@ -261,7 +268,13 @@ class FakeDurableLineage {
     const active = this.streams.get(claim.streamKey);
     const streamAuthority = !active || active.status === "released"
       ? { status: "absent" }
-      : { status: active.status, generation: active.generation };
+      : {
+          status: active.status,
+          generation: active.generation,
+          target: clone(active.target),
+          pane: active.pane,
+          resumeTokenHash: active.resumeTokenHash,
+        };
     if (streamAuthority.status !== "absent" && claim.mode === "new") {
       return { status: "conflict", reason: "stream_conflict" };
     }
@@ -302,6 +315,9 @@ class FakeDurableLineage {
           status: "live",
           generation: retained.outcome.generation,
           hostInstanceId: retained.hostInstanceId,
+          target: clone(retained.target),
+          pane: retained.pane,
+          resumeTokenHash: retained.outcome.resumeTokenHash,
         });
       }
       this.completeOpenReplayOutcome = undefined;
@@ -352,6 +368,9 @@ class FakeDurableLineage {
           status: "live",
           generation: retained.outcome.generation,
           hostInstanceId: retained.hostInstanceId,
+          target: clone(retained.target),
+          pane: retained.pane,
+          resumeTokenHash: retained.outcome.resumeTokenHash,
         });
       }
     } else if (input.streamEffect?.kind === "retire_previous") {
@@ -404,6 +423,28 @@ class FakeDurableLineage {
     return clone(existing.value);
   }
 
+  async markStreamClosed(input) {
+    this.markStreamClosedCalls.push(clone(input));
+    this.trace.push("lineage.stream.closed");
+    if (this.markStreamClosedWait) await this.markStreamClosedWait;
+    const configured = this.markStreamClosedResults.shift();
+    if (configured instanceof Error) throw configured;
+    if (configured) return clone(configured);
+    const stream = this.streams.get(input.streamKey);
+    if (
+      !stream
+      || stream.generation !== input.generation
+      || stream.hostInstanceId !== input.hostInstanceId
+      || (stream.status !== "live" && stream.status !== "closed")
+    ) {
+      return { status: "conflict", reason: "stream_identity_mismatch" };
+    }
+    stream.expiresAtMs = Math.max(stream.expiresAtMs ?? 0, input.expiresAtMs);
+    if (stream.status === "closed") return { status: "already_closed" };
+    stream.status = "closed";
+    return { status: "closed" };
+  }
+
   async releaseStreamReservation(input) {
     this.releaseStreamReservationCalls.push(clone(input));
     this.trace.push("lineage.stream.release");
@@ -440,12 +481,15 @@ function harness(options = {}) {
     backend,
     terminalControl: authority,
     now: () => now,
-    issueId: () => `generation-${++nextId}`,
+    issueId: options.issueId ?? (() => `generation-${++nextId}`),
     issueToken: () => `resume-token-${++nextToken}`,
     limits: options.limits,
     send: async (route, frame, responseLineage) => {
       // Every manager output must remain consumable by the frozen production codec.
       codec.encodeRelayV2WebSocketFrame("public", frame);
+      if (frame.kind === "event" && frame.type === "terminal.closed") {
+        trace.push("terminal.closed.event");
+      }
       const dropIndex = drops.findIndex((drop) => (
         drop.type === frame.type && (drop.kind === undefined || drop.kind === frame.kind)
       ));
@@ -1280,6 +1324,9 @@ test("stale closed retention clears its ring before absent-authority takeover", 
     status: "live",
     generation: "durable-takeover-generation",
     hostInstanceId: HOST_INSTANCE_ID,
+    target: clone(TARGET),
+    pane: 0,
+    resumeTokenHash: resumeTokenHash(first.payload.resumeToken),
   });
   await h.manager.open(goldenOpen({
     requestId: "stale-closed-unavailable-resume",
@@ -1401,6 +1448,83 @@ test("natural-close tombstone query responds on the current request route", asyn
   assert.equal(response.frame.payload.finalOffset, "3");
 });
 
+test("natural backend close durably marks the exact stream before local closed visibility", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "natural-durable-order-open" });
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  await h.backend.opens[0].handle.emit(Buffer.from([1, 2, 3]));
+
+  let releaseDurableClose;
+  h.lineage.markStreamClosedWait = new Promise((resolve) => {
+    releaseDurableClose = resolve;
+  });
+  const closing = h.backend.opens[0].handle.exit("backend_exit", 7);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(h.lineage.markStreamClosedCalls, [{
+    streamKey: h.lineage.claimOpenCalls[0].streamKey,
+    generation: frame.payload.generation,
+    hostInstanceId: HOST_INSTANCE_ID,
+    expiresAtMs: 1_000_000 + terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS,
+  }]);
+  assert.equal(
+    h.sent.some(({ frame: candidate }) => (
+      candidate.kind === "event" && candidate.type === "terminal.closed"
+    )),
+    false,
+    "process-local closed replay must wait for the durable transition",
+  );
+
+  releaseDurableClose();
+  await closing;
+  const durableIndex = h.trace.indexOf("lineage.stream.closed");
+  const eventIndex = h.trace.indexOf("terminal.closed.event");
+  assert.ok(durableIndex >= 0 && durableIndex < eventIndex);
+  assert.equal(h.sent.at(-1).frame.type, "terminal.closed");
+  assert.equal(h.sent.at(-1).frame.payload.reason, "backend_exit");
+  assert.equal(h.sent.at(-1).frame.payload.finalOffset, "3");
+});
+
+test("natural backend close failure never exposes a local closed event", async () => {
+  const scenarios = [
+    new Error("durable close unavailable"),
+    { status: "closed", unexpected: true },
+    { status: "conflict", reason: "stream_identity_mismatch" },
+  ];
+  for (const [index, result] of scenarios.entries()) {
+    const h = harness();
+    const request = goldenOpen({
+      requestId: `natural-durable-failure-open-${index}`,
+      streamId: `natural-durable-failure-stream-${index}`,
+      openId: `natural-durable-failure-open-id-${index}`,
+    });
+    await h.manager.open(request);
+    h.lineage.markStreamClosedResults.push(result);
+
+    await assert.rejects(
+      h.backend.opens[0].handle.exit("backend_exit", 0),
+      managerError("INTERNAL"),
+    );
+    assert.equal(h.lineage.markStreamClosedCalls.length, 1);
+    assert.equal(
+      h.sent.some(({ frame }) => frame.kind === "event" && frame.type === "terminal.closed"),
+      false,
+    );
+    assert.equal(h.manager.stats().liveOrDetachedStreams, 0);
+    await h.manager.open({
+      ...request,
+      requestId: `natural-durable-failure-retry-${index}`,
+    });
+    const retry = h.sent.find(
+      ({ frame }) => frame.requestId === `natural-durable-failure-retry-${index}`,
+    )?.frame;
+    assert.equal(retry.type, "terminal.reset_required");
+    assert.equal(retry.payload.reason, "stream_lost");
+    assert.equal(h.backend.opens.length, 1);
+  }
+});
+
 test("durable close route validation rejects process tokens and every extra key", async () => {
   for (const forbidden of ["runtimeBindingToken", "unexpectedRouteField"]) {
     const lineage = new FakeDurableLineage();
@@ -1462,6 +1586,120 @@ test("durable lineage fences process-restart open retry and serves close tombsto
   assert.equal(close.frame.payload.reason, "client_closed");
 });
 
+test("restart-like reset retires only an exact durable binding before admitting a replacement", async () => {
+  const lineage = new FakeDurableLineage();
+  const first = harness({ lineage, hostInstanceId: "restart-retire-host-one" });
+  const request = goldenOpen({
+    requestId: "restart-retire-source-open",
+    streamId: "restart-retire-stream",
+    openId: "restart-retire-source-open-id",
+  });
+  await first.manager.open(request);
+  const source = opened(first.sent, request.requestId);
+  const streamKey = lineage.claimOpenCalls[0].streamKey;
+
+  let restartedGeneration = 0;
+  const restarted = harness({
+    lineage,
+    hostInstanceId: "restart-retire-host-two",
+    issueId: () => `restart-retire-generation-${++restartedGeneration}`,
+  });
+  const exactResume = {
+    generation: source.payload.generation,
+    nextOffset: "0",
+    resumeToken: source.payload.resumeToken,
+  };
+  const wrongResumeSecret = "private-capability-not-used-by-any-request-identity";
+  const mismatches = [
+    {
+      name: "target",
+      overrides: { target: { ...clone(TARGET), sessionId: "ses_wrong_target" } },
+      expectedTokenHash: resumeTokenHash(source.payload.resumeToken),
+    },
+    {
+      name: "pane",
+      overrides: { pane: 1 },
+      expectedTokenHash: resumeTokenHash(source.payload.resumeToken),
+    },
+    {
+      name: "token",
+      overrides: {
+        resume: { ...exactResume, resumeToken: wrongResumeSecret },
+      },
+      expectedTokenHash: resumeTokenHash(wrongResumeSecret),
+    },
+  ];
+  for (const mismatch of mismatches) {
+    const attempt = goldenOpen({
+      requestId: `restart-retire-wrong-${mismatch.name}`,
+      streamId: request.streamId,
+      openId: `restart-retire-wrong-${mismatch.name}-open-id`,
+      mode: "reset",
+      resume: exactResume,
+      ...mismatch.overrides,
+    });
+    await restarted.manager.open(attempt);
+    const reset = restarted.sent.find(
+      ({ frame }) => frame.requestId === attempt.requestId,
+    )?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.reason, "stream_lost");
+    assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, { kind: "preserve" });
+    assert.equal(lineage.streams.get(streamKey).status, "live");
+    assert.equal(restarted.resolver.calls.length, 0);
+    assert.equal(restarted.backend.opens.length, 0);
+
+    const claim = lineage.claimOpenCalls.at(-1);
+    assert.deepEqual(claim.target, attempt.target);
+    assert.equal(claim.pane, attempt.pane);
+    assert.equal(claim.resumeTokenHash, mismatch.expectedTokenHash);
+    assert.equal(Object.hasOwn(claim, "resumeToken"), false);
+    assert.equal(JSON.stringify(claim).includes(attempt.resume.resumeToken), false);
+  }
+
+  await assert.rejects(
+    restarted.manager.open(goldenOpen({
+      requestId: "restart-retire-new-before-exact",
+      streamId: request.streamId,
+      openId: "restart-retire-new-before-exact-open-id",
+    })),
+    managerError("TERMINAL_STREAM_CONFLICT"),
+  );
+  assert.equal(lineage.streams.get(streamKey).status, "live");
+  assert.equal(restarted.backend.opens.length, 0);
+
+  const exactAttempt = goldenOpen({
+    requestId: "restart-retire-exact-reset",
+    streamId: request.streamId,
+    openId: "restart-retire-exact-reset-open-id",
+    mode: "reset",
+    resume: exactResume,
+  });
+  await restarted.manager.open(exactAttempt);
+
+  const reset = restarted.sent.find(
+    ({ frame }) => frame.requestId === exactAttempt.requestId,
+  )?.frame;
+  assert.equal(reset.type, "terminal.reset_required");
+  assert.equal(reset.payload.reason, "stream_lost");
+  assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, {
+    kind: "retire_previous",
+    generation: source.payload.generation,
+  });
+  assert.equal(lineage.streams.get(streamKey).status, "released");
+  assert.equal(restarted.resolver.calls.length, 0);
+  assert.equal(restarted.backend.opens.length, 0);
+
+  const replacement = goldenOpen({
+    requestId: "restart-retire-new-after-exact",
+    streamId: request.streamId,
+    openId: "restart-retire-new-after-exact-open-id",
+  });
+  await restarted.manager.open(replacement);
+  assert.ok(opened(restarted.sent, replacement.requestId));
+  assert.equal(restarted.backend.opens.length, 1);
+});
+
 test("durable open claims every mode and retains fingerprints and reset outcomes across restart", async () => {
   const lineage = new FakeDurableLineage();
   const first = harness({ lineage, hostInstanceId: "durable-host-one" });
@@ -1490,6 +1728,26 @@ test("durable open claims every mode and retains fingerprints and reset outcomes
     },
   }));
   assert.deepEqual(lineage.claimOpenCalls.map((claim) => claim.mode), ["new", "resume", "reset"]);
+  assert.deepEqual(
+    lineage.claimOpenCalls.map(({ target, pane, resumeTokenHash: hash }) => ({
+      target,
+      pane,
+      resumeTokenHash: hash,
+    })),
+    [
+      { target: TARGET, pane: 0, resumeTokenHash: null },
+      { target: TARGET, pane: 0, resumeTokenHash: resumeTokenHash(initial.payload.resumeToken) },
+      { target: TARGET, pane: 0, resumeTokenHash: resumeTokenHash(resumed.payload.resumeToken) },
+    ],
+  );
+  assert.equal(
+    lineage.claimOpenCalls.some((claim) => Object.hasOwn(claim, "resumeToken")),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(lineage.claimOpenCalls).includes(initial.payload.resumeToken),
+    false,
+  );
   assert.equal(lineage.completeOpenCalls.length, 3);
 
   const restarted = harness({ lineage, hostInstanceId: "durable-host-two" });
@@ -1598,10 +1856,23 @@ test("generation mismatch exposes watermarks only from the exact durable source"
   assert.equal(restarted.backend.opens.length, 0);
 });
 
-test("claimed generation or status divergence fences the local backend before INTERNAL", async () => {
+test("claimed durable authority divergence fences the local backend before INTERNAL", async () => {
   for (const scenario of [
-    { name: "generation", authority: { status: "live", generation: "durable-other-generation" } },
-    { name: "status", authority: { status: "closed", generation: "generation-1" } },
+    {
+      name: "generation",
+      authority: { generation: "durable-other-generation" },
+      requestGeneration: "durable-other-generation",
+    },
+    { name: "status", authority: { status: "closed" } },
+    {
+      name: "target",
+      authority: { target: { ...clone(TARGET), sessionId: "ses_durable_other" } },
+    },
+    { name: "pane", authority: { pane: 1 } },
+    {
+      name: "token",
+      authority: { resumeTokenHash: resumeTokenHash("durable-other-resume-token") },
+    },
   ]) {
     const lineage = new FakeDurableLineage();
     const h = harness({ lineage });
@@ -1614,8 +1885,13 @@ test("claimed generation or status divergence fences the local backend before IN
     const first = opened(h.sent, request.requestId);
     const streamKey = lineage.claimOpenCalls[0].streamKey;
     lineage.streams.set(streamKey, {
-      ...scenario.authority,
+      status: "live",
+      generation: first.payload.generation,
       hostInstanceId: HOST_INSTANCE_ID,
+      target: clone(TARGET),
+      pane: 0,
+      resumeTokenHash: resumeTokenHash(first.payload.resumeToken),
+      ...scenario.authority,
     });
     const resume = goldenOpen({
       requestId: `claimed-${scenario.name}-resume`,
@@ -1623,7 +1899,7 @@ test("claimed generation or status divergence fences the local backend before IN
       openId: `claimed-${scenario.name}-resume-open`,
       mode: "resume",
       resume: {
-        generation: scenario.authority.generation,
+        generation: scenario.requestGeneration ?? first.payload.generation,
         nextOffset: "0",
         resumeToken: first.payload.resumeToken,
       },
@@ -1671,6 +1947,9 @@ test("claimed or replayed generation divergence drops a previously lost local st
       status: "live",
       generation: `durable-${kind}-generation-b`,
       hostInstanceId: HOST_INSTANCE_ID,
+      target: clone(TARGET),
+      pane: 0,
+      resumeTokenHash: resumeTokenHash(first.payload.resumeToken),
     });
     let attempt;
     if (kind === "claimed") {
@@ -1992,6 +2271,8 @@ test("explicit close intent is durable before cleanup and a failed finalization 
   await assert.rejects(h.manager.close(closeRequest(frame)), /injected crash/);
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
   assert.equal(h.authority.releaseCalls.length, 1);
+  await h.backend.opens[0].handle.exit("backend_exit", 0);
+  assert.equal(h.lineage.markStreamClosedCalls.length, 0);
   const claimIndex = h.trace.indexOf("lineage.close.claim");
   const releaseIndex = h.trace.indexOf("control.release", claimIndex);
   const closeIndex = h.trace.indexOf("backend.close", releaseIndex);
