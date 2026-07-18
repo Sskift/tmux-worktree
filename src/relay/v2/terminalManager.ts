@@ -382,6 +382,11 @@ export interface RelayV2TerminalDurableOpenClaim {
   expiresAtMs: number;
 }
 
+export type RelayV2TerminalDurableStreamAuthority =
+  | { status: "absent" }
+  | { status: "live"; generation: string }
+  | { status: "closed"; generation: string };
+
 export type RelayV2TerminalDurableOpenOutcome =
   | {
       kind: "opened";
@@ -406,7 +411,13 @@ export type RelayV2TerminalDurableOpenOutcome =
     };
 
 export type RelayV2TerminalDurableOpenClaimResult =
-  | { status: "claimed"; claimToken: string; fence: string }
+  | {
+      status: "claimed";
+      claimToken: string;
+      fence: string;
+      streamAuthority: RelayV2TerminalDurableStreamAuthority;
+    }
+  | { status: "busy"; reason: "control_record_quota" }
   | {
       status: "replay";
       outcome: RelayV2TerminalDurableOpenOutcome;
@@ -416,11 +427,22 @@ export type RelayV2TerminalDurableOpenClaimResult =
 export interface RelayV2TerminalDurableOpenClaimAuthority {
   claimToken: string;
   fence: string;
+  streamAuthority: RelayV2TerminalDurableStreamAuthority;
 }
+
+export type RelayV2TerminalOpenFailureStreamEffect =
+  | { kind: "preserve" }
+  | { kind: "retire_previous"; generation: string };
 
 export type RelayV2TerminalDurableOpenCommitResult =
   | { status: "committed"; outcome: RelayV2TerminalDurableOpenOutcome }
-  | { status: "replay"; outcome: RelayV2TerminalDurableOpenOutcome };
+  | { status: "replay"; outcome: RelayV2TerminalDurableOpenOutcome }
+  | { status: "rejected"; reason: "generation_reuse" };
+
+export type RelayV2TerminalDurableStreamReleaseResult =
+  | { status: "released" }
+  | { status: "already_released" }
+  | { status: "conflict"; reason: "generation_mismatch" };
 
 export interface RelayV2TerminalDurableCloseTombstone {
   key: string;
@@ -454,15 +476,22 @@ export type RelayV2TerminalDurableCloseClaimResult =
  * requires this seam so a host process restart can never interpret an exact
  * mode=new retry as permission to allocate a second backend. Implementations
  * must atomically enforce the frozen retention and control-record quotas;
- * exhaustion is a hard BUSY failure, never permission to use volatile state.
- * claimOpen covers every new/resume/reset logical open before target resolution
- * or backend mutation. Only the returned claimToken/fence winner may complete
- * or fail that claim; both transitions are compare-and-swap and a late caller
- * receives the retained outcome without replacing it. Durable opened outcomes
- * contain only a token hash, never the plaintext resume token. claimClose persists the immutable
- * close winner and original connector route before lease/backend cleanup;
- * finalizeClose atomically advances only that intent to a final tombstone.
- * None of these methods may be implemented as a racy get followed by void put.
+ * exhaustion is a hard BUSY failure, never permission to consult volatile replay
+ * state. claimOpen covers every new/resume/reset logical open before local
+ * capacity checks, target resolution, or backend mutation. A claimed result
+ * freezes the absent/live/closed stream authority used by that exact claim.
+ * Only the returned claimToken/fence winner may complete or fail it; both
+ * transitions are compare-and-swap and a late caller receives the retained
+ * outcome without replacing it. failOpen must atomically preserve the current
+ * stream reservation or retire the named previous generation. A
+ * generation_reuse rejection leaves the same claim available for an exact
+ * failOpen settlement; it must not leave a second pending claim. Durable opened
+ * outcomes contain only a token hash, never the plaintext resume token.
+ * claimClose persists the immutable close winner and original connector route
+ * before lease/backend cleanup; finalizeClose atomically advances only that
+ * intent to a final tombstone. releaseStreamReservation compares the exact
+ * streamKey/generation/hostInstanceId before deletion. None of these methods
+ * may be implemented as a racy get followed by void put.
  */
 export interface RelayV2TerminalDurableLineage {
   claimOpen(
@@ -483,6 +512,7 @@ export interface RelayV2TerminalDurableLineage {
     claimToken: string;
     fence: string;
     outcome: Exclude<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>;
+    streamEffect: RelayV2TerminalOpenFailureStreamEffect;
   }): Promise<RelayV2TerminalDurableOpenCommitResult>;
   claimClose(input: {
     key: string;
@@ -495,6 +525,11 @@ export interface RelayV2TerminalDurableLineage {
     fingerprint: string;
     hostInstanceId: string;
   }): Promise<RelayV2TerminalDurableCloseTombstone>;
+  releaseStreamReservation(input: {
+    streamKey: string;
+    generation: string;
+    hostInstanceId: string;
+  }): Promise<RelayV2TerminalDurableStreamReleaseResult>;
 }
 
 export interface RelayV2TerminalManagerOptions {
@@ -650,10 +685,27 @@ interface OpenRecord {
   resumeToken?: string;
 }
 
-interface OpenCommitResult {
-  outcome: OpenRecordOutcome;
-  committed: boolean;
-}
+type LocalStreamLineageReconciliation =
+  | { status: "absent" }
+  | { status: "exact"; stream: TerminalStream }
+  | { status: "divergent"; stream: TerminalStream };
+
+type OpenCommitResult =
+  | {
+      status: "committed" | "replay";
+      outcome: OpenRecordOutcome;
+    }
+  | { status: "rejected"; reason: "generation_reuse" };
+
+type OpenCommitProposal =
+  | {
+      outcome: Extract<OpenRecordOutcome, { kind: "opened" }>;
+      stream: TerminalStream;
+    }
+  | {
+      outcome: Exclude<OpenRecordOutcome, { kind: "opened" }>;
+      streamEffect: RelayV2TerminalOpenFailureStreamEffect;
+    };
 
 interface ProvisionalGeneration {
   key: string;
@@ -1539,19 +1591,6 @@ export class RelayV2TerminalManager {
     const key = this.streamKey(request.auth, request.streamId);
     const recordKey = this.openRecordKey(request);
     const requestFingerprint = this.openFingerprint(request);
-    const retained = this.openRecords.get(recordKey);
-    if (retained) {
-      if (retained.fingerprint !== requestFingerprint) {
-        throw new RelayV2TerminalManagerError(
-          "TERMINAL_OPEN_CONFLICT",
-          "terminal openId was reused with a different request",
-        );
-      }
-      await this.replayOpenRecord(request, retained);
-      return;
-    }
-
-    const existing = this.streams.get(key);
     const claim = await this.lineage.claimOpen({
       key: recordKey,
       streamKey: key,
@@ -1564,6 +1603,15 @@ export class RelayV2TerminalManager {
     });
     if (!claim || typeof claim !== "object" || typeof claim.status !== "string") {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid open claim");
+    }
+    if (claim.status === "busy") {
+      if (claim.reason !== "control_record_quota") {
+        throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid busy reason");
+      }
+      throw new RelayV2TerminalManagerError(
+        "BUSY",
+        "Relay v2 terminal control record quota is full",
+      );
     }
     if (claim.status === "conflict") {
       if (claim.reason === "open_conflict") {
@@ -1581,19 +1629,105 @@ export class RelayV2TerminalManager {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid conflict");
     }
     if (claim.status === "replay") {
+      const durable = this.localOpenOutcome(claim.outcome);
+      const retained = this.openRecords.get(recordKey);
+      if (durable.kind === "opened") {
+        const reconciliation = await this.reconcileLocalStreamLineage(key, {
+          kind: "opened_replay",
+          outcome: claim.outcome as Extract<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>,
+          fingerprint: requestFingerprint,
+          target: request.target,
+          ...(retained ? { record: retained } : {}),
+        });
+        if (reconciliation.status === "divergent") {
+          throw new RelayV2TerminalManagerError(
+            "INTERNAL",
+            "durable terminal opened replay diverged from local stream lineage",
+          );
+        }
+        if (retained?.fingerprint !== undefined && retained.fingerprint !== requestFingerprint) {
+          throw new RelayV2TerminalManagerError(
+            "INTERNAL",
+            "local and durable terminal open fingerprints diverged",
+          );
+        }
+        if (retained && reconciliation.status === "exact") {
+          await this.replayOpenRecord(request, retained);
+          return;
+        }
+        await this.replayDurableOpen(
+          request,
+          key,
+          recordKey,
+          requestFingerprint,
+          claim,
+        );
+        return;
+      }
+      if (retained?.fingerprint !== undefined && retained.fingerprint !== requestFingerprint) {
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "local and durable terminal open fingerprints diverged",
+        );
+      }
       await this.replayDurableOpen(request, key, recordKey, requestFingerprint, claim);
       return;
     }
     if (claim.status !== "claimed") {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an unknown open claim");
     }
+    const retained = this.openRecords.get(recordKey);
     const claimAuthority = this.openClaimAuthority(claim);
-    if (request.mode === "new" && existing) {
-      const outcome = await this.completeOpenRecord(request, key, recordKey, requestFingerprint, {
+    const reconciliation = await this.reconcileLocalStreamLineage(key, {
+      kind: "claimed",
+      authority: claimAuthority.streamAuthority,
+      ...(retained ? { record: retained } : {}),
+    });
+    if (reconciliation.status === "divergent" || retained) {
+      const settled = await this.failOpenRecord(
+        request,
+        key,
+        recordKey,
+        requestFingerprint,
+        {
+          kind: "reset",
+          generation: reconciliation.status === "divergent"
+            ? reconciliation.stream.generation
+            : retained?.outcome.kind === "opened"
+              ? retained.outcome.generation
+              : request.resume?.generation ?? null,
+          reason: "stream_lost",
+          requestedOffset: request.resume
+            ? parseCounter(request.resume.nextOffset, "nextOffset")
+            : null,
+          bufferStartOffset: null,
+          tailOffset: null,
+        },
+        claimAuthority,
+        { kind: "preserve" },
+        false,
+      );
+      if (settled.kind === "opened") {
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "durable terminal divergence did not settle its pending claim",
+        );
+      }
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal claim diverged from local lineage",
+      );
+    }
+    const existing = reconciliation.status === "exact" ? reconciliation.stream : undefined;
+    if (
+      request.mode === "new"
+      && (claimAuthority.streamAuthority.status !== "absent" || existing)
+    ) {
+      const outcome = await this.failOpenRecord(request, key, recordKey, requestFingerprint, {
         kind: "error",
         code: "TERMINAL_STREAM_CONFLICT",
         message: "terminal streamId is already retained",
-      }, claimAuthority);
+      }, claimAuthority, { kind: "preserve" });
       this.throwOpenError(outcome);
       return;
     }
@@ -1601,31 +1735,31 @@ export class RelayV2TerminalManager {
       this.requireControlSlots(
         request.mode === "new" || (request.mode === "reset" && !existing) ? 2 : 1,
       );
+      if (
+        (request.mode === "new" || (request.mode === "reset" && !existing))
+        && this.liveOrDetachedCount() >= this.limits.maxStreams
+      ) {
+        throw new RelayV2TerminalManagerError(
+          "BUSY",
+          "Relay v2 terminal stream quota is full",
+        );
+      }
     } catch (error) {
       if (!(error instanceof RelayV2TerminalManagerError) || error.code !== "BUSY") throw error;
-      const outcome = await this.completeOpenRecord(
+      const outcome = await this.failOpenRecord(
         request,
         key,
         recordKey,
         requestFingerprint,
         { kind: "error", code: "BUSY", message: error.message },
         claimAuthority,
-        undefined,
+        { kind: "preserve" },
         false,
       );
       this.throwOpenError(outcome);
       return;
     }
     if (request.mode === "new") {
-      if (this.liveOrDetachedCount() >= this.limits.maxStreams) {
-        const outcome = await this.completeOpenRecord(request, key, recordKey, requestFingerprint, {
-          kind: "error",
-          code: "BUSY",
-          message: "Relay v2 terminal stream quota is full",
-        }, claimAuthority);
-        this.throwOpenError(outcome);
-        return;
-      }
       await this.createGeneration(request, key, recordKey, requestFingerprint, "new", claimAuthority);
       return;
     }
@@ -1644,7 +1778,30 @@ export class RelayV2TerminalManager {
     if (!isOpaqueId(claim.claimToken) || !isOpaqueId(claim.fence)) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable lineage returned an invalid open claim authority");
     }
-    return { claimToken: claim.claimToken, fence: claim.fence };
+    const authority = claim.streamAuthority;
+    let streamAuthority: RelayV2TerminalDurableStreamAuthority;
+    if (hasExactOwnKeys(authority, ["status"]) && authority.status === "absent") {
+      streamAuthority = Object.freeze({ status: "absent" });
+    } else if (
+      hasExactOwnKeys(authority, ["status", "generation"])
+      && (authority.status === "live" || authority.status === "closed")
+      && isOpaqueId(authority.generation)
+    ) {
+      streamAuthority = Object.freeze({
+        status: authority.status,
+        generation: authority.generation,
+      });
+    } else {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable lineage returned an invalid stream authority",
+      );
+    }
+    return Object.freeze({
+      claimToken: claim.claimToken,
+      fence: claim.fence,
+      streamAuthority,
+    });
   }
 
   private validateOpenMode(request: RelayV2TerminalOpenRequest): void {
@@ -1687,6 +1844,91 @@ export class RelayV2TerminalManager {
       };
     }
     return { ...outcome };
+  }
+
+  private localRecordMatchesDurable(
+    record: OpenRecord,
+    stream: TerminalStream | undefined,
+    durable: RelayV2TerminalDurableOpenOutcome,
+  ): boolean {
+    if (record.outcome.kind === "opened") {
+      if (
+        !stream
+        || stream.generation !== record.outcome.generation
+        || !record.resumeToken
+        || !this.validResumeToken(stream, record.resumeToken)
+      ) {
+        return false;
+      }
+      return sameDurableOpenOutcome(
+        this.durableOpenOutcome(record.outcome, stream),
+        durable,
+      );
+    }
+    return sameDurableOpenOutcome(this.durableOpenOutcome(record.outcome), durable);
+  }
+
+  private async reconcileLocalStreamLineage(
+    key: string,
+    expectation:
+      | {
+          kind: "claimed";
+          authority: RelayV2TerminalDurableStreamAuthority;
+          record?: OpenRecord;
+        }
+      | {
+          kind: "opened_replay";
+          outcome: Extract<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>;
+          fingerprint: string;
+          target: RelayV2TerminalWireTarget;
+          record?: OpenRecord;
+        },
+  ): Promise<LocalStreamLineageReconciliation> {
+    const stream = this.streams.get(key);
+    if (!stream) return { status: "absent" };
+    if (stream.status === "lost" && !stream.backend) {
+      const durableGeneration = expectation.kind === "opened_replay"
+        ? expectation.outcome.generation
+        : expectation.authority.status === "absent"
+          ? undefined
+          : expectation.authority.generation;
+      if (durableGeneration !== stream.generation) {
+        stream.reservedCloseRecord = false;
+        this.removeRing(stream, false);
+        if (this.streams.get(key) === stream) this.streams.delete(key);
+      }
+      return { status: "absent" };
+    }
+
+    let exact: boolean;
+    if (expectation.kind === "claimed") {
+      exact = expectation.record === undefined
+        && this.localStreamForAuthority(stream, expectation.authority) === stream;
+    } else {
+      const statusMatches = stream.status === "live"
+        || stream.status === "detached"
+        || (stream.status === "closed" && !!stream.close);
+      exact = statusMatches
+        && stream.generation === expectation.outcome.generation
+        && sameTarget(stream.target, expectation.target)
+        && safeHashEqual(stream.resumeTokenHash, expectation.outcome.resumeTokenHash)
+        && expectation.record !== undefined
+        && expectation.record.fingerprint === expectation.fingerprint
+        && this.localRecordMatchesDurable(expectation.record, stream, expectation.outcome);
+    }
+    if (exact) return { status: "exact", stream };
+
+    if (stream.status === "closed" && !stream.backend) {
+      await this.loseStream(stream, "stream_lost", false);
+      stream.reservedCloseRecord = false;
+      if (this.streams.get(key) === stream) this.streams.delete(key);
+      return { status: "absent" };
+    }
+
+    await this.loseStream(stream, "stream_lost", false);
+    stream.reservedCloseRecord = false;
+    if (this.streams.get(key) === stream) this.streams.delete(key);
+    return { status: "divergent", stream };
   }
 
   private localOpenOutcome(value: unknown): OpenRecordOutcome {
@@ -1777,17 +2019,17 @@ export class RelayV2TerminalManager {
     };
   }
 
-  private async commitOpenRecord(
+  private async settleOpenRecord(
     request: RelayV2TerminalOpenRequest,
     key: string,
     recordKey: string,
     requestFingerprint: string,
-    proposed: OpenRecordOutcome,
+    proposal: OpenCommitProposal,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
-    stream?: TerminalStream,
     retainLocal = true,
   ): Promise<OpenCommitResult> {
-    const durableProposed = this.durableOpenOutcome(proposed, stream);
+    const stream = "stream" in proposal ? proposal.stream : undefined;
+    const durableProposed = this.durableOpenOutcome(proposal.outcome, stream);
     const input = {
       key: recordKey,
       fingerprint: requestFingerprint,
@@ -1796,21 +2038,28 @@ export class RelayV2TerminalManager {
       fence: claimAuthority.fence,
       outcome: durableProposed,
     };
-    const result = durableProposed.kind === "opened"
+    const result = "stream" in proposal
       ? await this.lineage.completeOpen({
           ...input,
-          outcome: durableProposed,
+          outcome: durableProposed as Extract<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>,
         })
       : await this.lineage.failOpen({
           ...input,
-          outcome: durableProposed,
+          outcome: durableProposed as Exclude<RelayV2TerminalDurableOpenOutcome, { kind: "opened" }>,
+          streamEffect: proposal.streamEffect,
         });
     if (
       !result
       || typeof result !== "object"
-      || !(result.status === "committed" || result.status === "replay")
+      || !(result.status === "committed" || result.status === "replay" || result.status === "rejected")
     ) {
       throw new RelayV2TerminalManagerError("INTERNAL", "durable terminal open commit result is invalid");
+    }
+    if (result.status === "rejected") {
+      if (result.reason !== "generation_reuse" || durableProposed.kind !== "opened") {
+        throw new RelayV2TerminalManagerError("INTERNAL", "durable terminal open rejection is invalid");
+      }
+      return { status: "rejected", reason: "generation_reuse" };
     }
     let outcome = this.localOpenOutcome(result.outcome);
     if (result.status === "committed" && !sameDurableOpenOutcome(result.outcome, durableProposed)) {
@@ -1835,29 +2084,35 @@ export class RelayV2TerminalManager {
         resumeToken: outcome.kind === "opened" ? stream?.resumeToken : undefined,
       });
     }
-    return { outcome, committed: result.status === "committed" };
+    return { status: result.status, outcome };
   }
 
-  private async completeOpenRecord(
+  private async failOpenRecord(
     request: RelayV2TerminalOpenRequest,
     key: string,
     recordKey: string,
     requestFingerprint: string,
-    proposed: OpenRecordOutcome,
+    proposed: Exclude<OpenRecordOutcome, { kind: "opened" }>,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
-    stream?: TerminalStream,
+    streamEffect: RelayV2TerminalOpenFailureStreamEffect,
     retainLocal = true,
   ): Promise<OpenRecordOutcome> {
-    return (await this.commitOpenRecord(
+    const result = await this.settleOpenRecord(
       request,
       key,
       recordKey,
       requestFingerprint,
-      proposed,
+      { outcome: proposed, streamEffect },
       claimAuthority,
-      stream,
       retainLocal,
-    )).outcome;
+    );
+    if (result.status === "rejected") {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal lineage rejected a failure outcome as generation reuse",
+      );
+    }
+    return result.outcome;
   }
 
   private recoverOpenRecord(
@@ -1973,17 +2228,64 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     disposition: "new" | "reset",
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
+    previous?: TerminalStream,
   ): Promise<void> {
-    const generation = this.issueId();
-    const resumeToken = this.issueToken();
-    if (!isOpaqueId(generation)) {
-      throw new RelayV2TerminalManagerError("INTERNAL", "terminal generation issuer returned an invalid ID");
-    }
-    tokenHash(resumeToken);
-    let stream: TerminalStream | undefined;
+    let generation: string | null = null;
+    let resumeToken: string;
+    let resolvedTarget: RelayV2TerminalResolvedTarget;
     try {
-      const resolvedTarget = await this.resolveTarget(request);
-      stream = this.newStream(request, resolvedTarget, key, generation, resumeToken);
+      generation = this.issueId();
+      if (!isOpaqueId(generation)) {
+        throw new RelayV2TerminalManagerError("INTERNAL", "terminal generation issuer returned an invalid ID");
+      }
+      resumeToken = this.issueToken();
+      tokenHash(resumeToken);
+      resolvedTarget = await this.resolveTarget(request);
+    } catch {
+      const outcome: Exclude<OpenRecordOutcome, { kind: "opened" }> = {
+        kind: "reset",
+        generation: generation ?? request.resume?.generation ?? null,
+        reason: "stream_lost",
+        requestedOffset: request.resume
+          ? parseCounter(request.resume.nextOffset, "nextOffset")
+          : null,
+        bufferStartOffset: null,
+        tailOffset: null,
+      };
+      const completed = await this.failOpenRecord(
+        request,
+        key,
+        recordKey,
+        requestFingerprint,
+        outcome,
+        claimAuthority,
+        { kind: "preserve" },
+      );
+      this.throwOpenError(completed);
+      if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
+      return;
+    }
+    if (generation === null) {
+      throw new RelayV2TerminalManagerError("INTERNAL", "terminal generation was not initialized");
+    }
+
+    let failureStreamEffect: RelayV2TerminalOpenFailureStreamEffect = { kind: "preserve" };
+    if (previous) {
+      previous.binding = undefined;
+      previous.status = "lost";
+      previous.detachedUntil = undefined;
+      await this.releaseProducerLease(previous);
+      this.clearControlWindows(previous);
+      this.removeRing(previous, false);
+      await this.disposeBackend(previous);
+      failureStreamEffect = {
+        kind: "retire_previous",
+        generation: previous.generation,
+      };
+    }
+
+    const stream = this.newStream(request, resolvedTarget, key, generation, resumeToken);
+    try {
       stream.backend = await this.backend.open(
         stream.resolvedTarget,
         {
@@ -2012,12 +2314,10 @@ export class RelayV2TerminalManager {
           },
         },
       );
-    } catch (error) {
-      if (stream) {
-        await this.releaseProducerLease(stream);
-        await this.disposeBackend(stream);
-      }
-      const outcome: OpenRecordOutcome = {
+    } catch {
+      await this.releaseProducerLease(stream);
+      await this.disposeBackend(stream);
+      const outcome: Exclude<OpenRecordOutcome, { kind: "opened" }> = {
         kind: "reset",
         generation,
         reason: "stream_lost",
@@ -2027,25 +2327,28 @@ export class RelayV2TerminalManager {
         bufferStartOffset: null,
         tailOffset: null,
       };
-      const completed = await this.completeOpenRecord(
+      const completed = await this.failOpenRecord(
         request,
         key,
         recordKey,
         requestFingerprint,
         outcome,
         claimAuthority,
+        failureStreamEffect,
       );
+      if (failureStreamEffect.kind === "retire_previous" && previous) {
+        previous.reservedCloseRecord = false;
+      }
       this.throwOpenError(completed);
       if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
       return;
     }
-    if (!stream) throw new Error("Relay v2 terminal stream was not initialized");
     const provisional: ProvisionalGeneration = {
       key,
       openRecordKey: recordKey,
       stream,
     };
-    const outcome: OpenRecordOutcome = {
+    const outcome: Extract<OpenRecordOutcome, { kind: "opened" }> = {
       kind: "opened",
       generation,
       disposition,
@@ -2053,22 +2356,57 @@ export class RelayV2TerminalManager {
     };
     let completion: OpenCommitResult;
     try {
-      completion = await this.commitOpenRecord(
+      completion = await this.settleOpenRecord(
         request,
         key,
         recordKey,
         requestFingerprint,
-        outcome,
+        { outcome, stream },
         claimAuthority,
-        stream,
         false,
       );
     } catch (error) {
       await this.discardProvisionalGeneration(provisional);
       throw error;
     }
+    if (completion.status === "rejected") {
+      await this.discardProvisionalGeneration(provisional);
+      const rejectionEffect: RelayV2TerminalOpenFailureStreamEffect = previous
+        ? { kind: "retire_previous", generation: previous.generation }
+        : { kind: "preserve" };
+      const settled = await this.failOpenRecord(
+        request,
+        key,
+        recordKey,
+        requestFingerprint,
+        {
+          kind: "reset",
+          generation,
+          reason: "stream_lost",
+          requestedOffset: request.resume
+            ? parseCounter(request.resume.nextOffset, "nextOffset")
+            : null,
+          bufferStartOffset: null,
+          tailOffset: null,
+        },
+        claimAuthority,
+        rejectionEffect,
+        false,
+      );
+      if (settled.kind === "opened") {
+        throw new RelayV2TerminalManagerError(
+          "INTERNAL",
+          "durable terminal generation rejection did not settle its pending claim",
+        );
+      }
+      if (previous) previous.reservedCloseRecord = false;
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal lineage rejected a reused generation",
+      );
+    }
     const completed = completion.outcome;
-    if (!completion.committed) {
+    if (completion.status === "replay") {
       await this.discardProvisionalGeneration(provisional);
       this.throwOpenError(completed);
       if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
@@ -2119,8 +2457,10 @@ export class RelayV2TerminalManager {
   ): Promise<void> {
     const resume = request.resume!;
     const requestedOffset = parseCounter(resume.nextOffset, "nextOffset");
+    const source = claimAuthority.streamAuthority;
+    const authoritativeStream = this.localStreamForAuthority(stream, source);
     let outcome: OpenRecordOutcome;
-    if (!stream || stream.status === "lost" || !sameTarget(stream.target, request.target)) {
+    if (source.status === "absent") {
       outcome = {
         kind: "reset",
         generation: resume.generation,
@@ -2129,16 +2469,32 @@ export class RelayV2TerminalManager {
         bufferStartOffset: null,
         tailOffset: null,
       };
-    } else if (stream.generation !== resume.generation) {
+    } else if (source.generation !== resume.generation) {
       outcome = {
         kind: "reset",
         generation: resume.generation,
         reason: "generation_stale",
         requestedOffset,
-        bufferStartOffset: stream.ringRetained ? stream.ring.startOffset : null,
-        tailOffset: stream.close?.finalOffset ?? stream.ring.tailOffset,
+        bufferStartOffset: authoritativeStream?.ringRetained
+          ? authoritativeStream.ring.startOffset
+          : null,
+        tailOffset: authoritativeStream?.close?.finalOffset
+          ?? authoritativeStream?.ring.tailOffset
+          ?? null,
       };
-    } else if (!this.validResumeToken(stream, resume.resumeToken)) {
+    } else if (
+      !authoritativeStream
+      || !sameTarget(authoritativeStream.target, request.target)
+    ) {
+      outcome = {
+        kind: "reset",
+        generation: resume.generation,
+        reason: "stream_lost",
+        requestedOffset,
+        bufferStartOffset: null,
+        tailOffset: null,
+      };
+    } else if (!this.validResumeToken(authoritativeStream, resume.resumeToken)) {
       outcome = {
         kind: "reset",
         generation: resume.generation,
@@ -2148,62 +2504,77 @@ export class RelayV2TerminalManager {
         tailOffset: null,
       };
     } else {
-      const through = stream.close?.finalOffset ?? stream.ring.tailOffset;
+      const through = authoritativeStream.close?.finalOffset ?? authoritativeStream.ring.tailOffset;
       if (requestedOffset > through) {
         throw new RelayV2TerminalManagerError(
           "INVALID_ARGUMENT",
           "terminal resume offset is beyond the known tail",
         );
       }
-      if (!this.canReplay(stream, requestedOffset, through)) {
+      if (!this.canReplay(authoritativeStream, requestedOffset, through)) {
         outcome = {
           kind: "reset",
-          generation: stream.generation,
+          generation: authoritativeStream.generation,
           reason: "offset_expired",
           requestedOffset,
-          bufferStartOffset: stream.ringRetained ? stream.ring.startOffset : null,
+          bufferStartOffset: authoritativeStream.ringRetained
+            ? authoritativeStream.ring.startOffset
+            : null,
           tailOffset: through,
         };
       } else {
         outcome = {
           kind: "opened",
-          generation: stream.generation,
+          generation: authoritativeStream.generation,
           disposition: "resumed",
           replayFromOffset: requestedOffset,
         };
       }
     }
     if (outcome.kind === "reset") {
-      const completed = await this.completeOpenRecord(
+      const completed = await this.failOpenRecord(
         request,
         key,
         recordKey,
         requestFingerprint,
         outcome,
         claimAuthority,
+        { kind: "preserve" },
       );
       this.throwOpenError(completed);
       if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
       return;
     }
-    if (!stream!.close) {
-      await this.setAttachmentDisplaySizeHint(stream!, request.cols, request.rows);
+    if (!authoritativeStream!.close) {
+      await this.setAttachmentDisplaySizeHint(authoritativeStream!, request.cols, request.rows);
     }
-    const completed = await this.completeOpenRecord(
+    const completion = await this.settleOpenRecord(
       request,
       key,
       recordKey,
       requestFingerprint,
-      outcome,
+      { outcome, stream: authoritativeStream! },
       claimAuthority,
-      stream,
     );
+    if (completion.status === "rejected") {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal lineage rejected an exact resume generation",
+      );
+    }
+    const completed = completion.outcome;
     this.throwOpenError(completed);
     if (completed.kind === "reset") {
       await this.sendResetResponse(request, completed, "open");
       return;
     }
-    await this.bindOpened(request, stream!, completed.disposition, completed.replayFromOffset, false);
+    await this.bindOpened(
+      request,
+      authoritativeStream!,
+      completed.disposition,
+      completed.replayFromOffset,
+      false,
+    );
   }
 
   private async resetGeneration(
@@ -2214,50 +2585,38 @@ export class RelayV2TerminalManager {
     requestFingerprint: string,
     claimAuthority: RelayV2TerminalDurableOpenClaimAuthority,
   ): Promise<void> {
-    if (existing) {
-      if (
-        existing.status === "closed"
-        || existing.status === "lost"
-        || !request.resume
-        || request.resume.generation !== existing.generation
-        || !sameTarget(existing.target, request.target)
-        || !this.validResumeToken(existing, request.resume.resumeToken)
-      ) {
-        const outcome: OpenRecordOutcome = {
-          kind: "reset",
-          generation: request.resume?.generation ?? null,
-          reason: "stream_lost",
-          requestedOffset: request.resume
-            ? parseCounter(request.resume.nextOffset, "nextOffset")
-            : null,
-          bufferStartOffset: null,
-          tailOffset: null,
-        };
-        const completed = await this.completeOpenRecord(
-          request,
-          key,
-          recordKey,
-          requestFingerprint,
-          outcome,
-          claimAuthority,
-        );
-        this.throwOpenError(completed);
-        if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
-        return;
-      }
-      existing.binding = undefined;
-      existing.status = "lost";
-      await this.releaseProducerLease(existing);
-      this.clearControlWindows(existing);
-      this.removeRing(existing, false);
-      await this.disposeBackend(existing);
-    } else if (this.liveOrDetachedCount() >= this.limits.maxStreams) {
-      const outcome = await this.completeOpenRecord(request, key, recordKey, requestFingerprint, {
-        kind: "error",
-        code: "BUSY",
-        message: "Relay v2 terminal stream quota is full",
-      }, claimAuthority);
-      this.throwOpenError(outcome);
+    const source = claimAuthority.streamAuthority;
+    const sourceIsAbsent = source.status === "absent";
+    const validExisting = source.status === "live"
+      && !!existing
+      && (existing.status === "live" || existing.status === "detached")
+      && !!request.resume
+      && source.generation === request.resume.generation
+      && existing.generation === source.generation
+      && sameTarget(existing.target, request.target)
+      && this.validResumeToken(existing, request.resume.resumeToken);
+    if (!(sourceIsAbsent && !existing) && !validExisting) {
+      const outcome: Exclude<OpenRecordOutcome, { kind: "opened" }> = {
+        kind: "reset",
+        generation: request.resume?.generation ?? null,
+        reason: "stream_lost",
+        requestedOffset: request.resume
+          ? parseCounter(request.resume.nextOffset, "nextOffset")
+          : null,
+        bufferStartOffset: null,
+        tailOffset: null,
+      };
+      const completed = await this.failOpenRecord(
+        request,
+        key,
+        recordKey,
+        requestFingerprint,
+        outcome,
+        claimAuthority,
+        { kind: "preserve" },
+      );
+      this.throwOpenError(completed);
+      if (completed.kind === "reset") await this.sendResetResponse(request, completed, "open");
       return;
     }
     await this.createGeneration(
@@ -2267,6 +2626,7 @@ export class RelayV2TerminalManager {
       requestFingerprint,
       "reset",
       claimAuthority,
+      validExisting ? existing : undefined,
     );
   }
 
@@ -2591,6 +2951,23 @@ export class RelayV2TerminalManager {
 
   private canReplay(stream: TerminalStream, from: bigint, through: bigint): boolean {
     return stream.ringRetained && stream.ring.hasRange(from, through);
+  }
+
+  private localStreamForAuthority(
+    stream: TerminalStream | undefined,
+    authority: RelayV2TerminalDurableStreamAuthority,
+  ): TerminalStream | undefined {
+    if (
+      !stream
+      || authority.status === "absent"
+      || stream.generation !== authority.generation
+    ) {
+      return undefined;
+    }
+    if (authority.status === "closed") {
+      return stream.status === "closed" && !!stream.close ? stream : undefined;
+    }
+    return stream.status === "live" || stream.status === "detached" ? stream : undefined;
   }
 
   private prepareClosedNotification(
@@ -3858,6 +4235,42 @@ export class RelayV2TerminalManager {
     }
   }
 
+  private async releaseDurableStreamReservation(stream: TerminalStream): Promise<void> {
+    let result: RelayV2TerminalDurableStreamReleaseResult;
+    try {
+      result = await this.lineage.releaseStreamReservation({
+        streamKey: stream.key,
+        generation: stream.generation,
+        hostInstanceId: this.hostInstanceId,
+      });
+    } catch {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal stream reservation release failed",
+      );
+    }
+    if (
+      (hasExactOwnKeys(result, ["status"])
+        && (result.status === "released" || result.status === "already_released"))
+    ) {
+      return;
+    }
+    if (
+      hasExactOwnKeys(result, ["status", "reason"])
+      && result.status === "conflict"
+      && result.reason === "generation_mismatch"
+    ) {
+      throw new RelayV2TerminalManagerError(
+        "INTERNAL",
+        "durable terminal stream reservation generation mismatched",
+      );
+    }
+    throw new RelayV2TerminalManagerError(
+      "INTERNAL",
+      "durable terminal stream reservation release result is invalid",
+    );
+  }
+
   private async sweepInternal(maintainProducerLeases = false): Promise<void> {
     const now = this.now();
     for (const stream of this.streams.values()) {
@@ -3915,6 +4328,7 @@ export class RelayV2TerminalManager {
         && ![...this.openRecords.values()].some((record) => record.streamKey === key)
         && ![...this.closeRecords.values()].some((record) => record.streamKey === key)
       ) {
+        await this.releaseDurableStreamReservation(stream);
         stream.reservedCloseRecord = false;
         this.removeRing(stream, false);
         this.streams.delete(key);

@@ -103,9 +103,12 @@ class FakeByteBackend {
   }
 
   opens = [];
+  openResults = [];
 
   async open(target, options, observer) {
     this.trace.push("backend.open");
+    const result = this.openResults.shift();
+    if (result instanceof Error) throw result;
     const handle = new FakeByteHandle(observer, this.trace);
     this.opens.push({ target: clone(target), options: clone(options), handle });
     return handle;
@@ -220,11 +223,16 @@ class FakeDurableLineage {
   failOpenCalls = [];
   claimCloseCalls = [];
   finalizeCloseCalls = [];
+  releaseStreamReservationCalls = [];
   failFinalizeOnce = false;
   claimCounter = 0;
   completeOpenReplayOutcome = undefined;
   failCompleteOpenOnce = false;
   failFailOpenOnce = false;
+  busyClaimOpenOnce = false;
+  rejectGenerationReuseOnce = false;
+  releaseStreamReservationResults = [];
+  usedGenerations = new Set();
 
   async claimOpen(claim) {
     this.claimOpenCalls.push(clone(claim));
@@ -246,13 +254,20 @@ class FakeDurableLineage {
       }
       return { status: "replay", outcome: clone(retained.outcome) };
     }
+    if (this.busyClaimOpenOnce) {
+      this.busyClaimOpenOnce = false;
+      return { status: "busy", reason: "control_record_quota" };
+    }
     const active = this.streams.get(claim.streamKey);
-    if (active && claim.mode === "new") {
+    const streamAuthority = !active || active.status === "released"
+      ? { status: "absent" }
+      : { status: active.status, generation: active.generation };
+    if (streamAuthority.status !== "absent" && claim.mode === "new") {
       return { status: "conflict", reason: "stream_conflict" };
     }
-    if (active && claim.mode === "reset") {
+    if (streamAuthority.status !== "absent" && claim.mode === "reset") {
       const replacing = claim.previousGeneration !== null
-        && active.generation === claim.previousGeneration;
+        && streamAuthority.generation === claim.previousGeneration;
       if (!replacing) return { status: "conflict", reason: "stream_conflict" };
     }
     const claimNumber = ++this.claimCounter;
@@ -263,9 +278,10 @@ class FakeDurableLineage {
       state: "pending",
       claimToken,
       fence,
+      streamAuthority: clone(streamAuthority),
     };
     this.opens.set(claim.key, copy);
-    return { status: "claimed", claimToken, fence };
+    return { status: "claimed", claimToken, fence, streamAuthority: clone(streamAuthority) };
   }
 
   async completeOpen(input) {
@@ -281,7 +297,9 @@ class FakeDurableLineage {
       retained.state = "final";
       retained.outcome = clone(this.completeOpenReplayOutcome);
       if (retained.outcome.kind === "opened") {
+        this.usedGenerations.add(retained.outcome.generation);
         this.streams.set(retained.streamKey, {
+          status: "live",
           generation: retained.outcome.generation,
           hostInstanceId: retained.hostInstanceId,
         });
@@ -311,13 +329,37 @@ class FakeDurableLineage {
     if (retained.claimToken !== input.claimToken || retained.fence !== input.fence) {
       throw new Error("open claim authority lost");
     }
+    if (input.outcome.kind === "opened") {
+      const exactResume = retained.mode === "resume"
+        && retained.streamAuthority.status !== "absent"
+        && retained.streamAuthority.generation === input.outcome.generation;
+      if (this.rejectGenerationReuseOnce || (!exactResume && this.usedGenerations.has(input.outcome.generation))) {
+        this.rejectGenerationReuseOnce = false;
+        return { status: "rejected", reason: "generation_reuse" };
+      }
+    }
     retained.state = "final";
     retained.outcome = clone(input.outcome);
     if (retained.outcome.kind === "opened") {
-      this.streams.set(retained.streamKey, {
-        generation: retained.outcome.generation,
-        hostInstanceId: retained.hostInstanceId,
-      });
+      this.usedGenerations.add(retained.outcome.generation);
+      if (retained.outcome.disposition === "resumed") {
+        const current = this.streams.get(retained.streamKey);
+        if (!current || current.generation !== retained.outcome.generation) {
+          throw new Error("resume source authority lost");
+        }
+      } else {
+        this.streams.set(retained.streamKey, {
+          status: "live",
+          generation: retained.outcome.generation,
+          hostInstanceId: retained.hostInstanceId,
+        });
+      }
+    } else if (input.streamEffect?.kind === "retire_previous") {
+      const current = this.streams.get(retained.streamKey);
+      if (!current || current.generation !== input.streamEffect.generation) {
+        throw new Error("retired stream generation mismatched");
+      }
+      current.status = "released";
     }
     return { status: "committed", outcome: clone(retained.outcome) };
   }
@@ -357,7 +399,24 @@ class FakeDurableLineage {
       throw new Error("close intent lost");
     }
     existing.state = "final";
+    const stream = this.streams.get(existing.value.streamKey);
+    if (stream && stream.generation === existing.value.generation) stream.status = "closed";
     return clone(existing.value);
+  }
+
+  async releaseStreamReservation(input) {
+    this.releaseStreamReservationCalls.push(clone(input));
+    this.trace.push("lineage.stream.release");
+    const configured = this.releaseStreamReservationResults.shift();
+    if (configured instanceof Error) throw configured;
+    if (configured) return clone(configured);
+    const stream = this.streams.get(input.streamKey);
+    if (!stream || stream.status === "released") return { status: "already_released" };
+    if (stream.generation !== input.generation) {
+      return { status: "conflict", reason: "generation_mismatch" };
+    }
+    stream.status = "released";
+    return { status: "released" };
   }
 }
 
@@ -472,6 +531,35 @@ function outputBytes(messages) {
     .filter(({ frame }) => frame.type === "terminal.output")
     .map(({ frame }) => Buffer.from(frame.payload.data, "base64")));
 }
+
+test("durable control quota BUSY is not cached and the same openId can claim after release", async () => {
+  const lineage = new FakeDurableLineage();
+  lineage.busyClaimOpenOnce = true;
+  const h = harness({ lineage });
+  const request = goldenOpen({ requestId: "quota-busy-first" });
+
+  await assert.rejects(
+    h.manager.open(request),
+    (error) => {
+      assert.ok(error instanceof terminal.RelayV2TerminalManagerError);
+      assert.equal(error.code, "BUSY");
+      assert.equal(error.message, "Relay v2 terminal control record quota is full");
+      return true;
+    },
+  );
+  assert.equal(lineage.claimOpenCalls.length, 1);
+  assert.equal(lineage.completeOpenCalls.length, 0);
+  assert.equal(lineage.failOpenCalls.length, 0);
+  assert.equal(h.resolver.calls.length, 0);
+  assert.equal(h.backend.opens.length, 0);
+  assert.equal(h.manager.stats().controlRecords, 0);
+
+  await h.manager.open({ ...request, requestId: "quota-busy-retry" });
+  assert.equal(lineage.claimOpenCalls.length, 2);
+  assert.equal(h.resolver.calls.length, 1);
+  assert.equal(h.backend.opens.length, 1);
+  assert.ok(opened(h.sent, "quota-busy-retry"));
+});
 
 test("lost open and close responses replay retained control results without duplicating the backend", async () => {
   const h = harness();
@@ -852,6 +940,49 @@ test("detached lease expiry fences the generation and exact open retry never cre
   assert.equal(h.backend.opens.length, 1);
 });
 
+test("retention sweep releases the exact durable stream reservation before local deletion", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "release-before-delete-open" });
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  await h.manager.close(closeRequest(frame, ROUTE_ONE, {
+    requestId: "release-before-delete-close",
+  }));
+
+  h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+  await h.manager.sweep();
+  assert.deepEqual(h.lineage.releaseStreamReservationCalls, [{
+    streamKey: h.lineage.claimOpenCalls[0].streamKey,
+    generation: frame.payload.generation,
+    hostInstanceId: HOST_INSTANCE_ID,
+  }]);
+  assert.equal(h.manager.stats().retainedStreams, 0);
+});
+
+test("retention sweep fails closed and retains the stream on release generation mismatch", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "release-mismatch-open" });
+  await h.manager.open(request);
+  const frame = opened(h.sent, request.requestId);
+  await h.manager.close(closeRequest(frame, ROUTE_ONE, {
+    requestId: "release-mismatch-close",
+  }));
+  h.lineage.releaseStreamReservationResults.push({
+    status: "conflict",
+    reason: "generation_mismatch",
+  });
+  h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+
+  await assert.rejects(h.manager.sweep(), managerError("INTERNAL"));
+  assert.equal(h.manager.stats().retainedStreams, 1);
+  assert.equal(h.manager.stats().controlRecords, 0);
+  assert.equal(h.lineage.releaseStreamReservationCalls[0].generation, frame.payload.generation);
+
+  await h.manager.sweep();
+  assert.equal(h.manager.stats().retainedStreams, 0);
+  assert.equal(h.lineage.releaseStreamReservationCalls.length, 2);
+});
+
 test("open remains an observer while Feishu holds control and output stays available", async () => {
   const h = harness();
   h.authority.acquireResults.push({
@@ -1078,6 +1209,173 @@ test("retained explicit close isolates the old request and replays it for a new 
   assert.equal(h.backend.opens[0].handle.closeCalls, 1);
 });
 
+test("lost closed-resume opened response replays the same generation and token without a close slot", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "closed-resume-loss-source" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  await h.manager.close(closeRequest(first, ROUTE_ONE, {
+    requestId: "closed-resume-loss-close",
+  }));
+  assert.equal(h.manager.stats().reservedCloseRecords, 0);
+
+  const routeTwo = {
+    connectorId: "closed-resume-loss-connector",
+    routeId: "closed-resume-loss-route",
+    routeFence: "closed-resume-loss-fence",
+  };
+  const resume = goldenOpen({
+    route: routeTwo,
+    requestId: "closed-resume-loss-first",
+    openId: "closed-resume-loss-open-id",
+    mode: "resume",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  });
+  h.dropNext("terminal.opened", "response");
+  await h.manager.open(resume);
+  assert.equal(opened(h.sent, resume.requestId), undefined);
+  assert.equal(h.manager.stats().reservedCloseRecords, 0);
+
+  await h.manager.open({ ...resume, requestId: "closed-resume-loss-retry" });
+  const replay = opened(h.sent, "closed-resume-loss-retry");
+  assert.equal(replay.payload.deduplicated, true);
+  assert.equal(replay.payload.generation, first.payload.generation);
+  assert.equal(replay.payload.resumeToken, first.payload.resumeToken);
+  assert.equal(h.backend.opens.length, 1);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.equal(h.manager.stats().reservedCloseRecords, 0);
+
+  await h.manager.close(closeRequest(replay, routeTwo, {
+    requestId: "closed-resume-loss-close-retry",
+  }));
+  const closeRetry = h.sent.find(
+    ({ frame }) => frame.requestId === "closed-resume-loss-close-retry",
+  )?.frame;
+  assert.equal(closeRetry.type, "terminal.closed");
+  assert.equal(closeRetry.payload.deduplicated, true);
+});
+
+test("stale closed retention clears its ring before absent-authority takeover", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage });
+  const request = goldenOpen({
+    requestId: "stale-closed-source-open",
+    streamId: "stale-closed-stream",
+    openId: "stale-closed-source-open-id",
+  });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  await h.backend.opens[0].handle.emit(Buffer.from("retained-before-takeover"));
+  await h.manager.close(closeRequest(first, ROUTE_ONE, {
+    requestId: "stale-closed-source-close",
+  }));
+  assert.ok(h.manager.stats().ringBytes > 0);
+
+  const streamKey = lineage.claimOpenCalls[0].streamKey;
+  lineage.streams.set(streamKey, {
+    status: "live",
+    generation: "durable-takeover-generation",
+    hostInstanceId: HOST_INSTANCE_ID,
+  });
+  await h.manager.open(goldenOpen({
+    requestId: "stale-closed-unavailable-resume",
+    streamId: request.streamId,
+    openId: "stale-closed-unavailable-open-id",
+    mode: "resume",
+    resume: {
+      generation: "durable-takeover-generation",
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  }));
+  const unavailable = h.sent.find(
+    ({ frame }) => frame.requestId === "stale-closed-unavailable-resume",
+  )?.frame;
+  assert.equal(unavailable.type, "terminal.reset_required");
+  assert.equal(unavailable.payload.reason, "stream_lost");
+  assert.equal(h.backend.opens.length, 1);
+  assert.equal(h.manager.stats().ringBytes, 0);
+
+  lineage.streams.delete(streamKey);
+  await h.manager.open(goldenOpen({
+    requestId: "stale-closed-takeover",
+    streamId: request.streamId,
+    openId: "stale-closed-takeover-open-id",
+  }));
+
+  const takeover = opened(h.sent, "stale-closed-takeover");
+  assert.ok(takeover);
+  assert.notEqual(takeover.payload.generation, first.payload.generation);
+  assert.equal(h.backend.opens.length, 2);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.equal(h.manager.stats().ringBytes, 0);
+});
+
+test("an invalid reset preserves the exact live generation so it can still be closed", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "preserved-reset-source-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+
+  await h.manager.open(goldenOpen({
+    requestId: "invalid-reset-attempt",
+    openId: "invalid-reset-open-id",
+    mode: "reset",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: "invalid-reset-token",
+    },
+  }));
+  const reset = h.sent.find(({ frame }) => frame.requestId === "invalid-reset-attempt")?.frame;
+  assert.equal(reset.type, "terminal.reset_required");
+  assert.deepEqual(h.lineage.failOpenCalls.at(-1).streamEffect, { kind: "preserve" });
+  assert.equal(h.backend.opens.length, 1);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 0);
+
+  await h.manager.close(closeRequest(first, ROUTE_ONE, {
+    requestId: "close-preserved-reset-source",
+  }));
+  const closed = h.sent.find(
+    ({ frame }) => frame.requestId === "close-preserved-reset-source",
+  )?.frame;
+  assert.equal(closed.type, "terminal.closed");
+  assert.equal(closed.payload.generation, first.payload.generation);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+});
+
+test("a reset backend failure retires only the already-fenced previous generation", async () => {
+  const h = harness();
+  const request = goldenOpen({ requestId: "retire-source-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  h.backend.openResults.push(new Error("injected replacement backend failure"));
+
+  await h.manager.open(goldenOpen({
+    requestId: "retire-reset-attempt",
+    openId: "retire-reset-open-id",
+    mode: "reset",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  }));
+
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.deepEqual(h.lineage.failOpenCalls.at(-1).streamEffect, {
+    kind: "retire_previous",
+    generation: first.payload.generation,
+  });
+  const reset = h.sent.find(({ frame }) => frame.requestId === "retire-reset-attempt")?.frame;
+  assert.equal(reset.type, "terminal.reset_required");
+  assert.equal(opened(h.sent, "retire-reset-attempt"), undefined);
+});
+
 test("natural-close tombstone query responds on the current request route", async () => {
   const h = harness();
   const request = goldenOpen();
@@ -1233,6 +1531,210 @@ test("durable open claims every mode and retains fingerprints and reset outcomes
   assert.equal(missingRestarted.backend.opens.length, 0);
 });
 
+test("absent durable authority fences an unregistered local backend and fails INTERNAL", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage });
+  const request = goldenOpen({ requestId: "authority-divergence-source" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  const streamKey = lineage.claimOpenCalls[0].streamKey;
+  lineage.streams.delete(streamKey);
+  const resume = goldenOpen({
+    requestId: "authority-divergence-resume",
+    openId: "authority-divergence-open-id",
+    mode: "resume",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  });
+
+  await assert.rejects(h.manager.open(resume), managerError("INTERNAL"));
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.equal(opened(h.sent, resume.requestId), undefined);
+  assert.equal(
+    h.sent.some(({ frame }) => frame.requestId === resume.requestId),
+    false,
+    "authority divergence must not become a normal reset response",
+  );
+  assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, { kind: "preserve" });
+  assert.equal(h.manager.stats().liveOrDetachedStreams, 0);
+  await assert.rejects(
+    h.manager.input({
+      ...streamContext(first),
+      inputSeq: "1",
+      data: Buffer.from("must-stay-fenced"),
+    }),
+    managerError("TERMINAL_STREAM_NOT_FOUND"),
+  );
+});
+
+test("generation mismatch exposes watermarks only from the exact durable source", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage, hostInstanceId: "watermark-source-instance" });
+  const request = goldenOpen({ requestId: "watermark-source-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  const restarted = harness({ lineage, hostInstanceId: "watermark-source-instance" });
+
+  await restarted.manager.open(goldenOpen({
+    requestId: "watermark-mismatch-resume",
+    openId: "watermark-mismatch-open-id",
+    mode: "resume",
+    resume: {
+      generation: "stale-request-generation",
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  }));
+  const reset = restarted.sent.find(
+    ({ frame }) => frame.requestId === "watermark-mismatch-resume",
+  )?.frame;
+  assert.equal(reset.type, "terminal.reset_required");
+  assert.equal(reset.payload.reason, "generation_stale");
+  assert.equal(reset.payload.bufferStartOffset, null);
+  assert.equal(reset.payload.tailOffset, null);
+  assert.equal(restarted.backend.opens.length, 0);
+});
+
+test("claimed generation or status divergence fences the local backend before INTERNAL", async () => {
+  for (const scenario of [
+    { name: "generation", authority: { status: "live", generation: "durable-other-generation" } },
+    { name: "status", authority: { status: "closed", generation: "generation-1" } },
+  ]) {
+    const lineage = new FakeDurableLineage();
+    const h = harness({ lineage });
+    const request = goldenOpen({
+      requestId: `claimed-${scenario.name}-source`,
+      streamId: `claimed-${scenario.name}-stream`,
+      openId: `claimed-${scenario.name}-source-open`,
+    });
+    await h.manager.open(request);
+    const first = opened(h.sent, request.requestId);
+    const streamKey = lineage.claimOpenCalls[0].streamKey;
+    lineage.streams.set(streamKey, {
+      ...scenario.authority,
+      hostInstanceId: HOST_INSTANCE_ID,
+    });
+    const resume = goldenOpen({
+      requestId: `claimed-${scenario.name}-resume`,
+      streamId: request.streamId,
+      openId: `claimed-${scenario.name}-resume-open`,
+      mode: "resume",
+      resume: {
+        generation: scenario.authority.generation,
+        nextOffset: "0",
+        resumeToken: first.payload.resumeToken,
+      },
+    });
+
+    await assert.rejects(h.manager.open(resume), managerError("INTERNAL"));
+    assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+    await assert.rejects(
+      h.manager.input({
+        ...streamContext(first),
+        inputSeq: "1",
+        data: Buffer.from("fenced-after-divergence"),
+      }),
+      managerError("TERMINAL_STREAM_NOT_FOUND"),
+    );
+    assert.equal(h.authority.inputCalls.length, 0);
+
+    h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+    await h.manager.sweep();
+    assert.equal(h.lineage.releaseStreamReservationCalls.length, 0);
+    assert.equal(h.manager.stats().retainedStreams, 0);
+    assert.equal(h.manager.stats().ringBytes, 0);
+  }
+});
+
+test("claimed or replayed generation divergence drops a previously lost local stream without release", async () => {
+  for (const kind of ["claimed", "replay"]) {
+    const lineage = new FakeDurableLineage();
+    const h = harness({ lineage });
+    const request = goldenOpen({
+      requestId: `lost-divergence-${kind}-source`,
+      streamId: `lost-divergence-${kind}-stream`,
+      openId: `lost-divergence-${kind}-source-open-id`,
+    });
+    await h.manager.open(request);
+    const first = opened(h.sent, request.requestId);
+    await h.manager.unbind(AUTH, ROUTE_ONE);
+    h.advance(terminal.RELAY_V2_TERMINAL_DETACHED_LEASE_MS + 1);
+    await h.manager.sweep();
+    assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+    assert.equal(h.manager.stats().retainedStreams, 1);
+
+    const firstClaim = lineage.claimOpenCalls[0];
+    lineage.streams.set(firstClaim.streamKey, {
+      status: "live",
+      generation: `durable-${kind}-generation-b`,
+      hostInstanceId: HOST_INSTANCE_ID,
+    });
+    let attempt;
+    if (kind === "claimed") {
+      attempt = goldenOpen({
+        requestId: "lost-divergence-claimed-attempt",
+        streamId: request.streamId,
+        openId: "lost-divergence-claimed-open-id",
+        mode: "resume",
+        resume: {
+          generation: "durable-claimed-generation-b",
+          nextOffset: "0",
+          resumeToken: first.payload.resumeToken,
+        },
+      });
+    } else {
+      const retained = lineage.opens.get(firstClaim.key);
+      retained.outcome.generation = "durable-replay-generation-b";
+      attempt = { ...request, requestId: "lost-divergence-replay-attempt" };
+    }
+
+    await h.manager.open(attempt);
+    const reset = h.sent.find(({ frame }) => frame.requestId === attempt.requestId)?.frame;
+    assert.equal(reset.type, "terminal.reset_required");
+    assert.equal(reset.payload.reason, "stream_lost");
+    assert.equal(h.manager.stats().retainedStreams, 0);
+    assert.equal(h.manager.stats().ringBytes, 0);
+
+    h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+    await h.manager.sweep();
+    assert.equal(lineage.releaseStreamReservationCalls.length, 0);
+    assert.equal(h.manager.stats().retainedStreams, 0);
+    assert.equal(h.manager.stats().ringBytes, 0);
+  }
+});
+
+test("durable opened replay mismatch fences its local backend instead of emitting reset", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage });
+  const request = goldenOpen({ requestId: "opened-replay-divergence-source" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  const record = lineage.opens.get(lineage.claimOpenCalls[0].key);
+  record.outcome.generation = "durable-replayed-other-generation";
+
+  await assert.rejects(
+    h.manager.open({ ...request, requestId: "opened-replay-divergence-retry" }),
+    managerError("INTERNAL"),
+  );
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.equal(
+    h.sent.some(({ frame }) => frame.requestId === "opened-replay-divergence-retry"),
+    false,
+  );
+  await assert.rejects(
+    h.manager.input({
+      ...streamContext(first),
+      inputSeq: "1",
+      data: Buffer.from("must-not-reach-old-backend"),
+    }),
+    managerError("TERMINAL_STREAM_NOT_FOUND"),
+  );
+  assert.equal(h.authority.inputCalls.length, 0);
+});
+
 test("durable open conflicts are atomic across same-process and restart retries", async () => {
   const lineage = new FakeDurableLineage();
   const first = harness({ lineage, hostInstanceId: "cas-host-one" });
@@ -1370,6 +1872,45 @@ test("provisional generation loses every replayed CAS winner without publishing 
       assert.equal(h.backend.opens.length, 2);
     }
   }
+});
+
+test("generation reuse rejection destroys the provisional reset and exactly retires its source claim", async () => {
+  const lineage = new FakeDurableLineage();
+  const h = harness({ lineage });
+  const request = goldenOpen({ requestId: "generation-reuse-source-open" });
+  await h.manager.open(request);
+  const first = opened(h.sent, request.requestId);
+  lineage.rejectGenerationReuseOnce = true;
+  const resetRequest = goldenOpen({
+    requestId: "generation-reuse-reset",
+    openId: "generation-reuse-reset-open-id",
+    mode: "reset",
+    resume: {
+      generation: first.payload.generation,
+      nextOffset: "0",
+      resumeToken: first.payload.resumeToken,
+    },
+  });
+
+  await assert.rejects(h.manager.open(resetRequest), managerError("INTERNAL"));
+  assert.equal(h.backend.opens.length, 2);
+  assert.equal(h.backend.opens[0].handle.closeCalls, 1);
+  assert.equal(h.backend.opens[1].handle.closeCalls, 1);
+  assert.equal(opened(h.sent, resetRequest.requestId), undefined);
+  assert.deepEqual(lineage.failOpenCalls.at(-1).streamEffect, {
+    kind: "retire_previous",
+    generation: first.payload.generation,
+  });
+  const durableReset = lineage.opens.get(lineage.failOpenCalls.at(-1).key);
+  assert.equal(durableReset.state, "final", "the rejected completion must not leave a pending claim");
+  assert.equal(lineage.streams.values().next().value.status, "released");
+  assert.equal(h.manager.stats().controlRecords, 1, "the rejected reset must not enter local cache");
+  assert.equal(h.manager.stats().reservedCloseRecords, 0);
+
+  h.advance(terminal.RELAY_V2_TERMINAL_CONTROL_RETENTION_MS + 1);
+  await h.manager.sweep();
+  assert.equal(h.manager.stats().retainedStreams, 0);
+  assert.equal(lineage.releaseStreamReservationCalls.at(-1).generation, first.payload.generation);
 });
 
 test("pending resume and reset claims recover their generation and requested offset after restart", async () => {
@@ -2037,7 +2578,7 @@ test("control admission reserves close tombstones before opening or resetting a 
   let current = opened(h.sent, request.requestId);
   assert.equal(h.manager.stats().controlSlots, 2);
 
-  await h.manager.open(goldenOpen({
+  const firstReset = goldenOpen({
     requestId: "reset-one",
     openId: "reset-open-one",
     mode: "reset",
@@ -2046,10 +2587,17 @@ test("control admission reserves close tombstones before opening or resetting a 
       nextOffset: "0",
       resumeToken: current.payload.resumeToken,
     },
-  }));
+  });
+  await h.manager.open(firstReset);
   current = opened(h.sent, "reset-one");
   assert.equal(h.manager.stats().controlSlots, 3);
   assert.equal(h.backend.opens.length, 2);
+
+  await h.manager.open({ ...firstReset, requestId: "reset-one-replay-at-capacity" });
+  const replay = opened(h.sent, "reset-one-replay-at-capacity");
+  assert.equal(replay.payload.deduplicated, true);
+  assert.equal(replay.payload.generation, current.payload.generation);
+  assert.equal(h.backend.opens.length, 2, "durable replay must precede local capacity checks");
 
   await assert.rejects(
     h.manager.open(goldenOpen({

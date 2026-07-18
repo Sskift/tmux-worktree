@@ -331,6 +331,8 @@ function actualTerminalRuntimeHarness(options = {}) {
   let nextToken = 0;
   let now = 1_000_000;
   const closeRecords = new Map();
+  const openRecords = new Map();
+  const streamAuthorities = new Map();
   const backend = {
     opens: [],
     async open(_target, _openOptions, observer) {
@@ -348,16 +350,52 @@ function actualTerminalRuntimeHarness(options = {}) {
   const lineage = {
     claimCloseCalls: [],
     async claimOpen(claim) {
+      const openRecord = openRecords.get(claim.key);
+      if (openRecord) {
+        if (openRecord.fingerprint !== claim.fingerprint) {
+          return { status: "conflict", reason: "open_conflict" };
+        }
+        return { status: "replay", outcome: structuredClone(openRecord.outcome) };
+      }
+      const retained = streamAuthorities.get(claim.streamKey);
+      const streamAuthority = retained
+        ? { status: retained.status, generation: retained.generation }
+        : { status: "absent" };
+      openRecords.set(claim.key, {
+        fingerprint: claim.fingerprint,
+        streamKey: claim.streamKey,
+        streamAuthority: structuredClone(streamAuthority),
+        outcome: null,
+      });
       return {
         status: "claimed",
         claimToken: `actual-claim-${claim.key}`,
         fence: `actual-fence-${claim.key}`,
+        streamAuthority,
       };
     },
     async completeOpen(input) {
+      const openRecord = openRecords.get(input.key);
+      assert.ok(openRecord);
+      openRecord.outcome = structuredClone(input.outcome);
+      if (input.outcome.kind === "opened" && input.outcome.disposition !== "resumed") {
+        streamAuthorities.set(openRecord.streamKey, {
+          status: "live",
+          generation: input.outcome.generation,
+        });
+      }
       return { status: "committed", outcome: structuredClone(input.outcome) };
     },
     async failOpen(input) {
+      const openRecord = openRecords.get(input.key);
+      assert.ok(openRecord);
+      openRecord.outcome = structuredClone(input.outcome);
+      if (input.streamEffect.kind === "retire_previous") {
+        const retained = streamAuthorities.get(openRecord.streamKey);
+        if (retained?.generation === input.streamEffect.generation) {
+          streamAuthorities.delete(openRecord.streamKey);
+        }
+      }
       return { status: "committed", outcome: structuredClone(input.outcome) };
     },
     async claimClose(input) {
@@ -376,7 +414,18 @@ function actualTerminalRuntimeHarness(options = {}) {
       const retained = closeRecords.get(input.key);
       assert.ok(retained);
       retained.state = "final";
+      const authority = streamAuthorities.get(retained.value.streamKey);
+      if (authority?.generation === retained.value.generation) authority.status = "closed";
       return structuredClone(retained.value);
+    },
+    async releaseStreamReservation(input) {
+      const retained = streamAuthorities.get(input.streamKey);
+      if (!retained) return { status: "already_released" };
+      if (retained.generation !== input.generation) {
+        return { status: "conflict", reason: "generation_mismatch" };
+      }
+      streamAuthorities.delete(input.streamKey);
+      return { status: "released" };
     },
   };
   const h = createHarness({
@@ -2475,6 +2524,9 @@ test("the actual H0/H1/H2/spool/H3 adapter wires authorities without becoming on
               tailOffset: null,
             },
           };
+        },
+        async releaseStreamReservation() {
+          return { status: "already_released" };
         },
       },
       backend: {},
