@@ -1034,13 +1034,15 @@ test("paused client_closed emits a terminal resume and cannot poison carrier pre
     h.pump.acceptBrokerResult(highWater);
     await h.scheduler.flushReady();
   }
-  assert.equal(highWater.actions.some((action) => action.kind === "pause_client"), true);
+  const pauseAction = highWater.actions.find((action) => action.kind === "pause_client");
+  assert.ok(pauseAction);
   assert.deepEqual(h.pump.snapshot().pausedClients, ["client-paused-unbind"]);
 
   const unbinding = h.broker.unbindClient("client-paused-unbind", "client_closed");
   assert.deepEqual(unbinding.actions, [{
     kind: "resume_client",
     connectionId: "client-paused-unbind",
+    connectionIncarnation: pauseAction.connectionIncarnation,
   }]);
   h.pump.acceptBrokerResult(unbinding);
   await h.scheduler.flushReady();

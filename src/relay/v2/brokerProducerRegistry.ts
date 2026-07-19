@@ -11,6 +11,7 @@ export const RELAY_V2_BROKER_PRODUCER_MAX_ACTIONS =
 export type RelayV2BrokerProducerReceipt = "applied" | "rejected";
 
 type RelayV2BrokerProducerActionKind =
+  | "host_output_ready"
   | "send_host"
   | "close_host"
   | "pause_host_route"
@@ -22,6 +23,7 @@ export type RelayV2BrokerProducerAction = Extract<
 >;
 
 const HOST_PRODUCER_ACTION_KINDS = new Set<RelayV2BrokerProducerActionKind>([
+  "host_output_ready",
   "send_host",
   "close_host",
   "pause_host_route",
@@ -38,6 +40,29 @@ export type RelayV2BrokerProducerTarget = Readonly<{
   transportId: string;
   generation: string;
 }>;
+
+/**
+ * Opaque receipt binding one Broker carrier incarnation to one exact B7a
+ * producer generation. Its visible fields are diagnostic only; registry
+ * provenance, current-entry identity, and phase are checked at each use.
+ */
+export type RelayV2BrokerHostProducerBinding = Readonly<{
+  connectionIncarnation: string;
+  target: RelayV2BrokerProducerTarget;
+}>;
+
+export type RelayV2BrokerHostProducerOwnerInspection = Readonly<
+  | {
+      status: "current";
+      binding: RelayV2BrokerHostProducerBinding;
+      target: RelayV2BrokerProducerTarget;
+    }
+  | {
+      status: "current_unbound";
+      target: RelayV2BrokerProducerTarget;
+    }
+  | { status: "stale" }
+>;
 
 export type RelayV2BrokerProducerSource = Readonly<
   | {
@@ -127,6 +152,10 @@ export type RelayV2BrokerResultPartition<
 
 export interface RelayV2BrokerProducerRegistration {
   readonly target: RelayV2BrokerProducerTarget;
+  /** Binds this generation once to the Broker carrier opened on this socket. */
+  bindConnectionIncarnation(
+    connectionIncarnation: string,
+  ): RelayV2BrokerHostProducerBinding;
   /** The source lease exists before invoke and through the whole partition. */
   runBrokerCall<Result extends RelayV2BrokerResult>(
     invoke: () => Result,
@@ -162,7 +191,16 @@ type ProducerEntry = {
   targetEffects: number;
   effectEpoch: bigint;
   currentEffect: EffectLease | null;
+  hostBinding: RelayV2BrokerHostProducerBinding | null;
 };
+
+type HostBindingOwner = {
+  readonly registry: RelayV2BrokerProducerRegistry;
+  readonly entry: ProducerEntry;
+  readonly connectionIncarnation: string;
+};
+
+const HOST_PRODUCER_BINDINGS = new WeakMap<object, HostBindingOwner>();
 
 type SourcePartition = {
   readonly id: string;
@@ -516,11 +554,15 @@ export class RelayV2BrokerProducerRegistry {
       targetEffects: 0,
       effectEpoch: 0n,
       currentEffect: null,
+      hostBinding: null,
     };
     this.producers.set(transportId, entry);
 
     return Object.freeze({
       target,
+      bindConnectionIncarnation: (connectionIncarnation: string) => (
+        this.bindConnectionIncarnation(entry, connectionIncarnation)
+      ),
       runBrokerCall: <Result extends RelayV2BrokerResult>(
         invoke: () => Result,
         partition: RelayV2BrokerResultPartition<Result>,
@@ -529,6 +571,48 @@ export class RelayV2BrokerProducerRegistry {
         this.beginProducerClose(entry, closeBarrier);
       },
     });
+  }
+
+  /**
+   * Resolves only a registry-created receipt for the exact active producer and
+   * Broker incarnation named by an opaque output-ready fence.
+   */
+  resolveHostProducerBinding(
+    candidate: unknown,
+    transportId: string,
+    connectionIncarnation: string,
+  ): RelayV2BrokerProducerTarget | undefined {
+    if (candidate === null || typeof candidate !== "object") return undefined;
+    const owner = HOST_PRODUCER_BINDINGS.get(candidate);
+    if (
+      !owner
+      || owner.registry !== this
+      || owner.connectionIncarnation !== connectionIncarnation
+      || owner.entry.transportId !== transportId
+      || owner.entry.phase !== "active"
+      || owner.entry.hostBinding !== candidate
+      || this.producers.get(transportId) !== owner.entry
+    ) return undefined;
+    return owner.entry.target;
+  }
+
+  /** Distinguishes an exact current binding, an active-but-unbound
+   * composition failure, and a replacement/closing stale fence. */
+  inspectHostProducerOwner(
+    transportId: string,
+    connectionIncarnation: string,
+  ): RelayV2BrokerHostProducerOwnerInspection {
+    const entry = this.producers.get(transportId);
+    if (!entry || entry.phase !== "active") return Object.freeze({ status: "stale" });
+    const binding = entry.hostBinding;
+    if (!binding) {
+      return Object.freeze({ status: "current_unbound", target: entry.target });
+    }
+    if (
+      binding.connectionIncarnation !== connectionIncarnation
+      || HOST_PRODUCER_BINDINGS.get(binding)?.registry !== this
+    ) return Object.freeze({ status: "stale" });
+    return Object.freeze({ status: "current", binding, target: entry.target });
   }
 
   /** One-shot source for Broker calls that do not originate from a carrier. */
@@ -577,6 +661,34 @@ export class RelayV2BrokerProducerRegistry {
     entry.sourcePartitions += 1;
     this.partitions.set(active.id, active);
     return this.runBrokerCall(active, invoke, partition);
+  }
+
+  private bindConnectionIncarnation(
+    entry: ProducerEntry,
+    connectionIncarnation: unknown,
+  ): RelayV2BrokerHostProducerBinding {
+    if (
+      !isIdentifier(connectionIncarnation)
+      || this.producers.get(entry.transportId) !== entry
+      || entry.phase !== "active"
+    ) throw new Error("Relay v2 Broker producer registration is not active");
+    if (entry.hostBinding) {
+      if (entry.hostBinding.connectionIncarnation === connectionIncarnation) {
+        return entry.hostBinding;
+      }
+      throw new Error("Relay v2 Broker producer generation is already bound");
+    }
+    const binding = Object.freeze({
+      connectionIncarnation,
+      target: entry.target,
+    });
+    HOST_PRODUCER_BINDINGS.set(binding, {
+      registry: this,
+      entry,
+      connectionIncarnation,
+    });
+    entry.hostBinding = binding;
+    return binding;
   }
 
   private runBrokerCall<Result extends RelayV2BrokerResult>(
@@ -856,6 +968,7 @@ export class RelayV2BrokerProducerRegistry {
     ) return;
     entry.phase = "retired";
     entry.currentEffect = null;
+    entry.hostBinding = null;
     if (this.producers.get(entry.transportId) === entry) {
       this.producers.delete(entry.transportId);
     }

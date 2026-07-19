@@ -184,6 +184,16 @@ export interface RelayV2StructuredError {
 
 export type RelayV2BrokerAction =
   | {
+      /**
+       * Internal producer wake only. B7c still has to bind the exact
+       * generation target to the carrier Pump; this is never a wire frame.
+       */
+      kind: "host_output_ready";
+      transportId: string;
+      connectionIncarnation: string;
+      readyEpoch: string;
+    }
+  | {
       kind: "send_host";
       transportId: string;
       frame: RelayV2JsonObject;
@@ -199,6 +209,7 @@ export type RelayV2BrokerAction =
   | {
       kind: "route_opened";
       connectionId: string;
+      connectionIncarnation: string;
       routeId: string;
       routeFence: string;
       hostId: string;
@@ -209,6 +220,7 @@ export type RelayV2BrokerAction =
   | {
       kind: "route_unavailable";
       connectionId: string;
+      connectionIncarnation: string;
       hostId: string;
       closeCode: 1013 | 4401 | 4403 | 4406;
       error: RelayV2StructuredError;
@@ -216,12 +228,14 @@ export type RelayV2BrokerAction =
   | {
       kind: "close_client";
       connectionId: string;
+      connectionIncarnation: string;
       closeCode: number;
       reason: string;
     }
   | {
       kind: "pause_client" | "resume_client";
       connectionId: string;
+      connectionIncarnation: string;
     }
   | {
       kind: "pause_host_route" | "resume_host_route";
@@ -306,6 +320,29 @@ export interface RelayV2ClientDelivery {
   connectionId: string;
   opcode: "text";
   bytes: Uint8Array;
+}
+
+export type RelayV2BrokerOutputReadyFence = Readonly<
+  | {
+      kind: "host";
+      transportId: string;
+      connectionIncarnation: string;
+      readyEpoch: string;
+    }
+  | {
+      kind: "client";
+      connectionId: string;
+      connectionIncarnation: string;
+      readyEpoch: string;
+    }
+>;
+
+/**
+ * Synchronous edge sink. Implementations may only coalesce/schedule the
+ * opaque fence; they must not reenter BrokerCore from this callback.
+ */
+export interface RelayV2BrokerOutputReadyPort {
+  ready(fence: RelayV2BrokerOutputReadyFence): void;
 }
 
 export interface RelayV2HostDirectoryView {
@@ -430,6 +467,7 @@ type InFlightCarrierFrame = QueuedCarrierFrame & {
 type CarrierState = {
   transportId: string;
   connectionIncarnation: string;
+  outputReadyEpoch: bigint;
   authContext: RelayV2BrokerConnectionAuthorization;
   authorizationState: "active" | "fenced";
   authorizationCloseSignalled: boolean;
@@ -465,6 +503,7 @@ type InFlightClientFrame = QueuedClientFrame & {
 type ClientState = {
   connectionId: string;
   connectionIncarnation: string;
+  outputReadyEpoch: bigint;
   authContext: RelayV2BrokerConnectionAuthorization;
   authorizationState: "active" | "fenced";
   authorizationCloseSignalled: boolean;
@@ -476,6 +515,7 @@ type ClientState = {
 
 type RouteState = {
   connectionId: string;
+  connectionIncarnation: string;
   routeId: string;
   routeFence: string;
   openRequestId: string;
@@ -522,6 +562,31 @@ type DirectoryRecord = {
   presenceReason: RelayV2PresenceReason;
   previousHostInstanceId: string | null;
 };
+
+const BROKER_OUTPUT_READY_FENCES = new WeakMap<object, () => boolean>();
+
+/** Runtime provenance + current-owner check for an opaque ready capability. */
+export function relayV2BrokerOutputReadyMayDrain(
+  fence: unknown,
+): fence is RelayV2BrokerOutputReadyFence {
+  if (fence === null || typeof fence !== "object") return false;
+  const current = BROKER_OUTPUT_READY_FENCES.get(fence);
+  if (!current) return false;
+  try {
+    return current() === true;
+  } catch {
+    return false;
+  }
+}
+
+function brokerOutputReadyFence(
+  value: RelayV2BrokerOutputReadyFence,
+  current: () => boolean,
+): RelayV2BrokerOutputReadyFence {
+  const fence = Object.freeze(value);
+  BROKER_OUTPUT_READY_FENCES.set(fence, current);
+  return fence;
+}
 
 function roleForPath(pathname: string): RelayBrokerRole | undefined {
   if (pathname === "/client") return "client";
@@ -833,11 +898,13 @@ export class RelayV2BrokerCore {
   private readonly committedLiveAuthorizationInvalidations:
     CommittedLiveAuthorizationInvalidation[] = [];
   private liveAuthCompositionLatched = false;
+  private outputReadyCompositionLatched = false;
   private liveAuthGlobalFenceApplying = false;
   private liveAuthGlobalFenceApplied = false;
   private authorizationHighWater: RelayV2LiveAuthorizationCommitReceipt | null = null;
   private readonly now: () => number;
   private readonly authControlAuthority: RelayV2BrokerAuthControlAuthority | undefined;
+  private readonly outputReadyPort: RelayV2BrokerOutputReadyPort | undefined;
   private readonly baseCapabilityReadiness: string[];
   private readonly onLiveAuthorizationClose:
     ((signal: RelayV2LiveAuthorizationCloseSignal) => void) | undefined;
@@ -847,6 +914,7 @@ export class RelayV2BrokerCore {
     brokerEpoch?: string;
     now?: () => number;
     authControlAuthority?: RelayV2BrokerAuthControlAuthority;
+    outputReadyPort?: RelayV2BrokerOutputReadyPort;
     onLiveAuthorizationClose?: (signal: RelayV2LiveAuthorizationCloseSignal) => void;
     /**
      * Explicit complete base-v2 composition receipt. Omission keeps
@@ -858,6 +926,7 @@ export class RelayV2BrokerCore {
     if (!isIdentifier(this.brokerEpoch)) throw new Error("invalid Relay v2 broker epoch");
     this.now = options.now ?? Date.now;
     this.authControlAuthority = options.authControlAuthority;
+    this.outputReadyPort = options.outputReadyPort;
     this.onLiveAuthorizationClose = options.onLiveAuthorizationClose;
     this.liveAuthorizationFencePortValue = Object.freeze({
       begin: (invalidation: RelayV2LiveAuthorizationInvalidation) => (
@@ -879,14 +948,18 @@ export class RelayV2BrokerCore {
     return this.liveAuthorizationFencePortValue;
   }
 
+  get outputReadyCompositionState(): "open" | "latched_fail_closed" {
+    return this.outputReadyCompositionLatched ? "latched_fail_closed" : "open";
+  }
+
   /** Attach only after dispatchRelayBrokerUpgrade accepted a role=host v2 Upgrade. */
   attachHostCarrier(
     transportId: string,
     authContext: RelayV2BrokerConnectionAuthorization,
     connectionIncarnation = randomUUID(),
   ): void {
-    if (this.liveAuthCompositionLatched) {
-      throw new Error("Relay v2 live-auth composition is latched fail-closed");
+    if (this.liveAuthCompositionLatched || this.outputReadyCompositionLatched) {
+      throw new Error("Relay v2 Broker composition is latched fail-closed");
     }
     if (
       !isIdentifier(transportId)
@@ -906,6 +979,7 @@ export class RelayV2BrokerCore {
     this.carriers.set(transportId, {
       transportId,
       connectionIncarnation,
+      outputReadyEpoch: 0n,
       authContext: authorization,
       authorizationState: "active",
       authorizationCloseSignalled: false,
@@ -1028,13 +1102,13 @@ export class RelayV2BrokerCore {
   private inspectClosedClientAdmission(
     authorization: RelayV2BrokerConnectionAuthorization,
   ): RelayV2ClientAdmission {
-    if (this.liveAuthCompositionLatched) {
+    if (this.liveAuthCompositionLatched || this.outputReadyCompositionLatched) {
       return {
         outcome: "reject",
         status: 503,
         error: structuredError(
           "CAPABILITY_UNAVAILABLE",
-          "Live authorization composition is latched fail-closed",
+          "Broker composition is latched fail-closed",
         ),
       };
     }
@@ -1136,6 +1210,7 @@ export class RelayV2BrokerCore {
         actions: [{
           kind: "route_unavailable",
           connectionId,
+          connectionIncarnation,
           hostId: authorization.hostId,
           closeCode: admission.status === 426
             ? 4406
@@ -1163,6 +1238,7 @@ export class RelayV2BrokerCore {
         actions: [{
           kind: "route_unavailable",
           connectionId,
+          connectionIncarnation,
           hostId: authorization.hostId,
           closeCode: 1013,
           error,
@@ -1183,6 +1259,7 @@ export class RelayV2BrokerCore {
         actions: [{
           kind: "route_unavailable",
           connectionId,
+          connectionIncarnation,
           hostId: authorization.hostId,
           closeCode: 1013,
           error,
@@ -1200,6 +1277,7 @@ export class RelayV2BrokerCore {
         actions: [{
           kind: "route_unavailable",
           connectionId,
+          connectionIncarnation,
           hostId: authorization.hostId,
           closeCode: 1013,
           error,
@@ -1211,6 +1289,7 @@ export class RelayV2BrokerCore {
     const openRequestId = randomUUID();
     const route: RouteState = {
       connectionId,
+      connectionIncarnation,
       routeId,
       routeFence,
       openRequestId,
@@ -1268,6 +1347,7 @@ export class RelayV2BrokerCore {
         actions: [{
           kind: "route_unavailable",
           connectionId,
+          connectionIncarnation,
           hostId: authorization.hostId,
           closeCode: 1013,
           error,
@@ -1279,6 +1359,7 @@ export class RelayV2BrokerCore {
     this.clients.set(connectionId, {
       connectionId,
       connectionIncarnation,
+      outputReadyEpoch: 0n,
       authContext: authorization,
       authorizationState: "active",
       authorizationCloseSignalled: false,
@@ -1503,7 +1584,13 @@ export class RelayV2BrokerCore {
       return {
         accepted: false,
         error,
-        actions: [{ kind: "close_client", connectionId, closeCode: 1013, reason: "host_offline" }],
+        actions: [{
+          kind: "close_client",
+          connectionId,
+          connectionIncarnation: route.connectionIncarnation,
+          closeCode: 1013,
+          reason: "host_offline",
+        }],
       };
     }
     if (!this.isCarrierAuthorizationActive(carrier)) {
@@ -1517,6 +1604,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "close_client",
         connectionId,
+        connectionIncarnation: route.connectionIncarnation,
         closeCode: 4400,
         reason: "invalid_public_frame",
       });
@@ -1530,6 +1618,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "close_client",
         connectionId,
+        connectionIncarnation: route.connectionIncarnation,
         closeCode: 4400,
         reason: "invalid_public_identity",
       });
@@ -1556,6 +1645,7 @@ export class RelayV2BrokerCore {
         actions.push({
           kind: "close_client",
           connectionId,
+          connectionIncarnation: route.connectionIncarnation,
           closeCode: 1013,
           reason: "slow_consumer",
         });
@@ -1564,7 +1654,9 @@ export class RelayV2BrokerCore {
       route.hostToClientFrames += 1;
       route.hostToClientBufferedBytes += responseBytes.byteLength;
       carrier.hostToClientBufferedBytes += responseBytes.byteLength;
+      const clientQueueWasEmpty = client.queue.length === 0;
       client.queue.push({ bytes: responseBytes, route });
+      if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
       return { accepted: true, actions: [] };
     }
     const requestId = publicFrame.kind === "request"
@@ -1744,6 +1836,7 @@ export class RelayV2BrokerCore {
       if (outcome === "blocked") return deliveries;
       if (outcome === "fenced") return deliveries;
       carrier.controlQueue.shift();
+      this.invalidateCarrierOutputReadyIfEmpty(carrier);
     }
 
     if (options.controlOnly) return deliveries;
@@ -1756,6 +1849,7 @@ export class RelayV2BrokerCore {
       if (!queue || queue.length === 0) {
         carrier.dataQueues.delete(routeId);
         carrier.dataOrder.splice(carrier.dataCursor, 1);
+        this.invalidateCarrierOutputReadyIfEmpty(carrier);
         scansWithoutDelivery = 0;
         continue;
       }
@@ -1773,6 +1867,7 @@ export class RelayV2BrokerCore {
       if (queue.length === 0) {
         carrier.dataQueues.delete(routeId);
         carrier.dataOrder.splice(carrier.dataCursor, 1);
+        this.invalidateCarrierOutputReadyIfEmpty(carrier);
       } else {
         carrier.dataCursor = (carrier.dataCursor + 1) % carrier.dataOrder.length;
       }
@@ -1792,6 +1887,9 @@ export class RelayV2BrokerCore {
     if (delivery.route && delivery.routeSeq !== null) {
       delivery.route.clientToHostBufferedBytes -= delivery.rawBytes;
       delivery.route.clientToHostFrames -= 1;
+    }
+    if (!this.carrierOutputQueueEmpty(carrier)) {
+      this.signalCarrierOutputReady(carrier, false);
     }
     return { accepted: true, actions: this.collectCarrierResumes(carrier) };
   }
@@ -1851,6 +1949,7 @@ export class RelayV2BrokerCore {
       ) return deliveries;
       if (bytes + entry.bytes.byteLength > maxBytes) break;
       client.queue.shift();
+      this.invalidateClientOutputReadyIfEmpty(client);
       const deliveryId = randomUUID();
       client.inFlight.set(deliveryId, { ...entry, deliveryId });
       bytes += entry.bytes.byteLength;
@@ -1916,6 +2015,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "close_client",
         connectionId: route.connectionId,
+        connectionIncarnation: route.connectionIncarnation,
         closeCode: 1013,
         reason: "sustained_backpressure",
       });
@@ -2071,6 +2171,7 @@ export class RelayV2BrokerCore {
       actions: [{
         kind: "route_opened",
         connectionId: route.connectionId,
+        connectionIncarnation: route.connectionIncarnation,
         routeId: route.routeId,
         routeFence: route.routeFence,
         hostId: route.authContext.hostId,
@@ -2124,6 +2225,7 @@ export class RelayV2BrokerCore {
       actions: [{
         kind: "route_unavailable",
         connectionId: route.connectionId,
+        connectionIncarnation: route.connectionIncarnation,
         hostId: route.authContext.hostId,
         closeCode,
         error,
@@ -2181,7 +2283,9 @@ export class RelayV2BrokerCore {
     route.hostToClientFrames += 1;
     route.hostToClientBufferedBytes += bytes.byteLength;
     carrier.hostToClientBufferedBytes += bytes.byteLength;
+    const clientQueueWasEmpty = client.queue.length === 0;
     client.queue.push({ bytes, route });
+    if (clientQueueWasEmpty) this.signalClientOutputReady(client, true);
     if (responseRequestId !== null) route.inFlightRequestIds.delete(responseRequestId);
     const actions = this.hostToClientAtHighWater(carrier, route)
       ? this.markHostPressure(route)
@@ -2216,6 +2320,7 @@ export class RelayV2BrokerCore {
     actions.push({
       kind: "close_client",
       connectionId: route.connectionId,
+      connectionIncarnation: route.connectionIncarnation,
       closeCode: payload.closeCode as 1013 | 4400,
       reason: payload.reason as string,
     });
@@ -2601,6 +2706,7 @@ export class RelayV2BrokerCore {
   ): boolean {
     return !this.isAuthorizationExpired(authorization)
       && !this.liveAuthCompositionLatched
+      && !this.outputReadyCompositionLatched
       && this.liveAuthorizationInvalidationFor(authorization) === undefined
       && this.observeAuthorizationHighWater(authorization);
   }
@@ -2612,6 +2718,7 @@ export class RelayV2BrokerCore {
     if (
       this.isAuthorizationExpired(replacement)
       || this.liveAuthCompositionLatched
+      || this.outputReadyCompositionLatched
       || this.liveAuthorizationInvalidationFor(replacement) !== undefined
     ) return false;
     if (BigInt(replacement.authorizationRevision) < BigInt(current.authorizationRevision)) {
@@ -2621,9 +2728,17 @@ export class RelayV2BrokerCore {
   }
 
   private isCarrierAuthorizationActive(carrier: CarrierState): boolean {
-    if (carrier.authorizationState === "fenced" || this.liveAuthCompositionLatched) return false;
+    if (
+      carrier.authorizationState === "fenced"
+      || this.liveAuthCompositionLatched
+      || this.outputReadyCompositionLatched
+    ) return false;
     const expired = this.isAuthorizationExpired(carrier.authContext);
-    if (carrier.authorizationState === "fenced" || this.liveAuthCompositionLatched) return false;
+    if (
+      carrier.authorizationState === "fenced"
+      || this.liveAuthCompositionLatched
+      || this.outputReadyCompositionLatched
+    ) return false;
     if (expired) {
       this.fenceHostAuthorization(carrier, "access_expired");
       return false;
@@ -2637,9 +2752,17 @@ export class RelayV2BrokerCore {
   }
 
   private isClientAuthorizationActive(client: ClientState): boolean {
-    if (client.authorizationState === "fenced" || this.liveAuthCompositionLatched) return false;
+    if (
+      client.authorizationState === "fenced"
+      || this.liveAuthCompositionLatched
+      || this.outputReadyCompositionLatched
+    ) return false;
     const expired = this.isAuthorizationExpired(client.authContext);
-    if (client.authorizationState === "fenced" || this.liveAuthCompositionLatched) return false;
+    if (
+      client.authorizationState === "fenced"
+      || this.liveAuthCompositionLatched
+      || this.outputReadyCompositionLatched
+    ) return false;
     if (expired) {
       this.fenceClientAuthorization(client, "access_expired");
       return false;
@@ -2985,7 +3108,11 @@ export class RelayV2BrokerCore {
     if (route.clientReadPaused) {
       route.clientReadPaused = false;
       route.clientToHostPressureSinceMs = null;
-      actions.push({ kind: "resume_client", connectionId: route.connectionId });
+      actions.push({
+        kind: "resume_client",
+        connectionId: route.connectionId,
+        connectionIncarnation: route.connectionIncarnation,
+      });
     }
     const carrier = this.carriers.get(route.carrierTransportId);
     if (!carrier || carrier.status !== "active" || carrier.connectorId !== route.connectorId) {
@@ -3043,7 +3170,11 @@ export class RelayV2BrokerCore {
     }
     if (route.clientReadPaused) return [];
     route.clientReadPaused = true;
-    return [{ kind: "pause_client", connectionId: route.connectionId }];
+    return [{
+      kind: "pause_client",
+      connectionId: route.connectionId,
+      connectionIncarnation: route.connectionIncarnation,
+    }];
   }
 
   private markHostPressure(route: RouteState): RelayV2BrokerAction[] {
@@ -3074,7 +3205,11 @@ export class RelayV2BrokerCore {
     ) return [];
     route.clientReadPaused = false;
     route.clientToHostPressureSinceMs = null;
-    return [{ kind: "resume_client", connectionId: route.connectionId }];
+    return [{
+      kind: "resume_client",
+      connectionId: route.connectionId,
+      connectionIncarnation: route.connectionIncarnation,
+    }];
   }
 
   private maybeResumeHostPressure(route: RouteState): RelayV2BrokerAction[] {
@@ -3112,11 +3247,97 @@ export class RelayV2BrokerCore {
     return actions;
   }
 
+  private carrierOutputQueueEmpty(carrier: CarrierState): boolean {
+    return carrier.controlQueue.length === 0 && carrier.dataQueues.size === 0;
+  }
+
+  private signalCarrierOutputReady(
+    carrier: CarrierState,
+    newQueueEpoch: boolean,
+  ): void {
+    if (newQueueEpoch) carrier.outputReadyEpoch += 1n;
+    if (
+      !this.outputReadyPort
+      || this.outputReadyCompositionLatched
+      || this.carrierOutputQueueEmpty(carrier)
+    ) return;
+    const epoch = carrier.outputReadyEpoch;
+    const connectionIncarnation = carrier.connectionIncarnation;
+    const fence = brokerOutputReadyFence(Object.freeze({
+      kind: "host" as const,
+      transportId: carrier.transportId,
+      connectionIncarnation,
+      readyEpoch: epoch.toString(10),
+    }), () => (
+      this.carriers.get(carrier.transportId) === carrier
+      && carrier.connectionIncarnation === connectionIncarnation
+      && carrier.outputReadyEpoch === epoch
+      && carrier.authorizationState === "active"
+      && !this.liveAuthCompositionLatched
+      && !this.outputReadyCompositionLatched
+      && !this.carrierOutputQueueEmpty(carrier)
+    ));
+    try {
+      this.outputReadyPort.ready(fence);
+    } catch {
+      // The queue mutation is already committed. Never unwind it; permanently
+      // close all ready-based admission/dispatch instead of silently assuming
+      // a future edge will repair the composition.
+      this.outputReadyCompositionLatched = true;
+    }
+  }
+
+  private invalidateCarrierOutputReadyIfEmpty(carrier: CarrierState): void {
+    if (this.carrierOutputQueueEmpty(carrier)) carrier.outputReadyEpoch += 1n;
+  }
+
+  private signalClientOutputReady(
+    client: ClientState,
+    newQueueEpoch: boolean,
+  ): void {
+    if (newQueueEpoch) client.outputReadyEpoch += 1n;
+    if (
+      !this.outputReadyPort
+      || this.outputReadyCompositionLatched
+      || client.queue.length === 0
+    ) return;
+    const epoch = client.outputReadyEpoch;
+    const connectionIncarnation = client.connectionIncarnation;
+    const fence = brokerOutputReadyFence(Object.freeze({
+      kind: "client" as const,
+      connectionId: client.connectionId,
+      connectionIncarnation,
+      readyEpoch: epoch.toString(10),
+    }), () => {
+      const route = this.routes.get(client.routeId);
+      return this.clients.get(client.connectionId) === client
+        && client.connectionIncarnation === connectionIncarnation
+        && client.outputReadyEpoch === epoch
+        && client.authorizationState === "active"
+        && !this.liveAuthCompositionLatched
+        && !this.outputReadyCompositionLatched
+        && client.queue.length > 0
+        && route?.connectionId === client.connectionId
+        && route.connectionIncarnation === client.connectionIncarnation
+        && route.status === "opened";
+    });
+    try {
+      this.outputReadyPort.ready(fence);
+    } catch {
+      this.outputReadyCompositionLatched = true;
+    }
+  }
+
+  private invalidateClientOutputReadyIfEmpty(client: ClientState): void {
+    if (client.queue.length === 0) client.outputReadyEpoch += 1n;
+  }
+
   private enqueueCarrierControl(
     carrier: CarrierState,
     frame: RelayV2JsonObject,
     route: RouteState | null,
   ): boolean {
+    const wasEmpty = this.carrierOutputQueueEmpty(carrier);
     const entry = carrierFrame(frame);
     entry.route = route;
     if (
@@ -3125,6 +3346,7 @@ export class RelayV2BrokerCore {
     ) return false;
     carrier.controlQueue.push(entry);
     carrier.queuedBytes += entry.wireBytes;
+    if (wasEmpty) this.signalCarrierOutputReady(carrier, true);
     return true;
   }
 
@@ -3135,6 +3357,7 @@ export class RelayV2BrokerCore {
     rawBytes: number,
     routeSeq: bigint,
   ): boolean {
+    const wasEmpty = this.carrierOutputQueueEmpty(carrier);
     const wire = encodeCarrier(frame);
     if (
       route.clientToHostFrames + 1 > RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames
@@ -3161,6 +3384,7 @@ export class RelayV2BrokerCore {
     carrier.queuedBytes += wire.byteLength;
     route.clientToHostBufferedBytes += rawBytes;
     route.clientToHostFrames += 1;
+    if (wasEmpty) this.signalCarrierOutputReady(carrier, true);
     return true;
   }
 
@@ -3179,6 +3403,7 @@ export class RelayV2BrokerCore {
       if (carrier.dataCursor > index) carrier.dataCursor -= 1;
       if (carrier.dataCursor >= carrier.dataOrder.length) carrier.dataCursor = 0;
     }
+    this.invalidateCarrierOutputReadyIfEmpty(carrier);
   }
 
   private discardQueuedRouteControl(carrier: CarrierState, route: RouteState): void {
@@ -3191,6 +3416,7 @@ export class RelayV2BrokerCore {
       carrier.queuedBytes -= entry.wireBytes;
     }
     carrier.controlQueue = retained;
+    this.invalidateCarrierOutputReadyIfEmpty(carrier);
   }
 
   private dropRoute(route: RouteState): void {
@@ -3209,6 +3435,7 @@ export class RelayV2BrokerCore {
         this.releaseHostToClientBytes(route, delivery.bytes.byteLength);
       }
       client.inFlight.clear();
+      client.outputReadyEpoch += 1n;
       this.clients.delete(route.connectionId);
     }
     route.status = "closed";
@@ -3220,6 +3447,7 @@ export class RelayV2BrokerCore {
     if (!client) return;
     for (const entry of client.queue) this.releaseHostToClientBytes(route, entry.bytes.byteLength);
     client.queue = [];
+    client.outputReadyEpoch += 1n;
   }
 
   private releaseHostToClientBytes(route: RouteState, bytes: number): void {
@@ -3247,6 +3475,7 @@ export class RelayV2BrokerCore {
         actions.push({
           kind: "route_unavailable",
           connectionId: route.connectionId,
+          connectionIncarnation: route.connectionIncarnation,
           hostId: route.authContext.hostId,
           closeCode: 1013,
           error: structuredError(
@@ -3261,6 +3490,7 @@ export class RelayV2BrokerCore {
         actions.push({
           kind: "close_client",
           connectionId: route.connectionId,
+          connectionIncarnation: route.connectionIncarnation,
           closeCode: 1013,
           reason: superseded ? "host_superseded" : "host_offline",
         });
@@ -3275,6 +3505,7 @@ export class RelayV2BrokerCore {
     carrier.routeIds.clear();
     carrier.dataOrder = [];
     carrier.dataCursor = 0;
+    carrier.outputReadyEpoch += 1n;
     carrier.queuedBytes = 0;
     for (const delivery of carrier.inFlight.values()) {
       if (delivery.route && delivery.routeSeq !== null) {
