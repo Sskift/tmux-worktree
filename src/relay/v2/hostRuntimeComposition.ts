@@ -47,6 +47,8 @@ import type {
 
 type NonH2ReadinessSource = Exclude<RelayV2HostCapabilityReadinessSource, "h2">;
 
+const MAX_CARRIER_READINESS_GENERATION = 18_446_744_073_709_551_615n;
+
 export type RelayV2HostRuntimeCompositionH2ReadinessLifecycle =
   RelayV2HostH2ReadinessLifecycle;
 
@@ -131,9 +133,18 @@ export interface RelayV2HostCarrierRuntimeFacade {
   requestReauthentication(requestId: string, credentialReference: string): boolean;
 }
 
+export interface RelayV2HostCarrierRuntimeCompositionReadinessLifecycle {
+  readonly codec: RelayV2HostCapabilityReadinessSourceSink<"codec">;
+  readonly h0: RelayV2HostCapabilityReadinessSourceSink<"h0">;
+  readonly h1: RelayV2HostCapabilityReadinessSourceSink<"h1">;
+  readonly h2: RelayV2HostRuntimeCompositionH2ReadinessLifecycle;
+  readonly h3: RelayV2HostCapabilityReadinessSourceSink<"h3">;
+  current(): RelayV2HostReadinessSnapshot;
+}
+
 export interface RelayV2HostCarrierRuntimeComposition {
   readonly carrier: RelayV2HostCarrierRuntimeFacade;
-  readonly readiness: RelayV2HostRuntimeCompositionReadinessLifecycle;
+  readonly readiness: RelayV2HostCarrierRuntimeCompositionReadinessLifecycle;
   sendTerminalFrame(
     route: RelayV2TerminalRuntimeBinding,
     frame: RelayV2JsonObject,
@@ -442,7 +453,31 @@ export function createRelayV2HostCarrierRuntimeComposition(
   let acceptingBindings = true;
   let bridgeActive = true;
   let lifecycleDisposed = false;
+  let carrierReadinessActive = true;
+  let carrierReadinessGeneration = 0n;
   let actor: RelayV2HostCarrierActor | null = null;
+
+  const applyCarrierStatus = (status: RelayV2HostCarrierStatus): void => {
+    if (!carrierReadinessActive) return;
+    if (carrierReadinessGeneration === MAX_CARRIER_READINESS_GENERATION) {
+      carrierReadinessActive = false;
+      try { runtime.readiness.carrier.close(); } catch {}
+      return;
+    }
+    // Connecting and registered share one connector generation, while the
+    // readiness owner requires a newer generation for every readiness flip.
+    carrierReadinessGeneration += 1n;
+    try {
+      runtime.readiness.carrier.apply(Object.freeze({
+        source: "carrier",
+        generation: carrierReadinessGeneration.toString(10),
+        ready: status.phase === "registered",
+      }));
+    } catch {
+      carrierReadinessActive = false;
+      try { runtime.readiness.carrier.close(); } catch {}
+    }
+  };
 
   const resolveCarrierBinding = (
     binding: RelayV2HostRouteBinding,
@@ -521,8 +556,12 @@ export function createRelayV2HostCarrierRuntimeComposition(
   });
 
   try {
+    const {
+      onStatus: observedStatus,
+      ...carrierOptions
+    } = options.carrier;
     actor = new RelayV2HostCarrierActor({
-      ...options.carrier,
+      ...carrierOptions,
       hostId,
       hostEpoch,
       hostInstanceId,
@@ -530,8 +569,13 @@ export function createRelayV2HostCarrierRuntimeComposition(
       advertisedCapabilities: [],
       clientDialects: ["tw-relay.v2"],
       dialectAdapters: Object.freeze({}),
+      onStatus(status): void {
+        applyCarrierStatus(status);
+        observedStatus?.(status);
+      },
     });
   } catch (error) {
+    carrierReadinessActive = false;
     bridgeActive = false;
     bindings.clear();
     try { runtime.dispose(); } catch {}
@@ -549,9 +593,18 @@ export function createRelayV2HostCarrierRuntimeComposition(
     ),
   });
 
+  const readiness: RelayV2HostCarrierRuntimeCompositionReadinessLifecycle = Object.freeze({
+    codec: runtime.readiness.codec,
+    h0: runtime.readiness.h0,
+    h1: runtime.readiness.h1,
+    h2: runtime.readiness.h2,
+    h3: runtime.readiness.h3,
+    current: () => runtime.readiness.current(),
+  });
+
   return Object.freeze({
     carrier,
-    readiness: runtime.readiness,
+    readiness,
     sendTerminalFrame: (
       route: RelayV2TerminalRuntimeBinding,
       frame: RelayV2JsonObject,
@@ -567,6 +620,7 @@ export function createRelayV2HostCarrierRuntimeComposition(
         try {
           actor!.dispose();
         } finally {
+          carrierReadinessActive = false;
           bridgeActive = false;
           bindings.clear();
         }

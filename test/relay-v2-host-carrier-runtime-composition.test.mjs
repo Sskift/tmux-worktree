@@ -38,6 +38,10 @@ function settle(turns = 8) {
   );
 }
 
+function readinessReady(snapshot) {
+  return Object.values(snapshot.capabilities).every((ready) => ready === true);
+}
+
 class QueueDiscovery {
   scans = [];
 
@@ -90,7 +94,7 @@ function completeScope() {
   };
 }
 
-async function createHarness() {
+async function createHarness({ throwStatusObserver = false } = {}) {
   const home = mkdtempSync(join(tmpdir(), "tw-relay-v2-carrier-runtime-"));
   const store = await hostState.RelayV2HostStateStore.open({
     paths: hostState.relayV2HostStatePaths(home),
@@ -118,8 +122,10 @@ async function createHarness() {
   };
   let expectedWelcome = null;
   let expectedQuery = null;
+  let composition = null;
+  const statusObservations = [];
   const identityReads = { hostId: 0, hostEpoch: 0, hostInstanceId: 0 };
-  const composition = compositionModule.createRelayV2HostCarrierRuntimeComposition({
+  composition = compositionModule.createRelayV2HostCarrierRuntimeComposition({
     runtime: {
       get hostId() {
         if (++identityReads.hostId > 1) throw new Error("hostId was captured twice");
@@ -210,10 +216,18 @@ async function createHarness() {
       },
       idFactory: () => "carrier-runtime-host-hello",
       clock: () => 1_783_700_100_000,
+      onStatus(status) {
+        if (composition === null) throw new Error("carrier status preceded composition");
+        statusObservations.push({
+          status: structuredClone(status),
+          cut: composition.readiness.current(),
+        });
+        if (throwStatusObserver) throw new Error("status observer failure");
+      },
     },
   });
 
-  for (const source of ["codec", "carrier", "h0", "h1", "h3"]) {
+  for (const source of ["codec", "h0", "h1", "h3"]) {
     assert.equal(composition.readiness[source].apply({
       source,
       generation: "1",
@@ -238,6 +252,7 @@ async function createHarness() {
     spool,
     composition,
     identity,
+    statusObservations,
     expectedWelcome: () => expectedWelcome,
     expectedQuery: () => expectedQuery,
     async cleanup() {
@@ -254,18 +269,34 @@ function acknowledgeAll(connection, transport) {
   }
 }
 
-async function openRoute(harness) {
+function connectCarrier(harness) {
   const transport = new FakeTransport();
   const connection = harness.composition.carrier.connect(transport, "host-credential");
   const hello = decodeCarrier(transport.sent.at(-1));
   assert.deepEqual(hello.payload.capabilities, []);
   assert.deepEqual(hello.payload.clientDialects, ["tw-relay.v2"]);
+  return { transport, connection, hello };
+}
+
+function registerCarrier(active, connectorId, disposition = "connected") {
+  const { transport, connection, hello } = active;
   connection.acknowledge(transport.confirmNext());
 
   const registered = fixture("host-registered");
   registered.requestId = hello.requestId;
-  registered.connectorId = "carrier-runtime-connector";
+  registered.connectorId = connectorId;
+  registered.payload.disposition = disposition;
+  registered.payload.supersededHostInstanceId = disposition === "replaced"
+    ? "previous-carrier-runtime-instance"
+    : null;
   connection.receive(carrierWire(registered));
+  return registered;
+}
+
+async function openRoute(harness) {
+  const active = connectCarrier(harness);
+  const { transport, connection } = active;
+  const registered = registerCarrier(active, "carrier-runtime-connector");
 
   const route = fixture("route-open");
   route.connectorId = registered.connectorId;
@@ -298,6 +329,65 @@ function sendClientFrame(route, frame) {
     },
   }));
 }
+
+test("combined composition owns carrier readiness transitions before status observation", async () => {
+  const h = await createHarness({ throwStatusObserver: true });
+  try {
+    assert.equal(h.composition.readiness.carrier, undefined);
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
+    let previousCutGeneration = BigInt(h.composition.readiness.current().generation);
+    let observationCount = 0;
+
+    const expectStatus = (phase, ready) => {
+      observationCount += 1;
+      assert.equal(h.statusObservations.length, observationCount);
+      const observation = h.statusObservations[observationCount - 1];
+      assert.equal(observation.status.phase, phase);
+      assert.equal(readinessReady(observation.cut), ready);
+      assert.equal(readinessReady(h.composition.readiness.current()), ready);
+      const cutGeneration = BigInt(observation.cut.generation);
+      assert.ok(cutGeneration > previousCutGeneration);
+      previousCutGeneration = cutGeneration;
+    };
+
+    const first = connectCarrier(h);
+    expectStatus("connecting", false);
+    registerCarrier(first, "carrier-readiness-first");
+    expectStatus("registered", true);
+    assert.equal(h.composition.carrier.status().phase, "registered");
+
+    first.connection.closed(1006);
+    expectStatus("offline", false);
+
+    const second = connectCarrier(h);
+    expectStatus("connecting", false);
+    registerCarrier(second, "carrier-readiness-second");
+    expectStatus("registered", true);
+
+    const replacement = connectCarrier(h);
+    expectStatus("connecting", false);
+    assert.deepEqual(second.transport.closes, [{ code: 1000, reason: "connector_replaced" }]);
+    const replacementRegistration = registerCarrier(
+      replacement,
+      "carrier-readiness-replacement",
+      "replaced",
+    );
+    expectStatus("registered", true);
+
+    const superseded = fixture("host-superseded");
+    superseded.connectorId = replacementRegistration.connectorId;
+    superseded.payload.hostId = HOST_ID;
+    superseded.payload.losingConnectorId = replacementRegistration.connectorId;
+    superseded.payload.losingHostInstanceId = h.identity.hostInstanceId;
+    superseded.payload.winningConnectorId = "carrier-readiness-winner";
+    superseded.payload.winningHostInstanceId = "carrier-readiness-winning-instance";
+    replacement.connection.receive(carrierWire(superseded));
+    expectStatus("superseded", false);
+    assert.equal(h.composition.carrier.status().phase, "superseded");
+  } finally {
+    await h.cleanup();
+  }
+});
 
 function hostDataFrames(transport) {
   return transport.sent
@@ -385,14 +475,23 @@ test("combined dispose keeps the bridge alive through receipt cleanup and then c
     assert.equal(hostDataFrames(route.transport).length, 1);
     assert.equal(route.transport.pending.length, 1);
 
+    const observationsBeforeDispose = h.statusObservations.length;
     h.composition.dispose();
     h.composition.dispose();
+    assert.equal(h.statusObservations.length, observationsBeforeDispose + 1);
+    assert.equal(h.statusObservations.at(-1).status.phase, "offline");
+    assert.equal(readinessReady(h.statusObservations.at(-1).cut), false);
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
     assert.deepEqual(route.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
     assert.throws(
       () => h.composition.carrier.connect(new FakeTransport(), "host-credential"),
       /disposed and cannot reconnect/,
     );
 
+    const observationsAfterDispose = h.statusObservations.length;
+    route.connection.closed(1006);
+    assert.equal(h.statusObservations.length, observationsAfterDispose);
+    assert.equal(readinessReady(h.composition.readiness.current()), false);
     const late = route.transport.confirmNext();
     assert.doesNotThrow(() => route.connection.acknowledge(late));
     assert.deepEqual(route.transport.closes, [{ code: 1000, reason: "host_shutdown" }]);
