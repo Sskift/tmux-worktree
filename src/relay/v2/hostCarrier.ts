@@ -65,13 +65,21 @@ export interface RelayV2HostCredentialAckFence {
 }
 
 /**
- * The credential owner performs the durable CAS. The carrier only presents an
- * ACK when its connector/request/jti/reference fence is still current. This
- * module intentionally provides no credential authority or persistence
- * adapter; G1 integration must inject the later dedicated v2 implementation.
+ * The credential owner performs the durable preparation and ACK CAS. The
+ * carrier sends only the returned winner and presents an ACK when its
+ * connector/request/jti/reference fence is still current. This module
+ * intentionally provides no credential authority or persistence adapter; G1
+ * integration must inject the dedicated v2 implementation.
  */
 export interface RelayV2HostCarrierCredentialReferences {
   read(reference: string): RelayV2HostCredentialRecord;
+  prepareReauthentication(input: {
+    credentialReference: string;
+    requestId: string;
+  }): {
+    fence: RelayV2HostCredentialAckFence;
+    accessToken: string;
+  };
   acknowledgeReauthentication(fence: RelayV2HostCredentialAckFence): boolean;
 }
 
@@ -263,6 +271,9 @@ interface OutboundItem {
   payloadBytes?: number;
   queueKey?: string;
   onSent?: () => void;
+  /** Durable reauthentication is retried only by an explicit caller attempt. */
+  dropOnTransportRefusal?: boolean;
+  transportRefused?: boolean;
 }
 
 interface RouteState {
@@ -304,6 +315,14 @@ interface ConnectorState {
   orphanedInFlightSinceMs: number | null;
   pressureTimer: { deadlineMs: number; cancel: () => void } | null;
   flushing: boolean;
+}
+
+interface ReauthenticationPreparationLease {
+  readonly connector: ConnectorState;
+  readonly connectorGeneration: number;
+  readonly connectorId: string;
+  readonly transport: RelayV2HostCarrierTransport;
+  invalidated: boolean;
 }
 
 function positiveLimit(value: number | undefined, fallback: number): number {
@@ -436,6 +455,76 @@ function validateCredentialRecord(
   }
 }
 
+function captureExactOwnDataValues(
+  value: unknown,
+  fields: readonly string[],
+): readonly unknown[] | null {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    if (Object.getPrototypeOf(value) !== Object.prototype) return null;
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return null;
+  }
+  const expected = new Set(fields);
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.length !== fields.length
+    || keys.some((key) => typeof key !== "string" || !expected.has(key))) return null;
+  const values: unknown[] = [];
+  for (const field of fields) {
+    const descriptor = descriptors[field];
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) return null;
+    values.push(descriptor.value);
+  }
+  return values;
+}
+
+type PreparedReauthenticationSnapshot = Readonly<
+  RelayV2HostCredentialAckFence & { accessToken: string }
+>;
+
+function snapshotPreparedReauthentication(
+  requestedReference: string,
+  prepared: unknown,
+): PreparedReauthenticationSnapshot {
+  const preparedValues = captureExactOwnDataValues(prepared, ["fence", "accessToken"]);
+  const fenceValues = preparedValues
+    ? captureExactOwnDataValues(preparedValues[0], [
+        "reference", "version", "requestId", "grantId", "accessJti",
+      ])
+    : null;
+  if (!preparedValues || !fenceValues) {
+    throw new Error("Relay v2 host reauthentication preparation is invalid");
+  }
+  const [reference, version, requestId, grantId, accessJti] = fenceValues;
+  const accessToken = preparedValues[1];
+  if (typeof reference !== "string"
+    || typeof version !== "string"
+    || typeof requestId !== "string"
+    || typeof grantId !== "string"
+    || typeof accessJti !== "string"
+    || typeof accessToken !== "string") {
+    throw new Error("Relay v2 host reauthentication preparation is invalid");
+  }
+  const snapshot = Object.freeze({
+    reference,
+    version,
+    requestId,
+    grantId,
+    accessJti,
+    accessToken,
+  });
+  validateCredentialRecord(requestedReference, snapshot);
+  if (snapshot.version === "0"
+    || !snapshot.requestId
+    || Buffer.byteLength(snapshot.requestId, "utf8") > 128
+    || /[\0\r\n]/.test(snapshot.requestId)) {
+    throw new Error("Relay v2 host reauthentication fence is invalid");
+  }
+  return snapshot;
+}
+
 function structuredError(
   code: RelayV2HostCarrierStructuredErrorCode,
   message: string,
@@ -464,6 +553,13 @@ export class RelayV2HostCarrierActor {
   private readonly terminalMaxFrameBytes: number;
   private generation = 0;
   private current: ConnectorState | null = null;
+  /**
+   * A synchronous credential adapter may invoke arbitrary JavaScript (and a
+   * returned Proxy may do the same while its descriptors are inspected). Keep
+   * one actor-local lease bound to the exact connector incarnation so no such
+   * reentry can start a second durable preparation.
+   */
+  private reauthenticationPreparation: ReauthenticationPreparationLease | null = null;
   private permanentlySuperseded = false;
   private latestStatus: RelayV2HostCarrierStatus | null = null;
 
@@ -623,43 +719,90 @@ export class RelayV2HostCarrierActor {
   }
 
   requestReauthentication(requestId: string, credentialReference: string): boolean {
+    const activePreparation = this.reauthenticationPreparation;
+    if (activePreparation) {
+      activePreparation.invalidated = true;
+      throw new Error("Relay v2 host reauthentication preparation was reentered");
+    }
     const connector = this.current;
     if (!connector || connector.phase !== "registered" || !connector.connectorId) {
       return false;
     }
-    const credential = this.options.credentialReferences.read(credentialReference);
-    validateCredentialRecord(credentialReference, credential);
-    if (credential.grantId !== connector.credential.grantId) {
-      throw new Error("Relay v2 host reauthentication cannot change the host grant");
-    }
-
-    const queueKey = `reauth:${requestId}`;
-    if (connector.pendingReauthentication) {
-      this.removeControlItems(
-        connector,
-        (item) => item.queueKey === connector.pendingReauthentication?.queueKey,
-      );
-    }
-    connector.pendingReauthentication = {
-      reference: credential.reference,
-      version: credential.version,
-      requestId,
-      grantId: credential.grantId,
-      accessJti: credential.accessJti,
-      queueKey,
-    };
-
-    const frame: RelayV2JsonObject = {
-      carrierVersion: 1,
-      type: "host.reauthenticate",
-      requestId,
+    const preparation: ReauthenticationPreparationLease = {
+      connector,
+      connectorGeneration: connector.generation,
       connectorId: connector.connectorId,
-      payload: { accessToken: credential.accessToken },
+      transport: connector.transport,
+      invalidated: false,
     };
-    if (!this.enqueueControl(connector, frame, { queueKey })) {
-      return false;
+    this.reauthenticationPreparation = preparation;
+    try {
+      const winner = snapshotPreparedReauthentication(
+        credentialReference,
+        this.options.credentialReferences.prepareReauthentication({
+          credentialReference,
+          requestId,
+        }),
+      );
+      // Preparation and descriptor capture are both untrusted synchronous
+      // calls. Re-establish exact ownership before touching volatile pending
+      // state or either carrier queue.
+      if (!this.ownsReauthenticationPreparation(preparation)) return false;
+      if (winner.grantId !== connector.credential.grantId) {
+        throw new Error("Relay v2 host reauthentication cannot change the host grant");
+      }
+
+      const queueKey = `reauth:${winner.requestId}:${winner.version}:${winner.accessJti}`;
+      if (connector.pendingReauthentication) {
+        this.removeControlItems(
+          connector,
+          (item) => item.queueKey === connector.pendingReauthentication?.queueKey,
+        );
+      }
+      const pending: PendingReauthentication = {
+        reference: winner.reference,
+        version: winner.version,
+        requestId: winner.requestId,
+        grantId: winner.grantId,
+        accessJti: winner.accessJti,
+        queueKey,
+      };
+      connector.pendingReauthentication = pending;
+
+      const frame: RelayV2JsonObject = {
+        carrierVersion: 1,
+        type: "host.reauthenticate",
+        requestId: winner.requestId,
+        connectorId: preparation.connectorId,
+        payload: { accessToken: winner.accessToken },
+      };
+      if (!this.enqueueControl(connector, frame, {
+        queueKey,
+        dropOnTransportRefusal: true,
+      })) {
+        return false;
+      }
+      return true;
+    } finally {
+      // Never clear a lease installed by a later connector incarnation.
+      if (this.reauthenticationPreparation === preparation) {
+        this.reauthenticationPreparation = null;
+      }
     }
-    return true;
+  }
+
+  private ownsReauthenticationPreparation(
+    preparation: ReauthenticationPreparationLease,
+  ): boolean {
+    const connector = preparation.connector;
+    return !preparation.invalidated
+      && this.reauthenticationPreparation === preparation
+      && !this.permanentlySuperseded
+      && this.current === connector
+      && connector.generation === preparation.connectorGeneration
+      && connector.connectorId === preparation.connectorId
+      && connector.transport === preparation.transport
+      && connector.phase === "registered";
   }
 
   sendPublic(binding: RelayV2HostRouteBinding, payload: Uint8Array): boolean {
@@ -1226,16 +1369,17 @@ export class RelayV2HostCarrierActor {
       this.evaluatePressure(connector);
       return false;
     }
-    connector.controlQueue.push({
+    const item: OutboundItem = {
       ...metadata,
       bytes,
       deliveryToken: this.newDeliveryToken(connector),
-    });
+    };
+    connector.controlQueue.push(item);
     connector.controlBytes += bytes.byteLength;
     this.noteAdmissionPressure(connector, metadata.route ?? null, false);
     if (!this.connectorCanFlush(connector)) return false;
     this.flush(connector);
-    return connector.phase !== "closed";
+    return connector.phase !== "closed" && item.transportRefused !== true;
   }
 
   private enqueueData(
@@ -1296,7 +1440,19 @@ export class RelayV2HostCarrierActor {
           if (!connector.transport.trySend(
             control.bytes.slice(),
             control.deliveryToken,
-          )) return;
+          )) {
+            if (control.dropOnTransportRefusal) {
+              if (connector.controlQueue[0] !== control) {
+                this.failConnector(connector, 1013, "reentrant_transport_mutation");
+                return;
+              }
+              connector.controlQueue.shift();
+              connector.controlBytes -= control.bytes.byteLength;
+              control.transportRefused = true;
+              this.evaluatePressure(connector);
+            }
+            return;
+          }
           if (!this.connectorCanFlush(connector)) return;
           if (connector.controlQueue[0] !== control) {
             this.failConnector(connector, 1013, "reentrant_transport_mutation");

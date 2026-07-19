@@ -29,7 +29,7 @@ class FakeTransport {
     this.sent.push(Uint8Array.from(frame));
     this.bufferedBytes += frame.byteLength;
     this.pendingDeliveries.push({ deliveryToken, byteLength: frame.byteLength });
-    this.onTrySend?.(deliveryToken);
+    this.onTrySend?.(deliveryToken, Uint8Array.from(frame));
     return true;
   }
 
@@ -55,8 +55,12 @@ class FakeTransport {
 
 class FakeCredentials {
   records = new Map();
-  pending = null;
-  acknowledgements = [];
+  prepareResult = undefined;
+  prepareError = undefined;
+  onPrepare = undefined;
+  prepareCalls = [];
+  ackCalls = [];
+  ackResult = false;
 
   add(reference, version, accessJti) {
     this.records.set(reference, {
@@ -74,15 +78,31 @@ class FakeCredentials {
     return { ...record };
   }
 
-  acknowledgeReauthentication(fence) {
-    this.acknowledgements.push({ ...fence });
-    if (!this.pending) return false;
-    for (const key of ["reference", "version", "requestId", "grantId", "accessJti"]) {
-      if (this.pending[key] !== fence[key]) return false;
-    }
-    this.pending = null;
-    return true;
+  prepareReauthentication(input) {
+    this.prepareCalls.push({ ...input });
+    if (this.prepareError) throw this.prepareError;
+    if (this.onPrepare) return this.onPrepare({ ...input });
+    return this.prepareResult;
   }
+
+  acknowledgeReauthentication(fence) {
+    this.ackCalls.push({ ...fence });
+    return this.ackResult;
+  }
+}
+
+function preparedReauthentication(overrides = {}) {
+  const reference = overrides.reference ?? "credential-2";
+  return {
+    fence: {
+      reference,
+      version: overrides.version ?? "2",
+      requestId: overrides.requestId ?? "reauth-2",
+      grantId: overrides.grantId ?? "host-grant-uuid",
+      accessJti: overrides.accessJti ?? "access-jti-2",
+    },
+    accessToken: overrides.accessToken ?? `twcap2.${reference}.payload.mac`,
+  };
 }
 
 function createHarness(options = {}) {
@@ -240,6 +260,21 @@ function routeData(connectorId, routeId, routeFence, seq, bytes) {
       opcode: "text",
       encoding: "base64",
       data: Buffer.from(bytes).toString("base64"),
+    },
+  };
+}
+
+function reauthenticated(connectorId, requestId, accessJti, deduplicated = false) {
+  return {
+    carrierVersion: 1,
+    type: "host.reauthenticated",
+    requestId,
+    connectorId,
+    payload: {
+      grantId: "host-grant-uuid",
+      jti: accessJti,
+      expiresAtMs: 1_783_707_200_000,
+      deduplicated,
     },
   };
 }
@@ -781,60 +816,411 @@ test("connector replacement and broker supersede are atomic and never report a f
   );
 });
 
-test("a stale reauthentication ACK cannot clear a newer pending credential reference", () => {
-  const h = createHarness();
-  h.credentials.add("credential-2", "2", "access-jti-2");
-  h.credentials.add("credential-3", "3", "access-jti-3");
-  const active = connect(h);
-  const connectorId = register(active.connection, active.hello);
+test("reauthentication uses only a descriptor-safe durable winner", async (t) => {
+  function registeredHarness(prepared = preparedReauthentication()) {
+    const h = createHarness();
+    h.credentials.add("credential-2", "2", "access-jti-2");
+    h.credentials.prepareResult = prepared;
+    const active = connect(h);
+    const connectorId = register(active.connection, active.hello);
+    acknowledgeAll(active.connection, active.transport);
+    return { h, active, connectorId };
+  }
 
-  h.credentials.pending = {
-    reference: "credential-2",
-    version: "2",
-    requestId: "reauth-2",
-    grantId: "host-grant-uuid",
-    accessJti: "access-jti-2",
-  };
-  assert.equal(h.actor.requestReauthentication("reauth-2", "credential-2"), true);
-  h.credentials.pending = {
-    reference: "credential-3",
-    version: "3",
-    requestId: "reauth-3",
-    grantId: "host-grant-uuid",
-    accessJti: "access-jti-3",
-  };
-  assert.equal(h.actor.requestReauthentication("reauth-3", "credential-3"), true);
+  await t.test("prepare completes before transport and its winner overrides caller input", () => {
+    const prepared = preparedReauthentication({ requestId: "durable-reauth-2" });
+    const { h, active, connectorId } = registeredHarness(prepared);
+    active.transport.onTrySend = (_deliveryToken, bytes) => {
+      const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+      if (frame.type === "host.reauthenticate") {
+        assert.equal(h.credentials.prepareCalls.length, 1);
+      }
+    };
 
-  active.connection.receive(wire({
-    carrierVersion: 1,
-    type: "host.reauthenticated",
-    requestId: "reauth-2",
-    connectorId,
-    payload: {
-      grantId: "host-grant-uuid",
-      jti: "access-jti-2",
-      expiresAtMs: 1_783_707_200_000,
-      deduplicated: false,
+    assert.equal(
+      h.actor.requestReauthentication("caller-must-not-win", "credential-2"),
+      true,
+    );
+    assert.deepEqual(h.credentials.prepareCalls, [{
+      credentialReference: "credential-2",
+      requestId: "caller-must-not-win",
+    }]);
+    const sentReauthentication = decoded(active.transport.sent).at(-1);
+    assert.equal(sentReauthentication.carrierVersion, 1);
+    assert.equal(sentReauthentication.type, "host.reauthenticate");
+    assert.equal(sentReauthentication.requestId, "durable-reauth-2");
+    assert.equal(sentReauthentication.connectorId, connectorId);
+    assert.equal(sentReauthentication.payload.accessToken, prepared.accessToken);
+
+    h.credentials.ackResult = true;
+    active.connection.receive(wire(reauthenticated(
+      connectorId,
+      "durable-reauth-2",
+      "access-jti-2",
+    )));
+    assert.deepEqual(h.credentials.ackCalls, [{ ...prepared.fence }]);
+  });
+
+  await t.test("authority ACK rejection preserves the volatile winner", () => {
+    const prepared2 = preparedReauthentication();
+    const { h, active, connectorId } = registeredHarness(prepared2);
+    assert.equal(h.actor.requestReauthentication("caller-2", "credential-2"), true);
+
+    const prepared3 = preparedReauthentication({
+      reference: "credential-3",
+      version: "3",
+      requestId: "reauth-3",
+      accessJti: "access-jti-3",
+    });
+    h.credentials.prepareResult = prepared3;
+    assert.equal(h.actor.requestReauthentication("caller-3", "credential-3"), true);
+    active.connection.receive(wire(reauthenticated(
+      connectorId,
+      prepared2.fence.requestId,
+      prepared2.fence.accessJti,
+    )));
+    assert.equal(h.credentials.ackCalls.length, 0, "stale ACK is not presented");
+
+    h.credentials.ackResult = false;
+    const exactAck = reauthenticated(
+      connectorId,
+      prepared3.fence.requestId,
+      prepared3.fence.accessJti,
+    );
+    active.connection.receive(wire(exactAck));
+    assert.deepEqual(h.credentials.ackCalls, [{ ...prepared3.fence }]);
+    h.credentials.ackResult = true;
+    active.connection.receive(wire(exactAck));
+    assert.deepEqual(h.credentials.ackCalls, [
+      { ...prepared3.fence },
+      { ...prepared3.fence },
+    ]);
+    active.connection.receive(wire({
+      ...exactAck,
+      payload: { ...exactAck.payload, deduplicated: true },
+    }));
+    assert.equal(h.credentials.ackCalls.length, 2, "successful ACK clears only once");
+  });
+
+  await t.test("prepare failure cannot enqueue or trigger repair", () => {
+    const { h, active } = registeredHarness();
+    h.credentials.prepareError = new Error("durable prepare failed");
+    const sentBefore = active.transport.sent.length;
+    assert.throws(
+      () => h.actor.requestReauthentication("caller-id", "credential-2"),
+      /durable prepare failed/,
+    );
+    active.connection.writable();
+    assert.equal(active.transport.sent.length, sentBefore);
+    assert.equal(h.credentials.prepareCalls.length, 1);
+    assert.equal(h.credentials.ackCalls.length, 0);
+  });
+
+  await t.test("a nested preparation invalidates its outer lease without overwriting the old winner", () => {
+    const oldWinner = preparedReauthentication({ requestId: "durable-old" });
+    const { h, active, connectorId } = registeredHarness(oldWinner);
+    assert.equal(h.actor.requestReauthentication("caller-old", "credential-2"), true);
+    const sentBefore = active.transport.sent.length;
+
+    const hostileWinner = preparedReauthentication({
+      version: "3",
+      requestId: "durable-hostile",
+      accessJti: "access-jti-3",
+    });
+    h.credentials.onPrepare = () => {
+      assert.throws(
+        () => h.actor.requestReauthentication("nested", "credential-2"),
+        /preparation was reentered/,
+      );
+      return hostileWinner;
+    };
+    assert.equal(
+      h.actor.requestReauthentication("caller-hostile", "credential-2"),
+      false,
+    );
+    assert.equal(h.credentials.prepareCalls.length, 2, "nested call never reaches authority");
+    assert.equal(active.transport.sent.length, sentBefore, "no hostile frame is admitted");
+
+    h.credentials.ackResult = true;
+    active.connection.receive(wire(reauthenticated(
+      connectorId,
+      oldWinner.fence.requestId,
+      oldWinner.fence.accessJti,
+    )));
+    assert.deepEqual(
+      h.credentials.ackCalls,
+      [{ ...oldWinner.fence }],
+      "the invalidated attempt cannot overwrite the previous pending winner",
+    );
+  });
+
+  await t.test("a reentrant Proxy descriptor trap cannot reach authority twice or enqueue", () => {
+    const { h, active, connectorId } = registeredHarness();
+    const winner = preparedReauthentication({ requestId: "proxy-attempt" });
+    let descriptorTrapCalls = 0;
+    h.credentials.prepareResult = new Proxy(winner, {
+      getPrototypeOf(target) {
+        descriptorTrapCalls += 1;
+        assert.throws(
+          () => h.actor.requestReauthentication("proxy-nested", "credential-2"),
+          /preparation was reentered/,
+        );
+        return Reflect.getPrototypeOf(target);
+      },
+    });
+    const sentBefore = active.transport.sent.length;
+
+    assert.equal(h.actor.requestReauthentication("proxy-outer", "credential-2"), false);
+    assert.equal(descriptorTrapCalls, 1);
+    assert.equal(h.credentials.prepareCalls.length, 1);
+    assert.equal(active.transport.sent.length, sentBefore);
+    active.connection.receive(wire(reauthenticated(
+      connectorId,
+      winner.fence.requestId,
+      winner.fence.accessJti,
+    )));
+    assert.equal(h.credentials.ackCalls.length, 0, "no volatile pending fence was written");
+  });
+
+  await t.test("close and re-register during prepare invalidate only the old connector lease", () => {
+    const { h, active } = registeredHarness();
+    const staleWinner = preparedReauthentication({ requestId: "stale-after-close" });
+    let replacement;
+    let replacementConnectorId;
+    h.credentials.onPrepare = () => {
+      active.connection.closed(1006);
+      replacement = connect(h, new FakeTransport());
+      replacementConnectorId = register(replacement.connection, replacement.hello, {
+        connectorId: "connector-replacement",
+      });
+      acknowledgeAll(replacement.connection, replacement.transport);
+      return staleWinner;
+    };
+    const oldSentBefore = active.transport.sent.length;
+
+    assert.equal(h.actor.requestReauthentication("outer-close", "credential-2"), false);
+    assert.equal(active.transport.sent.length, oldSentBefore);
+    assert.ok(replacement);
+    assert.equal(
+      decoded(replacement.transport.sent).some((frame) => frame.type === "host.reauthenticate"),
+      false,
+    );
+    replacement.connection.receive(wire(reauthenticated(
+      replacementConnectorId,
+      staleWinner.fence.requestId,
+      staleWinner.fence.accessJti,
+    )));
+    assert.equal(h.credentials.ackCalls.length, 0, "stale preparation creates no pending ACK fence");
+
+    const freshWinner = preparedReauthentication({
+      version: "4",
+      requestId: "fresh-after-close",
+      accessJti: "access-jti-4",
+    });
+    h.credentials.onPrepare = undefined;
+    h.credentials.prepareResult = freshWinner;
+    assert.equal(h.actor.requestReauthentication("fresh-caller", "credential-2"), true);
+    const freshFrame = decoded(replacement.transport.sent).at(-1);
+    assert.equal(freshFrame.carrierVersion, 1);
+    assert.equal(freshFrame.type, "host.reauthenticate");
+    assert.equal(freshFrame.requestId, freshWinner.fence.requestId);
+    assert.equal(freshFrame.connectorId, replacementConnectorId);
+    assert.equal(freshFrame.payload.accessToken, freshWinner.accessToken);
+  });
+
+  for (const scenario of [
+    {
+      name: "missing field",
+      make() { return { fence: preparedReauthentication().fence }; },
+      error: /preparation is invalid/,
     },
-  }));
-  assert.equal(h.credentials.acknowledgements.length, 0);
-  assert.equal(h.credentials.pending.reference, "credential-3");
-
-  active.connection.receive(wire({
-    carrierVersion: 1,
-    type: "host.reauthenticated",
-    requestId: "reauth-3",
-    connectorId,
-    payload: {
-      grantId: "host-grant-uuid",
-      jti: "access-jti-3",
-      expiresAtMs: 1_783_707_200_000,
-      deduplicated: false,
+    {
+      name: "outer accessor",
+      make(state) {
+        const result = { fence: preparedReauthentication().fence };
+        Object.defineProperty(result, "accessToken", {
+          enumerable: true,
+          get() {
+            state.getterReads += 1;
+            return "twcap2.hostile-outer.payload.mac";
+          },
+        });
+        return result;
+      },
+      error: /preparation is invalid/,
     },
-  }));
-  assert.equal(h.credentials.acknowledgements.length, 1);
-  assert.equal(h.credentials.acknowledgements[0].reference, "credential-3");
-  assert.equal(h.credentials.pending, null);
+    {
+      name: "fence accessor",
+      make(state) {
+        const normal = preparedReauthentication();
+        const fence = { ...normal.fence };
+        Object.defineProperty(fence, "accessJti", {
+          enumerable: true,
+          get() {
+            state.getterReads += 1;
+            return "hostile-access-jti";
+          },
+        });
+        return { fence, accessToken: normal.accessToken };
+      },
+      error: /preparation is invalid/,
+    },
+    {
+      name: "symbol extension",
+      make() {
+        const result = preparedReauthentication();
+        result[Symbol("extra")] = true;
+        return result;
+      },
+      error: /preparation is invalid/,
+    },
+    {
+      name: "string extension",
+      make() {
+        return { ...preparedReauthentication(), extra: true };
+      },
+      error: /preparation is invalid/,
+    },
+    {
+      name: "non-plain fence",
+      make() {
+        const normal = preparedReauthentication();
+        return {
+          fence: Object.assign(Object.create(null), normal.fence),
+          accessToken: normal.accessToken,
+        };
+      },
+      error: /preparation is invalid/,
+    },
+    {
+      name: "grant conflict",
+      make() {
+        return preparedReauthentication({ grantId: "different-host-grant" });
+      },
+      error: /cannot change the host grant/,
+    },
+  ]) {
+    await t.test(`${scenario.name} fails closed before enqueue`, () => {
+      const state = { getterReads: 0 };
+      const { h, active } = registeredHarness(scenario.make(state));
+      const sentBefore = active.transport.sent.length;
+      assert.throws(
+        () => h.actor.requestReauthentication("caller-id", "credential-2"),
+        scenario.error,
+      );
+      active.connection.writable();
+      assert.equal(state.getterReads, 0);
+      assert.equal(active.transport.sent.length, sentBefore);
+      assert.equal(h.credentials.prepareCalls.length, 1);
+      assert.equal(h.credentials.ackCalls.length, 0);
+    });
+  }
+
+  for (const scenario of [
+    {
+      name: "trySend refusal",
+      expectedAttempts: 1,
+      accept(frame) { return frame.type !== "host.reauthenticate"; },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), false);
+        active.connection.writable();
+      },
+    },
+    {
+      name: "trySend throw",
+      expectedAttempts: 1,
+      accept(frame) {
+        if (frame.type === "host.reauthenticate") throw new Error("transport failed");
+        return true;
+      },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), false);
+        active.connection.writable();
+      },
+    },
+    {
+      name: "queued but never attempted",
+      expectedAttempts: 0,
+      accept(frame) { return frame.type !== "route.close"; },
+      run({ h, active, connectorId }) {
+        active.connection.receive(wire(routeOpen(connectorId)));
+        const binding = h.bound.at(-1);
+        acknowledgeAll(active.connection, active.transport);
+        assert.equal(h.actor.closeRoute(binding), true);
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), true);
+        active.connection.closed(1006);
+        active.connection.writable();
+      },
+    },
+    {
+      name: "in-flight reject",
+      expectedAttempts: 1,
+      accept() { return true; },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), true);
+        active.connection.rejectUnaccepted(
+          active.transport.pendingDeliveries.at(-1).deliveryToken,
+        );
+        active.connection.writable();
+      },
+    },
+    {
+      name: "in-flight close",
+      expectedAttempts: 1,
+      accept() { return true; },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), true);
+        active.connection.closed(1006);
+        active.connection.writable();
+      },
+    },
+    {
+      name: "reentrant close",
+      expectedAttempts: 1,
+      accept() { return true; },
+      before({ active }) {
+        active.transport.onTrySend = (_deliveryToken, bytes) => {
+          const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+          if (frame.type === "host.reauthenticate") active.connection.closed(1006);
+        };
+      },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), false);
+        active.connection.writable();
+      },
+    },
+    {
+      name: "reentrant transport ACK",
+      expectedAttempts: 1,
+      accept() { return true; },
+      before({ active }) {
+        active.transport.onTrySend = (_deliveryToken, bytes) => {
+          const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+          if (frame.type !== "host.reauthenticate") return;
+          active.connection.acknowledge(active.transport.confirmNext());
+        };
+      },
+      run({ h, active }) {
+        assert.equal(h.actor.requestReauthentication("caller-id", "credential-2"), false);
+        active.connection.writable();
+      },
+    },
+  ]) {
+    await t.test(`${scenario.name} never retries or acknowledges`, () => {
+      const context = registeredHarness();
+      let reauthenticationAttempts = 0;
+      context.active.transport.acceptFrame = (bytes) => {
+        const frame = codec.decodeRelayV2WebSocketFrame("carrier", bytes).frame;
+        if (frame.type === "host.reauthenticate") reauthenticationAttempts += 1;
+        return scenario.accept(frame);
+      };
+      scenario.before?.(context);
+      scenario.run(context);
+      assert.equal(reauthenticationAttempts, scenario.expectedAttempts);
+      assert.equal(context.h.credentials.prepareCalls.length, 1);
+      assert.equal(context.h.credentials.ackCalls.length, 0);
+    });
+  }
 });
 
 test("the actor retains refused frames and retries once per ACK or writable signal", () => {
@@ -1307,13 +1693,9 @@ test("control, queued data, and socket-buffered bytes share one carrier hard lim
   const dataBuffered = active.transport.bufferedAmount();
   assert.ok(dataBuffered <= 1_600 - 320);
 
-  h.credentials.pending = {
-    reference: "credential-2",
-    version: "2",
+  h.credentials.prepareResult = preparedReauthentication({
     requestId: "reauth-shared-limit",
-    grantId: "host-grant-uuid",
-    accessJti: "access-jti-2",
-  };
+  });
   assert.equal(
     h.actor.requestReauthentication("reauth-shared-limit", "credential-2"),
     true,
