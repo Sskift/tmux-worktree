@@ -64,7 +64,7 @@ export interface RelayV2EnrollmentView {
   v1CredentialLabel: string;
   v2CredentialLabel: string;
   hostCredentialAction: "bootstrap" | "refresh" | null;
-  connectorAction: "start" | "stop" | null;
+  connectorAction: "start" | "stop" | "restart" | null;
   enrollmentAction: "create" | "retry" | "rebuild" | null;
   enrollmentActionDisabled: boolean;
   enrollmentActionLabel: string;
@@ -510,12 +510,13 @@ export function deriveRelayV2EnrollmentView(
     connectorAction: !adapterAvailable
       || !normalizedState.hostCredential.credentialReference
       || connector.status === "starting"
-      || connector.status === "superseded"
       || (connector.status === "failed" && !connector.retryable)
       ? null
-      : connector.status === "registered" || connector.status === "registered_incomplete"
-        ? "stop"
-        : "start",
+      : connector.status === "superseded"
+        ? "restart"
+        : connector.status === "registered" || connector.status === "registered_incomplete"
+          ? "stop"
+          : "start",
     enrollmentAction,
     enrollmentActionDisabled: enrollmentAction === null,
     enrollmentActionLabel,

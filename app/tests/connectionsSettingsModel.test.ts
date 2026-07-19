@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createElement } from "react";
+import {
+  Children,
+  createElement,
+  isValidElement,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { RelayV2EnrollmentPreviewPanel } from "../src/dashboard/Settings/RelayV2EnrollmentPreviewPanel";
 import {
@@ -14,6 +20,7 @@ import {
 } from "../src/dashboard/Settings/connectionsModel";
 import {
   RELAY_V2_REQUIRED_CAPABILITIES,
+  createRelayV2EnrollmentState,
   deriveRelayV2EnrollmentView,
   relayV2EnrollmentReducer,
   type RelayV2EnrollmentReview,
@@ -43,6 +50,41 @@ function reduceRelayV2(
   events: Parameters<typeof relayV2EnrollmentReducer>[1][],
 ): RelayV2EnrollmentState {
   return events.reduce(relayV2EnrollmentReducer, initial);
+}
+
+type ButtonElement = ReactElement<{
+  "aria-label"?: string;
+  children?: ReactNode;
+  onClick?: () => void;
+}>;
+
+function accessibleText(node: ReactNode): string {
+  let text = "";
+  Children.forEach(node, (child) => {
+    if (typeof child === "string" || typeof child === "number") {
+      text += String(child);
+    } else if (isValidElement<{ children?: ReactNode }>(child)) {
+      text += accessibleText(child.props.children);
+    }
+  });
+  return text;
+}
+
+function findButtonByAccessibleName(node: ReactNode, name: string): ButtonElement {
+  const matches: ButtonElement[] = [];
+  const visit = (candidate: ReactNode) => {
+    if (!isValidElement<ButtonElement["props"]>(candidate)) return;
+    const accessibleName = candidate.props["aria-label"]
+      ?? accessibleText(candidate.props.children).replace(/\s+/g, " ").trim();
+    if (candidate.type === "button" && accessibleName === name) {
+      matches.push(candidate);
+    }
+    Children.forEach(candidate.props.children, visit);
+  };
+
+  visit(node);
+  assert.equal(matches.length, 1, `expected one button named “${name}”`);
+  return matches[0];
 }
 
 test("the existing Relay v1 UI receives no v2 preview markup without explicit fake state", () => {
@@ -591,28 +633,121 @@ test("Relay v2 contradictory registered observations fail closed", async () => {
   );
 });
 
-test("Relay v2 SUPERSEDED preserves active enrollment and exit 78 while hiding its QR", async () => {
-  const active = reduceRelayV2(readyRelayV2State(true), [
+test("Relay v2 SUPERSEDED requires an explicit restart before the same enrollment is ready", () => {
+  const ready = reduceRelayV2({
+    ...createRelayV2EnrollmentState(true),
+    authority: { kind: "node", reason: null },
+  }, [
+    { type: "v2CredentialReferenceObserved", credentialReference: "host-grant-reference" },
+    { type: "hostRegistered", hostId: "mac-admin", connectorId: "connector-1" },
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES,
+    },
+  ]);
+  const active = reduceRelayV2(ready, [
     { type: "enrollmentCreated", review: relayV2Review },
   ]);
+  const originalQr = deriveRelayV2EnrollmentView(active, 1_000).qrPayload;
+  assert.ok(originalQr);
   const superseded = relayV2EnrollmentReducer(active, {
     type: "connectorSuperseded",
   });
-  const adapter = createFakeMobileRelayV2Adapter({
-    initialState: superseded,
-    hostId: "mac-admin",
-    now: () => 1_000,
-  });
-  const observed = await adapter.status();
-  const view = deriveRelayV2EnrollmentView(observed, 1_000);
+  const supersededView = deriveRelayV2EnrollmentView(superseded, 1_000);
 
-  assert.equal(observed.authority.kind, "fake_preview");
-  assert.equal(observed.connector.status, "superseded");
-  assert.equal(observed.connector.exitCode, 78);
-  assert.equal(observed.enrollment.status, "active");
-  assert.equal(view.ready, false);
-  assert.equal(view.qrPayload, null);
-  assert.equal(observed.v1Profile.sharedSecretConfigured, true);
+  assert.equal(superseded.connector.status, "superseded");
+  assert.equal(superseded.connector.exitCode, 78);
+  assert.strictEqual(superseded.enrollment, active.enrollment);
+  assert.strictEqual(superseded.v1Profile, active.v1Profile);
+  assert.equal(supersededView.connectorAction, "restart");
+  assert.equal(supersededView.ready, false);
+  assert.equal(supersededView.qrPayload, null);
+
+  let startCalls = 0;
+  let stopCalls = 0;
+  const panel = RelayV2EnrollmentPreviewPanel({
+    state: superseded,
+    v1SharedSecretConfigured: true,
+    onStartConnector: () => {
+      startCalls += 1;
+    },
+    onStopConnector: () => {
+      stopCalls += 1;
+    },
+  });
+  assert.ok(panel);
+  const restartButton = findButtonByAccessibleName(panel, "Restart v2 connector");
+  assert.deepEqual([startCalls, stopCalls], [0, 0]);
+  assert.equal(typeof restartButton.props.onClick, "function");
+  restartButton.props.onClick?.();
+  assert.deepEqual([startCalls, stopCalls], [1, 0]);
+
+  const starting = relayV2EnrollmentReducer(superseded, { type: "connectorStarting" });
+  const registeredWithoutCapabilities = relayV2EnrollmentReducer(starting, {
+    type: "hostRegistered",
+    hostId: "mac-admin",
+    connectorId: "connector-2",
+  });
+  const registeredIncomplete = relayV2EnrollmentReducer(
+    registeredWithoutCapabilities,
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES.slice(0, -1),
+    },
+  );
+  const registeredReady = relayV2EnrollmentReducer(
+    registeredWithoutCapabilities,
+    {
+      type: "capabilityIntersectionObserved",
+      capabilities: RELAY_V2_REQUIRED_CAPABILITIES,
+    },
+  );
+  const credentialMissing = relayV2EnrollmentReducer(superseded, {
+    type: "v2CredentialReferenceObserved",
+    credentialReference: null,
+  });
+  const authorityUnavailable = relayV2EnrollmentReducer(superseded, {
+    type: "backendObservationFailed",
+    failure: {
+      code: "relay_v2_adapter_unavailable",
+      message: "Relay v2 authority is unavailable.",
+      retryable: false,
+    },
+  });
+  const restartFailed = relayV2EnrollmentReducer(superseded, {
+    type: "hostRegistrationLost",
+    error: "The explicit connector restart failed.",
+    retryable: false,
+  });
+  const defaultOff = createRelayV2EnrollmentState(true);
+
+  for (const [label, state, expectedAction, expectedQr] of [
+    ["starting", starting, null, null],
+    ["registered without capabilities", registeredWithoutCapabilities, "stop", null],
+    ["registered with one missing capability", registeredIncomplete, "stop", null],
+    ["registered with all capabilities", registeredReady, "stop", originalQr],
+    ["credential missing", credentialMissing, null, null],
+    ["authority unavailable", authorityUnavailable, null, null],
+    ["restart failed", restartFailed, null, null],
+    ["default off", defaultOff, null, null],
+  ] as const) {
+    const candidate = deriveRelayV2EnrollmentView(state, 1_000);
+    assert.equal(candidate.connectorAction, expectedAction, label);
+    assert.equal(candidate.qrPayload, expectedQr, label);
+    assert.equal(state.v1Profile.sharedSecretConfigured, true, label);
+  }
+
+  for (const state of [
+    starting,
+    registeredWithoutCapabilities,
+    registeredIncomplete,
+    registeredReady,
+    credentialMissing,
+    restartFailed,
+  ]) {
+    assert.deepEqual(state.enrollment, active.enrollment);
+    assert.deepEqual(state.v1Profile, active.v1Profile);
+  }
 });
 
 test("Relay v2 renderer state and QR omit bootstrap, access, refresh, and v1 secret values", () => {

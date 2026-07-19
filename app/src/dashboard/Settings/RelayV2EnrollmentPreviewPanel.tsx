@@ -90,9 +90,13 @@ export function RelayV2EnrollmentPreviewPanel({
             <button
               type="button"
               className="connections-button"
-              onClick={view.connectorAction === "start" ? onStartConnector : onStopConnector}
+              onClick={view.connectorAction === "stop" ? onStopConnector : onStartConnector}
             >
-              {view.connectorAction === "start" ? "Start v2 connector" : "Stop v2 connector"}
+              {view.connectorAction === "restart"
+                ? "Restart v2 connector"
+                : view.connectorAction === "start"
+                  ? "Start v2 connector"
+                  : "Stop v2 connector"}
             </button>
           )}
         </div>
