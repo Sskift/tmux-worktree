@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { RELAY_V2_CARRIER_ROUTE_HARD_LIMIT } from "./carrierLimits.js";
 import {
   type RelayV2BrokerAction,
@@ -6,6 +7,17 @@ import {
   type RelayV2CarrierDelivery,
   type RelayV2BrokerCore,
 } from "./brokerCore.js";
+import {
+  type RelayV2BrokerHostProducerBinding,
+  type RelayV2BrokerProducerAction,
+  type RelayV2BrokerProducerEffectFence,
+  type RelayV2BrokerProducerPort,
+  type RelayV2BrokerProducerReceipt,
+  type RelayV2BrokerProducerRegistration,
+  type RelayV2BrokerProducerRegistry,
+  type RelayV2BrokerProducerTarget,
+  type RelayV2BrokerProducerTerminalFailure,
+} from "./brokerProducerRegistry.js";
 import {
   decodeRelayV2WebSocketFrame,
   encodeRelayV2WebSocketFrame,
@@ -62,7 +74,17 @@ export interface RelayV2CarrierPumpOptions {
     action: RelayV2BrokerAction,
     fence: RelayV2BrokerActionFence,
   ) => boolean;
+  /**
+   * Opt-in B7a owner. Omission preserves the standalone Pump foundation and
+   * does not wire a listener, server, capability, or production composition.
+   */
+  producerRegistry?: RelayV2BrokerProducerRegistry;
 }
+
+export type RelayV2BrokerHostCarrierPumpProducerComposition = Readonly<{
+  target: RelayV2BrokerProducerTarget;
+  binding: RelayV2BrokerHostProducerBinding;
+}>;
 
 export interface RelayV2BrokerActionFence {
   readonly identity: string;
@@ -190,6 +212,10 @@ type OwnerFenceState = {
   readonly view: RelayV2BrokerActionFence;
   fenced: boolean;
 };
+
+type ProducerReadyTurn = Readonly<{
+  readyEpoch: string;
+}>;
 
 function positive(value: number | undefined, fallback: number): number {
   const selected = value ?? fallback;
@@ -326,6 +352,10 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private readonly deliveryTimeoutMs: number;
   private readonly now: () => number;
   private readonly schedule: (delayMs: number, callback: () => void) => () => void;
+  private readonly connectionIncarnation: string | null;
+  private producerRegistration: RelayV2BrokerProducerRegistration | null = null;
+  private producerCloseStarted = false;
+  private pendingProducerReadyTurn: ProducerReadyTurn | null = null;
   private readonly hostToBroker: DirectionState<HostFrame> = {
     entries: [], bytes: 0, routeCursor: 0, pressureSinceMs: null,
   };
@@ -376,6 +406,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private closeBarrierSettled = false;
   private resolveCloseBarrier!: (receipt: RelayV2CarrierPumpCloseReceipt) => void;
   private closeBarrier: Promise<RelayV2CarrierPumpCloseReceipt>;
+  readonly producerComposition: RelayV2BrokerHostCarrierPumpProducerComposition | null;
 
   constructor(private readonly options: RelayV2CarrierPumpOptions) {
     this.limits = makeLimits(options.queueLimits);
@@ -392,6 +423,37 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.closeBarrier = new Promise((resolve) => {
       this.resolveCloseBarrier = resolve;
     });
+    if (options.producerRegistry) {
+      this.connectionIncarnation = randomUUID();
+      const port = Object.create(null) as Record<string, unknown>;
+      Object.defineProperties(port, {
+        apply: {
+          value: (
+            actions: readonly Readonly<RelayV2BrokerProducerAction>[],
+            fence: RelayV2BrokerProducerEffectFence,
+          ) => this.applyProducerActions(actions, fence),
+        },
+        forceTerminal: {
+          value: (
+            failure: RelayV2BrokerProducerTerminalFailure,
+            fence: RelayV2BrokerProducerEffectFence,
+          ) => this.forceProducerTerminal(failure, fence),
+        },
+      });
+      const registration = options.producerRegistry.registerHostProducer(
+        options.transportId,
+        port as unknown as RelayV2BrokerProducerPort,
+      );
+      const binding = registration.bindConnectionIncarnation(this.connectionIncarnation);
+      this.producerRegistration = registration;
+      this.producerComposition = Object.freeze({
+        target: registration.target,
+        binding,
+      });
+    } else {
+      this.connectionIncarnation = null;
+      this.producerComposition = null;
+    }
   }
 
   start(): RelayV2HostCarrierConnection {
@@ -399,16 +461,31 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.phase = "running";
     let attached = false;
     try {
-      this.options.broker.attachHostCarrier(
-        this.options.transportId,
-        this.options.hostAuthContext,
-      );
+      if (this.connectionIncarnation === null) {
+        this.options.broker.attachHostCarrier(
+          this.options.transportId,
+          this.options.hostAuthContext,
+        );
+      } else {
+        this.options.broker.attachHostCarrier(
+          this.options.transportId,
+          this.options.hostAuthContext,
+          this.connectionIncarnation,
+        );
+      }
       attached = true;
       this.hostConnection = this.options.host.connect(
         this,
         this.options.credentialReference,
       );
     } catch (error) {
+      // Start failure is a terminal owner cut too. Publish it locally and to
+      // B7a before rollback can invoke another component.
+      this.pendingProducerReadyTurn = null;
+      this.lifecycleGeneration += 1;
+      this.phase = "closed";
+      this.closedWith = { code: 1013, reason: "carrier_pump_start_failure" };
+      this.beginProducerClose();
       if (attached) {
         try {
           this.options.broker.disconnectHost(this.options.transportId);
@@ -422,8 +499,6 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.hostToBroker.bytes = 0;
       this.brokerToHost.entries = [];
       this.brokerToHost.bytes = 0;
-      this.phase = "closed";
-      this.closedWith = { code: 1013, reason: "carrier_pump_start_failure" };
       this.settleCloseBarrier("closed");
       throw error;
     }
@@ -492,6 +567,116 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     }
     if (direction === "broker_to_host") this.brokerWritable = true;
     this.wake();
+  }
+
+  private producerFenceMayApply(fence: RelayV2BrokerProducerEffectFence): boolean {
+    const composition = this.producerComposition;
+    if (
+      !composition
+      || fence.target.transportId !== composition.target.transportId
+      || fence.target.generation !== composition.target.generation
+    ) return false;
+    try {
+      return fence.mayApply() === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private applyProducerActions(
+    actions: readonly Readonly<RelayV2BrokerProducerAction>[],
+    fence: RelayV2BrokerProducerEffectFence,
+  ): RelayV2BrokerProducerReceipt {
+    if (
+      this.phase !== "running"
+      || this.actionAdmissionStopped
+      || this.forceCallbackActive
+      || !this.producerFenceMayApply(fence)
+      || actions.length === 0
+    ) return "rejected";
+
+    const ready = actions.filter((action) => action.kind === "host_output_ready");
+    if (ready.length > 0) {
+      if (
+        actions.length !== 1
+        || fence.source.kind !== "internal"
+        || !this.acceptProducerReadyTurn(ready[0]!)
+      ) return "rejected";
+      return "applied";
+    }
+
+    // Preflight the whole ordinary batch before the first Pump mutation. A
+    // close_host is the terminal item: this preserves BrokerCore's canonical
+    // [terminal send_host, close_host] ordering and prevents a silently
+    // skipped suffix. The existing Pump transition then owns the batch once.
+    const closeCount = actions.filter((action) => action.kind === "close_host").length;
+    if (
+      closeCount > 1
+      || (closeCount === 1 && actions.at(-1)?.kind !== "close_host")
+      || !this.producerFenceMayApply(fence)
+    ) return "rejected";
+    this.acceptBrokerActions(actions);
+    if (this.phase === "closing") {
+      this.beginCloseDrain();
+      this.advanceCloseDrain();
+    } else if (this.phase === "running") {
+      this.wake();
+    }
+    return "applied";
+  }
+
+  private acceptProducerReadyTurn(
+    action: Extract<RelayV2BrokerProducerAction, { kind: "host_output_ready" }>,
+  ): boolean {
+    let keys: readonly PropertyKey[];
+    try {
+      keys = Reflect.ownKeys(action);
+    } catch {
+      return false;
+    }
+    if (
+      keys.length !== 4
+      || !keys.every((key) => (
+        key === "kind"
+        || key === "transportId"
+        || key === "connectionIncarnation"
+        || key === "readyEpoch"
+      ))
+      || action.transportId !== this.options.transportId
+      || action.connectionIncarnation !== this.connectionIncarnation
+      || !/^[1-9][0-9]*$/.test(action.readyEpoch)
+      || this.phase !== "running"
+    ) return false;
+    // Multiple callbacks that arrive before the scheduled turn share one
+    // bounded permit. A later real Core edge may reuse the same queue epoch
+    // after this permit has been consumed (for example, after a delivery ACK).
+    this.pendingProducerReadyTurn = Object.freeze({ readyEpoch: action.readyEpoch });
+    this.wake();
+    return true;
+  }
+
+  private forceProducerTerminal(
+    failure: RelayV2BrokerProducerTerminalFailure,
+    fence: RelayV2BrokerProducerEffectFence,
+  ): RelayV2BrokerProducerReceipt {
+    const composition = this.producerComposition;
+    if (
+      !composition
+      || failure.target.transportId !== composition.target.transportId
+      || failure.target.generation !== composition.target.generation
+      || !this.producerFenceMayApply(fence)
+      || this.phase === "closed"
+      || this.phase === "terminal_failure"
+    ) return "rejected";
+    void this.shutdown(1013, "broker_producer_terminal_failure");
+    return this.producerFenceMayApply(fence) ? "applied" : "rejected";
+  }
+
+  private beginProducerClose(): void {
+    const registration = this.producerRegistration;
+    if (!registration || this.producerCloseStarted) return;
+    this.producerCloseStarted = true;
+    registration.beginClose(this.closeBarrier);
   }
 
   setWritable(direction: RelayV2CarrierPumpDirection, writable: boolean): void {
@@ -629,6 +814,9 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     if (this.running || this.phase === "closed") return;
     this.running = true;
     try {
+      let producerDrainTurn = this.producerComposition === null
+        || this.pendingProducerReadyTurn !== null;
+      this.pendingProducerReadyTurn = null;
       let progressed = true;
       while (progressed && this.phase === "running") {
         progressed = false;
@@ -637,7 +825,10 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
           this.hostConnection.writable();
           progressed = true;
         }
-        progressed = this.drainBrokerCore() || progressed;
+        if (producerDrainTurn) {
+          progressed = this.drainBrokerCore() || progressed;
+          if (this.producerComposition !== null) producerDrainTurn = false;
+        }
         progressed = this.deliverBrokerFrame() || progressed;
         if (this.closeRequest) break;
         progressed = this.deliverHostFrame() || progressed;
@@ -1397,6 +1588,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     }
     if (!this.brokerActionAttempt
       && this.pendingActions.some((entry) => entry.state === "pending")) return true;
+    if (this.pendingProducerReadyTurn !== null) return true;
     if (this.brokerWritable && this.brokerToHost.entries.some((entry) => (
       entry.state === "pending"
       && this.routeHeadIsEligible(this.brokerToHost, entry)
@@ -1430,7 +1622,15 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.closeRequest.drainBrokerControl ||= drainBrokerControl;
       return;
     }
+    // Establish the Pump-local hard cut before the registry close cut and
+    // before any external abort/cancel callback can reenter. The exact effect
+    // that created this cut remains valid until it returns; B7a rejects every
+    // new ordinary effect while the registration is closing.
+    this.pendingProducerReadyTurn = null;
     this.lifecycleGeneration += 1;
+    this.phase = "closing";
+    this.closeRequest = { code, reason, drainBrokerControl };
+    this.beginProducerClose();
     this.hostDeliveryAttempt?.abort.abort();
     this.hostDeliveryAttempt?.cancelDeadline();
     this.hostDeliveryAttempt = null;
@@ -1464,8 +1664,6 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       (total, entry) => total + entry.byteLength,
       0,
     );
-    this.phase = "closing";
-    this.closeRequest = { code, reason, drainBrokerControl };
   }
 
   private shouldDrainBrokerControl(): boolean {
@@ -1860,13 +2058,16 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private finishTerminalFailure(reason: string): void {
     if (this.phase === "closed" || this.phase === "terminal_failure") return;
     this.actionAdmissionStopped = true;
+    this.pendingProducerReadyTurn = null;
+    this.terminalFailureReason = reason;
+    this.lifecycleGeneration += 1;
+    this.phase = "terminal_failure";
+    this.beginProducerClose();
     // A terminal receipt is the final owner boundary. Fence every lease that
     // may already have crossed an async sink before aborting or resolving the
     // barrier; generation checks inside the pump cannot undo a late external
     // socket effect.
     this.installAllOwnerFences();
-    this.terminalFailureReason = reason;
-    this.lifecycleGeneration += 1;
     this.hostDeliveryAttempt?.abort.abort();
     this.hostDeliveryAttempt?.cancelDeadline();
     this.hostDeliveryAttempt = null;
@@ -1891,13 +2092,14 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.hostConnection = null;
     // Mandatory registry and its now-permanently-fenced owner states are
     // retained because the external socket owner did not acknowledge cleanup.
-    this.phase = "terminal_failure";
     this.settleCloseBarrier("terminal_failure");
   }
 
   private finishClose(): void {
     if (this.phase === "closed" || this.phase === "terminal_failure") return;
     const close = this.closeRequest ?? { code: 1000, reason: "carrier_pump_shutdown" };
+    this.pendingProducerReadyTurn = null;
+    this.beginProducerClose();
     this.closedWith = { code: close.code, reason: close.reason };
     this.lifecycleGeneration += 1;
     this.hostDeliveryAttempt?.abort.abort();

@@ -3,6 +3,10 @@ import { randomUUID } from "node:crypto";
 import test from "node:test";
 
 const brokerModule = await import("../dist/relay/v2/brokerCore.js");
+const clientTransportModule = await import(
+  "../dist/relay/v2/brokerClientSocketTransport.js"
+);
+const producerModule = await import("../dist/relay/v2/brokerProducerRegistry.js");
 const carrierModule = await import("../dist/relay/v2/hostCarrier.js");
 const pumpModule = await import("../dist/relay/v2/carrierPump.js");
 const codec = await import("../dist/relay/v2/codec.js");
@@ -199,7 +203,7 @@ function decodedCarrier(bytes) {
 }
 
 function createHarness(options = {}) {
-  const scheduler = new ManualScheduler();
+  const scheduler = options.scheduler ?? new ManualScheduler();
   const hostEpoch = options.hostEpoch ?? randomUUID();
   const broker = options.broker ?? new brokerModule.RelayV2BrokerCore({
     now: () => scheduler.now,
@@ -251,6 +255,7 @@ function createHarness(options = {}) {
     schedule: scheduler.schedule,
     queueLimits: options.queueLimits,
     deliveryTimeoutMs: options.deliveryTimeoutMs,
+    producerRegistry: options.producerRegistry,
     onBrokerAction(action, signal, fence) {
       brokerActions.push(action);
       return options.actionSink?.(action, signal, fence);
@@ -279,6 +284,56 @@ function createHarness(options = {}) {
   };
 }
 
+function createProducerHarness(options = {}) {
+  const scheduler = new ManualScheduler();
+  const producerRegistry = new producerModule.RelayV2BrokerProducerRegistry();
+  let harness;
+  const composition = clientTransportModule
+    .createRelayV2BrokerClientSocketTransportComposition({
+      brokerOptions: { now: () => scheduler.now },
+      producerRegistry,
+      resolveHostProducerBinding() {
+        return harness?.pump.producerComposition?.binding;
+      },
+      scheduler,
+    });
+  harness = createHarness({
+    ...options,
+    scheduler,
+    broker: composition.broker,
+    producerRegistry,
+  });
+  return {
+    ...harness,
+    clientSocketTransport: composition.clientSocketTransport,
+    producerRegistry,
+  };
+}
+
+function applyProducerBatch(harness, actions) {
+  const target = harness.pump.producerComposition?.target;
+  assert.ok(target);
+  return harness.producerRegistry.runInternalBrokerCall(
+    () => ({ accepted: true, actions }),
+    (_result, handoff) => handoff.apply(target, actions),
+  );
+}
+
+function createProducerPort(calls = { apply: 0, forceTerminal: 0 }) {
+  const port = Object.create(null);
+  Object.defineProperties(port, {
+    apply: { value(_actions, fence) {
+      calls.apply += 1;
+      return fence.mayApply() ? "applied" : "rejected";
+    } },
+    forceTerminal: { value(_failure, fence) {
+      calls.forceTerminal += 1;
+      return fence.mayApply() ? "applied" : "rejected";
+    } },
+  });
+  return port;
+}
+
 async function startRegistered(harness) {
   const connection = harness.pump.start();
   await harness.scheduler.flushReady();
@@ -287,6 +342,189 @@ async function startRegistered(harness) {
   assert.deepEqual(harness.pump.snapshot().hostToBroker, { frames: 0, bytes: 0 });
   return connection;
 }
+
+test("exact Host ready edges grant one bounded Pump drain turn", async () => {
+  const h = createProducerHarness({ transportId: "producer-ready-pump" });
+  const composition = h.pump.producerComposition;
+  assert.ok(composition);
+  assert.equal(
+    h.producerRegistry.resolveHostProducerBinding(
+      composition.binding,
+      h.transportId,
+      composition.binding.connectionIncarnation,
+    ),
+    composition.target,
+  );
+  await startRegistered(h);
+
+  const ready = {
+    kind: "host_output_ready",
+    transportId: h.transportId,
+    connectionIncarnation: composition.binding.connectionIncarnation,
+    readyEpoch: "1",
+  };
+  const scheduledBeforeStale = h.pump.snapshot().scheduledTimers;
+  assert.equal(applyProducerBatch(h, [{
+    ...ready,
+    connectionIncarnation: "wrong-producer-incarnation",
+  }]), "rejected");
+  assert.deepEqual(h.pump.snapshot().brokerToHost, { frames: 0, bytes: 0 });
+  assert.equal(h.pump.snapshot().scheduledTimers, scheduledBeforeStale);
+  assert.equal(applyProducerBatch(h, [ready]), "applied");
+  const scheduledAfterFirstReady = h.pump.snapshot().scheduledTimers;
+  assert.equal(scheduledAfterFirstReady, scheduledBeforeStale + 1);
+  assert.equal(applyProducerBatch(h, [ready]), "applied");
+  assert.equal(
+    h.pump.snapshot().scheduledTimers,
+    scheduledAfterFirstReady,
+    "a coalesced ready receipt cannot schedule a second drain turn",
+  );
+  await h.scheduler.flushReady();
+  assert.deepEqual(h.pump.snapshot().brokerToHost, { frames: 0, bytes: 0 });
+  await h.scheduler.flushReady();
+  assert.equal(h.pump.snapshot().scheduledTimers, 0, "zero progress cannot reschedule itself");
+
+  h.pump.setWritable("broker_to_host", false);
+  for (const connectionId of ["producer-ready-a", "producer-ready-b"]) {
+    assert.equal(h.broker.openClientRoute(
+      connectionId,
+      authContext("client", h.scheduler.now),
+    ).accepted, true);
+  }
+  await h.scheduler.flushReady();
+  assert.equal(h.pump.snapshot().brokerToHost.frames, 1);
+  assert.ok(h.pump.snapshot().brokerToHost.bytes > 0);
+  await h.scheduler.flushReady();
+  assert.equal(
+    h.pump.snapshot().brokerToHost.frames,
+    1,
+    "a queued suffix cannot manufacture another ready turn",
+  );
+
+  h.pump.setWritable("broker_to_host", true);
+  await h.scheduler.flushReady();
+  assert.equal(h.bound.length, 2, "the delivery ACK creates the next real same-epoch edge");
+  h.pump.shutdown();
+  await h.scheduler.flushReady();
+});
+
+test("producer terminal batch closes atomically and fences pending ready from replacement", async () => {
+  const h = createProducerHarness({ transportId: "producer-terminal-pump" });
+  await startRegistered(h);
+  const firstTarget = h.pump.producerComposition.target;
+  const firstGeneration = firstTarget.generation;
+  const mixedReady = {
+    kind: "host_output_ready",
+    transportId: h.transportId,
+    connectionIncarnation: h.pump.producerComposition.binding.connectionIncarnation,
+    readyEpoch: "1",
+  };
+  assert.equal(applyProducerBatch(h, [{
+    kind: "pause_host_route",
+    transportId: h.transportId,
+    routeId: "producer-ordinary-batch-route",
+  }, {
+    kind: "resume_host_route",
+    transportId: h.transportId,
+    routeId: "producer-ordinary-batch-route",
+  }]), "applied");
+  assert.deepEqual(h.pump.snapshot().blockedHostRoutes, []);
+  assert.equal(applyProducerBatch(h, [{
+    kind: "pause_host_route",
+    transportId: h.transportId,
+    routeId: "producer-partial-route",
+  }, mixedReady]), "rejected");
+  assert.deepEqual(h.pump.snapshot().blockedHostRoutes, []);
+  assert.equal(h.broker.openClientRoute(
+    "producer-terminal-pending-ready",
+    authContext("client", h.scheduler.now),
+  ).accepted, true);
+
+  assert.equal(applyProducerBatch(h, [{
+    kind: "send_host",
+    transportId: h.transportId,
+    frame: {
+      carrierVersion: 1,
+      type: "carrier.error",
+      requestId: "producer-terminal-request",
+      connectorId: null,
+      payload: { failedType: "host.hello" },
+      error: {
+        code: "DUPLICATE_CONNECTOR",
+        message: "Duplicate connector",
+        retryable: false,
+        retryAfterMs: null,
+        commandDisposition: "not_applicable",
+        details: null,
+      },
+    },
+  }, {
+    kind: "close_host",
+    transportId: h.transportId,
+    closeCode: 4411,
+    reason: "duplicate_connector",
+  }]), "applied");
+  assert.equal(h.pump.snapshot().phase, "closing");
+  assert.throws(() => (
+    h.producerRegistry.registerHostProducer(h.transportId, createProducerPort())
+  ));
+
+  await h.scheduler.flushReady();
+  await h.pump.whenCloseSettled();
+  const replacementCalls = { apply: 0, forceTerminal: 0 };
+  const replacement = h.producerRegistry.registerHostProducer(
+    h.transportId,
+    createProducerPort(replacementCalls),
+  );
+  replacement.bindConnectionIncarnation("producer-terminal-replacement");
+  assert.ok(BigInt(replacement.target.generation) > BigInt(firstGeneration));
+  assert.equal(h.producerRegistry.runInternalBrokerCall(
+    () => ({ accepted: true, actions: [] }),
+    (_result, handoff) => handoff.forceTerminal({
+      kind: "target_failure",
+      target: firstTarget,
+      reason: "stale_terminal_callback",
+    }),
+  ), "rejected");
+  await new Promise((resolve) => setImmediate(resolve));
+  await h.scheduler.flushReady();
+  assert.deepEqual(replacementCalls, { apply: 0, forceTerminal: 0 });
+
+  const failed = createProducerHarness({
+    transportId: "producer-start-failure",
+    hostAuthContext: authContext("client", h.scheduler.now),
+  });
+  const failedTarget = failed.pump.producerComposition.target;
+  assert.throws(() => failed.pump.start());
+  await failed.pump.whenCloseSettled();
+  const failedReplacement = failed.producerRegistry.registerHostProducer(
+    failed.transportId,
+    createProducerPort(),
+  );
+  assert.ok(
+    BigInt(failedReplacement.target.generation) > BigInt(failedTarget.generation),
+    "start failure retires the preallocated producer generation",
+  );
+
+  const forced = createProducerHarness({ transportId: "producer-force-terminal" });
+  await startRegistered(forced);
+  const forcedTarget = forced.pump.producerComposition.target;
+  assert.equal(forced.producerRegistry.runInternalBrokerCall(
+    () => ({ accepted: false, actions: [] }),
+    (_result, handoff) => handoff.forceTerminal({
+      kind: "target_failure",
+      target: forcedTarget,
+      reason: "forced_exact_target",
+    }),
+  ), "applied");
+  assert.equal(forced.pump.snapshot().phase, "closing");
+  assert.throws(() => forced.producerRegistry.registerHostProducer(
+    forced.transportId,
+    createProducerPort(),
+  ));
+  await forced.scheduler.flushReady();
+  await forced.pump.whenCloseSettled();
+});
 
 async function openRoute(harness, connectionId) {
   const result = harness.broker.openClientRoute(

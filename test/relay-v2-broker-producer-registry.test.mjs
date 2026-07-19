@@ -221,6 +221,48 @@ test("settled close waits for an already-active source partition before retireme
   assert.notEqual(replacement.target.generation, producer.target.generation);
 });
 
+test("an admitted exact target effect may establish its own close barrier", async () => {
+  const registry = new producerModule.RelayV2BrokerProducerRegistry();
+  const barrier = deferred();
+  let registration;
+  let nestedInvoked = false;
+  const producerPort = createPort({
+    apply(_actions, fence) {
+      assert.equal(fence.mayApply(), true);
+      registration.beginClose(barrier.promise);
+      assert.equal(
+        fence.mayApply(),
+        true,
+        "the installed exact effect remains valid across its own close cut",
+      );
+      assert.equal(registration.runBrokerCall(
+        () => {
+          nestedInvoked = true;
+          return brokerResult();
+        },
+        (_result, handoff) => handoff.apply(
+          registration.target,
+          [hostAction("effect-close")],
+        ),
+      ), "rejected", "closing rejects new ordinary target admission");
+      assert.equal(nestedInvoked, true, "the pending barrier keeps exact source cleanup alive");
+      assert.throws(() => registry.registerHostProducer("effect-close", createPort().port));
+      assert.equal(fence.mayApply(), true);
+      return "applied";
+    },
+  });
+  registration = registry.registerHostProducer("effect-close", producerPort.port);
+  const firstGeneration = registration.target.generation;
+
+  assert.equal(applyFromInternal(registry, registration.target), "applied");
+  assert.throws(() => registry.registerHostProducer("effect-close", createPort().port));
+
+  barrier.resolve();
+  await settlePromises();
+  const replacement = registry.registerHostProducer("effect-close", createPort().port);
+  assert.ok(BigInt(replacement.target.generation) > BigInt(firstGeneration));
+});
+
 test("internal Broker calls allocate before invoke and retire on every exit path", () => {
   const registry = new producerModule.RelayV2BrokerProducerRegistry();
   const targetPort = createPort();

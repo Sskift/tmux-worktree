@@ -860,7 +860,6 @@ export class RelayV2BrokerProducerRegistry {
         source,
         target,
         effect,
-        targetAdmission,
       ),
     });
 
@@ -886,13 +885,15 @@ export class RelayV2BrokerProducerRegistry {
     source: SourcePartition,
     target: ProducerEntry,
     effect: EffectLease,
-    targetAdmission: "active" | "closing_allowed",
   ): boolean {
     const current = this.producers.get(target.transportId);
     const currentEffect = target.currentEffect;
-    const targetPhaseValid = targetAdmission === "active"
-      ? target.phase === "active"
-      : target.phase === "active" || target.phase === "closing";
+    // Initial ordinary admission is still restricted to active in
+    // invokeTargetEffect/applyTargetBatch. Once that exact lease is installed,
+    // let the effect synchronously establish its own active -> closing cut and
+    // finish. No later ordinary effect can enter closing, and retired always
+    // fences the installed lease.
+    const targetPhaseValid = target.phase === "active" || target.phase === "closing";
     return effect.active
       && this.isSourcePartitionActive(source)
       && current === target
