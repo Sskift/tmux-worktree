@@ -4,7 +4,7 @@ import com.tmuxworktree.mobile.core.relay.v2.runtime.RelayV2EffectGeneration
 
 /** Frozen and local bounds for the unwired Android terminal checkpoint core. */
 internal object RelayV2TerminalCheckpointLimits {
-    const val SCHEMA_VERSION = 7
+    const val SCHEMA_VERSION = 8
     const val IDENTITY_VERSION = 3
     const val MAX_ID_UTF8_BYTES = 128
     const val MAX_CREDENTIAL_REFERENCE_UTF8_BYTES = 256
@@ -249,6 +249,13 @@ internal enum class RelayV2TerminalControlDispatchAuthorization {
     PAYLOAD_MISMATCH,
 }
 
+internal enum class RelayV2TerminalParserDispatchAuthorization {
+    AUTHORIZED,
+    REVOKED,
+    STALE_AUTHORITY,
+    PAYLOAD_MISMATCH,
+}
+
 internal data class RelayV2TerminalOpenFence(
     override val target: RelayV2TerminalOpenTarget,
     override val deliveryToken: RelayV2TerminalDeliveryToken,
@@ -270,6 +277,18 @@ internal data class RelayV2TerminalParserCallbackToken(
     val startOffset: String,
     val endOffset: String,
 )
+
+/** Exact recovery-only proof for one sink reservation after its blocking handoff was released. */
+internal data class RelayV2TerminalParserEffectActivation(
+    val callbackToken: RelayV2TerminalParserCallbackToken,
+    val reservationId: String,
+    val batchFingerprint: String,
+) {
+    init {
+        requireTerminalId(reservationId)
+        requireTerminalId(batchFingerprint)
+    }
+}
 
 internal enum class RelayV2TerminalPhase {
     LIVE,
@@ -337,6 +356,67 @@ internal enum class RelayV2TerminalControlError {
     CONFLICT,
 }
 
+internal enum class RelayV2TerminalControlDispatchClaimPhase {
+    CLAIMED,
+    LOCALLY_SENT,
+}
+
+/** Exact durable grant for one parser operation; callback settlement must present this value. */
+internal sealed interface RelayV2TerminalParserDispatchClaim {
+    val fence: RelayV2TerminalEffectFence
+    val callbackToken: RelayV2TerminalParserCallbackToken
+    val authorizedPhase: RelayV2TerminalPhase
+
+    data class Write(
+        override val fence: RelayV2TerminalEffectFence,
+        override val callbackToken: RelayV2TerminalParserCallbackToken,
+        override val authorizedPhase: RelayV2TerminalPhase,
+        val bytes: RelayV2TerminalBytes,
+    ) : RelayV2TerminalParserDispatchClaim
+
+    data class Reset(
+        override val fence: RelayV2TerminalEffectFence,
+        override val callbackToken: RelayV2TerminalParserCallbackToken,
+        override val authorizedPhase: RelayV2TerminalPhase,
+    ) : RelayV2TerminalParserDispatchClaim
+}
+
+/** Exact Android-local proof that one persisted control effect was granted once for dispatch. */
+internal sealed interface RelayV2TerminalControlDispatchClaim {
+    val dispatchLease: RelayV2TerminalControlDispatchLease
+    val attemptId: String
+    val generation: String
+    val sequence: String
+    val phase: RelayV2TerminalControlDispatchClaimPhase
+
+    data class Input(
+        override val dispatchLease: RelayV2TerminalControlDispatchLease,
+        override val attemptId: String,
+        override val generation: String,
+        val inputSeq: String,
+        val bytes: RelayV2TerminalBytes,
+        override val phase: RelayV2TerminalControlDispatchClaimPhase =
+            RelayV2TerminalControlDispatchClaimPhase.CLAIMED,
+    ) : RelayV2TerminalControlDispatchClaim {
+        override val sequence: String
+            get() = inputSeq
+    }
+
+    data class Resize(
+        override val dispatchLease: RelayV2TerminalControlDispatchLease,
+        override val attemptId: String,
+        override val generation: String,
+        val resizeSeq: String,
+        val cols: Int,
+        val rows: Int,
+        override val phase: RelayV2TerminalControlDispatchClaimPhase =
+            RelayV2TerminalControlDispatchClaimPhase.CLAIMED,
+    ) : RelayV2TerminalControlDispatchClaim {
+        override val sequence: String
+            get() = resizeSeq
+    }
+}
+
 internal data class RelayV2PendingParserWrite(
     val callbackToken: RelayV2TerminalParserCallbackToken,
     val bytes: RelayV2TerminalBytes,
@@ -347,6 +427,8 @@ internal data class RelayV2PendingInput(
     val inputSeq: String,
     val bytes: RelayV2TerminalBytes,
     val disposition: RelayV2TerminalControlDisposition,
+    /** Non-null owns the merged permission; phase distinguishes claimed from exactly settled. */
+    val dispatchClaim: RelayV2TerminalControlDispatchClaim.Input? = null,
 )
 
 internal data class RelayV2PendingResize(
@@ -355,6 +437,8 @@ internal data class RelayV2PendingResize(
     val cols: Int,
     val rows: Int,
     val disposition: RelayV2TerminalControlDisposition,
+    /** Non-null owns the merged permission; phase distinguishes claimed from exactly settled. */
+    val dispatchClaim: RelayV2TerminalControlDispatchClaim.Resize? = null,
 )
 
 internal data class RelayV2AmbiguousInput(
@@ -454,11 +538,19 @@ internal data class RelayV2TerminalCheckpoint(
     val networkReceivedThrough: String,
     val nextParserOperationSeq: String,
     val nextReplayRequestSeq: String,
+    val nextControlDispatchAttemptSeq: String = "1",
     val replayRequestIds: List<String> = emptyList(),
     val closeRequestIds: List<String> = emptyList(),
     val parserResetCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val parserInFlightCallbackToken: RelayV2TerminalParserCallbackToken? = null,
     val lastAppliedParserCallbackToken: RelayV2TerminalParserCallbackToken? = null,
+    val pendingParserDispatchClaim: RelayV2TerminalParserDispatchClaim? = null,
+    /** Blocking proof while the callback's complete effect batch is only reserved upstream. */
+    val pendingParserEffectHandoff: RelayV2TerminalParserCallbackToken? = null,
+    /** Non-null only when H was born together with this callback-originated reset. */
+    val pendingParserEffectHandoffResetReason: RelayV2TerminalResetReason? = null,
+    /** Recovery proof after reservation is durable-ready but before activation is settled. */
+    val pendingParserEffectActivation: RelayV2TerminalParserEffectActivation? = null,
     val pendingOutput: List<RelayV2PendingParserWrite> = emptyList(),
     val pendingOpen: RelayV2TerminalPendingOpen? = null,
     val pendingReplay: RelayV2TerminalPendingReplay? = null,
@@ -575,16 +667,41 @@ internal sealed interface RelayV2TerminalAction {
         val tailOffsetAtStart: String,
     ) : RelayV2TerminalAction
 
+    data class ClaimParserDispatch(
+        val effect: RelayV2TerminalEffect,
+    ) : RelayV2TerminalAction
+
+    data class ReleaseParserDispatch(
+        val claim: RelayV2TerminalParserDispatchClaim,
+    ) : RelayV2TerminalAction
+
     data class ParserApplied(
-        val callbackToken: RelayV2TerminalParserCallbackToken,
+        val claim: RelayV2TerminalParserDispatchClaim.Write,
     ) : RelayV2TerminalAction
 
     data class ParserFailed(
-        val callbackToken: RelayV2TerminalParserCallbackToken,
+        val claim: RelayV2TerminalParserDispatchClaim,
+        val handoffEffects: Boolean = false,
     ) : RelayV2TerminalAction
 
     data class ParserResetApplied(
+        val claim: RelayV2TerminalParserDispatchClaim.Reset,
+    ) : RelayV2TerminalAction
+
+    data class ParserEffectsReserved(
+        val activation: RelayV2TerminalParserEffectActivation,
+    ) : RelayV2TerminalAction
+
+    data class ParserEffectsActivated(
+        val activation: RelayV2TerminalParserEffectActivation,
+    ) : RelayV2TerminalAction
+
+    data class ParserEffectReservationFailed(
         val callbackToken: RelayV2TerminalParserCallbackToken,
+    ) : RelayV2TerminalAction
+
+    data class ParserEffectActivationFailed(
+        val activation: RelayV2TerminalParserEffectActivation,
     ) : RelayV2TerminalAction
 
     data class EnqueueInput(
@@ -592,9 +709,20 @@ internal sealed interface RelayV2TerminalAction {
         val bytes: RelayV2TerminalBytes,
     ) : RelayV2TerminalAction
 
+    data class ClaimControlDispatch(
+        val effect: RelayV2TerminalEffect,
+    ) : RelayV2TerminalAction
+
+    data class ReleaseControlDispatch(
+        val claim: RelayV2TerminalControlDispatchClaim,
+    ) : RelayV2TerminalAction
+
+    data class ControlDispatchUncertain(
+        val claim: RelayV2TerminalControlDispatchClaim,
+    ) : RelayV2TerminalAction
+
     data class InputSent(
-        val fence: RelayV2TerminalActionFence,
-        val inputSeq: String,
+        val claim: RelayV2TerminalControlDispatchClaim.Input,
     ) : RelayV2TerminalAction
 
     data class InputAck(
@@ -616,8 +744,7 @@ internal sealed interface RelayV2TerminalAction {
     ) : RelayV2TerminalAction
 
     data class ResizeSent(
-        val fence: RelayV2TerminalActionFence,
-        val resizeSeq: String,
+        val claim: RelayV2TerminalControlDispatchClaim.Resize,
     ) : RelayV2TerminalAction
 
     data class ResizeAck(
@@ -815,6 +942,8 @@ internal enum class RelayV2TerminalIgnoredReason {
     STALE_CLOSE_RESPONSE,
     STALE_REPLAY_RESPONSE,
     NETWORK_REQUEST_ID_REUSED,
+    DUPLICATE_PARSER_DISPATCH,
+    DUPLICATE_CONTROL_DISPATCH,
 }
 
 internal enum class RelayV2TerminalControlRejectionReason {
@@ -841,6 +970,22 @@ internal sealed interface RelayV2TerminalOutcome {
     data class ControlQueued(
         val kind: RelayV2TerminalControlKind,
         val sequence: String,
+    ) : RelayV2TerminalOutcome
+
+    data class ParserDispatchClaimed(
+        val claim: RelayV2TerminalParserDispatchClaim,
+    ) : RelayV2TerminalOutcome
+
+    data class ParserDispatchDenied(
+        val authorization: RelayV2TerminalParserDispatchAuthorization,
+    ) : RelayV2TerminalOutcome
+
+    data class ControlDispatchClaimed(
+        val claim: RelayV2TerminalControlDispatchClaim,
+    ) : RelayV2TerminalOutcome
+
+    data class ControlDispatchDenied(
+        val authorization: RelayV2TerminalControlDispatchAuthorization,
     ) : RelayV2TerminalOutcome
 
     data class ControlAcked(

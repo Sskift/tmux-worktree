@@ -289,7 +289,9 @@ class RelayV2TerminalCheckpointReducerTest {
 
         val outOfOrder = reduce(
             checkpoint,
-            RelayV2TerminalAction.ParserApplied(suffix.callbackToken),
+            RelayV2TerminalAction.ParserApplied(
+                detachedParserWriteClaim(checkpoint, suffix.callbackToken),
+            ),
         )
         assertEquals(
             RelayV2TerminalIgnoredReason.OUT_OF_ORDER_PARSER_CALLBACK,
@@ -297,7 +299,7 @@ class RelayV2TerminalCheckpointReducerTest {
         )
         assertEquals("0", outOfOrder.checkpoint?.parserAppliedNextOffset)
 
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(firstWrite.callbackToken))
+        result = applyParser(checkpoint, firstWrite)
         checkpoint = requireNotNull(result.checkpoint)
         assertEquals("3", checkpoint.parserAppliedNextOffset)
         assertEquals("9", checkpoint.networkReceivedThrough)
@@ -306,6 +308,7 @@ class RelayV2TerminalCheckpointReducerTest {
             result.effects.filterIsInstance<RelayV2TerminalEffect.OutputAck>().single().nextOffset,
         )
         val secondWrite = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        checkpoint = handOffParserEffects(checkpoint, firstWrite.callbackToken)
 
         val fullyAppliedDuplicate = output(checkpoint, "0", "abc")
         assertEquals(
@@ -320,19 +323,23 @@ class RelayV2TerminalCheckpointReducerTest {
 
         val duplicateCallback = reduce(
             checkpoint,
-            RelayV2TerminalAction.ParserApplied(firstWrite.callbackToken),
+            RelayV2TerminalAction.ParserApplied(
+                detachedParserWriteClaim(checkpoint, firstWrite.callbackToken),
+            ),
         )
         assertEquals(
             RelayV2TerminalIgnoredReason.DUPLICATE_PARSER_CALLBACK,
             (duplicateCallback.outcome as RelayV2TerminalOutcome.Ignored).reason,
         )
 
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(secondWrite.callbackToken))
+        result = applyParser(checkpoint, secondWrite)
         checkpoint = requireNotNull(result.checkpoint)
         val thirdWrite = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(thirdWrite.callbackToken))
+        checkpoint = handOffParserEffects(checkpoint, secondWrite.callbackToken)
+        result = applyParser(checkpoint, thirdWrite)
         checkpoint = requireNotNull(result.checkpoint)
         assertEquals("9", checkpoint.parserAppliedNextOffset)
+        checkpoint = handOffParserEffects(checkpoint, thirdWrite.callbackToken)
 
         result = output(checkpoint, "10", "x")
         checkpoint = requireNotNull(result.checkpoint)
@@ -378,15 +385,13 @@ class RelayV2TerminalCheckpointReducerTest {
         assertEquals(2, checkpoint.pendingOutput.size)
         assertTrue(result.effects.isEmpty())
 
-        result = reduce(
-            checkpoint,
-            RelayV2TerminalAction.ParserApplied(replayWrite.callbackToken),
-        )
+        result = applyParser(checkpoint, replayWrite)
         checkpoint = requireNotNull(result.checkpoint)
         assertEquals(RelayV2TerminalPhase.LIVE, checkpoint.phase)
         assertEquals("1", checkpoint.parserAppliedNextOffset)
         val liveWrite = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(liveWrite.callbackToken))
+        checkpoint = handOffParserEffects(checkpoint, replayWrite.callbackToken)
+        result = applyParser(checkpoint, liveWrite)
         assertEquals("2", result.checkpoint?.parserAppliedNextOffset)
         assertTrue(result.outcome is RelayV2TerminalOutcome.ParserAdvanced)
     }
@@ -413,7 +418,10 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         staleTokens.forEach { stale ->
-            val result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(stale))
+            val result = reduce(
+                checkpoint,
+                RelayV2TerminalAction.ParserApplied(detachedParserWriteClaim(checkpoint, stale)),
+            )
             assertEquals(
                 RelayV2TerminalIgnoredReason.STALE_PARSER_CALLBACK,
                 (result.outcome as RelayV2TerminalOutcome.Ignored).reason,
@@ -424,7 +432,9 @@ class RelayV2TerminalCheckpointReducerTest {
         val wrongRange = callback.copy(endOffset = "4")
         val wrongRangeResult = reduce(
             checkpoint,
-            RelayV2TerminalAction.ParserApplied(wrongRange),
+            RelayV2TerminalAction.ParserApplied(
+                detachedParserWriteClaim(checkpoint, wrongRange),
+            ),
         )
         assertEquals(
             RelayV2TerminalIgnoredReason.OUT_OF_ORDER_PARSER_CALLBACK,
@@ -432,8 +442,90 @@ class RelayV2TerminalCheckpointReducerTest {
         )
         assertEquals("0", wrongRangeResult.checkpoint?.parserAppliedNextOffset)
 
-        val applied = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(callback))
+        val applied = applyParser(checkpoint, callback)
         assertEquals("3", applied.checkpoint?.parserAppliedNextOffset)
+
+        var activationCheckpoint = open()
+        val firstQueued = output(activationCheckpoint, "0", "a")
+        activationCheckpoint = requireNotNull(firstQueued.checkpoint)
+        val firstWrite = firstQueued.effects
+            .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        activationCheckpoint = requireNotNull(
+            output(activationCheckpoint, "1", "b").checkpoint,
+        )
+        val firstClaimed = reduce(
+            activationCheckpoint,
+            RelayV2TerminalAction.ClaimParserDispatch(firstWrite),
+        )
+        val firstClaim =
+            (firstClaimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed).claim as
+                RelayV2TerminalParserDispatchClaim.Write
+        val firstSettled = reduce(
+            requireNotNull(firstClaimed.checkpoint),
+            RelayV2TerminalAction.ParserApplied(firstClaim),
+        )
+        val nextWrite = firstSettled.effects
+            .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        val activation = RelayV2TerminalParserEffectActivation(
+            firstClaim.callbackToken,
+            reservationId = "reservation-next-head",
+            batchFingerprint = "batch-next-head",
+        )
+        val withActivation = requireNotNull(
+            reduce(
+                requireNotNull(firstSettled.checkpoint),
+                RelayV2TerminalAction.ParserEffectsReserved(activation),
+            ).checkpoint,
+        )
+
+        val nextClaimed = reduce(
+            withActivation,
+            RelayV2TerminalAction.ClaimParserDispatch(nextWrite),
+        )
+        val withActivationAndClaim = requireNotNull(nextClaimed.checkpoint)
+        val nextClaim =
+            (nextClaimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed).claim as
+                RelayV2TerminalParserDispatchClaim.Write
+        assertEquals(activation, withActivationAndClaim.pendingParserEffectActivation)
+        assertEquals(nextClaim, withActivationAndClaim.pendingParserDispatchClaim)
+
+        val detachedActivationToken = activation.callbackToken.copy(
+            endOffset = activation.callbackToken.startOffset,
+        )
+        val detachedActivation = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(
+                withActivationAndClaim.copy(
+                    lastAppliedParserCallbackToken = detachedActivationToken,
+                    pendingParserEffectActivation = activation.copy(
+                        callbackToken = detachedActivationToken,
+                    ),
+                ),
+            ),
+            withActivationAndClaim.identity,
+            withActivationAndClaim.openAttempt,
+            withActivationAndClaim.deliveryToken,
+            withActivationAndClaim.parserContinuityId,
+        )
+        assertNull(detachedActivation.checkpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (detachedActivation.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
+        val activationSettled = reduce(
+            withActivationAndClaim,
+            RelayV2TerminalAction.ParserEffectsActivated(activation),
+        )
+        val afterActivation = requireNotNull(activationSettled.checkpoint)
+        assertEquals(RelayV2TerminalOutcome.Applied, activationSettled.outcome)
+        assertNull(afterActivation.pendingParserEffectActivation)
+        assertEquals(nextClaim, afterActivation.pendingParserDispatchClaim)
+        val nextSettled = reduce(
+            afterActivation,
+            RelayV2TerminalAction.ParserApplied(nextClaim),
+        )
+        assertEquals("2", nextSettled.checkpoint?.parserAppliedNextOffset)
+        assertNull(nextSettled.checkpoint?.pendingParserDispatchClaim)
     }
 
     @Test
@@ -586,7 +678,7 @@ class RelayV2TerminalCheckpointReducerTest {
         assertEquals(RelayV2TerminalPhase.CLOSED_WAITING_PARSER, checkpoint.phase)
         assertTrue(result.effects.none { it is RelayV2TerminalEffect.RequestReplay })
 
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(callback))
+        result = applyParser(checkpoint, callback)
         val finalized = requireNotNull(result.checkpoint)
         assertEquals(RelayV2TerminalPhase.FINALIZED, finalized.phase)
         assertTrue(result.outcome is RelayV2TerminalOutcome.ClosedFinalized)
@@ -628,14 +720,20 @@ class RelayV2TerminalCheckpointReducerTest {
                 fromOffset = "3",
                 tailOffsetAtStart = "3",
             ),
-            RelayV2TerminalAction.ParserApplied(callback),
-            RelayV2TerminalAction.ParserFailed(callback),
-            RelayV2TerminalAction.ParserResetApplied(callback),
+            RelayV2TerminalAction.ParserApplied(
+                detachedParserWriteClaim(finalized, callback),
+            ),
+            RelayV2TerminalAction.ParserFailed(
+                detachedParserWriteClaim(finalized, callback),
+            ),
+            RelayV2TerminalAction.ParserResetApplied(
+                detachedParserResetClaim(finalized, callback),
+            ),
             RelayV2TerminalAction.EnqueueInput(
                 finalized.deliveryToken,
                 RelayV2TerminalBytes.utf8("x"),
             ),
-            RelayV2TerminalAction.InputSent(actionFence(finalized), "1"),
+            RelayV2TerminalAction.InputSent(detachedInputClaim(finalized, "1")),
             RelayV2TerminalAction.InputAck(actionFence(finalized), "1"),
             RelayV2TerminalAction.InputError(
                 actionFence(finalized),
@@ -644,7 +742,7 @@ class RelayV2TerminalCheckpointReducerTest {
                 error = RelayV2TerminalControlError.GAP,
             ),
             RelayV2TerminalAction.EnqueueResize(finalized.deliveryToken, 120, 36),
-            RelayV2TerminalAction.ResizeSent(actionFence(finalized), "1"),
+            RelayV2TerminalAction.ResizeSent(detachedResizeClaim(finalized, "1")),
             RelayV2TerminalAction.ResizeAck(actionFence(finalized), "1"),
             RelayV2TerminalAction.ResizeError(
                 actionFence(finalized),
@@ -844,20 +942,15 @@ class RelayV2TerminalCheckpointReducerTest {
         assertTrue(result.effects.none { it is RelayV2TerminalEffect.OutputAck })
         assertNotNull(checkpoint.closed)
 
-        result = reduce(
-            checkpoint,
-            RelayV2TerminalAction.ParserResetApplied(resetCallback),
-        )
+        result = applyParserReset(checkpoint, resetCallback)
         checkpoint = requireNotNull(result.checkpoint)
         val write = result.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
         assertNull(checkpoint.parserResetCallbackToken)
         assertEquals(write.callbackToken, checkpoint.parserInFlightCallbackToken)
         assertNotNull(checkpoint.closed)
+        checkpoint = handOffParserEffects(checkpoint, resetCallback)
 
-        result = reduce(
-            checkpoint,
-            RelayV2TerminalAction.ParserApplied(write.callbackToken),
-        )
+        result = applyParser(checkpoint, write)
         assertEquals(RelayV2TerminalPhase.FINALIZED, result.checkpoint?.phase)
         assertEquals("2", result.checkpoint?.parserAppliedNextOffset)
         assertEquals(
@@ -943,7 +1036,7 @@ class RelayV2TerminalCheckpointReducerTest {
         checkpoint = requireNotNull(queued.checkpoint)
         val callback = queued.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>()
             .single().callbackToken
-        result = reduce(checkpoint, RelayV2TerminalAction.ParserApplied(callback))
+        result = applyParser(checkpoint, callback)
         assertEquals(RelayV2TerminalPhase.FINALIZED, result.checkpoint?.phase)
 
         val unavailable = reduce(
@@ -997,11 +1090,38 @@ class RelayV2TerminalCheckpointReducerTest {
             RelayV2TerminalControlRejectionReason.ACK_BEYOND_SENT,
             (result.outcome as RelayV2TerminalOutcome.ControlRejected).reason,
         )
+        checkpoint = settleInputSent(checkpoint, "1")
+        val sentRetry = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RetryUnackedControls(checkpoint.deliveryToken),
+        )
+        checkpoint = requireNotNull(sentRetry.checkpoint)
+        val retryAfterSent = sentRetry.effects
+            .filterIsInstance<RelayV2TerminalEffect.SendInput>().single()
+        assertEquals(firstInput, retryAfterSent)
+        assertEquals(null, checkpoint.pendingInputs.single().dispatchClaim)
+        val duplicateRetryEffect = reduce(
+            checkpoint,
+            RelayV2TerminalAction.RetryUnackedControls(checkpoint.deliveryToken),
+        ).effects.filterIsInstance<RelayV2TerminalEffect.SendInput>().single()
+        assertEquals(retryAfterSent, duplicateRetryEffect)
+        val claimedRetry = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ClaimControlDispatch(retryAfterSent),
+        )
+        checkpoint = requireNotNull(claimedRetry.checkpoint)
+        val retryClaim = (claimedRetry.outcome as RelayV2TerminalOutcome.ControlDispatchClaimed)
+            .claim as RelayV2TerminalControlDispatchClaim.Input
+        val duplicateOriginal = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ClaimControlDispatch(firstInput),
+        )
+        assertEquals(
+            RelayV2TerminalIgnoredReason.DUPLICATE_CONTROL_DISPATCH,
+            (duplicateOriginal.outcome as RelayV2TerminalOutcome.Ignored).reason,
+        )
         checkpoint = requireNotNull(
-            reduce(
-                checkpoint,
-                RelayV2TerminalAction.InputSent(actionFence(checkpoint), "1"),
-            ).checkpoint,
+            reduce(checkpoint, RelayV2TerminalAction.InputSent(retryClaim)).checkpoint,
         )
         checkpoint = requireNotNull(
             reduce(
@@ -1027,12 +1147,7 @@ class RelayV2TerminalCheckpointReducerTest {
         assertEquals("3", checkpoint.nextResizeSeq)
         assertEquals(listOf(100, 120), checkpoint.pendingResizes.map { it.cols })
 
-        checkpoint = requireNotNull(
-            reduce(
-                checkpoint,
-                RelayV2TerminalAction.ResizeSent(actionFence(checkpoint), "1"),
-            ).checkpoint,
-        )
+        checkpoint = settleResizeSent(checkpoint, "1")
         result = reduce(
             checkpoint,
             RelayV2TerminalAction.EnqueueResize(checkpoint.deliveryToken, 140, 40),
@@ -1059,12 +1174,7 @@ class RelayV2TerminalCheckpointReducerTest {
             ),
         )
         checkpoint = requireNotNull(result.checkpoint)
-        checkpoint = requireNotNull(
-            reduce(
-                checkpoint,
-                RelayV2TerminalAction.InputSent(actionFence(checkpoint), "2"),
-            ).checkpoint,
-        )
+        checkpoint = settleInputSent(checkpoint, "2")
         val gap = reduce(
             checkpoint,
             RelayV2TerminalAction.InputError(
@@ -1164,10 +1274,7 @@ class RelayV2TerminalCheckpointReducerTest {
         val waitingForReset = requireNotNull(closedBeforeParserReset.checkpoint)
         assertEquals(RelayV2TerminalPhase.CLOSED_WAITING_PARSER, waitingForReset.phase)
         assertTrue(closedBeforeParserReset.effects.isEmpty())
-        val finalizedAfterReset = reduce(
-            waitingForReset,
-            RelayV2TerminalAction.ParserResetApplied(resetCallback),
-        )
+        val finalizedAfterReset = applyParserReset(waitingForReset, resetCallback)
         assertEquals(RelayV2TerminalPhase.FINALIZED, finalizedAfterReset.checkpoint?.phase)
         assertTrue(finalizedAfterReset.outcome is RelayV2TerminalOutcome.ClosedFinalized)
     }
@@ -1758,12 +1865,7 @@ class RelayV2TerminalCheckpointReducerTest {
         val issuedBeforeFinalize = pendingSend.effects.filterIsInstance<
             RelayV2TerminalEffect.SendInput
             >().single()
-        sentInput = requireNotNull(
-            reduce(
-                sentInput,
-                RelayV2TerminalAction.InputSent(actionFence(sentInput), "1"),
-            ).checkpoint,
-        )
+        sentInput = settleInputSent(sentInput, "1")
         val finalizedWithInput = reduce(
             sentInput,
             closedAction(sentInput, "0", replayAvailable = false, bufferStartOffset = null),
@@ -1844,7 +1946,7 @@ class RelayV2TerminalCheckpointReducerTest {
         resumed = requireNotNull(resumedOutput.checkpoint)
         val write = resumedOutput.effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>()
             .single()
-        val finalized = reduce(resumed, RelayV2TerminalAction.ParserApplied(write.callbackToken))
+        val finalized = applyParser(resumed, write)
         assertEquals(RelayV2TerminalPhase.FINALIZED, finalized.checkpoint?.phase)
 
         val lowAttempt = openAttempt("open-low-tail", "low-tail-fingerprint")
@@ -1896,11 +1998,9 @@ class RelayV2TerminalCheckpointReducerTest {
         val noRingWrite = noRingResult.effects
             .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
         noRing = requireNotNull(
-            reduce(
-                noRing,
-                RelayV2TerminalAction.ParserApplied(noRingWrite.callbackToken),
-            ).checkpoint,
+            applyParser(noRing, noRingWrite).checkpoint,
         )
+        noRing = handOffParserEffects(noRing, noRingWrite.callbackToken)
         val noRingCloseAttempt = closeAttempt("close-no-ring", "close-no-ring-fingerprint")
         noRing = requireNotNull(
             reduce(
@@ -2333,6 +2433,58 @@ class RelayV2TerminalCheckpointReducerTest {
             (malformed.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
         )
 
+        val unownedActivationBase = open()
+        val unownedActivation = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(
+                unownedActivationBase.copy(
+                    pendingParserEffectActivation = RelayV2TerminalParserEffectActivation(
+                        parserResetToken(unownedActivationBase, "unowned-activation"),
+                        reservationId = "reservation-unowned",
+                        batchFingerprint = "batch-unowned",
+                    ),
+                ),
+            ),
+            unownedActivationBase.identity,
+            unownedActivationBase.openAttempt,
+            unownedActivationBase.deliveryToken,
+            unownedActivationBase.parserContinuityId,
+        )
+        assertNull(unownedActivation.checkpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (unownedActivation.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
+        val handoffBase = open()
+        val handoffQueued = output(handoffBase, "0", "handoff")
+        val handoffWrite = handoffQueued
+            .effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        val handoff = requireNotNull(
+            applyParser(requireNotNull(handoffQueued.checkpoint), handoffWrite).checkpoint,
+        )
+        val handoffToken = requireNotNull(handoff.pendingParserEffectHandoff)
+        val freshDelivery = handoff.deliveryToken.copy(
+            localDispatchToken = handoff.deliveryToken.localDispatchToken + 1,
+        )
+        val mismatchedHandoff = RelayV2TerminalCheckpointReducer.restore(
+            RelayV2TerminalStoredCheckpoint.Present(
+                handoff.copy(
+                    pendingParserEffectHandoff = handoffToken.copy(
+                        fence = handoffToken.fence.copy(deliveryToken = freshDelivery),
+                    ),
+                ),
+            ),
+            handoff.identity,
+            handoff.openAttempt,
+            freshDelivery,
+            handoff.parserContinuityId,
+        )
+        assertNull(mismatchedHandoff.checkpoint)
+        assertEquals(
+            RelayV2TerminalResetReason.CHECKPOINT_INVALID,
+            (mismatchedHandoff.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+
         val oversizedBytes = RelayV2TerminalBytes.of(
             ByteArray(RelayV2TerminalCheckpointLimits.MAX_FRAME_BYTES) { 1 },
         )
@@ -2498,11 +2650,9 @@ class RelayV2TerminalCheckpointReducerTest {
         val responseLossReplay = result.effects
             .filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
         active = requireNotNull(
-            reduce(
-                active,
-                RelayV2TerminalAction.ParserApplied(responseLossReplay.callbackToken),
-            ).checkpoint,
+            applyParser(active, responseLossReplay).checkpoint,
         )
+        active = handOffParserEffects(active, responseLossReplay.callbackToken)
         assertEquals(RelayV2TerminalPhase.LIVE, active.phase)
 
         val unsolicited = RelayV2TerminalCheckpointReducer.reduce(null, firstOpened)
@@ -2898,10 +3048,7 @@ class RelayV2TerminalCheckpointReducerTest {
         result = output(replayingReset, "0", "ab")
         replayingReset = requireNotNull(result.checkpoint)
         assertTrue(result.effects.none { it is RelayV2TerminalEffect.WriteParser })
-        result = reduce(
-            replayingReset,
-            RelayV2TerminalAction.ParserResetApplied(resetParser.callbackToken),
-        )
+        result = applyParserReset(replayingReset, resetParser.callbackToken)
         assertTrue(result.effects.any { it is RelayV2TerminalEffect.WriteParser })
     }
 
@@ -3084,7 +3231,9 @@ class RelayV2TerminalCheckpointReducerTest {
         assertTrue(resetDedupe.effects.isEmpty())
         val lateParser = reduce(
             resetDeduplicated,
-            RelayV2TerminalAction.ParserApplied(oldParserCallback),
+            RelayV2TerminalAction.ParserApplied(
+                detachedParserWriteClaim(resetDeduplicated, oldParserCallback),
+            ),
         )
         assertEquals(
             RelayV2TerminalIgnoredReason.STALE_PARSER_CALLBACK,
@@ -3786,6 +3935,164 @@ class RelayV2TerminalCheckpointReducerTest {
         checkpoint: RelayV2TerminalCheckpoint,
         action: RelayV2TerminalAction,
     ): RelayV2TerminalReduction = RelayV2TerminalCheckpointReducer.reduce(checkpoint, action)
+
+    private fun applyParser(
+        checkpoint: RelayV2TerminalCheckpoint,
+        effect: RelayV2TerminalEffect.WriteParser,
+    ): RelayV2TerminalReduction {
+        val claimed = reduce(checkpoint, RelayV2TerminalAction.ClaimParserDispatch(effect))
+        val claim = (claimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed).claim as
+            RelayV2TerminalParserDispatchClaim.Write
+        return reduce(
+            requireNotNull(claimed.checkpoint),
+            RelayV2TerminalAction.ParserApplied(claim),
+        )
+    }
+
+    private fun applyParser(
+        checkpoint: RelayV2TerminalCheckpoint,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+    ): RelayV2TerminalReduction {
+        val pending = checkpoint.pendingOutput.single { it.callbackToken == callbackToken }
+        return applyParser(
+            checkpoint,
+            RelayV2TerminalEffect.WriteParser(callbackToken, pending.bytes),
+        )
+    }
+
+    private fun applyParserReset(
+        checkpoint: RelayV2TerminalCheckpoint,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+    ): RelayV2TerminalReduction {
+        val claimed = reduce(
+            checkpoint,
+            RelayV2TerminalAction.ClaimParserDispatch(
+                RelayV2TerminalEffect.ResetParser(callbackToken),
+            ),
+        )
+        val claim = (claimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed).claim as
+            RelayV2TerminalParserDispatchClaim.Reset
+        return reduce(
+            requireNotNull(claimed.checkpoint),
+            RelayV2TerminalAction.ParserResetApplied(claim),
+        )
+    }
+
+    private fun detachedParserWriteClaim(
+        checkpoint: RelayV2TerminalCheckpoint,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+    ): RelayV2TerminalParserDispatchClaim.Write = RelayV2TerminalParserDispatchClaim.Write(
+        callbackToken.fence,
+        callbackToken,
+        checkpoint.phase,
+        checkpoint.pendingOutput.firstOrNull { it.callbackToken == callbackToken }?.bytes
+            ?: RelayV2TerminalBytes.utf8("detached"),
+    )
+
+    private fun detachedParserResetClaim(
+        checkpoint: RelayV2TerminalCheckpoint,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+    ): RelayV2TerminalParserDispatchClaim.Reset = RelayV2TerminalParserDispatchClaim.Reset(
+        callbackToken.fence,
+        callbackToken,
+        checkpoint.phase,
+    )
+
+    private fun handOffParserEffects(
+        checkpoint: RelayV2TerminalCheckpoint,
+        callbackToken: RelayV2TerminalParserCallbackToken,
+    ): RelayV2TerminalCheckpoint {
+        if (checkpoint.pendingParserEffectHandoff == null) return checkpoint
+        val activation = RelayV2TerminalParserEffectActivation(
+            callbackToken,
+            reservationId = "reservation-${callbackToken.operationId}",
+            batchFingerprint = "batch-${callbackToken.operationId}",
+        )
+        val reserved = requireNotNull(
+            reduce(
+                checkpoint,
+                RelayV2TerminalAction.ParserEffectsReserved(activation),
+            ).checkpoint,
+        )
+        return requireNotNull(
+            reduce(
+                reserved,
+                RelayV2TerminalAction.ParserEffectsActivated(activation),
+            ).checkpoint,
+        )
+    }
+
+    private fun settleInputSent(
+        checkpoint: RelayV2TerminalCheckpoint,
+        inputSeq: String,
+    ): RelayV2TerminalCheckpoint {
+        val pending = checkpoint.pendingInputs.single { it.inputSeq == inputSeq }
+        val effect = RelayV2TerminalEffect.SendInput(
+            requireNotNull(checkpoint.activeControlDispatchLease),
+            pending.generation,
+            pending.inputSeq,
+            pending.bytes,
+        )
+        val claimed = reduce(checkpoint, RelayV2TerminalAction.ClaimControlDispatch(effect))
+        val claim = (claimed.outcome as RelayV2TerminalOutcome.ControlDispatchClaimed).claim as
+            RelayV2TerminalControlDispatchClaim.Input
+        return requireNotNull(
+            reduce(requireNotNull(claimed.checkpoint), RelayV2TerminalAction.InputSent(claim))
+                .checkpoint,
+        )
+    }
+
+    private fun settleResizeSent(
+        checkpoint: RelayV2TerminalCheckpoint,
+        resizeSeq: String,
+    ): RelayV2TerminalCheckpoint {
+        val pending = checkpoint.pendingResizes.single { it.resizeSeq == resizeSeq }
+        val effect = RelayV2TerminalEffect.SendResize(
+            requireNotNull(checkpoint.activeControlDispatchLease),
+            pending.generation,
+            pending.resizeSeq,
+            pending.cols,
+            pending.rows,
+        )
+        val claimed = reduce(checkpoint, RelayV2TerminalAction.ClaimControlDispatch(effect))
+        val claim = (claimed.outcome as RelayV2TerminalOutcome.ControlDispatchClaimed).claim as
+            RelayV2TerminalControlDispatchClaim.Resize
+        return requireNotNull(
+            reduce(requireNotNull(claimed.checkpoint), RelayV2TerminalAction.ResizeSent(claim))
+                .checkpoint,
+        )
+    }
+
+    private fun detachedInputClaim(
+        checkpoint: RelayV2TerminalCheckpoint,
+        inputSeq: String,
+    ): RelayV2TerminalControlDispatchClaim.Input = RelayV2TerminalControlDispatchClaim.Input(
+        RelayV2TerminalControlDispatchLease(effectFence(checkpoint)),
+        "dispatch-1",
+        checkpoint.identity.generation,
+        inputSeq,
+        RelayV2TerminalBytes.utf8("late"),
+    )
+
+    private fun detachedResizeClaim(
+        checkpoint: RelayV2TerminalCheckpoint,
+        resizeSeq: String,
+    ): RelayV2TerminalControlDispatchClaim.Resize = RelayV2TerminalControlDispatchClaim.Resize(
+        RelayV2TerminalControlDispatchLease(effectFence(checkpoint)),
+        "dispatch-1",
+        checkpoint.identity.generation,
+        resizeSeq,
+        120,
+        36,
+    )
+
+    private fun effectFence(
+        checkpoint: RelayV2TerminalCheckpoint,
+    ): RelayV2TerminalEffectFence = RelayV2TerminalEffectFence(
+        checkpoint.identity,
+        checkpoint.deliveryToken,
+        checkpoint.openAttempt,
+    )
 
     private fun beginOpen(
         checkpoint: RelayV2TerminalCheckpoint,

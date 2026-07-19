@@ -80,10 +80,12 @@ internal object RelayV2TerminalCheckpointCodec {
         val (kind, checkpoint) = when (stored) {
             is RelayV2TerminalStoredCheckpoint.PreOpen -> {
                 requireKey(key, stored.checkpoint.target)
+                requireCurrentSchema(stored.checkpoint.schemaVersion)
                 RelayV2TerminalCheckpointKind.PRE_OPEN to encodePreOpen(stored.checkpoint)
             }
             is RelayV2TerminalStoredCheckpoint.Present -> {
                 requireKey(key, stored.checkpoint.identity.target())
+                requireCurrentSchema(stored.checkpoint.schemaVersion)
                 RelayV2TerminalCheckpointKind.PRESENT to encodeCheckpoint(stored.checkpoint)
             }
             is RelayV2TerminalStoredCheckpoint.Invalid,
@@ -102,6 +104,12 @@ internal object RelayV2TerminalCheckpointCodec {
             throw RelayV2StorageException(RelayV2StorageFailure.LIMIT_EXCEEDED)
         }
         return RelayV2EncodedTerminalCheckpoint(kind, payload)
+    }
+
+    private fun requireCurrentSchema(schemaVersion: Int) {
+        if (schemaVersion != RelayV2TerminalCheckpointLimits.SCHEMA_VERSION) {
+            throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
     }
 
     fun decode(
@@ -397,6 +405,30 @@ internal object RelayV2TerminalCheckpointCodec {
         )
     }
 
+    private fun encodeParserEffectActivation(
+        value: RelayV2TerminalParserEffectActivation,
+    ): Map<String, Any?> = linkedMapOf(
+        "callbackToken" to encodeParserToken(value.callbackToken),
+        "reservationId" to value.reservationId,
+        "batchFingerprint" to value.batchFingerprint,
+    )
+
+    private fun decodeParserEffectActivation(
+        value: Map<String, Any?>,
+    ): RelayV2TerminalParserEffectActivation {
+        RelayV2StorageJson.requireKeys(
+            value,
+            "callbackToken",
+            "reservationId",
+            "batchFingerprint",
+        )
+        return RelayV2TerminalParserEffectActivation(
+            decodeParserToken(RelayV2StorageJson.objectValue(value, "callbackToken")),
+            RelayV2StorageJson.string(value, "reservationId"),
+            RelayV2StorageJson.string(value, "batchFingerprint"),
+        )
+    }
+
     private fun encodePendingOpen(value: RelayV2TerminalPendingOpen): Map<String, Any?> =
         linkedMapOf(
             "requestId" to value.requestId,
@@ -460,6 +492,10 @@ internal object RelayV2TerminalCheckpointCodec {
         )
 
     private fun decodePreOpen(value: Map<String, Any?>): RelayV2TerminalPreOpenCheckpoint {
+        val storedSchemaVersion = RelayV2StorageJson.int(value, "schemaVersion")
+        if (storedSchemaVersion !in setOf(7, RelayV2TerminalCheckpointLimits.SCHEMA_VERSION)) {
+            throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
         RelayV2StorageJson.requireKeys(
             value,
             "schemaVersion",
@@ -473,7 +509,7 @@ internal object RelayV2TerminalCheckpointCodec {
             "resetFence",
         )
         return RelayV2TerminalPreOpenCheckpoint(
-            RelayV2StorageJson.int(value, "schemaVersion"),
+            RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
             decodeTarget(RelayV2StorageJson.objectValue(value, "target")),
             decodeDelivery(RelayV2StorageJson.objectValue(value, "deliveryToken")),
             RelayV2StorageJson.string(value, "parserContinuityId"),
@@ -544,6 +580,54 @@ internal object RelayV2TerminalCheckpointCodec {
         )
     }
 
+    private fun encodeParserDispatchClaim(
+        value: RelayV2TerminalParserDispatchClaim,
+    ): Map<String, Any?> = mapOf(
+        "kind" to when (value) {
+            is RelayV2TerminalParserDispatchClaim.Write -> "WRITE"
+            is RelayV2TerminalParserDispatchClaim.Reset -> "RESET"
+        },
+        "fence" to encodeEffectFence(value.fence),
+        "callbackToken" to encodeParserToken(value.callbackToken),
+        "authorizedPhase" to value.authorizedPhase.name,
+        "bytes" to when (value) {
+            is RelayV2TerminalParserDispatchClaim.Write ->
+                Base64.getEncoder().encodeToString(value.bytes.copyBytes())
+            is RelayV2TerminalParserDispatchClaim.Reset -> null
+        },
+    )
+
+    private fun decodeParserDispatchClaim(
+        value: Map<String, Any?>,
+    ): RelayV2TerminalParserDispatchClaim {
+        RelayV2StorageJson.requireKeys(
+            value,
+            "kind",
+            "fence",
+            "callbackToken",
+            "authorizedPhase",
+            "bytes",
+        )
+        val fence = decodeEffectFence(RelayV2StorageJson.objectValue(value, "fence"))
+        val token = decodeParserToken(RelayV2StorageJson.objectValue(value, "callbackToken"))
+        val phase = RelayV2StorageJson.enum<RelayV2TerminalPhase>(value, "authorizedPhase")
+        return when (RelayV2StorageJson.string(value, "kind")) {
+            "WRITE" -> RelayV2TerminalParserDispatchClaim.Write(
+                fence,
+                token,
+                phase,
+                decodeBytes(RelayV2StorageJson.string(value, "bytes")),
+            )
+            "RESET" -> {
+                if (value["bytes"] != null) {
+                    throw RelayV2StorageException(RelayV2StorageFailure.MALFORMED)
+                }
+                RelayV2TerminalParserDispatchClaim.Reset(fence, token, phase)
+            }
+            else -> throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
+    }
+
     private fun encodePendingReplay(value: RelayV2TerminalPendingReplay): Map<String, Any?> = mapOf(
         "requestId" to value.requestId,
         "fence" to encodeEffectFence(value.fence),
@@ -559,20 +643,130 @@ internal object RelayV2TerminalCheckpointCodec {
         )
     }
 
+    private fun encodeControlLease(
+        value: RelayV2TerminalControlDispatchLease,
+    ): Map<String, Any?> = mapOf("fence" to encodeEffectFence(value.fence))
+
+    private fun decodeControlLease(
+        value: Map<String, Any?>,
+    ): RelayV2TerminalControlDispatchLease {
+        RelayV2StorageJson.requireKeys(value, "fence")
+        return RelayV2TerminalControlDispatchLease(
+            decodeEffectFence(RelayV2StorageJson.objectValue(value, "fence")),
+        )
+    }
+
+    private fun encodeControlClaim(
+        value: RelayV2TerminalControlDispatchClaim,
+    ): Map<String, Any?> = when (value) {
+        is RelayV2TerminalControlDispatchClaim.Input -> mapOf(
+            "kind" to "INPUT",
+            "dispatchLease" to encodeControlLease(value.dispatchLease),
+            "attemptId" to value.attemptId,
+            "generation" to value.generation,
+            "inputSeq" to value.inputSeq,
+            "bytes" to Base64.getEncoder().encodeToString(value.bytes.copyBytes()),
+            "phase" to value.phase.name,
+        )
+        is RelayV2TerminalControlDispatchClaim.Resize -> mapOf(
+            "kind" to "RESIZE",
+            "dispatchLease" to encodeControlLease(value.dispatchLease),
+            "attemptId" to value.attemptId,
+            "generation" to value.generation,
+            "resizeSeq" to value.resizeSeq,
+            "cols" to value.cols,
+            "rows" to value.rows,
+            "phase" to value.phase.name,
+        )
+    }
+
+    private fun decodeInputControlClaim(
+        value: Map<String, Any?>,
+    ): RelayV2TerminalControlDispatchClaim.Input {
+        RelayV2StorageJson.requireKeys(
+            value,
+            "kind",
+            "dispatchLease",
+            "attemptId",
+            "generation",
+            "inputSeq",
+            "bytes",
+            "phase",
+        )
+        if (RelayV2StorageJson.string(value, "kind") != "INPUT") {
+            throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
+        return RelayV2TerminalControlDispatchClaim.Input(
+            decodeControlLease(RelayV2StorageJson.objectValue(value, "dispatchLease")),
+            RelayV2StorageJson.string(value, "attemptId"),
+            RelayV2StorageJson.string(value, "generation"),
+            RelayV2StorageJson.string(value, "inputSeq"),
+            decodeBytes(RelayV2StorageJson.string(value, "bytes")),
+            RelayV2StorageJson.enum(value, "phase"),
+        )
+    }
+
+    private fun decodeResizeControlClaim(
+        value: Map<String, Any?>,
+    ): RelayV2TerminalControlDispatchClaim.Resize {
+        RelayV2StorageJson.requireKeys(
+            value,
+            "kind",
+            "dispatchLease",
+            "attemptId",
+            "generation",
+            "resizeSeq",
+            "cols",
+            "rows",
+            "phase",
+        )
+        if (RelayV2StorageJson.string(value, "kind") != "RESIZE") {
+            throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
+        return RelayV2TerminalControlDispatchClaim.Resize(
+            decodeControlLease(RelayV2StorageJson.objectValue(value, "dispatchLease")),
+            RelayV2StorageJson.string(value, "attemptId"),
+            RelayV2StorageJson.string(value, "generation"),
+            RelayV2StorageJson.string(value, "resizeSeq"),
+            RelayV2StorageJson.int(value, "cols"),
+            RelayV2StorageJson.int(value, "rows"),
+            RelayV2StorageJson.enum(value, "phase"),
+        )
+    }
+
     private fun encodePendingInput(value: RelayV2PendingInput): Map<String, Any?> = mapOf(
         "generation" to value.generation,
         "inputSeq" to value.inputSeq,
         "bytes" to Base64.getEncoder().encodeToString(value.bytes.copyBytes()),
         "disposition" to value.disposition.name,
+        "dispatchClaim" to value.dispatchClaim?.let(::encodeControlClaim),
     )
 
-    private fun decodePendingInput(value: Map<String, Any?>): RelayV2PendingInput {
-        RelayV2StorageJson.requireKeys(value, "generation", "inputSeq", "bytes", "disposition")
+    private fun decodePendingInput(
+        value: Map<String, Any?>,
+        schemaVersion: Int,
+    ): RelayV2PendingInput {
+        if (schemaVersion == 7) {
+            RelayV2StorageJson.requireKeys(value, "generation", "inputSeq", "bytes", "disposition")
+        } else {
+            RelayV2StorageJson.requireKeys(
+                value,
+                "generation",
+                "inputSeq",
+                "bytes",
+                "disposition",
+                "dispatchClaim",
+            )
+        }
         return RelayV2PendingInput(
             RelayV2StorageJson.string(value, "generation"),
             RelayV2StorageJson.string(value, "inputSeq"),
             decodeBytes(RelayV2StorageJson.string(value, "bytes")),
             RelayV2StorageJson.enum(value, "disposition"),
+            if (schemaVersion == 7) null else RelayV2StorageJson.nullableObject(
+                value,
+                "dispatchClaim",
+            )?.let(::decodeInputControlClaim),
         )
     }
 
@@ -582,23 +776,43 @@ internal object RelayV2TerminalCheckpointCodec {
         "cols" to value.cols,
         "rows" to value.rows,
         "disposition" to value.disposition.name,
+        "dispatchClaim" to value.dispatchClaim?.let(::encodeControlClaim),
     )
 
-    private fun decodePendingResize(value: Map<String, Any?>): RelayV2PendingResize {
-        RelayV2StorageJson.requireKeys(
-            value,
-            "generation",
-            "resizeSeq",
-            "cols",
-            "rows",
-            "disposition",
-        )
+    private fun decodePendingResize(
+        value: Map<String, Any?>,
+        schemaVersion: Int,
+    ): RelayV2PendingResize {
+        if (schemaVersion == 7) {
+            RelayV2StorageJson.requireKeys(
+                value,
+                "generation",
+                "resizeSeq",
+                "cols",
+                "rows",
+                "disposition",
+            )
+        } else {
+            RelayV2StorageJson.requireKeys(
+                value,
+                "generation",
+                "resizeSeq",
+                "cols",
+                "rows",
+                "disposition",
+                "dispatchClaim",
+            )
+        }
         return RelayV2PendingResize(
             RelayV2StorageJson.string(value, "generation"),
             RelayV2StorageJson.string(value, "resizeSeq"),
             RelayV2StorageJson.int(value, "cols"),
             RelayV2StorageJson.int(value, "rows"),
             RelayV2StorageJson.enum(value, "disposition"),
+            if (schemaVersion == 7) null else RelayV2StorageJson.nullableObject(
+                value,
+                "dispatchClaim",
+            )?.let(::decodeResizeControlClaim),
         )
     }
 
@@ -700,6 +914,7 @@ internal object RelayV2TerminalCheckpointCodec {
             "networkReceivedThrough" to value.networkReceivedThrough,
             "nextParserOperationSeq" to value.nextParserOperationSeq,
             "nextReplayRequestSeq" to value.nextReplayRequestSeq,
+            "nextControlDispatchAttemptSeq" to value.nextControlDispatchAttemptSeq,
             "replayRequestIds" to value.replayRequestIds,
             "closeRequestIds" to value.closeRequestIds,
             "parserResetCallbackToken" to value.parserResetCallbackToken?.let(::encodeParserToken),
@@ -707,6 +922,14 @@ internal object RelayV2TerminalCheckpointCodec {
                 value.parserInFlightCallbackToken?.let(::encodeParserToken),
             "lastAppliedParserCallbackToken" to
                 value.lastAppliedParserCallbackToken?.let(::encodeParserToken),
+            "pendingParserDispatchClaim" to
+                value.pendingParserDispatchClaim?.let(::encodeParserDispatchClaim),
+            "pendingParserEffectHandoff" to
+                value.pendingParserEffectHandoff?.let(::encodeParserToken),
+            "pendingParserEffectHandoffResetReason" to
+                value.pendingParserEffectHandoffResetReason?.name,
+            "pendingParserEffectActivation" to
+                value.pendingParserEffectActivation?.let(::encodeParserEffectActivation),
             "pendingOutput" to value.pendingOutput.map(::encodeParserWrite),
             "pendingOpen" to value.pendingOpen?.let(::encodePendingOpen),
             "pendingReplay" to value.pendingReplay?.let(::encodePendingReplay),
@@ -718,7 +941,7 @@ internal object RelayV2TerminalCheckpointCodec {
             "ackedThroughResizeSeq" to value.ackedThroughResizeSeq,
             "pendingResizes" to value.pendingResizes.map(::encodePendingResize),
             "activeControlDispatchLease" to value.activeControlDispatchLease?.let {
-                mapOf("fence" to encodeEffectFence(it.fence))
+                encodeControlLease(it)
             },
             "ambiguousInputs" to value.ambiguousInputs.map(::encodeAmbiguousInput),
             "pendingClose" to value.pendingClose?.let(::encodePendingClose),
@@ -727,8 +950,8 @@ internal object RelayV2TerminalCheckpointCodec {
         )
 
     private fun decodeCheckpoint(value: Map<String, Any?>): RelayV2TerminalCheckpoint {
-        RelayV2StorageJson.requireKeys(
-            value,
+        val storedSchemaVersion = RelayV2StorageJson.int(value, "schemaVersion")
+        val commonKeys = arrayOf(
             "schemaVersion",
             "identity",
             "openAttempt",
@@ -766,15 +989,24 @@ internal object RelayV2TerminalCheckpointCodec {
             "closed",
             "resetReason",
         )
-        val lease = RelayV2StorageJson.nullableObject(value, "activeControlDispatchLease")
-            ?.let { encoded ->
-                RelayV2StorageJson.requireKeys(encoded, "fence")
-                RelayV2TerminalControlDispatchLease(
-                    decodeEffectFence(RelayV2StorageJson.objectValue(encoded, "fence")),
+        when (storedSchemaVersion) {
+            7 -> RelayV2StorageJson.requireKeys(value, *commonKeys)
+            RelayV2TerminalCheckpointLimits.SCHEMA_VERSION -> {
+                val schemaEightKeys = commonKeys + arrayOf(
+                    "nextControlDispatchAttemptSeq",
+                    "pendingParserDispatchClaim",
+                    "pendingParserEffectHandoff",
+                    "pendingParserEffectHandoffResetReason",
+                    "pendingParserEffectActivation",
                 )
+                RelayV2StorageJson.requireKeys(value, *schemaEightKeys)
             }
+            else -> throw RelayV2StorageException(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE)
+        }
+        val lease = RelayV2StorageJson.nullableObject(value, "activeControlDispatchLease")
+            ?.let(::decodeControlLease)
         return RelayV2TerminalCheckpoint(
-            schemaVersion = RelayV2StorageJson.int(value, "schemaVersion"),
+            schemaVersion = RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
             identity = decodeIdentity(RelayV2StorageJson.objectValue(value, "identity")),
             openAttempt = decodeOpenAttempt(
                 RelayV2StorageJson.objectValue(value, "openAttempt"),
@@ -808,6 +1040,11 @@ internal object RelayV2TerminalCheckpointCodec {
                 "nextParserOperationSeq",
             ),
             nextReplayRequestSeq = RelayV2StorageJson.string(value, "nextReplayRequestSeq"),
+            nextControlDispatchAttemptSeq = if (storedSchemaVersion == 7) {
+                "1"
+            } else {
+                RelayV2StorageJson.string(value, "nextControlDispatchAttemptSeq")
+            },
             replayRequestIds = RelayV2StorageJson.stringList(
                 value,
                 "replayRequestIds",
@@ -830,6 +1067,32 @@ internal object RelayV2TerminalCheckpointCodec {
                 value,
                 "lastAppliedParserCallbackToken",
             )?.let(::decodeParserToken),
+            pendingParserDispatchClaim = if (storedSchemaVersion == 7) {
+                null
+            } else {
+                RelayV2StorageJson.nullableObject(value, "pendingParserDispatchClaim")
+                    ?.let(::decodeParserDispatchClaim)
+            },
+            pendingParserEffectHandoff = if (storedSchemaVersion == 7) {
+                null
+            } else {
+                RelayV2StorageJson.nullableObject(value, "pendingParserEffectHandoff")
+                    ?.let(::decodeParserToken)
+            },
+            pendingParserEffectHandoffResetReason = if (storedSchemaVersion == 7) {
+                null
+            } else {
+                RelayV2StorageJson.nullableEnum<RelayV2TerminalResetReason>(
+                    value,
+                    "pendingParserEffectHandoffResetReason",
+                )
+            },
+            pendingParserEffectActivation = if (storedSchemaVersion == 7) {
+                null
+            } else {
+                RelayV2StorageJson.nullableObject(value, "pendingParserEffectActivation")
+                    ?.let(::decodeParserEffectActivation)
+            },
             pendingOutput = RelayV2StorageJson.list(
                 value,
                 "pendingOutput",
@@ -846,14 +1109,18 @@ internal object RelayV2TerminalCheckpointCodec {
                 value,
                 "pendingInputs",
                 RelayV2TerminalCheckpointLimits.MAX_INPUT_RECORDS,
-            ).map { decodePendingInput(RelayV2StorageJson.objectValue(it)) },
+            ).map {
+                decodePendingInput(RelayV2StorageJson.objectValue(it), storedSchemaVersion)
+            },
             nextResizeSeq = RelayV2StorageJson.string(value, "nextResizeSeq"),
             ackedThroughResizeSeq = RelayV2StorageJson.string(value, "ackedThroughResizeSeq"),
             pendingResizes = RelayV2StorageJson.list(
                 value,
                 "pendingResizes",
                 RelayV2TerminalCheckpointLimits.MAX_RESIZE_RECORDS,
-            ).map { decodePendingResize(RelayV2StorageJson.objectValue(it)) },
+            ).map {
+                decodePendingResize(RelayV2StorageJson.objectValue(it), storedSchemaVersion)
+            },
             activeControlDispatchLease = lease,
             ambiguousInputs = RelayV2StorageJson.list(
                 value,

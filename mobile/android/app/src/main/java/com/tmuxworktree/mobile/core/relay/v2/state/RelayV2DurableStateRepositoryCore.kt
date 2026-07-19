@@ -97,16 +97,29 @@ internal interface RelayV2OutboxRecoveryAuthority {
 }
 
 /**
+ * Narrow durable authority used only by the default-off terminal runtime adapter.
+ *
+ * This interface owns whole-checkpoint transactions only. External parser, socket, and effect-sink
+ * calls are adapter work and must never run from inside a store transaction.
+ */
+internal interface RelayV2TerminalRuntimeAuthority {
+    suspend fun reduceTerminalUnderApplyLease(
+        key: RelayV2TerminalCheckpointKey,
+        action: RelayV2TerminalAction,
+    ): RelayV2TerminalReduction
+}
+
+/**
  * Single transaction owner for the accepted pure Outbox and terminal authorities.
  *
  * The actor apply lease is an entry precondition; this core deliberately does not inspect actor
- * generation state itself. Effects in returned results become dispatchable only after this method's
- * transaction has committed.
+ * generation state itself. Pure reducer effects in returned results become dispatchable only after
+ * their transaction has committed. External side effects are never invoked in these transactions.
  */
 internal class RelayV2DurableStateRepositoryCore(
     private val store: RelayV2DurableStateStore,
     private val outboxAuthority: RelayV2OutboxAuthorityCore = RelayV2OutboxAuthorityCore(),
-) : RelayV2OutboxRecoveryAuthority {
+) : RelayV2OutboxRecoveryAuthority, RelayV2TerminalRuntimeAuthority {
     private val restoredTerminalKeys = ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
     private val resetAuthorizedTerminalKeys =
         ConcurrentHashMap.newKeySet<RelayV2TerminalCheckpointKey>()
@@ -193,7 +206,7 @@ internal class RelayV2DurableStateRepositoryCore(
         key: RelayV2TerminalCheckpointKey,
     ): RelayV2TerminalStoredCheckpoint = store.transaction { decodeTerminal(key) }
 
-    suspend fun reduceTerminalUnderApplyLease(
+    override suspend fun reduceTerminalUnderApplyLease(
         key: RelayV2TerminalCheckpointKey,
         action: RelayV2TerminalAction,
     ): RelayV2TerminalReduction {

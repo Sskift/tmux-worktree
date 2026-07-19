@@ -407,6 +407,262 @@ class RelayV2DurableStateRepositoryCoreTest {
             )
         }
 
+    @Test
+    fun `legacy schema and parser recovery markers normalize through durable round trips`() =
+        runBlocking {
+            val store = MemoryStore()
+            val repository = RelayV2DurableStateRepositoryCore(store)
+            val identity = terminalIdentity()
+            val key = RelayV2TerminalCheckpointKey.from(identity.target())
+            val delivery = terminalDelivery()
+            val attempt = RelayV2TerminalOpenAttempt("open-v7", "open-v7-fingerprint")
+            repository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.BeginOpenAttempt(
+                    delivery,
+                    "open-v7-request",
+                    attempt,
+                    RelayV2TerminalOpenMode.NEW,
+                    120,
+                    36,
+                    identity.target(),
+                    PARSER_CONTINUITY,
+                    null,
+                ),
+            )
+            store.rewriteTerminalAsLegacyV7(key)
+            val preOpen = repository.loadTerminal(key) as RelayV2TerminalStoredCheckpoint.PreOpen
+            assertEquals(
+                RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
+                preOpen.checkpoint.schemaVersion,
+            )
+            assertStorageFailure(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE) {
+                RelayV2TerminalCheckpointCodec.encode(
+                    key,
+                    RelayV2TerminalStoredCheckpoint.PreOpen(
+                        preOpen.checkpoint.copy(schemaVersion = 7),
+                    ),
+                )
+            }
+
+            var checkpoint = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    key,
+                    RelayV2TerminalAction.Opened(
+                        identity,
+                        "open-v7-request",
+                        attempt,
+                        delivery,
+                        PARSER_CONTINUITY,
+                        RelayV2TerminalOpenDisposition.NEW,
+                        120,
+                        36,
+                        "0",
+                        "0",
+                    ),
+                ).checkpoint,
+            )
+            checkpoint = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    key,
+                    RelayV2TerminalAction.EnqueueInput(
+                        checkpoint.deliveryToken,
+                        RelayV2TerminalBytes.utf8("legacy-input"),
+                    ),
+                ).checkpoint,
+            )
+            checkpoint = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    key,
+                    RelayV2TerminalAction.EnqueueResize(checkpoint.deliveryToken, 132, 40),
+                ).checkpoint,
+            )
+            store.rewriteTerminalAsLegacyV7(key)
+
+            val present = RelayV2DurableStateRepositoryCore(store).loadTerminal(key)
+                as RelayV2TerminalStoredCheckpoint.Present
+            assertEquals(
+                RelayV2TerminalCheckpointLimits.SCHEMA_VERSION,
+                present.checkpoint.schemaVersion,
+            )
+            assertEquals("1", present.checkpoint.nextControlDispatchAttemptSeq)
+            assertEquals(null, present.checkpoint.pendingParserDispatchClaim)
+            assertEquals(null, present.checkpoint.pendingParserEffectHandoff)
+            assertEquals(null, present.checkpoint.pendingParserEffectHandoffResetReason)
+            assertEquals(null, present.checkpoint.pendingParserEffectActivation)
+            assertTrue(present.checkpoint.pendingInputs.all { it.dispatchClaim == null })
+            assertTrue(present.checkpoint.pendingResizes.all { it.dispatchClaim == null })
+            assertEquals(
+                checkpoint.pendingInputs.map { it.inputSeq },
+                present.checkpoint.pendingInputs.map { it.inputSeq },
+            )
+            assertStorageFailure(RelayV2StorageFailure.SCHEMA_INCOMPATIBLE) {
+                RelayV2TerminalCheckpointCodec.encode(
+                    key,
+                    RelayV2TerminalStoredCheckpoint.Present(
+                        present.checkpoint.copy(schemaVersion = 7),
+                    ),
+                )
+            }
+
+            ParserRecoveryMarker.entries.forEach { marker ->
+                listOf(false, true).forEach { freshDelivery ->
+                    assertParserRecoveryMarkerRoundTrip(
+                        marker = marker,
+                        freshDelivery = freshDelivery,
+                    )
+                }
+            }
+        }
+
+    private enum class ParserRecoveryMarker {
+        CLAIM,
+        HANDOFF,
+        ACTIVATION,
+    }
+
+    private suspend fun assertParserRecoveryMarkerRoundTrip(
+        marker: ParserRecoveryMarker,
+        freshDelivery: Boolean,
+    ) {
+        val store = MemoryStore()
+        val repository = RelayV2DurableStateRepositoryCore(store)
+        val identity = terminalIdentity()
+        val key = RelayV2TerminalCheckpointKey.from(identity.target())
+        val storedDelivery = terminalDelivery()
+        val attempt = RelayV2TerminalOpenAttempt(
+            "open-marker-${marker.name}-${freshDelivery}",
+            "open-marker-fingerprint-${marker.name}-${freshDelivery}",
+        )
+        repository.reduceTerminalUnderApplyLease(
+            key,
+            RelayV2TerminalAction.BeginOpenAttempt(
+                storedDelivery,
+                "open-marker-request",
+                attempt,
+                RelayV2TerminalOpenMode.NEW,
+                120,
+                36,
+                identity.target(),
+                PARSER_CONTINUITY,
+                null,
+            ),
+        )
+        var checkpoint = requireNotNull(
+            repository.reduceTerminalUnderApplyLease(
+                key,
+                RelayV2TerminalAction.Opened(
+                    identity,
+                    "open-marker-request",
+                    attempt,
+                    storedDelivery,
+                    PARSER_CONTINUITY,
+                    RelayV2TerminalOpenDisposition.NEW,
+                    120,
+                    36,
+                    "0",
+                    "0",
+                ),
+            ).checkpoint,
+        )
+        val write = repository.reduceTerminalUnderApplyLease(
+            key,
+            RelayV2TerminalAction.Output(
+                actionFence(checkpoint),
+                "0",
+                RelayV2TerminalBytes.utf8("marker"),
+            ),
+        ).effects.filterIsInstance<RelayV2TerminalEffect.WriteParser>().single()
+        val claimed = repository.reduceTerminalUnderApplyLease(
+            key,
+            RelayV2TerminalAction.ClaimParserDispatch(write),
+        )
+        val parserClaim = (claimed.outcome as RelayV2TerminalOutcome.ParserDispatchClaimed)
+            .claim as RelayV2TerminalParserDispatchClaim.Write
+        checkpoint = requireNotNull(claimed.checkpoint)
+        when (marker) {
+            ParserRecoveryMarker.CLAIM -> {
+                assertEquals(parserClaim, checkpoint.pendingParserDispatchClaim)
+                assertEquals(null, checkpoint.pendingParserEffectHandoff)
+                assertEquals(null, checkpoint.pendingParserEffectActivation)
+            }
+            ParserRecoveryMarker.HANDOFF,
+            ParserRecoveryMarker.ACTIVATION,
+            -> checkpoint = requireNotNull(
+                repository.reduceTerminalUnderApplyLease(
+                    key,
+                    RelayV2TerminalAction.ParserApplied(parserClaim),
+                ).checkpoint,
+            )
+        }
+        if (marker != ParserRecoveryMarker.CLAIM) {
+            val callbackToken = requireNotNull(checkpoint.pendingParserEffectHandoff)
+            if (marker == ParserRecoveryMarker.ACTIVATION) {
+                checkpoint = requireNotNull(
+                    repository.reduceTerminalUnderApplyLease(
+                        key,
+                        RelayV2TerminalAction.ParserEffectsReserved(
+                            RelayV2TerminalParserEffectActivation(
+                                callbackToken,
+                                "reservation-marker",
+                                "batch-marker",
+                            ),
+                        ),
+                    ).checkpoint,
+                )
+                assertEquals(null, checkpoint.pendingParserEffectHandoff)
+                assertNotNull(checkpoint.pendingParserEffectActivation)
+            } else {
+                assertEquals(callbackToken, checkpoint.pendingParserEffectHandoff)
+                assertEquals(null, checkpoint.pendingParserEffectActivation)
+            }
+        }
+
+        val currentDelivery = if (freshDelivery) {
+            storedDelivery.copy(localDispatchToken = storedDelivery.localDispatchToken + 1)
+        } else {
+            storedDelivery
+        }
+        val restarted = RelayV2DurableStateRepositoryCore(store)
+        val firstRestore = restarted.restoreTerminalUnderApplyLease(
+            key,
+            identity,
+            attempt,
+            currentDelivery,
+            PARSER_CONTINUITY,
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.STREAM_LOST,
+            (firstRestore.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+        val normalized = (restarted.loadTerminal(key) as
+            RelayV2TerminalStoredCheckpoint.Present).checkpoint
+        assertEquals(RelayV2TerminalPhase.RESET_REQUIRED, normalized.phase)
+        assertEquals(RelayV2TerminalResetReason.STREAM_LOST, normalized.resetReason)
+        assertEquals(currentDelivery, normalized.deliveryToken)
+        assertEquals(null, normalized.parserResetCallbackToken)
+        assertEquals(null, normalized.parserInFlightCallbackToken)
+        assertEquals(null, normalized.lastAppliedParserCallbackToken)
+        assertEquals(null, normalized.pendingParserDispatchClaim)
+        assertEquals(null, normalized.pendingParserEffectHandoff)
+        assertEquals(null, normalized.pendingParserEffectHandoffResetReason)
+        assertEquals(null, normalized.pendingParserEffectActivation)
+
+        val secondRestart = RelayV2DurableStateRepositoryCore(store)
+        val secondRestore = secondRestart.restoreTerminalUnderApplyLease(
+            key,
+            identity,
+            attempt,
+            currentDelivery,
+            PARSER_CONTINUITY,
+        )
+        assertEquals(
+            RelayV2TerminalResetReason.STREAM_LOST,
+            (secondRestore.outcome as RelayV2TerminalOutcome.ResetRequired).reason,
+        )
+        assertEquals(normalized, secondRestore.checkpoint)
+    }
+
     private class MemoryStore : RelayV2DurableStateStore, RelayV2DurableStateTransaction {
         private data class EntryKey(
             val namespace: RelayV2OutboxAuthorityNamespace,
@@ -516,6 +772,52 @@ class RelayV2DurableStateRepositoryCoreTest {
             terminals[key] = value.copy(
                 payload = value.payload.copy(
                     payloadUtf8Bytes = value.payload.payloadUtf8Bytes + 1,
+                ),
+            )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        fun rewriteTerminalAsLegacyV7(key: RelayV2TerminalCheckpointKey) {
+            val value = requireNotNull(terminals[key])
+            val root = LinkedHashMap(
+                RelayV2StorageJson.decode(
+                    value.payload,
+                    RelayV2TerminalCheckpointCodec.CODEC_VERSION,
+                    4 * 1024 * 1024,
+                    RelayV2JsonLimits(
+                        maxDepth = 32,
+                        maxDirectKeys = 128,
+                        maxTotalKeys = 300_000,
+                        maxNodes = 600_000,
+                    ),
+                ),
+            )
+            val checkpoint = LinkedHashMap(root["checkpoint"] as Map<String, Any?>)
+            checkpoint["schemaVersion"] = 7
+            checkpoint.remove("nextControlDispatchAttemptSeq")
+            checkpoint.remove("pendingParserDispatchClaim")
+            checkpoint.remove("pendingParserEffectHandoff")
+            checkpoint.remove("pendingParserEffectHandoffResetReason")
+            checkpoint.remove("pendingParserEffectActivation")
+            checkpoint["pendingInputs"]?.let { pendingInputs ->
+                checkpoint["pendingInputs"] = (pendingInputs as List<*>).map { item ->
+                    LinkedHashMap(item as Map<String, Any?>).apply {
+                        remove("dispatchClaim")
+                    }
+                }
+            }
+            checkpoint["pendingResizes"]?.let { pendingResizes ->
+                checkpoint["pendingResizes"] = (pendingResizes as List<*>).map { item ->
+                    LinkedHashMap(item as Map<String, Any?>).apply {
+                        remove("dispatchClaim")
+                    }
+                }
+            }
+            root["checkpoint"] = checkpoint
+            terminals[key] = value.copy(
+                payload = RelayV2StorageJson.encode(
+                    RelayV2TerminalCheckpointCodec.CODEC_VERSION,
+                    root,
                 ),
             )
         }
