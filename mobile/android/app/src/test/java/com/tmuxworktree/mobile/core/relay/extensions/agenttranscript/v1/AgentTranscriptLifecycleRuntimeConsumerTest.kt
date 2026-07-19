@@ -740,6 +740,11 @@ private class RecordingDurableOperationPort : AgentTranscriptLifecycleRuntimeDur
             parentPayloadSha256 = "1".repeat(64),
             localGeneration = "1",
             materializedThroughAgentSeq = "14",
+            sourceCut = AgentTranscriptLifecycleReadSourceCut.Available(
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-runtime-read",
+                currentSourceAttested = true,
+            ),
         )
         if (cursor != null && cursor.revision != revision) {
             return AgentTranscriptLifecycleRevisionPinnedReadResult.CursorRevisionChanged

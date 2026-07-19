@@ -616,8 +616,8 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
     /**
      * Reads one immutable projection page from the same transaction as its complete durable audit.
-     * A continuation first compares only the canonical parent revision, so a changed cut returns
-     * no content without touching entry/lifecycle materialization.
+     * A continuation first compares the complete parent revision and source cut, so any changed
+     * cut returns no content without touching entry/lifecycle materialization.
      */
     override suspend fun readRevisionPinnedPage(
         namespace: AgentTranscriptLifecycleDurableNamespace,
@@ -639,7 +639,8 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
                 .CursorRevisionChanged
         }
         val extension = decoded.state.extensionLane
-        if (extension.support != AgentExtensionSupport.AVAILABLE ||
+        if (candidateRevision.sourceCut is AgentTranscriptLifecycleReadSourceCut.Unavailable ||
+            extension.support != AgentExtensionSupport.AVAILABLE ||
             extension.requiresSnapshot || extension.requiresTimelineRotation
         ) {
             return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.ParentUnavailable
@@ -647,15 +648,13 @@ internal class AgentTranscriptLifecycleDurableRepositoryCore(
 
         val candidates = AgentTranscriptLifecycleReadCandidateCollector(cursor, limit)
         val audited = auditSingle(decoded, candidates)
-        val revision = AgentTranscriptLifecycleReadRevision(
-            namespace = audited.record.namespace,
-            parentPayloadSha256 = audited.payload.sha256,
-            localGeneration = audited.record.state.extensionLane.localGeneration,
-            materializedThroughAgentSeq = audited.record.state.extensionLane.lastAgentSeq,
-        )
+        val revision = audited.readRevision()
         if (cursor != null && cursor.revision != revision) {
             return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult
                 .CursorRevisionChanged
+        }
+        if (revision.sourceCut is AgentTranscriptLifecycleReadSourceCut.Unavailable) {
+            return@transaction AgentTranscriptLifecycleRevisionPinnedReadResult.ParentUnavailable
         }
         candidates.page(
             revision = revision,
@@ -3766,7 +3765,41 @@ private fun DecodedAgentTranscriptLifecycleDurableRecord.readRevision() =
         parentPayloadSha256 = payload.sha256,
         localGeneration = state.extensionLane.localGeneration,
         materializedThroughAgentSeq = state.extensionLane.lastAgentSeq,
+        sourceCut = state.extensionLane.toReadSourceCut(),
     )
+
+private fun AuditedAgentTranscriptLifecycleDurableRecord.readRevision() =
+    AgentTranscriptLifecycleReadRevision(
+        namespace = record.namespace,
+        parentPayloadSha256 = payload.sha256,
+        localGeneration = record.state.extensionLane.localGeneration,
+        materializedThroughAgentSeq = record.state.extensionLane.lastAgentSeq,
+        sourceCut = record.state.extensionLane.toReadSourceCut(),
+    )
+
+private fun AgentTranscriptLifecycleExtensionState.toReadSourceCut():
+    AgentTranscriptLifecycleReadSourceCut {
+    if (support != AgentExtensionSupport.AVAILABLE) {
+        return AgentTranscriptLifecycleReadSourceCut.Unavailable
+    }
+    val sourceEpoch = activeSourceEpoch
+        ?: return AgentTranscriptLifecycleReadSourceCut.Unavailable
+    val source = when (liveSource) {
+        AgentLiveSourceState.CONNECTED -> AgentLiveSourceState.CONNECTED
+        AgentLiveSourceState.INTERRUPTED -> AgentLiveSourceState.INTERRUPTED
+        null -> return AgentTranscriptLifecycleReadSourceCut.Unavailable
+    }
+    return AgentTranscriptLifecycleReadSourceCut.Available(
+        liveSource = source,
+        activeSourceEpoch = sourceEpoch,
+        currentSourceAttested =
+            support == AgentExtensionSupport.AVAILABLE &&
+                source == AgentLiveSourceState.CONNECTED &&
+                !requiresSnapshot &&
+                !requiresTimelineRotation &&
+                syncState !is AgentTimelineSyncState.StatusRefresh,
+    )
+}
 
 private fun ValidatedAgentTranscriptEntry.toReadItem():
     AgentTranscriptLifecycleReadItem.TranscriptEntry = when (this) {

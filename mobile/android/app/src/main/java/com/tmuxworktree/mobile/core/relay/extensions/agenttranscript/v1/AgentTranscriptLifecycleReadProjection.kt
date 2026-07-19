@@ -30,12 +30,32 @@ internal enum class AgentTranscriptLifecycleReadRecordKind(val storageValue: Str
     LIFECYCLE("LIFECYCLE"),
 }
 
+/** Closed current-source facts captured from the same durable parent cut as the revision. */
+internal sealed interface AgentTranscriptLifecycleReadSourceCut {
+    data object Unavailable : AgentTranscriptLifecycleReadSourceCut
+
+    data class Available(
+        val liveSource: AgentLiveSourceState,
+        val activeSourceEpoch: String,
+        val currentSourceAttested: Boolean,
+    ) : AgentTranscriptLifecycleReadSourceCut {
+        init {
+            require(
+                liveSource == AgentLiveSourceState.CONNECTED ||
+                    liveSource == AgentLiveSourceState.INTERRUPTED,
+            ) { "Read source cut has no readable source" }
+            requireReadOpaqueId(activeSourceEpoch, "Read source epoch")
+        }
+    }
+}
+
 /** Exact durable cut that every continuation must match before any materialized row is read. */
 internal data class AgentTranscriptLifecycleReadRevision(
     val namespace: AgentTranscriptLifecycleDurableNamespace,
     val parentPayloadSha256: String,
     val localGeneration: String,
     val materializedThroughAgentSeq: String,
+    val sourceCut: AgentTranscriptLifecycleReadSourceCut,
 ) {
     init {
         require(namespace.timelineEpoch != null) { "Read revision requires a timeline lineage" }
@@ -143,6 +163,12 @@ internal sealed interface AgentTranscriptLifecycleReadState {
         val nextCursor: AgentTranscriptLifecycleReadCursor?,
         val endReached: Boolean,
     ) : AgentTranscriptLifecycleReadState {
+        init {
+            require(revision.sourceCut is AgentTranscriptLifecycleReadSourceCut.Available) {
+                "A read page requires available source facts"
+            }
+        }
+
         val namespace: AgentTranscriptLifecycleDurableNamespace
             get() = revision.namespace
     }
@@ -168,7 +194,13 @@ internal sealed interface AgentTranscriptLifecycleRevisionPinnedReadResult {
         val items: List<AgentTranscriptLifecycleReadItem>,
         val nextCursor: AgentTranscriptLifecycleReadCursor?,
         val endReached: Boolean,
-    ) : AgentTranscriptLifecycleRevisionPinnedReadResult
+    ) : AgentTranscriptLifecycleRevisionPinnedReadResult {
+        init {
+            require(revision.sourceCut is AgentTranscriptLifecycleReadSourceCut.Available) {
+                "A revision-pinned page requires available source facts"
+            }
+        }
+    }
 }
 
 /**

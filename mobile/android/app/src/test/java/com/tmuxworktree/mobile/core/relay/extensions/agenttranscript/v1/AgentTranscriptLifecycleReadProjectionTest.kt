@@ -48,6 +48,140 @@ class AgentTranscriptLifecycleReadProjectionTest {
     }
 
     @Test
+    fun unavailableParentWithoutSourcePairReturnsNoContentWithoutMaterializedRead() = runBlocking {
+        val namespace = readNamespace()
+        val available = operationalReadState(namespace.consumer)
+        val unavailable = available.copy(
+            extensionLane = available.extensionLane.copy(
+                support = AgentExtensionSupport.UNAVAILABLE,
+                unavailableReason = AgentExtensionUnavailableReason.ADAPTER_UNAVAILABLE,
+                liveSource = null,
+                activeSourceEpoch = null,
+                effectiveHostLimits = null,
+            ),
+        )
+        val parent = AgentTranscriptLifecyclePersistedState(
+            namespace,
+            AgentTranscriptLifecycleDurableStateCodec.encode(
+                namespace,
+                unavailable,
+                AgentTranscriptDurableStorageAccounting.EMPTY,
+            ),
+        )
+        val store = ParentOnlyDurableStore(parent)
+        val core = AgentTranscriptLifecycleDurableRepositoryCore(store)
+
+        val result = core.readRevisionPinnedPage(
+            namespace = namespace,
+            cursor = null,
+            limit = 10,
+        )
+
+        assertEquals(AgentTranscriptLifecycleRevisionPinnedReadResult.ParentUnavailable, result)
+        assertEquals(0, store.materializedReads)
+    }
+
+    @Test
+    fun sourceCutChangeReturnsNoContentWithoutMaterializedRead() = runBlocking {
+        val namespace = readNamespace()
+        val state = operationalReadState(namespace.consumer)
+        val payload = AgentTranscriptLifecycleDurableStateCodec.encode(
+            namespace,
+            state,
+            AgentTranscriptDurableStorageAccounting.EMPTY,
+        )
+        val currentRevision = AgentTranscriptLifecycleReadRevision(
+            namespace = namespace,
+            parentPayloadSha256 = payload.sha256,
+            localGeneration = state.extensionLane.localGeneration,
+            materializedThroughAgentSeq = state.extensionLane.lastAgentSeq,
+            sourceCut = availableReadSourceCut(),
+        )
+        val staleCut = AgentTranscriptLifecycleReadSourceCut.Available(
+            liveSource = AgentLiveSourceState.CONNECTED,
+            activeSourceEpoch = "source-old",
+            currentSourceAttested = true,
+        )
+
+        val store = ParentOnlyDurableStore(
+            AgentTranscriptLifecyclePersistedState(namespace, payload),
+        )
+        val core = AgentTranscriptLifecycleDurableRepositoryCore(store)
+
+        val result = core.readRevisionPinnedPage(
+            namespace = namespace,
+            cursor = AgentTranscriptLifecycleReadCursor(
+                revision = currentRevision.copy(sourceCut = staleCut),
+                agentEventSeq = "1",
+                recordKind = AgentTranscriptLifecycleReadRecordKind.ENTRY,
+                stableIdentity = "entry-stale-cut",
+            ),
+            limit = 10,
+        )
+
+        assertEquals(
+            AgentTranscriptLifecycleRevisionPinnedReadResult.CursorRevisionChanged,
+            result,
+        )
+        assertEquals(0, store.materializedReads)
+
+        val unattestedParentCases = listOf(
+            state.copy(
+                extensionLane = state.extensionLane.copy(
+                    liveSource = AgentLiveSourceState.INTERRUPTED,
+                ),
+            ) to AgentTranscriptLifecycleReadSourceCut.Available(
+                liveSource = AgentLiveSourceState.INTERRUPTED,
+                activeSourceEpoch = "source-read",
+                currentSourceAttested = true,
+            ),
+            state.copy(
+                extensionLane = state.extensionLane.copy(
+                    syncState = AgentTimelineSyncState.StatusRefresh(),
+                ),
+            ) to AgentTranscriptLifecycleReadSourceCut.Available(
+                liveSource = AgentLiveSourceState.CONNECTED,
+                activeSourceEpoch = "source-read",
+                currentSourceAttested = true,
+            ),
+        )
+        unattestedParentCases.forEach { (parentState, staleCut) ->
+            val parentPayload = AgentTranscriptLifecycleDurableStateCodec.encode(
+                namespace,
+                parentState,
+                AgentTranscriptDurableStorageAccounting.EMPTY,
+            )
+            val store = ParentOnlyDurableStore(
+                AgentTranscriptLifecyclePersistedState(namespace, parentPayload),
+            )
+            val core = AgentTranscriptLifecycleDurableRepositoryCore(store)
+
+            val result = core.readRevisionPinnedPage(
+                namespace = namespace,
+                cursor = AgentTranscriptLifecycleReadCursor(
+                    revision = AgentTranscriptLifecycleReadRevision(
+                        namespace = namespace,
+                        parentPayloadSha256 = parentPayload.sha256,
+                        localGeneration = parentState.extensionLane.localGeneration,
+                        materializedThroughAgentSeq = parentState.extensionLane.lastAgentSeq,
+                        sourceCut = staleCut,
+                    ),
+                    agentEventSeq = "1",
+                    recordKind = AgentTranscriptLifecycleReadRecordKind.ENTRY,
+                    stableIdentity = "entry-unattested-cut",
+                ),
+                limit = 10,
+            )
+
+            assertEquals(
+                AgentTranscriptLifecycleRevisionPinnedReadResult.CursorRevisionChanged,
+                result,
+            )
+            assertEquals(0, store.materializedReads)
+        }
+    }
+
+    @Test
     fun auditedPagingBoundsMaterializationAndKeepsScanningAfterCandidateCapacity() {
         val revision = readRevision(readNamespace())
         val twoItems = listOf(
@@ -333,6 +467,13 @@ private fun readRevision(
     parentPayloadSha256 = "a".repeat(64),
     localGeneration = "1",
     materializedThroughAgentSeq = "257",
+    sourceCut = availableReadSourceCut(),
+)
+
+private fun availableReadSourceCut() = AgentTranscriptLifecycleReadSourceCut.Available(
+    liveSource = AgentLiveSourceState.CONNECTED,
+    activeSourceEpoch = "source-read",
+    currentSourceAttested = true,
 )
 
 private fun operationalReadState(

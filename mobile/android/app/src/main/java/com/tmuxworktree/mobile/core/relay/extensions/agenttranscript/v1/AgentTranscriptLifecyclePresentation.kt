@@ -10,8 +10,8 @@ internal const val AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY =
  * can expose content only when the Room read projection has already returned an exact-lineage
  * page. Mobile Outbox delivery remains the separate base-command domain; a transcript command ID
  * below is correlation only, while Waiting/Failed/Completed can occur only on [Lifecycle].
- * Future UI composition must separately define live-source/current-source presentation; this
- * unassembled domain foundation intentionally does not infer either status.
+ * Current-source presentation is derived only from the source attestation carried by that same
+ * audited durable read cut.
  */
 internal sealed interface AgentTranscriptLifecyclePresentation {
     data object Unavailable : AgentTranscriptLifecyclePresentation
@@ -48,6 +48,7 @@ internal sealed interface AgentTranscriptLifecyclePresentationItem {
         val failure: AgentLifecycleFailure?,
         val occurredAtMs: Long,
         val agentEventSeq: String,
+        val isCurrentSource: Boolean,
     ) : AgentTranscriptLifecyclePresentationItem
 }
 
@@ -57,41 +58,49 @@ internal object AgentTranscriptLifecyclePresentationMapper {
     ): AgentTranscriptLifecyclePresentation = when (state) {
         is AgentTranscriptLifecycleReadState.Unavailable ->
             AgentTranscriptLifecyclePresentation.Unavailable
-        is AgentTranscriptLifecycleReadState.Page -> AgentTranscriptLifecyclePresentation.Page(
-            revision = state.revision,
-            items = state.items.map { item ->
-                when (item) {
-                    is AgentTranscriptLifecycleReadItem.TranscriptEntry -> {
-                        val entry = item.entry
-                        AgentTranscriptLifecyclePresentationItem.Transcript(
-                            entryId = entry.entryId,
-                            runId = entry.runId,
-                            turnId = entry.turnId,
-                            role = entry.role,
-                            commandCorrelationId = entry.commandCorrelationId,
-                            createdAtMs = entry.createdAtMs,
-                            createdAgentSeq = entry.createdAgentSeq,
-                            lastModifiedAgentSeq = entry.lastModifiedAgentSeq,
-                            content = entry.content,
-                        )
+        is AgentTranscriptLifecycleReadState.Page -> {
+            val sourceCut = state.revision.sourceCut
+            AgentTranscriptLifecyclePresentation.Page(
+                revision = state.revision,
+                items = state.items.map { item ->
+                    when (item) {
+                        is AgentTranscriptLifecycleReadItem.TranscriptEntry -> {
+                            val entry = item.entry
+                            AgentTranscriptLifecyclePresentationItem.Transcript(
+                                entryId = entry.entryId,
+                                runId = entry.runId,
+                                turnId = entry.turnId,
+                                role = entry.role,
+                                commandCorrelationId = entry.commandCorrelationId,
+                                createdAtMs = entry.createdAtMs,
+                                createdAgentSeq = entry.createdAgentSeq,
+                                lastModifiedAgentSeq = entry.lastModifiedAgentSeq,
+                                content = entry.content,
+                            )
+                        }
+                        is AgentTranscriptLifecycleReadItem.LifecycleEvidence -> {
+                            val lifecycle = item.lifecycle
+                            AgentTranscriptLifecyclePresentationItem.Lifecycle(
+                                identity = lifecycle.identity,
+                                lifecycleEventId = lifecycle.lifecycleEventId,
+                                sourceEpoch = lifecycle.sourceEpoch,
+                                state = lifecycle.state,
+                                failure = lifecycle.failure,
+                                occurredAtMs = lifecycle.occurredAtMs,
+                                agentEventSeq = lifecycle.agentEventSeq,
+                                isCurrentSource =
+                                    sourceCut is AgentTranscriptLifecycleReadSourceCut.Available &&
+                                        sourceCut.currentSourceAttested &&
+                                        sourceCut.liveSource == AgentLiveSourceState.CONNECTED &&
+                                        lifecycle.sourceEpoch == sourceCut.activeSourceEpoch,
+                            )
+                        }
                     }
-                    is AgentTranscriptLifecycleReadItem.LifecycleEvidence -> {
-                        val lifecycle = item.lifecycle
-                        AgentTranscriptLifecyclePresentationItem.Lifecycle(
-                            identity = lifecycle.identity,
-                            lifecycleEventId = lifecycle.lifecycleEventId,
-                            sourceEpoch = lifecycle.sourceEpoch,
-                            state = lifecycle.state,
-                            failure = lifecycle.failure,
-                            occurredAtMs = lifecycle.occurredAtMs,
-                            agentEventSeq = lifecycle.agentEventSeq,
-                        )
-                    }
-                }
-            }.toList(),
-            nextCursor = state.nextCursor,
-            endReached = state.endReached,
-        )
+                }.toList(),
+                nextCursor = state.nextCursor,
+                endReached = state.endReached,
+            )
+        }
     }
 }
 

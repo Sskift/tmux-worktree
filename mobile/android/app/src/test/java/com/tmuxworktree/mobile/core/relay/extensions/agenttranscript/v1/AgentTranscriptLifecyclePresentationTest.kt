@@ -43,6 +43,10 @@ class AgentTranscriptLifecyclePresentationTest {
             parentPayloadSha256 = "a".repeat(64),
             localGeneration = "1",
             materializedThroughAgentSeq = "2",
+            sourceCut = presentationReadSourceCut(
+                liveSource = AgentLiveSourceState.CONNECTED,
+                currentSourceAttested = true,
+            ),
         )
         val readPage = AgentTranscriptLifecycleReadState.Page(
             revision = revision,
@@ -76,6 +80,93 @@ class AgentTranscriptLifecyclePresentationTest {
                 ),
             ),
         )
+    }
+
+    @Test
+    fun rowProjectionOnlyMarksAttestedConnectedExactSourceCurrent() {
+        data class Case(
+            val label: String,
+            val sourceCut: AgentTranscriptLifecycleReadSourceCut.Available,
+            val lifecycleSourceEpoch: String,
+            val expectedCurrent: Boolean,
+        )
+
+        val cases = listOf(
+            Case(
+                label = "connected exact",
+                sourceCut = presentationReadSourceCut(
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    currentSourceAttested = true,
+                ),
+                lifecycleSourceEpoch = "source-read",
+                expectedCurrent = true,
+            ),
+            Case(
+                label = "old source",
+                sourceCut = presentationReadSourceCut(
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    currentSourceAttested = true,
+                ),
+                lifecycleSourceEpoch = "source-old",
+                expectedCurrent = false,
+            ),
+            Case(
+                label = "interrupted source",
+                sourceCut = presentationReadSourceCut(
+                    liveSource = AgentLiveSourceState.INTERRUPTED,
+                    currentSourceAttested = true,
+                ),
+                lifecycleSourceEpoch = "source-read",
+                expectedCurrent = false,
+            ),
+            Case(
+                label = "status refresh unattested",
+                sourceCut = presentationReadSourceCut(
+                    liveSource = AgentLiveSourceState.CONNECTED,
+                    currentSourceAttested = false,
+                ),
+                lifecycleSourceEpoch = "source-read",
+                expectedCurrent = false,
+            ),
+        )
+
+        cases.forEach { case ->
+            val namespace = presentationReadNamespace()
+            val revision = AgentTranscriptLifecycleReadRevision(
+                namespace = namespace,
+                parentPayloadSha256 = "b".repeat(64),
+                localGeneration = "2",
+                materializedThroughAgentSeq = "1",
+                sourceCut = case.sourceCut,
+            )
+            val lifecycle = AgentTranscriptLifecycleReadItem.LifecycleEvidence(
+                AgentLifecycleRecord(
+                    lifecycleEventId = "event-${case.label}",
+                    sourceEpoch = case.lifecycleSourceEpoch,
+                    identity = AgentLifecycleIdentity(
+                        AgentLifecycleScope.RUN,
+                        "run-${case.label}",
+                        null,
+                    ),
+                    state = AgentLifecycleState.RUNNING,
+                    failure = null,
+                    occurredAtMs = 1,
+                    agentEventSeq = "1",
+                ),
+            )
+            val presentation = AgentTranscriptLifecyclePresentationMapper.map(
+                AgentTranscriptLifecycleReadState.Page(
+                    revision = revision,
+                    items = listOf(lifecycle),
+                    nextCursor = null,
+                    endReached = true,
+                ),
+            ) as AgentTranscriptLifecyclePresentation.Page
+            val presented = presentation.items.single()
+                as AgentTranscriptLifecyclePresentationItem.Lifecycle
+
+            assertEquals(case.label, case.expectedCurrent, presented.isCurrentSource)
+        }
     }
 
     @Test
@@ -178,6 +269,15 @@ private fun presentationReadNamespace(): AgentTranscriptLifecycleDurableNamespac
         ),
         timelineEpoch = "timeline-read-presentation",
     )
+
+private fun presentationReadSourceCut(
+    liveSource: AgentLiveSourceState,
+    currentSourceAttested: Boolean,
+) = AgentTranscriptLifecycleReadSourceCut.Available(
+    liveSource = liveSource,
+    activeSourceEpoch = "source-read",
+    currentSourceAttested = currentSourceAttested,
+)
 
 private fun presentationState(): AgentTranscriptLifecycleClientState {
     val identity = AgentExtensionSessionIdentity(
