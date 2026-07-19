@@ -196,6 +196,8 @@ export type RelayV2BrokerAction =
   | {
       kind: "send_host";
       transportId: string;
+      /** Exact carrier incarnation; only an exact source-self missing-carrier close may omit it. */
+      connectionIncarnation?: string;
       frame: RelayV2JsonObject;
       /** Present when adapter acceptance is an explicit broker commit fence. */
       deliveryId?: string;
@@ -203,6 +205,7 @@ export type RelayV2BrokerAction =
   | {
       kind: "close_host";
       transportId: string;
+      connectionIncarnation?: string;
       closeCode: 1013 | 4400 | 4401 | 4403 | 4409 | 4411;
       reason: string;
     }
@@ -240,6 +243,7 @@ export type RelayV2BrokerAction =
   | {
       kind: "pause_host_route" | "resume_host_route";
       transportId: string;
+      connectionIncarnation?: string;
       routeId: string;
     };
 
@@ -521,6 +525,7 @@ type RouteState = {
   openRequestId: string;
   connectorId: string;
   carrierTransportId: string;
+  carrierConnectionIncarnation: string;
   authContext: RelayV2BrokerConnectionAuthorization;
   status: "opening" | "opened" | "closing" | "closed";
   firstApplicationFrame: "pending" | "welcome" | "unavailable";
@@ -956,7 +961,7 @@ export class RelayV2BrokerCore {
   attachHostCarrier(
     transportId: string,
     authContext: RelayV2BrokerConnectionAuthorization,
-    connectionIncarnation = randomUUID(),
+    connectionIncarnation: string = randomUUID(),
   ): void {
     if (this.liveAuthCompositionLatched || this.outputReadyCompositionLatched) {
       throw new Error("Relay v2 Broker composition is latched fail-closed");
@@ -1295,6 +1300,7 @@ export class RelayV2BrokerCore {
       openRequestId,
       connectorId: admission.connectorId,
       carrierTransportId: carrier.transportId,
+      carrierConnectionIncarnation: carrier.connectionIncarnation,
       authContext: authorization,
       status: "opening",
       firstApplicationFrame: "pending",
@@ -1385,10 +1391,19 @@ export class RelayV2BrokerCore {
       return this.failure("HOST_SUPERSEDED", "Carrier delivery was cancelled");
     }
     const carrier = this.carriers.get(transportId);
-    if (!carrier || carrier.status === "closed") {
+    if (!carrier) {
       return this.failure("HOST_SUPERSEDED", "Carrier is no longer registered", [{
         kind: "close_host",
         transportId,
+        closeCode: 4409,
+        reason: "host_superseded",
+      }]);
+    }
+    if (carrier.status === "closed") {
+      return this.failure("HOST_SUPERSEDED", "Carrier is no longer registered", [{
+        kind: "close_host",
+        transportId,
+        connectionIncarnation: carrier.connectionIncarnation,
         closeCode: 4409,
         reason: "host_superseded",
       }]);
@@ -1414,6 +1429,7 @@ export class RelayV2BrokerCore {
       return this.failure("HOST_SUPERSEDED", "Carrier was superseded", [{
         kind: "close_host",
         transportId,
+        connectionIncarnation: carrier.connectionIncarnation,
         closeCode: 4409,
         reason: "host_superseded",
       }]);
@@ -1485,6 +1501,7 @@ export class RelayV2BrokerCore {
       return this.failure("BUSY", "Host registration changed before delivery commit", [{
         kind: "close_host",
         transportId,
+        connectionIncarnation: carrier.connectionIncarnation,
         closeCode: 1013,
         reason: "registration_commit_race",
       }]);
@@ -1518,6 +1535,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "send_host",
         transportId: previous.transportId,
+        connectionIncarnation: previous.connectionIncarnation,
         frame: this.checkedCarrierFrame({
           carrierVersion: 1,
           type: "host.superseded",
@@ -1535,6 +1553,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "close_host",
         transportId: previous.transportId,
+        connectionIncarnation: previous.connectionIncarnation,
         closeCode: 4409,
         reason: "host_superseded",
       });
@@ -2045,8 +2064,8 @@ export class RelayV2BrokerCore {
         accepted: false,
         error,
         actions: [
-          this.carrierErrorAction(carrier.transportId, hello.requestId, null, "host.hello", error),
-          { kind: "close_host", transportId: carrier.transportId, closeCode: 4403, reason: "host_identity_mismatch" },
+          this.carrierErrorAction(carrier, hello.requestId, null, "host.hello", error),
+          { kind: "close_host", transportId: carrier.transportId, connectionIncarnation: carrier.connectionIncarnation, closeCode: 4403, reason: "host_identity_mismatch" },
         ],
       };
     }
@@ -2064,8 +2083,8 @@ export class RelayV2BrokerCore {
         accepted: false,
         error,
         actions: [
-          this.carrierErrorAction(carrier.transportId, hello.requestId, null, "host.hello", error),
-          { kind: "close_host", transportId: carrier.transportId, closeCode: 4411, reason: "duplicate_connector" },
+          this.carrierErrorAction(carrier, hello.requestId, null, "host.hello", error),
+          { kind: "close_host", transportId: carrier.transportId, connectionIncarnation: carrier.connectionIncarnation, closeCode: 4411, reason: "duplicate_connector" },
         ],
       };
     }
@@ -2083,8 +2102,8 @@ export class RelayV2BrokerCore {
         accepted: false,
         error,
         actions: [
-          this.carrierErrorAction(carrier.transportId, hello.requestId, null, "host.hello", error),
-          { kind: "close_host", transportId: carrier.transportId, closeCode: 1013, reason: "registration_busy" },
+          this.carrierErrorAction(carrier, hello.requestId, null, "host.hello", error),
+          { kind: "close_host", transportId: carrier.transportId, connectionIncarnation: carrier.connectionIncarnation, closeCode: 1013, reason: "registration_busy" },
         ],
       };
     }
@@ -2107,6 +2126,7 @@ export class RelayV2BrokerCore {
     actions.push({
       kind: "send_host",
       transportId: carrier.transportId,
+      connectionIncarnation: carrier.connectionIncarnation,
       deliveryId,
       frame: this.checkedCarrierFrame({
         carrierVersion: 1,
@@ -3137,6 +3157,7 @@ export class RelayV2BrokerCore {
       actions.push({
         kind: "close_host",
         transportId: carrier.transportId,
+        connectionIncarnation: carrier.connectionIncarnation,
         closeCode: 1013,
         reason: "carrier_control_backpressure",
       });
@@ -3186,6 +3207,7 @@ export class RelayV2BrokerCore {
     return [{
       kind: "pause_host_route",
       transportId: route.carrierTransportId,
+      connectionIncarnation: route.carrierConnectionIncarnation,
       routeId: route.routeId,
     }];
   }
@@ -3229,6 +3251,7 @@ export class RelayV2BrokerCore {
     return [{
       kind: "resume_host_route",
       transportId: route.carrierTransportId,
+      connectionIncarnation: route.carrierConnectionIncarnation,
       routeId: route.routeId,
     }];
   }
@@ -3559,7 +3582,7 @@ export class RelayV2BrokerCore {
   }
 
   private carrierErrorAction(
-    transportId: string,
+    carrier: CarrierState,
     requestId: string,
     connectorId: string | null,
     failedType: "host.hello" | "host.reauthenticate" | "enrollment.create" | "grant.revoke",
@@ -3567,7 +3590,8 @@ export class RelayV2BrokerCore {
   ): RelayV2BrokerAction {
     return {
       kind: "send_host",
-      transportId,
+      transportId: carrier.transportId,
+      connectionIncarnation: carrier.connectionIncarnation,
       frame: this.carrierErrorFrame(requestId, connectorId, failedType, error),
     };
   }
@@ -3603,6 +3627,7 @@ export class RelayV2BrokerCore {
     return [{
       kind: "close_host",
       transportId: carrier.transportId,
+      connectionIncarnation: carrier.connectionIncarnation,
       closeCode: 1013,
       reason: "carrier_control_backpressure",
     }];
@@ -3617,6 +3642,7 @@ export class RelayV2BrokerCore {
     const actions: RelayV2BrokerAction[] = [{
       kind: "close_host",
       transportId: carrier.transportId,
+      connectionIncarnation: carrier.connectionIncarnation,
       closeCode: 4400,
       reason,
     }];

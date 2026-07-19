@@ -134,6 +134,13 @@ export interface RelayV2BrokerProducerPort {
  */
 export interface RelayV2BrokerProducerHandoff {
   readonly source: RelayV2BrokerProducerSource;
+  /**
+   * Resolves Host actions only from provenance captured before the Broker
+   * invocation. It never falls forward to a later producer generation.
+   */
+  resolveHostActionTarget(
+    action: unknown,
+  ): RelayV2BrokerPreparedTargetResolution;
   apply(
     target: RelayV2BrokerProducerTarget,
     actions: readonly RelayV2BrokerProducerAction[],
@@ -141,6 +148,29 @@ export interface RelayV2BrokerProducerHandoff {
   forceTerminal(
     failure: RelayV2BrokerProducerTerminalFailureRequest,
   ): RelayV2BrokerProducerReceipt;
+}
+
+export type RelayV2BrokerPreparedTargetResolution = Readonly<
+  | { status: "resolved"; target: RelayV2BrokerProducerTarget }
+  | { status: "stale" }
+  | { status: "invalid" }
+>;
+
+export interface RelayV2BrokerPreparedCall {
+  /**
+   * Opens one short settlement partition; the prepared interval owns none.
+   * A malformed result/partition or invalid callback completion fails the
+   * still-exact captured source through its producer port. If that source has
+   * retired, settlement is only rejected and never reaches a replacement.
+   * A literal rejected receipt remains business attribution owned by the
+   * partition callback and is not itself an exact-source failure.
+   */
+  settle<Result extends RelayV2BrokerResult>(
+    result: Result,
+    partition: RelayV2BrokerResultPartition<Result>,
+  ): RelayV2BrokerProducerReceipt;
+  /** Permanently consumes this prepared call without opening a partition. */
+  abandon(): RelayV2BrokerProducerReceipt;
 }
 
 export type RelayV2BrokerResultPartition<
@@ -156,6 +186,8 @@ export interface RelayV2BrokerProducerRegistration {
   bindConnectionIncarnation(
     connectionIncarnation: string,
   ): RelayV2BrokerHostProducerBinding;
+  /** Captures the exact source and generation high-water before invocation. */
+  prepareBrokerCall(): RelayV2BrokerPreparedCall;
   /** The source lease exists before invoke and through the whole partition. */
   runBrokerCall<Result extends RelayV2BrokerResult>(
     invoke: () => Result,
@@ -206,9 +238,15 @@ type SourcePartition = {
   readonly id: string;
   readonly source: RelayV2BrokerProducerSource;
   readonly producer: ProducerEntry | null;
+  readonly sourceBinding: HostBindingOwner | null;
+  readonly generationHighWater: bigint;
   active: boolean;
   failed: boolean;
   consumedActions: number;
+};
+
+type PreparedCallState = {
+  consumed: boolean;
 };
 
 type OwnDataRecord = {
@@ -522,6 +560,7 @@ function observeNativePromise(
  */
 export class RelayV2BrokerProducerRegistry {
   private readonly producers = new Map<string, ProducerEntry>();
+  private readonly hostBindings = new Map<string, HostBindingOwner>();
   private readonly partitions = new Map<string, SourcePartition>();
   private nextGeneration = 0n;
   private nextPartitionId = 0n;
@@ -563,6 +602,7 @@ export class RelayV2BrokerProducerRegistry {
       bindConnectionIncarnation: (connectionIncarnation: string) => (
         this.bindConnectionIncarnation(entry, connectionIncarnation)
       ),
+      prepareBrokerCall: () => this.prepareProducerBrokerCall(entry),
       runBrokerCall: <Result extends RelayV2BrokerResult>(
         invoke: () => Result,
         partition: RelayV2BrokerResultPartition<Result>,
@@ -629,6 +669,8 @@ export class RelayV2BrokerProducerRegistry {
       id: source.partitionId,
       source,
       producer: null,
+      sourceBinding: null,
+      generationHighWater: this.nextGeneration,
       active: true,
       failed: false,
       consumedActions: 0,
@@ -654,6 +696,8 @@ export class RelayV2BrokerProducerRegistry {
       id: source.partitionId,
       source,
       producer: entry,
+      sourceBinding: this.hostBindingOwner(entry),
+      generationHighWater: this.nextGeneration,
       active: true,
       failed: false,
       consumedActions: 0,
@@ -682,13 +726,149 @@ export class RelayV2BrokerProducerRegistry {
       connectionIncarnation,
       target: entry.target,
     });
-    HOST_PRODUCER_BINDINGS.set(binding, {
+    const owner: HostBindingOwner = {
       registry: this,
       entry,
       connectionIncarnation,
-    });
+    };
+    HOST_PRODUCER_BINDINGS.set(binding, owner);
+    this.hostBindings.set(
+      this.hostBindingKey(entry.transportId, connectionIncarnation),
+      owner,
+    );
     entry.hostBinding = binding;
     return binding;
+  }
+
+  private prepareProducerBrokerCall(
+    entry: ProducerEntry,
+  ): RelayV2BrokerPreparedCall {
+    if (!this.canStartSourcePartition(entry)) {
+      throw new Error("Relay v2 Broker producer registration is not active");
+    }
+    const sourceBinding = this.hostBindingOwner(entry);
+    if (!sourceBinding) {
+      throw new Error("Relay v2 Broker producer generation is not bound");
+    }
+    const source = Object.freeze({
+      kind: "host" as const,
+      transportId: entry.transportId,
+      generation: entry.generation,
+      partitionId: (++this.nextPartitionId).toString(10),
+    });
+    const generationHighWater = this.nextGeneration;
+    const state: PreparedCallState = { consumed: false };
+    return Object.freeze({
+      settle: <Result extends RelayV2BrokerResult>(
+        result: Result,
+        partition: RelayV2BrokerResultPartition<Result>,
+      ) => this.settlePreparedBrokerCall(
+        state,
+        source,
+        entry,
+        sourceBinding,
+        generationHighWater,
+        result,
+        partition,
+      ),
+      abandon: () => {
+        if (state.consumed) return "rejected";
+        state.consumed = true;
+        return "applied";
+      },
+    });
+  }
+
+  private settlePreparedBrokerCall<Result extends RelayV2BrokerResult>(
+    state: PreparedCallState,
+    source: Extract<RelayV2BrokerProducerSource, { kind: "host" }>,
+    entry: ProducerEntry,
+    sourceBinding: HostBindingOwner,
+    generationHighWater: bigint,
+    result: Result,
+    partition: RelayV2BrokerResultPartition<Result>,
+  ): RelayV2BrokerProducerReceipt {
+    if (state.consumed) return "rejected";
+    state.consumed = true;
+    if (
+      !this.canStartSourcePartition(entry)
+      || this.hostBindingOwner(entry) !== sourceBinding
+    ) {
+      observeRejectedNativePromise(result);
+      observeRejectedNativePromise(partition);
+      return "rejected";
+    }
+    const active: SourcePartition = {
+      id: source.partitionId,
+      source,
+      producer: entry,
+      sourceBinding,
+      generationHighWater,
+      active: true,
+      failed: false,
+      consumedActions: 0,
+    };
+    entry.sourcePartitions += 1;
+    this.partitions.set(active.id, active);
+    if (
+      typeof partition !== "function"
+      || isRejectedProxy(partition)
+      || !isOpaqueSynchronousBrokerResult(result)
+    ) {
+      observeRejectedNativePromise(result);
+      observeRejectedNativePromise(partition);
+      try {
+        return this.failPreparedSourcePartition(
+          active,
+          "prepared_broker_settlement_invalid",
+        );
+      } finally {
+        this.retireSourcePartition(active);
+      }
+    }
+    return this.runPreparedBrokerPartition(active, result, partition);
+  }
+
+  private runPreparedBrokerPartition<Result extends RelayV2BrokerResult>(
+    source: SourcePartition,
+    result: Result,
+    partition: RelayV2BrokerResultPartition<Result>,
+  ): RelayV2BrokerProducerReceipt {
+    try {
+      const handoff = this.createHandoff(source);
+      let receipt: unknown;
+      try {
+        receipt = Reflect.apply(partition, undefined, [result, handoff]);
+      } catch (error) {
+        this.failPreparedSourcePartition(
+          source,
+          "prepared_broker_partition_threw",
+        );
+        throw error;
+      }
+      if (receipt !== "applied" && receipt !== "rejected") {
+        observeRejectedNativePromise(receipt);
+        return this.failPreparedSourcePartition(
+          source,
+          "prepared_broker_partition_invalid_receipt",
+        );
+      }
+      return receipt === "applied" && !source.failed ? "applied" : "rejected";
+    } finally {
+      this.retireSourcePartition(source);
+    }
+  }
+
+  private failPreparedSourcePartition(
+    source: SourcePartition,
+    reason: string,
+  ): "rejected" {
+    source.failed = true;
+    this.forceTargetTerminal(source, {
+      kind: "producer_failure",
+      reason,
+    });
+    return "rejected";
   }
 
   private runBrokerCall<Result extends RelayV2BrokerResult>(
@@ -702,6 +882,18 @@ export class RelayV2BrokerProducerRegistry {
         observeRejectedNativePromise(result);
         return this.rejectSourcePartition(source);
       }
+      return this.runBrokerPartition(source, result, partition);
+    } finally {
+      if (source.active) this.retireSourcePartition(source);
+    }
+  }
+
+  private runBrokerPartition<Result extends RelayV2BrokerResult>(
+    source: SourcePartition,
+    result: Result,
+    partition: RelayV2BrokerResultPartition<Result>,
+  ): RelayV2BrokerProducerReceipt {
+    try {
       const handoff = this.createHandoff(source);
       const receipt = Reflect.apply(partition, undefined, [result, handoff]);
       if (receipt !== "applied" && receipt !== "rejected") {
@@ -726,6 +918,9 @@ export class RelayV2BrokerProducerRegistry {
   private createHandoff(source: SourcePartition): RelayV2BrokerProducerHandoff {
     return Object.freeze({
       source: source.source,
+      resolveHostActionTarget: (action: unknown) => (
+        this.resolvePreparedHostActionTarget(source, action)
+      ),
       apply: (
         target: RelayV2BrokerProducerTarget,
         actions: readonly RelayV2BrokerProducerAction[],
@@ -734,6 +929,88 @@ export class RelayV2BrokerProducerRegistry {
         this.forceTargetTerminal(source, failure)
       ),
     });
+  }
+
+  private resolvePreparedHostActionTarget(
+    source: SourcePartition,
+    action: unknown,
+  ): RelayV2BrokerPreparedTargetResolution {
+    const record = readOwnDataRecord(action);
+    const kind = record?.values.kind;
+    const transportId = record?.values.transportId;
+    if (
+      !record
+      || typeof kind !== "string"
+      || !HOST_PRODUCER_ACTION_KINDS.has(kind as RelayV2BrokerProducerActionKind)
+      || !isIdentifier(transportId)
+      || kind === "host_output_ready"
+    ) return Object.freeze({ status: "invalid" });
+
+    const hasIncarnation = record.keys.includes("connectionIncarnation");
+    let connectionIncarnation: string | undefined;
+    if (!hasIncarnation) {
+      if (
+        kind !== "close_host"
+        || source.source.kind !== "host"
+        || transportId !== source.source.transportId
+        || !source.sourceBinding
+      ) return Object.freeze({ status: "invalid" });
+    } else {
+      const candidate = record.values.connectionIncarnation;
+      if (!isIdentifier(candidate)) return Object.freeze({ status: "invalid" });
+      connectionIncarnation = candidate;
+    }
+
+    if (!this.isSourcePartitionActive(source)) {
+      return Object.freeze({ status: "stale" });
+    }
+    const current = this.producers.get(transportId);
+    if (!current || BigInt(current.generation) > source.generationHighWater) {
+      return Object.freeze({ status: "stale" });
+    }
+    const currentBinding = current.hostBinding;
+    const currentOwner = currentBinding
+      ? HOST_PRODUCER_BINDINGS.get(currentBinding)
+      : undefined;
+    if (
+      !currentBinding
+      || !currentOwner
+      || currentOwner.registry !== this
+      || currentOwner.entry !== current
+      || currentOwner.connectionIncarnation !== currentBinding.connectionIncarnation
+      || this.hostBindings.get(this.hostBindingKey(
+        transportId,
+        currentBinding.connectionIncarnation,
+      )) !== currentOwner
+    ) return Object.freeze({ status: "invalid" });
+
+    if (!hasIncarnation) {
+      if (
+        source.source.kind !== "host"
+        || source.sourceBinding !== currentOwner
+        || source.producer !== current
+        || source.source.generation !== current.generation
+      ) return Object.freeze({ status: "invalid" });
+      return Object.freeze({ status: "resolved", target: current.target });
+    }
+    if (
+      connectionIncarnation !== currentBinding.connectionIncarnation
+      || this.hostBindings.get(
+        this.hostBindingKey(transportId, connectionIncarnation),
+      ) !== currentOwner
+    ) return Object.freeze({ status: "invalid" });
+    return Object.freeze({ status: "resolved", target: current.target });
+  }
+
+  private hostBindingOwner(entry: ProducerEntry): HostBindingOwner | null {
+    const binding = entry.hostBinding;
+    if (!binding) return null;
+    const owner = HOST_PRODUCER_BINDINGS.get(binding);
+    return owner?.registry === this && owner.entry === entry ? owner : null;
+  }
+
+  private hostBindingKey(transportId: string, connectionIncarnation: string): string {
+    return `${transportId}\0${connectionIncarnation}`;
   }
 
   private applyTargetBatch(
@@ -969,6 +1246,11 @@ export class RelayV2BrokerProducerRegistry {
     ) return;
     entry.phase = "retired";
     entry.currentEffect = null;
+    const bindingOwner = this.hostBindingOwner(entry);
+    if (bindingOwner) {
+      const key = this.hostBindingKey(entry.transportId, bindingOwner.connectionIncarnation);
+      if (this.hostBindings.get(key) === bindingOwner) this.hostBindings.delete(key);
+    }
     entry.hostBinding = null;
     if (this.producers.get(entry.transportId) === entry) {
       this.producers.delete(entry.transportId);

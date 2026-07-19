@@ -301,7 +301,15 @@ function createProducerHarness(options = {}) {
     ...options,
     scheduler,
     broker: composition.broker,
-    producerRegistry,
+    producerRegistry: options.wrapProducerRegistration
+      ? Object.freeze({
+          registerHostProducer(transportId, port) {
+            return options.wrapProducerRegistration(
+              producerRegistry.registerHostProducer(transportId, port),
+            );
+          },
+        })
+      : producerRegistry,
   });
   return {
     ...harness,
@@ -332,6 +340,91 @@ function createProducerPort(calls = { apply: 0, forceTerminal: 0 }) {
     } },
   });
   return port;
+}
+
+function createPreparedResultRegistry() {
+  const calls = {
+    apply: [],
+    forceTerminal: [],
+    events: [],
+    settleReceipts: [],
+  };
+  const rejectedTargets = new Set();
+  let nextPartitionId = 0;
+  let sourceTarget;
+  let connectionIncarnation;
+  const targetFor = (transportId) => Object.freeze({
+    transportId,
+    generation: transportId === sourceTarget.transportId ? sourceTarget.generation
+      : transportId === "prepared-cross-target" ? "2" : "3",
+  });
+  const thisRegistry = {
+    calls,
+    rejectedTargets,
+    registerHostProducer(transportId) {
+      sourceTarget = Object.freeze({ transportId, generation: "1" });
+      return Object.freeze({
+        target: sourceTarget,
+        bindConnectionIncarnation(incarnation) {
+          connectionIncarnation = incarnation;
+          return Object.freeze({ connectionIncarnation: incarnation, target: sourceTarget });
+        },
+        prepareBrokerCall() {
+          const source = Object.freeze({
+            kind: "host",
+            transportId,
+            generation: sourceTarget.generation,
+            partitionId: String(++nextPartitionId),
+          });
+          let consumed = false;
+          return Object.freeze({
+            settle(result, partition) {
+              if (consumed) return "rejected";
+              consumed = true;
+              const receipt = partition(result, Object.freeze({
+                source,
+                resolveHostActionTarget(action) {
+                  if (action.transportId === "prepared-stale-target") {
+                    return Object.freeze({ status: "stale" });
+                  }
+                  if (action.transportId === "prepared-invalid-target") {
+                    return Object.freeze({ status: "invalid" });
+                  }
+                  return Object.freeze({
+                    status: "resolved",
+                    target: targetFor(action.transportId),
+                  });
+                },
+                apply(target, actions) {
+                  calls.events.push(`apply:${target.transportId}`);
+                  calls.apply.push({ target, actions });
+                  if (rejectedTargets.has(target.transportId)) return "rejected";
+                  return "applied";
+                },
+                forceTerminal(failure) {
+                  calls.events.push(`force:${failure.kind}`);
+                  calls.forceTerminal.push(failure);
+                  return "applied";
+                },
+              }));
+              calls.settleReceipts.push(receipt);
+              return receipt;
+            },
+            abandon() {
+              if (consumed) return "rejected";
+              consumed = true;
+              return "applied";
+            },
+          });
+        },
+        beginClose() {},
+      });
+    },
+    get connectionIncarnation() {
+      return connectionIncarnation;
+    },
+  };
+  return thisRegistry;
 }
 
 async function startRegistered(harness) {
@@ -419,19 +512,53 @@ test("producer terminal batch closes atomically and fences pending ready from re
     connectionIncarnation: h.pump.producerComposition.binding.connectionIncarnation,
     readyEpoch: "1",
   };
+  const connectionIncarnation = h.pump.producerComposition.binding.connectionIncarnation;
   assert.equal(applyProducerBatch(h, [{
     kind: "pause_host_route",
     transportId: h.transportId,
+    connectionIncarnation,
     routeId: "producer-ordinary-batch-route",
   }, {
     kind: "resume_host_route",
     transportId: h.transportId,
+    connectionIncarnation,
     routeId: "producer-ordinary-batch-route",
   }]), "applied");
   assert.deepEqual(h.pump.snapshot().blockedHostRoutes, []);
   assert.equal(applyProducerBatch(h, [{
     kind: "pause_host_route",
     transportId: h.transportId,
+    connectionIncarnation,
+    routeId: "producer-preflight-route",
+  }, {
+    kind: "resume_host_route",
+    transportId: h.transportId,
+    connectionIncarnation: "wrong-producer-incarnation",
+    routeId: "producer-preflight-route",
+  }]), "rejected");
+  assert.deepEqual(
+    h.pump.snapshot().blockedHostRoutes,
+    [],
+    "the full ordinary batch is checked before its first route mutation",
+  );
+  h.pump.acceptBrokerResult({
+    accepted: true,
+    actions: [{
+      kind: "pause_host_route",
+      transportId: h.transportId,
+      connectionIncarnation,
+      routeId: "producer-arbitrary-result-route",
+    }],
+  });
+  assert.deepEqual(
+    h.pump.snapshot().blockedHostRoutes,
+    [],
+    "composition mode cannot bypass provenance through arbitrary results",
+  );
+  assert.equal(applyProducerBatch(h, [{
+    kind: "pause_host_route",
+    transportId: h.transportId,
+    connectionIncarnation,
     routeId: "producer-partial-route",
   }, mixedReady]), "rejected");
   assert.deepEqual(h.pump.snapshot().blockedHostRoutes, []);
@@ -443,6 +570,7 @@ test("producer terminal batch closes atomically and fences pending ready from re
   assert.equal(applyProducerBatch(h, [{
     kind: "send_host",
     transportId: h.transportId,
+    connectionIncarnation,
     frame: {
       carrierVersion: 1,
       type: "carrier.error",
@@ -461,6 +589,7 @@ test("producer terminal batch closes atomically and fences pending ready from re
   }, {
     kind: "close_host",
     transportId: h.transportId,
+    connectionIncarnation,
     closeCode: 4411,
     reason: "duplicate_connector",
   }]), "applied");
@@ -525,6 +654,355 @@ test("producer terminal batch closes atomically and fences pending ready from re
   await forced.scheduler.flushReady();
   await forced.pump.whenCloseSettled();
 });
+
+test("prepared Pump results fence stale groups and attribute exact apply rejection", async () => {
+  const producerRegistry = createPreparedResultRegistry();
+  const h = createHarness({
+    transportId: "prepared-source-pump",
+    producerRegistry,
+  });
+  h.pump.start();
+  await h.scheduler.flushReady();
+  assert.equal(h.pump.snapshot().phase, "running");
+  producerRegistry.calls.apply.splice(0);
+  producerRegistry.calls.forceTerminal.splice(0);
+  producerRegistry.calls.events.splice(0);
+  producerRegistry.calls.settleReceipts.splice(0);
+  producerRegistry.rejectedTargets.add("prepared-cross-target");
+  h.broker.sweepBackpressure = () => ({
+    accepted: true,
+    actions: [{
+      kind: "close_host",
+      transportId: "prepared-stale-target",
+      connectionIncarnation: "stale-incarnation",
+      closeCode: 1013,
+      reason: "late_cleanup",
+    }, {
+      kind: "pause_host_route",
+      transportId: "prepared-cross-target",
+      connectionIncarnation: "cross-incarnation",
+      routeId: "prepared-cross-route",
+    }, {
+      kind: "resume_host_route",
+      transportId: "prepared-cleanup-target",
+      connectionIncarnation: "cleanup-incarnation",
+      routeId: "prepared-cleanup-route",
+    }],
+  });
+
+  h.pump.sweep();
+
+  assert.deepEqual(
+    producerRegistry.calls.apply.map((call) => call.target.transportId),
+    ["prepared-cross-target", "prepared-cleanup-target"],
+    "stale replacement is skipped while later independent cleanup still runs",
+  );
+  assert.deepEqual(producerRegistry.calls.forceTerminal, [{
+    kind: "target_failure",
+    target: { transportId: "prepared-cross-target", generation: "2" },
+    reason: "broker_result_host_target_rejected",
+  }]);
+  assert.deepEqual(producerRegistry.calls.settleReceipts, ["rejected"]);
+  assert.equal(
+    h.pump.snapshot().phase,
+    "running",
+    "a stale or cross-target rejection cannot blanket-close the source Pump",
+  );
+
+  producerRegistry.calls.apply.splice(0);
+  producerRegistry.calls.forceTerminal.splice(0);
+  producerRegistry.calls.events.splice(0);
+  producerRegistry.calls.settleReceipts.splice(0);
+  producerRegistry.rejectedTargets.clear();
+  producerRegistry.rejectedTargets.add(h.transportId);
+  h.broker.sweepBackpressure = () => ({
+    accepted: true,
+    actions: [{
+      kind: "send_host",
+      transportId: "prepared-invalid-target",
+      connectionIncarnation: "invalid-incarnation",
+      frame: { type: "invalid-provenance" },
+    }, {
+      kind: "close_host",
+      transportId: h.transportId,
+      connectionIncarnation: producerRegistry.connectionIncarnation,
+      closeCode: 1013,
+      reason: "source_batch_out_of_order",
+    }, {
+      kind: "pause_host_route",
+      transportId: h.transportId,
+      connectionIncarnation: producerRegistry.connectionIncarnation,
+      routeId: "prepared-invalid-source-route",
+    }, {
+      kind: "resume_host_route",
+      transportId: "prepared-cleanup-target",
+      connectionIncarnation: "cleanup-incarnation",
+      routeId: "prepared-cleanup-after-invalid",
+    }],
+  });
+  h.pump.sweep();
+  assert.deepEqual(producerRegistry.calls.events, [
+    `apply:${h.transportId}`,
+    "apply:prepared-cleanup-target",
+    "force:producer_failure",
+  ]);
+  assert.deepEqual(producerRegistry.calls.forceTerminal, [{
+    kind: "producer_failure",
+    reason: "broker_result_host_provenance_invalid",
+  }]);
+  assert.deepEqual(producerRegistry.calls.settleReceipts, ["rejected"]);
+
+  producerRegistry.calls.apply.splice(0);
+  producerRegistry.calls.forceTerminal.splice(0);
+  producerRegistry.calls.events.splice(0);
+  producerRegistry.calls.settleReceipts.splice(0);
+  producerRegistry.rejectedTargets.clear();
+  producerRegistry.rejectedTargets.add(h.transportId);
+  h.broker.sweepBackpressure = () => ({
+    accepted: true,
+    actions: [{
+      kind: "pause_host_route",
+      transportId: h.transportId,
+      connectionIncarnation: producerRegistry.connectionIncarnation,
+      routeId: "prepared-source-reject-route",
+    }],
+  });
+  h.pump.sweep();
+  assert.deepEqual(producerRegistry.calls.forceTerminal, [{
+    kind: "producer_failure",
+    reason: "broker_result_host_source_rejected",
+  }]);
+  assert.deepEqual(producerRegistry.calls.settleReceipts, ["rejected"]);
+
+  producerRegistry.rejectedTargets.clear();
+  const closeBarrier = h.pump.shutdown();
+  await h.scheduler.flushReady();
+  await closeBarrier;
+});
+
+test("composed host supersession routes one ordered batch to the exact old Pump", async () => {
+  const first = createProducerHarness({
+    transportId: "producer-superseded-old",
+  });
+  observeCarrierReceives(first);
+  await startRegistered(first);
+  const replacement = createHarness({
+    scheduler: first.scheduler,
+    broker: first.broker,
+    producerRegistry: first.producerRegistry,
+    hostEpoch: first.hostEpoch,
+    transportId: "producer-superseded-new",
+  });
+  await startRegistered(replacement);
+  await first.scheduler.flushReady();
+
+  assert.ok(first.eventLog.indexOf("receive:host.superseded") >= 0);
+  assert.equal(first.pump.snapshot().phase, "closed");
+  assert.equal(first.pump.snapshot().closeCode, 4409);
+  assert.equal(first.host.status().phase, "superseded");
+  assert.equal(replacement.host.status().phase, "registered");
+  assert.equal(replacement.pump.snapshot().phase, "running");
+  replacement.pump.shutdown();
+  await replacement.scheduler.flushReady();
+});
+
+test("Pump-origin Broker calls prepare before invoke and consume each token once", async (t) => {
+  const createRegistrationCounter = () => {
+    const calls = {
+      prepare: 0,
+      settleAttempts: 0,
+      abandonAttempts: 0,
+      activeTokens: 0,
+    };
+    const counter = {
+      calls,
+      failPrepare: false,
+      wrap(registration) {
+        return Object.freeze({
+          target: registration.target,
+          bindConnectionIncarnation(connectionIncarnation) {
+            return registration.bindConnectionIncarnation(connectionIncarnation);
+          },
+          prepareBrokerCall() {
+            if (counter.failPrepare) throw new Error("prepared call unavailable");
+            const prepared = registration.prepareBrokerCall();
+            calls.prepare += 1;
+            calls.activeTokens += 1;
+            let consumed = false;
+            return Object.freeze({
+              settle(result, partition) {
+                calls.settleAttempts += 1;
+                if (!consumed) {
+                  consumed = true;
+                  calls.activeTokens -= 1;
+                }
+                return prepared.settle(result, partition);
+              },
+              abandon() {
+                calls.abandonAttempts += 1;
+                if (!consumed) {
+                  consumed = true;
+                  calls.activeTokens -= 1;
+                }
+                return prepared.abandon();
+              },
+            });
+          },
+          runBrokerCall(invoke, partition) {
+            return registration.runBrokerCall(invoke, partition);
+          },
+          beginClose(closeBarrier) {
+            registration.beginClose(closeBarrier);
+          },
+        });
+      },
+    };
+    return counter;
+  };
+  const instrument = (h, counter, methodNames) => {
+    const invoked = [];
+    for (const methodName of methodNames) {
+      const original = h.broker[methodName].bind(h.broker);
+      h.broker[methodName] = (...args) => {
+        assert.ok(
+          counter.calls.activeTokens > 0,
+          `${methodName} must observe its pre-invoke prepared token`,
+        );
+        invoked.push(methodName);
+        return original(...args);
+      };
+    }
+    return invoked;
+  };
+
+  await t.test("receive, both ACKs, sweep, and close disconnect settle once", async () => {
+    const counter = createRegistrationCounter();
+    const h = createProducerHarness({
+      transportId: "prepared-call-lifecycle",
+      wrapProducerRegistration: (registration) => counter.wrap(registration),
+    });
+    const invoked = instrument(h, counter, [
+      "receiveHostFrame",
+      "acknowledgeHostControlDelivery",
+      "acknowledgeHostDelivery",
+      "sweepBackpressure",
+      "disconnectHost",
+    ]);
+    await startRegistered(h);
+    await openRouteViaReady(h, "prepared-call-lifecycle-client");
+    h.pump.sweep();
+    const closeBarrier = h.pump.shutdown();
+    await h.scheduler.flushReady();
+    await closeBarrier;
+
+    for (const methodName of [
+      "receiveHostFrame",
+      "acknowledgeHostControlDelivery",
+      "acknowledgeHostDelivery",
+      "sweepBackpressure",
+      "disconnectHost",
+    ]) assert.ok(invoked.includes(methodName), `${methodName} was exercised`);
+    assert.equal(counter.calls.prepare, invoked.length);
+    assert.equal(counter.calls.settleAttempts, invoked.length);
+    assert.equal(counter.calls.abandonAttempts, 0);
+    assert.equal(counter.calls.activeTokens, 0);
+  });
+
+  await t.test("start rollback prepares before disconnect and settles its result", async () => {
+    const counter = createRegistrationCounter();
+    const h = createProducerHarness({
+      transportId: "prepared-start-rollback",
+      wrapProducerRegistration: (registration) => counter.wrap(registration),
+    });
+    const invoked = instrument(h, counter, ["disconnectHost"]);
+    h.host.connect = () => { throw new Error("host connect failed"); };
+    assert.throws(() => h.pump.start(), /host connect failed/);
+    assert.deepEqual(invoked, ["disconnectHost"]);
+    assert.equal(counter.calls.prepare, 1);
+    assert.equal(counter.calls.settleAttempts, 1);
+    assert.equal(counter.calls.abandonAttempts, 0);
+    assert.equal(counter.calls.activeTokens, 0);
+    await h.pump.whenCloseSettled();
+
+    const unavailableCounter = createRegistrationCounter();
+    const unavailable = createProducerHarness({
+      transportId: "prepared-start-rollback-unavailable",
+      wrapProducerRegistration: (registration) => unavailableCounter.wrap(registration),
+    });
+    let disconnectCalls = 0;
+    const disconnectHost = unavailable.broker.disconnectHost.bind(unavailable.broker);
+    unavailable.broker.disconnectHost = (...args) => {
+      disconnectCalls += 1;
+      return disconnectHost(...args);
+    };
+    unavailable.host.connect = () => { throw new Error("host connect failed"); };
+    unavailableCounter.failPrepare = true;
+    assert.throws(() => unavailable.pump.start(), /host connect failed/);
+    assert.equal(disconnectCalls, 0, "failed provenance preparation fences Core invoke");
+    assert.equal(unavailable.pump.snapshot().phase, "terminal_failure");
+    assert.equal(
+      unavailable.pump.snapshot().terminalFailure,
+      "broker_disconnect_provenance_unavailable",
+    );
+    await unavailable.pump.whenCloseSettled();
+  });
+
+  for (const cut of ["shutdown", "timeout"]) {
+    await t.test(`${cut} abandons an async token once before late fulfillment`, async () => {
+      const counter = createRegistrationCounter();
+      const h = createProducerHarness({
+        transportId: `prepared-async-${cut}`,
+        wrapProducerRegistration: (registration) => counter.wrap(registration),
+      });
+      await startRegistered(h);
+      const connectionId = `prepared-async-${cut}-client`;
+      const route = await openRouteViaReady(h, connectionId);
+      const receiveHostFrame = h.broker.receiveHostFrame.bind(h.broker);
+      let resolveHung;
+      h.broker.receiveHostFrame = (transportId, bytes, signal) => {
+        if (decodedCarrier(bytes).type !== "route.data") {
+          return receiveHostFrame(transportId, bytes, signal);
+        }
+        assert.ok(counter.calls.activeTokens > 0);
+        return new Promise((resolve) => { resolveHung = resolve; });
+      };
+      const abandonBefore = counter.calls.abandonAttempts;
+      assert.equal(h.host.sendPublic(route, publicHostFrame(`prepared-${cut}`)), true);
+      await h.scheduler.flushReady();
+      assert.equal(h.pump.snapshot().inFlightHostDelivery, true);
+      if (cut === "timeout") await h.scheduler.advance(5_000);
+      else {
+        h.pump.shutdown(1013, "prepared_async_shutdown");
+        await h.scheduler.flushReady();
+      }
+      const settleAttemptsAfterCut = counter.calls.settleAttempts;
+      assert.equal(counter.calls.abandonAttempts, abandonBefore + 1);
+      assert.equal(counter.calls.activeTokens, 0);
+      resolveHung({ accepted: true, actions: [] });
+      await new Promise((resolve) => setImmediate(resolve));
+      await h.scheduler.flushReady();
+      assert.equal(counter.calls.abandonAttempts, abandonBefore + 1);
+      assert.equal(counter.calls.settleAttempts, settleAttemptsAfterCut);
+      assert.equal(counter.calls.activeTokens, 0);
+      await h.pump.whenCloseSettled();
+    });
+  }
+});
+
+async function openRouteViaReady(harness, connectionId) {
+  const result = harness.broker.openClientRoute(
+    connectionId,
+    authContext("client", harness.scheduler.now),
+  );
+  assert.equal(result.accepted, true);
+  await harness.scheduler.flushReady();
+  const binding = harness.bound.find((candidate) => candidate.connectionId === connectionId);
+  assert.ok(binding, "the exact output-ready composition drains route.open");
+  assert.equal(harness.brokerActions.some((action) => (
+    action.kind === "route_opened" && action.connectionId === connectionId
+  )), true);
+  return binding;
+}
 
 async function openRoute(harness, connectionId) {
   const result = harness.broker.openClientRoute(

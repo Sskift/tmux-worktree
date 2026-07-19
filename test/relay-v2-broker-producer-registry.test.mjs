@@ -396,6 +396,202 @@ test("opaque invoke results must be synchronous plain data before handoff is exp
   assert.equal(partitionCalls, 1);
 });
 
+test("prepared settlement resolves only pre-invoke exact Host provenance", async () => {
+  const registry = new producerModule.RelayV2BrokerProducerRegistry();
+  const source = registry.registerHostProducer("prepared-source", createPort().port);
+  source.bindConnectionIncarnation("prepared-source-incarnation");
+  const exact = registry.registerHostProducer("prepared-exact", createPort().port);
+  exact.bindConnectionIncarnation("prepared-exact-incarnation");
+  const closing = registry.registerHostProducer("prepared-closing", createPort().port);
+  closing.bindConnectionIncarnation("prepared-closing-incarnation");
+  const unbound = registry.registerHostProducer("prepared-unbound", createPort().port);
+  const absent = registry.registerHostProducer("prepared-absent", createPort().port);
+  absent.bindConnectionIncarnation("prepared-absent-incarnation");
+  const replaced = registry.registerHostProducer("prepared-replaced", createPort().port);
+  replaced.bindConnectionIncarnation("prepared-replaced-old-incarnation");
+  const prepared = source.prepareBrokerCall();
+  const closingBarrier = deferred();
+  const absentBarrier = deferred();
+  const replacedBarrier = deferred();
+  closing.beginClose(closingBarrier.promise);
+  absent.beginClose(absentBarrier.promise);
+  replaced.beginClose(replacedBarrier.promise);
+  absentBarrier.resolve();
+  replacedBarrier.resolve();
+  await settlePromises();
+  const replacement = registry.registerHostProducer("prepared-replaced", createPort().port);
+  replacement.bindConnectionIncarnation("prepared-replaced-new-incarnation");
+
+  assert.equal(prepared.settle(brokerResult(), (_result, handoff) => {
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-exact"),
+      connectionIncarnation: "prepared-exact-incarnation",
+    }), { status: "resolved", target: exact.target });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-closing"),
+      connectionIncarnation: "prepared-closing-incarnation",
+    }), { status: "resolved", target: closing.target });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-source"),
+    }), { status: "resolved", target: source.target });
+    for (const action of [{
+      kind: "send_host",
+      transportId: "prepared-source",
+      frame: { type: "complete-send" },
+    }, {
+      kind: "pause_host_route",
+      transportId: "prepared-source",
+      routeId: "complete-pause",
+    }, {
+      kind: "resume_host_route",
+      transportId: "prepared-source",
+      routeId: "complete-resume",
+    }]) {
+      assert.deepEqual(handoff.resolveHostActionTarget(action), { status: "invalid" });
+    }
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      kind: "send_host",
+      transportId: "prepared-never-existed",
+      frame: { type: "complete-absent-send" },
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      kind: "send_host",
+      transportId: "prepared-replaced",
+      frame: { type: "complete-replaced-send" },
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget(
+      hostAction("prepared-exact"),
+    ), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-never-existed"),
+      connectionIncarnation: "",
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-exact"),
+      connectionIncarnation: "wrong-incarnation",
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-unbound"),
+      connectionIncarnation: "unbound-incarnation",
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      kind: "host_output_ready",
+      transportId: "prepared-exact",
+      connectionIncarnation: "prepared-exact-incarnation",
+      readyEpoch: "1",
+    }), { status: "invalid" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-absent"),
+      connectionIncarnation: "prepared-absent-incarnation",
+    }), { status: "stale" });
+    assert.deepEqual(handoff.resolveHostActionTarget({
+      ...hostAction("prepared-replaced"),
+      connectionIncarnation: "prepared-replaced-old-incarnation",
+    }), { status: "stale" });
+    return "applied";
+  }), "applied");
+  assert.ok(BigInt(replacement.target.generation) > BigInt(replaced.target.generation));
+  closingBarrier.resolve();
+  await settlePromises();
+});
+
+test("invalid prepared settlement fails only the still-exact source generation", async () => {
+  const registry = new producerModule.RelayV2BrokerProducerRegistry();
+  const sourcePort = createPort();
+  const source = registry.registerHostProducer("prepared-invalid", sourcePort.port);
+  source.bindConnectionIncarnation("prepared-invalid-incarnation");
+  const malformedSettlements = [
+    [Promise.resolve(brokerResult()), () => "applied"],
+    [new Proxy(brokerResult(), {}), () => "applied"],
+    [brokerResult(), null],
+    [brokerResult(), new Proxy(() => "applied", {})],
+  ];
+  for (const [result, partition] of malformedSettlements) {
+    assert.equal(source.prepareBrokerCall().settle(result, partition), "rejected");
+  }
+  const forceCountAfterMalformed = sourcePort.calls.forceTerminal.length;
+  assert.equal(forceCountAfterMalformed, malformedSettlements.length);
+
+  assert.equal(source.prepareBrokerCall().settle(
+    brokerResult(),
+    () => Promise.reject(new Error("invalid prepared receipt")),
+  ), "rejected");
+  assert.equal(source.prepareBrokerCall().settle(
+    brokerResult(),
+    () => ({ outcome: "applied" }),
+  ), "rejected");
+  assert.throws(() => source.prepareBrokerCall().settle(
+    brokerResult(),
+    () => { throw new Error("prepared partition threw"); },
+  ), /prepared partition threw/);
+  const forceCountAfterCallbackFailures = sourcePort.calls.forceTerminal.length;
+  assert.equal(forceCountAfterCallbackFailures, forceCountAfterMalformed + 3);
+  assert.equal(source.prepareBrokerCall().settle(
+    brokerResult(),
+    () => "rejected",
+  ), "rejected");
+  assert.equal(
+    sourcePort.calls.forceTerminal.length,
+    forceCountAfterCallbackFailures,
+    "a semantic total rejection is not itself a source failure",
+  );
+  assert.equal(sourcePort.calls.forceTerminal.every((call) => (
+    call.failure.kind === "producer_failure"
+      && call.failure.target.transportId === "prepared-invalid"
+      && call.failure.target.generation === source.target.generation
+  )), true);
+
+  let settleFirstCallbacks = 0;
+  const forceCountBeforeReplay = sourcePort.calls.forceTerminal.length;
+  const settleFirst = source.prepareBrokerCall();
+  assert.equal(settleFirst.settle(brokerResult(), () => {
+    settleFirstCallbacks += 1;
+    return "applied";
+  }), "applied");
+  assert.equal(settleFirst.settle(brokerResult(), () => {
+    settleFirstCallbacks += 1;
+    return "applied";
+  }), "rejected");
+  assert.equal(settleFirst.abandon(), "rejected");
+  assert.equal(settleFirstCallbacks, 1);
+  assert.equal(sourcePort.calls.forceTerminal.length, forceCountBeforeReplay);
+  let abandonFirstCallbacks = 0;
+  const abandonFirst = source.prepareBrokerCall();
+  assert.equal(abandonFirst.abandon(), "applied");
+  assert.equal(abandonFirst.settle(brokerResult(), () => {
+    abandonFirstCallbacks += 1;
+    return "applied";
+  }), "rejected");
+  assert.equal(abandonFirst.abandon(), "rejected");
+  assert.equal(abandonFirstCallbacks, 0);
+  assert.equal(sourcePort.calls.forceTerminal.length, forceCountBeforeReplay);
+
+  const lateLegal = source.prepareBrokerCall();
+  const lateMalformed = source.prepareBrokerCall();
+  const closeBarrier = deferred();
+  source.beginClose(closeBarrier.promise);
+  closeBarrier.resolve();
+  await settlePromises();
+  const replacementPort = createPort();
+  const replacement = registry.registerHostProducer("prepared-invalid", replacementPort.port);
+  replacement.bindConnectionIncarnation("prepared-invalid-replacement");
+  let lateCallbacks = 0;
+  assert.equal(lateLegal.settle(brokerResult(), () => {
+    lateCallbacks += 1;
+    return "applied";
+  }), "rejected");
+  let malformedLateCallbacks = 0;
+  assert.equal(lateMalformed.settle(Promise.reject(new Error("retired malformed result")), () => {
+    malformedLateCallbacks += 1;
+    return "applied";
+  }), "rejected");
+  await settlePromises();
+  assert.equal(lateCallbacks, 0, "a legal late source-self settlement never enters replacement");
+  assert.equal(malformedLateCallbacks, 0, "retired malformed settlement never enters callback");
+  assert.equal(sourcePort.calls.forceTerminal.length, forceCountAfterCallbackFailures);
+  assert.equal(replacementPort.calls.forceTerminal.length, 0);
+});
+
 test("rejected native Promises are observed at every synchronous return boundary", async () => {
   const registry = new producerModule.RelayV2BrokerProducerRegistry();
   const unhandled = [];

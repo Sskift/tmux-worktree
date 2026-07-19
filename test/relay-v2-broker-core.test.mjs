@@ -57,14 +57,20 @@ function hostHello({
   };
 }
 
-async function registerHost(core, transportId, hello = hostHello(), authOverrides = {}) {
+async function registerHost(
+  core,
+  transportId,
+  hello = hostHello(),
+  authOverrides = {},
+  connectionIncarnation = randomUUID(),
+) {
   const hostId = hello.payload.hostId;
   const directoryBefore = core.inspectHost(hostId);
   core.attachHostCarrier(transportId, authContext("host", {
     hostId,
     jti: `${transportId}-jti`,
     ...authOverrides,
-  }));
+  }), connectionIncarnation);
   const result = await core.receiveHostFrame(transportId, carrierBytes(hello));
   assert.equal(result.accepted, true);
   const registration = result.actions.find((action) => (
@@ -85,6 +91,7 @@ async function registerHost(core, transportId, hello = hostHello(), authOverride
     result: { ...result, actions: [...result.actions, ...committed.actions] },
     registration,
     connectorId: registration.frame.connectorId,
+    connectionIncarnation,
   };
 }
 
@@ -352,7 +359,22 @@ test("Relay v2 Upgrade dispatch isolates credential and dialect stacks without f
 
 test("host registration commits delivery before admission and supersedes only a different instance", async () => {
   const fenceCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  fenceCore.attachHostCarrier("host-fence-pending", authContext("host"));
+  const missingCarrier = await fenceCore.receiveHostFrame(
+    "host-missing-source",
+    new Uint8Array(),
+  );
+  assert.equal(missingCarrier.actions[0].kind, "close_host");
+  assert.equal(
+    Object.hasOwn(missingCarrier.actions[0], "connectionIncarnation"),
+    false,
+    "only an entirely absent source carrier uses the incarnation-less close fallback",
+  );
+  const fenceIncarnation = randomUUID();
+  fenceCore.attachHostCarrier(
+    "host-fence-pending",
+    authContext("host"),
+    fenceIncarnation,
+  );
   const pending = await fenceCore.receiveHostFrame(
     "host-fence-pending",
     carrierBytes(hostHello()),
@@ -361,6 +383,7 @@ test("host registration commits delivery before admission and supersedes only a 
     action.kind === "send_host" && action.frame.type === "host.registered"
   ));
   assert.ok(registeredDelivery.deliveryId);
+  assert.equal(registeredDelivery.connectionIncarnation, fenceIncarnation);
   assert.equal(fenceCore.inspectHost(HOST_ID), undefined);
   assert.equal(
     fenceCore.openClientRoute(randomUUID(), authContext("client")).error.code,
@@ -377,13 +400,19 @@ test("host registration commits delivery before admission and supersedes only a 
   assert.equal(fenceCore.inspectHost(HOST_ID).state, "online");
 
   const lostAckCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  lostAckCore.attachHostCarrier("host-registration-ack-lost", authContext("host"));
+  const lostAckIncarnation = randomUUID();
+  lostAckCore.attachHostCarrier(
+    "host-registration-ack-lost",
+    authContext("host"),
+    lostAckIncarnation,
+  );
   const ackLost = await lostAckCore.receiveHostFrame(
     "host-registration-ack-lost",
     carrierBytes(hostHello()),
   );
   const lostDelivery = ackLost.actions.find((action) => action.deliveryId);
   assert.ok(lostDelivery);
+  assert.equal(lostDelivery.connectionIncarnation, lostAckIncarnation);
   assert.equal(lostAckCore.disconnectHost("host-registration-ack-lost").accepted, true);
   assert.equal(lostAckCore.inspectHost(HOST_ID), undefined);
   assert.equal(
@@ -399,6 +428,7 @@ test("host registration commits delivery before admission and supersedes only a 
   const hostEpoch = randomUUID();
   const firstInstance = randomUUID();
   const first = await registerHost(core, "host-old", hostHello({ hostEpoch, hostInstanceId: firstInstance }));
+  assert.equal(first.registration.connectionIncarnation, first.connectionIncarnation);
   const firstDirectory = core.inspectHost(HOST_ID);
   assert.equal(firstDirectory.state, "online");
   assert.equal(firstDirectory.revision, "1");
@@ -426,7 +456,12 @@ test("host registration commits delivery before admission and supersedes only a 
     undefined,
   );
 
-  core.attachHostCarrier("host-duplicate", authContext("host", { jti: "duplicate-jti" }));
+  const duplicateIncarnation = randomUUID();
+  core.attachHostCarrier(
+    "host-duplicate",
+    authContext("host", { jti: "duplicate-jti" }),
+    duplicateIncarnation,
+  );
   const duplicate = await core.receiveHostFrame("host-duplicate", carrierBytes(hostHello({
     hostEpoch,
     hostInstanceId: firstInstance,
@@ -440,11 +475,19 @@ test("host registration commits delivery before admission and supersedes only a 
   assert.equal(duplicate.actions.some((action) => (
     action.kind === "close_host" && action.closeCode === 4411
   )), true);
+  assert.equal(duplicate.actions.filter((action) => (
+    action.kind === "send_host" || action.kind === "close_host"
+  )).every((action) => action.connectionIncarnation === duplicateIncarnation), true);
   assert.equal(core.inspectHost(HOST_ID).connectorId, first.connectorId);
   assert.equal(core.inspectHost(HOST_ID).revision, "1");
 
   const winningInstance = randomUUID();
-  core.attachHostCarrier("host-winner", authContext("host", { jti: "winner-jti" }));
+  const winnerIncarnation = randomUUID();
+  core.attachHostCarrier(
+    "host-winner",
+    authContext("host", { jti: "winner-jti" }),
+    winnerIncarnation,
+  );
   const pendingWinner = await core.receiveHostFrame("host-winner", carrierBytes(hostHello({
     hostEpoch, hostInstanceId: winningInstance,
   })));
@@ -452,6 +495,7 @@ test("host registration commits delivery before admission and supersedes only a 
     action.kind === "send_host" && action.frame.type === "host.registered"
   ));
   assert.ok(pendingRegistration);
+  assert.equal(pendingRegistration.connectionIncarnation, winnerIncarnation);
   assert.equal(core.inspectHost(HOST_ID).connectorId, first.connectorId);
   assert.equal(core.openClientRoute(randomUUID(), authContext("client")).accepted, true);
   assert.equal(pendingWinner.actions.some((action) => action.frame?.type === "host.superseded"), false);
@@ -483,11 +527,13 @@ test("host registration commits delivery before admission and supersedes only a 
     action.kind === "send_host" && action.frame.type === "host.superseded"
   ));
   assert.equal(superseded.transportId, "host-old");
+  assert.equal(superseded.connectionIncarnation, first.connectionIncarnation);
   assert.equal(superseded.frame.payload.losingConnectorId, first.connectorId);
   assert.equal(superseded.frame.payload.winningConnectorId, winner.connectorId);
   assert.equal(winner.result.actions.some((action) => (
     action.kind === "close_host"
       && action.transportId === "host-old"
+      && action.connectionIncarnation === first.connectionIncarnation
       && action.closeCode === 4409
   )), true);
 
@@ -1853,7 +1899,7 @@ test("frame-count pressure resumes only below the 64-frame low water and closes 
   );
 
   const hostPressureCore = new broker.RelayV2BrokerCore({ now: () => NOW_MS });
-  await registerHost(hostPressureCore, "host-pressure-reverse");
+  const reverseHost = await registerHost(hostPressureCore, "host-pressure-reverse");
   const reverse = await openRoute(hostPressureCore, "host-pressure-reverse");
   let reverseHigh;
   for (let index = 1; index <= broker.RELAY_V2_BROKER_LIMITS.maxQueuedRouteFrames; index += 1) {
@@ -1876,7 +1922,10 @@ test("frame-count pressure resumes only below the 64-frame low water and closes 
     );
     assert.equal(reverseHigh.accepted, true);
   }
-  assert.equal(reverseHigh.actions.some((action) => action.kind === "pause_host_route"), true);
+  assert.equal(reverseHigh.actions.some((action) => (
+    action.kind === "pause_host_route"
+      && action.connectionIncarnation === reverseHost.connectionIncarnation
+  )), true);
   const reverseDeliveries = hostPressureCore.drainClient(reverse.connectionId, { maxFrames: 65 });
   for (let index = 0; index < 64; index += 1) {
     const acknowledged = hostPressureCore.acknowledgeClientDelivery(
@@ -1889,7 +1938,10 @@ test("frame-count pressure resumes only below the 64-frame low water and closes 
     reverse.connectionId,
     reverseDeliveries[64].deliveryId,
   );
-  assert.equal(reverseResume.actions.some((action) => action.kind === "resume_host_route"), true);
+  assert.equal(reverseResume.actions.some((action) => (
+    action.kind === "resume_host_route"
+      && action.connectionIncarnation === reverseHost.connectionIncarnation
+  )), true);
 });
 
 test("backpressure sweep is carrier-scoped and its production batch is hard-bounded", async () => {

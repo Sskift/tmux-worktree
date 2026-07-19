@@ -9,12 +9,14 @@ import {
 } from "./brokerCore.js";
 import {
   type RelayV2BrokerHostProducerBinding,
+  type RelayV2BrokerPreparedCall,
   type RelayV2BrokerProducerAction,
   type RelayV2BrokerProducerEffectFence,
   type RelayV2BrokerProducerPort,
   type RelayV2BrokerProducerReceipt,
   type RelayV2BrokerProducerRegistration,
   type RelayV2BrokerProducerRegistry,
+  type RelayV2BrokerProducerHandoff,
   type RelayV2BrokerProducerTarget,
   type RelayV2BrokerProducerTerminalFailure,
 } from "./brokerProducerRegistry.js";
@@ -173,8 +175,13 @@ type AsyncAttempt = {
   readonly cancelDeadline: () => void;
 };
 
+type PreparedCallHolder = {
+  call: RelayV2BrokerPreparedCall | null;
+};
+
 type HostDeliveryAttempt = AsyncAttempt & {
   readonly deliveryToken: string;
+  readonly preparedCallHolder: PreparedCallHolder;
 };
 
 type PendingAction = {
@@ -216,6 +223,14 @@ type OwnerFenceState = {
 type ProducerReadyTurn = Readonly<{
   readyEpoch: string;
 }>;
+
+function takePreparedCall(
+  holder: PreparedCallHolder,
+): RelayV2BrokerPreparedCall | null {
+  const preparedCall = holder.call;
+  holder.call = null;
+  return preparedCall;
+}
 
 function positive(value: number | undefined, fallback: number): number {
   const selected = value ?? fallback;
@@ -355,6 +370,8 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private readonly connectionIncarnation: string | null;
   private producerRegistration: RelayV2BrokerProducerRegistration | null = null;
   private producerCloseStarted = false;
+  private disconnectPreparedCall: RelayV2BrokerPreparedCall | null = null;
+  private disconnectCallPreparationAttempted = false;
   private pendingProducerReadyTurn: ProducerReadyTurn | null = null;
   private readonly hostToBroker: DirectionState<HostFrame> = {
     entries: [], bytes: 0, routeCursor: 0, pressureSinceMs: null,
@@ -479,6 +496,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
         this.options.credentialReference,
       );
     } catch (error) {
+      const disconnectPrepared = !attached || this.prepareDisconnectBrokerCall();
       // Start failure is a terminal owner cut too. Publish it locally and to
       // B7a before rollback can invoke another component.
       this.pendingProducerReadyTurn = null;
@@ -486,20 +504,31 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.phase = "closed";
       this.closedWith = { code: 1013, reason: "carrier_pump_start_failure" };
       this.beginProducerClose();
-      if (attached) {
-        try {
-          this.options.broker.disconnectHost(this.options.transportId);
-        } catch {
-          // The attach succeeded, so this pump must remain terminal even if
-          // the rollback owner itself reports failure.
+      if (attached && !disconnectPrepared) {
+        this.terminalFailureReason = "broker_disconnect_provenance_unavailable";
+        this.phase = "terminal_failure";
+      } else if (attached) {
+        const disconnected = this.disconnectBrokerForClose();
+        if (disconnected) {
+          for (const action of disconnected.actions) {
+            if (this.producerComposition && this.isHostProducerAction(action)) continue;
+            if (!this.forceStartRollbackAction(action)) {
+              this.terminalFailureReason = "start_rollback_cleanup_rejected";
+              this.phase = "terminal_failure";
+            }
+          }
+        } else {
+          this.terminalFailureReason = "broker_disconnect_failure";
+          this.phase = "terminal_failure";
         }
-        this.brokerDisconnected = true;
       }
       this.hostToBroker.entries = [];
       this.hostToBroker.bytes = 0;
       this.brokerToHost.entries = [];
       this.brokerToHost.bytes = 0;
-      this.settleCloseBarrier("closed");
+      this.settleCloseBarrier(
+        this.phase === "terminal_failure" ? "terminal_failure" : "closed",
+      );
       throw error;
     }
     this.wake();
@@ -550,7 +579,10 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   acceptBrokerResult(result: RelayV2BrokerResult): void {
     if ((this.phase !== "running" && this.phase !== "closing")
       || this.actionAdmissionStopped || this.forceCallbackActive) return;
-    this.acceptBrokerActions(result.actions);
+    const actions = this.producerComposition
+      ? result.actions.filter((action) => !this.isHostProducerAction(action))
+      : result.actions;
+    this.acceptBrokerActions(actions, false);
     if (this.phase === "closing") {
       this.beginCloseDrain();
       this.advanceCloseDrain();
@@ -613,16 +645,42 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     if (
       closeCount > 1
       || (closeCount === 1 && actions.at(-1)?.kind !== "close_host")
+      || actions.some((action) => !this.producerActionTargetsThisPump(action, fence))
       || !this.producerFenceMayApply(fence)
     ) return "rejected";
-    this.acceptBrokerActions(actions);
-    if (this.phase === "closing") {
+    this.acceptBrokerActions(actions, true);
+    const phaseAfterApply = this.phase as RelayV2CarrierPumpSnapshot["phase"];
+    if (phaseAfterApply === "closing") {
       this.beginCloseDrain();
       this.advanceCloseDrain();
-    } else if (this.phase === "running") {
+    } else if (phaseAfterApply === "running") {
       this.wake();
     }
     return "applied";
+  }
+
+  private producerActionTargetsThisPump(
+    action: Readonly<RelayV2BrokerProducerAction>,
+    fence: RelayV2BrokerProducerEffectFence,
+  ): boolean {
+    if (action.kind === "host_output_ready") return false;
+    if (action.transportId !== this.options.transportId) return false;
+    let hasIncarnation = false;
+    try {
+      hasIncarnation = Reflect.getOwnPropertyDescriptor(
+        action,
+        "connectionIncarnation",
+      ) !== undefined;
+    } catch {
+      return false;
+    }
+    if (hasIncarnation) {
+      return action.connectionIncarnation === this.connectionIncarnation;
+    }
+    return action.kind === "close_host"
+      && fence.source.kind === "host"
+      && fence.source.transportId === this.options.transportId
+      && fence.source.generation === fence.target.generation;
   }
 
   private acceptProducerReadyTurn(
@@ -672,11 +730,150 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     return this.producerFenceMayApply(fence) ? "applied" : "rejected";
   }
 
+  private isHostProducerAction(action: RelayV2BrokerAction): action is RelayV2BrokerProducerAction {
+    return action.kind === "host_output_ready"
+      || action.kind === "send_host"
+      || action.kind === "close_host"
+      || action.kind === "pause_host_route"
+      || action.kind === "resume_host_route";
+  }
+
+  private applyPreparedBrokerResult(
+    result: RelayV2BrokerResult,
+    handoff: RelayV2BrokerProducerHandoff,
+    applyLocalActions = true,
+  ): RelayV2BrokerProducerReceipt {
+    const localActions: RelayV2BrokerAction[] = [];
+    const targetGroups = new Map<
+      string,
+      { target: RelayV2BrokerProducerTarget; actions: RelayV2BrokerProducerAction[] }
+    >();
+    let invalidResolution = false;
+    let staleResolution = false;
+
+    // Resolve every Host action before the first target Pump mutation. The
+    // resolver is bound to the pre-invoke generation high-water, so a later
+    // replacement can never become the target of this settled result.
+    for (const action of result.actions) {
+      if (!this.isHostProducerAction(action)) {
+        localActions.push(action);
+        continue;
+      }
+      const resolution = handoff.resolveHostActionTarget(action);
+      if (resolution.status !== "resolved") {
+        if (resolution.status === "invalid") invalidResolution = true;
+        else staleResolution = true;
+        continue;
+      }
+      const key = `${resolution.target.transportId}\0${resolution.target.generation}`;
+      const group = targetGroups.get(key);
+      if (group) group.actions.push(action);
+      else targetGroups.set(key, { target: resolution.target, actions: [action] });
+    }
+
+    if (applyLocalActions && localActions.length > 0) {
+      this.acceptBrokerActions(localActions, false);
+    }
+
+    let receipt: RelayV2BrokerProducerReceipt =
+      invalidResolution || staleResolution ? "rejected" : "applied";
+    let sourceFailureReason = invalidResolution
+      ? "broker_result_host_provenance_invalid"
+      : null;
+    for (const group of targetGroups.values()) {
+      if (handoff.apply(group.target, group.actions) === "applied") continue;
+      receipt = "rejected";
+      if (
+        handoff.source.kind === "host"
+        && handoff.source.transportId === group.target.transportId
+        && handoff.source.generation === group.target.generation
+      ) {
+        sourceFailureReason ??= "broker_result_host_source_rejected";
+      } else {
+        handoff.forceTerminal({
+          kind: "target_failure",
+          target: group.target,
+          reason: "broker_result_host_target_rejected",
+        });
+      }
+    }
+    // Invalid provenance belongs to the source, but it must not starve local
+    // work or any independently resolved target group from the same result.
+    // Multiple invalid actions collapse to one exact producer failure.
+    if (sourceFailureReason) {
+      handoff.forceTerminal({
+        kind: "producer_failure",
+        reason: sourceFailureReason,
+      });
+    }
+    return receipt;
+  }
+
+  private invokeSynchronousBrokerCall<Result extends RelayV2BrokerResult>(
+    invoke: () => Result,
+    applyLocalActions = true,
+  ): { result: Result; receipt: RelayV2BrokerProducerReceipt | null } {
+    const prepared = this.producerRegistration?.prepareBrokerCall() ?? null;
+    let result: Result;
+    try {
+      result = invoke();
+    } catch (error) {
+      prepared?.abandon();
+      throw error;
+    }
+    if (!prepared) return { result, receipt: null };
+    return {
+      result,
+      receipt: prepared.settle(
+        result,
+        (settled, handoff) => this.applyPreparedBrokerResult(
+          settled,
+          handoff,
+          applyLocalActions,
+        ),
+      ),
+    };
+  }
+
   private beginProducerClose(): void {
     const registration = this.producerRegistration;
     if (!registration || this.producerCloseStarted) return;
     this.producerCloseStarted = true;
     registration.beginClose(this.closeBarrier);
+  }
+
+  private prepareDisconnectBrokerCall(): boolean {
+    if (this.brokerDisconnected) return true;
+    if (this.disconnectCallPreparationAttempted) {
+      return this.producerComposition === null || this.disconnectPreparedCall !== null;
+    }
+    this.disconnectCallPreparationAttempted = true;
+    try {
+      this.disconnectPreparedCall = this.producerRegistration?.prepareBrokerCall() ?? null;
+      return this.producerComposition === null || this.disconnectPreparedCall !== null;
+    } catch {
+      this.disconnectPreparedCall = null;
+      return false;
+    }
+  }
+
+  private forceStartRollbackAction(action: RelayV2BrokerAction): boolean {
+    const ownerFence = this.createOwnerFence(action, this.lifecycleGeneration);
+    this.installOwnerFence(ownerFence.identity);
+    let accepted = false;
+    this.forceCallbackActive = true;
+    try {
+      accepted = this.options.onForceBrokerAction(
+        structuredClone(action),
+        ownerFence.view,
+      ) === true;
+    } catch {
+      accepted = false;
+    } finally {
+      this.forceCallbackActive = false;
+      this.releaseOwnerFence(ownerFence);
+    }
+    return accepted;
   }
 
   setWritable(direction: RelayV2CarrierPumpDirection, writable: boolean): void {
@@ -692,8 +889,18 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   /** Deterministic sweep hook; production also schedules this automatically. */
   sweep(): void {
     if (this.phase !== "running") return;
-    const swept = this.options.broker.sweepBackpressure(this.options.transportId);
-    this.acceptBrokerResult(swept);
+    let call: ReturnType<typeof this.invokeSynchronousBrokerCall>;
+    try {
+      call = this.invokeSynchronousBrokerCall(() => (
+        this.options.broker.sweepBackpressure(this.options.transportId)
+      ));
+    } catch {
+      this.requestClose(1013, "broker_sweep_failure");
+      this.beginCloseDrain();
+      return;
+    }
+    const swept = call.result;
+    if (call.receipt === null) this.acceptBrokerResult(swept);
     this.notifyHostWritable = true;
     if (swept.actions.length > 0) {
       // The route/carrier owners have started their close path. Give their
@@ -909,10 +1116,18 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.noteBoundaryPressure(this.brokerToHost, identity.routeId, identity.control);
   }
 
-  private acceptBrokerActions(actions: readonly RelayV2BrokerAction[]): void {
+  private acceptBrokerActions(
+    actions: readonly RelayV2BrokerAction[],
+    hostProvenanceChecked: boolean,
+  ): void {
     for (const action of actions) {
       if (this.phase === "closed" || this.phase === "terminal_failure"
         || this.actionAdmissionStopped) break;
+      if (
+        this.producerComposition
+        && this.isHostProducerAction(action)
+        && !hostProvenanceChecked
+      ) continue;
       const mandatory = this.requiredDuringClose(action);
       if (this.phase === "closing" && !mandatory) continue;
       this.clearTerminalClientPressure(action);
@@ -1215,19 +1430,32 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.blockedHostRoutes.delete(entry.routeId);
     }
     let acknowledged: RelayV2BrokerResult | null = null;
+    let acknowledgementReceipt: RelayV2BrokerProducerReceipt | null = null;
     if (entry.deliveryId !== null) {
-      acknowledged = entry.registrationFence
-        ? this.options.broker.acknowledgeHostControlDelivery(
-            this.options.transportId,
-            entry.deliveryId,
-          )
-        : this.options.broker.acknowledgeHostDelivery(
-            this.options.transportId,
-            entry.deliveryId,
-          );
+      try {
+        const call = this.invokeSynchronousBrokerCall(() => (
+          entry.registrationFence
+            ? this.options.broker.acknowledgeHostControlDelivery(
+                this.options.transportId,
+                entry.deliveryId!,
+              )
+            : this.options.broker.acknowledgeHostDelivery(
+                this.options.transportId,
+                entry.deliveryId!,
+              )
+        ));
+        acknowledged = call.result;
+        acknowledgementReceipt = call.receipt;
+      } catch {
+        this.requestClose(1013, entry.registrationFence
+          ? "registration_delivery_provenance_unavailable"
+          : "broker_delivery_ack_provenance_unavailable");
+      }
     }
     if (acknowledged) {
-      this.acceptBrokerActions(acknowledged.actions);
+      if (acknowledgementReceipt === null) {
+        this.acceptBrokerActions(acknowledged.actions, false);
+      }
       if (!acknowledged.accepted) {
         this.requestClose(1013, entry.registrationFence
           ? "registration_delivery_commit_rejected"
@@ -1253,15 +1481,28 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     const id = ++this.nextAttemptId;
     const abort = new AbortController();
     const weakPump = new WeakRef(this);
+    const preparedCallHolder: PreparedCallHolder = { call: null };
     const cancelDeadline = this.schedule(this.deliveryTimeoutMs, () => {
-      weakPump.deref()?.timeoutHostDelivery(generation, id);
+      const pump = weakPump.deref();
+      if (pump) pump.timeoutHostDelivery(generation, id, preparedCallHolder);
+      else takePreparedCall(preparedCallHolder)?.abandon();
     });
+    try {
+      preparedCallHolder.call = this.producerRegistration?.prepareBrokerCall() ?? null;
+    } catch {
+      cancelDeadline();
+      entry.state = "pending";
+      this.requestClose(1013, "host_delivery_provenance_unavailable");
+      this.beginCloseDrain();
+      return true;
+    }
     this.hostDeliveryAttempt = {
       generation,
       id,
       abort,
       cancelDeadline,
       deliveryToken: entry.deliveryToken,
+      preparedCallHolder,
     };
     let result: Promise<RelayV2BrokerResult>;
     try {
@@ -1271,12 +1512,20 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
         abort.signal,
       );
     } catch {
-      this.failHostDelivery(generation, id);
+      this.failHostDelivery(generation, id, preparedCallHolder);
       return true;
     }
     void Promise.resolve(result).then(
-      (settled) => { weakPump.deref()?.completeHostDelivery(generation, id, settled); },
-      () => { weakPump.deref()?.failHostDelivery(generation, id); },
+      (settled) => {
+        const pump = weakPump.deref();
+        if (pump) pump.completeHostDelivery(generation, id, preparedCallHolder, settled);
+        else takePreparedCall(preparedCallHolder)?.abandon();
+      },
+      () => {
+        const pump = weakPump.deref();
+        if (pump) pump.failHostDelivery(generation, id, preparedCallHolder);
+        else takePreparedCall(preparedCallHolder)?.abandon();
+      },
     );
     return true;
   }
@@ -1284,22 +1533,48 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   private completeHostDelivery(
     generation: number,
     id: number,
+    preparedCallHolder: PreparedCallHolder,
     result: RelayV2BrokerResult,
   ): void {
     const attempt = this.hostDeliveryAttempt;
     if (!attempt || attempt.generation !== generation || attempt.id !== id
-      || generation !== this.lifecycleGeneration || this.phase !== "running") return;
+      || attempt.preparedCallHolder !== preparedCallHolder
+      || generation !== this.lifecycleGeneration || this.phase !== "running") {
+      takePreparedCall(preparedCallHolder)?.abandon();
+      return;
+    }
     attempt.cancelDeadline();
     this.hostDeliveryAttempt = null;
     const entry = this.hostToBroker.entries.find((candidate) => (
       candidate.deliveryToken === attempt.deliveryToken && candidate.state === "processing"
     ));
     if (!entry) {
+      takePreparedCall(preparedCallHolder)?.abandon();
       this.requestClose(1013, "carrier_pump_delivery_fence_lost");
       this.beginCloseDrain();
       return;
     }
-    this.acceptBrokerActions(result.actions);
+    const preparedCall = takePreparedCall(preparedCallHolder);
+    if (preparedCall) {
+      try {
+        preparedCall.settle(
+          result,
+          (settled, handoff) => this.applyPreparedBrokerResult(settled, handoff),
+        );
+      } catch {
+        if (this.phase === "running") {
+          this.requestClose(1013, "host_delivery_settlement_failure");
+        }
+        this.beginCloseDrain();
+        return;
+      }
+    } else {
+      this.acceptBrokerActions(result.actions, false);
+    }
+    if (this.closeRequest) {
+      this.wake();
+      return;
+    }
     const pressureRejected = !result.accepted
       && result.error?.code === "SLOW_CONSUMER"
       && entry.routeId !== null;
@@ -1310,10 +1585,6 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       this.wake();
       return;
     }
-    if (this.closeRequest) {
-      this.wake();
-      return;
-    }
     // A valid negative carrier response such as route.rejected was fully
     // processed. Protocol failures always carry close_host above.
     entry.state = "complete";
@@ -1321,23 +1592,41 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.wake();
   }
 
-  private timeoutHostDelivery(generation: number, id: number): void {
+  private timeoutHostDelivery(
+    generation: number,
+    id: number,
+    preparedCallHolder: PreparedCallHolder,
+  ): void {
     const attempt = this.hostDeliveryAttempt;
     if (!attempt || attempt.generation !== generation || attempt.id !== id
-      || generation !== this.lifecycleGeneration) return;
+      || attempt.preparedCallHolder !== preparedCallHolder
+      || generation !== this.lifecycleGeneration) {
+      takePreparedCall(preparedCallHolder)?.abandon();
+      return;
+    }
     attempt.abort.abort();
     attempt.cancelDeadline();
+    takePreparedCall(preparedCallHolder)?.abandon();
     this.hostDeliveryAttempt = null;
     this.requestClose(1013, "host_delivery_timeout");
     this.beginCloseDrain();
   }
 
-  private failHostDelivery(generation: number, id: number): void {
+  private failHostDelivery(
+    generation: number,
+    id: number,
+    preparedCallHolder: PreparedCallHolder,
+  ): void {
     const attempt = this.hostDeliveryAttempt;
     if (!attempt || attempt.generation !== generation || attempt.id !== id
-      || generation !== this.lifecycleGeneration) return;
+      || attempt.preparedCallHolder !== preparedCallHolder
+      || generation !== this.lifecycleGeneration) {
+      takePreparedCall(preparedCallHolder)?.abandon();
+      return;
+    }
     attempt.abort.abort();
     attempt.cancelDeadline();
+    takePreparedCall(attempt.preparedCallHolder)?.abandon();
     this.hostDeliveryAttempt = null;
     this.requestClose(1013, "host_delivery_failure");
     this.beginCloseDrain();
@@ -1626,6 +1915,10 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     // before any external abort/cancel callback can reenter. The exact effect
     // that created this cut remains valid until it returns; B7a rejects every
     // new ordinary effect while the registration is closing.
+    if (!this.prepareDisconnectBrokerCall()) {
+      this.finishTerminalFailure("broker_disconnect_provenance_unavailable");
+      return;
+    }
     this.pendingProducerReadyTurn = null;
     this.lifecycleGeneration += 1;
     this.phase = "closing";
@@ -1633,6 +1926,9 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.beginProducerClose();
     this.hostDeliveryAttempt?.abort.abort();
     this.hostDeliveryAttempt?.cancelDeadline();
+    if (this.hostDeliveryAttempt) {
+      takePreparedCall(this.hostDeliveryAttempt.preparedCallHolder)?.abandon();
+    }
     this.hostDeliveryAttempt = null;
     const actionAttempt = this.brokerActionAttempt;
     const processing = this.pendingActions[0]?.state === "processing"
@@ -1734,6 +2030,7 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
       }
       for (const action of disconnected.actions) {
         if (this.actionAdmissionStopped || this.isTerminalFailure()) break;
+        if (this.producerComposition && this.isHostProducerAction(action)) continue;
         let bytes = 0;
         try {
           bytes = Buffer.byteLength(JSON.stringify(action), "utf8");
@@ -1771,22 +2068,52 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
   }
 
   private disconnectBrokerForClose(): RelayV2BrokerResult | null {
-    if (this.brokerDisconnected) return { accepted: true, actions: [] };
+    if (this.brokerDisconnected) {
+      this.disconnectPreparedCall?.abandon();
+      this.disconnectPreparedCall = null;
+      return { accepted: true, actions: [] };
+    }
+    const preparedCall = this.disconnectPreparedCall;
+    this.disconnectPreparedCall = null;
+    if (this.producerComposition && !preparedCall) {
+      this.actionAdmissionStopped = true;
+      this.finishTerminalFailure("broker_disconnect_provenance_unavailable");
+      return null;
+    }
+    let result: RelayV2BrokerResult;
     try {
-      const result = this.options.broker.disconnectHost(this.options.transportId);
-      this.brokerDisconnected = true;
-      // Every route owned by this carrier is now terminal in BrokerCore. Do
-      // not leave edge-triggered pause state behind when a cleanup action has
-      // to take the emergency/failed force path and the remaining batch is
-      // intentionally no longer admitted.
-      this.pausedClients.clear();
-      this.brokerToHost.pressureSinceMs = null;
-      return result;
+      result = this.options.broker.disconnectHost(this.options.transportId);
     } catch {
+      preparedCall?.abandon();
       this.actionAdmissionStopped = true;
       this.finishTerminalFailure("broker_disconnect_failure");
       return null;
     }
+    this.brokerDisconnected = true;
+    if (preparedCall) {
+      try {
+        const receipt = preparedCall.settle(
+          result,
+          (settled, handoff) => this.applyPreparedBrokerResult(
+            settled,
+            handoff,
+            false,
+          ),
+        );
+        if (receipt === "rejected") this.closeActionFailures += 1;
+      } catch {
+        this.actionAdmissionStopped = true;
+        this.finishTerminalFailure("broker_disconnect_settlement_failure");
+        return null;
+      }
+    }
+    // Every route owned by this carrier is now terminal in BrokerCore. Do
+    // not leave edge-triggered pause state behind when a cleanup action has
+    // to take the emergency/failed force path and the remaining batch is
+    // intentionally no longer admitted.
+    this.pausedClients.clear();
+    this.brokerToHost.pressureSinceMs = null;
+    return result;
   }
 
   private requiredDuringClose(action: RelayV2BrokerAction): boolean {
@@ -2007,6 +2334,8 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.closeAdmissionTimer = null;
     this.closeAdmissionSealed = true;
     this.installAllOwnerFences();
+    this.disconnectPreparedCall?.abandon();
+    this.disconnectPreparedCall = null;
     this.closeActionAbort?.abort();
     this.closeDrainGeneration += 1;
     const retired = this.retiredBrokerActionAttempt;
@@ -2068,8 +2397,13 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     // barrier; generation checks inside the pump cannot undo a late external
     // socket effect.
     this.installAllOwnerFences();
+    this.disconnectPreparedCall?.abandon();
+    this.disconnectPreparedCall = null;
     this.hostDeliveryAttempt?.abort.abort();
     this.hostDeliveryAttempt?.cancelDeadline();
+    if (this.hostDeliveryAttempt) {
+      takePreparedCall(this.hostDeliveryAttempt.preparedCallHolder)?.abandon();
+    }
     this.hostDeliveryAttempt = null;
     this.brokerActionAttempt?.abort.abort();
     this.brokerActionAttempt?.cancelDeadline();
@@ -2101,9 +2435,14 @@ export class RelayV2BrokerHostCarrierPump implements RelayV2HostCarrierTransport
     this.pendingProducerReadyTurn = null;
     this.beginProducerClose();
     this.closedWith = { code: close.code, reason: close.reason };
+    this.disconnectPreparedCall?.abandon();
+    this.disconnectPreparedCall = null;
     this.lifecycleGeneration += 1;
     this.hostDeliveryAttempt?.abort.abort();
     this.hostDeliveryAttempt?.cancelDeadline();
+    if (this.hostDeliveryAttempt) {
+      takePreparedCall(this.hostDeliveryAttempt.preparedCallHolder)?.abandon();
+    }
     this.hostDeliveryAttempt = null;
     this.brokerActionAttempt?.abort.abort();
     this.brokerActionAttempt?.cancelDeadline();
