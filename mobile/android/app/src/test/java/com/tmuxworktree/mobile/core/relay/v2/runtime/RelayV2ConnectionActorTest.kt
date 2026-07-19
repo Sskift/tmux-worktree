@@ -54,6 +54,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StateSyncRepositoryCor
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2StoredSyncPhase
 import com.tmuxworktree.mobile.core.relay.v2.state.canonicalSnapshotDigest
 import java.util.UUID
+import java.util.concurrent.CancellationException
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -76,6 +77,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -206,10 +208,22 @@ class RelayV2ConnectionActorTest {
 
             val defaultHarness = Harness()
             try {
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    defaultHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
+                )
                 val hello = defaultHarness.connectThroughRelayWelcome(null)
                 assertEquals(
                     RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
                     hello.payload().stringList("capabilities"),
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    defaultHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
                 )
             } finally {
                 defaultHarness.close()
@@ -238,6 +252,12 @@ class RelayV2ConnectionActorTest {
                         RelayV2ConnectionActor.REQUIRED_CAPABILITIES,
                         hello.payload().stringList("requiredCapabilities"),
                     )
+                    assertEquals(
+                        RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                        harness.actor.currentRepositoryReadCut(
+                            RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                        ),
+                    )
                     val welcome = fixture("host-welcome-snapshot-required")
                     welcome["requestId"] = hello.stringValue("requestId")
                     welcome.payload()["capabilities"] =
@@ -251,9 +271,85 @@ class RelayV2ConnectionActorTest {
                         AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
                             effect.context.negotiatedCapabilities,
                     )
+                    when (val result = harness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    )) {
+                        is RelayV2CurrentRepositoryReadCutResult.Available -> {
+                            assertTrue(broker && host)
+                            assertEquals(effect.repositoryAuthority, result.cut.authority)
+                            assertEquals(
+                                RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                                result.cut.capability,
+                            )
+                            val authority = result.cut.authority
+                            assertEquals(harness.profile.profileId, authority.profileId)
+                            assertEquals(
+                                harness.profile.activationGeneration,
+                                authority.profileActivationGeneration,
+                            )
+                            assertEquals(authority.profileId, authority.generation.profileId)
+                            assertEquals(
+                                authority.profileActivationGeneration,
+                                authority.generation.profileGeneration,
+                            )
+                            assertTrue(authority.generation.connectionGeneration > 0)
+                            assertEquals(harness.profile.principalId, authority.principalId)
+                            assertEquals(
+                                harness.profile.clientInstanceId,
+                                authority.clientInstanceId,
+                            )
+                            assertEquals(harness.profile.hostId, authority.hostId)
+                            assertEquals(HOST_EPOCH, authority.hostEpoch)
+                        }
+                        RelayV2CurrentRepositoryReadCutResult.Unavailable ->
+                            assertFalse(broker && host)
+                    }
                 } finally {
                     harness.close()
                 }
+            }
+
+            val failedHarness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                failedHarness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+                assertTrue(
+                    failedHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ) is RelayV2CurrentRepositoryReadCutResult.Available,
+                )
+                failedHarness.transport().fail(
+                    RelayV2TransportFailure(RelayV2TransportFailureKind.NETWORK),
+                )
+                failedHarness.actor.awaitFailure(RelayV2FailureKind.TRANSPORT)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    failedHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
+                )
+            } finally {
+                failedHarness.close()
+            }
+
+            val disconnectedHarness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                disconnectedHarness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+                disconnectedHarness.actor.disconnectAndDrain(
+                    disconnectedHarness.profile.identity,
+                    "read-cut-disconnected",
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    disconnectedHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
+                )
+            } finally {
+                disconnectedHarness.close()
             }
         }
 
@@ -3649,6 +3745,249 @@ class RelayV2ConnectionActorTest {
     }
 
     @Test
+    fun `current repository read lease shares apply drain and rejects noncurrent cuts`() =
+        runBlocking {
+            val disconnectOwnerSealed = CompletableDeferred<Unit>()
+            val releaseHeldRead = CompletableDeferred<Unit>()
+            val harness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+                afterDisconnectOwnerSeal = { disconnectOwnerSealed.complete(Unit) },
+            )
+            val crossActor = Harness()
+            try {
+                val authority = harness.negotiateAgentExtension(
+                    RelayV2ConnectionPhase.RESYNCING,
+                )
+                val cut = (
+                    harness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ) as RelayV2CurrentRepositoryReadCutResult.Available
+                    ).cut
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Current("current"),
+                    harness.actor.withCurrentRepositoryReadLease(cut) { "current" },
+                )
+
+                val blockedInvocations = AtomicInteger(0)
+                val forged = object : RelayV2CurrentRepositoryReadCut {
+                    override val authority = authority
+                    override val capability =
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE
+                }
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    harness.actor.withCurrentRepositoryReadLease(forged) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    crossActor.actor.withCurrentRepositoryReadLease(cut) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+                assertEquals(0, blockedInvocations.get())
+
+                val failure = IllegalStateException("read failed")
+                assertSame(
+                    failure,
+                    runCatching {
+                        harness.actor.withCurrentRepositoryReadLease(cut) { throw failure }
+                    }.exceptionOrNull(),
+                )
+                val cancellation = CancellationException("read cancelled")
+                assertSame(
+                    cancellation,
+                    runCatching {
+                        harness.actor.withCurrentRepositoryReadLease(cut) {
+                            throw cancellation
+                        }
+                    }.exceptionOrNull(),
+                )
+
+                val readEntered = CompletableDeferred<Unit>()
+                val heldRead = async(Dispatchers.Default) {
+                    harness.actor.withCurrentRepositoryReadLease(cut) {
+                        readEntered.complete(Unit)
+                        releaseHeldRead.await()
+                        "held"
+                    }
+                }
+                withTimeout(TIMEOUT_MS) { readEntered.await() }
+                val barrier = async {
+                    harness.actor.disconnectAndDrain(
+                        harness.profile.identity,
+                        "repository-read-drain",
+                    )
+                }
+                withTimeout(TIMEOUT_MS) { disconnectOwnerSealed.await() }
+                assertFalse(barrier.isCompleted)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    harness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    harness.actor.withCurrentRepositoryReadLease(cut) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+
+                releaseHeldRead.complete(Unit)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Current("held"),
+                    withTimeout(TIMEOUT_MS) { heldRead.await() },
+                )
+                assertEquals(
+                    "repository-read-drain",
+                    withTimeout(TIMEOUT_MS) { barrier.await() }.barrierId,
+                )
+                withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first { it is RelayV2RuntimeEffect.Disconnected }
+                }
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    harness.actor.withCurrentRepositoryReadLease(cut) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+
+                val higherActivation = harness.profile.copy(activationGeneration = 2)
+                val higherAuthority = harness.negotiateAgentExtension(
+                    RelayV2ConnectionPhase.RESYNCING,
+                    connectingProfile = higherActivation,
+                )
+                val higherCut = (
+                    harness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ) as RelayV2CurrentRepositoryReadCutResult.Available
+                    ).cut
+                assertEquals(2L, higherAuthority.profileActivationGeneration)
+                assertEquals(higherAuthority, higherCut.authority)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    harness.actor.withCurrentRepositoryReadLease(cut) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+
+                harness.actor.disconnectAndDrain(
+                    higherActivation.identity,
+                    "higher-activation-drain",
+                )
+                withTimeout(TIMEOUT_MS) {
+                    harness.actor.effects.first { it is RelayV2RuntimeEffect.Disconnected }
+                }
+                val otherProfile = harness.installProfile("read-other", activationGeneration = 1)
+                val otherAuthority = harness.negotiateAgentExtension(
+                    RelayV2ConnectionPhase.RESYNCING,
+                    connectingProfile = otherProfile,
+                )
+                val otherCut = (
+                    harness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ) as RelayV2CurrentRepositoryReadCutResult.Available
+                    ).cut
+                assertEquals(otherProfile.profileId, otherAuthority.profileId)
+                assertEquals(otherAuthority, otherCut.authority)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    harness.actor.withCurrentRepositoryReadLease(higherCut) {
+                        blockedInvocations.incrementAndGet()
+                    },
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Current("other"),
+                    harness.actor.withCurrentRepositoryReadLease(otherCut) { "other" },
+                )
+                assertEquals(0, blockedInvocations.get())
+            } finally {
+                releaseHeldRead.complete(Unit)
+                harness.close()
+                crossActor.close()
+            }
+
+            val reconnectRelease = CompletableDeferred<Unit>()
+            val reconnectHarness = Harness(
+                optionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
+            )
+            try {
+                reconnectHarness.negotiateAgentExtension(RelayV2ConnectionPhase.RESYNCING)
+                val oldCut = (
+                    reconnectHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ) as RelayV2CurrentRepositoryReadCutResult.Available
+                    ).cut
+                val reconnectReadEntered = CompletableDeferred<Unit>()
+                val heldReconnectRead = async(Dispatchers.Default) {
+                    reconnectHarness.actor.withCurrentRepositoryReadLease(oldCut) {
+                        reconnectReadEntered.complete(Unit)
+                        reconnectRelease.await()
+                        "reconnect-held"
+                    }
+                }
+                withTimeout(TIMEOUT_MS) { reconnectReadEntered.await() }
+                val transportCount = reconnectHarness.factory.transports.size
+                assertTrue(reconnectHarness.actor.connect(reconnectHarness.profile))
+                withTimeout(TIMEOUT_MS) {
+                    while (reconnectHarness.actor.currentRepositoryReadCut(
+                            RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                        ) != RelayV2CurrentRepositoryReadCutResult.Unavailable
+                    ) {
+                        delay(1)
+                    }
+                }
+                assertEquals(transportCount, reconnectHarness.factory.transports.size)
+
+                reconnectRelease.complete(Unit)
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Current("reconnect-held"),
+                    withTimeout(TIMEOUT_MS) { heldReconnectRead.await() },
+                )
+                val replacement = reconnectHarness.awaitTransport(transportCount)
+                replacement.open(RelayV2Profile.RELAY_V2_SUBPROTOCOL)
+                reconnectHarness.actor.awaitPhase(
+                    RelayV2ConnectionPhase.AWAITING_RELAY_WELCOME,
+                )
+                replacement.sendFixture("relay-welcome")
+                val hello = replacement.awaitSentFrame()
+                val welcome = fixture("host-welcome-snapshot-required")
+                welcome["requestId"] = hello.stringValue("requestId")
+                welcome.payload()["capabilities"] =
+                    RelayV2ConnectionActor.REQUIRED_CAPABILITIES
+                replacement.sendFrame(welcome)
+                val effect = withTimeout(TIMEOUT_MS) {
+                    reconnectHarness.actor.effects.first {
+                        it is RelayV2RuntimeEffect.BeginStateResync
+                    }
+                } as RelayV2RuntimeEffect.BeginStateResync
+                assertFalse(
+                    AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY in
+                        effect.context.negotiatedCapabilities,
+                )
+                assertEquals(
+                    RelayV2CurrentRepositoryReadCutResult.Unavailable,
+                    reconnectHarness.actor.currentRepositoryReadCut(
+                        RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE,
+                    ),
+                )
+                var staleRuns = 0
+                assertEquals(
+                    RelayV2CurrentRepositoryReadLeaseResult.Stale,
+                    reconnectHarness.actor.withCurrentRepositoryReadLease(oldCut) {
+                        staleRuns += 1
+                    },
+                )
+                assertEquals(0, staleRuns)
+            } finally {
+                reconnectRelease.complete(Unit)
+                reconnectHarness.close()
+            }
+        }
+
+    @Test
     fun `profile barrier fences queued and future connects until a higher activation`() = runBlocking {
         val harness = Harness()
         try {
@@ -5716,6 +6055,7 @@ class RelayV2ConnectionActorTest {
 
         suspend fun negotiateAgentExtension(
             targetPhase: RelayV2ConnectionPhase,
+            connectingProfile: RelayV2Profile = profile,
         ): RelayV2RepositoryEffectAuthority {
             require(
                 targetPhase == RelayV2ConnectionPhase.QUERYING ||
@@ -5725,6 +6065,7 @@ class RelayV2ConnectionActorTest {
             val matched = targetPhase != RelayV2ConnectionPhase.RESYNCING
             val hello = connectThroughRelayWelcome(
                 resume = if (matched) RelayV2ResumeCursor(HOST_EPOCH, "91") else null,
+                connectingProfile = connectingProfile,
                 brokerOptionalCapabilities = setOf(AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY),
             )
             val welcome = fixture(

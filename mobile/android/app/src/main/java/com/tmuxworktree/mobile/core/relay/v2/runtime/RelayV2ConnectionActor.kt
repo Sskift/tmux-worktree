@@ -218,6 +218,81 @@ internal class RelayV2ConnectionActor(
         }
     }
 
+    internal fun currentRepositoryReadCut(
+        capability: RelayV2RepositoryReadCapability,
+    ): RelayV2CurrentRepositoryReadCutResult = synchronized(lifecycleLock) {
+        val fence = currentRepositoryReadFenceLocked(capability)
+            ?: return@synchronized RelayV2CurrentRepositoryReadCutResult.Unavailable
+        RelayV2CurrentRepositoryReadCutResult.Available(
+            ActorCurrentRepositoryReadCut(
+                originActor = this,
+                originFence = fence,
+                authority = fence.authority,
+                capability = capability,
+            ),
+        )
+    }
+
+    internal suspend fun <T> withCurrentRepositoryReadLease(
+        cut: RelayV2CurrentRepositoryReadCut,
+        block: suspend () -> T,
+    ): RelayV2CurrentRepositoryReadLeaseResult<T> {
+        val actorCut = cut as? ActorCurrentRepositoryReadCut
+            ?: return RelayV2CurrentRepositoryReadLeaseResult.Stale
+        val lease = synchronized(lifecycleLock) {
+            if (actorCut.originActor !== this) return@synchronized null
+            val currentFence = currentRepositoryReadFenceLocked(actorCut.capability)
+                ?: return@synchronized null
+            if (currentFence !== actorCut.originFence ||
+                currentFence.authority != actorCut.authority
+            ) {
+                return@synchronized null
+            }
+            effectApplyGate.begin(actorCut.authority.generation, actorCut.authority)
+        } ?: return RelayV2CurrentRepositoryReadLeaseResult.Stale
+
+        return try {
+            RelayV2CurrentRepositoryReadLeaseResult.Current(block())
+        } finally {
+            lease.close()
+        }
+    }
+
+    private fun currentRepositoryReadFenceLocked(
+        capability: RelayV2RepositoryReadCapability,
+    ): AgentExtensionSendFence? {
+        if (lifecycleState != LifecycleState.OPEN ||
+            _state.value.phase !in AGENT_EXTENSION_INBOUND_PHASES
+        ) {
+            return null
+        }
+        val committed = committedCallbackOwner ?: return null
+        if (!isCurrentCallbackLocked(committed.key, committed.source)) return null
+        val generation = committed.effectGeneration
+        val context = onlineContext ?: return null
+        val profile = activeProfile ?: return null
+        val fence = agentExtensionSendFence.get() ?: return null
+        if (publishedEffectGeneration.get() != generation ||
+            generation.connectionGeneration != connectionGeneration ||
+            context.profile != profile.identity ||
+            context.principalId != profile.principalId ||
+            context.clientInstanceId != profile.clientInstanceId ||
+            context.hostId != profile.hostId ||
+            context.repositoryEffectAuthority(generation) != fence.authority ||
+            context.negotiatedCapabilities != fence.negotiatedCapabilities ||
+            capability.wireIdentity !in context.negotiatedCapabilities
+        ) {
+            return null
+        }
+        return fence
+    }
+
+    private val RelayV2RepositoryReadCapability.wireIdentity: String
+        get() = when (this) {
+            RelayV2RepositoryReadCapability.AGENT_TRANSCRIPT_LIFECYCLE ->
+                AGENT_TRANSCRIPT_LIFECYCLE_CAPABILITY
+        }
+
     // Actor state is serialized below; callback source binding/fences are guarded by lifecycleLock.
     private var connectionGeneration = 0L
     private var activeTransport: RelayV2Transport? = null
@@ -247,6 +322,7 @@ internal class RelayV2ConnectionActor(
     private var recoveryStepWatchdog: Job? = null
     private var recoveryAttempt: RecoveryAttempt? = null
     private var onlineQueryWindow: OnlineQueryWindow? = null
+    @Volatile
     private var onlineContext: RelayV2HandshakeContext? = null
     private val recentIssuedIds = LinkedHashSet<String>()
     private val completedRecoveryResponses = LinkedHashSet<CompletedRecoveryResponse>()
@@ -635,8 +711,7 @@ internal class RelayV2ConnectionActor(
                 lifecycleState = LifecycleState.SHUTTING_DOWN
                 check(shutdownDrainCompletion == null) { "Relay v2 shutdown drain already exists" }
                 shutdownDrainCompletion = CompletableDeferred()
-                clearPublishedEffectAuthority()
-                effectApplyGate.invalidateAndDrain()
+                withdrawPublishedRepositoryAuthorityAndDrainLocked()
                 actions.trySendReserved(Action.Shutdown)
             }
         }
@@ -730,7 +805,7 @@ internal class RelayV2ConnectionActor(
 
             val preparation = synchronized(lifecycleLock) {
                 if (!isConnectTokenCurrentLocked(token)) return@synchronized null
-                clearPublishedEffectAuthority()
+                val applyDrain = withdrawPublishedRepositoryAuthorityAndDrainLocked()
                 revokeCallbackOwnersLocked()
                 val previous = activeTransport
                 activeTransport = null
@@ -745,7 +820,7 @@ internal class RelayV2ConnectionActor(
                 ConnectPreparation(
                     previousTransport = previous,
                     connectionGeneration = connectionGeneration,
-                    applyDrain = effectApplyGate.invalidateAndDrain(),
+                    applyDrain = applyDrain,
                 )
             } ?: return
             cancelHandshakeWatchdogs()
@@ -1104,7 +1179,7 @@ internal class RelayV2ConnectionActor(
         ) {
             callbackAdmissions.sealThrough(committed.key)
             committedCallbackOwner = null
-            clearPublishedEffectAuthority()
+            clearPublishedEffectAuthorityLocked()
         }
         effectApplyGate.invalidateThrough(profile.profileId, fenced)
     }
@@ -1129,8 +1204,7 @@ internal class RelayV2ConnectionActor(
             }
             committedCallbackOwner?.let { callbackAdmissions.sealThrough(it.key) }
             committedCallbackOwner = null
-            clearPublishedEffectAuthority()
-            effectApplyGate.invalidateAndDrain()
+            withdrawPublishedRepositoryAuthorityAndDrainLocked()
             val source = activeTransport
             activeTransport = null
             activeProfile = profile
@@ -2577,16 +2651,14 @@ internal class RelayV2ConnectionActor(
                 queryUntilMs = window.longValue("queryUntilMs"),
             ),
         )
-        onlineContext = context
         hostWelcomeWatchdog?.cancel()
         hostWelcomeWatchdog = null
         val helloRequestId = requireNotNull(pendingHelloRequestId)
         pendingHelloRequestId = null
         val effectGeneration = currentEffectGeneration(profile)
         if (!activateEffectGenerationIfCurrent(
+                context,
                 effectGeneration,
-                context.repositoryEffectAuthority(effectGeneration),
-                context.negotiatedCapabilities,
             )
         ) {
             return
@@ -3324,7 +3396,7 @@ internal class RelayV2ConnectionActor(
             effectApplyGate.activate(effectGeneration)
             callbackAdmissions.sealThrough(committed.key)
             committedCallbackOwner = null
-            clearPublishedEffectAuthority()
+            clearPublishedEffectAuthorityLocked()
             activeTransport.also { activeTransport = null }
         }
         clearRecoveryAttempt()
@@ -3661,9 +3733,8 @@ internal class RelayV2ConnectionActor(
         val profile = activeProfile
         val terminalSource = activeTransport ?: source
         betweenTerminalCauseReadAndOwnerRevoke()
+        withdrawPublishedRepositoryAuthorityAndDrainLocked()
         revokeCallbackOwnersLocked()
-        clearPublishedEffectAuthority()
-        effectApplyGate.invalidateAndDrain()
         activeTransport = null
         pendingTerminalIntent = null
         clearRecoveryAttempt()
@@ -3891,9 +3962,8 @@ internal class RelayV2ConnectionActor(
         cancelHandshakeWatchdogs()
         val fencedGeneration = current?.let(::currentEffectGeneration)
         val preparation = synchronized(lifecycleLock) {
+            val applyDrain = withdrawPublishedRepositoryAuthorityAndDrainLocked()
             revokeCallbackOwnersLocked()
-            clearPublishedEffectAuthority()
-            val applyDrain = effectApplyGate.invalidateAndDrain()
             val source = activeTransport
             activeTransport = null
             connectionGeneration += 1
@@ -4439,14 +4509,20 @@ internal class RelayV2ConnectionActor(
 
     private fun invalidateConnectionOwnershipAndDrain(): CompletableDeferred<Unit> =
         synchronized(lifecycleLock) {
+            val applyDrain = withdrawPublishedRepositoryAuthorityAndDrainLocked()
             revokeCallbackOwnersLocked()
-            clearPublishedEffectAuthority()
-            effectApplyGate.invalidateAndDrain()
+            applyDrain
         }
 
-    private fun clearPublishedEffectAuthority() {
-        publishedEffectGeneration.set(null)
+    private fun clearPublishedEffectAuthorityLocked() {
+        onlineContext = null
         agentExtensionSendFence.set(null)
+        publishedEffectGeneration.set(null)
+    }
+
+    private fun withdrawPublishedRepositoryAuthorityAndDrainLocked(): CompletableDeferred<Unit> {
+        clearPublishedEffectAuthorityLocked()
+        return effectApplyGate.invalidateAndDrain()
     }
 
     private fun revokeCallbackOwnersLocked() {
@@ -4457,23 +4533,29 @@ internal class RelayV2ConnectionActor(
     }
 
     private fun activateEffectGenerationIfCurrent(
+        context: RelayV2HandshakeContext,
         generation: RelayV2EffectGeneration,
-        repositoryAuthority: RelayV2RepositoryEffectAuthority? = null,
-        negotiatedCapabilities: Set<String> = emptySet(),
     ): Boolean = synchronized(lifecycleLock) {
         val committed = committedCallbackOwner
         if (lifecycleState != LifecycleState.OPEN ||
             committed?.effectGeneration != generation ||
-            publishedEffectGeneration.get() != generation
+            publishedEffectGeneration.get() != generation ||
+            activeProfile?.identity != context.profile ||
+            activeProfile?.principalId != context.principalId ||
+            activeProfile?.clientInstanceId != context.clientInstanceId ||
+            activeProfile?.hostId != context.hostId
         ) {
             return@synchronized false
         }
+        val repositoryAuthority = context.repositoryEffectAuthority(generation)
         effectApplyGate.activate(generation, repositoryAuthority)
-        agentExtensionSendFence.set(
-            repositoryAuthority?.let {
-                AgentExtensionSendFence(it, negotiatedCapabilities.toSet())
-            },
+        val fence = AgentExtensionSendFence(
+            repositoryAuthority,
+            context.negotiatedCapabilities.toSet(),
         )
+        onlineContext = context
+        publishedEffectGeneration.set(generation)
+        agentExtensionSendFence.set(fence)
         true
     }
 
@@ -4672,6 +4754,13 @@ internal class RelayV2ConnectionActor(
         val authority: RelayV2RepositoryEffectAuthority,
         val negotiatedCapabilities: Set<String>,
     )
+
+    private class ActorCurrentRepositoryReadCut(
+        val originActor: RelayV2ConnectionActor,
+        val originFence: AgentExtensionSendFence,
+        override val authority: RelayV2RepositoryEffectAuthority,
+        override val capability: RelayV2RepositoryReadCapability,
+    ) : RelayV2CurrentRepositoryReadCut
 
     private data class ClaimedTerminal(
         val cause: TerminalIntentCause,

@@ -269,6 +269,39 @@ internal fun RelayV2HandshakeContext.repositoryEffectAuthority(
     hostEpoch = hostEpoch,
 )
 
+/** Closed repository read domains whose current authority can be attested by the v2 actor. */
+internal enum class RelayV2RepositoryReadCapability {
+    AGENT_TRANSCRIPT_LIFECYCLE,
+}
+
+/**
+ * Opaque actor-issued cut for a current repository read.
+ *
+ * The concrete implementation is private to [RelayV2ConnectionActor]. The authority contains the
+ * complete profile activation, connection generation, principal, client, host, and host-epoch
+ * fence; no credential or endpoint material belongs in this type.
+ */
+internal interface RelayV2CurrentRepositoryReadCut {
+    val authority: RelayV2RepositoryEffectAuthority
+    val capability: RelayV2RepositoryReadCapability
+}
+
+internal sealed interface RelayV2CurrentRepositoryReadCutResult {
+    data object Unavailable : RelayV2CurrentRepositoryReadCutResult
+
+    data class Available(
+        val cut: RelayV2CurrentRepositoryReadCut,
+    ) : RelayV2CurrentRepositoryReadCutResult
+}
+
+internal sealed interface RelayV2CurrentRepositoryReadLeaseResult<out T> {
+    data object Stale : RelayV2CurrentRepositoryReadLeaseResult<Nothing>
+
+    data class Current<T>(
+        val value: T,
+    ) : RelayV2CurrentRepositoryReadLeaseResult<T>
+}
+
 /** Exact actor-owned recovery step that a durable repository receipt must acknowledge. */
 internal data class RelayV2RecoveryBinding(
     val generation: RelayV2EffectGeneration,
