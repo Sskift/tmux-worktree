@@ -65,6 +65,20 @@ class FakeCredentials {
     };
   }
 
+  prepareReauthentication({ credentialReference, requestId }) {
+    const credential = this.read(credentialReference);
+    return {
+      fence: {
+        reference: credential.reference,
+        version: credential.version,
+        requestId,
+        grantId: credential.grantId,
+        accessJti: credential.accessJti,
+      },
+      accessToken: credential.accessToken,
+    };
+  }
+
   acknowledgeReauthentication() {
     return true;
   }
