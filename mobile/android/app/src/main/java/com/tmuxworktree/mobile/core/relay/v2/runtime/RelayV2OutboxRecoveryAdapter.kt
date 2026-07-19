@@ -60,6 +60,8 @@ internal sealed interface RelayV2OutboxRecoveryApplyResult {
 
     data class Committed(
         val commit: RelayV2OutboxRecoveryCommit,
+        val dispatchIssuance: RelayV2OutboxDispatchIssuance =
+            RelayV2OutboxDispatchIssuance.Disabled,
     ) : RelayV2OutboxRecoveryApplyResult
 
     data class ProtocolViolation(
@@ -76,6 +78,7 @@ internal sealed interface RelayV2OutboxRecoveryApplyResult {
 private sealed interface RelayV2OutboxRecoveryLeaseResult {
     data class Committed(
         val commit: RelayV2OutboxRecoveryCommit,
+        val dispatchSeal: RelayV2OutboxDispatchCommittedSeal?,
     ) : RelayV2OutboxRecoveryLeaseResult
 
     data class Rejected(
@@ -105,12 +108,42 @@ private data class RelayV2ExpectedCommandsSnapshot(
  * transaction, closes the actor binding, uses only locally persisted command identity, and returns
  * a receipt and typed effects only after the transaction commits.
  */
-internal class RelayV2OutboxRecoveryAdapter(
+internal class RelayV2OutboxRecoveryAdapter private constructor(
     private val applyLease: RelayV2RepositoryEffectApplyLeasePort,
     private val outbox: RelayV2OutboxRecoveryAuthority,
-    private val newId: () -> String = { UUID.randomUUID().toString() },
-    private val clock: () -> Long = System::currentTimeMillis,
+    private val newId: () -> String,
+    private val clock: () -> Long,
+    private val dispatchIssuer: RelayV2OutboxDispatchIssuePort?,
 ) {
+    internal constructor(
+        applyLease: RelayV2RepositoryEffectApplyLeasePort,
+        outbox: RelayV2OutboxRecoveryAuthority,
+        newId: () -> String = { UUID.randomUUID().toString() },
+        clock: () -> Long = System::currentTimeMillis,
+    ) : this(
+        applyLease,
+        outbox,
+        newId,
+        clock,
+        dispatchIssuer = null,
+    )
+
+    internal companion object {
+        fun withDispatchIssuer(
+            applyLease: RelayV2RepositoryEffectApplyLeasePort,
+            outbox: RelayV2OutboxRecoveryAuthority,
+            newId: () -> String,
+            clock: () -> Long,
+            dispatchIssuer: RelayV2OutboxDispatchIssuePort,
+        ): RelayV2OutboxRecoveryAdapter = RelayV2OutboxRecoveryAdapter(
+            applyLease,
+            outbox,
+            newId,
+            clock,
+            dispatchIssuer,
+        )
+    }
+
     suspend fun handle(
         effect: RelayV2RuntimeEffect,
     ): RelayV2OutboxRecoveryApplyResult = when (effect) {
@@ -118,13 +151,13 @@ internal class RelayV2OutboxRecoveryAdapter(
             val expected = effect.expectedCommands.privateSnapshot()
             val snapshot = effect.message.validatedSnapshot()
             require(snapshot.type == "command.statuses")
-            applyCommandStatuses(effect, snapshot, expected).toApplyResult()
+            applyCommandStatuses(effect, snapshot, expected).toApplyResult(dispatchIssuer)
         }
         is RelayV2RuntimeEffect.DeliverPostHandshakeFrame -> {
             val snapshot = effect.message.validatedSnapshot()
             when (snapshot.type) {
                 "command.status", "command.result" ->
-                    applyCommandEvidence(effect, snapshot).toApplyResult()
+                    applyCommandEvidence(effect, snapshot).toApplyResult(dispatchIssuer)
                 else -> RelayV2OutboxRecoveryApplyResult.NotOwned(effect)
             }
         }
@@ -177,7 +210,8 @@ internal class RelayV2OutboxRecoveryAdapter(
             buildActions(effect, current, expected, statusByCommand)
         }
         return when (result) {
-            is RelayV2OutboxBatchResult.Applied -> RelayV2OutboxRecoveryLeaseResult.Committed(
+            is RelayV2OutboxBatchResult.Applied -> committed(
+                effect.repositoryAuthority,
                 RelayV2OutboxRecoveryCommit.CommandStatuses(
                     receipt = RelayV2RecoveryReceipt.CommandStatusesApplied(
                         effect.recovery,
@@ -248,7 +282,8 @@ internal class RelayV2OutboxRecoveryAdapter(
             listOf(RelayV2OutboxAction.ReconcileStatus(evidence))
         }
         return when (result) {
-            is RelayV2OutboxBatchResult.Applied -> RelayV2OutboxRecoveryLeaseResult.Committed(
+            is RelayV2OutboxBatchResult.Applied -> committed(
+                effect.repositoryAuthority,
                 RelayV2OutboxRecoveryCommit.CommandEvidence(
                     receipt = requireNotNull(postCommitReceipt),
                     effects = result.effects,
@@ -430,6 +465,16 @@ internal class RelayV2OutboxRecoveryAdapter(
         require(authority.hostId == context.hostId)
         require(authority.hostEpoch == context.hostEpoch)
     }
+
+    /** Called only after reduceOutboxBatchUnderApplyLease returned Applied. */
+    private fun committed(
+        authority: RelayV2RepositoryEffectAuthority,
+        commit: RelayV2OutboxRecoveryCommit,
+    ): RelayV2OutboxRecoveryLeaseResult.Committed =
+        RelayV2OutboxRecoveryLeaseResult.Committed(
+            commit = commit,
+            dispatchSeal = dispatchIssuer?.sealCommitted(authority, commit),
+        )
 }
 
 private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
@@ -454,11 +499,31 @@ private fun RelayV2CommandStatusEvidence.toAppliedReceipt(
     attemptRequestId = attemptRequestId,
 )
 
-private fun RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult>.toApplyResult():
-    RelayV2OutboxRecoveryApplyResult = when (this) {
+private fun RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult>.toApplyResult(
+    dispatchIssuer: RelayV2OutboxDispatchIssuePort?,
+): RelayV2OutboxRecoveryApplyResult = when (this) {
     is RelayV2EffectApplyResult.Applied -> when (val durable = value) {
-        is RelayV2OutboxRecoveryLeaseResult.Committed ->
-            RelayV2OutboxRecoveryApplyResult.Committed(durable.commit)
+        is RelayV2OutboxRecoveryLeaseResult.Committed -> {
+            val dispatchIssuance = if (dispatchIssuer == null) {
+                RelayV2OutboxDispatchIssuance.Disabled
+            } else if (durable.dispatchSeal == null) {
+                RelayV2OutboxDispatchIssuance.Rejected(
+                    RelayV2OutboxDispatchIssueFailure.ISSUER_FAILED,
+                )
+            } else {
+                try {
+                    dispatchIssuer.issue(durable.dispatchSeal)
+                } catch (_: Exception) {
+                    RelayV2OutboxDispatchIssuance.Rejected(
+                        RelayV2OutboxDispatchIssueFailure.ISSUER_FAILED,
+                    )
+                }
+            }
+            RelayV2OutboxRecoveryApplyResult.Committed(
+                durable.commit,
+                dispatchIssuance,
+            )
+        }
         is RelayV2OutboxRecoveryLeaseResult.Rejected ->
             if (durable.reason == RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH) {
                 RelayV2OutboxRecoveryApplyResult.ProtocolViolation(durable.reason)
