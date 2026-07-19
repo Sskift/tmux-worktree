@@ -10,6 +10,7 @@ import com.tmuxworktree.mobile.core.relay.v2.state.*
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -42,6 +43,48 @@ class RelayV2OutboxRecoveryAdapterTest {
         assertEquals("retry-attempt", state.command("retry").attempts.last().requestId)
         assertEquals(RelayV2OutboxStateTag.AMBIGUOUS, state.command("doubt").state)
     }
+
+    @Test
+    fun `status batch freezes expected command order before the durable transaction`() =
+        runBlocking {
+            val fixture = Fixture()
+            val commands = fixture.seed("snapshot-first", "snapshot-second")
+            val actorExpected = commands.mapTo(ArrayList()) { it.pending }
+            val originalExpected = actorExpected.map { it.copy() }
+            val replacement = RelayV2PendingCommand("replacement", "replacement-window")
+            val effect = fixture.effect(
+                commands,
+                commands.map { status(it, "accepted") },
+            ).copy(expectedCommands = actorExpected)
+            val creationCursor = fixture.repository.loadOutbox(fixture.namespace)
+                .nextCreationOrder
+            fixture.store.beforeNextTransaction = {
+                actorExpected.removeAt(0)
+                actorExpected[0] = replacement
+            }
+
+            val committed = fixture.apply(effect)
+
+            requireNotNull(committed)
+            assertEquals(listOf(replacement), actorExpected)
+            assertEquals(originalExpected, committed.receipt.appliedCommands)
+            assertTrue(committed.effects.isEmpty())
+            val state = fixture.repository.loadOutbox(fixture.namespace)
+            assertEquals(RelayV2OutboxStateTag.CONFIRMING, state.command("snapshot-first").state)
+            assertEquals(RelayV2OutboxStateTag.CONFIRMING, state.command("snapshot-second").state)
+            assertEquals(creationCursor, state.nextCreationOrder)
+
+            val receiptMutation = runCatching {
+                (committed.receipt.appliedCommands as MutableList<RelayV2PendingCommand>)
+                    .removeAt(0)
+            }
+            assertTrue(receiptMutation.isFailure)
+            assertEquals(originalExpected, committed.receipt.appliedCommands)
+            assertEquals(
+                creationCursor,
+                fixture.repository.loadOutbox(fixture.namespace).nextCreationOrder,
+            )
+        }
 
     @Test
     fun `all non retry query states map to exact existing evidence without effects`() =
@@ -80,6 +123,304 @@ class RelayV2OutboxRecoveryAdapterTest {
             assertEquals(RelayV2OutboxStateTag.AMBIGUOUS, state.command("expired").state)
             assertEquals(RelayV2OutboxStateTag.AMBIGUOUS, state.command("unknown").state)
         }
+
+    @Test
+    fun `direct status and result evidence use the durable transition matrix`() = runBlocking {
+        data class Case(
+            val name: String,
+            val type: String,
+            val wireState: String,
+            val expectedState: RelayV2OutboxStateTag,
+            val expectedSource: RelayV2CommandStatusSource,
+        )
+
+        listOf(
+            Case(
+                "accepted",
+                "command.status",
+                "accepted",
+                RelayV2OutboxStateTag.ACCEPTED,
+                RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+            ),
+            Case(
+                "running",
+                "command.status",
+                "running",
+                RelayV2OutboxStateTag.CONFIRMING,
+                RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+            ),
+            Case(
+                "succeeded",
+                "command.status",
+                "succeeded",
+                RelayV2OutboxStateTag.SUCCEEDED,
+                RelayV2CommandStatusSource.EXECUTE_RESPONSE,
+            ),
+            Case(
+                "failed",
+                "command.result",
+                "failed",
+                RelayV2OutboxStateTag.FAILED_FINAL,
+                RelayV2CommandStatusSource.RESULT_EVENT,
+            ),
+            Case(
+                "in-doubt",
+                "command.result",
+                "in_doubt",
+                RelayV2OutboxStateTag.AMBIGUOUS,
+                RelayV2CommandStatusSource.RESULT_EVENT,
+            ),
+        ).forEach { case ->
+            val fixture = Fixture()
+            val command = fixture.seedSending(case.name).single()
+            val effect = fixture.evidenceEffect(
+                decodeEvidence(fixture.context, command, case.type, case.wireState),
+            )
+
+            val result = fixture.handle(effect)
+
+            val commit = (result as RelayV2OutboxRecoveryApplyResult.Committed).commit
+            assertTrue(commit.effects.isEmpty())
+            val receipt = (commit as RelayV2OutboxRecoveryCommit.CommandEvidence).receipt
+            assertEquals(case.expectedSource, receipt.source)
+            assertEquals(case.expectedState, fixture.repository.loadOutbox(fixture.namespace)
+                .command(case.name).state)
+            assertEquals(
+                RelayV2OutboxAcceptanceEvidence.DURABLE,
+                fixture.repository.loadOutbox(fixture.namespace)
+                    .command(case.name).acceptanceEvidence,
+            )
+            assertEquals(
+                if (case.type == "command.status") "execute-${case.name}" else null,
+                receipt.attemptRequestId,
+            )
+        }
+    }
+
+    @Test
+    fun `late result without request id converges an ambiguous command`() = runBlocking {
+        val fixture = Fixture()
+        val command = fixture.seedSending("late-final").single()
+        val inDoubt = fixture.evidenceEffect(
+            decodeEvidence(fixture.context, command, "command.result", "in_doubt"),
+        )
+        val ambiguous = fixture.handle(inDoubt)
+        assertTrue(ambiguous is RelayV2OutboxRecoveryApplyResult.Committed)
+        assertEquals(
+            RelayV2OutboxStateTag.AMBIGUOUS,
+            fixture.repository.loadOutbox(fixture.namespace).command("late-final").state,
+        )
+
+        val succeeded = fixture.evidenceEffect(
+            decodeEvidence(fixture.context, command, "command.result", "succeeded"),
+        )
+        val converged = fixture.handle(succeeded)
+
+        val commit = (converged as RelayV2OutboxRecoveryApplyResult.Committed).commit
+        assertTrue(commit.effects.isEmpty())
+        val receipt = (commit as RelayV2OutboxRecoveryCommit.CommandEvidence).receipt
+        assertNull(receipt.attemptRequestId)
+        assertEquals(RelayV2CommandStatusSource.RESULT_EVENT, receipt.source)
+        assertEquals(
+            RelayV2OutboxStateTag.SUCCEEDED,
+            fixture.repository.loadOutbox(fixture.namespace).command("late-final").state,
+        )
+    }
+
+    @Test
+    fun `mutable decoded frame before handle cannot change canonical evidence ownership`() =
+        runBlocking {
+            val fixture = Fixture()
+            val command = fixture.seedSending("pre-handle-snapshot").single()
+            val message = decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+            )
+            val mutableFrame = message.mutableFrame()
+            mutableFrame["type"] = "host.presence"
+            message.mutablePayload()["state"] = "failed"
+            message.mutablePayload()["dedupeWindowId"] = "mutated-window"
+
+            val result = fixture.handle(fixture.evidenceEffect(message))
+
+            val commit = (result as RelayV2OutboxRecoveryApplyResult.Committed).commit
+                as RelayV2OutboxRecoveryCommit.CommandEvidence
+            assertEquals(RelayV2CommandStatusState.ACCEPTED, commit.receipt.state)
+            assertEquals(command.pending.dedupeWindowId, commit.receipt.dedupeWindowId)
+            val persisted = fixture.repository.loadOutbox(fixture.namespace)
+                .command(command.pending.commandId)
+            assertEquals(RelayV2OutboxStateTag.ACCEPTED, persisted.state)
+            assertEquals(RelayV2OutboxAcceptanceEvidence.DURABLE, persisted.acceptanceEvidence)
+        }
+
+    @Test
+    fun `mutable decoded frame during transaction cannot change canonical evidence`() =
+        runBlocking {
+            val fixture = Fixture()
+            val command = fixture.seedSending("transaction-snapshot").single()
+            val message = decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+            )
+            fixture.store.beforeNextTransaction = {
+                message.mutableFrame()["type"] = "command.result"
+                message.mutablePayload()["state"] = "failed"
+                message.mutablePayload()["dedupeWindowId"] = "mutated-window"
+            }
+
+            val result = fixture.handle(fixture.evidenceEffect(message))
+
+            val commit = (result as RelayV2OutboxRecoveryApplyResult.Committed).commit
+                as RelayV2OutboxRecoveryCommit.CommandEvidence
+            assertEquals(RelayV2CommandStatusSource.EXECUTE_RESPONSE, commit.receipt.source)
+            assertEquals(RelayV2CommandStatusState.ACCEPTED, commit.receipt.state)
+            assertEquals(command.pending.dedupeWindowId, commit.receipt.dedupeWindowId)
+            val persisted = fixture.repository.loadOutbox(fixture.namespace)
+                .command(command.pending.commandId)
+            assertEquals(RelayV2OutboxStateTag.ACCEPTED, persisted.state)
+            assertEquals(RelayV2OutboxAcceptanceEvidence.DURABLE, persisted.acceptanceEvidence)
+        }
+
+    @Test
+    fun `request command and attempt identity mismatches are protocol violations`() = runBlocking {
+        val fixture = Fixture()
+        val command = fixture.seed("guarded").single()
+        val before = fixture.repository.loadOutbox(fixture.namespace)
+        val writes = fixture.store.writeCount
+        val messages = listOf(
+            "wrong requestId" to decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                requestId = "unknown-request",
+            ),
+            "wrong attempt kind" to decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                requestId = QUERY_ID,
+            ),
+            "wrong commandId" to decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                commandId = "other-command",
+            ),
+        )
+
+        messages.forEach { (name, message) ->
+            assertEquals(
+                name,
+                RelayV2OutboxRecoveryApplyResult.ProtocolViolation(
+                    RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH,
+                ),
+                fixture.handle(fixture.evidenceEffect(message)),
+            )
+            assertEquals(writes, fixture.store.writeCount)
+            val after = fixture.repository.loadOutbox(fixture.namespace)
+            assertEquals(before.nextCreationOrder, after.nextCreationOrder)
+            assertEquals(before.entries, after.entries)
+        }
+    }
+
+    @Test
+    fun `other direct evidence identity mismatches fail closed without commit`() = runBlocking {
+        val fixture = Fixture()
+        val command = fixture.seed("guarded-other").single()
+        val before = fixture.repository.loadOutbox(fixture.namespace)
+        val writes = fixture.store.writeCount
+        val wrongOperationResult = linkedMapOf<String, Any?>(
+            "pane" to 0L,
+            "submit" to true,
+            "messageUtf8Bytes" to 1L,
+        )
+        val messages = listOf(
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                hostId = "other-host",
+            ),
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                hostEpoch = "other-epoch",
+            ),
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                dedupeWindowId = "other-window",
+            ),
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                scopeId = "other-scope",
+            ),
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.status",
+                "accepted",
+                sessionId = "other-session",
+            ),
+            decodeEvidence(
+                fixture.context,
+                command,
+                "command.result",
+                "succeeded",
+                result = wrongOperationResult,
+            ),
+        )
+
+        messages.forEach { message ->
+            val outcome = runCatching { fixture.handle(fixture.evidenceEffect(message)) }
+            assertTrue(
+                outcome.isFailure ||
+                    outcome.getOrNull() == RelayV2OutboxRecoveryApplyResult.ProtocolViolation(
+                        RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH,
+                    ),
+            )
+            assertEquals(writes, fixture.store.writeCount)
+            val after = fixture.repository.loadOutbox(fixture.namespace)
+            assertEquals(before.nextCreationOrder, after.nextCreationOrder)
+            assertEquals(before.entries, after.entries)
+        }
+    }
+
+    @Test
+    fun `non Outbox effect is returned unchanged without lease or transaction`() = runBlocking {
+        val fixture = Fixture()
+        val generation = RelayV2EffectGeneration("profile-v2", 7, 1)
+        val effect = RelayV2RuntimeEffect.Disconnected(
+            fixture.context.profile,
+            "not-owned",
+            generation,
+            generation.connectionGeneration,
+        )
+        val transactions = fixture.store.transactionCount
+        val writes = fixture.store.writeCount
+
+        val result = fixture.handle(effect) as RelayV2OutboxRecoveryApplyResult.NotOwned
+
+        assertSame(effect, result.effect)
+        assertEquals(0, fixture.lease.admittedBlocks)
+        assertEquals(transactions, fixture.store.transactionCount)
+        assertEquals(writes, fixture.store.writeCount)
+    }
 
     @Test
     fun `window-expired proof atomically reissues local command and exposes lineage effect`() =
@@ -166,6 +507,26 @@ class RelayV2OutboxRecoveryAdapterTest {
     }
 
     @Test
+    fun `storage failure rolls back direct evidence without post commit output`() = runBlocking {
+        val fixture = Fixture()
+        val command = fixture.seedSending("direct-storage").single()
+        val before = fixture.repository.loadOutbox(fixture.namespace)
+        val writes = fixture.store.writeCount
+        fixture.store.failNextReplaceCommandId = command.pending.commandId
+        val effect = fixture.evidenceEffect(
+            decodeEvidence(fixture.context, command, "command.result", "succeeded"),
+        )
+
+        val result = runCatching { fixture.handle(effect) }
+
+        assertTrue(result.isFailure)
+        assertEquals(writes, fixture.store.writeCount)
+        val after = fixture.repository.loadOutbox(fixture.namespace)
+        assertEquals(before.nextCreationOrder, after.nextCreationOrder)
+        assertEquals(before.entries, after.entries)
+    }
+
+    @Test
     fun `repository identity mismatch exposes no receipt effect or write`() = runBlocking {
         val fixture = Fixture()
         val command = fixture.seed("identity").single()
@@ -196,11 +557,16 @@ class RelayV2OutboxRecoveryAdapterTest {
         assertTrue(ambiguous.effects.isEmpty())
         val writes = fixture.store.writeCount
 
-        val rejected = fixture.apply(
+        val rejected = fixture.handle(
             fixture.effect(command, status(command, "accepted")),
         )
 
-        assertNull(rejected)
+        assertEquals(
+            RelayV2OutboxRecoveryApplyResult.Rejected(
+                RelayV2OutboxRejection.STATUS_NOT_AUTHORIZING,
+            ),
+            rejected,
+        )
         assertEquals(writes, fixture.store.writeCount)
         assertEquals(
             RelayV2OutboxStateTag.AMBIGUOUS,
@@ -213,18 +579,34 @@ class RelayV2OutboxRecoveryAdapterTest {
         val fixture = Fixture()
         val command = fixture.seed("stale").single()
         val effect = fixture.effect(command, status(command, "succeeded"))
+        val transactions = fixture.store.transactionCount
         val writes = fixture.store.writeCount
         fixture.lease.stale = true
 
-        val result = fixture.adapter.applyCommandStatuses(effect)
+        val result = fixture.handle(effect)
 
-        assertTrue(result is RelayV2EffectApplyResult.Stale)
+        assertEquals(RelayV2OutboxRecoveryApplyResult.Stale, result)
         assertEquals(0, fixture.lease.admittedBlocks)
+        assertEquals(transactions, fixture.store.transactionCount)
         assertEquals(writes, fixture.store.writeCount)
         assertEquals(
             RelayV2OutboxStateTag.CONFIRMING,
             fixture.repository.loadOutbox(fixture.namespace).command("stale").state,
         )
+
+        val direct = Fixture()
+        val directCommand = direct.seedSending("stale-result").single()
+        val directEffect = direct.evidenceEffect(
+            decodeEvidence(direct.context, directCommand, "command.result", "succeeded"),
+        )
+        val directTransactions = direct.store.transactionCount
+        val directWrites = direct.store.writeCount
+        direct.lease.stale = true
+
+        assertEquals(RelayV2OutboxRecoveryApplyResult.Stale, direct.handle(directEffect))
+        assertEquals(0, direct.lease.admittedBlocks)
+        assertEquals(directTransactions, direct.store.transactionCount)
+        assertEquals(directWrites, direct.store.writeCount)
     }
 
     @Test
@@ -272,22 +654,56 @@ class RelayV2OutboxRecoveryAdapterTest {
 
         suspend fun apply(
             effect: RelayV2RuntimeEffect.ApplyCommandStatuses,
-        ): RelayV2OutboxRecoveryCommit? =
-            when (val result = adapter.applyCommandStatuses(effect)) {
-                is RelayV2EffectApplyResult.Applied -> result.value
-                RelayV2EffectApplyResult.Stale -> error("test lease unexpectedly rejected effect")
+        ): RelayV2OutboxRecoveryCommit.CommandStatuses? =
+            when (val result = adapter.handle(effect)) {
+                is RelayV2OutboxRecoveryApplyResult.Committed ->
+                    result.commit as RelayV2OutboxRecoveryCommit.CommandStatuses
+                is RelayV2OutboxRecoveryApplyResult.Rejected -> null
+                is RelayV2OutboxRecoveryApplyResult.ProtocolViolation ->
+                    error("test effect violated protocol: ${result.reason}")
+                is RelayV2OutboxRecoveryApplyResult.NotOwned ->
+                    error("test effect was unexpectedly not owned")
+                RelayV2OutboxRecoveryApplyResult.Stale ->
+                    error("test lease unexpectedly rejected effect")
             }
+
+        suspend fun handle(
+            effect: RelayV2RuntimeEffect,
+        ): RelayV2OutboxRecoveryApplyResult = adapter.handle(effect)
 
         suspend fun seed(
             vararg commandIds: String,
             hostEpoch: String = context.hostEpoch,
-        ): List<TestCommand> {
-            val commands = commandIds.map { commandId ->
+        ): List<TestCommand> = seedCommands(
+            commandIds.map { commandId ->
                 TestCommand(
                     RelayV2PendingCommand(commandId, OLD_WINDOW),
                     "session-$commandId",
                 )
-            }
+            },
+            hostEpoch,
+            beginQueries = true,
+        )
+
+        suspend fun seedSending(
+            vararg commandIds: String,
+            hostEpoch: String = context.hostEpoch,
+        ): List<TestCommand> = seedCommands(
+            commandIds.map { commandId ->
+                TestCommand(
+                    RelayV2PendingCommand(commandId, OLD_WINDOW),
+                    "session-$commandId",
+                )
+            },
+            hostEpoch,
+            beginQueries = false,
+        )
+
+        private suspend fun seedCommands(
+            commands: List<TestCommand>,
+            hostEpoch: String,
+            beginQueries: Boolean,
+        ): List<TestCommand> {
             commands.forEachIndexed { index, command ->
                 repository.reduceOutboxUnderApplyLease(
                     namespace,
@@ -301,7 +717,7 @@ class RelayV2OutboxRecoveryAdapterTest {
                             commandId = command.pending.commandId,
                             scopeId = "scope-a",
                             sessionId = command.sessionId,
-                            arguments = RelayV2OutboxArguments.killSession(),
+                            arguments = command.arguments,
                         ),
                         index.toLong() + 1,
                     ),
@@ -315,6 +731,7 @@ class RelayV2OutboxRecoveryAdapterTest {
                     entries.size,
                 ),
             ) as RelayV2OutboxResult.Applied
+            if (!beginQueries) return commands
             entries = repository.loadOutbox(namespace).entries
             val queryIds = entries.chunked(RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH)
                 .mapIndexed { index, _ -> if (index == 0) QUERY_ID else "$QUERY_ID-$index" }
@@ -323,6 +740,22 @@ class RelayV2OutboxRecoveryAdapterTest {
                 RelayV2OutboxAction.BeginQueries(entries.map { it.id }, queryIds),
             ) as RelayV2OutboxResult.Applied
             return commands
+        }
+
+        fun evidenceEffect(
+            message: RelayV2DecodedMessage,
+        ): RelayV2RuntimeEffect.DeliverPostHandshakeFrame {
+            val generation = RelayV2EffectGeneration(
+                context.profile.profileId,
+                context.profile.activationGeneration,
+                1,
+            )
+            return RelayV2RuntimeEffect.DeliverPostHandshakeFrame(
+                context = context,
+                message = message,
+                rawUtf8Bytes = message.canonicalWire.toByteArray(Charsets.UTF_8).size,
+                generation = generation,
+            )
         }
 
         fun effect(
@@ -374,10 +807,18 @@ class RelayV2OutboxRecoveryAdapterTest {
         private var metas = linkedMapOf<RelayV2OutboxAuthorityNamespace, RelayV2PersistedOutboxMeta>()
         private var entries = linkedMapOf<EntryKey, RelayV2PersistedOutboxEntry>()
         var failNextReplaceCommandId: String? = null
+        var beforeNextTransaction: (() -> Unit)? = null
+        var transactionCount = 0
+            private set
         var writeCount = 0
             private set
 
         override suspend fun <T> transaction(block: RelayV2DurableStateTransaction.() -> T): T {
+            transactionCount += 1
+            beforeNextTransaction?.also {
+                beforeNextTransaction = null
+                it()
+            }
             val metasBefore = LinkedHashMap(metas)
             val entriesBefore = LinkedHashMap(entries)
             val writesBefore = writeCount
@@ -456,6 +897,7 @@ class RelayV2OutboxRecoveryAdapterTest {
     private data class TestCommand(
         val pending: RelayV2PendingCommand,
         val sessionId: String,
+        val arguments: RelayV2OutboxArguments = RelayV2OutboxArguments.killSession(),
     )
 
     private companion object {
@@ -497,6 +939,68 @@ class RelayV2OutboxRecoveryAdapterTest {
                 2_000,
             ),
         )
+
+        fun decodeEvidence(
+            context: RelayV2HandshakeContext,
+            command: TestCommand,
+            type: String,
+            state: String,
+            requestId: String = "execute-${command.pending.commandId}",
+            hostId: String = context.hostId,
+            hostEpoch: String = context.hostEpoch,
+            commandId: String = command.pending.commandId,
+            dedupeWindowId: String = command.pending.dedupeWindowId,
+            scopeId: String = "scope-a",
+            sessionId: String = command.sessionId,
+            result: Map<String, Any?>? = null,
+        ): RelayV2DecodedMessage {
+            require(type == "command.status" || type == "command.result")
+            require(state in setOf("accepted", "running", "succeeded", "failed", "in_doubt"))
+            if (type == "command.result") require(state !in setOf("accepted", "running"))
+            val finalResult = if (state == "succeeded") {
+                result ?: linkedMapOf(
+                    "sessionId" to command.sessionId,
+                    "terminated" to true,
+                )
+            } else {
+                null
+            }
+            val payload = linkedMapOf<String, Any?>(
+                "dedupeWindowId" to dedupeWindowId,
+                "state" to state,
+            ).apply {
+                if (type == "command.status") put("deduplicated", false)
+                put("updatedAtMs", 50L)
+                if (type == "command.status") {
+                    put("dedupeUntilMs", if (state in setOf("accepted", "running")) null else 1_000L)
+                }
+                put("result", finalResult)
+            }
+            val topLevelError = when (state) {
+                "failed" -> error("COMMAND_FAILED", false, "completed")
+                "in_doubt" -> error("COMMAND_IN_DOUBT", false, "in_doubt")
+                else -> null
+            }
+            val frame = linkedMapOf<String, Any?>(
+                "protocolVersion" to 2,
+                "kind" to if (type == "command.status") "response" else "event",
+                "type" to type,
+            ).apply {
+                if (type == "command.status") put("requestId", requestId)
+                put("commandId", commandId)
+                put("hostId", hostId)
+                put("hostEpoch", hostEpoch)
+                put("scopeId", scopeId)
+                put("sessionId", sessionId)
+                put("payload", payload)
+                put("error", topLevelError)
+            }
+            val codec = RelayV2Codec()
+            return codec.decodeWebSocketFrame(
+                RelayV2WebSocketChannel.PUBLIC,
+                codec.encodeWebSocketFrame(RelayV2WebSocketChannel.PUBLIC, frame),
+            )
+        }
 
         fun decodeStatuses(
             context: RelayV2HandshakeContext,
@@ -618,5 +1122,13 @@ class RelayV2OutboxRecoveryAdapterTest {
 
         fun RelayV2OutboxState.command(commandId: String) =
             entries.single { it.commandId == commandId }
+
+        @Suppress("UNCHECKED_CAST")
+        fun RelayV2DecodedMessage.mutableFrame(): MutableMap<String, Any?> =
+            frame as MutableMap<String, Any?>
+
+        @Suppress("UNCHECKED_CAST")
+        fun RelayV2DecodedMessage.mutablePayload(): MutableMap<String, Any?> =
+            frame.getValue("payload") as MutableMap<String, Any?>
     }
 }

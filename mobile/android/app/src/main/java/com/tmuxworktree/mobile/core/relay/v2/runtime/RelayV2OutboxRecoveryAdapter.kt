@@ -1,7 +1,9 @@
 package com.tmuxworktree.mobile.core.relay.v2.runtime
 
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2Codec
 import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2DecodedMessage
-import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2StrictJson
+import com.tmuxworktree.mobile.core.relay.v2.codec.RelayV2WebSocketChannel
+import com.tmuxworktree.mobile.core.relay.v2.codec.jsonInteger
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandDisposition
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandResult
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2CommandStatusEvidence
@@ -15,21 +17,88 @@ import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEntryId
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxEffect
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxLimits
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxOperation
+import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRejection
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxRecovery
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2OutboxState
 import com.tmuxworktree.mobile.core.relay.v2.outbox.RelayV2ResultSessionKind
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxAuthorityNamespace
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxBatchResult
 import com.tmuxworktree.mobile.core.relay.v2.state.RelayV2OutboxRecoveryAuthority
+import java.util.Collections
 import java.util.UUID
 
-internal data class RelayV2OutboxRecoveryCommit(
-    val receipt: RelayV2RecoveryReceipt.CommandStatusesApplied,
-    val effects: List<RelayV2OutboxEffect>,
+internal sealed interface RelayV2OutboxRecoveryCommit {
+    val effects: List<RelayV2OutboxEffect>
+
+    data class CommandStatuses(
+        val receipt: RelayV2RecoveryReceipt.CommandStatusesApplied,
+        override val effects: List<RelayV2OutboxEffect>,
+    ) : RelayV2OutboxRecoveryCommit
+
+    data class CommandEvidence(
+        val receipt: RelayV2OutboxEvidenceApplied,
+        override val effects: List<RelayV2OutboxEffect>,
+    ) : RelayV2OutboxRecoveryCommit
+}
+
+internal data class RelayV2OutboxEvidenceApplied(
+    val generation: RelayV2EffectGeneration,
+    val entryId: RelayV2OutboxEntryId,
+    val dedupeWindowId: String,
+    val scopeId: String,
+    val sessionId: String?,
+    val operation: RelayV2OutboxOperation,
+    val source: RelayV2CommandStatusSource,
+    val state: RelayV2CommandStatusState,
+    val attemptRequestId: String?,
+)
+
+internal sealed interface RelayV2OutboxRecoveryApplyResult {
+    data class NotOwned(
+        val effect: RelayV2RuntimeEffect,
+    ) : RelayV2OutboxRecoveryApplyResult
+
+    data class Committed(
+        val commit: RelayV2OutboxRecoveryCommit,
+    ) : RelayV2OutboxRecoveryApplyResult
+
+    data class ProtocolViolation(
+        val reason: RelayV2OutboxRejection,
+    ) : RelayV2OutboxRecoveryApplyResult
+
+    data class Rejected(
+        val reason: RelayV2OutboxRejection?,
+    ) : RelayV2OutboxRecoveryApplyResult
+
+    data object Stale : RelayV2OutboxRecoveryApplyResult
+}
+
+private sealed interface RelayV2OutboxRecoveryLeaseResult {
+    data class Committed(
+        val commit: RelayV2OutboxRecoveryCommit,
+    ) : RelayV2OutboxRecoveryLeaseResult
+
+    data class Rejected(
+        val reason: RelayV2OutboxRejection?,
+    ) : RelayV2OutboxRecoveryLeaseResult
+
+    data class ProtocolViolation(
+        val reason: RelayV2OutboxRejection,
+    ) : RelayV2OutboxRecoveryLeaseResult
+}
+
+private data class RelayV2OutboxValidatedFrameSnapshot(
+    val frame: Map<String, Any?>,
+) {
+    val type: String = frame.stringValue("type")
+}
+
+private data class RelayV2ExpectedCommandsSnapshot(
+    val ordered: List<RelayV2PendingCommand>,
 )
 
 /**
- * Unwired bridge from actor-decoded command statuses to the durable Outbox authority.
+ * Unwired bridge from actor-decoded command evidence to the durable Outbox authority.
  *
  * The actor remains the lease owner through [RelayV2RepositoryEffectApplyLeasePort]. This adapter
  * owns no generation or transition state: it acquires that lease around the complete repository
@@ -42,25 +111,49 @@ internal class RelayV2OutboxRecoveryAdapter(
     private val newId: () -> String = { UUID.randomUUID().toString() },
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
-    suspend fun applyCommandStatuses(
+    suspend fun handle(
+        effect: RelayV2RuntimeEffect,
+    ): RelayV2OutboxRecoveryApplyResult = when (effect) {
+        is RelayV2RuntimeEffect.ApplyCommandStatuses -> {
+            val expected = effect.expectedCommands.privateSnapshot()
+            val snapshot = effect.message.validatedSnapshot()
+            require(snapshot.type == "command.statuses")
+            applyCommandStatuses(effect, snapshot, expected).toApplyResult()
+        }
+        is RelayV2RuntimeEffect.DeliverPostHandshakeFrame -> {
+            val snapshot = effect.message.validatedSnapshot()
+            when (snapshot.type) {
+                "command.status", "command.result" ->
+                    applyCommandEvidence(effect, snapshot).toApplyResult()
+                else -> RelayV2OutboxRecoveryApplyResult.NotOwned(effect)
+            }
+        }
+        else -> RelayV2OutboxRecoveryApplyResult.NotOwned(effect)
+    }
+
+    private suspend fun applyCommandStatuses(
         effect: RelayV2RuntimeEffect.ApplyCommandStatuses,
-    ): RelayV2EffectApplyResult<RelayV2OutboxRecoveryCommit?> =
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+        expected: RelayV2ExpectedCommandsSnapshot,
+    ): RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult> =
         applyLease.withEffectApplyLease(effect.repositoryAuthority) {
-            applyCommandStatusesUnderLease(effect)
+            applyCommandStatusesUnderLease(effect, snapshot, expected)
         }
 
     private suspend fun applyCommandStatusesUnderLease(
         effect: RelayV2RuntimeEffect.ApplyCommandStatuses,
-    ): RelayV2OutboxRecoveryCommit? {
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+        expectedSnapshot: RelayV2ExpectedCommandsSnapshot,
+    ): RelayV2OutboxRecoveryLeaseResult {
         requireIdentity(effect)
-        val frame = effect.message.closedFrame()
+        val frame = snapshot.frame
         require(frame["kind"] == "response")
-        require(frame["type"] == "command.statuses")
+        require(snapshot.type == "command.statuses")
         require(frame["requestId"] == effect.recovery.requestId)
         require(frame["hostId"] == effect.context.hostId)
         require(frame["hostEpoch"] == effect.context.hostEpoch)
 
-        val expected = effect.expectedCommands
+        val expected = expectedSnapshot.ordered
         require(expected.size in 1..RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH)
         require(expected.distinctBy { it.commandId }.size == expected.size)
         val statusItems = frame.objectValue("payload").listValue("items").map {
@@ -83,16 +176,88 @@ internal class RelayV2OutboxRecoveryAdapter(
         val result = outbox.reduceOutboxBatchUnderApplyLease(namespace) { current ->
             buildActions(effect, current, expected, statusByCommand)
         }
-        if (result !is RelayV2OutboxBatchResult.Applied) return null
-        return RelayV2OutboxRecoveryCommit(
-            receipt = RelayV2RecoveryReceipt.CommandStatusesApplied(
-                effect.recovery,
-                effect.context.hostId,
-                effect.context.hostEpoch,
-                expected,
-            ),
-            effects = result.effects,
+        return when (result) {
+            is RelayV2OutboxBatchResult.Applied -> RelayV2OutboxRecoveryLeaseResult.Committed(
+                RelayV2OutboxRecoveryCommit.CommandStatuses(
+                    receipt = RelayV2RecoveryReceipt.CommandStatusesApplied(
+                        effect.recovery,
+                        effect.context.hostId,
+                        effect.context.hostEpoch,
+                        expected,
+                    ),
+                    effects = result.effects,
+                ),
+            )
+            is RelayV2OutboxBatchResult.Rejected ->
+                RelayV2OutboxRecoveryLeaseResult.Rejected(result.reason)
+        }
+    }
+
+    private suspend fun applyCommandEvidence(
+        effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame,
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+    ): RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult> =
+        applyLease.withEffectApplyLease(effect.repositoryAuthority) {
+            applyCommandEvidenceUnderLease(effect, snapshot)
+        }
+
+    private suspend fun applyCommandEvidenceUnderLease(
+        effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame,
+        snapshot: RelayV2OutboxValidatedFrameSnapshot,
+    ): RelayV2OutboxRecoveryLeaseResult {
+        requireIdentity(effect)
+        val frame = snapshot.frame
+        val source = when (snapshot.type) {
+            "command.status" -> RelayV2CommandStatusSource.EXECUTE_RESPONSE
+            "command.result" -> RelayV2CommandStatusSource.RESULT_EVENT
+            else -> error("Not a Relay v2 Outbox evidence frame")
+        }
+        require(frame["kind"] == if (source == RelayV2CommandStatusSource.RESULT_EVENT) {
+            "event"
+        } else {
+            "response"
+        })
+        val attemptRequestId = frame["requestId"] as? String
+        if (source == RelayV2CommandStatusSource.RESULT_EVENT) {
+            require(attemptRequestId == null)
+        } else {
+            require(attemptRequestId != null)
+        }
+        require(frame["hostId"] == effect.context.hostId)
+        require(frame["hostEpoch"] == effect.context.hostEpoch)
+
+        val commandId = frame.stringValue("commandId")
+        val entryId = RelayV2OutboxEntryId(
+            effect.repositoryAuthority.profileId,
+            effect.repositoryAuthority.principalId,
+            effect.repositoryAuthority.hostId,
+            effect.repositoryAuthority.hostEpoch,
+            commandId,
         )
+        val namespace = effect.repositoryAuthority.outboxNamespace()
+        var postCommitReceipt: RelayV2OutboxEvidenceApplied? = null
+        var actionSourceProtocolViolation: RelayV2OutboxRejection? = null
+        val result = outbox.reduceOutboxBatchUnderApplyLease(namespace) { current ->
+            val entry = current.entry(entryId) ?: run {
+                actionSourceProtocolViolation =
+                    RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH
+                return@reduceOutboxBatchUnderApplyLease null
+            }
+            val evidence = frame.toEvidence(entry, source, attemptRequestId)
+            postCommitReceipt = evidence.toAppliedReceipt(effect.generation)
+            listOf(RelayV2OutboxAction.ReconcileStatus(evidence))
+        }
+        return when (result) {
+            is RelayV2OutboxBatchResult.Applied -> RelayV2OutboxRecoveryLeaseResult.Committed(
+                RelayV2OutboxRecoveryCommit.CommandEvidence(
+                    receipt = requireNotNull(postCommitReceipt),
+                    effects = result.effects,
+                ),
+            )
+            is RelayV2OutboxBatchResult.Rejected -> actionSourceProtocolViolation?.let {
+                RelayV2OutboxRecoveryLeaseResult.ProtocolViolation(it)
+            } ?: RelayV2OutboxRecoveryLeaseResult.Rejected(result.reason)
+        }
     }
 
     private fun buildActions(
@@ -160,6 +325,43 @@ internal class RelayV2OutboxRecoveryAdapter(
         )
     }
 
+    private fun Map<String, Any?>.toEvidence(
+        entry: RelayV2OutboxEntry,
+        source: RelayV2CommandStatusSource,
+        attemptRequestId: String?,
+    ): RelayV2CommandStatusEvidence {
+        val payload = objectValue("payload")
+        val error = get("error")?.objectValue()
+        val details = error?.get("details")?.objectValue()
+        return RelayV2CommandStatusEvidence(
+            entryId = entry.id,
+            dedupeWindowId = payload.stringValue("dedupeWindowId"),
+            hostEpoch = stringValue("hostEpoch"),
+            scopeId = stringValue("scopeId"),
+            sessionId = get("sessionId") as? String,
+            operation = entry.operation,
+            source = source,
+            attemptKind = source.attemptKind,
+            state = RelayV2CommandStatusState.valueOf(
+                payload.stringValue("state").uppercase(),
+            ),
+            attemptRequestId = attemptRequestId,
+            result = payload.parseResult(entry),
+            retryable = error?.booleanValue("retryable") ?: false,
+            retryAfterMs = error?.numberOrNull("retryAfterMs"),
+            reissueRequired = false,
+            errorCode = error?.stringValue("code"),
+            commandDisposition = error?.stringValue("commandDisposition")?.let { wire ->
+                RelayV2CommandDisposition.entries.single { it.wireValue == wire }
+            },
+            detailsReissueRequired = details?.get("reissueRequired") as? Boolean,
+            expiredFinalState = (details?.get("finalState") as? String)?.let { wire ->
+                requireNotNull(RelayV2ExpiredFinalState.fromWireValue(wire))
+            },
+            errorMessage = error?.stringValue("message"),
+        )
+    }
+
     private fun Map<String, Any?>.parseResult(
         entry: RelayV2OutboxEntry,
     ): RelayV2CommandResult? {
@@ -207,25 +409,103 @@ internal class RelayV2OutboxRecoveryAdapter(
     }
 
     private fun requireIdentity(effect: RelayV2RuntimeEffect.ApplyCommandStatuses) {
-        require(
-            effect.repositoryAuthority ==
-                effect.context.repositoryEffectAuthority(effect.generation),
-        )
-        require(effect.repositoryAuthority.generation == effect.generation)
+        requireIdentity(effect.context, effect.generation, effect.repositoryAuthority)
         require(effect.recovery.generation == effect.generation)
-        require(effect.generation.profileId == effect.context.profile.profileId)
-        require(effect.generation.profileGeneration == effect.context.profile.activationGeneration)
-        require(effect.generation.connectionGeneration > 0)
-        require(effect.repositoryAuthority.hostId == effect.context.hostId)
-        require(effect.repositoryAuthority.hostEpoch == effect.context.hostEpoch)
+    }
+
+    private fun requireIdentity(effect: RelayV2RuntimeEffect.DeliverPostHandshakeFrame) {
+        requireIdentity(effect.context, effect.generation, effect.repositoryAuthority)
+    }
+
+    private fun requireIdentity(
+        context: RelayV2HandshakeContext,
+        generation: RelayV2EffectGeneration,
+        authority: RelayV2RepositoryEffectAuthority,
+    ) {
+        require(authority == context.repositoryEffectAuthority(generation))
+        require(authority.generation == generation)
+        require(generation.profileId == context.profile.profileId)
+        require(generation.profileGeneration == context.profile.activationGeneration)
+        require(generation.connectionGeneration > 0)
+        require(authority.hostId == context.hostId)
+        require(authority.hostEpoch == context.hostEpoch)
     }
 }
 
-private fun RelayV2DecodedMessage.closedFrame(): Map<String, Any?> {
-    require(RelayV2StrictJson.stringify(frame) == canonicalWire) {
-        "Relay v2 decoded frame changed after strict validation"
+private fun RelayV2RepositoryEffectAuthority.outboxNamespace() =
+    RelayV2OutboxAuthorityNamespace(
+        profileId,
+        profileActivationGeneration,
+        principalId,
+        clientInstanceId,
+    )
+
+private fun RelayV2CommandStatusEvidence.toAppliedReceipt(
+    generation: RelayV2EffectGeneration,
+) = RelayV2OutboxEvidenceApplied(
+    generation = generation,
+    entryId = entryId,
+    dedupeWindowId = dedupeWindowId,
+    scopeId = scopeId,
+    sessionId = sessionId,
+    operation = operation,
+    source = source,
+    state = state,
+    attemptRequestId = attemptRequestId,
+)
+
+private fun RelayV2EffectApplyResult<RelayV2OutboxRecoveryLeaseResult>.toApplyResult():
+    RelayV2OutboxRecoveryApplyResult = when (this) {
+    is RelayV2EffectApplyResult.Applied -> when (val durable = value) {
+        is RelayV2OutboxRecoveryLeaseResult.Committed ->
+            RelayV2OutboxRecoveryApplyResult.Committed(durable.commit)
+        is RelayV2OutboxRecoveryLeaseResult.Rejected ->
+            if (durable.reason == RelayV2OutboxRejection.STATUS_IDENTITY_MISMATCH) {
+                RelayV2OutboxRecoveryApplyResult.ProtocolViolation(durable.reason)
+            } else {
+                RelayV2OutboxRecoveryApplyResult.Rejected(durable.reason)
+            }
+        is RelayV2OutboxRecoveryLeaseResult.ProtocolViolation ->
+            RelayV2OutboxRecoveryApplyResult.ProtocolViolation(durable.reason)
     }
-    return frame
+    RelayV2EffectApplyResult.Stale -> RelayV2OutboxRecoveryApplyResult.Stale
+}
+
+private fun List<RelayV2PendingCommand>.privateSnapshot():
+    RelayV2ExpectedCommandsSnapshot {
+    val snapshotSize = size
+    require(snapshotSize in 1..RelayV2OutboxLimits.MAX_QUERY_ITEMS_PER_BATCH) {
+        "Relay v2 expected command batch is invalid"
+    }
+    val copied = ArrayList<RelayV2PendingCommand>(snapshotSize)
+    repeat(snapshotSize) { index ->
+        val pending = get(index)
+        copied += RelayV2PendingCommand(pending.commandId, pending.dedupeWindowId)
+    }
+    require(size == snapshotSize) {
+        "Relay v2 expected command batch changed while snapshotting"
+    }
+    repeat(snapshotSize) { index ->
+        require(get(index) == copied[index]) {
+            "Relay v2 expected command batch changed while snapshotting"
+        }
+    }
+    require(copied.distinctBy { it.commandId }.size == copied.size) {
+        "Relay v2 expected command IDs must be unique"
+    }
+    return RelayV2ExpectedCommandsSnapshot(Collections.unmodifiableList(copied))
+}
+
+private fun RelayV2DecodedMessage.validatedSnapshot(): RelayV2OutboxValidatedFrameSnapshot {
+    val wireSnapshot = canonicalWire
+    val decodedSnapshot = RelayV2Codec().decodeWebSocketFrame(
+        RelayV2WebSocketChannel.PUBLIC,
+        wireSnapshot.toByteArray(Charsets.UTF_8),
+    )
+    require(decodedSnapshot.canonicalWire == wireSnapshot) {
+        "Relay v2 canonical wire changed after strict validation"
+    }
+    return RelayV2OutboxValidatedFrameSnapshot(decodedSnapshot.frame)
 }
 
 @Suppress("UNCHECKED_CAST")
@@ -239,7 +519,7 @@ private fun Map<String, Any?>.stringValue(name: String): String = getValue(name)
 private fun Map<String, Any?>.longValue(name: String): Long = (getValue(name) as Number).toLong()
 
 private fun Map<String, Any?>.numberOrNull(name: String): Long? =
-    (getValue(name) as? Number)?.toLong()
+    get(name)?.let { jsonInteger(it) }
 
 private fun Map<String, Any?>.booleanValue(name: String): Boolean = getValue(name) as Boolean
 
